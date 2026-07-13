@@ -1,15 +1,14 @@
 use super::common::{
-    FORGE_MAVEN_BASE, FORGE_MAVEN_META, FORGE_PROMOTIONS_URL, apply_forge_promotion_selection,
+    FORGE_MAVEN_META, FORGE_PROMOTIONS_URL, apply_forge_promotion_selection,
     extract_forge_loader_version, extract_forge_minecraft_version, fetch_text,
-    infer_loader_build_metadata, is_prerelease_loader_version, minecraft_version_at_least,
+    forge_install_source, infer_loader_build_metadata, is_prerelease_loader_version,
     parse_maven_versions, provider_installed_version_id,
 };
 use crate::loaders::api::build_id_for;
 use crate::loaders::http::fetch_json;
 use crate::loaders::types::{
-    LoaderArtifactKind, LoaderBuildRecord, LoaderBuildSubjectKind, LoaderComponentId,
-    LoaderGameVersion, LoaderInstallSource, LoaderInstallStrategy, LoaderInstallability,
-    LoaderVersionIndex,
+    LoaderBuildRecord, LoaderBuildSubjectKind, LoaderComponentId, LoaderGameVersion,
+    LoaderInstallability, LoaderVersionIndex,
 };
 use crate::types::VersionSubjectKind;
 use crate::{LifecycleMeta, version_meta::MinecraftVersionMeta};
@@ -92,7 +91,7 @@ pub async fn fetch_builds(
             .as_ref()
             .is_some_and(|value| value == &loader_version);
         let (strategy, artifact_kind, install_source) =
-            forge_install_source(minecraft_version, &loader_version);
+            forge_install_source(minecraft_version, &loader_version)?;
         let mut build_meta =
             infer_loader_build_metadata(&loader_version, &[], is_recommended, is_latest, None);
         apply_forge_promotion_selection(
@@ -129,65 +128,10 @@ pub async fn fetch_builds(
     })
 }
 
-fn forge_install_source(
-    minecraft_version: &str,
-    loader_version: &str,
-) -> (
-    LoaderInstallStrategy,
-    LoaderArtifactKind,
-    LoaderInstallSource,
-) {
-    if !minecraft_version_at_least(minecraft_version, &[1, 5]) {
-        let exact = format!("{minecraft_version}-{loader_version}");
-        let suffix = earliest_legacy_forge_archive_suffix(minecraft_version);
-        return (
-            LoaderInstallStrategy::ForgeEarliestLegacy,
-            LoaderArtifactKind::LegacyArchive,
-            LoaderInstallSource::LegacyArchive {
-                url: format!(
-                    "{FORGE_MAVEN_BASE}/net/minecraftforge/forge/{exact}/forge-{exact}-{suffix}"
-                ),
-            },
-        );
-    }
-
-    let exact = format!("{minecraft_version}-{loader_version}");
-    if minecraft_version_at_least(minecraft_version, &[1, 13]) {
-        (
-            LoaderInstallStrategy::ForgeModern,
-            LoaderArtifactKind::InstallerJar,
-            LoaderInstallSource::InstallerJar {
-                url: format!(
-                    "{FORGE_MAVEN_BASE}/net/minecraftforge/forge/{0}/forge-{0}-installer.jar",
-                    exact
-                ),
-            },
-        )
-    } else {
-        (
-            LoaderInstallStrategy::ForgeLegacyInstaller,
-            LoaderArtifactKind::InstallerJar,
-            LoaderInstallSource::InstallerJar {
-                url: format!(
-                    "{FORGE_MAVEN_BASE}/net/minecraftforge/forge/{0}/forge-{0}-installer.jar",
-                    exact
-                ),
-            },
-        )
-    }
-}
-
-fn earliest_legacy_forge_archive_suffix(minecraft_version: &str) -> &'static str {
-    if minecraft_version_at_least(minecraft_version, &[1, 3]) {
-        "universal.zip"
-    } else {
-        "client.zip"
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{forge_install_source, parse_game_versions_from_maven_metadata};
+    use super::parse_game_versions_from_maven_metadata;
+    use crate::loaders::providers::common::forge_install_source;
     use crate::loaders::types::{LoaderArtifactKind, LoaderInstallSource, LoaderInstallStrategy};
 
     #[test]
@@ -224,7 +168,8 @@ mod tests {
 
     #[test]
     fn classifies_earliest_forge_as_legacy_archive() {
-        let (strategy, artifact_kind, install_source) = forge_install_source("1.2.4", "2.0.0.68");
+        let (strategy, artifact_kind, install_source) =
+            forge_install_source("1.2.4", "2.0.0.68").expect("source");
         assert_eq!(strategy, LoaderInstallStrategy::ForgeEarliestLegacy);
         assert_eq!(artifact_kind, LoaderArtifactKind::LegacyArchive);
         match install_source {
@@ -237,7 +182,8 @@ mod tests {
 
     #[test]
     fn classifies_middle_legacy_forge_as_universal_archive() {
-        let (strategy, artifact_kind, install_source) = forge_install_source("1.4.7", "6.6.2.534");
+        let (strategy, artifact_kind, install_source) =
+            forge_install_source("1.4.7", "6.6.2.534").expect("source");
         assert_eq!(strategy, LoaderInstallStrategy::ForgeEarliestLegacy);
         assert_eq!(artifact_kind, LoaderArtifactKind::LegacyArchive);
         match install_source {
@@ -251,7 +197,7 @@ mod tests {
     #[test]
     fn classifies_legacy_installer_forge_correctly() {
         let (strategy, artifact_kind, install_source) =
-            forge_install_source("1.6.4", "9.11.1.1345");
+            forge_install_source("1.6.4", "9.11.1.1345").expect("source");
         assert_eq!(strategy, LoaderInstallStrategy::ForgeLegacyInstaller);
         assert_eq!(artifact_kind, LoaderArtifactKind::InstallerJar);
         match install_source {
@@ -264,7 +210,8 @@ mod tests {
 
     #[test]
     fn classifies_modern_forge_correctly() {
-        let (strategy, artifact_kind, install_source) = forge_install_source("1.21.11", "61.1.5");
+        let (strategy, artifact_kind, install_source) =
+            forge_install_source("1.21.11", "61.1.5").expect("source");
         assert_eq!(strategy, LoaderInstallStrategy::ForgeModern);
         assert_eq!(artifact_kind, LoaderArtifactKind::InstallerJar);
         match install_source {

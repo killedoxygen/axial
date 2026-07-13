@@ -12,8 +12,9 @@ use crate::known_good_libraries::{
 };
 use crate::launch::{Library, VersionJson, effective_java_version_for};
 use crate::loaders::{
-    AuthenticatedInstallerReceiptInput, LoaderBuildRecord, LoaderComponentId,
-    LoaderInstallStrategy, VerifiedInstallerClientBytes, compose_loader_version,
+    AuthenticatedInstallerReceiptInput, AuthenticatedLegacyOverlayAuthority, LoaderBuildRecord,
+    LoaderComponentId, LoaderInstallSource, LoaderInstallStrategy, VerifiedInstallerClientBytes,
+    compose_loader_version,
 };
 #[cfg(test)]
 use crate::manifest::ManifestEntry;
@@ -126,7 +127,7 @@ pub struct KnownGoodInstallReceipt {
     authenticated: AuthenticatedKnownGoodReceipt,
 }
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Eq, PartialEq)]
 pub struct KnownGoodReconstructionReceipt {
     authenticated: AuthenticatedKnownGoodReceipt,
 }
@@ -268,23 +269,6 @@ impl KnownGoodInstallReceipt {
         Ok(expected)
     }
 
-    fn authenticated_client_known_good_integrity(
-        &self,
-    ) -> Result<KnownGoodIntegrity, KnownGoodInventoryError> {
-        let path = format!("{0}/{0}.jar", self.authenticated.version_id.as_str());
-        self.authenticated
-            .inventory
-            .entries
-            .iter()
-            .find(|entry| {
-                entry.root == KnownGoodRoot::Versions
-                    && entry.path.as_str() == path
-                    && entry.kind == KnownGoodArtifactKind::ClientJar
-            })
-            .map(|entry| entry.integrity.clone())
-            .ok_or(KnownGoodInventoryError::ClientIntegrity)
-    }
-
     pub(crate) fn authenticate_client_bytes(
         &self,
         bytes: &[u8],
@@ -300,78 +284,14 @@ impl KnownGoodInstallReceipt {
         version_bytes: &[u8],
         child_client_bytes: &[u8],
     ) -> Result<Self, KnownGoodInventoryError> {
-        if base.authenticated.version_id.as_str() != record.minecraft_version
-            || base.authenticated.effective_version.id != record.minecraft_version
-            || record.component_id != LoaderComponentId::Forge
-            || record.strategy != LoaderInstallStrategy::ForgeEarliestLegacy
-            || crate::loaders::api::validate_loader_build_record_identity(record).is_err()
-        {
-            return Err(KnownGoodInventoryError::LoaderIdentityMismatch);
-        }
-
-        let child_size = i64::try_from(child_client_bytes.len())
-            .map_err(|_| KnownGoodInventoryError::InputTooLarge)?;
-        let child_digest = sha1_digest(child_client_bytes);
-        let child_sha1 = child_digest.as_str().to_string();
-        let mut expected_version = base.authenticated.effective_version.clone();
-        expected_version.id = record.version_id.clone();
-        expected_version.inherits_from = record.minecraft_version.clone();
-        expected_version.materialized = true;
-        let client = expected_version
-            .downloads
-            .client
-            .as_mut()
-            .ok_or(KnownGoodInventoryError::MissingClient)?;
-        client.sha1 = child_sha1;
-        client.size = child_size;
-        client.url.clear();
-        if resolved_version != expected_version
-            || !serde_json::from_slice::<VersionJson>(version_bytes)
-                .is_ok_and(|version| version == resolved_version)
-        {
-            return Err(KnownGoodInventoryError::LoaderIdentityMismatch);
-        }
-
-        let version_id = KnownGoodId::new(&resolved_version.id)?;
-        let mut builder = InventoryBuilder::default();
-        for entry in base.authenticated.inventory.entries.iter().filter(|entry| {
-            matches!(
-                &entry.root,
-                KnownGoodRoot::Assets | KnownGoodRoot::ManagedRuntime { .. }
-            )
-        }) {
-            builder.insert(entry.clone())?;
-        }
-        builder.insert(KnownGoodEntry {
-            root: KnownGoodRoot::Versions,
-            path: KnownGoodRelativePath::new(&format!("{0}/{0}.json", version_id.as_str()))?,
-            kind: KnownGoodArtifactKind::VersionMetadata,
-            integrity: exact_bytes_integrity(version_bytes),
-        })?;
-        builder.insert(KnownGoodEntry {
-            root: KnownGoodRoot::Versions,
-            path: KnownGoodRelativePath::new(&format!("{0}/{0}.jar", version_id.as_str()))?,
-            kind: KnownGoodArtifactKind::ClientJar,
-            integrity: KnownGoodIntegrity::Sha1 {
-                digest: child_digest,
-                size: child_client_bytes.len() as u64,
-            },
-        })?;
-
-        add_exact_inherited_libraries(
-            &mut builder,
-            &resolved_version.libraries,
-            &base.authenticated.environment,
-            &base.authenticated.inventory,
-        )?;
-
         Ok(Self {
-            authenticated: AuthenticatedKnownGoodReceipt {
-                version_id,
-                inventory: builder.finish(),
-                effective_version: resolved_version,
-                environment: base.authenticated.environment.clone(),
-            },
+            authenticated: derive_legacy_archive_receipt(
+                &base.authenticated,
+                record,
+                resolved_version,
+                version_bytes,
+                child_client_bytes,
+            )?,
         })
     }
 
@@ -382,133 +302,14 @@ impl KnownGoodInstallReceipt {
         version_bytes: &[u8],
         library_declarations: SealedExactLibraryDeclarations,
     ) -> Result<Self, KnownGoodInventoryError> {
-        if base.authenticated.version_id.as_str() != record.minecraft_version
-            || base.authenticated.effective_version.id != record.minecraft_version
-            || resolved_version.id != record.version_id
-            || resolved_version.inherits_from != record.minecraft_version
-            || !resolved_version.materialized
-            || resolved_version.asset_index != base.authenticated.effective_version.asset_index
-            || resolved_version.assets != base.authenticated.effective_version.assets
-            || resolved_version.downloads != base.authenticated.effective_version.downloads
-            || resolved_version.java_version != base.authenticated.effective_version.java_version
-            || resolved_version.logging != base.authenticated.effective_version.logging
-            || !serde_json::from_slice::<VersionJson>(version_bytes)
-                .is_ok_and(|version| version == resolved_version)
-        {
-            return Err(KnownGoodInventoryError::LoaderIdentityMismatch);
-        }
-        let component_matches = matches!(
-            (record.component_id, record.strategy),
-            (
-                LoaderComponentId::Fabric,
-                LoaderInstallStrategy::FabricProfile
-            ) | (
-                LoaderComponentId::Quilt,
-                LoaderInstallStrategy::QuiltProfile
-            )
-        );
-        if !component_matches
-            || crate::loaders::api::validate_loader_build_record_identity(record).is_err()
-        {
-            return Err(KnownGoodInventoryError::LoaderIdentityMismatch);
-        }
-
-        let version_id = KnownGoodId::new(&resolved_version.id)?;
-        let mut builder = InventoryBuilder::default();
-        for entry in base.authenticated.inventory.entries.iter().filter(|entry| {
-            matches!(
-                &entry.root,
-                KnownGoodRoot::Assets | KnownGoodRoot::ManagedRuntime { .. }
-            )
-        }) {
-            builder.insert(entry.clone())?;
-        }
-
-        builder.insert(KnownGoodEntry {
-            root: KnownGoodRoot::Versions,
-            path: KnownGoodRelativePath::new(&format!("{0}/{0}.json", version_id.as_str()))?,
-            kind: KnownGoodArtifactKind::VersionMetadata,
-            integrity: exact_bytes_integrity(version_bytes),
-        })?;
-        builder.insert(KnownGoodEntry {
-            root: KnownGoodRoot::Versions,
-            path: KnownGoodRelativePath::new(&format!("{0}/{0}.jar", version_id.as_str()))?,
-            kind: KnownGoodArtifactKind::ClientJar,
-            integrity: base.authenticated_client_known_good_integrity()?,
-        })?;
-
-        if resolved_version.libraries.len() > MAX_KNOWN_GOOD_ENTRIES {
-            return Err(KnownGoodInventoryError::InputTooLarge);
-        }
-        let (profile_fragment, sealed_environment) = library_declarations
-            .profile_contract()
-            .ok_or(KnownGoodInventoryError::ProfileLibraryProofMismatch)?;
-        let recomposed = compose_loader_version(
-            &base.authenticated.effective_version,
-            &record.minecraft_version,
-            &record.version_id,
-            profile_fragment,
-        )
-        .map_err(|_| KnownGoodInventoryError::ProfileLibraryProofMismatch)?;
-        if sealed_environment != &base.authenticated.environment || resolved_version != recomposed {
-            return Err(KnownGoodInventoryError::ProfileLibraryProofMismatch);
-        }
-        let libraries = library_artifact_plans_for(
-            &resolved_version.libraries,
-            &base.authenticated.environment,
-        )
-        .map_err(|_| KnownGoodInventoryError::InvalidLibraryPlan)?;
-        let mut used_proofs = BTreeSet::new();
-        for plan in libraries {
-            let path = KnownGoodRelativePath::new(plan.relative_path.as_str())?;
-            let kind = if plan.is_native {
-                KnownGoodArtifactKind::NativeLibrary
-            } else {
-                KnownGoodArtifactKind::Library
-            };
-            let integrity = if let Some((sealed_kind, sealed_sha1, sealed_size)) =
-                library_declarations.get(&plan.relative_path)
-            {
-                let expected_kind = if plan.is_native {
-                    SealedLibraryKind::Native
-                } else {
-                    SealedLibraryKind::Library
-                };
-                if sealed_kind != expected_kind
-                    || plan.expected.size != Some(sealed_size)
-                    || plan.expected.sha1.as_deref().is_none_or(|sha1| {
-                        !Sha1Digest::from_metadata(sha1)
-                            .is_ok_and(|digest| digest == sha1_array_digest(&sealed_sha1))
-                    })
-                {
-                    return Err(KnownGoodInventoryError::ProfileLibraryProofMismatch);
-                }
-                used_proofs.insert(plan.relative_path.clone());
-                KnownGoodIntegrity::Sha1 {
-                    digest: sha1_array_digest(&sealed_sha1),
-                    size: sealed_size,
-                }
-            } else {
-                matching_base_library_integrity(base, &plan, &path, kind)?
-            };
-            builder.insert(KnownGoodEntry {
-                root: KnownGoodRoot::Libraries,
-                path,
-                kind,
-                integrity,
-            })?;
-        }
-        if used_proofs.len() != library_declarations.len() {
-            return Err(KnownGoodInventoryError::ProfileLibraryProofMismatch);
-        }
-
         Ok(Self {
-            authenticated: AuthenticatedKnownGoodReceipt {
-                version_id,
-                inventory: builder.finish(),
-                effective_version: resolved_version,
-                environment: base.authenticated.environment.clone(),
-            },
+            authenticated: derive_profile_receipt(
+                &base.authenticated,
+                record,
+                resolved_version,
+                version_bytes,
+                library_declarations,
+            )?,
         })
     }
 
@@ -669,7 +470,7 @@ impl KnownGoodInstallReceipt {
                     size,
                 }
             } else if allows_base {
-                matching_base_library_integrity(&base, &plan, &path, kind)
+                matching_base_library_integrity(&base.authenticated, &plan, &path, kind)
                     .map_err(|_| KnownGoodInventoryError::InstallerLibraryProofMismatch)?
             } else {
                 return Err(KnownGoodInventoryError::InstallerLibraryProofMismatch);
@@ -698,6 +499,232 @@ impl KnownGoodInstallReceipt {
     }
 }
 
+fn authenticated_client_known_good_integrity(
+    authenticated: &AuthenticatedKnownGoodReceipt,
+) -> Result<KnownGoodIntegrity, KnownGoodInventoryError> {
+    let path = format!("{0}/{0}.jar", authenticated.version_id.as_str());
+    authenticated
+        .inventory
+        .entries
+        .iter()
+        .find(|entry| {
+            entry.root == KnownGoodRoot::Versions
+                && entry.path.as_str() == path
+                && entry.kind == KnownGoodArtifactKind::ClientJar
+        })
+        .map(|entry| entry.integrity.clone())
+        .ok_or(KnownGoodInventoryError::ClientIntegrity)
+}
+
+fn derive_legacy_archive_receipt(
+    base: &AuthenticatedKnownGoodReceipt,
+    record: &LoaderBuildRecord,
+    resolved_version: VersionJson,
+    version_bytes: &[u8],
+    child_client_bytes: &[u8],
+) -> Result<AuthenticatedKnownGoodReceipt, KnownGoodInventoryError> {
+    if base.version_id.as_str() != record.minecraft_version
+        || base.effective_version.id != record.minecraft_version
+        || record.component_id != LoaderComponentId::Forge
+        || record.strategy != LoaderInstallStrategy::ForgeEarliestLegacy
+        || crate::loaders::api::validate_loader_build_record_identity(record).is_err()
+    {
+        return Err(KnownGoodInventoryError::LoaderIdentityMismatch);
+    }
+
+    let child_size = i64::try_from(child_client_bytes.len())
+        .map_err(|_| KnownGoodInventoryError::InputTooLarge)?;
+    let child_digest = sha1_digest(child_client_bytes);
+    let mut expected_version = base.effective_version.clone();
+    expected_version.id = record.version_id.clone();
+    expected_version.inherits_from = record.minecraft_version.clone();
+    expected_version.materialized = true;
+    let client = expected_version
+        .downloads
+        .client
+        .as_mut()
+        .ok_or(KnownGoodInventoryError::MissingClient)?;
+    client.sha1 = child_digest.as_str().to_string();
+    client.size = child_size;
+    client.url.clear();
+    if resolved_version != expected_version
+        || !serde_json::from_slice::<VersionJson>(version_bytes)
+            .is_ok_and(|version| version == resolved_version)
+    {
+        return Err(KnownGoodInventoryError::LoaderIdentityMismatch);
+    }
+
+    let version_id = KnownGoodId::new(&resolved_version.id)?;
+    let mut builder = InventoryBuilder::default();
+    for entry in base.inventory.entries.iter().filter(|entry| {
+        matches!(
+            &entry.root,
+            KnownGoodRoot::Assets | KnownGoodRoot::ManagedRuntime { .. }
+        )
+    }) {
+        builder.insert(entry.clone())?;
+    }
+    builder.insert(KnownGoodEntry {
+        root: KnownGoodRoot::Versions,
+        path: KnownGoodRelativePath::new(&format!("{0}/{0}.json", version_id.as_str()))?,
+        kind: KnownGoodArtifactKind::VersionMetadata,
+        integrity: exact_bytes_integrity(version_bytes),
+    })?;
+    builder.insert(KnownGoodEntry {
+        root: KnownGoodRoot::Versions,
+        path: KnownGoodRelativePath::new(&format!("{0}/{0}.jar", version_id.as_str()))?,
+        kind: KnownGoodArtifactKind::ClientJar,
+        integrity: KnownGoodIntegrity::Sha1 {
+            digest: child_digest,
+            size: child_client_bytes.len() as u64,
+        },
+    })?;
+    add_exact_inherited_libraries(
+        &mut builder,
+        &resolved_version.libraries,
+        &base.environment,
+        &base.inventory,
+    )?;
+
+    Ok(AuthenticatedKnownGoodReceipt {
+        version_id,
+        inventory: builder.finish(),
+        effective_version: resolved_version,
+        environment: base.environment.clone(),
+    })
+}
+
+fn derive_profile_receipt(
+    base: &AuthenticatedKnownGoodReceipt,
+    record: &LoaderBuildRecord,
+    resolved_version: VersionJson,
+    version_bytes: &[u8],
+    library_declarations: SealedExactLibraryDeclarations,
+) -> Result<AuthenticatedKnownGoodReceipt, KnownGoodInventoryError> {
+    if base.version_id.as_str() != record.minecraft_version
+        || base.effective_version.id != record.minecraft_version
+        || resolved_version.id != record.version_id
+        || resolved_version.inherits_from != record.minecraft_version
+        || !resolved_version.materialized
+        || resolved_version.asset_index != base.effective_version.asset_index
+        || resolved_version.assets != base.effective_version.assets
+        || resolved_version.downloads != base.effective_version.downloads
+        || resolved_version.java_version != base.effective_version.java_version
+        || resolved_version.logging != base.effective_version.logging
+        || !serde_json::from_slice::<VersionJson>(version_bytes)
+            .is_ok_and(|version| version == resolved_version)
+    {
+        return Err(KnownGoodInventoryError::LoaderIdentityMismatch);
+    }
+    let component_matches = matches!(
+        (record.component_id, record.strategy),
+        (
+            LoaderComponentId::Fabric,
+            LoaderInstallStrategy::FabricProfile
+        ) | (
+            LoaderComponentId::Quilt,
+            LoaderInstallStrategy::QuiltProfile
+        )
+    );
+    if !component_matches
+        || crate::loaders::api::validate_loader_build_record_identity(record).is_err()
+    {
+        return Err(KnownGoodInventoryError::LoaderIdentityMismatch);
+    }
+
+    let version_id = KnownGoodId::new(&resolved_version.id)?;
+    let mut builder = InventoryBuilder::default();
+    for entry in base.inventory.entries.iter().filter(|entry| {
+        matches!(
+            &entry.root,
+            KnownGoodRoot::Assets | KnownGoodRoot::ManagedRuntime { .. }
+        )
+    }) {
+        builder.insert(entry.clone())?;
+    }
+    builder.insert(KnownGoodEntry {
+        root: KnownGoodRoot::Versions,
+        path: KnownGoodRelativePath::new(&format!("{0}/{0}.json", version_id.as_str()))?,
+        kind: KnownGoodArtifactKind::VersionMetadata,
+        integrity: exact_bytes_integrity(version_bytes),
+    })?;
+    builder.insert(KnownGoodEntry {
+        root: KnownGoodRoot::Versions,
+        path: KnownGoodRelativePath::new(&format!("{0}/{0}.jar", version_id.as_str()))?,
+        kind: KnownGoodArtifactKind::ClientJar,
+        integrity: authenticated_client_known_good_integrity(base)?,
+    })?;
+
+    if resolved_version.libraries.len() > MAX_KNOWN_GOOD_ENTRIES {
+        return Err(KnownGoodInventoryError::InputTooLarge);
+    }
+    let (profile_fragment, sealed_environment) = library_declarations
+        .profile_contract()
+        .ok_or(KnownGoodInventoryError::ProfileLibraryProofMismatch)?;
+    let recomposed = compose_loader_version(
+        &base.effective_version,
+        &record.minecraft_version,
+        &record.version_id,
+        profile_fragment,
+    )
+    .map_err(|_| KnownGoodInventoryError::ProfileLibraryProofMismatch)?;
+    if sealed_environment != &base.environment || resolved_version != recomposed {
+        return Err(KnownGoodInventoryError::ProfileLibraryProofMismatch);
+    }
+    let libraries = library_artifact_plans_for(&resolved_version.libraries, &base.environment)
+        .map_err(|_| KnownGoodInventoryError::InvalidLibraryPlan)?;
+    let mut used_proofs = BTreeSet::new();
+    for plan in libraries {
+        let path = KnownGoodRelativePath::new(plan.relative_path.as_str())?;
+        let kind = if plan.is_native {
+            KnownGoodArtifactKind::NativeLibrary
+        } else {
+            KnownGoodArtifactKind::Library
+        };
+        let integrity = if let Some((sealed_kind, sealed_sha1, sealed_size)) =
+            library_declarations.get(&plan.relative_path)
+        {
+            let expected_kind = if plan.is_native {
+                SealedLibraryKind::Native
+            } else {
+                SealedLibraryKind::Library
+            };
+            if sealed_kind != expected_kind
+                || plan.expected.size != Some(sealed_size)
+                || plan.expected.sha1.as_deref().is_none_or(|sha1| {
+                    !Sha1Digest::from_metadata(sha1)
+                        .is_ok_and(|digest| digest == sha1_array_digest(&sealed_sha1))
+                })
+            {
+                return Err(KnownGoodInventoryError::ProfileLibraryProofMismatch);
+            }
+            used_proofs.insert(plan.relative_path.clone());
+            KnownGoodIntegrity::Sha1 {
+                digest: sha1_array_digest(&sealed_sha1),
+                size: sealed_size,
+            }
+        } else {
+            matching_base_library_integrity(base, &plan, &path, kind)?
+        };
+        builder.insert(KnownGoodEntry {
+            root: KnownGoodRoot::Libraries,
+            path,
+            kind,
+            integrity,
+        })?;
+    }
+    if used_proofs.len() != library_declarations.len() {
+        return Err(KnownGoodInventoryError::ProfileLibraryProofMismatch);
+    }
+
+    Ok(AuthenticatedKnownGoodReceipt {
+        version_id,
+        inventory: builder.finish(),
+        effective_version: resolved_version,
+        environment: base.environment.clone(),
+    })
+}
+
 impl KnownGoodReconstructionReceipt {
     pub fn into_activation_source(self) -> KnownGoodActivationSource {
         KnownGoodActivationSource {
@@ -705,6 +732,78 @@ impl KnownGoodReconstructionReceipt {
             inventory: self.authenticated.inventory,
         }
     }
+}
+
+pub(crate) fn reconstructed_effective_version(
+    receipt: &KnownGoodReconstructionReceipt,
+) -> &VersionJson {
+    &receipt.authenticated.effective_version
+}
+
+pub(crate) fn seal_reconstructed_profile_source(
+    base: KnownGoodReconstructionReceipt,
+    record: &LoaderBuildRecord,
+    resolved_version: VersionJson,
+    version_bytes: &[u8],
+    library_declarations: SealedExactLibraryDeclarations,
+) -> Result<KnownGoodReconstructionReceipt, KnownGoodInventoryError> {
+    let authenticated = derive_profile_receipt(
+        &base.authenticated,
+        record,
+        resolved_version,
+        version_bytes,
+        library_declarations,
+    )?;
+    Ok(KnownGoodReconstructionReceipt { authenticated })
+}
+
+pub(crate) fn seal_reconstructed_legacy_archive_source(
+    authority: AuthenticatedLegacyOverlayAuthority,
+) -> Result<KnownGoodReconstructionReceipt, KnownGoodInventoryError> {
+    let (
+        base,
+        base_client_source,
+        archive_source,
+        record,
+        resolved_version,
+        version_bytes,
+        child_client_bytes,
+    ) = authority.consume_for_sealing();
+    let LoaderInstallSource::LegacyArchive { url: archive_url } = &record.install_source else {
+        return Err(KnownGoodInventoryError::LoaderIdentityMismatch);
+    };
+    if !archive_source.matches_contract(archive_url, &record.version_id) {
+        return Err(KnownGoodInventoryError::LoaderIdentityMismatch);
+    }
+    let base_client = base
+        .authenticated
+        .effective_version
+        .downloads
+        .client
+        .as_ref()
+        .ok_or(KnownGoodInventoryError::MissingClient)?;
+    let expected = ExpectedIntegrity {
+        size: u64::try_from(base_client.size)
+            .ok()
+            .filter(|size| *size > 0),
+        sha1: (!base_client.sha1.trim().is_empty()).then(|| base_client.sha1.trim().to_string()),
+    };
+    if base_client_source.kind() != SelectedDownloadArtifactKind::ClientJar
+        || base_client_source.logical_identity() != base.authenticated.version_id.as_str()
+        || base_client_source.provider_url() != base_client.url
+        || base_client_source.expected() != &expected
+        || validate_bytes(base_client_source.bytes(), &expected).is_err()
+    {
+        return Err(KnownGoodInventoryError::ClientIntegrity);
+    }
+    let authenticated = derive_legacy_archive_receipt(
+        &base.authenticated,
+        &record,
+        resolved_version,
+        &version_bytes,
+        &child_client_bytes,
+    )?;
+    Ok(KnownGoodReconstructionReceipt { authenticated })
 }
 
 pub(crate) fn seal_reconstructed_vanilla(
@@ -1113,7 +1212,7 @@ fn add_exact_inherited_libraries(
 }
 
 fn matching_base_library_integrity(
-    base: &KnownGoodInstallReceipt,
+    base: &AuthenticatedKnownGoodReceipt,
     plan: &LibraryArtifactPlan,
     path: &KnownGoodRelativePath,
     kind: KnownGoodArtifactKind,
@@ -1125,7 +1224,6 @@ fn matching_base_library_integrity(
         .ok_or(KnownGoodInventoryError::MissingChecksum)
         .and_then(Sha1Digest::from_metadata)?;
     let entry = base
-        .authenticated
         .inventory
         .entries
         .iter()
@@ -2758,6 +2856,9 @@ mod tests {
             assert!(!derive.contains("Clone"));
             assert!(!derive.contains("Serialize"));
             assert!(!derive.contains("Deserialize"));
+            if receipt == "pub struct KnownGoodReconstructionReceipt" {
+                assert!(!derive.contains("Debug"));
+            }
         }
         let reconstruction_impl = source
             .split("impl KnownGoodReconstructionReceipt")

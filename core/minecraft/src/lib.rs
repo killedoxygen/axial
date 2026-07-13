@@ -37,7 +37,7 @@ pub use loaders::{
     LoaderSelectionReason, LoaderSelectionSource, LoaderTerm, LoaderTermEvidence, LoaderTermSource,
     LoaderVersionIndex, MaterializedLoaderProfile, build_id_for, fetch_builds, fetch_cached_builds,
     fetch_components, fetch_supported_versions, install_build, installed_version_id_for,
-    loader_components, parse_build_id, resolve_build_record_for_install,
+    loader_components, parse_build_id, reconstruct_build, resolve_build_record_for_install,
     validate_materialized_loader_profile,
 };
 pub use manifest::{

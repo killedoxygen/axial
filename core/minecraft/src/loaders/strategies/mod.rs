@@ -1,13 +1,12 @@
 mod common;
-mod fabric_profile;
-mod forge_earliest_legacy;
 mod forge_legacy_installer;
 mod forge_modern;
 mod neoforge_modern;
-mod quilt_profile;
+
+pub(crate) use common::AuthenticatedLegacyOverlayAuthority;
 
 use crate::download::DownloadProgress;
-use crate::known_good::KnownGoodInstallReceipt;
+use crate::known_good::{KnownGoodInstallReceipt, KnownGoodReconstructionReceipt};
 use crate::loaders::types::{LoaderError, LoaderInstallPlan, LoaderInstallStrategy};
 use std::path::Path;
 
@@ -20,11 +19,13 @@ where
     F: FnMut(DownloadProgress),
 {
     match plan.record.strategy {
-        LoaderInstallStrategy::FabricProfile => {
-            Box::pin(fabric_profile::install(library_dir, plan, &mut send)).await
-        }
-        LoaderInstallStrategy::QuiltProfile => {
-            Box::pin(quilt_profile::install(library_dir, plan, &mut send)).await
+        LoaderInstallStrategy::FabricProfile | LoaderInstallStrategy::QuiltProfile => {
+            Box::pin(common::install_from_profile_source(
+                library_dir,
+                plan,
+                &mut send,
+            ))
+            .await
         }
         LoaderInstallStrategy::ForgeModern => {
             Box::pin(forge_modern::install(library_dir, plan, &mut send)).await
@@ -38,10 +39,33 @@ where
             .await
         }
         LoaderInstallStrategy::ForgeEarliestLegacy => {
-            Box::pin(forge_earliest_legacy::install(library_dir, plan, &mut send)).await
+            Box::pin(common::install_from_legacy_archive(
+                library_dir,
+                plan,
+                &mut send,
+            ))
+            .await
         }
         LoaderInstallStrategy::NeoForgeModern => {
             Box::pin(neoforge_modern::install(library_dir, plan, &mut send)).await
         }
+    }
+}
+
+pub(crate) async fn reconstruct_build(
+    plan: &LoaderInstallPlan,
+) -> Result<KnownGoodReconstructionReceipt, LoaderError> {
+    match plan.record.strategy {
+        LoaderInstallStrategy::FabricProfile | LoaderInstallStrategy::QuiltProfile => {
+            Box::pin(common::reconstruct_from_profile_source(plan)).await
+        }
+        LoaderInstallStrategy::ForgeEarliestLegacy => {
+            Box::pin(common::reconstruct_from_legacy_archive(plan)).await
+        }
+        LoaderInstallStrategy::ForgeModern
+        | LoaderInstallStrategy::ForgeLegacyInstaller
+        | LoaderInstallStrategy::NeoForgeModern => Err(LoaderError::InvalidProfile(
+            "loader reconstruction strategy is not implemented".to_string(),
+        )),
     }
 }

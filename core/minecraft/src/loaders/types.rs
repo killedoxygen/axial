@@ -197,10 +197,6 @@ pub enum LoaderArtifactKind {
     ProfileJson,
     InstallerJar,
     LegacyArchive,
-    MavenArtifact,
-    Generated,
-    Packaged,
-    LegacyExternal,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

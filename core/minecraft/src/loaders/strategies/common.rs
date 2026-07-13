@@ -1,9 +1,14 @@
 use crate::download::{
-    DownloadProgress, Downloader, ExactLibraryDownloadProof, MaterializedLibraryIdentity,
+    AuthenticatedSelectedArtifactSource, DownloadProgress, Downloader, ExactLibraryDownloadProof,
+    MaterializedLibraryIdentity,
     download_installer_libraries_with_declarations_and_facts_and_descriptors,
     download_profile_libraries_with_declarations_and_facts_and_descriptors,
+    reconstruct_profile_library_declarations,
 };
-use crate::known_good::KnownGoodInstallReceipt;
+use crate::known_good::{
+    KnownGoodInstallReceipt, KnownGoodReconstructionReceipt, reconstructed_effective_version,
+    seal_reconstructed_legacy_archive_source, seal_reconstructed_profile_source,
+};
 use crate::known_good_libraries::{
     PendingExactLibraryDeclarations, PendingStreamedLibraryDeclarations,
     RetainedInstallerLibrarySource, seal_profile_exact_library_declarations,
@@ -37,13 +42,14 @@ use sha1::{Digest as _, Sha1};
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
 use std::path::Path;
+use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 use tokio::fs as async_fs;
 use zip::ZipArchive;
 use zip::ZipWriter;
 use zip::write::SimpleFileOptions;
 
-const MAX_INSTALLER_DOWNLOAD_SIZE: u64 = 50 << 20;
+const MAX_LOADER_SOURCE_BYTES: u64 = 50 << 20;
 const MAX_LEGACY_OVERLAY_ENTRIES: usize = 65_536;
 const MAX_LEGACY_OVERLAY_ENTRY_BYTES: u64 = 64 << 20;
 const MAX_LEGACY_OVERLAY_PAYLOAD_BYTES: u64 = 256 << 20;
@@ -51,11 +57,240 @@ const MAX_LEGACY_OVERLAY_NAME_BYTES: usize = 16 << 20;
 const MAX_LEGACY_OVERLAY_OVERHEAD_BYTES: usize = 16 << 20;
 const MAX_LEGACY_OVERLAY_OUTPUT_BYTES: usize = 272 << 20;
 
+pub(crate) struct AuthenticatedLegacyOverlayAuthority {
+    base: KnownGoodReconstructionReceipt,
+    base_client_source: AuthenticatedSelectedArtifactSource,
+    archive_source: VerifiedLoaderSource,
+    record: LoaderBuildRecord,
+    resolved_version: crate::launch::VersionJson,
+    version_bytes: Vec<u8>,
+    child_client_bytes: Vec<u8>,
+}
+
+impl AuthenticatedLegacyOverlayAuthority {
+    pub(crate) fn consume_for_sealing(
+        self,
+    ) -> (
+        KnownGoodReconstructionReceipt,
+        AuthenticatedSelectedArtifactSource,
+        VerifiedLoaderSource,
+        LoaderBuildRecord,
+        crate::launch::VersionJson,
+        Vec<u8>,
+        Vec<u8>,
+    ) {
+        (
+            self.base,
+            self.base_client_source,
+            self.archive_source,
+            self.record,
+            self.resolved_version,
+            self.version_bytes,
+            self.child_client_bytes,
+        )
+    }
+}
+
+struct AuthenticatedProfileSource {
+    bytes: Vec<u8>,
+    provider_url: String,
+    logical_identity: String,
+}
+
+impl AuthenticatedProfileSource {
+    fn into_bytes_for(
+        self,
+        provider_url: &str,
+        logical_identity: &str,
+    ) -> Result<Vec<u8>, LoaderError> {
+        if self.provider_url != provider_url || self.logical_identity != logical_identity {
+            return Err(LoaderError::Verify(
+                "authenticated loader profile does not match its selected contract".to_string(),
+            ));
+        }
+        Ok(self.bytes)
+    }
+}
+
+async fn acquire_profile_source(
+    provider_url: &str,
+    logical_identity: &str,
+) -> Result<AuthenticatedProfileSource, LoaderError> {
+    Ok(AuthenticatedProfileSource {
+        bytes: fetch_bytes(provider_url, MAX_LOADER_SOURCE_BYTES).await?,
+        provider_url: provider_url.to_string(),
+        logical_identity: logical_identity.to_string(),
+    })
+}
+
+pub(super) async fn reconstruct_from_profile_source(
+    plan: &LoaderInstallPlan,
+) -> Result<KnownGoodReconstructionReceipt, LoaderError> {
+    let downloader = Downloader::new(PathBuf::new());
+    let proof = providers::fetch_profile_install_proof(&plan.record).await?;
+    Box::pin(reconstruct_profile_with_downloader(
+        plan,
+        &downloader,
+        proof,
+    ))
+    .await
+}
+
+async fn reconstruct_profile_with_downloader(
+    plan: &LoaderInstallPlan,
+    downloader: &Downloader,
+    proof: ProfileInstallProof,
+) -> Result<KnownGoodReconstructionReceipt, LoaderError> {
+    let LoaderInstallSource::ProfileJson { url } = &plan.record.install_source else {
+        return Err(LoaderError::InvalidProfile(
+            "profile reconstruction requires a fixed profile source".to_string(),
+        ));
+    };
+    let base = downloader
+        .reconstruct_version(&plan.record.minecraft_version)
+        .await
+        .map_err(|error| LoaderError::Verify(format!("reconstruct vanilla base: {error}")))?;
+    let profile_source = acquire_profile_source(url, &plan.record.version_id).await?;
+    reconstruct_profile_after_sources(plan, base, profile_source, proof).await
+}
+
+#[cfg(test)]
+async fn reconstruct_profile_with_test_sources(
+    plan: &LoaderInstallPlan,
+    downloader: &Downloader,
+    proof_url: &str,
+) -> Result<KnownGoodReconstructionReceipt, LoaderError> {
+    let proof =
+        providers::fetch_profile_install_proof_from_url_for_test(&plan.record, proof_url).await?;
+    Box::pin(reconstruct_profile_with_downloader(plan, downloader, proof)).await
+}
+
+async fn reconstruct_profile_after_sources(
+    plan: &LoaderInstallPlan,
+    base: KnownGoodReconstructionReceipt,
+    profile_source: AuthenticatedProfileSource,
+    proof: ProfileInstallProof,
+) -> Result<KnownGoodReconstructionReceipt, LoaderError> {
+    if proof.provider_url().trim().is_empty() {
+        return Err(LoaderError::InvalidProfile(
+            "loader profile proof has no provider identity".to_string(),
+        ));
+    }
+    let LoaderInstallSource::ProfileJson { url } = &plan.record.install_source else {
+        return Err(LoaderError::InvalidProfile(
+            "profile reconstruction requires a fixed profile source".to_string(),
+        ));
+    };
+    let profile_bytes = profile_source.into_bytes_for(url, &plan.record.version_id)?;
+    let fragment = parse_profile_json(&profile_bytes, &plan.record.component_name)?;
+    validate_profile_source_structure(&fragment, &plan.record, &proof)?;
+    let declarations = seal_profile_exact_library_declarations(
+        fragment,
+        proof,
+        plan.record.component_id,
+        &crate::rules::default_environment(),
+    )
+    .map_err(|error| {
+        LoaderError::Verify(format!("derive profile library declarations: {error:?}"))
+    })?;
+    let declarations = reconstruct_profile_library_declarations(declarations)
+        .await
+        .map_err(|error| LoaderError::Verify(error.to_string()))?;
+    let (fragment, _) = declarations
+        .profile_contract()
+        .ok_or_else(|| LoaderError::Verify("profile library contract is missing".to_string()))?;
+    let version = compose_loader_version(
+        reconstructed_effective_version(&base),
+        &plan.record.minecraft_version,
+        &plan.record.version_id,
+        fragment,
+    )?;
+    let version_bytes = serde_json::to_vec_pretty(&version)?;
+    seal_reconstructed_profile_source(base, &plan.record, version, &version_bytes, declarations)
+        .map_err(|error| LoaderError::Verify(format!("derive loader authority: {error:?}")))
+}
+
+pub(super) async fn reconstruct_from_legacy_archive(
+    plan: &LoaderInstallPlan,
+) -> Result<KnownGoodReconstructionReceipt, LoaderError> {
+    let downloader = Downloader::new(PathBuf::new());
+    reconstruct_legacy_with_downloader(plan, &downloader).await
+}
+
+async fn reconstruct_legacy_with_downloader(
+    plan: &LoaderInstallPlan,
+    downloader: &Downloader,
+) -> Result<KnownGoodReconstructionReceipt, LoaderError> {
+    Box::pin(reconstruct_legacy_with_downloader_inner(plan, downloader)).await
+}
+
+async fn reconstruct_legacy_with_downloader_inner(
+    plan: &LoaderInstallPlan,
+    downloader: &Downloader,
+) -> Result<KnownGoodReconstructionReceipt, LoaderError> {
+    let LoaderInstallSource::LegacyArchive { url } = &plan.record.install_source else {
+        return Err(LoaderError::InvalidProfile(
+            "earliest Forge reconstruction requires a fixed archive source".to_string(),
+        ));
+    };
+    let base = downloader
+        .reconstruct_version_with_client_source(&plan.record.minecraft_version)
+        .await
+        .map_err(|error| LoaderError::Verify(format!("reconstruct vanilla base: {error}")))?;
+    let (base, base_client_source) = base.consume_for_overlay();
+    let archive_source = fetch_sha1_verified_source(
+        url,
+        MAX_LOADER_SOURCE_BYTES,
+        "legacy Forge archive",
+        &plan.record.version_id,
+    )
+    .await?;
+    let (resolved_version, version_bytes, child_client_bytes) = derive_legacy_archive_inputs(
+        reconstructed_effective_version(&base),
+        &plan.record,
+        base_client_source.bytes().to_vec(),
+        archive_source.bytes().to_vec(),
+    )
+    .await?;
+    seal_reconstructed_legacy_archive_source(AuthenticatedLegacyOverlayAuthority {
+        base,
+        base_client_source,
+        archive_source,
+        record: plan.record.clone(),
+        resolved_version,
+        version_bytes,
+        child_client_bytes,
+    })
+    .map_err(|error| LoaderError::Verify(format!("derive loader authority: {error:?}")))
+}
+
+async fn derive_legacy_archive_inputs(
+    base_version: &crate::launch::VersionJson,
+    record: &LoaderBuildRecord,
+    base_client_bytes: Vec<u8>,
+    archive_bytes: Vec<u8>,
+) -> Result<(crate::launch::VersionJson, Vec<u8>, Vec<u8>), LoaderError> {
+    let child_client_bytes =
+        overlay_legacy_archive_bytes_blocking(base_client_bytes, archive_bytes).await?;
+    let mut version = base_version.clone();
+    version.id = record.version_id.clone();
+    version.inherits_from = record.minecraft_version.clone();
+    version.materialized = true;
+    let client = version.downloads.client.as_mut().ok_or_else(|| {
+        LoaderError::Verify("authenticated base version has no client download".to_string())
+    })?;
+    client.sha1 = format!("{:x}", Sha1::digest(&child_client_bytes));
+    client.size = i64::try_from(child_client_bytes.len())
+        .map_err(|_| LoaderError::Verify("legacy client is too large".to_string()))?;
+    client.url.clear();
+    let version_bytes = serde_json::to_vec_pretty(&version)?;
+    Ok((version, version_bytes, child_client_bytes))
+}
+
 // Profile-source loaders ship a ready version JSON and then download its libraries.
 pub async fn install_from_profile_source<F>(
     library_dir: &Path,
     plan: &LoaderInstallPlan,
-    profile_url: &str,
     send: &mut F,
 ) -> Result<KnownGoodInstallReceipt, LoaderError>
 where
@@ -71,7 +306,6 @@ where
     Box::pin(install_profile_source_after_authenticated_base(
         library_dir,
         plan,
-        profile_url,
         &base_receipt,
         source_proof,
         send,
@@ -82,7 +316,6 @@ where
 async fn install_profile_source_after_authenticated_base<F>(
     library_dir: &Path,
     plan: &LoaderInstallPlan,
-    profile_url: &str,
     base_receipt: &KnownGoodInstallReceipt,
     source_proof: ProfileInstallProof,
     send: &mut F,
@@ -90,13 +323,25 @@ async fn install_profile_source_after_authenticated_base<F>(
 where
     F: FnMut(DownloadProgress),
 {
+    let LoaderInstallSource::ProfileJson { url: profile_url } = &plan.record.install_source else {
+        return Err(LoaderError::InvalidProfile(
+            "profile loader build requires a profile json source".to_string(),
+        ));
+    };
+    if profile_url.is_empty() {
+        return Err(LoaderError::InvalidProfile(
+            "profile loader source URL is empty".to_string(),
+        ));
+    }
     send(progress(
         "profile",
         0,
         1,
         Some("Fetching loader profile...".to_string()),
     ));
-    let profile_bytes = download_to_memory(profile_url).await?;
+    let profile_bytes = acquire_profile_source(profile_url, &plan.record.version_id)
+        .await?
+        .into_bytes_for(profile_url, &plan.record.version_id)?;
     let fragment = parse_profile_json(&profile_bytes, &plan.record.component_name)?;
     validate_profile_source_structure(&fragment, &plan.record, &source_proof)?;
     let library_declarations = seal_profile_exact_library_declarations(
@@ -189,13 +434,12 @@ where
 pub async fn install_from_installer_source<F>(
     library_dir: &Path,
     plan: &LoaderInstallPlan,
-    installer_url: &str,
     send: &mut F,
 ) -> Result<KnownGoodInstallReceipt, LoaderError>
 where
     F: FnMut(DownloadProgress),
 {
-    validate_installer_record_authority(&plan.record, installer_url)?;
+    let installer_url = validate_installer_record_authority(&plan.record)?;
     send(progress(
         "artifacts",
         0,
@@ -207,8 +451,9 @@ where
     ));
     let installer_source = fetch_sha1_verified_source(
         installer_url,
-        MAX_INSTALLER_DOWNLOAD_SIZE,
+        MAX_LOADER_SOURCE_BYTES,
         "loader installer",
+        &plan.record.version_id,
     )
     .await?;
     let authenticated =
@@ -416,10 +661,7 @@ where
     Ok(receipt)
 }
 
-fn validate_installer_record_authority(
-    record: &LoaderBuildRecord,
-    installer_url: &str,
-) -> Result<(), LoaderError> {
+fn validate_installer_record_authority(record: &LoaderBuildRecord) -> Result<&str, LoaderError> {
     validate_loader_build_record_identity(record)?;
     let expected_strategy = match record.component_id {
         LoaderComponentId::Forge => matches!(
@@ -431,7 +673,7 @@ fn validate_installer_record_authority(
     };
     let exact_source = matches!(
         &record.install_source,
-        LoaderInstallSource::InstallerJar { url } if url == installer_url && !url.is_empty()
+        LoaderInstallSource::InstallerJar { url } if !url.is_empty()
     );
     if !expected_strategy
         || record.component_name != record.component_id.display_name()
@@ -442,19 +684,41 @@ fn validate_installer_record_authority(
             "loader installer authority does not match the live build record".to_string(),
         ));
     }
-    Ok(())
+    let LoaderInstallSource::InstallerJar { url } = &record.install_source else {
+        unreachable!("validated installer source")
+    };
+    Ok(url)
+}
+
+fn legacy_archive_source_url(record: &LoaderBuildRecord) -> Result<&str, LoaderError> {
+    validate_loader_build_record_identity(record)?;
+    let exact_authority = record.component_id == LoaderComponentId::Forge
+        && record.component_name == record.component_id.display_name()
+        && record.strategy == LoaderInstallStrategy::ForgeEarliestLegacy
+        && record.artifact_kind == LoaderArtifactKind::LegacyArchive;
+    let LoaderInstallSource::LegacyArchive { url } = &record.install_source else {
+        return Err(LoaderError::InvalidProfile(
+            "earliest Forge build requires a legacy archive source".to_string(),
+        ));
+    };
+    if !exact_authority || url.is_empty() {
+        return Err(LoaderError::InvalidProfile(
+            "legacy archive authority does not match the live build record".to_string(),
+        ));
+    }
+    Ok(url)
 }
 
 // Legacy archive loaders carry Maven entries in provider-specific zip layouts.
 pub async fn install_from_legacy_archive<F>(
     library_dir: &Path,
     plan: &LoaderInstallPlan,
-    archive_url: &str,
     send: &mut F,
 ) -> Result<KnownGoodInstallReceipt, LoaderError>
 where
     F: FnMut(DownloadProgress),
 {
+    let archive_url = legacy_archive_source_url(&plan.record)?;
     send(progress(
         "artifacts",
         0,
@@ -466,8 +730,9 @@ where
     ));
     let archive_source = fetch_sha1_verified_source(
         archive_url,
-        MAX_INSTALLER_DOWNLOAD_SIZE,
+        MAX_LOADER_SOURCE_BYTES,
         "legacy Forge archive",
+        &plan.record.version_id,
     )
     .await?;
     let base_receipt = Box::pin(ensure_base_version(
@@ -497,6 +762,7 @@ where
     F: FnMut(DownloadProgress),
 {
     validate_version_id(&plan.record.version_id, "installed loader version id")?;
+    let archive_url = legacy_archive_source_url(&plan.record)?;
 
     let base_client_path = versions_dir(library_dir)
         .join(&plan.record.minecraft_version)
@@ -505,22 +771,14 @@ where
     base_receipt
         .authenticate_client_bytes(&base_client_bytes)
         .map_err(|error| LoaderError::Verify(format!("authenticate base client: {error:?}")))?;
-    let child_client_bytes =
-        overlay_legacy_archive_bytes_blocking(base_client_bytes, archive_source.into_bytes())
-            .await?;
-
-    let mut version = base_receipt.effective_version().clone();
-    version.id = plan.record.version_id.clone();
-    version.inherits_from = plan.record.minecraft_version.clone();
-    version.materialized = true;
-    let client = version.downloads.client.as_mut().ok_or_else(|| {
-        LoaderError::Verify("authenticated base version has no client download".to_string())
-    })?;
-    client.sha1 = format!("{:x}", Sha1::digest(&child_client_bytes));
-    client.size = i64::try_from(child_client_bytes.len())
-        .map_err(|_| LoaderError::Verify("legacy client is too large".to_string()))?;
-    client.url.clear();
-    let version_bytes = serde_json::to_vec_pretty(&version)?;
+    let archive_bytes = archive_source.into_bytes_for(archive_url, &plan.record.version_id)?;
+    let (version, version_bytes, child_client_bytes) = derive_legacy_archive_inputs(
+        base_receipt.effective_version(),
+        &plan.record,
+        base_client_bytes,
+        archive_bytes,
+    )
+    .await?;
     let receipt = KnownGoodInstallReceipt::from_verified_legacy_archive_source(
         base_receipt,
         &plan.record,
@@ -679,10 +937,6 @@ fn cleanup_on_error<T, E>(
     version_id: &str,
 ) -> Result<T, E> {
     result.inspect_err(|_| cleanup_incomplete_version(library_dir, version_id))
-}
-
-async fn download_to_memory(url: &str) -> Result<Vec<u8>, LoaderError> {
-    fetch_bytes(url, MAX_INSTALLER_DOWNLOAD_SIZE).await
 }
 
 fn parse_profile_json(
@@ -988,9 +1242,10 @@ mod tests {
         install_from_installer_source, install_from_legacy_archive, install_from_profile_source,
         install_legacy_archive_after_authenticated_base,
         install_profile_source_after_authenticated_base, overlay_legacy_archive_bytes,
+        reconstruct_legacy_with_downloader, reconstruct_profile_with_test_sources,
         validate_installer_record_authority, validate_profile_source_structure,
     };
-    use crate::download::{DownloadProgress, ExpectedIntegrity};
+    use crate::download::{DownloadProgress, Downloader, ExpectedIntegrity};
     use crate::known_good::{KnownGoodArtifactKind, KnownGoodInstallReceipt, KnownGoodIntegrity};
     use crate::launch::{
         AssetIndex, Downloads, JavaVersion, Library, LoggingConf, resolve_version,
@@ -1009,20 +1264,416 @@ mod tests {
         LoaderInstallability,
     };
     use crate::loaders::{build_id_for, installed_version_id_for, validate_version_id};
+    use crate::manifest::VersionManifest;
     use crate::paths::versions_dir;
     use crate::rules::default_environment;
     use sha1::{Digest as _, Sha1};
-    use std::collections::HashMap;
+    use std::collections::{BTreeMap, HashMap};
     use std::fs;
     use std::io::{ErrorKind, Read, Write};
     use std::net::{TcpListener, TcpStream};
-    use std::path::PathBuf;
-    use std::sync::Arc;
+    use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::mpsc;
+    use std::sync::{Arc, Mutex};
     use std::thread;
     use std::time::Duration;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[tokio::test]
+    async fn profile_reconstruction_matches_install_and_leaves_all_managed_state_untouched() {
+        for component in [LoaderComponentId::Fabric, LoaderComponentId::Quilt] {
+            let root = temp_dir(match component {
+                LoaderComponentId::Fabric => "fabric-reconstruction-parity",
+                LoaderComponentId::Quilt => "quilt-reconstruction-parity",
+                _ => unreachable!(),
+            });
+            let base_id = "1.21.5";
+            let base_client = zip_entries(&[("net/minecraft/client/Main.class", b"base")]);
+            let exact_library = b"exact-profile-library".to_vec();
+            let client_server = TestByteServer::start(base_client.clone());
+            let exact_server = TestByteServer::start(exact_library.clone());
+            let version_bytes = vanilla_version_bytes_with_exact_library(
+                base_id,
+                &client_server.url,
+                &base_client,
+                &exact_server.url,
+                &exact_library,
+            );
+            let version_server = TestByteServer::start(version_bytes.clone());
+            let manifest = test_install_manifest(base_id, &version_server.url, &version_bytes);
+            let incomplete_server = TestByteServer::start(zip_entries(&[(
+                "org/example/Incomplete.class",
+                b"incomplete",
+            )]));
+            let native_server =
+                TestByteServer::start(zip_entries(&[("org/example/Native.class", b"native")]));
+            let extra_server =
+                TestByteServer::start(zip_entries(&[("org/example/Extra.class", b"extra")]));
+
+            let mut record = profile_record();
+            if component == LoaderComponentId::Quilt {
+                record.component_id = component;
+                record.component_name = component.display_name().to_string();
+                record.loader_version = "0.29.2".to_string();
+                record.strategy = LoaderInstallStrategy::QuiltProfile;
+                canonicalize_record_identity(&mut record);
+            }
+            let (profile_bytes, proof_bytes, expected_fresh) = profile_reconstruction_sources(
+                &record,
+                &incomplete_server.url,
+                &exact_server.url,
+                &exact_library,
+                &native_server.url,
+                &extra_server.url,
+            );
+            let profile_server = TestByteServer::start(profile_bytes);
+            let proof_server = TestByteServer::start(proof_bytes);
+            record.install_source = LoaderInstallSource::ProfileJson {
+                url: profile_server.url.clone(),
+            };
+            let plan = LoaderInstallPlan {
+                record: record.clone(),
+            };
+
+            let install_downloader =
+                Downloader::with_test_install_manifest(&root, manifest.clone());
+            let base_receipt = install_downloader
+                .install_version(base_id, |_| {})
+                .await
+                .expect("install authenticated vanilla base");
+            let install_proof =
+                crate::loaders::providers::fetch_profile_install_proof_from_url_for_test(
+                    &record,
+                    &proof_server.url,
+                )
+                .await
+                .expect("install profile proof");
+            let install_receipt = install_profile_source_after_authenticated_base(
+                &root,
+                &plan,
+                &base_receipt,
+                install_proof,
+                &mut |_| {},
+            )
+            .await
+            .expect("install profile loader");
+            seed_reconstruction_sentinels(&root);
+            let before = snapshot_tree(&root);
+            let request_counts = (
+                version_server.request_count(),
+                client_server.request_count(),
+                profile_server.request_count(),
+                proof_server.request_count(),
+                exact_server.request_count(),
+                incomplete_server.request_count(),
+                native_server.request_count(),
+                extra_server.request_count(),
+            );
+
+            let reconstruction_downloader = Downloader::with_test_install_manifest(&root, manifest);
+            let reconstructed = reconstruct_profile_with_test_sources(
+                &plan,
+                &reconstruction_downloader,
+                &proof_server.url,
+            )
+            .await
+            .expect("reconstruct profile loader");
+
+            assert_eq!(snapshot_tree(&root), before);
+            assert_eq!(version_server.request_count(), request_counts.0 + 1);
+            assert_eq!(client_server.request_count(), request_counts.1);
+            assert_eq!(profile_server.request_count(), request_counts.2 + 1);
+            assert_eq!(proof_server.request_count(), request_counts.3 + 1);
+            assert_eq!(exact_server.request_count(), request_counts.4);
+            assert_eq!(
+                incomplete_server.request_count(),
+                request_counts.5 + expected_fresh.0
+            );
+            assert_eq!(
+                native_server.request_count(),
+                request_counts.6 + expected_fresh.1
+            );
+            assert_eq!(
+                extra_server.request_count(),
+                request_counts.7 + expected_fresh.2
+            );
+            assert_eq!(
+                install_receipt.into_activation_source().into_parts(),
+                reconstructed.into_activation_source().into_parts()
+            );
+
+            for server in [
+                client_server,
+                version_server,
+                exact_server,
+                incomplete_server,
+                native_server,
+                extra_server,
+                profile_server,
+                proof_server,
+            ] {
+                server.stop();
+            }
+            let _ = fs::remove_dir_all(root);
+        }
+    }
+
+    #[tokio::test]
+    async fn profile_reconstruction_rejects_fresh_404_despite_installed_and_cached_evidence() {
+        let root = temp_dir("profile-reconstruction-fresh-404");
+        let base_id = "1.21.5";
+        let base_client = zip_entries(&[("net/minecraft/client/Main.class", b"base")]);
+        let client_server = TestByteServer::start(base_client.clone());
+        let version_bytes = vanilla_version_bytes(base_id, &client_server.url, &base_client);
+        let version_server = TestByteServer::start(version_bytes.clone());
+        let manifest = test_install_manifest(base_id, &version_server.url, &version_bytes);
+        let exact_library = b"unused-exact-library".to_vec();
+        let incomplete_server = TestByteServer::start(zip_entries(&[(
+            "org/example/Incomplete.class",
+            b"incomplete",
+        )]));
+        let exact_server = TestByteServer::start(exact_library.clone());
+        let native_server =
+            TestByteServer::start(zip_entries(&[("org/example/Native.class", b"native")]));
+        let extra_server =
+            TestByteServer::start(zip_entries(&[("org/example/Extra.class", b"extra")]));
+        let mut record = profile_record();
+        let (profile_bytes, proof_bytes, _) = profile_reconstruction_sources(
+            &record,
+            &incomplete_server.url,
+            &exact_server.url,
+            &exact_library,
+            &native_server.url,
+            &extra_server.url,
+        );
+        let profile_server = TestByteServer::start(profile_bytes);
+        let proof_server = TestByteServer::start(proof_bytes);
+        record.install_source = LoaderInstallSource::ProfileJson {
+            url: profile_server.url.clone(),
+        };
+        let install_plan = LoaderInstallPlan {
+            record: record.clone(),
+        };
+        let downloader = Downloader::with_test_install_manifest(&root, manifest.clone());
+        let base_receipt = downloader
+            .install_version(base_id, |_| {})
+            .await
+            .expect("install authenticated vanilla base");
+        let install_proof =
+            crate::loaders::providers::fetch_profile_install_proof_from_url_for_test(
+                &record,
+                &proof_server.url,
+            )
+            .await
+            .expect("install profile proof");
+        install_profile_source_after_authenticated_base(
+            &root,
+            &install_plan,
+            &base_receipt,
+            install_proof,
+            &mut |_| {},
+        )
+        .await
+        .expect("install profile loader");
+
+        seed_reconstruction_sentinels(&root);
+        let before = snapshot_tree(&root);
+        let missing_server = TestByteServer::start_not_found();
+        let mut missing_plan = install_plan;
+        missing_plan.record.install_source = LoaderInstallSource::ProfileJson {
+            url: missing_server.url.clone(),
+        };
+        let version_count = version_server.request_count();
+        let missing_count = missing_server.request_count();
+        let reconstruction_downloader = Downloader::with_test_install_manifest(&root, manifest);
+
+        let error = match reconstruct_profile_with_test_sources(
+            &missing_plan,
+            &reconstruction_downloader,
+            &proof_server.url,
+        )
+        .await
+        {
+            Ok(_) => panic!("fresh profile 404 must reject installed evidence"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(error, LoaderError::ArtifactMissing(_)));
+        assert_eq!(version_server.request_count(), version_count + 1);
+        assert_eq!(missing_server.request_count(), missing_count + 1);
+        assert_eq!(snapshot_tree(&root), before);
+
+        for server in [
+            client_server,
+            version_server,
+            incomplete_server,
+            exact_server,
+            native_server,
+            extra_server,
+            profile_server,
+            proof_server,
+            missing_server,
+        ] {
+            server.stop();
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn earliest_archive_reconstruction_matches_install_uses_fresh_sources_once_and_is_effect_free()
+     {
+        for (minecraft_version, loader_version, label) in [
+            ("1.2.5", "3.4.9.171", "earliest-client-parity"),
+            ("1.4.7", "6.6.2.534", "earliest-universal-parity"),
+        ] {
+            let root = temp_dir(label);
+            let mut record = legacy_archive_record();
+            record.minecraft_version = minecraft_version.to_string();
+            record.loader_version = loader_version.to_string();
+            canonicalize_record_identity(&mut record);
+            let base_client = zip_entries(&[
+                ("net/minecraft/client/Minecraft.class", b"base"),
+                ("META-INF/MANIFEST.MF", b"manifest"),
+            ]);
+            let archive = zip_entries(&[("net/minecraftforge/Forge.class", b"forge")]);
+            let client_server = TestByteServer::start(base_client.clone());
+            let version_bytes =
+                vanilla_version_bytes(&record.minecraft_version, &client_server.url, &base_client);
+            let version_server = TestByteServer::start(version_bytes.clone());
+            let manifest = test_install_manifest(
+                &record.minecraft_version,
+                &version_server.url,
+                &version_bytes,
+            );
+            let archive_server = TestByteServer::start_with_sha1(archive);
+            record.install_source = LoaderInstallSource::LegacyArchive {
+                url: archive_server.url.clone(),
+            };
+            let plan = LoaderInstallPlan {
+                record: record.clone(),
+            };
+            let install_downloader =
+                Downloader::with_test_install_manifest(&root, manifest.clone());
+            let base_receipt = install_downloader
+                .install_version(&record.minecraft_version, |_| {})
+                .await
+                .expect("install authenticated vanilla base");
+            let archive_source = verified_test_source_for(
+                &archive_server.url,
+                "legacy Forge archive",
+                &record.version_id,
+            )
+            .await;
+            let install_receipt = install_legacy_archive_after_authenticated_base(
+                &root,
+                &plan,
+                archive_source,
+                &base_receipt,
+                &mut |_| {},
+            )
+            .await
+            .expect("install earliest Forge archive");
+            seed_reconstruction_sentinels(&root);
+            let before = snapshot_tree(&root);
+            let archive_path = reqwest::Url::parse(&archive_server.url)
+                .expect("archive URL")
+                .path()
+                .to_string();
+            let sidecar_path = format!("{archive_path}.sha1");
+            let counts = (
+                version_server.request_count(),
+                client_server.request_count(),
+                archive_server.request_count(),
+                archive_server.request_count_for(&archive_path),
+                archive_server.request_count_for(&sidecar_path),
+            );
+
+            let reconstruction_downloader = Downloader::with_test_install_manifest(&root, manifest);
+            let reconstructed =
+                reconstruct_legacy_with_downloader(&plan, &reconstruction_downloader)
+                    .await
+                    .expect("reconstruct earliest Forge archive");
+
+            assert_eq!(snapshot_tree(&root), before);
+            assert_eq!(version_server.request_count(), counts.0 + 1);
+            assert_eq!(client_server.request_count(), counts.1 + 1);
+            assert_eq!(archive_server.request_count(), counts.2 + 2);
+            assert_eq!(
+                archive_server.request_count_for(&archive_path),
+                counts.3 + 1
+            );
+            assert_eq!(
+                archive_server.request_count_for(&sidecar_path),
+                counts.4 + 1
+            );
+            assert_eq!(
+                install_receipt.into_activation_source().into_parts(),
+                reconstructed.into_activation_source().into_parts()
+            );
+
+            for server in [client_server, version_server, archive_server] {
+                server.stop();
+            }
+            let _ = fs::remove_dir_all(root);
+        }
+    }
+
+    #[tokio::test]
+    async fn earliest_archive_reconstruction_rejects_malformed_sidecar_without_effects() {
+        let root = temp_dir("earliest-reconstruction-malformed-sidecar");
+        let mut record = legacy_archive_record();
+        let base_client = zip_entries(&[("net/minecraft/client/Minecraft.class", b"base")]);
+        let client_server = TestByteServer::start(base_client.clone());
+        let version_bytes =
+            vanilla_version_bytes(&record.minecraft_version, &client_server.url, &base_client);
+        let version_server = TestByteServer::start(version_bytes.clone());
+        let manifest = test_install_manifest(
+            &record.minecraft_version,
+            &version_server.url,
+            &version_bytes,
+        );
+        let archive_server = TestByteServer::start_with_sha1_proof(
+            zip_entries(&[("net/minecraftforge/Forge.class", b"forge")]),
+            b"not-a-strict-sha1 archive.zip".to_vec(),
+        );
+        record.install_source = LoaderInstallSource::LegacyArchive {
+            url: archive_server.url.clone(),
+        };
+        let plan = LoaderInstallPlan { record };
+        let install_downloader = Downloader::with_test_install_manifest(&root, manifest.clone());
+        install_downloader
+            .install_version(&plan.record.minecraft_version, |_| {})
+            .await
+            .expect("install authenticated vanilla evidence");
+        seed_reconstruction_sentinels(&root);
+        let before = snapshot_tree(&root);
+        let counts = (
+            version_server.request_count(),
+            client_server.request_count(),
+            archive_server.request_count(),
+        );
+        let reconstruction_downloader = Downloader::with_test_install_manifest(&root, manifest);
+
+        let error =
+            match reconstruct_legacy_with_downloader(&plan, &reconstruction_downloader).await {
+                Ok(_) => panic!("malformed archive proof must reject reconstruction"),
+                Err(error) => error,
+            };
+
+        assert!(
+            matches!(error, LoaderError::InvalidProfile(message) if message.contains("exactly one 40-hex digest"))
+        );
+        assert_eq!(version_server.request_count(), counts.0 + 1);
+        assert_eq!(client_server.request_count(), counts.1 + 1);
+        assert_eq!(archive_server.request_count(), counts.2 + 2);
+        assert_eq!(snapshot_tree(&root), before);
+
+        for server in [client_server, version_server, archive_server] {
+            server.stop();
+        }
+        let _ = fs::remove_dir_all(root);
+    }
 
     #[test]
     fn cleanup_on_error_clears_incomplete_version_dir() {
@@ -1132,7 +1783,6 @@ mod tests {
             std::mem::size_of_val(&install_from_profile_source(
                 &root,
                 &profile_plan,
-                "https://example.test/profile.json",
                 &mut send,
             )) < 4096,
             "profile-backed loader install future should stay small"
@@ -1143,7 +1793,6 @@ mod tests {
             std::mem::size_of_val(&install_from_installer_source(
                 &root,
                 &installer_plan,
-                "https://example.test/installer.jar",
                 &mut send,
             )) < 4096,
             "installer-backed loader install future should stay small"
@@ -1151,12 +1800,8 @@ mod tests {
 
         let mut send = |_progress: DownloadProgress| {};
         assert!(
-            std::mem::size_of_val(&install_from_legacy_archive(
-                &root,
-                &legacy_plan,
-                "https://example.test/legacy.jar",
-                &mut send,
-            )) < 4096,
+            std::mem::size_of_val(&install_from_legacy_archive(&root, &legacy_plan, &mut send,))
+                < 4096,
             "legacy archive loader install future should stay small"
         );
 
@@ -1174,20 +1819,42 @@ mod tests {
             )) < 4096,
             "public loader install future should not embed the strategy dispatcher"
         );
-    }
 
-    #[test]
-    fn earliest_archive_route_never_enters_installer_declaration_pipeline() {
-        let route = include_str!("forge_earliest_legacy.rs");
-        assert!(route.contains("install_from_legacy_archive"));
-        for installer_transition in [
-            "bind_authenticated_installer_plan",
-            "into_install_execution",
-            "into_network_install",
-            "AuthenticatedInstallerLibraryInputs",
-        ] {
-            assert!(!route.contains(installer_transition));
-        }
+        assert!(
+            std::mem::size_of_val(&reconstruct_profile_with_test_sources(
+                &profile_plan,
+                &Downloader::with_test_install_manifest(
+                    &root,
+                    test_install_manifest(
+                        "1.21.5",
+                        "https://example.test/version.json",
+                        b"version"
+                    )
+                ),
+                "https://example.test/profile-proof.json",
+            )) < 4096,
+            "profile reconstruction future should stay small"
+        );
+        assert!(
+            std::mem::size_of_val(&reconstruct_legacy_with_downloader(
+                &legacy_plan,
+                &Downloader::with_test_install_manifest(
+                    &root,
+                    test_install_manifest("1.2.5", "https://example.test/version.json", b"version")
+                ),
+            )) < 4096,
+            "archive reconstruction future should stay small"
+        );
+        assert!(
+            std::mem::size_of_val(&super::super::reconstruct_build(&profile_plan)) < 4096,
+            "loader reconstruction dispatcher future should stay small"
+        );
+        assert!(
+            std::mem::size_of_val(&crate::loaders::reconstruct_build(
+                &profile_plan.record.version_id
+            )) < 4096,
+            "public loader reconstruction future should stay small"
+        );
     }
 
     #[tokio::test]
@@ -1309,7 +1976,6 @@ mod tests {
         let receipt = install_profile_source_after_authenticated_base(
             &root,
             &plan,
-            &profile_server.url,
             &base,
             proof,
             &mut |_progress| {},
@@ -1422,7 +2088,6 @@ mod tests {
         let receipt = install_profile_source_after_authenticated_base(
             &root,
             &plan,
-            &profile_server.url,
             &base,
             proof,
             &mut |_progress| {},
@@ -1514,7 +2179,7 @@ mod tests {
             canonicalize_record_identity(&mut record);
             let plan = LoaderInstallPlan { record };
 
-            let error = install_from_installer_source(&root, &plan, &server.url, &mut |_| {})
+            let error = install_from_installer_source(&root, &plan, &mut |_| {})
                 .await
                 .expect_err("mismatched proof must fail");
 
@@ -1540,7 +2205,7 @@ mod tests {
         };
         let plan = LoaderInstallPlan { record };
 
-        let error = install_from_installer_source(&root, &plan, &server.url, &mut |_| {})
+        let error = install_from_installer_source(&root, &plan, &mut |_| {})
             .await
             .expect_err("malformed proof must fail");
 
@@ -1555,35 +2220,32 @@ mod tests {
     #[test]
     fn installer_record_authority_rejects_every_envelope_drift() {
         let record = installer_record();
-        let url = match &record.install_source {
-            LoaderInstallSource::InstallerJar { url } => url.clone(),
-            _ => unreachable!("installer fixture source"),
-        };
-        validate_installer_record_authority(&record, &url).expect("canonical installer authority");
+        validate_installer_record_authority(&record).expect("canonical installer authority");
 
         let mut variants = Vec::new();
         let mut drift = record.clone();
         drift.build_id.push('x');
-        variants.push((drift, url.clone()));
+        variants.push(drift);
         let mut drift = record.clone();
         drift.component_name = "NeoForge".to_string();
-        variants.push((drift, url.clone()));
+        variants.push(drift);
         let mut drift = record.clone();
         drift.strategy = LoaderInstallStrategy::NeoForgeModern;
-        variants.push((drift, url.clone()));
+        variants.push(drift);
         let mut drift = record.clone();
         drift.artifact_kind = LoaderArtifactKind::ProfileJson;
-        variants.push((drift, url.clone()));
+        variants.push(drift);
         let mut drift = record.clone();
-        drift.install_source = LoaderInstallSource::ProfileJson { url: url.clone() };
-        variants.push((drift, url.clone()));
-        variants.push((
-            record,
-            "https://example.test/other-installer.jar".to_string(),
-        ));
+        drift.install_source = LoaderInstallSource::ProfileJson {
+            url: "https://example.test/profile.json".to_string(),
+        };
+        variants.push(drift);
+        let mut drift = record;
+        drift.install_source = LoaderInstallSource::InstallerJar { url: String::new() };
+        variants.push(drift);
 
-        for (record, requested_url) in variants {
-            assert!(validate_installer_record_authority(&record, &requested_url).is_err());
+        for record in variants {
+            assert!(validate_installer_record_authority(&record).is_err());
         }
     }
 
@@ -1599,7 +2261,7 @@ mod tests {
         };
         let plan = LoaderInstallPlan { record };
 
-        let error = install_from_installer_source(&root, &plan, &server.url, &mut |_| {})
+        let error = install_from_installer_source(&root, &plan, &mut |_| {})
             .await
             .expect_err("semantic drift must fail before base acquisition");
 
@@ -1624,7 +2286,7 @@ mod tests {
         };
         let plan = LoaderInstallPlan { record };
 
-        let error = install_from_installer_source(&root, &plan, &server.url, &mut |_| {})
+        let error = install_from_installer_source(&root, &plan, &mut |_| {})
             .await
             .expect_err("unsupported NeoForge processors");
 
@@ -2084,11 +2746,15 @@ mod tests {
         let mut record = legacy_archive_record();
         record.minecraft_version = base_version_id.to_string();
         canonicalize_record_identity(&mut record);
+        record.install_source = LoaderInstallSource::LegacyArchive {
+            url: server.url.clone(),
+        };
         let plan = LoaderInstallPlan {
             record: record.clone(),
         };
 
-        let archive_source = verified_test_source(&server.url, "legacy Forge archive").await;
+        let archive_source =
+            verified_test_source_for(&server.url, "legacy Forge archive", &record.version_id).await;
         let base_receipt = test_authenticated_receipt(&root, &record.minecraft_version);
         let receipt = install_legacy_archive_after_authenticated_base(
             &root,
@@ -2190,11 +2856,15 @@ mod tests {
             "net/minecraftforge/Forge.class",
             b"forge".as_slice(),
         )]));
-        let record = legacy_archive_record();
+        let mut record = legacy_archive_record();
+        record.install_source = LoaderInstallSource::LegacyArchive {
+            url: server.url.clone(),
+        };
         let plan = LoaderInstallPlan {
             record: record.clone(),
         };
-        let archive_source = verified_test_source(&server.url, "legacy Forge archive").await;
+        let archive_source =
+            verified_test_source_for(&server.url, "legacy Forge archive", &record.version_id).await;
 
         let error = install_legacy_archive_after_authenticated_base(
             &root,
@@ -2219,11 +2889,14 @@ mod tests {
         let root = temp_dir("legacy-archive-sha1-mismatch");
         let archive = zip_entries(&[("net/minecraftforge/Forge.class", b"forge".as_slice())]);
         let server = TestByteServer::start_with_sha1_proof(archive, vec![b'0'; 40]);
-        let record = legacy_archive_record();
+        let mut record = legacy_archive_record();
+        record.install_source = LoaderInstallSource::LegacyArchive {
+            url: server.url.clone(),
+        };
         let plan = LoaderInstallPlan {
             record: record.clone(),
         };
-        let error = install_from_legacy_archive(&root, &plan, &server.url, &mut |_| {})
+        let error = install_from_legacy_archive(&root, &plan, &mut |_| {})
             .await
             .expect_err("mismatched proof must fail");
 
@@ -2243,12 +2916,15 @@ mod tests {
             archive,
             b"not-a-strict-sha1 artifact.jar".to_vec(),
         );
-        let record = legacy_archive_record();
+        let mut record = legacy_archive_record();
+        record.install_source = LoaderInstallSource::LegacyArchive {
+            url: server.url.clone(),
+        };
         let plan = LoaderInstallPlan {
             record: record.clone(),
         };
 
-        let error = install_from_legacy_archive(&root, &plan, &server.url, &mut |_| {})
+        let error = install_from_legacy_archive(&root, &plan, &mut |_| {})
             .await
             .expect_err("malformed proof must fail");
 
@@ -2278,17 +2954,21 @@ mod tests {
         )
         .expect("valid base client");
         let base_receipt = test_authenticated_receipt(&root, base_version_id);
-        let record = legacy_archive_record();
+        let mut record = legacy_archive_record();
         let child_path = versions_dir(&root).join(&record.version_id);
         std::os::unix::fs::symlink(&outside, &child_path).expect("symlink child version");
         let server = TestByteServer::start_with_sha1(zip_entries(&[(
             "net/minecraftforge/Forge.class",
             b"forge".as_slice(),
         )]));
+        record.install_source = LoaderInstallSource::LegacyArchive {
+            url: server.url.clone(),
+        };
         let plan = LoaderInstallPlan {
             record: record.clone(),
         };
-        let archive_source = verified_test_source(&server.url, "legacy Forge archive").await;
+        let archive_source =
+            verified_test_source_for(&server.url, "legacy Forge archive", &record.version_id).await;
 
         let error = install_legacy_archive_after_authenticated_base(
             &root,
@@ -2715,7 +3395,17 @@ mod tests {
     }
 
     async fn verified_test_source(url: &str, label: &'static str) -> VerifiedLoaderSource {
-        fetch_sha1_verified_source(url, super::MAX_INSTALLER_DOWNLOAD_SIZE, label)
+        fetch_sha1_verified_source(url, super::MAX_LOADER_SOURCE_BYTES, label, label)
+            .await
+            .expect("verified test source")
+    }
+
+    async fn verified_test_source_for(
+        url: &str,
+        label: &'static str,
+        logical_identity: &str,
+    ) -> VerifiedLoaderSource {
+        fetch_sha1_verified_source(url, super::MAX_LOADER_SOURCE_BYTES, label, logical_identity)
             .await
             .expect("verified test source")
     }
@@ -2756,6 +3446,378 @@ mod tests {
         let mut hasher = Sha1::new();
         hasher.update(bytes);
         format!("{:x}", hasher.finalize())
+    }
+
+    fn vanilla_version_bytes(id: &str, client_url: &str, client_bytes: &[u8]) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "id": id,
+            "type": "release",
+            "mainClass": "net.minecraft.client.main.Main",
+            "downloads": {
+                "client": {
+                    "url": client_url,
+                    "sha1": sha1_hex(client_bytes),
+                    "size": client_bytes.len()
+                }
+            },
+            "libraries": []
+        }))
+        .expect("serialize vanilla version")
+    }
+
+    fn vanilla_version_bytes_with_exact_library(
+        id: &str,
+        client_url: &str,
+        client_bytes: &[u8],
+        library_url: &str,
+        library_bytes: &[u8],
+    ) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "id": id,
+            "type": "release",
+            "mainClass": "net.minecraft.client.main.Main",
+            "downloads": {
+                "client": {
+                    "url": client_url,
+                    "sha1": sha1_hex(client_bytes),
+                    "size": client_bytes.len()
+                }
+            },
+            "libraries": [{
+                "name": "org.example:vanilla-exact:1.0",
+                "downloads": {"artifact": {
+                    "path": "org/example/vanilla-exact/1.0/vanilla-exact-1.0.jar",
+                    "url": library_url,
+                    "sha1": sha1_hex(library_bytes),
+                    "size": library_bytes.len()
+                }}
+            }]
+        }))
+        .expect("serialize vanilla version with exact library")
+    }
+
+    fn test_install_manifest(id: &str, version_url: &str, version_bytes: &[u8]) -> VersionManifest {
+        serde_json::from_value(serde_json::json!({
+            "latest": { "release": id, "snapshot": id },
+            "versions": [{
+                "id": id,
+                "type": "release",
+                "url": version_url,
+                "sha1": sha1_hex(version_bytes),
+                "complianceLevel": 1
+            }]
+        }))
+        .expect("valid test install manifest")
+    }
+
+    fn profile_reconstruction_sources(
+        record: &LoaderBuildRecord,
+        incomplete_url: &str,
+        exact_url: &str,
+        exact_bytes: &[u8],
+        native_url: &str,
+        extra_url: &str,
+    ) -> (Vec<u8>, Vec<u8>, (usize, usize, usize)) {
+        let intermediary = format!("net.fabricmc:intermediary:{}", record.minecraft_version);
+        let intermediary_path = format!(
+            "net/fabricmc/intermediary/{0}/intermediary-{0}.jar",
+            record.minecraft_version
+        );
+        let environment = default_environment();
+        let native_classifier = match environment.os_arch.as_str() {
+            "x86_64" => "natives-64".to_string(),
+            "x86" => "natives-32".to_string(),
+            "arm64" => "natives-arm64".to_string(),
+            other => format!("natives-{other}"),
+        };
+        let native_path =
+            format!("org/example/profile-native/1.0/profile-native-1.0-{native_classifier}.jar");
+        let native_library = serde_json::json!({
+            "name": "org.example:profile-native:1.0",
+            "natives": {environment.os_name: "natives-${arch}"},
+            "downloads": {"classifiers": {
+                native_classifier: {
+                    "path": native_path,
+                    "url": native_url
+                }
+            }}
+        });
+        let extra_library = serde_json::json!({
+            "name": "org.example:profile-extra:1.0",
+            "downloads": {"artifact": {
+                "path": "org/example/profile-extra/1.0/profile-extra-1.0.jar",
+                "url": extra_url
+            }}
+        });
+        match record.component_id {
+            LoaderComponentId::Fabric => {
+                let loader = format!("net.fabricmc:fabric-loader:{}", record.loader_version);
+                let profile = serde_json::json!({
+                    "id": format!(
+                        "fabric-loader-{}-{}",
+                        record.loader_version, record.minecraft_version
+                    ),
+                    "inheritsFrom": record.minecraft_version,
+                    "type": "release",
+                    "mainClass": "net.fabricmc.loader.impl.launch.knot.KnotClient",
+                    "libraries": [
+                        {
+                            "name": loader,
+                            "downloads": {"artifact": {
+                                "path": format!(
+                                    "net/fabricmc/fabric-loader/{0}/fabric-loader-{0}.jar",
+                                    record.loader_version
+                                ),
+                                "url": incomplete_url
+                            }}
+                        },
+                        {
+                            "name": intermediary,
+                            "downloads": {"artifact": {
+                                "path": intermediary_path,
+                                "url": incomplete_url
+                            }}
+                        },
+                        native_library,
+                        extra_library
+                    ]
+                });
+                let proof = serde_json::json!({
+                    "loader": {
+                        "version": record.loader_version,
+                        "maven": format!(
+                            "net.fabricmc:fabric-loader:{}",
+                            record.loader_version
+                        )
+                    },
+                    "intermediary": {
+                        "version": record.minecraft_version,
+                        "maven": format!(
+                            "net.fabricmc:intermediary:{}",
+                            record.minecraft_version
+                        )
+                    },
+                    "launcherMeta": {"mainClass": {
+                        "client": "net.fabricmc.loader.impl.launch.knot.KnotClient"
+                    }}
+                });
+                (
+                    serde_json::to_vec(&profile).expect("Fabric profile"),
+                    serde_json::to_vec(&proof).expect("Fabric proof"),
+                    (2, 1, 1),
+                )
+            }
+            LoaderComponentId::Quilt => {
+                let loader = format!("org.quiltmc:quilt-loader:{}", record.loader_version);
+                let hashed = format!("org.quiltmc:hashed:{}", record.minecraft_version);
+                let exact_sha1 = sha1_hex(exact_bytes);
+                let profile = serde_json::json!({
+                    "id": format!(
+                        "quilt-loader-{}-{}",
+                        record.loader_version, record.minecraft_version
+                    ),
+                    "inheritsFrom": record.minecraft_version,
+                    "type": "release",
+                    "mainClass": "org.quiltmc.loader.impl.launch.knot.KnotClient",
+                    "libraries": [
+                        {
+                            "name": loader,
+                            "downloads": {"artifact": {
+                                "path": format!(
+                                    "org/quiltmc/quilt-loader/{0}/quilt-loader-{0}.jar",
+                                    record.loader_version
+                                ),
+                                "url": exact_url
+                            }}
+                        },
+                        {
+                            "name": hashed,
+                            "downloads": {"artifact": {
+                                "path": format!(
+                                    "org/quiltmc/hashed/{0}/hashed-{0}.jar",
+                                    record.minecraft_version
+                                ),
+                                "url": exact_url
+                            }}
+                        },
+                        {
+                            "name": intermediary,
+                            "downloads": {"artifact": {
+                                "path": intermediary_path,
+                                "url": incomplete_url
+                            }}
+                        },
+                        native_library,
+                        extra_library
+                    ]
+                });
+                let proof = serde_json::json!({
+                    "loader": {
+                        "version": record.loader_version,
+                        "maven": format!(
+                            "org.quiltmc:quilt-loader:{}",
+                            record.loader_version
+                        ),
+                        "file_size": exact_bytes.len(),
+                        "hashes": {"sha1": exact_sha1}
+                    },
+                    "hashed": {
+                        "version": record.minecraft_version,
+                        "maven": format!(
+                            "org.quiltmc:hashed:{}",
+                            record.minecraft_version
+                        ),
+                        "file_size": exact_bytes.len(),
+                        "hashes": {"sha1": sha1_hex(exact_bytes)}
+                    },
+                    "intermediary": {
+                        "version": record.minecraft_version,
+                        "maven": format!(
+                            "net.fabricmc:intermediary:{}",
+                            record.minecraft_version
+                        )
+                    },
+                    "launcherMeta": {"mainClass": {
+                        "client": "org.quiltmc.loader.impl.launch.knot.KnotClient"
+                    }}
+                });
+                (
+                    serde_json::to_vec(&profile).expect("Quilt profile"),
+                    serde_json::to_vec(&proof).expect("Quilt proof"),
+                    (1, 1, 1),
+                )
+            }
+            _ => panic!("profile fixture requires Fabric or Quilt"),
+        }
+    }
+
+    fn seed_reconstruction_sentinels(root: &Path) {
+        for (relative, bytes) in [
+            (
+                "assets/indexes/reconstruction-sentinel.json",
+                b"asset-index".as_slice(),
+            ),
+            (
+                "assets/objects/aa/reconstruction-sentinel",
+                b"asset-object".as_slice(),
+            ),
+            (
+                "assets/log_configs/reconstruction.xml",
+                b"log-config".as_slice(),
+            ),
+            (
+                "libraries/reconstruction/exact.jar",
+                b"exact-library".as_slice(),
+            ),
+            (
+                "libraries/reconstruction/fresh.jar",
+                b"fresh-library".as_slice(),
+            ),
+            (
+                "libraries/reconstruction/native.jar",
+                b"native-library".as_slice(),
+            ),
+            (
+                "libraries/reconstruction/extra.jar",
+                b"extra-library".as_slice(),
+            ),
+            (
+                "runtime/reconstruction/.axial-ready",
+                b"runtime-ready".as_slice(),
+            ),
+            (
+                "runtime/reconstruction/manifest.json",
+                b"runtime-manifest".as_slice(),
+            ),
+            (
+                "runtime/reconstruction/bin/java",
+                b"runtime-executable".as_slice(),
+            ),
+            (
+                "runtime/reconstruction/lib/runtime.bin",
+                b"runtime-file".as_slice(),
+            ),
+            (
+                "cache/version_manifest_v2.json",
+                b"manifest-cache".as_slice(),
+            ),
+            (
+                "cache/loaders/catalog/reconstruction.json",
+                b"catalog".as_slice(),
+            ),
+            (
+                "cache/loaders/work/reconstruction/.incomplete",
+                b"work".as_slice(),
+            ),
+            (
+                "state/known-good/reconstruction.json",
+                b"known-good".as_slice(),
+            ),
+            (
+                "versions/reconstruction-sentinel/.incomplete",
+                b"marker".as_slice(),
+            ),
+            ("launcher_profiles.json", b"launcher-profile".as_slice()),
+        ] {
+            let path = root.join(relative);
+            fs::create_dir_all(path.parent().expect("sentinel parent"))
+                .expect("create sentinel parent");
+            fs::write(path, bytes).expect("write reconstruction sentinel");
+        }
+        #[cfg(unix)]
+        {
+            let link = root.join("runtime/reconstruction/lib/runtime-link");
+            std::os::unix::fs::symlink("runtime.bin", link).expect("runtime sentinel symlink");
+        }
+        #[cfg(windows)]
+        {
+            let link = root.join("runtime/reconstruction/lib/runtime-link");
+            fs::write(link, b"runtime-link-surrogate").expect("runtime link sentinel");
+        }
+    }
+
+    fn snapshot_tree(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
+        fn visit(root: &Path, path: &Path, snapshot: &mut BTreeMap<PathBuf, Vec<u8>>) {
+            let metadata = fs::symlink_metadata(path).expect("snapshot metadata");
+            let relative = path.strip_prefix(root).expect("snapshot relative path");
+            if !relative.as_os_str().is_empty() {
+                let entry = if metadata.is_dir() {
+                    vec![b'd']
+                } else if metadata.is_file() {
+                    let mut entry = vec![b'f'];
+                    entry.extend(fs::read(path).expect("snapshot file"));
+                    entry
+                } else if metadata.file_type().is_symlink() {
+                    let mut entry = vec![b'l'];
+                    entry.extend(
+                        fs::read_link(path)
+                            .expect("snapshot symlink")
+                            .to_string_lossy()
+                            .as_bytes(),
+                    );
+                    entry
+                } else {
+                    vec![b'o']
+                };
+                snapshot.insert(relative.to_path_buf(), entry);
+            }
+            if metadata.is_dir() {
+                let mut children = fs::read_dir(path)
+                    .expect("snapshot directory")
+                    .map(|entry| entry.expect("snapshot entry").path())
+                    .collect::<Vec<_>>();
+                children.sort();
+                for child in children {
+                    visit(root, &child, snapshot);
+                }
+            }
+        }
+
+        let mut snapshot = BTreeMap::new();
+        if root.exists() {
+            visit(root, root, &mut snapshot);
+        }
+        snapshot
     }
 
     fn profile_record() -> LoaderBuildRecord {
@@ -2873,6 +3935,7 @@ mod tests {
     struct TestByteServer {
         url: String,
         request_count: Arc<AtomicUsize>,
+        request_paths: Arc<Mutex<Vec<String>>>,
         stop_server: mpsc::Sender<()>,
         server: thread::JoinHandle<()>,
     }
@@ -2892,6 +3955,18 @@ mod tests {
         }
 
         fn start_with_optional_sha1(body: Vec<u8>, sha1_proof: Option<Vec<u8>>) -> Self {
+            Self::start_with_status(body, sha1_proof, "200 OK")
+        }
+
+        fn start_not_found() -> Self {
+            Self::start_with_status(b"missing".to_vec(), None, "404 Not Found")
+        }
+
+        fn start_with_status(
+            body: Vec<u8>,
+            sha1_proof: Option<Vec<u8>>,
+            status: &'static str,
+        ) -> Self {
             let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
             listener
                 .set_nonblocking(true)
@@ -2902,13 +3977,19 @@ mod tests {
             );
             let request_count = Arc::new(AtomicUsize::new(0));
             let server_request_count = Arc::clone(&request_count);
+            let request_paths = Arc::new(Mutex::new(Vec::new()));
+            let server_request_paths = Arc::clone(&request_paths);
             let (stop_server, server_stopped) = mpsc::channel();
             let server = thread::spawn(move || {
                 loop {
                     match listener.accept() {
                         Ok((stream, _)) => {
                             server_request_count.fetch_add(1, Ordering::SeqCst);
-                            respond_ok(stream, &body, sha1_proof.as_deref());
+                            let path = respond(stream, status, &body, sha1_proof.as_deref());
+                            server_request_paths
+                                .lock()
+                                .expect("record request path")
+                                .push(path);
                         }
                         Err(error) if error.kind() == ErrorKind::WouldBlock => {
                             if server_stopped.try_recv().is_ok() {
@@ -2924,6 +4005,7 @@ mod tests {
             Self {
                 url,
                 request_count,
+                request_paths,
                 stop_server,
                 server,
             }
@@ -2933,32 +4015,49 @@ mod tests {
             self.request_count.load(Ordering::SeqCst)
         }
 
+        fn request_count_for(&self, path: &str) -> usize {
+            self.request_paths
+                .lock()
+                .expect("read request paths")
+                .iter()
+                .filter(|requested| requested.as_str() == path)
+                .count()
+        }
+
         fn stop(self) {
             self.stop_server.send(()).expect("stop test server");
             self.server.join().expect("server thread");
         }
     }
 
-    fn respond_ok(mut stream: TcpStream, body: &[u8], sha1_proof: Option<&[u8]>) {
+    fn respond(
+        mut stream: TcpStream,
+        status: &str,
+        body: &[u8],
+        sha1_proof: Option<&[u8]>,
+    ) -> String {
         let mut buffer = [0_u8; 1024];
         let read = stream.read(&mut buffer).unwrap_or_default();
         let request = String::from_utf8_lossy(&buffer[..read]);
-        let body = if request.lines().next().is_some_and(|line| {
-            line.split_whitespace()
-                .nth(1)
-                .is_some_and(|path| path.ends_with(".sha1"))
-        }) {
+        let request_path = request
+            .lines()
+            .next()
+            .and_then(|line| line.split_whitespace().nth(1))
+            .unwrap_or("/")
+            .to_string();
+        let body = if request_path.ends_with(".sha1") {
             sha1_proof.unwrap_or(body)
         } else {
             body
         };
         let header = format!(
-            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
             body.len()
         );
         stream
             .write_all(header.as_bytes())
             .expect("write response header");
         stream.write_all(body).expect("write response body");
+        request_path
     }
 }

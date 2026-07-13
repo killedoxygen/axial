@@ -11,6 +11,7 @@ use crate::loaders::types::{
 
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) struct ProfileInstallProof {
+    provider_url: String,
     canonical_profile_id: String,
     inherits_from: String,
     client_main_class: String,
@@ -25,6 +26,10 @@ pub(crate) struct ProfileLibraryProof {
 }
 
 impl ProfileInstallProof {
+    pub(crate) fn provider_url(&self) -> &str {
+        &self.provider_url
+    }
+
     pub(crate) fn identity(&self) -> (&str, &str, &str) {
         (
             &self.canonical_profile_id,
@@ -45,6 +50,7 @@ impl ProfileInstallProof {
         required_libraries: Vec<ProfileLibraryProof>,
     ) -> Self {
         Self {
+            provider_url: "https://fixtures.invalid/profile-proof.json".to_string(),
             canonical_profile_id,
             inherits_from,
             client_main_class,
@@ -105,6 +111,27 @@ pub(crate) async fn fetch_profile_install_proof(
     match record.component_id {
         LoaderComponentId::Fabric => fabric::fetch_profile_install_proof(record).await,
         LoaderComponentId::Quilt => quilt::fetch_profile_install_proof(record).await,
+        LoaderComponentId::Forge | LoaderComponentId::NeoForge => {
+            Err(LoaderError::ProviderDataInvalid {
+                kind: LoaderProviderFailureKind::SchemaInvalid,
+                status: None,
+            })
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) async fn fetch_profile_install_proof_from_url_for_test(
+    record: &LoaderBuildRecord,
+    url: &str,
+) -> Result<ProfileInstallProof, LoaderError> {
+    match record.component_id {
+        LoaderComponentId::Fabric => {
+            fabric::fetch_profile_install_proof_from_url_for_test(record, url).await
+        }
+        LoaderComponentId::Quilt => {
+            quilt::fetch_profile_install_proof_from_url_for_test(record, url).await
+        }
         LoaderComponentId::Forge | LoaderComponentId::NeoForge => {
             Err(LoaderError::ProviderDataInvalid {
                 kind: LoaderProviderFailureKind::SchemaInvalid,

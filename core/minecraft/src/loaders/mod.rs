@@ -1,15 +1,13 @@
 pub mod api;
-pub mod artifacts;
 mod bound_processors;
 mod compose;
 mod forge_installer;
 mod http;
 pub mod index;
-pub mod legacy;
 mod managed_fs;
 pub mod providers;
 mod source;
-pub mod strategies;
+mod strategies;
 pub mod types;
 pub mod workspace;
 
@@ -29,6 +27,7 @@ pub use index::{
     resolve_build_record_for_install,
 };
 pub(crate) use managed_fs::MaterializedInstallerLibrary;
+pub(crate) use strategies::AuthenticatedLegacyOverlayAuthority;
 pub use types::{
     LOADER_CATALOG_SCHEMA_VERSION, LoaderActiveInstallFailure, LoaderArtifactKind,
     LoaderAvailability, LoaderBuildId, LoaderBuildMetadata, LoaderBuildRecord, LoaderCatalogState,
@@ -41,7 +40,7 @@ pub use types::{
 
 use crate::artifact_path::MAX_ARTIFACT_PATH_SEGMENT_BYTES;
 use crate::download::DownloadProgress;
-use crate::known_good::KnownGoodInstallReceipt;
+use crate::known_good::{KnownGoodInstallReceipt, KnownGoodReconstructionReceipt};
 use std::path::{Component, Path};
 
 pub(crate) const MAX_VERSION_ID_BYTES: usize = MAX_ARTIFACT_PATH_SEGMENT_BYTES - ".json".len();
@@ -66,6 +65,13 @@ where
     Box::pin(strategies::install_build(library_dir, &plan, send))
         .await
         .map_err(LoaderInstallError::from)
+}
+
+pub async fn reconstruct_build(
+    installed_version_id: &str,
+) -> Result<KnownGoodReconstructionReceipt, LoaderError> {
+    let plan = api::loader_reconstruction_plan(installed_version_id)?;
+    strategies::reconstruct_build(&plan).await
 }
 
 fn require_exact_live_build_record(
@@ -120,8 +126,8 @@ mod tests {
     use super::{
         LoaderArtifactKind, LoaderBuildMetadata, LoaderBuildRecord, LoaderComponentId, LoaderError,
         LoaderInstallSource, LoaderInstallStrategy, LoaderInstallability, MAX_VERSION_ID_BYTES,
-        build_id_for, install_build, installed_version_id_for, require_exact_live_build_record,
-        validate_version_id,
+        build_id_for, install_build, installed_version_id_for, reconstruct_build,
+        require_exact_live_build_record, validate_version_id,
     };
     use crate::loaders::types::LoaderBuildSubjectKind;
     use crate::paths::loader_work_dir;
@@ -203,6 +209,43 @@ mod tests {
 
         assert!(!loader_work_dir(&root).exists());
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn reconstruction_rejects_noncanonical_and_unsupported_ids_before_effects() {
+        let sentinel_root = temp_library("reconstruction-id-rejection");
+        let sentinel = sentinel_root.join("untouched");
+        fs::create_dir_all(&sentinel_root).expect("sentinel root");
+        fs::write(&sentinel, b"untouched").expect("sentinel");
+
+        for invalid in ["loader-v1-obsolete", " loader-v2-invalid ", "../escape"] {
+            let Err(_) = reconstruct_build(invalid).await else {
+                panic!("noncanonical reconstruction identity");
+            };
+            assert_eq!(fs::read(&sentinel).expect("sentinel remains"), b"untouched");
+            assert_eq!(
+                fs::read_dir(&sentinel_root).expect("sentinel root").count(),
+                1
+            );
+        }
+
+        for (component, loader_version) in [
+            (LoaderComponentId::Forge, "55.0.0"),
+            (LoaderComponentId::NeoForge, "21.5.74"),
+        ] {
+            let unsupported = installed_version_id_for(component, "1.21.5", loader_version)
+                .expect("canonical unsupported identity");
+            let Err(_) = reconstruct_build(&unsupported).await else {
+                panic!("unsupported reconstruction strategy");
+            };
+            assert_eq!(fs::read(&sentinel).expect("sentinel remains"), b"untouched");
+            assert_eq!(
+                fs::read_dir(&sentinel_root).expect("sentinel root").count(),
+                1
+            );
+        }
+
+        let _ = fs::remove_dir_all(sentinel_root);
     }
 
     #[test]

@@ -34,7 +34,8 @@ use crate::known_good::{
     seal_reconstructed_vanilla,
 };
 use crate::known_good_libraries::{
-    ClassifiedLibraryDownload, LibraryAcquisition, PendingStreamedLibraryDeclarations,
+    ClassifiedLibraryDownload, LibraryAcquisition, PendingExactLibraryDeclarations,
+    PendingStreamedLibraryDeclarations, SealedExactLibraryDeclarations,
     seal_vanilla_exact_library_declarations,
 };
 use crate::launch::{VersionJson, effective_java_version_for};
@@ -48,6 +49,7 @@ use crate::runtime::{
 };
 use futures_util::StreamExt;
 use std::io;
+use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::fs as async_fs;
@@ -60,6 +62,22 @@ pub struct Downloader {
     install_manifest: Option<VersionManifest>,
     #[cfg(test)]
     runtime_source: Option<TestRuntimeSourceDescriptor>,
+}
+
+pub(crate) struct ReconstructedVanillaClientAuthority {
+    receipt: KnownGoodReconstructionReceipt,
+    client_source: AuthenticatedSelectedArtifactSource,
+}
+
+impl ReconstructedVanillaClientAuthority {
+    pub(crate) fn consume_for_overlay(
+        self,
+    ) -> (
+        KnownGoodReconstructionReceipt,
+        AuthenticatedSelectedArtifactSource,
+    ) {
+        (self.receipt, self.client_source)
+    }
 }
 
 struct AuthenticatedVanillaPlan {
@@ -253,6 +271,77 @@ impl Downloader {
         version_id: &str,
         version_manifest_entry: ManifestEntry,
     ) -> Result<KnownGoodReconstructionReceipt, DownloadError> {
+        let authority = self
+            .reconstruct_vanilla_authority(version_id, &version_manifest_entry)
+            .await?;
+        seal_reconstructed_vanilla(ReconstructedVanillaAuthority::new(authority)).map_err(|error| {
+            DownloadError::ResolveManifest(format!(
+                "reconstructed source inventory could not be derived: {error:?}"
+            ))
+        })
+    }
+
+    pub(crate) async fn reconstruct_version_with_client_source(
+        &self,
+        version_id: &str,
+    ) -> Result<ReconstructedVanillaClientAuthority, DownloadError> {
+        const MAX_RECONSTRUCTED_CLIENT_BYTES: usize = 512 << 20;
+
+        validate_install_version_id(version_id)?;
+        let version_manifest_entry = self.resolve_manifest_entry(version_id).await?;
+        let authority = self
+            .reconstruct_vanilla_authority(version_id, &version_manifest_entry)
+            .await?;
+        let client = authority.version.downloads.client.as_ref().ok_or_else(|| {
+            DownloadError::ResolveManifest(
+                "authenticated version has no exact client artifact".to_string(),
+            )
+        })?;
+        let expected = ExpectedIntegrity::from_mojang(client.size, &client.sha1);
+        let expected_size = expected.size.ok_or_else(|| {
+            DownloadError::ResolveManifest(
+                "authenticated version has no exact client size".to_string(),
+            )
+        })?;
+        let max_bytes = usize::try_from(expected_size)
+            .ok()
+            .filter(|size| *size <= MAX_RECONSTRUCTED_CLIENT_BYTES)
+            .ok_or_else(|| {
+                DownloadError::ResolveManifest(
+                    "authenticated client exceeds the reconstruction source limit".to_string(),
+                )
+            })?;
+        let target =
+            selected_download_source_label(SelectedDownloadArtifactKind::ClientJar, version_id);
+        let client_source =
+            acquire_authenticated_selected_artifact_source(SelectedArtifactSourceRequest {
+                client: &self.client,
+                kind: SelectedDownloadArtifactKind::ClientJar,
+                url: &client.url,
+                logical_identity: version_id,
+                expected: &expected,
+                max_bytes,
+                target: &target,
+                fact_tx: None,
+            })
+            .await?;
+        let receipt = seal_reconstructed_vanilla(ReconstructedVanillaAuthority::new(authority))
+            .map_err(|error| {
+                DownloadError::ResolveManifest(format!(
+                    "reconstructed source inventory could not be derived: {error:?}"
+                ))
+            })?;
+        Ok(ReconstructedVanillaClientAuthority {
+            receipt,
+            client_source,
+        })
+    }
+
+    async fn reconstruct_vanilla_authority(
+        &self,
+        version_id: &str,
+        version_manifest_entry: &ManifestEntry,
+    ) -> Result<VanillaAuthorityParts, DownloadError> {
         let AuthenticatedVanillaPlan {
             version,
             environment,
@@ -262,7 +351,7 @@ impl Downloader {
             asset_index_source,
             runtime_source,
         } = self
-            .acquire_vanilla_plan(version_id, &version_manifest_entry, None)
+            .acquire_vanilla_plan(version_id, version_manifest_entry, None)
             .await?;
         let mut library_proofs = Vec::new();
         let source_pool = LibrarySourcePool::new();
@@ -296,18 +385,13 @@ impl Downloader {
                 ))
             })?;
 
-        seal_reconstructed_vanilla(ReconstructedVanillaAuthority::new(VanillaAuthorityParts {
+        Ok(VanillaAuthorityParts {
             version,
             environment,
             libraries: library_declarations,
             version_source: version_json_source,
             asset_index_source,
             runtime_source,
-        }))
-        .map_err(|error| {
-            DownloadError::ResolveManifest(format!(
-                "reconstructed source inventory could not be derived: {error:?}"
-            ))
         })
     }
 
@@ -963,6 +1047,56 @@ impl Downloader {
 
         fetch_fresh_install_version_manifest().await
     }
+}
+
+pub(crate) async fn reconstruct_profile_library_declarations(
+    declarations: PendingExactLibraryDeclarations,
+) -> Result<SealedExactLibraryDeclarations, DownloadError> {
+    let jobs = {
+        let (libraries, environment) = declarations.profile_plan_inputs().ok_or_else(|| {
+            DownloadError::ResolveManifest(
+                "profile library reconstruction contract is missing".to_string(),
+            )
+        })?;
+        library_jobs_for(Path::new(""), libraries, environment)?
+    };
+    let (pending, classified) = declarations
+        .classify_jobs(&libraries_dir(Path::new("")), jobs)
+        .map_err(|error| {
+            DownloadError::ResolveManifest(format!(
+                "profile library reconstruction classification failed: {error:?}"
+            ))
+        })?;
+    let client = standard_minecraft_download_client();
+    let source_pool = LibrarySourcePool::new();
+    let mut proofs = Vec::new();
+    for classified in classified {
+        let (job, acquisition) = classified.into_parts();
+        if acquisition == LibraryAcquisition::ExactDeclaration {
+            continue;
+        }
+        let target = selected_download_source_label(
+            SelectedDownloadArtifactKind::Library,
+            job.relative_path.as_str(),
+        );
+        let source = acquire_authenticated_library_source(LibrarySourceRequest {
+            client: &client,
+            url: &job.url,
+            expected: &job.expected,
+            relative_path: &job.relative_path,
+            max_bytes: LIBRARY_SOURCE_MAX_BYTES,
+            target: &target,
+            pool: &source_pool,
+            fact_tx: None,
+        })
+        .await?;
+        proofs.push(source.into_exact_download_proof(job.is_native));
+    }
+    pending.seal_streamed(proofs).map_err(|error| {
+        DownloadError::ResolveManifest(format!(
+            "profile library reconstruction could not be completed: {error:?}"
+        ))
+    })
 }
 
 fn validate_install_version_id(version_id: &str) -> Result<(), DownloadError> {

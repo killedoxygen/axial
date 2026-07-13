@@ -170,20 +170,19 @@ Files:
 
 - `core/minecraft/src/loaders/strategies/mod.rs`
 - `core/minecraft/src/loaders/strategies/common.rs`
-- `core/minecraft/src/loaders/strategies/fabric_profile.rs`
-- `core/minecraft/src/loaders/strategies/quilt_profile.rs`
 - `core/minecraft/src/loaders/strategies/forge_modern.rs`
 - `core/minecraft/src/loaders/strategies/forge_legacy_installer.rs`
-- `core/minecraft/src/loaders/strategies/forge_earliest_legacy.rs`
 - `core/minecraft/src/loaders/strategies/neoforge_modern.rs`
 
 Responsibility:
 
-- install one normalized build
+- install one normalized build or reconstruct supported source authority
 - choose behavior from `LoaderInstallStrategy`
 - keep loader-family and era-specific work local to the selected strategy
 
-Profile-based loaders, currently Fabric and Quilt, download libraries declared by trusted upstream profile JSON. Those profile libraries may omit SHA-1 metadata, so the loader install operation observes the complete artifact bytes, authors the exact SHA-1 and byte size into the finalized profile metadata, and seals the same contract into the known-good inventory. Launch readiness remains exact-hash-only: neither KnownGood/State nor canonical loader identity grants a structural-integrity or file-existence exception. Loader strategies also validate base Minecraft dependencies before treating a base version as already installed: the base JSON, client jar, incomplete marker, and selected base libraries must be ready so a partially-installed vanilla base cannot produce a finalized loader profile with missing inherited libraries.
+`strategies/mod.rs` dispatches Fabric and Quilt profile work and earliest pre-installer Forge directly to `strategies/common.rs`; there are no family-specific forwarding wrappers. The remaining strategy modules are the live installer-era Forge and NeoForge entrypoints. Profile-based loaders download libraries declared by trusted upstream profile JSON. Those profile libraries may omit SHA-1 metadata, so installation observes the complete artifact bytes, authors the exact SHA-1 and byte size into the finalized profile metadata, and seals the same contract into the known-good inventory. Launch readiness remains exact-hash-only: neither KnownGood/State nor canonical loader identity grants a structural-integrity or file-existence exception. Install strategies also validate base Minecraft dependencies before treating a base version as already installed: the base JSON, client jar, incomplete marker, and selected base libraries must be ready so a partially-installed vanilla base cannot produce a finalized loader profile with missing inherited libraries.
+
+Reconstruction is reachable publicly only by a strict canonical `loader-v2` installed-version id. Core derives the provider URL and strategy itself; no caller record, catalog, cache, path, or installed file supplies authority. Fabric and Quilt consume fresh fixed profile proof/profile sources and source-only vanilla reconstruction. Earliest Forge consumes a fresh SHA-1-sidecar-authenticated archive and fresh authenticated base client. These paths produce a distinct reconstruction receipt through the same private inventory derivation as install and perform no destination effects. Installer-era Forge and NeoForge reconstruction are not implemented and fail closed.
 
 ### 4. Helper layers
 
@@ -191,19 +190,21 @@ Files:
 
 - `core/minecraft/src/loaders/api.rs`
 - `core/minecraft/src/loaders/types.rs`
-- `core/minecraft/src/loaders/artifacts/*`
 - `core/minecraft/src/loaders/workspace/*`
-- `core/minecraft/src/loaders/legacy/*`
 - `core/minecraft/src/loaders/compose.rs`
 - `core/minecraft/src/loaders/forge_installer.rs`
-- `core/minecraft/src/loaders/processors.rs`
+- `core/minecraft/src/loaders/bound_processors.rs`
+- `core/minecraft/src/loaders/http.rs`
+- `core/minecraft/src/loaders/managed_fs.rs`
+- `core/minecraft/src/loaders/source.rs`
 
 Responsibility:
 
-- `api.rs`: component ids, build ids, and installed version-id construction
+- `api.rs`: component ids, build ids, strict installed version-id construction/decoding, and canonical reconstruction-plan derivation
 - `types.rs`: normalized types and errors
-- helper modules: install artifacts, work dirs, composition, legacy behavior, processors
-- `forge_installer.rs` and `processors.rs`: parse installer ZIPs through bounded blocking work, with explicit decompressed-entry ceilings for profile JSON, embedded Maven libraries, and processor data extraction. Modern Forge/NeoForge installer profiles are not parsed as legacy root-library install profiles; legacy root-library extraction is a no-op unless the legacy `install` schema is present.
+- `workspace/*`, `managed_fs.rs`, and `compose.rs`: bounded work directories, capability-scoped managed filesystem effects, and version composition
+- `http.rs` and `source.rs`: bounded provider acquisition, redirect policy, and SHA-1-sidecar source authentication
+- `forge_installer.rs` and `bound_processors.rs`: parse installer ZIPs and execute bound processor plans through bounded work, with explicit decompressed-entry ceilings for profile JSON, embedded Maven libraries, and processor data extraction. Modern Forge/NeoForge installer profiles are not parsed as earliest archive overlays; legacy root-library extraction remains limited to installers that carry the legacy `install` schema.
 
 ## Selection flow
 

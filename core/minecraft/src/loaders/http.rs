@@ -43,7 +43,7 @@ where
 }
 
 #[cfg(test)]
-async fn fetch_json_for_test<T>(url: &str) -> Result<T, LoaderError>
+pub(crate) async fn fetch_json_for_test<T>(url: &str) -> Result<T, LoaderError>
 where
     T: DeserializeOwned + Send + 'static,
 {

@@ -157,6 +157,8 @@ Core Minecraft derives a bounded deterministic known-good artifact inventory as 
 
 Vanilla reconstruction is a separate Core producer path, not a conversion from an install receipt. It starts from the fresh fixed Mojang manifest and consumes authenticated unmaterialized version and asset-index sources, a source-only managed-runtime component manifest, and one-to-one incomplete-library observations. It performs no final launcher writes and yields a distinct move-only reconstruction receipt whose only outward transition is the same activation source. The private inventory derivation is shared with vanilla installation, making identical authenticated inputs inventory-identical without allowing reconstruction to publish install success.
 
+Loader reconstruction extends that same effect-free Core primitive to Fabric and Quilt profiles and earliest pre-installer Forge. It emits factual reconstruction authority only: no repair descriptor, Guardian authorization, or mutation capability is created, and source acquisition or proof failure fails closed. Installed files, catalog caches, persisted known-good snapshots, and other local evidence cannot substitute for a missing or invalid fresh source. Application orchestration and State reconciliation/activation wiring remain pending; until those boundaries consume the move-only reconstruction result, Core reconstruction alone changes no live or durable authority.
+
 ## Launch Runtime And JVM
 Runtime, JVM, and launch preparation code emit facts and provide execution hooks. Guardian decides whether to keep a requested runtime, switch to managed runtime, strip or preserve raw JVM args, disable custom GC, downgrade a preset, warn, repair, or block.
 

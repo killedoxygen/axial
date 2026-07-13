@@ -10,6 +10,9 @@ const MAX_SOURCE_SHA1_PROOF_BYTES: u64 = 128;
 #[derive(Debug)]
 pub(crate) struct VerifiedLoaderSource {
     bytes: Vec<u8>,
+    provider_url: String,
+    logical_identity: String,
+    expected_sha1: String,
 }
 
 impl VerifiedLoaderSource {
@@ -17,13 +20,40 @@ impl VerifiedLoaderSource {
         &self.bytes
     }
 
-    pub(crate) fn into_bytes(self) -> Vec<u8> {
-        self.bytes
+    pub(crate) fn matches_contract(&self, provider_url: &str, logical_identity: &str) -> bool {
+        self.provider_url == provider_url
+            && self.logical_identity == logical_identity
+            && self.expected_sha1.len() == 40
+            && self
+                .expected_sha1
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+    }
+
+    pub(crate) fn into_bytes_for(
+        self,
+        provider_url: &str,
+        logical_identity: &str,
+    ) -> Result<Vec<u8>, LoaderError> {
+        if self.provider_url != provider_url
+            || self.logical_identity != logical_identity
+            || self.expected_sha1.len() != 40
+        {
+            return Err(LoaderError::Verify(
+                "authenticated loader source does not match its selected contract".to_string(),
+            ));
+        }
+        Ok(self.bytes)
     }
 
     #[cfg(test)]
     pub(crate) fn from_test_bytes(bytes: Vec<u8>) -> Self {
-        Self { bytes }
+        Self {
+            expected_sha1: format!("{:x}", sha1::Sha1::digest(&bytes)),
+            bytes,
+            provider_url: "https://fixtures.invalid/loader-source.jar".to_string(),
+            logical_identity: "test-loader-source".to_string(),
+        }
     }
 }
 
@@ -31,6 +61,7 @@ pub(crate) async fn fetch_sha1_verified_source(
     source_url: &str,
     max_source_bytes: u64,
     source_label: &'static str,
+    logical_identity: &str,
 ) -> Result<VerifiedLoaderSource, LoaderError> {
     let proof_url = sha1_sidecar_url(source_url)?;
     let bytes = fetch_bytes(source_url, max_source_bytes).await?;
@@ -42,7 +73,12 @@ pub(crate) async fn fetch_sha1_verified_source(
             "{source_label} does not match its live sha1 proof"
         )));
     }
-    Ok(VerifiedLoaderSource { bytes })
+    Ok(VerifiedLoaderSource {
+        bytes,
+        provider_url: source_url.to_string(),
+        logical_identity: logical_identity.to_string(),
+        expected_sha1: proof.to_ascii_lowercase(),
+    })
 }
 
 fn sha1_sidecar_url(source_url: &str) -> Result<String, LoaderError> {

@@ -1,4 +1,7 @@
-use super::common::{FABRIC_META_BASE, infer_loader_build_metadata, provider_installed_version_id};
+use super::common::{
+    FABRIC_META_BASE, infer_loader_build_metadata, profile_proof_url, profile_source_url,
+    provider_installed_version_id,
+};
 use crate::lifecycle::LifecycleMeta;
 use crate::loaders::api::build_id_for;
 use crate::loaders::http::fetch_json;
@@ -77,11 +80,38 @@ pub async fn fetch_game_versions()
 pub(crate) async fn fetch_profile_install_proof(
     record: &LoaderBuildRecord,
 ) -> Result<ProfileInstallProof, crate::loaders::types::LoaderError> {
-    let entry = fetch_json::<FabricInstallEntry>(&format!(
-        "{FABRIC_META_BASE}/loader/{}/{}",
-        record.minecraft_version, record.loader_version
-    ))
-    .await?;
+    let url = profile_proof_url(
+        LoaderComponentId::Fabric,
+        &record.minecraft_version,
+        &record.loader_version,
+    )?;
+    fetch_profile_install_proof_from_url(record, &url).await
+}
+
+async fn fetch_profile_install_proof_from_url(
+    record: &LoaderBuildRecord,
+    url: &str,
+) -> Result<ProfileInstallProof, crate::loaders::types::LoaderError> {
+    let entry = fetch_json::<FabricInstallEntry>(url).await?;
+    profile_install_proof_from_entry(record, url, entry)
+}
+
+#[cfg(test)]
+pub(super) async fn fetch_profile_install_proof_from_url_for_test(
+    record: &LoaderBuildRecord,
+    url: &str,
+) -> Result<ProfileInstallProof, crate::loaders::types::LoaderError> {
+    use crate::loaders::http::fetch_json_for_test;
+
+    let entry = fetch_json_for_test::<FabricInstallEntry>(url).await?;
+    profile_install_proof_from_entry(record, url, entry)
+}
+
+fn profile_install_proof_from_entry(
+    record: &LoaderBuildRecord,
+    url: &str,
+    entry: FabricInstallEntry,
+) -> Result<ProfileInstallProof, crate::loaders::types::LoaderError> {
     let loader_coordinate = format!("net.fabricmc:fabric-loader:{}", record.loader_version);
     let intermediary_coordinate = format!("net.fabricmc:intermediary:{}", record.minecraft_version);
     if entry.loader.version != record.loader_version
@@ -96,6 +126,7 @@ pub(crate) async fn fetch_profile_install_proof(
         });
     }
     Ok(ProfileInstallProof {
+        provider_url: url.to_string(),
         canonical_profile_id: format!(
             "fabric-loader-{}-{}",
             record.loader_version, record.minecraft_version
@@ -155,10 +186,11 @@ pub async fn fetch_builds(
                     artifact_kind: LoaderArtifactKind::ProfileJson,
                     installability: LoaderInstallability::Installable,
                     install_source: LoaderInstallSource::ProfileJson {
-                        url: format!(
-                            "{FABRIC_META_BASE}/loader/{minecraft_version}/{}/profile/json",
-                            entry.loader.version
-                        ),
+                        url: profile_source_url(
+                            component_id,
+                            minecraft_version,
+                            &entry.loader.version,
+                        )?,
                     },
                 })
             })

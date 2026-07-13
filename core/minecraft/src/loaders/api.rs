@@ -1,8 +1,11 @@
 use super::MAX_VERSION_ID_BYTES;
-use super::providers::common::infer_loader_build_metadata;
+use super::providers::common::{
+    forge_install_source, infer_loader_build_metadata, profile_source_url,
+};
 use super::types::{
-    LoaderBuildId, LoaderBuildMetadata, LoaderBuildRecord, LoaderComponentId,
-    LoaderComponentRecord, LoaderError,
+    LoaderArtifactKind, LoaderBuildId, LoaderBuildMetadata, LoaderBuildRecord,
+    LoaderBuildSubjectKind, LoaderComponentId, LoaderComponentRecord, LoaderError,
+    LoaderInstallPlan, LoaderInstallSource, LoaderInstallStrategy, LoaderInstallability,
 };
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 
@@ -34,6 +37,64 @@ impl InstalledLoaderIdentity {
     pub(crate) fn loader_version(&self) -> &str {
         &self.loader_version
     }
+}
+
+pub(crate) fn loader_reconstruction_plan(
+    installed_version_id: &str,
+) -> Result<LoaderInstallPlan, LoaderError> {
+    let identity = decode_installed_version_id(installed_version_id)?;
+    let (strategy, artifact_kind, install_source) = match identity.component_id {
+        LoaderComponentId::Fabric => (
+            LoaderInstallStrategy::FabricProfile,
+            LoaderArtifactKind::ProfileJson,
+            LoaderInstallSource::ProfileJson {
+                url: profile_source_url(
+                    identity.component_id,
+                    &identity.minecraft_version,
+                    &identity.loader_version,
+                )?,
+            },
+        ),
+        LoaderComponentId::Quilt => (
+            LoaderInstallStrategy::QuiltProfile,
+            LoaderArtifactKind::ProfileJson,
+            LoaderInstallSource::ProfileJson {
+                url: profile_source_url(
+                    identity.component_id,
+                    &identity.minecraft_version,
+                    &identity.loader_version,
+                )?,
+            },
+        ),
+        LoaderComponentId::Forge => {
+            forge_install_source(&identity.minecraft_version, &identity.loader_version)?
+        }
+        LoaderComponentId::NeoForge => {
+            return Err(LoaderError::InvalidProfile(
+                "loader reconstruction strategy is not implemented".to_string(),
+            ));
+        }
+    };
+    Ok(LoaderInstallPlan {
+        record: LoaderBuildRecord {
+            subject_kind: LoaderBuildSubjectKind::LoaderBuild,
+            component_id: identity.component_id,
+            component_name: identity.component_id.display_name().to_string(),
+            build_id: build_id_for(
+                identity.component_id,
+                &identity.minecraft_version,
+                &identity.loader_version,
+            ),
+            minecraft_version: identity.minecraft_version,
+            loader_version: identity.loader_version,
+            version_id: installed_version_id.to_string(),
+            build_meta: LoaderBuildMetadata::default(),
+            strategy,
+            artifact_kind,
+            installability: LoaderInstallability::Installable,
+            install_source,
+        },
+    })
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
