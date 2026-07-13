@@ -29,9 +29,9 @@ This document is a deterministic human-readable projection of Guardian's strict 
 | Kernel cells | 540 |
 | Public kernel cells | 90 |
 | Diagnosis rules | 60 |
-| Registered facts | 119 |
-| Preflight senses | 6 |
-| Adapter sources | 102 |
+| Registered facts | 120 |
+| Preflight senses | 7 |
+| Adapter sources | 103 |
 | Repair hands | 3 |
 
 ### Decision Distribution
@@ -52,6 +52,7 @@ The complete kernel matrix remains in the JSON artifact.
 | installed_versions | content_io | launch_preflight_sense_timing | pending_phase_4 | pending | pending |
 | overrides | external_probe | launch_preflight_sense_timing | pending_phase_4 | pending | pending |
 | resources | metadata_io | launch_preflight_sense_timing | pending_phase_4 | pending | pending |
+| integrity_tier0 | metadata_io | launch_preflight_sense_timing | pending_i8_rotational_measurement | 9 | ignored rotational-fixture harness; candidate evidence requires review |
 | readiness | content_io | launch_preflight_sense_timing | pending_phase_4 | pending | pending |
 | guardian_policy | in_process | launch_preflight_sense_timing | pending_phase_4 | pending | pending |
 

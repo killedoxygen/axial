@@ -15,20 +15,22 @@ mod probe;
 mod rosetta;
 
 pub use discovery::{
-    find_java_runtime, is_known_runtime_component, list_java_runtimes, list_runtime_records,
+    is_known_runtime_component, list_java_runtimes,
     managed_runtime_contents_verified_without_probe, parse_runtime_override,
     preferred_runtime_component, runtime_component_executable_present_without_probe,
-    runtime_component_ready_without_probe, runtime_executable_ready_without_probe,
-    runtime_requirement,
+    runtime_component_ready_without_probe, runtime_component_structurally_ready_without_probe,
+    runtime_executable_ready_without_probe, runtime_requirement,
 };
+pub use ensure::ensure_runtime_with_events;
 pub(crate) use ensure::{
     ProcessorRuntime, materialize_ephemeral_processor_runtime, materialize_preferred_runtime_source,
 };
-pub use ensure::{ensure_java_runtime, ensure_runtime_with_events};
+pub use layout::ManagedRuntimeCache;
+pub(crate) use layout::runtime_java_relative_path;
 pub use model::{
-    JavaRuntimeInfo, JavaRuntimeLookupError, JavaRuntimeResult, RuntimeEnsureAction,
-    RuntimeEnsureEvent, RuntimeEnsureResult, RuntimeId, RuntimeInstallState, RuntimeOverride,
-    RuntimeProbeSource, RuntimeProbeUsage, RuntimeRecord, RuntimeRequirement, RuntimeSource,
+    JavaRuntimeInfo, JavaRuntimeLookupError, JavaRuntimeResult, RuntimeEnsureEvent,
+    RuntimeEnsureResult, RuntimeId, RuntimeInstallState, RuntimeOverride, RuntimeProbeSource,
+    RuntimeProbeUsage, RuntimeRecord, RuntimeRequirement, RuntimeSource,
 };
 pub use probe::{
     JavaRuntimeProbeReceipt, JavaRuntimeProbeResolution, JavaRuntimeProbeResolutionError,
@@ -37,11 +39,11 @@ pub use probe::{
 };
 
 #[cfg(test)]
-use discovery::{detect_runtime_state, resolve_component_runtime_from_roots};
+use discovery::detect_runtime_state;
+#[cfg(test)]
+use ensure::runtime_install_lock_file_path;
 #[cfg(test)]
 use ensure::runtime_record_matches_source_for_test;
-#[cfg(test)]
-use ensure::{runtime_install_lock_file_path, runtime_install_lock_from_map};
 #[cfg(test)]
 use file_download::{
     RuntimeDownloadActual, RuntimeDownloadEvidence, RuntimeDownloadIntegrityError,

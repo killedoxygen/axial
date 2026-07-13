@@ -45,8 +45,7 @@ pub use manifest::{
 };
 pub use paths::{
     cache_dir, create_minecraft_dir, default_minecraft_dir, libraries_dir, loader_cache_dir,
-    loader_catalog_dir, runtime_dirs, validate_installation, version_manifest_cache_path,
-    versions_dir,
+    loader_catalog_dir, validate_installation, version_manifest_cache_path, versions_dir,
 };
 pub use profiles::ensure_launcher_profiles;
 pub use rules::{
@@ -56,14 +55,14 @@ pub use rules::{
 pub use runtime::{
     JavaRuntimeInfo, JavaRuntimeLookupError, JavaRuntimeProbeReceipt, JavaRuntimeProbeResolution,
     JavaRuntimeProbeResolutionError, JavaRuntimeProbeSnapshot, JavaRuntimeResult,
-    RuntimeEnsureAction, RuntimeEnsureEvent, RuntimeEnsureResult, RuntimeId, RuntimeInstallState,
+    ManagedRuntimeCache, RuntimeEnsureEvent, RuntimeEnsureResult, RuntimeId, RuntimeInstallState,
     RuntimeOverride, RuntimeProbeSource, RuntimeProbeUsage, RuntimeRecord, RuntimeRequirement,
-    RuntimeSource, ensure_java_runtime, ensure_runtime_with_events, find_java_runtime,
-    is_known_runtime_component, list_java_runtimes, list_runtime_records,
+    RuntimeSource, ensure_runtime_with_events, is_known_runtime_component, list_java_runtimes,
     managed_runtime_contents_verified_without_probe, parse_runtime_override,
     preferred_runtime_component, probe_java_runtime_receipt, resolve_java_runtime_probe,
     runtime_component_executable_present_without_probe, runtime_component_ready_without_probe,
-    runtime_executable_ready_without_probe, runtime_requirement, snapshot_java_runtime,
+    runtime_component_structurally_ready_without_probe, runtime_executable_ready_without_probe,
+    runtime_requirement, snapshot_java_runtime,
 };
 pub use types::{VersionEntry, VersionLoaderAttachment, VersionSubjectKind};
 pub use version::{

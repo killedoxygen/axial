@@ -10,6 +10,10 @@ use axial_launcher::{
     LAUNCH_DISK_HEADROOM_MB, LAUNCH_MEMORY_HEADROOM_MB, LaunchReadinessReason,
     LaunchReadinessReasonId, LaunchReadinessSeverity, OverrideOrigin, SessionId,
 };
+use axial_minecraft::known_good::{
+    KnownGoodArtifactKind, KnownGoodInventory, TestKnownGoodEntry, TestKnownGoodIntegrity,
+    TestKnownGoodRoot,
+};
 use axial_performance::PerformanceManager;
 use axum::Json;
 use sha1::{Digest, Sha1};
@@ -70,11 +74,157 @@ impl TestFixture {
     }
 
     fn add_instance(&self, name: &str, version_id: &str) -> String {
-        self.state
+        let instance = self
+            .state
             .instances()
             .insert_for_test(name.to_string(), version_id.to_string())
-            .expect("add instance")
-            .id
+            .expect("add instance");
+        self.activate_ready_version_inventory(&instance.id, version_id);
+        instance.id
+    }
+
+    fn activate_ready_version_inventory(&self, instance_id: &str, version_id: &str) {
+        let version_dir = self.paths.library_dir.join("versions").join(version_id);
+        let json = version_dir.join(format!("{version_id}.json"));
+        let jar = version_dir.join(format!("{version_id}.jar"));
+        let (Ok(json_metadata), Ok(jar_metadata)) = (fs::metadata(&json), fs::metadata(jar)) else {
+            return;
+        };
+        let mut entries = vec![
+            TestKnownGoodEntry {
+                root: TestKnownGoodRoot::Versions,
+                path: format!("{version_id}/{version_id}.json"),
+                kind: KnownGoodArtifactKind::VersionMetadata,
+                integrity: TestKnownGoodIntegrity::File {
+                    size: json_metadata.len(),
+                },
+            },
+            TestKnownGoodEntry {
+                root: TestKnownGoodRoot::Versions,
+                path: format!("{version_id}/{version_id}.jar"),
+                kind: KnownGoodArtifactKind::ClientJar,
+                integrity: TestKnownGoodIntegrity::File {
+                    size: jar_metadata.len(),
+                },
+            },
+        ];
+        entries.extend(self.expected_runtime_entries(&json));
+        let inventory =
+            KnownGoodInventory::from_test_entries(entries).expect("ready version inventory");
+        self.state
+            .activate_known_good_inventory_for_test(instance_id, inventory);
+    }
+
+    fn activate_expected_version_inventory(
+        &self,
+        instance_id: &str,
+        version_id: &str,
+        client_size: Option<u64>,
+        extra_entries: impl IntoIterator<Item = TestKnownGoodEntry>,
+    ) {
+        let version_json = self
+            .paths
+            .library_dir
+            .join("versions")
+            .join(version_id)
+            .join(format!("{version_id}.json"));
+        let mut entries = vec![TestKnownGoodEntry {
+            root: TestKnownGoodRoot::Versions,
+            path: format!("{version_id}/{version_id}.json"),
+            kind: KnownGoodArtifactKind::VersionMetadata,
+            integrity: TestKnownGoodIntegrity::File {
+                size: fs::metadata(&version_json).expect("version metadata").len(),
+            },
+        }];
+        if let Some(size) = client_size {
+            entries.push(TestKnownGoodEntry {
+                root: TestKnownGoodRoot::Versions,
+                path: format!("{version_id}/{version_id}.jar"),
+                kind: KnownGoodArtifactKind::ClientJar,
+                integrity: TestKnownGoodIntegrity::File { size },
+            });
+        }
+        entries.extend(self.expected_runtime_entries(&version_json));
+        entries.extend(extra_entries);
+        self.state.activate_known_good_inventory_for_test(
+            instance_id,
+            KnownGoodInventory::from_test_entries(entries).expect("expected version inventory"),
+        );
+    }
+
+    fn expected_runtime_entries(&self, version_json: &Path) -> Vec<TestKnownGoodEntry> {
+        let Some(version) = fs::read(version_json)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        else {
+            return Vec::new();
+        };
+        let Some(component) = version
+            .get("javaVersion")
+            .and_then(|java| java.get("component"))
+            .and_then(serde_json::Value::as_str)
+            .filter(|component| !component.trim().is_empty())
+        else {
+            return Vec::new();
+        };
+        let Some(runtime_root) = self.state.managed_runtime_cache().component_root(component)
+        else {
+            return Vec::new();
+        };
+        let java_path = managed_runtime_java_path(&runtime_root);
+        let java_relative = java_path
+            .strip_prefix(&runtime_root)
+            .expect("managed Java relative path")
+            .to_string_lossy()
+            .replace('\\', "/");
+        let file_size_or = |path: &Path, fallback| {
+            fs::metadata(path)
+                .ok()
+                .filter(|metadata| metadata.is_file())
+                .map_or(fallback, |metadata| metadata.len())
+        };
+        let root = || TestKnownGoodRoot::ManagedRuntime {
+            component: component.to_string(),
+        };
+
+        vec![
+            TestKnownGoodEntry {
+                root: root(),
+                path: ".axial-runtime-manifest.json".to_string(),
+                kind: KnownGoodArtifactKind::RuntimeManifestProof,
+                integrity: TestKnownGoodIntegrity::File {
+                    size: file_size_or(&runtime_root.join(".axial-runtime-manifest.json"), 1),
+                },
+            },
+            TestKnownGoodEntry {
+                root: root(),
+                path: ".axial-ready".to_string(),
+                kind: KnownGoodArtifactKind::RuntimeReadyMarker,
+                integrity: TestKnownGoodIntegrity::File { size: 5 },
+            },
+            TestKnownGoodEntry {
+                root: root(),
+                path: java_relative,
+                kind: KnownGoodArtifactKind::RuntimeExecutable,
+                integrity: TestKnownGoodIntegrity::File {
+                    size: file_size_or(&java_path, 4),
+                },
+            },
+        ]
+    }
+
+    fn expected_file(
+        root: TestKnownGoodRoot,
+        path: impl Into<String>,
+        kind: KnownGoodArtifactKind,
+        size: usize,
+    ) -> TestKnownGoodEntry {
+        TestKnownGoodEntry {
+            root,
+            path: path.into(),
+            kind,
+            integrity: TestKnownGoodIntegrity::File { size: size as u64 },
+        }
     }
 
     fn write_ready_install(&self, version_id: &str) {
@@ -114,15 +264,25 @@ impl TestFixture {
     }
 
     fn write_ready_runtime(&self, component: &str) {
-        let runtime_root = self.paths.library_dir.join("runtime").join(component);
+        let runtime_root = self
+            .state
+            .managed_runtime_cache()
+            .component_root(component)
+            .expect("runtime root");
         let java_path = managed_runtime_java_path(&runtime_root);
         fs::create_dir_all(java_path.parent().expect("runtime bin")).expect("runtime bin");
         fs::write(&java_path, b"java").expect("runtime java");
         make_executable(&java_path);
+        write_runtime_manifest_proof(&runtime_root, &java_path);
+        fs::write(runtime_root.join(".axial-ready"), b"ready").expect("runtime ready marker");
     }
 
     fn write_global_runtime_without_ready_marker(&self, component: &str) -> PathBuf {
-        let runtime_root = self.paths.config_dir.join("runtimes").join(component);
+        let runtime_root = self
+            .state
+            .managed_runtime_cache()
+            .component_root(component)
+            .expect("runtime root");
         let java_path = managed_runtime_java_path(&runtime_root);
         fs::create_dir_all(java_path.parent().expect("global runtime java parent"))
             .expect("global runtime java parent");
@@ -217,6 +377,7 @@ impl TestFixture {
     ) -> Result<PreparedLaunch, (StatusCode, Json<serde_json::Value>)> {
         if let Some(instance) = self.state.instances().get(&instance_id) {
             self.write_ready_install(&instance.version_id);
+            self.activate_ready_version_inventory(&instance.id, &instance.version_id);
         }
         prepare_launch_session(
             &self.state,

@@ -7,10 +7,12 @@ pub(crate) use common::{
 use crate::download::DownloadProgress;
 use crate::known_good::{KnownGoodInstallReceipt, KnownGoodReconstructionReceipt};
 use crate::loaders::types::{LoaderError, LoaderInstallPlan, LoaderInstallStrategy};
+use crate::runtime::ManagedRuntimeCache;
 use std::path::Path;
 
 pub async fn install_build<F>(
     library_dir: &Path,
+    runtime_cache: &ManagedRuntimeCache,
     plan: &LoaderInstallPlan,
     mut send: F,
 ) -> Result<KnownGoodInstallReceipt, LoaderError>
@@ -21,6 +23,7 @@ where
         LoaderInstallStrategy::FabricProfile | LoaderInstallStrategy::QuiltProfile => {
             Box::pin(common::install_from_profile_source(
                 library_dir,
+                runtime_cache,
                 plan,
                 &mut send,
             ))
@@ -31,6 +34,7 @@ where
         | LoaderInstallStrategy::NeoForgeModern => {
             Box::pin(common::install_from_installer_source(
                 library_dir,
+                runtime_cache,
                 plan,
                 &mut send,
             ))
@@ -39,6 +43,7 @@ where
         LoaderInstallStrategy::ForgeEarliestLegacy => {
             Box::pin(common::install_from_legacy_archive(
                 library_dir,
+                runtime_cache,
                 plan,
                 &mut send,
             ))

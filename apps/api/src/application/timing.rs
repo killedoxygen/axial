@@ -2,6 +2,7 @@ use crate::guardian::GuardianActionKind;
 use std::time::Duration;
 
 pub(crate) const LAUNCH_PREFLIGHT_SENSE_TIMING_SIGNAL: &str = "launch_preflight_sense_timing";
+pub(crate) const INTEGRITY_TIER0_CEILING_MS: u64 = 9;
 
 macro_rules! launch_preflight_sense_cost_classes {
     ($($variant:ident => $name:literal),+ $(,)?) => {
@@ -51,6 +52,13 @@ macro_rules! launch_preflight_senses {
                     $(Self::$variant => LaunchPreflightSenseCostClass::$cost),+
                 }
             }
+
+            pub(crate) const fn declared_ceiling_ms(self) -> Option<u64> {
+                match self {
+                    Self::IntegrityTier0 => Some(INTEGRITY_TIER0_CEILING_MS),
+                    _ => None,
+                }
+            }
         }
     };
 }
@@ -60,6 +68,7 @@ launch_preflight_senses! {
     InstalledVersions => ("installed_versions", ContentIo),
     Overrides => ("overrides", ExternalProbe),
     Resources => ("resources", MetadataIo),
+    IntegrityTier0 => ("integrity_tier0", MetadataIo),
     Readiness => ("readiness", ContentIo),
     GuardianPolicy => ("guardian_policy", InProcess),
 }
@@ -69,6 +78,7 @@ pub(crate) struct LaunchPreflightSenseTimings {
     pub installed_versions: Duration,
     pub overrides: Duration,
     pub resources: Duration,
+    pub integrity_tier0: Duration,
     pub readiness: Duration,
     pub guardian_policy: Duration,
 }
@@ -80,6 +90,7 @@ impl LaunchPreflightSenseTimings {
             LaunchPreflightSenseId::InstalledVersions => self.installed_versions,
             LaunchPreflightSenseId::Overrides => self.overrides,
             LaunchPreflightSenseId::Resources => self.resources,
+            LaunchPreflightSenseId::IntegrityTier0 => self.integrity_tier0,
             LaunchPreflightSenseId::Readiness => self.readiness,
             LaunchPreflightSenseId::GuardianPolicy => self.guardian_policy,
         }
@@ -235,6 +246,12 @@ pub(crate) struct LaunchPreflightFactTiming<'a> {
     pub java_probe_source: &'a str,
     pub installed_versions_source: &'a str,
     pub installed_versions_refresh_count: u32,
+    pub integrity_selected_entry_count: usize,
+    pub integrity_skipped_bulk_entry_count: usize,
+    pub integrity_metadata_lookup_count: usize,
+    pub integrity_link_lookup_count: usize,
+    pub integrity_mtime_observation_count: usize,
+    pub integrity_suppressed_fact_count: usize,
 }
 
 pub(crate) fn trace_launch_preflight_facts(timing: LaunchPreflightFactTiming<'_>) {
@@ -252,6 +269,8 @@ pub(crate) fn trace_launch_preflight_facts(timing: LaunchPreflightFactTiming<'_>
         overrides_cost_class = LaunchPreflightSenseId::Overrides.declared_cost_class().as_str(),
         resources_ms = ms(timing.senses.duration(LaunchPreflightSenseId::Resources)),
         resources_cost_class = LaunchPreflightSenseId::Resources.declared_cost_class().as_str(),
+        integrity_tier0_ms = ms(timing.senses.duration(LaunchPreflightSenseId::IntegrityTier0)),
+        integrity_tier0_cost_class = LaunchPreflightSenseId::IntegrityTier0.declared_cost_class().as_str(),
         readiness_ms = ms(timing.senses.duration(LaunchPreflightSenseId::Readiness)),
         readiness_cost_class = LaunchPreflightSenseId::Readiness.declared_cost_class().as_str(),
         guardian_policy_ms = ms(timing.senses.duration(LaunchPreflightSenseId::GuardianPolicy)),
@@ -265,6 +284,12 @@ pub(crate) fn trace_launch_preflight_facts(timing: LaunchPreflightFactTiming<'_>
         java_probe_source = timing.java_probe_source,
         installed_versions_source = timing.installed_versions_source,
         installed_versions_refresh_count = timing.installed_versions_refresh_count,
+        integrity_selected_entry_count = timing.integrity_selected_entry_count,
+        integrity_skipped_bulk_entry_count = timing.integrity_skipped_bulk_entry_count,
+        integrity_metadata_lookup_count = timing.integrity_metadata_lookup_count,
+        integrity_link_lookup_count = timing.integrity_link_lookup_count,
+        integrity_mtime_observation_count = timing.integrity_mtime_observation_count,
+        integrity_suppressed_fact_count = timing.integrity_suppressed_fact_count,
         "launch preflight fact timing"
     );
     for sense in LaunchPreflightSenseId::ALL {
@@ -273,6 +298,7 @@ pub(crate) fn trace_launch_preflight_facts(timing: LaunchPreflightFactTiming<'_>
             timing_signal = LAUNCH_PREFLIGHT_SENSE_TIMING_SIGNAL,
             sense = sense.as_str(),
             declared_cost_class = sense.declared_cost_class().as_str(),
+            declared_ceiling_ms = sense.declared_ceiling_ms(),
             duration_ms = ms(timing.senses.duration(*sense)),
             "launch preflight sense timing"
         );
@@ -344,8 +370,9 @@ mod launch_preflight_sense_tests {
             installed_versions: Duration::from_millis(2),
             overrides: Duration::from_millis(3),
             resources: Duration::from_millis(4),
-            readiness: Duration::from_millis(5),
-            guardian_policy: Duration::from_millis(6),
+            integrity_tier0: Duration::from_millis(5),
+            readiness: Duration::from_millis(6),
+            guardian_policy: Duration::from_millis(7),
         };
         for (index, id) in LaunchPreflightSenseId::ALL.iter().enumerate() {
             assert_eq!(

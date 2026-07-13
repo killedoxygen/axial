@@ -366,6 +366,7 @@ pub(crate) async fn start_install_version_owned(
     let worker_operation_id = operation_id_task.clone();
     let worker_telemetry = telemetry.clone();
     let worker_state = state.clone();
+    let worker_runtime_cache = state.managed_runtime_cache().clone();
     let progress_owner = producer.claim_child();
     InstallStore::spawn_tracked_worker_with_interrupt_handler_owned(
         store,
@@ -422,7 +423,7 @@ pub(crate) async fn start_install_version_owned(
             };
 
             let installed_library_root = mc_dir.clone();
-            let downloader = Downloader::new(mc_dir);
+            let downloader = Downloader::new(mc_dir, worker_runtime_cache);
             let mut repair_resume = InstallRepairResume::default();
             let (final_install_succeeded, final_terminal_progress) = loop {
                 if let Ok(mut terminal_progress) = terminal_progress.lock() {

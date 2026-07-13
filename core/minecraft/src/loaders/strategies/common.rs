@@ -42,7 +42,7 @@ use crate::loaders::types::{
 use crate::loaders::{validate_provider_version_id, validate_version_id};
 use crate::paths::versions_dir;
 use crate::profiles::ensure_launcher_profiles;
-use crate::runtime::acquire_preferred_runtime_source;
+use crate::runtime::{ManagedRuntimeCache, acquire_preferred_runtime_source};
 use sha1::{Digest as _, Sha1};
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
@@ -478,6 +478,7 @@ async fn reconstruct_installer_with_downloader(
 // Profile-source loaders ship a ready version JSON and then download its libraries.
 pub async fn install_from_profile_source<F>(
     library_dir: &Path,
+    runtime_cache: &ManagedRuntimeCache,
     plan: &LoaderInstallPlan,
     send: &mut F,
 ) -> Result<KnownGoodInstallReceipt, LoaderError>
@@ -486,6 +487,7 @@ where
 {
     let base_receipt = Box::pin(ensure_base_version(
         library_dir,
+        runtime_cache,
         &plan.record.minecraft_version,
         send,
     ))
@@ -621,6 +623,7 @@ where
 // Installer-source loaders require extracting metadata and Maven entries from the installer jar.
 pub async fn install_from_installer_source<F>(
     library_dir: &Path,
+    runtime_cache: &ManagedRuntimeCache,
     plan: &LoaderInstallPlan,
     send: &mut F,
 ) -> Result<KnownGoodInstallReceipt, LoaderError>
@@ -664,6 +667,7 @@ where
         .map_err(|error| installer_extract_error(&plan.record.component_name, error))?;
     let base_receipt = Box::pin(ensure_base_version(
         library_dir,
+        runtime_cache,
         &plan.record.minecraft_version,
         send,
     ))
@@ -916,6 +920,7 @@ fn legacy_archive_source_url(record: &LoaderBuildRecord) -> Result<&str, LoaderE
 // Legacy archive loaders carry Maven entries in provider-specific zip layouts.
 pub async fn install_from_legacy_archive<F>(
     library_dir: &Path,
+    runtime_cache: &ManagedRuntimeCache,
     plan: &LoaderInstallPlan,
     send: &mut F,
 ) -> Result<KnownGoodInstallReceipt, LoaderError>
@@ -941,6 +946,7 @@ where
     .await?;
     let base_receipt = Box::pin(ensure_base_version(
         library_dir,
+        runtime_cache,
         &plan.record.minecraft_version,
         send,
     ))
@@ -1021,6 +1027,7 @@ where
 
 async fn ensure_base_version<F>(
     library_dir: &Path,
+    runtime_cache: &ManagedRuntimeCache,
     version_id: &str,
     send: &mut F,
 ) -> Result<KnownGoodInstallReceipt, LoaderError>
@@ -1030,7 +1037,7 @@ where
     let install_lock = base_version_install_lock(library_dir, version_id);
     let _guard = install_lock.lock().await;
 
-    let downloader = Downloader::new(library_dir.to_path_buf());
+    let downloader = Downloader::new(library_dir.to_path_buf(), runtime_cache.clone());
     let mut facts = Vec::new();
     let mut descriptors = Vec::new();
     let result = Box::pin(downloader.install_version_with_facts_and_descriptors(
@@ -1479,6 +1486,7 @@ mod tests {
     use crate::manifest::VersionManifest;
     use crate::paths::versions_dir;
     use crate::rules::default_environment;
+    use crate::runtime::ManagedRuntimeCache;
     #[cfg(unix)]
     use crate::runtime::{RuntimeId, TestRuntimeSourceDescriptor, acquire_test_runtime_source};
     use sha1::{Digest as _, Sha1};
@@ -2472,10 +2480,16 @@ printf '%s' 'processor-terminal' > "$last"
         let legacy_plan = LoaderInstallPlan {
             record: legacy_archive_record(),
         };
+        let runtime_cache = ManagedRuntimeCache::isolated_for_test().expect("runtime cache");
 
         let mut send = |_progress: DownloadProgress| {};
         assert!(
-            std::mem::size_of_val(&ensure_base_version(&root, "1.21.5", &mut send)) < 4096,
+            std::mem::size_of_val(&ensure_base_version(
+                &root,
+                &runtime_cache,
+                "1.21.5",
+                &mut send,
+            )) < 4096,
             "loader base-version future should not embed the full vanilla install future"
         );
 
@@ -2483,6 +2497,7 @@ printf '%s' 'processor-terminal' > "$last"
         assert!(
             std::mem::size_of_val(&install_from_profile_source(
                 &root,
+                &runtime_cache,
                 &profile_plan,
                 &mut send,
             )) < 4096,
@@ -2493,6 +2508,7 @@ printf '%s' 'processor-terminal' > "$last"
         assert!(
             std::mem::size_of_val(&install_from_installer_source(
                 &root,
+                &runtime_cache,
                 &installer_plan,
                 &mut send,
             )) < 4096,
@@ -2501,20 +2517,29 @@ printf '%s' 'processor-terminal' > "$last"
 
         let mut send = |_progress: DownloadProgress| {};
         assert!(
-            std::mem::size_of_val(&install_from_legacy_archive(&root, &legacy_plan, &mut send,))
-                < 4096,
+            std::mem::size_of_val(&install_from_legacy_archive(
+                &root,
+                &runtime_cache,
+                &legacy_plan,
+                &mut send,
+            )) < 4096,
             "legacy archive loader install future should stay small"
         );
 
         assert!(
-            std::mem::size_of_val(&super::super::install_build(&root, &installer_plan, |_| {}))
-                < 4096,
+            std::mem::size_of_val(&super::super::install_build(
+                &root,
+                &runtime_cache,
+                &installer_plan,
+                |_| {},
+            )) < 4096,
             "loader strategy dispatcher future should not embed the largest strategy branch"
         );
 
         assert!(
             std::mem::size_of_val(&crate::loaders::install_build(
                 &root,
+                runtime_cache.clone(),
                 installer_plan.record.clone(),
                 |_| {}
             )) < 4096,
@@ -2879,8 +2904,9 @@ printf '%s' 'processor-terminal' > "$last"
             };
             canonicalize_record_identity(&mut record);
             let plan = LoaderInstallPlan { record };
+            let runtime_cache = ManagedRuntimeCache::isolated_for_test().expect("runtime cache");
 
-            let error = install_from_installer_source(&root, &plan, &mut |_| {})
+            let error = install_from_installer_source(&root, &runtime_cache, &plan, &mut |_| {})
                 .await
                 .expect_err("mismatched proof must fail");
 
@@ -2905,8 +2931,9 @@ printf '%s' 'processor-terminal' > "$last"
             url: server.url.clone(),
         };
         let plan = LoaderInstallPlan { record };
+        let runtime_cache = ManagedRuntimeCache::isolated_for_test().expect("runtime cache");
 
-        let error = install_from_installer_source(&root, &plan, &mut |_| {})
+        let error = install_from_installer_source(&root, &runtime_cache, &plan, &mut |_| {})
             .await
             .expect_err("malformed proof must fail");
 
@@ -2961,8 +2988,9 @@ printf '%s' 'processor-terminal' > "$last"
             url: server.url.clone(),
         };
         let plan = LoaderInstallPlan { record };
+        let runtime_cache = ManagedRuntimeCache::isolated_for_test().expect("runtime cache");
 
-        let error = install_from_installer_source(&root, &plan, &mut |_| {})
+        let error = install_from_installer_source(&root, &runtime_cache, &plan, &mut |_| {})
             .await
             .expect_err("semantic drift must fail before base acquisition");
 
@@ -2986,8 +3014,9 @@ printf '%s' 'processor-terminal' > "$last"
             url: server.url.clone(),
         };
         let plan = LoaderInstallPlan { record };
+        let runtime_cache = ManagedRuntimeCache::isolated_for_test().expect("runtime cache");
 
-        let error = install_from_installer_source(&root, &plan, &mut |_| {})
+        let error = install_from_installer_source(&root, &runtime_cache, &plan, &mut |_| {})
             .await
             .expect_err("unsupported NeoForge processors");
 
@@ -3591,7 +3620,8 @@ printf '%s' 'processor-terminal' > "$last"
         let plan = LoaderInstallPlan {
             record: record.clone(),
         };
-        let error = install_from_legacy_archive(&root, &plan, &mut |_| {})
+        let runtime_cache = ManagedRuntimeCache::isolated_for_test().expect("runtime cache");
+        let error = install_from_legacy_archive(&root, &runtime_cache, &plan, &mut |_| {})
             .await
             .expect_err("mismatched proof must fail");
 
@@ -3618,8 +3648,9 @@ printf '%s' 'processor-terminal' > "$last"
         let plan = LoaderInstallPlan {
             record: record.clone(),
         };
+        let runtime_cache = ManagedRuntimeCache::isolated_for_test().expect("runtime cache");
 
-        let error = install_from_legacy_archive(&root, &plan, &mut |_| {})
+        let error = install_from_legacy_archive(&root, &runtime_cache, &plan, &mut |_| {})
             .await
             .expect_err("malformed proof must fail");
 

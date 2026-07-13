@@ -16,4 +16,5 @@ thiserror.workspace = true
 zip.workspace = true
 
 [dev-dependencies]
+axial-minecraft = { path = "../minecraft", features = ["test-support"] }
 tokio.workspace = true

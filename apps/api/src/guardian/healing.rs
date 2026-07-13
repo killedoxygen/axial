@@ -767,6 +767,7 @@ mod tests {
         GuardianFailureMemoryStore,
     };
     use axial_config::AppPaths;
+    use axial_minecraft::ManagedRuntimeCache;
     use sha1::{Digest, Sha1};
     use std::fs;
     use std::io;
@@ -875,16 +876,14 @@ mod tests {
     #[test]
     fn managed_runtime_ready_marker_repair_records_journal_and_memory() {
         let root = test_root("success");
-        let paths = test_paths(&root);
-        let runtime_root = managed_runtime_root(&paths, "java_runtime_delta");
+        let stores = stores();
+        let runtime_root = managed_runtime_root(&stores, "java-runtime-delta");
         let java_executable = write_fake_java(&runtime_root);
         write_runtime_manifest_proof(&runtime_root, &java_executable);
-        let stores = stores();
         let decision = repair_decision(OwnershipClass::LauncherManaged);
 
         let outcome = execute_repair(
             &decision,
-            &paths,
             &runtime_root,
             &java_executable,
             &stores,
@@ -926,14 +925,13 @@ mod tests {
     async fn planned_commit_failure_prevents_managed_runtime_mutation() {
         let root = test_root("planned-commit-gate");
         let paths = test_paths(&root);
-        let runtime_root = managed_runtime_root(&paths, "java_runtime_delta");
+        let stores = persistent_stores(&paths);
+        let runtime_root = managed_runtime_root(&stores, "java-runtime-delta");
         let java_executable = write_fake_java(&runtime_root);
         write_runtime_manifest_proof(&runtime_root, &java_executable);
-        let stores = persistent_stores(&paths);
         let decision = repair_decision(OwnershipClass::LauncherManaged);
         let result = execute_repair_async(
             &decision,
-            &paths,
             &runtime_root,
             &java_executable,
             &stores,
@@ -961,9 +959,6 @@ mod tests {
     async fn terminal_commit_failure_signals_bounded_owner_and_retries_without_repair_replay() {
         let root = test_root("terminal-commit-retry");
         let paths = test_paths(&root);
-        let runtime_root = managed_runtime_root(&paths, "java_runtime_delta");
-        let java_executable = write_fake_java(&runtime_root);
-        write_runtime_manifest_proof(&runtime_root, &java_executable);
         let backend = Arc::new(ControlledWriteBackend::default());
         backend.gate_attempt(2);
         let coordinator = PersistenceCoordinator::for_test(
@@ -972,6 +967,7 @@ mod tests {
             std::time::Duration::from_millis(5),
         );
         let stores = Stores {
+            runtime_cache: managed_runtime_cache(),
             journals: OperationJournalStore::try_load_from_paths_with_coordinator(
                 &paths,
                 coordinator,
@@ -979,11 +975,13 @@ mod tests {
             .expect("claim runtime journal persistence"),
             failure_memory: GuardianFailureMemoryStore::new(),
         };
+        let runtime_root = managed_runtime_root(&stores, "java-runtime-delta");
+        let java_executable = write_fake_java(&runtime_root);
+        write_runtime_manifest_proof(&runtime_root, &java_executable);
         let decision = repair_decision(OwnershipClass::LauncherManaged);
         let terminal_failure = tokio::sync::Notify::new();
         let repair = execute_repair_async(
             &decision,
-            &paths,
             &runtime_root,
             &java_executable,
             &stores,
@@ -1043,10 +1041,9 @@ mod tests {
     #[test]
     fn repeated_same_runtime_repair_is_suppressed() {
         let root = test_root("suppressed");
-        let paths = test_paths(&root);
-        let runtime_root = managed_runtime_root(&paths, "java_runtime_delta");
-        let java_executable = runtime_root.join("bin").join("java");
         let stores = stores();
+        let runtime_root = managed_runtime_root(&stores, "java-runtime-delta");
+        let java_executable = runtime_root.join("bin").join("java");
         let decision = repair_decision(OwnershipClass::LauncherManaged);
         let target = decision
             .action_plan()
@@ -1076,7 +1073,6 @@ mod tests {
 
         let outcome = execute_repair(
             &decision,
-            &paths,
             &runtime_root,
             &java_executable,
             &stores,
@@ -1118,8 +1114,8 @@ mod tests {
     fn user_owned_and_unknown_runtime_repairs_are_rejected() {
         for ownership in [OwnershipClass::UserOwned, OwnershipClass::Unknown] {
             let root = test_root("ownership-rejected");
-            let paths = test_paths(&root);
-            let runtime_root = managed_runtime_root(&paths, "java_runtime_delta");
+            let stores = stores();
+            let runtime_root = managed_runtime_root(&stores, "java-runtime-delta");
             let decision = repair_decision(ownership);
 
             let error = authorize_managed_runtime_ready_marker_repair(
@@ -1137,12 +1133,12 @@ mod tests {
     #[test]
     fn unsupported_runtime_repair_target_is_blocked_before_execution() {
         let root = test_root("unsupported-target");
-        let paths = test_paths(&root);
-        let runtime_root = managed_runtime_root(&paths, "java_runtime_delta");
+        let stores = stores();
+        let runtime_root = managed_runtime_root(&stores, "java-runtime-delta");
         let decision = repair_decision_for_target(TargetDescriptor::new(
             StabilizationSystem::Guardian,
             TargetKind::Runtime,
-            "java_runtime_delta",
+            "java-runtime-delta",
             OwnershipClass::LauncherManaged,
         ));
 
@@ -1160,15 +1156,13 @@ mod tests {
     #[test]
     fn runtime_root_target_must_match_owned_repair_target() {
         let root = test_root("root-target-mismatch");
-        let paths = test_paths(&root);
-        let runtime_root = managed_runtime_root(&paths, "other_runtime");
-        let java_executable = write_fake_java(&runtime_root);
         let stores = stores();
+        let runtime_root = managed_runtime_root(&stores, "java-runtime-epsilon");
+        let java_executable = write_fake_java(&runtime_root);
         let decision = repair_decision(OwnershipClass::LauncherManaged);
 
         let outcome = execute_repair(
             &decision,
-            &paths,
             &runtime_root,
             &java_executable,
             &stores,
@@ -1186,12 +1180,12 @@ mod tests {
     #[test]
     fn arbitrary_runtime_root_cannot_enter_authorized_repair() {
         let root = test_root("root-binding");
-        let paths = test_paths(&root);
+        let runtime_cache = managed_runtime_cache();
         let runtime_root = root.join("user-runtime");
         let java_executable = runtime_root.join("bin").join("java");
 
         assert_eq!(
-            ManagedRuntimeRoot::from_app_paths(&paths, &runtime_root, &java_executable)
+            ManagedRuntimeRoot::from_managed_root(&runtime_cache, &runtime_root, &java_executable)
                 .expect_error_without_debug("outside runtime root"),
             ManagedRuntimeRootError::UnsupportedRoot
         );
@@ -1253,8 +1247,8 @@ mod tests {
     #[test]
     fn malformed_or_non_repair_policy_is_blocked_before_execution() {
         let root = test_root("malformed-policy");
-        let paths = test_paths(&root);
-        let runtime_root = managed_runtime_root(&paths, "java_runtime_delta");
+        let stores = stores();
+        let runtime_root = managed_runtime_root(&stores, "java-runtime-delta");
         write_fake_java(&runtime_root);
         for decision in [
             {
@@ -1323,11 +1317,10 @@ mod tests {
     #[test]
     fn historical_runtime_attempt_without_cooldown_allows_safe_retry() {
         let root = test_root("historical-attempt-without-cooldown");
-        let paths = test_paths(&root);
-        let runtime_root = managed_runtime_root(&paths, "java_runtime_delta");
+        let stores = stores();
+        let runtime_root = managed_runtime_root(&stores, "java-runtime-delta");
         let java_executable = write_fake_java(&runtime_root);
         write_runtime_manifest_proof(&runtime_root, &java_executable);
-        let stores = stores();
         let decision = repair_decision(OwnershipClass::LauncherManaged);
         let target = decision_target(&decision);
         stores
@@ -1352,7 +1345,6 @@ mod tests {
         let _ = fs::remove_file(runtime_root.join(".axial-ready"));
         let outcome = execute_repair(
             &decision,
-            &paths,
             &runtime_root,
             &java_executable,
             &stores,
@@ -1375,11 +1367,10 @@ mod tests {
     #[test]
     fn expired_runtime_repair_cooldown_allows_new_safe_attempt() {
         let root = test_root("expired-attempt-limit");
-        let paths = test_paths(&root);
-        let runtime_root = managed_runtime_root(&paths, "java_runtime_delta");
+        let stores = stores();
+        let runtime_root = managed_runtime_root(&stores, "java-runtime-delta");
         let java_executable = write_fake_java(&runtime_root);
         write_runtime_manifest_proof(&runtime_root, &java_executable);
-        let stores = stores();
         let decision = repair_decision(OwnershipClass::LauncherManaged);
         let target = decision_target(&decision);
         stores
@@ -1405,7 +1396,6 @@ mod tests {
         let _ = fs::remove_file(runtime_root.join(".axial-ready"));
         let outcome = execute_repair(
             &decision,
-            &paths,
             &runtime_root,
             &java_executable,
             &stores,
@@ -1427,15 +1417,13 @@ mod tests {
     #[test]
     fn post_repair_verification_failure_is_not_reported_as_repaired() {
         let root = test_root("postcondition-failure");
-        let paths = test_paths(&root);
-        let runtime_root = managed_runtime_root(&paths, "java_runtime_delta");
-        let java_executable = runtime_root.join("bin").join("java");
         let stores = stores();
+        let runtime_root = managed_runtime_root(&stores, "java-runtime-delta");
+        let java_executable = runtime_root.join("bin").join("java");
         let decision = repair_decision(OwnershipClass::LauncherManaged);
 
         let outcome = execute_repair(
             &decision,
-            &paths,
             &runtime_root,
             &java_executable,
             &stores,
@@ -1464,11 +1452,10 @@ mod tests {
     #[test]
     fn public_repair_outcome_ids_are_sanitized() {
         let root = test_root("safe-outcome-ids");
-        let paths = test_paths(&root);
-        let runtime_root = managed_runtime_root(&paths, "java_runtime_delta");
+        let stores = stores();
+        let runtime_root = managed_runtime_root(&stores, "java-runtime-delta");
         let java_executable = write_fake_java(&runtime_root);
         write_runtime_manifest_proof(&runtime_root, &java_executable);
-        let stores = stores();
         let decision = repair_decision(OwnershipClass::LauncherManaged);
         let decision = GuardianDecision::for_test(
             Some(OperationId::new("/home/alice/token/operation")),
@@ -1480,7 +1467,6 @@ mod tests {
 
         let outcome = execute_repair(
             &decision,
-            &paths,
             &runtime_root,
             &java_executable,
             &stores,
@@ -1500,17 +1486,15 @@ mod tests {
     #[test]
     fn execution_failure_records_failed_outcome_and_suppression() {
         let root = test_root("failure");
-        let paths = test_paths(&root);
-        let runtime_root = managed_runtime_root(&paths, "java_runtime_delta");
+        let stores = stores();
+        let runtime_root = managed_runtime_root(&stores, "java-runtime-delta");
         let java_executable = runtime_root.join("bin").join("java");
         fs::create_dir_all(runtime_root.parent().expect("runtime parent")).expect("test root");
         fs::write(&runtime_root, b"not a directory").expect("runtime root file");
-        let stores = stores();
         let decision = repair_decision(OwnershipClass::LauncherManaged);
 
         let outcome = execute_repair(
             &decision,
-            &paths,
             &runtime_root,
             &java_executable,
             &stores,
@@ -1552,7 +1536,6 @@ mod tests {
 
     fn execute_repair(
         decision: &GuardianDecision,
-        paths: &AppPaths,
         runtime_root: &Path,
         java_executable: &Path,
         stores: &Stores,
@@ -1565,7 +1548,6 @@ mod tests {
             .expect("test runtime")
             .block_on(execute_repair_async(
                 decision,
-                paths,
                 runtime_root,
                 java_executable,
                 stores,
@@ -1579,7 +1561,6 @@ mod tests {
     #[allow(clippy::too_many_arguments)]
     async fn execute_repair_async(
         decision: &GuardianDecision,
-        paths: &AppPaths,
         runtime_root: &Path,
         java_executable: &Path,
         stores: &Stores,
@@ -1595,7 +1576,7 @@ mod tests {
         execute_managed_runtime_ready_marker_repair(
             authorization,
             decision.operation_id().cloned(),
-            runtime_root_binding(paths, runtime_root, java_executable),
+            runtime_root_binding(&stores.runtime_cache, runtime_root, java_executable),
             &stores.journals,
             &stores.failure_memory,
             observed_at,
@@ -1620,7 +1601,7 @@ mod tests {
         repair_decision_for_target(TargetDescriptor::new(
             StabilizationSystem::Execution,
             TargetKind::Runtime,
-            "java_runtime_delta",
+            "java-runtime-delta",
             ownership,
         ))
     }
@@ -1654,12 +1635,14 @@ mod tests {
     }
 
     struct Stores {
+        runtime_cache: ManagedRuntimeCache,
         journals: OperationJournalStore,
         failure_memory: GuardianFailureMemoryStore,
     }
 
     fn stores() -> Stores {
         Stores {
+            runtime_cache: managed_runtime_cache(),
             journals: OperationJournalStore::new(),
             failure_memory: GuardianFailureMemoryStore::new(),
         }
@@ -1674,6 +1657,7 @@ mod tests {
             std::time::Duration::from_millis(100),
         );
         Stores {
+            runtime_cache: managed_runtime_cache(),
             journals: OperationJournalStore::try_load_from_paths_with_coordinator(
                 paths,
                 coordinator,
@@ -1764,16 +1748,23 @@ mod tests {
         }
     }
 
-    fn managed_runtime_root(paths: &AppPaths, runtime_id: &str) -> PathBuf {
-        paths.library_dir.join("runtime").join(runtime_id)
+    fn managed_runtime_cache() -> ManagedRuntimeCache {
+        ManagedRuntimeCache::isolated_for_test().expect("isolated managed runtime cache")
+    }
+
+    fn managed_runtime_root(stores: &Stores, runtime_id: &str) -> PathBuf {
+        stores
+            .runtime_cache
+            .component_root(runtime_id)
+            .expect("known managed runtime component")
     }
 
     fn runtime_root_binding<'a>(
-        paths: &AppPaths,
+        runtime_cache: &'a ManagedRuntimeCache,
         runtime_root: &'a Path,
         java_executable: &'a Path,
     ) -> ManagedRuntimeRoot<'a> {
-        ManagedRuntimeRoot::from_app_paths(paths, runtime_root, java_executable)
+        ManagedRuntimeRoot::from_managed_root(runtime_cache, runtime_root, java_executable)
             .expect("managed runtime root binding")
     }
 

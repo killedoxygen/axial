@@ -574,6 +574,7 @@ async fn launch_session_inner_with_control(
             Err(error)
         } else {
             prepare_launch_attempt_with_events(
+                state.managed_runtime_cache(),
                 &intent,
                 &attempt,
                 java_probe_receipt.as_ref(),
@@ -1416,6 +1417,10 @@ mod tests {
         CrashEvidence, LaunchAuthContext, LaunchGuardianContext, LaunchIntent, LaunchSessionRecord,
         OverrideOrigin, SessionId,
     };
+    use axial_minecraft::known_good::{
+        KnownGoodArtifactKind, KnownGoodInventory, TestKnownGoodEntry, TestKnownGoodIntegrity,
+        TestKnownGoodRoot,
+    };
     use axial_performance::PerformanceManager;
     use sha1::{Digest as _, Sha1};
     use std::fs;
@@ -1430,6 +1435,16 @@ mod tests {
     const CRASH_E2E_INSTANCE_ID: &str = "0123456789abcdef";
     const CRASH_E2E_FABRIC_VERSION_ID: &str =
         "loader-v2-YXhpYWwtaW5zdGFsbGVkLWxvYWRlcgABAAYxLjIxLjEABzAuMTYuMTA";
+    const CRASH_E2E_FABRIC_LIBRARIES: [(&str, &str); 2] = [
+        (
+            "net.fabricmc:fabric-loader:0.16.10",
+            "net/fabricmc/fabric-loader/0.16.10/fabric-loader-0.16.10.jar",
+        ),
+        (
+            "net.fabricmc:intermediary:1.21.1",
+            "net/fabricmc/intermediary/1.21.1/intermediary-1.21.1.jar",
+        ),
+    ];
 
     fn empty_guardian_summary(mode: axial_launcher::GuardianMode) -> GuardianSummary {
         guardian_summary_for_test(
@@ -1540,7 +1555,7 @@ mod tests {
         align_fabric_crash_task(&mut task, &java_path);
         task.instance.max_memory_mb = 1024;
         task.intent.max_memory_mb = 1024;
-        let state = test_app_state_with_registered_launch_instance(&root, &task.instance);
+        let state = test_fabric_crash_app_state(&root, &task.instance);
         task.intent.game_dir = Some(state.instances().game_dir(&task.instance.id));
         task.launched_at = "2026-01-01T00:00:00.000Z".to_string();
         let mut session = test_record(session_id);
@@ -1976,7 +1991,7 @@ mod tests {
         let mut task = test_recovery_launch_task(session_id, &root);
         retarget_test_launch_task(&mut task, CRASH_E2E_INSTANCE_ID);
         align_fabric_crash_task(&mut task, &java_path);
-        let state = test_app_state_with_registered_launch_instance(&root, &task.instance);
+        let state = test_fabric_crash_app_state(&root, &task.instance);
         task.intent.game_dir = Some(state.instances().game_dir(&task.instance.id));
         task.launched_at = "2026-01-01T00:00:00.000Z".to_string();
         let mut session = test_record(session_id);
@@ -2975,10 +2990,8 @@ mod tests {
         })
     }
 
-    fn test_app_state_with_registered_launch_instance(
-        root: &Path,
-        instance: &Instance,
-    ) -> AppState {
+    #[cfg(unix)]
+    fn test_fabric_crash_app_state(root: &Path, instance: &Instance) -> AppState {
         let paths = test_paths(root);
         fs::create_dir_all(paths.instances_dir.join(&instance.id))
             .expect("registered launch instance directory");
@@ -2999,7 +3012,7 @@ mod tests {
             InstanceStore::from_snapshot(paths.clone(), snapshot)
                 .expect("load registered launch instance"),
         );
-        AppState::new(AppStateInit {
+        let state = AppState::new(AppStateInit {
             app_name: "Axial".to_string(),
             version: "test".to_string(),
             config,
@@ -3012,7 +3025,121 @@ mod tests {
             ),
             startup_warnings: Vec::new(),
             frontend_dir: root.join("frontend"),
-        })
+        });
+        activate_fabric_crash_known_good(&state, root, &instance.id);
+        state
+    }
+
+    #[cfg(unix)]
+    fn activate_fabric_crash_known_good(state: &AppState, root: &Path, instance_id: &str) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let library = root.join("library");
+        let version_dir = library.join("versions").join(CRASH_E2E_FABRIC_VERSION_ID);
+        let version_json = version_dir.join(format!("{CRASH_E2E_FABRIC_VERSION_ID}.json"));
+        let client_jar = version_dir.join(format!("{CRASH_E2E_FABRIC_VERSION_ID}.jar"));
+        let runtime_root = state
+            .managed_runtime_cache()
+            .component_root("java-runtime-delta")
+            .expect("runtime root");
+        let runtime_java = if cfg!(target_os = "macos") {
+            runtime_root.join("jre.bundle/Contents/Home/bin/java")
+        } else {
+            runtime_root.join("bin/java")
+        };
+        fs::create_dir_all(runtime_java.parent().expect("runtime Java parent"))
+            .expect("runtime Java directory");
+        let runtime_java_bytes = b"java";
+        fs::write(&runtime_java, runtime_java_bytes).expect("runtime Java");
+        let mut permissions = fs::metadata(&runtime_java)
+            .expect("runtime Java metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&runtime_java, permissions).expect("runtime Java executable");
+        let runtime_proof = runtime_root.join(".axial-runtime-manifest.json");
+        let runtime_marker = runtime_root.join(".axial-ready");
+        let runtime_java_relative = runtime_java
+            .strip_prefix(&runtime_root)
+            .expect("runtime Java relative path")
+            .to_string_lossy()
+            .replace('\\', "/");
+        let runtime_manifest = serde_json::json!({
+            "files": {
+                runtime_java_relative.clone(): {
+                    "type": "file",
+                    "downloads": {
+                        "raw": {
+                            "url": "https://example.invalid/java",
+                            "sha1": hex::encode(Sha1::digest(runtime_java_bytes)),
+                            "size": runtime_java_bytes.len()
+                        }
+                    }
+                }
+            }
+        });
+        fs::write(
+            &runtime_proof,
+            serde_json::to_vec(&runtime_manifest).expect("runtime manifest JSON"),
+        )
+        .expect("runtime proof");
+        fs::write(&runtime_marker, b"ready").expect("runtime marker");
+
+        let runtime_kind = || TestKnownGoodRoot::ManagedRuntime {
+            component: "java-runtime-delta".to_string(),
+        };
+        let file = |entry_root, path, kind, physical_path: &Path| TestKnownGoodEntry {
+            root: entry_root,
+            path,
+            kind,
+            integrity: TestKnownGoodIntegrity::File {
+                size: fs::metadata(physical_path).expect("known-good file").len(),
+            },
+        };
+        let library_entries = CRASH_E2E_FABRIC_LIBRARIES.iter().map(|(_, relative)| {
+            file(
+                TestKnownGoodRoot::Libraries,
+                (*relative).to_string(),
+                KnownGoodArtifactKind::Library,
+                &library.join("libraries").join(relative),
+            )
+        });
+        let mut entries = vec![
+            file(
+                TestKnownGoodRoot::Versions,
+                format!("{CRASH_E2E_FABRIC_VERSION_ID}/{CRASH_E2E_FABRIC_VERSION_ID}.json"),
+                KnownGoodArtifactKind::VersionMetadata,
+                &version_json,
+            ),
+            file(
+                TestKnownGoodRoot::Versions,
+                format!("{CRASH_E2E_FABRIC_VERSION_ID}/{CRASH_E2E_FABRIC_VERSION_ID}.jar"),
+                KnownGoodArtifactKind::ClientJar,
+                &client_jar,
+            ),
+            file(
+                runtime_kind(),
+                ".axial-runtime-manifest.json".to_string(),
+                KnownGoodArtifactKind::RuntimeManifestProof,
+                &runtime_proof,
+            ),
+            file(
+                runtime_kind(),
+                ".axial-ready".to_string(),
+                KnownGoodArtifactKind::RuntimeReadyMarker,
+                &runtime_marker,
+            ),
+            file(
+                runtime_kind(),
+                runtime_java_relative,
+                KnownGoodArtifactKind::RuntimeExecutable,
+                &runtime_java,
+            ),
+        ];
+        entries.extend(library_entries);
+        state.activate_known_good_inventory_for_test(
+            instance_id,
+            KnownGoodInventory::from_test_entries(entries).expect("Fabric crash inventory"),
+        );
     }
 
     fn test_app_state_with_telemetry(root: &Path) -> AppState {
@@ -3198,17 +3325,7 @@ exit 1
 
     #[cfg(unix)]
     fn write_fabric_crash_install(root: &Path) {
-        let library_specs = [
-            (
-                "net.fabricmc:fabric-loader:0.16.10",
-                "net/fabricmc/fabric-loader/0.16.10/fabric-loader-0.16.10.jar",
-            ),
-            (
-                "net.fabricmc:intermediary:1.21.1",
-                "net/fabricmc/intermediary/1.21.1/intermediary-1.21.1.jar",
-            ),
-        ];
-        let libraries = library_specs
+        let libraries = CRASH_E2E_FABRIC_LIBRARIES
             .into_iter()
             .map(|(name, relative_path)| {
                 let path = root.join("library").join("libraries").join(relative_path);
@@ -3248,6 +3365,11 @@ exit 1
             .expect("encode Fabric crash fixture version"),
         )
         .expect("write Fabric crash fixture version");
+        fs::copy(
+            root.join("library/versions/1.21.1/1.21.1.jar"),
+            version_dir.join(format!("{CRASH_E2E_FABRIC_VERSION_ID}.jar")),
+        )
+        .expect("materialize Fabric crash fixture client");
     }
 
     #[cfg(unix)]

@@ -26,7 +26,7 @@ use crate::runtime::{
 };
 use sha1::{Digest as _, Sha1};
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::{Component, Path};
+use std::path::{Component, Path, PathBuf};
 
 pub const MAX_KNOWN_GOOD_RELATIVE_PATH_BYTES: usize = MAX_ARTIFACT_RELATIVE_PATH_BYTES;
 pub const MAX_KNOWN_GOOD_PATH_SEGMENT_BYTES: usize = MAX_ARTIFACT_PATH_SEGMENT_BYTES;
@@ -34,6 +34,14 @@ pub const MAX_KNOWN_GOOD_ENTRIES: usize = 200_000;
 pub const MAX_KNOWN_GOOD_VERSION_JSON_BYTES: usize = 16 << 20;
 pub const MAX_KNOWN_GOOD_ASSET_INDEX_BYTES: usize = 64 << 20;
 pub const MAX_KNOWN_GOOD_RUNTIME_MANIFEST_BYTES: usize = 16 << 20;
+pub const MAX_LAUNCH_TIER0_ENTRIES: usize = 512;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LaunchTier0RuntimeSelection<'a> {
+    PreferredManaged,
+    ManagedComponent(&'a str),
+    ExternalExecutable,
+}
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum KnownGoodRoot {
@@ -78,6 +86,41 @@ pub enum KnownGoodArtifactKind {
     RuntimeLink,
 }
 
+impl KnownGoodArtifactKind {
+    pub fn stable_id(self) -> &'static str {
+        match self {
+            Self::VersionMetadata => "version_metadata",
+            Self::ClientJar => "client_jar",
+            Self::Library => "library",
+            Self::NativeLibrary => "native_library",
+            Self::AssetIndex => "asset_index",
+            Self::AssetObject => "asset_object",
+            Self::LogConfig => "log_config",
+            Self::RuntimeManifestProof => "runtime_manifest_proof",
+            Self::RuntimeReadyMarker => "runtime_ready_marker",
+            Self::RuntimeFile => "runtime_file",
+            Self::RuntimeExecutable => "runtime_executable",
+            Self::RuntimeDirectory => "runtime_directory",
+            Self::RuntimeLink => "runtime_link",
+        }
+    }
+
+    pub fn needed_for_launch_tier0(self) -> bool {
+        matches!(
+            self,
+            Self::VersionMetadata
+                | Self::ClientJar
+                | Self::Library
+                | Self::NativeLibrary
+                | Self::AssetIndex
+                | Self::LogConfig
+                | Self::RuntimeManifestProof
+                | Self::RuntimeReadyMarker
+                | Self::RuntimeExecutable
+        )
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum KnownGoodIntegrity {
     Sha1 { digest: Sha1Digest, size: u64 },
@@ -112,6 +155,61 @@ impl KnownGoodEntry {
     }
 }
 
+pub struct KnownGoodPhysicalPath {
+    root: PathBuf,
+    relative: PathBuf,
+}
+
+impl KnownGoodPhysicalPath {
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    pub fn relative(&self) -> &Path {
+        &self.relative
+    }
+
+    #[cfg(feature = "test-support")]
+    pub fn for_test(root: PathBuf, relative: PathBuf) -> Self {
+        Self { root, relative }
+    }
+
+    #[cfg(test)]
+    fn absolute(&self) -> PathBuf {
+        self.root.join(&self.relative)
+    }
+}
+
+pub fn known_good_entry_path(
+    library_root: &Path,
+    runtime_cache: &crate::runtime::ManagedRuntimeCache,
+    entry: &KnownGoodEntry,
+) -> KnownGoodPhysicalPath {
+    let (root, mut relative) = match entry.root() {
+        KnownGoodRoot::Versions => (library_root.to_path_buf(), PathBuf::from("versions")),
+        KnownGoodRoot::Libraries => (library_root.to_path_buf(), PathBuf::from("libraries")),
+        KnownGoodRoot::Assets => (library_root.to_path_buf(), PathBuf::from("assets")),
+        KnownGoodRoot::ManagedRuntime { component } => (
+            runtime_cache.root().to_path_buf(),
+            PathBuf::from(component.as_str()),
+        ),
+    };
+    for segment in entry.path().as_str().split('/') {
+        relative.push(segment);
+    }
+    KnownGoodPhysicalPath { root, relative }
+}
+
+pub fn known_good_link_target_matches(entry: &KnownGoodEntry, observed: &Path) -> bool {
+    let KnownGoodIntegrity::LinkTarget(expected) = entry.integrity() else {
+        return false;
+    };
+    observed.to_str().is_some_and(|observed| {
+        KnownGoodLinkTarget::new(entry.path().as_str(), observed)
+            .is_ok_and(|observed| observed == *expected)
+    })
+}
+
 #[derive(Debug, Eq, PartialEq)]
 pub struct KnownGoodInventory {
     entries: Vec<KnownGoodEntry>,
@@ -121,6 +219,112 @@ impl KnownGoodInventory {
     pub fn entries(&self) -> &[KnownGoodEntry] {
         &self.entries
     }
+
+    pub fn launch_tier0_projection(
+        &self,
+        runtime_selection: LaunchTier0RuntimeSelection<'_>,
+    ) -> Result<Vec<(usize, &KnownGoodEntry)>, LaunchTier0ProjectionError> {
+        let selected = self
+            .entries
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| {
+                entry.kind().needed_for_launch_tier0() && runtime_selection.includes(entry.root())
+            })
+            .collect::<Vec<_>>();
+        if selected.len() > MAX_LAUNCH_TIER0_ENTRIES {
+            return Err(LaunchTier0ProjectionError {
+                selected_entry_count: selected.len(),
+            });
+        }
+        Ok(selected)
+    }
+
+    #[cfg(feature = "test-support")]
+    pub fn from_test_entries(
+        entries: impl IntoIterator<Item = TestKnownGoodEntry>,
+    ) -> Result<Self, KnownGoodInventoryError> {
+        let mut builder = InventoryBuilder::default();
+        for entry in entries {
+            let root = match entry.root {
+                TestKnownGoodRoot::Versions => KnownGoodRoot::Versions,
+                TestKnownGoodRoot::Libraries => KnownGoodRoot::Libraries,
+                TestKnownGoodRoot::Assets => KnownGoodRoot::Assets,
+                TestKnownGoodRoot::ManagedRuntime { component } => KnownGoodRoot::ManagedRuntime {
+                    component: KnownGoodId::new(&component)?,
+                },
+            };
+            let integrity = match entry.integrity {
+                TestKnownGoodIntegrity::File { size } => KnownGoodIntegrity::Sha1 {
+                    digest: Sha1Digest::from_metadata("0000000000000000000000000000000000000000")?,
+                    size,
+                },
+                TestKnownGoodIntegrity::ExactBytes { size } => KnownGoodIntegrity::ExactBytes {
+                    digest: Sha1Digest::from_metadata("0000000000000000000000000000000000000000")?,
+                    size,
+                },
+                TestKnownGoodIntegrity::Directory => KnownGoodIntegrity::Directory,
+                TestKnownGoodIntegrity::LinkTarget(target) => {
+                    KnownGoodIntegrity::LinkTarget(KnownGoodLinkTarget::new(&entry.path, &target)?)
+                }
+            };
+            builder.insert(KnownGoodEntry {
+                root,
+                path: KnownGoodRelativePath::new(&entry.path)?,
+                kind: entry.kind,
+                integrity,
+            })?;
+        }
+        Ok(builder.finish())
+    }
+}
+
+impl LaunchTier0RuntimeSelection<'_> {
+    fn includes(self, root: &KnownGoodRoot) -> bool {
+        let KnownGoodRoot::ManagedRuntime { component } = root else {
+            return true;
+        };
+        match self {
+            Self::PreferredManaged => true,
+            Self::ManagedComponent(selected) => component.as_str() == selected,
+            Self::ExternalExecutable => false,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LaunchTier0ProjectionError {
+    selected_entry_count: usize,
+}
+
+impl LaunchTier0ProjectionError {
+    pub fn selected_entry_count(self) -> usize {
+        self.selected_entry_count
+    }
+}
+
+#[cfg(feature = "test-support")]
+pub struct TestKnownGoodEntry {
+    pub root: TestKnownGoodRoot,
+    pub path: String,
+    pub kind: KnownGoodArtifactKind,
+    pub integrity: TestKnownGoodIntegrity,
+}
+
+#[cfg(feature = "test-support")]
+pub enum TestKnownGoodRoot {
+    Versions,
+    Libraries,
+    Assets,
+    ManagedRuntime { component: String },
+}
+
+#[cfg(feature = "test-support")]
+pub enum TestKnownGoodIntegrity {
+    File { size: u64 },
+    ExactBytes { size: u64 },
+    Directory,
+    LinkTarget(String),
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -1086,6 +1290,7 @@ pub enum KnownGoodInventoryError {
     InvalidAssetObject,
     UnsupportedRuntimeEntry,
     MissingRuntimeDownload,
+    MissingRuntimeExecutable,
     RuntimeManifestParse,
     RuntimeManifestIntegrity,
     VersionIdentityMismatch,
@@ -1421,6 +1626,8 @@ fn add_runtime(
             integrity: KnownGoodIntegrity::Directory,
         });
     }
+    let java_path = crate::runtime::runtime_java_relative_path();
+    let mut saw_java = false;
     for (path, file) in plan.file_entries {
         let raw = file
             .downloads
@@ -1433,7 +1640,8 @@ fn add_runtime(
         entries.push(KnownGoodEntry {
             root: root.clone(),
             path: KnownGoodRelativePath::new(&path)?,
-            kind: if file.executable {
+            kind: if path == java_path {
+                saw_java = true;
                 KnownGoodArtifactKind::RuntimeExecutable
             } else {
                 KnownGoodArtifactKind::RuntimeFile
@@ -1445,15 +1653,26 @@ fn add_runtime(
         let target = file
             .target
             .ok_or(KnownGoodInventoryError::UnsupportedRuntimeEntry)?;
+        if cfg!(target_os = "windows") && path == java_path {
+            return Err(KnownGoodInventoryError::UnsupportedRuntimeEntry);
+        }
         entries.push(KnownGoodEntry {
             root: root.clone(),
             path: KnownGoodRelativePath::new(&path)?,
-            kind: KnownGoodArtifactKind::RuntimeLink,
+            kind: if path == java_path {
+                saw_java = true;
+                KnownGoodArtifactKind::RuntimeExecutable
+            } else {
+                KnownGoodArtifactKind::RuntimeLink
+            },
             integrity: KnownGoodIntegrity::LinkTarget(KnownGoodLinkTarget::new(&path, &target)?),
         });
     }
     if !plan.other_entries.is_empty() {
         return Err(KnownGoodInventoryError::UnsupportedRuntimeEntry);
+    }
+    if !saw_java {
+        return Err(KnownGoodInventoryError::MissingRuntimeExecutable);
     }
     validate_runtime_path_tree(&entries)?;
     for entry in entries {
@@ -2270,6 +2489,209 @@ mod tests {
     }
 
     #[test]
+    fn physical_mapping_covers_library_and_managed_runtime_roots() {
+        let fixture = tempfile::tempdir().expect("physical mapping fixture");
+        let runtime_cache = crate::runtime::ManagedRuntimeCache::isolated_for_test()
+            .expect("isolated runtime cache");
+        let library_root = &fixture.path().join("library-root");
+        let make_entry = |root, path, kind, integrity| KnownGoodEntry {
+            root,
+            path: KnownGoodRelativePath::new(path).expect("safe mapped path"),
+            kind,
+            integrity,
+        };
+        let file_integrity = || KnownGoodIntegrity::Sha1 {
+            digest: Sha1Digest::from_metadata(SHA_A).expect("digest"),
+            size: 10,
+        };
+        let cases = [
+            (
+                make_entry(
+                    KnownGoodRoot::Versions,
+                    "1.21.5/1.21.5.jar",
+                    KnownGoodArtifactKind::ClientJar,
+                    file_integrity(),
+                ),
+                library_root.join("versions/1.21.5/1.21.5.jar"),
+            ),
+            (
+                make_entry(
+                    KnownGoodRoot::Libraries,
+                    "com/example/library.jar",
+                    KnownGoodArtifactKind::Library,
+                    file_integrity(),
+                ),
+                library_root.join("libraries/com/example/library.jar"),
+            ),
+            (
+                make_entry(
+                    KnownGoodRoot::Assets,
+                    "indexes/1.21.json",
+                    KnownGoodArtifactKind::AssetIndex,
+                    file_integrity(),
+                ),
+                library_root.join("assets/indexes/1.21.json"),
+            ),
+        ];
+        for (entry, expected) in cases {
+            assert_eq!(
+                known_good_entry_path(library_root, &runtime_cache, &entry).absolute(),
+                expected
+            );
+        }
+
+        let runtime_root = KnownGoodRoot::ManagedRuntime {
+            component: KnownGoodId::new("java-runtime-delta").expect("runtime id"),
+        };
+        for (path, kind, integrity) in [
+            (
+                "bin",
+                KnownGoodArtifactKind::RuntimeDirectory,
+                KnownGoodIntegrity::Directory,
+            ),
+            (
+                "bin/java",
+                KnownGoodArtifactKind::RuntimeExecutable,
+                file_integrity(),
+            ),
+            (
+                ".axial-ready",
+                KnownGoodArtifactKind::RuntimeReadyMarker,
+                KnownGoodIntegrity::ExactBytes {
+                    digest: Sha1Digest::from_metadata(SHA_A).expect("digest"),
+                    size: 5,
+                },
+            ),
+            (
+                COMPONENT_MANIFEST_PROOF_FILE,
+                KnownGoodArtifactKind::RuntimeManifestProof,
+                file_integrity(),
+            ),
+            (
+                "java-link",
+                KnownGoodArtifactKind::RuntimeLink,
+                KnownGoodIntegrity::LinkTarget(KnownGoodLinkTarget("bin/java".to_string())),
+            ),
+        ] {
+            let entry = make_entry(runtime_root.clone(), path, kind, integrity);
+            assert_eq!(
+                known_good_entry_path(library_root, &runtime_cache, &entry).absolute(),
+                runtime_cache.root().join("java-runtime-delta").join(path)
+            );
+        }
+    }
+
+    #[test]
+    fn tier_zero_selection_is_launch_critical_only() {
+        for kind in [
+            KnownGoodArtifactKind::VersionMetadata,
+            KnownGoodArtifactKind::ClientJar,
+            KnownGoodArtifactKind::Library,
+            KnownGoodArtifactKind::NativeLibrary,
+            KnownGoodArtifactKind::AssetIndex,
+            KnownGoodArtifactKind::LogConfig,
+            KnownGoodArtifactKind::RuntimeManifestProof,
+            KnownGoodArtifactKind::RuntimeReadyMarker,
+            KnownGoodArtifactKind::RuntimeExecutable,
+        ] {
+            assert!(kind.needed_for_launch_tier0(), "{}", kind.stable_id());
+        }
+        for kind in [
+            KnownGoodArtifactKind::AssetObject,
+            KnownGoodArtifactKind::RuntimeFile,
+            KnownGoodArtifactKind::RuntimeDirectory,
+            KnownGoodArtifactKind::RuntimeLink,
+        ] {
+            assert!(!kind.needed_for_launch_tier0(), "{}", kind.stable_id());
+        }
+    }
+
+    #[test]
+    fn tier_zero_projection_tracks_the_selected_launch_runtime() {
+        let file = |root, path, kind| KnownGoodEntry {
+            root,
+            path: KnownGoodRelativePath::new(path).expect("path"),
+            kind,
+            integrity: KnownGoodIntegrity::Sha1 {
+                digest: Sha1Digest::from_metadata(SHA_A).expect("digest"),
+                size: 10,
+            },
+        };
+        let inventory = KnownGoodInventory {
+            entries: vec![
+                file(
+                    KnownGoodRoot::Versions,
+                    "1.21.1/1.21.1.jar",
+                    KnownGoodArtifactKind::ClientJar,
+                ),
+                file(
+                    KnownGoodRoot::ManagedRuntime {
+                        component: KnownGoodId::new("java-runtime-delta").expect("component"),
+                    },
+                    "bin/java",
+                    KnownGoodArtifactKind::RuntimeExecutable,
+                ),
+                file(
+                    KnownGoodRoot::ManagedRuntime {
+                        component: KnownGoodId::new("java-runtime-epsilon").expect("component"),
+                    },
+                    "bin/java",
+                    KnownGoodArtifactKind::RuntimeExecutable,
+                ),
+            ],
+        };
+
+        assert_eq!(
+            inventory
+                .launch_tier0_projection(LaunchTier0RuntimeSelection::PreferredManaged)
+                .expect("preferred projection")
+                .len(),
+            3
+        );
+        let component = inventory
+            .launch_tier0_projection(LaunchTier0RuntimeSelection::ManagedComponent(
+                "java-runtime-epsilon",
+            ))
+            .expect("component projection");
+        assert_eq!(component.len(), 2);
+        assert!(matches!(
+            component[1].1.root(),
+            KnownGoodRoot::ManagedRuntime { component }
+                if component.as_str() == "java-runtime-epsilon"
+        ));
+        assert_eq!(
+            inventory
+                .launch_tier0_projection(LaunchTier0RuntimeSelection::ExternalExecutable)
+                .expect("external projection")
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn tier_zero_projection_fails_closed_above_hard_bound() {
+        let entry = || KnownGoodEntry {
+            root: KnownGoodRoot::Libraries,
+            path: KnownGoodRelativePath::new("bounded/library.jar").expect("path"),
+            kind: KnownGoodArtifactKind::Library,
+            integrity: KnownGoodIntegrity::Sha1 {
+                digest: Sha1Digest::from_metadata(SHA_A).expect("digest"),
+                size: 10,
+            },
+        };
+        let inventory = KnownGoodInventory {
+            entries: (0..=MAX_LAUNCH_TIER0_ENTRIES).map(|_| entry()).collect(),
+        };
+        assert_eq!(
+            inventory
+                .launch_tier0_projection(LaunchTier0RuntimeSelection::PreferredManaged)
+                .expect_err("oversized projection")
+                .selected_entry_count(),
+            MAX_LAUNCH_TIER0_ENTRIES + 1
+        );
+    }
+
+    #[test]
     fn shuffled_metadata_derives_identical_sorted_inventory() {
         let mut left = fixture(false);
         let mut right = fixture(true);
@@ -2341,9 +2763,11 @@ mod tests {
     #[test]
     fn runtime_path_tree_allows_directory_ancestor() {
         let mut fixture = fixture(false);
+        let java_path = crate::runtime::runtime_java_relative_path();
+        let java_root = java_path.split('/').next().expect("java path root");
         fixture.replace_runtime_manifest(runtime_manifest_with_entries(&[
-            runtime_directory_entry("bin"),
-            runtime_file_entry("bin/java"),
+            runtime_directory_entry(java_root),
+            runtime_file_entry(java_path),
         ]));
 
         let inventory = fixture.derive().expect("valid runtime tree");
@@ -2351,19 +2775,24 @@ mod tests {
         assert_entry(
             &inventory,
             &runtime_root(),
-            "bin",
+            java_root,
             KnownGoodArtifactKind::RuntimeDirectory,
             &KnownGoodIntegrity::Directory,
         );
-        assert!(has_kind(&inventory, KnownGoodArtifactKind::RuntimeFile));
+        assert!(has_kind(
+            &inventory,
+            KnownGoodArtifactKind::RuntimeExecutable
+        ));
     }
 
     #[test]
     fn runtime_path_tree_rejects_file_ancestor() {
         let mut fixture = fixture(false);
+        let java_path = crate::runtime::runtime_java_relative_path();
+        let java_root = java_path.split('/').next().expect("java path root");
         fixture.replace_runtime_manifest(runtime_manifest_with_entries(&[
-            runtime_file_entry("bin"),
-            runtime_file_entry("bin/java"),
+            runtime_file_entry(java_root),
+            runtime_file_entry(java_path),
         ]));
 
         let error = fixture.derive().expect_err("file ancestor");
@@ -2373,9 +2802,11 @@ mod tests {
     #[test]
     fn runtime_path_tree_rejects_link_ancestor() {
         let mut fixture = fixture(false);
+        let java_path = crate::runtime::runtime_java_relative_path();
+        let java_root = java_path.split('/').next().expect("java path root");
         fixture.replace_runtime_manifest(runtime_manifest_with_entries(&[
-            runtime_link_entry("bin", "java"),
-            runtime_file_entry("bin/java"),
+            runtime_link_entry(java_root, "java"),
+            runtime_file_entry(java_path),
         ]));
 
         let error = fixture.derive().expect_err("link ancestor");
@@ -2385,12 +2816,43 @@ mod tests {
     #[test]
     fn runtime_path_tree_rejects_incompatible_exact_path() {
         let mut fixture = fixture(false);
-        fixture.replace_runtime_manifest(runtime_manifest_with_entries(&[runtime_file_entry(
-            ".axial-ready",
-        )]));
+        fixture.replace_runtime_manifest(runtime_manifest_with_entries(&[
+            runtime_file_entry(crate::runtime::runtime_java_relative_path()),
+            runtime_file_entry(".axial-ready"),
+        ]));
 
         let error = fixture.derive().expect_err("reserved path");
         assert_eq!(error, KnownGoodInventoryError::ConflictingRuntimePath);
+    }
+
+    #[test]
+    fn platform_java_link_is_tier_zero_executable_or_rejected_when_unsupported() {
+        let mut fixture = fixture(false);
+        let java_path = crate::runtime::runtime_java_relative_path();
+        let java_parent = Path::new(java_path).parent().expect("java parent");
+        let target_path = java_parent.join("java-real");
+        let target_path = target_path.to_str().expect("UTF-8 java target");
+        fixture.replace_runtime_manifest(runtime_manifest_with_entries(&[
+            runtime_file_entry(target_path),
+            runtime_link_entry(java_path, "java-real"),
+        ]));
+
+        if cfg!(target_os = "windows") {
+            assert_eq!(
+                fixture.derive().expect_err("Windows Java link"),
+                KnownGoodInventoryError::UnsupportedRuntimeEntry
+            );
+            return;
+        }
+
+        let inventory = fixture.derive().expect("platform Java link inventory");
+        assert_entry(
+            &inventory,
+            &runtime_root(),
+            java_path,
+            KnownGoodArtifactKind::RuntimeExecutable,
+            &KnownGoodIntegrity::LinkTarget(KnownGoodLinkTarget("java-real".to_string())),
+        );
     }
 
     #[test]
@@ -2505,7 +2967,10 @@ mod tests {
         let KnownGoodIntegrity::LinkTarget(target) = link.integrity() else {
             panic!("runtime link must carry its canonical target")
         };
-        assert_eq!(target.as_str(), "bin/java");
+        assert_eq!(
+            target.as_str(),
+            crate::runtime::runtime_java_relative_path()
+        );
     }
 
     #[test]
@@ -2776,9 +3241,10 @@ mod tests {
     }
 
     fn runtime_manifest_bytes(shuffled: bool) -> Vec<u8> {
-        let executable = runtime_executable_entry("bin/java");
+        let java_path = crate::runtime::runtime_java_relative_path();
+        let executable = runtime_executable_entry(java_path);
         let directory = runtime_directory_entry("bin");
-        let link = runtime_link_entry("java-link", "./bin/../bin/java");
+        let link = runtime_link_entry("java-link", &format!("./{java_path}"));
         let files = if shuffled {
             format!("{link},{executable},{directory}")
         } else {
@@ -2849,7 +3315,7 @@ mod tests {
         assert_entry(
             inventory,
             &root,
-            "bin/java",
+            crate::runtime::runtime_java_relative_path(),
             KnownGoodArtifactKind::RuntimeExecutable,
             &KnownGoodIntegrity::Sha1 {
                 digest: Sha1Digest::from_metadata(SHA_B).unwrap(),
@@ -2861,7 +3327,9 @@ mod tests {
             &root,
             "java-link",
             KnownGoodArtifactKind::RuntimeLink,
-            &KnownGoodIntegrity::LinkTarget(KnownGoodLinkTarget("bin/java".to_string())),
+            &KnownGoodIntegrity::LinkTarget(KnownGoodLinkTarget(
+                crate::runtime::runtime_java_relative_path().to_string(),
+            )),
         );
     }
 

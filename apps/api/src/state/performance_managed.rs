@@ -83,13 +83,13 @@ impl Drop for ManagedCompositionRetirement {
 
 pub(crate) struct AppManagedCompositionAdmission {
     managed: ManagedCompositionAdmission,
-    _instance_lifecycle: OwnedMutexGuard<()>,
+    _instance_lifecycle: super::InstanceLifecycleLease,
 }
 
 impl AppManagedCompositionAdmission {
     pub(super) fn bind(
         managed: ManagedCompositionAdmission,
-        instance_lifecycle: OwnedMutexGuard<()>,
+        instance_lifecycle: super::InstanceLifecycleLease,
     ) -> Self {
         Self {
             managed,
@@ -164,9 +164,14 @@ impl ManagedCompositionOwner {
     pub(super) async fn admit(
         &self,
         instance_id: &str,
-        instance_lifecycle: OwnedMutexGuard<()>,
+        instance_lifecycle: super::InstanceLifecycleLease,
         recovery_allowed: bool,
     ) -> Result<AppManagedCompositionAdmission, ManagedCompositionAdmissionError> {
+        if !instance_lifecycle.matches(instance_id) {
+            return Err(ManagedCompositionAdmissionError::Identity(
+                axial_performance::ManagedIdentityError::InvalidInstanceId,
+            ));
+        }
         if self.phase() != ManagedOwnerPhase::Running {
             return Err(ManagedCompositionAdmissionError::Closed);
         }
@@ -341,7 +346,7 @@ impl ManagedInstanceEntry {
 
 async fn recover_admission_owned(
     admission: ManagedCompositionAdmission,
-    instance_lifecycle: OwnedMutexGuard<()>,
+    instance_lifecycle: super::InstanceLifecycleLease,
 ) -> Result<AppManagedCompositionAdmission, ManagedCompositionAdmissionError> {
     let (completed_tx, completed_rx) = tokio::sync::oneshot::channel();
     tokio::spawn(async move {
@@ -519,7 +524,10 @@ mod tests {
             recovery_allowed: bool,
         ) -> Result<super::AppManagedCompositionAdmission, ManagedCompositionAdmissionError>
         {
-            let lifecycle = self.instance_lifecycle.acquire(instance_id).await;
+            let lifecycle = super::super::InstanceLifecycleLease::bind(
+                instance_id,
+                self.instance_lifecycle.acquire(instance_id).await,
+            );
             self.owner
                 .admit(instance_id, lifecycle, recovery_allowed)
                 .await

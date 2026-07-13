@@ -38,7 +38,7 @@ use crate::state::{
 use axial_config::{EnrichedInstance, Instance, generate_instance_id};
 use axial_launcher::{
     GuardianMode, LaunchReadinessReasonId, LaunchReadinessRequest, LaunchReadinessSeverity,
-    inspect_launch_readiness,
+    inspect_create_readiness,
 };
 use axial_minecraft::{
     LifecycleChannel, LifecycleMeta, LoaderAvailability, LoaderBuildRecord, LoaderCatalogState,
@@ -882,12 +882,15 @@ fn version_is_launch_ready_or_user_blocked(
         return Err(version_scan_degraded_response());
     }
     let config = state.config().current();
-    let readiness = inspect_launch_readiness(&LaunchReadinessRequest {
-        library_dir: installed_lookup.library_dir().to_path_buf(),
-        requested_java: config.java_path_override.trim().to_string(),
-        version_id: version_id.to_string(),
-        guardian_mode: GuardianMode::from_config(&config.guardian_mode),
-    });
+    let readiness = inspect_create_readiness(
+        state.managed_runtime_cache(),
+        &LaunchReadinessRequest {
+            library_dir: installed_lookup.library_dir().to_path_buf(),
+            requested_java: config.java_path_override.trim().to_string(),
+            version_id: version_id.to_string(),
+            guardian_mode: GuardianMode::from_config(&config.guardian_mode),
+        },
+    );
     if readiness.launchable {
         return Ok(true);
     }

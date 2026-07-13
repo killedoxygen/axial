@@ -3056,8 +3056,7 @@ async fn cancelled_delete_caller_cannot_cancel_lifecycle_waiting_owner() {
     drop(delete);
     drop(lifecycle);
 
-    wait_for_instance_absence(&fixture.state, &instance_id).await;
-    assert!(!known_good.exists());
+    wait_for_detached_delete(&fixture.state, &instance_id, Some(&known_good)).await;
 }
 
 #[tokio::test]
@@ -3086,7 +3085,7 @@ async fn cancelled_delete_caller_cannot_cancel_registry_waiting_owner() {
     drop(delete);
     drop(registry);
 
-    wait_for_instance_absence(&fixture.state, &instance_id).await;
+    wait_for_detached_delete(&fixture.state, &instance_id, None).await;
 }
 
 #[tokio::test]
@@ -3270,14 +3269,25 @@ async fn admitted_delete_claims_its_request_handoff_during_drain() {
     let _ = quiesce.await;
 }
 
-async fn wait_for_instance_absence(state: &AppState, instance_id: &str) {
-    for _ in 0..200 {
-        if state.instances().get(instance_id).is_none() {
-            return;
+async fn wait_for_detached_delete(
+    state: &AppState,
+    instance_id: &str,
+    retired_known_good: Option<&FsPath>,
+) {
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let lifecycle = state.acquire_instance_lifecycle(instance_id).await;
+            let registry_absent = state.instances().get(instance_id).is_none();
+            let known_good_absent = retired_known_good.is_none_or(|path| !path.exists());
+            drop(lifecycle);
+            if registry_absent && known_good_absent {
+                break;
+            }
+            tokio::task::yield_now().await;
         }
-        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-    }
-    panic!("detached instance deletion did not finish");
+    })
+    .await
+    .expect("detached instance deletion did not finish");
 }
 
 async fn latch_managed_instance(fixture: &TestFixture, instance_id: &str) -> PathBuf {

@@ -376,6 +376,27 @@ impl KnownGoodInventoryStore {
         )
     }
 
+    #[cfg(test)]
+    pub(super) fn activate_for_test(
+        &self,
+        instance_id: &str,
+        version_id: &str,
+        created_at: &str,
+        library_root: &Path,
+        inventory: Arc<KnownGoodInventory>,
+    ) -> io::Result<()> {
+        validate_identity(instance_id, version_id)?;
+        let library_root = normalize_library_root(library_root)?;
+        self.active.lock().expect(STORE_LOCK_INVARIANT).activate(
+            instance_id,
+            version_id,
+            created_at,
+            library_root,
+            inventory,
+        );
+        Ok(())
+    }
+
     pub(super) fn deactivate_exact(
         &self,
         instance_id: &str,

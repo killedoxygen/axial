@@ -1,4 +1,4 @@
-use super::{FactReliability, GuardianDomain, GuardianFact, GuardianFactId};
+use super::{FactReliability, GuardianDomain, GuardianFact, GuardianFactId, GuardianSeverity};
 use crate::execution::{ExecutionFact, ExecutionFactKind};
 use crate::observability::{EvidenceField, RedactionAudience, sanitize_evidence_token};
 use crate::state::contracts::{OperationPhase, OwnershipClass, TargetDescriptor};
@@ -10,13 +10,16 @@ pub fn guardian_fact_from_execution(fact: &ExecutionFact, phase: OperationPhase)
         .as_ref()
         .map(|target| target.ownership)
         .unwrap_or(OwnershipClass::Unknown);
+    let severity = (fact.kind == ExecutionFactKind::RuntimeMissingExecutable
+        && ownership == OwnershipClass::LauncherManaged)
+        .then_some(GuardianSeverity::Recoverable);
     GuardianFact {
         operation_id: fact.operation_id.clone(),
         id,
         domain,
         phase,
         reliability,
-        severity: None,
+        severity,
         confidence: None,
         ownership,
         target,
@@ -37,6 +40,9 @@ fn execution_fact_shape(fact: &ExecutionFact) -> (GuardianFactId, GuardianDomain
             GuardianFactId::ArtifactSizeMismatch,
             GuardianDomain::Library,
         ),
+        ExecutionFactKind::ArtifactSizeDrift => {
+            (GuardianFactId::ArtifactSizeDrift, GuardianDomain::Library)
+        }
         ExecutionFactKind::DownloadProviderFailure => (
             GuardianFactId::DownloadProviderUnavailable,
             GuardianDomain::Download,

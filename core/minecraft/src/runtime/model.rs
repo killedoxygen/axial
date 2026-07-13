@@ -46,8 +46,6 @@ impl From<&str> for RuntimeId {
 #[serde(rename_all = "snake_case")]
 pub enum RuntimeSource {
     Managed,
-    MinecraftBundled,
-    MicrosoftStore,
     ExternalOverride,
 }
 
@@ -55,8 +53,6 @@ impl RuntimeSource {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Managed => "managed",
-            Self::MinecraftBundled => "minecraft-runtime",
-            Self::MicrosoftStore => "ms-store",
             Self::ExternalOverride => "override",
         }
     }
@@ -94,13 +90,6 @@ pub enum RuntimeOverride {
     ExecutablePath(PathBuf),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum RuntimeEnsureAction {
-    UseRequested,
-    UseManaged,
-}
-
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum RuntimeProbeSource {
     #[default]
@@ -132,13 +121,8 @@ pub struct RuntimeEnsureResult {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub requested: Option<RuntimeRecord>,
     pub effective: RuntimeRecord,
-    pub bypassed_requested_runtime: bool,
-    pub install_performed: bool,
-    pub action: RuntimeEnsureAction,
     #[serde(skip)]
     pub probe_usage: RuntimeProbeUsage,
-    #[serde(skip)]
-    pub(crate) source_receipt: Option<super::manifest::RuntimeSourceReceipt>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

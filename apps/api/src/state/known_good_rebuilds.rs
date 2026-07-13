@@ -389,7 +389,13 @@ impl AppState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::state::{AppStateInit, InstallStore, SessionStore};
+    use crate::state::{
+        AppStateInit, InstallStore, KnownGoodVerificationUnavailable, SessionStore,
+    };
+    use axial_minecraft::known_good::{
+        KnownGoodArtifactKind, KnownGoodInventory, TestKnownGoodEntry, TestKnownGoodIntegrity,
+        TestKnownGoodRoot,
+    };
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
     use tokio::sync::{Notify, mpsc, oneshot};
@@ -816,6 +822,72 @@ mod tests {
         close_fixture(state, root).await;
     }
 
+    fn verification_test_inventory(version_id: &str) -> KnownGoodInventory {
+        KnownGoodInventory::from_test_entries([TestKnownGoodEntry {
+            root: TestKnownGoodRoot::Versions,
+            path: format!("{version_id}/{version_id}.jar"),
+            kind: KnownGoodArtifactKind::ClientJar,
+            integrity: TestKnownGoodIntegrity::File { size: 10 },
+        }])
+        .expect("verification inventory")
+    }
+
+    #[tokio::test]
+    async fn verification_lease_binds_exact_live_incarnation_and_current_root() {
+        let (state, root) = state_fixture("verification-lease");
+        let instance = state
+            .instances()
+            .insert_for_test("Lease", "1.21.5")
+            .expect("registered instance");
+        state.activate_known_good_inventory_for_test(
+            &instance.id,
+            verification_test_inventory(&instance.version_id),
+        );
+        let lifecycle = state.acquire_instance_lifecycle(&instance.id).await;
+        let lease = state
+            .mint_known_good_verification_lease(&lifecycle, &root.join("library"))
+            .expect("exact live lease");
+        let normalized_root = std::fs::canonicalize(root.join("library")).expect("library root");
+        assert_eq!(
+            lease.exact_identity_for_test(),
+            (
+                instance.id.as_str(),
+                instance.version_id.as_str(),
+                instance.created_at.as_str(),
+                normalized_root.as_path(),
+            )
+        );
+        drop(lease);
+
+        let different_expected_root = root.join("different-expected-library");
+        std::fs::create_dir_all(&different_expected_root).expect("different expected root");
+        assert!(matches!(
+            state.mint_known_good_verification_lease(&lifecycle, &different_expected_root),
+            Err(KnownGoodVerificationUnavailable::LiveAuthorityUnavailable)
+        ));
+
+        let mut recreated = instance.clone();
+        recreated.created_at = (chrono::Utc::now() + chrono::Duration::seconds(1)).to_rfc3339();
+        state
+            .instances()
+            .replace_for_test(recreated)
+            .expect("replace incarnation");
+        assert!(matches!(
+            state.mint_known_good_verification_lease(&lifecycle, &root.join("library")),
+            Err(KnownGoodVerificationUnavailable::LiveAuthorityUnavailable)
+        ));
+
+        let changed_root = root.join("changed-library");
+        std::fs::create_dir_all(&changed_root).expect("changed root");
+        state.set_library_dir_for_test(changed_root.to_string_lossy().into_owned());
+        assert!(matches!(
+            state.mint_known_good_verification_lease(&lifecycle, &root.join("library")),
+            Err(KnownGoodVerificationUnavailable::LiveAuthorityUnavailable)
+        ));
+        drop(lifecycle);
+        close_fixture(state, root).await;
+    }
+
     #[tokio::test]
     async fn version_and_root_drift_fail_exact_lifecycle_postcheck() {
         let (state, root) = state_fixture("version-root-drift");
@@ -960,6 +1032,15 @@ mod tests {
             Err(KnownGoodRebuildError::LiveAuthorityMissing),
             "persisted evidence must not hydrate live authority"
         );
+        let lifecycle = state.acquire_instance_lifecycle(&instance.id).await;
+        assert!(
+            matches!(
+                state.mint_known_good_verification_lease(&lifecycle, &root.join("library")),
+                Err(KnownGoodVerificationUnavailable::LiveAuthorityUnavailable)
+            ),
+            "persisted evidence must not mint verification authority"
+        );
+        drop(lifecycle);
         close_fixture(state, root).await;
     }
 

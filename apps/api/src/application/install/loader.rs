@@ -114,6 +114,7 @@ pub(super) async fn start_loader_install_owned(
     let worker_failure_memory = state.failure_memory().clone();
     let worker_telemetry = telemetry.clone();
     let worker_state = state.clone();
+    let worker_runtime_cache = state.managed_runtime_cache().clone();
     let progress_owner = producer.claim_child();
     InstallStore::spawn_tracked_worker_with_interrupt_handler_owned(
         store,
@@ -213,15 +214,20 @@ pub(super) async fn start_loader_install_owned(
                 }
                 let final_progress_for_install = Arc::clone(&final_progress);
                 let result = {
-                    let install = install_build(&library_dir, build.clone(), |progress| {
-                        if progress.done {
-                            if let Ok(mut final_progress) = final_progress_for_install.lock() {
-                                *final_progress = Some(progress);
+                    let install = install_build(
+                        &library_dir,
+                        worker_runtime_cache.clone(),
+                        build.clone(),
+                        |progress| {
+                            if progress.done {
+                                if let Ok(mut final_progress) = final_progress_for_install.lock() {
+                                    *final_progress = Some(progress);
+                                }
+                                return;
                             }
-                            return;
-                        }
-                        let _ = progress_tx.send(progress);
-                    });
+                            let _ = progress_tx.send(progress);
+                        },
+                    );
                     tokio::pin!(install);
                     tokio::select! {
                         result = &mut install => Some(result),

@@ -11,7 +11,9 @@ use super::{
 };
 use crate::application::install::loader_install_guardian_evidence_kind;
 use crate::application::launch::readiness_guardian_facts_for_coverage;
-use crate::application::timing::{LAUNCH_PREFLIGHT_SENSE_TIMING_SIGNAL, LaunchPreflightSenseId};
+use crate::application::timing::{
+    INTEGRITY_TIER0_CEILING_MS, LAUNCH_PREFLIGHT_SENSE_TIMING_SIGNAL, LaunchPreflightSenseId,
+};
 use crate::execution::{ExecutionFact, ExecutionFactKind, ExecutionFactSemantics};
 use crate::observability::evidence_text_looks_sensitive;
 use crate::state::contracts::{
@@ -519,9 +521,17 @@ fn preflight_sense_coverage() -> Vec<PreflightSenseCoverage> {
             id: sense.as_str().to_string(),
             declared_cost_class: sense.declared_cost_class().as_str().to_string(),
             timing_signal: LAUNCH_PREFLIGHT_SENSE_TIMING_SIGNAL.to_string(),
-            measurement_status: "pending_phase_4".to_string(),
-            ceiling_ms: None,
-            evidence: None,
+            measurement_status: if *sense == LaunchPreflightSenseId::IntegrityTier0 {
+                "pending_i8_rotational_measurement"
+            } else {
+                "pending_phase_4"
+            }
+            .to_string(),
+            ceiling_ms: (*sense == LaunchPreflightSenseId::IntegrityTier0)
+                .then_some(INTEGRITY_TIER0_CEILING_MS),
+            evidence: (*sense == LaunchPreflightSenseId::IntegrityTier0).then(|| {
+                "ignored rotational-fixture harness; candidate evidence requires review".to_string()
+            }),
         })
         .collect()
 }

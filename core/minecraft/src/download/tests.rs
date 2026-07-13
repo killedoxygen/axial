@@ -41,7 +41,7 @@ use crate::artifact_path::ArtifactRelativePath;
 use crate::known_good::KnownGoodArtifactKind;
 use crate::launch::{JavaVersion, Library, LibraryArtifact, LibraryDownload, maven_to_path};
 use crate::manifest::VersionManifest;
-use crate::paths::{assets_dir, libraries_dir, runtime_dirs, versions_dir};
+use crate::paths::{assets_dir, libraries_dir, versions_dir};
 use crate::rules::Environment;
 use crate::runtime::{
     RuntimeEnsureEvent, RuntimeId, RuntimeSourceReceipt, TestRuntimeSourceDescriptor,
@@ -97,10 +97,7 @@ async fn invalid_library_preflight_precedes_asset_runtime_and_client_effects() {
     let asset_index_path = assets_dir(&root)
         .join("indexes")
         .join("preflight-assets.json");
-    let runtime_sentinel = runtime_dirs(&root)[0]
-        .join("jre-legacy")
-        .join("preflight-sentinel");
-    for path in [&client_path, &asset_index_path, &runtime_sentinel] {
+    for path in [&client_path, &asset_index_path] {
         fs::create_dir_all(path.parent().expect("sentinel parent")).expect("sentinel parent");
         fs::write(path, b"untouched").expect("sentinel");
     }
@@ -123,7 +120,7 @@ async fn invalid_library_preflight_precedes_asset_runtime_and_client_effects() {
             "asset_index" | "java_runtime" | "java_runtime_ready" | "client_jar" | "libraries"
         )
     }));
-    for path in [&client_path, &asset_index_path, &runtime_sentinel] {
+    for path in [&client_path, &asset_index_path] {
         assert_eq!(fs::read(path).expect("unchanged sentinel"), b"untouched");
     }
 
@@ -1622,7 +1619,9 @@ fn download_integrity_futures_stay_small_enough_for_tokio_workers() {
     );
 
     let root = temp_dir("install-version-future-size");
-    let downloader = Downloader::new(&root);
+    let runtime_cache =
+        crate::ManagedRuntimeCache::isolated_for_test().expect("isolated downloader runtime cache");
+    let downloader = Downloader::new(&root, runtime_cache);
     assert!(
         std::mem::size_of_val(&downloader.install_version("1.21.1", |_| {})) < 8192,
         "version-install future should stay comfortably below tokio worker stack limits"

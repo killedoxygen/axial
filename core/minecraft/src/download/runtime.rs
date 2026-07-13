@@ -2,7 +2,7 @@ use super::model::{DownloadError, DownloadProgress, progress};
 use super::plan::TransferPlan;
 use crate::launch::JavaVersion;
 use crate::runtime::{
-    JavaRuntimeLookupError, RuntimeEnsureEvent, RuntimeSourceReceipt,
+    JavaRuntimeLookupError, ManagedRuntimeCache, RuntimeEnsureEvent, RuntimeSourceReceipt,
     materialize_preferred_runtime_source,
 };
 use std::sync::Arc;
@@ -15,6 +15,7 @@ pub(super) struct RuntimeEnsurePipeline {
 }
 
 pub(super) fn spawn_runtime_ensure_pipeline(
+    runtime_cache: ManagedRuntimeCache,
     java_version: JavaVersion,
     source_receipt: RuntimeSourceReceipt,
     plan: Arc<TransferPlan>,
@@ -29,8 +30,11 @@ pub(super) fn spawn_runtime_ensure_pipeline(
         let progress_tx = progress_tx.clone();
         let mut plan_contribution_resolved = false;
         let mut plan_done_seen = 0_u64;
-        let source_receipt =
-            materialize_preferred_runtime_source(&java_version, source_receipt, &mut |event| {
+        let source_receipt = materialize_preferred_runtime_source(
+            &runtime_cache,
+            &java_version,
+            source_receipt,
+            &mut |event| {
                 match &event {
                     RuntimeEnsureEvent::InstallingManagedRuntimeFiles {
                         bytes_done,
@@ -55,8 +59,9 @@ pub(super) fn spawn_runtime_ensure_pipeline(
                     RuntimeEnsureEvent::DownloadingManagedRuntime { .. } => {}
                 }
                 let _ = progress_tx.send(runtime_ensure_progress(&event_java_version, event));
-            })
-            .await;
+            },
+        )
+        .await;
         if !plan_contribution_resolved {
             plan.resolve_contribution(0);
         }

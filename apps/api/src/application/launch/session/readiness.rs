@@ -1,3 +1,4 @@
+use crate::execution::{ExecutionFact, ExecutionFactKind};
 use crate::guardian::{
     FactReliability, GuardianConfidence, GuardianDomain, GuardianFact, GuardianFactId,
     GuardianSeverity,
@@ -6,6 +7,112 @@ use crate::state::contracts::{
     OperationPhase, OwnershipClass, StabilizationSystem, TargetDescriptor, TargetKind,
 };
 use axial_launcher::{LaunchReadiness, LaunchReadinessReasonId, LaunchReadinessSeverity};
+
+pub(super) fn append_integrity_readiness_reasons(
+    readiness: &mut LaunchReadiness,
+    facts: &[ExecutionFact],
+) {
+    for fact in facts {
+        let Some(reason) = integrity_readiness_reason(fact) else {
+            continue;
+        };
+        if !readiness
+            .reasons
+            .iter()
+            .any(|existing| existing.id == reason.id)
+        {
+            readiness.reasons.push(reason);
+        }
+    }
+    readiness.launchable = readiness
+        .reasons
+        .iter()
+        .all(|reason| reason.severity != LaunchReadinessSeverity::Blocking);
+}
+
+fn integrity_readiness_reason(
+    fact: &ExecutionFact,
+) -> Option<axial_launcher::LaunchReadinessReason> {
+    let corrupt = match fact.kind {
+        ExecutionFactKind::ArtifactMissing => false,
+        ExecutionFactKind::ArtifactSizeDrift => true,
+        ExecutionFactKind::RuntimeMissingExecutable
+        | ExecutionFactKind::RuntimeReadyMarkerMissing => {
+            return Some(axial_launcher::LaunchReadinessReason {
+                id: LaunchReadinessReasonId::ManagedRuntimeMissing,
+                severity: LaunchReadinessSeverity::Recoverable,
+                message: "Managed Java runtime is missing and will be prepared before launch.",
+            });
+        }
+        ExecutionFactKind::FilePermissionDenied | ExecutionFactKind::PrimitiveRefused => {
+            return Some(axial_launcher::LaunchReadinessReason {
+                id: LaunchReadinessReasonId::IncompleteInstall,
+                severity: LaunchReadinessSeverity::Blocking,
+                message: "Installation verification could not finish. Try launching again shortly.",
+            });
+        }
+        _ => return None,
+    };
+    let kind = fact
+        .fields
+        .iter()
+        .find(|field| field.key == "artifact_kind")?
+        .value
+        .as_str();
+    let (id, severity, message) = match (kind, corrupt) {
+        ("version_metadata", false) => (
+            LaunchReadinessReasonId::VersionJsonMissing,
+            LaunchReadinessSeverity::Blocking,
+            "Installed version metadata is missing. Install this version before launching.",
+        ),
+        ("version_metadata", true) => (
+            LaunchReadinessReasonId::VersionJsonMissing,
+            LaunchReadinessSeverity::Blocking,
+            "Installed version metadata is invalid. Repair this version before launching.",
+        ),
+        ("client_jar", false) => (
+            LaunchReadinessReasonId::ClientJarMissing,
+            LaunchReadinessSeverity::Blocking,
+            "Client game files are missing. Install this version before launching.",
+        ),
+        ("client_jar", true) => (
+            LaunchReadinessReasonId::ClientJarCorrupt,
+            LaunchReadinessSeverity::Blocking,
+            "Client game files are corrupt. Repair this version before launching.",
+        ),
+        ("library" | "native_library" | "log_config", false) => (
+            LaunchReadinessReasonId::LibrariesMissing,
+            LaunchReadinessSeverity::Blocking,
+            "Required libraries are missing. Install this version before launching.",
+        ),
+        ("library" | "native_library" | "log_config", true) => (
+            LaunchReadinessReasonId::LibrariesCorrupt,
+            LaunchReadinessSeverity::Blocking,
+            "Required libraries are corrupt. Repair this version before launching.",
+        ),
+        ("asset_index", false) => (
+            LaunchReadinessReasonId::AssetIndexMissing,
+            LaunchReadinessSeverity::Blocking,
+            "Asset index is missing. Install this version before launching.",
+        ),
+        ("asset_index", true) => (
+            LaunchReadinessReasonId::AssetIndexCorrupt,
+            LaunchReadinessSeverity::Blocking,
+            "Asset index is corrupt. Repair this version before launching.",
+        ),
+        ("runtime_manifest_proof" | "runtime_ready_marker" | "runtime_executable", _) => (
+            LaunchReadinessReasonId::ManagedRuntimeMissing,
+            LaunchReadinessSeverity::Recoverable,
+            "Managed Java runtime is missing and will be prepared before launch.",
+        ),
+        _ => return None,
+    };
+    Some(axial_launcher::LaunchReadinessReason {
+        id,
+        severity,
+        message,
+    })
+}
 
 pub(super) fn readiness_has_managed_runtime_missing(readiness: &LaunchReadiness) -> bool {
     readiness

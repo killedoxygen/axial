@@ -45,12 +45,14 @@ pub use types::{
 use crate::artifact_path::MAX_ARTIFACT_PATH_SEGMENT_BYTES;
 use crate::download::DownloadProgress;
 use crate::known_good::{KnownGoodInstallReceipt, KnownGoodReconstructionReceipt};
+use crate::runtime::ManagedRuntimeCache;
 use std::path::{Component, Path};
 
 pub(crate) const MAX_VERSION_ID_BYTES: usize = MAX_ARTIFACT_PATH_SEGMENT_BYTES - ".json".len();
 
 pub async fn install_build<F>(
     library_dir: &Path,
+    runtime_cache: ManagedRuntimeCache,
     record: LoaderBuildRecord,
     send: F,
 ) -> Result<KnownGoodInstallReceipt, LoaderInstallError>
@@ -66,9 +68,14 @@ where
     let record =
         require_exact_live_build_record(&record, live_record).map_err(LoaderInstallError::from)?;
     let plan = LoaderInstallPlan { record };
-    Box::pin(strategies::install_build(library_dir, &plan, send))
-        .await
-        .map_err(LoaderInstallError::from)
+    Box::pin(strategies::install_build(
+        library_dir,
+        &runtime_cache,
+        &plan,
+        send,
+    ))
+    .await
+    .map_err(LoaderInstallError::from)
 }
 
 pub(crate) async fn reconstruct_build(
@@ -133,6 +140,7 @@ mod tests {
         build_id_for, install_build, installed_version_id_for, reconstruct_build,
         require_exact_live_build_record, validate_version_id,
     };
+    use crate::ManagedRuntimeCache;
     use crate::loaders::types::LoaderBuildSubjectKind;
     use std::fs;
     use std::path::PathBuf;
@@ -206,7 +214,8 @@ mod tests {
             },
         };
 
-        install_build(&root, record, |_| {})
+        let runtime_cache = ManagedRuntimeCache::isolated_for_test().expect("runtime cache");
+        install_build(&root, runtime_cache, record, |_| {})
             .await
             .expect_err("noncanonical identity");
 

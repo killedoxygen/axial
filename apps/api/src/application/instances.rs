@@ -307,12 +307,15 @@ pub(super) fn enrich_instance_for_scan(
     };
     let config = state.config().current();
     let readiness_started_at = Instant::now();
-    let readiness = inspect_launch_readiness_summary(&LaunchReadinessRequest {
-        library_dir: library_dir.to_path_buf(),
-        requested_java: selected_java_override(&instance, &config),
-        version_id: instance.version_id.clone(),
-        guardian_mode: GuardianMode::from_config(&config.guardian_mode),
-    });
+    let readiness = inspect_launch_readiness_summary(
+        state.managed_runtime_cache(),
+        &LaunchReadinessRequest {
+            library_dir: library_dir.to_path_buf(),
+            requested_java: selected_java_override(&instance, &config),
+            version_id: instance.version_id.clone(),
+            guardian_mode: GuardianMode::from_config(&config.guardian_mode),
+        },
+    );
     let readiness_elapsed = readiness_started_at.elapsed();
     if readiness_elapsed >= INSTANCE_READINESS_SLOW_SPAN {
         trace_slow_instance_readiness(

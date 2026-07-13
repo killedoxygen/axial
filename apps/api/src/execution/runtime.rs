@@ -9,10 +9,9 @@ use crate::observability::{
 };
 use crate::state::contracts::{OperationId, StabilizationSystem, TargetDescriptor, TargetKind};
 use crate::state::ownership::{classify_managed_runtime_root, protection_for};
-use axial_config::AppPaths;
 use axial_minecraft::{
-    RuntimeOverride, managed_runtime_contents_verified_without_probe, parse_runtime_override,
-    runtime_executable_ready_without_probe,
+    ManagedRuntimeCache, RuntimeOverride, managed_runtime_contents_verified_without_probe,
+    parse_runtime_override, runtime_executable_ready_without_probe,
 };
 use std::fmt;
 use std::fs;
@@ -56,13 +55,24 @@ impl<'a> RuntimeProbeRequest<'a> {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct ManagedRuntimeVerificationRequest<'a> {
     pub operation_id: Option<OperationId>,
     pub target: TargetDescriptor,
     pub runtime_root: &'a Path,
     pub java_executable: &'a Path,
     pub require_ready_marker: bool,
+}
+
+impl std::fmt::Debug for ManagedRuntimeVerificationRequest<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ManagedRuntimeVerificationRequest")
+            .field("operation_id", &self.operation_id)
+            .field("target", &self.target)
+            .field("require_ready_marker", &self.require_ready_marker)
+            .finish_non_exhaustive()
+    }
 }
 
 impl<'a> ManagedRuntimeVerificationRequest<'a> {
@@ -86,12 +96,24 @@ impl<'a> ManagedRuntimeVerificationRequest<'a> {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct ManagedRuntimeRepairRequest<'a> {
     pub operation_id: Option<OperationId>,
     pub target: TargetDescriptor,
     pub runtime_root: ManagedRuntimeRoot<'a>,
     pub primitive: ManagedRuntimeRepairPrimitive,
+}
+
+impl std::fmt::Debug for ManagedRuntimeRepairRequest<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ManagedRuntimeRepairRequest")
+            .field("operation_id", &self.operation_id)
+            .field("target", &self.target)
+            .field("runtime_root", &self.runtime_root)
+            .field("primitive", &self.primitive)
+            .finish()
+    }
 }
 
 impl<'a> ManagedRuntimeRepairRequest<'a> {
@@ -109,20 +131,30 @@ impl<'a> ManagedRuntimeRepairRequest<'a> {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct ManagedRuntimeRoot<'a> {
+    _runtime_cache: &'a ManagedRuntimeCache,
     target: TargetDescriptor,
     runtime_root: &'a Path,
     java_executable: &'a Path,
 }
 
+impl std::fmt::Debug for ManagedRuntimeRoot<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ManagedRuntimeRoot")
+            .field("target", &self.target)
+            .finish_non_exhaustive()
+    }
+}
+
 impl<'a> ManagedRuntimeRoot<'a> {
-    pub fn from_app_paths(
-        paths: &AppPaths,
+    pub fn from_managed_root(
+        runtime_cache: &'a ManagedRuntimeCache,
         runtime_root: &'a Path,
         java_executable: &'a Path,
     ) -> Result<Self, ManagedRuntimeRootError> {
-        let classification = classify_managed_runtime_root(paths, runtime_root)
+        let classification = classify_managed_runtime_root(runtime_cache, runtime_root)
             .ok_or(ManagedRuntimeRootError::UnsupportedRoot)?;
         if !classification.allows_automatic_managed_mutation() {
             return Err(ManagedRuntimeRootError::UnsupportedRoot);
@@ -133,6 +165,7 @@ impl<'a> ManagedRuntimeRoot<'a> {
         }
 
         Ok(Self {
+            _runtime_cache: runtime_cache,
             target: classification.target,
             runtime_root,
             java_executable,
@@ -567,7 +600,13 @@ pub fn repair_managed_runtime(
 
     match request.primitive {
         ManagedRuntimeRepairPrimitive::RecreateReadyMarker => {
-            if !managed_runtime_contents_verified_without_probe(request.runtime_root.path()) {
+            if !runtime_executable_ready_without_probe(request.runtime_root.java_executable())
+                || !request
+                    .runtime_root
+                    .path()
+                    .join(".axial-runtime-manifest.json")
+                    .is_file()
+            {
                 report.facts.push(runtime_fact(
                     ExecutionFactKind::RuntimeCorrupt,
                     request.operation_id.clone(),
@@ -746,7 +785,7 @@ mod tests {
         OwnershipClass, StabilizationSystem, TargetDescriptor, TargetKind,
     };
     use crate::state::ownership::{CurrentArtifact, classify_current_artifact};
-    use axial_config::AppPaths;
+    use axial_minecraft::ManagedRuntimeCache;
     use sha1::{Digest, Sha1};
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -827,7 +866,7 @@ mod tests {
         let root = test_root("wrong-major");
         let java_path = write_fake_java(&root);
         let target =
-            classify_current_artifact(CurrentArtifact::ManagedRuntimeCache, "java_runtime_delta")
+            classify_current_artifact(CurrentArtifact::ManagedRuntimeCache, "java-runtime-delta")
                 .target;
 
         let error = probe_java_runtime_with_runner(
@@ -852,7 +891,7 @@ mod tests {
         let root = test_root("zero-major");
         let java_path = write_fake_java(&root);
         let target =
-            classify_current_artifact(CurrentArtifact::ManagedRuntimeCache, "java_runtime_delta")
+            classify_current_artifact(CurrentArtifact::ManagedRuntimeCache, "java-runtime-delta")
                 .target;
 
         let error = probe_java_runtime_with_runner(
@@ -1069,6 +1108,7 @@ mod tests {
     #[test]
     fn user_java_override_and_unknown_targets_refuse_managed_repair() {
         let root = test_root("repair-refused");
+        let runtime_cache = managed_runtime_cache();
         let user_target = classify_current_artifact(
             CurrentArtifact::UserJavaOverride,
             r"C:\Users\Alice\AppData\Local\java.exe",
@@ -1079,10 +1119,9 @@ mod tests {
                 .target;
 
         for target in [user_target, unknown_target] {
-            let paths = test_paths(&root);
-            let runtime_root = managed_runtime_root(&paths, "java_runtime_delta");
+            let runtime_root = managed_runtime_root(&runtime_cache, "java-runtime-delta");
             let java_path = runtime_root.join("bin").join("java");
-            let runtime_root = runtime_root_binding(&paths, &runtime_root, &java_path);
+            let runtime_root = runtime_root_binding(&runtime_cache, &runtime_root, &java_path);
             let error = validate_managed_runtime_repair(ManagedRuntimeRepairRequest::new(
                 target,
                 runtime_root,
@@ -1100,24 +1139,24 @@ mod tests {
     #[test]
     fn managed_runtime_repair_refuses_unsupported_target_shapes() {
         let root = test_root("repair-unsupported-target");
-        let paths = test_paths(&root);
-        let runtime_root = managed_runtime_root(&paths, "java_runtime_delta");
+        let runtime_cache = managed_runtime_cache();
+        let runtime_root = managed_runtime_root(&runtime_cache, "java-runtime-delta");
         let java_path = runtime_root.join("bin").join("java");
         for target in [
             TargetDescriptor::new(
                 StabilizationSystem::Guardian,
                 TargetKind::Runtime,
-                "java_runtime_delta",
+                "java-runtime-delta",
                 OwnershipClass::LauncherManaged,
             ),
             TargetDescriptor::new(
                 StabilizationSystem::Execution,
                 TargetKind::Artifact,
-                "java_runtime_delta",
+                "java-runtime-delta",
                 OwnershipClass::LauncherManaged,
             ),
         ] {
-            let runtime_root = runtime_root_binding(&paths, &runtime_root, &java_path);
+            let runtime_root = runtime_root_binding(&runtime_cache, &runtime_root, &java_path);
             let error = repair_managed_runtime(ManagedRuntimeRepairRequest::new(
                 target,
                 runtime_root,
@@ -1136,26 +1175,22 @@ mod tests {
     #[test]
     fn managed_runtime_repair_refuses_mismatched_root_target() {
         let root = test_root("repair-mismatched-root-target");
-        let paths = test_paths(&root);
+        let runtime_cache = managed_runtime_cache();
         let target = managed_runtime_target();
-        let runtime_root = managed_runtime_root(&paths, "different_runtime");
+        let runtime_root = managed_runtime_root(&runtime_cache, "java-runtime-epsilon");
         let java_path = runtime_root.join("bin").join("java");
-        let runtime_root = runtime_root_binding(&paths, &runtime_root, &java_path);
+        let runtime_root_binding = runtime_root_binding(&runtime_cache, &runtime_root, &java_path);
 
         let error = repair_managed_runtime(ManagedRuntimeRepairRequest::new(
             target,
-            runtime_root,
+            runtime_root_binding,
             ManagedRuntimeRepairPrimitive::RecreateReadyMarker,
         ))
         .expect_err("mismatched runtime root target should refuse repair");
 
         assert_eq!(error.kind, RuntimeCapabilityErrorKind::UnsupportedTarget);
         assert!(has_fact(&error.facts, ExecutionFactKind::PrimitiveRefused));
-        assert!(
-            !managed_runtime_root(&paths, "different_runtime")
-                .join(".axial-ready")
-                .exists()
-        );
+        assert!(!runtime_root.join(".axial-ready").exists());
         assert_no_sensitive_runtime_material(&error.facts);
         cleanup(&root);
     }
@@ -1163,8 +1198,10 @@ mod tests {
     #[test]
     fn managed_runtime_root_binding_refuses_paths_outside_owned_runtime_root() {
         let root = test_root("repair-root-binding");
-        let paths = test_paths(&root);
-        let runtime_root = managed_runtime_root(&paths, "java_runtime_delta");
+        let runtime_cache_a = managed_runtime_cache();
+        let runtime_cache_b = managed_runtime_cache();
+        let runtime_root = managed_runtime_root(&runtime_cache_a, "java-runtime-delta");
+        let other_cache_root = managed_runtime_root(&runtime_cache_b, "java-runtime-delta");
         let java_path = runtime_root.join("bin").join("java");
         let outside_root = root.join("user-runtime");
         let outside_java = root.join("other").join("bin").join("java");
@@ -1175,36 +1212,81 @@ mod tests {
             .join("java");
 
         assert_eq!(
-            ManagedRuntimeRoot::from_app_paths(&paths, &outside_root, &outside_root.join("java"))
-                .expect_err("outside root"),
+            ManagedRuntimeRoot::from_managed_root(
+                &runtime_cache_a,
+                &outside_root,
+                &outside_root.join("java"),
+            )
+            .expect_err("outside root"),
             ManagedRuntimeRootError::UnsupportedRoot
         );
         assert_eq!(
-            ManagedRuntimeRoot::from_app_paths(&paths, &runtime_root, &outside_java)
+            ManagedRuntimeRoot::from_managed_root(
+                &runtime_cache_a,
+                &other_cache_root,
+                &other_cache_root.join("bin").join("java"),
+            )
+            .expect_err("root from another managed runtime cache"),
+            ManagedRuntimeRootError::UnsupportedRoot
+        );
+        assert_eq!(
+            ManagedRuntimeRoot::from_managed_root(&runtime_cache_a, &runtime_root, &outside_java)
                 .expect_err("java outside root"),
             ManagedRuntimeRootError::JavaExecutableOutsideRoot
         );
         assert_eq!(
-            ManagedRuntimeRoot::from_app_paths(&paths, &runtime_root, &escaping_java)
+            ManagedRuntimeRoot::from_managed_root(&runtime_cache_a, &runtime_root, &escaping_java)
                 .expect_err("java with parent component"),
             ManagedRuntimeRootError::JavaExecutableOutsideRoot
         );
-        assert!(ManagedRuntimeRoot::from_app_paths(&paths, &runtime_root, &java_path).is_ok());
+        assert!(
+            ManagedRuntimeRoot::from_managed_root(&runtime_cache_a, &runtime_root, &java_path)
+                .is_ok()
+        );
         cleanup(&root);
+    }
+
+    #[test]
+    fn managed_runtime_request_debug_redacts_paths() {
+        let runtime_cache = managed_runtime_cache();
+        let runtime_root = managed_runtime_root(&runtime_cache, "java-runtime-delta");
+        let java_path = managed_runtime_java_path(&runtime_root);
+        let target = managed_runtime_target();
+        let bound = runtime_root_binding(&runtime_cache, &runtime_root, &java_path);
+        let bound_debug = format!("{bound:?}");
+        let verification_debug = format!(
+            "{:?}",
+            ManagedRuntimeVerificationRequest::new(target.clone(), &runtime_root, &java_path)
+        );
+        let repair_debug = format!(
+            "{:?}",
+            ManagedRuntimeRepairRequest::new(
+                target,
+                bound,
+                ManagedRuntimeRepairPrimitive::RecreateReadyMarker,
+            )
+        );
+        let runtime_root = runtime_root.to_string_lossy();
+        let java_path = java_path.to_string_lossy();
+
+        for debug in [bound_debug, verification_debug, repair_debug] {
+            assert!(!debug.contains(runtime_root.as_ref()));
+            assert!(!debug.contains(java_path.as_ref()));
+        }
     }
 
     #[test]
     fn managed_runtime_repair_recreates_ready_marker() {
         let root = test_root("repair-ready-marker");
-        let paths = test_paths(&root);
-        let runtime_root_path = managed_runtime_root(&paths, "java_runtime_delta");
+        let runtime_cache = managed_runtime_cache();
+        let runtime_root_path = managed_runtime_root(&runtime_cache, "java-runtime-delta");
         let java_path = managed_runtime_java_path(&runtime_root_path);
         fs::create_dir_all(java_path.parent().expect("java parent")).expect("runtime bin");
         fs::write(&java_path, b"java").expect("fake java");
         make_executable(&java_path);
         write_runtime_manifest_proof(&runtime_root_path, &java_path);
         fs::create_dir_all(runtime_root_path.join(".axial-ready")).expect("bad marker dir");
-        let runtime_root = runtime_root_binding(&paths, &runtime_root_path, &java_path);
+        let runtime_root = runtime_root_binding(&runtime_cache, &runtime_root_path, &java_path);
 
         let report = repair_managed_runtime(ManagedRuntimeRepairRequest::new(
             managed_runtime_target(),
@@ -1225,10 +1307,10 @@ mod tests {
     #[test]
     fn managed_runtime_repair_fails_when_postcondition_is_unverified() {
         let root = test_root("repair-postcondition-failed");
-        let paths = test_paths(&root);
-        let runtime_root = managed_runtime_root(&paths, "java_runtime_delta");
+        let runtime_cache = managed_runtime_cache();
+        let runtime_root = managed_runtime_root(&runtime_cache, "java-runtime-delta");
         let java_path = runtime_root.join("bin").join("java");
-        let runtime_root_binding = runtime_root_binding(&paths, &runtime_root, &java_path);
+        let runtime_root_binding = runtime_root_binding(&runtime_cache, &runtime_root, &java_path);
 
         let error = repair_managed_runtime(ManagedRuntimeRepairRequest::new(
             managed_runtime_target(),
@@ -1331,7 +1413,7 @@ mod tests {
         TargetDescriptor::new(
             StabilizationSystem::Execution,
             TargetKind::Runtime,
-            "java_runtime_delta",
+            "java-runtime-delta",
             OwnershipClass::LauncherManaged,
         )
     }
@@ -1415,27 +1497,22 @@ mod tests {
     #[cfg(not(unix))]
     fn make_executable(_path: &Path) {}
 
-    fn test_paths(root: &Path) -> AppPaths {
-        AppPaths {
-            config_file: root.join("config").join("config.json"),
-            instances_file: root.join("config").join("instances.json"),
-            instances_dir: root.join("instances"),
-            music_dir: root.join("music"),
-            library_dir: root.join("library"),
-            config_dir: root.join("config"),
-        }
+    fn managed_runtime_cache() -> ManagedRuntimeCache {
+        ManagedRuntimeCache::isolated_for_test().expect("isolated managed runtime cache")
     }
 
-    fn managed_runtime_root(paths: &AppPaths, runtime_id: &str) -> PathBuf {
-        paths.library_dir.join("runtime").join(runtime_id)
+    fn managed_runtime_root(runtime_cache: &ManagedRuntimeCache, runtime_id: &str) -> PathBuf {
+        runtime_cache
+            .component_root(runtime_id)
+            .expect("known managed runtime component")
     }
 
     fn runtime_root_binding<'a>(
-        paths: &AppPaths,
+        runtime_cache: &'a ManagedRuntimeCache,
         runtime_root: &'a Path,
         java_path: &'a Path,
     ) -> ManagedRuntimeRoot<'a> {
-        ManagedRuntimeRoot::from_app_paths(paths, runtime_root, java_path)
+        ManagedRuntimeRoot::from_managed_root(runtime_cache, runtime_root, java_path)
             .expect("managed runtime root binding")
     }
 

@@ -4,6 +4,7 @@
   "artifact_checksum_mismatch",
   "artifact_missing",
   "artifact_quarantined",
+  "artifact_size_drift",
   "artifact_size_mismatch",
   "asset_index_missing",
   "atomic_promotion_completed",

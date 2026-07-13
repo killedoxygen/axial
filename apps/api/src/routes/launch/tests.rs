@@ -3667,29 +3667,64 @@ impl RouteTestFixture {
     }
 
     fn write_ready_runtime(&self, component: &str) {
-        let runtime_bin = self
-            .paths
-            .library_dir
-            .join("runtime")
-            .join(component)
-            .join("bin");
-        std::fs::create_dir_all(&runtime_bin).expect("runtime bin");
-        let java_name = if cfg!(target_os = "windows") {
-            "javaw.exe"
+        let runtime_root = self
+            .state
+            .managed_runtime_cache()
+            .component_root(component)
+            .expect("runtime root");
+        let java_path = if cfg!(target_os = "windows") {
+            runtime_root.join("bin").join("javaw.exe")
+        } else if cfg!(target_os = "macos") {
+            runtime_root
+                .join("jre.bundle")
+                .join("Contents")
+                .join("Home")
+                .join("bin")
+                .join("java")
         } else {
-            "java"
+            runtime_root.join("bin").join("java")
         };
-        let java_path = runtime_bin.join(java_name);
+        std::fs::create_dir_all(java_path.parent().expect("runtime bin")).expect("runtime bin");
         std::fs::write(&java_path, b"java").expect("runtime java");
         make_executable(&java_path);
+        std::fs::write(runtime_root.join(".axial-runtime-manifest.json"), b"{}")
+            .expect("runtime proof");
+        std::fs::write(runtime_root.join(".axial-ready"), b"ready").expect("runtime ready marker");
     }
 
     fn add_instance(&self, name: &str, version_id: &str) -> String {
-        self.state
+        let instance = self
+            .state
             .instances()
             .insert_for_test(name.to_string(), version_id.to_string())
-            .expect("add instance")
-            .id
+            .expect("add instance");
+        let version_dir = self.paths.library_dir.join("versions").join(version_id);
+        let json = version_dir.join(format!("{version_id}.json"));
+        let jar = version_dir.join(format!("{version_id}.jar"));
+        if let (Ok(json), Ok(jar)) = (std::fs::metadata(json), std::fs::metadata(jar)) {
+            use axial_minecraft::known_good::{
+                KnownGoodArtifactKind, KnownGoodInventory, TestKnownGoodEntry,
+                TestKnownGoodIntegrity, TestKnownGoodRoot,
+            };
+            let inventory = KnownGoodInventory::from_test_entries([
+                TestKnownGoodEntry {
+                    root: TestKnownGoodRoot::Versions,
+                    path: format!("{version_id}/{version_id}.json"),
+                    kind: KnownGoodArtifactKind::VersionMetadata,
+                    integrity: TestKnownGoodIntegrity::File { size: json.len() },
+                },
+                TestKnownGoodEntry {
+                    root: TestKnownGoodRoot::Versions,
+                    path: format!("{version_id}/{version_id}.jar"),
+                    kind: KnownGoodArtifactKind::ClientJar,
+                    integrity: TestKnownGoodIntegrity::File { size: jar.len() },
+                },
+            ])
+            .expect("ready version inventory");
+            self.state
+                .activate_known_good_inventory_for_test(&instance.id, inventory);
+        }
+        instance.id
     }
 
     fn update_instance(&self, id: &str, update: impl FnOnce(&mut axial_config::Instance)) {

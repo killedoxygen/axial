@@ -1029,14 +1029,16 @@ fn process_kill_and_watchdog_fields_preserve_exact_lifecycle_meaning() {
 
 #[test]
 fn runtime_missing_executable_preserves_managed_and_user_owned_branches() {
-    for (ownership, expected) in [
+    for (ownership, expected, expected_severity) in [
         (
             OwnershipClass::LauncherManaged,
             GuardianFactId::ManagedRuntimeMissing,
+            Some(GuardianSeverity::Recoverable),
         ),
         (
             OwnershipClass::UserOwned,
             GuardianFactId::JavaOverrideMissing,
+            None,
         ),
     ] {
         let fact = guardian_fact_from_execution(
@@ -1049,6 +1051,7 @@ fn runtime_missing_executable_preserves_managed_and_user_owned_branches() {
             OperationPhase::Validating,
         );
         assert_eq!(fact.id, expected);
+        assert_eq!(fact.severity, expected_severity);
     }
 }
 

@@ -15,12 +15,10 @@ use crate::observability::telemetry::{
     TelemetryErrorArea, TelemetryErrorKind, TelemetryErrorLevel, TelemetryEvent,
 };
 use crate::state::contracts::OperationPhase;
-use crate::state::{AppState, OperationJournalStoreError};
-use axial_config::{AppPaths, Instance};
+use crate::state::{AppState, InstanceLifecycleLease, OperationJournalStoreError};
+use axial_config::Instance;
 use axial_launcher::GuardianMode;
-use axial_minecraft::{
-    managed_runtime_contents_verified_without_probe, preferred_runtime_component, resolve_version,
-};
+use axial_minecraft::{ManagedRuntimeCache, preferred_runtime_component, resolve_version};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -59,6 +57,7 @@ impl Drop for RuntimeRepairRequestGuard {
 }
 
 pub(super) struct ManagedRuntimeRepairLaunch<'a> {
+    pub(super) instance_lifecycle: &'a InstanceLifecycleLease,
     pub(super) instance: &'a Instance,
     pub(super) library_dir: &'a Path,
     pub(super) game_dir: &'a Path,
@@ -79,14 +78,14 @@ pub(super) async fn maybe_repair_managed_runtime_before_launch_owned(
     }
 
     let Some(candidate) = managed_runtime_ready_marker_repair_candidate(
-        state.config().paths(),
+        state.managed_runtime_cache(),
         launch.library_dir,
         launch.instance,
     ) else {
         return Ok(preflight);
     };
-    let Ok(runtime_root) = ManagedRuntimeRoot::from_app_paths(
-        state.config().paths(),
+    let Ok(runtime_root) = ManagedRuntimeRoot::from_managed_root(
+        state.managed_runtime_cache(),
         &candidate.runtime_root,
         &candidate.java_executable,
     ) else {
@@ -128,8 +127,8 @@ pub(super) async fn maybe_repair_managed_runtime_before_launch_owned(
     let (ready_tx, mut ready_rx) = tokio::sync::oneshot::channel();
     let (result_tx, result_rx) = tokio::sync::oneshot::channel();
     producer.spawn_child(async move {
-        let result = match ManagedRuntimeRoot::from_app_paths(
-            state_task.config().paths(),
+        let result = match ManagedRuntimeRoot::from_managed_root(
+            state_task.managed_runtime_cache(),
             &runtime_root_path,
             &java_executable,
         ) {
@@ -221,6 +220,7 @@ pub(super) async fn maybe_repair_managed_runtime_before_launch_owned(
                 state,
                 producer,
                 LaunchPreflightBuild {
+                    instance_lifecycle: launch.instance_lifecycle,
                     instance: launch.instance,
                     config: &preflight.config,
                     library_dir: launch.library_dir,
@@ -252,20 +252,18 @@ struct ManagedRuntimeRepairCandidate {
 }
 
 fn managed_runtime_ready_marker_repair_candidate(
-    paths: &AppPaths,
+    runtime_cache: &ManagedRuntimeCache,
     library_dir: &Path,
     instance: &Instance,
 ) -> Option<ManagedRuntimeRepairCandidate> {
     let version = resolve_version(library_dir, &instance.version_id).ok()?;
     let component = preferred_runtime_component(&version.java_version);
-    let runtime_root = paths.config_dir.join("runtimes").join(component);
+    let runtime_root = runtime_cache.component_root(&component)?;
     if !runtime_root.exists() {
         return None;
     }
     let java_executable = managed_runtime_java_executable(&runtime_root);
-    if runtime_root.join(".axial-ready").is_file()
-        && managed_runtime_contents_verified_without_probe(&runtime_root)
-    {
+    if runtime_root.join(".axial-ready").is_file() {
         return None;
     }
     Some(ManagedRuntimeRepairCandidate {

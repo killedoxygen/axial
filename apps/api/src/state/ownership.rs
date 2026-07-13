@@ -7,7 +7,8 @@ use super::contracts::{
     OwnershipClass, StabilizationSystem, TargetDescriptor, TargetKind, sanitize_target_id,
 };
 use axial_config::AppPaths;
-use std::path::{Component, Path};
+use axial_minecraft::ManagedRuntimeCache;
+use std::path::Path;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum OwnershipProtection {
@@ -204,7 +205,11 @@ pub fn classify_current_artifact(
     ))
 }
 
-pub fn classify_app_path(paths: &AppPaths, path: &Path) -> OwnershipClassification {
+pub fn classify_app_path(
+    paths: &AppPaths,
+    runtime_cache: &ManagedRuntimeCache,
+    path: &Path,
+) -> OwnershipClassification {
     if path == paths.config_file.as_path() {
         return classify_current_artifact(CurrentArtifact::LauncherConfigFile, "");
     }
@@ -214,14 +219,8 @@ pub fn classify_app_path(paths: &AppPaths, path: &Path) -> OwnershipClassificati
     if path == paths.library_dir.as_path() {
         return classify_current_artifact(CurrentArtifact::ManagedLibraryRoot, "");
     }
-    if let Some(classification) = classify_managed_runtime_root(paths, path) {
-        return classification;
-    }
-    if path.starts_with(paths.library_dir.join("runtime")) {
-        return classify_current_artifact(CurrentArtifact::ManagedRuntimeCache, "");
-    }
-    if path.starts_with(paths.config_dir.join("runtimes")) {
-        return classify_current_artifact(CurrentArtifact::ManagedRuntimeCache, "");
+    if let Some(component) = runtime_cache.component_for_path(path) {
+        return classify_current_artifact(CurrentArtifact::ManagedRuntimeCache, component);
     }
     if path.starts_with(&paths.music_dir) {
         return classify_current_artifact(CurrentArtifact::MusicCacheFile, "music_cache_file");
@@ -249,28 +248,12 @@ pub fn classify_app_path(paths: &AppPaths, path: &Path) -> OwnershipClassificati
 }
 
 pub fn classify_managed_runtime_root(
-    paths: &AppPaths,
+    runtime_cache: &ManagedRuntimeCache,
     runtime_root: &Path,
 ) -> Option<OwnershipClassification> {
-    for runtime_dir in [
-        paths.library_dir.join("runtime"),
-        paths.config_dir.join("runtimes"),
-    ] {
-        let Ok(relative) = runtime_root.strip_prefix(runtime_dir) else {
-            continue;
-        };
-        let mut components = relative.components();
-        let runtime_id = match (components.next(), components.next()) {
-            (Some(Component::Normal(runtime_id)), None) => runtime_id.to_string_lossy(),
-            _ => continue,
-        };
-
-        return Some(classify_current_artifact(
-            CurrentArtifact::ManagedRuntimeCache,
-            runtime_id,
-        ));
-    }
-    None
+    runtime_cache
+        .component_for_root(runtime_root)
+        .map(|component| classify_current_artifact(CurrentArtifact::ManagedRuntimeCache, component))
 }
 
 #[cfg(test)]
@@ -281,6 +264,7 @@ mod tests {
     };
     use crate::state::contracts::{OwnershipClass, StabilizationSystem, TargetKind};
     use axial_config::AppPaths;
+    use axial_minecraft::ManagedRuntimeCache;
     use std::path::PathBuf;
 
     #[test]
@@ -332,6 +316,7 @@ mod tests {
 
     #[test]
     fn app_path_classifier_uses_safe_ids_and_protects_unknown_instance_paths() {
+        let runtime_cache = ManagedRuntimeCache::isolated_for_test().expect("runtime cache");
         let root = PathBuf::from("/tmp/axial-test");
         let paths = AppPaths {
             config_file: root.join("config").join("config.json"),
@@ -342,44 +327,31 @@ mod tests {
             config_dir: root.join("config"),
         };
 
-        let config = classify_app_path(&paths, &paths.config_file);
+        let config = classify_app_path(&paths, &runtime_cache, &paths.config_file);
         assert_eq!(config.target.ownership, OwnershipClass::LauncherManaged);
         assert_eq!(config.target.id, "launcher_config");
         assert!(config.allows_automatic_managed_mutation());
 
-        let runtime = classify_app_path(
-            &paths,
-            &paths.library_dir.join("runtime").join("java_runtime_21"),
-        );
+        let runtime_path = runtime_cache
+            .component_root("java-runtime-delta")
+            .expect("runtime root");
+        let runtime = classify_app_path(&paths, &runtime_cache, &runtime_path);
         assert_eq!(runtime.target.system, StabilizationSystem::Execution);
         assert_eq!(runtime.target.kind, TargetKind::Runtime);
         assert_eq!(runtime.target.ownership, OwnershipClass::LauncherManaged);
-        assert_eq!(runtime.target.id, "java_runtime_21");
+        assert_eq!(runtime.target.id, "java-runtime-delta");
         assert!(!runtime.target.id.contains('/'));
 
         let runtime_child = classify_app_path(
             &paths,
-            &paths
-                .library_dir
-                .join("runtime")
-                .join("java_runtime_21")
-                .join("bin")
-                .join("java"),
+            &runtime_cache,
+            &runtime_path.join("bin").join("java"),
         );
-        assert_eq!(runtime_child.target.id, "managed_runtime_cache");
+        assert_eq!(runtime_child.target.id, "java-runtime-delta");
 
-        let runtime_root = super::classify_managed_runtime_root(
-            &paths,
-            &paths.library_dir.join("runtime").join("java_runtime_21"),
-        )
-        .expect("managed runtime root");
-        assert_eq!(runtime_root.target.id, "java_runtime_21");
-
-        let global_runtime_root = super::classify_managed_runtime_root(
-            &paths,
-            &paths.config_dir.join("runtimes").join("java_runtime_21"),
-        )
-        .expect("global managed runtime root");
+        let global_runtime_root =
+            super::classify_managed_runtime_root(&runtime_cache, &runtime_path)
+                .expect("managed runtime root");
         assert_eq!(
             global_runtime_root.target.system,
             StabilizationSystem::Execution
@@ -389,29 +361,16 @@ mod tests {
             global_runtime_root.target.ownership,
             OwnershipClass::LauncherManaged
         );
-        assert_eq!(global_runtime_root.target.id, "java_runtime_21");
+        assert_eq!(global_runtime_root.target.id, "java-runtime-delta");
 
         assert!(
-            super::classify_managed_runtime_root(&paths, &paths.library_dir.join("runtime"))
-                .is_none()
+            super::classify_managed_runtime_root(&runtime_cache, runtime_cache.root()).is_none()
         );
         assert!(
-            super::classify_managed_runtime_root(&paths, &paths.config_dir.join("runtimes"))
+            super::classify_managed_runtime_root(&runtime_cache, &runtime_path.join("bin"))
                 .is_none()
         );
-        assert!(
-            super::classify_managed_runtime_root(
-                &paths,
-                &paths
-                    .library_dir
-                    .join("runtime")
-                    .join("java_runtime_21")
-                    .join("bin")
-            )
-            .is_none()
-        );
-
-        let music = classify_app_path(&paths, &paths.music_dir.join("track.mp3"));
+        let music = classify_app_path(&paths, &runtime_cache, &paths.music_dir.join("track.mp3"));
         assert_eq!(music.target.system, StabilizationSystem::Execution);
         assert_eq!(music.target.ownership, OwnershipClass::LauncherManaged);
         assert_eq!(music.target.id, "music_cache_file");
@@ -419,6 +378,7 @@ mod tests {
 
         let driver_status = classify_app_path(
             &paths,
+            &runtime_cache,
             &paths
                 .config_dir
                 .join("benchmarks")
@@ -435,6 +395,7 @@ mod tests {
 
         let suite_manifest = classify_app_path(
             &paths,
+            &runtime_cache,
             &paths
                 .config_dir
                 .join("benchmarks")
@@ -452,6 +413,7 @@ mod tests {
 
         let instance_path = classify_app_path(
             &paths,
+            &runtime_cache,
             &paths
                 .instances_dir
                 .join("example-instance")

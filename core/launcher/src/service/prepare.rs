@@ -8,7 +8,7 @@ use crate::jvm::{boot_throttle_args, gc_preset_args, recommended_preset};
 use crate::runtime::RuntimeSelection;
 use crate::types::LaunchFailureClass;
 use axial_minecraft::{
-    JavaRuntimeInfo, JavaRuntimeProbeReceipt, JavaVersion, RuntimeEnsureEvent,
+    JavaRuntimeInfo, JavaRuntimeProbeReceipt, JavaVersion, ManagedRuntimeCache, RuntimeEnsureEvent,
     ensure_runtime_with_events, resolve_version,
 };
 use std::time::Instant;
@@ -23,6 +23,7 @@ pub enum LaunchPreparationEvent {
 }
 
 pub async fn prepare_launch_attempt_with_events<F>(
+    runtime_cache: &ManagedRuntimeCache,
     intent: &LaunchIntent,
     attempt: &AttemptOverrides,
     probe_receipt: Option<&JavaRuntimeProbeReceipt>,
@@ -47,7 +48,7 @@ where
     let runtime_started_at = Instant::now();
     observer(LaunchPreparationEvent::EnsuringRuntime);
     let ensured_runtime = ensure_runtime_with_events(
-        &intent.library_dir,
+        runtime_cache,
         &version.java_version,
         &intent.requested_java,
         attempt.force_managed_runtime,
@@ -96,7 +97,7 @@ where
         });
     }
 
-    let mut runtime = runtime_selection_from_ensure(&intent.requested_java, ensured_runtime);
+    let mut runtime = runtime_selection_from_ensure(ensured_runtime);
     sanitize_effective_runtime_major(&mut runtime, &version.java_version);
 
     observer(LaunchPreparationEvent::Validating);
@@ -284,38 +285,12 @@ fn launch_auth_mode_for_context(intent: &LaunchIntent) -> &'static str {
 }
 
 fn runtime_selection_from_ensure(
-    requested_java: &str,
     ensured: axial_minecraft::RuntimeEnsureResult,
 ) -> RuntimeSelection {
-    let selected = ensured
-        .requested
-        .clone()
-        .unwrap_or_else(|| ensured.effective.clone());
-    let selected_path = if requested_java.trim().is_empty() {
-        String::new()
-    } else {
-        selected.java_path.clone()
-    };
-    let selected_info = if requested_java.trim().is_empty() {
-        JavaRuntimeInfo {
-            id: String::new(),
-            major: 0,
-            update: 0,
-            distribution: "unknown".to_string(),
-            path: String::new(),
-        }
-    } else {
-        selected.info.clone()
-    };
-
     RuntimeSelection {
-        requested_path: requested_java.trim().to_string(),
-        selected_path,
-        selected_info,
         effective_path: ensured.effective.java_path.clone(),
         effective_info: ensured.effective.info.clone(),
         effective_source: ensured.effective.source.as_str().to_string(),
-        bypassed_requested_runtime: ensured.bypassed_requested_runtime,
     }
 }
 
@@ -345,6 +320,7 @@ mod tests {
     #[tokio::test]
     async fn prepare_representative_fabric_launch_plans_without_spawning_java() {
         let root = unique_temp_root("axial-prepare-fabric-gate");
+        let runtime_cache = isolated_runtime_cache();
         let library_dir = root.join("library");
         let instance_root = root.join("instances");
         let fake_java = write_fake_java(&root);
@@ -402,6 +378,7 @@ mod tests {
             };
 
             let prepared = prepare_launch_attempt_with_events(
+                &runtime_cache,
                 &intent,
                 &AttemptOverrides::default(),
                 None,
@@ -477,6 +454,7 @@ mod tests {
     #[tokio::test]
     async fn prepare_launch_attempt_uses_offline_auth_context_from_intent_username() {
         let root = unique_temp_root("axial-prepare-auth-test");
+        let runtime_cache = isolated_runtime_cache();
         let library_dir = root.join("library");
         let game_dir = root.join("instances").join("auth-test");
         let fake_java = write_fake_java(&root);
@@ -540,10 +518,15 @@ mod tests {
             performance_mode: "managed".to_string(),
         };
 
-        let prepared =
-            prepare_launch_attempt_with_events(&intent, &AttemptOverrides::default(), None, |_| {})
-                .await
-                .expect("prepared launch");
+        let prepared = prepare_launch_attempt_with_events(
+            &runtime_cache,
+            &intent,
+            &AttemptOverrides::default(),
+            None,
+            |_| {},
+        )
+        .await
+        .expect("prepared launch");
 
         assert_arg_value(&prepared.plan.game_args, "--username", "Player");
         assert_arg_value(
@@ -560,6 +543,7 @@ mod tests {
     #[tokio::test]
     async fn custom_explicit_unsupported_named_preset_is_preserved_for_guardian_startup_handling() {
         let root = unique_temp_root("axial-prepare-custom-preset-block-test");
+        let runtime_cache = isolated_runtime_cache();
         let library_dir = root.join("library");
         let game_dir = root.join("instances").join("custom-preset-block-test");
         let fake_java = write_fake_openj9_java(&root);
@@ -616,10 +600,15 @@ mod tests {
             performance_mode: "managed".to_string(),
         };
 
-        let prepared =
-            prepare_launch_attempt_with_events(&intent, &AttemptOverrides::default(), None, |_| {})
-                .await
-                .expect("core preparation preserves explicit Custom preset intent");
+        let prepared = prepare_launch_attempt_with_events(
+            &runtime_cache,
+            &intent,
+            &AttemptOverrides::default(),
+            None,
+            |_| {},
+        )
+        .await
+        .expect("core preparation preserves explicit Custom preset intent");
 
         assert_eq!(prepared.effective_preset, crate::jvm::PRESET_SMOOTH);
         assert!(
@@ -636,6 +625,7 @@ mod tests {
     #[tokio::test]
     async fn prepare_launch_attempt_uses_explicit_online_auth_context() {
         let root = unique_temp_root("axial-prepare-online-auth-test");
+        let runtime_cache = isolated_runtime_cache();
         let library_dir = root.join("library");
         let game_dir = root.join("instances").join("online-auth-test");
         let fake_java = write_fake_java(&root);
@@ -706,10 +696,15 @@ mod tests {
             performance_mode: "managed".to_string(),
         };
 
-        let prepared =
-            prepare_launch_attempt_with_events(&intent, &AttemptOverrides::default(), None, |_| {})
-                .await
-                .expect("prepared launch");
+        let prepared = prepare_launch_attempt_with_events(
+            &runtime_cache,
+            &intent,
+            &AttemptOverrides::default(),
+            None,
+            |_| {},
+        )
+        .await
+        .expect("prepared launch");
 
         assert_arg_value(&prepared.plan.game_args, "--username", "ProfileName");
         assert_arg_value(
@@ -730,6 +725,7 @@ mod tests {
     #[tokio::test]
     async fn prepare_launch_attempt_with_events_observes_staged_preparation() {
         let root = unique_temp_root("axial-prepare-runtime-event-test");
+        let runtime_cache = isolated_runtime_cache();
         let library_dir = root.join("library");
         let game_dir = root.join("instances").join("runtime-event-test");
         let fake_java = write_fake_java(&root);
@@ -786,6 +782,7 @@ mod tests {
         let mut events = Vec::new();
 
         let prepared = prepare_launch_attempt_with_events(
+            &runtime_cache,
             &intent,
             &AttemptOverrides::default(),
             None,
@@ -814,6 +811,7 @@ mod tests {
     #[tokio::test]
     async fn preflight_receipt_reuses_java_info_without_a_second_probe_spawn() {
         let root = unique_temp_root("axial-prepare-java-receipt-reuse");
+        let runtime_cache = isolated_runtime_cache();
         let counter = root.join("probe-count");
         let java_path = root.join("fake-java").join("bin").join("java");
         write_counting_java(&java_path, &counter, 21);
@@ -822,6 +820,7 @@ mod tests {
             .expect("preflight Java receipt");
 
         let prepared = prepare_launch_attempt_with_events(
+            &runtime_cache,
             &intent,
             &AttemptOverrides::default(),
             Some(&receipt),
@@ -843,6 +842,7 @@ mod tests {
     #[tokio::test]
     async fn replaced_java_invalidates_receipt_and_fails_before_launch_planning() {
         let root = unique_temp_root("axial-prepare-java-receipt-replacement");
+        let runtime_cache = isolated_runtime_cache();
         let counter = root.join("probe-count");
         let java_path = root.join("fake-java").join("bin").join("java");
         write_counting_java(&java_path, &counter, 21);
@@ -854,6 +854,7 @@ mod tests {
         fs::rename(&replacement, &java_path).expect("replace Java executable");
 
         let error = prepare_launch_attempt_with_events(
+            &runtime_cache,
             &intent,
             &AttemptOverrides::default(),
             Some(&receipt),
@@ -885,6 +886,7 @@ mod tests {
                 .expect("time")
                 .as_nanos()
         ));
+        let runtime_cache = isolated_runtime_cache();
         let counter = root.join("probe-count");
         let java_path = root.join("fake-java").join("bin").join("java");
         write_counting_java(&java_path, &counter, 21);
@@ -896,6 +898,7 @@ mod tests {
             .expect("relative Java receipt");
 
         let prepared = prepare_launch_attempt_with_events(
+            &runtime_cache,
             &intent,
             &AttemptOverrides::default(),
             Some(&receipt),
@@ -922,6 +925,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt as _;
 
         let root = unique_temp_root("axial-prepare-java-receipt-permission");
+        let runtime_cache = isolated_runtime_cache();
         let counter = root.join("probe-count");
         let java_path = root.join("fake-java").join("bin").join("java");
         write_counting_java(&java_path, &counter, 21);
@@ -935,6 +939,7 @@ mod tests {
         fs::set_permissions(&java_path, permissions).expect("remove execute permission");
 
         let error = prepare_launch_attempt_with_events(
+            &runtime_cache,
             &intent,
             &AttemptOverrides::default(),
             Some(&receipt),
@@ -1001,6 +1006,10 @@ mod tests {
                 .expect("time")
                 .as_nanos()
         ))
+    }
+
+    fn isolated_runtime_cache() -> ManagedRuntimeCache {
+        ManagedRuntimeCache::isolated_for_test().expect("isolated managed runtime cache")
     }
 
     fn write_fake_java(root: &Path) -> PathBuf {

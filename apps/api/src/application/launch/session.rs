@@ -20,6 +20,7 @@ use crate::application::{
     LaunchInstanceCommand, LaunchInstanceStaging, flush_pending_saved_skin_applies_for_launch,
     launch_preflight_stage_evidence, stage_launch_instance_command,
 };
+use crate::execution::integrity::{IntegrityTier0Report, sense_integrity_tier0};
 use crate::guardian::{
     GuardianActionKind as ApiGuardianActionKind, GuardianDirective, GuardianFact,
     GuardianLaunchAdmission, GuardianLaunchFailureMemoryIntakeRequest,
@@ -31,22 +32,25 @@ use crate::guardian::{
 use crate::logging::timestamp_utc;
 use crate::state::contracts::OperationPhase;
 use crate::state::launch_reports::{LaunchBenchmarkMetadata, LaunchProofResourceBudget};
-use crate::state::{AppState, LaunchSessionRecord, ensure_instance_layout};
+use crate::state::{AppState, InstanceLifecycleLease, LaunchSessionRecord, ensure_instance_layout};
 use auth::{LaunchAuthRefreshOptions, resolve_launch_auth_context};
 use axial_config::{AppConfig, Instance};
 use axial_launcher::{
     GuardianMode, LaunchGuardianContext, LaunchIntent, LaunchReadiness, LaunchReadinessReason,
     LaunchReadinessReasonId, LaunchReadinessRequest, LaunchReadinessSeverity, LaunchStageEvidence,
-    LaunchState, inspect_launch_readiness,
+    LaunchState, inspect_launch_readiness_structural,
 };
-use axial_minecraft::{JavaRuntimeProbeReceipt, VersionScanState};
+use axial_minecraft::known_good::LaunchTier0RuntimeSelection;
+use axial_minecraft::{
+    JavaRuntimeProbeReceipt, RuntimeOverride, VersionScanState, parse_runtime_override,
+};
 use axum::{Json, http::StatusCode};
 use overrides::{
     inspect_explicit_java_override, inspect_explicit_jvm_args, preflight_override_signals,
 };
-use readiness::readiness_guardian_facts;
 #[cfg(test)]
 use readiness::readiness_has_managed_runtime_missing;
+use readiness::{append_integrity_readiness_reasons, readiness_guardian_facts};
 use resources::{
     ActiveLaunchResourceUse, LaunchMemoryEvidence, capture_launch_cpu_load_evidence,
     capture_launch_disk_evidence, capture_launch_memory_evidence, capture_resource_budget_snapshot,
@@ -230,6 +234,7 @@ async fn prepare_launch_session_with_auth_refresh(
         state,
         producer,
         LaunchPreflightBuild {
+            instance_lifecycle: &instance_lifecycle,
             instance: &instance,
             config: &config,
             library_dir: &library_dir,
@@ -247,6 +252,7 @@ async fn prepare_launch_session_with_auth_refresh(
         producer,
         preflight,
         ManagedRuntimeRepairLaunch {
+            instance_lifecycle: &instance_lifecycle,
             instance: &instance,
             library_dir: &library_dir,
             game_dir: &game_dir,
@@ -500,7 +506,7 @@ async fn prepare_launch_preflight_with_memory_capture(
         )
     })?;
     let library_dir = PathBuf::from(library_dir);
-    let _instance_lifecycle = state.acquire_instance_lifecycle(&instance_id).await;
+    let instance_lifecycle = state.acquire_instance_lifecycle(&instance_id).await;
 
     let instance = state.instances().get(&instance_id).ok_or_else(|| {
         (
@@ -514,6 +520,7 @@ async fn prepare_launch_preflight_with_memory_capture(
         state,
         &producer,
         LaunchPreflightBuild {
+            instance_lifecycle: &instance_lifecycle,
             instance: &instance,
             config: &config,
             library_dir: &library_dir,
@@ -540,6 +547,7 @@ async fn prepare_launch_preflight_with_memory_capture(
 }
 
 struct LaunchPreflightBuild<'a> {
+    instance_lifecycle: &'a InstanceLifecycleLease,
     instance: &'a Instance,
     config: &'a AppConfig,
     library_dir: &'a Path,
@@ -572,6 +580,7 @@ async fn build_launch_preflight_facts_with_memory_capture(
     capture_memory: impl FnOnce() -> LaunchMemoryEvidence,
 ) -> LaunchPreflightFacts {
     let LaunchPreflightBuild {
+        instance_lifecycle,
         instance,
         config,
         library_dir,
@@ -648,6 +657,12 @@ async fn build_launch_preflight_facts_with_memory_capture(
     );
     let mut requested_java = policy::selected_java_override(instance, config);
     let requested_preset = policy::selected_jvm_preset(instance, config);
+    let guardian = LaunchGuardianContext {
+        mode: policy::selected_guardian_mode(config),
+        java_override_origin: policy::java_override_origin(instance, config),
+        preset_override_origin: policy::preset_override_origin(instance, config),
+        raw_jvm_args_origin: policy::raw_jvm_args_origin(instance),
+    };
     let required_java_major = version_record
         .and_then(|version| (version.java_major > 0).then_some(version.java_major as u32));
     let overrides_started_at = Instant::now();
@@ -683,16 +698,30 @@ async fn build_launch_preflight_facts_with_memory_capture(
     let mut extra_jvm_args = jvm_args_inspection.args;
     execution_facts.extend(jvm_args_inspection.facts.iter().cloned());
     let overrides_elapsed = overrides_started_at.elapsed();
+    let integrity_started_at = Instant::now();
+    let requested_runtime = parse_runtime_override(&requested_java);
+    let runtime_selection = if guardian.mode == GuardianMode::Custom {
+        match &requested_runtime {
+            RuntimeOverride::Component(component) => {
+                LaunchTier0RuntimeSelection::ManagedComponent(component.0.as_str())
+            }
+            RuntimeOverride::ExecutablePath(_) => LaunchTier0RuntimeSelection::ExternalExecutable,
+            RuntimeOverride::None => LaunchTier0RuntimeSelection::PreferredManaged,
+        }
+    } else {
+        LaunchTier0RuntimeSelection::PreferredManaged
+    };
+    let (integrity_report, integrity_authority_unavailable) =
+        match sense_integrity_tier0(state, instance_lifecycle, library_dir, runtime_selection) {
+            Ok(report) => (report, false),
+            Err(_) => (IntegrityTier0Report::default(), true),
+        };
+    let integrity_elapsed = integrity_started_at.elapsed();
+    execution_facts.extend(integrity_report.facts.iter().cloned());
     let mut guardian_facts = execution_facts
         .iter()
         .map(|fact| guardian_fact_from_execution(fact, OperationPhase::Validating))
         .collect::<Vec<_>>();
-    let guardian = LaunchGuardianContext {
-        mode: policy::selected_guardian_mode(config),
-        java_override_origin: policy::java_override_origin(instance, config),
-        preset_override_origin: policy::preset_override_origin(instance, config),
-        raw_jvm_args_origin: policy::raw_jvm_args_origin(instance),
-    };
     let performance_mode = policy::selected_performance_mode(instance, config);
     let resources_started_at = Instant::now();
     let resource_budget = capture_resource_budget_snapshot(
@@ -734,7 +763,7 @@ async fn build_launch_preflight_facts_with_memory_capture(
         },
     ));
     let readiness_started_at = Instant::now();
-    let readiness = if version_scan_degraded {
+    let mut readiness = if version_scan_degraded {
         LaunchReadiness {
             launchable: false,
             reasons: vec![LaunchReadinessReason {
@@ -744,23 +773,41 @@ async fn build_launch_preflight_facts_with_memory_capture(
             }],
         }
     } else {
-        inspect_launch_readiness(&LaunchReadinessRequest {
-            library_dir: library_dir.to_path_buf(),
-            version_id: instance.version_id.clone(),
-            requested_java: requested_java.clone(),
-            guardian_mode: guardian.mode,
-        })
+        inspect_launch_readiness_structural(
+            state.managed_runtime_cache(),
+            &LaunchReadinessRequest {
+                library_dir: library_dir.to_path_buf(),
+                version_id: instance.version_id.clone(),
+                requested_java: requested_java.clone(),
+                guardian_mode: guardian.mode,
+            },
+        )
     };
+    if integrity_authority_unavailable && readiness.launchable {
+        readiness.reasons.push(LaunchReadinessReason {
+            id: LaunchReadinessReasonId::IncompleteInstall,
+            severity: LaunchReadinessSeverity::Blocking,
+            message: "Installation verification is still preparing. Try launching again shortly.",
+        });
+        readiness.launchable = false;
+    }
+    let structural_readiness_facts = readiness_guardian_facts(&readiness);
+    // Tier 0 facts already reached Guardian directly above. Keep their public
+    // readiness projection out of this adapter so size drift is not recast as
+    // a legacy checksum fact and the same observation is not admitted twice.
+    append_integrity_readiness_reasons(&mut readiness, &integrity_report.facts);
     let readiness_elapsed = readiness_started_at.elapsed();
-    let readiness_facts = readiness_guardian_facts(&readiness);
-    guardian_facts.extend(readiness_facts.iter().cloned());
+    guardian_facts.extend(structural_readiness_facts.iter().cloned());
     let guardian_policy_started_at = Instant::now();
     let guardian_outcome = guardian_preflight_outcome(GuardianPreflightOutcomeRequest {
         operation_id: None,
         mode: api_guardian_mode(guardian.mode),
         phase: OperationPhase::Validating,
         facts: &guardian_facts,
-        readiness: GuardianPreflightReadiness::from_facts(readiness.launchable, &readiness_facts),
+        readiness: GuardianPreflightReadiness::from_facts(
+            readiness.launchable,
+            &structural_readiness_facts,
+        ),
         resources: preflight_resource_signals(raw_min_memory_mb, max_memory_mb, &resource_budget),
         overrides: preflight_override_signals(&guardian),
         explicit_user_intent: guardian.has_risky_overrides(),
@@ -786,6 +833,7 @@ async fn build_launch_preflight_facts_with_memory_capture(
             installed_versions: installed_versions_elapsed,
             overrides: overrides_elapsed,
             resources: resources_elapsed,
+            integrity_tier0: integrity_elapsed,
             readiness: readiness_elapsed,
             guardian_policy: guardian_policy_elapsed,
         },
@@ -798,6 +846,12 @@ async fn build_launch_preflight_facts_with_memory_capture(
         java_probe_source: java_probe_source.as_str(),
         installed_versions_source: scan_source,
         installed_versions_refresh_count: refresh_count,
+        integrity_selected_entry_count: integrity_report.selected_entry_count,
+        integrity_skipped_bulk_entry_count: integrity_report.skipped_bulk_entry_count,
+        integrity_metadata_lookup_count: integrity_report.metadata_lookup_count,
+        integrity_link_lookup_count: integrity_report.link_lookup_count,
+        integrity_mtime_observation_count: integrity_report.mtime_observation_count,
+        integrity_suppressed_fact_count: integrity_report.suppressed_fact_count,
     });
 
     LaunchPreflightFacts {

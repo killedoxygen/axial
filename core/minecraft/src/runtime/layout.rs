@@ -1,18 +1,94 @@
 use super::file_download::runtime_filesystem_path;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
-pub(super) fn runtime_cache_dir() -> PathBuf {
-    if cfg!(target_os = "windows") {
-        std::env::var_os("APPDATA")
-            .map(PathBuf::from)
-            .map(|path| path.join("axial").join("runtimes"))
-            .unwrap_or_else(|| PathBuf::from(".axial").join("runtimes"))
-    } else {
-        std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .map(|path| path.join(".axial").join("runtimes"))
-            .unwrap_or_else(|| PathBuf::from(".axial").join("runtimes"))
+#[derive(Clone)]
+pub struct ManagedRuntimeCache {
+    inner: Arc<ManagedRuntimeCacheInner>,
+}
+
+struct ManagedRuntimeCacheInner {
+    root: PathBuf,
+    install_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    #[cfg(any(test, feature = "test-support"))]
+    _test_root: Option<tempfile::TempDir>,
+}
+
+impl std::fmt::Debug for ManagedRuntimeCache {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ManagedRuntimeCache")
+            .finish_non_exhaustive()
     }
+}
+
+impl ManagedRuntimeCache {
+    pub fn canonical() -> std::io::Result<Self> {
+        Ok(Self {
+            inner: Arc::new(ManagedRuntimeCacheInner {
+                root: canonical_managed_runtime_cache_dir()?,
+                install_locks: Mutex::new(HashMap::new()),
+                #[cfg(any(test, feature = "test-support"))]
+                _test_root: None,
+            }),
+        })
+    }
+
+    pub fn root(&self) -> &Path {
+        &self.inner.root
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn isolated_for_test() -> std::io::Result<Self> {
+        let test_root = tempfile::Builder::new()
+            .prefix("axial-managed-runtime-")
+            .tempdir()?;
+        let root = test_root.path().to_path_buf();
+        Ok(Self {
+            inner: Arc::new(ManagedRuntimeCacheInner {
+                root,
+                install_locks: Mutex::new(HashMap::new()),
+                _test_root: Some(test_root),
+            }),
+        })
+    }
+
+    pub(super) fn install_lock(&self, component: &str) -> Arc<tokio::sync::Mutex<()>> {
+        let mut locks = match self.inner.install_locks.lock() {
+            Ok(locks) => locks,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        locks
+            .entry(component.to_string())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+    }
+}
+
+fn canonical_managed_runtime_cache_dir() -> std::io::Result<PathBuf> {
+    let (variable, root) = if cfg!(target_os = "windows") {
+        ("APPDATA", std::env::var_os("APPDATA").map(PathBuf::from))
+    } else {
+        ("HOME", std::env::var_os("HOME").map(PathBuf::from))
+    };
+    let root = root.ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("{variable} is required for the canonical managed runtime cache"),
+        )
+    })?;
+    if !root.is_absolute() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{variable} must identify an absolute managed runtime cache base"),
+        ));
+    }
+    Ok(if cfg!(target_os = "windows") {
+        root.join("axial").join("runtimes")
+    } else {
+        root.join(".axial").join("runtimes")
+    })
 }
 pub(super) fn runtime_os_arch() -> String {
     runtime_os_arch_for(std::env::consts::OS, std::env::consts::ARCH)
@@ -51,6 +127,16 @@ fn runtime_arch_name(target_arch: &str) -> &str {
 
 pub(super) fn java_executable(runtime_root: &Path) -> PathBuf {
     java_executable_for_os(runtime_root, std::env::consts::OS)
+}
+
+pub(crate) fn runtime_java_relative_path() -> &'static str {
+    if cfg!(target_os = "windows") {
+        "bin/javaw.exe"
+    } else if cfg!(target_os = "macos") {
+        "jre.bundle/Contents/Home/bin/java"
+    } else {
+        "bin/java"
+    }
 }
 
 pub(super) fn java_executable_for_os(runtime_root: &Path, target_os: &str) -> PathBuf {

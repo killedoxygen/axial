@@ -4864,11 +4864,13 @@
       "diagnosis": "launcher_managed_artifact_corrupt",
       "triggers": [
         "artifact_checksum_mismatch",
+        "artifact_size_drift",
         "artifact_size_mismatch",
         "artifact_missing"
       ],
       "evidence": [
         "artifact_checksum_mismatch",
+        "artifact_size_drift",
         "artifact_size_mismatch",
         "artifact_missing"
       ],
@@ -5406,6 +5408,11 @@
       "fact": "artifact_quarantined",
       "availability": "registered_current",
       "referenced_by_rule": false
+    },
+    {
+      "fact": "artifact_size_drift",
+      "availability": "registered_current",
+      "referenced_by_rule": true
     },
     {
       "fact": "artifact_size_mismatch",
@@ -6012,6 +6019,14 @@
       "evidence": null
     },
     {
+      "id": "integrity_tier0",
+      "declared_cost_class": "metadata_io",
+      "timing_signal": "launch_preflight_sense_timing",
+      "measurement_status": "pending_i8_rotational_measurement",
+      "ceiling_ms": 9,
+      "evidence": "ignored rotational-fixture harness; candidate evidence requires review"
+    },
+    {
       "id": "readiness",
       "declared_cost_class": "content_io",
       "timing_signal": "launch_preflight_sense_timing",
@@ -6034,6 +6049,14 @@
         "source": "artifact_missing",
         "classification": "diagnostic",
         "fact": "artifact_missing",
+        "diagnoses": [
+          "launcher_managed_artifact_corrupt"
+        ]
+      },
+      {
+        "source": "artifact_size_drift",
+        "classification": "diagnostic",
+        "fact": "artifact_size_drift",
         "diagnoses": [
           "launcher_managed_artifact_corrupt"
         ]

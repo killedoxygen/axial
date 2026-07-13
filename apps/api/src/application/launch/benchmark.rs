@@ -1020,7 +1020,6 @@ fn benchmark_suite_state_only_terminal_outcome(state: &str) -> Option<&'static s
         "failed" => Some("failed"),
         "stopped" => Some("stopped"),
         "exited" => Some("exited"),
-        "completed" => Some("completed"),
         _ => None,
     }
 }
@@ -1773,7 +1772,12 @@ mod tests {
     use crate::state::{AppStateInit, InstallStore, SessionStore};
     use axial_config::{AppConfig, AppPaths, ConfigStore, InstanceRegistrySnapshot, InstanceStore};
     use axial_launcher::{LaunchSessionRecord, SessionId};
+    use axial_minecraft::known_good::{
+        KnownGoodArtifactKind, KnownGoodInventory, TestKnownGoodEntry, TestKnownGoodIntegrity,
+        TestKnownGoodRoot,
+    };
     use axial_performance::PerformanceManager;
+    use sha1::{Digest as _, Sha1};
     use std::fs;
     use std::future::Future;
     use std::path::{Path, PathBuf};
@@ -1800,15 +1804,21 @@ mod tests {
         compensation_gate: BlockingGate,
     }
 
-    struct GatedReservationBackend {
-        attempts: AtomicUsize,
-        started: Notify,
-        gate: BlockingGate,
-    }
-
     struct BlockingGate {
         released: Mutex<bool>,
         changed: Condvar,
+    }
+
+    struct GateRelease<'a> {
+        gates: Vec<&'a BlockingGate>,
+    }
+
+    impl Drop for GateRelease<'_> {
+        fn drop(&mut self) {
+            for gate in &self.gates {
+                gate.release();
+            }
+        }
     }
 
     impl FailingReservationBackend {
@@ -1822,33 +1832,17 @@ mod tests {
         }
 
         async fn wait_for_attempt(&self, expected: usize) {
-            loop {
-                let started = self.started.notified();
-                if self.attempts.load(Ordering::SeqCst) >= expected {
-                    return;
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    let started = self.started.notified();
+                    if self.attempts.load(Ordering::SeqCst) >= expected {
+                        return;
+                    }
+                    started.await;
                 }
-                started.await;
-            }
-        }
-    }
-
-    impl GatedReservationBackend {
-        fn new() -> Self {
-            Self {
-                attempts: AtomicUsize::new(0),
-                started: Notify::new(),
-                gate: BlockingGate::new(),
-            }
-        }
-
-        async fn wait_for_attempt(&self) {
-            loop {
-                let started = self.started.notified();
-                if self.attempts.load(Ordering::SeqCst) > 0 {
-                    return;
-                }
-                started.await;
-            }
+            })
+            .await
+            .expect("reservation persistence attempt starts");
         }
     }
 
@@ -1908,24 +1902,6 @@ mod tests {
                 .map(|_| ())
                 .map_err(io::Error::from),
             }
-        }
-    }
-
-    impl AtomicWriteBackend for GatedReservationBackend {
-        fn write(
-            &self,
-            target: &crate::state::contracts::TargetDescriptor,
-            destination: &Path,
-            contents: &[u8],
-        ) -> io::Result<()> {
-            let attempt = self.attempts.fetch_add(1, Ordering::SeqCst) + 1;
-            self.started.notify_waiters();
-            if attempt == 1 {
-                self.gate.wait();
-            }
-            write_file_atomically(FileWriteRequest::new(target.clone(), destination, contents))
-                .map(|_| ())
-                .map_err(io::Error::from)
         }
     }
 
@@ -2086,6 +2062,9 @@ mod tests {
             .await
             .expect("close default suite store");
         let backend = Arc::new(FailingReservationBackend::new());
+        let _gate_release = GateRelease {
+            gates: vec![&backend.first_gate, &backend.compensation_gate],
+        };
         let coordinator =
             PersistenceCoordinator::for_test(backend.clone(), Duration::ZERO, Duration::ZERO);
         let suite_store = Arc::new(
@@ -2210,7 +2189,10 @@ mod tests {
             .close()
             .await
             .expect("close default suite store");
-        let backend = Arc::new(GatedReservationBackend::new());
+        let backend = Arc::new(FailingReservationBackend::new());
+        let _gate_release = GateRelease {
+            gates: vec![&backend.first_gate, &backend.compensation_gate],
+        };
         let coordinator =
             PersistenceCoordinator::for_test(backend.clone(), Duration::ZERO, Duration::ZERO);
         let suite_store = Arc::new(
@@ -2242,18 +2224,19 @@ mod tests {
             producer,
         ));
 
-        backend.wait_for_attempt().await;
+        backend.wait_for_attempt(1).await;
         let prepared = state.sessions().active_records().await;
         assert_eq!(prepared.len(), 1);
         let session_id = prepared[0].session_id.0.clone();
         waiter.abort();
         let _ = waiter.await;
-        backend.gate.release();
+        backend.first_gate.release();
+        backend.wait_for_attempt(2).await;
 
         let terminal = tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 if let Some(record) = state.sessions().get(&session_id).await
-                    && matches!(record.state, LaunchState::Failed | LaunchState::Exited)
+                    && record.state == LaunchState::Failed
                 {
                     break record;
                 }
@@ -2264,17 +2247,25 @@ mod tests {
         .expect("owned continuation terminalizes after waiter abort");
         assert_eq!(
             terminal.outcome.as_ref().map(|outcome| outcome.kind),
-            Some(LaunchSessionOutcomeKind::Failed)
+            Some(LaunchSessionOutcomeKind::Unknown)
         );
+        assert_eq!(
+            state.sessions().retention_hold_count(&session_id).await,
+            Some(1)
+        );
+        backend.compensation_gate.release();
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 let manifest = state
                     .benchmark_suites()
                     .get(&suite_id)
-                    .expect("read committed suite")
-                    .expect("suite reservation committed");
-                if manifest.runs[0].state == "failed"
-                    && state.sessions().retention_hold_count(&session_id).await == Some(0)
+                    .expect("read committed suite");
+                if manifest.as_ref().is_some_and(|manifest| {
+                    manifest
+                        .runs
+                        .iter()
+                        .all(|run| run.state == "pending" && run.session_id.is_none())
+                }) && state.sessions().retention_hold_count(&session_id).await == Some(0)
                 {
                     break;
                 }
@@ -2287,12 +2278,13 @@ mod tests {
             .benchmark_suites()
             .get(&suite_id)
             .expect("read committed suite")
-            .expect("suite reservation committed");
-        assert_eq!(
-            manifest.runs[0].session_id.as_deref(),
-            Some(session_id.as_str())
+            .expect("suite compensation committed");
+        assert!(
+            manifest
+                .runs
+                .iter()
+                .all(|run| run.state == "pending" && run.session_id.is_none())
         );
-        assert_eq!(manifest.runs[0].state, "failed");
         assert_eq!(
             state.sessions().retention_hold_count(&session_id).await,
             Some(0)
@@ -2507,11 +2499,83 @@ mod tests {
         }
 
         fn add_instance(&self, name: &str, version_id: &str) -> String {
-            self.state
+            let instance = self
+                .state
                 .instances()
                 .insert_for_test(name.to_string(), version_id.to_string())
-                .expect("add instance")
-                .id
+                .expect("add instance");
+            self.activate_ready_inventory(&instance.id, version_id);
+            instance.id
+        }
+
+        fn activate_ready_inventory(&self, instance_id: &str, version_id: &str) {
+            let version_dir = self.paths.library_dir.join("versions").join(version_id);
+            let version_json = version_dir.join(format!("{version_id}.json"));
+            let client_jar = version_dir.join(format!("{version_id}.jar"));
+            let managed_root = self
+                .state
+                .managed_runtime_cache()
+                .component_root("java-runtime-delta")
+                .expect("runtime root");
+            let java_path = if cfg!(target_os = "windows") {
+                managed_root.join("bin").join("javaw.exe")
+            } else if cfg!(target_os = "macos") {
+                managed_root.join("jre.bundle/Contents/Home/bin/java")
+            } else {
+                managed_root.join("bin").join("java")
+            };
+            let java_relative = java_path
+                .strip_prefix(&managed_root)
+                .expect("managed Java relative path")
+                .to_string_lossy()
+                .replace('\\', "/");
+            let runtime_root = || TestKnownGoodRoot::ManagedRuntime {
+                component: "java-runtime-delta".to_string(),
+            };
+            let file = |root, path, kind, physical_path: &Path| TestKnownGoodEntry {
+                root,
+                path,
+                kind,
+                integrity: TestKnownGoodIntegrity::File {
+                    size: fs::metadata(physical_path).expect("known-good file").len(),
+                },
+            };
+            let entries = vec![
+                file(
+                    TestKnownGoodRoot::Versions,
+                    format!("{version_id}/{version_id}.json"),
+                    KnownGoodArtifactKind::VersionMetadata,
+                    &version_json,
+                ),
+                file(
+                    TestKnownGoodRoot::Versions,
+                    format!("{version_id}/{version_id}.jar"),
+                    KnownGoodArtifactKind::ClientJar,
+                    &client_jar,
+                ),
+                file(
+                    runtime_root(),
+                    ".axial-runtime-manifest.json".to_string(),
+                    KnownGoodArtifactKind::RuntimeManifestProof,
+                    &managed_root.join(".axial-runtime-manifest.json"),
+                ),
+                file(
+                    runtime_root(),
+                    ".axial-ready".to_string(),
+                    KnownGoodArtifactKind::RuntimeReadyMarker,
+                    &managed_root.join(".axial-ready"),
+                ),
+                file(
+                    runtime_root(),
+                    java_relative,
+                    KnownGoodArtifactKind::RuntimeExecutable,
+                    &java_path,
+                ),
+            ];
+            self.state.activate_known_good_inventory_for_test(
+                instance_id,
+                KnownGoodInventory::from_test_entries(entries).expect("ready inventory"),
+            );
         }
 
         fn write_ready_install(&self, version_id: &str) {
@@ -2536,21 +2600,47 @@ mod tests {
             fs::write(version_dir.join(format!("{version_id}.jar")), b"client jar")
                 .expect("write client jar");
 
-            let runtime_bin = self
-                .paths
-                .library_dir
-                .join("runtime")
-                .join("java-runtime-delta")
-                .join("bin");
-            fs::create_dir_all(&runtime_bin).expect("runtime bin");
-            let java_name = if cfg!(target_os = "windows") {
-                "javaw.exe"
+            let runtime_root = self
+                .state
+                .managed_runtime_cache()
+                .component_root("java-runtime-delta")
+                .expect("runtime root");
+            let java_path = if cfg!(target_os = "windows") {
+                runtime_root.join("bin").join("javaw.exe")
+            } else if cfg!(target_os = "macos") {
+                runtime_root.join("jre.bundle/Contents/Home/bin/java")
             } else {
-                "java"
+                runtime_root.join("bin").join("java")
             };
-            let java_path = runtime_bin.join(java_name);
-            fs::write(&java_path, b"java").expect("runtime java");
+            fs::create_dir_all(java_path.parent().expect("runtime bin")).expect("runtime bin");
+            let java_bytes = b"java";
+            fs::write(&java_path, java_bytes).expect("runtime java");
             make_executable(&java_path);
+            let java_relative = java_path
+                .strip_prefix(&runtime_root)
+                .expect("runtime Java relative path")
+                .to_string_lossy()
+                .replace('\\', "/");
+            let manifest = json!({
+                "files": {
+                    java_relative: {
+                        "type": "file",
+                        "downloads": {
+                            "raw": {
+                                "url": "https://example.invalid/java",
+                                "sha1": hex::encode(Sha1::digest(java_bytes)),
+                                "size": java_bytes.len()
+                            }
+                        }
+                    }
+                }
+            });
+            fs::write(
+                runtime_root.join(".axial-runtime-manifest.json"),
+                serde_json::to_vec(&manifest).expect("runtime manifest JSON"),
+            )
+            .expect("runtime proof");
+            fs::write(runtime_root.join(".axial-ready"), b"ready").expect("runtime ready marker");
         }
     }
 

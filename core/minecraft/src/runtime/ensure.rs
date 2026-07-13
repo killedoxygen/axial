@@ -5,22 +5,18 @@ use super::discovery::{
 };
 use super::file_download::runtime_filesystem_path;
 use super::install::{install_ephemeral_processor_runtime, install_managed_runtime};
-use super::layout::{runtime_cache_dir, runtime_os_arch};
+use super::layout::{ManagedRuntimeCache, runtime_os_arch};
 use super::manifest::{
     COMPONENT_MANIFEST_PROOF_FILE, RuntimeSourceReceipt, acquire_runtime_source,
     component_manifest_proof_bytes,
 };
 use super::model::{
-    JavaRuntimeLookupError, JavaRuntimeResult, RuntimeEnsureAction, RuntimeEnsureEvent,
-    RuntimeEnsureResult, RuntimeId, RuntimeOverride, RuntimeProbeUsage, RuntimeRecord,
-    RuntimeRequirement, RuntimeSource,
+    JavaRuntimeLookupError, RuntimeEnsureEvent, RuntimeEnsureResult, RuntimeId, RuntimeOverride,
+    RuntimeProbeUsage, RuntimeRecord, RuntimeRequirement, RuntimeSource,
 };
 use super::probe::{JavaRuntimeProbeReceipt, probe_java_runtime_receipt};
 use crate::launch::JavaVersion;
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, OnceLock};
-use tokio::sync::Mutex;
 
 pub(crate) struct ProcessorRuntime {
     probe_receipt: JavaRuntimeProbeReceipt,
@@ -87,6 +83,7 @@ pub(crate) async fn materialize_ephemeral_processor_runtime(
 }
 
 pub(crate) async fn materialize_preferred_runtime_source<F>(
+    cache: &ManagedRuntimeCache,
     java_version: &JavaVersion,
     source_receipt: RuntimeSourceReceipt,
     observer: &mut F,
@@ -100,11 +97,13 @@ where
             "runtime source does not match the preferred managed component".to_string(),
         ));
     }
-    let install_root = runtime_cache_dir().join(component.as_str());
-    let install_lock = runtime_install_lock(component.as_str());
+    let install_root = cache
+        .component_root(component.as_str())
+        .expect("validated managed runtime component has a cache root");
+    let install_lock = cache.install_lock(component.as_str());
     let _guard = install_lock.lock().await;
     let _file_lock = acquire_runtime_install_file_lock(&install_root).await?;
-    let current = resolve_axial_cached_runtime(&component, java_version.major_version).ok();
+    let current = resolve_axial_cached_runtime(cache, &component, java_version.major_version).ok();
     let matches_source = match current.as_ref() {
         Some(runtime) => runtime_record_matches_source(runtime, &source_receipt).await,
         None => false,
@@ -115,7 +114,7 @@ where
         });
         install_managed_runtime(&component, &install_root, &source_receipt, observer).await?;
     }
-    let runtime = resolve_axial_cached_runtime(&component, java_version.major_version)?;
+    let runtime = resolve_axial_cached_runtime(cache, &component, java_version.major_version)?;
     if !runtime_record_matches_source(&runtime, &source_receipt).await {
         return Err(JavaRuntimeLookupError::Download(
             "installed runtime does not match its authenticated source".to_string(),
@@ -127,29 +126,8 @@ where
     Ok(source_receipt)
 }
 
-pub async fn ensure_java_runtime(
-    library_dir: &Path,
-    java_version: &JavaVersion,
-    override_path: &str,
-) -> Result<JavaRuntimeResult, JavaRuntimeLookupError> {
-    let result = ensure_runtime_with_events(
-        library_dir,
-        java_version,
-        override_path,
-        false,
-        None,
-        |_| {},
-    )
-    .await?;
-    Ok(JavaRuntimeResult {
-        path: result.effective.java_path,
-        component: result.effective.id.0,
-        source: result.effective.source.as_str().to_string(),
-    })
-}
-
 pub async fn ensure_runtime_with_events<F>(
-    library_dir: &Path,
+    cache: &ManagedRuntimeCache,
     java_version: &JavaVersion,
     override_path: &str,
     force_managed: bool,
@@ -169,7 +147,7 @@ where
             RuntimeOverride::None => (None, RuntimeProbeUsage::default()),
             RuntimeOverride::Component(component) => (
                 Some(resolve_component_runtime(
-                    library_dir,
+                    cache,
                     component,
                     java_version.major_version,
                 )?),
@@ -196,7 +174,7 @@ where
     if let Some(requested_runtime) = requested.clone() {
         let requested_record = requested_runtime.clone();
         let refreshed = refresh_ready_managed_runtime(
-            library_dir,
+            cache,
             requested_runtime,
             java_version.major_version,
             &mut observer,
@@ -205,35 +183,24 @@ where
         return Ok(RuntimeEnsureResult {
             requested: Some(requested_record),
             effective: refreshed.effective,
-            bypassed_requested_runtime: false,
-            install_performed: refreshed.install_performed,
-            action: RuntimeEnsureAction::UseRequested,
             probe_usage,
-            source_receipt: refreshed.source_receipt,
         });
     }
 
-    let managed =
-        ensure_managed_runtime_with_events(library_dir, &requirement, &mut observer).await?;
+    let managed = ensure_managed_runtime_with_events(cache, &requirement, &mut observer).await?;
 
     Ok(RuntimeEnsureResult {
         requested,
         effective: managed.effective,
-        bypassed_requested_runtime: false,
-        install_performed: managed.install_performed,
-        action: RuntimeEnsureAction::UseManaged,
         probe_usage,
-        source_receipt: managed.source_receipt,
     })
 }
 struct ManagedEnsure {
     effective: RuntimeRecord,
-    install_performed: bool,
-    source_receipt: Option<RuntimeSourceReceipt>,
 }
 
 async fn ensure_managed_runtime_with_events<F>(
-    library_dir: &Path,
+    cache: &ManagedRuntimeCache,
     requirement: &RuntimeRequirement,
     observer: &mut F,
 ) -> Result<ManagedEnsure, JavaRuntimeLookupError>
@@ -241,10 +208,10 @@ where
     F: FnMut(RuntimeEnsureEvent),
 {
     let preferred = &requirement.preferred_component;
-    match resolve_managed_runtime(library_dir, preferred) {
+    match resolve_managed_runtime(cache, preferred) {
         Ok(runtime) => {
             let refreshed = refresh_ready_managed_runtime(
-                library_dir,
+                cache,
                 runtime,
                 requirement.required_java.major_version,
                 observer,
@@ -257,8 +224,6 @@ where
             }
             return Ok(ManagedEnsure {
                 effective: refreshed.effective,
-                install_performed: refreshed.install_performed,
-                source_receipt: refreshed.source_receipt,
             });
         }
         // reinstalling produces the same x86_64 build, so a missing-Rosetta
@@ -271,32 +236,20 @@ where
     // runtime install paths. The same parsed receipt is consumed below.
     let source_receipt = acquire_runtime_source(preferred, &runtime_os_arch()).await?;
 
-    let install_root = runtime_cache_dir().join(preferred.as_str());
-    let install_lock = runtime_install_lock(preferred.as_str());
+    let install_root = cache
+        .component_root(preferred.as_str())
+        .expect("validated managed runtime component has a cache root");
+    let install_lock = cache.install_lock(preferred.as_str());
     let _guard = install_lock.lock().await;
     let _file_lock = acquire_runtime_install_file_lock(&install_root).await?;
 
-    match resolve_managed_runtime(library_dir, preferred) {
+    match resolve_managed_runtime(cache, preferred) {
         Ok(runtime) => {
-            if runtime.source != RuntimeSource::Managed {
-                observer(RuntimeEnsureEvent::ManagedRuntimeReady {
-                    component: preferred.as_str().to_string(),
-                });
-                return Ok(ManagedEnsure {
-                    effective: runtime,
-                    install_performed: false,
-                    source_receipt: None,
-                });
-            }
             if runtime_record_matches_source(&runtime, &source_receipt).await {
                 observer(RuntimeEnsureEvent::ManagedRuntimeReady {
                     component: preferred.as_str().to_string(),
                 });
-                return Ok(ManagedEnsure {
-                    effective: runtime,
-                    install_performed: false,
-                    source_receipt: Some(source_receipt),
-                });
+                return Ok(ManagedEnsure { effective: runtime });
             }
         }
         Err(error @ JavaRuntimeLookupError::RosettaRequired { .. }) => return Err(error),
@@ -307,31 +260,23 @@ where
         component: preferred.as_str().to_string(),
     });
     install_managed_runtime(preferred, &install_root, &source_receipt, observer).await?;
-    let runtime = resolve_component_runtime(
-        library_dir,
-        preferred,
-        requirement.required_java.major_version,
-    )?;
+    let runtime =
+        resolve_component_runtime(cache, preferred, requirement.required_java.major_version)?;
     if !runtime_record_matches_source(&runtime, &source_receipt).await {
         return Err(JavaRuntimeLookupError::Download(
             "installed runtime does not match its authenticated source".to_string(),
         ));
     }
-    Ok(ManagedEnsure {
-        effective: runtime,
-        install_performed: true,
-        source_receipt: Some(source_receipt),
-    })
+    Ok(ManagedEnsure { effective: runtime })
 }
 
 struct RefreshedRuntime {
     effective: RuntimeRecord,
     install_performed: bool,
-    source_receipt: Option<RuntimeSourceReceipt>,
 }
 
 async fn refresh_ready_managed_runtime<F>(
-    library_dir: &Path,
+    cache: &ManagedRuntimeCache,
     runtime: RuntimeRecord,
     required_major: i32,
     observer: &mut F,
@@ -343,37 +288,31 @@ where
         return Ok(RefreshedRuntime {
             effective: runtime,
             install_performed: false,
-            source_receipt: None,
         });
     }
+
     let source_receipt = acquire_runtime_source(&runtime.id, &runtime_os_arch()).await?;
     let component = runtime.id.clone();
-    let install_root = runtime_cache_dir().join(component.as_str());
-    let install_lock = runtime_install_lock(component.as_str());
+    let install_root = cache
+        .component_root(component.as_str())
+        .expect("validated managed runtime component has a cache root");
+    let install_lock = cache.install_lock(component.as_str());
     let _guard = install_lock.lock().await;
     let _file_lock = acquire_runtime_install_file_lock(&install_root).await?;
-    if let Ok(current) = resolve_component_runtime(library_dir, &component, required_major) {
-        if current.source != RuntimeSource::Managed {
-            return Ok(RefreshedRuntime {
-                effective: current,
-                install_performed: false,
-                source_receipt: None,
-            });
-        }
-        if runtime_record_matches_source(&current, &source_receipt).await {
-            return Ok(RefreshedRuntime {
-                effective: current,
-                install_performed: false,
-                source_receipt: Some(source_receipt),
-            });
-        }
+    if let Ok(current) = resolve_component_runtime(cache, &component, required_major)
+        && runtime_record_matches_source(&current, &source_receipt).await
+    {
+        return Ok(RefreshedRuntime {
+            effective: current,
+            install_performed: false,
+        });
     }
 
     observer(RuntimeEnsureEvent::DownloadingManagedRuntime {
         component: component.as_str().to_string(),
     });
     install_managed_runtime(&component, &install_root, &source_receipt, observer).await?;
-    let effective = resolve_component_runtime(library_dir, &component, required_major)?;
+    let effective = resolve_component_runtime(cache, &component, required_major)?;
     if !runtime_record_matches_source(&effective, &source_receipt).await {
         return Err(JavaRuntimeLookupError::Download(
             "installed runtime does not match its authenticated source".to_string(),
@@ -382,7 +321,6 @@ where
     Ok(RefreshedRuntime {
         effective,
         install_performed: true,
-        source_receipt: Some(source_receipt),
     })
 }
 
@@ -419,26 +357,6 @@ pub(super) async fn runtime_record_matches_source_for_test(
     source: &RuntimeSourceReceipt,
 ) -> bool {
     runtime_record_matches_source(runtime, source).await
-}
-
-pub(super) fn runtime_install_lock(component: &str) -> Arc<Mutex<()>> {
-    static LOCKS: OnceLock<std::sync::Mutex<HashMap<String, Arc<Mutex<()>>>>> = OnceLock::new();
-    let mutex = LOCKS.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
-    runtime_install_lock_from_map(mutex, component)
-}
-
-pub(super) fn runtime_install_lock_from_map(
-    mutex: &std::sync::Mutex<HashMap<String, Arc<Mutex<()>>>>,
-    component: &str,
-) -> Arc<Mutex<()>> {
-    let mut guard = match mutex.lock() {
-        Ok(guard) => guard,
-        Err(poisoned) => poisoned.into_inner(),
-    };
-    guard
-        .entry(component.to_string())
-        .or_insert_with(|| Arc::new(Mutex::new(())))
-        .clone()
 }
 
 struct RuntimeInstallFileLock {

@@ -46,23 +46,6 @@ pub fn default_minecraft_dir() -> Option<PathBuf> {
     }
 }
 
-pub fn runtime_dirs(mc_dir: &Path) -> Vec<PathBuf> {
-    let mut dirs = vec![mc_dir.join("runtime")];
-    if cfg!(target_os = "windows")
-        && let Some(local_app_data) = std::env::var_os("LOCALAPPDATA")
-    {
-        dirs.push(
-            PathBuf::from(local_app_data)
-                .join("Packages")
-                .join("Microsoft.4297127D64EC6_8wekyb3d8bbwe")
-                .join("LocalCache")
-                .join("Local")
-                .join("runtime"),
-        );
-    }
-    dirs
-}
-
 pub fn validate_installation(mc_dir: &Path) -> bool {
     ["versions", "libraries", "assets"]
         .iter()

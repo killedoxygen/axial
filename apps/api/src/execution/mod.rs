@@ -6,6 +6,7 @@
 pub(crate) mod crash;
 pub mod download;
 pub mod file;
+pub(crate) mod integrity;
 pub mod jvm;
 pub mod launch;
 pub(crate) mod persistence;
@@ -108,6 +109,7 @@ macro_rules! execution_fact_kinds {
 
 execution_fact_kinds! {
     ArtifactMissing => ("artifact_missing", Diagnostic),
+    ArtifactSizeDrift => ("artifact_size_drift", Diagnostic),
     DownloadChecksumMismatch => ("download_checksum_mismatch", Diagnostic),
     DownloadInterrupted => ("download_interrupted", Diagnostic),
     DownloadNetworkFailure => ("download_network_failure", Diagnostic),

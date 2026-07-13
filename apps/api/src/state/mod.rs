@@ -31,6 +31,7 @@ use axial_config::{
     InstanceStore as StartupInstanceStore, InstanceStoreError, find_flag, is_canonical_instance_id,
 };
 pub use axial_launcher::{LaunchEvent, LaunchLogEvent, LaunchSessionRecord, LaunchStatusEvent};
+use axial_minecraft::ManagedRuntimeCache;
 pub use axial_minecraft::download::DownloadProgress;
 use axial_performance::PerformanceManager;
 use std::path::{Path, PathBuf};
@@ -99,6 +100,7 @@ pub struct AppState {
     app_name: String,
     version: String,
     config: Arc<AppConfigStore>,
+    managed_runtime_cache: ManagedRuntimeCache,
     instances: Arc<AppInstanceStore>,
     accounts: Arc<LauncherAccountStore>,
     auth_logins: Arc<AuthLoginStore>,
@@ -141,11 +143,78 @@ pub struct AppStateInit {
 }
 
 struct KnownGoodCandidateAdmission {
-    _lifecycle: tokio::sync::OwnedMutexGuard<()>,
+    _lifecycle: InstanceLifecycleLease,
     instance_id: String,
     version_id: String,
     created_at: String,
     library_root: PathBuf,
+}
+
+pub(crate) struct InstanceLifecycleLease {
+    instance_id: String,
+    _guard: tokio::sync::OwnedMutexGuard<()>,
+}
+
+pub(crate) struct KnownGoodVerificationLease<'a> {
+    _lifecycle: &'a InstanceLifecycleLease,
+    instance_id: String,
+    version_id: String,
+    created_at: String,
+    library_root: PathBuf,
+    managed_runtime_cache: ManagedRuntimeCache,
+    inventory: Arc<axial_minecraft::known_good::KnownGoodInventory>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum KnownGoodVerificationUnavailable {
+    InstanceNotRegistered,
+    LibraryRootUnavailable,
+    LiveAuthorityUnavailable,
+}
+
+impl InstanceLifecycleLease {
+    fn bind(instance_id: &str, guard: tokio::sync::OwnedMutexGuard<()>) -> Self {
+        Self {
+            instance_id: instance_id.to_string(),
+            _guard: guard,
+        }
+    }
+
+    fn matches(&self, instance_id: &str) -> bool {
+        self.instance_id == instance_id
+    }
+}
+
+impl KnownGoodVerificationLease<'_> {
+    pub(crate) fn execution_parts(
+        &self,
+    ) -> (
+        &str,
+        &str,
+        &str,
+        &Path,
+        &ManagedRuntimeCache,
+        &axial_minecraft::known_good::KnownGoodInventory,
+    ) {
+        (
+            &self.instance_id,
+            &self.version_id,
+            &self.created_at,
+            &self.library_root,
+            &self.managed_runtime_cache,
+            &self.inventory,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn exact_identity_for_test(&self) -> (&str, &str, &str, &Path) {
+        (
+            &self.instance_id,
+            &self.version_id,
+            &self.created_at,
+            &self.library_root,
+        )
+    }
 }
 
 impl KnownGoodCandidateAdmission {
@@ -192,6 +261,8 @@ impl AppState {
             telemetry,
             Arc::new(AuthLoginStore::new()),
             Arc::new(RemoteFlagStore::default()),
+            ManagedRuntimeCache::isolated_for_test()
+                .expect("failed to create isolated managed runtime cache"),
         )
         .unwrap_or_else(|error| {
             panic!("failed to initialize known-good inventory persistence: {error}")
@@ -223,6 +294,10 @@ impl AppState {
             AuthLoginStore::load_from_secure_store(),
             RemoteFlagStore::load_from_config_dir(remote_flags_config_dir),
         );
+        #[cfg(not(test))]
+        let managed_runtime_cache = ManagedRuntimeCache::canonical()?;
+        #[cfg(test)]
+        let managed_runtime_cache = ManagedRuntimeCache::isolated_for_test()?;
         let state = tokio::task::spawn_blocking(move || {
             Self::new_with_telemetry_inner(
                 init,
@@ -230,6 +305,7 @@ impl AppState {
                 telemetry,
                 Arc::new(auth_logins),
                 Arc::new(remote_flags),
+                managed_runtime_cache,
             )
         })
         .await
@@ -253,6 +329,8 @@ impl AppState {
             telemetry,
             Arc::new(AuthLoginStore::new()),
             Arc::new(RemoteFlagStore::default()),
+            ManagedRuntimeCache::isolated_for_test()
+                .expect("failed to create isolated managed runtime cache"),
         )
         .unwrap_or_else(|error| {
             panic!("failed to initialize known-good inventory persistence: {error}")
@@ -293,6 +371,7 @@ impl AppState {
         telemetry: Arc<TelemetryHub>,
         auth_logins: Arc<AuthLoginStore>,
         remote_flags: Arc<RemoteFlagStore>,
+        managed_runtime_cache: ManagedRuntimeCache,
     ) -> std::io::Result<Self> {
         let instance_registry_authoritative = init.instances.mutation_allowed();
         let instances = Arc::new(AppInstanceStore::claim(&init.instances).unwrap_or_else(
@@ -346,6 +425,7 @@ impl AppState {
             app_name: init.app_name,
             version: init.version,
             config,
+            managed_runtime_cache,
             instances,
             accounts,
             auth_logins,
@@ -386,6 +466,10 @@ impl AppState {
 
     pub fn config(&self) -> &Arc<AppConfigStore> {
         &self.config
+    }
+
+    pub(crate) fn managed_runtime_cache(&self) -> &ManagedRuntimeCache {
+        &self.managed_runtime_cache
     }
 
     pub fn instances(&self) -> &Arc<AppInstanceStore> {
@@ -897,8 +981,112 @@ impl AppState {
     pub(crate) async fn acquire_instance_lifecycle(
         &self,
         instance_id: &str,
-    ) -> tokio::sync::OwnedMutexGuard<()> {
-        self.instance_lifecycle_gates.acquire(instance_id).await
+    ) -> InstanceLifecycleLease {
+        InstanceLifecycleLease::bind(
+            instance_id,
+            self.instance_lifecycle_gates.acquire(instance_id).await,
+        )
+    }
+
+    pub(crate) fn mint_known_good_verification_lease<'a>(
+        &self,
+        lifecycle: &'a InstanceLifecycleLease,
+        expected_library_root: &Path,
+    ) -> Result<KnownGoodVerificationLease<'a>, KnownGoodVerificationUnavailable> {
+        let instance = self
+            .instances
+            .get(&lifecycle.instance_id)
+            .filter(|instance| {
+                instance.id == lifecycle.instance_id && is_canonical_instance_id(&instance.id)
+            })
+            .ok_or(KnownGoodVerificationUnavailable::InstanceNotRegistered)?;
+        let library_root = self
+            .library_dir()
+            .map(PathBuf::from)
+            .and_then(|root| known_good::normalize_library_root(&root).ok())
+            .ok_or(KnownGoodVerificationUnavailable::LibraryRootUnavailable)?;
+        let expected_library_root = known_good::normalize_library_root(expected_library_root)
+            .map_err(|_| KnownGoodVerificationUnavailable::LibraryRootUnavailable)?;
+        if library_root != expected_library_root {
+            return Err(KnownGoodVerificationUnavailable::LiveAuthorityUnavailable);
+        }
+        let inventory = self
+            .known_good
+            .active_inventory(
+                &instance.id,
+                &instance.version_id,
+                &instance.created_at,
+                &library_root,
+            )
+            .ok_or(KnownGoodVerificationUnavailable::LiveAuthorityUnavailable)?;
+
+        Ok(KnownGoodVerificationLease {
+            _lifecycle: lifecycle,
+            instance_id: instance.id,
+            version_id: instance.version_id,
+            created_at: instance.created_at,
+            library_root,
+            managed_runtime_cache: self.managed_runtime_cache.clone(),
+            inventory,
+        })
+    }
+
+    pub(crate) fn known_good_verification_lease_is_current(
+        &self,
+        lease: &KnownGoodVerificationLease<'_>,
+    ) -> bool {
+        let Some(instance) = self.instances.get(&lease.instance_id) else {
+            return false;
+        };
+        if instance.id != lease.instance_id
+            || instance.version_id != lease.version_id
+            || instance.created_at != lease.created_at
+        {
+            return false;
+        }
+        let Some(library_root) = self
+            .library_dir()
+            .map(PathBuf::from)
+            .and_then(|root| known_good::normalize_library_root(&root).ok())
+        else {
+            return false;
+        };
+        if library_root != lease.library_root {
+            return false;
+        }
+        if self.managed_runtime_cache.root() != lease.managed_runtime_cache.root() {
+            return false;
+        }
+        self.known_good
+            .active_inventory(
+                &instance.id,
+                &instance.version_id,
+                &instance.created_at,
+                &library_root,
+            )
+            .is_some_and(|inventory| Arc::ptr_eq(&inventory, &lease.inventory))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn activate_known_good_inventory_for_test(
+        &self,
+        instance_id: &str,
+        inventory: axial_minecraft::known_good::KnownGoodInventory,
+    ) {
+        let instance = self.instances.get(instance_id).expect("test instance");
+        let library_root = self
+            .library_dir()
+            .map(PathBuf::from)
+            .expect("test library root");
+        self.known_good
+            .activate_for_test(
+                &instance.id,
+                &instance.version_id,
+                &instance.created_at,
+                &library_root,
+                Arc::new(inventory),
+            )
+            .expect("activate test known-good inventory");
     }
 
     pub(crate) async fn admit_managed_instance(

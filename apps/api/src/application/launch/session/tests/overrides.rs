@@ -1,4 +1,45 @@
 use super::*;
+use crate::guardian::GuardianFactId;
+
+#[cfg(unix)]
+#[tokio::test]
+async fn custom_external_java_excludes_unused_managed_runtime_from_tier_zero() {
+    let fixture = TestFixture::new("custom-external-java-tier-zero-runtime-scope");
+    fixture.set_guardian_mode("custom");
+    fixture.write_ready_install("1.21.1");
+    let instance_id = fixture.add_instance("Survival", "1.21.1");
+    let managed_root = fixture
+        .state
+        .managed_runtime_cache()
+        .component_root("java-runtime-delta")
+        .expect("managed runtime root");
+    let managed_java = managed_runtime_java_path(&managed_root);
+    fixture.activate_expected_version_inventory(
+        &instance_id,
+        "1.21.1",
+        Some(b"client jar".len() as u64),
+        [],
+    );
+    fs::remove_file(managed_java).expect("remove unused managed java");
+    let external_java = fixture.write_manual_java_override();
+    fixture.update_instance(&instance_id, |instance| instance.java_path = external_java);
+
+    let preflight = prepare_launch_preflight(&fixture.state, instance_id)
+        .await
+        .expect("prepare custom external preflight");
+
+    assert!(preflight.readiness.launchable);
+    assert_ne!(
+        preflight.guardian.decision(),
+        GuardianSummaryDecision::Blocked
+    );
+    assert!(!preflight.guardian_facts.iter().any(|fact| {
+        matches!(
+            fact.id,
+            GuardianFactId::ArtifactMissing | GuardianFactId::ArtifactSizeDrift
+        )
+    }));
+}
 
 #[cfg(unix)]
 #[tokio::test]
@@ -37,6 +78,7 @@ async fn direct_launch_receipt_keeps_preparation_retries_to_one_probe_spawn() {
             ..Default::default()
         };
         let core_prepared = axial_launcher::prepare_launch_attempt_with_events(
+            fixture.state.managed_runtime_cache(),
             &prepared.task.intent,
             &attempt,
             Some(receipt),
@@ -160,6 +202,7 @@ async fn run_override_preflight_measurement(
         ),
     };
     let core_prepared = axial_launcher::prepare_launch_attempt_with_events(
+        fixture.state.managed_runtime_cache(),
         &prepared.task.intent,
         &axial_launcher::service::AttemptOverrides::default(),
         receipt,
@@ -266,6 +309,7 @@ async fn runtime_repreflight_shape_reuses_the_flow_receipt() {
         &fixture.state,
         &producer,
         LaunchPreflightBuild {
+            instance_lifecycle: &fixture.state.acquire_instance_lifecycle(&instance.id).await,
             instance: &instance,
             config: &config,
             library_dir: &fixture.paths.library_dir,
@@ -281,6 +325,7 @@ async fn runtime_repreflight_shape_reuses_the_flow_receipt() {
         &fixture.state,
         &producer,
         LaunchPreflightBuild {
+            instance_lifecycle: &fixture.state.acquire_instance_lifecycle(&instance.id).await,
             instance: &instance,
             config: &config,
             library_dir: &fixture.paths.library_dir,

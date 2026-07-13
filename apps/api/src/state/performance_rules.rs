@@ -147,7 +147,7 @@ impl AppPerformanceStore {
     pub(crate) async fn admit_managed(
         &self,
         instance_id: &str,
-        instance_lifecycle: OwnedMutexGuard<()>,
+        instance_lifecycle: super::InstanceLifecycleLease,
         recovery_allowed: bool,
     ) -> Result<AppManagedCompositionAdmission, ManagedCompositionAdmissionError> {
         self.managed

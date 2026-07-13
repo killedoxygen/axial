@@ -629,15 +629,6 @@ mod tests {
                 target_version_id: String::new(),
                 auth: LaunchAuthContext::offline("Player"),
                 runtime: RuntimeSelection {
-                    requested_path: String::new(),
-                    selected_path: String::new(),
-                    selected_info: axial_minecraft::JavaRuntimeInfo {
-                        id: String::new(),
-                        major: 21,
-                        update: 0,
-                        distribution: "test".to_string(),
-                        path: String::new(),
-                    },
                     effective_path: "/usr/bin/java".to_string(),
                     effective_info: axial_minecraft::JavaRuntimeInfo {
                         id: "java".to_string(),
@@ -647,7 +638,6 @@ mod tests {
                         path: "/usr/bin/java".to_string(),
                     },
                     effective_source: "managed".to_string(),
-                    bypassed_requested_runtime: false,
                 },
                 game_dir: Some(instance_dir.clone()),
                 launcher_name: "axial".to_string(),
@@ -1191,15 +1181,6 @@ mod tests {
             target_version_id: String::new(),
             auth: LaunchAuthContext::offline("Player"),
             runtime: RuntimeSelection {
-                requested_path: String::new(),
-                selected_path: String::new(),
-                selected_info: axial_minecraft::JavaRuntimeInfo {
-                    id: String::new(),
-                    major: 21,
-                    update: 0,
-                    distribution: "test".to_string(),
-                    path: String::new(),
-                },
                 effective_path: "/usr/bin/java".to_string(),
                 effective_info: axial_minecraft::JavaRuntimeInfo {
                     id: "java".to_string(),
@@ -1209,7 +1190,6 @@ mod tests {
                     path: "/usr/bin/java".to_string(),
                 },
                 effective_source: "managed".to_string(),
-                bypassed_requested_runtime: false,
             },
             game_dir: None,
             launcher_name: "axial".to_string(),
@@ -1470,15 +1450,6 @@ mod tests {
 
     fn test_runtime() -> RuntimeSelection {
         RuntimeSelection {
-            requested_path: String::new(),
-            selected_path: String::new(),
-            selected_info: axial_minecraft::JavaRuntimeInfo {
-                id: String::new(),
-                major: 21,
-                update: 0,
-                distribution: "test".to_string(),
-                path: String::new(),
-            },
             effective_path: "/usr/bin/java".to_string(),
             effective_info: axial_minecraft::JavaRuntimeInfo {
                 id: "java".to_string(),
@@ -1488,7 +1459,6 @@ mod tests {
                 path: "/usr/bin/java".to_string(),
             },
             effective_source: "managed".to_string(),
-            bypassed_requested_runtime: false,
         }
     }
 

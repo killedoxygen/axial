@@ -1,25 +1,21 @@
+#[cfg(unix)]
+use super::file_download::component_manifest_link_target_path;
 use super::file_download::{
     RuntimeDownloadActual, RuntimeDownloadEvidence, available_runtime_parallelism,
-    component_manifest_destination, component_manifest_link_target_path, runtime_filesystem_path,
-    verify_runtime_download,
+    component_manifest_destination, runtime_filesystem_path, verify_runtime_download,
 };
-use super::layout::{
-    java_executable, runtime_cache_dir, runtime_executable_ready, runtime_os_arch,
-};
+use super::layout::{ManagedRuntimeCache, java_executable, runtime_executable_ready};
 use super::manifest::{COMPONENT_MANIFEST_PROOF_FILE, ComponentManifest};
 use super::model::{
     JavaRuntimeInfo, JavaRuntimeLookupError, JavaRuntimeResult, RuntimeId, RuntimeInstallState,
     RuntimeOverride, RuntimeRecord, RuntimeRequirement, RuntimeSource,
 };
-use super::probe::{
-    JavaRuntimeProbeValidation, probe_java_runtime_info, probe_java_runtime_receipt,
-};
+use super::probe::{JavaRuntimeProbeValidation, probe_java_runtime_receipt};
 use super::rosetta::rosetta_required_error_for_current_host;
 use crate::launch::{JavaVersion, java_component_for_major};
-use crate::paths::runtime_dirs;
 use sha1::{Digest as _, Sha1};
 use std::io::Read;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 pub fn runtime_requirement(java_version: &JavaVersion) -> RuntimeRequirement {
     RuntimeRequirement {
@@ -39,30 +35,22 @@ pub fn parse_runtime_override(value: &str) -> RuntimeOverride {
     }
 }
 
-pub fn list_runtime_records(library_dir: &Path) -> Vec<RuntimeRecord> {
+fn list_runtime_records(cache: &ManagedRuntimeCache) -> Vec<RuntimeRecord> {
     let components = known_runtime_components();
-    let mut dirs = runtime_dirs(library_dir);
-    dirs.push(runtime_cache_dir());
-
     let mut results = Vec::new();
-    for dir in dirs {
-        for component in &components {
-            if let Some(runtime) = inspect_component_runtime(&dir, component)
-                && runtime.install_state == RuntimeInstallState::Ready
-                && !results.iter().any(|entry: &RuntimeRecord| {
-                    entry.id == runtime.id && entry.java_path == runtime.java_path
-                })
-            {
-                results.push(runtime);
-            }
+    for component in &components {
+        if let Ok(Some(runtime)) = inspect_axial_cached_runtime(cache.root(), component)
+            && runtime.install_state == RuntimeInstallState::Ready
+        {
+            results.push(runtime);
         }
     }
 
     results
 }
 
-pub fn list_java_runtimes(library_dir: &Path) -> Vec<JavaRuntimeResult> {
-    list_runtime_records(library_dir)
+pub fn list_java_runtimes(cache: &ManagedRuntimeCache) -> Vec<JavaRuntimeResult> {
+    list_runtime_records(cache)
         .into_iter()
         .filter(|record| record.install_state == RuntimeInstallState::Ready)
         .map(|record| JavaRuntimeResult {
@@ -73,21 +61,22 @@ pub fn list_java_runtimes(library_dir: &Path) -> Vec<JavaRuntimeResult> {
         .collect()
 }
 
-pub fn runtime_component_ready_without_probe(library_dir: &Path, component: &str) -> bool {
-    let mut dirs = runtime_dirs(library_dir);
-    dirs.push(runtime_cache_dir());
-    dirs.into_iter()
-        .any(|dir| component_runtime_ready_without_probe(&dir, component))
+pub fn runtime_component_ready_without_probe(cache: &ManagedRuntimeCache, component: &str) -> bool {
+    component_runtime_ready_without_probe(cache.root(), component)
 }
 
 pub fn runtime_component_executable_present_without_probe(
-    library_dir: &Path,
+    cache: &ManagedRuntimeCache,
     component: &str,
 ) -> bool {
-    let mut dirs = runtime_dirs(library_dir);
-    dirs.push(runtime_cache_dir());
-    dirs.into_iter()
-        .any(|dir| component_runtime_executable_present(&dir, component))
+    component_runtime_executable_present(cache.root(), component)
+}
+
+pub fn runtime_component_structurally_ready_without_probe(
+    cache: &ManagedRuntimeCache,
+    component: &str,
+) -> bool {
+    component_runtime_structurally_ready(cache.root(), component)
 }
 
 pub fn runtime_executable_ready_without_probe(java_exe: &Path) -> bool {
@@ -99,31 +88,6 @@ pub fn managed_runtime_contents_verified_without_probe(runtime_root: &Path) -> b
         && persisted_runtime_manifest_verified(runtime_root)
 }
 
-pub fn find_java_runtime(
-    library_dir: &Path,
-    java_version: &JavaVersion,
-    override_path: &str,
-) -> Result<JavaRuntimeResult, JavaRuntimeLookupError> {
-    let requirement = runtime_requirement(java_version);
-    let runtime_override = parse_runtime_override(override_path);
-    let record = match runtime_override {
-        RuntimeOverride::None => {
-            resolve_managed_runtime(library_dir, &requirement.preferred_component)?
-        }
-        RuntimeOverride::Component(component) => {
-            resolve_component_runtime(library_dir, &component, java_version.major_version)?
-        }
-        RuntimeOverride::ExecutablePath(path) => {
-            resolve_override_runtime(&path, &requirement.preferred_component, None)?.record
-        }
-    };
-
-    Ok(JavaRuntimeResult {
-        path: record.java_path,
-        component: record.id.0,
-        source: record.source.as_str().to_string(),
-    })
-}
 pub fn preferred_runtime_component(java_version: &JavaVersion) -> String {
     if java_version.component.trim().is_empty() {
         java_component_for_major(java_version.major_version)
@@ -140,6 +104,37 @@ pub fn is_known_runtime_component(value: &str) -> bool {
         .any(|component| *component == value.trim())
 }
 
+impl ManagedRuntimeCache {
+    pub fn component_root(&self, component: &str) -> Option<PathBuf> {
+        is_known_runtime_component(component).then(|| self.root().join(component.trim()))
+    }
+
+    pub fn component_for_root(&self, path: &Path) -> Option<String> {
+        let relative = path.strip_prefix(self.root()).ok()?;
+        let mut components = relative.components();
+        let Component::Normal(component) = components.next()? else {
+            return None;
+        };
+        if components.next().is_some() {
+            return None;
+        }
+        let component = component.to_str()?;
+        is_known_runtime_component(component).then(|| component.to_string())
+    }
+
+    pub fn component_for_path(&self, path: &Path) -> Option<String> {
+        let relative = path.strip_prefix(self.root()).ok()?;
+        let mut components = relative.components();
+        let Component::Normal(component) = components.next()? else {
+            return None;
+        };
+        let component = component.to_str()?;
+        (is_known_runtime_component(component)
+            && components.all(|component| matches!(component, Component::Normal(_))))
+        .then(|| component.to_string())
+    }
+}
+
 fn known_runtime_components() -> [&'static str; 6] {
     [
         "java-runtime-epsilon",
@@ -152,43 +147,11 @@ fn known_runtime_components() -> [&'static str; 6] {
 }
 
 pub(super) fn resolve_component_runtime(
-    library_dir: &Path,
+    cache: &ManagedRuntimeCache,
     component: &RuntimeId,
     required_major: i32,
 ) -> Result<RuntimeRecord, JavaRuntimeLookupError> {
-    let mut dirs = runtime_dirs(library_dir);
-    dirs.push(runtime_cache_dir());
-    resolve_component_runtime_from_roots(dirs, component, required_major, |dir| {
-        inspect_component_runtime_for_resolution(dir, component.as_str())
-    })
-}
-
-pub(super) fn resolve_component_runtime_from_roots(
-    dirs: Vec<PathBuf>,
-    component: &RuntimeId,
-    required_major: i32,
-    mut inspect: impl FnMut(&Path) -> Result<Option<RuntimeRecord>, JavaRuntimeLookupError>,
-) -> Result<RuntimeRecord, JavaRuntimeLookupError> {
-    // defer Rosetta blocks: a later root may hold a compatible runtime, and
-    // surfacing beats NotFound since reinstall yields the same x86_64 build
-    let mut rosetta_block = None;
-    for dir in dirs {
-        match inspect(&dir) {
-            Ok(Some(record)) if record.install_state == RuntimeInstallState::Ready => {
-                return Ok(record);
-            }
-            Ok(_) => {}
-            Err(error @ JavaRuntimeLookupError::RosettaRequired { .. }) => {
-                rosetta_block.get_or_insert(error);
-            }
-            Err(error) => return Err(error),
-        }
-    }
-
-    Err(rosetta_block.unwrap_or(JavaRuntimeLookupError::NotFound {
-        component: component.0.clone(),
-        major: required_major,
-    }))
+    resolve_axial_cached_runtime(cache, component, required_major)
 }
 
 pub(super) fn component_runtime_ready_without_probe(base_dir: &Path, component: &str) -> bool {
@@ -196,16 +159,18 @@ pub(super) fn component_runtime_ready_without_probe(base_dir: &Path, component: 
         return false;
     }
 
-    let os_arch = runtime_os_arch();
-    [
-        base_dir.join(component).join(&os_arch).join(component),
-        base_dir.join(component),
-    ]
-    .into_iter()
-    .any(|candidate| {
-        detect_runtime_state(&candidate, runtime_requires_ready_marker(base_dir))
-            == RuntimeInstallState::Ready
-    })
+    detect_runtime_state(&base_dir.join(component)) == RuntimeInstallState::Ready
+}
+
+fn component_runtime_structurally_ready(base_dir: &Path, component: &str) -> bool {
+    if !runtime_filesystem_path(base_dir).as_ref().exists() {
+        return false;
+    }
+
+    let candidate = base_dir.join(component);
+    runtime_executable_ready(&java_executable(&candidate))
+        && candidate.join(".axial-ready").is_file()
+        && candidate.join(COMPONENT_MANIFEST_PROOF_FILE).is_file()
 }
 
 fn component_runtime_executable_present(base_dir: &Path, component: &str) -> bool {
@@ -213,35 +178,29 @@ fn component_runtime_executable_present(base_dir: &Path, component: &str) -> boo
         return false;
     }
 
-    let os_arch = runtime_os_arch();
-    [
-        base_dir.join(component).join(&os_arch).join(component),
-        base_dir.join(component),
-    ]
-    .into_iter()
-    .any(|candidate| {
-        let java = java_executable(&candidate);
-        runtime_filesystem_path(&java).as_ref().is_file()
-    })
+    let java = java_executable(&base_dir.join(component));
+    runtime_filesystem_path(&java).as_ref().is_file()
 }
 
 pub(super) fn resolve_managed_runtime(
-    library_dir: &Path,
+    cache: &ManagedRuntimeCache,
     component: &RuntimeId,
 ) -> Result<RuntimeRecord, JavaRuntimeLookupError> {
-    resolve_component_runtime(library_dir, component, 0)
+    resolve_component_runtime(cache, component, 0)
 }
 
 pub(super) fn resolve_axial_cached_runtime(
+    cache: &ManagedRuntimeCache,
     component: &RuntimeId,
     required_major: i32,
 ) -> Result<RuntimeRecord, JavaRuntimeLookupError> {
-    resolve_component_runtime_from_roots(
-        vec![runtime_cache_dir()],
-        component,
-        required_major,
-        |dir| inspect_axial_cached_runtime(dir, component.as_str()),
-    )
+    match inspect_axial_cached_runtime(cache.root(), component.as_str())? {
+        Some(record) if record.install_state == RuntimeInstallState::Ready => Ok(record),
+        _ => Err(JavaRuntimeLookupError::NotFound {
+            component: component.0.clone(),
+            major: required_major,
+        }),
+    }
 }
 
 fn inspect_axial_cached_runtime(
@@ -251,40 +210,34 @@ fn inspect_axial_cached_runtime(
     if !runtime_filesystem_path(base_dir).as_ref().exists() {
         return Ok(None);
     }
-    let os_arch = runtime_os_arch();
-    for candidate in [
-        base_dir.join(component).join(&os_arch).join(component),
-        base_dir.join(component),
-    ] {
-        let state = detect_runtime_state(&candidate, true);
-        if state == RuntimeInstallState::Missing {
-            continue;
-        }
-        let java_exe = java_executable(&candidate);
-        if state == RuntimeInstallState::Ready
-            && rosetta_required_error_for_current_host(&java_exe, component).is_some()
-        {
-            return Err(JavaRuntimeLookupError::RosettaRequired {
-                component: component.to_string(),
-            });
-        }
-        let java_path = java_exe.to_string_lossy().to_string();
-        return Ok(Some(RuntimeRecord {
-            id: RuntimeId(component.to_string()),
-            java_path: java_path.clone(),
-            info: JavaRuntimeInfo {
-                id: component.to_string(),
-                major: 0,
-                update: 0,
-                distribution: "unknown".to_string(),
-                path: java_path,
-            },
-            source: RuntimeSource::Managed,
-            install_state: state,
-            root_dir: candidate.to_string_lossy().to_string(),
-        }));
+    let candidate = base_dir.join(component);
+    let state = detect_runtime_state(&candidate);
+    if state == RuntimeInstallState::Missing {
+        return Ok(None);
     }
-    Ok(None)
+    let java_exe = java_executable(&candidate);
+    if state == RuntimeInstallState::Ready
+        && rosetta_required_error_for_current_host(&java_exe, component).is_some()
+    {
+        return Err(JavaRuntimeLookupError::RosettaRequired {
+            component: component.to_string(),
+        });
+    }
+    let java_path = java_exe.to_string_lossy().to_string();
+    Ok(Some(RuntimeRecord {
+        id: RuntimeId(component.to_string()),
+        java_path: java_path.clone(),
+        info: JavaRuntimeInfo {
+            id: component.to_string(),
+            major: 0,
+            update: 0,
+            distribution: "unknown".to_string(),
+            path: java_path,
+        },
+        source: RuntimeSource::Managed,
+        install_state: state,
+        root_dir: candidate.to_string_lossy().to_string(),
+    }))
 }
 
 pub(super) struct ResolvedOverrideRuntime {
@@ -346,132 +299,23 @@ pub(super) fn resolve_override_runtime(
         probe_usage,
     })
 }
-pub(super) fn inspect_component_runtime(base_dir: &Path, component: &str) -> Option<RuntimeRecord> {
-    inspect_component_runtime_checked(base_dir, component, false)
-        .ok()
-        .flatten()
-}
-
-fn inspect_component_runtime_for_resolution(
-    base_dir: &Path,
-    component: &str,
-) -> Result<Option<RuntimeRecord>, JavaRuntimeLookupError> {
-    inspect_component_runtime_checked(base_dir, component, true)
-}
-
-fn inspect_component_runtime_checked(
-    base_dir: &Path,
-    component: &str,
-    strict_compatibility: bool,
-) -> Result<Option<RuntimeRecord>, JavaRuntimeLookupError> {
-    if !runtime_filesystem_path(base_dir).as_ref().exists() {
-        return Ok(None);
-    }
-
-    let os_arch = runtime_os_arch();
-    for candidate in [
-        base_dir.join(component).join(&os_arch).join(component),
-        base_dir.join(component),
-    ] {
-        let state = detect_runtime_state(&candidate, runtime_requires_ready_marker(base_dir));
-        if state == RuntimeInstallState::Missing {
-            continue;
-        }
-
-        let java_exe = java_executable(&candidate);
-        let rosetta_required = if state == RuntimeInstallState::Ready {
-            rosetta_required_error_for_current_host(&java_exe, component)
-        } else {
-            None
-        };
-        if rosetta_required.is_some() && strict_compatibility {
-            return Err(JavaRuntimeLookupError::RosettaRequired {
-                component: component.to_string(),
-            });
-        }
-        let source = classify_runtime_source(base_dir);
-        let info = if state == RuntimeInstallState::Ready && rosetta_required.is_none() {
-            probe_java_runtime_info(&java_exe, Some(component)).unwrap_or(JavaRuntimeInfo {
-                id: component.to_string(),
-                major: 0,
-                update: 0,
-                distribution: "unknown".to_string(),
-                path: java_exe.to_string_lossy().to_string(),
-            })
-        } else {
-            JavaRuntimeInfo {
-                id: component.to_string(),
-                major: 0,
-                update: 0,
-                distribution: "unknown".to_string(),
-                path: java_exe.to_string_lossy().to_string(),
-            }
-        };
-
-        return Ok(Some(RuntimeRecord {
-            id: RuntimeId(component.to_string()),
-            java_path: java_exe.to_string_lossy().to_string(),
-            info,
-            source,
-            install_state: state,
-            root_dir: candidate.to_string_lossy().to_string(),
-        }));
-    }
-
-    Ok(None)
-}
-
-pub(super) fn runtime_requires_ready_marker(base_dir: &Path) -> bool {
-    base_dir == runtime_cache_dir()
-}
-
-pub(super) fn classify_runtime_source(base_dir: &Path) -> RuntimeSource {
-    let label = base_dir.to_string_lossy();
-    if label.contains("Packages") {
-        RuntimeSource::MicrosoftStore
-    } else if label.contains("axial") {
-        RuntimeSource::Managed
-    } else {
-        RuntimeSource::MinecraftBundled
-    }
-}
-
-pub(super) fn detect_runtime_state(
-    runtime_root: &Path,
-    require_ready_marker: bool,
-) -> RuntimeInstallState {
+pub(super) fn detect_runtime_state(runtime_root: &Path) -> RuntimeInstallState {
     let installing_marker = runtime_root.join(".axial-installing");
     let ready_marker = runtime_root.join(".axial-ready");
-    let java_exe = java_executable(runtime_root);
 
-    if require_ready_marker {
-        if runtime_filesystem_path(&installing_marker)
-            .as_ref()
-            .exists()
-        {
-            return RuntimeInstallState::Installing;
-        }
-        if runtime_filesystem_path(&ready_marker).as_ref().is_file()
-            && managed_runtime_contents_verified_without_probe(runtime_root)
-        {
-            return RuntimeInstallState::Ready;
-        }
-        if runtime_filesystem_path(&ready_marker).as_ref().exists()
-            || runtime_filesystem_path(runtime_root).as_ref().exists()
-        {
-            return RuntimeInstallState::Broken;
-        }
-        return RuntimeInstallState::Missing;
-    }
-
-    if runtime_executable_ready(&java_exe) {
-        return RuntimeInstallState::Ready;
-    }
     if runtime_filesystem_path(&installing_marker)
         .as_ref()
         .exists()
     {
         return RuntimeInstallState::Installing;
+    }
+    if runtime_filesystem_path(&ready_marker).as_ref().is_file()
+        && runtime_filesystem_path(&runtime_root.join(COMPONENT_MANIFEST_PROOF_FILE))
+            .as_ref()
+            .is_file()
+        && runtime_executable_ready(&java_executable(runtime_root))
+    {
+        return RuntimeInstallState::Ready;
     }
     if runtime_filesystem_path(&ready_marker).as_ref().exists()
         || runtime_filesystem_path(runtime_root).as_ref().exists()
@@ -491,6 +335,7 @@ fn persisted_runtime_manifest_verified(runtime_root: &Path) -> bool {
     };
 
     let mut file_jobs = Vec::new();
+    #[cfg(unix)]
     let mut link_jobs = Vec::new();
     let mut saw_file = false;
     for (relative_path, file) in manifest.files {
@@ -524,28 +369,42 @@ fn persisted_runtime_manifest_verified(runtime_root: &Path) -> bool {
                 });
             }
             "link" => {
-                let Some(target) = file.target else {
-                    return false;
-                };
-                let Ok(target_path) = component_manifest_link_target_path(
-                    runtime_root,
-                    &path,
-                    &relative_path,
-                    &target,
-                ) else {
-                    return false;
-                };
-                link_jobs.push(RuntimeLinkVerificationJob {
-                    path,
-                    target,
-                    target_path,
-                });
+                #[cfg(not(unix))]
+                return false;
+                #[cfg(unix)]
+                {
+                    let Some(target) = file.target else {
+                        return false;
+                    };
+                    let Ok(target_path) = component_manifest_link_target_path(
+                        runtime_root,
+                        &path,
+                        &relative_path,
+                        &target,
+                    ) else {
+                        return false;
+                    };
+                    link_jobs.push(RuntimeLinkVerificationJob {
+                        path,
+                        target,
+                        target_path,
+                    });
+                }
             }
             _ => return false,
         }
     }
 
-    saw_file && verify_runtime_jobs(file_jobs) && link_jobs.into_iter().all(verify_runtime_link_job)
+    saw_file && verify_runtime_jobs(file_jobs) && {
+        #[cfg(unix)]
+        {
+            link_jobs.into_iter().all(verify_runtime_link_job)
+        }
+        #[cfg(not(unix))]
+        {
+            true
+        }
+    }
 }
 
 #[cfg(test)]
@@ -611,6 +470,7 @@ fn verify_runtime_job(job: RuntimeVerificationJob) -> bool {
     verify_runtime_download(&job.relative_path, &job.expected, &actual).is_ok()
 }
 
+#[cfg(unix)]
 struct RuntimeLinkVerificationJob {
     path: PathBuf,
     target: String,
@@ -631,11 +491,6 @@ fn verify_runtime_link_job(job: RuntimeLinkVerificationJob) -> bool {
     };
     actual_target == Path::new(&job.target)
         && runtime_filesystem_path(&job.target_path).as_ref().exists()
-}
-
-#[cfg(not(unix))]
-fn verify_runtime_link_job(_job: RuntimeLinkVerificationJob) -> bool {
-    false
 }
 
 fn runtime_sha1_hex(value: &str) -> bool {

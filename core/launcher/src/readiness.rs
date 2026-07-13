@@ -7,10 +7,10 @@ use axial_minecraft::download::{
 };
 use axial_minecraft::paths::assets_dir;
 use axial_minecraft::{
-    LaunchModelError, RuntimeOverride, VersionJson, default_environment, load_version_json,
-    parse_runtime_override, preferred_runtime_component, resolve_version,
+    LaunchModelError, ManagedRuntimeCache, RuntimeOverride, VersionJson, default_environment,
+    load_version_json, parse_runtime_override, preferred_runtime_component, resolve_version,
     runtime_component_executable_present_without_probe, runtime_component_ready_without_probe,
-    runtime_executable_ready_without_probe,
+    runtime_component_structurally_ready_without_probe, runtime_executable_ready_without_probe,
 };
 use serde::Deserialize;
 use serde::Serialize;
@@ -76,21 +76,44 @@ pub enum LaunchReadinessSeverity {
     Recoverable,
 }
 
-pub fn inspect_launch_readiness(request: &LaunchReadinessRequest) -> LaunchReadiness {
-    inspect_launch_readiness_with_depth(request, LaunchReadinessInspection::Full)
+pub fn inspect_create_readiness(
+    runtime_cache: &ManagedRuntimeCache,
+    request: &LaunchReadinessRequest,
+) -> LaunchReadiness {
+    inspect_readiness(
+        runtime_cache,
+        request,
+        LaunchReadinessInspection::CreateFull,
+    )
 }
 
-pub fn inspect_launch_readiness_summary(request: &LaunchReadinessRequest) -> LaunchReadiness {
-    inspect_launch_readiness_with_depth(request, LaunchReadinessInspection::Summary)
+pub fn inspect_launch_readiness_summary(
+    runtime_cache: &ManagedRuntimeCache,
+    request: &LaunchReadinessRequest,
+) -> LaunchReadiness {
+    inspect_readiness(runtime_cache, request, LaunchReadinessInspection::Summary)
+}
+
+pub fn inspect_launch_readiness_structural(
+    runtime_cache: &ManagedRuntimeCache,
+    request: &LaunchReadinessRequest,
+) -> LaunchReadiness {
+    inspect_readiness(
+        runtime_cache,
+        request,
+        LaunchReadinessInspection::Structural,
+    )
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum LaunchReadinessInspection {
-    Full,
+    CreateFull,
     Summary,
+    Structural,
 }
 
-fn inspect_launch_readiness_with_depth(
+fn inspect_readiness(
+    runtime_cache: &ManagedRuntimeCache,
     request: &LaunchReadinessRequest,
     inspection: LaunchReadinessInspection,
 ) -> LaunchReadiness {
@@ -99,13 +122,15 @@ fn inspect_launch_readiness_with_depth(
 
     let version = match resolve_version(&request.library_dir, &request.version_id) {
         Ok(version) => {
-            inspect_version_files(
-                &request.library_dir,
-                &request.version_id,
-                &version,
-                inspection,
-                &mut reasons,
-            );
+            if inspection != LaunchReadinessInspection::Structural {
+                inspect_version_files(
+                    &request.library_dir,
+                    &request.version_id,
+                    &version,
+                    inspection,
+                    &mut reasons,
+                );
+            }
             Some(version)
         }
         Err(error) => {
@@ -114,7 +139,13 @@ fn inspect_launch_readiness_with_depth(
         }
     };
 
-    inspect_runtime_files(request, version.as_ref(), inspection, &mut reasons);
+    inspect_runtime_files(
+        runtime_cache,
+        request,
+        version.as_ref(),
+        inspection,
+        &mut reasons,
+    );
 
     LaunchReadiness {
         launchable: reasons
@@ -161,7 +192,7 @@ fn inspect_version_files(
 ) {
     match find_client_jar(library_dir, version, version_id) {
         Some(client_jar) => {
-            let client_signature_corrupt = inspection == LaunchReadinessInspection::Full
+            let client_signature_corrupt = inspection == LaunchReadinessInspection::CreateFull
                 && legacy_forge_client_jar_has_signed_metadata(
                     library_dir,
                     version_id,
@@ -219,11 +250,14 @@ fn inspect_version_files(
             integrity: library.integrity,
         })
         .collect();
-    let library_signature_corrupt = inspection == LaunchReadinessInspection::Full
+    let library_signature_corrupt = inspection == LaunchReadinessInspection::CreateFull
         && legacy_forge_libraries_have_signed_metadata(library_dir, version_id, &library_jobs);
     let library_readiness = match inspection {
         LaunchReadinessInspection::Summary => verify_artifact_jobs_metadata(library_jobs),
-        LaunchReadinessInspection::Full => verify_artifact_jobs(library_jobs),
+        LaunchReadinessInspection::CreateFull => verify_artifact_jobs(library_jobs),
+        LaunchReadinessInspection::Structural => {
+            unreachable!("structural readiness skips artifact inspection")
+        }
     };
     let libraries_missing = readiness_contains(
         &library_readiness,
@@ -290,7 +324,7 @@ fn inspect_version_files(
                         reasons,
                     );
                 }
-                LaunchReadinessInspection::Full => {
+                LaunchReadinessInspection::CreateFull => {
                     match verify_existing_launcher_managed_artifact(&asset_index_path, &expected) {
                         LauncherManagedArtifactReadiness::Verified => {
                             inspect_asset_object_files(library_dir, &asset_index_path, reasons);
@@ -306,6 +340,9 @@ fn inspect_version_files(
                             LaunchReadinessSeverity::Blocking,
                         )),
                     }
+                }
+                LaunchReadinessInspection::Structural => {
+                    unreachable!("structural readiness skips artifact inspection")
                 }
             }
         }
@@ -641,6 +678,7 @@ fn asset_corrupt_reason() -> LaunchReadinessReason {
 }
 
 fn inspect_runtime_files(
+    runtime_cache: &ManagedRuntimeCache,
     request: &LaunchReadinessRequest,
     version: Option<&VersionJson>,
     inspection: LaunchReadinessInspection,
@@ -659,14 +697,19 @@ fn inspect_runtime_files(
                 let ready = match inspection {
                     LaunchReadinessInspection::Summary => {
                         runtime_component_executable_present_without_probe(
-                            &request.library_dir,
+                            runtime_cache,
                             component.as_str(),
                         )
                     }
-                    LaunchReadinessInspection::Full => runtime_component_ready_without_probe(
-                        &request.library_dir,
-                        component.as_str(),
-                    ),
+                    LaunchReadinessInspection::Structural => {
+                        runtime_component_structurally_ready_without_probe(
+                            runtime_cache,
+                            component.as_str(),
+                        )
+                    }
+                    LaunchReadinessInspection::CreateFull => {
+                        runtime_component_ready_without_probe(runtime_cache, component.as_str())
+                    }
                 };
                 if !ready {
                     reasons.push(java_override_missing_reason());
@@ -677,14 +720,15 @@ fn inspect_runtime_files(
         }
     }
 
+    if inspection != LaunchReadinessInspection::CreateFull {
+        return;
+    }
+
     let Some(version) = version else {
         return;
     };
-    if inspection == LaunchReadinessInspection::Summary {
-        return;
-    }
     let component = preferred_runtime_component(&version.java_version);
-    if !runtime_component_ready_without_probe(&request.library_dir, &component) {
+    if !runtime_component_ready_without_probe(runtime_cache, &component) {
         reasons.push(reason(
             LaunchReadinessReasonId::ManagedRuntimeMissing,
             "Managed Java runtime is missing and will be prepared before launch.",
@@ -748,8 +792,8 @@ fn reason(
 mod tests {
     use super::{
         ArtifactVerificationJob, LaunchReadinessReasonId, LaunchReadinessRequest,
-        LaunchReadinessSeverity, inspect_launch_readiness, inspect_launch_readiness_summary,
-        verify_artifact_job, verify_artifact_job_metadata,
+        LaunchReadinessSeverity, inspect_create_readiness, inspect_launch_readiness_structural,
+        inspect_launch_readiness_summary, verify_artifact_job, verify_artifact_job_metadata,
     };
     use crate::GuardianMode;
     use axial_minecraft::download::{
@@ -764,6 +808,7 @@ mod tests {
     #[test]
     fn managed_runtime_missing_is_recoverable_in_managed_mode() {
         let library_dir = temp_library("managed-runtime-missing-recoverable");
+        let runtime_cache = isolated_runtime_cache();
         write_version_json(
             &library_dir,
             "1.21.1",
@@ -788,12 +833,15 @@ mod tests {
         )
         .expect("write client jar");
 
-        let readiness = inspect_launch_readiness(&LaunchReadinessRequest {
-            library_dir: library_dir.clone(),
-            version_id: "1.21.1".to_string(),
-            requested_java: String::new(),
-            guardian_mode: GuardianMode::Managed,
-        });
+        let readiness = inspect_create_readiness(
+            &runtime_cache,
+            &LaunchReadinessRequest {
+                library_dir: library_dir.clone(),
+                version_id: "1.21.1".to_string(),
+                requested_java: String::new(),
+                guardian_mode: GuardianMode::Managed,
+            },
+        );
 
         assert!(readiness.launchable, "{:?}", readiness.reasons);
         let reason = readiness
@@ -806,8 +854,49 @@ mod tests {
     }
 
     #[test]
+    fn structural_readiness_defers_preferred_managed_runtime_to_tier_zero() {
+        let library_dir = temp_library("structural-runtime-tier-zero-authority");
+        let runtime_cache = isolated_runtime_cache();
+        write_version_json(
+            &library_dir,
+            "1.21.1",
+            r#"{
+                "id": "1.21.1",
+                "type": "release",
+                "mainClass": "net.minecraft.client.main.Main",
+                "assetIndex": {},
+                "javaVersion": {
+                    "component": "axial-test-runtime-missing",
+                    "majorVersion": 21
+                },
+                "libraries": []
+            }"#,
+        );
+
+        let readiness = inspect_launch_readiness_structural(
+            &runtime_cache,
+            &LaunchReadinessRequest {
+                library_dir: library_dir.clone(),
+                version_id: "1.21.1".to_string(),
+                requested_java: String::new(),
+                guardian_mode: GuardianMode::Managed,
+            },
+        );
+
+        assert!(readiness.launchable, "{:?}", readiness.reasons);
+        assert!(
+            readiness
+                .reasons
+                .iter()
+                .all(|reason| reason.id != LaunchReadinessReasonId::ManagedRuntimeMissing)
+        );
+        cleanup(&library_dir);
+    }
+
+    #[test]
     fn custom_component_override_missing_stays_blocking() {
         let library_dir = temp_library("custom-runtime-missing-blocking");
+        let runtime_cache = isolated_runtime_cache();
         write_version_json(
             &library_dir,
             "1.21.1",
@@ -832,12 +921,15 @@ mod tests {
         )
         .expect("write client jar");
 
-        let readiness = inspect_launch_readiness(&LaunchReadinessRequest {
-            library_dir: library_dir.clone(),
-            version_id: "1.21.1".to_string(),
-            requested_java: "axial-test-runtime-missing".to_string(),
-            guardian_mode: GuardianMode::Custom,
-        });
+        let readiness = inspect_create_readiness(
+            &runtime_cache,
+            &LaunchReadinessRequest {
+                library_dir: library_dir.clone(),
+                version_id: "1.21.1".to_string(),
+                requested_java: "axial-test-runtime-missing".to_string(),
+                guardian_mode: GuardianMode::Custom,
+            },
+        );
 
         assert!(!readiness.launchable);
         let reason = readiness
@@ -852,6 +944,7 @@ mod tests {
     #[test]
     fn corrupt_client_jar_blocks_launch_readiness() {
         let library_dir = temp_library("corrupt-client-jar");
+        let runtime_cache = isolated_runtime_cache();
         let expected_client = b"fresh";
         write_version_json(
             &library_dir,
@@ -884,12 +977,15 @@ mod tests {
         )
         .expect("write corrupt client jar");
 
-        let readiness = inspect_launch_readiness(&LaunchReadinessRequest {
-            library_dir: library_dir.clone(),
-            version_id: "1.21.1".to_string(),
-            requested_java: String::new(),
-            guardian_mode: GuardianMode::Managed,
-        });
+        let readiness = inspect_create_readiness(
+            &runtime_cache,
+            &LaunchReadinessRequest {
+                library_dir: library_dir.clone(),
+                version_id: "1.21.1".to_string(),
+                requested_java: String::new(),
+                guardian_mode: GuardianMode::Managed,
+            },
+        );
 
         assert!(!readiness.launchable);
         assert!(readiness.reasons.iter().any(|reason| {
@@ -902,6 +998,7 @@ mod tests {
     #[test]
     fn exact_library_hash_and_size_drift_block_readiness() {
         let library_dir = temp_library("corrupt-library");
+        let runtime_cache = isolated_runtime_cache();
         let client = b"client";
         let expected_library = b"fresh";
         write_version_json(
@@ -952,12 +1049,15 @@ mod tests {
         fs::create_dir_all(library_path.parent().expect("library parent")).expect("library dir");
         fs::write(&library_path, b"wrong").expect("write corrupt library");
 
-        let readiness = inspect_launch_readiness(&LaunchReadinessRequest {
-            library_dir: library_dir.clone(),
-            version_id: "1.21.1".to_string(),
-            requested_java: String::new(),
-            guardian_mode: GuardianMode::Managed,
-        });
+        let readiness = inspect_create_readiness(
+            &runtime_cache,
+            &LaunchReadinessRequest {
+                library_dir: library_dir.clone(),
+                version_id: "1.21.1".to_string(),
+                requested_java: String::new(),
+                guardian_mode: GuardianMode::Managed,
+            },
+        );
 
         assert!(!readiness.launchable);
         assert!(readiness.reasons.iter().any(|reason| {
@@ -966,12 +1066,15 @@ mod tests {
         }));
 
         fs::write(&library_path, b"wrong-size").expect("write size-drifted library");
-        let summary = inspect_launch_readiness_summary(&LaunchReadinessRequest {
-            library_dir: library_dir.clone(),
-            version_id: "1.21.1".to_string(),
-            requested_java: String::new(),
-            guardian_mode: GuardianMode::Managed,
-        });
+        let summary = inspect_launch_readiness_summary(
+            &runtime_cache,
+            &LaunchReadinessRequest {
+                library_dir: library_dir.clone(),
+                version_id: "1.21.1".to_string(),
+                requested_java: String::new(),
+                guardian_mode: GuardianMode::Managed,
+            },
+        );
         assert!(!summary.launchable);
         assert!(summary.reasons.iter().any(|reason| {
             reason.id == LaunchReadinessReasonId::LibrariesCorrupt
@@ -983,6 +1086,7 @@ mod tests {
     #[test]
     fn url_less_library_is_verified_for_launch_readiness() {
         let library_dir = temp_library("url-less-library-ready");
+        let runtime_cache = isolated_runtime_cache();
         let client = b"client";
         let library = b"library";
         write_version_json(
@@ -1033,12 +1137,15 @@ mod tests {
         fs::create_dir_all(library_path.parent().expect("library parent")).expect("library dir");
         fs::write(&library_path, library).expect("write library");
 
-        let readiness = inspect_launch_readiness(&LaunchReadinessRequest {
-            library_dir: library_dir.clone(),
-            version_id: "1.21.1".to_string(),
-            requested_java: String::new(),
-            guardian_mode: GuardianMode::Managed,
-        });
+        let readiness = inspect_create_readiness(
+            &runtime_cache,
+            &LaunchReadinessRequest {
+                library_dir: library_dir.clone(),
+                version_id: "1.21.1".to_string(),
+                requested_java: String::new(),
+                guardian_mode: GuardianMode::Managed,
+            },
+        );
 
         assert!(readiness.launchable, "{:?}", readiness.reasons);
         assert!(!readiness.reasons.iter().any(|reason| {
@@ -1054,6 +1161,7 @@ mod tests {
     #[test]
     fn summary_readiness_reports_missing_library_metadata() {
         let library_dir = temp_library("summary-missing-library");
+        let runtime_cache = isolated_runtime_cache();
         let client = b"client";
         let expected_library = b"fresh";
         write_version_json(
@@ -1095,12 +1203,15 @@ mod tests {
         )
         .expect("write client jar");
 
-        let readiness = inspect_launch_readiness_summary(&LaunchReadinessRequest {
-            library_dir: library_dir.clone(),
-            version_id: "1.21.1".to_string(),
-            requested_java: String::new(),
-            guardian_mode: GuardianMode::Managed,
-        });
+        let readiness = inspect_launch_readiness_summary(
+            &runtime_cache,
+            &LaunchReadinessRequest {
+                library_dir: library_dir.clone(),
+                version_id: "1.21.1".to_string(),
+                requested_java: String::new(),
+                guardian_mode: GuardianMode::Managed,
+            },
+        );
 
         assert!(!readiness.launchable);
         assert!(readiness.reasons.iter().any(|reason| {
@@ -1113,6 +1224,7 @@ mod tests {
     #[test]
     fn canonical_loader_profile_cannot_authorize_checksumless_library() {
         let library_dir = temp_library("marked-checksumless-library-readable");
+        let runtime_cache = isolated_runtime_cache();
         let client = b"client";
         let version_id = axial_minecraft::installed_version_id_for(
             axial_minecraft::LoaderComponentId::Quilt,
@@ -1161,12 +1273,15 @@ mod tests {
         )
         .expect("write readable jar");
 
-        let readiness = inspect_launch_readiness(&LaunchReadinessRequest {
-            library_dir: library_dir.clone(),
-            version_id,
-            requested_java: String::new(),
-            guardian_mode: GuardianMode::Managed,
-        });
+        let readiness = inspect_create_readiness(
+            &runtime_cache,
+            &LaunchReadinessRequest {
+                library_dir: library_dir.clone(),
+                version_id,
+                requested_java: String::new(),
+                guardian_mode: GuardianMode::Managed,
+            },
+        );
 
         assert!(!readiness.launchable);
         assert!(readiness.reasons.iter().any(|reason| {
@@ -1179,6 +1294,7 @@ mod tests {
     #[test]
     fn missing_checksum_is_always_fail_closed() {
         let library_dir = temp_library("missing-checksum-library");
+        let _runtime_cache = isolated_runtime_cache();
         let path = library_dir.join("libraries/example.jar");
         fs::create_dir_all(path.parent().expect("library parent")).expect("library directory");
         let bytes = zip_bytes(&[("example/Entry.class", b"entry")]);
@@ -1201,8 +1317,9 @@ mod tests {
     }
 
     #[test]
-    fn non_materialized_loader_profile_cannot_authorize_checksumless_library() {
+    fn non_materialized_loader_profile_is_rejected_before_library_authority() {
         let library_dir = temp_library("non-materialized-checksumless-library");
+        let runtime_cache = isolated_runtime_cache();
         let client = b"client";
         let version_id = axial_minecraft::installed_version_id_for(
             axial_minecraft::LoaderComponentId::Quilt,
@@ -1249,24 +1366,33 @@ mod tests {
         )
         .expect("write readable jar");
 
-        let readiness = inspect_launch_readiness(&LaunchReadinessRequest {
-            library_dir: library_dir.clone(),
-            version_id,
-            requested_java: String::new(),
-            guardian_mode: GuardianMode::Managed,
-        });
+        let readiness = inspect_create_readiness(
+            &runtime_cache,
+            &LaunchReadinessRequest {
+                library_dir: library_dir.clone(),
+                version_id,
+                requested_java: String::new(),
+                guardian_mode: GuardianMode::Managed,
+            },
+        );
 
         assert!(!readiness.launchable);
-        assert!(readiness.reasons.iter().any(|reason| {
-            reason.id == LaunchReadinessReasonId::LibrariesCorrupt
-                && reason.severity == LaunchReadinessSeverity::Blocking
-        }));
+        assert_eq!(readiness.reasons.len(), 1);
+        assert_eq!(
+            readiness.reasons[0].id,
+            LaunchReadinessReasonId::VersionJsonMissing
+        );
+        assert_eq!(
+            readiness.reasons[0].severity,
+            LaunchReadinessSeverity::Blocking
+        );
         cleanup(&library_dir);
     }
 
     #[test]
     fn signed_legacy_forge_child_client_blocks_launch_readiness() {
         let library_dir = temp_library("signed-legacy-forge-child-client");
+        let runtime_cache = isolated_runtime_cache();
         let version_id = legacy_forge_version_id();
         let signed_client = zip_bytes(&[
             ("META-INF/MANIFEST.MF", b"signed manifest"),
@@ -1300,12 +1426,15 @@ mod tests {
         )
         .expect("write signed child jar");
 
-        let readiness = inspect_launch_readiness(&LaunchReadinessRequest {
-            library_dir: library_dir.clone(),
-            version_id,
-            requested_java: String::new(),
-            guardian_mode: GuardianMode::Managed,
-        });
+        let readiness = inspect_create_readiness(
+            &runtime_cache,
+            &LaunchReadinessRequest {
+                library_dir: library_dir.clone(),
+                version_id,
+                requested_java: String::new(),
+                guardian_mode: GuardianMode::Managed,
+            },
+        );
 
         assert!(!readiness.launchable);
         assert!(readiness.reasons.iter().any(|reason| {
@@ -1324,6 +1453,7 @@ mod tests {
     #[test]
     fn signed_legacy_forge_child_client_prefers_signature_reason_over_checksum_mismatch() {
         let library_dir = temp_library("signed-legacy-forge-child-client-mismatched-checksum");
+        let runtime_cache = isolated_runtime_cache();
         let version_id = legacy_forge_version_id();
         let expected_client = b"fresh";
         let signed_client = zip_bytes(&[
@@ -1358,12 +1488,15 @@ mod tests {
         )
         .expect("write signed child jar");
 
-        let readiness = inspect_launch_readiness(&LaunchReadinessRequest {
-            library_dir: library_dir.clone(),
-            version_id,
-            requested_java: String::new(),
-            guardian_mode: GuardianMode::Managed,
-        });
+        let readiness = inspect_create_readiness(
+            &runtime_cache,
+            &LaunchReadinessRequest {
+                library_dir: library_dir.clone(),
+                version_id,
+                requested_java: String::new(),
+                guardian_mode: GuardianMode::Managed,
+            },
+        );
 
         assert!(!readiness.launchable);
         assert!(readiness.reasons.iter().any(|reason| {
@@ -1382,6 +1515,7 @@ mod tests {
     #[test]
     fn signed_legacy_forge_library_blocks_launch_readiness() {
         let library_dir = temp_library("signed-legacy-forge-library");
+        let runtime_cache = isolated_runtime_cache();
         let version_id = legacy_forge_version_id();
         let client = b"client";
         let signed_forge = zip_bytes(&[
@@ -1435,12 +1569,15 @@ mod tests {
         fs::create_dir_all(forge_path.parent().expect("forge parent")).expect("forge dir");
         fs::write(&forge_path, signed_forge).expect("write signed forge library");
 
-        let readiness = inspect_launch_readiness(&LaunchReadinessRequest {
-            library_dir: library_dir.clone(),
-            version_id,
-            requested_java: String::new(),
-            guardian_mode: GuardianMode::Managed,
-        });
+        let readiness = inspect_create_readiness(
+            &runtime_cache,
+            &LaunchReadinessRequest {
+                library_dir: library_dir.clone(),
+                version_id,
+                requested_java: String::new(),
+                guardian_mode: GuardianMode::Managed,
+            },
+        );
 
         assert!(!readiness.launchable);
         assert!(readiness.reasons.iter().any(|reason| {
@@ -1459,6 +1596,7 @@ mod tests {
     #[test]
     fn signed_legacy_forge_library_prefers_signature_reason_over_checksum_mismatch() {
         let library_dir = temp_library("signed-legacy-forge-library-mismatched-checksum");
+        let runtime_cache = isolated_runtime_cache();
         let version_id = legacy_forge_version_id();
         let client = b"client";
         let expected_library = b"fresh";
@@ -1513,12 +1651,15 @@ mod tests {
         fs::create_dir_all(forge_path.parent().expect("forge parent")).expect("forge dir");
         fs::write(&forge_path, signed_forge).expect("write signed forge library");
 
-        let readiness = inspect_launch_readiness(&LaunchReadinessRequest {
-            library_dir: library_dir.clone(),
-            version_id,
-            requested_java: String::new(),
-            guardian_mode: GuardianMode::Managed,
-        });
+        let readiness = inspect_create_readiness(
+            &runtime_cache,
+            &LaunchReadinessRequest {
+                library_dir: library_dir.clone(),
+                version_id,
+                requested_java: String::new(),
+                guardian_mode: GuardianMode::Managed,
+            },
+        );
 
         assert!(!readiness.launchable);
         assert!(readiness.reasons.iter().any(|reason| {
@@ -1537,6 +1678,7 @@ mod tests {
     #[test]
     fn corrupt_legacy_top_level_library_blocks_launch_readiness() {
         let library_dir = temp_library("corrupt-legacy-library");
+        let runtime_cache = isolated_runtime_cache();
         let client = b"client";
         let expected_library = b"fresh";
         write_version_json(
@@ -1575,12 +1717,15 @@ mod tests {
         fs::create_dir_all(library_path.parent().expect("library parent")).expect("library dir");
         fs::write(&library_path, b"wrong").expect("write corrupt library");
 
-        let readiness = inspect_launch_readiness(&LaunchReadinessRequest {
-            library_dir: library_dir.clone(),
-            version_id: "1.5.2".to_string(),
-            requested_java: String::new(),
-            guardian_mode: GuardianMode::Managed,
-        });
+        let readiness = inspect_create_readiness(
+            &runtime_cache,
+            &LaunchReadinessRequest {
+                library_dir: library_dir.clone(),
+                version_id: "1.5.2".to_string(),
+                requested_java: String::new(),
+                guardian_mode: GuardianMode::Managed,
+            },
+        );
 
         assert!(!readiness.launchable);
         assert!(readiness.reasons.iter().any(|reason| {
@@ -1593,6 +1738,7 @@ mod tests {
     #[test]
     fn corrupt_asset_index_blocks_launch_readiness() {
         let library_dir = temp_library("corrupt-asset-index");
+        let runtime_cache = isolated_runtime_cache();
         let client = b"client";
         let expected_asset_index = b"fresh";
         write_version_json(
@@ -1639,12 +1785,15 @@ mod tests {
             .expect("asset index dir");
         fs::write(&asset_index_path, b"wrong").expect("write corrupt asset index");
 
-        let readiness = inspect_launch_readiness(&LaunchReadinessRequest {
-            library_dir: library_dir.clone(),
-            version_id: "1.21.1".to_string(),
-            requested_java: String::new(),
-            guardian_mode: GuardianMode::Managed,
-        });
+        let readiness = inspect_create_readiness(
+            &runtime_cache,
+            &LaunchReadinessRequest {
+                library_dir: library_dir.clone(),
+                version_id: "1.21.1".to_string(),
+                requested_java: String::new(),
+                guardian_mode: GuardianMode::Managed,
+            },
+        );
 
         assert!(!readiness.launchable);
         assert!(readiness.reasons.iter().any(|reason| {
@@ -1657,6 +1806,7 @@ mod tests {
     #[test]
     fn missing_asset_object_blocks_launch_readiness() {
         let library_dir = temp_library("missing-asset-object");
+        let runtime_cache = isolated_runtime_cache();
         let asset = b"asset";
         write_asset_version_fixture(&library_dir, asset, false);
         let request = LaunchReadinessRequest {
@@ -1666,8 +1816,8 @@ mod tests {
             guardian_mode: GuardianMode::Managed,
         };
 
-        let summary = inspect_launch_readiness_summary(&request);
-        let readiness = inspect_launch_readiness(&request);
+        let summary = inspect_launch_readiness_summary(&runtime_cache, &request);
+        let readiness = inspect_create_readiness(&runtime_cache, &request);
 
         assert!(
             summary.launchable,
@@ -1685,6 +1835,7 @@ mod tests {
     #[test]
     fn corrupt_asset_object_blocks_launch_readiness() {
         let library_dir = temp_library("corrupt-asset-object");
+        let runtime_cache = isolated_runtime_cache();
         let asset = b"asset";
         let hash = sha1_hex(asset);
         write_asset_version_fixture(&library_dir, asset, false);
@@ -1696,12 +1847,15 @@ mod tests {
         fs::create_dir_all(object_path.parent().expect("object parent")).expect("object dir");
         fs::write(object_path, b"wrong").expect("write corrupt object");
 
-        let readiness = inspect_launch_readiness(&LaunchReadinessRequest {
-            library_dir: library_dir.clone(),
-            version_id: "asset-version".to_string(),
-            requested_java: String::new(),
-            guardian_mode: GuardianMode::Managed,
-        });
+        let readiness = inspect_create_readiness(
+            &runtime_cache,
+            &LaunchReadinessRequest {
+                library_dir: library_dir.clone(),
+                version_id: "asset-version".to_string(),
+                requested_java: String::new(),
+                guardian_mode: GuardianMode::Managed,
+            },
+        );
 
         assert!(!readiness.launchable);
         assert!(readiness.reasons.iter().any(|reason| {
@@ -1714,6 +1868,7 @@ mod tests {
     #[test]
     fn missing_legacy_virtual_asset_copy_does_not_block_launch_readiness() {
         let library_dir = temp_library("missing-legacy-virtual-asset");
+        let runtime_cache = isolated_runtime_cache();
         let asset = b"asset";
         let hash = sha1_hex(asset);
         write_asset_version_fixture(&library_dir, asset, true);
@@ -1725,12 +1880,15 @@ mod tests {
         fs::create_dir_all(object_path.parent().expect("object parent")).expect("object dir");
         fs::write(object_path, asset).expect("write object");
 
-        let readiness = inspect_launch_readiness(&LaunchReadinessRequest {
-            library_dir: library_dir.clone(),
-            version_id: "asset-version".to_string(),
-            requested_java: String::new(),
-            guardian_mode: GuardianMode::Managed,
-        });
+        let readiness = inspect_create_readiness(
+            &runtime_cache,
+            &LaunchReadinessRequest {
+                library_dir: library_dir.clone(),
+                version_id: "asset-version".to_string(),
+                requested_java: String::new(),
+                guardian_mode: GuardianMode::Managed,
+            },
+        );
 
         assert!(readiness.launchable, "{:?}", readiness.reasons);
         cleanup(&library_dir);
@@ -1747,6 +1905,11 @@ mod tests {
         ));
         fs::create_dir_all(&root).expect("create temp library");
         root
+    }
+
+    fn isolated_runtime_cache() -> axial_minecraft::ManagedRuntimeCache {
+        axial_minecraft::ManagedRuntimeCache::isolated_for_test()
+            .expect("isolated managed runtime cache")
     }
 
     fn write_version_json(library_dir: &Path, version_id: &str, json: &str) {

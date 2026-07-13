@@ -42,7 +42,7 @@ use crate::launch::{VersionJson, effective_java_version_for};
 use crate::manifest::{ManifestEntry, VersionManifest, fetch_fresh_install_version_manifest};
 use crate::paths::{assets_dir, libraries_dir, versions_dir};
 use crate::rules::{Environment, default_environment};
-use crate::runtime::{RuntimeSourceReceipt, acquire_preferred_runtime_source};
+use crate::runtime::{ManagedRuntimeCache, RuntimeSourceReceipt, acquire_preferred_runtime_source};
 #[cfg(test)]
 use crate::runtime::{
     TestRuntimeSourceDescriptor, acquire_test_runtime_source, authenticated_test_runtime_source,
@@ -65,7 +65,10 @@ pub struct Downloader {
 }
 
 enum DownloaderRoot {
-    Managed(PathBuf),
+    Managed {
+        library_root: PathBuf,
+        runtime_cache: ManagedRuntimeCache,
+    },
     SourceOnly,
 }
 
@@ -264,9 +267,12 @@ impl VanillaAuthorityParts {
 }
 
 impl Downloader {
-    pub fn new(mc_dir: impl Into<PathBuf>) -> Self {
+    pub fn new(mc_dir: impl Into<PathBuf>, runtime_cache: ManagedRuntimeCache) -> Self {
         Self {
-            root: DownloaderRoot::Managed(mc_dir.into()),
+            root: DownloaderRoot::Managed {
+                library_root: mc_dir.into(),
+                runtime_cache,
+            },
             client: standard_minecraft_download_client(),
             #[cfg(test)]
             install_manifest: None,
@@ -292,7 +298,11 @@ impl Downloader {
         manifest: VersionManifest,
     ) -> Self {
         Self {
-            root: DownloaderRoot::Managed(mc_dir.into()),
+            root: DownloaderRoot::Managed {
+                library_root: mc_dir.into(),
+                runtime_cache: ManagedRuntimeCache::isolated_for_test()
+                    .expect("isolated downloader runtime cache"),
+            },
             client: standard_minecraft_download_client(),
             install_manifest: Some(manifest),
             runtime_source: None,
@@ -309,16 +319,23 @@ impl Downloader {
     }
 
     fn managed_root(&self) -> &Path {
-        let DownloaderRoot::Managed(root) = &self.root else {
+        let DownloaderRoot::Managed { library_root, .. } = &self.root else {
             unreachable!("source-only downloader cannot materialize an installation");
         };
-        root
+        library_root
+    }
+
+    fn managed_runtime_cache(&self) -> &ManagedRuntimeCache {
+        let DownloaderRoot::Managed { runtime_cache, .. } = &self.root else {
+            unreachable!("source-only downloader cannot materialize a runtime");
+        };
+        runtime_cache
     }
 
     fn library_plan_root(&self) -> &Path {
         // Source-only plans bind safe relative library identities without granting a managed root.
         match &self.root {
-            DownloaderRoot::Managed(root) => root,
+            DownloaderRoot::Managed { library_root, .. } => library_root,
             DownloaderRoot::SourceOnly => Path::new(""),
         }
     }
@@ -1064,7 +1081,12 @@ impl Downloader {
         if self.install_manifest.is_some() {
             return spawn_test_runtime_source_pipeline(source_receipt, plan);
         }
-        spawn_runtime_ensure_pipeline(java_version, source_receipt, plan)
+        spawn_runtime_ensure_pipeline(
+            self.managed_runtime_cache().clone(),
+            java_version,
+            source_receipt,
+            plan,
+        )
     }
 
     async fn acquire_asset_index_source(

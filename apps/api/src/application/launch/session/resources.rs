@@ -108,7 +108,7 @@ pub(super) fn capture_launch_cpu_load_evidence() -> LaunchCpuLoadEvidence {
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, test))]
 pub(super) fn load_to_x100(value: f64) -> Option<u64> {
     if value.is_finite() && value >= 0.0 {
         Some((value * 100.0).round().clamp(0.0, u64::MAX as f64) as u64)
