@@ -141,6 +141,9 @@ fn read_exact_sha1(
 
 trait MetadataReader {
     fn symlink_metadata(&self, path: &KnownGoodPhysicalPath) -> io::Result<MetadataObservation>;
+    fn tier0_metadata(&self, path: &KnownGoodPhysicalPath) -> io::Result<MetadataObservation> {
+        self.symlink_metadata(path)
+    }
     fn read_link(&self, path: &KnownGoodPhysicalPath) -> io::Result<PathBuf>;
     fn revalidate(&self) -> io::Result<()> {
         Ok(())
@@ -544,15 +547,16 @@ mod confined_fs {
     use std::time::SystemTime;
     use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
     use windows_sys::Wdk::Storage::FileSystem::{
-        FILE_DIRECTORY_FILE, FILE_NON_DIRECTORY_FILE, FILE_OPEN, FILE_OPEN_REPARSE_POINT,
-        FILE_SYNCHRONOUS_IO_NONALERT, NtCreateFile,
+        FILE_DIRECTORY_FILE, FILE_NETWORK_OPEN_INFORMATION, FILE_NON_DIRECTORY_FILE, FILE_OPEN,
+        FILE_OPEN_REPARSE_POINT, FILE_SYNCHRONOUS_IO_NONALERT, FileNetworkOpenInformation,
+        NtCreateFile, NtQueryInformationFile,
     };
     use windows_sys::Win32::Foundation::{
         CloseHandle, GENERIC_READ, HANDLE, OBJ_CASE_INSENSITIVE, RtlNtStatusToDosError,
         UNICODE_STRING,
     };
     use windows_sys::Win32::Storage::FileSystem::{
-        FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_BASIC_INFO,
+        FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_BASIC_INFO, FILE_EXECUTE,
         FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_ID_INFO,
         FILE_READ_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_STANDARD_INFO, FileBasicInfo,
         FileIdInfo, FileStandardInfo, GetFileInformationByHandleEx, SYNCHRONIZE,
@@ -565,7 +569,8 @@ mod confined_fs {
         blocked: RefCell<HashMap<PathBuf, io::ErrorKind>>,
         roots: RefCell<HashSet<PathBuf>>,
         leaves: RefCell<Vec<HeldLeaf>>,
-        metadata_leaves: RefCell<Vec<HeldMetadataLeaf>>,
+        tier0_metadata_handles: RefCell<Vec<Rc<fs::File>>>,
+        revalidated_metadata_leaves: RefCell<Vec<HeldRevalidatedMetadataLeaf>>,
     }
 
     struct HeldLeaf {
@@ -579,7 +584,7 @@ mod confined_fs {
         changed: i64,
     }
 
-    struct HeldMetadataLeaf {
+    struct HeldRevalidatedMetadataLeaf {
         parent: Rc<fs::File>,
         name: OsString,
         file: Rc<fs::File>,
@@ -589,6 +594,21 @@ mod confined_fs {
         size: i64,
         modified: i64,
         changed: i64,
+    }
+
+    fn tier0_observation(info: FILE_NETWORK_OPEN_INFORMATION) -> MetadataObservation {
+        let kind = if info.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            MetadataKind::Link
+        } else if info.FileAttributes & FILE_ATTRIBUTE_DIRECTORY != 0 {
+            MetadataKind::Directory
+        } else {
+            MetadataKind::File
+        };
+        MetadataObservation {
+            kind,
+            size: info.EndOfFile.try_into().unwrap_or_default(),
+            modified: (info.LastWriteTime != 0).then_some(SystemTime::UNIX_EPOCH),
+        }
     }
 
     impl Reader {
@@ -665,6 +685,22 @@ mod confined_fs {
             directory: Option<bool>,
             access: u32,
         ) -> io::Result<fs::File> {
+            Self::open_relative_with_access_and_share(
+                parent,
+                name,
+                directory,
+                access,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+            )
+        }
+
+        fn open_relative_with_access_and_share(
+            parent: &fs::File,
+            name: &OsStr,
+            directory: Option<bool>,
+            access: u32,
+            share: u32,
+        ) -> io::Result<fs::File> {
             let mut encoded = name.encode_wide().collect::<Vec<_>>();
             let mut unicode = UNICODE_STRING {
                 Length: (encoded.len() * 2) as u16,
@@ -694,7 +730,7 @@ mod confined_fs {
                     &mut status,
                     ptr::null(),
                     0,
-                    FILE_SHARE_READ | FILE_SHARE_WRITE,
+                    share,
                     FILE_OPEN,
                     FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT | type_option,
                     ptr::null(),
@@ -767,17 +803,19 @@ mod confined_fs {
             let basic: FILE_BASIC_INFO = Self::query(file.as_ref(), FileBasicInfo)?;
             let standard: FILE_STANDARD_INFO = Self::query(file.as_ref(), FileStandardInfo)?;
             let id: FILE_ID_INFO = Self::query(file.as_ref(), FileIdInfo)?;
-            self.metadata_leaves.borrow_mut().push(HeldMetadataLeaf {
-                parent,
-                name: leaf,
-                file,
-                volume_serial_number: id.VolumeSerialNumber,
-                file_id: id.FileId.Identifier,
-                attributes: basic.FileAttributes,
-                size: standard.EndOfFile,
-                modified: basic.LastWriteTime,
-                changed: basic.ChangeTime,
-            });
+            self.revalidated_metadata_leaves
+                .borrow_mut()
+                .push(HeldRevalidatedMetadataLeaf {
+                    parent,
+                    name: leaf,
+                    file,
+                    volume_serial_number: id.VolumeSerialNumber,
+                    file_id: id.FileId.Identifier,
+                    attributes: basic.FileAttributes,
+                    size: standard.EndOfFile,
+                    modified: basic.LastWriteTime,
+                    changed: basic.ChangeTime,
+                });
             let kind = if basic.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
                 MetadataKind::Link
             } else if basic.FileAttributes & FILE_ATTRIBUTE_DIRECTORY != 0 || standard.Directory {
@@ -790,6 +828,39 @@ mod confined_fs {
                 size: standard.EndOfFile.try_into().unwrap_or_default(),
                 modified: (basic.LastWriteTime != 0).then_some(SystemTime::UNIX_EPOCH),
             })
+        }
+
+        pub(super) fn tier0_metadata(
+            &self,
+            path: &KnownGoodPhysicalPath,
+        ) -> io::Result<MetadataObservation> {
+            let (parent, leaf) = self.parent(path)?;
+            let file = Rc::new(Self::open_relative_with_access_and_share(
+                parent.as_ref(),
+                &leaf,
+                None,
+                FILE_EXECUTE,
+                FILE_SHARE_READ,
+            )?);
+            let mut info = FILE_NETWORK_OPEN_INFORMATION::default();
+            let mut status = IO_STATUS_BLOCK::default();
+            let result = unsafe {
+                NtQueryInformationFile(
+                    file.as_raw_handle() as HANDLE,
+                    &mut status,
+                    (&mut info as *mut FILE_NETWORK_OPEN_INFORMATION).cast(),
+                    size_of::<FILE_NETWORK_OPEN_INFORMATION>() as u32,
+                    FileNetworkOpenInformation,
+                )
+            };
+            if result < 0 {
+                let code = unsafe { RtlNtStatusToDosError(result) };
+                return Err(io::Error::from_raw_os_error(code as i32));
+            }
+            // FILE_EXECUTE engages read-class share enforcement; no read or map call is made.
+            // Last-write time is only an availability counter, not integrity authority.
+            self.tier0_metadata_handles.borrow_mut().push(file);
+            Ok(tier0_observation(info))
         }
 
         pub(super) fn read_link(&self, _path: &KnownGoodPhysicalPath) -> io::Result<PathBuf> {
@@ -896,7 +967,7 @@ mod confined_fs {
                     ));
                 }
             }
-            for leaf in self.metadata_leaves.borrow().iter() {
+            for leaf in self.revalidated_metadata_leaves.borrow().iter() {
                 let held_basic: FILE_BASIC_INFO = Self::query(leaf.file.as_ref(), FileBasicInfo)?;
                 let held_standard: FILE_STANDARD_INFO =
                     Self::query(leaf.file.as_ref(), FileStandardInfo)?;
@@ -962,6 +1033,203 @@ mod confined_fs {
             Ok(())
         }
     }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::io::Read;
+        use std::time::{SystemTime, UNIX_EPOCH};
+        use windows_sys::Wdk::Storage::FileSystem::{
+            FILE_RENAME_POSIX_SEMANTICS, FILE_RENAME_REPLACE_IF_EXISTS,
+        };
+        use windows_sys::Win32::Foundation::ERROR_SHARING_VIOLATION;
+        use windows_sys::Win32::Storage::FileSystem::{
+            DELETE, FILE_RENAME_INFO, FILE_SHARE_DELETE, FileRenameInfoEx,
+            SetFileInformationByHandle,
+        };
+
+        fn test_root(label: &str) -> PathBuf {
+            std::env::temp_dir().join(format!(
+                "axial-windows-tier0-{label}-{}-{}",
+                std::process::id(),
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .expect("clock")
+                    .as_nanos()
+            ))
+        }
+
+        fn replace_with_posix_semantics(source: &fs::File, target: &Path) -> io::Result<()> {
+            if !target.is_absolute() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "rename target must be absolute",
+                ));
+            }
+            let target_name: Vec<u16> = target.as_os_str().encode_wide().collect();
+            if target_name.is_empty() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "rename target must not be empty",
+                ));
+            }
+            let name_bytes = target_name
+                .len()
+                .checked_mul(size_of::<u16>())
+                .ok_or_else(|| io::Error::other("rename target is too long"))?;
+            let buffer_size = size_of::<FILE_RENAME_INFO>()
+                .checked_add(name_bytes)
+                .ok_or_else(|| io::Error::other("rename buffer size overflow"))?;
+            let word_count = buffer_size.div_ceil(size_of::<usize>());
+            let mut buffer = vec![0_usize; word_count];
+            let info = buffer.as_mut_ptr().cast::<FILE_RENAME_INFO>();
+            unsafe {
+                (*info).Anonymous.Flags =
+                    FILE_RENAME_REPLACE_IF_EXISTS | FILE_RENAME_POSIX_SEMANTICS;
+                (*info).RootDirectory = ptr::null_mut();
+                (*info).FileNameLength = name_bytes
+                    .try_into()
+                    .map_err(|_| io::Error::other("rename target is too long"))?;
+                ptr::copy_nonoverlapping(
+                    target_name.as_ptr(),
+                    (*info).FileName.as_mut_ptr(),
+                    target_name.len(),
+                );
+                if SetFileInformationByHandle(
+                    source.as_raw_handle() as HANDLE,
+                    FileRenameInfoEx,
+                    info.cast(),
+                    buffer_size
+                        .try_into()
+                        .map_err(|_| io::Error::other("rename buffer is too large"))?,
+                ) == 0
+                {
+                    return Err(io::Error::last_os_error());
+                }
+            }
+            Ok(())
+        }
+
+        #[test]
+        fn tier0_metadata_handle_rejects_posix_namespace_replacement() {
+            let root = test_root("retained-handle");
+            let parent = root.join("libraries");
+            fs::create_dir_all(&parent).expect("fixture parent");
+            let leaf = parent.join("library.jar");
+            let replacement = parent.join("replacement.jar");
+            fs::write(&leaf, b"1234567").expect("fixture leaf");
+            fs::write(&replacement, b"7654321").expect("replacement leaf");
+            let path = KnownGoodPhysicalPath::for_test(
+                root.clone(),
+                PathBuf::from("libraries/library.jar"),
+            );
+
+            let reader = Reader::default();
+            let observation = reader.tier0_metadata(&path).expect("Tier 0 metadata");
+            assert_eq!(observation.kind, MetadataKind::File);
+            assert_eq!(observation.size, 7);
+            assert_eq!(reader.tier0_metadata_handles.borrow().len(), 1);
+            assert!(reader.revalidated_metadata_leaves.borrow().is_empty());
+            reader.revalidate().expect("root currency");
+
+            assert!(
+                fs::OpenOptions::new().write(true).open(&leaf).is_err(),
+                "retained Tier 0 handle must reject data writers"
+            );
+            let replacement_handle = fs::OpenOptions::new()
+                .access_mode(DELETE)
+                .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+                .open(&replacement)
+                .expect("replacement handle");
+            let error = replace_with_posix_semantics(&replacement_handle, &leaf)
+                .expect_err("retained Tier 0 handle must reject POSIX replacement");
+            assert_eq!(error.raw_os_error(), Some(ERROR_SHARING_VIOLATION as i32));
+            drop(replacement_handle);
+
+            assert_eq!(fs::read(&leaf).expect("original contents"), b"1234567");
+            reader.revalidate().expect("root currency after rejection");
+
+            drop(reader);
+            let _ = fs::remove_dir_all(root);
+        }
+
+        #[test]
+        fn posix_replacement_succeeds_when_target_handle_shares_delete() {
+            let root = test_root("delete-sharing-control");
+            fs::create_dir_all(&root).expect("fixture root");
+            let target = root.join("target.jar");
+            let replacement = root.join("replacement.jar");
+            fs::write(&target, b"old bytes").expect("target leaf");
+            fs::write(&replacement, b"new bytes").expect("replacement leaf");
+
+            let mut target_handle = fs::OpenOptions::new()
+                .read(true)
+                .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+                .open(&target)
+                .expect("target handle");
+            let replacement_handle = fs::OpenOptions::new()
+                .access_mode(DELETE)
+                .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+                .open(&replacement)
+                .expect("replacement handle");
+
+            replace_with_posix_semantics(&replacement_handle, &target)
+                .expect("delete-sharing target permits POSIX replacement");
+            drop(replacement_handle);
+
+            let mut held_bytes = Vec::new();
+            target_handle
+                .read_to_end(&mut held_bytes)
+                .expect("read held target");
+            assert_eq!(held_bytes, b"old bytes");
+            assert_eq!(fs::read(&target).expect("reopened target"), b"new bytes");
+
+            drop(target_handle);
+            let _ = fs::remove_dir_all(root);
+        }
+
+        #[test]
+        fn tier0_metadata_fails_closed_when_writer_is_already_open() {
+            let root = test_root("existing-writer");
+            let parent = root.join("libraries");
+            fs::create_dir_all(&parent).expect("fixture parent");
+            let leaf = parent.join("library.jar");
+            fs::write(&leaf, b"1234567").expect("fixture leaf");
+            let writer = fs::OpenOptions::new()
+                .write(true)
+                .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+                .open(&leaf)
+                .expect("existing writer");
+            let path = KnownGoodPhysicalPath::for_test(
+                root.clone(),
+                PathBuf::from("libraries/library.jar"),
+            );
+
+            let reader = Reader::default();
+            let error = reader
+                .tier0_metadata(&path)
+                .expect_err("Tier 0 must reject an existing data writer");
+            assert_eq!(error.raw_os_error(), Some(ERROR_SHARING_VIOLATION as i32));
+
+            drop(writer);
+            drop(reader);
+            let _ = fs::remove_dir_all(root);
+        }
+
+        #[test]
+        fn tier0_network_observation_preserves_reparse_precedence_and_exact_size() {
+            let observation = tier0_observation(FILE_NETWORK_OPEN_INFORMATION {
+                EndOfFile: 37,
+                FileAttributes: FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DIRECTORY,
+                LastWriteTime: 1,
+                ..FILE_NETWORK_OPEN_INFORMATION::default()
+            });
+
+            assert_eq!(observation.kind, MetadataKind::Link);
+            assert_eq!(observation.size, 37);
+            assert!(observation.modified.is_some());
+        }
+    }
 }
 
 #[derive(Default)]
@@ -979,6 +1247,13 @@ impl MetadataReader for FilesystemIntegrityReader {
             io::ErrorKind::Unsupported,
             "race-resistant known-good metadata is unavailable on this platform",
         ))
+    }
+
+    fn tier0_metadata(&self, path: &KnownGoodPhysicalPath) -> io::Result<MetadataObservation> {
+        #[cfg(windows)]
+        return self.inner.tier0_metadata(path);
+        #[cfg(not(windows))]
+        self.symlink_metadata(path)
     }
 
     fn read_link(&self, path: &KnownGoodPhysicalPath) -> io::Result<PathBuf> {
@@ -1069,14 +1344,12 @@ pub(crate) fn sense_integrity_tier0(
 ) -> Result<IntegrityTier0Report, KnownGoodVerificationUnavailable> {
     let lease =
         state.mint_known_good_verification_lease(foreground, lifecycle, expected_library_root)?;
-    let report = sense_integrity_tier0_with(
-        &lease,
-        runtime_selection,
-        &FilesystemIntegrityReader::default(),
-    );
+    let reader = FilesystemIntegrityReader::default();
+    let report = sense_integrity_tier0_with(&lease, runtime_selection, &reader);
     if !state.known_good_verification_lease_is_current(&lease) {
         return Err(KnownGoodVerificationUnavailable::LiveAuthorityUnavailable);
     }
+    drop(reader);
     Ok(report)
 }
 
@@ -1105,7 +1378,7 @@ fn sense_integrity_tier0_with(
     for (ordinal, entry) in projection {
         report.metadata_lookup_count += 1;
         let path = known_good_entry_path(library_root, managed_runtime_cache, entry);
-        let fact = match reader.symlink_metadata(&path) {
+        let fact = match reader.tier0_metadata(&path) {
             Ok(observation) => {
                 report.mtime_observation_count += usize::from(observation.modified.is_some());
                 inspect_observation(reader, entry, &path, ordinal, observation, &mut report)
