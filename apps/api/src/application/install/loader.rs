@@ -20,7 +20,7 @@ use crate::dto::loaders::{
 };
 use crate::state::{
     AppState, InstallInitializationStatus, InstallProgressRecord, InstallSnapshot, InstallStore,
-    ProducerLease,
+    IntegrityForegroundLease, ProducerLease,
 };
 use axial_minecraft::loaders::LoaderActiveInstallFailure;
 use axial_minecraft::{
@@ -34,10 +34,11 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 
-pub(super) async fn start_loader_install_owned(
+pub(super) async fn start_loader_install_with_foreground(
     state: &AppState,
     request: LoaderInstallStartRequest,
     producer: &ProducerLease,
+    inherited_foreground: Option<IntegrityForegroundLease>,
 ) -> Result<InstallStartResponse, InstallApplicationError> {
     let build_id = request.build_id.trim().to_string();
     if build_id.is_empty() {
@@ -53,8 +54,14 @@ pub(super) async fn start_loader_install_owned(
             Json(serde_json::json!({ "error": "Axial library is not configured" })),
         )
     })?;
-    let foreground = register_install_foreground(state)?;
-    let foreground = foreground.wait_for_settlement().await;
+    let foreground = match inherited_foreground {
+        Some(foreground) => foreground,
+        None => {
+            register_install_foreground(state)?
+                .wait_for_settlement()
+                .await
+        }
+    };
     let build = resolve_build_record_for_install(request.component_id, &build_id)
         .await
         .map_err(loader_pre_operation_error_response)?;

@@ -44,7 +44,10 @@ use crate::application::version::{
     installed_versions_scan,
 };
 use crate::guardian::normalize_create_jvm_preset;
-use crate::state::{AppState, KnownGoodRebuildError, ProducerLease, RequestProducerHandoff};
+use crate::state::{
+    AppState, IntegrityForegroundLease, KnownGoodRebuildError, ProducerLease,
+    RequestProducerHandoff,
+};
 use axial_config::{EnrichedInstance, InstanceStoreError, LaunchActionState};
 use axial_launcher::{
     GuardianMode, LaunchReadiness, LaunchReadinessReasonId, LaunchReadinessRequest,
@@ -128,9 +131,7 @@ fn instance_internal_error_response(
     )
 }
 
-fn instance_shutdown_error_response(
-    _error: crate::state::LifecycleAdmissionError,
-) -> (StatusCode, Json<serde_json::Value>) {
+fn instance_shutdown_error_response<Error>(_error: Error) -> (StatusCode, Json<serde_json::Value>) {
     (
         StatusCode::SERVICE_UNAVAILABLE,
         Json(serde_json::json!({ "error": "application shutdown is in progress" })),
@@ -170,11 +171,11 @@ fn known_good_rebuild_error_response(
 
 async fn rollback_new_instance(
     state: &AppState,
+    foreground: &IntegrityForegroundLease,
     instance_id: &str,
-    producer: ProducerLease,
 ) -> Result<(), InstanceStoreError> {
     match state
-        .delete_instance(instance_id.to_string(), true, producer)
+        .delete_instance(foreground, instance_id.to_string(), true)
         .await
     {
         Ok(()) => Ok(()),
@@ -443,44 +444,57 @@ pub(crate) async fn handle_duplicate_instance_owned(
     payload: Option<DuplicateInstanceRequest>,
     handoff: RequestProducerHandoff,
 ) -> Result<EnrichedInstance, (StatusCode, Json<serde_json::Value>)> {
-    let producer = handoff
-        .try_claim()
-        .map_err(instance_shutdown_error_response)?;
-    complete_duplicate_instance_with_rebuild(
+    handle_duplicate_instance_owned_with_rebuild(
         state,
-        &producer,
         id,
         payload,
-        |state, producer, instance_id| async move {
-            crate::application::rebuild_registered_known_good(&state, &producer, &instance_id).await
+        handoff,
+        |state, foreground, producer, instance_id| async move {
+            crate::application::rebuild_registered_known_good(
+                &state,
+                &foreground,
+                &producer,
+                &instance_id,
+            )
+            .await
         },
     )
     .await
 }
 
-async fn complete_duplicate_instance_with_rebuild<Rebuild, RebuildFuture>(
+async fn handle_duplicate_instance_owned_with_rebuild<Rebuild, RebuildFuture>(
     state: &AppState,
-    producer: &ProducerLease,
     id: &str,
     payload: Option<DuplicateInstanceRequest>,
+    handoff: RequestProducerHandoff,
     rebuild: Rebuild,
 ) -> Result<EnrichedInstance, (StatusCode, Json<serde_json::Value>)>
 where
-    Rebuild: FnOnce(AppState, ProducerLease, String) -> RebuildFuture + Send + 'static,
+    Rebuild: FnOnce(AppState, IntegrityForegroundLease, ProducerLease, String) -> RebuildFuture
+        + Send
+        + 'static,
     RebuildFuture: Future<Output = Result<(), KnownGoodRebuildError>> + Send + 'static,
 {
-    let payload = payload.unwrap_or_default();
-    let continuation = producer.claim_child();
+    let producer = handoff
+        .try_claim()
+        .map_err(instance_shutdown_error_response)?;
+    let foreground = state
+        .register_integrity_foreground()
+        .map_err(instance_shutdown_error_response)?;
+    let transaction = producer.claim_child();
     let rebuild_owner = producer.claim_child();
-    let rollback_owner = producer.claim_child();
-    let continuation_state = state.clone();
+    let enrich_owner = producer.claim_child();
+    let transaction_state = state.clone();
     let source_id = id.to_string();
-    let completed = continuation.spawn_joinable(async move {
-        let instance = continuation_state
+    let completed = transaction.spawn_joinable(async move {
+        let foreground = foreground.wait_for_settlement().await;
+        let payload = payload.unwrap_or_default();
+        let instance = transaction_state
             .duplicate_instance(
+                &foreground,
                 source_id,
                 payload.name,
-                continuation_state.library_dir().map(PathBuf::from),
+                transaction_state.library_dir().map(PathBuf::from),
             )
             .await
             .map_err(|error| {
@@ -488,16 +502,22 @@ where
             })?;
         let instance_id = instance.id.clone();
         match rebuild(
-            continuation_state.clone(),
+            transaction_state.clone(),
+            foreground.retained(),
             rebuild_owner,
             instance_id.clone(),
         )
         .await
         {
-            Ok(()) => Ok(instance),
+            Ok(()) => {
+                Ok(
+                    enrich_instance_for_state_indexed(&transaction_state, &enrich_owner, instance)
+                        .await,
+                )
+            }
             Err(error) => {
                 if let Err(rollback_error) =
-                    rollback_new_instance(&continuation_state, &instance_id, rollback_owner).await
+                    rollback_new_instance(&transaction_state, &foreground, &instance_id).await
                 {
                     error!(
                         failure_class = instance_store_error_class(&rollback_error),
@@ -515,38 +535,45 @@ where
             }
         }
     });
-    let instance = completed
+    completed
         .await
-        .map_err(|_| instance_internal_error_response(InstanceWriteOperation::Duplicate))??;
-    Ok(enrich_instance_for_state_indexed(state, producer, instance).await)
+        .map_err(|_| instance_internal_error_response(InstanceWriteOperation::Duplicate))?
 }
 
 #[cfg(test)]
 pub(crate) async fn handle_duplicate_instance(
     state: &AppState,
-    producer: &ProducerLease,
     id: &str,
     payload: Option<DuplicateInstanceRequest>,
 ) -> Result<EnrichedInstance, (StatusCode, Json<serde_json::Value>)> {
-    complete_duplicate_instance_with_rebuild(state, producer, id, payload, |_, _, _| async {
-        Ok(())
-    })
+    let request = state
+        .try_admit_request()
+        .expect("admit test duplicate request");
+    handle_duplicate_instance_owned_with_rebuild(
+        state,
+        id,
+        payload,
+        request.producer_handoff(),
+        |_, _, _, _| async { Ok(()) },
+    )
     .await
 }
 
 #[cfg(test)]
 async fn handle_duplicate_instance_with_rebuild<Rebuild, RebuildFuture>(
     state: &AppState,
-    producer: &ProducerLease,
     id: &str,
     payload: Option<DuplicateInstanceRequest>,
+    handoff: RequestProducerHandoff,
     rebuild: Rebuild,
 ) -> Result<EnrichedInstance, (StatusCode, Json<serde_json::Value>)>
 where
-    Rebuild: FnOnce(AppState, ProducerLease, String) -> RebuildFuture + Send + 'static,
+    Rebuild: FnOnce(AppState, IntegrityForegroundLease, ProducerLease, String) -> RebuildFuture
+        + Send
+        + 'static,
     RebuildFuture: Future<Output = Result<(), KnownGoodRebuildError>> + Send + 'static,
 {
-    complete_duplicate_instance_with_rebuild(state, producer, id, payload, rebuild).await
+    handle_duplicate_instance_owned_with_rebuild(state, id, payload, handoff, rebuild).await
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -662,13 +689,26 @@ pub(crate) async fn handle_delete_instance_owned(
     let producer = handoff
         .try_claim()
         .map_err(instance_shutdown_error_response)?;
+    let foreground = state
+        .register_integrity_foreground()
+        .map_err(instance_shutdown_error_response)?;
     let keep_files = query.get("keep_files").is_some_and(|value| value == "true");
-    state
-        .delete_instance(id.to_string(), !keep_files, producer)
+    let transaction = producer.claim_child();
+    let transaction_state = state.clone();
+    let instance_id = id.to_string();
+    transaction
+        .spawn_joinable(async move {
+            let foreground = foreground.wait_for_settlement().await;
+            transaction_state
+                .delete_instance(&foreground, instance_id, !keep_files)
+                .await
+                .map_err(|error| {
+                    instance_write_error_response(InstanceWriteOperation::Delete, error)
+                })?;
+            Ok(serde_json::json!({ "status": "ok" }))
+        })
         .await
-        .map_err(|error| instance_write_error_response(InstanceWriteOperation::Delete, error))?;
-
-    Ok(serde_json::json!({ "status": "ok" }))
+        .map_err(|_| instance_internal_error_response(InstanceWriteOperation::Delete))?
 }
 
 #[cfg(test)]

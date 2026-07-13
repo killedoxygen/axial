@@ -3489,8 +3489,13 @@ async fn insert_persisted_test_instance(
         String::new(),
         String::new(),
     );
+    let foreground = state
+        .register_integrity_foreground()
+        .expect("register persisted fixture foreground")
+        .wait_for_settlement()
+        .await;
     state
-        .create_instance(instance, None)
+        .create_instance(&foreground, instance, None)
         .await
         .expect("persist restart instance fixture")
 }

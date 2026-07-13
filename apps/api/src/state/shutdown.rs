@@ -169,6 +169,7 @@ impl AppShutdownCoordinator {
                 .map_err(|_| AppShutdownError::at(AppShutdownStep::RequestDrain))?;
             self.mark_completed(AppShutdownStep::RequestDrain);
         }
+        state.integrity_activity.begin_shutdown();
 
         let (sessions, drivers) = self.settle_effects(state).await;
         let settlement_error = self.finish_settlement(sessions, drivers);

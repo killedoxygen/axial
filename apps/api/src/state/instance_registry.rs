@@ -3,9 +3,11 @@ use crate::execution::persistence::{
     AcceptedWrite, AtomicSnapshotWriter, PersistenceCoordinator, PersistenceError,
     PersistenceOwnerLease, WriteUrgency,
 };
+#[cfg(test)]
+use axial_config::generate_instance_id;
 use axial_config::{
     AppPaths, Instance, InstanceRegistrySnapshot, InstanceStore, InstanceStoreError,
-    derive_instance_art_seed, generate_instance_id, is_canonical_instance_id,
+    derive_instance_art_seed, is_canonical_instance_id,
 };
 use std::io;
 use std::path::{Path, PathBuf};
@@ -237,6 +239,7 @@ impl AppInstanceStore {
     pub(crate) async fn duplicate_with_gate(
         &self,
         source_id: String,
+        target_id: String,
         requested_name: Option<String>,
         library_dir: Option<PathBuf>,
         gate: OwnedMutexGuard<()>,
@@ -250,9 +253,8 @@ impl AppInstanceStore {
             .cloned()
             .ok_or_else(instance_not_found_error)?;
         let name = duplicate_name(&candidate, &source.name, requested_name)?;
-        let id = generate_instance_id();
         let mut instance = new_instance(
-            id,
+            target_id,
             name,
             source.version_id.clone(),
             source.icon.clone(),

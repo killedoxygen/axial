@@ -38,7 +38,8 @@ pub mod skins;
 
 use axial_config::{
     AppConfig, ConfigStore as StartupConfigStore, ConfigStoreError, INSTANCE_REGISTRY_MAX_ENTRIES,
-    InstanceStore as StartupInstanceStore, InstanceStoreError, find_flag, is_canonical_instance_id,
+    InstanceStore as StartupInstanceStore, InstanceStoreError, find_flag, generate_instance_id,
+    is_canonical_instance_id,
 };
 pub use axial_launcher::{LaunchEvent, LaunchLogEvent, LaunchSessionRecord, LaunchStatusEvent};
 use axial_minecraft::ManagedRuntimeCache;
@@ -860,13 +861,13 @@ impl AppState {
     #[cfg(test)]
     pub(crate) async fn quiesce(&self) -> Result<(), LifecycleQuiesceError> {
         self.lifecycle.begin_quiesce();
+        self.lifecycle.wait_for_shutdown_started().await?;
         self.integrity_activity.begin_shutdown();
         self.lifecycle.wait_for_quiesced().await
     }
 
     pub async fn shutdown(&self) -> Result<(), AppShutdownError> {
         self.lifecycle.begin_quiesce();
-        self.integrity_activity.begin_shutdown();
         self.shutdown_coordinator.start(self.clone()).wait().await
     }
 
@@ -961,78 +962,76 @@ impl AppState {
 
     pub(crate) async fn create_instance(
         &self,
+        foreground: &IntegrityForegroundLease,
         instance: axial_config::Instance,
         library_dir: Option<PathBuf>,
     ) -> Result<axial_config::Instance, InstanceStoreError> {
+        self.validate_integrity_foreground(foreground)
+            .map_err(|_| InstanceStoreError::Persistence(foreign_integrity_foreground_error()))?;
+        let _lifecycle = self
+            .acquire_integrity_instance_lifecycle(foreground, &instance.id)
+            .await
+            .map_err(|_| InstanceStoreError::Persistence(foreign_integrity_foreground_error()))?;
         let instances = self.instances.clone();
         let gate = instances.acquire_mutation().await?;
-        let (completed_tx, completed_rx) = tokio::sync::oneshot::channel();
-        tokio::spawn(async move {
-            let result = instances
-                .create_with_gate(instance, library_dir, gate)
-                .await;
-            let _ = completed_tx.send(result);
-        });
-        completed_rx.await.map_err(|_| {
-            InstanceStoreError::Persistence(std::io::Error::other(
-                "instance creation owner stopped before reporting completion",
-            ))
-        })?
+        instances
+            .create_with_gate(instance, library_dir, gate)
+            .await
     }
 
     pub(crate) async fn duplicate_instance(
         &self,
+        foreground: &IntegrityForegroundLease,
         source_id: String,
         requested_name: Option<String>,
         library_dir: Option<PathBuf>,
     ) -> Result<axial_config::Instance, InstanceStoreError> {
+        self.validate_integrity_foreground(foreground)
+            .map_err(|_| InstanceStoreError::Persistence(foreign_integrity_foreground_error()))?;
+        let target_id = loop {
+            let candidate = generate_instance_id();
+            if candidate != source_id && self.instances.get(&candidate).is_none() {
+                break candidate;
+            }
+        };
+        let (first_id, second_id) = if source_id < target_id {
+            (&source_id, &target_id)
+        } else {
+            (&target_id, &source_id)
+        };
+        let _first_lifecycle = self
+            .acquire_integrity_instance_lifecycle(foreground, first_id)
+            .await
+            .map_err(|_| InstanceStoreError::Persistence(foreign_integrity_foreground_error()))?;
+        let _second_lifecycle = self
+            .acquire_integrity_instance_lifecycle(foreground, second_id)
+            .await
+            .map_err(|_| InstanceStoreError::Persistence(foreign_integrity_foreground_error()))?;
         let instances = self.instances.clone();
         let gate = instances.acquire_mutation().await?;
-        let (completed_tx, completed_rx) = tokio::sync::oneshot::channel();
-        tokio::spawn(async move {
-            let result = instances
-                .duplicate_with_gate(source_id, requested_name, library_dir, gate)
-                .await;
-            let _ = completed_tx.send(result);
-        });
-        completed_rx.await.map_err(|_| {
-            InstanceStoreError::Persistence(std::io::Error::other(
-                "instance duplication owner stopped before reporting completion",
-            ))
-        })?
+        instances
+            .duplicate_with_gate(source_id, target_id, requested_name, library_dir, gate)
+            .await
     }
 
     pub(crate) async fn delete_instance(
         &self,
-        instance_id: String,
-        delete_files: bool,
-        owner: ProducerLease,
-    ) -> Result<(), InstanceStoreError> {
-        let state = self.clone();
-        owner
-            .spawn_joinable(
-                async move { state.delete_instance_owned(instance_id, delete_files).await },
-            )
-            .await
-            .map_err(|_| {
-                InstanceStoreError::Persistence(std::io::Error::other(
-                    "instance deletion owner stopped before reporting completion",
-                ))
-            })?
-    }
-
-    async fn delete_instance_owned(
-        &self,
+        foreground: &IntegrityForegroundLease,
         instance_id: String,
         delete_files: bool,
     ) -> Result<(), InstanceStoreError> {
+        self.validate_integrity_foreground(foreground)
+            .map_err(|_| InstanceStoreError::Persistence(foreign_integrity_foreground_error()))?;
         if self.sessions.has_active_instance(&instance_id).await {
             return Err(InstanceStoreError::Persistence(std::io::Error::new(
                 std::io::ErrorKind::WouldBlock,
                 "cannot delete a running instance; stop the game first",
             )));
         }
-        let lifecycle = self.acquire_instance_lifecycle(&instance_id).await;
+        let lifecycle = self
+            .acquire_integrity_instance_lifecycle(foreground, &instance_id)
+            .await
+            .map_err(|_| InstanceStoreError::Persistence(foreign_integrity_foreground_error()))?;
         if self.sessions.has_active_instance(&instance_id).await {
             return Err(InstanceStoreError::Persistence(std::io::Error::new(
                 std::io::ErrorKind::WouldBlock,

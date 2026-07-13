@@ -554,12 +554,13 @@ async fn install_existing_active_response_includes_backend_operation_id() {
     assert!(state.installs().mark_initialized("existing-install").await);
 
     let producer = state.try_claim_producer().expect("claim install producer");
-    let response = start_install_version_owned(
+    let response = start_install_version_with_foreground(
         &state,
         InstallVersionStartRequest {
             version_id: "1.21.5".to_string(),
         },
         &producer,
+        None,
     )
     .await
     .expect("existing active install should be returned");
@@ -594,12 +595,13 @@ async fn vanilla_start_registers_before_waiting_on_the_install_store() {
         let state = state.clone();
         async move {
             let producer = state.try_claim_producer().expect("claim install producer");
-            start_install_version_owned(
+            start_install_version_with_foreground(
                 &state,
                 InstallVersionStartRequest {
                     version_id: "1.21.5".to_string(),
                 },
                 &producer,
+                None,
             )
             .await
         }
@@ -623,6 +625,66 @@ async fn vanilla_start_registers_before_waiting_on_the_install_store() {
         .expect("existing install response");
     assert_eq!(response.install_id, "existing-install");
     wait_for_integrity_idle(&state).await;
+    state.installs().remove("existing-install").await;
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn queued_install_dispatch_uses_inherited_foreground_after_fresh_admission_closes() {
+    let root = temp_root("queued-install-inherited-foreground");
+    let state = build_test_state(&root);
+    configure_library_dir(&state, &root.join("library"));
+    state
+        .installs()
+        .insert_or_existing_vanilla("existing-install".to_string(), "1.21.5".to_string())
+        .await;
+    assert!(state.installs().mark_initialized("existing-install").await);
+    let foreground = state
+        .register_integrity_foreground()
+        .expect("register inherited foreground")
+        .wait_for_settlement()
+        .await;
+    let producer = state.try_claim_producer().expect("claim queue producer");
+    let shutdown_state = state.clone();
+    let quiesce = tokio::spawn(async move { shutdown_state.quiesce().await });
+    timeout(Duration::from_secs(1), async {
+        loop {
+            if state.register_integrity_foreground().is_err() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("integrity admission closes after request drain");
+
+    let inherited = start_queued_install(
+        &state,
+        &crate::state::InstallQueueSpec::vanilla("1.21.5".to_string()),
+        &producer,
+        Some(foreground.retained()),
+    )
+    .await
+    .expect("settled inherited foreground remains valid");
+    assert_eq!(inherited.install_id, "existing-install");
+
+    let fresh = start_queued_install(
+        &state,
+        &crate::state::InstallQueueSpec::vanilla("1.21.5".to_string()),
+        &producer,
+        None,
+    )
+    .await
+    .expect_err("closed integrity admission rejects fresh registration");
+    assert_eq!(fresh.0, StatusCode::SERVICE_UNAVAILABLE);
+
+    drop(foreground);
+    drop(producer);
+    timeout(Duration::from_secs(1), quiesce)
+        .await
+        .expect("queue producer drains")
+        .expect("quiesce task")
+        .expect("quiesce succeeds");
     state.installs().remove("existing-install").await;
     let _ = fs::remove_dir_all(root);
 }
@@ -2632,13 +2694,14 @@ async fn loader_pre_operation_failure_does_not_allocate_an_operation() {
         .try_claim()
         .expect("claim loader producer");
 
-    let error = start_loader_install_owned(
+    let error = start_loader_install_with_foreground(
         &state,
         LoaderInstallStartRequest {
             component_id: LoaderComponentId::Fabric,
             build_id: "invalid-build-id".to_string(),
         },
         &producer,
+        None,
     )
     .await
     .expect_err("invalid build is rejected before operation allocation");
@@ -2667,13 +2730,14 @@ async fn loader_start_registers_before_resolving_the_install_target() {
         let state = state.clone();
         async move {
             let producer = state.try_claim_producer().expect("claim loader producer");
-            start_loader_install_owned(
+            start_loader_install_with_foreground(
                 &state,
                 LoaderInstallStartRequest {
                     component_id: LoaderComponentId::Fabric,
                     build_id: "invalid-build-id".to_string(),
                 },
                 &producer,
+                None,
             )
             .await
         }

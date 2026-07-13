@@ -313,7 +313,7 @@ struct InstallQueueSelection {
     outcome: InstallQueueEnqueueOutcome,
 }
 
-use loader::start_loader_install_owned;
+use loader::start_loader_install_with_foreground;
 #[cfg(test)]
 use loader::{
     dispatch_loader_install_failure, loader_install_done_progress, loader_install_error_progress,
@@ -355,10 +355,11 @@ pub use repair::{
 };
 pub use stream::{install_events_stream, loader_install_events_stream};
 
-pub(crate) async fn start_install_version_owned(
+async fn start_install_version_with_foreground(
     state: &AppState,
     request: InstallVersionStartRequest,
     producer: &ProducerLease,
+    inherited_foreground: Option<IntegrityForegroundLease>,
 ) -> Result<InstallStartResponse, InstallApplicationError> {
     let version_id = effective_install_version_id(&request);
     if version_id.is_empty() {
@@ -374,8 +375,14 @@ pub(crate) async fn start_install_version_owned(
             Json(serde_json::json!({ "error": "Axial library is not configured" })),
         )
     })?;
-    let foreground = register_install_foreground(state)?;
-    let foreground = foreground.wait_for_settlement().await;
+    let foreground = match inherited_foreground {
+        Some(foreground) => foreground,
+        None => {
+            register_install_foreground(state)?
+                .wait_for_settlement()
+                .await
+        }
+    };
 
     let install_id = loop {
         let candidate = generate_install_id("install");
@@ -942,6 +949,7 @@ pub(crate) async fn enqueue_install_owned(
 
 pub(crate) async fn enqueue_install_from_continuation(
     state: &AppState,
+    foreground: &IntegrityForegroundLease,
     request: InstallQueueRequest,
     producer: ProducerLease,
 ) -> Result<ContinuationInstallQueueResult, InstallApplicationError> {
@@ -965,7 +973,10 @@ pub(crate) async fn enqueue_install_from_continuation(
             |spec| {
                 let state = start_state.clone();
                 let attempt_owner = producer.claim_child();
-                async move { start_queued_install(&state, &spec, &attempt_owner).await }
+                let foreground = foreground.retained();
+                async move {
+                    start_queued_install(&state, &spec, &attempt_owner, Some(foreground)).await
+                }
             },
         )
         .await?
@@ -1114,16 +1125,17 @@ async fn maybe_start_next_queued_install(
         else {
             return Ok(None);
         };
-        let started = match start_queued_install(&transaction_state, &entry.spec, &producer).await {
-            Ok(started) => started,
-            Err(error) => {
-                transaction_state
-                    .installs()
-                    .discard_active_queued_install(&entry.queue_id)
-                    .await;
-                return Err(error);
-            }
-        };
+        let started =
+            match start_queued_install(&transaction_state, &entry.spec, &producer, None).await {
+                Ok(started) => started,
+                Err(error) => {
+                    transaction_state
+                        .installs()
+                        .discard_active_queued_install(&entry.queue_id)
+                        .await;
+                    return Err(error);
+                }
+            };
         if !transaction_state
             .installs()
             .mark_queued_install_started(&entry.queue_id, started.install_id.clone())
@@ -1151,7 +1163,7 @@ async fn maybe_start_next_queued_install_owned(
     let Some(entry) = state.installs().reserve_next_queued_install().await else {
         return Ok(None);
     };
-    let started = match start_queued_install(state, &entry.spec, producer).await {
+    let started = match start_queued_install(state, &entry.spec, producer, None).await {
         Ok(started) => started,
         Err(error) => {
             state
@@ -1256,15 +1268,17 @@ async fn start_queued_install(
     state: &AppState,
     spec: &InstallQueueSpec,
     producer: &ProducerLease,
+    foreground: Option<IntegrityForegroundLease>,
 ) -> Result<InstallStartResponse, InstallApplicationError> {
     match spec {
         InstallQueueSpec::Vanilla { version_id } => {
-            start_install_version_owned(
+            start_install_version_with_foreground(
                 state,
                 InstallVersionStartRequest {
                     version_id: version_id.clone(),
                 },
                 producer,
+                foreground,
             )
             .await
         }
@@ -1273,13 +1287,14 @@ async fn start_queued_install(
             build_id,
             ..
         } => {
-            start_loader_install_owned(
+            start_loader_install_with_foreground(
                 state,
                 LoaderInstallStartRequest {
                     component_id: *component_id,
                     build_id: build_id.clone(),
                 },
                 producer,
+                foreground,
             )
             .await
         }

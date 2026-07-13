@@ -1,6 +1,7 @@
 use super::*;
 use crate::state::{
-    AppState, AppStateInit, InstallStore, ProducerLease, RequestLease, SessionStore,
+    AppState, AppStateInit, IdleSweepCancellation, IdleSweepReservation, IdleSweepTerminal,
+    InstallStore, ProducerLease, RequestLease, SessionStore,
 };
 use axial_config::{AppPaths, ConfigStore, InstanceRegistrySnapshot, InstanceStore};
 use axial_launcher::{LaunchSessionRecord, LaunchState, SessionId};
@@ -1132,10 +1133,9 @@ async fn public_instance_responses_redact_stored_runtime_overrides() {
     let fetched = handle_get_instance(&fixture.state, &fixture.producer, &instance.id)
         .await
         .expect("get instance");
-    let duplicated =
-        handle_duplicate_instance(&fixture.state, &fixture.producer, &instance.id, None)
-            .await
-            .expect("duplicate instance");
+    let duplicated = handle_duplicate_instance(&fixture.state, &instance.id, None)
+        .await
+        .expect("duplicate instance");
 
     assert_eq!(listed.instances[0].instance.java_path, "");
     assert_eq!(listed.instances[0].instance.extra_jvm_args, "");
@@ -1466,7 +1466,7 @@ async fn create_ready_instance_rebuilds_known_good_once() {
                 selection_id: "vanilla|1.21.1".to_string(),
                 ..CreateInstanceRequest::default()
             },
-            move |_, _, _| async move {
+            move |_, _, _, _| async move {
                 observed_rebuilds.fetch_add(1, Ordering::SeqCst);
                 entered_tx.send(()).expect("signal rebuild entry");
                 release_rx.await.expect("release rebuild");
@@ -1490,6 +1490,54 @@ async fn create_ready_instance_rebuilds_known_good_once() {
 
     assert!(created.install_queue.is_none());
     assert_eq!(rebuilds.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn create_waits_for_cancelled_sweep_settlement_before_registry_and_filesystem_effects() {
+    let fixture = TestFixture::new("create-sweep-settlement");
+    let library_dir = fixture.configure_create_manifest(&["1.21.1"]);
+    write_installed_vanilla_version(&library_dir, "1.21.1");
+    let directories_before = instance_directory_names(&fixture.root);
+    let (reservation, cancellation) = reserve_instance_sweep(&fixture.state);
+    let state = fixture.state.clone();
+    let create = tokio::spawn(async move {
+        super::create::handle_create_instance_with_rebuild(
+            &state,
+            CreateInstanceRequest {
+                name: "Sweep create".to_string(),
+                selection_id: "vanilla|1.21.1".to_string(),
+                ..CreateInstanceRequest::default()
+            },
+            |_, _, _, _| async { Ok(()) },
+        )
+        .await
+    });
+
+    wait_for_sweep_cancellation(&cancellation).await;
+    assert!(fixture.state.instances().list().is_empty());
+    assert_eq!(instance_directory_names(&fixture.root), directories_before);
+    assert!(!create.is_finished());
+
+    reservation.settle(IdleSweepTerminal::Cancelled);
+    let created = tokio::time::timeout(std::time::Duration::from_secs(5), create)
+        .await
+        .expect("create settles after sweep")
+        .expect("create task")
+        .expect("create succeeds");
+    assert!(
+        fixture
+            .state
+            .instances()
+            .get(&created.instance.id)
+            .is_some()
+    );
+    assert!(
+        fixture
+            .state
+            .instances()
+            .game_dir(&created.instance.id)
+            .is_dir()
+    );
 }
 
 async fn seed_committed_busy_install(state: &AppState, queue_id: &str) {
@@ -1532,7 +1580,7 @@ async fn create_queued_instance_does_not_rebuild_known_good() {
             selection_id: "vanilla|1.21.2".to_string(),
             ..CreateInstanceRequest::default()
         },
-        move |_, _, _| async move {
+        move |_, _, _, _| async move {
             observed_rebuilds.fetch_add(1, Ordering::SeqCst);
             Ok(())
         },
@@ -1572,7 +1620,7 @@ async fn create_missed_active_install_receipt_rolls_back_new_instance() {
             selection_id: "vanilla|1.21.2".to_string(),
             ..CreateInstanceRequest::default()
         },
-        |_, _, _| async { panic!("queued create must not reconstruct") },
+        |_, _, _, _| async { panic!("queued create must not reconstruct") },
     )
     .await
     .expect_err("instance absent from active receipt fanout must roll back");
@@ -1605,7 +1653,7 @@ async fn create_rebuild_failure_rolls_back_the_new_instance() {
             selection_id: "vanilla|1.21.1".to_string(),
             ..CreateInstanceRequest::default()
         },
-        move |_, _, instance_id| async move {
+        move |_, _, _, instance_id| async move {
             *observed_id.lock().expect("capture created id") = Some(instance_id);
             Err(crate::state::KnownGoodRebuildError::ReconstructionFailed)
         },
@@ -1640,18 +1688,15 @@ async fn duplicate_instance_rebuilds_known_good_once() {
     let request = duplicate_state
         .try_admit_request()
         .expect("admit duplicate request");
-    let producer = request
-        .producer_handoff()
-        .try_claim()
-        .expect("claim duplicate producer");
+    let handoff = request.producer_handoff();
     let duplicate = tokio::spawn(async move {
         let _request = request;
         handle_duplicate_instance_with_rebuild(
             &duplicate_state,
-            &producer,
             &source_id,
             None,
-            move |_, _, _| async move {
+            handoff,
+            move |_, _, _, _| async move {
                 observed_rebuilds.fetch_add(1, Ordering::SeqCst);
                 entered_tx.send(()).expect("signal rebuild entry");
                 release_rx.await.expect("release rebuild");
@@ -1680,18 +1725,76 @@ async fn duplicate_instance_rebuilds_known_good_once() {
 }
 
 #[tokio::test]
+async fn duplicate_waits_for_cancelled_sweep_settlement_before_registry_and_filesystem_effects() {
+    let fixture = TestFixture::new("duplicate-sweep-settlement");
+    let source = add_test_instance(&fixture, "Sweep source", "1.21.1");
+    let marker = fixture
+        .state
+        .instances()
+        .game_dir(&source.id)
+        .join("mods/source.jar");
+    fs::write(&marker, "source").expect("write source marker");
+    let directories_before = instance_directory_names(&fixture.root);
+    let (reservation, cancellation) = reserve_instance_sweep(&fixture.state);
+    let state = fixture.state.clone();
+    let source_id = source.id.clone();
+    let duplicate = tokio::spawn(async move {
+        let request = state.try_admit_request().expect("admit duplicate request");
+        let handoff = request.producer_handoff();
+        handle_duplicate_instance_with_rebuild(
+            &state,
+            &source_id,
+            None,
+            handoff,
+            |_, _, _, _| async { Ok(()) },
+        )
+        .await
+    });
+
+    wait_for_sweep_cancellation(&cancellation).await;
+    assert_eq!(fixture.state.instances().list(), vec![source.clone()]);
+    assert_eq!(instance_directory_names(&fixture.root), directories_before);
+    assert_eq!(
+        fs::read_to_string(&marker).expect("read source marker"),
+        "source"
+    );
+    assert!(!duplicate.is_finished());
+
+    reservation.settle(IdleSweepTerminal::Cancelled);
+    let duplicate = tokio::time::timeout(std::time::Duration::from_secs(5), duplicate)
+        .await
+        .expect("duplicate settles after sweep")
+        .expect("duplicate task")
+        .expect("duplicate succeeds");
+    assert_ne!(duplicate.id, source.id);
+    assert!(fixture.state.instances().get(&duplicate.id).is_some());
+    assert!(
+        fixture
+            .state
+            .instances()
+            .game_dir(&duplicate.id)
+            .join("mods/source.jar")
+            .is_file()
+    );
+}
+
+#[tokio::test]
 async fn duplicate_rebuild_failure_rolls_back_only_the_copy() {
     let fixture = TestFixture::new("duplicate-known-good-rollback");
     let source = add_test_instance(&fixture, "Source", "1.21.1");
     let duplicate_id = Arc::new(Mutex::new(None::<String>));
     let observed_id = duplicate_id.clone();
+    let request = fixture
+        .state
+        .try_admit_request()
+        .expect("admit duplicate request");
 
     let (status, Json(body)) = handle_duplicate_instance_with_rebuild(
         &fixture.state,
-        &fixture.producer,
         &source.id,
         None,
-        move |_, _, instance_id| async move {
+        request.producer_handoff(),
+        move |_, _, _, instance_id| async move {
             *observed_id.lock().expect("capture duplicate id") = Some(instance_id);
             Err(crate::state::KnownGoodRebuildError::ReconstructionFailed)
         },
@@ -1734,7 +1837,7 @@ async fn dropped_create_caller_keeps_rebuild_rollback_owned_until_quiescence() {
                 selection_id: "vanilla|1.21.1".to_string(),
                 ..CreateInstanceRequest::default()
             },
-            move |_, _, instance_id| async move {
+            move |_, _, _, instance_id| async move {
                 *observed_id.lock().expect("capture created id") = Some(instance_id);
                 entered_tx.send(()).expect("signal rebuild entry");
                 release_rx.await.expect("release rebuild");
@@ -1781,6 +1884,89 @@ async fn dropped_create_caller_keeps_rebuild_rollback_owned_until_quiescence() {
 
     assert!(state.instances().get(&created_id).is_none());
     assert!(!state.instances().game_dir(&created_id).exists());
+    state
+        .close_known_good_inventories()
+        .await
+        .expect("close known-good store");
+    state
+        .close_instance_registry()
+        .await
+        .expect("close instance registry");
+    drop(state);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn dropped_duplicate_caller_keeps_rebuild_rollback_owned_until_quiescence() {
+    let (state, root) = test_state("duplicate-known-good-caller-drop");
+    let source = state
+        .instances()
+        .insert_for_test("Source", "1.21.1")
+        .expect("register source");
+    let duplicate_id = Arc::new(Mutex::new(None::<String>));
+    let observed_id = duplicate_id.clone();
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let duplicate_state = state.clone();
+    let source_id = source.id.clone();
+    let caller = tokio::spawn(async move {
+        let request = duplicate_state
+            .try_admit_request()
+            .expect("admit duplicate request");
+        let handoff = request.producer_handoff();
+        handle_duplicate_instance_with_rebuild(
+            &duplicate_state,
+            &source_id,
+            None,
+            handoff,
+            move |_, _, _, instance_id| async move {
+                *observed_id.lock().expect("capture duplicate id") = Some(instance_id);
+                entered_tx.send(()).expect("signal rebuild entry");
+                release_rx.await.expect("release rebuild");
+                Err(crate::state::KnownGoodRebuildError::ReconstructionFailed)
+            },
+        )
+        .await
+    });
+
+    tokio::time::timeout(std::time::Duration::from_secs(5), entered_rx)
+        .await
+        .expect("duplicate rebuild enters")
+        .expect("duplicate rebuild signal");
+    let duplicate_id = duplicate_id
+        .lock()
+        .expect("read duplicate id")
+        .clone()
+        .expect("rebuild observed duplicate id");
+    assert!(state.instances().get(&duplicate_id).is_some());
+    caller.abort();
+    assert!(
+        caller
+            .await
+            .expect_err("caller cancellation")
+            .is_cancelled()
+    );
+
+    let shutdown_state = state.clone();
+    let quiesce = tokio::spawn(async move { shutdown_state.quiesce().await });
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while state.lifecycle_phase() != crate::state::AppLifecyclePhase::QuiescingProducers {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("quiescence waits on accepted duplicate");
+    assert!(!quiesce.is_finished());
+
+    release_tx.send(()).expect("release failed rebuild");
+    tokio::time::timeout(std::time::Duration::from_secs(5), quiesce)
+        .await
+        .expect("duplicate rollback drains")
+        .expect("quiesce task")
+        .expect("quiesce succeeds");
+    assert!(state.instances().get(&source.id).is_some());
+    assert!(state.instances().get(&duplicate_id).is_none());
+    assert!(!state.instances().game_dir(&duplicate_id).exists());
     state
         .close_known_good_inventories()
         .await
@@ -2916,7 +3102,6 @@ async fn duplicate_instance_existing_name_maps_to_conflict_json_error() {
 
     let (status, Json(body)) = handle_duplicate_instance(
         &fixture.state,
-        &fixture.producer,
         &source.id,
         Some(DuplicateInstanceRequest {
             name: Some("Existing".to_string()),
@@ -3056,6 +3241,97 @@ async fn delete_instance_default_removes_files_and_keep_files_preserves_them() {
 }
 
 #[tokio::test]
+async fn delete_waits_for_cancelled_sweep_settlement_before_registry_and_filesystem_effects() {
+    let fixture = TestFixture::new("delete-sweep-settlement");
+    let instance = add_test_instance(&fixture, "Sweep delete", "1.21.1");
+    let marker = fixture
+        .state
+        .instances()
+        .game_dir(&instance.id)
+        .join("saves/world/level.dat");
+    fs::create_dir_all(marker.parent().expect("marker parent")).expect("create marker parent");
+    fs::write(&marker, "world").expect("write marker");
+    let directories_before = instance_directory_names(&fixture.root);
+    let (reservation, cancellation) = reserve_instance_sweep(&fixture.state);
+    let state = fixture.state.clone();
+    let instance_id = instance.id.clone();
+    let delete =
+        tokio::spawn(
+            async move { handle_delete_instance(&state, &instance_id, HashMap::new()).await },
+        );
+
+    wait_for_sweep_cancellation(&cancellation).await;
+    assert_eq!(
+        fixture.state.instances().get(&instance.id),
+        Some(instance.clone())
+    );
+    assert_eq!(instance_directory_names(&fixture.root), directories_before);
+    assert_eq!(fs::read_to_string(&marker).expect("read marker"), "world");
+    assert!(!delete.is_finished());
+
+    reservation.settle(IdleSweepTerminal::Cancelled);
+    let body = tokio::time::timeout(std::time::Duration::from_secs(5), delete)
+        .await
+        .expect("delete settles after sweep")
+        .expect("delete task")
+        .expect("delete succeeds");
+    assert_eq!(body, serde_json::json!({ "status": "ok" }));
+    assert!(fixture.state.instances().get(&instance.id).is_none());
+    assert!(!fixture.state.instances().game_dir(&instance.id).exists());
+}
+
+#[tokio::test]
+async fn state_instance_transactions_reject_foreign_foreground_before_effects() {
+    let owner = TestFixture::new("foreign-foreground-owner");
+    let target = TestFixture::new("foreign-foreground-target");
+    let foreground = instance_foreground(&owner.state).await;
+
+    let create_id = axial_config::generate_instance_id();
+    let create = crate::state::new_instance(
+        create_id.clone(),
+        "Foreign create".to_string(),
+        "1.21.1".to_string(),
+        String::new(),
+        String::new(),
+    );
+    let error = target
+        .state
+        .create_instance(&foreground, create, None)
+        .await
+        .expect_err("foreign create foreground rejected");
+    assert_foreign_foreground_error(error);
+    assert!(target.state.instances().get(&create_id).is_none());
+    assert!(!target.state.instances().game_dir(&create_id).exists());
+
+    let source = add_test_instance(&target, "Foreign source", "1.21.1");
+    let source_marker = target
+        .state
+        .instances()
+        .game_dir(&source.id)
+        .join("mods/source.jar");
+    fs::write(&source_marker, "source").expect("write source marker");
+    let directories_before = instance_directory_names(&target.root);
+    let error = target
+        .state
+        .duplicate_instance(&foreground, source.id.clone(), None, None)
+        .await
+        .expect_err("foreign duplicate foreground rejected");
+    assert_foreign_foreground_error(error);
+    assert_eq!(target.state.instances().list(), vec![source.clone()]);
+    assert_eq!(instance_directory_names(&target.root), directories_before);
+    assert!(source_marker.is_file());
+
+    let error = target
+        .state
+        .delete_instance(&foreground, source.id.clone(), true)
+        .await
+        .expect_err("foreign delete foreground rejected");
+    assert_foreign_foreground_error(error);
+    assert_eq!(target.state.instances().get(&source.id), Some(source));
+    assert!(source_marker.is_file());
+}
+
+#[tokio::test]
 async fn delete_waits_for_launch_admission_and_rejects_newly_queued_session() {
     let fixture = TestFixture::new("delete-launch-admission");
     let instance = add_test_instance(&fixture, "Launch admission", "1.21.1");
@@ -3096,19 +3372,25 @@ async fn delete_waits_for_launch_admission_and_rejects_newly_queued_session() {
 
 #[tokio::test]
 async fn cancelled_delete_caller_cannot_cancel_lifecycle_waiting_owner() {
-    let fixture = TestFixture::new("delete-cancel-lifecycle");
-    let instance = add_test_instance(&fixture, "Cancel lifecycle", "1.21.1");
-    let known_good = fixture
-        .root
+    let (state, root) = test_state("delete-cancel-lifecycle");
+    let instance = state
+        .instances()
+        .insert_for_test("Cancel lifecycle", "1.21.1")
+        .expect("register instance");
+    let known_good = root
         .join("config/state/known-good")
         .join(format!("{}.json", instance.id));
     fs::create_dir_all(known_good.parent().expect("known-good parent")).expect("state directory");
     fs::write(&known_good, "known-good").expect("known-good snapshot");
-    let lifecycle = fixture.state.acquire_instance_lifecycle(&instance.id).await;
-    let state = fixture.state.clone();
+    let lifecycle = state.acquire_instance_lifecycle(&instance.id).await;
     let instance_id = instance.id.clone();
-    let mut delete =
-        Box::pin(state.delete_instance(instance_id.clone(), false, fixture.producer.claim_child()));
+    let request = state.try_admit_request().expect("admit delete request");
+    let mut delete = Box::pin(handle_delete_instance_owned(
+        &state,
+        &instance_id,
+        HashMap::from([("keep_files".to_string(), "true".to_string())]),
+        request.producer_handoff(),
+    ));
     {
         let waker = futures_util::task::noop_waker();
         let mut context = std::task::Context::from_waker(&waker);
@@ -3118,25 +3400,51 @@ async fn cancelled_delete_caller_cannot_cancel_lifecycle_waiting_owner() {
         ));
     }
     drop(delete);
+    drop(request);
+    let shutdown_state = state.clone();
+    let quiesce = tokio::spawn(async move { shutdown_state.quiesce().await });
+    wait_for_producer_quiescence(&state).await;
+    assert!(!quiesce.is_finished());
     drop(lifecycle);
-
-    wait_for_detached_delete(&fixture.state, &instance_id, Some(&known_good)).await;
+    tokio::time::timeout(std::time::Duration::from_secs(5), quiesce)
+        .await
+        .expect("delete lifecycle owner drains")
+        .expect("quiesce task")
+        .expect("quiesce succeeds");
+    assert!(state.instances().get(&instance_id).is_none());
+    assert!(!known_good.exists());
+    state
+        .close_known_good_inventories()
+        .await
+        .expect("close known-good store");
+    state
+        .close_instance_registry()
+        .await
+        .expect("close instance registry");
+    drop(state);
+    let _ = fs::remove_dir_all(root);
 }
 
 #[tokio::test]
 async fn cancelled_delete_caller_cannot_cancel_registry_waiting_owner() {
-    let fixture = TestFixture::new("delete-cancel-registry");
-    let instance = add_test_instance(&fixture, "Cancel registry", "1.21.1");
-    let registry = fixture
-        .state
+    let (state, root) = test_state("delete-cancel-registry");
+    let instance = state
+        .instances()
+        .insert_for_test("Cancel registry", "1.21.1")
+        .expect("register instance");
+    let registry = state
         .instances()
         .acquire_mutation()
         .await
         .expect("hold registry mutation");
-    let state = fixture.state.clone();
     let instance_id = instance.id.clone();
-    let mut delete =
-        Box::pin(state.delete_instance(instance_id.clone(), false, fixture.producer.claim_child()));
+    let request = state.try_admit_request().expect("admit delete request");
+    let mut delete = Box::pin(handle_delete_instance_owned(
+        &state,
+        &instance_id,
+        HashMap::from([("keep_files".to_string(), "true".to_string())]),
+        request.producer_handoff(),
+    ));
     {
         let waker = futures_util::task::noop_waker();
         let mut context = std::task::Context::from_waker(&waker);
@@ -3145,11 +3453,29 @@ async fn cancelled_delete_caller_cannot_cancel_registry_waiting_owner() {
             std::task::Poll::Pending
         ));
     }
-    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     drop(delete);
+    drop(request);
+    let shutdown_state = state.clone();
+    let quiesce = tokio::spawn(async move { shutdown_state.quiesce().await });
+    wait_for_producer_quiescence(&state).await;
+    assert!(!quiesce.is_finished());
     drop(registry);
-
-    wait_for_detached_delete(&fixture.state, &instance_id, None).await;
+    tokio::time::timeout(std::time::Duration::from_secs(5), quiesce)
+        .await
+        .expect("delete registry owner drains")
+        .expect("quiesce task")
+        .expect("quiesce succeeds");
+    assert!(state.instances().get(&instance_id).is_none());
+    state
+        .close_known_good_inventories()
+        .await
+        .expect("close known-good store");
+    state
+        .close_instance_registry()
+        .await
+        .expect("close instance registry");
+    drop(state);
+    let _ = fs::remove_dir_all(root);
 }
 
 #[tokio::test]
@@ -3176,7 +3502,11 @@ async fn successful_registry_delete_without_absence_compensates_retirements() {
 
     let error = fixture
         .state
-        .delete_instance(instance.id.clone(), false, fixture.producer.claim_child())
+        .delete_instance(
+            &instance_foreground(&fixture.state).await,
+            instance.id.clone(),
+            false,
+        )
         .await
         .expect_err("registry presence must fail the deletion postcondition");
     let InstanceStoreError::Persistence(error) = error else {
@@ -3220,7 +3550,11 @@ async fn failed_registry_delete_with_presence_compensates_retirements() {
 
     let error = fixture
         .state
-        .delete_instance(instance.id.clone(), false, fixture.producer.claim_child())
+        .delete_instance(
+            &instance_foreground(&fixture.state).await,
+            instance.id.clone(),
+            false,
+        )
         .await
         .expect_err("registry failure must fail deletion");
     let InstanceStoreError::Persistence(error) = error else {
@@ -3253,7 +3587,11 @@ async fn deletion_recovers_latched_managed_state_before_registry_absence() {
 
     fixture
         .state
-        .delete_instance(instance.id.clone(), false, fixture.producer.claim_child())
+        .delete_instance(
+            &instance_foreground(&fixture.state).await,
+            instance.id.clone(),
+            false,
+        )
         .await
         .expect("recovered latch permits deletion");
 
@@ -3275,7 +3613,11 @@ async fn unrecoverable_latched_managed_state_preserves_present_instance_authorit
 
     fixture
         .state
-        .delete_instance(instance.id.clone(), false, fixture.producer.claim_child())
+        .delete_instance(
+            &instance_foreground(&fixture.state).await,
+            instance.id.clone(),
+            false,
+        )
         .await
         .expect_err("unrecoverable latch must block deletion");
 
@@ -3333,25 +3675,67 @@ async fn admitted_delete_claims_its_request_handoff_during_drain() {
     let _ = quiesce.await;
 }
 
-async fn wait_for_detached_delete(
-    state: &AppState,
-    instance_id: &str,
-    retired_known_good: Option<&FsPath>,
-) {
+fn reserve_instance_sweep(state: &AppState) -> (IdleSweepReservation, IdleSweepCancellation) {
+    let epoch = state.subscribe_integrity_idle().borrow().epoch();
+    let reservation = state
+        .try_reserve_idle_sweep(
+            epoch,
+            state.try_claim_producer().expect("claim sweep producer"),
+        )
+        .expect("reserve instance sweep");
+    let cancellation = reservation.cancellation();
+    (reservation, cancellation)
+}
+
+async fn wait_for_sweep_cancellation(cancellation: &IdleSweepCancellation) {
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        loop {
-            let lifecycle = state.acquire_instance_lifecycle(instance_id).await;
-            let registry_absent = state.instances().get(instance_id).is_none();
-            let known_good_absent = retired_known_good.is_none_or(|path| !path.exists());
-            drop(lifecycle);
-            if registry_absent && known_good_absent {
-                break;
-            }
+        while !cancellation.is_cancelled() {
             tokio::task::yield_now().await;
         }
     })
     .await
-    .expect("detached instance deletion did not finish");
+    .expect("foreground registration cancels sweep");
+}
+
+async fn wait_for_producer_quiescence(state: &AppState) {
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while state.lifecycle_phase() != crate::state::AppLifecyclePhase::QuiescingProducers {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("request drain reaches producer quiescence");
+}
+
+fn instance_directory_names(root: &FsPath) -> Vec<String> {
+    let mut names = fs::read_dir(root.join("instances"))
+        .into_iter()
+        .flatten()
+        .map(|entry| {
+            entry
+                .expect("read instance directory entry")
+                .file_name()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect::<Vec<_>>();
+    names.sort();
+    names
+}
+
+fn assert_foreign_foreground_error(error: InstanceStoreError) {
+    let InstanceStoreError::Persistence(error) = error else {
+        panic!("foreign foreground must fail as persistence permission denial");
+    };
+    assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+}
+
+async fn instance_foreground(state: &AppState) -> IntegrityForegroundLease {
+    state
+        .register_integrity_foreground()
+        .expect("register instance foreground")
+        .wait_for_settlement()
+        .await
 }
 
 async fn latch_managed_instance(fixture: &TestFixture, instance_id: &str) -> PathBuf {

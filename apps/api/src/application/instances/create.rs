@@ -32,8 +32,8 @@ use crate::guardian::{
 use crate::observability::telemetry::TelemetryEvent;
 use crate::state::contracts::{CommandKind, OperationId, OperationStatus};
 use crate::state::{
-    AppState, InstallQueueEnqueueOutcome, InstalledVersionsLookup, ProducerLease,
-    RequestProducerHandoff, new_instance,
+    AppState, InstallQueueEnqueueOutcome, InstalledVersionsLookup, IntegrityForegroundLease,
+    ProducerLease, RequestProducerHandoff, new_instance,
 };
 use axial_config::{EnrichedInstance, Instance, generate_instance_id};
 use axial_launcher::{
@@ -436,8 +436,8 @@ pub(crate) async fn handle_create_instance_owned(
         state,
         payload,
         handoff,
-        |state, producer, instance_id| async move {
-            rebuild_registered_known_good(&state, &producer, &instance_id).await
+        |state, foreground, producer, instance_id| async move {
+            rebuild_registered_known_good(&state, &foreground, &producer, &instance_id).await
         },
     )
     .await
@@ -450,131 +450,144 @@ async fn handle_create_instance_owned_with_rebuild<Rebuild, RebuildFuture>(
     rebuild: Rebuild,
 ) -> Result<CreateInstanceResponse, (StatusCode, Json<serde_json::Value>)>
 where
-    Rebuild: FnOnce(AppState, ProducerLease, String) -> RebuildFuture + Send + 'static,
+    Rebuild: FnOnce(AppState, IntegrityForegroundLease, ProducerLease, String) -> RebuildFuture
+        + Send
+        + 'static,
     RebuildFuture:
         Future<Output = Result<(), crate::state::KnownGoodRebuildError>> + Send + 'static,
 {
-    let started_at = Instant::now();
     let producer = handoff
         .try_claim()
         .map_err(instance_shutdown_error_response)?;
-    let installed_lookup = state
-        .installed_versions_snapshot(&producer)
-        .await
-        .ok_or_else(library_not_configured_response)?;
-    let installed_scan = installed_versions_scan(&installed_lookup.snapshot);
-    if installed_scan.is_degraded() {
-        return Err(version_scan_degraded_response());
-    }
-    let selection =
-        resolve_create_selection(&installed_lookup, &installed_scan.versions, &payload).await?;
-    let preset = normalize_create_jvm_preset(payload.jvm_preset_id.as_deref());
-    let mc_dir = Some(installed_lookup.library_dir().to_path_buf());
-    let install_request = create_install_queue_request_if_needed(
-        state,
-        &installed_lookup,
-        &installed_scan,
-        &selection,
-    )?;
-    let queued_install_request = install_request.clone();
-    let instance = build_created_instance(&payload, &selection, &preset)?;
-    let continuation = producer.claim_child();
-    let rebuild_owner = producer.claim_child();
-    let rollback_owner = producer.claim_child();
-    let queue_owner = install_request.as_ref().map(|_| producer.claim_child());
-    let continuation_state = state.clone();
-    let completed = continuation.spawn_joinable(async move {
-        let instance = continuation_state
-            .create_instance(instance, mc_dir)
-            .await
-            .map_err(|error| {
-                instance_write_error_response(InstanceWriteOperation::Create, error)
-            })?;
-        let instance_id = instance.id.clone();
-        let completion = match install_request {
-            Some(request) => match enqueue_install_from_continuation(
-                &continuation_state,
-                request,
-                queue_owner.expect("queued create retains its install owner"),
-            )
-            .await
-            {
-                Ok(queued) => {
-                    if matches!(
-                        &queued.outcome,
-                        InstallQueueEnqueueOutcome::AlreadyActive { .. }
-                    ) && !registered_known_good_is_live(&continuation_state, &instance_id).await
-                    {
-                        Err(active_install_missed_instance_response())
-                    } else {
-                        Ok(Some(queued.response))
-                    }
-                }
-                Err(error) => Err(error),
-            },
-            None => rebuild(
-                continuation_state.clone(),
-                rebuild_owner,
-                instance_id.clone(),
-            )
-            .await
-            .map(|()| None)
-            .map_err(|error| {
-                known_good_rebuild_error_response(InstanceWriteOperation::Create, error)
-            }),
-        };
-        match completion {
-            Ok(install_queue) => Ok((instance, install_queue)),
-            Err(error) => {
-                if let Err(rollback_error) =
-                    rollback_new_instance(&continuation_state, &instance_id, rollback_owner).await
-                {
-                    error!(
-                        failure_class = instance_store_error_class(&rollback_error),
-                        "create compensation rollback persistence failed"
-                    );
-                    return Err(instance_write_error_response(
-                        InstanceWriteOperation::Create,
-                        rollback_error,
-                    ));
-                }
-                Err(error)
+    let foreground = state
+        .register_integrity_foreground()
+        .map_err(instance_shutdown_error_response)?;
+    let transaction = producer.claim_child();
+    let transaction_state = state.clone();
+    transaction
+        .spawn_joinable(async move {
+            let started_at = Instant::now();
+            let foreground = foreground.wait_for_settlement().await;
+            let installed_lookup = transaction_state
+                .installed_versions_snapshot_with_foreground(&producer, foreground.retained())
+                .await
+                .ok_or_else(library_not_configured_response)?;
+            let installed_scan = installed_versions_scan(&installed_lookup.snapshot);
+            if installed_scan.is_degraded() {
+                return Err(version_scan_degraded_response());
             }
-        }
-    });
-    let (instance, install_queue) = completed
-        .await
-        .map_err(|_| instance_internal_error_response(InstanceWriteOperation::Create))??;
-    let enriched = enrich_instance_for_scan(
-        state,
-        instance,
-        &installed_scan,
-        Some(installed_lookup.library_dir()),
-    );
-    state
-        .telemetry()
-        .emit(TelemetryEvent::instance_created(Some(
-            enriched.version_display.loader_key.clone(),
-        )));
-    let queued_install = install_queue.as_ref().and_then(|response| {
-        queued_install_request
-            .as_ref()
-            .and_then(|request| create_queued_install_summary(response, request))
-    });
-    trace_create_instance(CreateInstanceTiming {
-        total: started_at.elapsed(),
-        version_count: installed_scan.versions.len(),
-        scan_source: installed_lookup.source.as_str(),
-        refresh_count: installed_lookup.refresh_count,
-        queued_install: queued_install.is_some(),
-    });
+            let selection =
+                resolve_create_selection(&installed_lookup, &installed_scan.versions, &payload)
+                    .await?;
+            let preset = normalize_create_jvm_preset(payload.jvm_preset_id.as_deref());
+            let mc_dir = Some(installed_lookup.library_dir().to_path_buf());
+            let install_request = create_install_queue_request_if_needed(
+                &transaction_state,
+                &installed_lookup,
+                &installed_scan,
+                &selection,
+            )?;
+            let queued_install_request = install_request.clone();
+            let instance = build_created_instance(&payload, &selection, &preset)?;
+            let rebuild_owner = producer.claim_child();
+            let queue_owner = install_request.as_ref().map(|_| producer.claim_child());
+            let instance = transaction_state
+                .create_instance(&foreground, instance, mc_dir)
+                .await
+                .map_err(|error| {
+                    instance_write_error_response(InstanceWriteOperation::Create, error)
+                })?;
+            let instance_id = instance.id.clone();
+            let completion = match install_request {
+                Some(request) => match enqueue_install_from_continuation(
+                    &transaction_state,
+                    &foreground,
+                    request,
+                    queue_owner.expect("queued create retains its install owner"),
+                )
+                .await
+                {
+                    Ok(queued) => {
+                        if matches!(
+                            &queued.outcome,
+                            InstallQueueEnqueueOutcome::AlreadyActive { .. }
+                        ) && !registered_known_good_is_live(
+                            &transaction_state,
+                            &foreground,
+                            &instance_id,
+                        )
+                        .await
+                        {
+                            Err(active_install_missed_instance_response())
+                        } else {
+                            Ok(Some(queued.response))
+                        }
+                    }
+                    Err(error) => Err(error),
+                },
+                None => rebuild(
+                    transaction_state.clone(),
+                    foreground.retained(),
+                    rebuild_owner,
+                    instance_id.clone(),
+                )
+                .await
+                .map(|()| None)
+                .map_err(|error| {
+                    known_good_rebuild_error_response(InstanceWriteOperation::Create, error)
+                }),
+            };
+            let install_queue = match completion {
+                Ok(install_queue) => install_queue,
+                Err(error) => {
+                    if let Err(rollback_error) =
+                        rollback_new_instance(&transaction_state, &foreground, &instance_id).await
+                    {
+                        error!(
+                            failure_class = instance_store_error_class(&rollback_error),
+                            "create compensation rollback persistence failed"
+                        );
+                        return Err(instance_write_error_response(
+                            InstanceWriteOperation::Create,
+                            rollback_error,
+                        ));
+                    }
+                    return Err(error);
+                }
+            };
+            let enriched = enrich_instance_for_scan(
+                &transaction_state,
+                instance,
+                &installed_scan,
+                Some(installed_lookup.library_dir()),
+            );
+            transaction_state
+                .telemetry()
+                .emit(TelemetryEvent::instance_created(Some(
+                    enriched.version_display.loader_key.clone(),
+                )));
+            let queued_install = install_queue.as_ref().and_then(|response| {
+                queued_install_request
+                    .as_ref()
+                    .and_then(|request| create_queued_install_summary(response, request))
+            });
+            trace_create_instance(CreateInstanceTiming {
+                total: started_at.elapsed(),
+                version_count: installed_scan.versions.len(),
+                scan_source: installed_lookup.source.as_str(),
+                refresh_count: installed_lookup.refresh_count,
+                queued_install: queued_install.is_some(),
+            });
 
-    Ok(create_instance_response(
-        enriched,
-        install_queue,
-        queued_install,
-        guardian_jvm_preset_notice(preset),
-    ))
+            Ok(create_instance_response(
+                enriched,
+                install_queue,
+                queued_install,
+                guardian_jvm_preset_notice(preset),
+            ))
+        })
+        .await
+        .map_err(|_| instance_internal_error_response(InstanceWriteOperation::Create))?
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -856,7 +869,7 @@ pub(crate) async fn handle_create_instance(
     state: &AppState,
     payload: CreateInstanceRequest,
 ) -> Result<CreateInstanceResponse, (StatusCode, Json<serde_json::Value>)> {
-    handle_create_instance_with_rebuild(state, payload, |_, _, _| async { Ok(()) }).await
+    handle_create_instance_with_rebuild(state, payload, |_, _, _, _| async { Ok(()) }).await
 }
 
 #[cfg(test)]
@@ -866,7 +879,9 @@ pub(super) async fn handle_create_instance_with_rebuild<Rebuild, RebuildFuture>(
     rebuild: Rebuild,
 ) -> Result<CreateInstanceResponse, (StatusCode, Json<serde_json::Value>)>
 where
-    Rebuild: FnOnce(AppState, ProducerLease, String) -> RebuildFuture + Send + 'static,
+    Rebuild: FnOnce(AppState, IntegrityForegroundLease, ProducerLease, String) -> RebuildFuture
+        + Send
+        + 'static,
     RebuildFuture:
         Future<Output = Result<(), crate::state::KnownGoodRebuildError>> + Send + 'static,
 {

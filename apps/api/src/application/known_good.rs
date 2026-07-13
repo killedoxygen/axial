@@ -1,4 +1,4 @@
-use crate::state::{AppState, KnownGoodRebuildError, ProducerLease};
+use crate::state::{AppState, IntegrityForegroundLease, KnownGoodRebuildError, ProducerLease};
 use axial_config::INSTANCE_REGISTRY_MAX_ENTRIES;
 use axial_minecraft::{KnownGoodReconstructionError, KnownGoodReconstructionReceipt};
 use futures_util::{StreamExt, future::join_all, stream};
@@ -9,17 +9,13 @@ const MAX_STARTUP_REBUILD_GROUPS: usize = 2;
 
 pub(crate) async fn rebuild_registered_known_good(
     state: &AppState,
+    foreground: &IntegrityForegroundLease,
     producer: &ProducerLease,
     instance_id: &str,
 ) -> Result<(), KnownGoodRebuildError> {
-    let foreground = state
-        .register_integrity_foreground()
-        .map_err(|_| KnownGoodRebuildError::OwnerStopped)?
-        .wait_for_settlement()
-        .await;
     state
         .rebuild_known_good_for_registered_instance(
-            &foreground,
+            foreground,
             producer,
             instance_id,
             |version_id| async move { axial_minecraft::reconstruct_known_good(&version_id).await },
@@ -27,13 +23,13 @@ pub(crate) async fn rebuild_registered_known_good(
         .await
 }
 
-pub(crate) async fn registered_known_good_is_live(state: &AppState, instance_id: &str) -> bool {
-    let Ok(foreground) = state.register_integrity_foreground() else {
-        return false;
-    };
-    let foreground = foreground.wait_for_settlement().await;
+pub(crate) async fn registered_known_good_is_live(
+    state: &AppState,
+    foreground: &IntegrityForegroundLease,
+    instance_id: &str,
+) -> bool {
     state
-        .registered_instance_has_live_known_good(&foreground, instance_id)
+        .registered_instance_has_live_known_good(foreground, instance_id)
         .await
         .unwrap_or(false)
 }
