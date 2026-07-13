@@ -375,7 +375,7 @@ fn classify_modpack_file_options(
             installed,
         });
     }
-    files.sort_by(|left, right| left.title.to_lowercase().cmp(&right.title.to_lowercase()));
+    files.sort_by_key(|file| file.title.to_lowercase());
     files
 }
 
