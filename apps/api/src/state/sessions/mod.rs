@@ -80,8 +80,8 @@ impl SessionStore {
         }
     }
 
-    pub fn try_lock_instance_lifecycle(&self, instance_id: &str) -> Option<OwnedMutexGuard<()>> {
-        let lock = {
+    fn instance_lifecycle_lock(&self, instance_id: &str) -> Arc<Mutex<()>> {
+        {
             let mut locks = self
                 .instance_lifecycle_locks
                 .lock()
@@ -95,8 +95,17 @@ impl SessionStore {
                     lock
                 }
             }
-        };
-        lock.try_lock_owned().ok()
+        }
+    }
+
+    pub fn try_lock_instance_lifecycle(&self, instance_id: &str) -> Option<OwnedMutexGuard<()>> {
+        self.instance_lifecycle_lock(instance_id)
+            .try_lock_owned()
+            .ok()
+    }
+
+    pub async fn lock_instance_lifecycle(&self, instance_id: &str) -> OwnedMutexGuard<()> {
+        self.instance_lifecycle_lock(instance_id).lock_owned().await
     }
 
     fn notify_changed(&self) {

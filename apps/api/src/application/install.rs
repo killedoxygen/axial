@@ -49,6 +49,7 @@ pub(crate) const LOADER_INSTALL_INTERRUPTED_MESSAGE: &str =
 pub(crate) const BASE_INSTALL_FAILED_MESSAGE: &str =
     "Base game install failed. Retry the install from Downloads.";
 const INSTALL_REPAIR_RESUME_MAX_DEPTH: u8 = 1;
+const CONTENT_INSTANCE_REMOVED_PHASE: &str = "error_instance_removed";
 
 pub type InstallApplicationError = (StatusCode, Json<serde_json::Value>);
 
@@ -535,7 +536,7 @@ pub async fn remove_queued_install(
     queue_id: &str,
 ) -> Result<InstallQueueStateResponse, InstallApplicationError> {
     let removed = state.installs().remove_queued_install(queue_id).await;
-    if let Some(QueuedInstallEntry {
+    let removed_instance_id = if let Some(QueuedInstallEntry {
         spec:
             InstallQueueSpec::Content {
                 instance_id,
@@ -546,8 +547,14 @@ pub async fn remove_queued_install(
     }) = removed.as_ref()
         && content_action_owns_instance(action)
     {
-        let _ = state.instances().remove(instance_id, true);
-    }
+        state
+            .instances()
+            .remove(instance_id, true)
+            .is_ok()
+            .then(|| instance_id.clone())
+    } else {
+        None
+    };
     let notice = removed
         .as_ref()
         .map(|entry| {
@@ -566,7 +573,9 @@ pub async fn remove_queued_install(
                 Some("It may have already started or left the queue.".to_string()),
             ))
         });
-    Ok(install_queue_state_response(state, notice, None).await)
+    let mut response = install_queue_state_response(state, notice, None).await;
+    response.removed_instance_id = removed_instance_id;
+    Ok(response)
 }
 
 fn content_action_owns_instance(action: &ContentQueueAction) -> bool {
@@ -877,11 +886,12 @@ async fn start_content_operation(
     let interrupted_state = state.clone();
     let interrupted_instance_id = instance_id.to_string();
     let remove_instance_if_interrupted = content_action_owns_instance(action);
+    let interrupted_progress = content_interrupted_progress(remove_instance_if_interrupted);
 
     InstallStore::spawn_tracked_worker_with_interrupt_handler(
         state.installs().clone(),
         install_id.clone(),
-        content_interrupted_progress(),
+        interrupted_progress,
         async move {
             let (progress_tx, mut progress_rx) = mpsc::unbounded_channel::<DownloadProgress>();
             let progress_store = worker_store.clone();
@@ -967,7 +977,8 @@ async fn start_content_operation(
             let terminal = match result {
                 Ok(()) => content_progress("done", 1, 1, true, None),
                 Err((_, Json(body))) => {
-                    if content_action_owns_instance(&worker_action) {
+                    let removed_instance = content_action_owns_instance(&worker_action);
+                    if removed_instance {
                         let _ = worker_state.instances().remove(&worker_instance_id, true);
                     }
                     let message = body
@@ -975,7 +986,17 @@ async fn start_content_operation(
                         .and_then(serde_json::Value::as_str)
                         .unwrap_or(INSTALL_FAILURE_MESSAGE)
                         .to_string();
-                    content_progress("error", 0, 1, true, Some(message))
+                    content_progress(
+                        if removed_instance {
+                            CONTENT_INSTANCE_REMOVED_PHASE
+                        } else {
+                            "error"
+                        },
+                        0,
+                        1,
+                        true,
+                        Some(message),
+                    )
                 }
             };
             let _ = progress_tx.send(terminal);
@@ -1024,13 +1045,21 @@ fn content_progress(
     }
 }
 
-fn content_interrupted_progress() -> DownloadProgress {
+fn content_interrupted_progress(removes_instance: bool) -> DownloadProgress {
     content_progress(
-        "error",
+        if removes_instance {
+            CONTENT_INSTANCE_REMOVED_PHASE
+        } else {
+            "error"
+        },
         0,
         1,
         true,
-        Some("Content operation stopped before completing. Try again.".to_string()),
+        Some(if removes_instance {
+            "Content operation stopped. The incomplete setup instance was removed.".to_string()
+        } else {
+            "Content operation stopped before completing. Try again.".to_string()
+        }),
     )
 }
 
@@ -1105,6 +1134,7 @@ async fn install_queue_state_response(
         view_model,
         notice,
         started_install,
+        removed_instance_id: None,
     }
 }
 
@@ -1481,12 +1511,16 @@ fn install_failure_view_model(
     );
 
     Some(InstallFailureViewModel {
-        state_id: failure_state_id(guardian, repair).to_string(),
+        state_id: if progress.phase_id == CONTENT_INSTANCE_REMOVED_PHASE {
+            "failed_instance_removed".to_string()
+        } else {
+            failure_state_id(guardian, repair).to_string()
+        },
         title: "Install failed".to_string(),
         tone: "err".to_string(),
         detail: details.first().cloned(),
         details,
-        retry_action: install_retry_action(guardian, repair),
+        retry_action: install_retry_action(progress, guardian, repair),
         dismiss_action: InstallActionViewModel {
             action: "dismiss".to_string(),
             label: "Dismiss".to_string(),
@@ -1531,9 +1565,21 @@ fn failure_state_id(
 }
 
 fn install_retry_action(
+    progress: &InstallProgressViewModel,
     guardian: Option<&InstallGuardianOutcomeSummary>,
     repair: Option<&InstallGuardianRepairSummary>,
 ) -> InstallActionViewModel {
+    if progress.phase_id == CONTENT_INSTANCE_REMOVED_PHASE {
+        return InstallActionViewModel {
+            action: "retry".to_string(),
+            label: "Retry install".to_string(),
+            enabled: false,
+            disabled_reason: Some(
+                "The temporary setup instance was removed. Create the instance again to retry."
+                    .to_string(),
+            ),
+        };
+    }
     if repair.is_some_and(|repair| repair.status == "repaired") {
         return InstallActionViewModel {
             action: "retry".to_string(),

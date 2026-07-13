@@ -258,6 +258,13 @@ export async function applyInstallQueueResponse(
   response: InstallQueueStateResponse,
   options: { showNotice?: boolean; connectActive?: boolean } = {},
 ): Promise<InstallQueueStateResponse> {
+  if (response.removed_instance_id) {
+    const removedId = response.removed_instance_id;
+    batch(() => {
+      instances.value = instances.value.filter((instance) => instance.id !== removedId);
+      if (lastInstanceId.value === removedId) lastInstanceId.value = null;
+    });
+  }
   const terminalActive = response.active?.progress.failed || response.active?.progress.terminal;
   const activeResponse = terminalActive ? { ...response, active: null } : response;
   reconcileDownloadQueue(activeResponse);

@@ -7,7 +7,8 @@ use super::target::ResolveTarget;
 use super::{ContentApiError, ContentSelection, content_error_response, json_error};
 use axial_content::{
     CanonicalId, ContentDependency, ContentError, ContentKind, ContentManifest, ContentVersion,
-    DependencyKind, FileRef, ManifestEntry, PlannedFile, ProviderId, ReleaseChannel,
+    DependencyKind, FileRef, ManifestEntry, PlannedFile, ProjectMetadata, ProviderId,
+    ReleaseChannel, entry_file_present,
 };
 use axum::http::StatusCode;
 use serde::Serialize;
@@ -156,33 +157,46 @@ impl Resolution {
     }
 }
 
-/// Reject selections the target cannot physically accept. Resource packs and
-/// shaders drop into any instance; a mod needs a loader.
-pub fn require_installable(
-    selections: &[ContentSelection],
+/// Reject a provider-authored type the target cannot physically accept.
+fn require_installable_kind(
+    kind: ContentKind,
     target: &ResolveTarget,
 ) -> Result<(), ContentApiError> {
-    if selections.is_empty() {
-        return Err(json_error(StatusCode::BAD_REQUEST, "no content selected"));
-    }
-    if selections
-        .iter()
-        .any(|selection| selection.kind == ContentKind::Modpack)
-    {
+    if kind == ContentKind::Modpack {
         return Err(json_error(
             StatusCode::BAD_REQUEST,
             "a modpack is installed as its own instance, not added to one",
         ));
     }
-    if !target.supports_mods
-        && selections
-            .iter()
-            .any(|selection| selection.kind.requires_mod_loader())
-    {
+    if !target.supports_mods && kind.requires_mod_loader() {
         return Err(json_error(
             StatusCode::PRECONDITION_FAILED,
             "this instance has no mod loader; add mods to a modded instance",
         ));
+    }
+    Ok(())
+}
+
+fn validate_selected_kinds(
+    selections: &[ContentSelection],
+    metadata: &HashMap<CanonicalId, ProjectMetadata>,
+    target: &ResolveTarget,
+) -> Result<(), ContentApiError> {
+    if selections.is_empty() {
+        return Err(json_error(StatusCode::BAD_REQUEST, "no content selected"));
+    }
+    for selection in selections {
+        let canonical_id = CanonicalId(selection.canonical_id.clone());
+        let Some(authoritative) = metadata.get(&canonical_id) else {
+            continue;
+        };
+        if selection.kind != authoritative.kind {
+            return Err(json_error(
+                StatusCode::BAD_REQUEST,
+                "the selected content type changed; refresh it and try again",
+            ));
+        }
+        require_installable_kind(authoritative.kind, target)?;
     }
     Ok(())
 }
@@ -193,24 +207,37 @@ pub async fn resolve(
     selections: &[ContentSelection],
     manifest: &ContentManifest,
 ) -> Result<Resolution, ContentApiError> {
+    if selections.is_empty() {
+        return Err(json_error(StatusCode::BAD_REQUEST, "no content selected"));
+    }
+    let selected_ids: Vec<CanonicalId> = selections
+        .iter()
+        .map(|selection| CanonicalId(selection.canonical_id.clone()))
+        .collect();
+    let mut metadata = state
+        .content()
+        .metadata(&selected_ids)
+        .await
+        .map_err(content_error_response)?;
+    validate_selected_kinds(selections, &metadata, target)?;
+    let mut metadata_requested: HashSet<CanonicalId> = selected_ids.into_iter().collect();
     let mut resolved_versions: HashMap<CanonicalId, String> = HashMap::new();
     let mut items: Vec<ResolvedItem> = Vec::new();
     let mut conflicts: Vec<PlanConflict> = Vec::new();
     let mut incompatibilities: HashSet<(CanonicalId, CanonicalId)> = HashSet::new();
 
-    let mut queue: VecDeque<(CanonicalId, ContentKind, Option<String>, PlanReason)> = selections
+    let mut queue: VecDeque<(CanonicalId, Option<String>, PlanReason)> = selections
         .iter()
         .map(|selection| {
             (
                 CanonicalId(selection.canonical_id.clone()),
-                selection.kind,
                 selection.version_id.clone(),
                 PlanReason::Selected,
             )
         })
         .collect();
 
-    while let Some((canonical_id, kind, forced_version, reason)) = queue.pop_front() {
+    while let Some((canonical_id, forced_version, reason)) = queue.pop_front() {
         if let Some(chosen_version) = resolved_versions.get(&canonical_id) {
             if let Some(required_version) = forced_version.as_deref()
                 && required_version != chosen_version
@@ -232,6 +259,28 @@ pub async fn resolve(
             });
             break;
         }
+
+        if !metadata_requested.contains(&canonical_id) {
+            let mut missing_ids = HashSet::new();
+            missing_ids.insert(canonical_id.clone());
+            missing_ids.extend(queue.iter().filter_map(|(queued_id, _, _)| {
+                (!metadata_requested.contains(queued_id)).then(|| queued_id.clone())
+            }));
+            let missing_ids: Vec<CanonicalId> = missing_ids.into_iter().collect();
+            let fetched = state
+                .content()
+                .metadata(&missing_ids)
+                .await
+                .map_err(content_error_response)?;
+            metadata.extend(fetched);
+            metadata_requested.extend(missing_ids);
+        }
+        let Some(project) = metadata.get(&canonical_id).cloned() else {
+            conflicts.push(unavailable_conflict(&canonical_id));
+            continue;
+        };
+        let kind = project.kind;
+        require_installable_kind(kind, target)?;
 
         let filter = target.filter_for(kind);
         let versions = match state.content().versions(&canonical_id, &filter).await {
@@ -257,11 +306,8 @@ pub async fn resolve(
             match dependency.kind {
                 DependencyKind::Required => {
                     if let Some(project_id) = &dependency.project_id {
-                        // A dependency of a mod is a mod; nothing else declares
-                        // required dependencies upstream.
                         queue.push_back((
                             CanonicalId::for_project(ProviderId::Modrinth, project_id),
-                            kind,
                             dependency.version_id.clone(),
                             PlanReason::Dependency,
                         ));
@@ -297,8 +343,8 @@ pub async fn resolve(
         }
 
         let existing = manifest.find(&canonical_id);
-        let already_installed = existing.is_some();
-        let update = existing.is_some_and(|entry| entry.version_id != version.id);
+        let (already_installed, update) =
+            resolved_install_state(existing, target.game_dir.as_deref(), &version.id);
         let project_id = canonical_id.project_id().to_string();
 
         items.push(ResolvedItem {
@@ -308,10 +354,11 @@ pub async fn resolve(
             kind,
             version_id: version.id.clone(),
             version_number: version.version_number.clone(),
-            // A placeholder: a version is named things like "Sodium 0.7.3 for
-            // Fabric 1.21.8", which is not what anyone calls the mod. The real
-            // project titles are fetched in one batch below.
-            title: version.name.clone(),
+            title: if project.title.trim().is_empty() {
+                version.name.clone()
+            } else {
+                project.title
+            },
             file,
             dependencies: version.dependencies.clone(),
             reason,
@@ -322,8 +369,20 @@ pub async fn resolve(
 
     conflicts.extend(selected_incompatibility_conflicts(&items));
 
-    apply_project_titles(state, &mut items, &mut conflicts).await;
+    apply_metadata_titles(&metadata, &mut conflicts);
     Ok(Resolution { items, conflicts })
+}
+
+fn resolved_install_state(
+    existing: Option<&ManifestEntry>,
+    game_dir: Option<&std::path::Path>,
+    resolved_version_id: &str,
+) -> (bool, bool) {
+    let already_installed =
+        existing.is_some_and(|entry| game_dir.is_none_or(|root| entry_file_present(root, entry)));
+    let update =
+        already_installed && existing.is_some_and(|entry| entry.version_id != resolved_version_id);
+    (already_installed, update)
 }
 
 fn selected_incompatibility_conflicts(items: &[ResolvedItem]) -> Vec<PlanConflict> {
@@ -355,38 +414,17 @@ fn selected_incompatibility_conflicts(items: &[ResolvedItem]) -> Vec<PlanConflic
     conflicts
 }
 
-/// Replace version names with project names in one round trip, and give every
-/// conflict a subject so "has no compatible version" becomes "Sodium has no
-/// compatible version". Best-effort: if the lookup fails the plan still stands,
-/// conflicts fall back to the raw project id.
-async fn apply_project_titles(
-    state: &AppState,
-    items: &mut [ResolvedItem],
+/// Give every conflict a provider-authored subject so "has no compatible
+/// version" becomes "Sodium has no compatible version".
+fn apply_metadata_titles(
+    metadata: &HashMap<CanonicalId, ProjectMetadata>,
     conflicts: &mut [PlanConflict],
 ) {
-    if items.is_empty() && conflicts.is_empty() {
-        return;
-    }
-    let ids: Vec<CanonicalId> = items
-        .iter()
-        .map(|item| item.canonical_id.clone())
-        .chain(
-            conflicts
-                .iter()
-                .filter_map(|conflict| conflict.canonical_id.clone()),
-        )
-        .collect();
-    let titles = state.content().titles(&ids).await.unwrap_or_default();
-    for item in items {
-        if let Some(title) = titles.get(&item.canonical_id) {
-            item.title = title.clone();
-        }
-    }
     for conflict in conflicts {
         if let Some(id) = &conflict.canonical_id {
-            let label = titles
+            let label = metadata
                 .get(id)
-                .cloned()
+                .map(|project| project.title.clone())
                 .unwrap_or_else(|| id.project_id().to_string());
             conflict.detail = format!("{label} {}", conflict.detail);
         }
@@ -779,13 +817,11 @@ mod tests {
 
         for kind in [ContentKind::ResourcePack, ContentKind::ShaderPack] {
             assert!(
-                require_installable(&[selection("modrinth:x", kind)], &vanilla).is_ok(),
+                require_installable_kind(kind, &vanilla).is_ok(),
                 "{kind:?} needs no mod loader"
             );
         }
-        assert!(
-            require_installable(&[selection("modrinth:x", ContentKind::Mod)], &vanilla).is_err()
-        );
+        assert!(require_installable_kind(ContentKind::Mod, &vanilla).is_err());
     }
 
     #[test]
@@ -796,20 +832,63 @@ mod tests {
             ContentKind::ResourcePack,
             ContentKind::ShaderPack,
         ] {
-            assert!(require_installable(&[selection("modrinth:x", kind)], &fabric).is_ok());
+            assert!(require_installable_kind(kind, &fabric).is_ok());
         }
     }
 
     #[test]
     fn modpacks_are_never_added_to_an_instance() {
-        assert!(
-            require_installable(
-                &[selection("modrinth:x", ContentKind::Modpack)],
-                &target(true)
-            )
-            .is_err()
+        assert!(require_installable_kind(ContentKind::Modpack, &target(true)).is_err());
+    }
+
+    #[test]
+    fn selected_kind_must_match_provider_metadata() {
+        let id = CanonicalId::for_project(ProviderId::Modrinth, "project");
+        let metadata = HashMap::from([(
+            id,
+            ProjectMetadata {
+                kind: ContentKind::Mod,
+                title: "Project".to_string(),
+            },
+        )]);
+        let forged = selection("modrinth:project", ContentKind::ResourcePack);
+
+        assert!(validate_selected_kinds(&[forged], &metadata, &target(true)).is_err());
+        assert!(validate_selected_kinds(&[], &metadata, &target(true)).is_err());
+    }
+
+    #[test]
+    fn stale_manifest_entry_is_not_treated_as_installed() {
+        let root = std::env::temp_dir().join(format!(
+            "axial-resolve-stale-manifest-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(root.join("mods")).expect("mods");
+        let entry = ManifestEntry::managed(
+            CanonicalId::for_project(ProviderId::Modrinth, "project"),
+            ProviderId::Modrinth,
+            "project".to_string(),
+            "v1".to_string(),
+            ContentKind::Mod,
+            &file("project.jar", None),
+            Vec::new(),
+            None,
         );
-        assert!(require_installable(&[], &target(true)).is_err());
+
+        assert_eq!(
+            resolved_install_state(Some(&entry), Some(&root), "v1"),
+            (false, false)
+        );
+        std::fs::write(root.join("mods/project.jar"), b"jar").expect("managed file");
+        assert_eq!(
+            resolved_install_state(Some(&entry), Some(&root), "v1"),
+            (true, false)
+        );
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

@@ -16,13 +16,22 @@ use axial_minecraft::download::{
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::io;
+use std::io::{self, Read};
 use std::path::{Component, Path, PathBuf};
 
 const INDEX_FILE: &str = "modrinth.index.json";
 const OVERRIDES: &str = "overrides";
 const CLIENT_OVERRIDES: &str = "client-overrides";
 const SUPPORTED_FORMAT_VERSION: u32 = 1;
+#[cfg(not(test))]
+const MAX_OVERRIDE_ENTRY_BYTES: u64 = 128 << 20;
+#[cfg(test)]
+const MAX_OVERRIDE_ENTRY_BYTES: u64 = 1024;
+#[cfg(not(test))]
+const MAX_OVERRIDE_TOTAL_BYTES: u64 = 512 << 20;
+#[cfg(test)]
+const MAX_OVERRIDE_TOTAL_BYTES: u64 = 2048;
+const MAX_OVERRIDE_FILES: usize = 10_000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PackLoader {
@@ -123,7 +132,7 @@ where
         selected_paths,
         include_overrides,
         on_progress,
-        |_| Ok(()),
+        |_, _| Ok(()),
     )
     .await
 }
@@ -139,10 +148,15 @@ pub async fn install_pack_files_with_finalize<F, P>(
 ) -> ContentResult<PackInstallReport>
 where
     F: FnMut(DownloadProgress),
-    P: FnOnce(&PackInstallReport) -> ContentResult<()>,
+    P: FnOnce(&PackInstallReport, &mut PackFinalizeContext<'_>) -> ContentResult<()>,
 {
     let index = read_pack_index(archive)?;
     let selected: HashSet<&str> = selected_paths.iter().map(String::as_str).collect();
+    if !selected.is_empty() && include_overrides {
+        return Err(ContentError::Invalid(
+            "modpack overrides cannot be applied with selected files".to_string(),
+        ));
+    }
     let files: Vec<&PackFile> = index
         .files
         .iter()
@@ -152,6 +166,9 @@ where
         return Err(ContentError::Invalid(
             "the selected modpack files changed; review the pack again".to_string(),
         ));
+    }
+    if !selected.is_empty() {
+        reject_occupied_pack_destinations(game_dir, files.iter().map(|file| file.path.as_str()))?;
     }
     let total = files.len() as i32;
     let mut installed = Vec::with_capacity(files.len());
@@ -204,13 +221,24 @@ where
     relative_paths.sort();
     relative_paths.dedup();
     on_progress(progress("commit", total, total, None));
-    let transaction = FileTransaction::apply(game_dir, staging.transfer(), &relative_paths)?;
+    let mut transaction = if selected.is_empty() {
+        FileTransaction::apply(game_dir, staging.transfer(), &relative_paths)?
+    } else {
+        reject_occupied_pack_destinations(game_dir, relative_paths.iter().map(String::as_str))?;
+        FileTransaction::apply_new(game_dir, staging.transfer(), &relative_paths)?
+    };
     let report = PackInstallReport {
         index,
         installed,
         overrides_applied,
     };
-    if let Err(error) = finalize(&report) {
+    let finalize_result = {
+        let mut context = PackFinalizeContext {
+            transaction: &mut transaction,
+        };
+        finalize(&report, &mut context)
+    };
+    if let Err(error) = finalize_result {
         transaction.rollback();
         return Err(error);
     }
@@ -220,12 +248,55 @@ where
     Ok(report)
 }
 
+fn reject_occupied_pack_destinations<'a>(
+    game_dir: &Path,
+    relative_paths: impl IntoIterator<Item = &'a str>,
+) -> ContentResult<()> {
+    for relative in relative_paths {
+        let mut variants = vec![relative.to_string()];
+        if matches!(
+            relative.split('/').next(),
+            Some("mods" | "resourcepacks" | "shaderpacks")
+        ) && !relative.ends_with(".disabled")
+        {
+            variants.push(format!("{relative}.disabled"));
+        }
+        for variant in variants {
+            let destination = contained_path(game_dir, &variant)?;
+            match fs::symlink_metadata(destination) {
+                Ok(_) => {
+                    return Err(ContentError::Invalid(
+                        "a selected modpack destination is already occupied".to_string(),
+                    ));
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(ContentError::Io(error)),
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Filesystem changes that must be committed with a pack import. Stale managed
+/// files are moved into the pack transaction's backup and restored if the
+/// manifest finalizer fails.
+pub struct PackFinalizeContext<'a> {
+    transaction: &'a mut FileTransaction,
+}
+
+impl PackFinalizeContext<'_> {
+    pub fn stage_removals(&mut self, relative_paths: &[String]) -> ContentResult<()> {
+        self.transaction.stage_removals(relative_paths)
+    }
+}
+
 fn apply_overrides(game_dir: &Path, archive: &Path) -> ContentResult<Vec<String>> {
     let file = fs::File::open(archive)?;
     let mut zip = zip::ZipArchive::new(file)
         .map_err(|error| ContentError::Invalid(format!("not a readable modpack: {error}")))?;
 
     let mut applied = Vec::new();
+    let mut extracted_bytes = 0_u64;
     // Client overrides go last: where both define a file, the client copy wins.
     for root in [OVERRIDES, CLIENT_OVERRIDES] {
         let prefix = format!("{root}/");
@@ -249,13 +320,34 @@ fn apply_overrides(game_dir: &Path, archive: &Path) -> ContentResult<Vec<String>
             if relative.is_empty() {
                 continue;
             }
+            if applied.len() >= MAX_OVERRIDE_FILES {
+                return Err(ContentError::Invalid(
+                    "modpack contains too many override files".to_string(),
+                ));
+            }
+            let declared_size = entry.size();
+            if declared_size > MAX_OVERRIDE_ENTRY_BYTES
+                || extracted_bytes.saturating_add(declared_size) > MAX_OVERRIDE_TOTAL_BYTES
+            {
+                return Err(ContentError::Invalid(
+                    "modpack overrides exceed the extraction limit".to_string(),
+                ));
+            }
 
             let destination = contained_path(game_dir, &relative)?;
             if let Some(parent) = destination.parent() {
                 fs::create_dir_all(parent)?;
             }
             let mut sink = fs::File::create(&destination)?;
-            io::copy(&mut entry, &mut sink)?;
+            let remaining_total = MAX_OVERRIDE_TOTAL_BYTES.saturating_sub(extracted_bytes);
+            let copy_limit = MAX_OVERRIDE_ENTRY_BYTES.min(remaining_total);
+            let copied = io::copy(&mut (&mut entry).take(copy_limit + 1), &mut sink)?;
+            if copied > copy_limit {
+                return Err(ContentError::Invalid(
+                    "modpack overrides exceed the extraction limit".to_string(),
+                ));
+            }
+            extracted_bytes = extracted_bytes.saturating_add(copied);
             applied.push(relative);
         }
     }
@@ -458,6 +550,7 @@ mod dto {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
 
     const INDEX: &str = r#"{
         "formatVersion": 1,
@@ -571,5 +664,90 @@ mod tests {
             contained_path(root, "./config/sodium.json").expect("contained"),
             root.join("config").join("sodium.json")
         );
+    }
+
+    fn override_archive(name: &str, entries: &[(&str, Vec<u8>)]) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "axial-pack-overrides-{name}-{}-{}.mrpack",
+            std::process::id(),
+            crate::transaction::staging_dir(Path::new(""), "test")
+                .file_name()
+                .expect("sequence")
+                .to_string_lossy()
+        ));
+        let file = fs::File::create(&path).expect("archive");
+        let mut writer = zip::ZipWriter::new(file);
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
+        for (entry_name, bytes) in entries {
+            writer.start_file(*entry_name, options).expect("entry");
+            writer.write_all(bytes).expect("entry bytes");
+        }
+        writer.finish().expect("finish archive");
+        path
+    }
+
+    #[test]
+    fn override_entry_size_is_bounded() {
+        let root = std::env::temp_dir().join("axial-pack-override-entry-limit");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("root");
+        let archive = override_archive(
+            "entry-limit",
+            &[(
+                "overrides/config/oversized.bin",
+                vec![b'x'; MAX_OVERRIDE_ENTRY_BYTES as usize + 1],
+            )],
+        );
+
+        assert!(apply_overrides(&root, &archive).is_err());
+
+        let _ = fs::remove_file(archive);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cumulative_override_size_is_bounded() {
+        let root = std::env::temp_dir().join("axial-pack-override-total-limit");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("root");
+        let archive = override_archive(
+            "total-limit",
+            &[
+                (
+                    "overrides/config/first.bin",
+                    vec![b'a'; MAX_OVERRIDE_ENTRY_BYTES as usize],
+                ),
+                (
+                    "overrides/config/second.bin",
+                    vec![b'b'; MAX_OVERRIDE_ENTRY_BYTES as usize],
+                ),
+                ("overrides/config/third.bin", vec![b'c']),
+            ],
+        );
+
+        assert!(apply_overrides(&root, &archive).is_err());
+
+        let _ = fs::remove_file(archive);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn selected_pack_destinations_preserve_enabled_and_disabled_files() {
+        let root = std::env::temp_dir().join("axial-pack-selected-occupied");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("mods")).expect("mods");
+
+        fs::write(root.join("mods/example.jar"), b"enabled").expect("enabled");
+        assert!(
+            reject_occupied_pack_destinations(&root, ["mods/example.jar"].into_iter()).is_err()
+        );
+        fs::remove_file(root.join("mods/example.jar")).expect("remove enabled");
+        fs::write(root.join("mods/example.jar.disabled"), b"disabled").expect("disabled");
+        assert!(
+            reject_occupied_pack_destinations(&root, ["mods/example.jar"].into_iter()).is_err()
+        );
+
+        let _ = fs::remove_dir_all(root);
     }
 }

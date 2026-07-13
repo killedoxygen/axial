@@ -276,4 +276,6 @@ pub struct InstallQueueStateResponse {
     pub notice: Option<InstallQueueNoticeViewModel>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub started_install: Option<InstallStartResponse>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub removed_instance_id: Option<String>,
 }

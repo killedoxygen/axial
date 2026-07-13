@@ -187,4 +187,5 @@ export interface InstallQueueStateResponse {
   view_model: InstallQueueViewModel;
   notice?: InstallQueueNoticeViewModel | null;
   started_install?: InstallStartResponse | null;
+  removed_instance_id?: string | null;
 }

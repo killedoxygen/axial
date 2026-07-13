@@ -596,7 +596,7 @@ fn install_progress_label(progress: &DownloadProgress, kind: InstallProgressKind
         "commit" => "Finishing content changes".to_string(),
         "removing" => "Removing content".to_string(),
         "done" => "Complete".to_string(),
-        "error" => progress
+        "error" | "error_instance_removed" => progress
             .error
             .clone()
             .unwrap_or_else(|| INSTALL_FAILURE_MESSAGE.to_string()),
@@ -628,7 +628,7 @@ fn install_progress_pct(progress: &DownloadProgress, kind: InstallProgressKind) 
     // artifacts, processors), and journal-replayed history.
     let pct = match (kind, progress.phase.as_str()) {
         (_, "done") => 100,
-        (_, "error") => 100,
+        (_, "error" | "error_instance_removed") => 100,
         (_, "planning") => 3,
         (_, "download") => 5 + (progress_fraction(progress) * 85.0).round() as i32,
         (_, "overrides") => 92,

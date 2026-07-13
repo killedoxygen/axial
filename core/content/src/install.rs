@@ -5,9 +5,9 @@ use crate::transaction::{FileTransaction, StagingGuard, contained_path};
 use axial_minecraft::download::{
     DownloadProgress, ExpectedIntegrity, download_file_with_client_report,
 };
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 /// A single resolved file the pipeline should download and record. Callers build
 /// these from a resolution plan (selected content plus its dependencies).
@@ -38,25 +38,11 @@ where
 {
     let mut manifest = ContentManifest::load(game_dir)?;
     let total = files.len() as i32;
+    let destinations = prepare_install_destinations(game_dir, &manifest, files)?;
     let staging = StagingGuard::create(game_dir, "axial-content-stage")?;
-    let mut relative_paths = Vec::with_capacity(files.len());
-    let mut enabled_states = Vec::with_capacity(files.len());
 
-    for (index, planned) in files.iter().enumerate() {
-        let Some(kind_dir) = planned.kind.install_subdir() else {
-            return Err(ContentError::Invalid(format!(
-                "{} is not installable as a single file",
-                planned.kind.as_str()
-            )));
-        };
-        let enabled = preserved_enabled_state(game_dir, &manifest, &planned.canonical_id);
-        let destination_filename = if enabled {
-            planned.file.filename.clone()
-        } else {
-            format!("{}.disabled", planned.file.filename)
-        };
-        let relative = format!("{kind_dir}/{destination_filename}");
-        let destination = contained_path(staging.path(), &relative)?;
+    for (index, (planned, planned_destination)) in files.iter().zip(&destinations).enumerate() {
+        let destination = contained_path(staging.path(), &planned_destination.relative)?;
         if let Some(parent) = destination.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -75,23 +61,20 @@ where
         download_file_with_client_report(client, &planned.file.url, &destination, &expected)
             .await
             .map_err(|error| ContentError::Download(error.into_download_error().to_string()))?;
-
-        relative_paths.push(relative);
-        enabled_states.push(enabled);
     }
 
     on_progress(progress("commit", total, total, None));
-    let transaction = FileTransaction::apply(game_dir, staging.transfer(), &relative_paths)?;
+    let relative_paths: Vec<String> = destinations
+        .iter()
+        .map(|destination| destination.relative.clone())
+        .collect();
+    let mut transaction = FileTransaction::apply(game_dir, staging.transfer(), &relative_paths)?;
     let mut stale_files = Vec::new();
 
-    for (planned, enabled) in files.iter().zip(&enabled_states) {
-        let kind_dir = planned.kind.install_subdir().ok_or_else(|| {
-            ContentError::Invalid(format!(
-                "{} is not installable as a single file",
-                planned.kind.as_str()
-            ))
-        })?;
-        let subdir = game_dir.join(kind_dir);
+    for (planned, planned_destination) in files.iter().zip(&destinations) {
+        let previous_filename = manifest
+            .find(&planned.canonical_id)
+            .map(|entry| entry.filename.clone());
         let mut entry = ManifestEntry::managed(
             planned.canonical_id.clone(),
             planned.provider,
@@ -102,26 +85,131 @@ where
             planned.dependencies.clone(),
             planned.title.clone(),
         );
-        entry.enabled = *enabled;
-        if let Some(stale) = manifest.upsert(entry) {
-            stale_files.push((subdir, stale));
+        entry.enabled = planned_destination.enabled;
+        manifest.upsert(entry);
+        if let Some(previous_filename) = previous_filename {
+            stale_files.extend(managed_file_variants(planned.kind, &previous_filename));
         }
     }
 
+    stale_files.sort();
+    stale_files.dedup();
+    transaction.stage_removals(&stale_files)?;
     if let Err(error) = manifest.save(game_dir) {
         transaction.rollback();
         return Err(error);
     }
     transaction.commit();
-    let installed_destinations: HashSet<PathBuf> = relative_paths
-        .iter()
-        .map(|relative| game_dir.join(relative))
-        .collect();
-    for (subdir, stale) in stale_files {
-        remove_content_file_except(&subdir, &stale, &installed_destinations);
-    }
     on_progress(done(total));
     Ok(manifest)
+}
+
+#[derive(Debug)]
+struct InstallDestination {
+    enabled: bool,
+    relative: String,
+    variants: Vec<String>,
+}
+
+/// Resolve and validate every final path before downloading. A manifest entry
+/// owns both its enabled and disabled variants; an existing unmanaged path is
+/// never implicitly adopted or overwritten.
+fn prepare_install_destinations(
+    game_dir: &Path,
+    manifest: &ContentManifest,
+    files: &[PlannedFile],
+) -> ContentResult<Vec<InstallDestination>> {
+    let mut seen_ids = HashSet::new();
+    let mut batch_variants = HashSet::new();
+    let mut variants_by_id: HashMap<CanonicalId, Vec<String>> = HashMap::new();
+    let mut manifest_variant_owners: HashMap<String, Vec<&ManifestEntry>> = HashMap::new();
+    for entry in &manifest.entries {
+        for variant in managed_file_variants(entry.kind, &entry.filename) {
+            manifest_variant_owners
+                .entry(variant)
+                .or_default()
+                .push(entry);
+        }
+    }
+    let mut destinations = Vec::with_capacity(files.len());
+
+    for planned in files {
+        if !seen_ids.insert(planned.canonical_id.clone()) {
+            return Err(ContentError::Invalid(
+                "the content plan contains the same project more than once".to_string(),
+            ));
+        }
+        if planned.file.filename.is_empty() || planned.file.filename.ends_with(".disabled") {
+            return Err(ContentError::Invalid(
+                "the provider returned an invalid content filename".to_string(),
+            ));
+        }
+        let variants = managed_file_variants(planned.kind, &planned.file.filename);
+        if variants.len() != 2 {
+            return Err(ContentError::Invalid(format!(
+                "{} is not installable as a single file",
+                planned.kind.as_str()
+            )));
+        }
+        for variant in &variants {
+            contained_path(game_dir, variant)?;
+            if !batch_variants.insert(variant.clone()) {
+                return Err(ContentError::Invalid(
+                    "multiple content projects resolve to the same destination".to_string(),
+                ));
+            }
+        }
+        let enabled = preserved_enabled_state(game_dir, manifest, &planned.canonical_id);
+        let relative = variants[usize::from(!enabled)].clone();
+        variants_by_id.insert(planned.canonical_id.clone(), variants.clone());
+        destinations.push(InstallDestination {
+            enabled,
+            relative,
+            variants,
+        });
+    }
+
+    for (planned, destination) in files.iter().zip(&destinations) {
+        for variant in &destination.variants {
+            let owners = manifest_variant_owners
+                .get(variant)
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            for owner in owners {
+                if owner.canonical_id == planned.canonical_id {
+                    continue;
+                }
+                let owner_moves_away = variants_by_id
+                    .get(&owner.canonical_id)
+                    .is_some_and(|new_variants| !new_variants.contains(variant));
+                if !owner_moves_away {
+                    return Err(ContentError::Invalid(
+                        "a content destination is already owned by another project".to_string(),
+                    ));
+                }
+            }
+
+            let path = contained_path(game_dir, variant)?;
+            match fs::symlink_metadata(path) {
+                Ok(metadata) if metadata.is_file() && !owners.is_empty() => {}
+                Ok(_) if owners.is_empty() => {
+                    return Err(ContentError::Invalid(
+                        "a content destination is already occupied by an unmanaged file"
+                            .to_string(),
+                    ));
+                }
+                Ok(_) => {
+                    return Err(ContentError::Invalid(
+                        "a managed content destination is not a regular file".to_string(),
+                    ));
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(ContentError::Io(error)),
+            }
+        }
+    }
+
+    Ok(destinations)
 }
 
 /// Remove a managed file (enabled or disabled variant) and drop its manifest
@@ -131,27 +219,25 @@ pub fn uninstall(game_dir: &Path, canonical_id: &CanonicalId) -> ContentResult<b
     let Some(entry) = manifest.remove(canonical_id) else {
         return Ok(false);
     };
-    if let Some(kind_dir) = entry.kind.install_subdir() {
-        remove_content_file(&game_dir.join(kind_dir), &entry.filename);
+    let mut transaction = FileTransaction::empty(game_dir)?;
+    transaction.stage_removals(&managed_file_variants(entry.kind, &entry.filename))?;
+    if let Err(error) = manifest.save(game_dir) {
+        transaction.rollback();
+        return Err(error);
     }
-    manifest.save(game_dir)?;
+    transaction.commit();
     Ok(true)
 }
 
-fn remove_content_file(subdir: &Path, filename: &str) {
-    let _ = fs::remove_file(subdir.join(filename));
-    let _ = fs::remove_file(subdir.join(format!("{filename}.disabled")));
-}
-
-fn remove_content_file_except(subdir: &Path, filename: &str, protected: &HashSet<PathBuf>) {
-    for candidate in [
-        subdir.join(filename),
-        subdir.join(format!("{filename}.disabled")),
-    ] {
-        if !protected.contains(&candidate) {
-            let _ = fs::remove_file(candidate);
-        }
-    }
+/// Relative enabled and disabled paths owned by one manifest entry.
+pub fn managed_file_variants(kind: ContentKind, filename: &str) -> Vec<String> {
+    let Some(kind_dir) = kind.install_subdir() else {
+        return Vec::new();
+    };
+    vec![
+        format!("{kind_dir}/{filename}"),
+        format!("{kind_dir}/{filename}.disabled"),
+    ]
 }
 
 fn preserved_enabled_state(
@@ -181,31 +267,125 @@ fn preserved_enabled_state(
 mod tests {
     use super::*;
 
-    #[test]
-    fn stale_cleanup_preserves_destinations_installed_by_the_same_batch() {
+    fn planned(project: &str, filename: &str) -> PlannedFile {
+        PlannedFile {
+            canonical_id: CanonicalId::for_project(ProviderId::Modrinth, project),
+            provider: ProviderId::Modrinth,
+            project_id: project.to_string(),
+            version_id: format!("{project}-version"),
+            kind: ContentKind::Mod,
+            file: FileRef {
+                url: format!("https://example.invalid/{filename}"),
+                filename: filename.to_string(),
+                sha1: None,
+                sha512: None,
+                size: None,
+                primary: true,
+            },
+            dependencies: Vec::new(),
+            title: Some(project.to_string()),
+        }
+    }
+
+    fn recorded(project: &str, filename: &str) -> ManifestEntry {
+        let planned = planned(project, filename);
+        ManifestEntry::managed(
+            planned.canonical_id,
+            planned.provider,
+            planned.project_id,
+            planned.version_id,
+            planned.kind,
+            &planned.file,
+            Vec::new(),
+            planned.title,
+        )
+    }
+
+    fn test_root(name: &str) -> std::path::PathBuf {
         let root = std::env::temp_dir().join(format!(
-            "axial-content-stale-cleanup-{}-{}",
+            "axial-content-install-{name}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .expect("system clock")
                 .as_nanos()
         ));
-        let mods = root.join("mods");
-        fs::create_dir_all(&mods).expect("create mods directory");
-        let installed = mods.join("common.jar");
-        let stale_disabled = mods.join("common.jar.disabled");
-        fs::write(&installed, b"new content").expect("write installed file");
-        fs::write(&stale_disabled, b"stale content").expect("write stale disabled file");
-        let protected = HashSet::from([installed.clone()]);
+        fs::create_dir_all(&root).expect("root");
+        root
+    }
 
-        remove_content_file_except(&mods, "common.jar", &protected);
+    #[test]
+    fn unmanaged_enabled_or_disabled_destinations_are_rejected() {
+        for suffix in ["", ".disabled"] {
+            let root = test_root(if suffix.is_empty() {
+                "unmanaged-enabled"
+            } else {
+                "unmanaged-disabled"
+            });
+            fs::create_dir_all(root.join("mods")).expect("mods");
+            fs::write(root.join(format!("mods/shared.jar{suffix}")), b"user file")
+                .expect("unmanaged file");
 
-        assert_eq!(
-            fs::read(&installed).expect("installed file"),
-            b"new content"
+            assert!(
+                prepare_install_destinations(
+                    &root,
+                    &ContentManifest::default(),
+                    &[planned("new", "shared.jar")],
+                )
+                .is_err()
+            );
+            let _ = fs::remove_dir_all(root);
+        }
+    }
+
+    #[test]
+    fn destination_owned_by_unselected_content_is_rejected() {
+        let root = test_root("owned-collision");
+        let mut manifest = ContentManifest::default();
+        manifest.upsert(recorded("existing", "shared.jar"));
+
+        assert!(
+            prepare_install_destinations(&root, &manifest, &[planned("new", "shared.jar")],)
+                .is_err()
         );
-        assert!(!stale_disabled.exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn batch_can_reuse_a_path_only_when_its_owner_moves_away() {
+        let root = test_root("owned-batch-move");
+        let mut manifest = ContentManifest::default();
+        manifest.upsert(recorded("first", "common.jar"));
+        manifest.upsert(recorded("second", "second.jar"));
+
+        let result = prepare_install_destinations(
+            &root,
+            &manifest,
+            &[
+                planned("first", "first.jar"),
+                planned("second", "common.jar"),
+            ],
+        );
+
+        assert!(result.is_ok());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn batch_projects_cannot_claim_the_same_destination() {
+        let root = test_root("batch-collision");
+
+        assert!(
+            prepare_install_destinations(
+                &root,
+                &ContentManifest::default(),
+                &[
+                    planned("first", "shared.jar"),
+                    planned("second", "shared.jar")
+                ],
+            )
+            .is_err()
+        );
         let _ = fs::remove_dir_all(root);
     }
 
@@ -246,6 +426,44 @@ mod tests {
         fs::rename(mods.join("old.jar.disabled"), mods.join("old.jar"))
             .expect("enable existing mod");
         assert!(preserved_enabled_state(&root, &manifest, &id));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn uninstall_does_not_commit_when_the_managed_path_cannot_be_removed() {
+        let root = std::env::temp_dir().join(format!(
+            "axial-content-uninstall-failure-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock")
+                .as_nanos()
+        ));
+        fs::create_dir_all(root.join("mods/managed.jar")).expect("managed path fixture");
+        let id = CanonicalId::for_project(ProviderId::Modrinth, "project");
+        let mut manifest = ContentManifest::default();
+        manifest.upsert(ManifestEntry::managed(
+            id.clone(),
+            ProviderId::Modrinth,
+            "project".to_string(),
+            "version".to_string(),
+            ContentKind::Mod,
+            &FileRef {
+                url: "https://example.invalid/managed.jar".to_string(),
+                filename: "managed.jar".to_string(),
+                sha1: None,
+                sha512: None,
+                size: None,
+                primary: true,
+            },
+            Vec::new(),
+            None,
+        ));
+        manifest.save(&root).expect("save manifest");
+
+        assert!(uninstall(&root, &id).is_err());
+        let persisted = ContentManifest::load(&root).expect("reload manifest");
+        assert!(persisted.find(&id).is_some());
         let _ = fs::remove_dir_all(root);
     }
 }

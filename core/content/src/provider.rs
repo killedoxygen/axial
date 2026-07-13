@@ -1,7 +1,7 @@
 use crate::error::ContentResult;
 use crate::model::{
-    CanonicalContent, CanonicalId, ContentDetail, ContentKind, ContentVersion, ProviderId,
-    VersionIdentity,
+    CanonicalContent, CanonicalId, ContentDetail, ContentKind, ContentVersion, ProjectMetadata,
+    ProviderId, VersionIdentity,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -94,11 +94,10 @@ pub trait ContentProvider: Send + Sync {
         sha512_hashes: &[String],
     ) -> impl std::future::Future<Output = ContentResult<HashMap<String, VersionIdentity>>> + Send;
 
-    /// Project titles for a batch of ids. A version's own name ("Sodium 0.7.3
-    /// for Fabric 1.21.8") is not what anyone calls the thing, so anywhere a
-    /// resolved item is shown or recorded needs the project's name instead.
-    fn titles(
+    /// Trusted project type and title metadata, fetched in a batch so
+    /// resolution never needs to rely on client-authored content kinds.
+    fn metadata(
         &self,
         ids: &[CanonicalId],
-    ) -> impl std::future::Future<Output = ContentResult<HashMap<CanonicalId, String>>> + Send;
+    ) -> impl std::future::Future<Output = ContentResult<HashMap<CanonicalId, ProjectMetadata>>> + Send;
 }

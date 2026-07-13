@@ -192,6 +192,14 @@ pub struct CanonicalContent {
     pub sources: Vec<ProviderRef>,
 }
 
+/// Provider-authored identity used by trusted workflows that only need a
+/// project's stable type and display name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectMetadata {
+    pub kind: ContentKind,
+    pub title: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GalleryImage {
     pub url: String,
@@ -220,6 +228,8 @@ pub struct VersionIdentity {
     pub provider: ProviderId,
     pub project_id: String,
     pub version_id: String,
+    #[serde(default)]
+    pub dependencies: Vec<ContentDependency>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
 }

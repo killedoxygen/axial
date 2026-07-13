@@ -1,6 +1,6 @@
 import type { JSX } from 'preact';
 import { contentRevision } from '../../../content-activity';
-import { useCallback, useEffect, useState } from 'preact/hooks';
+import { useCallback, useEffect, useRef, useState } from 'preact/hooks';
 import { Icon } from '../../../ui/Icons';
 import { Button, Input } from '../../../ui/Atoms';
 import { SelectField } from '../../../ui/Select';
@@ -39,6 +39,7 @@ export function ModsPane({
   const [filter, setFilter] = useState<ModFilter>('all');
   const [provenance, setProvenance] = useState<ModProvenance | null>(() => cachedModProvenance(inst.id));
   const [provenanceStamp, setProvenanceStamp] = useState(0);
+  const resourceRevision = useRef({ instanceId: inst.id, revision: contentRevision.value });
 
   useEffect(() => {
     let alive = true;
@@ -50,6 +51,17 @@ export function ModsPane({
       alive = false;
     };
   }, [inst.id, provenanceStamp, contentRevision.value]);
+
+  useEffect(() => {
+    const observed = resourceRevision.current;
+    if (observed.instanceId !== inst.id) {
+      resourceRevision.current = { instanceId: inst.id, revision: contentRevision.value };
+      return;
+    }
+    if (observed.revision === contentRevision.value) return;
+    resourceRevision.current = { instanceId: inst.id, revision: contentRevision.value };
+    onRefresh();
+  }, [inst.id, onRefresh, contentRevision.value]);
 
   const refreshAll = (): void => {
     setProvenanceStamp((stamp) => stamp + 1);

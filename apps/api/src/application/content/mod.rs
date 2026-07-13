@@ -41,7 +41,7 @@ pub use resolve::{ConflictKind, PlanConflict, PlanItem, PlanReason, ResolutionPl
 pub use target::TargetRef;
 
 use futures_util::{StreamExt, stream};
-use resolve::{newer_version, require_installable, resolve, version_conflicts_with_installed};
+use resolve::{newer_version, resolve, version_conflicts_with_installed};
 use target::{require_instance_game_dir, resolve_target};
 
 pub type ContentApiError = (StatusCode, Json<serde_json::Value>);
@@ -228,7 +228,6 @@ pub async fn content_plan(
     request: ContentPlanRequest,
 ) -> Result<ResolutionPlan, ContentApiError> {
     let target = resolve_target(state, &request.target).await?;
-    require_installable(&request.selections, &target)?;
 
     // A draft target has nothing installed, so it plans against an empty
     // manifest and every item reads as fresh.
@@ -316,7 +315,6 @@ where
     });
     let _lifecycle_guard = lock_instance_for_content_mutation(state, &request.instance_id)?;
     let target = target::instance_target(state, &request.instance_id).await?;
-    require_installable(&request.selections, &target)?;
     if state
         .sessions()
         .has_active_instance(&request.instance_id)
@@ -488,6 +486,7 @@ pub async fn instance_content(
     instance_id: &str,
 ) -> Result<InstanceContentResponse, ContentApiError> {
     let game_dir = require_instance_game_dir(state, instance_id)?;
+    let _lifecycle_guard = state.sessions().lock_instance_lifecycle(instance_id).await;
     let mut manifest = ContentManifest::load(&game_dir).map_err(content_error_response)?;
     let report = reconcile(&game_dir, &manifest);
 

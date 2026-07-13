@@ -3717,6 +3717,30 @@ fn launcher_managed_download_temp_path(destination: &Path) -> PathBuf {
     destination.with_file_name(name)
 }
 
+#[test]
+fn retry_is_disabled_when_setup_failure_removed_the_instance() {
+    let progress = InstallProgressViewModel {
+        phase_id: CONTENT_INSTANCE_REMOVED_PHASE.to_string(),
+        label: "Setup failed and the incomplete instance was removed".to_string(),
+        progress_pct: 100,
+        terminal: true,
+        failed: true,
+        active_step: None,
+    };
+
+    let failure = install_failure_view_model(&progress, None, None).expect("failure view model");
+
+    assert!(!failure.retry_action.enabled);
+    assert_eq!(failure.state_id, "failed_instance_removed");
+    assert!(
+        failure
+            .retry_action
+            .disabled_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("Create the instance again"))
+    );
+}
+
 struct TestByteServer {
     url: String,
     request_count: Arc<AtomicUsize>,

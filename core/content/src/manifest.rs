@@ -2,6 +2,7 @@ use crate::error::{ContentError, ContentResult};
 use crate::model::{
     CanonicalId, ContentDependency, ContentKind, FileRef, ProviderId, VersionIdentity,
 };
+use crate::transaction::promote_replacement;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha512};
 use std::collections::HashSet;
@@ -77,21 +78,28 @@ impl ManifestEntry {
     }
 
     pub fn imported(kind: ContentKind, filename: String, identity: VersionIdentity) -> Self {
+        let VersionIdentity {
+            provider,
+            project_id,
+            version_id,
+            dependencies,
+            title,
+        } = identity;
         Self {
-            canonical_id: CanonicalId::for_project(identity.provider, &identity.project_id),
-            provider: identity.provider,
-            project_id: identity.project_id,
-            version_id: identity.version_id,
+            canonical_id: CanonicalId::for_project(provider, &project_id),
+            provider,
+            project_id,
+            version_id,
             kind,
             filename,
             sha1: None,
             sha512: None,
             size: None,
-            dependencies: Vec::new(),
+            dependencies,
             enabled: true,
             source: EntrySource::Imported,
             installed_at: now_rfc3339(),
-            title: identity.title,
+            title,
         }
     }
 }
@@ -145,8 +153,13 @@ impl ContentManifest {
         let body = serde_json::to_vec_pretty(self)?;
         let temp = path.with_extension("json.tmp");
         fs::write(&temp, &body)?;
-        fs::rename(&temp, &path)?;
-        Ok(())
+        match promote_replacement(&temp, &path) {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                let _ = fs::remove_file(temp);
+                Err(error)
+            }
+        }
     }
 
     pub fn find(&self, canonical_id: &CanonicalId) -> Option<&ManifestEntry> {
@@ -284,15 +297,19 @@ pub fn reconcile(game_dir: &Path, manifest: &ContentManifest) -> ReconcileReport
     report
 }
 
-fn entry_file_present(game_dir: &Path, entry: &ManifestEntry) -> bool {
+pub fn entry_file_present(game_dir: &Path, entry: &ManifestEntry) -> bool {
     // A modpack entry records which pack the instance came from and owns no file
     // of its own, so it can never go missing.
     let Some(kind_dir) = entry.kind.install_subdir() else {
         return true;
     };
     let dir = game_dir.join(kind_dir);
-    dir.join(&entry.filename).is_file()
-        || dir.join(format!("{}.disabled", entry.filename)).is_file()
+    [
+        dir.join(&entry.filename),
+        dir.join(format!("{}.disabled", entry.filename)),
+    ]
+    .into_iter()
+    .any(|path| fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_file()))
 }
 
 pub fn manifest_path(game_dir: &Path) -> PathBuf {
@@ -331,7 +348,7 @@ fn now_rfc3339() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::FileRef;
+    use crate::model::{DependencyKind, FileRef};
 
     fn temp_game_dir(name: &str) -> PathBuf {
         let path = std::env::temp_dir().join(format!(
@@ -385,6 +402,21 @@ mod tests {
     }
 
     #[test]
+    fn save_replaces_an_existing_manifest() {
+        let dir = temp_game_dir("replace");
+        let mut manifest = ContentManifest::default();
+        manifest.upsert(managed_entry("AAA", "old.jar"));
+        manifest.save(&dir).expect("initial save");
+        manifest.upsert(managed_entry("AAA", "new.jar"));
+
+        manifest.save(&dir).expect("replacement save");
+
+        let loaded = ContentManifest::load(&dir).expect("load replacement");
+        assert_eq!(loaded.entries[0].filename, "new.jar");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn load_missing_manifest_is_empty() {
         let dir = temp_game_dir("missing");
         let loaded = ContentManifest::load(&dir).expect("load");
@@ -408,6 +440,32 @@ mod tests {
             None
         );
         assert_eq!(manifest.entries.len(), 1);
+    }
+
+    #[test]
+    fn imported_identity_keeps_dependency_metadata() {
+        let entry = ManifestEntry::imported(
+            ContentKind::Mod,
+            "project-a.jar".to_string(),
+            VersionIdentity {
+                provider: ProviderId::Modrinth,
+                project_id: "project-a".to_string(),
+                version_id: "version-a".to_string(),
+                dependencies: vec![ContentDependency {
+                    project_id: Some("project-b".to_string()),
+                    version_id: None,
+                    kind: DependencyKind::Incompatible,
+                }],
+                title: Some("Project A".to_string()),
+            },
+        );
+
+        assert_eq!(entry.dependencies.len(), 1);
+        assert_eq!(
+            entry.dependencies[0].project_id.as_deref(),
+            Some("project-b")
+        );
+        assert_eq!(entry.dependencies[0].kind, DependencyKind::Incompatible);
     }
 
     #[test]

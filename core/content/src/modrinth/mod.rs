@@ -3,8 +3,8 @@ mod dto;
 use crate::error::{ContentError, ContentResult};
 use crate::model::{
     CanonicalContent, CanonicalId, ContentDependency, ContentDetail, ContentKind, ContentVersion,
-    DependencyKind, FileRef, GalleryImage, ProviderId, ProviderRef, ReleaseChannel,
-    VersionIdentity,
+    DependencyKind, FileRef, GalleryImage, ProjectMetadata, ProviderId, ProviderRef,
+    ReleaseChannel, VersionIdentity,
 };
 use crate::provider::{ContentProvider, ContentQuery, LoaderGameFilter, Page, SortOrder};
 use std::collections::HashMap;
@@ -133,7 +133,10 @@ impl ContentProvider for ModrinthProvider {
         Ok(versions.into_iter().map(map_version).collect())
     }
 
-    async fn titles(&self, ids: &[CanonicalId]) -> ContentResult<HashMap<CanonicalId, String>> {
+    async fn metadata(
+        &self,
+        ids: &[CanonicalId],
+    ) -> ContentResult<HashMap<CanonicalId, ProjectMetadata>> {
         if ids.is_empty() {
             return Ok(HashMap::new());
         }
@@ -149,11 +152,15 @@ impl ContentProvider for ModrinthProvider {
             .await?;
         Ok(projects
             .into_iter()
-            .map(|project| {
-                (
+            .filter_map(|project| {
+                let kind = kind_from_project_type(&project.project_type)?;
+                Some((
                     CanonicalId::for_project(ProviderId::Modrinth, &project.id),
-                    project.title,
-                )
+                    ProjectMetadata {
+                        kind,
+                        title: project.title,
+                    },
+                ))
             })
             .collect())
     }
@@ -389,10 +396,16 @@ fn map_dependency(dependency: dto::Dependency) -> Option<ContentDependency> {
 }
 
 fn map_identity(version: dto::Version) -> Option<VersionIdentity> {
+    let dependencies = version
+        .dependencies
+        .into_iter()
+        .filter_map(map_dependency)
+        .collect();
     Some(VersionIdentity {
         provider: ProviderId::Modrinth,
         project_id: version.project_id,
         version_id: version.id,
+        dependencies,
         title: Some(version.name),
     })
 }
@@ -402,5 +415,34 @@ fn release_channel(version_type: &str) -> ReleaseChannel {
         "beta" => ReleaseChannel::Beta,
         "alpha" => ReleaseChannel::Alpha,
         _ => ReleaseChannel::Release,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hash_identity_preserves_version_dependencies() {
+        let version: dto::Version = serde_json::from_value(serde_json::json!({
+            "id": "version-a",
+            "project_id": "project-a",
+            "name": "Project A",
+            "version_number": "1.0.0",
+            "dependencies": [{
+                "project_id": "project-b",
+                "dependency_type": "incompatible"
+            }]
+        }))
+        .expect("version payload");
+
+        let identity = map_identity(version).expect("identity");
+
+        assert_eq!(identity.dependencies.len(), 1);
+        assert_eq!(
+            identity.dependencies[0].project_id.as_deref(),
+            Some("project-b")
+        );
+        assert_eq!(identity.dependencies[0].kind, DependencyKind::Incompatible);
     }
 }

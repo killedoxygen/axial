@@ -1,6 +1,7 @@
 use crate::error::{ContentError, ContentResult};
 use crate::model::{
-    CanonicalContent, CanonicalId, ContentDetail, ContentVersion, ProviderId, VersionIdentity,
+    CanonicalContent, CanonicalId, ContentDetail, ContentVersion, ProjectMetadata, ProviderId,
+    VersionIdentity,
 };
 use crate::modrinth::ModrinthProvider;
 use crate::provider::{ContentProvider, ContentQuery, LoaderGameFilter, Page};
@@ -60,7 +61,19 @@ impl ContentRegistry {
 
     /// Project titles for a batch of ids, in one round trip.
     pub async fn titles(&self, ids: &[CanonicalId]) -> ContentResult<HashMap<CanonicalId, String>> {
-        self.modrinth.titles(ids).await
+        Ok(self
+            .metadata(ids)
+            .await?
+            .into_iter()
+            .map(|(id, metadata)| (id, metadata.title))
+            .collect())
+    }
+
+    pub async fn metadata(
+        &self,
+        ids: &[CanonicalId],
+    ) -> ContentResult<HashMap<CanonicalId, ProjectMetadata>> {
+        self.modrinth.metadata(ids).await
     }
 
     fn provider_for(&self, id: &CanonicalId) -> ContentResult<&ModrinthProvider> {
