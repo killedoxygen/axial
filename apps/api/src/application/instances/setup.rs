@@ -189,7 +189,9 @@ pub async fn execute_instance_setup(
             Ok(created)
         }
         Err(error) => {
-            let _ = state.instances().remove(&instance_id, true);
+            let _ =
+                crate::application::install::remove_setup_instance_if_inactive(state, &instance_id)
+                    .await;
             Err(error)
         }
     }
@@ -238,7 +240,9 @@ pub async fn execute_modpack_instance_setup(
             Ok(created)
         }
         Err(error) => {
-            let _ = state.instances().remove(&instance_id, true);
+            let _ =
+                crate::application::install::remove_setup_instance_if_inactive(state, &instance_id)
+                    .await;
             Err(error)
         }
     }

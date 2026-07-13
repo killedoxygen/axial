@@ -547,10 +547,8 @@ pub async fn remove_queued_install(
     }) = removed.as_ref()
         && content_action_owns_instance(action)
     {
-        state
-            .instances()
-            .remove(instance_id, true)
-            .is_ok()
+        remove_setup_instance_if_inactive(state, instance_id)
+            .await
             .then(|| instance_id.clone())
     } else {
         None
@@ -589,6 +587,19 @@ fn content_action_owns_instance(action: &ContentQueueAction) -> bool {
             ..
         }
     )
+}
+
+/// Remove an instance created solely for a setup operation, but only while no
+/// launch or content mutation can be using it. Acquiring the lifecycle guard
+/// before checking sessions closes the race with launch registration.
+pub(crate) async fn remove_setup_instance_if_inactive(state: &AppState, instance_id: &str) -> bool {
+    let Some(_lifecycle_guard) = state.sessions().try_lock_instance_lifecycle(instance_id) else {
+        return false;
+    };
+    if state.sessions().has_active_instance(instance_id).await {
+        return false;
+    }
+    state.instances().remove(instance_id, true).is_ok()
 }
 
 async fn enqueue_install_with_placement(
@@ -805,7 +816,7 @@ async fn maybe_start_next_queued_install(
             } = &entry.spec
                 && content_action_owns_instance(action)
             {
-                let _ = state.instances().remove(instance_id, true);
+                let _ = remove_setup_instance_if_inactive(state, instance_id).await;
             }
             continue;
         }
@@ -883,15 +894,10 @@ async fn start_content_operation(
     let worker_install_id = install_id.clone();
     let worker_instance_id = instance_id.to_string();
     let worker_action = action.clone();
-    let interrupted_state = state.clone();
-    let interrupted_instance_id = instance_id.to_string();
-    let remove_instance_if_interrupted = content_action_owns_instance(action);
-    let interrupted_progress = content_interrupted_progress(remove_instance_if_interrupted);
-
-    InstallStore::spawn_tracked_worker_with_interrupt_handler(
+    InstallStore::spawn_tracked_worker(
         state.installs().clone(),
         install_id.clone(),
-        interrupted_progress,
+        content_interrupted_progress(),
         async move {
             let (progress_tx, mut progress_rx) = mpsc::unbounded_channel::<DownloadProgress>();
             let progress_store = worker_store.clone();
@@ -910,7 +916,7 @@ async fn start_content_operation(
                 Err((
                     StatusCode::PRECONDITION_FAILED,
                     Json(serde_json::json!({
-                        "error": "Minecraft or the selected mod loader did not finish installing. The incomplete instance was removed."
+                        "error": "Minecraft or the selected mod loader did not finish installing."
                     })),
                 ))
             } else {
@@ -977,15 +983,17 @@ async fn start_content_operation(
             let terminal = match result {
                 Ok(()) => content_progress("done", 1, 1, true, None),
                 Err((_, Json(body))) => {
-                    let removed_instance = content_action_owns_instance(&worker_action);
-                    if removed_instance {
-                        let _ = worker_state.instances().remove(&worker_instance_id, true);
-                    }
-                    let message = body
+                    let removed_instance = content_action_owns_instance(&worker_action)
+                        && remove_setup_instance_if_inactive(&worker_state, &worker_instance_id)
+                            .await;
+                    let mut message = body
                         .get("error")
                         .and_then(serde_json::Value::as_str)
                         .unwrap_or(INSTALL_FAILURE_MESSAGE)
                         .to_string();
+                    if removed_instance {
+                        message.push_str(" The incomplete setup instance was removed.");
+                    }
                     content_progress(
                         if removed_instance {
                             CONTENT_INSTANCE_REMOVED_PHASE
@@ -1002,13 +1010,6 @@ async fn start_content_operation(
             let _ = progress_tx.send(terminal);
             drop(progress_tx);
             let _ = progress_task.await;
-        },
-        move |_| {
-            if remove_instance_if_interrupted {
-                let _ = interrupted_state
-                    .instances()
-                    .remove(&interrupted_instance_id, true);
-            }
         },
     );
 
@@ -1045,21 +1046,13 @@ fn content_progress(
     }
 }
 
-fn content_interrupted_progress(removes_instance: bool) -> DownloadProgress {
+fn content_interrupted_progress() -> DownloadProgress {
     content_progress(
-        if removes_instance {
-            CONTENT_INSTANCE_REMOVED_PHASE
-        } else {
-            "error"
-        },
+        "error",
         0,
         1,
         true,
-        Some(if removes_instance {
-            "Content operation stopped. The incomplete setup instance was removed.".to_string()
-        } else {
-            "Content operation stopped before completing. Try again.".to_string()
-        }),
+        Some("Content operation stopped before completing. Try again.".to_string()),
     )
 }
 

@@ -11,6 +11,7 @@ use crate::state::{
     SessionStore,
 };
 use axial_config::{AppPaths, ConfigStore, InstanceStore};
+use axial_launcher::{LaunchSessionRecord, LaunchState, SessionId};
 use axial_minecraft::download::{
     ExecutionDownloadFact, ExecutionDownloadFactKind, ExpectedIntegrity,
     SelectedDownloadArtifactDescriptor, SelectedDownloadArtifactKind,
@@ -191,6 +192,117 @@ async fn setup_owned_content_does_not_run_after_its_base_install_failed() {
     wait_for_install_terminal(&state, &started.install_id).await;
 
     assert!(state.instances().get(&instance.id).is_none());
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn canceling_setup_content_preserves_a_running_instance() {
+    let root = temp_root("running-setup-cancellation");
+    let state = build_test_state(&root);
+    let instance = state
+        .instances()
+        .add(
+            "Running setup".to_string(),
+            "1.21.1".to_string(),
+            String::new(),
+            String::new(),
+            None,
+        )
+        .expect("create setup instance");
+    let marker = state
+        .instances()
+        .game_dir(&instance.id)
+        .join("running.marker");
+    fs::write(&marker, "preserve").expect("write marker");
+    state
+        .sessions()
+        .insert(test_launch_record("running-setup", &instance.id))
+        .await;
+    state
+        .installs()
+        .enqueue_queued_install(
+            "setup-content".to_string(),
+            InstallQueueSpec::Content {
+                instance_id: instance.id.clone(),
+                label: "Setup content".to_string(),
+                action: ContentQueueAction::Install {
+                    selections: Vec::new(),
+                    allow_incompatible: false,
+                    remove_instance_on_failure: true,
+                },
+                prerequisite_queue_id: None,
+            },
+            InstallQueuePlacement::Back,
+        )
+        .await;
+
+    let response = remove_queued_install(&state, "setup-content")
+        .await
+        .expect("remove queued setup content");
+
+    assert_eq!(response.removed_instance_id, None);
+    assert!(state.instances().get(&instance.id).is_some());
+    assert_eq!(
+        fs::read_to_string(marker).expect("preserved marker"),
+        "preserve"
+    );
+    assert!(state.installs().queue_snapshot().await.pending.is_empty());
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn busy_setup_content_failure_preserves_a_running_instance() {
+    let root = temp_root("running-setup-start-conflict");
+    let state = build_test_state(&root);
+    let library_dir = root.join("library");
+    configure_library_dir(&state, &library_dir);
+    write_installed_vanilla_version(&library_dir, "1.21.1");
+    let instance = state
+        .instances()
+        .add(
+            "Running setup".to_string(),
+            "1.21.1".to_string(),
+            String::new(),
+            String::new(),
+            None,
+        )
+        .expect("create setup instance");
+    let marker = state
+        .instances()
+        .game_dir(&instance.id)
+        .join("running.marker");
+    fs::write(&marker, "preserve").expect("write marker");
+    state
+        .sessions()
+        .insert(test_launch_record("running-setup", &instance.id))
+        .await;
+    let action = ContentQueueAction::Install {
+        selections: vec![QueuedContentSelection {
+            canonical_id: "modrinth:test".to_string(),
+            kind: axial_content::ContentKind::Mod,
+            version_id: Some("version-1".to_string()),
+        }],
+        allow_incompatible: false,
+        remove_instance_on_failure: true,
+    };
+
+    let started = start_content_operation(&state, &instance.id, "Setup content", &action)
+        .await
+        .expect("start content operation");
+    wait_for_install_terminal(&state, &started.install_id).await;
+
+    let progress = state
+        .installs()
+        .snapshot(&started.install_id)
+        .await
+        .and_then(|snapshot| snapshot.latest)
+        .expect("terminal progress");
+    assert_eq!(progress.progress.phase, "error");
+    assert!(state.instances().get(&instance.id).is_some());
+    assert_eq!(
+        fs::read_to_string(marker).expect("preserved marker"),
+        "preserve"
+    );
     let _ = fs::remove_dir_all(root);
 }
 
@@ -3501,6 +3613,49 @@ fn configure_library_dir(state: &AppState, library_dir: &Path) {
         .replace_in_memory(config.clone())
         .expect("config update");
     state.set_library_dir(config.library_dir);
+}
+
+fn write_installed_vanilla_version(library_dir: &Path, version_id: &str) {
+    let version_dir = library_dir.join("versions").join(version_id);
+    fs::create_dir_all(&version_dir).expect("create version dir");
+    fs::write(
+        version_dir.join(format!("{version_id}.json")),
+        format!(
+            r#"{{
+                "id": "{version_id}",
+                "type": "release",
+                "releaseTime": "2026-01-01T00:00:00+00:00",
+                "javaVersion": {{"component": "java-runtime-gamma", "majorVersion": 17}}
+            }}"#
+        ),
+    )
+    .expect("write version json");
+    fs::write(version_dir.join(format!("{version_id}.jar")), "client jar").expect("write jar");
+}
+
+fn test_launch_record(session_id: &str, instance_id: &str) -> LaunchSessionRecord {
+    LaunchSessionRecord {
+        session_id: SessionId(session_id.to_string()),
+        instance_id: instance_id.to_string(),
+        version_id: "1.21.1".to_string(),
+        launched_at: Some("2026-01-01T00:00:00.000Z".to_string()),
+        benchmark: None,
+        state: LaunchState::Queued,
+        pid: None,
+        process_started_at_ms: None,
+        boot_completed_at_ms: None,
+        boot_duration_ms: None,
+        priority: None,
+        exit_code: None,
+        command: Vec::new(),
+        java_path: None,
+        natives_dir: None,
+        failure: None,
+        healing: None,
+        guardian: None,
+        outcome: None,
+        stages: Vec::new(),
+    }
 }
 
 fn test_app_paths(root: &Path) -> AppPaths {
