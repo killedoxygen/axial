@@ -170,7 +170,7 @@ function loaderDisplay(
 /** Disk name of a mod without its `.disabled` suffix; the manifest keys mods by
  * this enabled-state base name. */
 export function modBaseName(name: string): string {
-  return name.endsWith('.disabled') ? name.slice(0, -'.disabled'.length) : name;
+  return name.toLowerCase().endsWith('.disabled') ? name.slice(0, -'.disabled'.length) : name;
 }
 
 export const USERNAME_MIN_LEN = 3;

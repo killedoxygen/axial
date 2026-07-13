@@ -54,6 +54,7 @@ pub type ContentApiError = (StatusCode, Json<serde_json::Value>);
 const DEFAULT_SEARCH_LIMIT: u32 = 40;
 const MAX_SEARCH_LIMIT: u32 = 100;
 const MAX_COMPAT_ITEMS: usize = 40;
+const COMPAT_DETAIL_CONCURRENCY: usize = 6;
 
 #[derive(Debug, Deserialize)]
 pub struct ContentSearchParams {
@@ -407,9 +408,8 @@ pub async fn content_compatibility(
         ));
     }
 
-    let mut items = Vec::with_capacity(request.selections.len());
-    for selection in &request.selections {
-        let id = CanonicalId(selection.canonical_id.clone());
+    let item_results = stream::iter(request.selections.into_iter().map(|selection| async move {
+        let id = CanonicalId(selection.canonical_id);
         let detail = state
             .content()
             .detail(&id)
@@ -430,13 +430,17 @@ pub async fn content_compatibility(
                 game_versions: version.game_versions,
             })
             .collect();
-        items.push(compat::CompatItem {
+        Ok(compat::CompatItem {
             canonical_id: id,
             title: detail.content.title,
             kind: detail.content.kind,
             versions,
-        });
-    }
+        })
+    }))
+    .buffered(COMPAT_DETAIL_CONCURRENCY)
+    .collect::<Vec<Result<compat::CompatItem, ContentApiError>>>()
+    .await;
+    let items = item_results.into_iter().collect::<Result<Vec<_>, _>>()?;
 
     let candidates = compat::rank_candidates(&items);
     let create_view = if let Some(best) = candidates.first() {

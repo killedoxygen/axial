@@ -239,11 +239,7 @@ pub(crate) async fn handle_update_instance_mod(
     }
 
     let mut manifest = ContentManifest::load(&game_dir).map_err(mod_manifest_error_response)?;
-    let base_name = if name.to_ascii_lowercase().ends_with(".disabled") {
-        &name[..name.len() - ".disabled".len()]
-    } else {
-        name
-    };
+    let base_name = mod_base_name(name);
     let tracked = manifest
         .entries
         .iter_mut()
@@ -272,12 +268,24 @@ pub(crate) async fn handle_delete_instance_mod(
     id: &str,
     name: &str,
 ) -> Result<serde_json::Value, (StatusCode, Json<serde_json::Value>)> {
+    let _lifecycle_guard = state.sessions().lock_instance_lifecycle(id).await;
     reject_running_instance(state, id, "mods").await?;
     validate_mod_name(name)?;
 
     let game_dir = instance_game_dir(state, id)?;
     let source = game_dir.join("mods").join(name);
     require_mod_file(&source)?;
+    let manifest = ContentManifest::load(&game_dir).map_err(mod_manifest_error_response)?;
+    if manifest
+        .entries
+        .iter()
+        .any(|entry| entry.kind == ContentKind::Mod && entry.filename == mod_base_name(name))
+    {
+        return Err(json_error(
+            StatusCode::CONFLICT,
+            "managed mods must be removed through content operations",
+        ));
+    }
     fs::remove_file(source).map_err(mod_file_write_error_response)?;
     Ok(serde_json::json!({ "status": "ok" }))
 }
@@ -945,6 +953,14 @@ fn is_screenshot_name(name: &str) -> bool {
 fn is_mod_name(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
     (lower.ends_with(".jar") || lower.ends_with(".jar.disabled")) && is_safe_resource_name(name)
+}
+
+fn mod_base_name(name: &str) -> &str {
+    if name.to_ascii_lowercase().ends_with(".disabled") {
+        &name[..name.len() - ".disabled".len()]
+    } else {
+        name
+    }
 }
 
 fn mod_enabled_name(

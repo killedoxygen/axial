@@ -264,7 +264,7 @@ export function ModsPane({
             label: 'Delete',
             icon: 'trash',
             danger: true,
-            onClick: () => void deleteMods(inst, selectedMods, clearAndRefresh),
+            onClick: () => void deleteMods(inst, selectedMods, clearAndRefresh, provenance?.entries),
           },
         ]}
       />

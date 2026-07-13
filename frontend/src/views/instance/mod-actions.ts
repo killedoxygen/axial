@@ -3,7 +3,7 @@ import { checkContentUpdates, installContent, listInstanceContent, uninstallCont
 import { applyInstallQueueResponse } from '../../machines/downloads';
 import { toast } from '../../toast';
 import { navigate } from '../../ui-state';
-import { errMessage } from '../../utils';
+import { errMessage, modBaseName } from '../../utils';
 import type { ContextMenuItem } from '../../ui/ContextMenu';
 import type { ContentUpdate, InstanceContentEntry } from '../../types-content';
 import type { EnrichedInstance, InstanceMod } from '../../types-instance';
@@ -109,12 +109,20 @@ export async function removeManagedMod(
   });
   if (!confirmed) return;
   try {
-    const queue = await uninstallContent(inst.id, entry.canonical_id);
-    await applyInstallQueueResponse(queue, { showNotice: true, connectActive: true });
+    await queueManagedModRemoval(inst, entry, true);
     toast('Mod removal queued');
   } catch (err) {
     toast(`Could not remove the mod: ${errMessage(err)}`, 'error');
   }
+}
+
+async function queueManagedModRemoval(
+  inst: EnrichedInstance,
+  entry: InstanceContentEntry,
+  showNotice: boolean,
+): Promise<void> {
+  const queue = await uninstallContent(inst.id, entry.canonical_id);
+  await applyInstallQueueResponse(queue, { showNotice, connectActive: true });
 }
 
 async function updateModEnabled(inst: EnrichedInstance, modName: string, enabled: boolean): Promise<void> {
@@ -159,21 +167,31 @@ export async function setModsEnabled(
   });
 }
 
-export async function deleteMods(inst: EnrichedInstance, mods: InstanceMod[], onDone: () => void): Promise<void> {
+export async function deleteMods(
+  inst: EnrichedInstance,
+  mods: InstanceMod[],
+  onDone: () => void,
+  managedEntries: ReadonlyMap<string, InstanceContentEntry> = new Map(),
+): Promise<void> {
+  const removals = mods.map((mod) => ({
+    mod,
+    entry: managedEntries.get(modBaseName(mod.name)),
+  }));
+  const managedCount = removals.filter(({ entry }) => entry !== undefined).length;
   const confirmed = await confirmDeleteItems({
     count: mods.length,
     itemLabel: 'mod',
     message:
       mods.length === 1
-        ? `Delete "${mods[0]!.name}" from this instance. This removes the mod file from disk.`
-        : `Delete ${mods.length} mods from this instance. This removes the selected mod files from disk.`,
+        ? `Remove "${mods[0]!.name}" from this instance. This deletes the mod file${managedCount ? ' and its install record' : ''}.`
+        : `Remove ${mods.length} mods from this instance. Managed mods are safely removed from the install record too.`,
   });
   if (!confirmed) return;
   await runBulkMutation({
-    items: mods,
-    action: (mod) => removeMod(inst, mod.name),
-    success: (count) => (count === 1 ? 'Mod deleted' : `${count} mods deleted`),
-    partial: (done, total, err) => partialFailureMessage('Deleted', done, total, err),
+    items: removals,
+    action: ({ mod, entry }) => (entry ? queueManagedModRemoval(inst, entry, false) : removeMod(inst, mod.name)),
+    success: (count) => (count === 1 ? 'Mod removal started' : `${count} mod removals started`),
+    partial: (done, total, err) => partialFailureMessage('Started removal for', done, total, err),
     onDone,
   });
 }

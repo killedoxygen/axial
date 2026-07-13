@@ -825,6 +825,70 @@ async fn instance_mod_delete_removes_only_named_mod_file() {
     );
 }
 
+#[tokio::test]
+async fn instance_mod_delete_rejects_managed_files() {
+    let fixture = TestFixture::new("managed-mod-delete");
+    let instance = fixture
+        .state
+        .instances()
+        .add(
+            "Managed mod deletion".to_string(),
+            "1.21.1".to_string(),
+            String::new(),
+            String::new(),
+            None,
+        )
+        .expect("add instance");
+    let game_dir = fixture.state.instances().game_dir(&instance.id);
+    let mods_dir = game_dir.join("mods");
+    fs::create_dir_all(&mods_dir).expect("create mods dir");
+    fs::write(mods_dir.join("managed.jar.disabled"), "managed").expect("write managed mod");
+
+    let tracked_id = axial_content::CanonicalId::for_project(
+        axial_content::ProviderId::Modrinth,
+        "managed-project",
+    );
+    let mut manifest = axial_content::ContentManifest::default();
+    let mut entry = axial_content::ManifestEntry::managed(
+        tracked_id.clone(),
+        axial_content::ProviderId::Modrinth,
+        "managed-project".to_string(),
+        "managed-version".to_string(),
+        axial_content::ContentKind::Mod,
+        &axial_content::FileRef {
+            url: "https://example.invalid/managed.jar".to_string(),
+            filename: "managed.jar".to_string(),
+            sha1: None,
+            sha512: None,
+            size: None,
+            primary: true,
+        },
+        Vec::new(),
+        None,
+    );
+    entry.enabled = false;
+    manifest.upsert(entry);
+    manifest.save(&game_dir).expect("save manifest");
+
+    let (status, Json(body)) =
+        handle_delete_instance_mod(&fixture.state, &instance.id, "managed.jar.disabled")
+            .await
+            .expect_err("raw deletion must reject managed content");
+
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_bounded_error_body(
+        &body,
+        "managed mods must be removed through content operations",
+    );
+    assert!(mods_dir.join("managed.jar.disabled").is_file());
+    assert!(
+        axial_content::ContentManifest::load(&game_dir)
+            .expect("load manifest")
+            .find(&tracked_id)
+            .is_some()
+    );
+}
+
 #[test]
 fn instance_world_names_reject_path_traversal_hidden_and_control_names() {
     for name in ["World", "My World", "World-2026_05_31"] {
