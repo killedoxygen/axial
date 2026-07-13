@@ -1,5 +1,7 @@
-use super::create::handle_create_instance;
-use super::create::{CreateSelection, resolve_create_selection};
+use super::create::{
+    CreateSelection, handle_create_instance, handle_create_instance_without_shared_files,
+    resolve_create_selection,
+};
 use super::{CreateInstanceRequest, CreateInstanceResponse};
 use crate::application::content::{
     ContentInstallRequest, PlanReason, TargetRef, queue_content_install_with_cleanup_after,
@@ -215,7 +217,7 @@ pub async fn execute_modpack_instance_setup(
         ));
     }
     request.create.selection_id = target.selection_id;
-    let mut created = handle_create_instance(state, request.create).await?;
+    let mut created = handle_create_instance_without_shared_files(state, request.create).await?;
     let instance_id = created.instance.id.clone();
     let prerequisite_queue_id = created
         .queued_install

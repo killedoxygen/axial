@@ -437,7 +437,15 @@ pub(crate) async fn handle_create_instance(
     state: &AppState,
     payload: CreateInstanceRequest,
 ) -> Result<CreateInstanceResponse, (StatusCode, Json<serde_json::Value>)> {
-    let prepared = prepare_instance_create(state, payload).await?;
+    let prepared = prepare_instance_create(state, payload, true).await?;
+    finalize_instance_create(state, prepared).await
+}
+
+pub(super) async fn handle_create_instance_without_shared_files(
+    state: &AppState,
+    payload: CreateInstanceRequest,
+) -> Result<CreateInstanceResponse, (StatusCode, Json<serde_json::Value>)> {
+    let prepared = prepare_instance_create(state, payload, false).await?;
     finalize_instance_create(state, prepared).await
 }
 
@@ -450,10 +458,15 @@ struct PreparedInstanceCreate {
 async fn prepare_instance_create(
     state: &AppState,
     payload: CreateInstanceRequest,
+    seed_shared_files: bool,
 ) -> Result<PreparedInstanceCreate, (StatusCode, Json<serde_json::Value>)> {
     let selection = resolve_create_selection(state, &payload).await?;
     let preset = normalize_create_jvm_preset(payload.jvm_preset_id.as_deref());
-    let mc_dir = state.library_dir().map(PathBuf::from);
+    let mc_dir = if seed_shared_files {
+        state.library_dir().map(PathBuf::from)
+    } else {
+        None
+    };
     let install_request = create_install_queue_request_if_needed(state, &selection)?;
     let instance =
         create_instance_with_unique_name(state, &payload, &selection, mc_dir.as_deref())?;

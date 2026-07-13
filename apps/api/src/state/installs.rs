@@ -708,6 +708,9 @@ fn now_unix_ms() -> u64 {
 }
 
 fn record_queue_outcome(queue: &mut InstallQueueInner, queue_id: &str, succeeded: bool) {
+    queue
+        .completed_order
+        .retain(|completed_id| completed_id != queue_id);
     queue.completed.insert(queue_id.to_string(), succeeded);
     queue.completed_order.push_back(queue_id.to_string());
     while queue.completed_order.len() > MAX_COMPLETED_QUEUE_OUTCOMES {
@@ -726,6 +729,31 @@ impl Default for InstallStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn queue_outcomes_keep_reused_ids_recent_and_unique() {
+        let mut queue = InstallQueueInner::default();
+        record_queue_outcome(&mut queue, "reused", false);
+        for index in 0..MAX_COMPLETED_QUEUE_OUTCOMES - 1 {
+            record_queue_outcome(&mut queue, &format!("older-{index}"), true);
+        }
+
+        record_queue_outcome(&mut queue, "reused", true);
+        record_queue_outcome(&mut queue, "newest", true);
+
+        assert_eq!(queue.completed.get("reused"), Some(&true));
+        assert_eq!(
+            queue
+                .completed_order
+                .iter()
+                .filter(|queue_id| queue_id.as_str() == "reused")
+                .count(),
+            1
+        );
+        assert_eq!(queue.completed_order.len(), MAX_COMPLETED_QUEUE_OUTCOMES);
+        assert!(!queue.completed.contains_key("older-0"));
+        assert_eq!(queue.completed.get("newest"), Some(&true));
+    }
 
     #[tokio::test]
     async fn install_insert_or_existing_reuses_active_matching_key() {

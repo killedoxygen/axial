@@ -1661,6 +1661,30 @@ async fn create_queue_failure_rolls_back_created_instance() {
 }
 
 #[tokio::test]
+async fn modpack_setup_creation_does_not_seed_shared_instance_files() {
+    let fixture = TestFixture::new("modpack-create-without-shared-files");
+    let library_dir = fixture.configure_create_manifest(&["1.21.1"]);
+    fs::write(library_dir.join("options.txt"), "shared options").expect("write shared options");
+    fs::write(library_dir.join("servers.dat"), "shared servers").expect("write shared servers");
+
+    let created = super::create::handle_create_instance_without_shared_files(
+        &fixture.state,
+        CreateInstanceRequest {
+            name: "Pack target".to_string(),
+            selection_id: "vanilla|1.21.1".to_string(),
+            ..CreateInstanceRequest::default()
+        },
+    )
+    .await
+    .expect("create modpack target");
+    let game_dir = fixture.state.instances().game_dir(&created.id);
+
+    assert!(!game_dir.join("options.txt").exists());
+    assert!(!game_dir.join("servers.dat").exists());
+    assert!(game_dir.join("config").is_dir());
+}
+
+#[tokio::test]
 async fn create_instance_duplicate_name_gets_backend_owned_suffix() {
     let fixture = TestFixture::new("create-name-conflict");
     let library_dir = fixture.configure_create_manifest(&["1.21.1", "1.21.2"]);

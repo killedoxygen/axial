@@ -255,8 +255,15 @@ pub(crate) async fn handle_update_instance_mod(
         fs::rename(&source, &target).map_err(mod_file_write_error_response)?;
     }
     if manifest_changed && let Err(error) = manifest.save(&game_dir) {
-        if renamed {
-            let _ = fs::rename(&target, &source);
+        if renamed && let Err(rollback_error) = fs::rename(&target, &source) {
+            tracing::error!(
+                instance_id = id,
+                current_name = target_name,
+                original_name = name,
+                manifest_error = %error,
+                rollback_error = %rollback_error,
+                "failed to restore mod filename after manifest persistence failure"
+            );
         }
         return Err(mod_manifest_error_response(error));
     }
