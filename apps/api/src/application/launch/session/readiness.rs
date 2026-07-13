@@ -167,9 +167,6 @@ fn readiness_guardian_fact_id(reason: LaunchReadinessReasonId) -> GuardianFactId
         LaunchReadinessReasonId::ClientJarCorrupt => GuardianFactId::ArtifactChecksumMismatch,
         LaunchReadinessReasonId::LibrariesMissing => GuardianFactId::LibrariesMissing,
         LaunchReadinessReasonId::LibrariesCorrupt => GuardianFactId::ArtifactChecksumMismatch,
-        LaunchReadinessReasonId::LauncherManagedArtifactSignatureCorrupt => {
-            GuardianFactId::LauncherManagedArtifactSignatureCorruption
-        }
         LaunchReadinessReasonId::AssetIndexMissing => GuardianFactId::AssetIndexMissing,
         LaunchReadinessReasonId::AssetIndexCorrupt => GuardianFactId::ArtifactChecksumMismatch,
         LaunchReadinessReasonId::ManagedRuntimeMissing => GuardianFactId::ManagedRuntimeMissing,
@@ -184,7 +181,6 @@ fn readiness_guardian_domain(reason: LaunchReadinessReasonId) -> GuardianDomain 
         | LaunchReadinessReasonId::JavaOverrideMissing => GuardianDomain::Runtime,
         LaunchReadinessReasonId::ClientJarCorrupt
         | LaunchReadinessReasonId::LibrariesCorrupt
-        | LaunchReadinessReasonId::LauncherManagedArtifactSignatureCorrupt
         | LaunchReadinessReasonId::AssetIndexCorrupt => GuardianDomain::Download,
         _ => GuardianDomain::Install,
     }
@@ -215,7 +211,6 @@ fn readiness_guardian_target_kind(reason: LaunchReadinessReasonId) -> TargetKind
         | LaunchReadinessReasonId::ClientJarCorrupt
         | LaunchReadinessReasonId::LibrariesMissing
         | LaunchReadinessReasonId::LibrariesCorrupt
-        | LaunchReadinessReasonId::LauncherManagedArtifactSignatureCorrupt
         | LaunchReadinessReasonId::AssetIndexMissing
         | LaunchReadinessReasonId::AssetIndexCorrupt => TargetKind::Artifact,
         LaunchReadinessReasonId::ManagedRuntimeMissing => TargetKind::Runtime,
@@ -235,7 +230,6 @@ fn readiness_guardian_target_id(reason: LaunchReadinessReasonId) -> &'static str
         LaunchReadinessReasonId::LibrariesMissing | LaunchReadinessReasonId::LibrariesCorrupt => {
             "libraries"
         }
-        LaunchReadinessReasonId::LauncherManagedArtifactSignatureCorrupt => "launcher_managed_jars",
         LaunchReadinessReasonId::AssetIndexMissing | LaunchReadinessReasonId::AssetIndexCorrupt => {
             "asset_index"
         }
@@ -250,7 +244,6 @@ fn readiness_guardian_fact_reliability(reason: LaunchReadinessReasonId) -> FactR
         LaunchReadinessReasonId::IncompleteInstall => FactReliability::DirectStructured,
         LaunchReadinessReasonId::ClientJarCorrupt
         | LaunchReadinessReasonId::LibrariesCorrupt
-        | LaunchReadinessReasonId::LauncherManagedArtifactSignatureCorrupt
         | LaunchReadinessReasonId::AssetIndexCorrupt => FactReliability::ExactClassifier,
         _ => FactReliability::ExpectedMarkerAbsence,
     }

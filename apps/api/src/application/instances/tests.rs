@@ -2689,6 +2689,70 @@ async fn create_instance_installed_vanilla_selection_does_not_queue_install() {
 }
 
 #[tokio::test]
+async fn create_instance_missing_library_queues_install() {
+    let fixture = TestFixture::new("create-missing-library");
+    let library_dir = fixture.configure_create_manifest(&["1.21.1"]);
+    write_version_with_missing_library(&library_dir, "1.21.1");
+    seed_committed_busy_install(&fixture.state, "busy-missing-library").await;
+
+    let created = handle_create_instance(
+        &fixture.state,
+        CreateInstanceRequest {
+            name: "Missing library".to_string(),
+            selection_id: "vanilla|1.21.1".to_string(),
+            ..CreateInstanceRequest::default()
+        },
+    )
+    .await
+    .expect("create instance and queue repair install");
+
+    assert!(!created.instance.launchable);
+    assert!(created.queued_install.is_some());
+}
+
+#[tokio::test]
+async fn create_instance_missing_asset_object_does_not_queue_install() {
+    let fixture = TestFixture::new("create-missing-asset-object");
+    let library_dir = fixture.configure_create_manifest(&["1.21.1"]);
+    write_version_with_missing_asset_object(&library_dir, "1.21.1");
+
+    let created = handle_create_instance(
+        &fixture.state,
+        CreateInstanceRequest {
+            name: "Missing asset object".to_string(),
+            selection_id: "vanilla|1.21.1".to_string(),
+            ..CreateInstanceRequest::default()
+        },
+    )
+    .await
+    .expect("create instance without asset object walk");
+
+    assert!(created.instance.launchable);
+    assert!(created.queued_install.is_none());
+}
+
+#[tokio::test]
+async fn create_instance_same_size_client_drift_does_not_queue_install() {
+    let fixture = TestFixture::new("create-same-size-client-drift");
+    let library_dir = fixture.configure_create_manifest(&["1.21.1"]);
+    write_version_with_corrupt_client_jar(&library_dir, "1.21.1");
+
+    let created = handle_create_instance(
+        &fixture.state,
+        CreateInstanceRequest {
+            name: "Client drift".to_string(),
+            selection_id: "vanilla|1.21.1".to_string(),
+            ..CreateInstanceRequest::default()
+        },
+    )
+    .await
+    .expect("create instance without client hash scan");
+
+    assert!(created.instance.launchable);
+    assert!(created.queued_install.is_none());
+}
+
+#[tokio::test]
 async fn create_instance_vanilla_reuses_one_request_snapshot_without_warm_walks() {
     let fixture = TestFixture::new("create-vanilla-shared-version-snapshot");
     let library_dir = fixture.configure_create_manifest(&["1.21.1"]);

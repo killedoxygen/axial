@@ -92,7 +92,7 @@ async fn existing_artifact_integrity_with_policy(
     {
         // Asset objects are named by SHA-1 and verified while being downloaded.
         // Later ensure passes only prove the expected-size file is still present
-        // at that content-addressed path; full readiness/repair checks still hash.
+        // at that content-addressed path.
         return Ok(ExistingArtifactIntegrity::Verified(metadata.len()));
     }
 
@@ -101,64 +101,6 @@ async fn existing_artifact_integrity_with_policy(
         Ok(()) => Ok(ExistingArtifactIntegrity::Verified(actual.size)),
         Err(error) => Ok(ExistingArtifactIntegrity::Corrupt(error)),
     }
-}
-
-pub fn verify_existing_launcher_managed_artifact(
-    path: &Path,
-    expected: &ExpectedIntegrity,
-) -> LauncherManagedArtifactReadiness {
-    if expected.sha1.is_none() {
-        return LauncherManagedArtifactReadiness::MetadataMissing;
-    }
-    if let Some(expected_sha1) = expected.sha1.as_deref()
-        && !is_sha1_hex(expected_sha1)
-    {
-        return LauncherManagedArtifactReadiness::MetadataInvalid;
-    }
-    let Ok(metadata) = std::fs::symlink_metadata(filesystem_path(path).as_ref()) else {
-        return LauncherManagedArtifactReadiness::Missing;
-    };
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
-        return LauncherManagedArtifactReadiness::UnsupportedExisting;
-    }
-    if let Some(expected_size) = expected.size
-        && metadata.len() != expected_size
-    {
-        return LauncherManagedArtifactReadiness::Corrupt;
-    }
-    let actual = match hash_file_sync(path) {
-        Ok(actual) => actual,
-        Err(_) => return LauncherManagedArtifactReadiness::Corrupt,
-    };
-    match verify_download_integrity(path, expected, &actual) {
-        Ok(()) => LauncherManagedArtifactReadiness::Verified,
-        Err(_) => LauncherManagedArtifactReadiness::Corrupt,
-    }
-}
-
-pub fn jar_contains_signed_metadata(path: &Path) -> bool {
-    let Ok(file) = std::fs::File::open(filesystem_path(path).as_ref()) else {
-        return false;
-    };
-    let Ok(mut archive) = zip::ZipArchive::new(file) else {
-        return false;
-    };
-    for index in 0..archive.len() {
-        let Ok(entry) = archive.by_index(index) else {
-            return false;
-        };
-        if signed_jar_metadata_entry_name(entry.name()) {
-            return true;
-        }
-    }
-    false
-}
-
-pub fn signed_jar_metadata_entry_name(name: &str) -> bool {
-    let upper = name.replace('\\', "/").to_ascii_uppercase();
-    upper == "META-INF/MANIFEST.MF"
-        || (upper.starts_with("META-INF/")
-            && (upper.ends_with(".SF") || upper.ends_with(".RSA") || upper.ends_with(".DSA")))
 }
 
 #[cfg(test)]

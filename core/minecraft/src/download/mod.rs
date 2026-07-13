@@ -26,10 +26,7 @@ pub(crate) use install::{
     reconstruct_installer_library_declarations, reconstruct_installer_processor_sources,
     reconstruct_profile_library_declarations,
 };
-pub use integrity::{
-    LauncherManagedArtifactReadiness, jar_contains_signed_metadata,
-    verify_existing_launcher_managed_artifact,
-};
+pub use integrity::LauncherManagedArtifactReadiness;
 pub(crate) use libraries::DownloadJob;
 pub(crate) use libraries::download_installer_libraries_with_declarations_and_facts_and_descriptors;
 pub(crate) use libraries::{
