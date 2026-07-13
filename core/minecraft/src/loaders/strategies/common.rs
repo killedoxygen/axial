@@ -1855,10 +1855,16 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn missing_size_processor_reconstruction_executes_and_seals_observed_output() {
+    async fn missing_size_processor_reconstruction_cancels_descendants_then_retries_cleanly() {
         let root = temp_dir("processor-required-installer-reconstruction");
         seed_reconstruction_sentinels(&root);
         let before = snapshot_tree(&root);
+        let processor_state = root.join("processor-state");
+        let cancelled_leader = root.join("cancelled-leader.pid");
+        let cancelled_descendant = root.join("cancelled-descendant.pid");
+        let cancelled_workspace = root.join("cancelled-workspace");
+        let successful_descendant = root.join("successful-descendant.pid");
+        let successful_workspace = root.join("successful-workspace");
         let mut record = installer_record();
         let base_client = zip_entries(&[("net/minecraft/client/Main.class", b"base")]);
         let client_server = TestByteServer::start(base_client.clone());
@@ -1888,14 +1894,34 @@ mod tests {
             url: installer_server.url.clone(),
         };
         let plan = LoaderInstallPlan { record };
-        let fake_java = br#"#!/bin/sh
+        let fake_java = format!(
+            r#"#!/bin/sh
 case "$*" in
   *-version*) printf '%s\n' 'openjdk version "17.0.1"' >&2; exit 0 ;;
 esac
 for last do :; done
+if [ ! -e {processor_state} ]; then
+  : > {processor_state}
+  printf '%s\n' "$$" > {cancelled_leader}
+  printf '%s\n' "$PWD" > {cancelled_workspace}
+  sleep 30 &
+  printf '%s\n' "$!" > {cancelled_descendant}
+  wait
+  exit 1
+fi
+printf '%s\n' "$PWD" > {successful_workspace}
+sleep 30 &
+printf '%s\n' "$!" > {successful_descendant}
 printf '%s' 'processor-terminal' > "$last"
-"#
-        .to_vec();
+"#,
+            processor_state = shell_quote_path(&processor_state),
+            cancelled_leader = shell_quote_path(&cancelled_leader),
+            cancelled_descendant = shell_quote_path(&cancelled_descendant),
+            cancelled_workspace = shell_quote_path(&cancelled_workspace),
+            successful_descendant = shell_quote_path(&successful_descendant),
+            successful_workspace = shell_quote_path(&successful_workspace),
+        )
+        .into_bytes();
         let runtime_file_server = TestByteServer::start(fake_java.clone());
         let runtime_manifest_bytes = serde_json::to_vec(&serde_json::json!({
             "files": {
@@ -1913,33 +1939,82 @@ printf '%s' 'processor-terminal' > "$last"
         }))
         .expect("runtime manifest");
         let runtime_manifest_server = TestByteServer::start(runtime_manifest_bytes.clone());
-        let downloader = Downloader::with_test_install_manifest(&root, manifest)
-            .with_test_runtime_source(TestRuntimeSourceDescriptor {
-                component: RuntimeId::from("java-runtime-delta"),
-                url: runtime_manifest_server.url.clone(),
-                sha1: sha1_hex(&runtime_manifest_bytes),
-                size: runtime_manifest_bytes.len() as u64,
-            });
+        let runtime_source = TestRuntimeSourceDescriptor {
+            component: RuntimeId::from("java-runtime-delta"),
+            url: runtime_manifest_server.url.clone(),
+            sha1: sha1_hex(&runtime_manifest_bytes),
+            size: runtime_manifest_bytes.len() as u64,
+        };
         let installer_path = reqwest::Url::parse(&installer_server.url)
             .expect("installer URL")
             .path()
             .to_string();
         let installer_sidecar_path = format!("{installer_path}.sha1");
 
+        let cancelled_root = root.clone();
+        let cancelled_plan = plan.clone();
+        let cancelled_manifest = manifest.clone();
+        let cancelled_runtime_source = runtime_source.clone();
+        let reconstruction = tokio::spawn(async move {
+            let downloader =
+                Downloader::with_test_install_manifest(&cancelled_root, cancelled_manifest)
+                    .with_test_runtime_source(cancelled_runtime_source);
+            reconstruct_installer_with_downloader(&cancelled_plan, &downloader).await
+        });
+        wait_for_test_file(&cancelled_descendant).await;
+        let cancelled_leader_pid = read_test_pid(&cancelled_leader);
+        let cancelled_descendant_pid = read_test_pid(&cancelled_descendant);
+        let cancelled_workspace_root = read_processor_workspace_root(&cancelled_workspace);
+        reconstruction.abort();
+        match reconstruction.await {
+            Err(error) => assert!(
+                error.is_cancelled(),
+                "the caller cancellation must drop the in-flight reconstruction future"
+            ),
+            Ok(_) => panic!("cancelled reconstruction task completed"),
+        }
+        wait_for_process_and_workspace_cleanup(
+            &[cancelled_leader_pid, cancelled_descendant_pid],
+            &cancelled_workspace_root,
+        )
+        .await;
+
+        let downloader = Downloader::with_test_install_manifest(&root, manifest)
+            .with_test_runtime_source(runtime_source);
         let reconstructed = reconstruct_installer_with_downloader(&plan, &downloader)
             .await
-            .expect("processor reconstruction");
-        assert_eq!(snapshot_tree(&root), before);
-        assert_eq!(version_server.request_count(), 1);
-        assert_eq!(client_server.request_count(), 1);
-        assert_eq!(fresh_server.request_count(), 1);
-        assert_eq!(installer_server.request_count_for(&installer_path), 1);
+            .expect("processor reconstruction retry");
+        wait_for_test_file(&successful_descendant).await;
+        let successful_descendant_pid = read_test_pid(&successful_descendant);
+        let successful_workspace_root = read_processor_workspace_root(&successful_workspace);
+        wait_for_process_and_workspace_cleanup(
+            &[successful_descendant_pid],
+            &successful_workspace_root,
+        )
+        .await;
+
+        let mut after = snapshot_tree(&root);
+        for marker in [
+            &processor_state,
+            &cancelled_leader,
+            &cancelled_descendant,
+            &cancelled_workspace,
+            &successful_descendant,
+            &successful_workspace,
+        ] {
+            after.remove(marker.strip_prefix(&root).expect("marker below test root"));
+        }
+        assert_eq!(after, before);
+        assert_eq!(version_server.request_count(), 2);
+        assert_eq!(client_server.request_count(), 2);
+        assert_eq!(fresh_server.request_count(), 2);
+        assert_eq!(installer_server.request_count_for(&installer_path), 2);
         assert_eq!(
             installer_server.request_count_for(&installer_sidecar_path),
-            1
+            2
         );
-        assert_eq!(runtime_manifest_server.request_count(), 1);
-        assert_eq!(runtime_file_server.request_count(), 1);
+        assert_eq!(runtime_manifest_server.request_count(), 2);
+        assert_eq!(runtime_file_server.request_count(), 2);
         let (_, inventory) = reconstructed.into_activation_source().into_parts();
         let terminal = inventory
             .entries()
@@ -3600,6 +3675,70 @@ printf '%s' 'processor-terminal' > "$last"
             .map(|value| value.as_nanos())
             .unwrap_or_default();
         std::env::temp_dir().join(format!("axial-{prefix}-{nanos:x}"))
+    }
+
+    #[cfg(unix)]
+    fn shell_quote_path(path: &Path) -> String {
+        format!(
+            "'{}'",
+            path.to_str()
+                .expect("test path must be UTF-8")
+                .replace('\'', "'\"'\"'")
+        )
+    }
+
+    #[cfg(unix)]
+    async fn wait_for_test_file(path: &Path) {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !path.is_file() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("processor lifecycle marker");
+    }
+
+    #[cfg(unix)]
+    fn read_test_pid(path: &Path) -> i32 {
+        fs::read_to_string(path)
+            .expect("read processor PID marker")
+            .trim()
+            .parse()
+            .expect("parse processor PID marker")
+    }
+
+    #[cfg(unix)]
+    fn read_processor_workspace_root(path: &Path) -> PathBuf {
+        let root = PathBuf::from(
+            fs::read_to_string(path)
+                .expect("read processor workspace marker")
+                .trim(),
+        );
+        root.parent()
+            .and_then(Path::parent)
+            .expect("processor stage root")
+            .to_path_buf()
+    }
+
+    #[cfg(unix)]
+    fn process_exists(raw_pid: i32) -> bool {
+        let pid = rustix::process::Pid::from_raw(raw_pid).expect("positive processor PID");
+        match rustix::process::test_kill_process(pid) {
+            Ok(()) => true,
+            Err(rustix::io::Errno::SRCH) => false,
+            Err(error) => panic!("inspect processor PID: {error}"),
+        }
+    }
+
+    #[cfg(unix)]
+    async fn wait_for_process_and_workspace_cleanup(raw_pids: &[i32], workspace_root: &Path) {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while raw_pids.iter().copied().any(process_exists) || workspace_root.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("processor tree and workspace cleanup");
     }
 
     fn installer_jar(version_id: &str) -> Vec<u8> {
