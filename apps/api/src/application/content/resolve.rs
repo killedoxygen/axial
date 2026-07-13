@@ -11,7 +11,7 @@ use axial_content::{
 };
 use axum::http::StatusCode;
 use serde::Serialize;
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use crate::state::AppState;
 
@@ -193,9 +193,10 @@ pub async fn resolve(
     selections: &[ContentSelection],
     manifest: &ContentManifest,
 ) -> Result<Resolution, ContentApiError> {
-    let mut resolved_ids: HashSet<CanonicalId> = HashSet::new();
+    let mut resolved_versions: HashMap<CanonicalId, String> = HashMap::new();
     let mut items: Vec<ResolvedItem> = Vec::new();
     let mut conflicts: Vec<PlanConflict> = Vec::new();
+    let mut incompatibilities: HashSet<(CanonicalId, CanonicalId)> = HashSet::new();
 
     let mut queue: VecDeque<(CanonicalId, ContentKind, Option<String>, PlanReason)> = selections
         .iter()
@@ -210,7 +211,16 @@ pub async fn resolve(
         .collect();
 
     while let Some((canonical_id, kind, forced_version, reason)) = queue.pop_front() {
-        if !resolved_ids.insert(canonical_id.clone()) {
+        if let Some(chosen_version) = resolved_versions.get(&canonical_id) {
+            if let Some(required_version) = forced_version.as_deref()
+                && required_version != chosen_version
+            {
+                conflicts.push(exact_dependency_conflict(
+                    &canonical_id,
+                    chosen_version,
+                    required_version,
+                ));
+            }
             continue;
         }
         if items.len() >= MAX_RESOLVE_ITEMS {
@@ -241,6 +251,7 @@ pub async fn resolve(
             conflicts.push(unavailable_conflict(&canonical_id));
             continue;
         };
+        resolved_versions.insert(canonical_id.clone(), version.id.clone());
 
         for dependency in &version.dependencies {
             match dependency.kind {
@@ -267,12 +278,21 @@ pub async fn resolve(
                     if let Some(project_id) = &dependency.project_id {
                         let incompatible =
                             CanonicalId::for_project(ProviderId::Modrinth, project_id);
-                        if let Some(entry) = manifest.find(&incompatible) {
+                        if let Some(entry) = manifest.find(&incompatible)
+                            && incompatibilities
+                                .insert((canonical_id.clone(), entry.canonical_id.clone()))
+                        {
                             conflicts.push(incompatible_conflict(&canonical_id, entry));
                         }
                     }
                 }
                 DependencyKind::Optional | DependencyKind::Embedded => {}
+            }
+        }
+
+        for entry in installed_entries_incompatible_with(manifest, &canonical_id) {
+            if incompatibilities.insert((canonical_id.clone(), entry.canonical_id.clone())) {
+                conflicts.push(incompatible_conflict(&canonical_id, entry));
             }
         }
 
@@ -453,6 +473,40 @@ fn unavailable_conflict(canonical_id: &CanonicalId) -> PlanConflict {
         kind: ConflictKind::Unavailable,
         detail: "has no compatible version for this loader and Minecraft version".to_string(),
     }
+}
+
+fn exact_dependency_conflict(
+    canonical_id: &CanonicalId,
+    chosen_version: &str,
+    required_version: &str,
+) -> PlanConflict {
+    PlanConflict {
+        canonical_id: Some(canonical_id.clone()),
+        kind: ConflictKind::Unavailable,
+        detail: format!(
+            "has conflicting exact version requirements: {chosen_version} and {required_version}"
+        ),
+    }
+}
+
+fn installed_entries_incompatible_with<'a>(
+    manifest: &'a ContentManifest,
+    candidate: &CanonicalId,
+) -> Vec<&'a ManifestEntry> {
+    manifest
+        .entries
+        .iter()
+        .filter(|entry| entry.canonical_id != *candidate)
+        .filter(|entry| {
+            entry.dependencies.iter().any(|dependency| {
+                dependency.kind == DependencyKind::Incompatible
+                    && dependency
+                        .project_id
+                        .as_deref()
+                        .is_some_and(|project_id| project_id == candidate.project_id())
+            })
+        })
+        .collect()
 }
 
 fn incompatible_conflict(canonical_id: &CanonicalId, installed: &ManifestEntry) -> PlanConflict {
@@ -680,6 +734,26 @@ mod tests {
         assert!(version_conflicts_with_installed(
             &update, &candidate, &installed
         ));
+
+        let manifest = ContentManifest {
+            entries: installed,
+            ..ContentManifest::default()
+        };
+        assert_eq!(
+            installed_entries_incompatible_with(&manifest, &candidate).len(),
+            1
+        );
+    }
+
+    #[test]
+    fn conflicting_exact_dependency_versions_are_unavailable() {
+        let dependency = CanonicalId::for_project(ProviderId::Modrinth, "dependency");
+        let conflict = exact_dependency_conflict(&dependency, "version-a", "version-b");
+
+        assert_eq!(conflict.kind, ConflictKind::Unavailable);
+        assert_eq!(conflict.canonical_id, Some(dependency));
+        assert!(conflict.detail.contains("version-a"));
+        assert!(conflict.detail.contains("version-b"));
     }
 
     #[test]

@@ -382,6 +382,7 @@ where
         bytes_done: None,
         bytes_total: None,
     });
+    let _lifecycle_guard = super::lock_instance_for_content_mutation(state, &request.instance_id)?;
     if state
         .sessions()
         .has_active_instance(&request.instance_id)

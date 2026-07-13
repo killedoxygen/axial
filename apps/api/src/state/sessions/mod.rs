@@ -15,11 +15,11 @@ use axial_launcher::{
 };
 use std::collections::{HashMap, HashSet};
 use std::process::Stdio;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex as StdMutex, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::process::{Child, Command};
-use tokio::sync::{Mutex, RwLock, broadcast};
+use tokio::sync::{Mutex, OwnedMutexGuard, RwLock, broadcast};
 
 const MAX_GUARDIAN_STAGE_DETAILS: usize = 8;
 const MAX_STAGE_EVIDENCE: usize = 16;
@@ -58,6 +58,7 @@ impl ObservedFailureSignal {
 
 pub struct SessionStore {
     sessions: RwLock<HashMap<String, SessionEntry>>,
+    instance_lifecycle_locks: StdMutex<HashMap<String, Weak<Mutex<()>>>>,
     changes: broadcast::Sender<()>,
 }
 
@@ -74,8 +75,28 @@ impl SessionStore {
         let (changes, _) = broadcast::channel(64);
         Self {
             sessions: RwLock::new(HashMap::new()),
+            instance_lifecycle_locks: StdMutex::new(HashMap::new()),
             changes,
         }
+    }
+
+    pub fn try_lock_instance_lifecycle(&self, instance_id: &str) -> Option<OwnedMutexGuard<()>> {
+        let lock = {
+            let mut locks = self
+                .instance_lifecycle_locks
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            locks.retain(|_, lock| lock.strong_count() > 0);
+            match locks.get(instance_id).and_then(Weak::upgrade) {
+                Some(lock) => lock,
+                None => {
+                    let lock = Arc::new(Mutex::new(()));
+                    locks.insert(instance_id.to_string(), Arc::downgrade(&lock));
+                    lock
+                }
+            }
+        };
+        lock.try_lock_owned().ok()
     }
 
     fn notify_changed(&self) {
@@ -1008,6 +1029,19 @@ mod tests {
     use serde_json::json;
     use std::sync::Arc;
     use tokio::process::Command;
+
+    #[test]
+    fn instance_lifecycle_lock_excludes_launch_and_content_races() {
+        let store = SessionStore::new();
+        let first = store
+            .try_lock_instance_lifecycle("instance-1")
+            .expect("first lifecycle operation");
+
+        assert!(store.try_lock_instance_lifecycle("instance-1").is_none());
+        assert!(store.try_lock_instance_lifecycle("instance-2").is_some());
+        drop(first);
+        assert!(store.try_lock_instance_lifecycle("instance-1").is_some());
+    }
 
     #[tokio::test]
     async fn launch_stage_history_tracks_transitions_results_and_healing_notes() {

@@ -314,6 +314,7 @@ where
         bytes_done: None,
         bytes_total: None,
     });
+    let _lifecycle_guard = lock_instance_for_content_mutation(state, &request.instance_id)?;
     let target = target::instance_target(state, &request.instance_id).await?;
     require_installable(&request.selections, &target)?;
     if state
@@ -452,6 +453,7 @@ pub(crate) async fn execute_content_uninstall(
     instance_id: &str,
     canonical_id: &str,
 ) -> Result<(), ContentApiError> {
+    let _lifecycle_guard = lock_instance_for_content_mutation(state, instance_id)?;
     let game_dir = require_instance_game_dir(state, instance_id)?;
     if state.sessions().has_active_instance(instance_id).await {
         return Err(json_error(
@@ -461,6 +463,21 @@ pub(crate) async fn execute_content_uninstall(
     }
     uninstall(&game_dir, &CanonicalId(canonical_id.to_string())).map_err(content_error_response)?;
     Ok(())
+}
+
+fn lock_instance_for_content_mutation(
+    state: &AppState,
+    instance_id: &str,
+) -> Result<tokio::sync::OwnedMutexGuard<()>, ContentApiError> {
+    state
+        .sessions()
+        .try_lock_instance_lifecycle(instance_id)
+        .ok_or_else(|| {
+            json_error(
+                StatusCode::CONFLICT,
+                "another launch or content operation is already using this instance",
+            )
+        })
 }
 
 /// List an instance's tracked content. Along the way it reconciles the manifest

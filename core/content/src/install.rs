@@ -40,6 +40,7 @@ where
     let total = files.len() as i32;
     let staging = StagingGuard::create(game_dir, "axial-content-stage")?;
     let mut relative_paths = Vec::with_capacity(files.len());
+    let mut enabled_states = Vec::with_capacity(files.len());
 
     for (index, planned) in files.iter().enumerate() {
         let Some(kind_dir) = planned.kind.install_subdir() else {
@@ -48,7 +49,13 @@ where
                 planned.kind.as_str()
             )));
         };
-        let relative = format!("{kind_dir}/{}", planned.file.filename);
+        let enabled = preserved_enabled_state(game_dir, &manifest, &planned.canonical_id);
+        let destination_filename = if enabled {
+            planned.file.filename.clone()
+        } else {
+            format!("{}.disabled", planned.file.filename)
+        };
+        let relative = format!("{kind_dir}/{destination_filename}");
         let destination = contained_path(staging.path(), &relative)?;
         if let Some(parent) = destination.parent() {
             fs::create_dir_all(parent)?;
@@ -70,13 +77,14 @@ where
             .map_err(|error| ContentError::Download(error.into_download_error().to_string()))?;
 
         relative_paths.push(relative);
+        enabled_states.push(enabled);
     }
 
     on_progress(progress("commit", total, total, None));
     let transaction = FileTransaction::apply(game_dir, staging.transfer(), &relative_paths)?;
     let mut stale_files = Vec::new();
 
-    for planned in files {
+    for (planned, enabled) in files.iter().zip(&enabled_states) {
         let kind_dir = planned.kind.install_subdir().ok_or_else(|| {
             ContentError::Invalid(format!(
                 "{} is not installable as a single file",
@@ -84,7 +92,7 @@ where
             ))
         })?;
         let subdir = game_dir.join(kind_dir);
-        let entry = ManifestEntry::managed(
+        let mut entry = ManifestEntry::managed(
             planned.canonical_id.clone(),
             planned.provider,
             planned.project_id.clone(),
@@ -94,6 +102,7 @@ where
             planned.dependencies.clone(),
             planned.title.clone(),
         );
+        entry.enabled = *enabled;
         if let Some(stale) = manifest.upsert(entry) {
             stale_files.push((subdir, stale));
         }
@@ -145,6 +154,29 @@ fn remove_content_file_except(subdir: &Path, filename: &str, protected: &HashSet
     }
 }
 
+fn preserved_enabled_state(
+    game_dir: &Path,
+    manifest: &ContentManifest,
+    canonical_id: &CanonicalId,
+) -> bool {
+    let Some(existing) = manifest.find(canonical_id) else {
+        return true;
+    };
+    let Some(kind_dir) = existing.kind.install_subdir() else {
+        return existing.enabled;
+    };
+    let subdir = game_dir.join(kind_dir);
+    let enabled_path = subdir.join(&existing.filename);
+    let disabled_path = subdir.join(format!("{}.disabled", existing.filename));
+    if enabled_path.exists() {
+        true
+    } else if disabled_path.exists() {
+        false
+    } else {
+        existing.enabled
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -174,6 +206,46 @@ mod tests {
             b"new content"
         );
         assert!(!stale_disabled.exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn updates_preserve_the_existing_disabled_file_state() {
+        let root = std::env::temp_dir().join(format!(
+            "axial-content-disabled-update-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock")
+                .as_nanos()
+        ));
+        let mods = root.join("mods");
+        fs::create_dir_all(&mods).expect("create mods directory");
+        fs::write(mods.join("old.jar.disabled"), b"disabled").expect("write disabled mod");
+        let id = CanonicalId::for_project(ProviderId::Modrinth, "project");
+        let mut manifest = ContentManifest::default();
+        manifest.upsert(ManifestEntry::managed(
+            id.clone(),
+            ProviderId::Modrinth,
+            "project".to_string(),
+            "old-version".to_string(),
+            ContentKind::Mod,
+            &FileRef {
+                url: "https://example.invalid/old.jar".to_string(),
+                filename: "old.jar".to_string(),
+                sha1: None,
+                sha512: None,
+                size: None,
+                primary: true,
+            },
+            Vec::new(),
+            None,
+        ));
+
+        assert!(!preserved_enabled_state(&root, &manifest, &id));
+        fs::rename(mods.join("old.jar.disabled"), mods.join("old.jar"))
+            .expect("enable existing mod");
+        assert!(preserved_enabled_state(&root, &manifest, &id));
         let _ = fs::remove_dir_all(root);
     }
 }

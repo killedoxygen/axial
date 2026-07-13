@@ -173,6 +173,17 @@ async fn prepare_launch_session_with_auth_refresh(
             Json(json!({ "error": "instance not found" })),
         )
     })?;
+    let _lifecycle_guard = state
+        .sessions()
+        .try_lock_instance_lifecycle(&instance.id)
+        .ok_or_else(|| {
+            (
+                StatusCode::CONFLICT,
+                Json(json!({
+                    "error": "instance is busy with another launch or content operation"
+                })),
+            )
+        })?;
     if state.sessions().has_active_instance(&instance.id).await {
         return Err((
             StatusCode::CONFLICT,
