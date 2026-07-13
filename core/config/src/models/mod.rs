@@ -44,6 +44,10 @@ fn default_discord_rpc_enabled() -> bool {
     true
 }
 
+fn default_guardian_idle_integrity_enabled() -> bool {
+    true
+}
+
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum AppConfigValidationError {
     #[error("invalid username: {0}")]
@@ -74,6 +78,8 @@ pub struct AppConfig {
     pub performance_mode: String,
     #[serde(default)]
     pub guardian_mode: String,
+    #[serde(default = "default_guardian_idle_integrity_enabled")]
+    pub guardian_idle_integrity_enabled: bool,
     #[serde(default)]
     pub theme: String,
     #[serde(default)]
@@ -119,6 +125,7 @@ impl Default for AppConfig {
             jvm_preset: String::new(),
             performance_mode: "managed".to_string(),
             guardian_mode: "managed".to_string(),
+            guardian_idle_integrity_enabled: true,
             theme: String::new(),
             custom_hue: None,
             custom_vibrancy: None,
@@ -231,6 +238,11 @@ mod tests {
     }
 
     #[test]
+    fn guardian_idle_integrity_defaults_to_enabled() {
+        assert!(AppConfig::default().guardian_idle_integrity_enabled);
+    }
+
+    #[test]
     fn missing_launch_auth_mode_deserializes_to_offline() {
         let config = serde_json::from_value::<AppConfig>(serde_json::json!({
             "username": "Player",
@@ -244,12 +256,32 @@ mod tests {
         assert!(config.telemetry_install_id.is_empty());
         assert!(config.discord_rpc_enabled);
         assert!(!config.discord_rpc_onboarding_seen);
+        assert!(config.guardian_idle_integrity_enabled);
         assert_eq!(
             config
                 .normalized()
                 .expect("config should normalize")
                 .launch_auth_mode,
             LAUNCH_AUTH_MODE_OFFLINE
+        );
+    }
+
+    #[test]
+    fn guardian_idle_integrity_can_be_explicitly_disabled() {
+        let config = serde_json::from_value::<AppConfig>(serde_json::json!({
+            "username": "Player",
+            "max_memory_mb": 4096,
+            "min_memory_mb": 512,
+            "guardian_idle_integrity_enabled": false
+        }))
+        .expect("explicit idle integrity setting should deserialize");
+
+        assert!(!config.guardian_idle_integrity_enabled);
+        assert_eq!(
+            serde_json::to_value(config)
+                .expect("idle integrity setting should serialize")
+                .get("guardian_idle_integrity_enabled"),
+            Some(&serde_json::Value::Bool(false))
         );
     }
 

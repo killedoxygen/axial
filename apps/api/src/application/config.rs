@@ -30,6 +30,7 @@ pub struct ConfigPatch {
     jvm_preset: Option<String>,
     performance_mode: Option<String>,
     guardian_mode: Option<String>,
+    guardian_idle_integrity_enabled: Option<bool>,
     theme: Option<String>,
     custom_hue: Option<i32>,
     custom_vibrancy: Option<i32>,
@@ -84,6 +85,9 @@ pub async fn update_config(state: &AppState, patch: ConfigPatch) -> Result<AppCo
             }
             if let Some(guardian_mode) = patch.guardian_mode {
                 latest.guardian_mode = guardian_mode;
+            }
+            if let Some(guardian_idle_integrity_enabled) = patch.guardian_idle_integrity_enabled {
+                latest.guardian_idle_integrity_enabled = guardian_idle_integrity_enabled;
             }
             if let Some(theme) = patch.theme {
                 latest.theme = theme;
@@ -223,6 +227,16 @@ mod tests {
     }
 
     #[test]
+    fn config_patch_accepts_guardian_idle_integrity_setting() {
+        let patch = serde_json::from_value::<ConfigPatch>(serde_json::json!({
+            "guardian_idle_integrity_enabled": false
+        }))
+        .expect("guardian idle integrity patch should deserialize");
+
+        assert_eq!(patch.guardian_idle_integrity_enabled, Some(false));
+    }
+
+    #[test]
     fn config_patch_rejects_library_ownership_fields() {
         for field in ["library_dir", "library_mode"] {
             let error = serde_json::from_value::<ConfigPatch>(serde_json::json!({
@@ -323,6 +337,49 @@ mod tests {
             .await
             .expect("config change notification should arrive")
             .expect("config change sender should remain open");
+    }
+
+    #[tokio::test]
+    async fn config_update_persists_guardian_idle_integrity_setting() {
+        let fixture = TestFixture::new("guardian-idle-integrity-setting");
+
+        let disabled = super::update_config(
+            &fixture.state,
+            ConfigPatch {
+                guardian_idle_integrity_enabled: Some(false),
+                ..ConfigPatch::default()
+            },
+        )
+        .await
+        .expect("disable guardian idle integrity");
+
+        assert!(!disabled.guardian_idle_integrity_enabled);
+        assert!(
+            !fixture
+                .state
+                .config()
+                .current()
+                .guardian_idle_integrity_enabled
+        );
+
+        let enabled = super::update_config(
+            &fixture.state,
+            ConfigPatch {
+                guardian_idle_integrity_enabled: Some(true),
+                ..ConfigPatch::default()
+            },
+        )
+        .await
+        .expect("enable guardian idle integrity");
+
+        assert!(enabled.guardian_idle_integrity_enabled);
+        assert!(
+            fixture
+                .state
+                .config()
+                .current()
+                .guardian_idle_integrity_enabled
+        );
     }
 
     #[tokio::test]
