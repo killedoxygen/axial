@@ -124,8 +124,8 @@ pub fn read_pack_index(archive: &Path) -> ContentResult<PackIndex> {
 }
 
 /// Materialize a pack into `game_dir`: fetch every indexed file through the
-/// verified downloader, then lay the overrides on top (client overrides last, so
-/// they win).
+/// verified downloader, then lay the overrides on top. Pack payloads never
+/// replace files that already exist in the target instance.
 pub async fn install_pack<F>(
     client: &reqwest::Client,
     game_dir: &Path,
@@ -194,9 +194,7 @@ where
             "the selected modpack files changed; review the pack again".to_string(),
         ));
     }
-    if !selected.is_empty() {
-        reject_occupied_pack_destinations(game_dir, files.iter().map(|file| file.path.as_str()))?;
-    }
+    reject_occupied_pack_destinations(game_dir, files.iter().map(|file| file.path.as_str()))?;
     let total = files.len() as i32;
     let mut installed = Vec::with_capacity(files.len());
     let staging = StagingGuard::create(game_dir, "axial-pack-stage")?;
@@ -258,12 +256,9 @@ where
     relative_paths.sort();
     relative_paths.dedup();
     on_progress(progress("commit", total, total, None));
-    let mut transaction = if selected.is_empty() {
-        FileTransaction::apply(game_dir, staging.transfer(), &relative_paths)?
-    } else {
-        reject_occupied_pack_destinations(game_dir, relative_paths.iter().map(String::as_str))?;
-        FileTransaction::apply_new(game_dir, staging.transfer(), &relative_paths)?
-    };
+    reject_occupied_pack_destinations(game_dir, relative_paths.iter().map(String::as_str))?;
+    let mut transaction =
+        FileTransaction::apply_new(game_dir, staging.transfer(), &relative_paths)?;
     let report = PackInstallReport {
         index,
         installed,
@@ -450,7 +445,7 @@ fn reject_occupied_pack_destinations<'a>(
             match fs::symlink_metadata(destination) {
                 Ok(_) => {
                     return Err(ContentError::Invalid(
-                        "a selected modpack destination is already occupied".to_string(),
+                        "a modpack destination is already occupied".to_string(),
                     ));
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -1099,6 +1094,88 @@ mod tests {
             reject_occupied_pack_destinations(&root, ["mods/example.jar"].into_iter()).is_err()
         );
 
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn full_pack_preserves_an_occupied_indexed_destination() {
+        let root = std::env::temp_dir().join(format!(
+            "axial-pack-full-indexed-occupied-{}-{}",
+            std::process::id(),
+            crate::transaction::staging_dir(Path::new(""), "test")
+                .file_name()
+                .expect("sequence")
+                .to_string_lossy()
+        ));
+        fs::create_dir_all(root.join("mods")).expect("mods");
+        let destination = root.join("mods/example.jar");
+        fs::write(&destination, b"user content").expect("user file");
+        let index = br#"{
+            "formatVersion": 1,
+            "game": "minecraft",
+            "versionId": "1.0.0",
+            "name": "Test Pack",
+            "dependencies": { "minecraft": "1.21.6" },
+            "files": [{
+                "path": "mods/example.jar",
+                "hashes": {},
+                "downloads": ["https://cdn.modrinth.com/example.jar"]
+            }]
+        }"#;
+        let archive = override_archive("full-indexed-occupied", &[(INDEX_FILE, index.to_vec())]);
+
+        let error = install_pack_files(&reqwest::Client::new(), &root, &archive, &[], true, |_| {})
+            .await
+            .expect_err("full pack must not replace an indexed destination");
+
+        assert!(error.to_string().contains("occupied"));
+        assert_eq!(
+            fs::read(&destination).expect("preserved file"),
+            b"user content"
+        );
+        let _ = fs::remove_file(archive);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn full_pack_preserves_an_occupied_override_destination() {
+        let root = std::env::temp_dir().join(format!(
+            "axial-pack-full-override-occupied-{}-{}",
+            std::process::id(),
+            crate::transaction::staging_dir(Path::new(""), "test")
+                .file_name()
+                .expect("sequence")
+                .to_string_lossy()
+        ));
+        fs::create_dir_all(root.join("config")).expect("config");
+        let destination = root.join("config/options.txt");
+        fs::write(&destination, b"user settings").expect("user file");
+        let index = br#"{
+            "formatVersion": 1,
+            "game": "minecraft",
+            "versionId": "1.0.0",
+            "name": "Test Pack",
+            "dependencies": { "minecraft": "1.21.6" },
+            "files": []
+        }"#;
+        let archive = override_archive(
+            "full-override-occupied",
+            &[
+                (INDEX_FILE, index.to_vec()),
+                ("overrides/config/options.txt", b"pack settings".to_vec()),
+            ],
+        );
+
+        let error = install_pack_files(&reqwest::Client::new(), &root, &archive, &[], true, |_| {})
+            .await
+            .expect_err("full pack must not replace an override destination");
+
+        assert!(error.to_string().contains("occupied"));
+        assert_eq!(
+            fs::read(&destination).expect("preserved file"),
+            b"user settings"
+        );
+        let _ = fs::remove_file(archive);
         let _ = fs::remove_dir_all(root);
     }
 }
