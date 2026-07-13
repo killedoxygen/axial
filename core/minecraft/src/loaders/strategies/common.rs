@@ -41,7 +41,6 @@ use crate::loaders::types::{
 };
 use crate::loaders::{validate_provider_version_id, validate_version_id};
 use crate::paths::versions_dir;
-use crate::profiles::ensure_launcher_profiles;
 use crate::runtime::{ManagedRuntimeCache, acquire_preferred_runtime_source};
 use sha1::{Digest as _, Sha1};
 use std::collections::{HashMap, HashSet};
@@ -607,11 +606,6 @@ where
         &installed_version_id,
     )?;
     cleanup_on_error(
-        ensure_launcher_profiles(library_dir, &installed_version_id),
-        library_dir,
-        &installed_version_id,
-    )?;
-    cleanup_on_error(
         finalize_version_install(library_dir, &installed_version_id),
         library_dir,
         &installed_version_id,
@@ -835,11 +829,6 @@ where
     }
 
     cleanup_on_error(
-        ensure_launcher_profiles(library_dir, &installed_version_id),
-        library_dir,
-        &installed_version_id,
-    )?;
-    cleanup_on_error(
         finalize_version_install(library_dir, &installed_version_id),
         library_dir,
         &installed_version_id,
@@ -1011,11 +1000,6 @@ where
         &plan.record.version_id,
     )?;
 
-    cleanup_on_error(
-        ensure_launcher_profiles(library_dir, &plan.record.version_id),
-        library_dir,
-        &plan.record.version_id,
-    )?;
     cleanup_on_error(
         finalize_version_install(library_dir, &plan.record.version_id),
         library_dir,
@@ -3149,48 +3133,6 @@ printf '%s' 'processor-terminal' > "$last"
 
         assert!(matches!(error, LoaderError::ProcessorFailed(_)));
         assert!(!versions_dir(&root).join(&record.version_id).exists());
-        installer_server.stop();
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[tokio::test]
-    async fn finalization_failure_cleans_receipt_backed_version_without_done() {
-        let root = temp_dir("installer-finalization-cleanup");
-        write_base_version(&root, "1.21.5");
-        fs::create_dir_all(root.join("launcher_profiles.json"))
-            .expect("block launcher profile write");
-        let record = installer_record();
-        let installer_server =
-            TestByteServer::start_with_sha1(modern_forge_installer_jar(&record, None));
-        let plan = LoaderInstallPlan {
-            record: record.clone(),
-        };
-        let installer_source =
-            verified_test_source(&installer_server.url, "loader installer").await;
-        let execution = materialize_test_installer_network(
-            &root,
-            bind_test_installer(installer_source, &record),
-            &mut |_| {},
-        )
-        .await;
-        let mut progress = Vec::new();
-
-        let error = finish_supported_installer_install(
-            &root,
-            &plan,
-            execution,
-            test_authenticated_receipt(&root, "1.21.5"),
-            &mut |update| progress.push(update),
-        )
-        .await
-        .expect_err("launcher profile finalization failure");
-
-        assert!(matches!(error, LoaderError::Io(_) | LoaderError::Verify(_)));
-        let version_dir = versions_dir(&root).join(&record.version_id);
-        if version_dir.exists() {
-            assert_eq!(fs::read_dir(version_dir).expect("clean version").count(), 0);
-        }
-        assert!(!progress.iter().any(|update| update.done));
         installer_server.stop();
         let _ = fs::remove_dir_all(root);
     }

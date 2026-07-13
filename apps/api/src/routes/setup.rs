@@ -1,5 +1,8 @@
-use crate::{application, state::AppState};
-use axum::{Json, Router, extract::State, http::StatusCode, routing::post};
+use crate::{
+    application,
+    state::{AppState, RequestProducerHandoff},
+};
+use axum::{Extension, Json, Router, extract::State, http::StatusCode, routing::post};
 
 pub fn router() -> Router<AppState> {
     Router::new()
@@ -12,8 +15,11 @@ pub fn router() -> Router<AppState> {
 
 async fn handle_setup_init(
     State(state): State<AppState>,
+    Extension(handoff): Extension<RequestProducerHandoff>,
 ) -> Result<Json<application::SetupLibraryResponse>, (StatusCode, Json<serde_json::Value>)> {
-    application::setup_init(&state).await.map(Json)
+    application::setup_init_owned(&state, handoff)
+        .await
+        .map(Json)
 }
 
 async fn handle_onboarding_complete(

@@ -10,7 +10,11 @@ pub(crate) use create::{
     CreateLoaderBuildsViewResponse, handle_create_instance_owned, handle_create_instance_view,
     handle_create_loader_builds_view,
 };
-pub(crate) use create_cache::{invalidate_create_view_cache, invalidate_create_view_source};
+#[cfg(test)]
+pub(crate) use create_cache::{
+    create_view_cache_contains_root_for_tests, seed_create_view_cache_for_tests,
+};
+pub(crate) use create_cache::{invalidate_create_view_root, invalidate_create_view_source};
 
 #[cfg(test)]
 use create::{CreateSelection, resolve_loader_create_selection_from_build_catalog};

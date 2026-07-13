@@ -1579,7 +1579,6 @@ mod tests {
 
     #[test]
     fn stale_loader_catalog_rows_are_not_cached_or_reused() {
-        super::super::create_cache::reset_create_view_cache_for_tests();
         let component_id = LoaderComponentId::Fabric;
         let library_dir = std::env::temp_dir().join(format!(
             "axial-create-source-cache-stale-{}",
@@ -1594,8 +1593,6 @@ mod tests {
         store_source_rows(&library_dir, source_id, vec![row]);
         assert!(cacheable_source_rows(&library_dir, source_id).is_none());
         assert!(cached_source_rows(&library_dir, source_id).is_none());
-
-        super::super::create_cache::reset_create_view_cache_for_tests();
     }
 
     fn stale_required_loader_row(

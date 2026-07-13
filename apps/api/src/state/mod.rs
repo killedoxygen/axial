@@ -198,6 +198,17 @@ pub(crate) enum KnownGoodVerificationUnavailable {
 #[error("integrity foreground lease belongs to another application state")]
 pub(crate) struct IntegrityForegroundOwnershipError;
 
+pub(crate) struct ManagedLibrarySetupTarget {
+    owner: Arc<AppConfigStore>,
+    library_dir: PathBuf,
+}
+
+impl ManagedLibrarySetupTarget {
+    pub(crate) fn library_dir(&self) -> &Path {
+        &self.library_dir
+    }
+}
+
 impl InstanceLifecycleLease {
     fn bind(instance_id: &str, guard: tokio::sync::OwnedMutexGuard<()>) -> Self {
         Self {
@@ -930,6 +941,48 @@ impl AppState {
         self.config.close(self.config_commit_observer()).await
     }
 
+    pub(crate) fn managed_library_setup_target(
+        &self,
+        foreground: &IntegrityForegroundLease,
+    ) -> Result<ManagedLibrarySetupTarget, ConfigStoreError> {
+        self.validate_integrity_foreground(foreground)
+            .map_err(|_| ConfigStoreError::Persistence(foreign_integrity_foreground_error()))?;
+        Ok(ManagedLibrarySetupTarget {
+            owner: self.config.clone(),
+            library_dir: self.config.paths().library_dir.clone(),
+        })
+    }
+
+    pub(crate) async fn commit_managed_library_setup(
+        &self,
+        foreground: &IntegrityForegroundLease,
+        target: &ManagedLibrarySetupTarget,
+    ) -> Result<AppConfig, ConfigStoreError> {
+        self.validate_integrity_foreground(foreground)
+            .map_err(|_| ConfigStoreError::Persistence(foreign_integrity_foreground_error()))?;
+        if !Arc::ptr_eq(&target.owner, &self.config)
+            || target.library_dir != self.config.paths().library_dir
+        {
+            return Err(ConfigStoreError::Persistence(
+                foreign_integrity_foreground_error(),
+            ));
+        }
+        let gate = self.config.acquire_mutation().await?;
+        let library_dir = target.library_dir.to_string_lossy().into_owned();
+        self.config
+            .mutate_with_gate(
+                move |latest| {
+                    latest.library_dir = library_dir;
+                    latest.library_mode = "managed".to_string();
+                    Ok(())
+                },
+                self.telemetry.export_configured(),
+                self.config_commit_observer(),
+                gate,
+            )
+            .await
+    }
+
     pub(crate) async fn create_instance(
         &self,
         foreground: &IntegrityForegroundLease,
@@ -1366,12 +1419,18 @@ impl AppState {
         let telemetry = self.telemetry.clone();
         let changes = self.config_changes.clone();
         let known_good = self.known_good.clone();
+        let installed_versions = self.installed_versions.clone();
         Arc::new(move |previous: AppConfig, current: AppConfig| {
             if previous.telemetry_enabled && !current.telemetry_enabled {
                 telemetry.clear_queue();
             }
             if previous.library_dir != current.library_dir {
                 known_good.clear_active();
+            }
+            if previous.library_dir != current.library_dir
+                || previous.library_mode != current.library_mode
+            {
+                installed_versions.invalidate();
             }
             let _ = changes.send(());
         })
@@ -1648,6 +1707,67 @@ mod known_good_identity_tests {
         assert_eq!(state.installed_versions_walk_count(), 1);
         assert!(state.subscribe_integrity_idle().borrow().is_stably_idle());
 
+        state
+            .close_known_good_inventories()
+            .await
+            .expect("close known-good store");
+        drop(state);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn library_root_config_commit_invalidates_installed_version_cache() {
+        let root = std::env::temp_dir().join(format!(
+            "axial-installed-cache-root-commit-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let state = known_good_state_fixture(&root);
+        let first_root = root.join("first-library");
+        let second_root = root.join("second-library");
+        std::fs::create_dir_all(axial_minecraft::versions_dir(&first_root))
+            .expect("create first versions root");
+        std::fs::create_dir_all(axial_minecraft::versions_dir(&second_root))
+            .expect("create second versions root");
+
+        let first_root_config = first_root.to_string_lossy().into_owned();
+        state
+            .mutate_config(move |latest| {
+                latest.library_dir = first_root_config;
+                latest.library_mode = "existing".to_string();
+                Ok(())
+            })
+            .await
+            .expect("publish first library root");
+        let producer = state.try_claim_producer().expect("claim lookup producer");
+        state
+            .installed_versions_snapshot(&producer)
+            .await
+            .expect("scan first library root");
+        state
+            .installed_versions_snapshot(&producer)
+            .await
+            .expect("reuse first library root snapshot");
+        assert_eq!(state.installed_versions_walk_count(), 1);
+
+        let second_root_config = second_root.to_string_lossy().into_owned();
+        state
+            .mutate_config(move |latest| {
+                latest.library_dir = second_root_config;
+                Ok(())
+            })
+            .await
+            .expect("publish changed library root");
+        state
+            .installed_versions_snapshot(&producer)
+            .await
+            .expect("scan changed library root");
+        assert_eq!(state.installed_versions_walk_count(), 2);
+
+        drop(producer);
         state
             .close_known_good_inventories()
             .await

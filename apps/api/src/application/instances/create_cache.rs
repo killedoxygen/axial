@@ -64,9 +64,11 @@ pub(super) fn store_source_rows(
     );
 }
 
-pub(crate) fn invalidate_create_view_cache() {
+pub(crate) fn invalidate_create_view_root(library_dir: &Path) {
     if let Ok(mut cache) = CREATE_VIEW_CACHE.lock() {
-        cache.source_rows.clear();
+        cache
+            .source_rows
+            .retain(|key, _| key.library_dir.as_path() != library_dir);
     }
 }
 
@@ -80,8 +82,21 @@ pub(crate) fn invalidate_create_view_source(library_dir: &Path, source_id: &str)
 }
 
 #[cfg(test)]
-pub(super) fn reset_create_view_cache_for_tests() {
-    invalidate_create_view_cache();
+pub(crate) fn seed_create_view_cache_for_tests(library_dir: &Path) {
+    store_source_rows(library_dir, "test-source", Vec::new());
+}
+
+#[cfg(test)]
+pub(crate) fn create_view_cache_contains_root_for_tests(library_dir: &Path) -> bool {
+    CREATE_VIEW_CACHE
+        .lock()
+        .map(|cache| {
+            cache
+                .source_rows
+                .keys()
+                .any(|key| key.library_dir.as_path() == library_dir)
+        })
+        .unwrap_or_default()
 }
 
 impl CreateViewCache {

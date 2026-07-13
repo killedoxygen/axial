@@ -10,7 +10,6 @@ pub mod lifecycle;
 pub mod loaders;
 pub mod manifest;
 pub mod paths;
-pub mod profiles;
 pub mod rules;
 pub mod runtime;
 pub mod types;
@@ -47,7 +46,6 @@ pub use paths::{
     cache_dir, create_minecraft_dir, default_minecraft_dir, libraries_dir, loader_cache_dir,
     loader_catalog_dir, validate_installation, version_manifest_cache_path, versions_dir,
 };
-pub use profiles::ensure_launcher_profiles;
 pub use rules::{
     Environment, Rule, current_os_arch, current_os_name, default_environment, evaluate_rules,
     is_native_library, native_classifier_key,

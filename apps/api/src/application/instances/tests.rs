@@ -2538,7 +2538,6 @@ async fn create_instance_view_marks_loader_minecraft_row_full_when_any_loader_is
 
 #[tokio::test]
 async fn create_instance_view_refreshes_when_versions_root_metadata_changes() {
-    super::create_cache::reset_create_view_cache_for_tests();
     let fixture = TestFixture::new("create-view-installed-scan-cache");
     let library_dir = fixture.root.join("library");
     fixture
