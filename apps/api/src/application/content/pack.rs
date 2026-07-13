@@ -122,6 +122,15 @@ struct ResolvedModpackVersion {
     version: axial_content::ContentVersion,
 }
 
+#[derive(Debug)]
+struct PackFileCompatibility {
+    game: bool,
+    loader: bool,
+    title: String,
+}
+
+type PackCompatibilityMap = HashMap<(String, String), PackFileCompatibility>;
+
 async fn resolve_modpack_version(
     state: &AppState,
     canonical_id: &str,
@@ -269,7 +278,7 @@ async fn classify_modpack_files(
         .metadata(&project_ids)
         .await
         .unwrap_or_default();
-    let identity_versions: HashMap<(String, String), Option<(bool, bool, String)>> = identities
+    let identity_versions: PackCompatibilityMap = identities
         .values()
         .map(|identity| {
             let project_id = CanonicalId::for_project(identity.provider, &identity.project_id);
@@ -288,7 +297,11 @@ async fn classify_modpack_files(
                 .unwrap_or_else(|| identity.project_id.clone());
             (
                 (project_id.as_str().to_string(), identity.version_id.clone()),
-                Some((game, loader, title)),
+                PackFileCompatibility {
+                    game,
+                    loader,
+                    title,
+                },
             )
         })
         .collect();
@@ -320,7 +333,7 @@ fn classify_modpack_file_options(
     game_dir: &Path,
     index: &PackIndex,
     identities: &HashMap<String, VersionIdentity>,
-    identity_versions: &HashMap<(String, String), Option<(bool, bool, String)>>,
+    identity_versions: &PackCompatibilityMap,
 ) -> Vec<ModpackFileOption> {
     let mut files = Vec::new();
     for file in &index.files {
@@ -330,8 +343,9 @@ fn classify_modpack_file_options(
             let project_id = CanonicalId::for_project(identity.provider, &identity.project_id);
             identity_versions
                 .get(&(project_id.as_str().to_string(), identity.version_id.clone()))
-                .and_then(Option::as_ref)
-                .is_some_and(|(game, loader, _)| *game && (kind != ContentKind::Mod || *loader))
+                .is_some_and(|compatibility| {
+                    compatibility.game && (kind != ContentKind::Mod || compatibility.loader)
+                })
         } else {
             false
         };
@@ -352,8 +366,7 @@ fn classify_modpack_file_options(
                         CanonicalId::for_project(identity.provider, &identity.project_id);
                     identity_versions
                         .get(&(project_id.as_str().to_string(), identity.version_id.clone()))
-                        .and_then(|compatibility| compatibility.as_ref())
-                        .map(|(_, _, title)| title.clone())
+                        .map(|compatibility| compatibility.title.clone())
                         .or_else(|| identity.title.clone())
                 })
                 .unwrap_or_else(|| file.filename().to_string()),

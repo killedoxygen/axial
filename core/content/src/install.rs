@@ -341,6 +341,32 @@ fn preserved_enabled_state(
     }
 }
 
+fn progress(phase: &str, current: i32, total: i32, file: Option<String>) -> DownloadProgress {
+    DownloadProgress {
+        phase: phase.to_string(),
+        current,
+        total,
+        file,
+        error: None,
+        done: false,
+        bytes_done: None,
+        bytes_total: None,
+    }
+}
+
+fn done(total: i32) -> DownloadProgress {
+    DownloadProgress {
+        phase: "done".to_string(),
+        current: total,
+        total,
+        file: None,
+        error: None,
+        done: true,
+        bytes_done: None,
+        bytes_total: None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -598,31 +624,5 @@ mod tests {
                 .is_some()
         );
         let _ = fs::remove_dir_all(root);
-    }
-}
-
-fn progress(phase: &str, current: i32, total: i32, file: Option<String>) -> DownloadProgress {
-    DownloadProgress {
-        phase: phase.to_string(),
-        current,
-        total,
-        file,
-        error: None,
-        done: false,
-        bytes_done: None,
-        bytes_total: None,
-    }
-}
-
-fn done(total: i32) -> DownloadProgress {
-    DownloadProgress {
-        phase: "done".to_string(),
-        current: total,
-        total,
-        file: None,
-        error: None,
-        done: true,
-        bytes_done: None,
-        bytes_total: None,
     }
 }

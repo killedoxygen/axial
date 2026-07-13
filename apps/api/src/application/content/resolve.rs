@@ -322,9 +322,12 @@ async fn resolve_pass(
         if !metadata_requested.contains(&canonical_id) {
             let mut missing_ids = HashSet::new();
             missing_ids.insert(canonical_id.clone());
-            missing_ids.extend(queue.iter().filter_map(|(queued_id, _, _)| {
-                (!metadata_requested.contains(queued_id)).then(|| queued_id.clone())
-            }));
+            missing_ids.extend(
+                queue
+                    .iter()
+                    .filter(|(queued_id, _, _)| !metadata_requested.contains(queued_id))
+                    .map(|(queued_id, _, _)| queued_id.clone()),
+            );
             let missing_ids: Vec<CanonicalId> = missing_ids.into_iter().collect();
             let fetched = state
                 .content()
