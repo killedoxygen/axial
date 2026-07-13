@@ -134,6 +134,7 @@ impl Drop for KnownGoodRetirementReservation {
 
 struct ActiveInventory<T> {
     version_id: String,
+    created_at: String,
     library_root: PathBuf,
     inventory: Arc<T>,
 }
@@ -156,11 +157,12 @@ impl<T> ActiveInventories<T> {
         snapshot: &KnownGoodSnapshot,
         instance_id: &str,
         version_id: &str,
+        created_at: &str,
         library_root: PathBuf,
         inventory: Arc<T>,
     ) -> io::Result<()> {
         snapshot.validate()?;
-        self.activate(instance_id, version_id, library_root, inventory);
+        self.activate(instance_id, version_id, created_at, library_root, inventory);
         Ok(())
     }
 
@@ -168,6 +170,7 @@ impl<T> ActiveInventories<T> {
         &mut self,
         instance_id: &str,
         version_id: &str,
+        created_at: &str,
         library_root: PathBuf,
         inventory: Arc<T>,
     ) {
@@ -175,15 +178,24 @@ impl<T> ActiveInventories<T> {
             instance_id.to_string(),
             ActiveInventory {
                 version_id: version_id.to_string(),
+                created_at: created_at.to_string(),
                 library_root,
                 inventory,
             },
         );
     }
 
-    fn get(&self, instance_id: &str, version_id: &str, library_root: &Path) -> Option<Arc<T>> {
+    fn get(
+        &self,
+        instance_id: &str,
+        version_id: &str,
+        created_at: &str,
+        library_root: &Path,
+    ) -> Option<Arc<T>> {
         let active = self.by_instance.get(instance_id)?;
-        (active.version_id == version_id && active.library_root == library_root)
+        (active.version_id == version_id
+            && active.created_at == created_at
+            && active.library_root == library_root)
             .then(|| active.inventory.clone())
     }
 
@@ -191,20 +203,26 @@ impl<T> ActiveInventories<T> {
         self.by_instance.remove(instance_id);
     }
 
-    fn remove_exact(&mut self, instance_id: &str, version_id: &str, library_root: &Path) {
+    fn remove_exact(
+        &mut self,
+        instance_id: &str,
+        version_id: &str,
+        created_at: &str,
+        library_root: &Path,
+    ) {
         if self.by_instance.get(instance_id).is_some_and(|active| {
-            active.version_id == version_id && active.library_root == library_root
+            active.version_id == version_id
+                && active.created_at == created_at
+                && active.library_root == library_root
         }) {
             self.by_instance.remove(instance_id);
         }
     }
 
-    fn remove_identity(&mut self, instance_id: &str, version_id: &str) {
-        if self
-            .by_instance
-            .get(instance_id)
-            .is_some_and(|active| active.version_id == version_id)
-        {
+    fn remove_incarnation(&mut self, instance_id: &str, version_id: &str, created_at: &str) {
+        if self.by_instance.get(instance_id).is_some_and(|active| {
+            active.version_id == version_id && active.created_at == created_at
+        }) {
             self.by_instance.remove(instance_id);
         }
     }
@@ -300,6 +318,7 @@ impl KnownGoodInventoryStore {
         &self,
         instance_id: &str,
         version_id: &str,
+        created_at: &str,
         library_root: &Path,
         inventory: Arc<KnownGoodInventory>,
     ) -> io::Result<()> {
@@ -327,7 +346,14 @@ impl KnownGoodInventoryStore {
         self.active
             .lock()
             .expect(STORE_LOCK_INVARIANT)
-            .activate_validated(&snapshot, instance_id, version_id, library_root, inventory)?;
+            .activate_validated(
+                &snapshot,
+                instance_id,
+                version_id,
+                created_at,
+                library_root,
+                inventory,
+            )?;
         Ok(())
     }
 
@@ -335,22 +361,26 @@ impl KnownGoodInventoryStore {
         &self,
         instance_id: &str,
         version_id: &str,
+        created_at: &str,
         library_root: &Path,
     ) -> Option<Arc<KnownGoodInventory>> {
         if !is_canonical_instance_id(instance_id) {
             return None;
         }
         let library_root = normalize_library_root(library_root).ok()?;
-        self.active
-            .lock()
-            .expect(STORE_LOCK_INVARIANT)
-            .get(instance_id, version_id, &library_root)
+        self.active.lock().expect(STORE_LOCK_INVARIANT).get(
+            instance_id,
+            version_id,
+            created_at,
+            &library_root,
+        )
     }
 
     pub(super) fn deactivate_exact(
         &self,
         instance_id: &str,
         version_id: &str,
+        created_at: &str,
         library_root: &Path,
     ) {
         let normalized_root = normalize_library_root(library_root).ok();
@@ -359,6 +389,7 @@ impl KnownGoodInventoryStore {
             &mut active,
             instance_id,
             version_id,
+            created_at,
             normalized_root.as_deref(),
         );
     }
@@ -370,13 +401,16 @@ impl KnownGoodInventoryStore {
     pub(super) fn retain_active(
         &self,
         library_root: &Path,
-        instances: impl IntoIterator<Item = (String, String)>,
+        instances: impl IntoIterator<Item = (String, String, String)>,
     ) {
         let Ok(library_root) = normalize_library_root(library_root) else {
             self.clear_active();
             return;
         };
-        let instances = instances.into_iter().collect::<HashMap<_, _>>();
+        let instances = instances
+            .into_iter()
+            .map(|(instance_id, version_id, created_at)| (instance_id, (version_id, created_at)))
+            .collect::<HashMap<_, _>>();
         self.active
             .lock()
             .expect(STORE_LOCK_INVARIANT)
@@ -385,7 +419,9 @@ impl KnownGoodInventoryStore {
                 active.library_root == library_root
                     && instances
                         .get(instance_id)
-                        .is_some_and(|version_id| version_id == &active.version_id)
+                        .is_some_and(|(version_id, created_at)| {
+                            version_id == &active.version_id && created_at == &active.created_at
+                        })
             });
     }
 
@@ -1148,11 +1184,14 @@ fn deactivate_active_inventory<T>(
     active: &mut ActiveInventories<T>,
     instance_id: &str,
     version_id: &str,
+    created_at: &str,
     normalized_root: Option<&Path>,
 ) {
     match normalized_root {
-        Some(library_root) => active.remove_exact(instance_id, version_id, library_root),
-        None => active.remove_identity(instance_id, version_id),
+        Some(library_root) => {
+            active.remove_exact(instance_id, version_id, created_at, library_root)
+        }
+        None => active.remove_incarnation(instance_id, version_id, created_at),
     }
 }
 
@@ -1434,7 +1473,7 @@ mod tests {
     }
 
     #[test]
-    fn active_authority_requires_exact_identity_and_replaces_only_its_instance() {
+    fn active_authority_requires_exact_incarnation_and_replaces_only_its_instance() {
         let root = PathBuf::from("/library");
         let other_root = PathBuf::from("/other-library");
         let first = Arc::new(1_u8);
@@ -1442,38 +1481,97 @@ mod tests {
         let unrelated = Arc::new(3_u8);
         let mut active = ActiveInventories::default();
 
-        active.activate("0000000000000001", "1.21.5", root.clone(), first);
+        active.activate(
+            "0000000000000001",
+            "1.21.5",
+            "created-1",
+            root.clone(),
+            first,
+        );
         active.activate(
             "0000000000000002",
             "1.21.6",
+            "created-2",
             root.clone(),
             unrelated.clone(),
         );
-        assert!(active.get("0000000000000001", "1.21.4", &root).is_none());
         assert!(
             active
-                .get("0000000000000001", "1.21.5", &other_root)
+                .get("0000000000000001", "1.21.4", "created-1", &root)
+                .is_none()
+        );
+        assert!(
+            active
+                .get("0000000000000001", "1.21.5", "created-other", &root)
+                .is_none()
+        );
+        assert!(
+            active
+                .get("0000000000000001", "1.21.5", "created-1", &other_root,)
                 .is_none()
         );
 
         active.activate(
             "0000000000000001",
             "1.21.7",
+            "created-1",
             other_root.clone(),
             replacement.clone(),
         );
-        assert!(active.get("0000000000000001", "1.21.5", &root).is_none());
+        assert!(
+            active
+                .get("0000000000000001", "1.21.5", "created-1", &root)
+                .is_none()
+        );
         assert!(Arc::ptr_eq(
             &active
-                .get("0000000000000001", "1.21.7", &other_root)
+                .get("0000000000000001", "1.21.7", "created-1", &other_root,)
                 .expect("replacement authority"),
             &replacement
         ));
         assert!(Arc::ptr_eq(
             &active
-                .get("0000000000000002", "1.21.6", &root)
+                .get("0000000000000002", "1.21.6", "created-2", &root)
                 .expect("unrelated authority"),
             &unrelated
+        ));
+    }
+
+    #[test]
+    fn same_id_version_and_root_recreation_cannot_inherit_or_lose_replacement_authority() {
+        let instance_id = "0000000000000001";
+        let version_id = "1.21.5";
+        let root = PathBuf::from("/library");
+        let replacement = Arc::new(2_u8);
+        let mut active = ActiveInventories::default();
+
+        active.activate(
+            instance_id,
+            version_id,
+            "old-created-at",
+            root.clone(),
+            Arc::new(1_u8),
+        );
+        active.activate(
+            instance_id,
+            version_id,
+            "new-created-at",
+            root.clone(),
+            replacement.clone(),
+        );
+
+        assert!(
+            active
+                .get(instance_id, version_id, "old-created-at", &root)
+                .is_none(),
+            "the old incarnation must not use replacement authority as a live fast path"
+        );
+        active.remove_exact(instance_id, version_id, "old-created-at", &root);
+        assert!(Arc::ptr_eq(
+            &active
+                .get(instance_id, version_id, "new-created-at", &root)
+                .expect("replacement authority survives stale cleanup"),
+            &replacement
         ));
     }
 
@@ -1494,30 +1592,63 @@ mod tests {
                 &incompatible,
                 instance_id,
                 version_id,
+                "created-1",
                 root.clone(),
                 Arc::new(1_u8),
             )
             .expect_err("incompatible producer contract must fail closed");
 
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
-        assert!(active.get(instance_id, version_id, &root).is_none());
+        assert!(
+            active
+                .get(instance_id, version_id, "created-1", &root)
+                .is_none()
+        );
     }
 
     #[test]
     fn retirement_exact_removal_and_clear_are_fail_closed() {
         let root = PathBuf::from("/library");
         let mut active = ActiveInventories::default();
-        active.activate("0000000000000001", "1.21.5", root.clone(), Arc::new(1_u8));
-        active.activate("0000000000000002", "1.21.6", root.clone(), Arc::new(2_u8));
+        active.activate(
+            "0000000000000001",
+            "1.21.5",
+            "created-1",
+            root.clone(),
+            Arc::new(1_u8),
+        );
+        active.activate(
+            "0000000000000002",
+            "1.21.6",
+            "created-2",
+            root.clone(),
+            Arc::new(2_u8),
+        );
 
-        active.remove_exact("0000000000000001", "1.21.4", &root);
-        assert!(active.get("0000000000000001", "1.21.5", &root).is_some());
+        active.remove_exact("0000000000000001", "1.21.4", "created-1", &root);
+        assert!(
+            active
+                .get("0000000000000001", "1.21.5", "created-1", &root)
+                .is_some()
+        );
         active.remove("0000000000000001");
-        assert!(active.get("0000000000000001", "1.21.5", &root).is_none());
-        assert!(active.get("0000000000000002", "1.21.6", &root).is_some());
+        assert!(
+            active
+                .get("0000000000000001", "1.21.5", "created-1", &root)
+                .is_none()
+        );
+        assert!(
+            active
+                .get("0000000000000002", "1.21.6", "created-2", &root)
+                .is_some()
+        );
 
         active.clear();
-        assert!(active.get("0000000000000002", "1.21.6", &root).is_none());
+        assert!(
+            active
+                .get("0000000000000002", "1.21.6", "created-2", &root)
+                .is_none()
+        );
     }
 
     #[test]
@@ -1536,33 +1667,35 @@ mod tests {
         active.activate(
             "0000000000000001",
             "1.21.5",
+            "created-1",
             bound_root.clone(),
             Arc::new(1_u8),
         );
         active.activate(
             "0000000000000002",
             "1.21.6",
+            "created-2",
             bound_root.clone(),
             Arc::new(2_u8),
         );
 
         assert!(normalize_library_root(&missing_root).is_err());
-        deactivate_active_inventory(&mut active, "0000000000000001", "1.21.4", None);
+        deactivate_active_inventory(&mut active, "0000000000000001", "1.21.4", "created-1", None);
         assert!(
             active
-                .get("0000000000000001", "1.21.5", &bound_root)
+                .get("0000000000000001", "1.21.5", "created-1", &bound_root,)
                 .is_some()
         );
 
-        deactivate_active_inventory(&mut active, "0000000000000001", "1.21.5", None);
+        deactivate_active_inventory(&mut active, "0000000000000001", "1.21.5", "created-1", None);
         assert!(
             active
-                .get("0000000000000001", "1.21.5", &bound_root)
+                .get("0000000000000001", "1.21.5", "created-1", &bound_root,)
                 .is_none()
         );
         assert!(
             active
-                .get("0000000000000002", "1.21.6", &bound_root)
+                .get("0000000000000002", "1.21.6", "created-2", &bound_root,)
                 .is_some()
         );
     }
@@ -1649,7 +1782,12 @@ mod tests {
         assert_eq!(fs::read(path).expect("read untouched snapshot"), bytes);
         assert!(
             store
-                .active_inventory("0000000000000002", "1.21.5", &paths.library_dir,)
+                .active_inventory(
+                    "0000000000000002",
+                    "1.21.5",
+                    "created-2",
+                    &paths.library_dir,
+                )
                 .is_none()
         );
         drop(store);

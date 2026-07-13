@@ -13,6 +13,7 @@ mod instance_registry;
 mod java_probe_failures;
 mod journals;
 mod known_good;
+mod known_good_rebuilds;
 pub(crate) mod launch_reports;
 mod lifecycle;
 pub mod ownership;
@@ -105,6 +106,7 @@ pub struct AppState {
     journals: Arc<OperationJournalStore>,
     installed_versions: Arc<installed_versions::InstalledVersionsIndex>,
     known_good: Arc<known_good::KnownGoodInventoryStore>,
+    known_good_rebuilds: Arc<known_good_rebuilds::KnownGoodRebuildFlights>,
     java_probe_failures: Arc<JavaProbeFailureCache>,
     sessions: Arc<SessionStore>,
     skins: Arc<skins::SavedSkinStore>,
@@ -141,15 +143,17 @@ struct KnownGoodCandidateAdmission {
     _lifecycle: tokio::sync::OwnedMutexGuard<()>,
     instance_id: String,
     version_id: String,
+    created_at: String,
     library_root: PathBuf,
 }
 
 impl KnownGoodCandidateAdmission {
     fn revalidate(&self, state: &AppState) -> std::io::Result<bool> {
-        if !matches_known_good_identity(
+        if !matches_known_good_incarnation(
             state.instances.get(&self.instance_id).as_ref(),
             &self.instance_id,
             &self.version_id,
+            &self.created_at,
         ) {
             return Ok(false);
         }
@@ -158,9 +162,12 @@ impl KnownGoodCandidateAdmission {
     }
 
     fn deactivate(&self, state: &AppState) {
-        state
-            .known_good
-            .deactivate_exact(&self.instance_id, &self.version_id, &self.library_root);
+        state.known_good.deactivate_exact(
+            &self.instance_id,
+            &self.version_id,
+            &self.created_at,
+            &self.library_root,
+        );
     }
 }
 
@@ -346,6 +353,7 @@ impl AppState {
             journals,
             installed_versions: Arc::new(installed_versions::InstalledVersionsIndex::default()),
             known_good,
+            known_good_rebuilds: Arc::new(known_good_rebuilds::KnownGoodRebuildFlights::default()),
             java_probe_failures: Arc::new(JavaProbeFailureCache::default()),
             sessions: init.sessions,
             skins,
@@ -470,9 +478,14 @@ impl AppState {
             .list()
             .into_iter()
             .filter(|instance| {
-                matches_known_good_identity(Some(instance), &instance.id, &version_id)
+                matches_known_good_incarnation(
+                    Some(instance),
+                    &instance.id,
+                    &version_id,
+                    &instance.created_at,
+                )
             })
-            .map(|instance| instance.id)
+            .map(|instance| (instance.id, instance.created_at))
             .take(INSTANCE_REGISTRY_MAX_ENTRIES + 1)
             .collect::<Vec<_>>();
         if candidates.len() > INSTANCE_REGISTRY_MAX_ENTRIES {
@@ -484,12 +497,13 @@ impl AppState {
         let inventory = Arc::new(inventory);
         let version_id = version_id.as_str();
         let installed_library_root = installed_library_root.as_path();
-        complete_independent_known_good_fanout(candidates, |instance_id| {
+        complete_independent_known_good_fanout(candidates, |(instance_id, created_at)| {
             let inventory = inventory.clone();
             async move {
                 self.reconcile_known_good_instance(
                     &instance_id,
                     version_id,
+                    &created_at,
                     installed_library_root,
                     inventory,
                 )
@@ -503,11 +517,12 @@ impl AppState {
         &self,
         instance_id: &str,
         version_id: &str,
+        created_at: &str,
         installed_library_root: &Path,
         inventory: Arc<axial_minecraft::known_good::KnownGoodInventory>,
     ) -> std::io::Result<()> {
         let admission = match self
-            .admit_known_good_candidate(instance_id, version_id, installed_library_root)
+            .admit_known_good_candidate(instance_id, version_id, created_at, installed_library_root)
             .await
         {
             Ok(Some(admission)) => admission,
@@ -520,6 +535,7 @@ impl AppState {
             .reconcile(
                 &admission.instance_id,
                 &admission.version_id,
+                &admission.created_at,
                 &admission.library_root,
                 inventory,
             )
@@ -545,6 +561,7 @@ impl AppState {
             .active_inventory(
                 &admission.instance_id,
                 &admission.version_id,
+                &admission.created_at,
                 &admission.library_root,
             )
             .is_none()
@@ -562,16 +579,22 @@ impl AppState {
         &self,
         instance_id: &str,
         version_id: &str,
+        created_at: &str,
         installed_library_root: &Path,
     ) -> std::io::Result<Option<KnownGoodCandidateAdmission>> {
         let lifecycle = self.acquire_instance_lifecycle(instance_id).await;
-        if !matches_known_good_identity(
+        if !matches_known_good_incarnation(
             self.instances.get(instance_id).as_ref(),
             instance_id,
             version_id,
+            created_at,
         ) {
-            self.known_good
-                .deactivate_exact(instance_id, version_id, installed_library_root);
+            self.known_good.deactivate_exact(
+                instance_id,
+                version_id,
+                created_at,
+                installed_library_root,
+            );
             return Ok(None);
         }
         let library_root = match require_matching_known_good_library_root(
@@ -580,8 +603,12 @@ impl AppState {
         ) {
             Ok(root) => root,
             Err(error) => {
-                self.known_good
-                    .deactivate_exact(instance_id, version_id, installed_library_root);
+                self.known_good.deactivate_exact(
+                    instance_id,
+                    version_id,
+                    created_at,
+                    installed_library_root,
+                );
                 return Err(error);
             }
         };
@@ -589,6 +616,7 @@ impl AppState {
             _lifecycle: lifecycle,
             instance_id: instance_id.to_string(),
             version_id: version_id.to_string(),
+            created_at: created_at.to_string(),
             library_root,
         }))
     }
@@ -982,7 +1010,7 @@ impl AppState {
                 .list()
                 .into_iter()
                 .filter(|instance| is_canonical_instance_id(&instance.id))
-                .map(|instance| (instance.id, instance.version_id)),
+                .map(|instance| (instance.id, instance.version_id, instance.created_at)),
         );
     }
 
@@ -1046,12 +1074,12 @@ fn bound_startup_warnings(warnings: Vec<String>) -> Vec<String> {
         .collect()
 }
 
-async fn complete_independent_known_good_fanout<F, Fut>(
-    candidates: Vec<String>,
+async fn complete_independent_known_good_fanout<C, F, Fut>(
+    candidates: Vec<C>,
     mut activate: F,
 ) -> std::io::Result<()>
 where
-    F: FnMut(String) -> Fut,
+    F: FnMut(C) -> Fut,
     Fut: std::future::Future<Output = std::io::Result<()>>,
 {
     let mut first_error = None;
@@ -1065,14 +1093,16 @@ where
     first_error.map_or(Ok(()), Err)
 }
 
-fn matches_known_good_identity(
+fn matches_known_good_incarnation(
     instance: Option<&axial_config::Instance>,
     instance_id: &str,
     version_id: &str,
+    created_at: &str,
 ) -> bool {
     instance.is_some_and(|instance| {
         instance.id == instance_id
             && instance.version_id == version_id
+            && instance.created_at == created_at
             && is_canonical_instance_id(&instance.id)
     })
 }
@@ -1163,8 +1193,13 @@ mod known_good_identity_tests {
             .insert_for_test("Drifted", "1.21.5")
             .expect("drifted instance");
         let exact_id = exact.id.clone();
+        let exact_created_at = exact.created_at.clone();
         let drifted_id = drifted.id.clone();
-        let fanout_candidates = vec![exact_id.clone(), drifted_id.clone()];
+        let drifted_created_at = drifted.created_at.clone();
+        let fanout_candidates = vec![
+            (exact_id.clone(), exact_created_at),
+            (drifted_id.clone(), drifted_created_at),
+        ];
         let lifecycle = state.acquire_instance_lifecycle(&drifted.id).await;
         let activated = Arc::new(Mutex::new(Vec::new()));
         let first_activated = Arc::new(tokio::sync::Notify::new());
@@ -1173,25 +1208,33 @@ mod known_good_identity_tests {
         let fanout_activated = activated.clone();
         let fanout_first_activated = first_activated.clone();
         let fanout = tokio::spawn(async move {
-            complete_independent_known_good_fanout(fanout_candidates, |instance_id| {
-                let state = fanout_state.clone();
-                let library_root = fanout_root.clone();
-                let activated = fanout_activated.clone();
-                let first_activated = fanout_first_activated.clone();
-                async move {
-                    if let Some(admission) = state
-                        .admit_known_good_candidate(&instance_id, "1.21.5", &library_root)
-                        .await?
-                    {
-                        activated
-                            .lock()
-                            .expect("activated candidates")
-                            .push(admission.instance_id.clone());
-                        first_activated.notify_one();
+            complete_independent_known_good_fanout(
+                fanout_candidates,
+                |(instance_id, created_at)| {
+                    let state = fanout_state.clone();
+                    let library_root = fanout_root.clone();
+                    let activated = fanout_activated.clone();
+                    let first_activated = fanout_first_activated.clone();
+                    async move {
+                        if let Some(admission) = state
+                            .admit_known_good_candidate(
+                                &instance_id,
+                                "1.21.5",
+                                &created_at,
+                                &library_root,
+                            )
+                            .await?
+                        {
+                            activated
+                                .lock()
+                                .expect("activated candidates")
+                                .push(admission.instance_id.clone());
+                            first_activated.notify_one();
+                        }
+                        Ok(())
                     }
-                    Ok(())
-                }
-            })
+                },
+            )
             .await
         });
 
@@ -1253,10 +1296,16 @@ mod known_good_identity_tests {
         let lifecycle = state.acquire_instance_lifecycle(&instance.id).await;
         let admission_state = state.clone();
         let admission_id = instance.id.clone();
+        let admission_created_at = instance.created_at.clone();
         let admission_root = installed_root.clone();
         let admission = tokio::spawn(async move {
             admission_state
-                .admit_known_good_candidate(&admission_id, "1.21.5", &admission_root)
+                .admit_known_good_candidate(
+                    &admission_id,
+                    "1.21.5",
+                    &admission_created_at,
+                    &admission_root,
+                )
                 .await
         });
 
@@ -1296,7 +1345,12 @@ mod known_good_identity_tests {
             .insert_for_test("Post-admission root drift", "1.21.5")
             .expect("post-admission instance");
         let admission = state
-            .admit_known_good_candidate(&instance.id, "1.21.5", &installed_root)
+            .admit_known_good_candidate(
+                &instance.id,
+                "1.21.5",
+                &instance.created_at,
+                &installed_root,
+            )
             .await
             .expect("admit exact root")
             .expect("exact candidate admission");
@@ -1395,7 +1449,7 @@ mod known_good_identity_tests {
     }
 
     #[test]
-    fn unrelated_instance_changes_preserve_known_good_identity() {
+    fn unrelated_instance_changes_preserve_known_good_incarnation() {
         let mut instance = new_instance(
             "0000000000000042".to_string(),
             "Before".to_string(),
@@ -1403,38 +1457,52 @@ mod known_good_identity_tests {
             String::new(),
             String::new(),
         );
-        assert!(matches_known_good_identity(
+        let created_at = instance.created_at.clone();
+        assert!(matches_known_good_incarnation(
             Some(&instance),
             &instance.id,
-            "1.21.5"
+            "1.21.5",
+            &created_at,
         ));
 
         instance.name = "After".to_string();
         instance.max_memory_mb = 8_192;
         instance.icon = "grass".to_string();
-        assert!(matches_known_good_identity(
+        assert!(matches_known_good_incarnation(
             Some(&instance),
             &instance.id,
-            "1.21.5"
+            "1.21.5",
+            &created_at,
         ));
 
         instance.version_id = "1.21.6".to_string();
-        assert!(!matches_known_good_identity(
+        assert!(!matches_known_good_incarnation(
             Some(&instance),
             &instance.id,
-            "1.21.5"
+            "1.21.5",
+            &created_at,
         ));
-        assert!(!matches_known_good_identity(
+        assert!(!matches_known_good_incarnation(
             None,
             "0000000000000042",
-            "1.21.5"
+            "1.21.5",
+            &created_at,
         ));
         instance.version_id = "1.21.5".to_string();
+        instance.created_at.push_str("-replacement");
+        assert!(!matches_known_good_incarnation(
+            Some(&instance),
+            &instance.id,
+            "1.21.5",
+            &created_at,
+        ));
+        instance.created_at = created_at.clone();
         instance.id = "not-canonical".to_string();
-        assert!(!matches_known_good_identity(
+        assert!(!matches_known_good_incarnation(
             Some(&instance),
             "not-canonical",
-            "1.21.5"
+            "1.21.5",
+            &created_at,
         ));
     }
 
