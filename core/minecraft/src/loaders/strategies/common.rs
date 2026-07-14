@@ -1,11 +1,10 @@
 use crate::download::{
     AuthenticatedSelectedArtifactSource, DownloadProgress, Downloader, ExactLibraryDownloadProof,
-    MaterializedLibraryIdentity, PreparedVersionBundlePublication,
-    acquire_version_bundle_publication_lease,
+    MaterializedLibraryIdentity, PreparedManagedInstall,
     download_installer_libraries_with_declarations_and_facts,
-    download_profile_libraries_with_declarations_and_facts,
-    prepare_local_version_bundle_publication, publish_prepared_managed_install,
-    reconstruct_installer_library_declarations, reconstruct_profile_library_declarations,
+    download_profile_retained_libraries_with_declarations_and_facts, prepare_local_managed_install,
+    publish_prepared_managed_install, reconstruct_installer_library_declarations,
+    reconstruct_profile_library_declarations,
 };
 use crate::known_good::{
     KnownGoodInstallReceipt, KnownGoodReconstructionReceipt, reconstructed_effective_version,
@@ -542,7 +541,7 @@ where
     let installed_version_id = plan.record.version_id.clone();
     validate_version_id(&installed_version_id, "installed loader version id")?;
 
-    let (library_declarations, library_proofs) =
+    let (library_declarations, library_proofs, library_sources) =
         Box::pin(download_profile_loader_libraries_with_evidence(
             library_dir,
             library_declarations,
@@ -576,15 +575,15 @@ where
         library_declarations,
     )
     .map_err(|error| LoaderError::Verify(format!("derive loader authority: {error:?}")))?;
-    let prepared = prepare_local_version_bundle_publication(
+    let prepared = prepare_local_managed_install(
         authority,
         version_bytes,
         base_client_bytes,
         log_config_bytes,
+        library_sources,
     )
-    .map_err(loader_version_bundle_error)?;
-    let receipt =
-        publish_loader_version_bundle(library_dir, &installed_version_id, prepared).await?;
+    .map_err(loader_managed_install_error)?;
+    let receipt = publish_loader_managed_install(library_dir, prepared).await?;
     send(done());
     Ok(receipt)
 }
@@ -781,15 +780,15 @@ where
     let authority = pending_receipt.complete(materialized).map_err(|error| {
         LoaderError::Verify(format!("complete installer materializations: {error:?}"))
     })?;
-    let prepared = prepare_local_version_bundle_publication(
+    let prepared = prepare_local_managed_install(
         authority,
         version_bytes,
         child_client_bytes,
         log_config_bytes,
+        Vec::new(),
     )
-    .map_err(loader_version_bundle_error)?;
-    let receipt =
-        publish_loader_version_bundle(library_dir, &installed_version_id, prepared).await?;
+    .map_err(loader_managed_install_error)?;
+    let receipt = publish_loader_managed_install(library_dir, prepared).await?;
     if child_client_differs {
         send(progress(
             "client_jar",
@@ -875,25 +874,17 @@ fn read_installed_base_version_bundle_members(
     ))
 }
 
-async fn publish_loader_version_bundle(
+async fn publish_loader_managed_install(
     library_dir: &Path,
-    version_id: &str,
-    prepared: PreparedVersionBundlePublication,
+    prepared: PreparedManagedInstall,
 ) -> Result<KnownGoodInstallReceipt, LoaderError> {
-    let lease = acquire_version_bundle_publication_lease(library_dir.to_path_buf(), version_id)
+    publish_prepared_managed_install(library_dir.to_path_buf(), prepared)
         .await
-        .map_err(loader_version_bundle_error)?;
-    publish_prepared_managed_install(
-        lease,
-        prepared,
-        Vec::<crate::download::library_source::RetainedLibraryComponentSource>::new(),
-    )
-    .await
-    .map_err(loader_version_bundle_error)
+        .map_err(loader_managed_install_error)
 }
 
-fn loader_version_bundle_error(_error: crate::download::DownloadError) -> LoaderError {
-    LoaderError::Verify("loader version bundle publication failed".to_string())
+fn loader_managed_install_error(_error: crate::download::DownloadError) -> LoaderError {
+    LoaderError::Verify("loader managed install publication failed".to_string())
 }
 
 fn validate_installer_record_authority(record: &LoaderBuildRecord) -> Result<&str, LoaderError> {
@@ -1019,15 +1010,15 @@ where
         &child_client_bytes,
     )
     .map_err(|error| LoaderError::Verify(format!("derive loader authority: {error:?}")))?;
-    let prepared = prepare_local_version_bundle_publication(
+    let prepared = prepare_local_managed_install(
         authority,
         version_bytes,
         child_client_bytes,
         log_config_bytes,
+        Vec::new(),
     )
-    .map_err(loader_version_bundle_error)?;
-    let receipt =
-        publish_loader_version_bundle(library_dir, &plan.record.version_id, prepared).await?;
+    .map_err(loader_managed_install_error)?;
+    let receipt = publish_loader_managed_install(library_dir, prepared).await?;
     send(done());
     Ok(receipt)
 }
@@ -1097,6 +1088,7 @@ async fn download_profile_loader_libraries_with_evidence<F>(
     (
         PendingStreamedLibraryDeclarations,
         Vec<ExactLibraryDownloadProof>,
+        Vec<crate::download::library_source::RetainedLibraryComponentSource>,
     ),
     LoaderError,
 >
@@ -1104,7 +1096,7 @@ where
     F: FnMut(DownloadProgress),
 {
     let mut facts = Vec::new();
-    download_profile_libraries_with_declarations_and_facts(
+    download_profile_retained_libraries_with_declarations_and_facts(
         library_dir,
         declarations,
         phase,
@@ -1487,15 +1479,19 @@ mod tests {
             });
             let base_id = "1.21.5";
             let base_client = zip_entries(&[("net/minecraft/client/Main.class", b"base")]);
-            let exact_library = b"exact-profile-library".to_vec();
+            let vanilla_exact =
+                zip_entries(&[("org/example/VanillaExact.class", b"inherited-vanilla-exact")]);
+            let profile_exact =
+                zip_entries(&[("org/example/ProfileExact.class", b"profile-exact-library")]);
             let client_server = TestByteServer::start(base_client.clone());
-            let exact_server = TestByteServer::start(exact_library.clone());
+            let vanilla_exact_server = TestByteServer::start(vanilla_exact.clone());
+            let exact_server = TestByteServer::start(profile_exact.clone());
             let version_bytes = vanilla_version_bytes_with_exact_library(
                 base_id,
                 &client_server.url,
                 &base_client,
-                &exact_server.url,
-                &exact_library,
+                &vanilla_exact_server.url,
+                &vanilla_exact,
             );
             let version_server = TestByteServer::start(version_bytes.clone());
             let manifest = test_install_manifest(base_id, &version_server.url, &version_bytes);
@@ -1520,7 +1516,7 @@ mod tests {
                 &record,
                 &incomplete_server.url,
                 &exact_server.url,
-                &exact_library,
+                &profile_exact,
                 &native_server.url,
                 &extra_server.url,
             );
@@ -1539,6 +1535,11 @@ mod tests {
                 .install_version(base_id, |_| {})
                 .await
                 .expect("install authenticated vanilla base");
+            let inherited_requests_after_base = vanilla_exact_server.request_count();
+            assert_eq!(
+                inherited_requests_after_base, 1,
+                "vanilla exact library must be fetched during base install"
+            );
             let install_proof =
                 crate::loaders::providers::fetch_profile_install_proof_from_url_for_test(
                     &record,
@@ -1555,6 +1556,19 @@ mod tests {
             )
             .await
             .expect("install profile loader");
+            assert_eq!(
+                vanilla_exact_server.request_count(),
+                inherited_requests_after_base,
+                "profile install must not refetch the inherited exact vanilla library"
+            );
+            assert_eq!(
+                fs::read(
+                    root.join("libraries/org/example/vanilla-exact/1.0/vanilla-exact-1.0.jar"),
+                )
+                .expect("inherited exact vanilla library"),
+                vanilla_exact,
+                "profile install must preserve inherited exact canonical bytes"
+            );
             seed_reconstruction_sentinels(&root);
             let before = snapshot_tree(&root);
             let request_counts = (
@@ -1562,6 +1576,7 @@ mod tests {
                 client_server.request_count(),
                 profile_server.request_count(),
                 proof_server.request_count(),
+                vanilla_exact_server.request_count(),
                 exact_server.request_count(),
                 incomplete_server.request_count(),
                 native_server.request_count(),
@@ -1582,18 +1597,19 @@ mod tests {
             assert_eq!(client_server.request_count(), request_counts.1);
             assert_eq!(profile_server.request_count(), request_counts.2 + 1);
             assert_eq!(proof_server.request_count(), request_counts.3 + 1);
-            assert_eq!(exact_server.request_count(), request_counts.4);
+            assert_eq!(vanilla_exact_server.request_count(), request_counts.4);
+            assert_eq!(exact_server.request_count(), request_counts.5);
             assert_eq!(
                 incomplete_server.request_count(),
-                request_counts.5 + expected_fresh.0
+                request_counts.6 + expected_fresh.0
             );
             assert_eq!(
                 native_server.request_count(),
-                request_counts.6 + expected_fresh.1
+                request_counts.7 + expected_fresh.1
             );
             assert_eq!(
                 extra_server.request_count(),
-                request_counts.7 + expected_fresh.2
+                request_counts.8 + expected_fresh.2
             );
             assert_eq!(
                 install_receipt.into_activation_source().into_parts(),
@@ -1603,6 +1619,7 @@ mod tests {
             for server in [
                 client_server,
                 version_server,
+                vanilla_exact_server,
                 exact_server,
                 incomplete_server,
                 native_server,
@@ -1621,7 +1638,10 @@ mod tests {
         let root = temp_dir("modern-installer-reconstruction-parity");
         let base_id = "1.21.5";
         let base_client = zip_entries(&[("net/minecraft/client/Main.class", b"base")]);
-        let vanilla_exact = b"vanilla-exact".to_vec();
+        let vanilla_exact = zip_entries(&[(
+            "org/example/VanillaExact.class",
+            b"modern-installer-vanilla-exact",
+        )]);
         let installer_exact =
             zip_entries(&[("example/Exact.class", b"installer-exact".as_slice())]);
         let installer_fresh =
@@ -2838,7 +2858,7 @@ printf '%s' 'processor-terminal' > "$last"
         let prepared = prepared_test_legacy_bundle(&root, &record, b"failed child client");
         crate::version_bundle_publication::fail_after_promotions_for_test(&record.version_id, 1);
 
-        let error = super::publish_loader_version_bundle(&root, &record.version_id, prepared)
+        let error = super::publish_loader_managed_install(&root, prepared)
             .await
             .expect_err("injected loader publication failure");
 
@@ -2859,7 +2879,7 @@ printf '%s' 'processor-terminal' > "$last"
     }
 
     #[tokio::test]
-    async fn loader_bundle_tail_survives_caller_cancellation_and_settles() {
+    async fn zero_source_legacy_managed_install_survives_cancellation_and_settles() {
         let root = temp_dir("loader-bundle-cancelled-caller");
         let mut record = legacy_archive_record();
         record.loader_version = "3.4.9.171-cancellation".to_string();
@@ -2872,9 +2892,8 @@ printf '%s' 'processor-terminal' > "$last"
             1,
         );
         let task_root = root.clone();
-        let task_version_id = record.version_id.clone();
         let task = tokio::spawn(async move {
-            super::publish_loader_version_bundle(&task_root, &task_version_id, prepared).await
+            super::publish_loader_managed_install(&task_root, prepared).await
         });
         reached.await.expect("loader publication reached effect");
         task.abort();
@@ -2902,10 +2921,11 @@ printf '%s' 'processor-terminal' > "$last"
         .expect("detached loader publication completed");
 
         let retry = prepared_test_legacy_bundle(&root, &record, child_client);
-        let receipt = super::publish_loader_version_bundle(&root, &record.version_id, retry)
+        let receipt = super::publish_loader_managed_install(&root, retry)
             .await
             .expect("settled loader publication admits exact retry");
         assert_eq!(receipt.version_id(), record.version_id);
+        assert_settled_loader_libraries_lane(&root);
         let _ = fs::remove_dir_all(root);
     }
 
@@ -4505,14 +4525,15 @@ esac
         let authority = pending
             .complete(materialized)
             .expect("complete installed processor receipt");
-        let prepared = super::prepare_local_version_bundle_publication(
+        let prepared = super::prepare_local_managed_install(
             authority,
             version_bytes,
             child_client_bytes,
             log_config_bytes,
+            Vec::new(),
         )
         .expect("prepare installed processor bundle");
-        super::publish_loader_version_bundle(root, &plan.record.version_id, prepared)
+        super::publish_loader_managed_install(root, prepared)
             .await
             .expect("publish installed processor bundle")
     }
@@ -4899,7 +4920,7 @@ esac
         root: &Path,
         record: &LoaderBuildRecord,
         child_client: &[u8],
-    ) -> super::PreparedVersionBundlePublication {
+    ) -> super::PreparedManagedInstall {
         let base = test_authenticated_receipt(root, &record.minecraft_version);
         let mut version = base.effective_version().clone();
         version.id = record.version_id.clone();
@@ -4922,13 +4943,20 @@ esac
             child_client,
         )
         .expect("test legacy pending authority");
-        super::prepare_local_version_bundle_publication(
+        let prepared = super::prepare_local_managed_install(
             authority,
             version_bytes,
             child_client.to_vec(),
             None,
+            Vec::new(),
         )
-        .expect("prepare test legacy bundle")
+        .expect("prepare test legacy bundle");
+        assert_eq!(
+            prepared.retained_library_source_count(),
+            0,
+            "legacy publication must carry no new Libraries sources"
+        );
+        prepared
     }
 
     fn write_base_version(root: &std::path::Path, version_id: &str) {
@@ -4949,6 +4977,40 @@ esac
         .expect("write base version json");
         fs::write(version_dir.join(format!("{version_id}.jar")), b"client jar")
             .expect("write base jar");
+    }
+
+    fn assert_settled_loader_libraries_lane(root: &Path) {
+        let lane = root.join(".axial-publication/libraries");
+        let mut entries = fs::read_dir(&lane)
+            .expect("settled loader Libraries lane")
+            .map(|entry| {
+                entry
+                    .expect("loader Libraries lane entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect::<Vec<_>>();
+        entries.sort();
+        assert_eq!(entries, ["ancestors", "quarantine", "staging", "table"]);
+        for child in ["quarantine", "staging", "table"] {
+            assert!(
+                fs::read_dir(lane.join(child))
+                    .expect("settled loader Libraries child")
+                    .next()
+                    .is_none(),
+                "settled loader Libraries {child} must be empty"
+            );
+        }
+        for child in ["records", "staging"] {
+            assert!(
+                fs::read_dir(lane.join("ancestors").join(child))
+                    .expect("settled loader Libraries ancestor child")
+                    .next()
+                    .is_none(),
+                "settled loader Libraries ancestors/{child} must be empty"
+            );
+        }
     }
 
     fn add_test_base_log_config(root: &Path, version_id: &str, log_id: &str, bytes: &[u8]) {

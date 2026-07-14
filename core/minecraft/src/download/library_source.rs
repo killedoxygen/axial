@@ -525,6 +525,10 @@ pub(crate) struct RetainedLibraryComponentSource {
 }
 
 impl RetainedLibraryComponentSource {
+    pub(crate) fn observed_size(&self) -> u64 {
+        self.observed_size
+    }
+
     pub(crate) fn exact_download_proof(&self) -> ExactLibraryDownloadProof {
         ExactLibraryDownloadProof::new(
             self.relative_path.clone(),

@@ -5,7 +5,7 @@ use super::assets::{
 };
 use super::client::{adaptive_download_concurrency, build_http_client};
 use super::facts::{ExecutionDownloadRequest, execution_download_fact};
-use super::install::observe_vanilla_publication_lease_wait_for_test;
+use super::install::observe_managed_install_lease_wait_for_test;
 use super::integrity::{
     download_size_mismatch, existing_asset_object_satisfies, existing_file_satisfies, hash_file,
     observe_hash_file_calls, verify_download_integrity,
@@ -40,7 +40,7 @@ use super::transfer::{
 };
 use super::*;
 use crate::artifact_path::ArtifactRelativePath;
-use crate::known_good::KnownGoodArtifactKind;
+use crate::known_good::{KnownGoodArtifactKind, KnownGoodIntegrity};
 use crate::launch::{JavaVersion, Library, LibraryArtifact, LibraryDownload, maven_to_path};
 use crate::managed_fs::ManagedDir;
 use crate::managed_publication::ManagedRootPublicationLease;
@@ -287,11 +287,39 @@ async fn reconstruction_matches_install_without_touching_seeded_destinations() {
     .into_parts();
 
     assert_eq!(installed, reconstructed);
+    let [exact, observed, observed_two] = reconstruction_parity_library_bodies();
+    let installed_libraries = [
+        ("org/example/exact/1.0.0/exact-1.0.0.jar", exact),
+        ("org/example/observed/1.0.0/observed-1.0.0.jar", observed),
+        (
+            "org/example/observed-two/1.0.0/observed-two-1.0.0.jar",
+            observed_two,
+        ),
+    ];
+    for (relative_path, expected_bytes) in &installed_libraries {
+        assert_eq!(
+            fs::read(root.join("libraries").join(relative_path))
+                .expect("read replaced canonical library"),
+            *expected_bytes,
+            "install must replace the seeded corrupt {relative_path}"
+        );
+        let expected_sha1 = sha1_hex(expected_bytes);
+        let entry = installed
+            .1
+            .entries()
+            .iter()
+            .find(|entry| entry.path().as_str() == *relative_path)
+            .expect("installed library inventory entry");
+        assert!(matches!(
+            entry.integrity(),
+            KnownGoodIntegrity::Sha1 { digest, size }
+                if digest.as_str() == expected_sha1 && *size == expected_bytes.len() as u64
+        ));
+    }
     let install_requests = std::iter::from_fn(|| requests.try_recv().ok()).collect::<Vec<_>>();
     for path in [
         "/version.json",
         "/client.jar",
-        "/libraries/exact.jar",
         "/libraries/observed.jar",
         "/libraries/observed-two.jar",
         "/asset-index.json",
@@ -306,6 +334,16 @@ async fn reconstruction_matches_install_without_touching_seeded_destinations() {
             "{path} must be fetched exactly once"
         );
     }
+    assert_eq!(
+        install_requests
+            .iter()
+            .filter(|request| request.as_str() == "/libraries/exact.jar")
+            .count(),
+        1,
+        "the corrupt exact declaration must be retained once for replacement"
+    );
+    assert_settled_libraries_lane(&root);
+    assert_settled_version_bundle_lane(&root);
     let _ = fs::remove_dir_all(root);
 }
 
@@ -472,6 +510,46 @@ async fn normal_install_publishes_and_settles_three_member_version_bundle() {
 }
 
 #[tokio::test]
+async fn normal_reinstall_omits_exact_cached_library_source() {
+    let version_id = "normal-exact-cache-reinstall";
+    let root = temp_dir(version_id);
+    let (version_url, version_sha1, mut requests) =
+        spawn_reconstruction_parity_server(version_id).await;
+    let downloader = test_manifest_downloader(&root, version_id, &version_url, &version_sha1);
+
+    downloader
+        .install_version(version_id, |_| {})
+        .await
+        .expect("initial normal install");
+    while requests.try_recv().is_ok() {}
+
+    downloader
+        .install_version(version_id, |_| {})
+        .await
+        .expect("exact-cache reinstall");
+    let reinstall_requests = std::iter::from_fn(|| requests.try_recv().ok()).collect::<Vec<_>>();
+    assert!(
+        !reinstall_requests
+            .iter()
+            .any(|request| request == "/libraries/exact.jar"),
+        "exact cached declaration must not be downloaded again"
+    );
+    for path in ["/libraries/observed.jar", "/libraries/observed-two.jar"] {
+        assert_eq!(
+            reinstall_requests
+                .iter()
+                .filter(|request| request.as_str() == path)
+                .count(),
+            1,
+            "FreshStream {path} must be retained again"
+        );
+    }
+    assert_settled_libraries_lane(&root);
+    assert_settled_version_bundle_lane(&root);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
 async fn normal_install_accepts_effect_failure_that_settles_committed() {
     let version_id = "normal-effect-committed";
     let root = temp_dir(version_id);
@@ -625,7 +703,7 @@ async fn cancelling_normal_install_does_not_cancel_started_bundle_publication() 
 }
 
 #[tokio::test]
-async fn cancelling_normal_install_while_waiting_for_lease_does_not_detach_publication() {
+async fn cancelling_normal_install_while_waiting_for_lease_detaches_publication_owner() {
     let version_id = "normal-lease-wait-cancellation";
     let root = temp_dir(version_id);
     fs::create_dir_all(&root).expect("create normal install root");
@@ -634,7 +712,7 @@ async fn cancelling_normal_install_while_waiting_for_lease_does_not_detach_publi
     )
     .await
     .expect("acquire held normal install lease");
-    let reached = observe_vanilla_publication_lease_wait_for_test(version_id);
+    let reached = observe_managed_install_lease_wait_for_test(version_id);
     let (version_url, version_sha1, _) = spawn_reconstruction_parity_server(version_id).await;
     let downloader = test_manifest_downloader(&root, version_id, &version_url, &version_sha1);
 
@@ -661,21 +739,24 @@ async fn cancelling_normal_install_while_waiting_for_lease_does_not_detach_publi
     drop(held_lease);
     let probe_lease = timeout(Duration::from_secs(10), probe)
         .await
-        .expect("probe should acquire after cancelled waiter")
+        .expect("probe should acquire after detached publication")
         .expect("probe lease task should finish")
         .expect("probe lease should be acquired");
 
-    let version_root = versions_dir(&root).join(version_id);
-    assert!(!version_root.join(format!("{version_id}.json")).exists());
-    assert!(!version_root.join(format!("{version_id}.jar")).exists());
-    assert!(
-        !assets_dir(&root)
-            .join("log_configs/reconstruction-log.xml")
-            .exists()
-    );
-    assert!(!root.join(".axial-publication/version-bundle").exists());
-
     drop(probe_lease);
+    timeout(Duration::from_secs(10), async {
+        loop {
+            if normal_bundle_contents_match(&root, version_id, true)
+                && libraries_lane_is_settled(&root)
+                && version_bundle_lane_is_settled(&root)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("detached lease waiter should publish and settle");
     let _ = fs::remove_dir_all(root);
 }
 
@@ -1556,15 +1637,16 @@ async fn execute_download_to_temp_reports_successful_integrity() {
 }
 
 fn checksumless_test_jar() -> Vec<u8> {
+    test_jar("example/Entry.class", b"entry")
+}
+
+fn test_jar(entry_name: &str, entry_bytes: &[u8]) -> Vec<u8> {
     let cursor = std::io::Cursor::new(Vec::new());
     let mut archive = zip::ZipWriter::new(cursor);
     archive
-        .start_file(
-            "example/Entry.class",
-            zip::write::SimpleFileOptions::default(),
-        )
+        .start_file(entry_name, zip::write::SimpleFileOptions::default())
         .expect("start jar entry");
-    std::io::Write::write_all(&mut archive, b"entry").expect("write jar entry");
+    std::io::Write::write_all(&mut archive, entry_bytes).expect("write jar entry");
     archive.finish().expect("finish jar").into_inner()
 }
 
@@ -2929,7 +3011,10 @@ async fn spawn_overlapped_install_server() -> (
     let base_url = format!("http://{}", listener.local_addr().expect("local addr"));
     let (request_tx, request_rx) = mpsc::unbounded_channel();
     let (release_library_tx, release_library_rx) = oneshot::channel();
-    let library_body = b"library".to_vec();
+    let library_body = test_jar(
+        "org/example/overlap/OverlapLibrary.class",
+        b"overlapped-library",
+    );
     let library_sha1 = sha1_hex(&library_body);
     let client_body = b"client".to_vec();
     let client_sha1 = sha1_hex(&client_body);
@@ -3018,9 +3103,7 @@ async fn spawn_reconstruction_parity_server(
     let base_url = format!("http://{}", listener.local_addr().expect("local addr"));
     let (request_tx, request_rx) = mpsc::unbounded_channel();
     let client = b"reconstruction-client".to_vec();
-    let exact = b"reconstruction-exact-library".to_vec();
-    let observed = checksumless_test_jar();
-    let observed_two = checksumless_test_jar();
+    let [exact, observed, observed_two] = reconstruction_parity_library_bodies();
     let log_config = b"<log4j/>".to_vec();
     let asset_index = br#"{"objects":{}}"#.to_vec();
     let version = serde_json::json!({
@@ -3064,8 +3147,7 @@ async fn spawn_reconstruction_parity_server(
                 "name": "org.example:observed:1.0.0",
                 "downloads": { "artifact": {
                     "path": "org/example/observed/1.0.0/observed-1.0.0.jar",
-                    "url": format!("{base_url}/libraries/observed.jar"),
-                    "sha1": sha1_hex(&observed)
+                    "url": format!("{base_url}/libraries/observed.jar")
                 }}
             },
             {
@@ -3112,6 +3194,17 @@ async fn spawn_reconstruction_parity_server(
     });
 
     (format!("{base_url}/version.json"), version_sha1, request_rx)
+}
+
+fn reconstruction_parity_library_bodies() -> [Vec<u8>; 3] {
+    [
+        test_jar(
+            "example/ReconstructionExact.class",
+            b"reconstruction-exact-library",
+        ),
+        checksumless_test_jar(),
+        checksumless_test_jar(),
+    ]
 }
 
 async fn spawn_runtime_reconstruction_server(

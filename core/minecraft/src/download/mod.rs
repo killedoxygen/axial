@@ -18,9 +18,8 @@ pub use assets::repair_virtual_assets_from_index;
 pub use install::Downloader;
 pub(crate) use install::{
     AuthenticatedVanillaInstallSources, AuthenticatedVersionBundleMemberSource,
-    AuthenticatedVersionBundleSource, PreparedVersionBundlePublication,
-    ReconstructedVanillaAuthority, acquire_version_bundle_publication_lease,
-    prepare_local_version_bundle_publication, publish_prepared_managed_install,
+    AuthenticatedVersionBundleSource, PreparedManagedInstall, ReconstructedVanillaAuthority,
+    prepare_local_managed_install, publish_prepared_managed_install,
 };
 pub(crate) use install::{
     reconstruct_installer_library_declarations, reconstruct_installer_processor_sources,
@@ -30,7 +29,7 @@ pub use integrity::LauncherManagedArtifactReadiness;
 pub(crate) use libraries::DownloadJob;
 pub(crate) use libraries::download_installer_libraries_with_declarations_and_facts;
 pub(crate) use libraries::{
-    LibraryArtifactPlan, download_profile_libraries_with_declarations_and_facts,
+    LibraryArtifactPlan, download_profile_retained_libraries_with_declarations_and_facts,
     library_artifact_plans_for,
 };
 pub use libraries::{

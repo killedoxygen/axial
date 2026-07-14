@@ -1,9 +1,10 @@
 use super::client::{library_download_concurrency, standard_minecraft_download_client};
-use super::facts::selected_download_target_label;
+use super::facts::{selected_download_source_label, selected_download_target_label};
 use super::integrity::is_sha1_hex;
 use super::library_source::{
-    LIBRARY_SOURCE_MAX_BYTES, LibrarySourcePool, LibrarySourceRequest,
-    acquire_authenticated_library_source,
+    LIBRARY_SOURCE_MAX_BYTES, LibraryComponentSourceKind, LibrarySourcePool, LibrarySourceRequest,
+    RetainedLibraryComponentSource, acquire_authenticated_library_source,
+    acquire_retained_library_component_source,
 };
 use super::model::{
     DownloadError, DownloadProgress, ExactLibraryDownloadProof, ExecutionDownloadFact,
@@ -20,10 +21,13 @@ use crate::known_good_libraries::{
     PendingStreamedLibraryDeclarations, SealedLibraryDeclarationError,
 };
 use crate::launch::{Library, maven_to_path};
+use crate::loaders::types::LoaderError;
+use crate::managed_fs::ManagedDir;
 use crate::paths::libraries_dir;
 use crate::rules::{Environment, evaluate_rules};
 use futures_util::StreamExt;
 use std::collections::BTreeMap;
+use std::io;
 use std::path::{Path, PathBuf};
 use tokio::sync::mpsc;
 #[derive(Debug, Clone)]
@@ -87,7 +91,179 @@ impl LibraryArtifactPlan {
     }
 }
 
-pub(crate) async fn download_profile_libraries_with_declarations_and_facts<F, G>(
+#[derive(Clone)]
+pub(crate) struct ExactLibraryCacheAdmission {
+    libraries: Option<ManagedDir>,
+}
+
+impl ExactLibraryCacheAdmission {
+    pub(crate) async fn bind(managed_root: &Path) -> Result<Self, DownloadError> {
+        let managed_root = managed_root.to_path_buf();
+        tokio::task::spawn_blocking(move || {
+            let root = match ManagedDir::open_root(&managed_root) {
+                Ok(root) => root,
+                Err(LoaderError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
+                    return Ok(Self { libraries: None });
+                }
+                Err(error) => return Err(cache_admission_error(error)),
+            };
+            if !root
+                .has_portably_exact_child_name("libraries")
+                .map_err(cache_admission_error)?
+            {
+                return Ok(Self { libraries: None });
+            }
+            let libraries = root
+                .open_child("libraries")
+                .map_err(cache_admission_error)?;
+            Ok(Self {
+                libraries: Some(libraries),
+            })
+        })
+        .await
+        .map_err(|error| {
+            DownloadError::FileOperation(io::Error::other(format!(
+                "library cache admission task stopped unexpectedly: {error}"
+            )))
+        })?
+    }
+
+    pub(crate) async fn requires_retained_source(
+        &self,
+        job: &DownloadJob,
+    ) -> Result<bool, DownloadError> {
+        let expected_size = job.expected.size.ok_or(LibraryPlanError::InvalidChecksum)?;
+        if expected_size == 0 || expected_size > LIBRARY_SOURCE_MAX_BYTES {
+            return Err(DownloadError::Integrity(
+                "exact library cache contract exceeds the admitted size bound".to_string(),
+            ));
+        }
+        let expected_sha1 = job
+            .expected
+            .sha1
+            .as_deref()
+            .and_then(decode_sha1)
+            .ok_or(LibraryPlanError::InvalidChecksum)?;
+        let Some(libraries) = self.libraries.clone() else {
+            return Ok(true);
+        };
+        let relative_path = job.relative_path.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut segments = relative_path.as_str().split('/').peekable();
+            let mut directory = libraries;
+            while let Some(segment) = segments.next() {
+                if segments.peek().is_none() {
+                    if !directory
+                        .has_portably_exact_child_name(segment)
+                        .map_err(cache_admission_error)?
+                    {
+                        return Ok(true);
+                    }
+                    let guard = directory
+                        .inspect_regular_file(segment)
+                        .map_err(cache_admission_error)?
+                        .ok_or_else(|| {
+                            DownloadError::Integrity(
+                                "library cache identity changed during admission".to_string(),
+                            )
+                        })?;
+                    if guard.size() != expected_size {
+                        return Ok(true);
+                    }
+                    let observed = directory
+                        .sha1_guarded_file_bytes(segment, &guard, expected_size)
+                        .map_err(cache_admission_error)?;
+                    return Ok(observed != expected_sha1);
+                }
+                if !directory
+                    .has_portably_exact_child_name(segment)
+                    .map_err(cache_admission_error)?
+                {
+                    return Ok(true);
+                }
+                directory = directory
+                    .open_child(segment)
+                    .map_err(cache_admission_error)?;
+            }
+            Err(DownloadError::Integrity(
+                "library cache admission received an empty artifact path".to_string(),
+            ))
+        })
+        .await
+        .map_err(|error| {
+            DownloadError::FileOperation(io::Error::other(format!(
+                "library cache inspection task stopped unexpectedly: {error}"
+            )))
+        })?
+    }
+}
+
+fn cache_admission_error(error: LoaderError) -> DownloadError {
+    DownloadError::Integrity(format!("library cache admission failed: {error}"))
+}
+
+pub(super) struct RetainedClassifiedLibraryAcquisition {
+    pub(super) relative_path: ArtifactRelativePath,
+    pub(super) name: String,
+    pub(super) observed_size: u64,
+    pub(super) proof: Option<ExactLibraryDownloadProof>,
+    pub(super) source: Option<RetainedLibraryComponentSource>,
+}
+
+pub(super) async fn acquire_retained_classified_library(
+    client: &reqwest::Client,
+    classified: ClassifiedLibraryDownload,
+    cache_admission: &ExactLibraryCacheAdmission,
+    source_pool: &LibrarySourcePool,
+    fact_tx: Option<&mpsc::UnboundedSender<ExecutionDownloadFact>>,
+) -> Result<RetainedClassifiedLibraryAcquisition, DownloadError> {
+    let (job, acquisition) = classified.into_parts();
+    let requires_source = match acquisition {
+        LibraryAcquisition::ExactDeclaration => {
+            cache_admission.requires_retained_source(&job).await?
+        }
+        LibraryAcquisition::FreshStream => true,
+    };
+    let (observed_size, proof, source) = if requires_source {
+        let target = selected_download_source_label(
+            SelectedDownloadArtifactKind::Library,
+            job.relative_path.as_str(),
+        );
+        let source = acquire_retained_library_component_source(
+            LibrarySourceRequest {
+                client,
+                url: &job.url,
+                expected: &job.expected,
+                relative_path: &job.relative_path,
+                max_bytes: LIBRARY_SOURCE_MAX_BYTES,
+                target: &target,
+                pool: source_pool,
+                fact_tx,
+            },
+            if job.is_native {
+                LibraryComponentSourceKind::NativeLibrary
+            } else {
+                LibraryComponentSourceKind::Library
+            },
+        )
+        .await?;
+        let observed_size = source.observed_size();
+        let proof =
+            (acquisition == LibraryAcquisition::FreshStream).then(|| source.exact_download_proof());
+        (observed_size, proof, Some(source))
+    } else {
+        (job.expected.size.unwrap_or(0), None, None)
+    };
+    Ok(RetainedClassifiedLibraryAcquisition {
+        relative_path: job.relative_path,
+        name: job.name,
+        observed_size,
+        proof,
+        source,
+    })
+}
+
+pub(crate) async fn download_profile_retained_libraries_with_declarations_and_facts<F, G>(
     mc_dir: &Path,
     declarations: PendingExactLibraryDeclarations,
     phase: &str,
@@ -97,6 +273,7 @@ pub(crate) async fn download_profile_libraries_with_declarations_and_facts<F, G>
     (
         PendingStreamedLibraryDeclarations,
         Vec<ExactLibraryDownloadProof>,
+        Vec<RetainedLibraryComponentSource>,
     ),
     DownloadError,
 >
@@ -113,23 +290,15 @@ where
     let (declarations, jobs) = declarations
         .classify_jobs(&libraries_dir(mc_dir), jobs)
         .map_err(profile_declaration_error)?;
+    let cache_admission = ExactLibraryCacheAdmission::bind(mc_dir).await?;
     let (fact_tx, mut fact_rx) = mpsc::unbounded_channel();
     let result =
-        download_classified_library_jobs(mc_dir, jobs, phase, send, Some(fact_tx), false).await;
+        download_profile_retained_library_jobs(jobs, cache_admission, phase, send, Some(fact_tx))
+            .await;
     while let Ok(fact) = fact_rx.try_recv() {
         send_fact(fact);
     }
-    result.map(|identities| {
-        let proofs = identities
-            .into_iter()
-            .map(|identity| {
-                let (path, _destination, is_native, provider_url, expected, size, sha1) =
-                    identity.into_parts();
-                ExactLibraryDownloadProof::new(path, is_native, provider_url, expected, size, sha1)
-            })
-            .collect();
-        (declarations, proofs)
-    })
+    result.map(|(proofs, sources)| (declarations, proofs, sources))
 }
 
 fn profile_declaration_error(error: SealedLibraryDeclarationError) -> DownloadError {
@@ -158,20 +327,81 @@ where
     let (pending_execution, jobs) = install.into_parts();
     let (fact_tx, mut fact_rx) = mpsc::unbounded_channel();
     let result =
-        download_classified_library_jobs(mc_dir, jobs, phase, send, Some(fact_tx), true).await;
+        download_installer_classified_library_jobs(mc_dir, jobs, phase, send, Some(fact_tx)).await;
     while let Ok(fact) = fact_rx.try_recv() {
         send_fact(fact);
     }
     result.map(|materialized| (pending_execution, materialized))
 }
 
-async fn download_classified_library_jobs<F>(
+async fn download_profile_retained_library_jobs<F>(
+    jobs: Vec<ClassifiedLibraryDownload>,
+    cache_admission: ExactLibraryCacheAdmission,
+    phase: &str,
+    mut send: F,
+    fact_tx: Option<mpsc::UnboundedSender<ExecutionDownloadFact>>,
+) -> Result<
+    (
+        Vec<ExactLibraryDownloadProof>,
+        Vec<RetainedLibraryComponentSource>,
+    ),
+    DownloadError,
+>
+where
+    F: FnMut(DownloadProgress),
+{
+    let client = standard_minecraft_download_client();
+    let source_pool = LibrarySourcePool::for_component_retention()?;
+    send(progress(phase, 0, jobs.len() as i32, None));
+    let total_jobs = jobs.len() as i32;
+    let mut completed_jobs = 0;
+    let mut proofs = Vec::new();
+    let mut sources = BTreeMap::new();
+    let mut downloads = futures_util::stream::iter(jobs.into_iter().map(|classified| {
+        let client = client.clone();
+        let fact_tx = fact_tx.clone();
+        let source_pool = source_pool.clone();
+        let cache_admission = cache_admission.clone();
+        async move {
+            acquire_retained_classified_library(
+                &client,
+                classified,
+                &cache_admission,
+                &source_pool,
+                fact_tx.as_ref(),
+            )
+            .await
+        }
+    }))
+    .buffer_unordered(library_download_concurrency());
+    while let Some(result) = downloads.next().await {
+        let RetainedClassifiedLibraryAcquisition {
+            relative_path,
+            name,
+            observed_size: _,
+            proof,
+            source,
+        } = result?;
+        completed_jobs += 1;
+        send(progress(phase, completed_jobs, total_jobs, Some(name)));
+        if let Some(proof) = proof {
+            proofs.push(proof);
+        }
+        if let Some(source) = source
+            && sources.insert(relative_path, source).is_some()
+        {
+            return Err(LibraryPlanError::ConflictingArtifactPath.into());
+        }
+    }
+    Ok((proofs, sources.into_values().collect()))
+}
+
+async fn download_installer_classified_library_jobs<F>(
     mc_dir: &Path,
     jobs: Vec<ClassifiedLibraryDownload>,
     phase: &str,
     mut send: F,
     fact_tx: Option<mpsc::UnboundedSender<ExecutionDownloadFact>>,
-    retain_exact_proofs: bool,
 ) -> Result<Vec<MaterializedLibraryIdentity>, DownloadError>
 where
     F: FnMut(DownloadProgress),
@@ -207,18 +437,16 @@ where
                         .ok_or(LibraryPlanError::InvalidChecksum)?,
                 )
                 .ok_or(LibraryPlanError::InvalidChecksum)?;
-                let proof = retain_exact_proofs.then(|| {
-                    MaterializedLibraryIdentity::new(
-                        job.relative_path.clone(),
-                        job.path.clone(),
-                        job.is_native,
-                        job.url.clone(),
-                        job.expected.clone(),
-                        observed_size,
-                        sha1,
-                    )
-                });
-                (proof, job.relative_path)
+                let proof = MaterializedLibraryIdentity::new(
+                    job.relative_path.clone(),
+                    job.path.clone(),
+                    job.is_native,
+                    job.url.clone(),
+                    job.expected.clone(),
+                    observed_size,
+                    sha1,
+                );
+                (Some(proof), job.relative_path)
             } else {
                 let target = selected_download_target_label(
                     SelectedDownloadArtifactKind::Library,
@@ -581,10 +809,18 @@ fn native_name_matches_env(name: &str, env: &crate::rules::Environment) -> bool 
 }
 
 #[cfg(test)]
-mod exact_library_proof_tests {
-    use super::library_artifact_plans_for;
+mod tests {
+    use super::{DownloadJob, ExactLibraryCacheAdmission, library_artifact_plans_for};
+    use crate::artifact_path::ArtifactRelativePath;
+    use crate::download::ExpectedIntegrity;
     use crate::launch::{Library, LibraryArtifact, LibraryDownload};
+    use sha1::{Digest as _, Sha1};
     use std::collections::HashMap;
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
     fn direct_library(path: &str, url: &str, sha1: &str, size: i64) -> Library {
         Library {
@@ -602,6 +838,30 @@ mod exact_library_proof_tests {
         }
     }
 
+    fn temp_root(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "axial-library-admission-{label}-{}-{}",
+            std::process::id(),
+            TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ))
+    }
+
+    fn exact_job(root: &Path, bytes: &[u8]) -> DownloadJob {
+        let relative_path =
+            ArtifactRelativePath::new("org/example/exact/1/exact-1.jar").expect("artifact path");
+        DownloadJob {
+            path: relative_path.join_under(&root.join("libraries")),
+            relative_path,
+            url: "https://example.invalid/exact.jar".to_string(),
+            name: "exact-1.jar".to_string(),
+            expected: ExpectedIntegrity {
+                size: Some(bytes.len() as u64),
+                sha1: Some(format!("{:x}", Sha1::digest(bytes))),
+            },
+            is_native: false,
+        }
+    }
+
     #[test]
     fn library_plans_preserve_checksumless_metadata() {
         let library = direct_library(
@@ -614,5 +874,82 @@ mod exact_library_proof_tests {
             .expect("checksumless plan");
         assert_eq!(plans.len(), 1);
         assert!(plans[0].expected.sha1.is_none());
+    }
+
+    #[tokio::test]
+    async fn exact_cache_admission_treats_missing_root_and_library_tree_as_misses() {
+        let root = temp_root("missing");
+        let job = exact_job(&root, b"exact bytes");
+        let missing_root = ExactLibraryCacheAdmission::bind(&root)
+            .await
+            .expect("bind missing root");
+        assert!(
+            missing_root
+                .requires_retained_source(&job)
+                .await
+                .expect("inspect missing root")
+        );
+        drop(missing_root);
+
+        fs::create_dir_all(&root).expect("create managed root");
+        let missing_libraries = ExactLibraryCacheAdmission::bind(&root)
+            .await
+            .expect("bind missing Libraries tree");
+        assert!(
+            missing_libraries
+                .requires_retained_source(&job)
+                .await
+                .expect("inspect missing Libraries tree")
+        );
+        drop(missing_libraries);
+        fs::remove_dir_all(root).expect("remove missing-tree test root");
+    }
+
+    #[tokio::test]
+    async fn exact_cache_admission_omits_exact_and_retains_corrupt_files() {
+        let root = temp_root("exact-corrupt");
+        let bytes = b"exact library bytes";
+        let job = exact_job(&root, bytes);
+        fs::create_dir_all(job.path.parent().expect("artifact parent"))
+            .expect("create artifact parent");
+        fs::write(&job.path, bytes).expect("write exact library");
+        let admission = ExactLibraryCacheAdmission::bind(&root)
+            .await
+            .expect("bind exact Libraries tree");
+        assert!(
+            !admission
+                .requires_retained_source(&job)
+                .await
+                .expect("admit exact library")
+        );
+
+        let corrupt = b"wrong library bytes";
+        assert_eq!(corrupt.len(), bytes.len(), "exercise guarded hashing");
+        fs::write(&job.path, corrupt).expect("replace same-size corrupt library");
+        assert!(
+            admission
+                .requires_retained_source(&job)
+                .await
+                .expect("classify corrupt library")
+        );
+        drop(admission);
+        fs::remove_dir_all(root).expect("remove exact-corrupt test root");
+    }
+
+    #[tokio::test]
+    async fn exact_cache_admission_rejects_invalid_final_topology() {
+        let root = temp_root("invalid-topology");
+        let job = exact_job(&root, b"exact library bytes");
+        fs::create_dir_all(&job.path).expect("create directory at artifact path");
+        let admission = ExactLibraryCacheAdmission::bind(&root)
+            .await
+            .expect("bind Libraries tree");
+        let error = admission
+            .requires_retained_source(&job)
+            .await
+            .expect_err("directory final must fail closed");
+        assert!(error.to_string().contains("unsupported type"));
+        drop(admission);
+        fs::remove_dir_all(root).expect("remove invalid-topology test root");
     }
 }

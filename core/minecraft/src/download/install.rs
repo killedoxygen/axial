@@ -4,7 +4,10 @@ use super::assets::{
 };
 use super::client::{library_download_concurrency, standard_minecraft_download_client};
 use super::facts::selected_download_source_label;
-use super::libraries::library_jobs_for;
+use super::libraries::{
+    ExactLibraryCacheAdmission, RetainedClassifiedLibraryAcquisition,
+    acquire_retained_classified_library, library_jobs_for,
+};
 use super::library_source::{
     LIBRARY_SOURCE_MAX_BYTES, LibrarySourcePool, LibrarySourceRequest,
     RetainedLibraryComponentSource, acquire_authenticated_library_source,
@@ -22,9 +25,8 @@ use super::runtime::{
 use super::transfer::{
     AuthenticatedSelectedArtifactSource, AuthenticatedSelectedArtifactVersionBundleParts,
     MaterializedSelectedArtifactSource, SelectedArtifactSourceRequest,
-    acquire_authenticated_selected_artifact_source, ensure_selected_artifact_with_client,
-    materialize_authenticated_library_source, materialize_authenticated_selected_artifact_source,
-    prepare_library_publication, prepare_selected_artifact_install,
+    acquire_authenticated_selected_artifact_source,
+    materialize_authenticated_selected_artifact_source, prepare_selected_artifact_install,
 };
 use crate::artifact_path::validate_artifact_path_segment;
 use crate::known_good::{
@@ -41,9 +43,7 @@ use crate::known_good_libraries::{
 };
 use crate::launch::{VersionJson, effective_java_version_for};
 use crate::managed_fs::ManagedDir;
-use crate::managed_libraries_publication::{
-    LibrariesLifecycleError, RetainedLibrariesPublicationSource, publish_libraries_component,
-};
+use crate::managed_libraries_publication::{LibrariesLifecycleError, publish_libraries_component};
 use crate::managed_publication::{ManagedRootPublicationLease, run_publication_blocking};
 use crate::manifest::{ManifestEntry, VersionManifest, fetch_fresh_install_version_manifest};
 use crate::paths::{assets_dir, libraries_dir};
@@ -385,9 +385,17 @@ pub(crate) struct ReconstructedVanillaAuthority {
     parts: VanillaAuthorityParts,
 }
 
-pub(crate) struct PreparedVersionBundlePublication {
+pub(crate) struct PreparedManagedInstall {
     authority: PendingKnownGoodInstallAuthority,
-    source: AuthenticatedVersionBundleSource,
+    version_bundle_source: AuthenticatedVersionBundleSource,
+    library_sources: Vec<RetainedLibraryComponentSource>,
+}
+
+#[cfg(test)]
+impl PreparedManagedInstall {
+    pub(crate) fn retained_library_source_count(&self) -> usize {
+        self.library_sources.len()
+    }
 }
 
 pub(crate) struct AuthenticatedVanillaInstallSources {
@@ -905,13 +913,7 @@ impl Downloader {
                     fact_tx.as_ref(),
                 )
                 .await?;
-            let lease = acquire_version_bundle_publication_lease(managed_root, version_id).await?;
-            publish_prepared_managed_install(
-                lease,
-                prepared,
-                Vec::<RetainedLibraryComponentSource>::new(),
-            )
-            .await
+            publish_prepared_managed_install(managed_root, prepared).await
         }
         .await;
 
@@ -952,7 +954,7 @@ impl Downloader {
         send: &mut F,
         plan: &Arc<TransferPlan>,
         fact_tx: Option<&mpsc::UnboundedSender<ExecutionDownloadFact>>,
-    ) -> Result<PreparedVersionBundlePublication, DownloadError>
+    ) -> Result<PreparedManagedInstall, DownloadError>
     where
         F: FnMut(DownloadProgress),
     {
@@ -972,6 +974,7 @@ impl Downloader {
             asset_index_source,
             runtime_source,
         } = authenticated;
+        let library_cache_admission = ExactLibraryCacheAdmission::bind(self.managed_root()).await?;
         send(progress(
             "version_json",
             1,
@@ -1130,85 +1133,27 @@ impl Downloader {
             );
             send(progress("libraries", 0, library_jobs.len() as i32, None));
             let client = self.client.clone();
-            let source_pool = LibrarySourcePool::new();
+            let source_pool = LibrarySourcePool::for_component_retention()?;
             let total_library_jobs = library_jobs.len() as i32;
             let mut completed_library_jobs = 0;
             let library_result = async {
                 let mut proofs = Vec::with_capacity(total_library_jobs as usize);
+                let mut sources = Vec::with_capacity(total_library_jobs as usize);
                 let mut library_downloads =
                     futures_util::stream::iter(library_jobs.into_iter().map(|classified| {
-                        let (job, acquisition) = classified.into_parts();
                         let client = client.clone();
                         let fact_tx = fact_tx.cloned();
                         let source_pool = source_pool.clone();
+                        let cache_admission = library_cache_admission.clone();
                         async move {
-                            if acquisition == LibraryAcquisition::FreshStream {
-                                let target = selected_download_source_label(
-                                    SelectedDownloadArtifactKind::Library,
-                                    job.relative_path.as_str(),
-                                );
-                                let source = acquire_authenticated_library_source(
-                                    LibrarySourceRequest {
-                                        client: &client,
-                                        url: &job.url,
-                                        expected: &job.expected,
-                                        relative_path: &job.relative_path,
-                                        max_bytes: LIBRARY_SOURCE_MAX_BYTES,
-                                        target: &target,
-                                        pool: &source_pool,
-                                        fact_tx: fact_tx.as_ref(),
-                                    },
-                                )
-                                .await?;
-                                let prepared = prepare_library_publication(
-                                    self.managed_root(),
-                                    job.relative_path.clone(),
-                                    &job.url,
-                                    &job.expected,
-                                    job.is_native,
-                                    fact_tx.as_ref(),
-                                )
-                                .await?;
-                                let (identity, _) = materialize_authenticated_library_source(
-                                    prepared,
-                                    source,
-                                    fact_tx.as_ref(),
-                                )
-                                .await?;
-                                let (
-                                    path,
-                                    _destination,
-                                    is_native,
-                                    provider_url,
-                                    expected,
-                                    observed_size,
-                                    sha1,
-                                ) = identity.into_parts();
-                                let proof = ExactLibraryDownloadProof::new(
-                                    path,
-                                    is_native,
-                                    provider_url,
-                                    expected,
-                                    observed_size,
-                                    sha1,
-                                );
-                                Ok::<_, DownloadError>((job.name, observed_size, Some(proof)))
-                            } else {
-                                ensure_selected_artifact_with_client(
-                                    SelectedDownloadArtifactKind::Library,
-                                    &client,
-                                    &job.url,
-                                    &job.path,
-                                    &job.expected,
-                                    fact_tx.as_ref(),
-                                )
-                                .await?;
-                                Ok::<_, DownloadError>((
-                                    job.name,
-                                    job.expected.size.unwrap_or(0),
-                                    None,
-                                ))
-                            }
+                            acquire_retained_classified_library(
+                                &client,
+                                classified,
+                                &cache_admission,
+                                &source_pool,
+                                fact_tx.as_ref(),
+                            )
+                            .await
                         }
                     }))
                     .buffer_unordered(library_download_concurrency());
@@ -1234,11 +1179,20 @@ impl Downloader {
                             let Some(result) = result else {
                                 break;
                             };
-                            let (name, bytes, proof) = result?;
+                            let RetainedClassifiedLibraryAcquisition {
+                                relative_path: _,
+                                name,
+                                observed_size,
+                                proof,
+                                source,
+                            } = result?;
                             if let Some(proof) = proof {
                                 proofs.push(proof);
                             }
-                            plan.add_done(bytes);
+                            if let Some(source) = source {
+                                sources.push(source);
+                            }
+                            plan.add_done(observed_size);
                             completed_library_jobs += 1;
                             send(progress(
                                 "libraries",
@@ -1249,7 +1203,7 @@ impl Downloader {
                         }
                     }
                 }
-                Ok::<_, DownloadError>(proofs)
+                Ok::<_, DownloadError>((proofs, sources))
             }
             .await;
             let client_jar_result = await_selected_source_task(client_jar_task, "client").await;
@@ -1285,10 +1239,11 @@ impl Downloader {
             }
             let client_source = client_jar_result?;
             let log_config_source = log_config_result.transpose()?;
-            let library_proofs = library_result?;
+            let (library_proofs, library_sources) = library_result?;
             Ok::<_, DownloadError>((
                 pending_library_declarations,
                 library_proofs,
+                library_sources,
                 client_source,
                 log_config_source,
             ))
@@ -1297,7 +1252,13 @@ impl Downloader {
 
         let (
             runtime_receipt,
-            (pending_library_declarations, library_proofs, client_source, log_config_source),
+            (
+                pending_library_declarations,
+                library_proofs,
+                library_sources,
+                client_source,
+                log_config_source,
+            ),
         ) = finish_runtime_pipeline_after_artifacts(runtime_pipeline, artifact_result, send)
             .await?;
 
@@ -1328,7 +1289,11 @@ impl Downloader {
                 ))
             })?;
         let source = source_authority.into_version_bundle_source()?;
-        Ok(PreparedVersionBundlePublication { authority, source })
+        Ok(PreparedManagedInstall {
+            authority,
+            version_bundle_source: source,
+            library_sources,
+        })
     }
 
     async fn acquire_vanilla_plan(
@@ -1961,12 +1926,13 @@ enum LocalVersionBundleSettlement {
     Retry(ManagedVersionBundleSettlementFailure),
 }
 
-pub(crate) fn prepare_local_version_bundle_publication(
+pub(crate) fn prepare_local_managed_install(
     authority: PendingKnownGoodInstallAuthority,
     version_json: Vec<u8>,
     client_jar: Vec<u8>,
     log_config: Option<Vec<u8>>,
-) -> Result<PreparedVersionBundlePublication, DownloadError> {
+    library_sources: Vec<RetainedLibraryComponentSource>,
+) -> Result<PreparedManagedInstall, DownloadError> {
     let source = {
         let projection = authority.version_bundle_projection().map_err(|_| {
             version_bundle_install_error("version bundle projection could not be derived")
@@ -1979,31 +1945,38 @@ pub(crate) fn prepare_local_version_bundle_publication(
             log_config,
         )?
     };
-    Ok(PreparedVersionBundlePublication { authority, source })
+    Ok(PreparedManagedInstall {
+        authority,
+        version_bundle_source: source,
+        library_sources,
+    })
 }
 
-pub(crate) async fn publish_prepared_managed_install<S>(
-    lease: ManagedRootPublicationLease,
-    prepared: PreparedVersionBundlePublication,
-    sources: Vec<S>,
-) -> Result<KnownGoodInstallReceipt, DownloadError>
-where
-    S: RetainedLibrariesPublicationSource + 'static,
-{
+pub(crate) async fn publish_prepared_managed_install(
+    managed_root: PathBuf,
+    prepared: PreparedManagedInstall,
+) -> Result<KnownGoodInstallReceipt, DownloadError> {
+    let observer_key = prepared.authority.version_id().to_string();
     let owner = tokio::spawn(async move {
-        let lease = publish_libraries_component(lease, &prepared.authority, sources)
+        let PreparedManagedInstall {
+            authority,
+            version_bundle_source,
+            library_sources,
+        } = prepared;
+        let lease = acquire_managed_install_publication_lease(managed_root, &observer_key).await?;
+        let lease = publish_libraries_component(lease, &authority, library_sources)
             .await
             .map_err(managed_libraries_install_error)?;
-        complete_prepared_version_bundle_install(lease, prepared).await
+        complete_prepared_version_bundle_install(lease, authority, version_bundle_source).await
     });
     owner.await.map_err(managed_install_owner_error)?
 }
 
 async fn complete_prepared_version_bundle_install(
     lease: ManagedRootPublicationLease,
-    prepared: PreparedVersionBundlePublication,
+    authority: PendingKnownGoodInstallAuthority,
+    source: AuthenticatedVersionBundleSource,
 ) -> Result<KnownGoodInstallReceipt, DownloadError> {
-    let PreparedVersionBundlePublication { authority, source } = prepared;
     let publication = {
         let projection = authority.version_bundle_projection().map_err(|_| {
             version_bundle_install_error("version bundle projection could not be derived")
@@ -2031,7 +2004,7 @@ async fn complete_prepared_version_bundle_install(
     }
 }
 
-pub(crate) async fn acquire_version_bundle_publication_lease(
+async fn acquire_managed_install_publication_lease(
     managed_root: PathBuf,
     _version_id: &str,
 ) -> Result<ManagedRootPublicationLease, DownloadError> {
@@ -2043,23 +2016,23 @@ pub(crate) async fn acquire_version_bundle_publication_lease(
     .map_err(|_| version_bundle_install_error("version bundle root task stopped"))?
     .map_err(|_| version_bundle_install_error("version bundle root is unavailable"))?;
     #[cfg(test)]
-    notify_vanilla_publication_lease_wait_for_test(_version_id);
+    notify_managed_install_lease_wait_for_test(_version_id);
     ManagedRootPublicationLease::acquire(root)
         .await
         .map_err(|_| version_bundle_install_error("version bundle publication lock failed"))
 }
 
 #[cfg(test)]
-static VANILLA_PUBLICATION_LEASE_WAIT_OBSERVERS: std::sync::OnceLock<
+static MANAGED_INSTALL_LEASE_WAIT_OBSERVERS: std::sync::OnceLock<
     std::sync::Mutex<std::collections::HashMap<String, tokio::sync::oneshot::Sender<()>>>,
 > = std::sync::OnceLock::new();
 
 #[cfg(test)]
-pub(super) fn observe_vanilla_publication_lease_wait_for_test(
+pub(super) fn observe_managed_install_lease_wait_for_test(
     version_id: &str,
 ) -> tokio::sync::oneshot::Receiver<()> {
     let (reached_tx, reached_rx) = tokio::sync::oneshot::channel();
-    let replaced = VANILLA_PUBLICATION_LEASE_WAIT_OBSERVERS
+    let replaced = MANAGED_INSTALL_LEASE_WAIT_OBSERVERS
         .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -2069,8 +2042,8 @@ pub(super) fn observe_vanilla_publication_lease_wait_for_test(
 }
 
 #[cfg(test)]
-fn notify_vanilla_publication_lease_wait_for_test(version_id: &str) {
-    let observer = VANILLA_PUBLICATION_LEASE_WAIT_OBSERVERS
+fn notify_managed_install_lease_wait_for_test(version_id: &str) {
+    let observer = MANAGED_INSTALL_LEASE_WAIT_OBSERVERS
         .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
