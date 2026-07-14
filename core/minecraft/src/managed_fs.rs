@@ -50,6 +50,13 @@ pub(crate) struct ManagedFileGuard {
     size: u64,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum ManagedEmptyChildRemoval {
+    Removed,
+    IdentityMismatchRestored,
+    IdentityMismatchParked,
+}
+
 pub(crate) struct MaterializedInstallerLibrary {
     source: RetainedInstallerLibrarySource,
     destination: PathBuf,
@@ -469,6 +476,109 @@ impl ManagedDir {
         }
     }
 
+    pub(crate) fn create_child_new(&self, name: &str) -> Result<Self, LoaderError> {
+        self.create_child_new_inner(name, |_| {})
+    }
+
+    #[cfg(test)]
+    fn create_child_new_with_hook(
+        &self,
+        name: &str,
+        after_park_open: impl FnOnce(&str),
+    ) -> Result<Self, LoaderError> {
+        self.create_child_new_inner(name, after_park_open)
+    }
+
+    fn create_child_new_inner(
+        &self,
+        name: &str,
+        after_park_open: impl FnOnce(&str),
+    ) -> Result<Self, LoaderError> {
+        validate_segment(name)?;
+        self.revalidate()?;
+        if self.has_portably_exact_child_name(name)? {
+            return Err(LoaderError::Verify(
+                "managed create-only child already exists".to_string(),
+            ));
+        }
+        let parked_name = directory_park_name();
+        platform::create_child_directory(
+            &self.inner.handle,
+            &self.inner.path,
+            OsStr::new(&parked_name),
+        )?;
+        let (handle, identity) = platform::open_child_directory(
+            &self.inner.handle,
+            &self.inner.path,
+            OsStr::new(&parked_name),
+        )?;
+        after_park_open(&parked_name);
+        if let Err(error) = platform::rename_entry_no_replace(
+            &self.inner.handle,
+            &self.inner.path,
+            OsStr::new(&parked_name),
+            &self.inner.handle,
+            &self.inner.path,
+            OsStr::new(name),
+        ) {
+            drop(handle);
+            let _ = platform::remove_empty_directory(
+                &self.inner.handle,
+                &self.inner.path,
+                OsStr::new(&parked_name),
+                identity,
+            );
+            return Err(LoaderError::Io(error));
+        }
+        let promoted_identity = match platform::child_directory_identity(
+            &self.inner.handle,
+            &self.inner.path,
+            OsStr::new(name),
+        ) {
+            Ok(identity) => identity,
+            Err(error) => {
+                let _ = platform::rename_entry_no_replace(
+                    &self.inner.handle,
+                    &self.inner.path,
+                    OsStr::new(name),
+                    &self.inner.handle,
+                    &self.inner.path,
+                    OsStr::new(&parked_name),
+                );
+                return Err(LoaderError::Io(error));
+            }
+        };
+        if promoted_identity != identity {
+            let _ = platform::rename_entry_no_replace(
+                &self.inner.handle,
+                &self.inner.path,
+                OsStr::new(name),
+                &self.inner.handle,
+                &self.inner.path,
+                OsStr::new(&parked_name),
+            );
+            return Err(LoaderError::Verify(
+                "managed create-only child identity changed during publication".to_string(),
+            ));
+        }
+        let child = match self.child(name, handle, identity) {
+            Ok(child) => child,
+            Err(error) => {
+                let _ = platform::rename_entry_no_replace(
+                    &self.inner.handle,
+                    &self.inner.path,
+                    OsStr::new(name),
+                    &self.inner.handle,
+                    &self.inner.path,
+                    OsStr::new(&parked_name),
+                );
+                return Err(error);
+            }
+        };
+        self.revalidate()?;
+        Ok(child)
+    }
+
     pub(crate) fn open_or_create_persistent_file(
         &self,
         name: &str,
@@ -818,24 +928,26 @@ impl ManagedDir {
                 "managed loader source exceeds the processor stage file bound".to_string(),
             ));
         }
-        self.import_relative_authenticated_inner(
-            relative,
-            source,
-            expected_size,
-            expected_sha1,
-            true,
-            (),
-            #[cfg(test)]
-            None,
-            #[cfg(test)]
-            false,
-        )
-        .await
+        let (parent, name) = self.open_or_create_relative_parent(relative)?;
+        parent
+            .import_authenticated_inner(
+                &name,
+                source,
+                expected_size,
+                expected_sha1,
+                true,
+                (),
+                #[cfg(test)]
+                None,
+                #[cfg(test)]
+                false,
+            )
+            .await
     }
 
-    pub(crate) async fn import_relative_authenticated_create_new<R, G>(
+    pub(crate) async fn import_authenticated_create_new<R, G>(
         &self,
-        relative: &ArtifactRelativePath,
+        name: &str,
         source: R,
         expected_size: u64,
         expected_sha1: [u8; 20],
@@ -850,8 +962,8 @@ impl ManagedDir {
                 "managed retained source exceeds the bounded file limit".to_string(),
             ));
         }
-        self.import_relative_authenticated_inner(
-            relative,
+        self.import_authenticated_inner(
+            name,
             source,
             expected_size,
             expected_sha1,
@@ -866,9 +978,9 @@ impl ManagedDir {
     }
 
     #[cfg(test)]
-    pub(crate) async fn import_relative_authenticated_create_new_with_hook<R, G>(
+    pub(crate) async fn import_authenticated_create_new_with_hook<R, G>(
         &self,
-        relative: &ArtifactRelativePath,
+        name: &str,
         source: R,
         expected_size: u64,
         expected_sha1: [u8; 20],
@@ -884,8 +996,8 @@ impl ManagedDir {
                 "managed retained source exceeds the bounded file limit".to_string(),
             ));
         }
-        self.import_relative_authenticated_inner(
-            relative,
+        self.import_authenticated_inner(
+            name,
             source,
             expected_size,
             expected_sha1,
@@ -898,9 +1010,9 @@ impl ManagedDir {
     }
 
     #[cfg(test)]
-    async fn import_relative_authenticated_create_new_with_post_promotion_failure<R, G>(
+    async fn import_authenticated_create_new_with_post_promotion_failure<R, G>(
         &self,
-        relative: &ArtifactRelativePath,
+        name: &str,
         source: R,
         expected_size: u64,
         expected_sha1: [u8; 20],
@@ -910,8 +1022,8 @@ impl ManagedDir {
         R: Read + Seek + Send + 'static,
         G: Send + 'static,
     {
-        self.import_relative_authenticated_inner(
-            relative,
+        self.import_authenticated_inner(
+            name,
             source,
             expected_size,
             expected_sha1,
@@ -923,9 +1035,9 @@ impl ManagedDir {
         .await
     }
 
-    async fn import_relative_authenticated_inner<R, G>(
+    async fn import_authenticated_inner<R, G>(
         &self,
-        relative: &ArtifactRelativePath,
+        name: &str,
         source: R,
         expected_size: u64,
         expected_sha1: [u8; 20],
@@ -938,7 +1050,9 @@ impl ManagedDir {
         R: Read + Seek + Send + 'static,
         G: Send + 'static,
     {
-        let (parent, name) = self.open_or_create_relative_parent(relative)?;
+        validate_segment(name)?;
+        let parent = self.clone();
+        let name = name.to_string();
         tokio::task::spawn_blocking(move || {
             let _lifetime_guard = lifetime_guard;
             #[cfg(test)]
@@ -1725,6 +1839,157 @@ impl ManagedDir {
         self.revalidate()
     }
 
+    pub(crate) fn remove_empty_child_guarded(
+        &self,
+        name: &str,
+        park_name: &str,
+        child: ManagedDir,
+    ) -> Result<ManagedEmptyChildRemoval, LoaderError> {
+        self.remove_empty_child_guarded_inner(name, park_name, child, || {})
+    }
+
+    #[cfg(test)]
+    fn remove_empty_child_guarded_with_hook(
+        &self,
+        name: &str,
+        park_name: &str,
+        child: ManagedDir,
+        after_park: impl FnOnce(),
+    ) -> Result<ManagedEmptyChildRemoval, LoaderError> {
+        self.remove_empty_child_guarded_inner(name, park_name, child, after_park)
+    }
+
+    fn remove_empty_child_guarded_inner(
+        &self,
+        name: &str,
+        park_name: &str,
+        child: ManagedDir,
+        after_park: impl FnOnce(),
+    ) -> Result<ManagedEmptyChildRemoval, LoaderError> {
+        validate_segment(name)?;
+        validate_segment(park_name)?;
+        if name.eq_ignore_ascii_case(park_name) {
+            return Err(LoaderError::Verify(
+                "managed cleanup park name aliases its target".to_string(),
+            ));
+        }
+        let DirectoryBinding::Child {
+            parent,
+            name: child_name,
+        } = &child.inner.binding
+        else {
+            return Err(LoaderError::Verify(
+                "managed cleanup target is not a child directory".to_string(),
+            ));
+        };
+        if !Arc::ptr_eq(parent, &self.inner) || child_name.as_os_str() != OsStr::new(name) {
+            return Err(LoaderError::Verify(
+                "managed cleanup child binding does not match its parent".to_string(),
+            ));
+        }
+        if Arc::strong_count(&child.inner) != 1 {
+            return Err(LoaderError::Verify(
+                "managed cleanup child capability is not uniquely owned".to_string(),
+            ));
+        }
+        self.revalidate()?;
+        if !self.has_portably_exact_child_name(name)? {
+            return Err(LoaderError::Verify(
+                "managed cleanup child directory is absent".to_string(),
+            ));
+        }
+        if self.has_portably_exact_child_name(park_name)? {
+            return Err(LoaderError::Verify(
+                "managed cleanup park name is already occupied".to_string(),
+            ));
+        }
+        child.revalidate()?;
+        if !child.entries_bounded(1)?.is_empty() {
+            return Err(LoaderError::Verify(
+                "managed cleanup child directory is not empty".to_string(),
+            ));
+        }
+        let expected_identity = child.inner.identity;
+        platform::rename_entry_no_replace(
+            &self.inner.handle,
+            &self.inner.path,
+            OsStr::new(name),
+            &self.inner.handle,
+            &self.inner.path,
+            OsStr::new(park_name),
+        )?;
+        after_park();
+        let (parked_handle, parked_identity) = match platform::open_child_directory(
+            &self.inner.handle,
+            &self.inner.path,
+            OsStr::new(park_name),
+        ) {
+            Ok(parked) => parked,
+            Err(error) => {
+                drop(child);
+                return match platform::rename_entry_no_replace(
+                    &self.inner.handle,
+                    &self.inner.path,
+                    OsStr::new(park_name),
+                    &self.inner.handle,
+                    &self.inner.path,
+                    OsStr::new(name),
+                ) {
+                    Ok(()) => Err(LoaderError::Io(error)),
+                    Err(_) => Ok(ManagedEmptyChildRemoval::IdentityMismatchParked),
+                };
+            }
+        };
+        if parked_identity != expected_identity {
+            drop((parked_handle, child));
+            return match platform::rename_entry_no_replace(
+                &self.inner.handle,
+                &self.inner.path,
+                OsStr::new(park_name),
+                &self.inner.handle,
+                &self.inner.path,
+                OsStr::new(name),
+            ) {
+                Ok(()) => Ok(ManagedEmptyChildRemoval::IdentityMismatchRestored),
+                Err(_) => Ok(ManagedEmptyChildRemoval::IdentityMismatchParked),
+            };
+        }
+        let parked_entries =
+            platform::entry_names(&parked_handle, &self.inner.path.join(park_name), 1)?;
+        if !parked_entries.is_empty() {
+            drop((parked_handle, child));
+            return match platform::rename_entry_no_replace(
+                &self.inner.handle,
+                &self.inner.path,
+                OsStr::new(park_name),
+                &self.inner.handle,
+                &self.inner.path,
+                OsStr::new(name),
+            ) {
+                Ok(()) => Err(LoaderError::Verify(
+                    "managed cleanup child changed after parking".to_string(),
+                )),
+                Err(_) => Ok(ManagedEmptyChildRemoval::IdentityMismatchParked),
+            };
+        }
+        drop((parked_handle, child));
+        platform::remove_empty_directory(
+            &self.inner.handle,
+            &self.inner.path,
+            OsStr::new(park_name),
+            expected_identity,
+        )?;
+        if platform::entry_kind(&self.inner.handle, &self.inner.path, OsStr::new(park_name))?
+            .is_some()
+        {
+            return Err(LoaderError::Verify(
+                "managed cleanup child directory remained after removal".to_string(),
+            ));
+        }
+        self.revalidate()?;
+        Ok(ManagedEmptyChildRemoval::Removed)
+    }
+
     pub(crate) fn clear_owned_contents(self) -> Result<(), LoaderError> {
         if !matches!(&self.inner.binding, DirectoryBinding::Child { .. }) {
             return Err(LoaderError::Verify(
@@ -2062,6 +2327,10 @@ fn temp_name() -> String {
     format!("{TEMP_PREFIX}{}-{nanos:x}-{sequence:x}", std::process::id())
 }
 
+fn directory_park_name() -> String {
+    format!(".axial-loader-dir-{}", uuid::Uuid::new_v4().simple())
+}
+
 fn temp_owner_pid(name: &str) -> Option<u32> {
     let mut parts = name.strip_prefix(TEMP_PREFIX)?.split('-');
     let pid_text = parts.next()?;
@@ -2269,6 +2538,24 @@ mod platform {
         Ok(rfs::unlinkat(parent, name, AtFlags::empty())?)
     }
 
+    pub(super) fn remove_empty_directory(
+        parent: &DirectoryHandle,
+        _parent_path: &Path,
+        name: &OsStr,
+        expected: DirectoryIdentity,
+    ) -> io::Result<()> {
+        let stat = rfs::statat(parent, name, AtFlags::SYMLINK_NOFOLLOW)?;
+        if FileType::from_raw_mode(stat.st_mode) != FileType::Directory
+            || identity_from_stat(stat) != expected
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "managed directory identity changed before removal",
+            ));
+        }
+        Ok(rfs::unlinkat(parent, name, AtFlags::REMOVEDIR)?)
+    }
+
     pub(super) fn sync_directory(directory: &DirectoryHandle) -> io::Result<()> {
         Ok(rfs::fsync(directory)?)
     }
@@ -2340,6 +2627,175 @@ mod platform {
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn create_child_new_is_create_only_and_returns_an_exact_child() {
+        let root = test_root("create-child-new");
+        fs::create_dir_all(&root).expect("root");
+        let parent = ManagedDir::open_root(&root).expect("managed root");
+
+        let child = parent.create_child_new("stage").expect("new child");
+        child.revalidate().expect("exact new child");
+        assert_eq!(child.path(), root.join("stage"));
+        assert!(parent.create_child_new("stage").is_err());
+
+        fs::write(root.join("occupied"), b"file").expect("occupied file");
+        assert!(parent.create_child_new("occupied").is_err());
+        assert_eq!(
+            fs::read(root.join("occupied")).expect("retained file"),
+            b"file"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn create_child_new_rejects_a_portable_name_alias() {
+        let root = test_root("create-child-alias");
+        fs::create_dir_all(root.join("Stage")).expect("aliased child");
+        let parent = ManagedDir::open_root(&root).expect("managed root");
+
+        assert!(parent.create_child_new("stage").is_err());
+        assert!(root.join("Stage").is_dir());
+        assert!(!root.join("stage").exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn create_child_new_never_adopts_a_parked_name_replacement() {
+        let root = test_root("create-child-park-race");
+        fs::create_dir_all(&root).expect("root");
+        let parent = ManagedDir::open_root(&root).expect("managed root");
+        let saved_created = root.join("saved-created");
+
+        let result = parent.create_child_new_with_hook("stage", |parked_name| {
+            fs::rename(root.join(parked_name), &saved_created).expect("park created child");
+            fs::create_dir(root.join(parked_name)).expect("replace private park name");
+        });
+
+        assert!(result.is_err());
+        assert!(!root.join("stage").exists());
+        assert!(saved_created.is_dir());
+        let parked = fs::read_dir(&root)
+            .expect("root listing")
+            .map(|entry| entry.expect("root entry").file_name())
+            .find(|name| name.to_string_lossy().starts_with(".axial-loader-dir-"))
+            .expect("replacement restored to private park name");
+        assert!(root.join(parked).is_dir());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn guarded_empty_child_removal_rejects_nonempty_and_wrong_bindings() {
+        let root = test_root("remove-empty-child");
+        let other_root = test_root("remove-empty-child-other");
+        fs::create_dir_all(&root).expect("root");
+        fs::create_dir_all(&other_root).expect("other root");
+        let parent = ManagedDir::open_root(&root).expect("managed root");
+        let child = parent.create_child_new("stage").expect("stage");
+        fs::write(child.path().join("owned"), b"owned").expect("owned file");
+
+        assert!(
+            parent
+                .remove_empty_child_guarded("stage", "park-stage", child)
+                .is_err()
+        );
+        assert_eq!(
+            fs::read(root.join("stage/owned")).expect("retained owned file"),
+            b"owned"
+        );
+        fs::remove_file(root.join("stage/owned")).expect("empty child");
+
+        let child = parent.open_child("stage").expect("reopened stage");
+        let other = ManagedDir::open_root(&other_root).expect("other managed root");
+        assert!(
+            other
+                .remove_empty_child_guarded("stage", "park-stage", child)
+                .is_err()
+        );
+        assert!(root.join("stage").is_dir());
+
+        let child = parent.open_child("stage").expect("final stage capability");
+        assert_eq!(
+            parent
+                .remove_empty_child_guarded("stage", "park-stage", child)
+                .expect("remove exact empty child"),
+            ManagedEmptyChildRemoval::Removed
+        );
+        assert!(!root.join("stage").exists());
+        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(other_root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn guarded_empty_child_removal_preserves_a_replacement_identity() {
+        let root = test_root("remove-empty-child-replacement");
+        fs::create_dir_all(&root).expect("root");
+        let parent = ManagedDir::open_root(&root).expect("managed root");
+        let child = parent.create_child_new("stage").expect("stage");
+        let parked = root.join("parked");
+        fs::rename(child.path(), &parked).expect("park admitted child");
+        fs::create_dir(child.path()).expect("replacement child");
+
+        assert!(
+            parent
+                .remove_empty_child_guarded("stage", "park-stage", child)
+                .is_err()
+        );
+        assert!(root.join("stage").is_dir());
+        assert!(parked.is_dir());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn guarded_empty_child_removal_restores_a_parked_replacement_without_deleting_it() {
+        let root = test_root("remove-empty-child-park-race");
+        fs::create_dir_all(&root).expect("root");
+        let parent = ManagedDir::open_root(&root).expect("managed root");
+        let child = parent.create_child_new("stage").expect("stage");
+        let saved_expected = root.join("saved-expected");
+        let park_name = "park-stage";
+
+        let outcome = parent
+            .remove_empty_child_guarded_with_hook("stage", park_name, child, || {
+                fs::rename(root.join(park_name), &saved_expected).expect("save expected child");
+                fs::create_dir(root.join(park_name)).expect("parked replacement");
+            })
+            .expect("fail-closed removal outcome");
+
+        assert_eq!(outcome, ManagedEmptyChildRemoval::IdentityMismatchRestored);
+        assert!(root.join("stage").is_dir());
+        assert!(saved_expected.is_dir());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn guarded_empty_child_removal_reports_a_replacement_left_parked() {
+        let root = test_root("remove-empty-child-park-blocked");
+        fs::create_dir_all(&root).expect("root");
+        let parent = ManagedDir::open_root(&root).expect("managed root");
+        let child = parent.create_child_new("stage").expect("stage");
+        let saved_expected = root.join("saved-expected");
+        let park_name = "park-stage";
+
+        let outcome = parent
+            .remove_empty_child_guarded_with_hook("stage", park_name, child, || {
+                fs::rename(root.join(park_name), &saved_expected).expect("save expected child");
+                fs::create_dir(root.join(park_name)).expect("parked replacement");
+                fs::create_dir(root.join("stage")).expect("block replacement restoration");
+            })
+            .expect("fail-closed parked outcome");
+
+        assert_eq!(outcome, ManagedEmptyChildRemoval::IdentityMismatchParked);
+        assert!(root.join("stage").is_dir());
+        assert!(root.join(park_name).is_dir());
+        assert!(saved_expected.is_dir());
+        let _ = fs::remove_dir_all(root);
+    }
 
     #[tokio::test]
     async fn active_temp_is_not_swept_by_another_writer() {
@@ -2556,12 +3012,15 @@ mod tests {
         let source_path = source_root.join("source");
         fs::write(&source_path, bytes).expect("source");
         let destination = ManagedDir::open_root(&destination_root).expect("destination");
-        let slot = ArtifactRelativePath::new("000000/000003").expect("sharded slot");
+        let bucket = destination
+            .create_child_new("000000")
+            .expect("shard bucket");
+        let slot = "000003";
         let sha1: [u8; 20] = Sha1::digest(bytes).into();
 
-        let error = destination
-            .import_relative_authenticated_create_new_with_post_promotion_failure(
-                &slot,
+        let error = bucket
+            .import_authenticated_create_new_with_post_promotion_failure(
+                slot,
                 fs::File::open(&source_path).expect("failure source"),
                 bytes.len() as u64,
                 sha1,
@@ -2570,11 +3029,11 @@ mod tests {
             .await
             .expect_err("injected post-promotion failure");
         assert!(error.to_string().contains("failed after create-only"));
-        assert!(!slot.join_under(&destination_root).exists());
+        assert!(!bucket.path().join(slot).exists());
 
-        destination
-            .import_relative_authenticated_create_new(
-                &slot,
+        bucket
+            .import_authenticated_create_new(
+                slot,
                 fs::File::open(&source_path).expect("retry source"),
                 bytes.len() as u64,
                 sha1,
@@ -2583,7 +3042,7 @@ mod tests {
             .await
             .expect("same-slot retry after cleanup");
         assert_eq!(
-            fs::read(slot.join_under(&destination_root)).expect("retried destination"),
+            fs::read(bucket.path().join(slot)).expect("retried destination"),
             bytes
         );
         let _ = fs::remove_dir_all(source_root);
@@ -3102,11 +3561,15 @@ mod platform {
     use std::path::Path;
     use windows_sys::Win32::Storage::FileSystem::{
         FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_BASIC_INFO,
-        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_ID_INFO,
-        FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ,
-        FILE_SHARE_WRITE, FILE_STANDARD_INFO, FileBasicInfo, FileIdInfo, FileStandardInfo,
-        GetFileInformationByHandleEx, MoveFileExW,
+        FILE_DISPOSITION_FLAG_DELETE, FILE_DISPOSITION_FLAG_POSIX_SEMANTICS,
+        FILE_DISPOSITION_INFO_EX, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+        FILE_ID_INFO, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE,
+        FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_STANDARD_INFO, FileBasicInfo,
+        FileDispositionInfoEx, FileIdInfo, FileStandardInfo, GetFileInformationByHandleEx,
+        MoveFileExW, SetFileInformationByHandle,
     };
+
+    const DELETE_ACCESS: u32 = 0x0001_0000;
 
     pub(super) type DirectoryHandle = fs::File;
     pub(super) type FileIdentity = DirectoryIdentity;
@@ -3262,6 +3725,49 @@ mod platform {
         name: &OsStr,
     ) -> io::Result<()> {
         fs::remove_file(parent_path.join(name))
+    }
+
+    pub(super) fn remove_empty_directory(
+        _parent: &DirectoryHandle,
+        parent_path: &Path,
+        name: &OsStr,
+        expected: DirectoryIdentity,
+    ) -> io::Result<()> {
+        let path = parent_path.join(name);
+        let directory = open_no_follow(
+            &path,
+            FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES | DELETE_ACCESS,
+            true,
+        )?;
+        let basic: FILE_BASIC_INFO = query(&directory, FileBasicInfo)?;
+        let standard: FILE_STANDARD_INFO = query(&directory, FileStandardInfo)?;
+        if basic.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
+            || basic.FileAttributes & FILE_ATTRIBUTE_DIRECTORY == 0
+            || !standard.Directory
+            || directory_identity(&directory)? != expected
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "managed directory identity changed before removal",
+            ));
+        }
+        let disposition = FILE_DISPOSITION_INFO_EX {
+            Flags: FILE_DISPOSITION_FLAG_DELETE | FILE_DISPOSITION_FLAG_POSIX_SEMANTICS,
+        };
+        let removed = unsafe {
+            SetFileInformationByHandle(
+                directory.as_raw_handle(),
+                FileDispositionInfoEx,
+                (&disposition as *const FILE_DISPOSITION_INFO_EX).cast(),
+                u32::try_from(size_of::<FILE_DISPOSITION_INFO_EX>())
+                    .map_err(|_| io::Error::other("Windows disposition size overflowed"))?,
+            )
+        };
+        if removed == 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
     }
 
     pub(super) fn sync_directory(directory: &DirectoryHandle) -> io::Result<()> {

@@ -70,8 +70,17 @@ pub(crate) enum ManagedPublicationError {
 pub(crate) struct ManagedRootPublicationLease {
     root: ManagedDir,
     publication_directory: ManagedDir,
+    ownership: Arc<ManagedRootPublicationOwnership>,
+}
+
+struct ManagedRootPublicationOwnership {
     lock_file: Arc<ManagedPersistentFile>,
     _in_process_guard: tokio::sync::OwnedMutexGuard<()>,
+}
+
+#[derive(Clone)]
+pub(crate) struct ManagedPublicationLifetimeGuard {
+    _ownership: Arc<ManagedRootPublicationOwnership>,
 }
 
 pub(crate) enum ManagedRootPublicationReadLease {
@@ -140,8 +149,10 @@ impl ManagedRootPublicationLease {
         Ok(Self {
             root,
             publication_directory,
-            lock_file,
-            _in_process_guard: in_process_guard,
+            ownership: Arc::new(ManagedRootPublicationOwnership {
+                lock_file,
+                _in_process_guard: in_process_guard,
+            }),
         })
     }
 
@@ -153,10 +164,16 @@ impl ManagedRootPublicationLease {
         &self.publication_directory
     }
 
+    pub(crate) fn lifetime_guard(&self) -> ManagedPublicationLifetimeGuard {
+        ManagedPublicationLifetimeGuard {
+            _ownership: Arc::clone(&self.ownership),
+        }
+    }
+
     pub(crate) fn revalidate(&self) -> Result<(), ManagedPublicationError> {
         self.root.revalidate()?;
         self.publication_directory.revalidate()?;
-        self.lock_file.revalidate()?;
+        self.ownership.lock_file.revalidate()?;
         Ok(())
     }
 }
@@ -246,7 +263,7 @@ where
     .map_err(|_| ManagedPublicationError::BlockingTaskStopped)
 }
 
-impl Drop for ManagedRootPublicationLease {
+impl Drop for ManagedRootPublicationOwnership {
     fn drop(&mut self) {
         let _ = self.lock_file.unlock();
     }
@@ -839,6 +856,31 @@ mod tests {
         assert!(!waiter.is_finished());
         drop(first);
         waiter.await.expect("waiter task").expect("alias lease");
+    }
+
+    #[tokio::test]
+    async fn lifetime_guard_retains_writer_exclusion_after_lease_drop() {
+        let temporary = library_root("lifetime-guard");
+        let root = temporary.path().join("library");
+        let lease =
+            ManagedRootPublicationLease::acquire(ManagedDir::open_root(&root).expect("first root"))
+                .await
+                .expect("first lease");
+        let lifetime_guard = lease.lifetime_guard();
+        drop(lease);
+
+        let waiter = tokio::spawn(ManagedRootPublicationLease::acquire(
+            ManagedDir::open_root(&root).expect("waiting root"),
+        ));
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(!waiter.is_finished());
+
+        drop(lifetime_guard);
+        tokio::time::timeout(Duration::from_millis(200), waiter)
+            .await
+            .expect("lifetime guard released writer")
+            .expect("waiter task")
+            .expect("waiting lease");
     }
 
     #[tokio::test]

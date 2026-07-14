@@ -10,6 +10,7 @@ use crate::artifact_path::ArtifactRelativePath;
 use crate::known_good::MAX_TIER2_AGGREGATE_BYTES;
 use crate::loaders::types::LoaderError;
 use crate::managed_fs::ManagedDir;
+use crate::managed_publication::ManagedPublicationLifetimeGuard;
 use futures_util::StreamExt as _;
 use sha1::{Digest as _, Sha1};
 use std::fs::File;
@@ -564,8 +565,9 @@ impl RetainedLibraryComponentSource {
 
     pub(crate) async fn stage_create_new(
         self,
-        staging: &ManagedDir,
-        slot: &ArtifactRelativePath,
+        staging_bucket: &ManagedDir,
+        slot: &str,
+        lifetime_guard: ManagedPublicationLifetimeGuard,
     ) -> Result<StagedLibraryComponentSource, LoaderError> {
         let Self {
             allocation,
@@ -577,13 +579,13 @@ impl RetainedLibraryComponentSource {
             kind,
         } = self;
         let reader = allocation.into_reader()?;
-        staging
-            .import_relative_authenticated_create_new(
+        staging_bucket
+            .import_authenticated_create_new(
                 slot,
                 reader,
                 observed_size,
                 observed_sha1,
-                (),
+                lifetime_guard,
             )
             .await?;
         Ok(StagedLibraryComponentSource {
@@ -597,8 +599,9 @@ impl RetainedLibraryComponentSource {
     #[cfg(test)]
     async fn stage_create_new_with_hook(
         self,
-        staging: &ManagedDir,
-        slot: &ArtifactRelativePath,
+        staging_bucket: &ManagedDir,
+        slot: &str,
+        lifetime_guard: ManagedPublicationLifetimeGuard,
         blocking_hook: BlockingValidationHook,
     ) -> Result<StagedLibraryComponentSource, LoaderError> {
         let Self {
@@ -611,13 +614,13 @@ impl RetainedLibraryComponentSource {
             kind,
         } = self;
         let reader = allocation.into_reader()?;
-        staging
-            .import_relative_authenticated_create_new_with_hook(
+        staging_bucket
+            .import_authenticated_create_new_with_hook(
                 slot,
                 reader,
                 observed_size,
                 observed_sha1,
-                (),
+                lifetime_guard,
                 blocking_hook,
             )
             .await?;
@@ -1229,6 +1232,7 @@ fn source_integrity_error(message: &str) -> DownloadError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::managed_publication::ManagedRootPublicationLease;
     use sha1::Sha1;
     use std::collections::VecDeque;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1864,11 +1868,16 @@ mod tests {
         assert_eq!(source.kind(), LibraryComponentSourceKind::NativeLibrary);
 
         let temp = tempfile::tempdir().expect("component staging root");
-        let staging = ManagedDir::open_root(temp.path()).expect("managed component staging root");
-        let slot = ArtifactRelativePath::new("000000/000001").expect("deterministic staging slot");
+        let root = ManagedDir::open_root(temp.path()).expect("managed component staging root");
+        let lease = ManagedRootPublicationLease::acquire(root.clone())
+            .await
+            .expect("component staging lease");
+        let staging = root.create_child_new("staging").expect("staging directory");
+        let bucket = staging.create_child_new("000000").expect("staging bucket");
+        let slot = "000001";
         let proof = source.exact_download_proof();
         let staged = source
-            .stage_create_new(&staging, &slot)
+            .stage_create_new(&bucket, slot, lease.lifetime_guard())
             .await
             .expect("stage retained component source");
         assert_eq!(staged.relative_path(), &fixture_relative_path());
@@ -1876,7 +1885,7 @@ mod tests {
         assert_eq!(staged.observed_size(), body.len() as u64);
         assert_eq!(staged.observed_sha1(), sha1_bytes(&body));
         assert_eq!(
-            std::fs::read(slot.join_under(temp.path())).expect("read staged source"),
+            std::fs::read(bucket.path().join(slot)).expect("read staged source"),
             body
         );
         assert_eq!(
@@ -1902,13 +1911,16 @@ mod tests {
         )
         .await
         .expect("retained occupied-slot source");
-        let error = match occupied.stage_create_new(&staging, &slot).await {
+        let error = match occupied
+            .stage_create_new(&bucket, slot, lease.lifetime_guard())
+            .await
+        {
             Err(error) => error,
             Ok(_) => panic!("occupied staging slot must fail closed"),
         };
         assert!(matches!(error, LoaderError::Io(_)));
         assert_eq!(
-            std::fs::read(slot.join_under(temp.path())).expect("read unchanged staged source"),
+            std::fs::read(bucket.path().join(slot)).expect("read unchanged staged source"),
             body
         );
         assert_eq!(
@@ -1953,24 +1965,29 @@ mod tests {
         assert_eq!(pool.retained_available_bytes(), Some(0));
 
         let temp = tempfile::tempdir().expect("adjacent spool staging root");
-        let staging = ManagedDir::open_root(temp.path()).expect("managed adjacent spool root");
-        let first_slot = ArtifactRelativePath::new("000000/000010").expect("first spool slot");
-        let second_slot = ArtifactRelativePath::new("000000/000011").expect("second spool slot");
+        let root = ManagedDir::open_root(temp.path()).expect("managed adjacent spool root");
+        let lease = ManagedRootPublicationLease::acquire(root.clone())
+            .await
+            .expect("adjacent staging lease");
+        let staging = root.create_child_new("staging").expect("staging directory");
+        let bucket = staging.create_child_new("000000").expect("staging bucket");
+        let first_slot = "000010";
+        let second_slot = "000011";
         first
-            .stage_create_new(&staging, &first_slot)
+            .stage_create_new(&bucket, first_slot, lease.lifetime_guard())
             .await
             .expect("stage first spool slice");
         second
-            .stage_create_new(&staging, &second_slot)
+            .stage_create_new(&bucket, second_slot, lease.lifetime_guard())
             .await
             .expect("stage second spool slice");
 
         assert_eq!(
-            std::fs::read(first_slot.join_under(temp.path())).expect("read first spool slice"),
+            std::fs::read(bucket.path().join(first_slot)).expect("read first spool slice"),
             first_body
         );
         assert_eq!(
-            std::fs::read(second_slot.join_under(temp.path())).expect("read second spool slice"),
+            std::fs::read(bucket.path().join(second_slot)).expect("read second spool slice"),
             second_body
         );
         assert_eq!(pool.retained_available_bytes(), Some(0));
@@ -1995,18 +2012,24 @@ mod tests {
         assert_eq!(pool.retained_available_bytes(), Some(0));
 
         let temp = tempfile::tempdir().expect("cancelled staging root");
-        let staging = ManagedDir::open_root(temp.path()).expect("managed cancellation root");
-        let slot = ArtifactRelativePath::new("000000/000002").expect("cancellation staging slot");
+        let root = ManagedDir::open_root(temp.path()).expect("managed cancellation root");
+        let lease = ManagedRootPublicationLease::acquire(root.clone())
+            .await
+            .expect("cancellation staging lease");
+        let staging = root.create_child_new("staging").expect("staging directory");
+        let bucket = staging.create_child_new("000000").expect("staging bucket");
+        let slot = "000002";
         let (entered_tx, entered_rx) = oneshot::channel();
         let release = Arc::new((Mutex::new(false), Condvar::new()));
         let release_for_hook = Arc::clone(&release);
-        let task_staging = staging.clone();
-        let task_slot = slot.clone();
+        let task_bucket = bucket.clone();
+        let lifetime_guard = lease.lifetime_guard();
         let task = tokio::spawn(async move {
             source
                 .stage_create_new_with_hook(
-                    &task_staging,
-                    &task_slot,
+                    &task_bucket,
+                    slot,
+                    lifetime_guard,
                     Box::new(move || {
                         let _ = entered_tx.send(());
                         let (lock, condition) = &*release_for_hook;
@@ -2026,18 +2049,30 @@ mod tests {
         task.abort();
         let _ = task.await;
         assert_eq!(pool.retained_available_bytes(), Some(0));
+        drop(lease);
+
+        let waiter = tokio::spawn(ManagedRootPublicationLease::acquire(
+            ManagedDir::open_root(temp.path()).expect("waiting cancellation root"),
+        ));
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(!waiter.is_finished());
 
         let (lock, condition) = &*release;
         *lock.lock().expect("staging release lock") = true;
         condition.notify_one();
         for _ in 0..100 {
-            if slot.join_under(temp.path()).exists() {
+            if bucket.path().join(slot).exists() {
                 assert_eq!(
-                    std::fs::read(slot.join_under(temp.path()))
+                    std::fs::read(bucket.path().join(slot))
                         .expect("completed detached staging copy"),
                     body
                 );
                 assert_eq!(pool.retained_available_bytes(), Some(0));
+                tokio::time::timeout(Duration::from_millis(200), waiter)
+                    .await
+                    .expect("blocking copy released writer exclusion")
+                    .expect("waiting writer task")
+                    .expect("waiting writer lease");
                 return;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
