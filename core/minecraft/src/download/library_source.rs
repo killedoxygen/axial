@@ -7,11 +7,14 @@ use super::model::{
     ExpectedIntegrity,
 };
 use crate::artifact_path::ArtifactRelativePath;
+use crate::known_good::MAX_TIER2_AGGREGATE_BYTES;
+use crate::loaders::types::LoaderError;
+use crate::managed_fs::ManagedDir;
 use futures_util::StreamExt as _;
 use sha1::{Digest as _, Sha1};
 use std::fs::File;
 use std::io::{Read as _, Seek as _, SeekFrom};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::AsyncWriteExt as _;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
@@ -36,13 +39,99 @@ const ZIP_MAX_COMMENT_BYTES: usize = u16::MAX as usize;
 
 #[derive(Clone)]
 pub(super) struct LibrarySourcePool {
-    permits: Arc<Semaphore>,
+    acquisition_permits: Arc<Semaphore>,
+    retention: LibrarySourceRetention,
+}
+
+#[derive(Clone)]
+enum LibrarySourceRetention {
+    DirectWriter,
+    Component { budget: Arc<RetainedSourceBudget> },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LibrarySourceRetentionKind {
+    DirectWriter,
+    Component,
+}
+
+struct RetainedSourceBudget {
+    available_bytes: Mutex<u64>,
+}
+
+struct RetainedSourcePermit {
+    budget: Arc<RetainedSourceBudget>,
+    bytes: u64,
+}
+
+pub(super) struct LibrarySourcePermit(LibrarySourcePermitInner);
+
+enum LibrarySourcePermitInner {
+    DirectWriter { _permit: OwnedSemaphorePermit },
+    Component { permit: RetainedSourcePermit },
+}
+
+impl RetainedSourceBudget {
+    fn new(bytes: u64) -> Arc<Self> {
+        Arc::new(Self {
+            available_bytes: Mutex::new(bytes),
+        })
+    }
+
+    fn try_reserve(self: &Arc<Self>, bytes: u64) -> Result<RetainedSourcePermit, DownloadError> {
+        let mut available = self
+            .available_bytes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *available = available
+            .checked_sub(bytes)
+            .ok_or_else(|| source_integrity_error("exceeds the aggregate retained-source limit"))?;
+        Ok(RetainedSourcePermit {
+            budget: Arc::clone(self),
+            bytes,
+        })
+    }
+
+    #[cfg(test)]
+    fn available_bytes(&self) -> u64 {
+        *self
+            .available_bytes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+impl Drop for RetainedSourcePermit {
+    fn drop(&mut self) {
+        let mut available = self
+            .budget
+            .available_bytes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *available = available
+            .checked_add(self.bytes)
+            .expect("retained library source budget overflow");
+    }
 }
 
 impl LibrarySourcePool {
     pub(super) fn new() -> Self {
         Self {
-            permits: Arc::new(Semaphore::new(LIBRARY_SOURCE_BUDGET_UNITS as usize)),
+            acquisition_permits: Arc::new(Semaphore::new(LIBRARY_SOURCE_BUDGET_UNITS as usize)),
+            retention: LibrarySourceRetention::DirectWriter,
+        }
+    }
+
+    pub(super) fn for_component_retention() -> Self {
+        Self::for_component_retention_bytes(MAX_TIER2_AGGREGATE_BYTES)
+    }
+
+    fn for_component_retention_bytes(retained_bytes: u64) -> Self {
+        Self {
+            acquisition_permits: Arc::new(Semaphore::new(LIBRARY_SOURCE_BUDGET_UNITS as usize)),
+            retention: LibrarySourceRetention::Component {
+                budget: RetainedSourceBudget::new(retained_bytes),
+            },
         }
     }
 
@@ -51,15 +140,46 @@ impl LibrarySourcePool {
             return Err(source_integrity_error("exceeds the bounded scratch limit"));
         }
         let units = hard_limit.div_ceil(LIBRARY_SOURCE_BUDGET_UNIT_BYTES) as u32;
-        Arc::clone(&self.permits)
+        Arc::clone(&self.acquisition_permits)
             .acquire_many_owned(units)
             .await
             .map_err(|_| source_integrity_error("scratch budget is closed"))
     }
 
+    fn retain_validated(
+        &self,
+        observed_size: u64,
+        acquisition_permit: OwnedSemaphorePermit,
+    ) -> Result<(LibrarySourcePermit, LibrarySourceRetentionKind), DownloadError> {
+        let LibrarySourceRetention::Component { budget } = &self.retention else {
+            return Ok((
+                LibrarySourcePermit(LibrarySourcePermitInner::DirectWriter {
+                    _permit: acquisition_permit,
+                }),
+                LibrarySourceRetentionKind::DirectWriter,
+            ));
+        };
+        let retained_permit = budget.try_reserve(observed_size)?;
+        drop(acquisition_permit);
+        Ok((
+            LibrarySourcePermit(LibrarySourcePermitInner::Component {
+                permit: retained_permit,
+            }),
+            LibrarySourceRetentionKind::Component,
+        ))
+    }
+
     #[cfg(test)]
     fn available_bytes(&self) -> u64 {
-        self.permits.available_permits() as u64 * LIBRARY_SOURCE_BUDGET_UNIT_BYTES
+        self.acquisition_permits.available_permits() as u64 * LIBRARY_SOURCE_BUDGET_UNIT_BYTES
+    }
+
+    #[cfg(test)]
+    fn retained_available_bytes(&self) -> Option<u64> {
+        match &self.retention {
+            LibrarySourceRetention::DirectWriter => None,
+            LibrarySourceRetention::Component { budget } => Some(budget.available_bytes()),
+        }
     }
 }
 
@@ -71,7 +191,8 @@ pub(super) struct AuthenticatedLibrarySource {
     expected: ExpectedIntegrity,
     target: String,
     provider_url: String,
-    _permit: OwnedSemaphorePermit,
+    _permit: LibrarySourcePermit,
+    retention_kind: LibrarySourceRetentionKind,
 }
 
 impl AuthenticatedLibrarySource {
@@ -125,7 +246,7 @@ impl AuthenticatedLibrarySource {
         ExpectedIntegrity,
         String,
         String,
-        OwnedSemaphorePermit,
+        LibrarySourcePermit,
     ) {
         (
             self.file,
@@ -151,6 +272,152 @@ impl AuthenticatedLibrarySource {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum LibraryComponentSourceKind {
+    Library,
+    NativeLibrary,
+}
+
+pub(crate) struct RetainedLibraryComponentSource {
+    _file: File,
+    relative_path: ArtifactRelativePath,
+    observed_size: u64,
+    observed_sha1: [u8; 20],
+    expected: ExpectedIntegrity,
+    provider_url: String,
+    kind: LibraryComponentSourceKind,
+    _permit: RetainedSourcePermit,
+}
+
+pub(crate) struct StagedLibraryComponentSource {
+    relative_path: ArtifactRelativePath,
+    observed_size: u64,
+    observed_sha1: [u8; 20],
+    kind: LibraryComponentSourceKind,
+}
+
+impl RetainedLibraryComponentSource {
+    pub(crate) fn relative_path(&self) -> &ArtifactRelativePath {
+        &self.relative_path
+    }
+
+    pub(crate) fn observed_size(&self) -> u64 {
+        self.observed_size
+    }
+
+    pub(crate) fn observed_sha1(&self) -> [u8; 20] {
+        self.observed_sha1
+    }
+
+    pub(crate) fn expected(&self) -> &ExpectedIntegrity {
+        &self.expected
+    }
+
+    pub(crate) fn provider_url(&self) -> &str {
+        &self.provider_url
+    }
+
+    pub(super) fn kind(&self) -> LibraryComponentSourceKind {
+        self.kind
+    }
+
+    pub(crate) fn exact_download_proof(&self) -> ExactLibraryDownloadProof {
+        ExactLibraryDownloadProof::new(
+            self.relative_path.clone(),
+            self.kind == LibraryComponentSourceKind::NativeLibrary,
+            self.provider_url.clone(),
+            self.expected.clone(),
+            self.observed_size,
+            self.observed_sha1,
+        )
+    }
+
+    pub(crate) async fn stage_create_new(
+        self,
+        staging: &ManagedDir,
+        slot: &ArtifactRelativePath,
+    ) -> Result<StagedLibraryComponentSource, LoaderError> {
+        let Self {
+            _file: file,
+            relative_path,
+            observed_size,
+            observed_sha1,
+            expected: _,
+            provider_url: _,
+            kind,
+            _permit: permit,
+        } = self;
+        staging
+            .import_relative_authenticated_create_new(
+                slot,
+                file,
+                observed_size,
+                observed_sha1,
+                permit,
+            )
+            .await?;
+        Ok(StagedLibraryComponentSource {
+            relative_path,
+            observed_size,
+            observed_sha1,
+            kind,
+        })
+    }
+
+    #[cfg(test)]
+    async fn stage_create_new_with_hook(
+        self,
+        staging: &ManagedDir,
+        slot: &ArtifactRelativePath,
+        blocking_hook: BlockingValidationHook,
+    ) -> Result<StagedLibraryComponentSource, LoaderError> {
+        let Self {
+            _file: file,
+            relative_path,
+            observed_size,
+            observed_sha1,
+            expected: _,
+            provider_url: _,
+            kind,
+            _permit: permit,
+        } = self;
+        staging
+            .import_relative_authenticated_create_new_with_hook(
+                slot,
+                file,
+                observed_size,
+                observed_sha1,
+                permit,
+                blocking_hook,
+            )
+            .await?;
+        Ok(StagedLibraryComponentSource {
+            relative_path,
+            observed_size,
+            observed_sha1,
+            kind,
+        })
+    }
+}
+
+impl StagedLibraryComponentSource {
+    pub(crate) fn relative_path(&self) -> &ArtifactRelativePath {
+        &self.relative_path
+    }
+
+    pub(super) fn kind(&self) -> LibraryComponentSourceKind {
+        self.kind
+    }
+
+    pub(crate) fn observed_size(&self) -> u64 {
+        self.observed_size
+    }
+
+    pub(crate) fn observed_sha1(&self) -> [u8; 20] {
+        self.observed_sha1
+    }
+}
+
 pub(super) struct LibrarySourceRequest<'a> {
     pub(super) client: &'a reqwest::Client,
     pub(super) url: &'a str,
@@ -167,6 +434,41 @@ pub(super) async fn acquire_authenticated_library_source(
 ) -> Result<AuthenticatedLibrarySource, DownloadError> {
     acquire_authenticated_library_source_with_retry_delays(request, &LIBRARY_SOURCE_RETRY_DELAYS)
         .await
+}
+
+pub(super) async fn acquire_retained_library_component_source(
+    request: LibrarySourceRequest<'_>,
+    kind: LibraryComponentSourceKind,
+) -> Result<RetainedLibraryComponentSource, DownloadError> {
+    if !matches!(
+        &request.pool.retention,
+        LibrarySourceRetention::Component { .. }
+    ) {
+        return Err(source_integrity_error(
+            "component retention requires a component source pool",
+        ));
+    }
+    let source = acquire_authenticated_library_source(request).await?;
+    if source.retention_kind != LibrarySourceRetentionKind::Component {
+        return Err(source_integrity_error(
+            "component source did not retain its aggregate budget",
+        ));
+    }
+    let LibrarySourcePermit(LibrarySourcePermitInner::Component { permit }) = source._permit else {
+        return Err(source_integrity_error(
+            "component source retained the wrong budget kind",
+        ));
+    };
+    Ok(RetainedLibraryComponentSource {
+        _file: source.file,
+        relative_path: source.relative_path,
+        observed_size: source.observed_size,
+        observed_sha1: source.observed_sha1,
+        expected: source.expected,
+        provider_url: source.provider_url,
+        kind,
+        _permit: permit,
+    })
 }
 
 async fn acquire_authenticated_library_source_with_retry_delays(
@@ -444,6 +746,11 @@ async fn acquire_authenticated_library_source_attempt_inner(
         )));
     }
 
+    let (permit, retention_kind) = request
+        .pool
+        .retain_validated(observed_size, permit)
+        .map_err(nonretryable)?;
+
     Ok(AuthenticatedLibrarySource {
         file,
         relative_path: request.relative_path.clone(),
@@ -453,6 +760,7 @@ async fn acquire_authenticated_library_source_attempt_inner(
         target: request.target.to_string(),
         provider_url: request.url.to_string(),
         _permit: permit,
+        retention_kind,
     })
 }
 
@@ -912,6 +1220,32 @@ mod tests {
         .await
     }
 
+    async fn acquire_component(
+        url: &str,
+        expected: &ExpectedIntegrity,
+        max_bytes: u64,
+        target: &str,
+        pool: &LibrarySourcePool,
+        kind: LibraryComponentSourceKind,
+    ) -> Result<RetainedLibraryComponentSource, DownloadError> {
+        let client = reqwest::Client::new();
+        let relative_path = fixture_relative_path();
+        acquire_retained_library_component_source(
+            LibrarySourceRequest {
+                client: &client,
+                url,
+                expected,
+                relative_path: &relative_path,
+                max_bytes,
+                target,
+                pool,
+                fact_tx: None,
+            },
+            kind,
+        )
+        .await
+    }
+
     fn fixture_relative_path() -> ArtifactRelativePath {
         ArtifactRelativePath::new("org/example/fixture/1/fixture-1.jar")
             .expect("fixture relative path")
@@ -1091,6 +1425,274 @@ mod tests {
         );
         drop(source);
         assert_eq!(pool.available_bytes(), LIBRARY_SOURCE_MAX_BYTES);
+    }
+
+    #[tokio::test]
+    async fn component_retention_releases_acquisition_charge_and_uses_exact_observed_bytes() {
+        let first_body = jar_bytes(b"first-checksumless-component-source");
+        let second_body = jar_bytes(b"second-checksumless-component-source");
+        let (url, _) = spawn_server(vec![
+            ScriptedResponse::full(first_body.clone()),
+            ScriptedResponse::full(second_body.clone()),
+        ])
+        .await;
+        let pool = LibrarySourcePool::for_component_retention();
+
+        let first = acquire_component(
+            &url,
+            &ExpectedIntegrity::default(),
+            LIBRARY_SOURCE_MAX_BYTES,
+            "library:component-first",
+            &pool,
+            LibraryComponentSourceKind::Library,
+        )
+        .await
+        .expect("first retained component source");
+        assert_eq!(pool.available_bytes(), LIBRARY_SOURCE_MAX_BYTES);
+        assert_eq!(
+            pool.retained_available_bytes(),
+            Some(MAX_TIER2_AGGREGATE_BYTES - first_body.len() as u64)
+        );
+
+        let second = tokio::time::timeout(
+            Duration::from_secs(1),
+            acquire_component(
+                &url,
+                &ExpectedIntegrity::default(),
+                LIBRARY_SOURCE_MAX_BYTES,
+                "library:component-second",
+                &pool,
+                LibraryComponentSourceKind::NativeLibrary,
+            ),
+        )
+        .await
+        .expect("second source must not deadlock on the acquisition budget")
+        .expect("second retained component source");
+        assert_eq!(pool.available_bytes(), LIBRARY_SOURCE_MAX_BYTES);
+        assert_eq!(
+            pool.retained_available_bytes(),
+            Some(MAX_TIER2_AGGREGATE_BYTES - first_body.len() as u64 - second_body.len() as u64)
+        );
+
+        drop((first, second));
+        assert_eq!(pool.available_bytes(), LIBRARY_SOURCE_MAX_BYTES);
+        assert_eq!(
+            pool.retained_available_bytes(),
+            Some(MAX_TIER2_AGGREGATE_BYTES)
+        );
+    }
+
+    #[tokio::test]
+    async fn component_retention_fails_fast_when_exact_aggregate_budget_is_exhausted() {
+        let body = jar_bytes(b"aggregate-overflow");
+        let (url, requests) = spawn_server(vec![
+            ScriptedResponse::full(body.clone()),
+            ScriptedResponse::full(body.clone()),
+        ])
+        .await;
+        let pool = LibrarySourcePool::for_component_retention_bytes(body.len() as u64);
+        let first = acquire_component(
+            &url,
+            &ExpectedIntegrity::default(),
+            LIBRARY_SOURCE_MAX_BYTES,
+            "library:aggregate-owner",
+            &pool,
+            LibraryComponentSourceKind::Library,
+        )
+        .await
+        .expect("aggregate owner");
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            acquire_component(
+                &url,
+                &ExpectedIntegrity::default(),
+                LIBRARY_SOURCE_MAX_BYTES,
+                "library:aggregate-overflow",
+                &pool,
+                LibraryComponentSourceKind::Library,
+            ),
+        )
+        .await
+        .expect("aggregate overflow must fail without waiting");
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("aggregate overflow must be rejected"),
+        };
+
+        assert!(
+            error
+                .to_string()
+                .contains("aggregate retained-source limit")
+        );
+        assert_eq!(requests.load(Ordering::SeqCst), 2);
+        assert_eq!(pool.available_bytes(), LIBRARY_SOURCE_MAX_BYTES);
+        assert_eq!(pool.retained_available_bytes(), Some(0));
+        drop(first);
+        assert_eq!(pool.retained_available_bytes(), Some(body.len() as u64));
+    }
+
+    #[test]
+    fn exact_retention_budget_accepts_the_maximum_count_of_one_byte_sources() {
+        let budget = RetainedSourceBudget::new(crate::known_good::MAX_TIER2_ENTRIES as u64);
+        let permits = (0..crate::known_good::MAX_TIER2_ENTRIES)
+            .map(|_| budget.try_reserve(1).expect("one-byte retained source"))
+            .collect::<Vec<_>>();
+
+        assert_eq!(budget.available_bytes(), 0);
+        assert!(budget.try_reserve(1).is_err());
+        drop(permits);
+        assert_eq!(
+            budget.available_bytes(),
+            crate::known_good::MAX_TIER2_ENTRIES as u64
+        );
+    }
+
+    #[tokio::test]
+    async fn retained_component_source_stages_create_only_and_derives_exact_proof() {
+        let body = jar_bytes(b"component-staging");
+        let (url, _) = spawn_server(vec![
+            ScriptedResponse::full(body.clone()),
+            ScriptedResponse::full(body.clone()),
+        ])
+        .await;
+        let pool = LibrarySourcePool::for_component_retention();
+        let source = acquire_component(
+            &url,
+            &ExpectedIntegrity::default(),
+            LIBRARY_SOURCE_MAX_BYTES,
+            "library:component-staging",
+            &pool,
+            LibraryComponentSourceKind::NativeLibrary,
+        )
+        .await
+        .expect("retained staging source");
+        assert_eq!(source.relative_path(), &fixture_relative_path());
+        assert_eq!(source.observed_size(), body.len() as u64);
+        assert_eq!(source.observed_sha1(), sha1_bytes(&body));
+        assert_eq!(source.expected(), &ExpectedIntegrity::default());
+        assert_eq!(source.provider_url(), url);
+        assert_eq!(source.kind(), LibraryComponentSourceKind::NativeLibrary);
+
+        let temp = tempfile::tempdir().expect("component staging root");
+        let staging = ManagedDir::open_root(temp.path()).expect("managed component staging root");
+        let slot = ArtifactRelativePath::new("000000/000001").expect("deterministic staging slot");
+        let proof = source.exact_download_proof();
+        let staged = source
+            .stage_create_new(&staging, &slot)
+            .await
+            .expect("stage retained component source");
+        assert_eq!(staged.relative_path(), &fixture_relative_path());
+        assert_eq!(staged.kind(), LibraryComponentSourceKind::NativeLibrary);
+        assert_eq!(staged.observed_size(), body.len() as u64);
+        assert_eq!(staged.observed_sha1(), sha1_bytes(&body));
+        assert_eq!(
+            std::fs::read(slot.join_under(temp.path())).expect("read staged source"),
+            body
+        );
+        assert_eq!(
+            pool.retained_available_bytes(),
+            Some(MAX_TIER2_AGGREGATE_BYTES)
+        );
+
+        let (path, is_native, provider_url, expected, size, sha1) = proof.into_parts();
+        assert_eq!(path, fixture_relative_path());
+        assert!(is_native);
+        assert_eq!(provider_url, url);
+        assert_eq!(expected, ExpectedIntegrity::default());
+        assert_eq!(size, body.len() as u64);
+        assert_eq!(sha1, sha1_bytes(&body));
+
+        let occupied = acquire_component(
+            &url,
+            &ExpectedIntegrity::default(),
+            LIBRARY_SOURCE_MAX_BYTES,
+            "library:component-occupied",
+            &pool,
+            LibraryComponentSourceKind::Library,
+        )
+        .await
+        .expect("retained occupied-slot source");
+        let error = match occupied.stage_create_new(&staging, &slot).await {
+            Err(error) => error,
+            Ok(_) => panic!("occupied staging slot must fail closed"),
+        };
+        assert!(matches!(error, LoaderError::Io(_)));
+        assert_eq!(
+            std::fs::read(slot.join_under(temp.path())).expect("read unchanged staged source"),
+            body
+        );
+        assert_eq!(
+            pool.retained_available_bytes(),
+            Some(MAX_TIER2_AGGREGATE_BYTES)
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_staging_keeps_retained_budget_until_blocking_copy_finishes() {
+        let body = jar_bytes(b"cancelled-component-staging");
+        let (url, _) = spawn_server(vec![ScriptedResponse::full(body.clone())]).await;
+        let pool = LibrarySourcePool::for_component_retention_bytes(body.len() as u64);
+        let source = acquire_component(
+            &url,
+            &ExpectedIntegrity::default(),
+            LIBRARY_SOURCE_MAX_BYTES,
+            "library:cancelled-component-staging",
+            &pool,
+            LibraryComponentSourceKind::Library,
+        )
+        .await
+        .expect("retained cancellation source");
+        assert_eq!(pool.retained_available_bytes(), Some(0));
+
+        let temp = tempfile::tempdir().expect("cancelled staging root");
+        let staging = ManagedDir::open_root(temp.path()).expect("managed cancellation root");
+        let slot = ArtifactRelativePath::new("000000/000002").expect("cancellation staging slot");
+        let (entered_tx, entered_rx) = oneshot::channel();
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let release_for_hook = Arc::clone(&release);
+        let task_staging = staging.clone();
+        let task_slot = slot.clone();
+        let task = tokio::spawn(async move {
+            source
+                .stage_create_new_with_hook(
+                    &task_staging,
+                    &task_slot,
+                    Box::new(move || {
+                        let _ = entered_tx.send(());
+                        let (lock, condition) = &*release_for_hook;
+                        let released = lock.lock().expect("staging gate lock");
+                        drop(
+                            condition
+                                .wait_while(released, |released| !*released)
+                                .expect("staging gate wait"),
+                        );
+                    }),
+                )
+                .await
+        });
+        entered_rx.await.expect("blocking staging owns source");
+        assert_eq!(pool.retained_available_bytes(), Some(0));
+
+        task.abort();
+        let _ = task.await;
+        assert_eq!(pool.retained_available_bytes(), Some(0));
+
+        let (lock, condition) = &*release;
+        *lock.lock().expect("staging release lock") = true;
+        condition.notify_one();
+        for _ in 0..100 {
+            if pool.retained_available_bytes() == Some(body.len() as u64) {
+                assert_eq!(
+                    std::fs::read(slot.join_under(temp.path()))
+                        .expect("completed detached staging copy"),
+                    body
+                );
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(pool.retained_available_bytes(), Some(body.len() as u64));
     }
 
     #[tokio::test]

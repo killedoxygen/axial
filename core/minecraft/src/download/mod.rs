@@ -4,7 +4,7 @@ mod facts;
 mod install;
 mod integrity;
 mod libraries;
-mod library_source;
+pub(crate) mod library_source;
 mod model;
 mod path_safety;
 mod plan;

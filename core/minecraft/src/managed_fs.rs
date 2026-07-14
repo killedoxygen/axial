@@ -307,6 +307,12 @@ struct PendingTemp {
     armed: bool,
 }
 
+struct PendingCreatedFile {
+    directory: ManagedDir,
+    name: String,
+    guard: Option<ManagedFileGuard>,
+}
+
 struct CleanupPlan {
     entries: Vec<CleanupPlanEntry>,
 }
@@ -384,6 +390,28 @@ impl Drop for PendingTemp {
                 &self.directory.inner.path,
                 &self.name,
             );
+        }
+    }
+}
+
+impl PendingCreatedFile {
+    fn arm(directory: ManagedDir, name: String, guard: ManagedFileGuard) -> Self {
+        Self {
+            directory,
+            name,
+            guard: Some(guard),
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.guard = None;
+    }
+}
+
+impl Drop for PendingCreatedFile {
+    fn drop(&mut self) {
+        if let Some(guard) = self.guard.as_ref() {
+            let _ = self.directory.remove_guarded_file(&self.name, guard);
         }
     }
 }
@@ -790,9 +818,138 @@ impl ManagedDir {
                 "managed loader source exceeds the processor stage file bound".to_string(),
             ));
         }
+        self.import_relative_authenticated_inner(
+            relative,
+            source,
+            expected_size,
+            expected_sha1,
+            true,
+            (),
+            #[cfg(test)]
+            None,
+            #[cfg(test)]
+            false,
+        )
+        .await
+    }
+
+    pub(crate) async fn import_relative_authenticated_create_new<G>(
+        &self,
+        relative: &ArtifactRelativePath,
+        source: std::fs::File,
+        expected_size: u64,
+        expected_sha1: [u8; 20],
+        lifetime_guard: G,
+    ) -> Result<(), LoaderError>
+    where
+        G: Send + 'static,
+    {
+        if expected_size == 0 || expected_size > MAX_MANAGED_READ_BYTES {
+            return Err(LoaderError::Verify(
+                "managed retained source exceeds the bounded file limit".to_string(),
+            ));
+        }
+        self.import_relative_authenticated_inner(
+            relative,
+            source,
+            expected_size,
+            expected_sha1,
+            false,
+            lifetime_guard,
+            #[cfg(test)]
+            None,
+            #[cfg(test)]
+            false,
+        )
+        .await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn import_relative_authenticated_create_new_with_hook<G>(
+        &self,
+        relative: &ArtifactRelativePath,
+        source: std::fs::File,
+        expected_size: u64,
+        expected_sha1: [u8; 20],
+        lifetime_guard: G,
+        blocking_hook: Box<dyn FnOnce() + Send + 'static>,
+    ) -> Result<(), LoaderError>
+    where
+        G: Send + 'static,
+    {
+        if expected_size == 0 || expected_size > MAX_MANAGED_READ_BYTES {
+            return Err(LoaderError::Verify(
+                "managed retained source exceeds the bounded file limit".to_string(),
+            ));
+        }
+        self.import_relative_authenticated_inner(
+            relative,
+            source,
+            expected_size,
+            expected_sha1,
+            false,
+            lifetime_guard,
+            Some(blocking_hook),
+            false,
+        )
+        .await
+    }
+
+    #[cfg(test)]
+    async fn import_relative_authenticated_create_new_with_post_promotion_failure<G>(
+        &self,
+        relative: &ArtifactRelativePath,
+        source: std::fs::File,
+        expected_size: u64,
+        expected_sha1: [u8; 20],
+        lifetime_guard: G,
+    ) -> Result<(), LoaderError>
+    where
+        G: Send + 'static,
+    {
+        self.import_relative_authenticated_inner(
+            relative,
+            source,
+            expected_size,
+            expected_sha1,
+            false,
+            lifetime_guard,
+            None,
+            true,
+        )
+        .await
+    }
+
+    async fn import_relative_authenticated_inner<G>(
+        &self,
+        relative: &ArtifactRelativePath,
+        source: std::fs::File,
+        expected_size: u64,
+        expected_sha1: [u8; 20],
+        replace_existing: bool,
+        lifetime_guard: G,
+        #[cfg(test)] blocking_hook: Option<Box<dyn FnOnce() + Send + 'static>>,
+        #[cfg(test)] fail_after_promotion: bool,
+    ) -> Result<(), LoaderError>
+    where
+        G: Send + 'static,
+    {
         let (parent, name) = self.open_or_create_relative_parent(relative)?;
         tokio::task::spawn_blocking(move || {
-            parent.import_authenticated(&name, source, expected_size, expected_sha1)
+            let _lifetime_guard = lifetime_guard;
+            #[cfg(test)]
+            if let Some(hook) = blocking_hook {
+                hook();
+            }
+            parent.import_authenticated(
+                &name,
+                source,
+                expected_size,
+                expected_sha1,
+                replace_existing,
+                #[cfg(test)]
+                fail_after_promotion,
+            )
         })
         .await
         .map_err(|_| {
@@ -808,6 +965,8 @@ impl ManagedDir {
         mut source: std::fs::File,
         expected_size: u64,
         expected_sha1: [u8; 20],
+        replace_existing: bool,
+        #[cfg(test)] fail_after_promotion: bool,
     ) -> Result<(), LoaderError> {
         validate_segment(name)?;
         source.seek(SeekFrom::Start(0))?;
@@ -846,19 +1005,50 @@ impl ManagedDir {
         }
         destination.flush()?;
         destination.sync_all()?;
+        let promoted_guard = if replace_existing {
+            None
+        } else {
+            let file = destination.try_clone()?;
+            Some(ManagedFileGuard {
+                identity: platform::file_identity(&file)?,
+                file,
+                size: expected_size,
+            })
+        };
         drop(destination);
-        if platform::entry_kind(&self.inner.handle, &self.inner.path, OsStr::new(name))?.is_some() {
-            platform::remove_file(&self.inner.handle, &self.inner.path, OsStr::new(name))?;
+        if replace_existing {
+            if platform::entry_kind(&self.inner.handle, &self.inner.path, OsStr::new(name))?
+                .is_some()
+            {
+                platform::remove_file(&self.inner.handle, &self.inner.path, OsStr::new(name))?;
+            }
+            platform::rename_entry(
+                &self.inner.handle,
+                &self.inner.path,
+                OsStr::new(&temp_name),
+                &self.inner.handle,
+                &self.inner.path,
+                OsStr::new(name),
+            )?;
+        } else {
+            platform::rename_entry_no_replace(
+                &self.inner.handle,
+                &self.inner.path,
+                OsStr::new(&temp_name),
+                &self.inner.handle,
+                &self.inner.path,
+                OsStr::new(name),
+            )?;
         }
-        platform::rename_entry(
-            &self.inner.handle,
-            &self.inner.path,
-            OsStr::new(&temp_name),
-            &self.inner.handle,
-            &self.inner.path,
-            OsStr::new(name),
-        )?;
+        let mut promoted = promoted_guard
+            .map(|guard| PendingCreatedFile::arm(self.clone(), name.to_string(), guard));
         pending.disarm();
+        #[cfg(test)]
+        if fail_after_promotion {
+            return Err(LoaderError::Verify(
+                "managed retained source failed after create-only promotion".to_string(),
+            ));
+        }
         let mut budget = TreeCaptureBudget {
             remaining_entries: 1,
             remaining_bytes: expected_size,
@@ -874,12 +1064,19 @@ impl ManagedDir {
             &mut budget,
         )?;
         if fact.size != expected_size || fact.sha1 != expected_sha1 {
-            let _ = platform::remove_file(&self.inner.handle, &self.inner.path, OsStr::new(name));
+            if replace_existing {
+                let _ =
+                    platform::remove_file(&self.inner.handle, &self.inner.path, OsStr::new(name));
+            }
             return Err(LoaderError::Verify(
                 "managed loader import changed before promotion".to_string(),
             ));
         }
-        self.revalidate()
+        self.revalidate()?;
+        if let Some(promoted) = promoted.as_mut() {
+            promoted.disarm();
+        }
+        Ok(())
     }
 
     pub(crate) async fn materialize_installer_library(
@@ -2339,6 +2536,50 @@ mod tests {
             destination
                 .read_relative_authenticated(&relative, Some(bytes.len() as u64), &sha1)
                 .expect("authenticated destination"),
+            bytes
+        );
+        let _ = fs::remove_dir_all(source_root);
+        let _ = fs::remove_dir_all(destination_root);
+    }
+
+    #[tokio::test]
+    async fn create_new_import_cleans_its_slot_after_post_promotion_failure() {
+        let source_root = test_root("managed-create-new-failure-source");
+        let destination_root = test_root("managed-create-new-failure-destination");
+        fs::create_dir_all(&source_root).expect("source root");
+        fs::create_dir_all(&destination_root).expect("destination root");
+        let bytes = b"create-new authenticated source";
+        let source_path = source_root.join("source");
+        fs::write(&source_path, bytes).expect("source");
+        let destination = ManagedDir::open_root(&destination_root).expect("destination");
+        let slot = ArtifactRelativePath::new("000000/000003").expect("sharded slot");
+        let sha1: [u8; 20] = Sha1::digest(bytes).into();
+
+        let error = destination
+            .import_relative_authenticated_create_new_with_post_promotion_failure(
+                &slot,
+                fs::File::open(&source_path).expect("failure source"),
+                bytes.len() as u64,
+                sha1,
+                (),
+            )
+            .await
+            .expect_err("injected post-promotion failure");
+        assert!(error.to_string().contains("failed after create-only"));
+        assert!(!slot.join_under(&destination_root).exists());
+
+        destination
+            .import_relative_authenticated_create_new(
+                &slot,
+                fs::File::open(&source_path).expect("retry source"),
+                bytes.len() as u64,
+                sha1,
+                (),
+            )
+            .await
+            .expect("same-slot retry after cleanup");
+        assert_eq!(
+            fs::read(slot.join_under(&destination_root)).expect("retried destination"),
             bytes
         );
         let _ = fs::remove_dir_all(source_root);
