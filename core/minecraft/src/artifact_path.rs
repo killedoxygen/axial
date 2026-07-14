@@ -41,6 +41,7 @@ impl ArtifactRelativePath {
 
         for segment in self.0.split('/') {
             if segment.bytes().any(|byte| b"<>:\"|?*".contains(&byte))
+                || segment.starts_with(' ')
                 || segment.ends_with('.')
                 || segment.ends_with(' ')
                 || windows_device_name(segment)
@@ -205,6 +206,26 @@ mod tests {
                 Err(ArtifactRelativePathError::Unsafe),
                 "accepted trailing dot or space in {value:?}"
             );
+        }
+    }
+
+    #[test]
+    fn portable_persisted_paths_reject_leading_space_aliases() {
+        for (aliased, normalized) in [
+            (" library.jar", "library.jar"),
+            ("org/ example/library.jar", "org/example/library.jar"),
+            ("org/  example/library.jar", "org/example/library.jar"),
+        ] {
+            let aliased = ArtifactRelativePath::new(aliased).expect("general canonical path");
+            let normalized =
+                ArtifactRelativePath::new(normalized).expect("portable normalized path");
+
+            assert_eq!(
+                aliased.portable_persisted_key(),
+                Err(ArtifactRelativePathError::Unsafe),
+                "accepted leading-space alias for {normalized:?}"
+            );
+            assert!(normalized.portable_persisted_key().is_ok());
         }
     }
 
