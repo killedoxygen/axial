@@ -1,8 +1,10 @@
 use crate::download::{
     AuthenticatedSelectedArtifactSource, DownloadProgress, Downloader, ExactLibraryDownloadProof,
-    MaterializedLibraryIdentity,
+    MaterializedLibraryIdentity, PreparedVersionBundlePublication,
+    acquire_version_bundle_publication_lease,
     download_installer_libraries_with_declarations_and_facts_and_descriptors,
     download_profile_libraries_with_declarations_and_facts_and_descriptors,
+    prepare_local_version_bundle_publication, publish_prepared_version_bundle_install,
     reconstruct_installer_library_declarations, reconstruct_profile_library_declarations,
 };
 use crate::known_good::{
@@ -19,10 +21,7 @@ use crate::loaders::bound_processors::{
     AuthenticatedProcessorSources, spawn_bound_processor_execution,
     spawn_reconstruction_processor_execution,
 };
-use crate::loaders::compose::{
-    LoaderProfileFragment, cleanup_incomplete_version, compose_loader_version,
-    create_managed_version_dir, finalize_version_install, write_composed_version,
-};
+use crate::loaders::compose::{LoaderProfileFragment, compose_loader_version};
 use crate::loaders::forge_installer::{
     AuthenticatedForgeInstallerPlan, AuthenticatedInstallerReconstructionInput,
     BoundForgeInstallExecution, PendingForgeInstallExecution, PendingForgeNetworkInstall,
@@ -40,14 +39,12 @@ use crate::loaders::types::{
 };
 use crate::loaders::{validate_provider_version_id, validate_version_id};
 use crate::managed_fs::ManagedDir;
-use crate::paths::versions_dir;
 use crate::runtime::{ManagedRuntimeCache, acquire_preferred_runtime_source};
 use sha1::{Digest as _, Sha1};
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
 use std::path::Path;
 use std::sync::{Arc, OnceLock};
-use tokio::fs as async_fs;
 use zip::ZipArchive;
 use zip::ZipWriter;
 use zip::write::SimpleFileOptions;
@@ -545,71 +542,49 @@ where
     let installed_version_id = plan.record.version_id.clone();
     validate_version_id(&installed_version_id, "installed loader version id")?;
 
-    let library_download_result = Box::pin(download_profile_loader_libraries_with_evidence(
-        library_dir,
-        library_declarations,
-        "loader_libraries",
-        &mut *send,
-    ))
-    .await;
     let (library_declarations, library_proofs) =
-        cleanup_on_error(library_download_result, library_dir, &installed_version_id)?;
-    let library_declarations = cleanup_on_error(
+        Box::pin(download_profile_loader_libraries_with_evidence(
+            library_dir,
+            library_declarations,
+            "loader_libraries",
+            &mut *send,
+        ))
+        .await?;
+    let library_declarations =
         library_declarations
             .seal_streamed(library_proofs)
             .map_err(|error| {
                 LoaderError::Verify(format!("complete profile library declarations: {error:?}"))
-            }),
-        library_dir,
-        &installed_version_id,
-    )?;
+            })?;
     let (fragment, _) = library_declarations
         .profile_contract()
         .ok_or_else(|| LoaderError::Verify("profile library contract is missing".to_string()))?;
-    let version = cleanup_on_error(
-        compose_loader_version(
-            base_receipt.effective_version(),
-            &plan.record.minecraft_version,
-            &installed_version_id,
-            fragment,
-        ),
-        library_dir,
+    let version = compose_loader_version(
+        base_receipt.effective_version(),
+        &plan.record.minecraft_version,
         &installed_version_id,
+        fragment,
     )?;
     let version_bytes = serde_json::to_vec_pretty(&version)?;
-    let receipt = cleanup_on_error(
-        KnownGoodInstallReceipt::from_verified_profile_source(
-            base_receipt,
-            &plan.record,
-            version.clone(),
-            &version_bytes,
-            library_declarations,
-        )
-        .map_err(|error| LoaderError::Verify(format!("derive loader authority: {error:?}"))),
-        library_dir,
-        &installed_version_id,
-    )?;
-    let authenticated_client = base_receipt
-        .authenticated_client_integrity()
-        .map_err(|error| LoaderError::Verify(format!("authenticate base client: {error:?}")))?;
-    cleanup_on_error(
-        write_composed_version(
-            library_dir,
-            &installed_version_id,
-            &version,
-            &version_bytes,
-            &plan.record.minecraft_version,
-            &authenticated_client,
-        )
-        .await,
-        library_dir,
-        &installed_version_id,
-    )?;
-    cleanup_on_error(
-        finalize_version_install(library_dir, &installed_version_id),
-        library_dir,
-        &installed_version_id,
-    )?;
+    let (base_client_bytes, log_config_bytes) =
+        read_installed_base_version_bundle_members(library_dir, base_receipt, &version)?;
+    let authority = KnownGoodInstallReceipt::from_verified_profile_source(
+        base_receipt,
+        &plan.record,
+        version,
+        &version_bytes,
+        library_declarations,
+    )
+    .map_err(|error| LoaderError::Verify(format!("derive loader authority: {error:?}")))?;
+    let prepared = prepare_local_version_bundle_publication(
+        authority,
+        version_bytes,
+        base_client_bytes,
+        log_config_bytes,
+    )
+    .map_err(loader_version_bundle_error)?;
+    let receipt =
+        publish_loader_version_bundle(library_dir, &installed_version_id, prepared).await?;
     send(done());
     Ok(receipt)
 }
@@ -778,6 +753,7 @@ where
         .map_err(|_| LoaderError::Verify("loader client is too large".to_string()))?;
     client.url.clear();
     let version_bytes = serde_json::to_vec_pretty(&version)?;
+    let log_config_bytes = read_inherited_log_config(library_dir, &base_receipt, &version)?;
     let pending_receipt = KnownGoodInstallReceipt::from_verified_installer_source(
         base_receipt,
         &plan.record,
@@ -789,7 +765,8 @@ where
     )
     .map_err(|error| LoaderError::Verify(format!("derive loader authority: {error:?}")))?;
 
-    if child_client.bytes() != base_client_bytes {
+    let child_client_differs = child_client.bytes() != base_client_bytes;
+    if child_client_differs {
         send(progress(
             "client_jar",
             0,
@@ -799,27 +776,21 @@ where
     }
     let child_client_bytes = child_client.into_bytes();
     let (pending_receipt, retained_sources) = pending_receipt.into_publications();
-    let version_dir = create_managed_version_dir(library_dir, &installed_version_id)?;
-    cleanup_on_error(
-        write_loader_install_effects(
-            &version_dir,
-            &installed_version_id,
-            &version_bytes,
-            &child_client_bytes,
-        )
-        .await,
-        library_dir,
-        &installed_version_id,
-    )?;
-    let materialized = cleanup_on_error(
-        materialize_retained_installer_libraries(library_dir, retained_sources).await,
-        library_dir,
-        &installed_version_id,
-    )?;
-    let receipt = pending_receipt.complete(materialized).map_err(|error| {
+    let materialized =
+        materialize_retained_installer_libraries(library_dir, retained_sources).await?;
+    let authority = pending_receipt.complete(materialized).map_err(|error| {
         LoaderError::Verify(format!("complete installer materializations: {error:?}"))
     })?;
-    if child_client_bytes != base_client_bytes {
+    let prepared = prepare_local_version_bundle_publication(
+        authority,
+        version_bytes,
+        child_client_bytes,
+        log_config_bytes,
+    )
+    .map_err(loader_version_bundle_error)?;
+    let receipt =
+        publish_loader_version_bundle(library_dir, &installed_version_id, prepared).await?;
+    if child_client_differs {
         send(progress(
             "client_jar",
             1,
@@ -828,11 +799,6 @@ where
         ));
     }
 
-    cleanup_on_error(
-        finalize_version_install(library_dir, &installed_version_id),
-        library_dir,
-        &installed_version_id,
-    )?;
     send(done());
     Ok(receipt)
 }
@@ -851,11 +817,91 @@ fn read_installed_base_client(
             &format!("{}.jar", receipt.version_id()),
             integrity.size,
             integrity.sha1.as_deref(),
-        )?;
+        )
+        .map_err(|_| {
+            LoaderError::Verify(
+                "authenticate base client: installed bytes do not match authority".to_string(),
+            )
+        })?;
     receipt
         .authenticate_client_bytes(&bytes)
         .map_err(|error| LoaderError::Verify(format!("authenticate base client: {error:?}")))?;
     Ok(bytes)
+}
+
+fn read_inherited_log_config(
+    library_dir: &Path,
+    receipt: &KnownGoodInstallReceipt,
+    child_version: &crate::launch::VersionJson,
+) -> Result<Option<Vec<u8>>, LoaderError> {
+    if child_version.logging != receipt.effective_version().logging {
+        return Err(LoaderError::Verify(
+            "loader logging must inherit the authenticated base configuration".to_string(),
+        ));
+    }
+    let Some(logging) = receipt
+        .effective_version()
+        .logging
+        .as_ref()
+        .and_then(|logging| logging.client.as_ref())
+    else {
+        return Ok(None);
+    };
+    let expected =
+        crate::download::ExpectedIntegrity::from_mojang(logging.file.size, &logging.file.sha1);
+    if expected.size.is_none() || expected.sha1.is_none() {
+        return Err(LoaderError::Verify(
+            "authenticated base log configuration lacks an exact contract".to_string(),
+        ));
+    }
+    let bytes = ManagedDir::open_root(library_dir)?
+        .open_child("assets")?
+        .open_child("log_configs")?
+        .read_authenticated(&logging.file.id, expected.size, expected.sha1.as_deref())?;
+    receipt
+        .authenticate_log_config_bytes(&logging.file.id, &bytes)
+        .map_err(|error| LoaderError::Verify(format!("authenticate base log config: {error:?}")))?;
+    Ok(Some(bytes))
+}
+
+fn read_installed_base_version_bundle_members(
+    library_dir: &Path,
+    receipt: &KnownGoodInstallReceipt,
+    child_version: &crate::launch::VersionJson,
+) -> Result<(Vec<u8>, Option<Vec<u8>>), LoaderError> {
+    Ok((
+        read_installed_base_client(library_dir, receipt)?,
+        read_inherited_log_config(library_dir, receipt, child_version)?,
+    ))
+}
+
+async fn publish_loader_version_bundle(
+    library_dir: &Path,
+    version_id: &str,
+    prepared: PreparedVersionBundlePublication,
+) -> Result<KnownGoodInstallReceipt, LoaderError> {
+    let lease = acquire_version_bundle_publication_lease(library_dir.to_path_buf(), version_id)
+        .await
+        .map_err(loader_version_bundle_error)?;
+    tokio::spawn(publish_prepared_version_bundle_install(lease, prepared))
+        .await
+        .map_err(|error| {
+            let reason = if error.is_cancelled() {
+                "cancelled"
+            } else if error.is_panic() {
+                "panicked"
+            } else {
+                "failed"
+            };
+            LoaderError::InstallExecutionFailed(format!(
+                "loader version bundle publication task {reason}"
+            ))
+        })?
+        .map_err(loader_version_bundle_error)
+}
+
+fn loader_version_bundle_error(_error: crate::download::DownloadError) -> LoaderError {
+    LoaderError::Verify("loader version bundle publication failed".to_string())
 }
 
 fn validate_installer_record_authority(record: &LoaderBuildRecord) -> Result<&str, LoaderError> {
@@ -963,13 +1009,7 @@ where
     validate_version_id(&plan.record.version_id, "installed loader version id")?;
     let archive_url = legacy_archive_source_url(&plan.record)?;
 
-    let base_client_path = versions_dir(library_dir)
-        .join(&plan.record.minecraft_version)
-        .join(format!("{}.jar", plan.record.minecraft_version));
-    let base_client_bytes = async_fs::read(&base_client_path).await?;
-    base_receipt
-        .authenticate_client_bytes(&base_client_bytes)
-        .map_err(|error| LoaderError::Verify(format!("authenticate base client: {error:?}")))?;
+    let base_client_bytes = read_installed_base_client(library_dir, base_receipt)?;
     let archive_bytes = archive_source.into_bytes_for(archive_url, &plan.record.version_id)?;
     let (version, version_bytes, child_client_bytes) = derive_legacy_archive_inputs(
         base_receipt.effective_version(),
@@ -978,7 +1018,8 @@ where
         archive_bytes,
     )
     .await?;
-    let receipt = KnownGoodInstallReceipt::from_verified_legacy_archive_source(
+    let log_config_bytes = read_inherited_log_config(library_dir, base_receipt, &version)?;
+    let authority = KnownGoodInstallReceipt::from_verified_legacy_archive_source(
         base_receipt,
         &plan.record,
         version,
@@ -986,25 +1027,15 @@ where
         &child_client_bytes,
     )
     .map_err(|error| LoaderError::Verify(format!("derive loader authority: {error:?}")))?;
-
-    let version_dir = create_managed_version_dir(library_dir, &plan.record.version_id)?;
-    cleanup_on_error(
-        write_loader_install_effects(
-            &version_dir,
-            &plan.record.version_id,
-            &version_bytes,
-            &child_client_bytes,
-        )
-        .await,
-        library_dir,
-        &plan.record.version_id,
-    )?;
-
-    cleanup_on_error(
-        finalize_version_install(library_dir, &plan.record.version_id),
-        library_dir,
-        &plan.record.version_id,
-    )?;
+    let prepared = prepare_local_version_bundle_publication(
+        authority,
+        version_bytes,
+        child_client_bytes,
+        log_config_bytes,
+    )
+    .map_err(loader_version_bundle_error)?;
+    let receipt =
+        publish_loader_version_bundle(library_dir, &plan.record.version_id, prepared).await?;
     send(done());
     Ok(receipt)
 }
@@ -1126,14 +1157,6 @@ where
     .map_err(|_| LoaderError::ArtifactDownloadFailed { facts, descriptors })
 }
 
-fn cleanup_on_error<T, E>(
-    result: Result<T, E>,
-    library_dir: &Path,
-    version_id: &str,
-) -> Result<T, E> {
-    result.inspect_err(|_| cleanup_incomplete_version(library_dir, version_id))
-}
-
 fn parse_profile_json(
     bytes: &[u8],
     component_name: &str,
@@ -1211,25 +1234,6 @@ async fn overlay_legacy_archive_bytes_blocking(
     })
     .await
     .map_err(|error| LoaderError::InstallExecutionFailed(error.to_string()))?
-}
-
-async fn write_loader_install_effects(
-    version_dir: &ManagedDir,
-    version_id: &str,
-    version_bytes: &[u8],
-    child_client_bytes: &[u8],
-) -> Result<(), LoaderError> {
-    validate_version_id(version_id, "installed loader version id")?;
-    version_dir
-        .write_exact(".incomplete", b"installing")
-        .await?;
-    version_dir
-        .write_exact(&format!("{version_id}.json"), version_bytes)
-        .await?;
-    version_dir
-        .write_exact(&format!("{version_id}.jar"), child_client_bytes)
-        .await?;
-    version_dir.revalidate()
 }
 
 fn overlay_legacy_archive_bytes(
@@ -1436,9 +1440,8 @@ mod tests {
         read_installed_base_client, spawn_bound_processor_execution,
     };
     use super::{
-        base_version_install_lock_from_map, cleanup_on_error,
-        download_installer_libraries_with_evidence, ensure_base_version,
-        fetch_sha1_verified_source, finish_supported_installer_install,
+        base_version_install_lock_from_map, download_installer_libraries_with_evidence,
+        ensure_base_version, fetch_sha1_verified_source, finish_supported_installer_install,
         install_from_installer_source, install_from_legacy_archive, install_from_profile_source,
         install_legacy_archive_after_authenticated_base,
         install_profile_source_after_authenticated_base, overlay_legacy_archive_bytes,
@@ -2369,31 +2372,6 @@ printf '%s' 'processor-terminal' > "$last"
     }
 
     #[test]
-    fn cleanup_on_error_clears_incomplete_version_dir() {
-        let root = temp_dir("cleanup-on-error");
-        let version_dir = versions_dir(&root).join("broken-loader");
-        fs::create_dir_all(&version_dir).expect("version dir");
-        fs::write(version_dir.join(".incomplete"), b"installing").expect("marker");
-
-        let result = cleanup_on_error::<(), _>(
-            Err(LoaderError::Verify("broken".to_string())),
-            &root,
-            "broken-loader",
-        );
-
-        assert!(result.is_err());
-        assert!(version_dir.is_dir());
-        assert_eq!(
-            fs::read_dir(&version_dir)
-                .expect("retained version shell")
-                .count(),
-            0
-        );
-
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
     fn profile_source_validation_does_not_enrich_profile() {
         let record = profile_record();
         let proof = fabric_profile_proof(&record);
@@ -2681,6 +2659,12 @@ printf '%s' 'processor-terminal' > "$last"
             )],
         );
         write_base_version(&root, &record.minecraft_version);
+        add_test_base_log_config(
+            &root,
+            &record.minecraft_version,
+            "fabric-base-log.xml",
+            b"authenticated Fabric base log",
+        );
         let base = test_authenticated_receipt(&root, &record.minecraft_version);
 
         let receipt = install_profile_source_after_authenticated_base(
@@ -2717,22 +2701,28 @@ printf '%s' 'processor-terminal' > "$last"
             .expect("written artifact");
         assert_eq!(artifact.sha1, digest);
         assert_eq!(artifact.size, fresh.len() as i64);
+        assert_eq!(written.logging, base.effective_version().logging);
         assert!(
             receipt
-                .into_activation_source()
-                .into_parts()
-                .1
-                .entries()
-                .iter()
-                .any(|entry| {
-                    entry.path().as_str() == artifact_path
-                        && matches!(
-                            entry.integrity(),
-                            KnownGoodIntegrity::Sha1 { digest: receipt_digest, size }
-                                if receipt_digest.as_str() == digest && *size == fresh.len() as u64
-                        )
-                })
+                .effective_version()
+                .logging
+                .as_ref()
+                .and_then(|logging| logging.client.as_ref())
+                .is_some_and(|logging| logging.file.id == "fabric-base-log.xml")
         );
+        let inventory = receipt.into_activation_source().into_parts().1;
+        assert!(inventory.entries().iter().any(|entry| {
+            entry.kind() == KnownGoodArtifactKind::LogConfig
+                && entry.path().as_str() == "log_configs/fabric-base-log.xml"
+        }));
+        assert!(inventory.entries().iter().any(|entry| {
+            entry.path().as_str() == artifact_path
+                && matches!(
+                    entry.integrity(),
+                    KnownGoodIntegrity::Sha1 { digest: receipt_digest, size }
+                        if receipt_digest.as_str() == digest && *size == fresh.len() as u64
+                )
+        }));
         assert_eq!(library_server.request_count(), 1);
         profile_server.stop();
         library_server.stop();
@@ -2826,6 +2816,13 @@ printf '%s' 'processor-terminal' > "$last"
         assert_eq!(artifact.sha1, digest);
         assert_eq!(artifact.size, library_bytes.len() as i64);
         let inventory = receipt.into_activation_source().into_parts().1;
+        assert!(written.logging.is_none());
+        assert!(
+            inventory
+                .entries()
+                .iter()
+                .all(|entry| entry.kind() != KnownGoodArtifactKind::LogConfig)
+        );
         assert!(inventory.entries().iter().any(|entry| {
             entry.path().as_str() == artifact_path
                 && matches!(
@@ -2837,6 +2834,93 @@ printf '%s' 'processor-terminal' > "$last"
         assert_eq!(library_server.request_count(), 1);
         profile_server.stop();
         library_server.stop();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn loader_bundle_failure_settles_without_releasing_a_receipt() {
+        let root = temp_dir("loader-bundle-failure-settlement");
+        let mut record = legacy_archive_record();
+        record.loader_version = "3.4.9.171-failure".to_string();
+        canonicalize_record_identity(&mut record);
+        write_base_version(&root, &record.minecraft_version);
+        let base_client = fs::read(
+            versions_dir(&root)
+                .join(&record.minecraft_version)
+                .join(format!("{}.jar", record.minecraft_version)),
+        )
+        .expect("base client before failed publication");
+        let prepared = prepared_test_legacy_bundle(&root, &record, b"failed child client");
+        crate::version_bundle_publication::fail_after_promotions_for_test(&record.version_id, 1);
+
+        let error = super::publish_loader_version_bundle(&root, &record.version_id, prepared)
+            .await
+            .expect_err("injected loader publication failure");
+
+        assert!(matches!(error, LoaderError::Verify(_)));
+        let child = versions_dir(&root).join(&record.version_id);
+        assert!(!child.join(format!("{}.json", record.version_id)).exists());
+        assert!(!child.join(format!("{}.jar", record.version_id)).exists());
+        assert_eq!(
+            fs::read(
+                versions_dir(&root)
+                    .join(&record.minecraft_version)
+                    .join(format!("{}.jar", record.minecraft_version))
+            )
+            .expect("base client after failed publication"),
+            base_client
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn loader_bundle_tail_survives_caller_cancellation_and_settles() {
+        let root = temp_dir("loader-bundle-cancelled-caller");
+        let mut record = legacy_archive_record();
+        record.loader_version = "3.4.9.171-cancellation".to_string();
+        canonicalize_record_identity(&mut record);
+        write_base_version(&root, &record.minecraft_version);
+        let child_client: &[u8] = b"detached child client";
+        let prepared = prepared_test_legacy_bundle(&root, &record, child_client);
+        let (reached, release) = crate::version_bundle_publication::pause_after_promotions_for_test(
+            &record.version_id,
+            1,
+        );
+        let task_root = root.clone();
+        let task_version_id = record.version_id.clone();
+        let task = tokio::spawn(async move {
+            super::publish_loader_version_bundle(&task_root, &task_version_id, prepared).await
+        });
+        reached.await.expect("loader publication reached effect");
+        task.abort();
+        assert!(
+            task.await
+                .expect_err("cancelled loader caller")
+                .is_cancelled()
+        );
+        release
+            .send(())
+            .expect("release detached loader publication");
+
+        let child_jar = versions_dir(&root)
+            .join(&record.version_id)
+            .join(format!("{}.jar", record.version_id));
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if fs::read(&child_jar).ok().as_deref() == Some(child_client) {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("detached loader publication completed");
+
+        let retry = prepared_test_legacy_bundle(&root, &record, child_client);
+        let receipt = super::publish_loader_version_bundle(&root, &record.version_id, retry)
+            .await
+            .expect("settled loader publication admits exact retry");
+        assert_eq!(receipt.version_id(), record.version_id);
         let _ = fs::remove_dir_all(root);
     }
 
@@ -3237,6 +3321,10 @@ printf '%s' 'processor-terminal' > "$last"
             ("META-INF/MOJANG_C.RSA", b"signature".as_slice()),
             ("net/minecraft/client/Minecraft.class", b"class".as_slice()),
         ]);
+        let base_log = b"authenticated base log config";
+        let log_dir = root.join("assets").join("log_configs");
+        fs::create_dir_all(&log_dir).expect("base log config dir");
+        fs::write(log_dir.join("base-log.xml"), base_log).expect("base log config");
         fs::write(
             base_dir.join(format!("{minecraft_version}.jar")),
             &signed_client,
@@ -3255,7 +3343,7 @@ printf '%s' 'processor-terminal' > "$last"
                     "logging":{{
                         "client":{{
                             "argument":"base-logging",
-                            "file":{{"id":"base-log.xml","url":"","sha1":"","size":0}}
+                            "file":{{"id":"base-log.xml","url":"","sha1":"{}","size":{}}}
                         }}
                     }},
                     "downloads":{{
@@ -3267,6 +3355,8 @@ printf '%s' 'processor-terminal' > "$last"
                     }},
                     "libraries":[]
                 }}"#,
+                sha1_hex(base_log),
+                base_log.len(),
                 sha1_hex(&signed_client),
                 signed_client.len()
             ),
@@ -3728,6 +3818,16 @@ printf '%s' 'processor-terminal' > "$last"
 
     #[cfg(unix)]
     fn process_exists(raw_pid: i32) -> bool {
+        #[cfg(target_os = "linux")]
+        if fs::read_to_string(format!("/proc/{raw_pid}/stat"))
+            .ok()
+            .is_some_and(|stat| {
+                stat.rsplit_once(") ")
+                    .is_some_and(|(_, status)| status.starts_with("Z "))
+            })
+        {
+            return false;
+        }
         let pid = rustix::process::Pid::from_raw(raw_pid).expect("positive processor PID");
         match rustix::process::test_kill_process(pid) {
             Ok(()) => true,
@@ -4400,6 +4500,8 @@ esac
         client.url.clear();
         let version_bytes =
             serde_json::to_vec_pretty(&version).expect("serialize installed processor version");
+        let log_config_bytes = super::read_inherited_log_config(root, &base_receipt, &version)
+            .expect("authenticated installed log config");
         let pending = KnownGoodInstallReceipt::from_verified_installer_source(
             base_receipt,
             &plan.record,
@@ -4410,13 +4512,24 @@ esac
             &child_client,
         )
         .expect("derive installed processor receipt");
+        let child_client_bytes = child_client.into_bytes();
         let (pending, retained_sources) = pending.into_publications();
         let materialized = materialize_retained_installer_libraries(root, retained_sources)
             .await
             .expect("publish installed processor outputs");
-        pending
+        let authority = pending
             .complete(materialized)
-            .expect("complete installed processor receipt")
+            .expect("complete installed processor receipt");
+        let prepared = super::prepare_local_version_bundle_publication(
+            authority,
+            version_bytes,
+            child_client_bytes,
+            log_config_bytes,
+        )
+        .expect("prepare installed processor bundle");
+        super::publish_loader_version_bundle(root, &plan.record.version_id, prepared)
+            .await
+            .expect("publish installed processor bundle")
     }
 
     #[cfg(unix)]
@@ -4797,6 +4910,42 @@ esac
             .into_bytes()
     }
 
+    fn prepared_test_legacy_bundle(
+        root: &Path,
+        record: &LoaderBuildRecord,
+        child_client: &[u8],
+    ) -> super::PreparedVersionBundlePublication {
+        let base = test_authenticated_receipt(root, &record.minecraft_version);
+        let mut version = base.effective_version().clone();
+        version.id = record.version_id.clone();
+        version.inherits_from = record.minecraft_version.clone();
+        version.materialized = true;
+        let client = version
+            .downloads
+            .client
+            .as_mut()
+            .expect("test legacy client declaration");
+        client.sha1 = sha1_hex(child_client);
+        client.size = i64::try_from(child_client.len()).expect("test legacy client size");
+        client.url.clear();
+        let version_bytes = serde_json::to_vec_pretty(&version).expect("test legacy version bytes");
+        let authority = KnownGoodInstallReceipt::from_verified_legacy_archive_source(
+            &base,
+            record,
+            version,
+            &version_bytes,
+            child_client,
+        )
+        .expect("test legacy pending authority");
+        super::prepare_local_version_bundle_publication(
+            authority,
+            version_bytes,
+            child_client.to_vec(),
+            None,
+        )
+        .expect("prepare test legacy bundle")
+    }
+
     fn write_base_version(root: &std::path::Path, version_id: &str) {
         let version_dir = versions_dir(root).join(version_id);
         fs::create_dir_all(&version_dir).expect("create base version dir");
@@ -4815,6 +4964,35 @@ esac
         .expect("write base version json");
         fs::write(version_dir.join(format!("{version_id}.jar")), b"client jar")
             .expect("write base jar");
+    }
+
+    fn add_test_base_log_config(root: &Path, version_id: &str, log_id: &str, bytes: &[u8]) {
+        let version_path = versions_dir(root)
+            .join(version_id)
+            .join(format!("{version_id}.json"));
+        let mut version = serde_json::from_slice::<serde_json::Value>(
+            &fs::read(&version_path).expect("read test base version"),
+        )
+        .expect("parse test base version");
+        version["logging"] = serde_json::json!({
+            "client": {
+                "argument": "base logging",
+                "file": {
+                    "id": log_id,
+                    "sha1": sha1_hex(bytes),
+                    "size": bytes.len(),
+                    "url": "https://example.invalid/base-log.xml"
+                }
+            }
+        });
+        fs::write(
+            &version_path,
+            serde_json::to_vec(&version).expect("serialize test base version"),
+        )
+        .expect("write test base version");
+        let log_dir = root.join("assets").join("log_configs");
+        fs::create_dir_all(&log_dir).expect("test base log directory");
+        fs::write(log_dir.join(log_id), bytes).expect("test base log config");
     }
 
     fn test_client_integrity(root: &std::path::Path, version_id: &str) -> ExpectedIntegrity {
@@ -5186,7 +5364,7 @@ esac
                 b"known-good".as_slice(),
             ),
             (
-                "versions/reconstruction-sentinel/.incomplete",
+                "versions/reconstruction-sentinel/no-effect-sentinel",
                 b"marker".as_slice(),
             ),
             ("launcher_profiles.json", b"launcher-profile".as_slice()),

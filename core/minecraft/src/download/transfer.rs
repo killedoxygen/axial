@@ -73,6 +73,15 @@ pub(crate) struct AuthenticatedSelectedArtifactSource {
     target: String,
 }
 
+pub(crate) struct AuthenticatedSelectedArtifactVersionBundleParts {
+    pub(crate) bytes: Arc<[u8]>,
+    pub(crate) observed_size: u64,
+    pub(crate) observed_sha1: [u8; 20],
+    pub(crate) kind: SelectedDownloadArtifactKind,
+    pub(crate) logical_identity: String,
+    pub(crate) expected: ExpectedIntegrity,
+}
+
 impl AuthenticatedSelectedArtifactSource {
     pub(crate) fn bytes(&self) -> &[u8] {
         &self.bytes
@@ -92,6 +101,19 @@ impl AuthenticatedSelectedArtifactSource {
 
     pub(crate) fn expected(&self) -> &ExpectedIntegrity {
         &self.expected
+    }
+
+    pub(crate) fn into_version_bundle_parts(
+        self,
+    ) -> AuthenticatedSelectedArtifactVersionBundleParts {
+        AuthenticatedSelectedArtifactVersionBundleParts {
+            bytes: self.bytes,
+            observed_size: self.observed_size,
+            observed_sha1: self.observed_sha1,
+            kind: self.kind,
+            logical_identity: self.logical_identity,
+            expected: self.expected,
+        }
     }
 
     #[cfg(test)]

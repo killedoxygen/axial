@@ -1368,20 +1368,20 @@ async fn list_instances_summary_does_not_hash_client_jar() {
 }
 
 #[tokio::test]
-async fn list_instances_incomplete_parent_marker_does_not_show_launch_action() {
-    let fixture = TestFixture::new("list-readiness-incomplete-parent");
+async fn list_instances_missing_parent_client_does_not_show_launch_action() {
+    let fixture = TestFixture::new("list-readiness-missing-parent-client");
     let library_dir = fixture.root.join("library");
     fixture
         .state
         .set_library_dir_for_test(library_dir.to_string_lossy().to_string());
-    write_child_version_with_incomplete_parent(
+    write_child_version_with_missing_parent_client(
         &library_dir,
         "fabric-loader-0.16.14-1.21.1",
         "1.21.1",
     );
     let instance = add_test_instance(
         &fixture,
-        "Incomplete parent",
+        "Missing parent client",
         "fabric-loader-0.16.14-1.21.1",
     );
 
@@ -1392,7 +1392,10 @@ async fn list_instances_incomplete_parent_marker_does_not_show_launch_action() {
         listed.launch_action.primary_action,
         axial_config::LaunchPrimaryAction::Install
     );
-    assert!(listed.status_detail.contains("incomplete"));
+    assert_eq!(
+        listed.status_detail,
+        "Client game files are missing. Install this version before launching."
+    );
 }
 
 #[tokio::test]
@@ -4451,7 +4454,7 @@ fn write_version_with_corrupt_client_jar(library_dir: &FsPath, version_id: &str)
     .expect("write corrupt client jar");
 }
 
-fn write_child_version_with_incomplete_parent(
+fn write_child_version_with_missing_parent_client(
     library_dir: &FsPath,
     child_version_id: &str,
     parent_version_id: &str,
@@ -4468,13 +4471,6 @@ fn write_child_version_with_incomplete_parent(
             "libraries": []
         }),
     );
-    let parent_dir = library_dir.join("versions").join(parent_version_id);
-    fs::write(
-        parent_dir.join(format!("{parent_version_id}.jar")),
-        b"client",
-    )
-    .expect("write parent jar");
-    fs::write(parent_dir.join(".incomplete"), "incomplete").expect("write parent marker");
     write_version_json_value(
         library_dir,
         child_version_id,

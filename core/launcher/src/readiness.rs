@@ -5,13 +5,12 @@ use axial_minecraft::download::{
     library_verification_plans_for,
 };
 use axial_minecraft::{
-    LaunchModelError, ManagedRuntimeCache, RuntimeOverride, VersionJson, default_environment,
-    load_version_json, parse_runtime_override, resolve_version,
+    LaunchModelError, ManagedRuntimeCache, RuntimeOverride, VersionBundleReadGuard, VersionJson,
+    default_environment, parse_runtime_override, resolve_version,
     runtime_component_executable_present_without_probe,
     runtime_component_structurally_ready_without_probe, runtime_executable_ready_without_probe,
 };
 use serde::Serialize;
-use std::collections::HashSet;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
@@ -101,8 +100,11 @@ fn inspect_readiness(
     request: &LaunchReadinessRequest,
     inspection: LaunchReadinessInspection,
 ) -> LaunchReadiness {
+    let publication_read = match VersionBundleReadGuard::acquire(&request.library_dir) {
+        Ok(publication_read) => publication_read,
+        Err(error) => return publication_readiness_error(&error),
+    };
     let mut reasons = Vec::new();
-    inspect_incomplete_install_markers(&request.library_dir, &request.version_id, &mut reasons);
 
     match resolve_version(&request.library_dir, &request.version_id) {
         Ok(version) => {
@@ -122,6 +124,10 @@ fn inspect_readiness(
 
     inspect_runtime_files(runtime_cache, request, inspection, &mut reasons);
 
+    if let Err(error) = publication_read.revalidate() {
+        return publication_readiness_error(&error);
+    }
+
     LaunchReadiness {
         launchable: reasons
             .iter()
@@ -130,31 +136,23 @@ fn inspect_readiness(
     }
 }
 
-fn inspect_incomplete_install_markers(
-    library_dir: &Path,
-    version_id: &str,
-    reasons: &mut Vec<LaunchReadinessReason>,
-) {
-    let mut current_id = version_id.trim().to_string();
-    let mut seen = HashSet::new();
-    let mut depth = 0;
-
-    while !current_id.is_empty() && seen.insert(current_id.clone()) && depth <= 10 {
-        let version_dir = library_dir.join("versions").join(&current_id);
-        if version_dir.join(".incomplete").exists() {
-            reasons.push(reason(
-                LaunchReadinessReasonId::IncompleteInstall,
-                "Installation is incomplete. Finish or repair this version before launching.",
-                LaunchReadinessSeverity::Blocking,
-            ));
-            return;
-        }
-
-        let Ok(version) = load_version_json(library_dir, &current_id) else {
-            return;
-        };
-        current_id = version.inherits_from.trim().to_string();
-        depth += 1;
+fn publication_readiness_error(error: &std::io::Error) -> LaunchReadiness {
+    let reason = if error.kind() == ErrorKind::WouldBlock {
+        reason(
+            LaunchReadinessReasonId::IncompleteInstall,
+            "Installation is changing. Wait for it to finish before launching.",
+            LaunchReadinessSeverity::Blocking,
+        )
+    } else {
+        reason(
+            LaunchReadinessReasonId::InstalledVersionsDegraded,
+            "Installed versions could not be inspected safely.",
+            LaunchReadinessSeverity::Blocking,
+        )
+    };
+    LaunchReadiness {
+        launchable: false,
+        reasons: vec![reason],
     }
 }
 
@@ -442,7 +440,47 @@ mod tests {
     use std::fs;
     use std::io::Write;
     use std::path::{Path, PathBuf};
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn readiness_rejects_active_publication_promptly() {
+        let library_dir = temp_library("active-version-publication");
+        let runtime_cache = isolated_runtime_cache();
+        let publication_dir = library_dir.join(".axial-publication");
+        fs::create_dir_all(&publication_dir).expect("publication directory");
+        let lock_file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(publication_dir.join("publication.lock"))
+            .expect("publication lock file");
+        lock_file.try_lock().expect("exclusive publication lock");
+
+        let started = Instant::now();
+        let readiness = inspect_launch_readiness_summary(
+            &runtime_cache,
+            &LaunchReadinessRequest {
+                library_dir: library_dir.clone(),
+                version_id: "1.21.1".to_string(),
+                requested_java: String::new(),
+                guardian_mode: GuardianMode::Managed,
+            },
+        );
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < Duration::from_millis(400),
+            "active publication admission blocked for {elapsed:?}"
+        );
+        assert!(!readiness.launchable);
+        assert_eq!(readiness.reasons.len(), 1);
+        assert_eq!(
+            readiness.reasons[0].id,
+            LaunchReadinessReasonId::IncompleteInstall
+        );
+        lock_file.unlock().expect("unlock publication");
+        cleanup(&library_dir);
+    }
 
     #[test]
     fn structural_readiness_defers_preferred_managed_runtime_to_tier_zero() {

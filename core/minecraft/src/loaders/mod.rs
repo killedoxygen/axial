@@ -4,6 +4,7 @@ mod compose;
 mod forge_installer;
 mod http;
 pub mod index;
+mod install_flight;
 pub mod providers;
 mod source;
 mod strategies;
@@ -61,12 +62,18 @@ where
     api::validate_loader_build_record_identity(&record).map_err(LoaderInstallError::from)?;
     validate_version_id(&record.version_id, "loader build version id")
         .map_err(LoaderInstallError::from)?;
+    let install_flight = install_flight::acquire(library_dir, &record.version_id)
+        .await
+        .map_err(LoaderInstallError::from)?;
     let live_record = resolve_build_record_for_install(record.component_id, &record.build_id)
         .await
         .map_err(LoaderInstallError::from)?;
     let record =
         require_exact_live_build_record(&record, live_record).map_err(LoaderInstallError::from)?;
     let plan = LoaderInstallPlan { record };
+    install_flight
+        .revalidate()
+        .map_err(LoaderInstallError::from)?;
     Box::pin(strategies::install_build(
         library_dir,
         &runtime_cache,

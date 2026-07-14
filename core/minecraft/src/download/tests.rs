@@ -219,7 +219,7 @@ async fn reconstruction_matches_install_without_touching_seeded_destinations() {
     let seeded = [
         root.join("versions/reconstruction/reconstruction.json"),
         root.join("versions/reconstruction/reconstruction.jar"),
-        root.join("versions/reconstruction/.incomplete"),
+        root.join("versions/reconstruction/untouched.sentinel"),
         root.join("libraries/org/example/exact/1.0.0/exact-1.0.0.jar"),
         root.join("libraries/org/example/observed/1.0.0/observed-1.0.0.jar"),
         root.join("libraries/org/example/observed-two/1.0.0/observed-two-1.0.0.jar"),
@@ -320,7 +320,7 @@ async fn reconstruction_derives_runtime_inventory_without_runtime_effects() {
     let sentinels = [
         root.join("versions/runtime-reconstruction/runtime-reconstruction.json"),
         root.join("versions/runtime-reconstruction/runtime-reconstruction.jar"),
-        root.join("versions/runtime-reconstruction/.incomplete"),
+        root.join("versions/runtime-reconstruction/untouched.sentinel"),
         root.join("runtime/jre-legacy/.axial-runtime-manifest.json"),
         root.join("runtime/jre-legacy/.axial-ready"),
         root.join("runtime/jre-legacy/bin/java"),
@@ -453,7 +453,6 @@ async fn install_version_with_facts_emits_private_download_facts_only() {
         fs::read(version_root.join("overlap.jar")).expect("published client jar"),
         b"client"
     );
-    assert!(!version_root.join(".incomplete").exists());
     assert_settled_version_bundle_lane(&root);
 
     let _ = fs::remove_dir_all(root);
@@ -596,7 +595,6 @@ async fn normal_install_rolls_back_bundle_replacements_before_returning_error() 
         fs::read(log_path).expect("restored log config"),
         previous_log
     );
-    assert!(!version_root.join(".incomplete").exists());
     assert_settled_version_bundle_lane(&root);
 
     let _ = fs::remove_dir_all(root);
@@ -643,13 +641,6 @@ async fn cancelling_normal_install_does_not_cancel_started_bundle_publication() 
     })
     .await
     .expect("detached normal publication should settle");
-    assert!(
-        !versions_dir(&root)
-            .join(version_id)
-            .join(".incomplete")
-            .exists()
-    );
-
     let _ = fs::remove_dir_all(root);
 }
 
@@ -2875,7 +2866,6 @@ fn assert_normal_bundle_contents(root: &Path, version_id: &str, with_log_config:
             b"<log4j/>"
         );
     }
-    assert!(!version_root.join(".incomplete").exists());
 }
 
 fn normal_bundle_contents_match(root: &Path, version_id: &str, with_log_config: bool) -> bool {

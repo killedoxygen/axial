@@ -24,6 +24,8 @@ pub(crate) enum ManagedPublicationError {
     RootCapacityExhausted,
     #[error("managed publication blocking task stopped unexpectedly")]
     BlockingTaskStopped,
+    #[error("managed publication is changing")]
+    ReadBusy,
 }
 
 pub(crate) struct ManagedRootPublicationLease {
@@ -31,6 +33,17 @@ pub(crate) struct ManagedRootPublicationLease {
     publication_directory: ManagedDir,
     lock_file: Arc<ManagedPersistentFile>,
     _in_process_guard: tokio::sync::OwnedMutexGuard<()>,
+}
+
+pub(crate) enum ManagedRootPublicationReadLease {
+    NoLane {
+        root: ManagedDir,
+    },
+    Locked {
+        root: ManagedDir,
+        publication_directory: ManagedDir,
+        lock_file: ManagedPersistentFile,
+    },
 }
 
 impl std::fmt::Debug for ManagedRootPublicationLease {
@@ -109,6 +122,72 @@ impl ManagedRootPublicationLease {
     }
 }
 
+impl ManagedRootPublicationReadLease {
+    pub(crate) fn acquire(root: ManagedDir) -> Result<Self, ManagedPublicationError> {
+        Self::try_acquire(root)?.ok_or(ManagedPublicationError::ReadBusy)
+    }
+
+    fn try_acquire(root: ManagedDir) -> Result<Option<Self>, ManagedPublicationError> {
+        root.revalidate()?;
+        if !root.has_portably_exact_child_name(PUBLICATION_DIRECTORY)? {
+            return Ok(Some(Self::NoLane { root }));
+        }
+
+        let publication_directory = root.open_child(PUBLICATION_DIRECTORY)?;
+        if !publication_directory.has_portably_exact_child_name(PUBLICATION_LOCK_FILE)? {
+            return Ok(None);
+        }
+        let lock_file = publication_directory.open_persistent_file(PUBLICATION_LOCK_FILE)?;
+        if !lock_file.try_lock_shared()? {
+            return Ok(None);
+        }
+        if let Err(error) = root
+            .revalidate()
+            .and_then(|()| publication_directory.revalidate())
+            .and_then(|()| lock_file.revalidate())
+        {
+            let _ = lock_file.unlock();
+            return Err(error.into());
+        }
+
+        Ok(Some(Self::Locked {
+            root,
+            publication_directory,
+            lock_file,
+        }))
+    }
+
+    pub(crate) fn revalidate(&self) -> Result<(), ManagedPublicationError> {
+        match self {
+            Self::NoLane { root } => {
+                root.revalidate()?;
+                if root.has_portably_exact_child_name(PUBLICATION_DIRECTORY)? {
+                    return Err(ManagedPublicationError::ReadBusy);
+                }
+            }
+            Self::Locked {
+                root,
+                publication_directory,
+                lock_file,
+            } => {
+                root.revalidate()?;
+                publication_directory.revalidate()?;
+                lock_file.revalidate()?;
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn root_identity(
+        &self,
+    ) -> Result<ManagedDirectoryIdentity, ManagedPublicationError> {
+        let root = match self {
+            Self::NoLane { root } | Self::Locked { root, .. } => root,
+        };
+        Ok(root.identity()?)
+    }
+}
+
 pub(crate) async fn run_publication_blocking<F, R>(work: F) -> Result<R, ManagedPublicationError>
 where
     F: FnOnce() -> R + Send + 'static,
@@ -134,6 +213,14 @@ impl Drop for ManagedRootPublicationLease {
     }
 }
 
+impl Drop for ManagedRootPublicationReadLease {
+    fn drop(&mut self) {
+        if let Self::Locked { lock_file, .. } = self {
+            let _ = lock_file.unlock();
+        }
+    }
+}
+
 fn root_mutex(
     identity: ManagedDirectoryIdentity,
 ) -> Result<Arc<RootMutex>, ManagedPublicationError> {
@@ -156,8 +243,8 @@ fn root_mutex(
 #[cfg(test)]
 mod tests {
     use super::{
-        ManagedPublicationError, ManagedRootPublicationLease, PUBLICATION_DIRECTORY,
-        PUBLICATION_LOCK_FILE,
+        ManagedPublicationError, ManagedRootPublicationLease, ManagedRootPublicationReadLease,
+        PUBLICATION_DIRECTORY, PUBLICATION_LOCK_FILE,
     };
     use crate::managed_fs::ManagedDir;
     use std::ffi::OsString;
@@ -204,6 +291,68 @@ mod tests {
         .expect("second lease");
 
         drop((first, second));
+    }
+
+    #[test]
+    fn reader_without_a_publication_lane_does_not_create_metadata() {
+        let temporary = library_root("reader-no-lane");
+        let root = temporary.path().join("library");
+        let reader = ManagedRootPublicationReadLease::acquire(
+            ManagedDir::open_root(&root).expect("managed root"),
+        )
+        .expect("reader admission");
+
+        assert!(!root.join(PUBLICATION_DIRECTORY).exists());
+        reader.revalidate().expect("stable missing lane");
+    }
+
+    #[tokio::test]
+    async fn publication_lane_appearing_during_an_unlocked_read_invalidates_it() {
+        let temporary = library_root("reader-lane-race");
+        let root = temporary.path().join("library");
+        let reader = ManagedRootPublicationReadLease::acquire(
+            ManagedDir::open_root(&root).expect("reader root"),
+        )
+        .expect("reader admission");
+        let writer = ManagedRootPublicationLease::acquire(
+            ManagedDir::open_root(&root).expect("writer root"),
+        )
+        .await
+        .expect("writer admission");
+
+        assert!(matches!(
+            reader.revalidate(),
+            Err(ManagedPublicationError::ReadBusy)
+        ));
+        drop(writer);
+    }
+
+    #[tokio::test]
+    async fn existing_publication_lane_excludes_writer_while_reader_is_live() {
+        let temporary = library_root("reader-shared-lock");
+        let root = temporary.path().join("library");
+        ManagedRootPublicationLease::acquire(
+            ManagedDir::open_root(&root).expect("initial writer root"),
+        )
+        .await
+        .expect("initial writer admission");
+        let reader = ManagedRootPublicationReadLease::acquire(
+            ManagedDir::open_root(&root).expect("reader root"),
+        )
+        .expect("reader admission");
+        let waiter = tokio::spawn(ManagedRootPublicationLease::acquire(
+            ManagedDir::open_root(&root).expect("waiting writer root"),
+        ));
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!waiter.is_finished());
+        reader.revalidate().expect("live reader");
+        drop(reader);
+        tokio::time::timeout(Duration::from_millis(200), waiter)
+            .await
+            .expect("writer unblocked")
+            .expect("writer task")
+            .expect("writer admission");
     }
 
     #[tokio::test]

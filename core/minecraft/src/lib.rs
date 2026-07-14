@@ -71,8 +71,8 @@ pub use runtime::{
 };
 pub use types::{VersionEntry, VersionLoaderAttachment, VersionSubjectKind};
 pub use version::{
-    VersionScanDependencyStamp, VersionScanIssue, VersionScanIssueKind, VersionScanReport,
-    VersionScanSnapshot, VersionScanState, scan_versions, scan_versions_report,
+    VersionBundleReadGuard, VersionScanDependencyStamp, VersionScanIssue, VersionScanIssueKind,
+    VersionScanReport, VersionScanSnapshot, VersionScanState, scan_versions, scan_versions_report,
     scan_versions_snapshot,
 };
 pub use version_bundle_publication::{

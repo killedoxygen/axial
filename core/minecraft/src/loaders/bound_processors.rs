@@ -31,9 +31,15 @@ const MAX_PROCESSOR_JAR_ENTRIES: usize = 4096;
 const MAX_MAIN_CLASS_BYTES: usize = 256;
 const MAX_PROCESS_OUTPUT_BYTES: usize = 1 << 20;
 const MAX_PROCESS_OUTPUT_TOTAL_BYTES: usize = 2 << 20;
+#[cfg(target_os = "linux")]
+const MAX_LINUX_PROCESS_STAT_BYTES: u64 = 4096;
 const PROCESSOR_TIMEOUT: Duration = Duration::from_secs(120);
 const PIPE_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 const PROCESS_REAP_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(target_os = "linux")]
+const PROCESS_REAP_POLL_INTERVAL: Duration = Duration::from_millis(200);
+#[cfg(not(target_os = "linux"))]
+const PROCESS_REAP_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const STAGE_WATCH_INTERVAL: Duration = Duration::from_millis(100);
 
 #[cfg(unix)]
@@ -65,12 +71,10 @@ impl PendingProcessContainment {
 #[cfg(unix)]
 impl ProcessContainment {
     fn terminate(&self) -> Result<(), BoundProcessorError> {
-        match rustix::process::kill_process_group(self.group, rustix::process::Signal::KILL) {
-            Ok(()) | Err(rustix::io::Errno::SRCH) => Ok(()),
-            Err(_) => Err(BoundProcessorError::Unreaped),
-        }
+        terminate_process_group(self.group)
     }
 
+    #[cfg(not(target_os = "linux"))]
     fn is_empty(&self) -> Result<bool, BoundProcessorError> {
         match rustix::process::test_kill_process_group(self.group) {
             Ok(()) => Ok(false),
@@ -78,6 +82,123 @@ impl ProcessContainment {
             Err(_) => Err(BoundProcessorError::Unreaped),
         }
     }
+}
+
+#[cfg(unix)]
+fn terminate_process_group(group: rustix::process::Pid) -> Result<(), BoundProcessorError> {
+    match rustix::process::kill_process_group(group, rustix::process::Signal::KILL) {
+        Ok(()) | Err(rustix::io::Errno::SRCH) => Ok(()),
+        Err(_) => Err(BoundProcessorError::Unreaped),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_process_group_is_empty(group: rustix::process::Pid) -> Result<bool, BoundProcessorError> {
+    match rustix::process::test_kill_process_group(group) {
+        Err(rustix::io::Errno::SRCH) => Ok(true),
+        Ok(()) => {
+            terminate_process_group(group)?;
+            if !linux_process_group_has_only_zombies(group)? {
+                return Ok(false);
+            }
+            match rustix::process::test_kill_process_group(group) {
+                Err(rustix::io::Errno::SRCH) => Ok(true),
+                Ok(()) => {
+                    terminate_process_group(group)?;
+                    linux_process_group_has_only_zombies(group)
+                }
+                Err(_) => Err(BoundProcessorError::Unreaped),
+            }
+        }
+        Err(_) => Err(BoundProcessorError::Unreaped),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_process_group_has_only_zombies(
+    group: rustix::process::Pid,
+) -> Result<bool, BoundProcessorError> {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let group = group.as_raw_nonzero().get();
+    let proc_dir = std::fs::File::open("/proc").map_err(|_| BoundProcessorError::Unreaped)?;
+    let proc_stat = rustix::fs::fstatfs(&proc_dir).map_err(|_| BoundProcessorError::Unreaped)?;
+    if proc_stat.f_type != rustix::fs::PROC_SUPER_MAGIC {
+        return Err(BoundProcessorError::Unreaped);
+    }
+    let processes = std::fs::read_dir("/proc").map_err(|_| BoundProcessorError::Unreaped)?;
+    let mut observed_member = false;
+    for process in processes {
+        let process = process.map_err(|_| BoundProcessorError::Unreaped)?;
+        let file_name = process.file_name();
+        let Some(pid) = parse_linux_decimal_i32(file_name.as_bytes()).filter(|pid| *pid > 0) else {
+            continue;
+        };
+        let file = match std::fs::File::open(process.path().join("stat")) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => return Err(BoundProcessorError::Unreaped),
+        };
+        let mut stat = Vec::with_capacity(MAX_LINUX_PROCESS_STAT_BYTES as usize + 1);
+        match file
+            .take(MAX_LINUX_PROCESS_STAT_BYTES + 1)
+            .read_to_end(&mut stat)
+        {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => return Err(BoundProcessorError::Unreaped),
+        }
+        if stat.len() as u64 > MAX_LINUX_PROCESS_STAT_BYTES {
+            return Err(BoundProcessorError::Unreaped);
+        }
+        let (state, process_group, threads) =
+            parse_linux_process_stat(&stat, pid).ok_or(BoundProcessorError::Unreaped)?;
+        if process_group == group {
+            observed_member = true;
+            if state != b'Z' || threads != 1 {
+                return Ok(false);
+            }
+        }
+    }
+    Ok(observed_member)
+}
+
+#[cfg(target_os = "linux")]
+fn parse_linux_process_stat(stat: &[u8], expected_pid: i32) -> Option<(u8, i32, u64)> {
+    let pid_end = stat.iter().position(|byte| *byte == b' ')?;
+    if stat.get(pid_end + 1) != Some(&b'(')
+        || parse_linux_decimal_i32(&stat[..pid_end]) != Some(expected_pid)
+    {
+        return None;
+    }
+    let fields_start = stat.windows(2).rposition(|window| window == b") ")? + 2;
+    if fields_start <= pid_end + 2 {
+        return None;
+    }
+    let mut fields = stat[fields_start..]
+        .split(|byte| byte.is_ascii_whitespace())
+        .filter(|field| !field.is_empty());
+    let state = fields.next()?;
+    if state.len() != 1 {
+        return None;
+    }
+    fields.next()?;
+    let process_group = parse_linux_decimal_i32(fields.next()?)?;
+    for _ in 0..14 {
+        fields.next()?;
+    }
+    let threads = parse_linux_decimal_u64(fields.next()?)?;
+    Some((state[0], process_group, threads))
+}
+
+#[cfg(target_os = "linux")]
+fn parse_linux_decimal_i32(bytes: &[u8]) -> Option<i32> {
+    std::str::from_utf8(bytes).ok()?.parse().ok()
+}
+
+#[cfg(target_os = "linux")]
+fn parse_linux_decimal_u64(bytes: &[u8]) -> Option<u64> {
+    std::str::from_utf8(bytes).ok()?.parse().ok()
 }
 
 #[cfg(unix)]
@@ -1382,13 +1503,22 @@ async fn terminate_and_reap(child: &mut ContainedChild) -> Result<(), BoundProce
         .map_err(|_| BoundProcessorError::Unreaped)?;
     let deadline = tokio::time::Instant::now() + PROCESS_REAP_TIMEOUT;
     loop {
-        if child.containment.is_empty()? {
+        #[cfg(target_os = "linux")]
+        let empty = {
+            let group = child.containment.group;
+            tokio::task::spawn_blocking(move || linux_process_group_is_empty(group))
+                .await
+                .map_err(|_| BoundProcessorError::Unreaped)??
+        };
+        #[cfg(not(target_os = "linux"))]
+        let empty = child.containment.is_empty()?;
+        if empty {
             return Ok(());
         }
         if tokio::time::Instant::now() >= deadline {
             return Err(BoundProcessorError::Unreaped);
         }
-        tokio::time::sleep(Duration::from_millis(10)).await;
+        tokio::time::sleep(PROCESS_REAP_POLL_INTERVAL).await;
     }
 }
 
@@ -1624,6 +1754,25 @@ mod tests {
     use tokio::process::Command;
     use tokio::sync::{mpsc, oneshot};
     use zip::{ZipWriter, write::SimpleFileOptions};
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn parses_linux_process_stat_with_adversarial_process_names() {
+        let zombie = b"42 (processor) worker\n\xff) Z 1 42 42 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0";
+        assert_eq!(
+            super::parse_linux_process_stat(zombie, 42),
+            Some((b'Z', 42, 1))
+        );
+        assert_eq!(
+            super::parse_linux_process_stat(
+                b"43 (processor) R 1 42 42 0 -1 0 0 0 0 0 0 0 0 0 20 0 2 0",
+                43
+            ),
+            Some((b'R', 42, 2))
+        );
+        assert_eq!(super::parse_linux_process_stat(zombie, 43), None);
+        assert_eq!(super::parse_linux_process_stat(b"malformed", 42), None);
+    }
 
     #[test]
     fn parses_manifest_continuations_and_validates_binary_name() {
@@ -1980,6 +2129,12 @@ mod tests {
         .await
         .expect("contained success");
         assert!(child.child.try_wait().expect("leader wait").is_some());
+        #[cfg(target_os = "linux")]
+        assert!(
+            super::linux_process_group_is_empty(child.containment.group)
+                .expect("empty process group")
+        );
+        #[cfg(not(target_os = "linux"))]
         assert!(child.containment.is_empty().expect("empty process group"));
     }
 

@@ -20,11 +20,11 @@ use super::runtime::{
     finish_runtime_pipeline_after_artifacts, recv_runtime_progress, spawn_runtime_ensure_pipeline,
 };
 use super::transfer::{
-    AuthenticatedSelectedArtifactSource, MaterializedSelectedArtifactSource,
-    SelectedArtifactSourceRequest, acquire_authenticated_selected_artifact_source,
-    ensure_selected_artifact_with_client, materialize_authenticated_library_source,
-    materialize_authenticated_selected_artifact_source, prepare_library_publication,
-    prepare_selected_artifact_install,
+    AuthenticatedSelectedArtifactSource, AuthenticatedSelectedArtifactVersionBundleParts,
+    MaterializedSelectedArtifactSource, SelectedArtifactSourceRequest,
+    acquire_authenticated_selected_artifact_source, ensure_selected_artifact_with_client,
+    materialize_authenticated_library_source, materialize_authenticated_selected_artifact_source,
+    prepare_library_publication, prepare_selected_artifact_install,
 };
 use crate::artifact_path::validate_artifact_path_segment;
 use crate::known_good::{
@@ -56,6 +56,7 @@ use crate::version_bundle_publication::{
     ManagedVersionBundleSettlementOutcome, publish_version_bundle,
 };
 use futures_util::StreamExt;
+use sha1::{Digest as _, Sha1};
 use std::io;
 use std::path::Path;
 use std::path::PathBuf;
@@ -81,9 +82,15 @@ enum DownloaderRoot {
 
 pub(crate) struct AuthenticatedVersionBundleSource {
     version_id: String,
-    version_json: AuthenticatedSelectedArtifactSource,
-    client_jar: AuthenticatedSelectedArtifactSource,
-    log_config: Option<AuthenticatedSelectedArtifactSource>,
+    members: Vec<AuthenticatedVersionBundleMemberSource>,
+}
+
+pub(crate) struct AuthenticatedVersionBundleMemberSource {
+    kind: KnownGoodArtifactKind,
+    logical_identity: String,
+    bytes: Arc<[u8]>,
+    observed_sha1: String,
+    observed_size: u64,
 }
 
 impl AuthenticatedVersionBundleSource {
@@ -92,24 +99,195 @@ impl AuthenticatedVersionBundleSource {
     }
 
     pub(crate) fn matches_projection(&self, projection: &ManagedComponentProjection<'_>) -> bool {
-        version_bundle_sources_match_projection(
-            &self.version_id,
-            projection,
-            &self.version_json,
-            &self.client_jar,
-            self.log_config.as_ref(),
-        )
+        version_bundle_sources_match_projection(&self.version_id, projection, &self.members)
     }
 
-    pub(crate) fn into_sources(
-        self,
-    ) -> (
-        AuthenticatedSelectedArtifactSource,
-        AuthenticatedSelectedArtifactSource,
-        Option<AuthenticatedSelectedArtifactSource>,
-    ) {
-        (self.version_json, self.client_jar, self.log_config)
+    pub(crate) fn into_sources(self) -> Vec<AuthenticatedVersionBundleMemberSource> {
+        self.members
     }
+
+    fn from_selected_sources(
+        version_id: String,
+        version_json: AuthenticatedSelectedArtifactSource,
+        client_jar: AuthenticatedSelectedArtifactSource,
+        log_config: Option<AuthenticatedSelectedArtifactSource>,
+    ) -> Result<Self, DownloadError> {
+        let mut members = Vec::with_capacity(2 + usize::from(log_config.is_some()));
+        members.push(AuthenticatedVersionBundleMemberSource::from_selected(
+            version_json,
+        )?);
+        members.push(AuthenticatedVersionBundleMemberSource::from_selected(
+            client_jar,
+        )?);
+        if let Some(log_config) = log_config {
+            members.push(AuthenticatedVersionBundleMemberSource::from_selected(
+                log_config,
+            )?);
+        }
+        Ok(Self {
+            version_id,
+            members,
+        })
+    }
+
+    fn from_local_projection(
+        version_id: String,
+        projection: &ManagedComponentProjection<'_>,
+        version_json: Vec<u8>,
+        client_jar: Vec<u8>,
+        log_config: Option<Vec<u8>>,
+    ) -> Result<Self, DownloadError> {
+        let version_json_identity = projected_member_identity(
+            &version_id,
+            projection,
+            KnownGoodArtifactKind::VersionMetadata,
+        )?;
+        let client_jar_identity =
+            projected_member_identity(&version_id, projection, KnownGoodArtifactKind::ClientJar)?;
+        let projected_log_identity = projected_optional_log_identity(projection)?;
+        if projected_log_identity.is_some() != log_config.is_some() {
+            return Err(version_bundle_install_error(
+                "local version bundle logging source does not match the admitted projection",
+            ));
+        }
+
+        let mut members = Vec::with_capacity(2 + usize::from(log_config.is_some()));
+        members.push(AuthenticatedVersionBundleMemberSource::from_local(
+            KnownGoodArtifactKind::VersionMetadata,
+            version_json_identity,
+            version_json,
+        )?);
+        members.push(AuthenticatedVersionBundleMemberSource::from_local(
+            KnownGoodArtifactKind::ClientJar,
+            client_jar_identity,
+            client_jar,
+        )?);
+        if let (Some(identity), Some(bytes)) = (projected_log_identity, log_config) {
+            members.push(AuthenticatedVersionBundleMemberSource::from_local(
+                KnownGoodArtifactKind::LogConfig,
+                identity,
+                bytes,
+            )?);
+        }
+        let source = Self {
+            version_id,
+            members,
+        };
+        if !source.matches_projection(projection) {
+            return Err(version_bundle_install_error(
+                "local version bundle sources do not match the admitted projection",
+            ));
+        }
+        Ok(source)
+    }
+}
+
+impl AuthenticatedVersionBundleMemberSource {
+    fn from_selected(source: AuthenticatedSelectedArtifactSource) -> Result<Self, DownloadError> {
+        let AuthenticatedSelectedArtifactVersionBundleParts {
+            bytes,
+            observed_size,
+            observed_sha1,
+            kind: selected_kind,
+            logical_identity,
+            expected,
+        } = source.into_version_bundle_parts();
+        let kind = match selected_kind {
+            SelectedDownloadArtifactKind::VersionJson => KnownGoodArtifactKind::VersionMetadata,
+            SelectedDownloadArtifactKind::ClientJar => KnownGoodArtifactKind::ClientJar,
+            SelectedDownloadArtifactKind::LogConfig => KnownGoodArtifactKind::LogConfig,
+            _ => {
+                return Err(version_bundle_install_error(
+                    "selected artifact is not a version bundle member",
+                ));
+            }
+        };
+        let observed_sha1 = encode_sha1_digest(observed_sha1);
+        if observed_size == 0
+            || observed_size > MAX_TIER2_ARTIFACT_BYTES
+            || u64::try_from(bytes.len()).ok() != Some(observed_size)
+            || expected.size.is_some_and(|size| size != observed_size)
+            || !expected
+                .sha1
+                .as_deref()
+                .is_some_and(|digest| digest.eq_ignore_ascii_case(&observed_sha1))
+        {
+            return Err(version_bundle_install_error(
+                "selected version bundle source lacks an exact authenticated contract",
+            ));
+        }
+        Ok(Self {
+            kind,
+            logical_identity,
+            bytes,
+            observed_sha1,
+            observed_size,
+        })
+    }
+
+    fn from_local(
+        kind: KnownGoodArtifactKind,
+        logical_identity: String,
+        bytes: Vec<u8>,
+    ) -> Result<Self, DownloadError> {
+        if !matches!(
+            kind,
+            KnownGoodArtifactKind::VersionMetadata
+                | KnownGoodArtifactKind::ClientJar
+                | KnownGoodArtifactKind::LogConfig
+        ) || logical_identity.trim().is_empty()
+        {
+            return Err(version_bundle_install_error(
+                "local version bundle member identity is invalid",
+            ));
+        }
+        let observed_size = u64::try_from(bytes.len()).map_err(|_| {
+            version_bundle_install_error("local version bundle source is too large")
+        })?;
+        if observed_size == 0 || observed_size > MAX_TIER2_ARTIFACT_BYTES {
+            return Err(version_bundle_install_error(
+                "local version bundle source exceeds the admitted bounds",
+            ));
+        }
+        let observed_sha1 = format!("{:x}", Sha1::digest(&bytes));
+        Ok(Self {
+            kind,
+            logical_identity,
+            bytes: bytes.into(),
+            observed_sha1,
+            observed_size,
+        })
+    }
+
+    pub(crate) fn kind(&self) -> KnownGoodArtifactKind {
+        self.kind
+    }
+
+    pub(crate) fn logical_identity(&self) -> &str {
+        &self.logical_identity
+    }
+
+    pub(crate) fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    fn observed_sha1(&self) -> &str {
+        &self.observed_sha1
+    }
+
+    fn observed_size(&self) -> u64 {
+        self.observed_size
+    }
+}
+
+fn encode_sha1_digest(digest: [u8; 20]) -> String {
+    use std::fmt::Write as _;
+
+    let mut encoded = String::with_capacity(40);
+    for byte in digest {
+        let _ = write!(encoded, "{byte:02x}");
+    }
+    encoded
 }
 
 pub(crate) struct ReconstructedVanillaClientAuthority {
@@ -204,7 +382,7 @@ pub(crate) struct ReconstructedVanillaAuthority {
     parts: VanillaAuthorityParts,
 }
 
-struct PreparedVanillaPublication {
+pub(crate) struct PreparedVersionBundlePublication {
     authority: PendingKnownGoodInstallAuthority,
     source: AuthenticatedVersionBundleSource,
 }
@@ -267,13 +445,13 @@ impl AuthenticatedVanillaInstallSources {
         )
     }
 
-    fn into_version_bundle_source(self) -> AuthenticatedVersionBundleSource {
-        AuthenticatedVersionBundleSource {
-            version_id: self.parts.version.id,
-            version_json: self.parts.version_source,
-            client_jar: self.client_source,
-            log_config: self.log_config_source,
-        }
+    fn into_version_bundle_source(self) -> Result<AuthenticatedVersionBundleSource, DownloadError> {
+        AuthenticatedVersionBundleSource::from_selected_sources(
+            self.parts.version.id,
+            self.parts.version_source,
+            self.client_source,
+            self.log_config_source,
+        )
     }
 }
 
@@ -534,12 +712,12 @@ impl Downloader {
             .acquire_version_bundle_log_config_source(&version)
             .await?;
 
-        Ok(AuthenticatedVersionBundleSource {
-            version_id: version_id.to_string(),
-            version_json: version_json_source,
+        AuthenticatedVersionBundleSource::from_selected_sources(
+            version_id.to_string(),
+            version_json_source,
             client_jar,
             log_config,
-        })
+        )
     }
 
     async fn acquire_version_bundle_client_source(
@@ -736,8 +914,9 @@ impl Downloader {
                     descriptor_tx.as_ref(),
                 )
                 .await?;
-            let lease = acquire_vanilla_publication_lease(managed_root, version_id).await?;
-            let publication = tokio::spawn(publish_prepared_vanilla_install(lease, prepared));
+            let lease = acquire_version_bundle_publication_lease(managed_root, version_id).await?;
+            let publication =
+                tokio::spawn(publish_prepared_version_bundle_install(lease, prepared));
             publication.await.map_err(version_bundle_task_error)?
         }
         .await;
@@ -780,7 +959,7 @@ impl Downloader {
         plan: &Arc<TransferPlan>,
         fact_tx: Option<&mpsc::UnboundedSender<ExecutionDownloadFact>>,
         descriptor_tx: Option<&mpsc::UnboundedSender<SelectedDownloadArtifactDescriptor>>,
-    ) -> Result<PreparedVanillaPublication, DownloadError>
+    ) -> Result<PreparedVersionBundlePublication, DownloadError>
     where
         F: FnMut(DownloadProgress),
     {
@@ -1159,10 +1338,8 @@ impl Downloader {
                     "installed source inventory could not be derived: {error:?}"
                 ))
             })?;
-        Ok(PreparedVanillaPublication {
-            authority,
-            source: source_authority.into_version_bundle_source(),
-        })
+        let source = source_authority.into_version_bundle_source()?;
+        Ok(PreparedVersionBundlePublication { authority, source })
     }
 
     async fn acquire_vanilla_plan(
@@ -1536,79 +1713,133 @@ fn exact_version_bundle_source_limit(size: i64, label: &str) -> Result<usize, Do
 fn version_bundle_sources_match_projection(
     version_id: &str,
     projection: &ManagedComponentProjection<'_>,
-    version_json: &AuthenticatedSelectedArtifactSource,
-    client_jar: &AuthenticatedSelectedArtifactSource,
-    log_config: Option<&AuthenticatedSelectedArtifactSource>,
+    members: &[AuthenticatedVersionBundleMemberSource],
 ) -> bool {
     if projection.component() != ManagedKnownGoodComponent::VersionBundle
-        || projection.entry_count() != 2 + usize::from(log_config.is_some())
+        || projection.entry_count() != members.len()
+        || !(2..=3).contains(&members.len())
     {
         return false;
     }
-    let version_json_path = format!("{version_id}/{version_id}.json");
-    let client_jar_path = format!("{version_id}/{version_id}.jar");
-    if !source_matches_version_bundle_entry(
-        projection,
-        version_json,
-        SelectedDownloadArtifactKind::VersionJson,
-        KnownGoodArtifactKind::VersionMetadata,
-        &KnownGoodRoot::Versions,
-        &version_json_path,
-    ) || !source_matches_version_bundle_entry(
-        projection,
-        client_jar,
-        SelectedDownloadArtifactKind::ClientJar,
-        KnownGoodArtifactKind::ClientJar,
-        &KnownGoodRoot::Versions,
-        &client_jar_path,
-    ) {
-        return false;
-    }
-    match log_config {
-        Some(source) => source_matches_version_bundle_entry(
-            projection,
-            source,
-            SelectedDownloadArtifactKind::LogConfig,
-            KnownGoodArtifactKind::LogConfig,
-            &KnownGoodRoot::Assets,
-            &format!("log_configs/{}", source.logical_identity()),
-        ),
-        None => true,
-    }
+    members
+        .iter()
+        .all(|source| source_matches_version_bundle_entry(projection, version_id, source))
+        && projection.entries().iter().all(|projected| {
+            members
+                .iter()
+                .filter(|source| source.kind() == projected.entry().kind())
+                .count()
+                == 1
+        })
 }
 
 fn source_matches_version_bundle_entry(
     projection: &ManagedComponentProjection<'_>,
-    source: &AuthenticatedSelectedArtifactSource,
-    source_kind: SelectedDownloadArtifactKind,
-    artifact_kind: KnownGoodArtifactKind,
-    root: &KnownGoodRoot,
-    path: &str,
+    version_id: &str,
+    source: &AuthenticatedVersionBundleMemberSource,
 ) -> bool {
-    if source.kind() != source_kind {
-        return false;
-    }
     let Some(projected) = projection.entries().iter().find(|projected| {
         let entry = projected.entry();
-        entry.kind() == artifact_kind && entry.root() == root && entry.path().as_str() == path
+        entry.kind() == source.kind()
     }) else {
         return false;
+    };
+    let expected_identity = match source.kind() {
+        KnownGoodArtifactKind::VersionMetadata
+            if projected.entry().root() == &KnownGoodRoot::Versions
+                && projected.entry().path().as_str()
+                    == format!("{version_id}/{version_id}.json") =>
+        {
+            version_id
+        }
+        KnownGoodArtifactKind::ClientJar
+            if projected.entry().root() == &KnownGoodRoot::Versions
+                && projected.entry().path().as_str()
+                    == format!("{version_id}/{version_id}.jar") =>
+        {
+            version_id
+        }
+        KnownGoodArtifactKind::LogConfig if projected.entry().root() == &KnownGoodRoot::Assets => {
+            let Some(identity) = projected
+                .entry()
+                .path()
+                .as_str()
+                .strip_prefix("log_configs/")
+                .filter(|identity| !identity.is_empty() && !identity.contains('/'))
+            else {
+                return false;
+            };
+            identity
+        }
+        _ => return false,
     };
     let (digest, size) = match projected.entry().integrity() {
         KnownGoodIntegrity::Sha1 { digest, size }
         | KnownGoodIntegrity::ExactBytes { digest, size } => (digest, *size),
         KnownGoodIntegrity::Directory | KnownGoodIntegrity::LinkTarget(_) => return false,
     };
-    u64::try_from(source.bytes().len()).is_ok_and(|observed| observed == size)
-        && source
-            .expected()
-            .size
-            .is_none_or(|expected| expected == size)
-        && source
-            .expected()
-            .sha1
-            .as_deref()
-            .is_some_and(|expected| expected.eq_ignore_ascii_case(digest.as_str()))
+    source.logical_identity() == expected_identity
+        && source.observed_size() == size
+        && u64::try_from(source.bytes().len()).is_ok_and(|observed| observed == size)
+        && source.observed_sha1().eq_ignore_ascii_case(digest.as_str())
+}
+
+fn projected_member_identity(
+    version_id: &str,
+    projection: &ManagedComponentProjection<'_>,
+    kind: KnownGoodArtifactKind,
+) -> Result<String, DownloadError> {
+    let expected_path = match kind {
+        KnownGoodArtifactKind::VersionMetadata => format!("{version_id}/{version_id}.json"),
+        KnownGoodArtifactKind::ClientJar => format!("{version_id}/{version_id}.jar"),
+        _ => {
+            return Err(version_bundle_install_error(
+                "local version bundle member kind is invalid",
+            ));
+        }
+    };
+    let matches = projection
+        .entries()
+        .iter()
+        .filter(|projected| {
+            let entry = projected.entry();
+            entry.kind() == kind
+                && entry.root() == &KnownGoodRoot::Versions
+                && entry.path().as_str() == expected_path
+        })
+        .count();
+    if matches != 1 {
+        return Err(version_bundle_install_error(
+            "local version bundle projection topology is invalid",
+        ));
+    }
+    Ok(version_id.to_string())
+}
+
+fn projected_optional_log_identity(
+    projection: &ManagedComponentProjection<'_>,
+) -> Result<Option<String>, DownloadError> {
+    let mut logs = projection
+        .entries()
+        .iter()
+        .filter(|projected| projected.entry().kind() == KnownGoodArtifactKind::LogConfig);
+    let Some(projected) = logs.next() else {
+        return Ok(None);
+    };
+    if logs.next().is_some() || projected.entry().root() != &KnownGoodRoot::Assets {
+        return Err(version_bundle_install_error(
+            "local version bundle log projection is invalid",
+        ));
+    }
+    projected
+        .entry()
+        .path()
+        .as_str()
+        .strip_prefix("log_configs/")
+        .filter(|identity| !identity.is_empty() && !identity.contains('/'))
+        .map(str::to_string)
+        .map(Some)
+        .ok_or_else(|| version_bundle_install_error("local version bundle log identity is invalid"))
 }
 
 fn validate_install_version_id(version_id: &str) -> Result<(), DownloadError> {
@@ -1743,11 +1974,32 @@ enum LocalVersionBundleSettlement {
     Retry(ManagedVersionBundleSettlementFailure),
 }
 
-async fn publish_prepared_vanilla_install(
+pub(crate) fn prepare_local_version_bundle_publication(
+    authority: PendingKnownGoodInstallAuthority,
+    version_json: Vec<u8>,
+    client_jar: Vec<u8>,
+    log_config: Option<Vec<u8>>,
+) -> Result<PreparedVersionBundlePublication, DownloadError> {
+    let source = {
+        let projection = authority.version_bundle_projection().map_err(|_| {
+            version_bundle_install_error("version bundle projection could not be derived")
+        })?;
+        AuthenticatedVersionBundleSource::from_local_projection(
+            authority.version_id().to_string(),
+            &projection,
+            version_json,
+            client_jar,
+            log_config,
+        )?
+    };
+    Ok(PreparedVersionBundlePublication { authority, source })
+}
+
+pub(crate) async fn publish_prepared_version_bundle_install(
     lease: ManagedRootPublicationLease,
-    prepared: PreparedVanillaPublication,
+    prepared: PreparedVersionBundlePublication,
 ) -> Result<KnownGoodInstallReceipt, DownloadError> {
-    let PreparedVanillaPublication { authority, source } = prepared;
+    let PreparedVersionBundlePublication { authority, source } = prepared;
     let publication = {
         let projection = authority.version_bundle_projection().map_err(|_| {
             version_bundle_install_error("version bundle projection could not be derived")
@@ -1775,7 +2027,7 @@ async fn publish_prepared_vanilla_install(
     }
 }
 
-async fn acquire_vanilla_publication_lease(
+pub(crate) async fn acquire_version_bundle_publication_lease(
     managed_root: PathBuf,
     _version_id: &str,
 ) -> Result<ManagedRootPublicationLease, DownloadError> {
@@ -1883,7 +2135,6 @@ fn version_bundle_task_error(error: tokio::task::JoinError) -> DownloadError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sha1::{Digest as _, Sha1};
     use std::collections::HashMap;
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
@@ -2141,18 +2392,18 @@ mod tests {
             .expect("authenticated version bundle source");
 
         assert_eq!(source.version_id(), "bundle-source");
-        let (version_json, client_jar, log_config) = source.into_sources();
-        assert_eq!(
-            version_json.kind(),
-            SelectedDownloadArtifactKind::VersionJson
-        );
+        let mut sources = source.into_sources();
+        let version_json = sources.remove(0);
+        let client_jar = sources.remove(0);
+        let log_config = sources.pop();
+        assert_eq!(version_json.kind(), KnownGoodArtifactKind::VersionMetadata);
         assert_eq!(version_json.logical_identity(), "bundle-source");
         assert_eq!(version_json.bytes(), fixture.version_json);
-        assert_eq!(client_jar.kind(), SelectedDownloadArtifactKind::ClientJar);
+        assert_eq!(client_jar.kind(), KnownGoodArtifactKind::ClientJar);
         assert_eq!(client_jar.logical_identity(), "bundle-source");
         assert_eq!(client_jar.bytes(), fixture.client_jar);
         let log_config = log_config.expect("retained log config");
-        assert_eq!(log_config.kind(), SelectedDownloadArtifactKind::LogConfig);
+        assert_eq!(log_config.kind(), KnownGoodArtifactKind::LogConfig);
         assert_eq!(log_config.logical_identity(), "client.xml");
         assert_eq!(
             log_config.bytes(),
@@ -2178,12 +2429,51 @@ mod tests {
             .await
             .expect("authenticated version bundle source");
 
-        let (_, _, log_config) = source.into_sources();
-        assert!(log_config.is_none());
+        assert_eq!(source.into_sources().len(), 2);
         let mut requests =
             std::iter::from_fn(|| fixture.requests.try_recv().ok()).collect::<Vec<_>>();
         requests.sort();
         assert_eq!(requests, vec!["/client.jar", "/version.json"]);
+    }
+
+    #[test]
+    fn local_version_bundle_source_requires_exact_projected_members() {
+        let version_id = "local-bundle";
+        let version_json = br#"{"id":"local-bundle"}"#.to_vec();
+        let client_jar = b"exact local client".to_vec();
+        let log_config = b"exact local log".to_vec();
+        let inventory = crate::known_good::KnownGoodInventory::version_bundle_for_test(
+            version_id,
+            &version_json,
+            &client_jar,
+            Some(("client.xml", &log_config)),
+        );
+        let projection = inventory
+            .managed_component_projection(ManagedKnownGoodComponent::VersionBundle)
+            .expect("version bundle projection");
+
+        let source = AuthenticatedVersionBundleSource::from_local_projection(
+            version_id.to_string(),
+            &projection,
+            version_json.clone(),
+            client_jar.clone(),
+            Some(log_config.clone()),
+        )
+        .expect("exact local source");
+        assert!(source.matches_projection(&projection));
+
+        let mut corrupt_client = client_jar;
+        corrupt_client[0] ^= 0xff;
+        assert!(
+            AuthenticatedVersionBundleSource::from_local_projection(
+                version_id.to_string(),
+                &projection,
+                version_json,
+                corrupt_client,
+                Some(log_config),
+            )
+            .is_err()
+        );
     }
 
     #[tokio::test]

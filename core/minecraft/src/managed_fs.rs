@@ -461,6 +461,25 @@ impl ManagedDir {
             }
             Err(error) => return Err(LoaderError::Io(error)),
         };
+        self.bind_persistent_file(name, file)
+    }
+
+    pub(crate) fn open_persistent_file(
+        &self,
+        name: &str,
+    ) -> Result<ManagedPersistentFile, LoaderError> {
+        validate_segment(name)?;
+        self.revalidate()?;
+        let name = OsString::from(name);
+        let file = platform::open_file_read_write(&self.inner.handle, &self.inner.path, &name)?;
+        self.bind_persistent_file(name, file)
+    }
+
+    fn bind_persistent_file(
+        &self,
+        name: OsString,
+        file: std::fs::File,
+    ) -> Result<ManagedPersistentFile, LoaderError> {
         let persistent = ManagedPersistentFile {
             directory: self.clone(),
             name,
@@ -1055,10 +1074,6 @@ impl ManagedDir {
         self.revalidate()
     }
 
-    pub(crate) fn read_exact(&self, name: &str) -> Result<Vec<u8>, LoaderError> {
-        self.read_bounded(name, MAX_MANAGED_READ_BYTES, false)
-    }
-
     pub(crate) fn read_authenticated(
         &self,
         name: &str,
@@ -1489,22 +1504,6 @@ impl ManagedDir {
         Ok(bytes)
     }
 
-    pub(crate) fn remove_file(&self, name: &str) -> Result<(), LoaderError> {
-        validate_segment(name)?;
-        match platform::entry_kind(&self.inner.handle, &self.inner.path, OsStr::new(name))? {
-            None => Err(LoaderError::Verify(
-                "managed loader cleanup target is missing".to_string(),
-            )),
-            Some(EntryKind::File | EntryKind::Link) => {
-                platform::remove_file(&self.inner.handle, &self.inner.path, OsStr::new(name))?;
-                self.revalidate()
-            }
-            Some(_) => Err(LoaderError::Verify(
-                "managed loader cleanup target is not a file".to_string(),
-            )),
-        }
-    }
-
     pub(crate) fn remove_guarded_file(
         &self,
         name: &str,
@@ -1776,6 +1775,21 @@ impl ManagedPersistentFile {
     pub(crate) fn try_lock_exclusive(&self) -> Result<bool, LoaderError> {
         self.revalidate()?;
         match self.file.try_lock() {
+            Ok(()) => {
+                if let Err(error) = self.revalidate() {
+                    let _ = self.file.unlock();
+                    return Err(error);
+                }
+                Ok(true)
+            }
+            Err(std::fs::TryLockError::WouldBlock) => Ok(false),
+            Err(std::fs::TryLockError::Error(error)) => Err(LoaderError::Io(error)),
+        }
+    }
+
+    pub(crate) fn try_lock_shared(&self) -> Result<bool, LoaderError> {
+        self.revalidate()?;
+        match self.file.try_lock_shared() {
             Ok(()) => {
                 if let Err(error) = self.revalidate() {
                     let _ = self.file.unlock();
@@ -2169,7 +2183,7 @@ mod tests {
         drop(file);
 
         let error = directory
-            .read_exact("artifact.jar")
+            .read_authenticated("artifact.jar", None, None)
             .expect_err("oversized file");
         assert!(matches!(error, LoaderError::Verify(_)));
         let _ = fs::remove_dir_all(root);

@@ -1,7 +1,4 @@
-use crate::download::{
-    AuthenticatedSelectedArtifactSource, AuthenticatedVersionBundleSource,
-    SelectedDownloadArtifactKind,
-};
+use crate::download::{AuthenticatedVersionBundleMemberSource, AuthenticatedVersionBundleSource};
 use crate::known_good::{
     KnownGoodArtifactKind, KnownGoodIntegrity, KnownGoodRelativePath, KnownGoodRoot,
     MAX_TIER2_AGGREGATE_BYTES, MAX_TIER2_ARTIFACT_BYTES, ManagedComponentProjection,
@@ -86,7 +83,7 @@ struct EntryFingerprint {
 
 struct PlannedEntry {
     fingerprint: EntryFingerprint,
-    source: AuthenticatedSelectedArtifactSource,
+    source: AuthenticatedVersionBundleMemberSource,
     target: Option<CanonicalTarget>,
 }
 
@@ -659,16 +656,12 @@ fn bind_sources(
     source: AuthenticatedVersionBundleSource,
     fingerprints: Vec<EntryFingerprint>,
 ) -> Result<Vec<PlannedEntry>, ManagedVersionBundlePublicationError> {
-    let (version_json, client_jar, log_config) = source.into_sources();
-    let mut sources = vec![version_json, client_jar];
-    if let Some(log_config) = log_config {
-        sources.push(log_config);
-    }
+    let mut sources = source.into_sources();
     let mut planned = Vec::with_capacity(fingerprints.len());
     for fingerprint in fingerprints {
         let source_index = sources
             .iter()
-            .position(|source| source_matches_kind(source.kind(), fingerprint.kind))
+            .position(|source| source.kind() == fingerprint.kind)
             .ok_or(ManagedVersionBundlePublicationError::ProjectionMismatch)?;
         planned.push(PlannedEntry {
             fingerprint,
@@ -3553,25 +3546,6 @@ fn projection_matches_fingerprints(
     expected: Vec<EntryFingerprint>,
 ) -> bool {
     own_fingerprints(projection).is_ok_and(|actual| actual == expected)
-}
-
-fn source_matches_kind(
-    source: SelectedDownloadArtifactKind,
-    artifact: KnownGoodArtifactKind,
-) -> bool {
-    matches!(
-        (source, artifact),
-        (
-            SelectedDownloadArtifactKind::VersionJson,
-            KnownGoodArtifactKind::VersionMetadata
-        ) | (
-            SelectedDownloadArtifactKind::ClientJar,
-            KnownGoodArtifactKind::ClientJar
-        ) | (
-            SelectedDownloadArtifactKind::LogConfig,
-            KnownGoodArtifactKind::LogConfig
-        )
-    )
 }
 
 #[cfg(test)]

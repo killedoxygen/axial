@@ -1080,17 +1080,18 @@ struct AuthenticatedKnownGoodReceipt {
     environment: Environment,
 }
 
+#[derive(Debug, Eq, PartialEq)]
 pub(crate) struct PendingKnownGoodInstallAuthority {
     authenticated: AuthenticatedKnownGoodReceipt,
 }
 
 pub(crate) struct PendingInstallerReceipt {
-    receipt: KnownGoodInstallReceipt,
+    authority: PendingKnownGoodInstallAuthority,
     publications: PendingInstallerPublications,
 }
 
 pub(crate) struct PendingInstallerReceiptPublication {
-    receipt: KnownGoodInstallReceipt,
+    authority: PendingKnownGoodInstallAuthority,
     publications: PendingInstallerPublications,
 }
 
@@ -1104,7 +1105,7 @@ impl PendingInstallerReceipt {
         let (publications, sources) = self.publications.into_sources();
         (
             PendingInstallerReceiptPublication {
-                receipt: self.receipt,
+                authority: self.authority,
                 publications,
             },
             sources,
@@ -1116,11 +1117,11 @@ impl PendingInstallerReceiptPublication {
     pub(crate) fn complete(
         self,
         materialized: Vec<crate::download::MaterializedLibraryIdentity>,
-    ) -> Result<KnownGoodInstallReceipt, KnownGoodInventoryError> {
+    ) -> Result<PendingKnownGoodInstallAuthority, KnownGoodInventoryError> {
         self.publications
             .complete(materialized)
             .map_err(|_| KnownGoodInventoryError::InstallerLibraryProofMismatch)?;
-        Ok(self.receipt)
+        Ok(self.authority)
     }
 }
 
@@ -1174,6 +1175,26 @@ impl KnownGoodInstallReceipt {
                 },
             })
             .expect("unique test client entry");
+        if let Some(logging) = effective_version
+            .logging
+            .as_ref()
+            .and_then(|logging| logging.client.as_ref())
+        {
+            inventory
+                .insert(KnownGoodEntry {
+                    root: KnownGoodRoot::Assets,
+                    path: KnownGoodRelativePath::new(&format!("log_configs/{}", logging.file.id))
+                        .expect("safe test log config path"),
+                    kind: KnownGoodArtifactKind::LogConfig,
+                    integrity: KnownGoodIntegrity::Sha1 {
+                        digest: Sha1Digest::from_metadata(&logging.file.sha1)
+                            .expect("test authenticated log config digest"),
+                        size: u64::try_from(logging.file.size)
+                            .expect("test authenticated log config size"),
+                    },
+                })
+                .expect("unique test log config entry");
+        }
         Self {
             authenticated: AuthenticatedKnownGoodReceipt {
                 version_id,
@@ -1197,14 +1218,55 @@ impl KnownGoodInstallReceipt {
         authenticate_client_bytes(&self.authenticated, bytes)
     }
 
+    pub(crate) fn authenticate_log_config_bytes(
+        &self,
+        logical_identity: &str,
+        bytes: &[u8],
+    ) -> Result<(), KnownGoodInventoryError> {
+        let expected_identity = self
+            .authenticated
+            .effective_version
+            .logging
+            .as_ref()
+            .and_then(|logging| logging.client.as_ref())
+            .map(|logging| logging.file.id.as_str())
+            .ok_or(KnownGoodInventoryError::LogConfigIntegrity)?;
+        if logical_identity != expected_identity {
+            return Err(KnownGoodInventoryError::LogConfigIntegrity);
+        }
+        let expected_path = format!("log_configs/{logical_identity}");
+        let entry = self
+            .authenticated
+            .inventory
+            .entries()
+            .iter()
+            .find(|entry| {
+                entry.root() == &KnownGoodRoot::Assets
+                    && entry.kind() == KnownGoodArtifactKind::LogConfig
+                    && entry.path().as_str() == expected_path
+            })
+            .ok_or(KnownGoodInventoryError::LogConfigIntegrity)?;
+        let (digest, size) = match entry.integrity() {
+            KnownGoodIntegrity::Sha1 { digest, size }
+            | KnownGoodIntegrity::ExactBytes { digest, size } => (digest, *size),
+            KnownGoodIntegrity::Directory | KnownGoodIntegrity::LinkTarget(_) => {
+                return Err(KnownGoodInventoryError::LogConfigIntegrity);
+            }
+        };
+        if u64::try_from(bytes.len()).ok() != Some(size) || sha1_digest(bytes) != *digest {
+            return Err(KnownGoodInventoryError::LogConfigIntegrity);
+        }
+        Ok(())
+    }
+
     pub(crate) fn from_verified_legacy_archive_source(
         base: &Self,
         record: &LoaderBuildRecord,
         resolved_version: VersionJson,
         version_bytes: &[u8],
         child_client_bytes: &[u8],
-    ) -> Result<Self, KnownGoodInventoryError> {
-        Ok(Self {
+    ) -> Result<PendingKnownGoodInstallAuthority, KnownGoodInventoryError> {
+        Ok(PendingKnownGoodInstallAuthority {
             authenticated: derive_legacy_archive_receipt(
                 &base.authenticated,
                 record,
@@ -1221,8 +1283,8 @@ impl KnownGoodInstallReceipt {
         resolved_version: VersionJson,
         version_bytes: &[u8],
         library_declarations: SealedExactLibraryDeclarations,
-    ) -> Result<Self, KnownGoodInventoryError> {
-        Ok(Self {
+    ) -> Result<PendingKnownGoodInstallAuthority, KnownGoodInventoryError> {
+        Ok(PendingKnownGoodInstallAuthority {
             authenticated: derive_profile_receipt(
                 &base.authenticated,
                 record,
@@ -1256,7 +1318,7 @@ impl KnownGoodInstallReceipt {
             },
         )?;
         Ok(PendingInstallerReceipt {
-            receipt: Self { authenticated },
+            authority: PendingKnownGoodInstallAuthority { authenticated },
             publications: pending_publications,
         })
     }
@@ -1930,6 +1992,10 @@ fn authenticate_vanilla_authority(
 }
 
 impl PendingKnownGoodInstallAuthority {
+    pub(crate) fn version_id(&self) -> &str {
+        self.authenticated.version_id.as_str()
+    }
+
     pub(crate) fn version_bundle_projection(
         &self,
     ) -> Result<ManagedComponentProjection<'_>, ManagedComponentProjectionError> {
@@ -2021,6 +2087,7 @@ pub enum KnownGoodInventoryError {
     AssetIndexIntegrity,
     VersionMetadataIntegrity,
     ClientIntegrity,
+    LogConfigIntegrity,
     AssetIndexParse,
     InvalidAssetObject,
     UnsupportedRuntimeEntry,
@@ -2830,17 +2897,28 @@ mod tests {
     #[test]
     fn profile_receipt_binds_authored_recombination_and_exact_base_shadowing() {
         let (base, record, declarations, resolved, version_bytes) = profile_receipt_fixture();
-        let inventory = KnownGoodInstallReceipt::from_verified_profile_source(
+        let pending = KnownGoodInstallReceipt::from_verified_profile_source(
             &base,
             &record,
             resolved,
             &version_bytes,
             declarations,
         )
-        .expect("profile receipt")
-        .into_activation_source()
-        .into_parts()
-        .1;
+        .expect("pending profile authority");
+        assert_eq!(pending.version_id(), record.version_id);
+        let projection = pending
+            .version_bundle_projection()
+            .expect("pending profile version bundle projection");
+        assert_eq!(
+            projection.component(),
+            ManagedKnownGoodComponent::VersionBundle
+        );
+        assert_eq!(projection.entry_count(), 2);
+        let inventory = pending
+            .seal_after_version_bundle_commit()
+            .into_activation_source()
+            .into_parts()
+            .1;
         assert_eq!(
             inventory
                 .entries()
@@ -2992,7 +3070,11 @@ mod tests {
             child_client_bytes,
         )
         .expect("legacy receipt");
-        let inventory = receipt.into_activation_source().into_parts().1;
+        let inventory = receipt
+            .seal_after_version_bundle_commit()
+            .into_activation_source()
+            .into_parts()
+            .1;
 
         assert_entry(
             &inventory,

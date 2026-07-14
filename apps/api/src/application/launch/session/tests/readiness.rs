@@ -1458,20 +1458,10 @@ async fn launch_preparation_blocks_on_active_prior_managed_runtime_repair() {
 }
 
 #[tokio::test]
-async fn launch_preflight_readiness_reports_incomplete_install_marker() {
-    let fixture = TestFixture::new("preflight-readiness-incomplete-install");
-    fixture.write_ready_install("1.21.1");
-    fs::write(
-        fixture
-            .paths
-            .library_dir
-            .join("versions")
-            .join("1.21.1")
-            .join(".incomplete"),
-        b"installing",
-    )
-    .expect("incomplete marker");
+async fn launch_preflight_readiness_reports_missing_integrity_authority() {
+    let fixture = TestFixture::new("preflight-readiness-missing-integrity-authority");
     let instance_id = fixture.add_instance("Survival", "1.21.1");
+    fixture.write_ready_install("1.21.1");
 
     let preflight = prepare_launch_preflight(&fixture.state, instance_id)
         .await
@@ -1540,20 +1530,10 @@ async fn prepare_launch_session_rejects_missing_version_json_with_guardian_block
 }
 
 #[tokio::test]
-async fn prepare_launch_session_rejects_incomplete_install_without_session() {
-    let fixture = TestFixture::new("prepare-rejects-incomplete-install");
-    fixture.write_ready_install("1.21.1");
-    fs::write(
-        fixture
-            .paths
-            .library_dir
-            .join("versions")
-            .join("1.21.1")
-            .join(".incomplete"),
-        b"installing",
-    )
-    .expect("incomplete marker");
+async fn prepare_launch_session_rejects_missing_integrity_authority_without_session() {
+    let fixture = TestFixture::new("prepare-rejects-missing-integrity-authority");
     let instance_id = fixture.add_instance("Survival", "1.21.1");
+    fixture.write_ready_install("1.21.1");
 
     let error = match prepare_launch_session(
         &fixture.state,
@@ -1567,7 +1547,7 @@ async fn prepare_launch_session_rejects_incomplete_install_without_session() {
     )
     .await
     {
-        Ok(_) => panic!("incomplete install should not queue"),
+        Ok(_) => panic!("install without integrity authority should not queue"),
         Err(error) => error,
     };
 
@@ -1605,24 +1585,12 @@ async fn prepare_launch_session_rejects_incomplete_install_without_session() {
     );
     let payload = error.1.0.to_string();
     assert!(!payload.contains(&fixture.root.to_string_lossy().to_string()));
-    assert!(!payload.contains(".incomplete"));
 }
 
 #[tokio::test]
-async fn prepare_launch_session_rejects_incomplete_parent_without_session() {
-    let fixture = TestFixture::new("prepare-rejects-incomplete-parent");
-    fixture.write_ready_install("1.21.1");
+async fn prepare_launch_session_rejects_missing_parent_without_session() {
+    let fixture = TestFixture::new("prepare-rejects-missing-parent");
     fixture.write_child_version("fabric-loader-0.16.10-1.21.1", "1.21.1");
-    fs::write(
-        fixture
-            .paths
-            .library_dir
-            .join("versions")
-            .join("1.21.1")
-            .join(".incomplete"),
-        b"installing",
-    )
-    .expect("incomplete marker");
     let instance_id = fixture.add_instance("Modded", "fabric-loader-0.16.10-1.21.1");
 
     let error = match prepare_launch_session(
@@ -1637,21 +1605,21 @@ async fn prepare_launch_session_rejects_incomplete_parent_without_session() {
     )
     .await
     {
-        Ok(_) => panic!("incomplete parent install should not queue"),
+        Ok(_) => panic!("missing parent install should not queue"),
         Err(error) => error,
     };
 
     assert_eq!(error.0, StatusCode::PRECONDITION_FAILED);
     assert_eq!(
         error.1.0["readiness"]["reasons"][0]["id"],
-        "incomplete_install"
+        "parent_version_missing"
     );
     assert_eq!(error.1.0["guardian"]["decision"], "blocked");
     assert!(
         error.1.0["guardian"]["details"]
             .as_array()
             .is_some_and(|details| details.iter().any(|detail| detail.as_str()
-                == Some("Guardian blocked launch because the install is incomplete.")))
+                == Some("Guardian blocked launch because parent version metadata is missing.")))
     );
     assert_eq!(fixture.state.sessions().active_session_count().await, 0);
     assert!(

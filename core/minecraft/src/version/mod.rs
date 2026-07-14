@@ -1,5 +1,7 @@
 use crate::launch::{Downloads, JavaVersion, effective_java_version_for};
 use crate::loaders::{MaterializedLoaderProfile, validate_materialized_loader_profile};
+use crate::managed_fs::{ManagedDir, ManagedDirectoryIdentity};
+use crate::managed_publication::{ManagedPublicationError, ManagedRootPublicationReadLease};
 use crate::paths::versions_dir;
 use crate::types::{VersionEntry, VersionLoaderAttachment, VersionSubjectKind};
 use crate::version_meta::{analyze_minecraft_version, compare_version_entries};
@@ -23,6 +25,68 @@ pub struct VersionScanSnapshot {
     dependencies: VersionScanDependencyStamp,
 }
 
+pub struct VersionBundleReadGuard {
+    admission: VersionBundleReadAdmission,
+}
+
+enum VersionBundleReadAdmission {
+    MissingRoot(std::path::PathBuf),
+    Managed(ManagedRootPublicationReadLease),
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum VersionBundleRootBinding {
+    Missing,
+    Managed(ManagedDirectoryIdentity),
+}
+
+impl VersionBundleReadGuard {
+    pub fn acquire(library_dir: &Path) -> io::Result<Self> {
+        let root = match ManagedDir::open_root(library_dir) {
+            Ok(root) => root,
+            Err(crate::loaders::types::LoaderError::Io(error))
+                if error.kind() == io::ErrorKind::NotFound =>
+            {
+                return Ok(Self {
+                    admission: VersionBundleReadAdmission::MissingRoot(library_dir.to_path_buf()),
+                });
+            }
+            Err(error) => return Err(io::Error::other(error)),
+        };
+        let lease =
+            ManagedRootPublicationReadLease::acquire(root).map_err(publication_read_error)?;
+        Ok(Self {
+            admission: VersionBundleReadAdmission::Managed(lease),
+        })
+    }
+
+    pub fn revalidate(&self) -> io::Result<()> {
+        match &self.admission {
+            VersionBundleReadAdmission::MissingRoot(path) => match fs::symlink_metadata(path) {
+                Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+                Ok(_) => Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "managed publication root appeared during read",
+                )),
+                Err(error) => Err(error),
+            },
+            VersionBundleReadAdmission::Managed(lease) => {
+                lease.revalidate().map_err(publication_read_error)
+            }
+        }
+    }
+
+    fn root_binding(&self) -> io::Result<VersionBundleRootBinding> {
+        match &self.admission {
+            VersionBundleReadAdmission::MissingRoot(_) => Ok(VersionBundleRootBinding::Missing),
+            VersionBundleReadAdmission::Managed(lease) => lease
+                .root_identity()
+                .map(VersionBundleRootBinding::Managed)
+                .map_err(publication_read_error),
+        }
+    }
+}
+
 impl VersionScanSnapshot {
     pub fn dependencies(&self) -> &VersionScanDependencyStamp {
         &self.dependencies
@@ -31,17 +95,27 @@ impl VersionScanSnapshot {
 
 #[derive(Clone)]
 pub struct VersionScanDependencyStamp {
+    library_dir: std::path::PathBuf,
+    root_binding: VersionBundleRootBinding,
     observations: Vec<DependencyObservation>,
     revalidatable: bool,
 }
 
 impl VersionScanDependencyStamp {
     pub fn is_revalidated(&self) -> bool {
-        self.revalidatable
+        let Ok(publication_read) = VersionBundleReadGuard::acquire(&self.library_dir) else {
+            return false;
+        };
+        let Ok(root_binding) = publication_read.root_binding() else {
+            return false;
+        };
+        self.root_binding == root_binding
+            && self.revalidatable
             && self
                 .observations
                 .iter()
                 .all(DependencyObservation::is_revalidated)
+            && publication_read.revalidate().is_ok()
     }
 }
 
@@ -129,10 +203,6 @@ impl DependencyTracker {
         self.observe_kind(path) == Some(DependencyKind::File)
     }
 
-    fn exists(&mut self, path: &Path) -> bool {
-        self.observe_kind(path).is_some()
-    }
-
     fn mark_unrevalidatable(&mut self) {
         self.revalidatable = false;
     }
@@ -151,8 +221,14 @@ impl DependencyTracker {
         }
     }
 
-    fn into_stamp(self) -> VersionScanDependencyStamp {
+    fn into_stamp(
+        self,
+        library_dir: &Path,
+        root_binding: VersionBundleRootBinding,
+    ) -> VersionScanDependencyStamp {
         VersionScanDependencyStamp {
+            library_dir: library_dir.to_path_buf(),
+            root_binding,
             observations: self.observations,
             revalidatable: self.revalidatable,
         }
@@ -290,6 +366,7 @@ pub fn scan_versions_report(mc_dir: &Path) -> io::Result<VersionScanReport> {
 }
 
 pub fn scan_versions_snapshot(mc_dir: &Path) -> io::Result<VersionScanSnapshot> {
+    let publication_read = VersionBundleReadGuard::acquire(mc_dir)?;
     let versions_dir = versions_dir(mc_dir);
     let mut dependencies = DependencyTracker::new();
     let versions_root_before = dependencies.begin(&versions_dir);
@@ -297,18 +374,20 @@ pub fn scan_versions_snapshot(mc_dir: &Path) -> io::Result<VersionScanSnapshot> 
         Ok(entries) => entries,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
             dependencies.finish(&versions_dir, versions_root_before);
-            return Ok(finish_scan_snapshot(
+            return finish_scan_snapshot(
                 VersionScanReport {
                     state: VersionScanState::Empty,
                     versions: Vec::new(),
                     issues: Vec::new(),
                 },
                 dependencies,
-            ));
+                mc_dir,
+                &publication_read,
+            );
         }
         Err(_) => {
             dependencies.finish(&versions_dir, versions_root_before);
-            return Ok(finish_scan_snapshot(
+            return finish_scan_snapshot(
                 VersionScanReport {
                     state: VersionScanState::Degraded,
                     versions: Vec::new(),
@@ -318,7 +397,9 @@ pub fn scan_versions_snapshot(mc_dir: &Path) -> io::Result<VersionScanSnapshot> 
                     )],
                 },
                 dependencies,
-            ));
+                mc_dir,
+                &publication_read,
+            );
         }
     };
     let mut stubs = HashMap::new();
@@ -349,11 +430,6 @@ pub fn scan_versions_snapshot(mc_dir: &Path) -> io::Result<VersionScanSnapshot> 
         let data = match data_result {
             Ok(data) => data,
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                let incomplete =
-                    reserved_loader_id && dependencies.exists(&entry_path.join(".incomplete"));
-                if incomplete {
-                    continue;
-                }
                 issues.push(version_scan_issue(
                     VersionScanIssueKind::VersionJsonMissing,
                     Some(id),
@@ -406,16 +482,7 @@ pub fn scan_versions_snapshot(mc_dir: &Path) -> io::Result<VersionScanSnapshot> 
         let jar_path = versions_dir.join(id).join(format!("{id}.jar"));
 
         let resolved_java = resolve_java_version(id, &stubs);
-        let incomplete = crate::loaders::api::is_reserved_installed_loader_id(id)
-            && dependencies.exists(&versions_dir.join(id).join(".incomplete"));
-        let (launchable, status, status_detail, needs_install) = if incomplete {
-            (
-                false,
-                "incomplete".to_string(),
-                "Installation incomplete".to_string(),
-                id.clone(),
-            )
-        } else if effective_parent.is_empty() {
+        let (launchable, status, status_detail, needs_install) = if effective_parent.is_empty() {
             let jar_ready = dependencies.is_file(&jar_path);
             if jar_ready {
                 (true, "ready".to_string(), String::new(), String::new())
@@ -513,23 +580,36 @@ pub fn scan_versions_snapshot(mc_dir: &Path) -> io::Result<VersionScanSnapshot> 
         VersionScanState::Ready
     };
     dependencies.finish(&versions_dir, versions_root_before);
-    Ok(finish_scan_snapshot(
+    finish_scan_snapshot(
         VersionScanReport {
             state,
             versions,
             issues,
         },
         dependencies,
-    ))
+        mc_dir,
+        &publication_read,
+    )
 }
 
 fn finish_scan_snapshot(
     report: VersionScanReport,
     dependencies: DependencyTracker,
-) -> VersionScanSnapshot {
-    VersionScanSnapshot {
+    library_dir: &Path,
+    publication_read: &VersionBundleReadGuard,
+) -> io::Result<VersionScanSnapshot> {
+    publication_read.revalidate()?;
+    let root_binding = publication_read.root_binding()?;
+    Ok(VersionScanSnapshot {
         report,
-        dependencies: dependencies.into_stamp(),
+        dependencies: dependencies.into_stamp(library_dir, root_binding),
+    })
+}
+
+fn publication_read_error(error: ManagedPublicationError) -> io::Error {
+    match error {
+        ManagedPublicationError::ReadBusy => io::Error::new(io::ErrorKind::WouldBlock, error),
+        error => io::Error::other(error),
     }
 }
 
@@ -688,6 +768,38 @@ mod tests {
     }
 
     #[test]
+    fn missing_library_admission_is_invalidated_when_the_root_appears() {
+        let mc_dir = unique_test_dir("appearing-library-root");
+        let read =
+            super::VersionBundleReadGuard::acquire(&mc_dir).expect("admit missing library root");
+
+        fs::create_dir_all(&mc_dir).expect("create library root");
+
+        assert_eq!(
+            read.revalidate()
+                .expect_err("appearing root must invalidate read")
+                .kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        fs::remove_dir_all(&mc_dir).expect("remove temp test dir");
+    }
+
+    #[test]
+    fn dependency_stamp_rejects_equivalent_replacement_library_root() {
+        let mc_dir = unique_test_dir("replacement-library-root");
+        let displaced = mc_dir.with_extension("displaced");
+        fs::create_dir_all(&mc_dir).expect("create original library root");
+        let snapshot = super::scan_versions_snapshot(&mc_dir).expect("scan original root");
+
+        fs::rename(&mc_dir, &displaced).expect("displace original library root");
+        fs::create_dir_all(&mc_dir).expect("create equivalent replacement root");
+
+        assert!(!snapshot.dependencies().is_revalidated());
+        fs::remove_dir_all(&mc_dir).expect("remove replacement root");
+        fs::remove_dir_all(&displaced).expect("remove displaced root");
+    }
+
+    #[test]
     fn scan_versions_report_marks_malformed_version_json_as_degraded() {
         let mc_dir = unique_test_dir("malformed-version-scan");
         let version_dir = mc_dir.join("versions").join("1.21.1");
@@ -708,120 +820,39 @@ mod tests {
     }
 
     #[test]
-    fn scan_versions_ignores_stale_vanilla_incomplete_marker() {
-        let mc_dir = unique_test_dir("stale-vanilla-incomplete-marker");
-        let version_dir = mc_dir.join("versions").join("1.21.5");
-        fs::create_dir_all(&version_dir).expect("create version dir");
-        fs::write(
-            version_dir.join("1.21.5.json"),
-            r#"{
-                "id":"1.21.5",
-                "type":"release",
-                "mainClass":"net.minecraft.client.main.Main",
-                "libraries":[]
-            }"#,
-        )
-        .expect("write version json");
-        fs::write(version_dir.join("1.21.5.jar"), b"client").expect("write client jar");
-        fs::write(version_dir.join(".incomplete"), b"stale").expect("write stale marker");
+    fn scan_versions_reports_partial_reserved_loader_directory_normally() {
+        let mc_dir = unique_test_dir("partial-reserved-loader");
+        let loader_id = installed_version_id_for(LoaderComponentId::Quilt, "1.21.5", "0.29.2")
+            .expect("valid loader identity");
+        fs::create_dir_all(mc_dir.join("versions").join(&loader_id))
+            .expect("create partial loader directory");
 
-        let report = scan_versions_report(&mc_dir).expect("scan versions");
-        let version = report
-            .versions
-            .iter()
-            .find(|entry| entry.id == "1.21.5")
-            .expect("vanilla version exists");
-
-        assert_eq!(report.state, VersionScanState::Ready);
-        assert!(version.launchable);
-        assert_eq!(version.status, "ready");
-
-        fs::remove_dir_all(&mc_dir).expect("remove temp test dir");
-    }
-
-    #[test]
-    fn scan_versions_reports_missing_vanilla_json_despite_incomplete_marker() {
-        let mc_dir = unique_test_dir("missing-vanilla-json-with-marker");
-        let version_dir = mc_dir.join("versions").join("1.21.5");
-        fs::create_dir_all(&version_dir).expect("create version dir");
-        fs::write(version_dir.join(".incomplete"), b"stale").expect("write stale marker");
-
-        let report = scan_versions_report(&mc_dir).expect("scan versions");
+        let report = scan_versions_report(&mc_dir).expect("scan partial loader directory");
 
         assert_eq!(report.state, VersionScanState::Degraded);
         assert!(report.versions.is_empty());
         assert!(report.issues.iter().any(|issue| {
             issue.kind == VersionScanIssueKind::VersionJsonMissing
-                && issue.version_id.as_deref() == Some("1.21.5")
+                && issue.version_id.as_deref() == Some(loader_id.as_str())
         }));
 
         fs::remove_dir_all(&mc_dir).expect("remove temp test dir");
     }
 
-    #[test]
-    fn scan_versions_suppresses_missing_json_for_reserved_loader_in_progress() {
-        let mc_dir = unique_test_dir("reserved-loader-missing-json");
-        let loader_id = installed_version_id_for(LoaderComponentId::Quilt, "1.21.5", "0.29.2")
-            .expect("valid loader identity");
-        let loader_dir = mc_dir.join("versions").join(loader_id);
-        fs::create_dir_all(&loader_dir).expect("create loader version dir");
-        fs::write(loader_dir.join(".incomplete"), b"installing").expect("write loader marker");
-
-        let report = scan_versions_report(&mc_dir).expect("scan versions");
-
-        assert_eq!(report.state, VersionScanState::Empty);
-        assert!(report.versions.is_empty());
-        assert!(report.issues.is_empty());
-
-        fs::remove_dir_all(&mc_dir).expect("remove temp test dir");
-    }
-
-    #[test]
-    fn scan_versions_retains_incomplete_marker_for_reserved_loader_id() {
-        let mc_dir = unique_test_dir("reserved-loader-incomplete-marker");
-        let versions_dir = mc_dir.join("versions");
-        let base_dir = versions_dir.join("1.21.5");
-        fs::create_dir_all(&base_dir).expect("create base version dir");
-        fs::write(
-            base_dir.join("1.21.5.json"),
-            r#"{
-                "id":"1.21.5",
-                "type":"release",
-                "mainClass":"net.minecraft.client.main.Main",
-                "libraries":[]
-            }"#,
+    #[tokio::test]
+    async fn scan_versions_returns_transient_error_while_publication_is_exclusive() {
+        let mc_dir = unique_test_dir("active-publication");
+        fs::create_dir_all(&mc_dir).expect("create library root");
+        let writer = crate::managed_publication::ManagedRootPublicationLease::acquire(
+            crate::managed_fs::ManagedDir::open_root(&mc_dir).expect("managed root"),
         )
-        .expect("write base version json");
-        fs::write(base_dir.join("1.21.5.jar"), b"client").expect("write base client jar");
+        .await
+        .expect("writer admission");
 
-        let loader_id = installed_version_id_for(LoaderComponentId::Fabric, "1.21.5", "0.19.3")
-            .expect("valid loader identity");
-        let loader_dir = versions_dir.join(&loader_id);
-        fs::create_dir_all(&loader_dir).expect("create loader version dir");
-        fs::write(
-            loader_dir.join(format!("{loader_id}.json")),
-            format!(
-                r#"{{
-                    "id":"{loader_id}",
-                    "inheritsFrom":"1.21.5",
-                    "axialMaterialized":true,
-                    "type":"release"
-                }}"#
-            ),
-        )
-        .expect("write loader version json");
-        fs::write(loader_dir.join(".incomplete"), b"installing").expect("write loader marker");
+        let error = scan_versions_report(&mc_dir).expect_err("active writer must deny scan");
 
-        let versions = scan_versions(&mc_dir).expect("scan versions");
-        let loader = versions
-            .iter()
-            .find(|entry| entry.id == loader_id)
-            .expect("loader version exists");
-
-        assert!(!loader.launchable);
-        assert_eq!(loader.status, "incomplete");
-        assert_eq!(loader.needs_install, loader_id);
-
+        assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+        drop(writer);
         fs::remove_dir_all(&mc_dir).expect("remove temp test dir");
     }
 
