@@ -105,15 +105,7 @@ async fn handle_install_events(
 mod tests {
     use super::*;
     use crate::{
-        application::{
-            begin_install_operation_journal, install::INSTALL_FAILURE_MESSAGE,
-            install_operation_id, record_install_operation_guardian_repair_outcome,
-            record_install_operation_progress,
-        },
-        guardian::{
-            DiagnosisId, GuardianActionKind, GuardianArtifactRepairOutcome,
-            GuardianArtifactRepairStatus,
-        },
+        application::install_operation_id,
         state::{AppStateInit, InstallStore, SessionStore},
     };
     use axial_config::{AppPaths, ConfigStore, InstanceRegistrySnapshot, InstanceStore};
@@ -184,125 +176,6 @@ mod tests {
                 .await;
             assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
         }
-    }
-
-    #[tokio::test]
-    async fn install_status_route_serializes_guardian_repair_status_payload() {
-        let fixture = RouteInstallFixture::new("install-status-guardian-repair-route");
-        let install_id = "repair-status-route-install";
-        let operation_id = install_operation_id(install_id);
-        let failed_progress = DownloadProgress {
-            phase: "error".to_string(),
-            current: 0,
-            total: 0,
-            file: Some("/Users/alice/.axial/libraries/secret-client.jar".to_string()),
-            error: Some(
-                "checksum failed in /Users/alice/.axial with token secret provider_payload"
-                    .to_string(),
-            ),
-            done: true,
-            bytes_done: None,
-            bytes_total: None,
-        };
-
-        fixture
-            .state
-            .installs()
-            .insert(install_id.to_string())
-            .await;
-        fixture
-            .state
-            .installs()
-            .emit(install_id, failed_progress.clone())
-            .await;
-        begin_install_operation_journal(fixture.state.journals(), &operation_id, "1.21.5")
-            .await
-            .expect("record install journal");
-        let mut last_phase = None;
-        record_install_operation_progress(
-            fixture.state.journals(),
-            &operation_id,
-            &failed_progress,
-            &mut last_phase,
-        )
-        .await
-        .expect("record install journal");
-        record_install_operation_guardian_repair_outcome(
-            fixture.state.journals(),
-            &operation_id,
-            &GuardianArtifactRepairOutcome {
-                operation_id: crate::state::contracts::OperationId::new(
-                    "guardian-artifact-repair:123e4567-e89b-12d3-a456-426614174002",
-                ),
-                diagnosis_id: DiagnosisId::LauncherManagedArtifactCorrupt,
-                action: GuardianActionKind::Repair,
-                status: GuardianArtifactRepairStatus::Repaired,
-                facts: vec![
-                    "https://example.invalid/client.jar?token=secret".to_string(),
-                    "/Users/alice/.axial/libraries/secret-client.jar".to_string(),
-                ],
-                summary: "guardian_artifact_repaired".to_string(),
-            },
-        )
-        .await
-        .expect("record install journal");
-
-        let (status, payload) = fixture
-            .request_json(
-                Method::GET,
-                "/api/v1/install/repair-status-route-install/status",
-            )
-            .await;
-
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(payload["install_id"], install_id);
-        assert_eq!(payload["operation_id"], operation_id.as_str());
-        assert_eq!(payload["done"], true);
-        assert_eq!(payload["progress"][0]["phase"], "error");
-        assert_eq!(payload["progress"][0]["error"], INSTALL_FAILURE_MESSAGE);
-        assert_eq!(
-            payload["guardian_repair"]["diagnosis_id"],
-            "launcher_managed_artifact_corrupt"
-        );
-        assert_eq!(payload["guardian_repair"]["status"], "repaired");
-        assert_eq!(
-            payload["guardian_repair"]["repair_operation_id"],
-            "guardian-artifact-repair:123e4567-e89b-12d3-a456-426614174002"
-        );
-        assert!(
-            payload["guardian_repair"]["label"]
-                .as_str()
-                .is_some_and(|label| label.contains("repaired"))
-        );
-        assert_eq!(
-            payload["failure_view_model"]["state_id"],
-            "failed_repair_applied"
-        );
-        assert_eq!(payload["failure_view_model"]["title"], "Install failed");
-        assert_eq!(
-            payload["failure_view_model"]["retry_action"]["action"],
-            "retry"
-        );
-        assert_eq!(
-            payload["failure_view_model"]["retry_action"]["enabled"],
-            true
-        );
-        assert_eq!(
-            payload["failure_view_model"]["repair_action"]["action"],
-            "repair"
-        );
-        assert_eq!(
-            payload["failure_view_model"]["repair_action"]["enabled"],
-            false
-        );
-        assert!(
-            payload["proof"]["guardian_diagnosis_ids"]
-                .as_array()
-                .expect("proof diagnosis ids")
-                .iter()
-                .any(|id| id == "launcher_managed_artifact_corrupt")
-        );
-        assert_no_install_status_route_sensitive_fragments(&payload);
     }
 
     #[tokio::test]

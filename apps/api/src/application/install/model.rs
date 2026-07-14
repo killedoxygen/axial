@@ -1,5 +1,5 @@
 use super::super::{ApplicationCommand, CommandResult, InstallVersionPayload};
-use crate::guardian::{DiagnosisId, GuardianInstallOutcomeSummary};
+use crate::guardian::GuardianInstallOutcomeSummary;
 use crate::observability::OperationProofRecord;
 use crate::state::contracts::OperationId;
 use axial_minecraft::{DownloadProgress, LoaderComponentId};
@@ -9,16 +9,6 @@ use serde::{Deserialize, Serialize};
 pub struct InstallVersionStaging {
     pub command: ApplicationCommand,
     pub result: CommandResult<InstallVersionPayload>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct InstallGuardianRepairSummary {
-    pub repair_operation_id: OperationId,
-    pub diagnosis_id: DiagnosisId,
-    pub status: String,
-    pub label: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub detail: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -92,8 +82,6 @@ pub struct InstallStatusResponse {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub guardian: Option<GuardianInstallOutcomeSummary>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub guardian_repair: Option<InstallGuardianRepairSummary>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub proof: Option<OperationProofRecord>,
 }
 
@@ -118,7 +106,6 @@ pub struct InstallFailureViewModel {
     pub details: Vec<String>,
     pub retry_action: InstallActionViewModel,
     pub dismiss_action: InstallActionViewModel,
-    pub repair_action: InstallActionViewModel,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

@@ -51,15 +51,6 @@ export interface InstallFailureViewModel {
   details: string[];
   retry_action: InstallActionViewModel;
   dismiss_action: InstallActionViewModel;
-  repair_action: InstallActionViewModel;
-}
-
-export interface InstallGuardianRepairSummary {
-  repair_operation_id: string;
-  diagnosis_id: string;
-  status: string;
-  label: string;
-  detail?: string | null;
 }
 
 export interface InstallStatusResponse {
@@ -71,7 +62,6 @@ export interface InstallStatusResponse {
   failure_view_model?: InstallFailureViewModel | null;
   failure_point?: string | null;
   guardian?: InstallGuardianOutcome | null;
-  guardian_repair?: InstallGuardianRepairSummary | null;
   proof?: unknown;
 }
 

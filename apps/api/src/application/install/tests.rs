@@ -2,9 +2,7 @@ use super::*;
 use crate::application::InstallVersionCommand;
 use crate::execution::file::{FileWriteRequest, write_file_atomically};
 use crate::execution::persistence::{AtomicWriteBackend, PersistenceCoordinator};
-use crate::guardian::{
-    DiagnosisId, GuardianActionKind, GuardianArtifactRepairOutcome, GuardianArtifactRepairStatus,
-};
+use crate::guardian::DiagnosisId;
 use crate::state::contracts::{
     CommandKind, JournalId, OperationId, OperationJournalStep, OperationOutcome, OperationPhase,
     OperationStatus, OperationStepResult, OwnershipClass, RollbackState, StabilizationSystem,
@@ -15,10 +13,7 @@ use crate::state::{
     SessionStore,
 };
 use axial_config::{AppPaths, ConfigStore, InstanceRegistrySnapshot, InstanceStore};
-use axial_minecraft::download::{
-    ExecutionDownloadFact, ExecutionDownloadFactKind, SelectedDownloadArtifactDescriptor,
-    SelectedDownloadArtifactKind,
-};
+use axial_minecraft::download::{ExecutionDownloadFact, ExecutionDownloadFactKind};
 use axial_minecraft::{
     DownloadError, DownloadProgress, LoaderComponentId, LoaderError, LoaderInstallError,
     LoaderProviderFailureKind, build_id_for,
@@ -26,15 +21,12 @@ use axial_minecraft::{
 use axial_performance::PerformanceManager;
 use axum::{body::to_bytes, response::IntoResponse};
 use serde_json::json;
-use sha1::{Digest, Sha1};
-use std::io::{self, Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
-use std::thread;
 use std::time::Duration;
-use std::{fs, sync::mpsc};
 use tokio::sync::{Notify, mpsc as tokio_mpsc};
 use tokio::time::timeout;
 
@@ -1454,85 +1446,6 @@ async fn queue_monitor_does_not_start_successor_while_requests_are_draining() {
 }
 
 #[tokio::test]
-async fn install_status_exposes_backend_authored_guardian_repair_summary() {
-    let root = temp_root("install-status-guardian-repair");
-    let state = build_test_state(&root);
-    let install_id = "repair-status-install";
-    let operation_id = install_operation_id(install_id);
-    state.installs().insert(install_id.to_string()).await;
-    state
-        .installs()
-        .emit(install_id, observed_install_failure_progress())
-        .await;
-    begin_install_operation_journal(state.journals(), &operation_id, "1.21.5")
-        .await
-        .expect("begin install journal");
-    let mut last_phase = None;
-    record_install_operation_progress(
-        state.journals(),
-        &operation_id,
-        &observed_install_failure_progress(),
-        &mut last_phase,
-    )
-    .await
-    .expect("record install progress");
-    record_install_operation_guardian_repair_outcome(
-        state.journals(),
-        &operation_id,
-        &GuardianArtifactRepairOutcome {
-            operation_id: OperationId::new(
-                "guardian-artifact-repair:123e4567-e89b-12d3-a456-426614174000",
-            ),
-            diagnosis_id: DiagnosisId::LauncherManagedArtifactCorrupt,
-            action: GuardianActionKind::Repair,
-            status: GuardianArtifactRepairStatus::Repaired,
-            facts: vec!["https://example.invalid/client.jar?token=secret".to_string()],
-            summary: "guardian_artifact_repaired".to_string(),
-        },
-    )
-    .await
-    .expect("record Guardian repair outcome");
-
-    let response = install_status(&state, install_id)
-        .await
-        .expect("install status");
-
-    assert_eq!(response.install_id, install_id);
-    assert_eq!(response.operation_id, operation_id);
-    assert!(response.done);
-    assert_eq!(response.progress.len(), 1);
-    let repair = response.guardian_repair.as_ref().expect("guardian repair");
-    assert_eq!(repair.status, "repaired");
-    assert_eq!(
-        repair.repair_operation_id.as_str(),
-        "guardian-artifact-repair:123e4567-e89b-12d3-a456-426614174000"
-    );
-    assert!(repair.label.contains("repaired"));
-    assert_no_public_raw_fragments(&serde_json::to_string(&repair).expect("repair json"));
-    let failure_view_model = response
-        .failure_view_model
-        .as_ref()
-        .expect("failure view model");
-    assert_eq!(failure_view_model.state_id, "failed_repair_applied");
-    assert_eq!(failure_view_model.title, "Install failed");
-    assert_eq!(failure_view_model.retry_action.action, "retry");
-    assert!(failure_view_model.retry_action.enabled);
-    assert_eq!(failure_view_model.repair_action.action, "repair");
-    assert!(!failure_view_model.repair_action.enabled);
-    assert!(
-        failure_view_model
-            .repair_action
-            .label
-            .contains("repair applied")
-    );
-    assert_no_public_raw_fragments(
-        &serde_json::to_string(&failure_view_model).expect("failure view model json"),
-    );
-
-    let _ = fs::remove_dir_all(root);
-}
-
-#[tokio::test]
 async fn install_status_exposes_interrupted_install_as_redacted_terminal_state() {
     let root = temp_root("install-status-interrupted");
     let state = build_test_state(&root);
@@ -1586,7 +1499,6 @@ async fn install_status_exposes_interrupted_install_as_redacted_terminal_state()
             .label()
             .contains("install download failure as retryable")
     );
-    assert!(response.guardian_repair.is_none());
     let journal = state.journals().get(&operation_id).expect("journal");
     assert_eq!(journal.status, OperationStatus::Failed);
     assert_eq!(
@@ -1749,85 +1661,6 @@ async fn install_status_reconstructs_journal_progress_when_snapshot_is_missing()
 }
 
 #[tokio::test]
-async fn install_status_reconstructs_restart_loaded_journal_and_guardian_repair() {
-    let root = temp_root("install-status-restart-journal-replay");
-    let install_id = "restart-repair-status-install";
-    let operation_id = install_operation_id(install_id);
-    {
-        let state = build_test_state(&root);
-        begin_install_operation_journal(state.journals(), &operation_id, "1.21.5")
-            .await
-            .expect("record install journal");
-        let mut last_phase = None;
-        record_install_operation_progress(
-            state.journals(),
-            &operation_id,
-            &observed_install_failure_progress(),
-            &mut last_phase,
-        )
-        .await
-        .expect("record install journal");
-        record_install_operation_guardian_repair_outcome(
-            state.journals(),
-            &operation_id,
-            &GuardianArtifactRepairOutcome {
-                operation_id: OperationId::new(
-                    "guardian-artifact-repair:123e4567-e89b-12d3-a456-426614174001",
-                ),
-                diagnosis_id: DiagnosisId::LauncherManagedArtifactCorrupt,
-                action: GuardianActionKind::Repair,
-                status: GuardianArtifactRepairStatus::Failed,
-                facts: vec!["https://example.invalid/client.jar?token=secret".to_string()],
-                summary: "guardian_artifact_repair_failed".to_string(),
-            },
-        )
-        .await
-        .expect("record install journal");
-    }
-
-    let reloaded = build_test_state(&root);
-    let response = install_status(&reloaded, install_id)
-        .await
-        .expect("restart-loaded journal status");
-
-    assert_eq!(response.install_id, install_id);
-    assert_eq!(response.operation_id, operation_id);
-    assert!(response.done);
-    assert_eq!(response.progress.len(), 1);
-    assert_eq!(
-        response.progress[0].error.as_deref(),
-        Some(INSTALL_FAILURE_MESSAGE)
-    );
-    let repair = response.guardian_repair.as_ref().expect("guardian repair");
-    assert_eq!(repair.status, "failed");
-    assert_eq!(
-        repair.repair_operation_id.as_str(),
-        "guardian-artifact-repair:123e4567-e89b-12d3-a456-426614174001"
-    );
-    assert!(repair.label.contains("could not repair"));
-    let proof = response.proof.as_ref().expect("operation proof");
-    assert_eq!(proof.operation_id, operation_id);
-    assert_eq!(proof.command, CommandKind::InstallVersion);
-    assert_eq!(proof.status, OperationStatus::Failed);
-    assert_eq!(proof.outcome, Some(OperationOutcome::Failed));
-    assert_eq!(
-        proof.failure_point.as_deref(),
-        Some("install_progress_error")
-    );
-    assert!(
-        proof
-            .guardian_diagnosis_ids
-            .contains(&DiagnosisId::LauncherManagedArtifactCorrupt)
-    );
-    assert!(proof.fields.iter().any(|field| {
-        field.key == "generated_fact" && field.value == "guardian_repair_status:failed"
-    }));
-    assert_no_public_raw_fragments(&serde_json::to_string(&response).expect("status json"));
-
-    let _ = fs::remove_dir_all(root);
-}
-
-#[tokio::test]
 async fn install_events_replay_journal_terminal_progress_when_snapshot_is_missing() {
     let root = temp_root("install-events-journal-replay");
     let state = build_test_state(&root);
@@ -1939,12 +1772,11 @@ async fn install_status_exposes_backend_authored_guardian_download_failure_outco
             ),
         ],
     }];
-    record_install_failure_outcome_and_repair(
+    record_install_failure_outcome(
         state.journals(),
         &GuardianFailureMemoryStore::new(),
         &operation_id,
         &facts,
-        &[],
         "2026-07-09T10:00:00+00:00",
     )
     .await;
@@ -1954,7 +1786,6 @@ async fn install_status_exposes_backend_authored_guardian_download_failure_outco
         .expect("install status");
 
     assert!(response.done);
-    assert!(response.guardian_repair.is_none());
     let guardian = response.guardian.as_ref().expect("guardian outcome");
     assert_eq!(guardian.diagnosis_id(), DiagnosisId::DownloadUnavailable);
     assert_eq!(guardian.decision(), "retry");
@@ -1970,14 +1801,6 @@ async fn install_status_exposes_backend_authored_guardian_download_failure_outco
     assert_eq!(failure_view_model.state_id, "failed_retryable");
     assert_eq!(failure_view_model.summary, guardian.label());
     assert!(failure_view_model.retry_action.enabled);
-    assert!(!failure_view_model.repair_action.enabled);
-    assert!(
-        failure_view_model
-            .repair_action
-            .disabled_reason
-            .as_deref()
-            .is_some_and(|reason| reason.contains("No automatic repair"))
-    );
     assert!(
         guardian
             .detail()
@@ -2037,13 +1860,12 @@ async fn install_status_exposes_runtime_unavailable_failure_without_retry() {
             fields: Vec::new(),
         },
     ];
-    record_install_failure_outcome_and_repair_for_error(
+    record_install_failure_outcome_for_error(
         state.journals(),
         &failure_memory,
         &operation_id,
         &error,
         &facts,
-        &[],
         "2026-07-09T10:00:00+00:00",
     )
     .await;
@@ -2137,13 +1959,12 @@ async fn install_status_exposes_rosetta_required_failure_with_retry() {
             fields: Vec::new(),
         },
     ];
-    record_install_failure_outcome_and_repair_for_error(
+    record_install_failure_outcome_for_error(
         state.journals(),
         &failure_memory,
         &operation_id,
         &error,
         &facts,
-        &[],
         "2026-07-09T10:00:00+00:00",
     )
     .await;
@@ -2239,13 +2060,12 @@ async fn network_install_error_wins_over_benign_accumulated_download_facts() {
             fields: Vec::new(),
         },
     ];
-    record_install_failure_outcome_and_repair_for_error(
+    record_install_failure_outcome_for_error(
         state.journals(),
         &failure_memory,
         &operation_id,
         &error,
         &facts,
-        &[],
         "2026-07-09T10:05:00+00:00",
     )
     .await;
@@ -2303,13 +2123,12 @@ async fn request_install_error_keeps_terminal_artifact_target_for_failure_memory
         .await
         .expect("create install journal");
 
-    record_install_failure_outcome_and_repair_for_error(
+    record_install_failure_outcome_for_error(
         &journals,
         &failure_memory,
         &operation_id,
         &error,
         &facts,
-        &[],
         "2026-07-09T10:05:00+00:00",
     )
     .await;
@@ -2321,62 +2140,6 @@ async fn request_install_error_keeps_terminal_artifact_target_for_failure_memory
         .expect("provider failure memory");
     assert_eq!(entry.target.id, terminal_target);
     assert_ne!(entry.target.id, "minecraft_download");
-}
-
-#[tokio::test]
-async fn error_based_install_repair_skips_stale_artifact_facts_for_runtime_failure() {
-    let root = temp_root("install-runtime-stale-artifact-repair");
-    let destination = root.join("library.jar");
-    fs::write(&destination, b"already repaired library").expect("existing artifact");
-    let replacement = b"unexpected guardian repair".to_vec();
-    let server = TestByteServer::start(replacement.clone());
-    let journals = OperationJournalStore::new();
-    let failure_memory = GuardianFailureMemoryStore::new();
-    let operation_id = install_operation_id("runtime-stale-artifact-repair");
-    begin_install_operation_journal(&journals, &operation_id, "1.11.2")
-        .await
-        .expect("record install journal");
-    let target_id = "minecraft_library_runtime_stale";
-    let facts = vec![download_fact(
-        ExecutionDownloadFactKind::ChecksumMismatch,
-        target_id,
-    )];
-    let descriptors = vec![selected_descriptor(
-        SelectedDownloadArtifactKind::Library,
-        target_id,
-        &destination,
-        &server.url,
-        &replacement,
-    )];
-    let error = DownloadError::RuntimeRosettaRequired {
-        component: "jre-legacy".to_string(),
-    };
-
-    let outcome = record_install_failure_outcome_and_repair_for_error(
-        &journals,
-        &failure_memory,
-        &operation_id,
-        &error,
-        &facts,
-        &descriptors,
-        "2026-07-09T10:05:00+00:00",
-    )
-    .await;
-
-    assert!(outcome.is_none());
-    assert_eq!(
-        fs::read(&destination).expect("artifact should be untouched"),
-        b"already repaired library"
-    );
-    assert_eq!(server.request_count(), 0);
-    let entry = journals.get(&operation_id).expect("operation journal");
-    assert!(
-        install_guardian_repair_summary_from_journal(&entry).is_none(),
-        "runtime failure should not record stale artifact repair state"
-    );
-
-    server.stop();
-    let _ = fs::remove_dir_all(root);
 }
 
 #[tokio::test]
@@ -2478,12 +2241,11 @@ async fn install_status_exposes_backend_authored_guardian_blocking_safety_outcom
                 ("jvm_arg".to_string(), "-Xmx8192M".to_string()),
             ],
         }];
-        record_install_failure_outcome_and_repair(
+        record_install_failure_outcome(
             state.journals(),
             &GuardianFailureMemoryStore::new(),
             &operation_id,
             &facts,
-            &[],
             "2026-07-09T10:00:00+00:00",
         )
         .await;
@@ -2493,7 +2255,6 @@ async fn install_status_exposes_backend_authored_guardian_blocking_safety_outcom
             .expect("install status");
 
         assert!(response.done);
-        assert!(response.guardian_repair.is_none());
         let guardian = response.guardian.as_ref().expect("guardian outcome");
         assert_eq!(guardian.diagnosis_id(), diagnosis_id);
         assert_eq!(guardian.decision(), decision);
@@ -4126,7 +3887,7 @@ async fn install_journal_records_guardian_evidence_from_core_download_facts() {
     .await
     .expect("record install journal");
 
-    record_install_failure_outcome_and_repair(
+    record_install_failure_outcome(
         &journals,
         &GuardianFailureMemoryStore::new(),
         &operation_id,
@@ -4148,7 +3909,6 @@ async fn install_journal_records_guardian_evidence_from_core_download_facts() {
                 fields: Vec::new(),
             },
         ],
-        &[],
         "2026-07-09T10:00:00+00:00",
     )
     .await;
@@ -4199,12 +3959,11 @@ async fn install_journal_treats_temp_discard_as_non_terminal_evidence_only() {
             "/Users/alice/.axial/libraries/secret.jar".to_string(),
         )],
     }];
-    record_install_failure_outcome_and_repair(
+    record_install_failure_outcome(
         &journals,
         &GuardianFailureMemoryStore::new(),
         &operation_id,
         &facts,
-        &[],
         "2026-07-09T10:00:00+00:00",
     )
     .await;
@@ -4253,12 +4012,11 @@ async fn install_journal_records_guardian_download_failure_outcome_without_raw_d
             ),
         ],
     }];
-    record_install_failure_outcome_and_repair(
+    record_install_failure_outcome(
         &journals,
         &GuardianFailureMemoryStore::new(),
         &operation_id,
         &facts,
-        &[],
         "2026-07-09T10:00:00+00:00",
     )
     .await;
@@ -4368,17 +4126,15 @@ async fn vanilla_provider_failure_records_guardian_retry_then_suppression_withou
         fields: vec![("status".to_string(), "503".to_string())],
     }];
 
-    let (_, policy_evaluations) = crate::guardian::with_guardian_policy_evaluation_count(
-        record_install_failure_outcome_and_repair(
+    let (_, policy_evaluations) =
+        crate::guardian::with_guardian_policy_evaluation_count(record_install_failure_outcome(
             &journals,
             &failure_memory,
             &operation_id,
             &facts,
-            &[],
             "2026-06-16T10:00:00+00:00",
-        ),
-    )
-    .await;
+        ))
+        .await;
     assert_eq!(policy_evaluations, 1);
 
     let entry = journals.get(&operation_id).expect("journal");
@@ -4406,12 +4162,11 @@ async fn vanilla_provider_failure_records_guardian_retry_then_suppression_withou
     )
     .await
     .expect("record install journal");
-    record_install_failure_outcome_and_repair(
+    record_install_failure_outcome(
         &journals,
         &failure_memory,
         &suppressed_operation_id,
         &facts,
-        &[],
         "2026-06-16T10:01:00+00:00",
     )
     .await;
@@ -4554,7 +4309,7 @@ async fn delegated_base_provider_fact_uses_download_pipeline_without_dependency_
         descriptors: Vec::new(),
     });
 
-    let outcome = dispatch_loader_install_failure(
+    dispatch_loader_install_failure(
         &journals,
         &failure_memory,
         &operation_id,
@@ -4565,7 +4320,6 @@ async fn delegated_base_provider_fact_uses_download_pipeline_without_dependency_
     )
     .await;
 
-    assert!(outcome.is_none());
     let entry = journals.get(&operation_id).expect("journal");
     let summary = install_guardian_outcome_summary_from_journal(&entry).expect("guardian outcome");
     assert_eq!(summary.diagnosis_id(), DiagnosisId::DownloadUnavailable);
@@ -4591,7 +4345,7 @@ async fn empty_base_install_payload_uses_only_dependency_fallback() {
         facts: Vec::new(),
         descriptors: Vec::new(),
     });
-    let outcome = dispatch_loader_install_failure(
+    dispatch_loader_install_failure(
         &journals,
         &failure_memory,
         &operation_id,
@@ -4602,7 +4356,6 @@ async fn empty_base_install_payload_uses_only_dependency_fallback() {
     )
     .await;
 
-    assert!(outcome.is_none());
     let entry = journals.get(&operation_id).expect("journal");
     let summary = install_guardian_outcome_summary_from_journal(&entry).expect("guardian outcome");
     assert_eq!(summary.diagnosis_id(), DiagnosisId::InstallDependencyFailed);
@@ -4626,419 +4379,6 @@ async fn empty_base_install_payload_uses_only_dependency_fallback() {
     );
     assert_no_sensitive_fragments(&serde_json::to_string(&entry).expect("journal json"));
     assert_no_sensitive_fragments(&serde_json::to_string(&summary).expect("summary json"));
-}
-
-#[tokio::test]
-async fn delegated_artifact_checksum_dispatch_repairs_and_journals_real_effect() {
-    let root = temp_root("loader-delegated-artifact-repair");
-    let destination = root.join("loader.jar");
-    fs::write(&destination, b"corrupt loader").expect("corrupt artifact");
-    let replacement = b"fresh loader".to_vec();
-    let server = TestByteServer::start(replacement.clone());
-    let journals = OperationJournalStore::new();
-    let failure_memory = GuardianFailureMemoryStore::new();
-    let operation_id = install_operation_id("loader-delegated-artifact-repair");
-    begin_install_operation_journal(&journals, &operation_id, "fabric-loader")
-        .await
-        .expect("record install journal");
-    let target_id = "loader_fabric_library";
-    let error = LoaderInstallError::from(LoaderError::ArtifactDownloadFailed {
-        facts: vec![download_fact(
-            ExecutionDownloadFactKind::ChecksumMismatch,
-            target_id,
-        )],
-        descriptors: vec![selected_descriptor(
-            SelectedDownloadArtifactKind::Library,
-            target_id,
-            &destination,
-            &server.url,
-            &replacement,
-        )],
-    });
-
-    let outcome = dispatch_loader_install_failure(
-        &journals,
-        &failure_memory,
-        &operation_id,
-        "loader_fabric_build_1_21_5",
-        "1.21.5",
-        error,
-        "2026-06-16T10:00:00+00:00",
-    )
-    .await
-    .expect("matching delegated artifact is repaired");
-
-    assert_eq!(outcome.status, GuardianArtifactRepairStatus::Repaired);
-    assert_eq!(
-        fs::read(&destination).expect("repaired artifact"),
-        replacement
-    );
-    assert!(server.request_count() >= 1);
-    let repair_journal = journals.get(&outcome.operation_id).expect("repair journal");
-    assert_eq!(repair_journal.status, OperationStatus::Succeeded);
-    assert_eq!(repair_journal.outcome, Some(OperationOutcome::Succeeded));
-    assert!(
-        repair_journal
-            .completed_steps
-            .iter()
-            .any(|step| step.step_id == "promote_verified_artifact")
-    );
-    assert!(outcome.facts.iter().any(|fact| fact == "download_promoted"));
-
-    server.stop();
-    let _ = fs::remove_dir_all(root);
-}
-
-#[tokio::test]
-async fn install_journal_records_guardian_repair_summary_without_raw_details() {
-    let journals = OperationJournalStore::new();
-    let operation_id = install_operation_id("install-guardian-repair-summary");
-    begin_install_operation_journal(&journals, &operation_id, "1.21.5")
-        .await
-        .expect("record install journal");
-    let mut last_phase = None;
-    record_install_operation_progress(
-        &journals,
-        &operation_id,
-        &progress("error", true, Some("sanitized failure")),
-        &mut last_phase,
-    )
-    .await
-    .expect("record install journal");
-
-    record_install_operation_guardian_repair_outcome(
-        &journals,
-        &operation_id,
-        &GuardianArtifactRepairOutcome {
-            operation_id: OperationId::new(
-                "guardian-artifact-repair:123e4567-e89b-12d3-a456-426614174000",
-            ),
-            diagnosis_id: DiagnosisId::LauncherManagedArtifactCorrupt,
-            action: GuardianActionKind::Repair,
-            status: GuardianArtifactRepairStatus::Failed,
-            facts: vec!["https://example.invalid/artifact.jar?token=secret".to_string()],
-            summary: "guardian_artifact_repair_failed".to_string(),
-        },
-    )
-    .await
-    .expect("record install journal");
-
-    let entry = journals.get(&operation_id).expect("journal");
-    let summary = install_guardian_repair_summary_from_journal(&entry).expect("repair summary");
-    assert_eq!(summary.status, "failed");
-    assert_eq!(
-        summary.repair_operation_id.as_str(),
-        "guardian-artifact-repair:123e4567-e89b-12d3-a456-426614174000"
-    );
-    assert_eq!(
-        summary.diagnosis_id,
-        DiagnosisId::LauncherManagedArtifactCorrupt
-    );
-    assert!(summary.label.contains("could not repair"));
-    assert_no_sensitive_fragments(&serde_json::to_string(&entry).expect("journal json"));
-    assert_no_sensitive_fragments(&serde_json::to_string(&summary).expect("summary json"));
-}
-
-#[tokio::test]
-async fn install_guardian_repair_repairs_matching_checksum_failure() {
-    let root = temp_root("guardian-install-repair");
-    let destination = root.join("library.jar");
-    fs::write(&destination, b"corrupt library").expect("corrupt artifact");
-    let replacement = b"fresh library".to_vec();
-    let server = TestByteServer::start(replacement.clone());
-    let journals = OperationJournalStore::new();
-    let failure_memory = GuardianFailureMemoryStore::new();
-    let operation_id = install_operation_id("install-repair");
-    let target_id = "minecraft_library_example";
-    let facts = vec![download_fact(
-        ExecutionDownloadFactKind::ChecksumMismatch,
-        target_id,
-    )];
-    let descriptors = vec![selected_descriptor(
-        SelectedDownloadArtifactKind::Library,
-        target_id,
-        &destination,
-        &server.url,
-        &replacement,
-    )];
-
-    let (outcome, policy_evaluations) =
-        crate::guardian::with_guardian_policy_evaluation_count(record_repairable_install_failure(
-            &journals,
-            &failure_memory,
-            &operation_id,
-            &facts,
-            &descriptors,
-            "2026-06-15T10:00:00+00:00",
-        ))
-        .await;
-    let outcome = outcome.expect("repair outcome");
-    assert_eq!(policy_evaluations, 1);
-
-    assert_eq!(outcome.status, GuardianArtifactRepairStatus::Repaired);
-    assert_eq!(
-        fs::read(&destination).expect("repaired artifact"),
-        replacement
-    );
-    assert!(server.request_count() >= 1);
-    let repair_journal = journals
-        .get(&outcome.operation_id)
-        .expect("repair journal should be recorded");
-    assert_eq!(repair_journal.status, OperationStatus::Succeeded);
-    assert_eq!(repair_journal.outcome, Some(OperationOutcome::Succeeded));
-    assert_eq!(failure_memory.list().len(), 1);
-    assert_no_sensitive_fragments(&serde_json::to_string(&repair_journal).expect("journal json"));
-
-    server.stop();
-    let _ = fs::remove_dir_all(root);
-}
-
-#[tokio::test]
-async fn install_guardian_repair_restores_missing_matching_artifact() {
-    let root = temp_root("guardian-install-missing-repair");
-    let destination = root.join("missing-library.jar");
-    let replacement = b"fresh missing library".to_vec();
-    let server = TestByteServer::start(replacement.clone());
-    let journals = OperationJournalStore::new();
-    let failure_memory = GuardianFailureMemoryStore::new();
-    let operation_id = install_operation_id("install-missing-repair");
-    let target_id = "minecraft_library_example_missing";
-    let facts = vec![download_fact(
-        ExecutionDownloadFactKind::ArtifactMissing,
-        target_id,
-    )];
-    let descriptors = vec![selected_descriptor(
-        SelectedDownloadArtifactKind::Library,
-        target_id,
-        &destination,
-        &server.url,
-        &replacement,
-    )];
-
-    let outcome = record_repairable_install_failure(
-        &journals,
-        &failure_memory,
-        &operation_id,
-        &facts,
-        &descriptors,
-        "2026-06-15T10:00:00+00:00",
-    )
-    .await
-    .expect("repair outcome");
-
-    assert_eq!(outcome.status, GuardianArtifactRepairStatus::Repaired);
-    assert_eq!(
-        fs::read(&destination).expect("repaired artifact"),
-        replacement
-    );
-    let journal = journals.get(&outcome.operation_id).expect("repair journal");
-    assert!(
-        !journal
-            .completed_steps
-            .iter()
-            .any(|step| { step.step_id.contains("quarantine_launcher_managed_target") })
-    );
-
-    server.stop();
-    let _ = fs::remove_dir_all(root);
-}
-
-#[tokio::test]
-async fn install_guardian_missing_artifact_repair_blocks_if_target_now_exists() {
-    let root = temp_root("guardian-install-missing-now-exists");
-    let destination = root.join("existing-library.jar");
-    fs::write(&destination, b"existing library").expect("existing artifact");
-    let replacement = b"fresh library".to_vec();
-    let server = TestByteServer::start(replacement.clone());
-    let journals = OperationJournalStore::new();
-    let failure_memory = GuardianFailureMemoryStore::new();
-    let operation_id = install_operation_id("install-missing-now-exists");
-    let target_id = "minecraft_library_example_existing";
-    let facts = vec![download_fact(
-        ExecutionDownloadFactKind::ArtifactMissing,
-        target_id,
-    )];
-    let descriptors = vec![selected_descriptor(
-        SelectedDownloadArtifactKind::Library,
-        target_id,
-        &destination,
-        &server.url,
-        &replacement,
-    )];
-
-    let outcome = record_repairable_install_failure(
-        &journals,
-        &failure_memory,
-        &operation_id,
-        &facts,
-        &descriptors,
-        "2026-06-15T10:00:00+00:00",
-    )
-    .await
-    .expect("blocked repair outcome");
-
-    assert_eq!(outcome.status, GuardianArtifactRepairStatus::Blocked);
-    assert_eq!(
-        fs::read(&destination).expect("existing artifact is preserved"),
-        b"existing library"
-    );
-    assert_eq!(server.request_count(), 0);
-    let journal = journals.get(&outcome.operation_id).expect("repair journal");
-    assert_eq!(journal.status, OperationStatus::Blocked);
-    assert!(
-        !journal
-            .completed_steps
-            .iter()
-            .any(|step| { step.step_id.contains("quarantine_launcher_managed_target") })
-    );
-
-    server.stop();
-    let _ = fs::remove_dir_all(root);
-}
-
-#[tokio::test]
-async fn install_guardian_repair_skips_artifact_missing_when_provider_failure_matches_target() {
-    let root = temp_root("guardian-install-mixed-provider-failure");
-    let destination = root.join("missing-library.jar");
-    let replacement = b"fresh library".to_vec();
-    let server = TestByteServer::start(replacement.clone());
-    let journals = OperationJournalStore::new();
-    let failure_memory = GuardianFailureMemoryStore::new();
-    let operation_id = install_operation_id("install-mixed-provider-failure");
-    let target_id = "minecraft_library_example_mixed";
-    let facts = vec![
-        download_fact(ExecutionDownloadFactKind::ArtifactMissing, target_id),
-        ExecutionDownloadFact {
-            kind: ExecutionDownloadFactKind::ProviderFailure,
-            target: target_id.to_string(),
-            fields: vec![("status".to_string(), "503".to_string())],
-        },
-    ];
-    let descriptors = vec![selected_descriptor(
-        SelectedDownloadArtifactKind::Library,
-        target_id,
-        &destination,
-        &server.url,
-        &replacement,
-    )];
-
-    let outcome = record_repairable_install_failure(
-        &journals,
-        &failure_memory,
-        &operation_id,
-        &facts,
-        &descriptors,
-        "2026-06-15T10:00:00+00:00",
-    )
-    .await;
-
-    assert!(outcome.is_none());
-    assert!(!destination.exists());
-    assert_eq!(server.request_count(), 0);
-    assert!(failure_memory.list().is_empty());
-
-    server.stop();
-    let _ = fs::remove_dir_all(root);
-}
-
-#[tokio::test]
-async fn install_guardian_repair_skips_artifact_missing_when_later_terminal_failure_exists() {
-    let root = temp_root("guardian-install-mixed-metadata-failure");
-    let destination = root.join("asset-index.json");
-    let replacement = b"fresh index".to_vec();
-    let server = TestByteServer::start(replacement.clone());
-    let journals = OperationJournalStore::new();
-    let failure_memory = GuardianFailureMemoryStore::new();
-    let operation_id = install_operation_id("install-mixed-metadata-failure");
-    let facts = vec![
-        download_fact(
-            ExecutionDownloadFactKind::ArtifactMissing,
-            "minecraft_asset_index_1.18",
-        ),
-        download_fact(
-            ExecutionDownloadFactKind::MetadataInvalid,
-            "minecraft_asset_object_bad",
-        ),
-    ];
-    let descriptors = vec![selected_descriptor(
-        SelectedDownloadArtifactKind::AssetIndex,
-        "minecraft_asset_index_1.18",
-        &destination,
-        &server.url,
-        &replacement,
-    )];
-
-    let outcome = record_repairable_install_failure(
-        &journals,
-        &failure_memory,
-        &operation_id,
-        &facts,
-        &descriptors,
-        "2026-06-15T10:00:00+00:00",
-    )
-    .await;
-
-    assert!(outcome.is_none());
-    assert!(!destination.exists());
-    assert_eq!(server.request_count(), 0);
-
-    server.stop();
-    let _ = fs::remove_dir_all(root);
-}
-
-#[tokio::test]
-async fn install_guardian_repair_ignores_unrepairable_or_unmatched_facts() {
-    let root = temp_root("guardian-install-repair-noop");
-    let destination = root.join("library.jar");
-    fs::write(&destination, b"corrupt library").expect("corrupt artifact");
-    let journals = OperationJournalStore::new();
-    let failure_memory = GuardianFailureMemoryStore::new();
-    let operation_id = install_operation_id("install-no-repair");
-    let descriptors = vec![selected_descriptor(
-        SelectedDownloadArtifactKind::Library,
-        "minecraft_library_example",
-        &destination,
-        "https://example.invalid/library.jar",
-        b"fresh library",
-    )];
-
-    let network_outcome = record_repairable_install_failure(
-        &journals,
-        &failure_memory,
-        &operation_id,
-        &[download_fact(
-            ExecutionDownloadFactKind::NetworkFailure,
-            "minecraft_library_example",
-        )],
-        &descriptors,
-        "2026-06-15T10:00:00+00:00",
-    )
-    .await;
-    let unmatched_operation_id = install_operation_id("install-no-repair-unmatched");
-    let unmatched_outcome = record_repairable_install_failure(
-        &journals,
-        &failure_memory,
-        &unmatched_operation_id,
-        &[download_fact(
-            ExecutionDownloadFactKind::ChecksumMismatch,
-            "other.jar",
-        )],
-        &descriptors,
-        "2026-06-15T10:00:00+00:00",
-    )
-    .await;
-
-    assert!(network_outcome.is_none());
-    assert!(unmatched_outcome.is_none());
-    assert_eq!(
-        fs::read(&destination).expect("artifact"),
-        b"corrupt library"
-    );
-    let memory = failure_memory.list();
-    assert_eq!(memory.len(), 1);
-    assert_eq!(memory[0].diagnosis_id, DiagnosisId::DownloadUnavailable);
-
-    let _ = fs::remove_dir_all(root);
 }
 
 fn assert_no_public_raw_fragments(message: &str) {
@@ -5389,46 +4729,6 @@ fn download_fact(kind: ExecutionDownloadFactKind, target: &str) -> ExecutionDown
     }
 }
 
-async fn record_repairable_install_failure(
-    journals: &OperationJournalStore,
-    failure_memory: &GuardianFailureMemoryStore,
-    operation_id: &OperationId,
-    facts: &[ExecutionDownloadFact],
-    descriptors: &[SelectedDownloadArtifactDescriptor],
-    observed_at: &str,
-) -> Option<GuardianArtifactRepairOutcome> {
-    begin_install_operation_journal(journals, operation_id, "guardian-repair-test")
-        .await
-        .expect("record install journal");
-    record_install_failure_outcome_and_repair(
-        journals,
-        failure_memory,
-        operation_id,
-        facts,
-        descriptors,
-        observed_at,
-    )
-    .await
-}
-
-fn selected_descriptor(
-    kind: SelectedDownloadArtifactKind,
-    target: &str,
-    destination: &Path,
-    provider_url: &str,
-    body: &[u8],
-) -> SelectedDownloadArtifactDescriptor {
-    SelectedDownloadArtifactDescriptor::new(
-        kind,
-        target,
-        destination.to_path_buf(),
-        provider_url,
-        sha1_hex(body),
-        Some(body.len() as u64),
-        1024,
-    )
-}
-
 async fn wait_for_queue_empty(state: &AppState) {
     for _ in 0..40 {
         let snapshot = state.installs().queue_snapshot().await;
@@ -5457,10 +4757,6 @@ fn temp_root(name: &str) -> PathBuf {
     path
 }
 
-fn sha1_hex(bytes: impl AsRef<[u8]>) -> String {
-    format!("{:x}", Sha1::digest(bytes.as_ref()))
-}
-
 fn launcher_managed_download_temp_path(destination: &Path) -> PathBuf {
     let mut name = destination
         .file_name()
@@ -5468,73 +4764,4 @@ fn launcher_managed_download_temp_path(destination: &Path) -> PathBuf {
         .to_os_string();
     name.push(".axial-tmp");
     destination.with_file_name(name)
-}
-
-struct TestByteServer {
-    url: String,
-    request_count: Arc<AtomicUsize>,
-    stop_server: mpsc::Sender<()>,
-    server: thread::JoinHandle<()>,
-}
-
-impl TestByteServer {
-    fn start(body: Vec<u8>) -> Self {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
-        listener
-            .set_nonblocking(true)
-            .expect("set test server nonblocking");
-        let url = format!(
-            "http://{}/artifact.jar",
-            listener.local_addr().expect("server addr")
-        );
-        let request_count = Arc::new(AtomicUsize::new(0));
-        let server_request_count = Arc::clone(&request_count);
-        let (stop_server, server_stopped) = mpsc::channel();
-        let server = thread::spawn(move || {
-            loop {
-                match listener.accept() {
-                    Ok((stream, _)) => {
-                        server_request_count.fetch_add(1, Ordering::SeqCst);
-                        respond_ok(stream, &body);
-                    }
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                        if server_stopped.try_recv().is_ok() {
-                            break;
-                        }
-                        thread::sleep(Duration::from_millis(10));
-                    }
-                    Err(error) => panic!("accept connection: {error}"),
-                }
-            }
-        });
-
-        Self {
-            url,
-            request_count,
-            stop_server,
-            server,
-        }
-    }
-
-    fn request_count(&self) -> usize {
-        self.request_count.load(Ordering::SeqCst)
-    }
-
-    fn stop(self) {
-        self.stop_server.send(()).expect("stop test server");
-        self.server.join().expect("server thread");
-    }
-}
-
-fn respond_ok(mut stream: TcpStream, body: &[u8]) {
-    let mut buffer = [0_u8; 1024];
-    let _ = stream.read(&mut buffer);
-    let header = format!(
-        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-        body.len()
-    );
-    stream
-        .write_all(header.as_bytes())
-        .expect("write response header");
-    stream.write_all(body).expect("write response body");
 }

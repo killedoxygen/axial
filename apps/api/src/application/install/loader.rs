@@ -1,4 +1,3 @@
-use super::repair::InstallRepairResume;
 use super::{
     BASE_INSTALL_FAILED_MESSAGE, INSTALL_FAILURE_MESSAGE, InstallApplicationError,
     InstallForegroundActivity, InstallProgressCoalescer, InstallProgressViewModel,
@@ -7,7 +6,7 @@ use super::{
     emit_install_failed, finish_install_progress_task, generate_install_id,
     install_journal_error_response, install_operation_id, known_good_acceptance_download_error,
     operation::install_progress_with_terminal_error, record_and_emit_install_progress,
-    record_install_failure_outcome_and_repair, record_install_failure_outcome_and_repair_for_error,
+    record_install_failure_outcome, record_install_failure_outcome_for_error,
     record_install_operation_interrupted,
     record_loader_base_install_dependency_guardian_failure_outcome,
     record_loader_install_operation_guardian_failure_outcome, register_install_foreground,
@@ -254,106 +253,95 @@ pub(super) async fn start_loader_install_with_foreground(
             }
 
             let final_progress = Arc::new(Mutex::new(None::<DownloadProgress>));
-            let mut repair_resume = InstallRepairResume::default();
-            loop {
-                if let Ok(mut final_progress) = final_progress.lock() {
-                    *final_progress = None;
-                }
-                let final_progress_for_install = Arc::clone(&final_progress);
-                let result = {
-                    let install = install_build(
-                        &library_dir,
-                        worker_runtime_cache.clone(),
-                        build.clone(),
-                        |progress| {
-                            if progress.done {
-                                if let Ok(mut final_progress) = final_progress_for_install.lock() {
-                                    *final_progress = Some(progress);
-                                }
-                                return;
+            let final_progress_for_install = Arc::clone(&final_progress);
+            let result = {
+                let install = install_build(
+                    &library_dir,
+                    worker_runtime_cache.clone(),
+                    build.clone(),
+                    |progress| {
+                        if progress.done {
+                            if let Ok(mut final_progress) = final_progress_for_install.lock() {
+                                *final_progress = Some(progress);
                             }
+                            return;
+                        }
+                        let _ = progress_tx.send(progress);
+                    },
+                );
+                tokio::pin!(install);
+                tokio::select! {
+                    result = &mut install => Some(result),
+                    () = journal_failed.notified() => None,
+                }
+            };
+            let Some(result) = result else {
+                drop(progress_tx);
+                let _ = finish_install_progress_task(store_task).await;
+                return;
+            };
+
+            match result {
+                Err(error) => {
+                    let observed_at = chrono::Utc::now().to_rfc3339();
+                    let progress = loader_install_error_progress(&error);
+                    dispatch_loader_install_failure(
+                        worker_journals.as_ref(),
+                        worker_failure_memory.as_ref(),
+                        &worker_operation_id,
+                        &loader_target_id,
+                        &base_version_id,
+                        error,
+                        &observed_at,
+                    )
+                    .await;
+                    let failure_summary = progress
+                        .error
+                        .clone()
+                        .unwrap_or_else(|| BASE_INSTALL_FAILED_MESSAGE.to_string());
+                    let _ = progress_tx.send(progress);
+                    drop(progress_tx);
+                    if finish_install_progress_task(store_task).await {
+                        emit_install_failed(worker_telemetry.as_ref(), &failure_summary);
+                    }
+                }
+                Ok(receipt) => {
+                    let captured_terminal = final_progress
+                        .lock()
+                        .ok()
+                        .and_then(|mut progress| progress.take());
+                    let publication = publish_known_good_loader_terminal(
+                        async {
+                            require_exact_loader_receipt_version(
+                                &version_id,
+                                receipt.version_id(),
+                            )?;
+                            worker_state
+                                .accept_known_good_install_receipt(
+                                    &loader_foreground,
+                                    &library_dir,
+                                    receipt,
+                                )
+                                .await
+                        },
+                        captured_terminal,
+                        |progress| {
                             let _ = progress_tx.send(progress);
                         },
-                    );
-                    tokio::pin!(install);
-                    tokio::select! {
-                        result = &mut install => Some(result),
-                        () = journal_failed.notified() => None,
+                    )
+                    .await;
+                    if publication.acceptance_failed {
+                        tracing::warn!(
+                            operation_id = worker_operation_id.as_str(),
+                            version_id = version_id.as_str(),
+                            failure_kind = "known_good_reconciliation",
+                            "loader install worker could not accept verified install authority"
+                        );
                     }
-                };
-                let Some(result) = result else {
                     drop(progress_tx);
-                    let _ = finish_install_progress_task(store_task).await;
-                    return;
-                };
-
-                match result {
-                    Err(error) => {
-                        let observed_at = chrono::Utc::now().to_rfc3339();
-                        let progress = loader_install_error_progress(&error);
-                        let repair_outcome = dispatch_loader_install_failure(
-                            worker_journals.as_ref(),
-                            worker_failure_memory.as_ref(),
-                            &worker_operation_id,
-                            &loader_target_id,
-                            &base_version_id,
-                            error,
-                            &observed_at,
-                        )
-                        .await;
-                        if repair_resume.resume_after(repair_outcome.as_ref()) {
-                            continue;
-                        }
-                        let failure_summary = progress
-                            .error
-                            .clone()
-                            .unwrap_or_else(|| BASE_INSTALL_FAILED_MESSAGE.to_string());
-                        let _ = progress_tx.send(progress);
-                        drop(progress_tx);
-                        if finish_install_progress_task(store_task).await {
-                            emit_install_failed(worker_telemetry.as_ref(), &failure_summary);
-                        }
-                        return;
-                    }
-                    Ok(receipt) => {
-                        let captured_terminal = final_progress
-                            .lock()
-                            .ok()
-                            .and_then(|mut progress| progress.take());
-                        let publication = publish_known_good_loader_terminal(
-                            async {
-                                require_exact_loader_receipt_version(
-                                    &version_id,
-                                    receipt.version_id(),
-                                )?;
-                                worker_state
-                                    .accept_known_good_install_receipt(
-                                        &loader_foreground,
-                                        &library_dir,
-                                        receipt,
-                                    )
-                                    .await
-                            },
-                            captured_terminal,
-                            |progress| {
-                                let _ = progress_tx.send(progress);
-                            },
-                        )
-                        .await;
-                        if publication.acceptance_failed {
-                            tracing::warn!(
-                                operation_id = worker_operation_id.as_str(),
-                                version_id = version_id.as_str(),
-                                failure_kind = "known_good_reconciliation",
-                                "loader install worker could not accept verified install authority"
-                            );
-                        }
-                        drop(progress_tx);
-                        let journal_committed = finish_install_progress_task(store_task).await;
-                        if journal_committed && let Some(summary) = publication.failure_summary {
-                            emit_install_failed(worker_telemetry.as_ref(), &summary);
-                        }
-                        return;
+                    let journal_committed = finish_install_progress_task(store_task).await;
+                    if journal_committed && let Some(summary) = publication.failure_summary {
+                        emit_install_failed(worker_telemetry.as_ref(), &summary);
                     }
                 }
             }
@@ -450,7 +438,7 @@ pub(super) async fn dispatch_loader_install_failure(
     base_version_id: &str,
     error: LoaderInstallError,
     observed_at: &str,
-) -> Option<crate::guardian::GuardianArtifactRepairOutcome> {
+) {
     match error {
         LoaderInstallError::BaseInstallFailed(failure) => {
             if failure.facts().is_empty() {
@@ -462,26 +450,24 @@ pub(super) async fn dispatch_loader_install_failure(
                 )
                 .await
                 .ok();
-                return None;
+                return;
             }
-            record_install_failure_outcome_and_repair_for_error(
+            record_install_failure_outcome_for_error(
                 journals,
                 failure_memory,
                 operation_id,
                 failure.error(),
                 failure.facts(),
-                failure.descriptors(),
                 observed_at,
             )
             .await
         }
         LoaderInstallError::ArtifactDownloadFailed(failure) => {
-            record_install_failure_outcome_and_repair(
+            record_install_failure_outcome(
                 journals,
                 failure_memory,
                 operation_id,
                 failure.facts(),
-                failure.descriptors(),
                 observed_at,
             )
             .await
@@ -497,7 +483,6 @@ pub(super) async fn dispatch_loader_install_failure(
             )
             .await
             .ok();
-            None
         }
     }
 }

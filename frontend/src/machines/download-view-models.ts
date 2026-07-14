@@ -72,7 +72,6 @@ export function installFailureViewModel(value: unknown): InstallFailureViewModel
   }
   const retryFallback = unavailableFailureAction('retry', 'Retry unavailable');
   const dismissFallback = dismissFailureAction();
-  const repairFallback = unavailableFailureAction('repair', 'Repair unavailable');
   return {
     state_id: candidate.state_id,
     title: candidate.title.trim() || 'Install failed',
@@ -84,7 +83,6 @@ export function installFailureViewModel(value: unknown): InstallFailureViewModel
       : [],
     retry_action: installActionViewModel(candidate.retry_action, retryFallback),
     dismiss_action: installActionViewModel(candidate.dismiss_action, dismissFallback),
-    repair_action: installActionViewModel(candidate.repair_action, repairFallback),
   };
 }
 
@@ -129,7 +127,6 @@ export function unresolvedFailureViewModel(message: string): InstallFailureViewM
     details: [],
     retry_action: unavailableFailureAction('retry', 'Retry unavailable'),
     dismiss_action: dismissFailureAction(),
-    repair_action: unavailableFailureAction('repair', 'Repair unavailable'),
   };
 }
 

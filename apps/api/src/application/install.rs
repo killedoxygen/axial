@@ -2,14 +2,13 @@
 //!
 //! The facade owns request/response contracts, vanilla install worker
 //! coordination, and status composition. Child modules own loader workflows,
-//! operation journal/progress mapping, Guardian repair mapping, and event
+//! operation journal/progress mapping, Guardian failure mapping, and event
 //! streaming. Core Minecraft code still owns provider resolution, download
 //! verification, and concrete install effects.
 
 mod loader;
 mod model;
 mod operation;
-mod repair;
 mod stream;
 
 #[cfg(test)]
@@ -17,8 +16,7 @@ pub(crate) use operation::loader_install_guardian_evidence_kind;
 
 use super::InstallVersionCommand;
 use crate::guardian::{
-    DiagnosisId, GuardianArtifactRepairOutcome, GuardianInstallArtifactFailureEvidence,
-    GuardianInstallOutcomeSummary,
+    DiagnosisId, GuardianInstallArtifactFailureEvidence, GuardianInstallOutcomeSummary,
 };
 use crate::observability::{
     operation_journal_proof_record,
@@ -36,8 +34,7 @@ use crate::state::{
 use crate::state::{AppState, ProducerLease, RequestProducerHandoff};
 use crate::state::{IntegrityForegroundLease, IntegrityForegroundRegistration};
 use axial_minecraft::{
-    DownloadError, DownloadProgress, Downloader,
-    download::{ExecutionDownloadFact, SelectedDownloadArtifactDescriptor},
+    DownloadError, DownloadProgress, Downloader, download::ExecutionDownloadFact,
     resolve_build_record_for_install,
 };
 use axum::{Json, http::StatusCode};
@@ -324,12 +321,12 @@ pub use loader::{
     loader_builds, loader_components, loader_game_versions, loader_pre_operation_error_response,
 };
 pub use model::{
-    InstallActionViewModel, InstallFailureViewModel, InstallGuardianRepairSummary,
-    InstallProgressStepViewModel, InstallProgressViewModel, InstallQueueActiveViewModel,
-    InstallQueueInstallItemViewModel, InstallQueueLoaderItemViewModel, InstallQueueNoticeViewModel,
-    InstallQueueRequest, InstallQueueStateResponse, InstallQueueViewModel,
-    InstallQueuedItemViewModel, InstallStartResponse, InstallStatusResponse, InstallVersionStaging,
-    InstallVersionStartRequest, LoaderBuildsRequest, LoaderInstallStartRequest,
+    InstallActionViewModel, InstallFailureViewModel, InstallProgressStepViewModel,
+    InstallProgressViewModel, InstallQueueActiveViewModel, InstallQueueInstallItemViewModel,
+    InstallQueueLoaderItemViewModel, InstallQueueNoticeViewModel, InstallQueueRequest,
+    InstallQueueStateResponse, InstallQueueViewModel, InstallQueuedItemViewModel,
+    InstallStartResponse, InstallStatusResponse, InstallVersionStaging, InstallVersionStartRequest,
+    LoaderBuildsRequest, LoaderInstallStartRequest,
 };
 use operation::{
     InstallProgressCoalescer, assess_install_guardian_failure,
@@ -348,10 +345,6 @@ pub use operation::{
     public_vanilla_install_progress_json, record_install_operation_interrupted,
     record_install_operation_progress, sanitize_install_progress, stage_install_version_command,
     vanilla_install_progress_view_model,
-};
-use repair::{InstallRepairResume, repair_install_artifact_corruption_with_guardian};
-pub use repair::{
-    install_guardian_repair_summary_from_journal, record_install_operation_guardian_repair_outcome,
 };
 pub use stream::{install_events_stream, loader_install_events_stream};
 
@@ -513,114 +506,101 @@ async fn start_install_version_with_foreground(
 
             let installed_library_root = mc_dir.clone();
             let downloader = Downloader::new(mc_dir, worker_runtime_cache);
-            let mut repair_resume = InstallRepairResume::default();
-            let (final_install_succeeded, final_terminal_progress) = loop {
-                if let Ok(mut terminal_progress) = terminal_progress.lock() {
-                    *terminal_progress = None;
+            let progress_tx_for_downloader = progress_tx.clone();
+            let terminal_progress_for_downloader = Arc::clone(&terminal_progress);
+            let mut install_facts = Vec::new();
+            let install_result = {
+                let install = downloader.install_version_with_facts_and_descriptors(
+                    &version_id,
+                    move |progress| {
+                        if progress.done {
+                            if let Ok(mut terminal_progress) =
+                                terminal_progress_for_downloader.lock()
+                            {
+                                *terminal_progress = Some(progress);
+                            }
+                            return;
+                        }
+                        let _ = progress_tx_for_downloader.send(progress);
+                    },
+                    |fact| install_facts.push(fact),
+                    |_| {},
+                );
+                tokio::pin!(install);
+                tokio::select! {
+                    result = &mut install => Some(result),
+                    () = journal_failed.notified() => None,
                 }
-                let progress_tx_for_downloader = progress_tx.clone();
-                let terminal_progress_for_downloader = Arc::clone(&terminal_progress);
-                let mut install_facts = Vec::new();
-                let mut install_descriptors = Vec::new();
-                let install_result = {
-                    let install = downloader.install_version_with_facts_and_descriptors(
-                        &version_id,
-                        move |progress| {
-                            if progress.done {
-                                if let Ok(mut terminal_progress) =
-                                    terminal_progress_for_downloader.lock()
-                                {
-                                    *terminal_progress = Some(progress);
-                                }
-                                return;
-                            }
-                            let _ = progress_tx_for_downloader.send(progress);
-                        },
-                        |fact| install_facts.push(fact),
-                        |descriptor| install_descriptors.push(descriptor),
-                    );
-                    tokio::pin!(install);
-                    tokio::select! {
-                        result = &mut install => Some(result),
-                        () = journal_failed.notified() => None,
-                    }
-                };
-                let Some(install_result) = install_result else {
-                    drop(progress_tx);
-                    let _ = finish_install_progress_task(store_task).await;
-                    return;
-                };
-                let attempt_terminal_progress = terminal_progress
-                    .lock()
-                    .ok()
-                    .and_then(|mut progress| progress.take());
-                let install_error = match install_result {
-                    Ok(receipt) => {
-                        let acceptance = match worker_foreground.retained() {
-                            Some(foreground) => {
-                                worker_state
-                                    .accept_known_good_install_receipt(
-                                        &foreground,
-                                        &installed_library_root,
-                                        receipt,
-                                    )
-                                    .await
-                            }
-                            None => Err(std::io::Error::other(
-                                "install foreground authority ended before receipt activation",
-                            )),
-                        };
-                        match acceptance {
-                            Ok(()) => break (true, attempt_terminal_progress),
-                            Err(error) => {
-                                tracing::warn!(
-                                    operation_id = worker_operation_id.as_str(),
-                                    version_id = version_id.as_str(),
-                                    failure_kind = "known_good_reconciliation",
-                                    "install worker could not accept verified install authority"
-                                );
-                                let error = known_good_acceptance_download_error(error);
-                                break (
-                                    false,
-                                    Some(install_progress_with_terminal_error(
-                                        terminal_failure_progress_or_default(
-                                            attempt_terminal_progress,
-                                        ),
-                                        &error,
-                                    )),
-                                );
-                            }
+            };
+            let Some(install_result) = install_result else {
+                drop(progress_tx);
+                let _ = finish_install_progress_task(store_task).await;
+                return;
+            };
+            let attempt_terminal_progress = terminal_progress
+                .lock()
+                .ok()
+                .and_then(|mut progress| progress.take());
+            let (final_install_succeeded, final_terminal_progress) = match install_result {
+                Ok(receipt) => {
+                    let acceptance = match worker_foreground.retained() {
+                        Some(foreground) => {
+                            worker_state
+                                .accept_known_good_install_receipt(
+                                    &foreground,
+                                    &installed_library_root,
+                                    receipt,
+                                )
+                                .await
+                        }
+                        None => Err(std::io::Error::other(
+                            "install foreground authority ended before receipt activation",
+                        )),
+                    };
+                    match acceptance {
+                        Ok(()) => (true, attempt_terminal_progress),
+                        Err(error) => {
+                            tracing::warn!(
+                                operation_id = worker_operation_id.as_str(),
+                                version_id = version_id.as_str(),
+                                failure_kind = "known_good_reconciliation",
+                                "install worker could not accept verified install authority"
+                            );
+                            let error = known_good_acceptance_download_error(error);
+                            (
+                                false,
+                                Some(install_progress_with_terminal_error(
+                                    terminal_failure_progress_or_default(attempt_terminal_progress),
+                                    &error,
+                                )),
+                            )
                         }
                     }
-                    Err(error) => error,
-                };
-                tracing::warn!(
-                    operation_id = worker_operation_id.as_str(),
-                    version_id = version_id.as_str(),
-                    failure_kind = install_error_log_kind(&install_error),
-                    "install worker observed failed install"
-                );
-                let observed_at = chrono::Utc::now().to_rfc3339();
-                let repair_outcome = record_install_failure_outcome_and_repair_for_error(
-                    worker_journals.as_ref(),
-                    worker_failure_memory.as_ref(),
-                    &worker_operation_id,
-                    &install_error,
-                    &install_facts,
-                    &install_descriptors,
-                    &observed_at,
-                )
-                .await;
-                if repair_resume.resume_after(repair_outcome.as_ref()) {
-                    continue;
                 }
-                break (
-                    false,
-                    Some(install_progress_with_terminal_error(
-                        terminal_failure_progress_or_default(attempt_terminal_progress),
+                Err(install_error) => {
+                    tracing::warn!(
+                        operation_id = worker_operation_id.as_str(),
+                        version_id = version_id.as_str(),
+                        failure_kind = install_error_log_kind(&install_error),
+                        "install worker observed failed install"
+                    );
+                    record_install_failure_outcome_for_error(
+                        worker_journals.as_ref(),
+                        worker_failure_memory.as_ref(),
+                        &worker_operation_id,
                         &install_error,
-                    )),
-                );
+                        &install_facts,
+                        &chrono::Utc::now().to_rfc3339(),
+                    )
+                    .await;
+                    (
+                        false,
+                        Some(install_progress_with_terminal_error(
+                            terminal_failure_progress_or_default(attempt_terminal_progress),
+                            &install_error,
+                        )),
+                    )
+                }
             };
             let terminal_progress = if final_install_succeeded {
                 final_terminal_progress.unwrap_or_else(vanilla_install_done_progress)
@@ -669,46 +649,42 @@ async fn start_install_version_with_foreground(
     })
 }
 
-pub(super) async fn record_install_failure_outcome_and_repair(
+pub(super) async fn record_install_failure_outcome(
     journals: &crate::state::OperationJournalStore,
     failure_memory: &crate::state::GuardianFailureMemoryStore,
     operation_id: &crate::state::contracts::OperationId,
     install_facts: &[ExecutionDownloadFact],
-    install_descriptors: &[SelectedDownloadArtifactDescriptor],
     observed_at: &str,
-) -> Option<GuardianArtifactRepairOutcome> {
+) {
     let evidence = install_failure_evidence_from_download_facts(operation_id, install_facts);
-    record_install_failure_evidence_and_repair(
+    record_install_failure_evidence(
         journals,
         failure_memory,
         operation_id,
         &evidence,
-        install_descriptors,
         observed_at,
     )
-    .await
+    .await;
 }
 
-pub(super) async fn record_install_failure_outcome_and_repair_for_error(
+pub(super) async fn record_install_failure_outcome_for_error(
     journals: &crate::state::OperationJournalStore,
     failure_memory: &crate::state::GuardianFailureMemoryStore,
     operation_id: &crate::state::contracts::OperationId,
     error: &DownloadError,
     install_facts: &[ExecutionDownloadFact],
-    install_descriptors: &[SelectedDownloadArtifactDescriptor],
     observed_at: &str,
-) -> Option<GuardianArtifactRepairOutcome> {
+) {
     let evidence =
         install_failure_evidence_from_download_error_or_facts(operation_id, error, install_facts);
-    record_install_failure_evidence_and_repair(
+    record_install_failure_evidence(
         journals,
         failure_memory,
         operation_id,
         &evidence,
-        install_descriptors,
         observed_at,
     )
-    .await
+    .await;
 }
 
 fn install_error_log_kind(error: &DownloadError) -> &'static str {
@@ -725,14 +701,13 @@ fn install_error_log_kind(error: &DownloadError) -> &'static str {
     }
 }
 
-async fn record_install_failure_evidence_and_repair(
+async fn record_install_failure_evidence(
     journals: &crate::state::OperationJournalStore,
     failure_memory: &crate::state::GuardianFailureMemoryStore,
     operation_id: &crate::state::contracts::OperationId,
     evidence: &[GuardianInstallArtifactFailureEvidence],
-    install_descriptors: &[SelectedDownloadArtifactDescriptor],
     observed_at: &str,
-) -> Option<GuardianArtifactRepairOutcome> {
+) {
     if record_install_operation_guardian_evidence(
         journals,
         operation_id,
@@ -743,7 +718,7 @@ async fn record_install_failure_evidence_and_repair(
     .is_err()
     {
         tracing::warn!("failed to commit install Guardian evidence");
-        return None;
+        return;
     }
     let assessment = assess_install_guardian_failure(
         Some(failure_memory),
@@ -751,7 +726,9 @@ async fn record_install_failure_evidence_and_repair(
         evidence,
         crate::state::contracts::OperationPhase::Downloading,
         observed_at,
-    )?;
+    ) else {
+        return;
+    };
     if record_install_guardian_terminal_outcome(
         journals,
         Some(failure_memory),
@@ -765,35 +742,8 @@ async fn record_install_failure_evidence_and_repair(
     .is_err()
     {
         tracing::warn!("failed to commit install Guardian outcome");
-        return None;
+        return;
     }
-    let repair_client = reqwest::Client::new();
-    let repair_outcome = match repair_install_artifact_corruption_with_guardian(
-        journals,
-        failure_memory,
-        &repair_client,
-        assessment,
-        evidence,
-        install_descriptors,
-        observed_at,
-    )
-    .await
-    {
-        Ok(outcome) => outcome,
-        Err(_) => {
-            tracing::warn!("failed to commit install artifact-repair journal");
-            return None;
-        }
-    };
-    if let Some(repair_outcome) = repair_outcome.as_ref()
-        && record_install_operation_guardian_repair_outcome(journals, operation_id, repair_outcome)
-            .await
-            .is_err()
-    {
-        tracing::warn!("failed to commit install Guardian repair outcome");
-        return None;
-    }
-    repair_outcome
 }
 
 fn terminal_failure_progress_or_default(progress: Option<DownloadProgress>) -> DownloadProgress {
@@ -904,14 +854,10 @@ pub async fn install_status(
     let failure_point = journal
         .as_ref()
         .and_then(install_failure_point_from_journal);
-    let guardian_repair = journal
-        .as_ref()
-        .and_then(install_guardian_repair_summary_from_journal);
     let guardian = journal
         .as_ref()
         .and_then(install_guardian_outcome_summary_from_journal);
-    let failure_view_model =
-        install_failure_view_model(&view_model, guardian.as_ref(), guardian_repair.as_ref());
+    let failure_view_model = install_failure_view_model(&view_model, guardian.as_ref());
     let proof = journal
         .as_ref()
         .filter(|journal| install_journal_is_terminal(journal.status))
@@ -926,7 +872,6 @@ pub async fn install_status(
         failure_view_model,
         failure_point,
         guardian,
-        guardian_repair,
         proof,
     })
 }
@@ -1704,7 +1649,6 @@ pub(crate) fn effective_install_version_id(request: &InstallVersionStartRequest)
 fn install_failure_view_model(
     progress: &InstallProgressViewModel,
     guardian: Option<&GuardianInstallOutcomeSummary>,
-    repair: Option<&InstallGuardianRepairSummary>,
 ) -> Option<InstallFailureViewModel> {
     if !progress.failed {
         return None;
@@ -1712,7 +1656,6 @@ fn install_failure_view_model(
 
     let summary = guardian
         .map(|guardian| guardian.label().to_string())
-        .or_else(|| repair.map(|repair| repair.label.clone()))
         .unwrap_or_else(|| progress.label.clone());
     let mut details = Vec::new();
     push_install_failure_detail(
@@ -1724,26 +1667,19 @@ fn install_failure_view_model(
             push_install_failure_detail(&mut details, Some(guidance.clone()));
         }
     }
-    push_install_failure_detail(&mut details, repair.map(|repair| repair.label.clone()));
-    push_install_failure_detail(
-        &mut details,
-        repair.and_then(|repair| repair.detail.clone()),
-    );
-
     Some(InstallFailureViewModel {
-        state_id: failure_state_id(guardian, repair).to_string(),
+        state_id: failure_state_id(guardian).to_string(),
         title: "Install failed".to_string(),
         tone: "err".to_string(),
         detail: details.first().cloned(),
         details,
-        retry_action: install_retry_action(guardian, repair),
+        retry_action: install_retry_action(guardian),
         dismiss_action: InstallActionViewModel {
             action: "dismiss".to_string(),
             label: "Dismiss".to_string(),
             enabled: true,
             disabled_reason: None,
         },
-        repair_action: install_repair_action(repair),
         summary,
     })
 }
@@ -1758,18 +1694,7 @@ fn push_install_failure_detail(details: &mut Vec<String>, detail: Option<String>
     details.push(detail);
 }
 
-fn failure_state_id(
-    guardian: Option<&GuardianInstallOutcomeSummary>,
-    repair: Option<&InstallGuardianRepairSummary>,
-) -> &'static str {
-    if let Some(repair) = repair {
-        return match repair.status.as_str() {
-            "repaired" => "failed_repair_applied",
-            "blocked" => "failed_repair_blocked",
-            "failed" => "failed_repair_failed",
-            _ => "failed_repair_recorded",
-        };
-    }
+fn failure_state_id(guardian: Option<&GuardianInstallOutcomeSummary>) -> &'static str {
     match guardian.map(GuardianInstallOutcomeSummary::decision) {
         Some("retry") => "failed_retryable",
         Some("block") => "failed_blocked",
@@ -1781,17 +1706,7 @@ fn failure_state_id(
 
 fn install_retry_action(
     guardian: Option<&GuardianInstallOutcomeSummary>,
-    repair: Option<&InstallGuardianRepairSummary>,
 ) -> InstallActionViewModel {
-    if repair.is_some_and(|repair| repair.status == "repaired") {
-        return InstallActionViewModel {
-            action: "retry".to_string(),
-            label: "Retry install".to_string(),
-            enabled: true,
-            disabled_reason: None,
-        };
-    }
-
     if let Some(guardian) = guardian.filter(|guardian| {
         guardian.decision() == "block" && !blocking_guardian_allows_retry(guardian)
     }) {
@@ -1813,30 +1728,6 @@ fn install_retry_action(
 
 fn blocking_guardian_allows_retry(guardian: &GuardianInstallOutcomeSummary) -> bool {
     guardian.diagnosis_id() == DiagnosisId::ManagedRuntimeRosettaRequired
-}
-
-fn install_repair_action(repair: Option<&InstallGuardianRepairSummary>) -> InstallActionViewModel {
-    let Some(repair) = repair else {
-        return InstallActionViewModel {
-            action: "repair".to_string(),
-            label: "Automatic repair unavailable".to_string(),
-            enabled: false,
-            disabled_reason: Some("No automatic repair is available for this failure.".to_string()),
-        };
-    };
-
-    let label = match repair.status.as_str() {
-        "repaired" => "Automatic repair applied",
-        "blocked" => "Automatic repair blocked",
-        "failed" => "Automatic repair failed",
-        _ => "Automatic repair recorded",
-    };
-    InstallActionViewModel {
-        action: "repair".to_string(),
-        label: label.to_string(),
-        enabled: false,
-        disabled_reason: repair.detail.clone().or_else(|| Some(repair.label.clone())),
-    }
 }
 
 fn generate_install_id(prefix: &str) -> String {
