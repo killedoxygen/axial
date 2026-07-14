@@ -31,8 +31,8 @@ use crate::known_good::{
     KnownGoodArtifactKind, KnownGoodInstallReceipt, KnownGoodIntegrity,
     KnownGoodReconstructionReceipt, KnownGoodRoot, MAX_KNOWN_GOOD_ASSET_INDEX_BYTES,
     MAX_KNOWN_GOOD_VERSION_JSON_BYTES, MAX_TIER2_ARTIFACT_BYTES, ManagedComponentProjection,
-    ManagedKnownGoodComponent, PendingVanillaInstallReceipt, authenticate_pending_vanilla_install,
-    seal_completed_vanilla_install, seal_reconstructed_vanilla,
+    ManagedKnownGoodComponent, PendingKnownGoodInstallAuthority,
+    authenticate_pending_known_good_install, seal_reconstructed_vanilla,
 };
 use crate::known_good_libraries::{
     ClassifiedLibraryDownload, LibraryAcquisition, PendingExactLibraryDeclarations,
@@ -43,7 +43,7 @@ use crate::launch::{VersionJson, effective_java_version_for};
 use crate::managed_fs::ManagedDir;
 use crate::managed_publication::{ManagedRootPublicationLease, run_publication_blocking};
 use crate::manifest::{ManifestEntry, VersionManifest, fetch_fresh_install_version_manifest};
-use crate::paths::{assets_dir, libraries_dir, versions_dir};
+use crate::paths::{assets_dir, libraries_dir};
 use crate::rules::{Environment, default_environment};
 use crate::runtime::{ManagedRuntimeCache, RuntimeSourceReceipt, acquire_preferred_runtime_source};
 #[cfg(test)]
@@ -52,14 +52,14 @@ use crate::runtime::{
 };
 use crate::version_bundle_publication::{
     ManagedVersionBundleCommitReceipt, ManagedVersionBundleFailureReceipt,
-    ManagedVersionBundleRebuildError, publish_version_bundle,
+    ManagedVersionBundleRebuildError, ManagedVersionBundleSettlementFailure,
+    ManagedVersionBundleSettlementOutcome, publish_version_bundle,
 };
 use futures_util::StreamExt;
 use std::io;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::fs as async_fs;
 use tokio::sync::mpsc;
 
 pub struct Downloader {
@@ -204,24 +204,15 @@ pub(crate) struct ReconstructedVanillaAuthority {
     parts: VanillaAuthorityParts,
 }
 
-struct PendingVanillaInstall {
-    receipt: PendingVanillaInstallReceipt,
-    destinations: AllVanillaDestinationsMaterialized,
+struct PreparedVanillaPublication {
+    authority: PendingKnownGoodInstallAuthority,
+    source: AuthenticatedVersionBundleSource,
 }
 
-pub(crate) struct CompletedVanillaInstallAuthority {
-    receipt: PendingVanillaInstallReceipt,
-    _destinations: AllVanillaDestinationsMaterialized,
-}
-
-pub(crate) struct PendingVanillaInstallSourceAuthority {
+pub(crate) struct AuthenticatedVanillaInstallSources {
     parts: VanillaAuthorityParts,
-}
-
-struct AllVanillaDestinationsMaterialized {
-    version_id: String,
-    libraries: usize,
-    marker_removed: bool,
+    client_source: AuthenticatedSelectedArtifactSource,
+    log_config_source: Option<AuthenticatedSelectedArtifactSource>,
 }
 
 impl ReconstructedVanillaAuthority {
@@ -243,50 +234,46 @@ impl ReconstructedVanillaAuthority {
     }
 }
 
-impl PendingVanillaInstall {
-    fn validate_completion(&self, version_id: &str) -> Result<(), DownloadError> {
-        if self.destinations.version_id != version_id
-            || self.destinations.marker_removed
-            || self.destinations.libraries > crate::known_good::MAX_KNOWN_GOOD_ENTRIES
-        {
-            return Err(DownloadError::ResolveManifest(
-                "vanilla install completion identity mismatch".to_string(),
-            ));
-        }
-        Ok(())
-    }
-
-    fn complete_after_marker_removal(mut self) -> CompletedVanillaInstallAuthority {
-        self.destinations.marker_removed = true;
-        CompletedVanillaInstallAuthority {
-            receipt: self.receipt,
-            _destinations: self.destinations,
+impl AuthenticatedVanillaInstallSources {
+    fn new(
+        parts: VanillaAuthorityParts,
+        client_source: AuthenticatedSelectedArtifactSource,
+        log_config_source: Option<AuthenticatedSelectedArtifactSource>,
+    ) -> Self {
+        Self {
+            parts,
+            client_source,
+            log_config_source,
         }
     }
-}
 
-impl CompletedVanillaInstallAuthority {
-    pub(crate) fn into_pending_receipt(self) -> PendingVanillaInstallReceipt {
-        self.receipt
-    }
-}
-
-impl PendingVanillaInstallSourceAuthority {
-    fn new(parts: VanillaAuthorityParts) -> Self {
-        Self { parts }
-    }
-
-    pub(crate) fn into_parts(
-        self,
+    pub(crate) fn authentication_parts(
+        &self,
     ) -> (
-        VersionJson,
-        Environment,
-        crate::known_good_libraries::SealedExactLibraryDeclarations,
-        AuthenticatedSelectedArtifactSource,
-        Option<AuthenticatedSelectedArtifactSource>,
-        Option<RuntimeSourceReceipt>,
+        &VersionJson,
+        &Environment,
+        &crate::known_good_libraries::SealedExactLibraryDeclarations,
+        &AuthenticatedSelectedArtifactSource,
+        Option<&AuthenticatedSelectedArtifactSource>,
+        Option<&RuntimeSourceReceipt>,
     ) {
-        self.parts.into_parts()
+        (
+            &self.parts.version,
+            &self.parts.environment,
+            &self.parts.libraries,
+            &self.parts.version_source,
+            self.parts.asset_index_source.as_ref(),
+            self.parts.runtime_source.as_ref(),
+        )
+    }
+
+    fn into_version_bundle_source(self) -> AuthenticatedVersionBundleSource {
+        AuthenticatedVersionBundleSource {
+            version_id: self.parts.version.id,
+            version_json: self.parts.version_source,
+            client_jar: self.client_source,
+            log_config: self.log_config_source,
+        }
     }
 }
 
@@ -726,8 +713,7 @@ impl Downloader {
     where
         F: FnMut(DownloadProgress),
     {
-        let version_dir = versions_dir(self.managed_root()).join(version_id);
-        let marker_path = version_dir.join(".incomplete");
+        let managed_root = self.managed_root().to_path_buf();
         let plan = TransferPlan::shared();
         let mut send = |mut progress: DownloadProgress| {
             plan.stamp(&mut progress);
@@ -740,9 +726,7 @@ impl Downloader {
             let authenticated = self
                 .acquire_vanilla_plan(version_id, &version_manifest_entry, fact_tx.as_ref())
                 .await?;
-            async_fs::create_dir_all(&version_dir).await?;
-            async_fs::write(&marker_path, b"installing").await?;
-            let pending = self
+            let prepared = self
                 .install_version_inner(
                     version_id,
                     authenticated,
@@ -752,10 +736,9 @@ impl Downloader {
                     descriptor_tx.as_ref(),
                 )
                 .await?;
-            pending.validate_completion(version_id)?;
-            async_fs::remove_file(&marker_path).await?;
-            let completed = pending.complete_after_marker_removal();
-            Ok::<_, DownloadError>(seal_completed_vanilla_install(completed))
+            let lease = acquire_vanilla_publication_lease(managed_root, version_id).await?;
+            let publication = tokio::spawn(publish_prepared_vanilla_install(lease, prepared));
+            publication.await.map_err(version_bundle_task_error)?
         }
         .await;
 
@@ -797,12 +780,10 @@ impl Downloader {
         plan: &Arc<TransferPlan>,
         fact_tx: Option<&mpsc::UnboundedSender<ExecutionDownloadFact>>,
         descriptor_tx: Option<&mpsc::UnboundedSender<SelectedDownloadArtifactDescriptor>>,
-    ) -> Result<PendingVanillaInstall, DownloadError>
+    ) -> Result<PreparedVanillaPublication, DownloadError>
     where
         F: FnMut(DownloadProgress),
     {
-        let version_dir = versions_dir(self.managed_root()).join(version_id);
-        let json_path = version_dir.join(format!("{version_id}.json"));
         send(progress(
             "version_json",
             0,
@@ -819,23 +800,12 @@ impl Downloader {
             asset_index_source,
             runtime_source,
         } = authenticated;
-        let version_json_install = prepare_selected_artifact_install(
-            SelectedDownloadArtifactKind::VersionJson,
-            &json_path,
-            version_json_source.provider_url(),
-            version_json_source.logical_identity(),
-            version_json_source.expected(),
-            fact_tx,
-            descriptor_tx,
-        )
-        .await?;
-        let version_json_source = materialize_authenticated_selected_artifact_source(
-            version_json_install,
-            version_json_source,
-            fact_tx,
-        )
-        .await?;
-        let selected_library_count = library_jobs.len();
+        send(progress(
+            "version_json",
+            1,
+            1,
+            Some(format!("{version_id}.json")),
+        ));
         let asset_index_bytes = version
             .asset_index
             .size
@@ -916,23 +886,60 @@ impl Downloader {
             })?;
             let http_client = self.client.clone();
             let url = client.url.clone();
-            let jar_path = version_dir.join(format!("{version_id}.jar"));
             let expected = ExpectedIntegrity::from_mojang(client.size, &client.sha1);
+            let max_bytes = exact_version_bundle_source_limit(client.size, "client")?;
+            let logical_identity = version_id.to_string();
+            let target = selected_download_source_label(
+                SelectedDownloadArtifactKind::ClientJar,
+                version_id,
+            );
             let client_fact_tx = fact_tx.cloned();
-            let client_descriptor_tx = descriptor_tx.cloned();
             let client_jar_task = tokio::spawn(async move {
-                ensure_selected_artifact_with_client(
-                    SelectedDownloadArtifactKind::ClientJar,
-                    &http_client,
-                    &url,
-                    &jar_path,
-                    &expected,
-                    client_fact_tx.as_ref(),
-                    client_descriptor_tx.as_ref(),
-                )
-                .await?;
-                Ok::<(), DownloadError>(())
+                acquire_authenticated_selected_artifact_source(SelectedArtifactSourceRequest {
+                    client: &http_client,
+                    kind: SelectedDownloadArtifactKind::ClientJar,
+                    url: &url,
+                    logical_identity: &logical_identity,
+                    expected: &expected,
+                    max_bytes,
+                    target: &target,
+                    fact_tx: client_fact_tx.as_ref(),
+                })
+                .await
             });
+            let log_config_task = if let Some(logging) = version
+                .logging
+                .as_ref()
+                .and_then(|logging| logging.client.as_ref())
+            {
+                send(progress("log_config", 0, 1, Some(logging.file.id.clone())));
+                let http_client = self.client.clone();
+                let file = logging.file.clone();
+                let expected = ExpectedIntegrity::from_mojang(file.size, &file.sha1);
+                let max_bytes = exact_version_bundle_source_limit(file.size, "log config")?;
+                let target = selected_download_source_label(
+                    SelectedDownloadArtifactKind::LogConfig,
+                    &file.id,
+                );
+                let log_fact_tx = fact_tx.cloned();
+                Some(tokio::spawn(async move {
+                    acquire_authenticated_selected_artifact_source(
+                        SelectedArtifactSourceRequest {
+                            client: &http_client,
+                            kind: SelectedDownloadArtifactKind::LogConfig,
+                            url: &file.url,
+                            logical_identity: &file.id,
+                            expected: &expected,
+                            max_bytes,
+                            target: &target,
+                            fact_tx: log_fact_tx.as_ref(),
+                        },
+                    )
+                    .await
+                }))
+            } else {
+                None
+            };
             let mut asset_pipeline = asset_index_source.as_ref().map(|source| {
                 spawn_asset_download_pipeline(
                     self.managed_root().to_path_buf(),
@@ -1077,7 +1084,11 @@ impl Downloader {
                 Ok::<_, DownloadError>(proofs)
             }
             .await;
-            let client_jar_result = await_client_jar_download(client_jar_task).await;
+            let client_jar_result = await_selected_source_task(client_jar_task, "client").await;
+            let log_config_result = match log_config_task {
+                Some(task) => Some(await_selected_source_task(task, "log config").await),
+                None => None,
+            };
             if client_jar_result.is_ok() {
                 plan.add_done(client_jar_bytes);
                 send(progress(
@@ -1087,44 +1098,40 @@ impl Downloader {
                     Some(format!("{version_id}.jar")),
                 ));
             }
-            if client_jar_result.is_err() || library_result.is_err() {
+            if log_config_result.as_ref().is_some_and(Result::is_ok)
+                && let Some(logging) = version
+                    .logging
+                    .as_ref()
+                    .and_then(|logging| logging.client.as_ref())
+            {
+                plan.add_done(log_config_bytes);
+                send(progress("log_config", 1, 1, Some(logging.file.id.clone())));
+            }
+            if client_jar_result.is_err()
+                || log_config_result.as_ref().is_some_and(Result::is_err)
+                || library_result.is_err()
+            {
                 abort_asset_download_pipeline(asset_pipeline).await;
             } else {
                 await_asset_download_pipeline(asset_pipeline, send).await?;
             }
-            client_jar_result?;
+            let client_source = client_jar_result?;
+            let log_config_source = log_config_result.transpose()?;
             let library_proofs = library_result?;
-
-            if let Some(logging) = version
-                .logging
-                .as_ref()
-                .and_then(|logging| logging.client.as_ref())
-            {
-                let log_config_path = assets_dir(self.managed_root())
-                    .join("log_configs")
-                    .join(&logging.file.id);
-                send(progress("log_config", 0, 1, Some(logging.file.id.clone())));
-                let expected =
-                    ExpectedIntegrity::from_mojang(logging.file.size, &logging.file.sha1);
-                ensure_selected_artifact_with_client(
-                    SelectedDownloadArtifactKind::LogConfig,
-                    &self.client,
-                    &logging.file.url,
-                    &log_config_path,
-                    &expected,
-                    fact_tx,
-                    descriptor_tx,
-                )
-                .await?;
-                plan.add_done(log_config_bytes);
-            }
-            Ok::<_, DownloadError>((pending_library_declarations, library_proofs))
+            Ok::<_, DownloadError>((
+                pending_library_declarations,
+                library_proofs,
+                client_source,
+                log_config_source,
+            ))
         }
         .await;
 
-        let (runtime_receipt, (pending_library_declarations, library_proofs)) =
-            finish_runtime_pipeline_after_artifacts(runtime_pipeline, artifact_result, send)
-                .await?;
+        let (
+            runtime_receipt,
+            (pending_library_declarations, library_proofs, client_source, log_config_source),
+        ) = finish_runtime_pipeline_after_artifacts(runtime_pipeline, artifact_result, send)
+            .await?;
 
         let library_declarations = pending_library_declarations
             .seal_streamed(library_proofs)
@@ -1133,29 +1140,28 @@ impl Downloader {
                     "installed library declarations could not be completed: {error:?}"
                 ))
             })?;
-        let receipt = authenticate_pending_vanilla_install(
-            PendingVanillaInstallSourceAuthority::new(VanillaAuthorityParts {
+        let source_authority = AuthenticatedVanillaInstallSources::new(
+            VanillaAuthorityParts {
                 version,
                 environment,
                 libraries: library_declarations,
-                version_source: version_json_source.into_authenticated_source(),
+                version_source: version_json_source,
                 asset_index_source: asset_index_source
                     .map(MaterializedSelectedArtifactSource::into_authenticated_source),
                 runtime_source: runtime_receipt,
-            }),
-        )
-        .map_err(|error| {
-            DownloadError::ResolveManifest(format!(
-                "installed source inventory could not be derived: {error:?}"
-            ))
-        })?;
-        Ok(PendingVanillaInstall {
-            receipt,
-            destinations: AllVanillaDestinationsMaterialized {
-                version_id: version_id.to_string(),
-                libraries: selected_library_count,
-                marker_removed: false,
             },
+            client_source,
+            log_config_source,
+        );
+        let authority =
+            authenticate_pending_known_good_install(&source_authority).map_err(|error| {
+                DownloadError::ResolveManifest(format!(
+                    "installed source inventory could not be derived: {error:?}"
+                ))
+            })?;
+        Ok(PreparedVanillaPublication {
+            authority,
+            source: source_authority.into_version_bundle_source(),
         })
     }
 
@@ -1522,7 +1528,7 @@ fn exact_version_bundle_source_limit(size: i64, label: &str) -> Result<usize, Do
         .and_then(|size| usize::try_from(size).ok())
         .ok_or_else(|| {
             DownloadError::ResolveManifest(format!(
-                "authenticated {label} exceeds the reconstruction source limit"
+                "authenticated {label} exceeds the version bundle source limit"
             ))
         })
 }
@@ -1731,13 +1737,128 @@ fn parse_vanilla_version_source(
     Ok(version)
 }
 
-async fn await_client_jar_download(
-    task: tokio::task::JoinHandle<Result<(), DownloadError>>,
-) -> Result<(), DownloadError> {
-    task.await.map_err(client_jar_task_error)?
+enum LocalVersionBundleSettlement {
+    Commit(ManagedVersionBundleCommitReceipt),
+    Failure(ManagedVersionBundleFailureReceipt),
+    Retry(ManagedVersionBundleSettlementFailure),
 }
 
-fn client_jar_task_error(error: tokio::task::JoinError) -> DownloadError {
+async fn publish_prepared_vanilla_install(
+    lease: ManagedRootPublicationLease,
+    prepared: PreparedVanillaPublication,
+) -> Result<KnownGoodInstallReceipt, DownloadError> {
+    let PreparedVanillaPublication { authority, source } = prepared;
+    let publication = {
+        let projection = authority.version_bundle_projection().map_err(|_| {
+            version_bundle_install_error("version bundle projection could not be derived")
+        })?;
+        publish_version_bundle(lease, source, projection).await
+    };
+    let settlement = match publication {
+        Ok(receipt) => LocalVersionBundleSettlement::Commit(receipt),
+        Err(error) => match error.into_effect_receipt() {
+            Some(receipt) => LocalVersionBundleSettlement::Failure(receipt),
+            None => {
+                return Err(version_bundle_install_error(
+                    "version bundle publication failed before settlement",
+                ));
+            }
+        },
+    };
+    match settle_local_version_bundle(settlement).await {
+        ManagedVersionBundleSettlementOutcome::Committed => {
+            Ok(authority.seal_after_version_bundle_commit())
+        }
+        ManagedVersionBundleSettlementOutcome::RolledBack { .. } => Err(
+            version_bundle_install_error("version bundle publication rolled back"),
+        ),
+    }
+}
+
+async fn acquire_vanilla_publication_lease(
+    managed_root: PathBuf,
+    _version_id: &str,
+) -> Result<ManagedRootPublicationLease, DownloadError> {
+    let root = run_publication_blocking(move || {
+        std::fs::create_dir_all(&managed_root)?;
+        ManagedDir::open_root(&managed_root)
+    })
+    .await
+    .map_err(|_| version_bundle_install_error("version bundle root task stopped"))?
+    .map_err(|_| version_bundle_install_error("version bundle root is unavailable"))?;
+    #[cfg(test)]
+    notify_vanilla_publication_lease_wait_for_test(_version_id);
+    ManagedRootPublicationLease::acquire(root)
+        .await
+        .map_err(|_| version_bundle_install_error("version bundle publication lock failed"))
+}
+
+#[cfg(test)]
+static VANILLA_PUBLICATION_LEASE_WAIT_OBSERVERS: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<String, tokio::sync::oneshot::Sender<()>>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+pub(super) fn observe_vanilla_publication_lease_wait_for_test(
+    version_id: &str,
+) -> tokio::sync::oneshot::Receiver<()> {
+    let (reached_tx, reached_rx) = tokio::sync::oneshot::channel();
+    let replaced = VANILLA_PUBLICATION_LEASE_WAIT_OBSERVERS
+        .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(version_id.to_string(), reached_tx);
+    assert!(replaced.is_none(), "lease wait observer must be unique");
+    reached_rx
+}
+
+#[cfg(test)]
+fn notify_vanilla_publication_lease_wait_for_test(version_id: &str) {
+    let observer = VANILLA_PUBLICATION_LEASE_WAIT_OBSERVERS
+        .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(version_id);
+    if let Some(observer) = observer {
+        let _ = observer.send(());
+    }
+}
+
+async fn settle_local_version_bundle(
+    mut settlement: LocalVersionBundleSettlement,
+) -> ManagedVersionBundleSettlementOutcome {
+    let mut retry_delay = std::time::Duration::from_millis(25);
+    let maximum_retry_delay = std::time::Duration::from_secs(1);
+    loop {
+        let attempted = match settlement {
+            LocalVersionBundleSettlement::Commit(receipt) => receipt.settle().await,
+            LocalVersionBundleSettlement::Failure(receipt) => receipt.settle().await,
+            LocalVersionBundleSettlement::Retry(retry) => retry.retry().await,
+        };
+        match attempted {
+            Ok(outcome) => return outcome,
+            Err(retry) => {
+                settlement = LocalVersionBundleSettlement::Retry(retry);
+                tokio::time::sleep(retry_delay).await;
+                retry_delay = retry_delay.saturating_mul(2).min(maximum_retry_delay);
+            }
+        }
+    }
+}
+
+fn version_bundle_install_error(message: impl Into<String>) -> DownloadError {
+    DownloadError::ResolveManifest(message.into())
+}
+
+async fn await_selected_source_task(
+    task: tokio::task::JoinHandle<Result<AuthenticatedSelectedArtifactSource, DownloadError>>,
+    label: &'static str,
+) -> Result<AuthenticatedSelectedArtifactSource, DownloadError> {
+    task.await
+        .map_err(|error| selected_source_task_error(error, label))?
+}
+
+fn selected_source_task_error(error: tokio::task::JoinError, label: &str) -> DownloadError {
     let reason = if error.is_cancelled() {
         "cancelled"
     } else if error.is_panic() {
@@ -1745,9 +1866,18 @@ fn client_jar_task_error(error: tokio::task::JoinError) -> DownloadError {
     } else {
         "failed"
     };
-    DownloadError::FileOperation(io::Error::other(format!(
-        "client jar download task {reason}"
-    )))
+    DownloadError::FileOperation(io::Error::other(format!("{label} source task {reason}")))
+}
+
+fn version_bundle_task_error(error: tokio::task::JoinError) -> DownloadError {
+    let reason = if error.is_cancelled() {
+        "cancelled"
+    } else if error.is_panic() {
+        "panicked"
+    } else {
+        "failed"
+    };
+    version_bundle_install_error(format!("version bundle publication task {reason}"))
 }
 
 #[cfg(test)]

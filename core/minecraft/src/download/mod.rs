@@ -17,8 +17,8 @@ pub(crate) use assets::parse_asset_index;
 pub use assets::repair_virtual_assets_from_index;
 pub use install::Downloader;
 pub(crate) use install::{
-    AuthenticatedVersionBundleSource, CompletedVanillaInstallAuthority,
-    PendingVanillaInstallSourceAuthority, ReconstructedVanillaAuthority,
+    AuthenticatedVanillaInstallSources, AuthenticatedVersionBundleSource,
+    ReconstructedVanillaAuthority,
 };
 pub(crate) use install::{
     reconstruct_installer_library_declarations, reconstruct_installer_processor_sources,

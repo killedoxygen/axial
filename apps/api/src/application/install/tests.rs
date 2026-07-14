@@ -2326,8 +2326,8 @@ async fn request_install_error_keeps_terminal_artifact_target_for_failure_memory
 #[tokio::test]
 async fn error_based_install_repair_skips_stale_artifact_facts_for_runtime_failure() {
     let root = temp_root("install-runtime-stale-artifact-repair");
-    let destination = root.join("client.jar");
-    fs::write(&destination, b"already repaired client").expect("existing artifact");
+    let destination = root.join("library.jar");
+    fs::write(&destination, b"already repaired library").expect("existing artifact");
     let replacement = b"unexpected guardian repair".to_vec();
     let server = TestByteServer::start(replacement.clone());
     let journals = OperationJournalStore::new();
@@ -2336,13 +2336,13 @@ async fn error_based_install_repair_skips_stale_artifact_facts_for_runtime_failu
     begin_install_operation_journal(&journals, &operation_id, "1.11.2")
         .await
         .expect("record install journal");
-    let target_id = "minecraft_client_runtime_stale";
+    let target_id = "minecraft_library_runtime_stale";
     let facts = vec![download_fact(
         ExecutionDownloadFactKind::ChecksumMismatch,
         target_id,
     )];
     let descriptors = vec![selected_descriptor(
-        SelectedDownloadArtifactKind::ClientJar,
+        SelectedDownloadArtifactKind::Library,
         target_id,
         &destination,
         &server.url,
@@ -2366,7 +2366,7 @@ async fn error_based_install_repair_skips_stale_artifact_facts_for_runtime_failu
     assert!(outcome.is_none());
     assert_eq!(
         fs::read(&destination).expect("artifact should be untouched"),
-        b"already repaired client"
+        b"already repaired library"
     );
     assert_eq!(server.request_count(), 0);
     let entry = journals.get(&operation_id).expect("operation journal");
@@ -4742,20 +4742,20 @@ async fn install_journal_records_guardian_repair_summary_without_raw_details() {
 #[tokio::test]
 async fn install_guardian_repair_repairs_matching_checksum_failure() {
     let root = temp_root("guardian-install-repair");
-    let destination = root.join("client.jar");
-    fs::write(&destination, b"corrupt client").expect("corrupt artifact");
-    let replacement = b"fresh client".to_vec();
+    let destination = root.join("library.jar");
+    fs::write(&destination, b"corrupt library").expect("corrupt artifact");
+    let replacement = b"fresh library".to_vec();
     let server = TestByteServer::start(replacement.clone());
     let journals = OperationJournalStore::new();
     let failure_memory = GuardianFailureMemoryStore::new();
     let operation_id = install_operation_id("install-repair");
-    let target_id = "minecraft_client_1.21.5";
+    let target_id = "minecraft_library_example";
     let facts = vec![download_fact(
         ExecutionDownloadFactKind::ChecksumMismatch,
         target_id,
     )];
     let descriptors = vec![selected_descriptor(
-        SelectedDownloadArtifactKind::ClientJar,
+        SelectedDownloadArtifactKind::Library,
         target_id,
         &destination,
         &server.url,
@@ -4796,19 +4796,19 @@ async fn install_guardian_repair_repairs_matching_checksum_failure() {
 #[tokio::test]
 async fn install_guardian_repair_restores_missing_matching_artifact() {
     let root = temp_root("guardian-install-missing-repair");
-    let destination = root.join("missing-client.jar");
-    let replacement = b"fresh missing client".to_vec();
+    let destination = root.join("missing-library.jar");
+    let replacement = b"fresh missing library".to_vec();
     let server = TestByteServer::start(replacement.clone());
     let journals = OperationJournalStore::new();
     let failure_memory = GuardianFailureMemoryStore::new();
     let operation_id = install_operation_id("install-missing-repair");
-    let target_id = "minecraft_client_1.21.5_missing";
+    let target_id = "minecraft_library_example_missing";
     let facts = vec![download_fact(
         ExecutionDownloadFactKind::ArtifactMissing,
         target_id,
     )];
     let descriptors = vec![selected_descriptor(
-        SelectedDownloadArtifactKind::ClientJar,
+        SelectedDownloadArtifactKind::Library,
         target_id,
         &destination,
         &server.url,
@@ -4846,20 +4846,20 @@ async fn install_guardian_repair_restores_missing_matching_artifact() {
 #[tokio::test]
 async fn install_guardian_missing_artifact_repair_blocks_if_target_now_exists() {
     let root = temp_root("guardian-install-missing-now-exists");
-    let destination = root.join("existing-client.jar");
-    fs::write(&destination, b"existing client").expect("existing artifact");
-    let replacement = b"fresh client".to_vec();
+    let destination = root.join("existing-library.jar");
+    fs::write(&destination, b"existing library").expect("existing artifact");
+    let replacement = b"fresh library".to_vec();
     let server = TestByteServer::start(replacement.clone());
     let journals = OperationJournalStore::new();
     let failure_memory = GuardianFailureMemoryStore::new();
     let operation_id = install_operation_id("install-missing-now-exists");
-    let target_id = "minecraft_client_1.21.5_existing";
+    let target_id = "minecraft_library_example_existing";
     let facts = vec![download_fact(
         ExecutionDownloadFactKind::ArtifactMissing,
         target_id,
     )];
     let descriptors = vec![selected_descriptor(
-        SelectedDownloadArtifactKind::ClientJar,
+        SelectedDownloadArtifactKind::Library,
         target_id,
         &destination,
         &server.url,
@@ -4880,7 +4880,7 @@ async fn install_guardian_missing_artifact_repair_blocks_if_target_now_exists() 
     assert_eq!(outcome.status, GuardianArtifactRepairStatus::Blocked);
     assert_eq!(
         fs::read(&destination).expect("existing artifact is preserved"),
-        b"existing client"
+        b"existing library"
     );
     assert_eq!(server.request_count(), 0);
     let journal = journals.get(&outcome.operation_id).expect("repair journal");
@@ -4899,13 +4899,13 @@ async fn install_guardian_missing_artifact_repair_blocks_if_target_now_exists() 
 #[tokio::test]
 async fn install_guardian_repair_skips_artifact_missing_when_provider_failure_matches_target() {
     let root = temp_root("guardian-install-mixed-provider-failure");
-    let destination = root.join("missing-client.jar");
-    let replacement = b"fresh client".to_vec();
+    let destination = root.join("missing-library.jar");
+    let replacement = b"fresh library".to_vec();
     let server = TestByteServer::start(replacement.clone());
     let journals = OperationJournalStore::new();
     let failure_memory = GuardianFailureMemoryStore::new();
     let operation_id = install_operation_id("install-mixed-provider-failure");
-    let target_id = "minecraft_client_1.21.5_mixed";
+    let target_id = "minecraft_library_example_mixed";
     let facts = vec![
         download_fact(ExecutionDownloadFactKind::ArtifactMissing, target_id),
         ExecutionDownloadFact {
@@ -4915,7 +4915,7 @@ async fn install_guardian_repair_skips_artifact_missing_when_provider_failure_ma
         },
     ];
     let descriptors = vec![selected_descriptor(
-        SelectedDownloadArtifactKind::ClientJar,
+        SelectedDownloadArtifactKind::Library,
         target_id,
         &destination,
         &server.url,
@@ -4989,17 +4989,17 @@ async fn install_guardian_repair_skips_artifact_missing_when_later_terminal_fail
 #[tokio::test]
 async fn install_guardian_repair_ignores_unrepairable_or_unmatched_facts() {
     let root = temp_root("guardian-install-repair-noop");
-    let destination = root.join("client.jar");
-    fs::write(&destination, b"corrupt client").expect("corrupt artifact");
+    let destination = root.join("library.jar");
+    fs::write(&destination, b"corrupt library").expect("corrupt artifact");
     let journals = OperationJournalStore::new();
     let failure_memory = GuardianFailureMemoryStore::new();
     let operation_id = install_operation_id("install-no-repair");
     let descriptors = vec![selected_descriptor(
-        SelectedDownloadArtifactKind::ClientJar,
-        "client.jar",
+        SelectedDownloadArtifactKind::Library,
+        "minecraft_library_example",
         &destination,
-        "https://example.invalid/client.jar",
-        b"fresh client",
+        "https://example.invalid/library.jar",
+        b"fresh library",
     )];
 
     let network_outcome = record_repairable_install_failure(
@@ -5008,7 +5008,7 @@ async fn install_guardian_repair_ignores_unrepairable_or_unmatched_facts() {
         &operation_id,
         &[download_fact(
             ExecutionDownloadFactKind::NetworkFailure,
-            "client.jar",
+            "minecraft_library_example",
         )],
         &descriptors,
         "2026-06-15T10:00:00+00:00",
@@ -5030,7 +5030,10 @@ async fn install_guardian_repair_ignores_unrepairable_or_unmatched_facts() {
 
     assert!(network_outcome.is_none());
     assert!(unmatched_outcome.is_none());
-    assert_eq!(fs::read(&destination).expect("artifact"), b"corrupt client");
+    assert_eq!(
+        fs::read(&destination).expect("artifact"),
+        b"corrupt library"
+    );
     let memory = failure_memory.list();
     assert_eq!(memory.len(), 1);
     assert_eq!(memory[0].diagnosis_id, DiagnosisId::DownloadUnavailable);

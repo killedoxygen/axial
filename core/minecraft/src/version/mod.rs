@@ -343,13 +343,14 @@ pub fn scan_versions_snapshot(mc_dir: &Path) -> io::Result<VersionScanSnapshot> 
             continue;
         }
         let id = entry.file_name().to_string_lossy().to_string();
+        let reserved_loader_id = crate::loaders::api::is_reserved_installed_loader_id(&id);
         let json_path = entry_path.join(format!("{id}.json"));
         let data_result = dependencies.read_to_string(&json_path);
         let data = match data_result {
             Ok(data) => data,
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                let incomplete_marker = entry_path.join(".incomplete");
-                let incomplete = dependencies.exists(&incomplete_marker);
+                let incomplete =
+                    reserved_loader_id && dependencies.exists(&entry_path.join(".incomplete"));
                 if incomplete {
                     continue;
                 }
@@ -377,7 +378,6 @@ pub fn scan_versions_snapshot(mc_dir: &Path) -> io::Result<VersionScanSnapshot> 
                 continue;
             }
         };
-        let reserved_loader_id = crate::loaders::api::is_reserved_installed_loader_id(&id);
         match validate_materialized_loader_profile(
             &id,
             &stub.id,
@@ -404,10 +404,10 @@ pub fn scan_versions_snapshot(mc_dir: &Path) -> io::Result<VersionScanSnapshot> 
         let loader_profile = loader_profiles.get(id);
         let effective_parent = stub.inherits_from.clone();
         let jar_path = versions_dir.join(id).join(format!("{id}.jar"));
-        let incomplete_marker = versions_dir.join(id).join(".incomplete");
 
         let resolved_java = resolve_java_version(id, &stubs);
-        let incomplete = dependencies.exists(&incomplete_marker);
+        let incomplete = crate::loaders::api::is_reserved_installed_loader_id(id)
+            && dependencies.exists(&versions_dir.join(id).join(".incomplete"));
         let (launchable, status, status_detail, needs_install) = if incomplete {
             (
                 false,
@@ -703,6 +703,124 @@ mod tests {
             issue.kind == VersionScanIssueKind::VersionJsonMalformed
                 && issue.version_id.as_deref() == Some("1.21.1")
         }));
+
+        fs::remove_dir_all(&mc_dir).expect("remove temp test dir");
+    }
+
+    #[test]
+    fn scan_versions_ignores_stale_vanilla_incomplete_marker() {
+        let mc_dir = unique_test_dir("stale-vanilla-incomplete-marker");
+        let version_dir = mc_dir.join("versions").join("1.21.5");
+        fs::create_dir_all(&version_dir).expect("create version dir");
+        fs::write(
+            version_dir.join("1.21.5.json"),
+            r#"{
+                "id":"1.21.5",
+                "type":"release",
+                "mainClass":"net.minecraft.client.main.Main",
+                "libraries":[]
+            }"#,
+        )
+        .expect("write version json");
+        fs::write(version_dir.join("1.21.5.jar"), b"client").expect("write client jar");
+        fs::write(version_dir.join(".incomplete"), b"stale").expect("write stale marker");
+
+        let report = scan_versions_report(&mc_dir).expect("scan versions");
+        let version = report
+            .versions
+            .iter()
+            .find(|entry| entry.id == "1.21.5")
+            .expect("vanilla version exists");
+
+        assert_eq!(report.state, VersionScanState::Ready);
+        assert!(version.launchable);
+        assert_eq!(version.status, "ready");
+
+        fs::remove_dir_all(&mc_dir).expect("remove temp test dir");
+    }
+
+    #[test]
+    fn scan_versions_reports_missing_vanilla_json_despite_incomplete_marker() {
+        let mc_dir = unique_test_dir("missing-vanilla-json-with-marker");
+        let version_dir = mc_dir.join("versions").join("1.21.5");
+        fs::create_dir_all(&version_dir).expect("create version dir");
+        fs::write(version_dir.join(".incomplete"), b"stale").expect("write stale marker");
+
+        let report = scan_versions_report(&mc_dir).expect("scan versions");
+
+        assert_eq!(report.state, VersionScanState::Degraded);
+        assert!(report.versions.is_empty());
+        assert!(report.issues.iter().any(|issue| {
+            issue.kind == VersionScanIssueKind::VersionJsonMissing
+                && issue.version_id.as_deref() == Some("1.21.5")
+        }));
+
+        fs::remove_dir_all(&mc_dir).expect("remove temp test dir");
+    }
+
+    #[test]
+    fn scan_versions_suppresses_missing_json_for_reserved_loader_in_progress() {
+        let mc_dir = unique_test_dir("reserved-loader-missing-json");
+        let loader_id = installed_version_id_for(LoaderComponentId::Quilt, "1.21.5", "0.29.2")
+            .expect("valid loader identity");
+        let loader_dir = mc_dir.join("versions").join(loader_id);
+        fs::create_dir_all(&loader_dir).expect("create loader version dir");
+        fs::write(loader_dir.join(".incomplete"), b"installing").expect("write loader marker");
+
+        let report = scan_versions_report(&mc_dir).expect("scan versions");
+
+        assert_eq!(report.state, VersionScanState::Empty);
+        assert!(report.versions.is_empty());
+        assert!(report.issues.is_empty());
+
+        fs::remove_dir_all(&mc_dir).expect("remove temp test dir");
+    }
+
+    #[test]
+    fn scan_versions_retains_incomplete_marker_for_reserved_loader_id() {
+        let mc_dir = unique_test_dir("reserved-loader-incomplete-marker");
+        let versions_dir = mc_dir.join("versions");
+        let base_dir = versions_dir.join("1.21.5");
+        fs::create_dir_all(&base_dir).expect("create base version dir");
+        fs::write(
+            base_dir.join("1.21.5.json"),
+            r#"{
+                "id":"1.21.5",
+                "type":"release",
+                "mainClass":"net.minecraft.client.main.Main",
+                "libraries":[]
+            }"#,
+        )
+        .expect("write base version json");
+        fs::write(base_dir.join("1.21.5.jar"), b"client").expect("write base client jar");
+
+        let loader_id = installed_version_id_for(LoaderComponentId::Fabric, "1.21.5", "0.19.3")
+            .expect("valid loader identity");
+        let loader_dir = versions_dir.join(&loader_id);
+        fs::create_dir_all(&loader_dir).expect("create loader version dir");
+        fs::write(
+            loader_dir.join(format!("{loader_id}.json")),
+            format!(
+                r#"{{
+                    "id":"{loader_id}",
+                    "inheritsFrom":"1.21.5",
+                    "axialMaterialized":true,
+                    "type":"release"
+                }}"#
+            ),
+        )
+        .expect("write loader version json");
+        fs::write(loader_dir.join(".incomplete"), b"installing").expect("write loader marker");
+
+        let versions = scan_versions(&mc_dir).expect("scan versions");
+        let loader = versions
+            .iter()
+            .find(|entry| entry.id == loader_id)
+            .expect("loader version exists");
+
+        assert!(!loader.launchable);
+        assert_eq!(loader.status, "incomplete");
+        assert_eq!(loader.needs_install, loader_id);
 
         fs::remove_dir_all(&mc_dir).expect("remove temp test dir");
     }

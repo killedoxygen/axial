@@ -23,6 +23,7 @@ const RECONCILIATION_TARGET_DOMAIN: &[u8] = b"axial.guardian.artifact-target.v1"
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum GuardianArtifactDescriptorError {
+    UnsupportedAtomicBundleMember,
     MissingDestination,
     MissingProviderUrl,
     UnsupportedProviderUrl,
@@ -50,6 +51,7 @@ impl GuardianMinecraftArtifactRepairDescriptor {
     pub(crate) fn from_core_selected_descriptor(
         descriptor: &SelectedDownloadArtifactDescriptor,
     ) -> Result<Self, GuardianArtifactDescriptorError> {
+        let component = reconciliation_component(descriptor.kind)?;
         if descriptor.destination().as_os_str().is_empty() {
             return Err(GuardianArtifactDescriptorError::MissingDestination);
         }
@@ -69,7 +71,6 @@ impl GuardianMinecraftArtifactRepairDescriptor {
             target_id,
             OwnershipClass::LauncherManaged,
         );
-        let component = reconciliation_component(descriptor.kind);
         let reconciliation_target = exact_reconciliation_target(
             &target,
             component,
@@ -148,7 +149,7 @@ impl GuardianMinecraftArtifactRepairDescriptor {
         if expected_size.is_some_and(|expected_size| expected_size > max_bytes) {
             return Err(GuardianArtifactDescriptorError::ExpectedSizeExceedsMaxBytes);
         }
-        let component = ReconciliationComponent::VersionBundle;
+        let component = ReconciliationComponent::Libraries;
         let reconciliation_target = exact_reconciliation_target(
             &target,
             component,
@@ -173,14 +174,18 @@ impl GuardianMinecraftArtifactRepairDescriptor {
     }
 }
 
-const fn reconciliation_component(kind: SelectedDownloadArtifactKind) -> ReconciliationComponent {
+const fn reconciliation_component(
+    kind: SelectedDownloadArtifactKind,
+) -> Result<ReconciliationComponent, GuardianArtifactDescriptorError> {
     match kind {
         SelectedDownloadArtifactKind::VersionJson
         | SelectedDownloadArtifactKind::ClientJar
-        | SelectedDownloadArtifactKind::LogConfig => ReconciliationComponent::VersionBundle,
-        SelectedDownloadArtifactKind::Library => ReconciliationComponent::Libraries,
+        | SelectedDownloadArtifactKind::LogConfig => {
+            Err(GuardianArtifactDescriptorError::UnsupportedAtomicBundleMember)
+        }
+        SelectedDownloadArtifactKind::Library => Ok(ReconciliationComponent::Libraries),
         SelectedDownloadArtifactKind::AssetIndex | SelectedDownloadArtifactKind::AssetObject => {
-            ReconciliationComponent::Assets
+            Ok(ReconciliationComponent::Assets)
         }
     }
 }
@@ -358,7 +363,7 @@ mod tests {
         GuardianArtifactDescriptorError, GuardianMinecraftArtifactRepairDescriptor,
         MAX_MINECRAFT_REPAIR_ARTIFACT_BYTES,
     };
-    use crate::state::contracts::OwnershipClass;
+    use crate::state::contracts::{OwnershipClass, ReconciliationComponent};
     use axial_minecraft::download::{
         SelectedDownloadArtifactDescriptor, SelectedDownloadArtifactKind,
     };
@@ -368,17 +373,17 @@ mod tests {
     const ONE_MIB: u64 = 1 << 20;
 
     #[test]
-    fn typed_selected_descriptor_maps_to_guardian_repair_descriptor_and_redacts_debug() {
+    fn typed_library_descriptor_maps_to_guardian_repair_descriptor_and_redacts_debug() {
         let root = PathBuf::from("/tmp/axial/selected");
-        let destination = root.join("logs/log4j2.xml");
-        let checksum = sha1_hex(b"log config");
+        let destination = root.join("libraries/example/library.jar");
+        let checksum = sha1_hex(b"library");
         let core_descriptor = SelectedDownloadArtifactDescriptor::new(
-            SelectedDownloadArtifactKind::LogConfig,
-            "log4j2.xml",
+            SelectedDownloadArtifactKind::Library,
+            "minecraft_library_example",
             destination.clone(),
-            "https://example.invalid/log4j2.xml?token=secret",
+            "https://example.invalid/library.jar?token=secret",
             checksum.clone(),
-            Some(10),
+            Some(7),
             ONE_MIB,
         );
 
@@ -387,7 +392,7 @@ mod tests {
         )
         .expect("guardian descriptor");
 
-        assert_eq!(descriptor.target().id, "log4j2.xml");
+        assert_eq!(descriptor.target().id, "minecraft_library_example");
         assert!(
             descriptor
                 .reconciliation_target()
@@ -399,11 +404,12 @@ mod tests {
             descriptor.target().ownership,
             OwnershipClass::LauncherManaged
         );
+        assert_eq!(descriptor.component(), ReconciliationComponent::Libraries);
         assert_eq!(descriptor.destination(), destination);
         let source = descriptor.repair_source();
         assert_eq!(source.checksum_algorithm, "sha1");
         assert_eq!(source.expected_checksum, checksum);
-        assert_eq!(source.expected_size, Some(10));
+        assert_eq!(source.expected_size, Some(7));
         assert_eq!(source.max_bytes, Some(ONE_MIB));
 
         let debug = format!("{descriptor:?}").to_ascii_lowercase();
@@ -412,8 +418,35 @@ mod tests {
         assert!(!debug.contains("token"));
         assert!(!debug.contains("secret"));
         assert!(!debug.contains(&checksum));
-        assert!(debug.contains("log4j2.xml"));
+        assert!(debug.contains("minecraft_library_example"));
         assert!(debug.contains("sha1"));
+    }
+
+    #[test]
+    fn typed_selected_descriptor_rejects_atomic_version_bundle_members() {
+        for kind in [
+            SelectedDownloadArtifactKind::VersionJson,
+            SelectedDownloadArtifactKind::ClientJar,
+            SelectedDownloadArtifactKind::LogConfig,
+        ] {
+            let descriptor = SelectedDownloadArtifactDescriptor::new(
+                kind,
+                "atomic_bundle_member",
+                "/tmp/axial/selected/artifact",
+                "https://example.invalid/artifact",
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                Some(128),
+                ONE_MIB,
+            );
+
+            assert_eq!(
+                GuardianMinecraftArtifactRepairDescriptor::from_core_selected_descriptor(
+                    &descriptor,
+                )
+                .expect_err("bundle members require atomic publication"),
+                GuardianArtifactDescriptorError::UnsupportedAtomicBundleMember,
+            );
+        }
     }
 
     #[test]

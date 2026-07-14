@@ -5,6 +5,7 @@ use super::assets::{
 };
 use super::client::{adaptive_download_concurrency, build_http_client};
 use super::facts::{ExecutionDownloadRequest, execution_download_fact};
+use super::install::observe_vanilla_publication_lease_wait_for_test;
 use super::integrity::{
     download_size_mismatch, existing_asset_object_satisfies, existing_file_satisfies, hash_file,
     observe_hash_file_calls, verify_download_integrity,
@@ -41,6 +42,8 @@ use super::*;
 use crate::artifact_path::ArtifactRelativePath;
 use crate::known_good::KnownGoodArtifactKind;
 use crate::launch::{JavaVersion, Library, LibraryArtifact, LibraryDownload, maven_to_path};
+use crate::managed_fs::ManagedDir;
+use crate::managed_publication::ManagedRootPublicationLease;
 use crate::manifest::VersionManifest;
 use crate::paths::{assets_dir, libraries_dir, versions_dir};
 use crate::rules::Environment;
@@ -408,11 +411,6 @@ async fn install_version_with_facts_emits_private_download_facts_only() {
     assert!(
         facts
             .iter()
-            .any(|fact| fact.kind == ExecutionDownloadFactKind::MetadataMissing)
-    );
-    assert!(
-        facts
-            .iter()
             .any(|fact| fact.kind == ExecutionDownloadFactKind::ArtifactVerified)
     );
     assert!(
@@ -427,6 +425,14 @@ async fn install_version_with_facts_emits_private_download_facts_only() {
         descriptor.kind == SelectedDownloadArtifactKind::Library
             && descriptor.destination().ends_with("lib-1.0.0.jar")
     }));
+    assert!(descriptors.iter().all(|descriptor| {
+        !matches!(
+            descriptor.kind,
+            SelectedDownloadArtifactKind::VersionJson
+                | SelectedDownloadArtifactKind::ClientJar
+                | SelectedDownloadArtifactKind::LogConfig
+        )
+    }));
     let debug = format!("{:?}", descriptors[0]).to_ascii_lowercase();
     assert!(!debug.contains(root.to_string_lossy().as_ref()));
     assert!(!debug.contains("http://"));
@@ -435,8 +441,305 @@ async fn install_version_with_facts_emits_private_download_facts_only() {
     assert!(!progress_json.contains("facts"));
     assert!(!progress_json.contains("descriptors"));
     assert!(!progress_json.contains("sha1"));
+    let version_root = versions_dir(&root).join("overlap");
+    let version_json = fs::read(version_root.join("overlap.json")).expect("published version json");
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&version_json)
+            .expect("published version metadata")["id"]
+            .as_str(),
+        Some("overlap")
+    );
+    assert_eq!(
+        fs::read(version_root.join("overlap.jar")).expect("published client jar"),
+        b"client"
+    );
+    assert!(!version_root.join(".incomplete").exists());
+    assert_settled_version_bundle_lane(&root);
 
     let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn normal_install_publishes_and_settles_three_member_version_bundle() {
+    let version_id = "normal-three-member-success";
+    let root = temp_dir(version_id);
+    let (version_url, version_sha1, mut requests) =
+        spawn_reconstruction_parity_server(version_id).await;
+    let downloader = test_manifest_downloader(&root, version_id, &version_url, &version_sha1);
+
+    let receipt = timeout(
+        Duration::from_secs(10),
+        downloader.install_version(version_id, |_| {}),
+    )
+    .await
+    .expect("normal install should settle")
+    .expect("normal install should succeed");
+
+    assert_eq!(receipt.version_id(), version_id);
+    assert_normal_bundle_contents(&root, version_id, true);
+    assert_settled_version_bundle_lane(&root);
+    let requests = std::iter::from_fn(|| requests.try_recv().ok()).collect::<Vec<_>>();
+    for path in ["/version.json", "/client.jar", "/log-config.xml"] {
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request.as_str() == path)
+                .count(),
+            1,
+            "{path} must be fetched exactly once"
+        );
+    }
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn normal_install_accepts_effect_failure_that_settles_committed() {
+    let version_id = "normal-effect-committed";
+    let root = temp_dir(version_id);
+    let (version_url, version_sha1, _) = spawn_reconstruction_parity_server(version_id).await;
+    crate::version_bundle_publication::fail_after_committed_outcome_for_test(version_id);
+    let downloader = test_manifest_downloader(&root, version_id, &version_url, &version_sha1);
+
+    let receipt = timeout(
+        Duration::from_secs(10),
+        downloader.install_version(version_id, |_| {}),
+    )
+    .await
+    .expect("effect receipt settlement should terminate")
+    .expect("committed settlement should succeed");
+
+    assert_eq!(receipt.version_id(), version_id);
+    assert_normal_bundle_contents(&root, version_id, true);
+    assert_settled_version_bundle_lane(&root);
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn normal_install_settles_crash_after_artifact_promotion_before_returning() {
+    let version_id = "normal-crash-after-promotion";
+    let root = temp_dir(version_id);
+    let (version_url, version_sha1, _) = spawn_reconstruction_parity_server(version_id).await;
+    crate::version_bundle_publication::crash_after_artifact_promotion_for_test(
+        version_id,
+        KnownGoodArtifactKind::ClientJar,
+    );
+    let downloader = test_manifest_downloader(&root, version_id, &version_url, &version_sha1);
+
+    let error = timeout(
+        Duration::from_secs(10),
+        downloader.install_version(version_id, |_| {}),
+    )
+    .await
+    .expect("crashed publication settlement should terminate")
+    .expect_err("partially promoted bundle should settle rolled back");
+
+    assert!(error.to_string().contains("rolled back"));
+    let version_root = versions_dir(&root).join(version_id);
+    assert!(!version_root.join(format!("{version_id}.json")).exists());
+    assert!(!version_root.join(format!("{version_id}.jar")).exists());
+    assert!(
+        !assets_dir(&root)
+            .join("log_configs/reconstruction-log.xml")
+            .exists()
+    );
+    assert_settled_version_bundle_lane(&root);
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn normal_install_rolls_back_bundle_replacements_before_returning_error() {
+    let version_id = "normal-effect-rolled-back";
+    let root = temp_dir(version_id);
+    let version_root = versions_dir(&root).join(version_id);
+    let log_path = assets_dir(&root).join("log_configs/reconstruction-log.xml");
+    fs::create_dir_all(&version_root).expect("create previous version root");
+    fs::create_dir_all(log_path.parent().expect("log parent")).expect("create previous log root");
+    let previous_json = b"previous-version-json";
+    let previous_client = b"previous-client-jar";
+    let previous_log = b"previous-log-config";
+    fs::write(
+        version_root.join(format!("{version_id}.json")),
+        previous_json,
+    )
+    .expect("seed previous version json");
+    fs::write(
+        version_root.join(format!("{version_id}.jar")),
+        previous_client,
+    )
+    .expect("seed previous client jar");
+    fs::write(&log_path, previous_log).expect("seed previous log config");
+    let (version_url, version_sha1, _) = spawn_reconstruction_parity_server(version_id).await;
+    crate::version_bundle_publication::fail_after_promotions_for_test(version_id, 2);
+    let downloader = test_manifest_downloader(&root, version_id, &version_url, &version_sha1);
+
+    let error = timeout(
+        Duration::from_secs(10),
+        downloader.install_version(version_id, |_| {}),
+    )
+    .await
+    .expect("rollback settlement should terminate")
+    .expect_err("rolled-back publication must not return a receipt");
+
+    assert!(error.to_string().contains("rolled back"));
+    assert_eq!(
+        fs::read(version_root.join(format!("{version_id}.json"))).expect("restored version json"),
+        previous_json
+    );
+    assert_eq!(
+        fs::read(version_root.join(format!("{version_id}.jar"))).expect("restored client jar"),
+        previous_client
+    );
+    assert_eq!(
+        fs::read(log_path).expect("restored log config"),
+        previous_log
+    );
+    assert!(!version_root.join(".incomplete").exists());
+    assert_settled_version_bundle_lane(&root);
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn cancelling_normal_install_does_not_cancel_started_bundle_publication() {
+    let version_id = "normal-publication-cancellation";
+    let root = temp_dir(version_id);
+    let (version_url, version_sha1, _) = spawn_reconstruction_parity_server(version_id).await;
+    let (reached, release) =
+        crate::version_bundle_publication::pause_after_promotions_for_test(version_id, 1);
+    let downloader = test_manifest_downloader(&root, version_id, &version_url, &version_sha1);
+
+    let install = tokio::spawn(async move { downloader.install_version(version_id, |_| {}).await });
+    timeout(Duration::from_secs(10), reached)
+        .await
+        .expect("normal publication should reach its first promotion")
+        .expect("normal publication pause signal");
+    assert!(
+        !install.is_finished(),
+        "normal install must not return a receipt before publication settles"
+    );
+    install.abort();
+    assert!(
+        install
+            .await
+            .expect_err("outer install task should be cancelled")
+            .is_cancelled()
+    );
+    release
+        .send(())
+        .expect("release detached normal publication");
+
+    timeout(Duration::from_secs(10), async {
+        loop {
+            if normal_bundle_contents_match(&root, version_id, true)
+                && version_bundle_lane_is_settled(&root)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("detached normal publication should settle");
+    assert!(
+        !versions_dir(&root)
+            .join(version_id)
+            .join(".incomplete")
+            .exists()
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn cancelling_normal_install_while_waiting_for_lease_does_not_detach_publication() {
+    let version_id = "normal-lease-wait-cancellation";
+    let root = temp_dir(version_id);
+    fs::create_dir_all(&root).expect("create normal install root");
+    let held_lease = ManagedRootPublicationLease::acquire(
+        ManagedDir::open_root(&root).expect("open held normal install root"),
+    )
+    .await
+    .expect("acquire held normal install lease");
+    let reached = observe_vanilla_publication_lease_wait_for_test(version_id);
+    let (version_url, version_sha1, _) = spawn_reconstruction_parity_server(version_id).await;
+    let downloader = test_manifest_downloader(&root, version_id, &version_url, &version_sha1);
+
+    let install = tokio::spawn(async move { downloader.install_version(version_id, |_| {}).await });
+    timeout(Duration::from_secs(10), reached)
+        .await
+        .expect("normal install should reach lease admission")
+        .expect("normal install lease wait signal");
+    assert!(
+        !install.is_finished(),
+        "normal install must wait for the lease"
+    );
+    install.abort();
+    assert!(
+        install
+            .await
+            .expect_err("lease waiter should be cancelled")
+            .is_cancelled()
+    );
+
+    let probe = tokio::spawn(ManagedRootPublicationLease::acquire(
+        ManagedDir::open_root(&root).expect("open probe normal install root"),
+    ));
+    drop(held_lease);
+    let probe_lease = timeout(Duration::from_secs(10), probe)
+        .await
+        .expect("probe should acquire after cancelled waiter")
+        .expect("probe lease task should finish")
+        .expect("probe lease should be acquired");
+
+    let version_root = versions_dir(&root).join(version_id);
+    assert!(!version_root.join(format!("{version_id}.json")).exists());
+    assert!(!version_root.join(format!("{version_id}.jar")).exists());
+    assert!(
+        !assets_dir(&root)
+            .join("log_configs/reconstruction-log.xml")
+            .exists()
+    );
+    assert!(!root.join(".axial-publication/version-bundle").exists());
+
+    drop(probe_lease);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn normal_install_retries_local_version_bundle_settlement() {
+    let cases = [
+        (
+            "normal-settlement-retry",
+            crate::version_bundle_publication::fail_settlement_once_for_test as fn(&str),
+        ),
+        (
+            "normal-settlement-marker-retry",
+            crate::version_bundle_publication::fail_after_settlement_marker_for_test,
+        ),
+    ];
+
+    for (version_id, inject_failure) in cases {
+        let root = temp_dir(version_id);
+        let (version_url, version_sha1, _) = spawn_reconstruction_parity_server(version_id).await;
+        inject_failure(version_id);
+        let downloader = test_manifest_downloader(&root, version_id, &version_url, &version_sha1);
+
+        let receipt = timeout(
+            Duration::from_secs(10),
+            downloader.install_version(version_id, |_| {}),
+        )
+        .await
+        .expect("local settlement retry should terminate")
+        .expect("local settlement retry should preserve success");
+
+        assert_eq!(receipt.version_id(), version_id);
+        assert_normal_bundle_contents(&root, version_id, true);
+        assert_settled_version_bundle_lane(&root);
+        let _ = fs::remove_dir_all(root);
+    }
 }
 
 #[tokio::test]
@@ -459,7 +762,7 @@ async fn selected_missing_artifact_fact_is_emitted_before_download_failure() {
     let (descriptor_tx, mut descriptor_rx) = mpsc::unbounded_channel();
 
     let result = ensure_selected_artifact_with_client(
-        SelectedDownloadArtifactKind::ClientJar,
+        SelectedDownloadArtifactKind::Library,
         &client,
         &url,
         &destination,
@@ -482,7 +785,7 @@ async fn selected_missing_artifact_fact_is_emitted_before_download_failure() {
     }
     assert!(facts.iter().any(|fact| {
         fact.kind == ExecutionDownloadFactKind::ArtifactMissing
-            && fact.target == "minecraft_client_artifact"
+            && fact.target == "minecraft_library_artifact"
     }));
     assert!(
         facts
@@ -490,8 +793,8 @@ async fn selected_missing_artifact_fact_is_emitted_before_download_failure() {
             .any(|fact| fact.kind == ExecutionDownloadFactKind::ProviderFailure)
     );
     assert_eq!(descriptors.len(), 1);
-    assert_eq!(descriptors[0].kind, SelectedDownloadArtifactKind::ClientJar);
-    assert_eq!(descriptors[0].target, "minecraft_client_artifact");
+    assert_eq!(descriptors[0].kind, SelectedDownloadArtifactKind::Library);
+    assert_eq!(descriptors[0].target, "minecraft_library_artifact");
     assert!(!destination.exists());
 
     let _ = fs::remove_dir_all(root);
@@ -520,7 +823,7 @@ async fn selected_existing_corrupt_artifact_is_replaced_after_verified_download(
     let (descriptor_tx, mut descriptor_rx) = mpsc::unbounded_channel();
 
     let result = ensure_selected_artifact_with_client(
-        SelectedDownloadArtifactKind::ClientJar,
+        SelectedDownloadArtifactKind::Library,
         &client,
         &url,
         &destination,
@@ -544,7 +847,7 @@ async fn selected_existing_corrupt_artifact_is_replaced_after_verified_download(
     }
     assert!(facts.iter().any(|fact| {
         fact.kind == ExecutionDownloadFactKind::ChecksumMismatch
-            && fact.target == "minecraft_client_artifact"
+            && fact.target == "minecraft_library_artifact"
             && fact
                 .fields
                 .iter()
@@ -552,7 +855,7 @@ async fn selected_existing_corrupt_artifact_is_replaced_after_verified_download(
     }));
     assert!(facts.iter().any(|fact| {
         fact.kind == ExecutionDownloadFactKind::Promoted
-            && fact.target == "minecraft_client_artifact"
+            && fact.target == "minecraft_library_artifact"
             && fact
                 .fields
                 .iter()
@@ -569,8 +872,8 @@ async fn selected_existing_corrupt_artifact_is_replaced_after_verified_download(
             .any(|fact| fact.kind == ExecutionDownloadFactKind::Promoted)
     );
     assert_eq!(descriptors.len(), 1);
-    assert_eq!(descriptors[0].kind, SelectedDownloadArtifactKind::ClientJar);
-    assert_eq!(descriptors[0].target, "minecraft_client_artifact");
+    assert_eq!(descriptors[0].kind, SelectedDownloadArtifactKind::Library);
+    assert_eq!(descriptors[0].target, "minecraft_library_artifact");
 
     let _ = fs::remove_dir_all(root);
 }
@@ -586,7 +889,7 @@ async fn selected_existing_unsupported_artifact_blocks_without_network() {
     let (descriptor_tx, mut descriptor_rx) = mpsc::unbounded_channel();
 
     let result = ensure_selected_artifact_with_client(
-        SelectedDownloadArtifactKind::ClientJar,
+        SelectedDownloadArtifactKind::Library,
         &client,
         "http://127.0.0.1:9/artifact.jar",
         &destination,
@@ -624,7 +927,7 @@ async fn selected_existing_unsupported_artifact_blocks_without_network() {
             .any(|fact| fact.kind == ExecutionDownloadFactKind::WrittenToTemp)
     );
     assert_eq!(descriptors.len(), 1);
-    assert_eq!(descriptors[0].target, "minecraft_client_artifact");
+    assert_eq!(descriptors[0].target, "minecraft_library_artifact");
 
     let _ = fs::remove_dir_all(root);
 }
@@ -2027,15 +2330,20 @@ async fn promotion_sweep_preserves_live_other_pid_backup() {
 #[tokio::test]
 async fn selected_temp_sweep_removes_only_strict_stale_owner_names() {
     let root = temp_dir("selected-temp-owner-sweep");
-    let destination = root.join("version.json");
+    let destination = root.join("asset-index.json");
     fs::create_dir_all(&root).expect("source root");
     let stale_pid = unused_pid_for_test(&[std::process::id()]);
-    let stale = root.join(format!("version.json.axial-selected-tmp-{stale_pid}"));
+    let stale = root.join(format!("asset-index.json.axial-selected-tmp-{stale_pid}"));
     let current = selected_promotion_temp_path(&destination);
-    let malformed = root.join(format!("version.json.axial-selected-tmp-{stale_pid}-extra"));
+    let malformed = root.join(format!(
+        "asset-index.json.axial-selected-tmp-{stale_pid}-extra"
+    ));
     let foreign = root.join(format!("other.json.axial-selected-tmp-{stale_pid}"));
     let mut child = spawn_promotion_sweep_child_process();
-    let live = root.join(format!("version.json.axial-selected-tmp-{}", child.id()));
+    let live = root.join(format!(
+        "asset-index.json.axial-selected-tmp-{}",
+        child.id()
+    ));
     for path in [&stale, &current, &malformed, &foreign, &live] {
         fs::write(path, b"reserved").expect("write selected temp fixture");
     }
@@ -2544,6 +2852,66 @@ fn snapshot_tree(root: &Path) -> BTreeMap<PathBuf, SnapshotEntry> {
     let mut snapshot = BTreeMap::new();
     visit(root, root, &mut snapshot);
     snapshot
+}
+
+fn assert_normal_bundle_contents(root: &Path, version_id: &str, with_log_config: bool) {
+    let version_root = versions_dir(root).join(version_id);
+    let version_json =
+        fs::read(version_root.join(format!("{version_id}.json"))).expect("published version json");
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&version_json)
+            .expect("published version metadata")["id"]
+            .as_str(),
+        Some(version_id)
+    );
+    assert_eq!(
+        fs::read(version_root.join(format!("{version_id}.jar"))).expect("published client jar"),
+        b"reconstruction-client"
+    );
+    if with_log_config {
+        assert_eq!(
+            fs::read(assets_dir(root).join("log_configs/reconstruction-log.xml"))
+                .expect("published log config"),
+            b"<log4j/>"
+        );
+    }
+    assert!(!version_root.join(".incomplete").exists());
+}
+
+fn normal_bundle_contents_match(root: &Path, version_id: &str, with_log_config: bool) -> bool {
+    let version_root = versions_dir(root).join(version_id);
+    let version_matches = fs::read(version_root.join(format!("{version_id}.json")))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        .is_some_and(|version| version["id"].as_str() == Some(version_id));
+    let client_matches = fs::read(version_root.join(format!("{version_id}.jar")))
+        .is_ok_and(|bytes| bytes == b"reconstruction-client");
+    let log_matches = !with_log_config
+        || fs::read(assets_dir(root).join("log_configs/reconstruction-log.xml"))
+            .is_ok_and(|bytes| bytes == b"<log4j/>");
+    version_matches && client_matches && log_matches
+}
+
+fn assert_settled_version_bundle_lane(root: &Path) {
+    assert!(
+        version_bundle_lane_is_settled(root),
+        "version bundle lane must be terminally settled"
+    );
+}
+
+fn version_bundle_lane_is_settled(root: &Path) -> bool {
+    let lane = root.join(".axial-publication/version-bundle");
+    let Ok(entries) = fs::read_dir(&lane) else {
+        return false;
+    };
+    let mut names = entries
+        .filter_map(Result::ok)
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    names.sort();
+    names == vec!["quarantine".to_string(), "staging".to_string()]
+        && fs::read_dir(lane.join("quarantine")).is_ok_and(|mut entries| entries.next().is_none())
+        && fs::read_dir(lane.join("staging")).is_ok_and(|mut entries| entries.next().is_none())
 }
 
 async fn spawn_download_response_server(
@@ -3088,7 +3456,7 @@ async fn download_file_with_client_report_retries_interrupted_body_stream() {
 #[tokio::test]
 async fn authenticated_source_retry_preserves_destination_and_binds_observed_bytes() {
     let root = temp_dir("verified-source-retry-provider");
-    let destination = root.join("version.json");
+    let destination = root.join("asset-index.json");
     let temp_path = download_temp_path(&destination);
     fs::create_dir_all(&root).expect("source sentinel root");
     fs::write(&destination, b"installed-sentinel").expect("destination sentinel");
@@ -3171,7 +3539,7 @@ async fn authenticated_source_interrupted_retry_never_mutates_destination() {
 #[tokio::test]
 async fn authenticated_source_checksum_failure_never_mutates_destination() {
     let root = temp_dir("verified-source-checksum-failure");
-    let destination = root.join("version.json");
+    let destination = root.join("asset-index.json");
     let temp_path = download_temp_path(&destination);
     fs::create_dir_all(&root).expect("source sentinel root");
     fs::write(&destination, b"installed-sentinel").expect("destination sentinel");
@@ -3248,7 +3616,7 @@ async fn authenticated_source_size_failure_never_mutates_destination() {
 #[tokio::test]
 async fn authenticated_source_oversize_failure_never_mutates_destination() {
     let root = temp_dir("verified-source-oversize-failure");
-    let destination = root.join("version.json");
+    let destination = root.join("asset-index.json");
     let temp_path = download_temp_path(&destination);
     fs::create_dir_all(&root).expect("source sentinel root");
     fs::write(&destination, b"installed-sentinel").expect("destination sentinel");
@@ -3324,8 +3692,8 @@ async fn authenticated_source_provider_failure_never_mutates_destination() {
 #[tokio::test]
 async fn authenticated_source_materialization_consumes_matching_prepared_contract() {
     let root = temp_dir("verified-source-materialization-contract");
-    let destination = root.join("version.json");
-    let body = br#"{"id":"1.21.1"}"#.to_vec();
+    let destination = root.join("asset-index.json");
+    let body = br#"{"objects":{}}"#.to_vec();
     let expected = ExpectedIntegrity::from_mojang(body.len() as i64, &sha1_hex(&body));
     let (url, _) = spawn_scripted_download_server(vec![ScriptedDownloadResponse::full(
         "200 OK",
@@ -3334,10 +3702,10 @@ async fn authenticated_source_materialization_consumes_matching_prepared_contrac
     .await;
     let (fact_tx, mut fact_rx) = mpsc::unbounded_channel();
     let prepared = prepare_selected_artifact_install(
-        SelectedDownloadArtifactKind::VersionJson,
+        SelectedDownloadArtifactKind::AssetIndex,
         &destination,
         &url,
-        "1.21.1",
+        "fixture-assets",
         &expected,
         Some(&fact_tx),
         None,
@@ -3346,9 +3714,9 @@ async fn authenticated_source_materialization_consumes_matching_prepared_contrac
     .expect("prepare destination capability");
     let source = acquire_authenticated_selected_artifact_source(SelectedArtifactSourceRequest {
         client: &build_http_client(Duration::from_secs(5)),
-        kind: SelectedDownloadArtifactKind::VersionJson,
+        kind: SelectedDownloadArtifactKind::AssetIndex,
         url: &url,
-        logical_identity: "1.21.1",
+        logical_identity: "fixture-assets",
         expected: &expected,
         max_bytes: 1024,
         target: prepared.target(),
@@ -3380,7 +3748,7 @@ async fn authenticated_source_materialization_consumes_matching_prepared_contrac
 #[tokio::test]
 async fn authenticated_source_repeat_exact_materialization_reuses_with_retained_backup() {
     let root = temp_dir("selected-repeat-exact");
-    let destination = root.join("version.json");
+    let destination = root.join("asset-index.json");
     fs::create_dir_all(&root).expect("source root");
     fs::write(&destination, b"old-source").expect("old destination");
     let (prepared, source) = selected_materialization_fixture(&destination, b"new-source").await;
@@ -3488,20 +3856,20 @@ async fn authenticated_source_rejects_each_cross_identity_recombination_axis() {
         let source =
             acquire_authenticated_selected_artifact_source(SelectedArtifactSourceRequest {
                 client: &build_http_client(Duration::from_secs(5)),
-                kind: SelectedDownloadArtifactKind::VersionJson,
+                kind: SelectedDownloadArtifactKind::AssetIndex,
                 url: &source_url,
                 logical_identity: "shared-identity",
                 expected: &expected,
                 max_bytes: 1024,
-                target: "version_source",
+                target: "asset_index_source",
                 fact_tx: None,
             })
             .await
             .expect("acquire authenticated source");
         let prepared_kind = if case == "kind" {
-            SelectedDownloadArtifactKind::AssetIndex
+            SelectedDownloadArtifactKind::Library
         } else {
-            SelectedDownloadArtifactKind::VersionJson
+            SelectedDownloadArtifactKind::AssetIndex
         };
         let prepared_provider = if case == "provider" {
             format!("{source_url}?different-provider")
@@ -3547,17 +3915,17 @@ async fn authenticated_source_materialization_failure_emits_no_verified_fact() {
     fs::create_dir_all(&root).expect("source root");
     let blocked_parent = root.join("blocked-parent");
     fs::write(&blocked_parent, b"not-a-directory").expect("blocked parent");
-    let destination = blocked_parent.join("version.json");
-    let body = br#"{"id":"1.21.1"}"#.to_vec();
+    let destination = blocked_parent.join("asset-index.json");
+    let body = br#"{"objects":{}}"#.to_vec();
     let expected = ExpectedIntegrity::from_mojang(body.len() as i64, &sha1_hex(&body));
     let (url, _) =
         spawn_scripted_download_server(vec![ScriptedDownloadResponse::full("200 OK", body)]).await;
     let (fact_tx, mut fact_rx) = mpsc::unbounded_channel();
     let prepared = prepare_selected_artifact_install(
-        SelectedDownloadArtifactKind::VersionJson,
+        SelectedDownloadArtifactKind::AssetIndex,
         &destination,
         &url,
-        "1.21.1",
+        "fixture-assets",
         &expected,
         Some(&fact_tx),
         None,
@@ -3566,9 +3934,9 @@ async fn authenticated_source_materialization_failure_emits_no_verified_fact() {
     .expect("prepare destination capability");
     let source = acquire_authenticated_selected_artifact_source(SelectedArtifactSourceRequest {
         client: &build_http_client(Duration::from_secs(5)),
-        kind: SelectedDownloadArtifactKind::VersionJson,
+        kind: SelectedDownloadArtifactKind::AssetIndex,
         url: &url,
-        logical_identity: "1.21.1",
+        logical_identity: "fixture-assets",
         expected: &expected,
         max_bytes: 1024,
         target: prepared.target(),
@@ -3601,10 +3969,10 @@ async fn selected_materialization_fixture(
     let (url, _) =
         spawn_scripted_download_server(vec![ScriptedDownloadResponse::full("200 OK", body)]).await;
     let prepared = prepare_selected_artifact_install(
-        SelectedDownloadArtifactKind::VersionJson,
+        SelectedDownloadArtifactKind::AssetIndex,
         destination,
         &url,
-        "fixture-version",
+        "fixture-assets",
         &expected,
         None,
         None,
@@ -3613,9 +3981,9 @@ async fn selected_materialization_fixture(
     .expect("prepare selected materialization");
     let source = acquire_authenticated_selected_artifact_source(SelectedArtifactSourceRequest {
         client: &build_http_client(Duration::from_secs(5)),
-        kind: SelectedDownloadArtifactKind::VersionJson,
+        kind: SelectedDownloadArtifactKind::AssetIndex,
         url: &url,
-        logical_identity: "fixture-version",
+        logical_identity: "fixture-assets",
         expected: &expected,
         max_bytes: 1024,
         target: prepared.target(),
@@ -3660,7 +4028,7 @@ fn selected_reserved_backups(destination: &Path) -> Vec<PathBuf> {
 #[tokio::test]
 async fn authenticated_source_rejects_temp_path_substitution_before_namespace_mutation() {
     let root = temp_dir("selected-temp-substitution");
-    let destination = root.join("version.json");
+    let destination = root.join("asset-index.json");
     fs::create_dir_all(&root).expect("source root");
     fs::write(&destination, b"old-source").expect("old destination");
     let (prepared, source) = selected_materialization_fixture(&destination, b"new-source").await;
@@ -3709,7 +4077,7 @@ async fn authenticated_source_rejects_temp_path_substitution_before_namespace_mu
 #[tokio::test]
 async fn authenticated_source_post_publish_corruption_restores_exact_backup() {
     let root = temp_dir("selected-post-publish-restore");
-    let destination = root.join("version.json");
+    let destination = root.join("asset-index.json");
     fs::create_dir_all(&root).expect("source root");
     fs::write(&destination, b"old-source").expect("old destination");
     let (prepared, source) = selected_materialization_fixture(&destination, b"new-source").await;
@@ -3741,7 +4109,7 @@ async fn authenticated_source_post_publish_corruption_restores_exact_backup() {
 #[tokio::test]
 async fn authenticated_source_post_publish_corruption_restores_absence() {
     let root = temp_dir("selected-post-publish-absence");
-    let destination = root.join("version.json");
+    let destination = root.join("asset-index.json");
     fs::create_dir_all(&root).expect("source root");
     let (prepared, source) = selected_materialization_fixture(&destination, b"new-source").await;
     let control = selected_promotion_control(|stage, _temp, destination| {
@@ -3769,7 +4137,7 @@ async fn authenticated_source_post_publish_corruption_restores_absence() {
 #[tokio::test]
 async fn authenticated_source_forced_publish_failure_restores_backup_and_retains_temp() {
     let root = temp_dir("selected-forced-publish-restore");
-    let destination = root.join("version.json");
+    let destination = root.join("asset-index.json");
     fs::create_dir_all(&root).expect("source root");
     fs::write(&destination, b"old-source").expect("old destination");
     let (prepared, source) = selected_materialization_fixture(&destination, b"new-source").await;
@@ -3798,7 +4166,7 @@ async fn authenticated_source_forced_publish_failure_restores_backup_and_retains
 #[tokio::test]
 async fn authenticated_source_forced_publish_failure_restores_absence_and_retains_temp() {
     let root = temp_dir("selected-forced-publish-absence");
-    let destination = root.join("version.json");
+    let destination = root.join("asset-index.json");
     fs::create_dir_all(&root).expect("source root");
     let (prepared, source) = selected_materialization_fixture(&destination, b"new-source").await;
     let mut control = selected_promotion_control(|_, _, _| {});
@@ -3823,7 +4191,7 @@ async fn authenticated_source_forced_publish_failure_restores_absence_and_retain
 #[tokio::test]
 async fn authenticated_source_destination_substitution_never_deletes_foreign_replacement() {
     let root = temp_dir("selected-destination-substitution");
-    let destination = root.join("version.json");
+    let destination = root.join("asset-index.json");
     let displaced = root.join("displaced-authenticated-source");
     fs::create_dir_all(&root).expect("source root");
     fs::write(&destination, b"old-source").expect("old destination");
@@ -3873,7 +4241,7 @@ async fn authenticated_source_destination_substitution_never_deletes_foreign_rep
 #[tokio::test]
 async fn authenticated_source_cancellation_after_backup_still_settles_publication() {
     let root = temp_dir("selected-cancel-after-backup");
-    let destination = root.join("version.json");
+    let destination = root.join("asset-index.json");
     fs::create_dir_all(&root).expect("source root");
     fs::write(&destination, b"old-source").expect("old destination");
     let (prepared, source) = selected_materialization_fixture(&destination, b"new-source").await;
@@ -4216,7 +4584,7 @@ async fn prepared_library_publication_rejects_provider_url_substitution() {
 #[tokio::test]
 async fn authenticated_source_missing_temp_after_backup_restores_destination() {
     let root = temp_dir("selected-missing-temp-after-backup");
-    let destination = root.join("version.json");
+    let destination = root.join("asset-index.json");
     fs::create_dir_all(&root).expect("source root");
     fs::write(&destination, b"old-source").expect("old destination");
     let (prepared, source) = selected_materialization_fixture(&destination, b"new-source").await;
@@ -4244,7 +4612,7 @@ async fn authenticated_source_missing_temp_after_backup_restores_destination() {
 #[tokio::test]
 async fn authenticated_source_missing_publication_restores_destination() {
     let root = temp_dir("selected-missing-publication");
-    let destination = root.join("version.json");
+    let destination = root.join("asset-index.json");
     fs::create_dir_all(&root).expect("source root");
     fs::write(&destination, b"old-source").expect("old destination");
     let (prepared, source) = selected_materialization_fixture(&destination, b"new-source").await;
@@ -4272,7 +4640,7 @@ async fn authenticated_source_missing_publication_restores_destination() {
 #[tokio::test]
 async fn authenticated_source_foreign_backup_substitution_is_nonterminal_and_retained() {
     let root = temp_dir("selected-foreign-backup-cleanup");
-    let destination = root.join("version.json");
+    let destination = root.join("asset-index.json");
     let displaced_backup = root.join("displaced-exact-backup");
     fs::create_dir_all(&root).expect("source root");
     fs::write(&destination, b"old-source").expect("old destination");

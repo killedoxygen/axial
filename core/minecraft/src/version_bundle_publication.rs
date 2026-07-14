@@ -176,6 +176,7 @@ enum PublicationTestHook {
     },
     FailSettlementOnce,
     FailAfterSettlementMarkerOnce,
+    FailAfterCommittedOutcomeOnce,
 }
 
 #[cfg(test)]
@@ -2286,7 +2287,17 @@ fn reconstruct_terminal_context(
 }
 
 fn committed_receipt(context: TransactionContext) -> ManagedVersionBundleCommitReceipt {
-    let dispositions = context
+    let dispositions = committed_dispositions(&context);
+    ManagedVersionBundleCommitReceipt {
+        context: Arc::new(context),
+        dispositions,
+    }
+}
+
+fn committed_dispositions(
+    context: &TransactionContext,
+) -> Vec<ManagedVersionBundleOrdinalDisposition> {
+    context
         .entries
         .iter()
         .map(|entry| ManagedVersionBundleOrdinalDisposition {
@@ -2303,44 +2314,71 @@ fn committed_receipt(context: TransactionContext) -> ManagedVersionBundleCommitR
                 | EntryState::RollbackUncertain => unreachable!("terminal committed state"),
             },
         })
-        .collect();
-    ManagedVersionBundleCommitReceipt {
-        context: Arc::new(context),
-        dispositions,
-    }
+        .collect()
+}
+
+enum MutationDecision {
+    Committed(Vec<ManagedVersionBundleOrdinalDisposition>),
+    RolledBack { effect: ManagedVersionBundleEffect },
+    Pending { effect: ManagedVersionBundleEffect },
 }
 
 fn mutate(
     mut context: TransactionContext,
 ) -> Result<ManagedVersionBundleCommitReceipt, ManagedVersionBundleFailureReceipt> {
-    if prepare_canonical_targets(&mut context).is_err() {
-        return Err(rollback_failure(
+    let mut current_effect = ManagedVersionBundleEffect::Promotion;
+    let decision = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        mutate_in_place(&mut context, &mut current_effect)
+    }));
+    match decision {
+        Ok(MutationDecision::Committed(dispositions)) => Ok(ManagedVersionBundleCommitReceipt {
+            context: Arc::new(context),
+            dispositions,
+        }),
+        Ok(MutationDecision::RolledBack { effect }) => Err(terminal_failure(context, effect)),
+        Ok(MutationDecision::Pending { effect }) => Err(reconciliation_failure(context, effect)),
+        Err(_) => Err(reconciliation_failure(context, current_effect)),
+    }
+}
+
+fn mutate_in_place(
+    context: &mut TransactionContext,
+    current_effect: &mut ManagedVersionBundleEffect,
+) -> MutationDecision {
+    *current_effect = ManagedVersionBundleEffect::Promotion;
+    if prepare_canonical_targets(context).is_err() {
+        return rollback_mutation_failure(
             context,
             ManagedVersionBundleEffect::Promotion,
-        ));
+            current_effect,
+        );
     }
     for index in 0..context.entries.len() {
-        if context.lease.revalidate().is_err() || promote_entry(&mut context, index).is_err() {
-            return Err(rollback_failure(
+        if context.lease.revalidate().is_err() || promote_entry(context, index).is_err() {
+            return rollback_mutation_failure(
                 context,
                 ManagedVersionBundleEffect::Promotion,
-            ));
+                current_effect,
+            );
         }
         #[cfg(test)]
-        if apply_test_hook(&mut context, index + 1) {
-            return Err(rollback_failure(
+        if apply_test_hook(context, index + 1) {
+            return rollback_mutation_failure(
                 context,
                 ManagedVersionBundleEffect::Promotion,
-            ));
+                current_effect,
+            );
         }
     }
+    *current_effect = ManagedVersionBundleEffect::Postcheck;
     if sync_recorded_ancestors_bottom_up(context.lease.root(), &context.intent).is_err()
-        || verify_committed_physical(&context).is_err()
+        || verify_committed_physical(context).is_err()
     {
-        return Err(rollback_failure(
+        return rollback_mutation_failure(
             context,
             ManagedVersionBundleEffect::Postcheck,
-        ));
+            current_effect,
+        );
     }
     let outcome_guard = match write_outcome(
         &context.lane,
@@ -2349,24 +2387,57 @@ fn mutate(
     ) {
         Ok(guard) => guard,
         Err(_) => {
-            return Err(reconciliation_failure(
-                context,
-                ManagedVersionBundleEffect::Postcheck,
-            ));
+            return MutationDecision::Pending {
+                effect: ManagedVersionBundleEffect::Postcheck,
+            };
         }
     };
     context.outcome_guard = Some(outcome_guard);
-    if revalidate_committed(&context).is_err() {
-        context.outcome_guard = None;
-        return Err(ManagedVersionBundleFailureReceipt {
-            context: Arc::new(context),
+    #[cfg(test)]
+    if matches!(
+        context.test_hook.as_ref(),
+        Some(PublicationTestHook::FailAfterCommittedOutcomeOnce)
+    ) {
+        context.test_hook = None;
+        return MutationDecision::Pending {
             effect: ManagedVersionBundleEffect::Postcheck,
-            expectation: SettlementExpectation::PendingFailure {
-                effect: ManagedVersionBundleEffect::Postcheck,
-            },
-        });
+        };
     }
-    Ok(committed_receipt(context))
+    if revalidate_committed(context).is_err() {
+        context.outcome_guard = None;
+        return MutationDecision::Pending {
+            effect: ManagedVersionBundleEffect::Postcheck,
+        };
+    }
+    MutationDecision::Committed(committed_dispositions(context))
+}
+
+fn rollback_mutation_failure(
+    context: &mut TransactionContext,
+    effect: ManagedVersionBundleEffect,
+    current_effect: &mut ManagedVersionBundleEffect,
+) -> MutationDecision {
+    *current_effect = ManagedVersionBundleEffect::Rollback;
+    if rollback(context).is_ok() {
+        match write_outcome(
+            &context.lane,
+            &context.intent,
+            PersistedTerminalOutcome::RolledBack { effect },
+        ) {
+            Ok(guard) => context.outcome_guard = Some(guard),
+            Err(_) => {
+                return MutationDecision::Pending {
+                    effect: ManagedVersionBundleEffect::Rollback,
+                };
+            }
+        }
+        if revalidate_failure(context).is_ok() {
+            return MutationDecision::RolledBack { effect };
+        }
+    }
+    MutationDecision::Pending {
+        effect: ManagedVersionBundleEffect::Rollback,
+    }
 }
 
 fn promote_entry(context: &mut TransactionContext, index: usize) -> Result<(), LoaderError> {
@@ -2456,28 +2527,6 @@ fn promote_entry(context: &mut TransactionContext, index: usize) -> Result<(), L
         entry.fingerprint.size,
         &entry.fingerprint.digest,
     )
-}
-
-fn rollback_failure(
-    mut context: TransactionContext,
-    effect: ManagedVersionBundleEffect,
-) -> ManagedVersionBundleFailureReceipt {
-    if rollback(&mut context).is_ok() {
-        match write_outcome(
-            &context.lane,
-            &context.intent,
-            PersistedTerminalOutcome::RolledBack { effect },
-        ) {
-            Ok(guard) => context.outcome_guard = Some(guard),
-            Err(_) => {
-                return reconciliation_failure(context, ManagedVersionBundleEffect::Rollback);
-            }
-        }
-        if revalidate_failure(&context).is_ok() {
-            return terminal_failure(context, effect);
-        }
-    }
-    reconciliation_failure(context, ManagedVersionBundleEffect::Rollback)
 }
 
 fn rollback(context: &mut TransactionContext) -> Result<(), ()> {
@@ -2843,7 +2892,8 @@ fn apply_test_hook(context: &mut TransactionContext, promotions: usize) -> bool 
             | PublicationTestHook::CrashAfterPromotion { .. }
             | PublicationTestHook::CrashAfterQuarantine { .. }
             | PublicationTestHook::FailSettlementOnce
-            | PublicationTestHook::FailAfterSettlementMarkerOnce,
+            | PublicationTestHook::FailAfterSettlementMarkerOnce
+            | PublicationTestHook::FailAfterCommittedOutcomeOnce,
         )
         | None => false,
     }
@@ -2913,6 +2963,42 @@ pub(crate) fn crash_after_artifact_quarantine_for_test(
         .insert(
             version_id.to_string(),
             PublicationTestHook::CrashAfterQuarantine { kind },
+        );
+}
+
+#[cfg(test)]
+pub(crate) fn fail_after_committed_outcome_for_test(version_id: &str) {
+    TEST_HOOKS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(
+            version_id.to_string(),
+            PublicationTestHook::FailAfterCommittedOutcomeOnce,
+        );
+}
+
+#[cfg(test)]
+pub(crate) fn fail_settlement_once_for_test(version_id: &str) {
+    TEST_HOOKS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(
+            version_id.to_string(),
+            PublicationTestHook::FailSettlementOnce,
+        );
+}
+
+#[cfg(test)]
+pub(crate) fn fail_after_settlement_marker_for_test(version_id: &str) {
+    TEST_HOOKS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(
+            version_id.to_string(),
+            PublicationTestHook::FailAfterSettlementMarkerOnce,
         );
 }
 

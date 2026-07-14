@@ -2,9 +2,9 @@ use crate::artifact_path::{
     ArtifactRelativePath, MAX_ARTIFACT_PATH_SEGMENT_BYTES, MAX_ARTIFACT_RELATIVE_PATH_BYTES,
 };
 use crate::download::{
-    AuthenticatedSelectedArtifactSource, CompletedVanillaInstallAuthority, ExpectedIntegrity,
-    LibraryArtifactPlan, PendingVanillaInstallSourceAuthority, ReconstructedVanillaAuthority,
-    SelectedDownloadArtifactKind, library_artifact_plans_for, parse_asset_index,
+    AuthenticatedSelectedArtifactSource, AuthenticatedVanillaInstallSources, ExpectedIntegrity,
+    LibraryArtifactPlan, ReconstructedVanillaAuthority, SelectedDownloadArtifactKind,
+    library_artifact_plans_for, parse_asset_index,
 };
 use crate::known_good_libraries::{
     PendingInstallerPublications, RetainedInstallerLibrarySource, SealedExactLibraryDeclarations,
@@ -1080,7 +1080,7 @@ struct AuthenticatedKnownGoodReceipt {
     environment: Environment,
 }
 
-pub(crate) struct PendingVanillaInstallReceipt {
+pub(crate) struct PendingKnownGoodInstallAuthority {
     authenticated: AuthenticatedKnownGoodReceipt,
 }
 
@@ -1824,29 +1824,21 @@ pub(crate) fn seal_reconstructed_vanilla(
     let (version, environment, libraries, version_source, asset_source, runtime_source) =
         authority.into_parts();
     let authenticated = authenticate_vanilla_authority(
-        version,
-        environment,
-        libraries,
-        version_source,
-        asset_source,
-        runtime_source,
+        &version,
+        &environment,
+        &libraries,
+        &version_source,
+        asset_source.as_ref(),
+        runtime_source.as_ref(),
     )?;
     Ok(KnownGoodReconstructionReceipt { authenticated })
 }
 
-pub(crate) fn seal_completed_vanilla_install(
-    authority: CompletedVanillaInstallAuthority,
-) -> KnownGoodInstallReceipt {
-    KnownGoodInstallReceipt {
-        authenticated: authority.into_pending_receipt().authenticated,
-    }
-}
-
-pub(crate) fn authenticate_pending_vanilla_install(
-    authority: PendingVanillaInstallSourceAuthority,
-) -> Result<PendingVanillaInstallReceipt, KnownGoodInventoryError> {
+pub(crate) fn authenticate_pending_known_good_install(
+    authority: &AuthenticatedVanillaInstallSources,
+) -> Result<PendingKnownGoodInstallAuthority, KnownGoodInventoryError> {
     let (version, environment, libraries, version_source, asset_source, runtime_source) =
-        authority.into_parts();
+        authority.authentication_parts();
     let authenticated = authenticate_vanilla_authority(
         version,
         environment,
@@ -1855,19 +1847,19 @@ pub(crate) fn authenticate_pending_vanilla_install(
         asset_source,
         runtime_source,
     )?;
-    Ok(PendingVanillaInstallReceipt { authenticated })
+    Ok(PendingKnownGoodInstallAuthority { authenticated })
 }
 
 fn authenticate_vanilla_authority(
-    resolved_version: VersionJson,
-    environment: Environment,
-    libraries: SealedExactLibraryDeclarations,
-    version_source: AuthenticatedSelectedArtifactSource,
-    asset_source: Option<AuthenticatedSelectedArtifactSource>,
-    runtime_source: Option<RuntimeSourceReceipt>,
+    resolved_version: &VersionJson,
+    environment: &Environment,
+    libraries: &SealedExactLibraryDeclarations,
+    version_source: &AuthenticatedSelectedArtifactSource,
+    asset_source: Option<&AuthenticatedSelectedArtifactSource>,
+    runtime_source: Option<&RuntimeSourceReceipt>,
 ) -> Result<AuthenticatedKnownGoodReceipt, KnownGoodInventoryError> {
     if version_source.kind() != SelectedDownloadArtifactKind::VersionJson
-        || version_source.logical_identity() != resolved_version.id
+        || version_source.logical_identity() != resolved_version.id.as_str()
         || version_source.provider_url().trim().is_empty()
     {
         return Err(KnownGoodInventoryError::VersionIdentityMismatch);
@@ -1887,14 +1879,14 @@ fn authenticate_vanilla_authority(
         &authenticated.kind,
         &authenticated.java_version,
     );
-    if authenticated != resolved_version {
+    if &authenticated != resolved_version {
         return Err(KnownGoodInventoryError::VersionIdentityMismatch);
     }
-    let asset_index_bytes = match asset_source.as_ref() {
+    let asset_index_bytes = match asset_source {
         Some(source)
             if source.kind() == SelectedDownloadArtifactKind::AssetIndex
-                && source.logical_identity() == resolved_version.asset_index.id
-                && source.provider_url() == resolved_version.asset_index.url
+                && source.logical_identity() == resolved_version.asset_index.id.as_str()
+                && source.provider_url() == resolved_version.asset_index.url.as_str()
                 && source.expected()
                     == &ExpectedIntegrity::from_mojang(
                         resolved_version.asset_index.size,
@@ -1909,19 +1901,17 @@ fn authenticate_vanilla_authority(
     let version_id = KnownGoodId::new(&resolved_version.id)?;
     let version_metadata_size = u64::try_from(version_source.bytes().len())
         .map_err(|_| KnownGoodInventoryError::InputTooLarge)?;
-    let runtime_observation = runtime_source
-        .as_ref()
-        .map(|receipt| RuntimeSourceObservation {
-            component: receipt.component(),
-            manifest_bytes: receipt.bytes(),
-            manifest_expected: ExpectedIntegrity {
-                size: Some(receipt.expected_size()),
-                sha1: Some(receipt.expected_sha1().to_string()),
-            },
-        });
+    let runtime_observation = runtime_source.map(|receipt| RuntimeSourceObservation {
+        component: receipt.component(),
+        manifest_bytes: receipt.bytes(),
+        manifest_expected: ExpectedIntegrity {
+            size: Some(receipt.expected_size()),
+            sha1: Some(receipt.expected_sha1().to_string()),
+        },
+    });
     let inventory = derive_known_good_inventory(
-        &resolved_version,
-        &libraries,
+        resolved_version,
+        libraries,
         asset_index_bytes,
         VersionSourceObservation {
             identity: version_source.logical_identity(),
@@ -1929,14 +1919,30 @@ fn authenticate_vanilla_authority(
             metadata_size: version_metadata_size,
         },
         runtime_observation,
-        &environment,
+        environment,
     )?;
     Ok(AuthenticatedKnownGoodReceipt {
         version_id,
         inventory,
-        effective_version: resolved_version,
-        environment,
+        effective_version: resolved_version.clone(),
+        environment: environment.clone(),
     })
+}
+
+impl PendingKnownGoodInstallAuthority {
+    pub(crate) fn version_bundle_projection(
+        &self,
+    ) -> Result<ManagedComponentProjection<'_>, ManagedComponentProjectionError> {
+        self.authenticated
+            .inventory
+            .managed_component_projection(ManagedKnownGoodComponent::VersionBundle)
+    }
+
+    pub(crate) fn seal_after_version_bundle_commit(self) -> KnownGoodInstallReceipt {
+        KnownGoodInstallReceipt {
+            authenticated: self.authenticated,
+        }
+    }
 }
 
 impl KnownGoodActivationSource {
