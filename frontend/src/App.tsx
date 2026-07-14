@@ -27,6 +27,24 @@ type AccountSwitcherHostComponent = (typeof import('./views/accounts/AccountSwit
 let loadedCommandPalette: CommandPaletteComponent | null = null;
 let loadedAccountSwitcherHost: AccountSwitcherHostComponent | null = null;
 
+const deferredViewPreloads: (() => Promise<void>)[] = [
+  async () => {
+    loadedCommandPalette ??= (await import('./ui/CommandPalette')).CommandPalette;
+  },
+  async () => {
+    loadedAccountSwitcherHost ??= (await import('./views/accounts/AccountSwitcherHost')).AccountSwitcherHost;
+  },
+];
+
+/* Warm every lazily loaded view during idle time so the first navigation (or
+   first New Instance) renders synchronously instead of hitting a chunk load.
+   Failures are ignored: the lazy path retries on actual navigation. */
+export function preloadDeferredViews(): void {
+  for (const preload of deferredViewPreloads) {
+    void preload().catch(() => undefined);
+  }
+}
+
 const InstanceDetailRoute = createRouteLoader<{ id: string }>(
   async () => (await import('./views/instance/InstanceDetailView')).InstanceDetailView,
 );
@@ -56,6 +74,10 @@ const DevLabRouteView = loadDevLabView ? createRouteLoader(loadDevLabView) : nul
 
 function createRouteLoader<P extends object>(load: () => Promise<ComponentType<P>>): ComponentType<P> {
   let loadedView: ComponentType<P> | null = null;
+
+  deferredViewPreloads.push(async () => {
+    loadedView ??= await load();
+  });
 
   return function LazyRouteView(props: P): JSX.Element {
     const [View, setView] = useState<ComponentType<P> | null>(() => loadedView);

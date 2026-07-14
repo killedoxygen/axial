@@ -1,6 +1,6 @@
 import { render } from 'preact';
 import './styles';
-import { App } from './App';
+import { App, preloadDeferredViews } from './App';
 import { local } from './state';
 import {
   appVersion,
@@ -118,6 +118,7 @@ async function init(): Promise<void> {
     Music.applyConfig(configRes);
     bootstrapError.value = null;
     bootstrapState.value = 'ready';
+    scheduleDeferredViewWarmup();
     if (!setupRequired) refreshAccountSkin();
 
     const startupWarnings = Array.isArray(statusRes?.warnings) ? statusRes.warnings : [];
@@ -155,6 +156,17 @@ async function init(): Promise<void> {
   window.addEventListener('pointerdown', activateSound, { once: true, capture: true });
   window.addEventListener('touchstart', activateSound, { once: true, capture: true });
   window.addEventListener('keydown', activateSound, { once: true, capture: true });
+}
+
+function scheduleDeferredViewWarmup(): void {
+  const warm = (): void => preloadDeferredViews();
+  // WebKitGTK lacks requestIdleCallback; a short delay keeps the warmup off
+  // the first interactive frames there.
+  if (typeof window.requestIdleCallback === 'function') {
+    window.requestIdleCallback(warm, { timeout: 3000 });
+  } else {
+    window.setTimeout(warm, 400);
+  }
 }
 
 function registerNativeCloseBlockedToast(): void {
