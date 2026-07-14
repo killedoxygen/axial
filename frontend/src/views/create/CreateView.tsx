@@ -52,6 +52,10 @@ import {
 
 type CreateStep = 'version' | 'details';
 
+/* Last good create-view response per source, kept across dialog opens so the
+   version list renders immediately while a fresh copy loads in the background. */
+const createViewCache = new Map<string, CreateBackendViewResponse>();
+
 interface CreatePresetOption {
   id: string;
   label: string;
@@ -497,40 +501,28 @@ function CreateCard(): JSX.Element {
     if (next) setJvmPreset(next.id);
   };
 
-  const loadCreateView = async (source = sourceId, providedView?: CreateBackendViewResponse): Promise<void> => {
-    const requestId = loadRequestRef.current + 1;
-    loadRequestRef.current = requestId;
-    setViewLoading(true);
-    setViewError(null);
-    try {
-      const res: CreateBackendViewResponse & { error?: string } = providedView
-        ? providedView
-        : ((await api(
-            'GET',
-            `/instances/create-view?source=${encodeURIComponent(source)}`,
-          )) as CreateBackendViewResponse & { error?: string });
-      if (requestId !== loadRequestRef.current) return;
-      if (res.error) throw new Error(res.error);
-      loadedCreateViewSourceRef.current = source;
-      setBackendView(res);
-      const options = Array.isArray(res.preset_options)
-        ? res.preset_options.filter(
-            (option): option is CreatePresetOption =>
-              typeof option.id === 'string' && typeof option.label === 'string' && typeof option.detail === 'string',
-          )
-        : [];
-      setPresetOptions(options);
-      const selectableOptions = options.filter((option) => !option.disabled_reason);
-      const defaultPresetId = res.defaults?.jvm_preset_id;
-      const defaultOption =
-        selectableOptions.find((option) => option.id === defaultPresetId) ??
-        selectableOptions.find((option) => option.default) ??
-        selectableOptions[0];
-      if (defaultOption) {
-        setJvmPreset((current) =>
-          selectableOptions.some((option) => option.id === current) ? current : defaultOption.id,
-        );
-      }
+  const applyCreateView = (source: string, res: CreateBackendViewResponse, applyMutableDefaults = true): void => {
+    loadedCreateViewSourceRef.current = source;
+    setBackendView(res);
+    const options = Array.isArray(res.preset_options)
+      ? res.preset_options.filter(
+          (option): option is CreatePresetOption =>
+            typeof option.id === 'string' && typeof option.label === 'string' && typeof option.detail === 'string',
+        )
+      : [];
+    setPresetOptions(options);
+    const selectableOptions = options.filter((option) => !option.disabled_reason);
+    const defaultPresetId = res.defaults?.jvm_preset_id;
+    const defaultOption =
+      selectableOptions.find((option) => option.id === defaultPresetId) ??
+      selectableOptions.find((option) => option.default) ??
+      selectableOptions[0];
+    if (defaultOption) {
+      setJvmPreset((current) =>
+        selectableOptions.some((option) => option.id === current) ? current : defaultOption.id,
+      );
+    }
+    if (applyMutableDefaults) {
       const defaultMaxMemoryMb = res.defaults?.max_memory_mb;
       if (typeof defaultMaxMemoryMb === 'number' && Number.isFinite(defaultMaxMemoryMb) && defaultMaxMemoryMb > 0) {
         setMemoryGB(Math.max(1, Math.round((defaultMaxMemoryMb / 1024) * 2) / 2));
@@ -550,19 +542,48 @@ function CreateCard(): JSX.Element {
         );
         setWindowPresetId(defaultWindowPreset?.id ?? 'default');
       }
-      const defaultSource = res.defaults?.source_id;
-      const sources = Array.isArray(res.sources) ? res.sources.filter((option) => option.enabled) : [];
-      const nextSource = sources.find((option) => option.id === defaultSource) ?? sources[0];
-      if (nextSource)
-        setSourceId((current) => (sources.some((option) => option.id === current) ? current : nextSource.id));
-      const defaultChannel = normalizeChannel(res.defaults?.channel_id);
-      setChannel((current) => (CHANNEL_ORDER.includes(current) ? current : defaultChannel));
+    }
+    const defaultSource = res.defaults?.source_id;
+    const sources = Array.isArray(res.sources) ? res.sources.filter((option) => option.enabled) : [];
+    const nextSource = sources.find((option) => option.id === defaultSource) ?? sources[0];
+    if (nextSource)
+      setSourceId((current) => (sources.some((option) => option.id === current) ? current : nextSource.id));
+    const defaultChannel = normalizeChannel(res.defaults?.channel_id);
+    setChannel((current) => (CHANNEL_ORDER.includes(current) ? current : defaultChannel));
+  };
+
+  const loadCreateView = async (source = sourceId, providedView?: CreateBackendViewResponse): Promise<void> => {
+    const requestId = loadRequestRef.current + 1;
+    loadRequestRef.current = requestId;
+    if (providedView) {
+      createViewCache.set(source, providedView);
+      applyCreateView(source, providedView);
+      setViewLoading(false);
+      setViewError(null);
+      return;
+    }
+    const cached = createViewCache.get(source);
+    if (cached) applyCreateView(source, cached);
+    setViewLoading(!cached);
+    setViewError(null);
+    try {
+      const res = (await api(
+        'GET',
+        `/instances/create-view?source=${encodeURIComponent(source)}`,
+      )) as CreateBackendViewResponse & { error?: string };
+      if (requestId !== loadRequestRef.current) return;
+      if (res.error) throw new Error(res.error);
+      createViewCache.set(source, res);
+      applyCreateView(source, res, !cached);
     } catch (err: unknown) {
       if (requestId !== loadRequestRef.current) return;
-      if (loadedCreateViewSourceRef.current === source) loadedCreateViewSourceRef.current = null;
-      setBackendView(null);
-      setPresetOptions([]);
-      setViewError(errMessage(err));
+      // A failed background refresh keeps showing the cached view.
+      if (!cached) {
+        if (loadedCreateViewSourceRef.current === source) loadedCreateViewSourceRef.current = null;
+        setBackendView(null);
+        setPresetOptions([]);
+        setViewError(errMessage(err));
+      }
     } finally {
       if (requestId === loadRequestRef.current) setViewLoading(false);
     }

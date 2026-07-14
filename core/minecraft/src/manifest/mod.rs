@@ -2,6 +2,7 @@ use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -74,6 +75,13 @@ pub async fn fetch_version_manifest() -> Result<VersionManifest, String> {
 }
 
 pub async fn fetch_version_manifest_cached(library_dir: &Path) -> Result<VersionManifest, String> {
+    fetch_version_manifest_cached_from_url(library_dir, MANIFEST_URL).await
+}
+
+async fn fetch_version_manifest_cached_from_url(
+    library_dir: &Path,
+    manifest_url: &str,
+) -> Result<VersionManifest, String> {
     let cache_path = version_manifest_cache_path(library_dir);
 
     if let Some(value) = fresh_persistent_manifest_cache(&cache_path) {
@@ -86,11 +94,21 @@ pub async fn fetch_version_manifest_cached(library_dir: &Path) -> Result<Version
         return Ok(value);
     }
 
-    let cached_stale = stale_cached_manifest();
+    // Serve any stale manifest immediately and refresh in the background:
+    // callers on the interactive path (the create dialog) must not wait on
+    // the network once a manifest exists locally.
+    let stale = read_persistent_manifest_cache(&cache_path)
+        .ok()
+        .or_else(stale_cached_manifest);
+    if let Some(stale) = stale {
+        spawn_manifest_refresh(cache_path, manifest_url.to_string());
+        return Ok(stale);
+    }
+
     let (manifest, live_body) = resolve_manifest_from_live_or_cache(
         &cache_path,
-        fetch_manifest_live_body().await,
-        cached_stale,
+        fetch_manifest_live_body_from_url(manifest_url).await,
+        None,
     )?;
 
     if let Some(live_body) = live_body {
@@ -99,6 +117,22 @@ pub async fn fetch_version_manifest_cached(library_dir: &Path) -> Result<Version
 
     update_manifest_cache(manifest.clone());
     Ok(manifest)
+}
+
+fn spawn_manifest_refresh(cache_path: PathBuf, manifest_url: String) {
+    static REFRESH_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+    if REFRESH_IN_FLIGHT.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    tokio::spawn(async move {
+        if let Ok(body) = fetch_manifest_live_body_from_url(&manifest_url).await
+            && let Ok(manifest) = parse_manifest_body(&body)
+        {
+            let _ = write_persistent_manifest_cache(&cache_path, &body).await;
+            update_manifest_cache(manifest);
+        }
+        REFRESH_IN_FLIGHT.store(false, Ordering::Release);
+    });
 }
 
 fn fresh_cached_manifest() -> Option<VersionManifest> {
@@ -391,6 +425,32 @@ mod tests {
 
         assert_eq!(manifest.latest.release, "1.21.3");
         assert!(live_body.is_none());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn expired_persistent_cache_is_served_stale_without_waiting_on_the_network() {
+        let root = temp_dir("manifest-cache-swr");
+        let cache_path = version_manifest_cache_path(&root);
+        write_persistent_manifest_cache(&cache_path, sample_manifest_body("1.21.8").as_bytes())
+            .await
+            .expect("write cache");
+        let cache_file = fs::OpenOptions::new()
+            .write(true)
+            .open(&cache_path)
+            .expect("open cache");
+        cache_file
+            .set_modified(SystemTime::now() - CACHE_TTL - Duration::from_secs(60))
+            .expect("backdate cache");
+        let manifest = fetch_version_manifest_cached_from_url(
+            &root,
+            "http://127.0.0.1:9/version_manifest_v2.json",
+        )
+        .await
+        .expect("stale manifest should be served");
+
+        assert_eq!(manifest.latest.release, "1.21.8");
 
         let _ = fs::remove_dir_all(root);
     }
