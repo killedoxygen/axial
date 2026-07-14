@@ -97,7 +97,7 @@ fn content_queue_view_model_retains_semantic_intent_without_download_urls() {
                 version_id: Some("version-2".to_string()),
             }],
             allow_incompatible: false,
-            remove_instance_on_failure: false,
+            setup_cleanup: None,
         },
     };
 
@@ -115,7 +115,7 @@ fn setup_owned_content_actions_are_identified_for_cleanup() {
     let action = ContentQueueAction::Install {
         selections: Vec::new(),
         allow_incompatible: false,
-        remove_instance_on_failure: true,
+        setup_cleanup: Some(SetupInstanceCleanup { baseline: None }),
     };
 
     assert!(content_action_owns_instance(&action));
@@ -151,7 +151,7 @@ async fn public_queue_payload_cannot_claim_instance_cleanup_ownership() {
     }))
     .expect("deserialize public queue request");
 
-    let spec = install_queue_spec_from_request(&state, request, None, false)
+    let spec = install_queue_spec_from_request(&state, request, None, None)
         .await
         .expect("build public queue spec");
     let InstallQueueSpec::Content { action, .. } = spec else {
@@ -176,6 +176,7 @@ async fn setup_owned_content_does_not_run_after_its_base_install_failed() {
             None,
         )
         .expect("create setup instance");
+    let cleanup = setup_instance_cleanup(&state, &instance, false);
     let action = ContentQueueAction::Install {
         selections: vec![QueuedContentSelection {
             canonical_id: "modrinth:test".to_string(),
@@ -183,7 +184,7 @@ async fn setup_owned_content_does_not_run_after_its_base_install_failed() {
             version_id: Some("version-1".to_string()),
         }],
         allow_incompatible: false,
-        remove_instance_on_failure: true,
+        setup_cleanup: Some(cleanup),
     };
 
     let started = start_content_operation(&state, &instance.id, "Setup content", &action)
@@ -209,6 +210,7 @@ async fn canceling_setup_content_preserves_a_running_instance() {
             None,
         )
         .expect("create setup instance");
+    let cleanup = setup_instance_cleanup(&state, &instance, false);
     let marker = state
         .instances()
         .game_dir(&instance.id)
@@ -228,7 +230,7 @@ async fn canceling_setup_content_preserves_a_running_instance() {
                 action: ContentQueueAction::Install {
                     selections: Vec::new(),
                     allow_incompatible: false,
-                    remove_instance_on_failure: true,
+                    setup_cleanup: Some(cleanup),
                 },
                 prerequisite_queue_id: None,
             },
@@ -251,6 +253,118 @@ async fn canceling_setup_content_preserves_a_running_instance() {
 }
 
 #[tokio::test]
+async fn canceling_setup_content_preserves_user_added_files() {
+    let root = temp_root("modified-setup-cancellation");
+    let state = build_test_state(&root);
+    let instance = state
+        .instances()
+        .add(
+            "Modified setup".to_string(),
+            "1.21.1".to_string(),
+            String::new(),
+            String::new(),
+            None,
+        )
+        .expect("create setup instance");
+    let cleanup = setup_instance_cleanup(&state, &instance, false);
+    let world_dir = state
+        .instances()
+        .game_dir(&instance.id)
+        .join("saves")
+        .join("My World");
+    fs::create_dir_all(&world_dir).expect("create user world");
+    fs::write(world_dir.join("level.dat"), "user data").expect("write user world");
+    state
+        .installs()
+        .enqueue_queued_install(
+            "setup-content".to_string(),
+            InstallQueueSpec::Content {
+                instance_id: instance.id.clone(),
+                label: "Setup content".to_string(),
+                action: ContentQueueAction::Install {
+                    selections: Vec::new(),
+                    allow_incompatible: false,
+                    setup_cleanup: Some(cleanup),
+                },
+                prerequisite_queue_id: None,
+            },
+            InstallQueuePlacement::Back,
+        )
+        .await;
+
+    let response = remove_queued_install(&state, "setup-content")
+        .await
+        .expect("remove queued setup content");
+
+    assert_eq!(response.removed_instance_id, None);
+    assert!(state.instances().get(&instance.id).is_some());
+    assert_eq!(
+        fs::read_to_string(world_dir.join("level.dat")).expect("preserved user world"),
+        "user data"
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn setup_cleanup_preserves_modified_instance_settings() {
+    let root = temp_root("modified-setup-settings");
+    let state = build_test_state(&root);
+    let instance = state
+        .instances()
+        .add(
+            "Original setup".to_string(),
+            "1.21.1".to_string(),
+            String::new(),
+            String::new(),
+            None,
+        )
+        .expect("create setup instance");
+    let cleanup = setup_instance_cleanup(&state, &instance, false);
+    let mut modified = instance.clone();
+    modified.name = "User renamed setup".to_string();
+    modified.max_memory_mb = 6144;
+    state
+        .instances()
+        .update(modified.clone())
+        .expect("update instance settings");
+
+    assert!(!remove_pristine_setup_instance(&state, &instance.id, &cleanup).await);
+    assert_eq!(state.instances().get(&instance.id), Some(modified));
+    assert!(state.instances().game_dir(&instance.id).exists());
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn setup_cleanup_preserves_modified_seeded_settings_files() {
+    let root = temp_root("modified-seeded-setup-settings");
+    let state = build_test_state(&root);
+    let library_dir = root.join("library");
+    configure_library_dir(&state, &library_dir);
+    fs::write(library_dir.join("options.txt"), "original").expect("write shared settings");
+    let instance = state
+        .instances()
+        .add(
+            "Seeded setup".to_string(),
+            "1.21.1".to_string(),
+            String::new(),
+            String::new(),
+            Some(&library_dir),
+        )
+        .expect("create seeded setup instance");
+    let cleanup = setup_instance_cleanup(&state, &instance, true);
+    let options = state.instances().game_dir(&instance.id).join("options.txt");
+    fs::write(&options, "modified").expect("modify seeded settings");
+
+    assert!(!remove_pristine_setup_instance(&state, &instance.id, &cleanup).await);
+    assert_eq!(
+        fs::read_to_string(options).expect("preserved settings"),
+        "modified"
+    );
+    assert!(state.instances().get(&instance.id).is_some());
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
 async fn busy_setup_content_failure_preserves_a_running_instance() {
     let root = temp_root("running-setup-start-conflict");
     let state = build_test_state(&root);
@@ -267,6 +381,7 @@ async fn busy_setup_content_failure_preserves_a_running_instance() {
             None,
         )
         .expect("create setup instance");
+    let cleanup = setup_instance_cleanup(&state, &instance, false);
     let marker = state
         .instances()
         .game_dir(&instance.id)
@@ -283,7 +398,7 @@ async fn busy_setup_content_failure_preserves_a_running_instance() {
             version_id: Some("version-1".to_string()),
         }],
         allow_incompatible: false,
-        remove_instance_on_failure: true,
+        setup_cleanup: Some(cleanup),
     };
 
     let started = start_content_operation(&state, &instance.id, "Setup content", &action)
@@ -320,10 +435,12 @@ async fn interrupted_setup_worker_cleans_up_an_inactive_instance() {
             None,
         )
         .expect("create setup instance");
+    let cleanup = setup_instance_cleanup(&state, &instance, false);
     let install_id = "interrupted-setup".to_string();
     state.installs().insert(install_id.clone()).await;
     let interrupted_state = state.clone();
     let interrupted_instance_id = instance.id.clone();
+    let interrupted_cleanup = cleanup.clone();
 
     InstallStore::spawn_tracked_worker_with_async_interrupt_handler(
         state.installs().clone(),
@@ -331,7 +448,12 @@ async fn interrupted_setup_worker_cleans_up_an_inactive_instance() {
         content_interrupted_progress(false),
         async { panic!("simulated interrupted setup worker") },
         move |_| async move {
-            interrupted_content_progress(&interrupted_state, &interrupted_instance_id, true).await
+            interrupted_content_progress(
+                &interrupted_state,
+                &interrupted_instance_id,
+                Some(&interrupted_cleanup),
+            )
+            .await
         },
     )
     .await
@@ -364,6 +486,7 @@ async fn failed_queue_prerequisite_discards_setup_content_and_its_instance() {
             None,
         )
         .expect("create setup instance");
+    let cleanup = setup_instance_cleanup(&state, &instance, false);
     state
         .installs()
         .enqueue_queued_install(
@@ -402,7 +525,7 @@ async fn failed_queue_prerequisite_discards_setup_content_and_its_instance() {
             ..InstallQueueRequest::default()
         },
         Some("base-queue".to_string()),
-        true,
+        Some(cleanup),
     )
     .await
     .expect("queue dependent content");

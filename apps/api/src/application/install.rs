@@ -28,15 +28,19 @@ use crate::state::contracts::OperationId;
 use crate::state::{
     ActiveQueuedInstallEntry, ContentQueueAction, InstallQueueEnqueueOutcome,
     InstallQueuePlacement, InstallQueueSnapshot, InstallQueueSpec, InstallStore,
-    OperationJournalStore, QueuedContentSelection, QueuedInstallEntry,
+    OperationJournalStore, QueuedContentSelection, QueuedInstallEntry, SetupInstanceBaseline,
+    SetupInstanceCleanup, SetupInstancePathKind, SetupInstancePathSnapshot,
 };
+use axial_config::{INSTANCE_LAYOUT_DIRS, Instance, SHARED_INSTANCE_FILES};
 use axial_minecraft::{
     DownloadError, DownloadProgress, Downloader, LoaderComponentId,
     download::{ExecutionDownloadFact, SelectedDownloadArtifactDescriptor},
     resolve_build_record,
 };
 use axum::{Json, http::StatusCode};
-use std::path::PathBuf;
+use std::collections::{HashMap, HashSet};
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 use tokio::sync::broadcast::error::RecvError;
@@ -505,21 +509,21 @@ pub async fn enqueue_install(
     state: &AppState,
     request: InstallQueueRequest,
 ) -> Result<InstallQueueStateResponse, InstallApplicationError> {
-    enqueue_install_with_dependency(state, request, None, false).await
+    enqueue_install_with_dependency(state, request, None, None).await
 }
 
 pub(crate) async fn enqueue_install_with_dependency(
     state: &AppState,
     request: InstallQueueRequest,
     prerequisite_queue_id: Option<String>,
-    remove_instance_on_failure: bool,
+    setup_cleanup: Option<SetupInstanceCleanup>,
 ) -> Result<InstallQueueStateResponse, InstallApplicationError> {
     enqueue_install_with_placement(
         state,
         request,
         InstallQueuePlacement::Back,
         prerequisite_queue_id,
-        remove_instance_on_failure,
+        setup_cleanup,
     )
     .await
 }
@@ -528,7 +532,7 @@ pub async fn retry_install(
     state: &AppState,
     request: InstallQueueRequest,
 ) -> Result<InstallQueueStateResponse, InstallApplicationError> {
-    enqueue_install_with_placement(state, request, InstallQueuePlacement::Front, None, false).await
+    enqueue_install_with_placement(state, request, InstallQueuePlacement::Front, None, None).await
 }
 
 pub async fn remove_queued_install(
@@ -545,11 +549,15 @@ pub async fn remove_queued_install(
             },
         ..
     }) = removed.as_ref()
-        && content_action_owns_instance(action)
+        && content_action_setup_cleanup(action).is_some()
     {
-        remove_setup_instance_if_inactive(state, instance_id)
-            .await
-            .then(|| instance_id.clone())
+        remove_pristine_setup_instance(
+            state,
+            instance_id,
+            content_action_setup_cleanup(action).expect("setup cleanup is present"),
+        )
+        .await
+        .then(|| instance_id.clone())
     } else {
         None
     };
@@ -577,26 +585,137 @@ pub async fn remove_queued_install(
 }
 
 fn content_action_owns_instance(action: &ContentQueueAction) -> bool {
-    matches!(
-        action,
-        ContentQueueAction::Install {
-            remove_instance_on_failure: true,
-            ..
-        } | ContentQueueAction::Modpack {
-            remove_instance_on_failure: true,
-            ..
+    content_action_setup_cleanup(action).is_some()
+}
+
+fn content_action_setup_cleanup(action: &ContentQueueAction) -> Option<&SetupInstanceCleanup> {
+    match action {
+        ContentQueueAction::Install { setup_cleanup, .. }
+        | ContentQueueAction::Modpack { setup_cleanup, .. } => setup_cleanup.as_ref(),
+        ContentQueueAction::Uninstall { .. } => None,
+    }
+}
+
+pub(crate) fn setup_instance_cleanup(
+    state: &AppState,
+    instance: &Instance,
+    seed_shared_files: bool,
+) -> SetupInstanceCleanup {
+    let baseline = setup_instance_baseline(state, instance, seed_shared_files)
+        .filter(|baseline| setup_instance_matches_baseline(state, baseline))
+        .map(Box::new);
+    SetupInstanceCleanup { baseline }
+}
+
+fn setup_instance_baseline(
+    state: &AppState,
+    instance: &Instance,
+    seed_shared_files: bool,
+) -> Option<SetupInstanceBaseline> {
+    let mut paths = INSTANCE_LAYOUT_DIRS
+        .iter()
+        .map(|path| SetupInstancePathSnapshot {
+            relative_path: PathBuf::from(path),
+            kind: SetupInstancePathKind::Directory,
+        })
+        .collect::<Vec<_>>();
+    if seed_shared_files && let Some(library_dir) = state.library_dir() {
+        for file_name in SHARED_INSTANCE_FILES {
+            let source = Path::new(&library_dir).join(file_name);
+            let metadata = match fs::symlink_metadata(&source) {
+                Ok(metadata) if metadata.is_file() => metadata,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                _ => return None,
+            };
+            paths.push(SetupInstancePathSnapshot {
+                relative_path: PathBuf::from(file_name),
+                kind: SetupInstancePathKind::File {
+                    size: metadata.len(),
+                    sha512: axial_content::sha512_file(&source).ok()?,
+                },
+            });
         }
+    }
+    paths.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
+    Some(SetupInstanceBaseline {
+        instance: instance.clone(),
+        paths,
+    })
+}
+
+fn setup_instance_matches_baseline(state: &AppState, baseline: &SetupInstanceBaseline) -> bool {
+    if state.instances().get(&baseline.instance.id).as_ref() != Some(&baseline.instance) {
+        return false;
+    }
+    setup_instance_paths_match(
+        &state.instances().game_dir(&baseline.instance.id),
+        &baseline.paths,
     )
 }
 
-/// Remove an instance created solely for a setup operation, but only while no
-/// launch or content mutation can be using it. Acquiring the lifecycle guard
-/// before checking sessions closes the race with launch registration.
-pub(crate) async fn remove_setup_instance_if_inactive(state: &AppState, instance_id: &str) -> bool {
+fn setup_instance_paths_match(game_dir: &Path, expected: &[SetupInstancePathSnapshot]) -> bool {
+    let Ok(root_metadata) = fs::symlink_metadata(game_dir) else {
+        return false;
+    };
+    if !root_metadata.is_dir() || root_metadata.file_type().is_symlink() {
+        return false;
+    }
+    let expected: HashMap<&Path, &SetupInstancePathKind> = expected
+        .iter()
+        .map(|entry| (entry.relative_path.as_path(), &entry.kind))
+        .collect();
+    let mut seen = HashSet::new();
+    let mut pending = vec![game_dir.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        let Ok(entries) = fs::read_dir(&directory) else {
+            return false;
+        };
+        for entry in entries {
+            let Ok(entry) = entry else { return false };
+            let path = entry.path();
+            let Ok(relative) = path.strip_prefix(game_dir) else {
+                return false;
+            };
+            let Some(expected_kind) = expected.get(relative) else {
+                return false;
+            };
+            let Ok(metadata) = fs::symlink_metadata(&path) else {
+                return false;
+            };
+            if metadata.file_type().is_symlink() || !seen.insert(relative.to_path_buf()) {
+                return false;
+            }
+            match expected_kind {
+                SetupInstancePathKind::Directory if metadata.is_dir() => pending.push(path),
+                SetupInstancePathKind::File { size, sha512 }
+                    if metadata.is_file()
+                        && metadata.len() == *size
+                        && axial_content::sha512_file(&path).ok().as_ref() == Some(sha512) => {}
+                _ => return false,
+            }
+        }
+    }
+    seen.len() == expected.len()
+}
+
+/// Remove an untouched instance created solely for setup, but only while no
+/// launch or content mutation can be using it. Any metadata or filesystem
+/// difference is treated as user ownership and retains the instance.
+pub(crate) async fn remove_pristine_setup_instance(
+    state: &AppState,
+    instance_id: &str,
+    cleanup: &SetupInstanceCleanup,
+) -> bool {
     let Some(_lifecycle_guard) = state.sessions().try_lock_instance_lifecycle(instance_id) else {
         return false;
     };
     if state.sessions().has_active_instance(instance_id).await {
+        return false;
+    }
+    let Some(baseline) = cleanup.baseline.as_ref() else {
+        return false;
+    };
+    if baseline.instance.id != instance_id || !setup_instance_matches_baseline(state, baseline) {
         return false;
     }
     state.instances().remove(instance_id, true).is_ok()
@@ -607,15 +726,11 @@ async fn enqueue_install_with_placement(
     request: InstallQueueRequest,
     placement: InstallQueuePlacement,
     prerequisite_queue_id: Option<String>,
-    remove_instance_on_failure: bool,
+    setup_cleanup: Option<SetupInstanceCleanup>,
 ) -> Result<InstallQueueStateResponse, InstallApplicationError> {
-    let spec = install_queue_spec_from_request(
-        state,
-        request,
-        prerequisite_queue_id,
-        remove_instance_on_failure,
-    )
-    .await?;
+    let spec =
+        install_queue_spec_from_request(state, request, prerequisite_queue_id, setup_cleanup)
+            .await?;
     let queue_id = generate_install_id("install-queue");
     let outcome = state
         .installs()
@@ -632,7 +747,7 @@ async fn install_queue_spec_from_request(
     state: &AppState,
     request: InstallQueueRequest,
     prerequisite_queue_id: Option<String>,
-    remove_instance_on_failure: bool,
+    setup_cleanup: Option<SetupInstanceCleanup>,
 ) -> Result<InstallQueueSpec, InstallApplicationError> {
     match request.kind.trim() {
         "vanilla" | "minecraft" => {
@@ -729,7 +844,7 @@ async fn install_queue_spec_from_request(
                             })
                             .collect(),
                         allow_incompatible,
-                        remove_instance_on_failure,
+                        setup_cleanup,
                     }
                 }
                 InstallQueueContentActionRequest::Uninstall { canonical_id } => {
@@ -764,7 +879,7 @@ async fn install_queue_spec_from_request(
                         version_id,
                         selected_paths,
                         include_overrides,
-                        remove_instance_on_failure,
+                        setup_cleanup,
                     }
                 }
             };
@@ -814,9 +929,9 @@ async fn maybe_start_next_queued_install(
                 action,
                 ..
             } = &entry.spec
-                && content_action_owns_instance(action)
+                && let Some(cleanup) = content_action_setup_cleanup(action)
             {
-                let _ = remove_setup_instance_if_inactive(state, instance_id).await;
+                let _ = remove_pristine_setup_instance(state, instance_id, cleanup).await;
             }
             continue;
         }
@@ -896,7 +1011,7 @@ async fn start_content_operation(
     let worker_action = action.clone();
     let interrupted_state = state.clone();
     let interrupted_instance_id = instance_id.to_string();
-    let interrupted_action_owns_instance = content_action_owns_instance(action);
+    let interrupted_setup_cleanup = content_action_setup_cleanup(action).cloned();
     InstallStore::spawn_tracked_worker_with_async_interrupt_handler(
         state.installs().clone(),
         install_id.clone(),
@@ -986,9 +1101,17 @@ async fn start_content_operation(
             let terminal = match result {
                 Ok(()) => content_progress("done", 1, 1, true, None),
                 Err((_, Json(body))) => {
-                    let removed_instance = content_action_owns_instance(&worker_action)
-                        && remove_setup_instance_if_inactive(&worker_state, &worker_instance_id)
-                            .await;
+                    let removed_instance = match content_action_setup_cleanup(&worker_action) {
+                        Some(cleanup) => {
+                            remove_pristine_setup_instance(
+                                &worker_state,
+                                &worker_instance_id,
+                                cleanup,
+                            )
+                            .await
+                        }
+                        None => false,
+                    };
                     let mut message = body
                         .get("error")
                         .and_then(serde_json::Value::as_str)
@@ -1018,7 +1141,7 @@ async fn start_content_operation(
             interrupted_content_progress(
                 &interrupted_state,
                 &interrupted_instance_id,
-                interrupted_action_owns_instance,
+                interrupted_setup_cleanup.as_ref(),
             )
             .await
         },
@@ -1060,10 +1183,12 @@ fn content_progress(
 async fn interrupted_content_progress(
     state: &AppState,
     instance_id: &str,
-    action_owns_instance: bool,
+    setup_cleanup: Option<&SetupInstanceCleanup>,
 ) -> DownloadProgress {
-    let removed =
-        action_owns_instance && remove_setup_instance_if_inactive(state, instance_id).await;
+    let removed = match setup_cleanup {
+        Some(cleanup) => remove_pristine_setup_instance(state, instance_id, cleanup).await,
+        None => false,
+    };
     content_interrupted_progress(removed)
 }
 

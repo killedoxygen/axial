@@ -170,6 +170,8 @@ pub async fn execute_instance_setup(
     request.create.selection_id = stored.selection_id;
     let mut created = handle_create_instance(state, request.create).await?;
     let instance_id = created.instance.id.clone();
+    let setup_cleanup =
+        crate::application::install::setup_instance_cleanup(state, &created.instance, true);
     let prerequisite_queue_id = created
         .queued_install
         .as_ref()
@@ -181,7 +183,7 @@ pub async fn execute_instance_setup(
             selections: stored.request.selections,
             allow_incompatible: false,
         },
-        true,
+        Some(setup_cleanup.clone()),
         prerequisite_queue_id,
     )
     .await
@@ -191,9 +193,12 @@ pub async fn execute_instance_setup(
             Ok(created)
         }
         Err(error) => {
-            let _ =
-                crate::application::install::remove_setup_instance_if_inactive(state, &instance_id)
-                    .await;
+            let _ = crate::application::install::remove_pristine_setup_instance(
+                state,
+                &instance_id,
+                &setup_cleanup,
+            )
+            .await;
             Err(error)
         }
     }
@@ -219,6 +224,8 @@ pub async fn execute_modpack_instance_setup(
     request.create.selection_id = target.selection_id;
     let mut created = handle_create_instance_without_shared_files(state, request.create).await?;
     let instance_id = created.instance.id.clone();
+    let setup_cleanup =
+        crate::application::install::setup_instance_cleanup(state, &created.instance, false);
     let prerequisite_queue_id = created
         .queued_install
         .as_ref()
@@ -233,7 +240,7 @@ pub async fn execute_modpack_instance_setup(
             include_overrides: true,
         },
         prerequisite_queue_id,
-        true,
+        Some(setup_cleanup.clone()),
     )
     .await;
     match queued {
@@ -242,9 +249,12 @@ pub async fn execute_modpack_instance_setup(
             Ok(created)
         }
         Err(error) => {
-            let _ =
-                crate::application::install::remove_setup_instance_if_inactive(state, &instance_id)
-                    .await;
+            let _ = crate::application::install::remove_pristine_setup_instance(
+                state,
+                &instance_id,
+                &setup_cleanup,
+            )
+            .await;
             Err(error)
         }
     }

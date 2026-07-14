@@ -45,6 +45,7 @@ pub use installs::{
     ActiveQueuedInstallEntry, ContentQueueAction, InstallProgressRecord,
     InstallQueueEnqueueOutcome, InstallQueuePlacement, InstallQueueSnapshot, InstallQueueSpec,
     InstallSnapshot, InstallStore, QueuedContentSelection, QueuedInstallEntry,
+    SetupInstanceBaseline, SetupInstanceCleanup, SetupInstancePathKind, SetupInstancePathSnapshot,
 };
 pub use journals::OperationJournalStore;
 pub use remote_flags::{RemoteFlagRefreshOutcome, RemoteFlagStore};

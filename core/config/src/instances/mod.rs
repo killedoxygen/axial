@@ -9,6 +9,17 @@ use std::path::Path;
 use std::sync::RwLock;
 use thiserror::Error;
 
+pub const INSTANCE_LAYOUT_DIRS: [&str; 7] = [
+    "mods",
+    "saves",
+    "resourcepacks",
+    "shaderpacks",
+    "config",
+    "screenshots",
+    "logs",
+];
+pub const SHARED_INSTANCE_FILES: [&str; 2] = ["options.txt", "servers.dat"];
+
 /// `art_seed` is the source of truth for the instance identity tile: the
 /// frontend derives the tile hues from it, and "shuffle" rewrites it.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -746,20 +757,12 @@ impl InstanceStore {
         mc_dir: Option<&Path>,
     ) -> Result<(), std::io::Error> {
         let game_dir = self.paths.instances_dir.join(instance_id);
-        for subdir in [
-            "mods",
-            "saves",
-            "resourcepacks",
-            "shaderpacks",
-            "config",
-            "screenshots",
-            "logs",
-        ] {
+        for subdir in INSTANCE_LAYOUT_DIRS {
             fs::create_dir_all(game_dir.join(subdir))?;
         }
 
         if let Some(mc_dir) = mc_dir {
-            for file_name in ["options.txt", "servers.dat"] {
+            for file_name in SHARED_INSTANCE_FILES {
                 copy_shared_file_if_missing(mc_dir, &game_dir, file_name)?;
             }
         }

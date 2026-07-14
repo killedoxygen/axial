@@ -287,21 +287,13 @@ pub async fn queue_content_install(
     state: &AppState,
     request: ContentInstallRequest,
 ) -> Result<InstallQueueStateResponse, ContentApiError> {
-    queue_content_install_with_cleanup(state, request, false).await
-}
-
-pub(crate) async fn queue_content_install_with_cleanup(
-    state: &AppState,
-    request: ContentInstallRequest,
-    remove_instance_on_failure: bool,
-) -> Result<InstallQueueStateResponse, ContentApiError> {
-    queue_content_install_with_cleanup_after(state, request, remove_instance_on_failure, None).await
+    queue_content_install_with_cleanup_after(state, request, None, None).await
 }
 
 pub(crate) async fn queue_content_install_with_cleanup_after(
     state: &AppState,
     request: ContentInstallRequest,
-    remove_instance_on_failure: bool,
+    setup_cleanup: Option<crate::state::SetupInstanceCleanup>,
     prerequisite_queue_id: Option<String>,
 ) -> Result<InstallQueueStateResponse, ContentApiError> {
     let count = request.selections.len();
@@ -329,7 +321,7 @@ pub(crate) async fn queue_content_install_with_cleanup_after(
             ..InstallQueueRequest::default()
         },
         prerequisite_queue_id,
-        remove_instance_on_failure,
+        setup_cleanup,
     )
     .await
 }

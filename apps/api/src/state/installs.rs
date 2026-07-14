@@ -1,8 +1,10 @@
+use axial_config::Instance;
 use axial_content::ContentKind;
 use axial_minecraft::{LoaderComponentId, download::DownloadProgress};
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     future::Future,
+    path::PathBuf,
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -70,11 +72,34 @@ pub struct QueuedContentSelection {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SetupInstanceCleanup {
+    pub baseline: Option<Box<SetupInstanceBaseline>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SetupInstanceBaseline {
+    pub instance: Instance,
+    pub paths: Vec<SetupInstancePathSnapshot>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SetupInstancePathSnapshot {
+    pub relative_path: PathBuf,
+    pub kind: SetupInstancePathKind,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SetupInstancePathKind {
+    Directory,
+    File { size: u64, sha512: String },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ContentQueueAction {
     Install {
         selections: Vec<QueuedContentSelection>,
         allow_incompatible: bool,
-        remove_instance_on_failure: bool,
+        setup_cleanup: Option<SetupInstanceCleanup>,
     },
     Uninstall {
         canonical_id: String,
@@ -84,7 +109,7 @@ pub enum ContentQueueAction {
         version_id: String,
         selected_paths: Vec<String>,
         include_overrides: bool,
-        remove_instance_on_failure: bool,
+        setup_cleanup: Option<SetupInstanceCleanup>,
     },
 }
 
@@ -798,7 +823,7 @@ mod tests {
                     action: ContentQueueAction::Install {
                         selections: Vec::new(),
                         allow_incompatible: false,
-                        remove_instance_on_failure: false,
+                        setup_cleanup: None,
                     },
                     prerequisite_queue_id: Some("prerequisite".to_string()),
                 },

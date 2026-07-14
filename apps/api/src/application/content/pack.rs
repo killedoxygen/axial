@@ -383,14 +383,14 @@ pub async fn queue_modpack_install(
     state: &AppState,
     request: ModpackInstallRequest,
 ) -> Result<InstallQueueStateResponse, ContentApiError> {
-    queue_modpack_install_after(state, request, None, false).await
+    queue_modpack_install_after(state, request, None, None).await
 }
 
 pub(crate) async fn queue_modpack_install_after(
     state: &AppState,
     request: ModpackInstallRequest,
     prerequisite_queue_id: Option<String>,
-    remove_instance_on_failure: bool,
+    setup_cleanup: Option<crate::state::SetupInstanceCleanup>,
 ) -> Result<InstallQueueStateResponse, ContentApiError> {
     reject_cherry_pick_overrides(&request)?;
     let resolved =
@@ -405,7 +405,7 @@ pub(crate) async fn queue_modpack_install_after(
             resolved.name,
         ),
         prerequisite_queue_id,
-        remove_instance_on_failure,
+        setup_cleanup,
     )
     .await
 }
