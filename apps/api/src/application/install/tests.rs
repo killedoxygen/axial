@@ -2531,7 +2531,6 @@ fn loader_base_install_rosetta_failure_keeps_specific_terminal_message() {
             component: "jre-legacy".to_string(),
         }),
         facts: Vec::new(),
-        descriptors: Vec::new(),
     });
     let progress = loader_install_error_progress(&error);
 
@@ -3931,6 +3930,14 @@ async fn install_journal_records_guardian_evidence_from_core_download_facts() {
             .iter()
             .any(|fact| fact.contains("Promoted"))
     );
+    let guardian = install_guardian_outcome_summary_from_journal(&entry)
+        .expect("persisted corruption outcome");
+    let progress = vanilla_install_progress_view_model(&observed_install_failure_progress());
+    let failure_view_model = install_failure_view_model(&progress, Some(&guardian))
+        .expect("corruption failure view model");
+    assert_eq!(failure_view_model.state_id, "failed_blocked");
+    assert!(failure_view_model.retry_action.enabled);
+    assert_eq!(failure_view_model.retry_action.disabled_reason, None);
     assert_no_sensitive_fragments(&serde_json::to_string(&entry).expect("journal json"));
 }
 
@@ -4306,7 +4313,6 @@ async fn delegated_base_provider_fact_uses_download_pipeline_without_dependency_
             ExecutionDownloadFactKind::ProviderFailure,
             "minecraft_version_manifest",
         )],
-        descriptors: Vec::new(),
     });
 
     dispatch_loader_install_failure(
@@ -4343,7 +4349,6 @@ async fn empty_base_install_payload_uses_only_dependency_fallback() {
             "private manifest".to_string(),
         )),
         facts: Vec::new(),
-        descriptors: Vec::new(),
     });
     dispatch_loader_install_failure(
         &journals,

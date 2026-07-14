@@ -252,10 +252,6 @@ fn validate_managed_runtime_admission(
         || attempt.domain() != GuardianDomain::Runtime
         || attempt.rung() != ReconciliationRung::RebuildComponent
         || attempt.component() != ReconciliationComponent::Runtime
-        || !matches!(
-            attempt.scope(),
-            ReconciliationScope::RegisteredInstance { .. }
-        )
         || attempt.ownership() != OwnershipClass::LauncherManaged
         || attempt.target().ownership != OwnershipClass::LauncherManaged
         || attempt.target().system != StabilizationSystem::Execution
@@ -330,11 +326,10 @@ fn component_rebuild_plan(
         RollbackState::NotApplicable,
     );
     entry.targets.push(target.clone());
-    if let ReconciliationScope::RegisteredInstance { instance_id, .. } = attempt.scope() {
-        entry
-            .targets
-            .push(reconciliation_instance_target(instance_id));
-    }
+    let ReconciliationScope::RegisteredInstance { instance_id, .. } = attempt.scope();
+    entry
+        .targets
+        .push(reconciliation_instance_target(instance_id));
     entry.planned_steps.push(repair_step(
         COMPONENT_REBUILD_START_STEP,
         OperationStepResult::Planned,
@@ -919,11 +914,10 @@ mod tests {
             RollbackState::Available,
         );
         entry.targets.push(attempt.target().clone());
-        if let ReconciliationScope::RegisteredInstance { instance_id, .. } = attempt.scope() {
-            entry
-                .targets
-                .push(reconciliation_instance_target(instance_id));
-        }
+        let ReconciliationScope::RegisteredInstance { instance_id, .. } = attempt.scope();
+        entry
+            .targets
+            .push(reconciliation_instance_target(instance_id));
         let mut step = OperationJournalStep::new("repair_runtime", OperationPhase::Repairing);
         step.result = OperationStepResult::Planned;
         step.changed_target = Some(attempt.target().clone());

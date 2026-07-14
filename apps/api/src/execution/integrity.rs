@@ -5270,7 +5270,6 @@ mod tests {
                 .expect("already repaired outcome");
 
         assert_eq!(outcome.status, GuardianArtifactRepairStatus::Repaired);
-        assert!(outcome.facts.is_empty());
         let journal = state.journals().get(&operation_id).expect("repair journal");
         assert_eq!(
             journal

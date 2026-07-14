@@ -104,10 +104,7 @@ async fn handle_install_events(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        application::install_operation_id,
-        state::{AppStateInit, InstallStore, SessionStore},
-    };
+    use crate::state::{AppStateInit, InstallStore, SessionStore};
     use axial_config::{AppPaths, ConfigStore, InstanceRegistrySnapshot, InstanceStore};
     use axial_minecraft::DownloadProgress;
     use axial_performance::PerformanceManager;
@@ -335,31 +332,6 @@ mod tests {
                 .with_state(self.state.clone())
         }
 
-        async fn request_json(&self, method: Method, uri: &str) -> (StatusCode, Value) {
-            let request_lease = self
-                .state
-                .try_admit_request()
-                .expect("admit route install request");
-            let response = self
-                .router()
-                .oneshot(
-                    Request::builder()
-                        .extension(request_lease.producer_handoff())
-                        .method(method)
-                        .uri(uri)
-                        .body(Body::empty())
-                        .expect("request"),
-                )
-                .await
-                .expect("route response");
-            let status = response.status();
-            let body = to_bytes(response.into_body(), usize::MAX)
-                .await
-                .expect("read body");
-            let payload = serde_json::from_slice(&body).expect("json response");
-            (status, payload)
-        }
-
         async fn request_json_body(
             &self,
             method: Method,
@@ -458,26 +430,6 @@ mod tests {
             done: true,
             bytes_done: None,
             bytes_total: None,
-        }
-    }
-
-    fn assert_no_install_status_route_sensitive_fragments(value: &Value) {
-        let text = value.to_string();
-        for material in [
-            "/Users/alice",
-            ".axial",
-            ".minecraft",
-            "secret-client.jar",
-            "provider_payload",
-            "accessToken",
-            "token=secret",
-            "https://example.invalid",
-            "client.jar?token",
-        ] {
-            assert!(
-                !text.contains(material),
-                "public install status JSON exposed sensitive material {material}: {text}"
-            );
         }
     }
 }

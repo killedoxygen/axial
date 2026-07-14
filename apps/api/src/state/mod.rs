@@ -102,9 +102,8 @@ pub use performance_rules::AppPerformanceStore;
 pub(crate) use reconciliation::{
     ReconciliationAttemptReservation, ReconciliationEvidenceRejection,
     RegisteredComponentRebuildAdmission, RegisteredReconciliationAuthority,
-    commit_reconciliation_memory, install_operation_reconciliation_attempt,
-    reconciliation_attempt_key, reconciliation_instance_target, reconciliation_journal_attempt,
-    reconciliation_memory_entry, reconciliation_terminal, record_guardian_repair_refusal,
+    commit_reconciliation_memory, reconciliation_attempt_key, reconciliation_instance_target,
+    reconciliation_journal_attempt, reconciliation_memory_entry, record_guardian_repair_refusal,
     record_reconciliation_journal_failure, record_reconciliation_journal_success,
     reserve_reconciliation_attempt, settle_reconciliation_memory, validate_reconciliation_memory,
 };

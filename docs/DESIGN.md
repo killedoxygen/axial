@@ -69,7 +69,7 @@ This project is a desktop Minecraft launcher, not a marketing site. Keep UI work
 - Use theme variables and color-mix patterns already present in the app. Do not hardcode state colors when theme-derived colors are expected.
 
 ## Sensitive Surfaces
-Frontend surfaces render backend-authored policy. Do not add UI code that decides readiness, classifies exits, parses raw JVM args, infers install repair state, decides performance health, or chooses Guardian/Healing precedence. Use backend notices, actions, operation states, and view models as the display contract.
+Frontend surfaces render backend-authored policy. Do not add UI code that decides readiness, classifies exits, parses raw JVM args, infers install failure or retry policy, decides performance health, or chooses Guardian/Healing precedence. Use backend notices, actions, operation states, and view models as the display contract.
 
 ### InstanceDetail
 - Do not reintroduce an Overview tab, summary cards, or a persistent Guardian preflight card without a planned design; the hero plus content tabs is the whole surface.

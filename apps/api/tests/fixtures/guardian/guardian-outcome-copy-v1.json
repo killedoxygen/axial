@@ -54,9 +54,9 @@
       }
     },
     {
-      "id": "install_artifact_repair.repaired",
+      "id": "registered_artifact_repair.repaired",
       "input": {
-        "surface": "install_artifact_repair",
+        "surface": "registered_artifact_repair",
         "status": "Repaired"
       },
       "outcome": {
@@ -70,9 +70,9 @@
       }
     },
     {
-      "id": "install_artifact_repair.blocked",
+      "id": "registered_artifact_repair.blocked",
       "input": {
-        "surface": "install_artifact_repair",
+        "surface": "registered_artifact_repair",
         "status": "Blocked"
       },
       "outcome": {
@@ -86,9 +86,9 @@
       }
     },
     {
-      "id": "install_artifact_repair.failed",
+      "id": "registered_artifact_repair.failed",
       "input": {
-        "surface": "install_artifact_repair",
+        "surface": "registered_artifact_repair",
         "status": "Failed"
       },
       "outcome": {

@@ -19,9 +19,9 @@ const EXPECTED_CASE_IDS: [&str; EXPECTED_CASE_COUNT] = [
     "runtime_repair.repaired",
     "runtime_repair.blocked",
     "runtime_repair.failed",
-    "install_artifact_repair.repaired",
-    "install_artifact_repair.blocked",
-    "install_artifact_repair.failed",
+    "registered_artifact_repair.repaired",
+    "registered_artifact_repair.blocked",
+    "registered_artifact_repair.failed",
     "install_failure.download_retry",
     "install_failure.download_block",
     "install_failure.metadata_invalid",
@@ -72,7 +72,7 @@ enum GuardianOutcomeCopyInput {
     RuntimeRepair {
         status: GuardianRepairStatus,
     },
-    InstallArtifactRepair {
+    RegisteredArtifactRepair {
         status: GuardianArtifactRepairStatus,
     },
     InstallFailure {
@@ -187,7 +187,7 @@ fn render_outcome(input: &GuardianOutcomeCopyInput) -> GuardianUserOutcomeProjec
         )
         .expect("runtime repair copy rule")
         .into(),
-        GuardianOutcomeCopyInput::InstallArtifactRepair { status } => {
+        GuardianOutcomeCopyInput::RegisteredArtifactRepair { status } => {
             author_guardian_copy(GuardianCopyRequest::artifact_repair(
                 DiagnosisId::LauncherManagedArtifactCorrupt,
                 *status,
@@ -356,7 +356,7 @@ fn assert_snapshot_coverage(snapshot: &GuardianOutcomeCopySnapshot) {
         assert_eq!(case.id, canonical_case_id(&case.input));
         let axis = match &case.input {
             GuardianOutcomeCopyInput::RuntimeRepair { .. } => 0,
-            GuardianOutcomeCopyInput::InstallArtifactRepair { .. } => 1,
+            GuardianOutcomeCopyInput::RegisteredArtifactRepair { .. } => 1,
             GuardianOutcomeCopyInput::InstallFailure { .. } => 2,
             GuardianOutcomeCopyInput::LaunchRecoverySuppressed { .. } => 3,
             GuardianOutcomeCopyInput::PerformanceRejection { .. } => 4,
@@ -372,8 +372,8 @@ fn canonical_case_id(input: &GuardianOutcomeCopyInput) -> String {
         GuardianOutcomeCopyInput::RuntimeRepair { status } => {
             format!("runtime_repair.{}", repair_status_id(*status))
         }
-        GuardianOutcomeCopyInput::InstallArtifactRepair { status } => {
-            format!("install_artifact_repair.{}", status.as_persisted_id())
+        GuardianOutcomeCopyInput::RegisteredArtifactRepair { status } => {
+            format!("registered_artifact_repair.{}", status.as_persisted_id())
         }
         GuardianOutcomeCopyInput::InstallFailure {
             diagnosis,

@@ -1056,14 +1056,13 @@ fn validate_reconciliation_attempt(
     {
         return Err(OperationJournalValidationError::ReconciliationTerminalMismatch);
     }
-    if let ReconciliationScope::RegisteredInstance { instance_id, .. } = attempt.scope()
-        && !entry.targets.iter().any(|target| {
-            target.system == StabilizationSystem::State
-                && target.kind == TargetKind::Instance
-                && target.id == *instance_id
-                && target.ownership == attempt.ownership()
-        })
-    {
+    let ReconciliationScope::RegisteredInstance { instance_id, .. } = attempt.scope();
+    if !entry.targets.iter().any(|target| {
+        target.system == StabilizationSystem::State
+            && target.kind == TargetKind::Instance
+            && target.id == *instance_id
+            && target.ownership == attempt.ownership()
+    }) {
         return Err(OperationJournalValidationError::ReconciliationTerminalMismatch);
     }
     Ok(())
@@ -1692,17 +1691,19 @@ mod tests {
                 ReconciliationComponent::WholeInstance,
             ]
         );
-        assert!(matches!(
-            attempts[0].scope(),
-            ReconciliationScope::InstallOperation
-        ));
+        let ReconciliationScope::RegisteredInstance {
+            instance_id: artifact_instance_id,
+            fingerprint: artifact_fingerprint,
+        } = attempts[0].scope();
+        assert_eq!(artifact_instance_id, "0123456789abcdef");
+        assert_eq!(
+            artifact_fingerprint.as_str(),
+            "sha256.aaaaaaaa.bbbbbbbb.cccccccc.dddddddd.eeeeeeee.ffffffff.01234567.89abcdef"
+        );
         let ReconciliationScope::RegisteredInstance {
             instance_id,
             fingerprint,
-        } = attempts[1].scope()
-        else {
-            panic!("fixture must exercise registered-instance scope");
-        };
+        } = attempts[1].scope();
         assert_eq!(instance_id, "0123456789abcdef");
         assert_eq!(
             fingerprint.as_str(),

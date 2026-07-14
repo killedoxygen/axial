@@ -2,7 +2,9 @@ use super::reconciliation_journal::{
     GuardianJournalReconciliation, reconcile_guardian_journal_error,
     record_reconciliation_terminal_reconciled, repair_step,
 };
-use super::{DiagnosisId, GuardianActionKind, GuardianDomain, ReadyMarker, RepairAuthorization};
+use super::{
+    DiagnosisId, GuardianActionKind, GuardianDomain, GuardianMode, ReadyMarkerRepairAuthorization,
+};
 use crate::execution::ExecutionFact;
 use crate::execution::runtime::{
     ManagedRuntimeRepairPrimitive, ManagedRuntimeRepairRequest, ManagedRuntimeRoot,
@@ -81,7 +83,7 @@ enum RuntimeTerminalJournal {
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn execute_managed_runtime_ready_marker_repair(
-    authorization: RepairAuthorization<ReadyMarker>,
+    authorization: ReadyMarkerRepairAuthorization,
     operation_id: Option<OperationId>,
     authority: RegisteredReconciliationAuthority,
     runtime_root: ManagedRuntimeRoot<'_>,
@@ -136,7 +138,7 @@ pub(crate) async fn execute_managed_runtime_ready_marker_repair(
             GuardianDomain::Runtime,
             ReconciliationComponent::Runtime,
             target.clone(),
-            authorization.mode,
+            GuardianMode::Managed,
             Duration::minutes(DEFAULT_REPAIR_SUPPRESSION_MINUTES),
         )
         .map_err(reconciliation_evidence_error)?;
@@ -507,11 +509,10 @@ fn planned_runtime_journal(
         RollbackState::NotApplicable,
     );
     entry.targets.push(target.clone());
-    if let ReconciliationScope::RegisteredInstance { instance_id, .. } = attempt.scope() {
-        entry
-            .targets
-            .push(reconciliation_instance_target(instance_id));
-    }
+    let ReconciliationScope::RegisteredInstance { instance_id, .. } = attempt.scope();
+    entry
+        .targets
+        .push(reconciliation_instance_target(instance_id));
     entry.planned_steps.push(repair_step(
         RUNTIME_REPAIR_START_STEP,
         OperationStepResult::Planned,

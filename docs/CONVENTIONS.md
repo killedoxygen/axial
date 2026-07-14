@@ -18,7 +18,7 @@ keep this short and real. if the codebase changes, update this file.
 - keep complex async workflows in small machine modules built on signals, not scattered local flags
 - keep workflow machines under `frontend/src/machines/`
 - frontend renders backend-authored readiness, safety, performance, install, operation, and notice state; do not move business policy into UI helpers
-- do not classify process exits, parse raw JVM args for policy, decide install repair state, decide performance health, or choose Guardian/Healing notice precedence in frontend code
+- do not classify process exits, parse raw JVM args for policy, decide install failure or retry policy, decide performance health, or choose Guardian/Healing notice precedence in frontend code
 - loader UI logic should consume normalized backend records, not raw ids or raw provider payloads
 - do not use composite version-id parsing as the main loader UI data model
 

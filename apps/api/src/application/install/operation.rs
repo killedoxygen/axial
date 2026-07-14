@@ -409,12 +409,7 @@ pub fn install_guardian_outcome_summary_from_journal(
     let fact_group = entry.completed_steps.iter().rev().find_map(|step| {
         guardian_install_outcome_fact_group(step.generated_facts.iter().map(String::as_str))
     })?;
-    let diagnosis_id = entry
-        .guardian_diagnosis_ids
-        .iter()
-        .copied()
-        .rev()
-        .find(|id| *id != DiagnosisId::LauncherManagedArtifactCorrupt)?;
+    let diagnosis_id = entry.guardian_diagnosis_ids.last().copied()?;
     guardian_install_outcome_from_persisted_group(diagnosis_id, fact_group)
 }
 
@@ -1594,16 +1589,4 @@ fn install_version_target(version_id: &str) -> TargetDescriptor {
 fn safe_progress_phase(phase: &str) -> String {
     sanitize_evidence_token(phase, RedactionAudience::UserVisible, 48)
         .unwrap_or_else(|| "install".to_string())
-}
-
-pub(super) fn latest_generated_fact_value(
-    entry: &OperationJournalEntry,
-    prefix: &str,
-) -> Option<String> {
-    entry
-        .completed_steps
-        .iter()
-        .rev()
-        .flat_map(|step| step.generated_facts.iter().rev())
-        .find_map(|fact| fact.strip_prefix(prefix).map(str::to_string))
 }

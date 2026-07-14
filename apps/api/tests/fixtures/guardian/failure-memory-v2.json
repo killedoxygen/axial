@@ -206,12 +206,12 @@
       "reconciliation_terminal": null
     },
     {
-      "key": "Install:launcher_managed_artifact_corrupt:Guardian.Artifact.fixture_target_10:Managed:no_intent:rung.RepairArtifact:component.Libraries:scope.install",
+      "key": "Library:launcher_managed_artifact_corrupt:Execution.Artifact.fixture_target_10:Managed:no_intent:rung.RepairArtifact:component.Libraries:scope.registered.0123456789abcdef.sha256.aaaaaaaa.bbbbbbbb.cccccccc.dddddddd.eeeeeeee.ffffffff.01234567.89abcdef",
       "diagnosis_id": "launcher_managed_artifact_corrupt",
-      "domain": "Install",
+      "domain": "Library",
       "mode": "Managed",
       "target": {
-        "system": "Guardian",
+        "system": "Execution",
         "kind": "Artifact",
         "id": "fixture_target_10",
         "ownership": "LauncherManaged"
@@ -231,12 +231,17 @@
         "attempt": {
           "operation_id": "guardian-reconciliation-operation-artifact",
           "diagnosis_id": "launcher_managed_artifact_corrupt",
-          "domain": "Install",
+          "domain": "Library",
           "rung": "RepairArtifact",
-          "scope": "InstallOperation",
+          "scope": {
+            "RegisteredInstance": {
+              "instance_id": "0123456789abcdef",
+              "fingerprint": "sha256.aaaaaaaa.bbbbbbbb.cccccccc.dddddddd.eeeeeeee.ffffffff.01234567.89abcdef"
+            }
+          },
           "component": "Libraries",
           "target": {
-            "system": "Guardian",
+            "system": "Execution",
             "kind": "Artifact",
             "id": "fixture_target_10",
             "ownership": "LauncherManaged"

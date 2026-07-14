@@ -85,13 +85,11 @@ impl FailureMemoryKey {
         component: ReconciliationComponent,
         reconciliation_scope: &ReconciliationScope,
     ) -> Self {
-        let scope = match reconciliation_scope {
-            ReconciliationScope::InstallOperation => "install".to_string(),
-            ReconciliationScope::RegisteredInstance {
-                instance_id,
-                fingerprint,
-            } => format!("registered.{instance_id}.{}", fingerprint.as_str()),
-        };
+        let ReconciliationScope::RegisteredInstance {
+            instance_id,
+            fingerprint,
+        } = reconciliation_scope;
+        let scope = format!("registered.{instance_id}.{}", fingerprint.as_str());
         let base = Self::for_observation(domain, diagnosis_id, target, mode, None);
         Self(format!(
             "{}:rung.{:?}:component.{:?}:scope.{scope}",
@@ -1030,16 +1028,14 @@ mod tests {
     use crate::execution::persistence::{AtomicWriteBackend, PersistenceCoordinator};
     use crate::guardian::{DiagnosisId, GuardianActionKind, GuardianDomain, GuardianMode};
     use crate::state::contracts::{
-        OperationId, OwnershipClass, ReconciliationComponent, ReconciliationRung,
-        ReconciliationScope, ReconciliationTerminalOutcome, StabilizationSystem, TargetDescriptor,
-        TargetKind,
+        OperationId, OwnershipClass, ReconciliationAttempt, ReconciliationComponent,
+        ReconciliationIncarnationFingerprint, ReconciliationRung, ReconciliationScope,
+        ReconciliationTerminal, ReconciliationTerminalOutcome, StabilizationSystem,
+        TargetDescriptor, TargetKind,
     };
     use crate::state::journals::DEFAULT_OPERATION_JOURNAL_LIMIT;
     use crate::state::ownership::{CurrentArtifact, classify_current_artifact};
-    use crate::state::{
-        install_operation_reconciliation_attempt, reconciliation_memory_entry,
-        reconciliation_terminal,
-    };
+    use crate::state::reconciliation_memory_entry;
     use axial_config::AppPaths;
     use std::fs;
     use std::io;
@@ -1240,20 +1236,22 @@ mod tests {
         let ReconciliationScope::RegisteredInstance {
             instance_id,
             fingerprint,
-        } = terminals[0].scope()
-        else {
-            panic!("fixture must exercise registered-instance scope");
-        };
+        } = terminals[0].scope();
         assert_eq!(instance_id, "0123456789abcdef");
         assert_eq!(
             fingerprint.as_str(),
             "sha256.aaaaaaaa.bbbbbbbb.cccccccc.dddddddd.eeeeeeee.ffffffff.01234567.89abcdef"
         );
         assert!(terminals[0].quarantined_target().is_some());
-        assert!(matches!(
-            terminals[1].scope(),
-            ReconciliationScope::InstallOperation
-        ));
+        let ReconciliationScope::RegisteredInstance {
+            instance_id,
+            fingerprint,
+        } = terminals[1].scope();
+        assert_eq!(instance_id, "0123456789abcdef");
+        assert_eq!(
+            fingerprint.as_str(),
+            "sha256.aaaaaaaa.bbbbbbbb.cccccccc.dddddddd.eeeeeeee.ffffffff.01234567.89abcdef"
+        );
         assert!(terminals[1].quarantined_target().is_none());
 
         let pretty = serde_json::to_string_pretty(&snapshot).expect("pretty fixture json");
@@ -1897,18 +1895,25 @@ mod tests {
             format!("library-artifact-{index}"),
             OwnershipClass::LauncherManaged,
         );
-        let attempt = install_operation_reconciliation_attempt(
+        let attempt = ReconciliationAttempt::new(
             OperationId::new(format!("reconciliation-capacity-{index}")),
             DiagnosisId::LauncherManagedArtifactCorrupt,
-            GuardianDomain::Install,
+            GuardianDomain::Library,
+            ReconciliationRung::RepairArtifact,
+            ReconciliationScope::RegisteredInstance {
+                instance_id: "0123456789abcdef".to_string(),
+                fingerprint: ReconciliationIncarnationFingerprint::from_digest(
+                    "sha256.aaaaaaaa.bbbbbbbb.cccccccc.dddddddd.eeeeeeee.ffffffff.01234567.89abcdef",
+                ),
+            },
             ReconciliationComponent::Libraries,
             target,
             GuardianMode::Managed,
+            OwnershipClass::LauncherManaged,
             &observed_at.to_rfc3339(),
             &suppression_until.to_rfc3339(),
-        )
-        .expect("valid reconciliation attempt");
-        reconciliation_memory_entry(reconciliation_terminal(
+        );
+        reconciliation_memory_entry(ReconciliationTerminal::from_attempt(
             attempt,
             ReconciliationTerminalOutcome::Failed,
             None,

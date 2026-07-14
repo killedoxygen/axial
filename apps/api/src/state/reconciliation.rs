@@ -319,10 +319,7 @@ impl RegisteredComponentRebuildAdmission {
         let ReconciliationScope::RegisteredInstance {
             instance_id,
             fingerprint,
-        } = self.attempt.scope()
-        else {
-            return Err(ReconciliationEvidenceRejection::ScopeMismatch);
-        };
+        } = self.attempt.scope();
         let current = self
             .authority
             .state
@@ -358,10 +355,7 @@ impl RegisteredComponentRebuildAdmission {
         {
             return Err(ReconciliationEvidenceRejection::JournalMismatch);
         }
-        let ReconciliationScope::RegisteredInstance { instance_id, .. } = self.attempt.scope()
-        else {
-            return Err(ReconciliationEvidenceRejection::ScopeMismatch);
-        };
+        let ReconciliationScope::RegisteredInstance { instance_id, .. } = self.attempt.scope();
         if instance_id != &self.known_good.instance_id {
             return Err(ReconciliationEvidenceRejection::IncarnationMismatch);
         }
@@ -535,13 +529,12 @@ impl RegisteredReconciliationAuthority {
         let current = self
             .state
             .current_reconciliation_incarnation(&self.lifecycle.instance_id)?;
-        match attempt.scope() {
-            ReconciliationScope::RegisteredInstance {
-                instance_id,
-                fingerprint,
-            } if instance_id == &self.lifecycle.instance_id
-                && fingerprint == &current.fingerprint => {}
-            _ => return Err(ReconciliationEvidenceRejection::IncarnationMismatch),
+        let ReconciliationScope::RegisteredInstance {
+            instance_id,
+            fingerprint,
+        } = attempt.scope();
+        if instance_id != &self.lifecycle.instance_id || fingerprint != &current.fingerprint {
+            return Err(ReconciliationEvidenceRejection::IncarnationMismatch);
         }
         if let Some(quarantined_target) = &quarantined_target {
             let expected = TargetDescriptor::new(
@@ -562,44 +555,6 @@ impl RegisteredReconciliationAuthority {
             quarantined_target,
         ))
     }
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn install_operation_reconciliation_attempt(
-    operation_id: OperationId,
-    diagnosis_id: DiagnosisId,
-    domain: GuardianDomain,
-    component: ReconciliationComponent,
-    target: TargetDescriptor,
-    mode: GuardianMode,
-    observed_at: &str,
-    suppression_until: &str,
-) -> Result<ReconciliationAttempt, ReconciliationEvidenceRejection> {
-    let attempt = ReconciliationAttempt::new(
-        operation_id,
-        diagnosis_id,
-        domain,
-        ReconciliationRung::RepairArtifact,
-        ReconciliationScope::InstallOperation,
-        component,
-        target,
-        mode,
-        OwnershipClass::LauncherManaged,
-        observed_at,
-        suppression_until,
-    );
-    attempt
-        .validate()
-        .map_err(|_| ReconciliationEvidenceRejection::JournalMismatch)?;
-    Ok(attempt)
-}
-
-pub(crate) fn reconciliation_terminal(
-    attempt: ReconciliationAttempt,
-    outcome: ReconciliationTerminalOutcome,
-    quarantined_target: Option<TargetDescriptor>,
-) -> ReconciliationTerminal {
-    ReconciliationTerminal::from_attempt(attempt, outcome, quarantined_target)
 }
 
 pub(crate) fn reconciliation_journal_attempt(
@@ -1300,17 +1255,12 @@ impl AppState {
         if observed_at < last_observed_at || observed_at >= suppression_until {
             return Err(ReconciliationEvidenceRejection::MemoryWindowInactive);
         }
-        match terminal.scope() {
-            ReconciliationScope::InstallOperation => {
-                return Err(ReconciliationEvidenceRejection::ScopeMismatch);
-            }
-            ReconciliationScope::RegisteredInstance {
-                instance_id: terminal_instance_id,
-                fingerprint,
-            } if terminal_instance_id == instance_id && fingerprint == &before.fingerprint => {}
-            ReconciliationScope::RegisteredInstance { .. } => {
-                return Err(ReconciliationEvidenceRejection::IncarnationMismatch);
-            }
+        let ReconciliationScope::RegisteredInstance {
+            instance_id: terminal_instance_id,
+            fingerprint,
+        } = terminal.scope();
+        if terminal_instance_id != instance_id || fingerprint != &before.fingerprint {
+            return Err(ReconciliationEvidenceRejection::IncarnationMismatch);
         }
         if journal.operation_id != *terminal.operation_id()
             || journal.command != CommandKind::RepairInstance
@@ -1785,11 +1735,10 @@ mod tests {
             RollbackState::Available,
         );
         entry.targets.push(attempt.target().clone());
-        if let ReconciliationScope::RegisteredInstance { instance_id, .. } = attempt.scope() {
-            entry
-                .targets
-                .push(reconciliation_instance_target(instance_id));
-        }
+        let ReconciliationScope::RegisteredInstance { instance_id, .. } = attempt.scope();
+        entry
+            .targets
+            .push(reconciliation_instance_target(instance_id));
         let mut step = OperationJournalStep::new("repair_artifact", OperationPhase::Repairing);
         step.changed_target = Some(attempt.target().clone());
         entry.planned_steps.push(step);

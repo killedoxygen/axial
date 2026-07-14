@@ -4,7 +4,6 @@
 //! supervised recovery, user outcomes, and bounded failure memory across
 //! launch, install, runtime, and performance workflows.
 
-mod artifact_descriptor;
 mod artifact_repair;
 mod component_rebuild;
 mod copy;
@@ -49,12 +48,8 @@ mod rules;
 #[cfg(test)]
 mod tests;
 
-pub(crate) use artifact_descriptor::GuardianMinecraftArtifactRepairDescriptor;
-pub use artifact_repair::{GuardianArtifactRepairOutcome, GuardianArtifactRepairStatus};
-pub(crate) use artifact_repair::{
-    execute_guardian_missing_download, execute_guardian_quarantine_redownload,
-    execute_registered_guardian_artifact_repair,
-};
+pub use artifact_repair::GuardianArtifactRepairStatus;
+pub(crate) use artifact_repair::execute_registered_guardian_artifact_repair;
 pub(crate) use component_rebuild::{
     GuardianRuntimeComponentRebuildOutcome, GuardianRuntimeComponentRebuildStatus,
     execute_managed_runtime_component_rebuild,
@@ -147,10 +142,9 @@ pub use preflight::{
     GuardianPreflightOutcome, GuardianPreflightOutcomeRequest, GuardianPreflightOverrideSignals,
     GuardianPreflightReadiness, GuardianPreflightResourceSignals, guardian_preflight_outcome,
 };
+#[cfg(test)]
+pub(crate) use repair_authorization::RepairAuthorizationRejection;
 pub(crate) use repair_authorization::{
-    ArtifactRepairKind, MissingDownload, QuarantineRedownload, ReadyMarker, RepairAuthorization,
-    RepairAuthorizationRejection, authorize_launcher_managed_artifact_repair,
-    authorize_launcher_managed_missing_artifact_repair,
-    authorize_managed_runtime_ready_marker_repair,
+    ReadyMarkerRepairAuthorization, authorize_managed_runtime_ready_marker_repair,
 };
 pub use state_evidence::{GuardianStateLoadOutcome, persisted_state_load_guardian_outcome};

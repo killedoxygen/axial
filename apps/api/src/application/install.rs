@@ -510,7 +510,7 @@ async fn start_install_version_with_foreground(
             let terminal_progress_for_downloader = Arc::clone(&terminal_progress);
             let mut install_facts = Vec::new();
             let install_result = {
-                let install = downloader.install_version_with_facts_and_descriptors(
+                let install = downloader.install_version_with_facts(
                     &version_id,
                     move |progress| {
                         if progress.done {
@@ -524,7 +524,6 @@ async fn start_install_version_with_foreground(
                         let _ = progress_tx_for_downloader.send(progress);
                     },
                     |fact| install_facts.push(fact),
-                    |_| {},
                 );
                 tokio::pin!(install);
                 tokio::select! {
@@ -720,7 +719,7 @@ async fn record_install_failure_evidence(
         tracing::warn!("failed to commit install Guardian evidence");
         return;
     }
-    let assessment = assess_install_guardian_failure(
+    let Some(assessment) = assess_install_guardian_failure(
         Some(failure_memory),
         operation_id,
         evidence,
@@ -1727,7 +1726,10 @@ fn install_retry_action(
 }
 
 fn blocking_guardian_allows_retry(guardian: &GuardianInstallOutcomeSummary) -> bool {
-    guardian.diagnosis_id() == DiagnosisId::ManagedRuntimeRosettaRequired
+    matches!(
+        guardian.diagnosis_id(),
+        DiagnosisId::ManagedRuntimeRosettaRequired | DiagnosisId::LauncherManagedArtifactCorrupt
+    )
 }
 
 fn generate_install_id(prefix: &str) -> String {

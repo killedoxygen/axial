@@ -56,7 +56,6 @@ impl ReconciliationIncarnationFingerprint {
 #[derive(Clone, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub enum ReconciliationScope {
-    InstallOperation,
     RegisteredInstance {
         instance_id: String,
         fingerprint: ReconciliationIncarnationFingerprint,
@@ -190,29 +189,15 @@ impl ReconciliationAttempt {
         if suppression_until <= observed_at {
             return Err(ReconciliationTerminalValidationError::InvalidWindow);
         }
-        match &self.scope {
-            ReconciliationScope::InstallOperation => {
-                if self.rung != ReconciliationRung::RepairArtifact
-                    || self.domain != GuardianDomain::Install
-                    || matches!(
-                        self.component,
-                        ReconciliationComponent::Runtime | ReconciliationComponent::WholeInstance
-                    )
-                {
-                    return Err(ReconciliationTerminalValidationError::ImpossibleScope);
-                }
-            }
-            ReconciliationScope::RegisteredInstance {
-                instance_id,
-                fingerprint,
-            } => {
-                if !axial_config::is_canonical_instance_id(instance_id) {
-                    return Err(ReconciliationTerminalValidationError::UnsafeInstanceId);
-                }
-                if !valid_reconciliation_fingerprint(fingerprint.as_str()) {
-                    return Err(ReconciliationTerminalValidationError::UnsafeFingerprint);
-                }
-            }
+        let ReconciliationScope::RegisteredInstance {
+            instance_id,
+            fingerprint,
+        } = &self.scope;
+        if !axial_config::is_canonical_instance_id(instance_id) {
+            return Err(ReconciliationTerminalValidationError::UnsafeInstanceId);
+        }
+        if !valid_reconciliation_fingerprint(fingerprint.as_str()) {
+            return Err(ReconciliationTerminalValidationError::UnsafeFingerprint);
         }
         match (self.rung, self.component) {
             (
@@ -234,10 +219,7 @@ impl ReconciliationAttempt {
                 if self.target.kind == TargetKind::Artifact => {}
             ReconciliationComponent::Runtime if self.target.kind == TargetKind::Runtime => {}
             ReconciliationComponent::WholeInstance => {
-                let ReconciliationScope::RegisteredInstance { instance_id, .. } = &self.scope
-                else {
-                    return Err(ReconciliationTerminalValidationError::ImpossibleComponent);
-                };
+                let ReconciliationScope::RegisteredInstance { instance_id, .. } = &self.scope;
                 if self.target.system != StabilizationSystem::State
                     || self.target.kind != TargetKind::Instance
                     || self.target.id != *instance_id
@@ -346,7 +328,6 @@ pub(super) enum ReconciliationTerminalValidationError {
     UnsafeTarget,
     DisabledMode,
     InvalidWindow,
-    ImpossibleScope,
     ImpossibleComponent,
 }
 

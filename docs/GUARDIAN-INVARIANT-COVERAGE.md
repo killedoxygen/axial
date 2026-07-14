@@ -32,7 +32,7 @@ This document is a deterministic human-readable projection of Guardian's strict 
 | Registered facts | 122 |
 | Preflight senses | 7 |
 | Adapter sources | 103 |
-| Repair hands | 3 |
+| Repair hands | 2 |
 
 ### Decision Distribution
 The complete kernel matrix remains in the JSON artifact.
@@ -59,8 +59,7 @@ The complete kernel matrix remains in the JSON artifact.
 ## Repair Hands
 | Kind | Diagnosis | Maximum attempts |
 | --- | --- | --- |
-| quarantine_redownload | launcher_managed_artifact_corrupt | 1 |
-| missing_download | launcher_managed_artifact_corrupt | 1 |
+| registered_artifact | launcher_managed_artifact_corrupt | 1 |
 | ready_marker | managed_runtime_corrupt | 1 |
 
 ## Deferred Demonstrations

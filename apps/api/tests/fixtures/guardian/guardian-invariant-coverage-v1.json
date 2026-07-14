@@ -6731,12 +6731,7 @@
   },
   "repair_hands": [
     {
-      "kind": "quarantine_redownload",
-      "diagnosis": "launcher_managed_artifact_corrupt",
-      "max_attempts": 1
-    },
-    {
-      "kind": "missing_download",
+      "kind": "registered_artifact",
       "diagnosis": "launcher_managed_artifact_corrupt",
       "max_attempts": 1
     },

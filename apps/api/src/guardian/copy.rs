@@ -2019,6 +2019,21 @@ const GUARDIAN_COPY_RULES: &[GuardianCopyRule] = &[
     ),
     fixed_rule(
         key(
+            Some(DiagnosisId::LauncherManagedArtifactCorrupt),
+            GuardianActionKind::Block,
+            CopyContextKey::InstallFailure,
+        ),
+        OperationPhase::Downloading,
+        "Guardian stopped install after launcher-managed artifact verification failed.",
+        &[CopyLine::Static(
+            "The failed attempt ended without automatically mutating or retrying the artifact.",
+        )],
+        &[CopyLine::Static(
+            "Retry the install to start a new launcher-managed attempt.",
+        )],
+    ),
+    fixed_rule(
+        key(
             Some(DiagnosisId::DownloadUnavailable),
             GuardianActionKind::Retry,
             CopyContextKey::InstallFailure,

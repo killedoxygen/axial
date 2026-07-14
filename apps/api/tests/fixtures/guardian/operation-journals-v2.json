@@ -171,9 +171,15 @@
       "ownership": "LauncherManaged",
       "targets": [
         {
-          "system": "Guardian",
+          "system": "Execution",
           "kind": "Artifact",
           "id": "fixture_target_10",
+          "ownership": "LauncherManaged"
+        },
+        {
+          "system": "State",
+          "kind": "Instance",
+          "id": "0123456789abcdef",
           "ownership": "LauncherManaged"
         }
       ],
@@ -193,7 +199,7 @@
           "phase": "Repairing",
           "result": "Failed",
           "changed_target": {
-            "system": "Guardian",
+            "system": "Execution",
             "kind": "Artifact",
             "id": "fixture_target_10",
             "ownership": "LauncherManaged"
@@ -211,12 +217,17 @@
       "reconciliation_attempt": {
         "operation_id": "guardian-reconciliation-operation-artifact",
         "diagnosis_id": "launcher_managed_artifact_corrupt",
-        "domain": "Install",
+        "domain": "Library",
         "rung": "RepairArtifact",
-        "scope": "InstallOperation",
+        "scope": {
+          "RegisteredInstance": {
+            "instance_id": "0123456789abcdef",
+            "fingerprint": "sha256.aaaaaaaa.bbbbbbbb.cccccccc.dddddddd.eeeeeeee.ffffffff.01234567.89abcdef"
+          }
+        },
         "component": "Libraries",
         "target": {
-          "system": "Guardian",
+          "system": "Execution",
           "kind": "Artifact",
           "id": "fixture_target_10",
           "ownership": "LauncherManaged"
@@ -230,12 +241,17 @@
         "attempt": {
           "operation_id": "guardian-reconciliation-operation-artifact",
           "diagnosis_id": "launcher_managed_artifact_corrupt",
-          "domain": "Install",
+          "domain": "Library",
           "rung": "RepairArtifact",
-          "scope": "InstallOperation",
+          "scope": {
+            "RegisteredInstance": {
+              "instance_id": "0123456789abcdef",
+              "fingerprint": "sha256.aaaaaaaa.bbbbbbbb.cccccccc.dddddddd.eeeeeeee.ffffffff.01234567.89abcdef"
+            }
+          },
           "component": "Libraries",
           "target": {
-            "system": "Guardian",
+            "system": "Execution",
             "kind": "Artifact",
             "id": "fixture_target_10",
             "ownership": "LauncherManaged"
