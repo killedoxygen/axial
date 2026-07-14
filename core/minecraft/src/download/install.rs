@@ -2910,12 +2910,15 @@ mod tests {
         let first = downloader
             .rebuild_managed_vanilla_version_bundle(version_id, first_projection)
             .await;
-        assert!(matches!(
-            first,
+        let failure_receipt = match first {
             Err(ManagedVersionBundleRebuildError::Publication(
-                crate::version_bundle_publication::ManagedVersionBundlePublicationError::TaskStopped
-            ))
-        ));
+                crate::version_bundle_publication::ManagedVersionBundlePublicationError::Effect(
+                    receipt,
+                ),
+            )) => receipt,
+            other => panic!("expected reconciled crash failure, got {other:?}"),
+        };
+        drop(failure_receipt);
 
         let canonical_json = version_root.join(format!("{version_id}.json"));
         let (staging_slot, quarantine_slot) = persisted_version_metadata_slots(&library_root);
