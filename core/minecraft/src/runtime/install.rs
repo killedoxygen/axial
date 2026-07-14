@@ -1213,9 +1213,7 @@ async fn materialize_runtime_tree_with_concurrency(
     }
     .await;
 
-    if let Err(error) = install_result {
-        return Err(error);
-    }
+    install_result?;
 
     let ready_marker = dest_dir.join(".axial-ready");
     if let Err(error) =
