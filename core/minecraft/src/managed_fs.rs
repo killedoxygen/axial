@@ -82,6 +82,23 @@ pub(crate) enum ManagedEmptyChildRemoval {
     IdentityMismatchParked,
 }
 
+#[derive(Debug)]
+pub(crate) enum ManagedDirectoryMoveFailure {
+    BeforeMove(LoaderError),
+    MoveAttempted {
+        expected_identity: ManagedDirectoryIdentity,
+        cause: LoaderError,
+    },
+    IdentityMismatchRestored {
+        expected_identity: ManagedDirectoryIdentity,
+        cause: LoaderError,
+    },
+    IdentityMismatchParked {
+        expected_identity: ManagedDirectoryIdentity,
+        cause: LoaderError,
+    },
+}
+
 pub(crate) struct MaterializedInstallerLibrary {
     source: RetainedInstallerLibrarySource,
     destination: PathBuf,
@@ -731,17 +748,19 @@ impl ManagedDir {
         &self,
         expected: &str,
     ) -> Result<bool, LoaderError> {
+        Ok(self.portable_child_name_state(expected)?.0)
+    }
+
+    fn portable_child_name_state(&self, expected: &str) -> Result<(bool, usize), LoaderError> {
         validate_segment(expected)?;
-        let expected_folded = expected
-            .chars()
-            .flat_map(char::to_lowercase)
-            .collect::<String>();
+        let expected_folded = portable_case_fold(expected);
         let entries = self.entries_bounded(MAX_MANAGED_DIRECTORY_ENTRIES + 1)?;
         if entries.len() > MAX_MANAGED_DIRECTORY_ENTRIES {
             return Err(LoaderError::Verify(
                 "managed directory exceeds the portable alias scan bound".to_string(),
             ));
         }
+        let entry_count = entries.len();
         let mut matching_name = None;
         for entry in entries {
             let Some(entry) = entry.to_str() else {
@@ -749,10 +768,7 @@ impl ManagedDir {
                     "managed directory contains a non-portable entry name".to_string(),
                 ));
             };
-            let folded = entry
-                .chars()
-                .flat_map(char::to_lowercase)
-                .collect::<String>();
+            let folded = portable_case_fold(entry);
             if folded != expected_folded {
                 continue;
             }
@@ -762,7 +778,7 @@ impl ManagedDir {
                 ));
             }
         }
-        Ok(matching_name.is_some())
+        Ok((matching_name.is_some(), entry_count))
     }
 
     pub(crate) fn inspect_regular_file(
@@ -997,6 +1013,299 @@ impl ManagedDir {
         }
         self.revalidate()?;
         Ok(())
+    }
+
+    pub(crate) fn move_child_guarded_no_replace(
+        &self,
+        name: &str,
+        child: ManagedDir,
+        destination: &ManagedDir,
+        destination_name: &str,
+    ) -> Result<ManagedDir, ManagedDirectoryMoveFailure> {
+        self.move_child_guarded_no_replace_inner(
+            name,
+            child,
+            destination,
+            destination_name,
+            || {},
+            || {},
+        )
+    }
+
+    #[cfg(test)]
+    fn move_child_guarded_no_replace_with_hook(
+        &self,
+        name: &str,
+        child: ManagedDir,
+        destination: &ManagedDir,
+        destination_name: &str,
+        after_move: impl FnOnce(),
+    ) -> Result<ManagedDir, ManagedDirectoryMoveFailure> {
+        self.move_child_guarded_no_replace_inner(
+            name,
+            child,
+            destination,
+            destination_name,
+            || {},
+            after_move,
+        )
+    }
+
+    #[cfg(test)]
+    fn move_child_guarded_no_replace_with_before_move_hook(
+        &self,
+        name: &str,
+        child: ManagedDir,
+        destination: &ManagedDir,
+        destination_name: &str,
+        before_move: impl FnOnce(),
+    ) -> Result<ManagedDir, ManagedDirectoryMoveFailure> {
+        self.move_child_guarded_no_replace_inner(
+            name,
+            child,
+            destination,
+            destination_name,
+            before_move,
+            || {},
+        )
+    }
+
+    #[cfg(test)]
+    fn move_child_guarded_no_replace_with_hooks(
+        &self,
+        name: &str,
+        child: ManagedDir,
+        destination: &ManagedDir,
+        destination_name: &str,
+        before_move: impl FnOnce(),
+        after_move: impl FnOnce(),
+    ) -> Result<ManagedDir, ManagedDirectoryMoveFailure> {
+        self.move_child_guarded_no_replace_inner(
+            name,
+            child,
+            destination,
+            destination_name,
+            before_move,
+            after_move,
+        )
+    }
+
+    fn move_child_guarded_no_replace_inner(
+        &self,
+        name: &str,
+        child: ManagedDir,
+        destination: &ManagedDir,
+        destination_name: &str,
+        before_move: impl FnOnce(),
+        after_move: impl FnOnce(),
+    ) -> Result<ManagedDir, ManagedDirectoryMoveFailure> {
+        validate_segment(name).map_err(ManagedDirectoryMoveFailure::BeforeMove)?;
+        validate_segment(destination_name).map_err(ManagedDirectoryMoveFailure::BeforeMove)?;
+        let DirectoryBinding::Child {
+            parent,
+            name: child_name,
+        } = &child.inner.binding
+        else {
+            return Err(ManagedDirectoryMoveFailure::BeforeMove(
+                LoaderError::Verify(
+                    "managed directory move source is not a child directory".to_string(),
+                ),
+            ));
+        };
+        if !Arc::ptr_eq(parent, &self.inner) || child_name.as_os_str() != OsStr::new(name) {
+            return Err(ManagedDirectoryMoveFailure::BeforeMove(
+                LoaderError::Verify(
+                    "managed directory move source binding does not match its parent".to_string(),
+                ),
+            ));
+        }
+        if Arc::strong_count(&child.inner) != 1 {
+            return Err(ManagedDirectoryMoveFailure::BeforeMove(
+                LoaderError::Verify(
+                    "managed directory move source capability is not uniquely owned".to_string(),
+                ),
+            ));
+        }
+        self.revalidate()
+            .map_err(ManagedDirectoryMoveFailure::BeforeMove)?;
+        destination
+            .revalidate()
+            .map_err(ManagedDirectoryMoveFailure::BeforeMove)?;
+        if self.inner.identity == destination.inner.identity
+            && portable_case_fold(name) == portable_case_fold(destination_name)
+        {
+            return Err(ManagedDirectoryMoveFailure::BeforeMove(
+                LoaderError::Verify(
+                    "managed directory move destination aliases its source".to_string(),
+                ),
+            ));
+        }
+        if !self
+            .has_portably_exact_child_name(name)
+            .map_err(ManagedDirectoryMoveFailure::BeforeMove)?
+        {
+            return Err(ManagedDirectoryMoveFailure::BeforeMove(
+                LoaderError::Verify("managed directory move source is absent".to_string()),
+            ));
+        }
+        let (destination_exists, destination_entries) = destination
+            .portable_child_name_state(destination_name)
+            .map_err(ManagedDirectoryMoveFailure::BeforeMove)?;
+        if destination_exists {
+            return Err(ManagedDirectoryMoveFailure::BeforeMove(
+                LoaderError::Verify(
+                    "managed directory move destination is already occupied".to_string(),
+                ),
+            ));
+        }
+        if self.inner.identity != destination.inner.identity
+            && destination_entries >= MAX_MANAGED_DIRECTORY_ENTRIES
+        {
+            return Err(ManagedDirectoryMoveFailure::BeforeMove(
+                LoaderError::Verify(
+                    "managed directory move destination is at capacity".to_string(),
+                ),
+            ));
+        }
+        child
+            .revalidate()
+            .map_err(ManagedDirectoryMoveFailure::BeforeMove)?;
+        let expected_identity = ManagedDirectoryIdentity(child.inner.identity);
+        before_move();
+        platform::rename_entry_no_replace(
+            &self.inner.handle,
+            &self.inner.path,
+            OsStr::new(name),
+            &destination.inner.handle,
+            &destination.inner.path,
+            OsStr::new(destination_name),
+        )
+        .map_err(|error| ManagedDirectoryMoveFailure::MoveAttempted {
+            expected_identity,
+            cause: LoaderError::Io(error),
+        })?;
+        after_move();
+        if !destination
+            .has_portably_exact_child_name(destination_name)
+            .map_err(|cause| ManagedDirectoryMoveFailure::MoveAttempted {
+                expected_identity,
+                cause,
+            })?
+        {
+            return Err(ManagedDirectoryMoveFailure::MoveAttempted {
+                expected_identity,
+                cause: LoaderError::Verify(
+                    "managed directory move destination is absent after publication".to_string(),
+                ),
+            });
+        }
+        let (handle, observed_identity) = platform::open_child_directory(
+            &destination.inner.handle,
+            &destination.inner.path,
+            OsStr::new(destination_name),
+        )
+        .map_err(|error| ManagedDirectoryMoveFailure::MoveAttempted {
+            expected_identity,
+            cause: LoaderError::Io(error),
+        })?;
+        if ManagedDirectoryIdentity(observed_identity) != expected_identity {
+            drop((handle, child));
+            return Err(self.restore_moved_identity_mismatch(
+                name,
+                destination,
+                destination_name,
+                expected_identity,
+                ManagedDirectoryIdentity(observed_identity),
+            ));
+        }
+        if self.has_portably_exact_child_name(name).map_err(|cause| {
+            ManagedDirectoryMoveFailure::MoveAttempted {
+                expected_identity,
+                cause,
+            }
+        })? {
+            return Err(ManagedDirectoryMoveFailure::MoveAttempted {
+                expected_identity,
+                cause: LoaderError::Verify(
+                    "managed directory move source was replaced after publication".to_string(),
+                ),
+            });
+        }
+        self.revalidate()
+            .map_err(|cause| ManagedDirectoryMoveFailure::MoveAttempted {
+                expected_identity,
+                cause,
+            })?;
+        let moved = destination
+            .child(destination_name, handle, observed_identity)
+            .map_err(|cause| ManagedDirectoryMoveFailure::MoveAttempted {
+                expected_identity,
+                cause,
+            })?;
+        drop(child);
+        Ok(moved)
+    }
+
+    fn restore_moved_identity_mismatch(
+        &self,
+        source_name: &str,
+        destination: &ManagedDir,
+        destination_name: &str,
+        expected_identity: ManagedDirectoryIdentity,
+        observed_identity: ManagedDirectoryIdentity,
+    ) -> ManagedDirectoryMoveFailure {
+        let mismatch = || {
+            LoaderError::Verify(
+                "managed directory move relocated a replacement identity".to_string(),
+            )
+        };
+        let source_absent = self
+            .has_portably_exact_child_name(source_name)
+            .is_ok_and(|present| !present);
+        if !source_absent {
+            return ManagedDirectoryMoveFailure::IdentityMismatchParked {
+                expected_identity,
+                cause: mismatch(),
+            };
+        }
+        if platform::rename_entry_no_replace(
+            &destination.inner.handle,
+            &destination.inner.path,
+            OsStr::new(destination_name),
+            &self.inner.handle,
+            &self.inner.path,
+            OsStr::new(source_name),
+        )
+        .is_err()
+        {
+            return ManagedDirectoryMoveFailure::IdentityMismatchParked {
+                expected_identity,
+                cause: mismatch(),
+            };
+        }
+        let restored = self
+            .has_portably_exact_child_name(source_name)
+            .is_ok_and(|present| present)
+            && destination
+                .has_portably_exact_child_name(destination_name)
+                .is_ok_and(|present| !present)
+            && platform::child_directory_identity(
+                &self.inner.handle,
+                &self.inner.path,
+                OsStr::new(source_name),
+            )
+            .is_ok_and(|identity| ManagedDirectoryIdentity(identity) == observed_identity);
+        if restored {
+            ManagedDirectoryMoveFailure::IdentityMismatchRestored {
+                expected_identity,
+                cause: mismatch(),
+            }
+        } else {
+            ManagedDirectoryMoveFailure::IdentityMismatchParked {
+                expected_identity,
+                cause: mismatch(),
+            }
+        }
     }
 
     pub(crate) fn sync(&self) -> Result<(), LoaderError> {
@@ -2632,15 +2941,15 @@ fn validate_segment(name: &str) -> Result<(), LoaderError> {
     })
 }
 
+fn portable_case_fold(name: &str) -> String {
+    name.chars().flat_map(char::to_lowercase).collect()
+}
+
 fn insert_tree_alias(
     aliases: &mut HashMap<String, String>,
     path: &ArtifactRelativePath,
 ) -> Result<(), LoaderError> {
-    let portable = path
-        .as_str()
-        .chars()
-        .flat_map(char::to_lowercase)
-        .collect::<String>();
+    let portable = portable_case_fold(path.as_str());
     match aliases.get(&portable) {
         Some(existing) if existing != path.as_str() => Err(LoaderError::Verify(
             "managed tree contains a portable case-fold alias".to_string(),
@@ -3045,6 +3354,295 @@ mod tests {
             .find(|name| name.to_string_lossy().starts_with(".axial-loader-dir-"))
             .expect("replacement restored to private park name");
         assert!(root.join(parked).is_dir());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn guarded_directory_move_crosses_parents_and_rebinds_the_exact_identity() {
+        let root = test_root("move-child-cross-parent");
+        fs::create_dir_all(root.join("source")).expect("source parent");
+        fs::create_dir_all(root.join("destination")).expect("destination parent");
+        let managed = ManagedDir::open_root(&root).expect("managed root");
+        let source = managed.open_child("source").expect("source");
+        let destination = managed.open_child("destination").expect("destination");
+        let child = source.create_child_new("created").expect("created child");
+        fs::write(child.path().join("owned"), b"owned").expect("owned contents");
+        let expected_identity = child.identity().expect("source identity");
+
+        let moved = source
+            .move_child_guarded_no_replace("created", child, &destination, "parked")
+            .expect("guarded move");
+
+        assert_eq!(
+            moved.identity().expect("destination identity"),
+            expected_identity
+        );
+        assert_eq!(moved.path(), root.join("destination/parked"));
+        assert!(!root.join("source/created").exists());
+        assert_eq!(fs::read(moved.path().join("owned")).unwrap(), b"owned");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn guarded_directory_move_rejects_replacement_alias_and_wrong_binding_before_move() {
+        let root = test_root("move-child-validation");
+        fs::create_dir_all(root.join("source")).expect("source parent");
+        fs::create_dir_all(root.join("other")).expect("other parent");
+        fs::create_dir_all(root.join("destination/Occupied")).expect("occupied destination");
+        let managed = ManagedDir::open_root(&root).expect("managed root");
+        let source = managed.open_child("source").expect("source");
+        let other = managed.open_child("other").expect("other");
+        let destination = managed.open_child("destination").expect("destination");
+
+        let replacement = source
+            .create_child_new("replacement")
+            .expect("replacement source");
+        assert!(matches!(
+            source.move_child_guarded_no_replace(
+                "replacement",
+                replacement,
+                &destination,
+                "Occupied",
+            ),
+            Err(ManagedDirectoryMoveFailure::BeforeMove(_))
+        ));
+        assert!(root.join("source/replacement").is_dir());
+        assert!(root.join("destination/Occupied").is_dir());
+
+        let alias = source.create_child_new("alias").expect("alias source");
+        assert!(matches!(
+            source.move_child_guarded_no_replace("alias", alias, &destination, "occupied"),
+            Err(ManagedDirectoryMoveFailure::BeforeMove(_))
+        ));
+        assert!(root.join("source/alias").is_dir());
+
+        let wrong = other.create_child_new("wrong").expect("wrong-bound child");
+        assert!(matches!(
+            source.move_child_guarded_no_replace("wrong", wrong, &destination, "wrong"),
+            Err(ManagedDirectoryMoveFailure::BeforeMove(_))
+        ));
+        assert!(root.join("other/wrong").is_dir());
+
+        let shared = source.create_child_new("shared").expect("shared child");
+        let retained = shared.clone();
+        assert!(matches!(
+            source.move_child_guarded_no_replace("shared", shared, &destination, "shared"),
+            Err(ManagedDirectoryMoveFailure::BeforeMove(_))
+        ));
+        retained.revalidate().expect("retained exact capability");
+
+        let same_parent = source
+            .create_child_new("same-parent")
+            .expect("same-parent source");
+        assert!(matches!(
+            source.move_child_guarded_no_replace(
+                "same-parent",
+                same_parent,
+                &source,
+                "SAME-PARENT"
+            ),
+            Err(ManagedDirectoryMoveFailure::BeforeMove(_))
+        ));
+        assert!(root.join("source/same-parent").is_dir());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn guarded_directory_move_exposes_identity_after_a_post_move_replacement() {
+        let root = test_root("move-child-attempted-replacement");
+        fs::create_dir_all(root.join("source")).expect("source parent");
+        fs::create_dir_all(root.join("destination")).expect("destination parent");
+        let managed = ManagedDir::open_root(&root).expect("managed root");
+        let source = managed.open_child("source").expect("source");
+        let destination = managed.open_child("destination").expect("destination");
+        let child = source.create_child_new("created").expect("created child");
+        let expected_identity = child.identity().expect("source identity");
+        let saved = root.join("saved-created");
+
+        let failure = source
+            .move_child_guarded_no_replace_with_hook(
+                "created",
+                child,
+                &destination,
+                "parked",
+                || {
+                    fs::rename(root.join("destination/parked"), &saved)
+                        .expect("save moved identity");
+                    fs::create_dir(root.join("destination/parked"))
+                        .expect("replacement destination");
+                },
+            )
+            .expect_err("replacement must make the attempted move ambiguous");
+        let ManagedDirectoryMoveFailure::IdentityMismatchRestored {
+            expected_identity: retained_identity,
+            cause,
+        } = failure
+        else {
+            panic!("post-move failure must remain observable");
+        };
+
+        assert_eq!(retained_identity, expected_identity);
+        assert!(matches!(cause, LoaderError::Verify(_)));
+        assert_eq!(
+            ManagedDir::open_root(&saved).unwrap().identity().unwrap(),
+            retained_identity
+        );
+        assert!(!root.join("destination/parked").exists());
+        assert_ne!(
+            source.open_child("created").unwrap().identity().unwrap(),
+            retained_identity
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn guarded_directory_move_restores_a_source_swapped_before_the_syscall() {
+        let root = test_root("move-child-source-swap-before-syscall");
+        fs::create_dir_all(root.join("source")).expect("source parent");
+        fs::create_dir_all(root.join("destination")).expect("destination parent");
+        let managed = ManagedDir::open_root(&root).expect("managed root");
+        let source = managed.open_child("source").expect("source");
+        let destination = managed.open_child("destination").expect("destination");
+        let child = source.create_child_new("created").expect("created child");
+        let expected_identity = child.identity().expect("source identity");
+        let saved = root.join("saved-created");
+
+        let failure = source
+            .move_child_guarded_no_replace_with_before_move_hook(
+                "created",
+                child,
+                &destination,
+                "parked",
+                || {
+                    fs::rename(root.join("source/created"), &saved)
+                        .expect("save admitted identity");
+                    fs::create_dir(root.join("source/created"))
+                        .expect("replacement source identity");
+                    fs::write(root.join("source/created/foreign"), b"foreign")
+                        .expect("foreign sentinel");
+                },
+            )
+            .expect_err("a source swap must not be reported as a successful move");
+        let ManagedDirectoryMoveFailure::IdentityMismatchRestored {
+            expected_identity: retained_identity,
+            cause,
+        } = failure
+        else {
+            panic!("the moved replacement must be restored to its source name");
+        };
+
+        assert_eq!(retained_identity, expected_identity);
+        assert!(matches!(cause, LoaderError::Verify(_)));
+        assert_eq!(
+            ManagedDir::open_root(&saved).unwrap().identity().unwrap(),
+            retained_identity
+        );
+        assert_eq!(
+            fs::read(root.join("source/created/foreign")).unwrap(),
+            b"foreign"
+        );
+        assert!(!root.join("destination/parked").exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn guarded_directory_move_retains_a_typed_parked_source_swap() {
+        let root = test_root("move-child-source-swap-parked");
+        fs::create_dir_all(root.join("source")).expect("source parent");
+        fs::create_dir_all(root.join("destination")).expect("destination parent");
+        let managed = ManagedDir::open_root(&root).expect("managed root");
+        let source = managed.open_child("source").expect("source");
+        let destination = managed.open_child("destination").expect("destination");
+        let child = source.create_child_new("created").expect("created child");
+        let expected_identity = child.identity().expect("source identity");
+        let saved = root.join("saved-created");
+
+        let failure = source
+            .move_child_guarded_no_replace_with_hooks(
+                "created",
+                child,
+                &destination,
+                "parked",
+                || {
+                    fs::rename(root.join("source/created"), &saved)
+                        .expect("save admitted identity");
+                    fs::create_dir(root.join("source/created"))
+                        .expect("replacement source identity");
+                    fs::write(root.join("source/created/foreign"), b"foreign")
+                        .expect("foreign sentinel");
+                },
+                || {
+                    fs::create_dir(root.join("source/created")).expect("raced source occupant");
+                },
+            )
+            .expect_err("an occupied source must retain an observable parked replacement");
+        let ManagedDirectoryMoveFailure::IdentityMismatchParked {
+            expected_identity: retained_identity,
+            cause,
+        } = failure
+        else {
+            panic!("the unreturnable replacement must remain typed as parked");
+        };
+
+        assert_eq!(retained_identity, expected_identity);
+        assert!(matches!(cause, LoaderError::Verify(_)));
+        assert_eq!(
+            ManagedDir::open_root(&saved).unwrap().identity().unwrap(),
+            retained_identity
+        );
+        assert_eq!(
+            fs::read(root.join("destination/parked/foreign")).unwrap(),
+            b"foreign"
+        );
+        assert!(root.join("source/created").is_dir());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn guarded_directory_move_rejects_a_post_move_source_replacement() {
+        let root = test_root("move-child-attempted-source-replacement");
+        fs::create_dir_all(root.join("source")).expect("source parent");
+        fs::create_dir_all(root.join("destination")).expect("destination parent");
+        let managed = ManagedDir::open_root(&root).expect("managed root");
+        let source = managed.open_child("source").expect("source");
+        let destination = managed.open_child("destination").expect("destination");
+        let child = source.create_child_new("created").expect("created child");
+        let expected_identity = child.identity().expect("source identity");
+
+        let failure = source
+            .move_child_guarded_no_replace_with_hook(
+                "created",
+                child,
+                &destination,
+                "parked",
+                || fs::create_dir(root.join("source/created")).expect("replacement source"),
+            )
+            .expect_err("source replacement must make the attempted move ambiguous");
+        let ManagedDirectoryMoveFailure::MoveAttempted {
+            expected_identity: retained_identity,
+            cause,
+        } = failure
+        else {
+            panic!("post-move failure must remain observable");
+        };
+
+        assert_eq!(retained_identity, expected_identity);
+        assert!(matches!(cause, LoaderError::Verify(_)));
+        assert_eq!(
+            destination
+                .open_child("parked")
+                .unwrap()
+                .identity()
+                .unwrap(),
+            retained_identity
+        );
+        assert_ne!(
+            source.open_child("created").unwrap().identity().unwrap(),
+            retained_identity
+        );
         let _ = fs::remove_dir_all(root);
     }
 
