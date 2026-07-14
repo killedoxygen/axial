@@ -1072,9 +1072,6 @@ button.cp-status-pill--content {
   overflow: auto;
   width: 100%;
   background-color: var(--bg);
-  background-image: var(--bg-noise);
-  background-repeat: repeat;
-  background-size: 140px 140px;
   border-top-left-radius: var(--r-lg);
 }
 

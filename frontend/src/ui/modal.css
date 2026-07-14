@@ -3,8 +3,6 @@
   inset: 0;
   z-index: 900;
   background: color-mix(in oklab, var(--bg-deep) 62%, transparent);
-  backdrop-filter: blur(6px);
-  -webkit-backdrop-filter: blur(6px);
   animation: cp-fade-in 220ms ease both;
 }
 

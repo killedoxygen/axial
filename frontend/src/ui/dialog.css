@@ -7,7 +7,6 @@
   justify-content: center;
   padding: 24px;
   background: color-mix(in oklab, var(--bg-deep) 62%, transparent);
-  backdrop-filter: blur(6px);
   animation: cp-fade-in 120ms ease;
 }
 .cp-dialog {
