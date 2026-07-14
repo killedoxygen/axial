@@ -106,7 +106,7 @@ fn windows_prefixed(value: &str) -> bool {
 
 fn windows_device_name(segment: &str) -> bool {
     let basename = segment.split('.').next().unwrap_or(segment);
-    if ["CON", "PRN", "AUX", "NUL", "CLOCK$"]
+    if ["CON", "PRN", "AUX", "NUL", "CLOCK$", "CONIN$", "CONOUT$"]
         .iter()
         .any(|device| basename.eq_ignore_ascii_case(device))
     {
@@ -237,6 +237,10 @@ mod tests {
             "Aux/library.jar",
             "nul.json",
             "CLOCK$.jar",
+            "CONIN$",
+            "conin$.txt",
+            "CONOUT$",
+            "conout$.log",
             "com1",
             "COM9.zip",
             "lpt1",
