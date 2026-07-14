@@ -246,7 +246,6 @@ export function InstanceDetailView({ id }: { id: string }): JSX.Element {
               {running ? (
                 <div class="cp-session">
                   <span class="cp-session-time">
-                    <span class="cp-session-dot" aria-hidden="true" />
                     <span>{fmtElapsed(session?.launchedAt, now)}</span>
                   </span>
                   <button class="cp-session-stop" type="button" onClick={onStop}>

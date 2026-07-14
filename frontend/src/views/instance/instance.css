@@ -249,13 +249,6 @@ html[data-color-mode='light'] .cp-instance-hero-tile {
   font-weight: 700;
   font-variant-numeric: tabular-nums;
 }
-.cp-session-dot {
-  width: 7px;
-  height: 7px;
-  border-radius: 999px;
-  background: var(--accent);
-  animation: cp-live-pulse 1.8s ease-in-out infinite;
-}
 .cp-session-stop {
   display: inline-flex;
   align-items: center;
@@ -282,12 +275,6 @@ html[data-color-mode='light'] .cp-instance-hero-tile {
   outline: none;
   box-shadow: var(--focus-ring-inset);
 }
-@media (prefers-reduced-motion: reduce) {
-  .cp-session-dot {
-    animation: none;
-  }
-}
-
 .cp-instance-split-launch {
   display: inline-flex;
   height: 46px;
