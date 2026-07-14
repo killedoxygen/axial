@@ -11,7 +11,7 @@ use super::library_source::{
 };
 use super::model::{
     DownloadError, DownloadProgress, ExactLibraryDownloadProof, ExecutionDownloadFact,
-    ExpectedIntegrity, SelectedDownloadArtifactDescriptor, SelectedDownloadArtifactKind, progress,
+    ExpectedIntegrity, SelectedDownloadArtifactKind, progress,
 };
 use super::plan::TransferPlan;
 #[cfg(test)]
@@ -626,7 +626,7 @@ impl Downloader {
     where
         F: FnMut(DownloadProgress),
     {
-        Box::pin(self.install_version_with_fact_sender(version_id, &mut send, None, None)).await
+        Box::pin(self.install_version_with_fact_sender(version_id, &mut send, None)).await
     }
 
     pub(crate) async fn reconstruct_version(
@@ -851,32 +851,22 @@ impl Downloader {
         })
     }
 
-    pub async fn install_version_with_facts_and_descriptors<F, G, H>(
+    pub async fn install_version_with_facts<F, G>(
         &self,
         version_id: &str,
         mut send: F,
         mut send_fact: G,
-        mut send_descriptor: H,
     ) -> Result<KnownGoodInstallReceipt, DownloadError>
     where
         F: FnMut(DownloadProgress),
         G: FnMut(ExecutionDownloadFact),
-        H: FnMut(SelectedDownloadArtifactDescriptor),
     {
         let (fact_tx, mut fact_rx) = mpsc::unbounded_channel();
-        let (descriptor_tx, mut descriptor_rx) = mpsc::unbounded_channel();
-        let result = Box::pin(self.install_version_with_fact_sender(
-            version_id,
-            &mut send,
-            Some(fact_tx),
-            Some(descriptor_tx),
-        ))
-        .await;
+        let result =
+            Box::pin(self.install_version_with_fact_sender(version_id, &mut send, Some(fact_tx)))
+                .await;
         while let Ok(fact) = fact_rx.try_recv() {
             send_fact(fact);
-        }
-        while let Ok(descriptor) = descriptor_rx.try_recv() {
-            send_descriptor(descriptor);
         }
         result
     }
@@ -886,7 +876,6 @@ impl Downloader {
         version_id: &str,
         send: &mut F,
         fact_tx: Option<mpsc::UnboundedSender<ExecutionDownloadFact>>,
-        descriptor_tx: Option<mpsc::UnboundedSender<SelectedDownloadArtifactDescriptor>>,
     ) -> Result<KnownGoodInstallReceipt, DownloadError>
     where
         F: FnMut(DownloadProgress),
@@ -911,7 +900,6 @@ impl Downloader {
                     &mut send,
                     &plan,
                     fact_tx.as_ref(),
-                    descriptor_tx.as_ref(),
                 )
                 .await?;
             let lease = acquire_version_bundle_publication_lease(managed_root, version_id).await?;
@@ -958,7 +946,6 @@ impl Downloader {
         send: &mut F,
         plan: &Arc<TransferPlan>,
         fact_tx: Option<&mpsc::UnboundedSender<ExecutionDownloadFact>>,
-        descriptor_tx: Option<&mpsc::UnboundedSender<SelectedDownloadArtifactDescriptor>>,
     ) -> Result<PreparedVersionBundlePublication, DownloadError>
     where
         F: FnMut(DownloadProgress),
@@ -1002,7 +989,7 @@ impl Downloader {
             ));
         }
         let asset_index_source = self
-            .materialize_asset_index_source(&version, asset_index_source, fact_tx, descriptor_tx)
+            .materialize_asset_index_source(&version, asset_index_source, fact_tx)
             .await?;
         if asset_index_source.is_some() {
             plan.add_done(asset_index_bytes);
@@ -1125,7 +1112,6 @@ impl Downloader {
                     self.client.clone(),
                     source.shared_bytes(),
                     fact_tx.cloned(),
-                    descriptor_tx.cloned(),
                     plan.clone(),
                 )
             });
@@ -1148,7 +1134,6 @@ impl Downloader {
                         let (job, acquisition) = classified.into_parts();
                         let client = client.clone();
                         let fact_tx = fact_tx.cloned();
-                        let descriptor_tx = descriptor_tx.cloned();
                         let source_pool = source_pool.clone();
                         async move {
                             if acquisition == LibraryAcquisition::FreshStream {
@@ -1176,7 +1161,6 @@ impl Downloader {
                                     &job.expected,
                                     job.is_native,
                                     fact_tx.as_ref(),
-                                    descriptor_tx.as_ref(),
                                 )
                                 .await?;
                                 let (identity, _) = materialize_authenticated_library_source(
@@ -1211,7 +1195,6 @@ impl Downloader {
                                     &job.path,
                                     &job.expected,
                                     fact_tx.as_ref(),
-                                    descriptor_tx.as_ref(),
                                 )
                                 .await?;
                                 Ok::<_, DownloadError>((
@@ -1493,7 +1476,6 @@ impl Downloader {
         version: &VersionJson,
         source: Option<AuthenticatedSelectedArtifactSource>,
         fact_tx: Option<&mpsc::UnboundedSender<ExecutionDownloadFact>>,
-        descriptor_tx: Option<&mpsc::UnboundedSender<SelectedDownloadArtifactDescriptor>>,
     ) -> Result<Option<MaterializedSelectedArtifactSource>, DownloadError> {
         let Some(source) = source else {
             return Ok(None);
@@ -1511,7 +1493,6 @@ impl Downloader {
             &version.asset_index.id,
             &expected,
             fact_tx,
-            descriptor_tx,
         )
         .await?;
         materialize_authenticated_selected_artifact_source(prepared, source, fact_tx)

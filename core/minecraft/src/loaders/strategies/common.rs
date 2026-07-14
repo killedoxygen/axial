@@ -2,8 +2,8 @@ use crate::download::{
     AuthenticatedSelectedArtifactSource, DownloadProgress, Downloader, ExactLibraryDownloadProof,
     MaterializedLibraryIdentity, PreparedVersionBundlePublication,
     acquire_version_bundle_publication_lease,
-    download_installer_libraries_with_declarations_and_facts_and_descriptors,
-    download_profile_libraries_with_declarations_and_facts_and_descriptors,
+    download_installer_libraries_with_declarations_and_facts,
+    download_profile_libraries_with_declarations_and_facts,
     prepare_local_version_bundle_publication, publish_prepared_version_bundle_install,
     reconstruct_installer_library_declarations, reconstruct_profile_library_declarations,
 };
@@ -1054,8 +1054,7 @@ where
 
     let downloader = Downloader::new(library_dir.to_path_buf(), runtime_cache.clone());
     let mut facts = Vec::new();
-    let mut descriptors = Vec::new();
-    let result = Box::pin(downloader.install_version_with_facts_and_descriptors(
+    let result = Box::pin(downloader.install_version_with_facts(
         version_id,
         |progress| {
             if !progress.done {
@@ -1063,7 +1062,6 @@ where
             }
         },
         |fact| facts.push(fact),
-        |descriptor| descriptors.push(descriptor),
     ))
     .await;
     match result {
@@ -1071,7 +1069,6 @@ where
         Err(error) => Err(LoaderError::BaseInstallFailed {
             error: Box::new(error),
             facts,
-            descriptors,
         }),
     }
 }
@@ -1115,17 +1112,15 @@ where
     F: FnMut(DownloadProgress),
 {
     let mut facts = Vec::new();
-    let mut descriptors = Vec::new();
-    download_profile_libraries_with_declarations_and_facts_and_descriptors(
+    download_profile_libraries_with_declarations_and_facts(
         library_dir,
         declarations,
         phase,
         &mut *send,
         |fact| facts.push(fact),
-        |descriptor| descriptors.push(descriptor),
     )
     .await
-    .map_err(|_| LoaderError::ArtifactDownloadFailed { facts, descriptors })
+    .map_err(|_| LoaderError::ArtifactDownloadFailed { facts })
 }
 
 async fn download_installer_libraries_with_evidence<F>(
@@ -1144,17 +1139,15 @@ where
     F: FnMut(DownloadProgress),
 {
     let mut facts = Vec::new();
-    let mut descriptors = Vec::new();
-    download_installer_libraries_with_declarations_and_facts_and_descriptors(
+    download_installer_libraries_with_declarations_and_facts(
         library_dir,
         install,
         phase,
         &mut *send,
         |fact| facts.push(fact),
-        |descriptor| descriptors.push(descriptor),
     )
     .await
-    .map_err(|_| LoaderError::ArtifactDownloadFailed { facts, descriptors })
+    .map_err(|_| LoaderError::ArtifactDownloadFailed { facts })
 }
 
 fn parse_profile_json(

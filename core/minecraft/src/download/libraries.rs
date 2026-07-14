@@ -7,8 +7,8 @@ use super::library_source::{
 };
 use super::model::{
     DownloadError, DownloadProgress, ExactLibraryDownloadProof, ExecutionDownloadFact,
-    ExpectedIntegrity, LibraryPlanError, MaterializedLibraryIdentity,
-    SelectedDownloadArtifactDescriptor, SelectedDownloadArtifactKind, progress,
+    ExpectedIntegrity, LibraryPlanError, MaterializedLibraryIdentity, SelectedDownloadArtifactKind,
+    progress,
 };
 use super::transfer::{
     ensure_selected_artifact_with_client_and_observed_size,
@@ -87,17 +87,12 @@ impl LibraryArtifactPlan {
     }
 }
 
-pub(crate) async fn download_profile_libraries_with_declarations_and_facts_and_descriptors<
-    F,
-    G,
-    H,
->(
+pub(crate) async fn download_profile_libraries_with_declarations_and_facts<F, G>(
     mc_dir: &Path,
     declarations: PendingExactLibraryDeclarations,
     phase: &str,
     send: F,
     mut send_fact: G,
-    mut send_descriptor: H,
 ) -> Result<
     (
         PendingStreamedLibraryDeclarations,
@@ -108,7 +103,6 @@ pub(crate) async fn download_profile_libraries_with_declarations_and_facts_and_d
 where
     F: FnMut(DownloadProgress),
     G: FnMut(ExecutionDownloadFact),
-    H: FnMut(SelectedDownloadArtifactDescriptor),
 {
     let jobs = {
         let (libraries, environment) = declarations.profile_plan_inputs().ok_or_else(|| {
@@ -120,22 +114,10 @@ where
         .classify_jobs(&libraries_dir(mc_dir), jobs)
         .map_err(profile_declaration_error)?;
     let (fact_tx, mut fact_rx) = mpsc::unbounded_channel();
-    let (descriptor_tx, mut descriptor_rx) = mpsc::unbounded_channel();
-    let result = download_classified_library_jobs(
-        mc_dir,
-        jobs,
-        phase,
-        send,
-        Some(fact_tx),
-        Some(descriptor_tx),
-        false,
-    )
-    .await;
+    let result =
+        download_classified_library_jobs(mc_dir, jobs, phase, send, Some(fact_tx), false).await;
     while let Ok(fact) = fact_rx.try_recv() {
         send_fact(fact);
-    }
-    while let Ok(descriptor) = descriptor_rx.try_recv() {
-        send_descriptor(descriptor);
     }
     result.map(|identities| {
         let proofs = identities
@@ -156,17 +138,12 @@ fn profile_declaration_error(error: SealedLibraryDeclarationError) -> DownloadEr
     ))
 }
 
-pub(crate) async fn download_installer_libraries_with_declarations_and_facts_and_descriptors<
-    F,
-    G,
-    H,
->(
+pub(crate) async fn download_installer_libraries_with_declarations_and_facts<F, G>(
     mc_dir: &Path,
     install: crate::loaders::PendingForgeNetworkInstall,
     phase: &str,
     send: F,
     mut send_fact: G,
-    mut send_descriptor: H,
 ) -> Result<
     (
         crate::loaders::PendingForgeInstallExecution,
@@ -177,26 +154,13 @@ pub(crate) async fn download_installer_libraries_with_declarations_and_facts_and
 where
     F: FnMut(DownloadProgress),
     G: FnMut(ExecutionDownloadFact),
-    H: FnMut(SelectedDownloadArtifactDescriptor),
 {
     let (pending_execution, jobs) = install.into_parts();
     let (fact_tx, mut fact_rx) = mpsc::unbounded_channel();
-    let (descriptor_tx, mut descriptor_rx) = mpsc::unbounded_channel();
-    let result = download_classified_library_jobs(
-        mc_dir,
-        jobs,
-        phase,
-        send,
-        Some(fact_tx),
-        Some(descriptor_tx),
-        true,
-    )
-    .await;
+    let result =
+        download_classified_library_jobs(mc_dir, jobs, phase, send, Some(fact_tx), true).await;
     while let Ok(fact) = fact_rx.try_recv() {
         send_fact(fact);
-    }
-    while let Ok(descriptor) = descriptor_rx.try_recv() {
-        send_descriptor(descriptor);
     }
     result.map(|materialized| (pending_execution, materialized))
 }
@@ -207,7 +171,6 @@ async fn download_classified_library_jobs<F>(
     phase: &str,
     mut send: F,
     fact_tx: Option<mpsc::UnboundedSender<ExecutionDownloadFact>>,
-    descriptor_tx: Option<mpsc::UnboundedSender<SelectedDownloadArtifactDescriptor>>,
     retain_exact_proofs: bool,
 ) -> Result<Vec<MaterializedLibraryIdentity>, DownloadError>
 where
@@ -224,7 +187,6 @@ where
         let (job, acquisition) = classified.into_parts();
         let client = client.clone();
         let fact_tx = fact_tx.clone();
-        let descriptor_tx = descriptor_tx.clone();
         let source_pool = source_pool.clone();
         let mc_dir = mc_dir.clone();
         async move {
@@ -236,7 +198,6 @@ where
                     &job.path,
                     &job.expected,
                     fact_tx.as_ref(),
-                    descriptor_tx.as_ref(),
                 )
                 .await?;
                 let sha1 = decode_sha1(
@@ -281,7 +242,6 @@ where
                     &job.expected,
                     job.is_native,
                     fact_tx.as_ref(),
-                    descriptor_tx.as_ref(),
                 )
                 .await?;
                 let (authority, _) =

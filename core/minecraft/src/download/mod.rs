@@ -28,9 +28,9 @@ pub(crate) use install::{
 };
 pub use integrity::LauncherManagedArtifactReadiness;
 pub(crate) use libraries::DownloadJob;
-pub(crate) use libraries::download_installer_libraries_with_declarations_and_facts_and_descriptors;
+pub(crate) use libraries::download_installer_libraries_with_declarations_and_facts;
 pub(crate) use libraries::{
-    LibraryArtifactPlan, download_profile_libraries_with_declarations_and_facts_and_descriptors,
+    LibraryArtifactPlan, download_profile_libraries_with_declarations_and_facts,
     library_artifact_plans_for,
 };
 pub use libraries::{
@@ -39,8 +39,7 @@ pub use libraries::{
 pub use model::{
     DownloadError, DownloadProgress, ExecutionDownloadError, ExecutionDownloadFact,
     ExecutionDownloadFactKind, ExecutionDownloadOwnership, ExecutionDownloadReport,
-    ExpectedIntegrity, LibraryPlanError, SelectedDownloadArtifactDescriptor,
-    SelectedDownloadArtifactKind,
+    ExpectedIntegrity, LibraryPlanError, SelectedDownloadArtifactKind,
 };
 pub(crate) use model::{ExactLibraryDownloadProof, MaterializedLibraryIdentity};
 pub(crate) use transfer::AuthenticatedSelectedArtifactSource;

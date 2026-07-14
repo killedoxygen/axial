@@ -1,8 +1,7 @@
 use super::facts::{
-    ExecutionDownloadRequest, emit_execution_download_facts, emit_selected_download_descriptor,
-    execution_download_error, execution_download_fact, integrity_mismatch_fact, metadata_facts,
-    no_download_fact_fields, selected_artifact_missing_fact, selected_download_target_label,
-    size_mismatch_fact,
+    ExecutionDownloadRequest, emit_execution_download_facts, execution_download_error,
+    execution_download_fact, integrity_mismatch_fact, metadata_facts, no_download_fact_fields,
+    selected_artifact_missing_fact, selected_download_target_label, size_mismatch_fact,
 };
 use super::integrity::{
     ExistingArtifactIntegrity, download_size_mismatch, existing_artifact_integrity,
@@ -12,7 +11,7 @@ use super::library_source::AuthenticatedLibrarySource;
 use super::model::{
     ActualIntegrity, DownloadError, DownloadIntegrityError, ExecutionDownloadError,
     ExecutionDownloadFact, ExecutionDownloadFactKind, ExecutionDownloadReport, ExpectedIntegrity,
-    MaterializedLibraryIdentity, SelectedDownloadArtifactDescriptor, SelectedDownloadArtifactKind,
+    MaterializedLibraryIdentity, SelectedDownloadArtifactKind,
 };
 use super::path_safety::{
     bounded_download_file_label, filesystem_path, safe_download_target_label,
@@ -59,7 +58,6 @@ struct SelectedArtifactDownload<'a> {
     destination: &'a Path,
     expected: &'a ExpectedIntegrity,
     fact_tx: Option<&'a mpsc::UnboundedSender<ExecutionDownloadFact>>,
-    descriptor_tx: Option<&'a mpsc::UnboundedSender<SelectedDownloadArtifactDescriptor>>,
 }
 
 pub(crate) struct AuthenticatedSelectedArtifactSource {
@@ -141,7 +139,6 @@ pub(super) struct PreparedLibraryPublication {
     is_native: bool,
     selected: PreparedSelectedArtifactInstall,
     provider_url: String,
-    descriptor_tx: Option<mpsc::UnboundedSender<SelectedDownloadArtifactDescriptor>>,
 }
 
 impl PreparedLibraryPublication {
@@ -283,18 +280,8 @@ pub(super) async fn prepare_selected_artifact_install(
     logical_identity: &str,
     expected: &ExpectedIntegrity,
     fact_tx: Option<&mpsc::UnboundedSender<ExecutionDownloadFact>>,
-    descriptor_tx: Option<&mpsc::UnboundedSender<SelectedDownloadArtifactDescriptor>>,
 ) -> Result<PreparedSelectedArtifactInstall, DownloadError> {
-    guard_existing_unsupported_selected_artifact(
-        kind,
-        destination,
-        url,
-        expected,
-        fact_tx,
-        descriptor_tx,
-    )
-    .await?;
-    emit_selected_download_descriptor(descriptor_tx, kind, destination, url, expected);
+    guard_existing_unsupported_selected_artifact(kind, destination, fact_tx).await?;
     emit_selected_artifact_missing_fact_if_absent(fact_tx, kind, destination, expected).await;
     Ok(PreparedSelectedArtifactInstall {
         destination: destination.to_path_buf(),
@@ -313,16 +300,12 @@ pub(super) async fn prepare_library_publication(
     expected: &ExpectedIntegrity,
     is_native: bool,
     fact_tx: Option<&mpsc::UnboundedSender<ExecutionDownloadFact>>,
-    descriptor_tx: Option<&mpsc::UnboundedSender<SelectedDownloadArtifactDescriptor>>,
 ) -> Result<PreparedLibraryPublication, DownloadError> {
     let destination = relative_path.join_under(&libraries_dir(mc_dir));
     guard_existing_unsupported_selected_artifact(
         SelectedDownloadArtifactKind::Library,
         &destination,
-        url,
-        expected,
         fact_tx,
-        None,
     )
     .await?;
     let selected = PreparedSelectedArtifactInstall {
@@ -338,7 +321,6 @@ pub(super) async fn prepare_library_publication(
         is_native,
         selected,
         provider_url: url.to_string(),
-        descriptor_tx: descriptor_tx.cloned(),
     })
 }
 
@@ -379,13 +361,6 @@ pub(super) async fn materialize_authenticated_library_source(
         size: Some(observed_size),
         sha1: Some(hex_sha1(&observed_sha1)),
     };
-    emit_selected_download_descriptor(
-        prepared.descriptor_tx.as_ref(),
-        SelectedDownloadArtifactKind::Library,
-        &prepared.selected.destination,
-        &prepared.provider_url,
-        &exact_expected,
-    );
     emit_selected_artifact_missing_fact_if_absent(
         fact_tx,
         SelectedDownloadArtifactKind::Library,
@@ -1559,7 +1534,6 @@ pub(super) async fn ensure_selected_artifact_with_client(
     destination: &Path,
     expected: &ExpectedIntegrity,
     fact_tx: Option<&mpsc::UnboundedSender<ExecutionDownloadFact>>,
-    descriptor_tx: Option<&mpsc::UnboundedSender<SelectedDownloadArtifactDescriptor>>,
 ) -> Result<Option<ExecutionDownloadReport>, DownloadError> {
     ensure_selected_artifact_with_client_and_observed_size(
         kind,
@@ -1568,7 +1542,6 @@ pub(super) async fn ensure_selected_artifact_with_client(
         destination,
         expected,
         fact_tx,
-        descriptor_tx,
     )
     .await
     .map(|(report, _)| report)
@@ -1581,7 +1554,6 @@ pub(super) async fn ensure_selected_artifact_with_client_and_observed_size(
     destination: &Path,
     expected: &ExpectedIntegrity,
     fact_tx: Option<&mpsc::UnboundedSender<ExecutionDownloadFact>>,
-    descriptor_tx: Option<&mpsc::UnboundedSender<SelectedDownloadArtifactDescriptor>>,
 ) -> Result<(Option<ExecutionDownloadReport>, u64), DownloadError> {
     match selected_existing_artifact_integrity(kind, destination, expected).await? {
         ExistingArtifactIntegrity::Verified(size) => Ok((None, size)),
@@ -1615,7 +1587,6 @@ pub(super) async fn ensure_selected_artifact_with_client_and_observed_size(
                 destination,
                 expected,
                 fact_tx,
-                descriptor_tx,
             },
             Some(error),
         )
@@ -1625,14 +1596,7 @@ pub(super) async fn ensure_selected_artifact_with_client_and_observed_size(
             (Some(report), size)
         }),
         ExistingArtifactIntegrity::UnsupportedExisting => {
-            emit_unsupported_selected_artifact(
-                kind,
-                destination,
-                url,
-                expected,
-                fact_tx,
-                descriptor_tx,
-            );
+            emit_unsupported_selected_artifact(kind, destination, fact_tx);
             Err(unsupported_selected_artifact_error(destination))
         }
         ExistingArtifactIntegrity::Missing => download_selected_artifact_with_client(
@@ -1643,7 +1607,6 @@ pub(super) async fn ensure_selected_artifact_with_client_and_observed_size(
                 destination,
                 expected,
                 fact_tx,
-                descriptor_tx,
             },
             None,
         )
@@ -1670,24 +1633,14 @@ async fn selected_existing_artifact_integrity(
 async fn guard_existing_unsupported_selected_artifact(
     kind: SelectedDownloadArtifactKind,
     destination: &Path,
-    url: &str,
-    expected: &ExpectedIntegrity,
     fact_tx: Option<&mpsc::UnboundedSender<ExecutionDownloadFact>>,
-    descriptor_tx: Option<&mpsc::UnboundedSender<SelectedDownloadArtifactDescriptor>>,
 ) -> Result<(), DownloadError> {
     let Ok(metadata) = async_fs::symlink_metadata(filesystem_path(destination).as_ref()).await
     else {
         return Ok(());
     };
     if metadata.file_type().is_symlink() || !metadata.is_file() {
-        emit_unsupported_selected_artifact(
-            kind,
-            destination,
-            url,
-            expected,
-            fact_tx,
-            descriptor_tx,
-        );
+        emit_unsupported_selected_artifact(kind, destination, fact_tx);
         return Err(unsupported_selected_artifact_error(destination));
     }
     Ok(())
@@ -1704,9 +1657,7 @@ async fn download_selected_artifact_with_client(
         destination,
         expected,
         fact_tx,
-        descriptor_tx,
     } = request;
-    emit_selected_download_descriptor(descriptor_tx, kind, destination, url, expected);
     if let Some(error) = existing_corrupt.as_ref() {
         emit_existing_corrupt_selected_artifact_fact(kind, destination, fact_tx, error);
     }
@@ -1752,12 +1703,8 @@ fn corrupt_artifact_replaced_fact(target: &str) -> ExecutionDownloadFact {
 fn emit_unsupported_selected_artifact(
     kind: SelectedDownloadArtifactKind,
     destination: &Path,
-    url: &str,
-    expected: &ExpectedIntegrity,
     fact_tx: Option<&mpsc::UnboundedSender<ExecutionDownloadFact>>,
-    descriptor_tx: Option<&mpsc::UnboundedSender<SelectedDownloadArtifactDescriptor>>,
 ) {
-    emit_selected_download_descriptor(descriptor_tx, kind, destination, url, expected);
     if let Some(fact_tx) = fact_tx {
         let target = selected_download_target_label(kind, destination);
         let _ = fact_tx.send(execution_download_fact(

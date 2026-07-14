@@ -2,14 +2,12 @@ use super::integrity::is_sha1_hex;
 use super::model::{
     DownloadError, DownloadIntegrityError, ExecutionDownloadError, ExecutionDownloadFact,
     ExecutionDownloadFactKind, ExecutionDownloadOwnership, ExpectedIntegrity,
-    SelectedDownloadArtifactDescriptor, SelectedDownloadArtifactKind,
+    SelectedDownloadArtifactKind,
 };
 use super::path_safety::safe_download_fact_value;
 use std::io;
 use std::path::Path;
 use tokio::sync::mpsc;
-
-const DEFAULT_SELECTED_ARTIFACT_MAX_BYTES: u64 = 512 << 20;
 
 pub(super) struct ExecutionDownloadRequest<'a> {
     pub(super) url: &'a str,
@@ -31,37 +29,6 @@ impl<'a> ExecutionDownloadRequest<'a> {
             ownership: ExecutionDownloadOwnership::LauncherManaged,
         }
     }
-}
-
-pub(super) fn emit_selected_download_descriptor(
-    descriptor_tx: Option<&mpsc::UnboundedSender<SelectedDownloadArtifactDescriptor>>,
-    kind: SelectedDownloadArtifactKind,
-    destination: &Path,
-    provider_url: &str,
-    expected: &ExpectedIntegrity,
-) {
-    let Some(descriptor_tx) = descriptor_tx else {
-        return;
-    };
-    let Some(sha1) = expected.sha1.as_deref() else {
-        return;
-    };
-    if !is_sha1_hex(sha1) {
-        return;
-    }
-    let descriptor = SelectedDownloadArtifactDescriptor::new(
-        kind,
-        selected_download_target_label(kind, destination),
-        destination.to_path_buf(),
-        provider_url.to_string(),
-        sha1.to_ascii_lowercase(),
-        expected.size,
-        expected
-            .size
-            .unwrap_or(DEFAULT_SELECTED_ARTIFACT_MAX_BYTES)
-            .max(1),
-    );
-    let _ = descriptor_tx.send(descriptor);
 }
 
 pub(super) fn emit_execution_download_facts(

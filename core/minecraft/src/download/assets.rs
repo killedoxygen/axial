@@ -4,7 +4,7 @@ use super::integrity::existing_asset_object_satisfies;
 use super::integrity::hash_file;
 use super::model::{
     DownloadError, DownloadProgress, ExecutionDownloadFact, ExpectedIntegrity,
-    SelectedDownloadArtifactDescriptor, SelectedDownloadArtifactKind, progress,
+    SelectedDownloadArtifactKind, progress,
 };
 use super::path_safety::{
     bounded_download_file_label, bounded_provider_path_label, filesystem_path, path_is_file,
@@ -44,7 +44,6 @@ pub(super) fn spawn_asset_download_pipeline(
     client: reqwest::Client,
     verified_index_bytes: Arc<[u8]>,
     fact_tx: Option<mpsc::UnboundedSender<ExecutionDownloadFact>>,
-    descriptor_tx: Option<mpsc::UnboundedSender<SelectedDownloadArtifactDescriptor>>,
     plan: Arc<TransferPlan>,
 ) -> AssetDownloadPipeline {
     // Asset-object bytes are unknown until the index is parsed; reserve the
@@ -58,7 +57,6 @@ pub(super) fn spawn_asset_download_pipeline(
             client,
             verified_index_bytes,
             fact_tx,
-            descriptor_tx,
             &plan,
             |progress| {
                 let _ = progress_tx.send(progress);
@@ -116,7 +114,6 @@ async fn download_asset_objects_with_client<F>(
     client: reqwest::Client,
     verified_index_bytes: Arc<[u8]>,
     fact_tx: Option<mpsc::UnboundedSender<ExecutionDownloadFact>>,
-    descriptor_tx: Option<mpsc::UnboundedSender<SelectedDownloadArtifactDescriptor>>,
     plan: &TransferPlan,
     mut send: F,
 ) -> Result<(), DownloadError>
@@ -144,7 +141,6 @@ where
     let mut asset_downloads = futures_util::stream::iter(jobs.into_iter().map(|job| {
         let client = client.clone();
         let fact_tx = fact_tx.clone();
-        let descriptor_tx = descriptor_tx.clone();
         async move {
             let hash = job.hash;
             let path = job.path;
@@ -162,7 +158,6 @@ where
                 &path,
                 &expected,
                 fact_tx.as_ref(),
-                descriptor_tx.as_ref(),
             )
             .await?;
             Ok::<u64, DownloadError>(bytes)
@@ -402,7 +397,6 @@ mod source_first_tests {
             reqwest::Client::new(),
             Arc::from(br#"{"objects":{}}"#.as_slice()),
             None,
-            None,
             plan,
         );
         let mut progress = Vec::new();
@@ -422,7 +416,6 @@ mod source_first_tests {
             PathBuf::from("/path/that/is/not/read"),
             reqwest::Client::new(),
             Arc::from(b"not json".as_slice()),
-            None,
             None,
             TransferPlan::shared(),
         );

@@ -1,8 +1,7 @@
 use crate::artifact_path::ArtifactRelativePath;
 use serde::{Deserialize, Serialize};
-use std::fmt;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use thiserror::Error;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -355,66 +354,6 @@ pub enum SelectedDownloadArtifactKind {
     AssetIndex,
     AssetObject,
     LogConfig,
-}
-
-#[derive(Clone, PartialEq, Eq)]
-pub struct SelectedDownloadArtifactDescriptor {
-    pub kind: SelectedDownloadArtifactKind,
-    pub target: String,
-    destination: PathBuf,
-    provider_url: String,
-    sha1: String,
-    pub expected_size: Option<u64>,
-    pub max_bytes: u64,
-}
-
-impl SelectedDownloadArtifactDescriptor {
-    pub fn new(
-        kind: SelectedDownloadArtifactKind,
-        target: impl Into<String>,
-        destination: impl Into<PathBuf>,
-        provider_url: impl Into<String>,
-        sha1: impl Into<String>,
-        expected_size: Option<u64>,
-        max_bytes: u64,
-    ) -> Self {
-        Self {
-            kind,
-            target: target.into(),
-            destination: destination.into(),
-            provider_url: provider_url.into(),
-            sha1: sha1.into(),
-            expected_size,
-            max_bytes,
-        }
-    }
-
-    pub fn destination(&self) -> &Path {
-        &self.destination
-    }
-
-    pub fn provider_url(&self) -> &str {
-        &self.provider_url
-    }
-
-    pub fn sha1(&self) -> &str {
-        &self.sha1
-    }
-}
-
-impl fmt::Debug for SelectedDownloadArtifactDescriptor {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("SelectedDownloadArtifactDescriptor")
-            .field("kind", &self.kind)
-            .field("target", &self.target)
-            .field("destination", &"<redacted>")
-            .field("provider_url", &"<redacted>")
-            .field("sha1", &"<redacted>")
-            .field("expected_size", &self.expected_size)
-            .field("max_bytes", &self.max_bytes)
-            .finish()
-    }
 }
 
 #[derive(Debug)]

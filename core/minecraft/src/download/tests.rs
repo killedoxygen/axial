@@ -376,14 +376,12 @@ async fn install_version_with_facts_emits_private_download_facts_only() {
     let downloader = test_manifest_downloader(&root, "overlap", &version_url, &version_sha1);
     let mut events = Vec::new();
     let mut facts = Vec::new();
-    let mut descriptors = Vec::new();
 
     let receipt = downloader
-        .install_version_with_facts_and_descriptors(
+        .install_version_with_facts(
             "overlap",
             |progress| events.push(progress),
             |fact| facts.push(fact),
-            |descriptor| descriptors.push(descriptor),
         )
         .await
         .expect("install should succeed");
@@ -418,28 +416,8 @@ async fn install_version_with_facts_emits_private_download_facts_only() {
             .iter()
             .any(|fact| fact.kind == ExecutionDownloadFactKind::Promoted)
     );
-    assert!(descriptors.iter().any(|descriptor| {
-        descriptor.kind == SelectedDownloadArtifactKind::AssetIndex && descriptor.sha1().len() == 40
-    }));
-    assert!(descriptors.iter().any(|descriptor| {
-        descriptor.kind == SelectedDownloadArtifactKind::Library
-            && descriptor.destination().ends_with("lib-1.0.0.jar")
-    }));
-    assert!(descriptors.iter().all(|descriptor| {
-        !matches!(
-            descriptor.kind,
-            SelectedDownloadArtifactKind::VersionJson
-                | SelectedDownloadArtifactKind::ClientJar
-                | SelectedDownloadArtifactKind::LogConfig
-        )
-    }));
-    let debug = format!("{:?}", descriptors[0]).to_ascii_lowercase();
-    assert!(!debug.contains(root.to_string_lossy().as_ref()));
-    assert!(!debug.contains("http://"));
-    assert!(!debug.contains(descriptors[0].sha1()));
     let progress_json = serde_json::to_string(&events).expect("progress json");
     assert!(!progress_json.contains("facts"));
-    assert!(!progress_json.contains("descriptors"));
     assert!(!progress_json.contains("sha1"));
     let version_root = versions_dir(&root).join("overlap");
     let version_json = fs::read(version_root.join("overlap.json")).expect("published version json");
@@ -750,7 +728,6 @@ async fn selected_missing_artifact_fact_is_emitted_before_download_failure() {
     .await;
     let client = build_http_client(Duration::from_secs(5));
     let (fact_tx, mut fact_rx) = mpsc::unbounded_channel();
-    let (descriptor_tx, mut descriptor_rx) = mpsc::unbounded_channel();
 
     let result = ensure_selected_artifact_with_client(
         SelectedDownloadArtifactKind::Library,
@@ -759,20 +736,14 @@ async fn selected_missing_artifact_fact_is_emitted_before_download_failure() {
         &destination,
         &expected,
         Some(&fact_tx),
-        Some(&descriptor_tx),
     )
     .await;
 
     assert!(result.is_err());
     drop(fact_tx);
-    drop(descriptor_tx);
     let mut facts = Vec::new();
     while let Some(fact) = fact_rx.recv().await {
         facts.push(fact);
-    }
-    let mut descriptors = Vec::new();
-    while let Some(descriptor) = descriptor_rx.recv().await {
-        descriptors.push(descriptor);
     }
     assert!(facts.iter().any(|fact| {
         fact.kind == ExecutionDownloadFactKind::ArtifactMissing
@@ -783,9 +754,6 @@ async fn selected_missing_artifact_fact_is_emitted_before_download_failure() {
             .iter()
             .any(|fact| fact.kind == ExecutionDownloadFactKind::ProviderFailure)
     );
-    assert_eq!(descriptors.len(), 1);
-    assert_eq!(descriptors[0].kind, SelectedDownloadArtifactKind::Library);
-    assert_eq!(descriptors[0].target, "minecraft_library_artifact");
     assert!(!destination.exists());
 
     let _ = fs::remove_dir_all(root);
@@ -811,7 +779,6 @@ async fn selected_existing_corrupt_artifact_is_replaced_after_verified_download(
     .await;
     let client = build_http_client(Duration::from_secs(1));
     let (fact_tx, mut fact_rx) = mpsc::unbounded_channel();
-    let (descriptor_tx, mut descriptor_rx) = mpsc::unbounded_channel();
 
     let result = ensure_selected_artifact_with_client(
         SelectedDownloadArtifactKind::Library,
@@ -820,21 +787,15 @@ async fn selected_existing_corrupt_artifact_is_replaced_after_verified_download(
         &destination,
         &expected,
         Some(&fact_tx),
-        Some(&descriptor_tx),
     )
     .await;
 
     assert!(result.expect("corrupt artifact should self-heal").is_some());
     assert_eq!(fs::read(&destination).expect("artifact replaced"), body);
     drop(fact_tx);
-    drop(descriptor_tx);
     let mut facts = Vec::new();
     while let Some(fact) = fact_rx.recv().await {
         facts.push(fact);
-    }
-    let mut descriptors = Vec::new();
-    while let Some(descriptor) = descriptor_rx.recv().await {
-        descriptors.push(descriptor);
     }
     assert!(facts.iter().any(|fact| {
         fact.kind == ExecutionDownloadFactKind::ChecksumMismatch
@@ -862,9 +823,6 @@ async fn selected_existing_corrupt_artifact_is_replaced_after_verified_download(
             .iter()
             .any(|fact| fact.kind == ExecutionDownloadFactKind::Promoted)
     );
-    assert_eq!(descriptors.len(), 1);
-    assert_eq!(descriptors[0].kind, SelectedDownloadArtifactKind::Library);
-    assert_eq!(descriptors[0].target, "minecraft_library_artifact");
 
     let _ = fs::remove_dir_all(root);
 }
@@ -877,7 +835,6 @@ async fn selected_existing_unsupported_artifact_blocks_without_network() {
     let expected = ExpectedIntegrity::from_mojang(5, &sha1_hex(b"fresh"));
     let client = build_http_client(Duration::from_secs(1));
     let (fact_tx, mut fact_rx) = mpsc::unbounded_channel();
-    let (descriptor_tx, mut descriptor_rx) = mpsc::unbounded_channel();
 
     let result = ensure_selected_artifact_with_client(
         SelectedDownloadArtifactKind::Library,
@@ -886,21 +843,15 @@ async fn selected_existing_unsupported_artifact_blocks_without_network() {
         &destination,
         &expected,
         Some(&fact_tx),
-        Some(&descriptor_tx),
     )
     .await;
 
     assert!(matches!(result, Err(DownloadError::Integrity(_))));
     assert!(destination.is_dir());
     drop(fact_tx);
-    drop(descriptor_tx);
     let mut facts = Vec::new();
     while let Some(fact) = fact_rx.recv().await {
         facts.push(fact);
-    }
-    let mut descriptors = Vec::new();
-    while let Some(descriptor) = descriptor_rx.recv().await {
-        descriptors.push(descriptor);
     }
     assert!(
         facts
@@ -917,8 +868,6 @@ async fn selected_existing_unsupported_artifact_blocks_without_network() {
             .iter()
             .any(|fact| fact.kind == ExecutionDownloadFactKind::WrittenToTemp)
     );
-    assert_eq!(descriptors.len(), 1);
-    assert_eq!(descriptors[0].target, "minecraft_library_artifact");
 
     let _ = fs::remove_dir_all(root);
 }
@@ -3698,7 +3647,6 @@ async fn authenticated_source_materialization_consumes_matching_prepared_contrac
         "fixture-assets",
         &expected,
         Some(&fact_tx),
-        None,
     )
     .await
     .expect("prepare destination capability");
@@ -3802,7 +3750,6 @@ async fn authenticated_source_rejects_mismatched_prepared_contract_without_mutat
         "asset-index",
         &prepared_expected,
         None,
-        None,
     )
     .await
     .expect("prepare destination capability");
@@ -3878,7 +3825,6 @@ async fn authenticated_source_rejects_each_cross_identity_recombination_axis() {
             prepared_identity,
             &expected,
             None,
-            None,
         )
         .await
         .expect("prepare distinct destination contract");
@@ -3918,7 +3864,6 @@ async fn authenticated_source_materialization_failure_emits_no_verified_fact() {
         "fixture-assets",
         &expected,
         Some(&fact_tx),
-        None,
     )
     .await
     .expect("prepare destination capability");
@@ -3964,7 +3909,6 @@ async fn selected_materialization_fixture(
         &url,
         "fixture-assets",
         &expected,
-        None,
         None,
     )
     .await
@@ -4351,7 +4295,6 @@ async fn prepared_library_publication_reuses_exact_destination_with_occupied_bac
     let client = build_http_client(Duration::from_secs(5));
     let pool = LibrarySourcePool::new();
     let (fact_tx, mut fact_rx) = mpsc::unbounded_channel();
-    let (descriptor_tx, mut descriptor_rx) = mpsc::unbounded_channel();
 
     let prepared = prepare_library_publication(
         &root,
@@ -4360,7 +4303,6 @@ async fn prepared_library_publication_reuses_exact_destination_with_occupied_bac
         &expected,
         false,
         Some(&fact_tx),
-        Some(&descriptor_tx),
     )
     .await
     .expect("prepare first publication");
@@ -4393,7 +4335,6 @@ async fn prepared_library_publication_reuses_exact_destination_with_occupied_bac
         &expected,
         false,
         Some(&fact_tx),
-        Some(&descriptor_tx),
     )
     .await
     .expect("prepare repeated publication");
@@ -4425,11 +4366,6 @@ async fn prepared_library_publication_reuses_exact_destination_with_occupied_bac
             .count(),
         1
     );
-    let descriptors = std::iter::from_fn(|| descriptor_rx.try_recv().ok()).collect::<Vec<_>>();
-    assert_eq!(descriptors.len(), 2);
-    assert!(descriptors.iter().all(|descriptor| {
-        descriptor.expected_size == Some(body.len() as u64) && descriptor.sha1() == sha1_hex(&body)
-    }));
     let _ = fs::remove_dir_all(root);
 }
 
@@ -4456,7 +4392,6 @@ async fn prepared_library_publication_rejects_mismatched_source_contract() {
         &url,
         &prepared_expected,
         false,
-        None,
         None,
     )
     .await
@@ -4501,10 +4436,9 @@ async fn prepared_library_publication_rejects_colliding_relative_path() {
         spawn_scripted_download_server(vec![ScriptedDownloadResponse::full("200 OK", body)]).await;
     let client = build_http_client(Duration::from_secs(5));
     let pool = LibrarySourcePool::new();
-    let prepared =
-        prepare_library_publication(&root, prepared_path, &url, &expected, false, None, None)
-            .await
-            .expect("prepare destination contract");
+    let prepared = prepare_library_publication(&root, prepared_path, &url, &expected, false, None)
+        .await
+        .expect("prepare destination contract");
     let source = acquire_authenticated_library_source(LibrarySourceRequest {
         client: &client,
         url: &url,
@@ -4543,7 +4477,6 @@ async fn prepared_library_publication_rejects_provider_url_substitution() {
         "https://provider-b.invalid/library.jar",
         &expected,
         false,
-        None,
         None,
     )
     .await

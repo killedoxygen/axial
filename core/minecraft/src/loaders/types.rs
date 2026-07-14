@@ -1,4 +1,4 @@
-use crate::download::{DownloadError, ExecutionDownloadFact, SelectedDownloadArtifactDescriptor};
+use crate::download::{DownloadError, ExecutionDownloadFact};
 use crate::types::VersionSubjectKind;
 use crate::version_meta::MinecraftVersionMeta;
 use chrono::Utc;
@@ -386,13 +386,9 @@ pub enum LoaderError {
     BaseInstallFailed {
         error: Box<DownloadError>,
         facts: Vec<ExecutionDownloadFact>,
-        descriptors: Vec<SelectedDownloadArtifactDescriptor>,
     },
     #[error("loader artifact download failed")]
-    ArtifactDownloadFailed {
-        facts: Vec<ExecutionDownloadFact>,
-        descriptors: Vec<SelectedDownloadArtifactDescriptor>,
-    },
+    ArtifactDownloadFailed { facts: Vec<ExecutionDownloadFact> },
     #[error("parse failed: {0}")]
     Parse(#[from] serde_json::Error),
     #[error("io failed: {0}")]
@@ -478,7 +474,6 @@ impl LoaderActiveInstallFailure {
 pub struct LoaderBaseInstallFailure {
     error: Box<DownloadError>,
     facts: Vec<ExecutionDownloadFact>,
-    descriptors: Vec<SelectedDownloadArtifactDescriptor>,
 }
 
 impl LoaderBaseInstallFailure {
@@ -489,26 +484,17 @@ impl LoaderBaseInstallFailure {
     pub fn facts(&self) -> &[ExecutionDownloadFact] {
         &self.facts
     }
-
-    pub fn descriptors(&self) -> &[SelectedDownloadArtifactDescriptor] {
-        &self.descriptors
-    }
 }
 
 #[derive(Debug, Error)]
 #[error("loader artifact download failed")]
 pub struct LoaderArtifactDownloadFailure {
     facts: Vec<ExecutionDownloadFact>,
-    descriptors: Vec<SelectedDownloadArtifactDescriptor>,
 }
 
 impl LoaderArtifactDownloadFailure {
     pub fn facts(&self) -> &[ExecutionDownloadFact] {
         &self.facts
-    }
-
-    pub fn descriptors(&self) -> &[SelectedDownloadArtifactDescriptor] {
-        &self.descriptors
     }
 }
 
@@ -525,17 +511,11 @@ pub enum LoaderInstallError {
 impl From<LoaderError> for LoaderInstallError {
     fn from(source: LoaderError) -> Self {
         match source {
-            LoaderError::BaseInstallFailed {
-                error,
-                facts,
-                descriptors,
-            } => Self::BaseInstallFailed(LoaderBaseInstallFailure {
-                error,
-                facts,
-                descriptors,
-            }),
-            LoaderError::ArtifactDownloadFailed { facts, descriptors } => {
-                Self::ArtifactDownloadFailed(LoaderArtifactDownloadFailure { facts, descriptors })
+            LoaderError::BaseInstallFailed { error, facts } => {
+                Self::BaseInstallFailed(LoaderBaseInstallFailure { error, facts })
+            }
+            LoaderError::ArtifactDownloadFailed { facts } => {
+                Self::ArtifactDownloadFailed(LoaderArtifactDownloadFailure { facts })
             }
             source => Self::Active(LoaderActiveInstallFailure {
                 kind: active_install_failure_kind(&source),
@@ -681,10 +661,7 @@ mod tests {
             Some(LoaderPreOperationFailureKind::InvalidBuildId)
         );
         assert!(matches!(
-            LoaderInstallError::from(LoaderError::ArtifactDownloadFailed {
-                facts: Vec::new(),
-                descriptors: Vec::new(),
-            }),
+            LoaderInstallError::from(LoaderError::ArtifactDownloadFailed { facts: Vec::new() }),
             LoaderInstallError::ArtifactDownloadFailed(_)
         ));
 
