@@ -14,7 +14,7 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
 const TEMP_PREFIX: &str = ".axial-loader-tmp-";
 const MAX_TEMP_SWEEP_ENTRIES: usize = 128;
-const MAX_MANAGED_DIRECTORY_ENTRIES: usize = 4096;
+pub(crate) const MAX_MANAGED_DIRECTORY_ENTRIES: usize = 4096;
 const MAX_MANAGED_READ_BYTES: u64 = 512 << 20;
 const MAX_MANAGED_TREE_ENTRIES: usize = MAX_MANAGED_DIRECTORY_ENTRIES;
 const MAX_MANAGED_TREE_DEPTH: usize = 16;
