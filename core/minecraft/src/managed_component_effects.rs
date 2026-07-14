@@ -24,10 +24,11 @@ use std::collections::BTreeSet;
 mod managed_component_transaction;
 
 pub(crate) use managed_component_transaction::{
-    ComponentCommitReceipt, ComponentExecutionResult, ComponentIntentPublicationRecovery,
-    ComponentRecoveryRequired, ComponentRecoveryRetryResult, ComponentRollbackReceipt,
-    ComponentStartupRecoveryResult, execute_component_intent, recover_component_intent_publication,
-    recover_component_transaction, retry_component_recovery,
+    ComponentExecutionResult, ComponentIntentPublicationRecovery, ComponentRecoveryRequired,
+    ComponentRecoveryRetryResult, ComponentSettledOutcome, ComponentSettlementResult,
+    ComponentSettlementRetry, ComponentStartupRecoveryResult, ComponentTransactionReceipt,
+    execute_component_intent, recover_component_intent_publication, recover_component_transaction,
+    retry_component_recovery, retry_component_settlement, settle_component_transaction,
 };
 
 #[cfg(test)]
@@ -1784,6 +1785,28 @@ mod tests {
             .count()
     }
 
+    fn assert_component_lane_settled(temporary: &tempfile::TempDir) {
+        let lane = temporary.path().join(".axial-publication/libraries");
+        let mut lane_names = fs::read_dir(&lane)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect::<Vec<_>>();
+        lane_names.sort();
+        assert_eq!(
+            lane_names,
+            vec!["ancestors", "quarantine", "staging", "table"]
+        );
+        for path in [
+            lane.join("table"),
+            lane.join("staging"),
+            lane.join("quarantine"),
+            lane.join("ancestors/records"),
+            lane.join("ancestors/staging"),
+        ] {
+            assert!(fs::read_dir(path).unwrap().next().is_none());
+        }
+    }
+
     fn single_valid_table_shard() -> Vec<u8> {
         let digest = [0x51; 20];
         let mut builder =
@@ -2633,6 +2656,399 @@ mod tests {
                 .path()
                 .join(".axial-publication/libraries/ancestors/staging/000000/000")
                 .is_dir()
+        );
+    }
+
+    #[tokio::test]
+    async fn component_settlement_returns_semantic_outcome_and_same_lease() {
+        let temporary = tempfile::tempdir().unwrap();
+        let published = single_replacement_row_candidate(&temporary)
+            .await
+            .publish_intent()
+            .unwrap_or_else(|_| panic!("publish component intent"));
+        let ComponentExecutionResult::Committed(receipt) =
+            managed_component_transaction::execute_component_intent(published).await
+        else {
+            panic!("replacement transaction must commit")
+        };
+        let ComponentSettlementResult::Settled(ComponentSettledOutcome::Committed(lease)) =
+            settle_component_transaction(receipt).await
+        else {
+            panic!("committed component must settle")
+        };
+        lease.revalidate().unwrap();
+        assert_eq!(
+            fs::read(temporary.path().join("libraries/replacement.jar")).unwrap(),
+            b"replacement-library"
+        );
+        assert_component_lane_settled(&temporary);
+
+        let temporary = tempfile::tempdir().unwrap();
+        let published = single_absent_row_candidate(&temporary)
+            .await
+            .publish_intent()
+            .unwrap_or_else(|_| panic!("publish component intent"));
+        let ComponentExecutionResult::RolledBack(receipt) =
+            managed_component_transaction::execute_component_intent_with_fault(
+                published,
+                managed_component_transaction::ComponentExecutionFault::AfterFirstRow,
+            )
+            .await
+        else {
+            panic!("injected execution failure must roll back")
+        };
+        let ComponentSettlementResult::Settled(ComponentSettledOutcome::RolledBack {
+            lease,
+            effect: crate::managed_component_publication::ComponentRollbackEffect::Execution,
+        }) = settle_component_transaction(receipt).await
+        else {
+            panic!("rolled-back component must settle with its exact effect")
+        };
+        lease.revalidate().unwrap();
+        assert!(!temporary.path().join("libraries").exists());
+        assert_component_lane_settled(&temporary);
+    }
+
+    #[tokio::test]
+    async fn component_settlement_retries_every_durable_frontier() {
+        use managed_component_transaction::ComponentSettlementFault;
+
+        for fault in [
+            ComponentSettlementFault::AfterSettlementPromotion,
+            ComponentSettlementFault::AfterStagingBucket,
+            ComponentSettlementFault::AfterQuarantineBucket,
+            ComponentSettlementFault::AfterTableShard,
+            ComponentSettlementFault::AfterOutcomeRemoval,
+            ComponentSettlementFault::AfterIntentRemoval,
+            ComponentSettlementFault::AfterSettlementRemoval,
+        ] {
+            let temporary = tempfile::tempdir().unwrap();
+            let published = single_replacement_row_candidate(&temporary)
+                .await
+                .publish_intent()
+                .unwrap_or_else(|_| panic!("publish component intent"));
+            let ComponentExecutionResult::Committed(receipt) =
+                managed_component_transaction::execute_component_intent(published).await
+            else {
+                panic!("frontier fixture must commit")
+            };
+            let ComponentSettlementResult::Retry(retry) =
+                managed_component_transaction::settle_component_transaction_with_fault(
+                    receipt, fault,
+                )
+                .await
+            else {
+                panic!("fault must retain settlement retry authority")
+            };
+            let ComponentSettlementResult::Settled(ComponentSettledOutcome::Committed(lease)) =
+                retry_component_settlement(retry).await
+            else {
+                panic!("durable settlement frontier must resume")
+            };
+            lease.revalidate().unwrap();
+            assert_component_lane_settled(&temporary);
+        }
+    }
+
+    #[tokio::test]
+    async fn component_settlement_retries_committed_and_rolled_back_ancestor_frontiers() {
+        use managed_component_transaction::ComponentSettlementFault;
+
+        for fault in [
+            ComponentSettlementFault::AfterAncestorBucket,
+            ComponentSettlementFault::AfterAncestorRecord,
+        ] {
+            let temporary = tempfile::tempdir().unwrap();
+            let published = single_absent_row_candidate(&temporary)
+                .await
+                .publish_intent()
+                .unwrap_or_else(|_| panic!("publish component intent"));
+            let ComponentExecutionResult::Committed(receipt) =
+                managed_component_transaction::execute_component_intent(published).await
+            else {
+                panic!("committed ancestor fixture must commit")
+            };
+            let ComponentSettlementResult::Retry(retry) =
+                managed_component_transaction::settle_component_transaction_with_fault(
+                    receipt, fault,
+                )
+                .await
+            else {
+                panic!("committed ancestor frontier must be retryable")
+            };
+            assert!(matches!(
+                retry_component_settlement(retry).await,
+                ComponentSettlementResult::Settled(ComponentSettledOutcome::Committed(_))
+            ));
+
+            let temporary = tempfile::tempdir().unwrap();
+            let published = single_absent_row_candidate(&temporary)
+                .await
+                .publish_intent()
+                .unwrap_or_else(|_| panic!("publish component intent"));
+            let ComponentExecutionResult::RolledBack(receipt) =
+                managed_component_transaction::execute_component_intent_with_fault(
+                    published,
+                    managed_component_transaction::ComponentExecutionFault::AfterFirstRow,
+                )
+                .await
+            else {
+                panic!("rolled-back ancestor fixture must roll back")
+            };
+            let ComponentSettlementResult::Retry(retry) =
+                managed_component_transaction::settle_component_transaction_with_fault(
+                    receipt, fault,
+                )
+                .await
+            else {
+                panic!("rolled-back ancestor frontier must be retryable")
+            };
+            assert!(matches!(
+                retry_component_settlement(retry).await,
+                ComponentSettlementResult::Settled(ComponentSettledOutcome::RolledBack { .. })
+            ));
+            assert_component_lane_settled(&temporary);
+        }
+    }
+
+    #[tokio::test]
+    async fn startup_resumes_each_settlement_marker_suffix() {
+        use managed_component_transaction::ComponentSettlementFault;
+
+        for fault in [
+            ComponentSettlementFault::AfterSettlementPromotion,
+            ComponentSettlementFault::AfterOutcomeRemoval,
+            ComponentSettlementFault::AfterIntentRemoval,
+        ] {
+            let temporary = tempfile::tempdir().unwrap();
+            let published = single_absent_row_candidate(&temporary)
+                .await
+                .publish_intent()
+                .unwrap_or_else(|_| panic!("publish component intent"));
+            let ComponentExecutionResult::Committed(receipt) =
+                managed_component_transaction::execute_component_intent(published).await
+            else {
+                panic!("startup settlement fixture must commit")
+            };
+            let ComponentSettlementResult::Retry(retry) =
+                managed_component_transaction::settle_component_transaction_with_fault(
+                    receipt, fault,
+                )
+                .await
+            else {
+                panic!("fault must retain settlement retry authority")
+            };
+            drop(retry);
+            let lease = ManagedRootPublicationLease::acquire(
+                ManagedDir::open_root(temporary.path()).unwrap(),
+            )
+            .await
+            .unwrap();
+            let ComponentStartupRecoveryResult::Settled(ComponentSettledOutcome::Committed(lease)) =
+                recover_component_transaction(lease, ManagedComponentKind::Libraries).await
+            else {
+                panic!("startup must resume the embedded settlement")
+            };
+            lease.revalidate().unwrap();
+            assert_component_lane_settled(&temporary);
+        }
+    }
+
+    #[tokio::test]
+    async fn startup_rejects_outcome_only_settlement_suffix_without_cleanup() {
+        let temporary = tempfile::tempdir().unwrap();
+        let published = single_absent_row_candidate(&temporary)
+            .await
+            .publish_intent()
+            .unwrap_or_else(|_| panic!("publish component intent"));
+        let ComponentExecutionResult::Committed(receipt) =
+            managed_component_transaction::execute_component_intent(published).await
+        else {
+            panic!("invalid suffix fixture must commit")
+        };
+        let ComponentSettlementResult::Retry(retry) =
+            managed_component_transaction::settle_component_transaction_with_fault(
+                receipt,
+                managed_component_transaction::ComponentSettlementFault::AfterSettlementPromotion,
+            )
+            .await
+        else {
+            panic!("settlement marker fault must be retryable")
+        };
+        let lane = temporary.path().join(".axial-publication/libraries");
+        fs::remove_file(lane.join("intent.bin")).unwrap();
+        drop(retry);
+        let lease =
+            ManagedRootPublicationLease::acquire(ManagedDir::open_root(temporary.path()).unwrap())
+                .await
+                .unwrap();
+
+        assert!(matches!(
+            recover_component_transaction(lease, ManagedComponentKind::Libraries).await,
+            ComponentStartupRecoveryResult::Transaction(
+                ComponentExecutionResult::RecoveryRequired(_)
+            )
+        ));
+        assert!(lane.join("outcome.bin").is_file());
+        assert!(lane.join("settlement.bin").is_file());
+        assert!(lane.join("ancestors/records/000000.anc").is_file());
+    }
+
+    #[tokio::test]
+    async fn settlement_admission_rejects_foreign_rows_before_ancestor_cleanup() {
+        let temporary = tempfile::tempdir().unwrap();
+        let published = single_absent_row_candidate(&temporary)
+            .await
+            .publish_intent()
+            .unwrap_or_else(|_| panic!("publish component intent"));
+        let ComponentExecutionResult::Committed(receipt) =
+            managed_component_transaction::execute_component_intent(published).await
+        else {
+            panic!("foreign obstruction fixture must commit")
+        };
+        let ComponentSettlementResult::Retry(retry) =
+            managed_component_transaction::settle_component_transaction_with_fault(
+                receipt,
+                managed_component_transaction::ComponentSettlementFault::AfterSettlementPromotion,
+            )
+            .await
+        else {
+            panic!("settlement marker fault must be retryable")
+        };
+        let lane = temporary.path().join(".axial-publication/libraries");
+        let foreign = lane.join("staging/000000/foreign");
+        fs::write(&foreign, b"foreign").unwrap();
+        let record = lane.join("ancestors/records/000000.anc");
+        let record_bytes = fs::read(&record).unwrap();
+
+        let ComponentSettlementResult::Retry(retry) = retry_component_settlement(retry).await
+        else {
+            panic!("foreign row entry must fail closed")
+        };
+        assert_eq!(fs::read(&record).unwrap(), record_bytes);
+        assert!(lane.join("ancestors/staging/000000").is_dir());
+        assert_eq!(fs::read(&foreign).unwrap(), b"foreign");
+
+        fs::remove_file(foreign).unwrap();
+        assert!(matches!(
+            retry_component_settlement(retry).await,
+            ComponentSettlementResult::Settled(ComponentSettledOutcome::Committed(_))
+        ));
+        assert_component_lane_settled(&temporary);
+    }
+
+    #[tokio::test]
+    async fn settlement_rejects_replaced_marker_and_parked_ancestor_identity() {
+        let temporary = tempfile::tempdir().unwrap();
+        let published = single_absent_row_candidate(&temporary)
+            .await
+            .publish_intent()
+            .unwrap_or_else(|_| panic!("publish component intent"));
+        let ComponentExecutionResult::Committed(receipt) =
+            managed_component_transaction::execute_component_intent(published).await
+        else {
+            panic!("marker replacement fixture must commit")
+        };
+        let ComponentSettlementResult::Retry(retry) =
+            managed_component_transaction::settle_component_transaction_with_fault(
+                receipt,
+                managed_component_transaction::ComponentSettlementFault::AfterSettlementPromotion,
+            )
+            .await
+        else {
+            panic!("settlement marker fault must be retryable")
+        };
+        let settlement = temporary
+            .path()
+            .join(".axial-publication/libraries/settlement.bin");
+        let saved = temporary.path().join("saved-settlement");
+        let bytes = fs::read(&settlement).unwrap();
+        fs::rename(&settlement, &saved).unwrap();
+        fs::write(&settlement, bytes).unwrap();
+        let ComponentSettlementResult::Retry(_retry) = retry_component_settlement(retry).await
+        else {
+            panic!("same-byte settlement replacement must fail closed")
+        };
+        assert!(settlement.is_file());
+        assert!(saved.is_file());
+
+        let temporary = tempfile::tempdir().unwrap();
+        let published = single_absent_row_candidate(&temporary)
+            .await
+            .publish_intent()
+            .unwrap_or_else(|_| panic!("publish component intent"));
+        let rolled_back = managed_component_transaction::execute_component_intent_with_fault(
+            published,
+            managed_component_transaction::ComponentExecutionFault::AfterFirstRow,
+        )
+        .await;
+        let ComponentExecutionResult::RolledBack(receipt) = rolled_back else {
+            panic!("park replacement fixture must roll back")
+        };
+        let ComponentSettlementResult::Retry(retry) =
+            managed_component_transaction::settle_component_transaction_with_fault(
+                receipt,
+                managed_component_transaction::ComponentSettlementFault::AfterSettlementPromotion,
+            )
+            .await
+        else {
+            panic!("settlement marker fault must be retryable")
+        };
+        let bucket = temporary
+            .path()
+            .join(".axial-publication/libraries/ancestors/staging/000000");
+        let mut slots = fs::read_dir(&bucket)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect::<Vec<_>>();
+        slots.sort();
+        let last = slots.pop().unwrap();
+        let saved = temporary.path().join("saved-ancestor-slot");
+        fs::rename(bucket.join(last), &saved).unwrap();
+        fs::create_dir(bucket.join("slot-park-a")).unwrap();
+        let ComponentSettlementResult::Retry(_retry) = retry_component_settlement(retry).await
+        else {
+            panic!("foreign parked ancestor identity must fail closed")
+        };
+        assert!(bucket.join("slot-park-a").is_dir());
+        assert!(saved.is_dir());
+    }
+
+    #[tokio::test]
+    async fn caller_cancellation_does_not_abandon_component_settlement() {
+        let temporary = tempfile::tempdir().unwrap();
+        let published = single_replacement_row_candidate(&temporary)
+            .await
+            .publish_intent()
+            .unwrap_or_else(|_| panic!("publish component intent"));
+        let ComponentExecutionResult::Committed(receipt) =
+            managed_component_transaction::execute_component_intent(published).await
+        else {
+            panic!("cancellation fixture must commit")
+        };
+        let caller = tokio::spawn(settle_component_transaction(receipt));
+        tokio::task::yield_now().await;
+        caller.abort();
+
+        let settlement = temporary
+            .path()
+            .join(".axial-publication/libraries/settlement.bin");
+        for _ in 0..200 {
+            if !settlement.exists()
+                && temporary
+                    .path()
+                    .join(".axial-publication/libraries/table")
+                    .read_dir()
+                    .is_ok_and(|mut entries| entries.next().is_none())
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_component_lane_settled(&temporary);
+        assert_eq!(
+            fs::read(temporary.path().join("libraries/replacement.jar")).unwrap(),
+            b"replacement-library"
         );
     }
 

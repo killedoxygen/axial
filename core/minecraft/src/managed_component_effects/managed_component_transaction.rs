@@ -7,8 +7,9 @@ use crate::managed_component_publication::{
     COMPONENT_OUTCOME_BYTES, COMPONENT_OUTCOME_FILE, COMPONENT_SETTLEMENT_FILE,
     ComponentObservedCanonical, ComponentOutcomeRecord, ComponentRecoveryDecision,
     ComponentRecoveryEntryState, ComponentRecoveryObservation, ComponentRecoveryPlan,
-    ComponentRecoveryPlanner, ComponentRollbackEffect, ComponentTerminalOutcome,
-    decode_component_outcome, encode_component_outcome,
+    ComponentRecoveryPlanner, ComponentRollbackEffect, ComponentSettlementRecord,
+    ComponentTerminalOutcome, MAX_COMPONENT_SETTLEMENT_BYTES, decode_component_outcome,
+    decode_component_settlement, encode_component_outcome, encode_component_settlement,
 };
 use crate::managed_component_table::{
     ComponentCreatedAncestor, ComponentTableParser, ComponentTableRow, ComponentTableShard,
@@ -28,13 +29,14 @@ const ANCESTOR_SLOT_PARK_A: &str = "slot-park-a";
 const ANCESTOR_SLOT_PARK_B: &str = "slot-park-b";
 
 pub(crate) enum ComponentExecutionResult {
-    Committed(ComponentCommitReceipt),
-    RolledBack(ComponentRollbackReceipt),
+    Committed(ComponentTransactionReceipt),
+    RolledBack(ComponentTransactionReceipt),
     RecoveryRequired(ComponentRecoveryRequired),
 }
 
 pub(crate) enum ComponentStartupRecoveryResult {
     NoTransaction(ManagedRootPublicationLease),
+    Settled(ComponentSettledOutcome),
     Transaction(ComponentExecutionResult),
 }
 
@@ -45,18 +47,32 @@ pub(crate) enum ComponentIntentPublicationRecovery {
 
 pub(crate) enum ComponentRecoveryRetryResult {
     NoTransaction(ManagedRootPublicationLease),
+    Settled(ComponentSettledOutcome),
     RetryIntent(ComponentIntentCandidate),
     Transaction(ComponentExecutionResult),
 }
 
-pub(crate) struct ComponentCommitReceipt {
-    context: ComponentIntentPublished,
-    outcome_guard: ManagedFileGuard,
+pub(crate) enum ComponentSettlementResult {
+    Settled(ComponentSettledOutcome),
+    Retry(ComponentSettlementRetry),
 }
 
-pub(crate) struct ComponentRollbackReceipt {
+pub(crate) enum ComponentSettledOutcome {
+    Committed(ManagedRootPublicationLease),
+    RolledBack {
+        lease: ManagedRootPublicationLease,
+        effect: ComponentRollbackEffect,
+    },
+}
+
+pub(crate) struct ComponentTransactionReceipt {
     context: ComponentIntentPublished,
     outcome_guard: ManagedFileGuard,
+    terminal: ComponentTerminalOutcome,
+}
+
+pub(crate) struct ComponentSettlementRetry {
+    authority: ComponentSettlementAuthority,
 }
 
 pub(crate) struct ComponentRecoveryRequired {
@@ -64,16 +80,7 @@ pub(crate) struct ComponentRecoveryRequired {
 }
 
 #[cfg(test)]
-impl ComponentCommitReceipt {
-    pub(super) fn into_restart_seed(self) -> (ManagedRootPublicationLease, ManagedComponentKind) {
-        let component = self.context.manifest.component;
-        drop(self.outcome_guard);
-        (self.context.lease, component)
-    }
-}
-
-#[cfg(test)]
-impl ComponentRollbackReceipt {
+impl ComponentTransactionReceipt {
     pub(super) fn into_restart_seed(self) -> (ManagedRootPublicationLease, ManagedComponentKind) {
         let component = self.context.manifest.component;
         drop(self.outcome_guard);
@@ -103,6 +110,14 @@ enum ComponentRecoveryAuthority {
     IntentPromotionAttempted(ComponentIntentPublishFailure),
 }
 
+struct ComponentSettlementAuthority {
+    context: ComponentIntentPublished,
+    outcome_guard: ManagedFileGuard,
+    terminal: ComponentTerminalOutcome,
+    outcome: Option<ComponentOutcomeRecord>,
+    settlement_identity: Option<ManagedFileIdentity>,
+}
+
 struct ComponentRestartAdmission {
     lane: ComponentLane,
     manifest: ComponentIntentManifest,
@@ -122,13 +137,21 @@ enum OutcomePublicationFailure {
 enum BlockingDisposition {
     NoTransaction,
     RetryIntent,
+    Settled(ComponentOutcomeRecord),
     Committed(ManagedFileGuard),
     RolledBack(ManagedFileGuard),
     RecoveryRequired(Option<ManagedFileGuard>),
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum SettlementDisposition {
+    Settled,
+    Retry,
+}
+
 enum RecoveryOwnerResult {
     NoTransaction(ManagedRootPublicationLease),
+    Settled(ComponentSettledOutcome),
     RetryIntent(ComponentIntentCandidate),
     Transaction(ComponentExecutionResult),
 }
@@ -136,6 +159,7 @@ enum RecoveryOwnerResult {
 enum RecoveryNormalization {
     Published,
     NoTransaction,
+    Settled(ComponentOutcomeRecord),
     RetryIntent,
 }
 
@@ -150,6 +174,15 @@ struct EmptyRecoveryPark {
     directory: ManagedDir,
 }
 
+struct SettlementAncestorPlan {
+    record_count: usize,
+    created_ancestors: Vec<ComponentCreatedAncestor>,
+}
+
+struct SettlementRowsPlan {
+    table_count: usize,
+}
+
 #[derive(Clone, Copy, Eq, PartialEq)]
 pub(super) enum ComponentExecutionFault {
     None,
@@ -159,6 +192,20 @@ pub(super) enum ComponentExecutionFault {
     CrashAfterFirstAncestor,
     CrashBeforeOutcome,
     OutcomePromotionAttempted,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(super) enum ComponentSettlementFault {
+    None,
+    AfterSettlementPromotion,
+    AfterAncestorBucket,
+    AfterAncestorRecord,
+    AfterStagingBucket,
+    AfterQuarantineBucket,
+    AfterTableShard,
+    AfterOutcomeRemoval,
+    AfterIntentRemoval,
+    AfterSettlementRemoval,
 }
 
 struct ObservedRow {
@@ -182,6 +229,7 @@ pub(crate) async fn recover_component_transaction(
         RecoveryOwnerResult::NoTransaction(lease) => {
             ComponentStartupRecoveryResult::NoTransaction(lease)
         }
+        RecoveryOwnerResult::Settled(outcome) => ComponentStartupRecoveryResult::Settled(outcome),
         RecoveryOwnerResult::Transaction(result) => {
             ComponentStartupRecoveryResult::Transaction(result)
         }
@@ -215,6 +263,9 @@ pub(crate) async fn recover_component_intent_publication(
             RecoveryOwnerResult::NoTransaction(_) => {
                 unreachable!("attempted publication recovery cannot lose its candidate")
             }
+            RecoveryOwnerResult::Settled(_) => {
+                unreachable!("attempted publication recovery cannot settle a terminal transaction")
+            }
         },
     )
 }
@@ -226,12 +277,88 @@ pub(crate) async fn retry_component_recovery(
         RecoveryOwnerResult::NoTransaction(lease) => {
             ComponentRecoveryRetryResult::NoTransaction(lease)
         }
+        RecoveryOwnerResult::Settled(outcome) => ComponentRecoveryRetryResult::Settled(outcome),
         RecoveryOwnerResult::Transaction(result) => {
             ComponentRecoveryRetryResult::Transaction(result)
         }
         RecoveryOwnerResult::RetryIntent(candidate) => {
             ComponentRecoveryRetryResult::RetryIntent(candidate)
         }
+    }
+}
+
+pub(crate) async fn settle_component_transaction(
+    receipt: ComponentTransactionReceipt,
+) -> ComponentSettlementResult {
+    settle_component_transaction_inner(receipt, ComponentSettlementFault::None).await
+}
+
+pub(crate) async fn retry_component_settlement(
+    retry: ComponentSettlementRetry,
+) -> ComponentSettlementResult {
+    run_component_settlement(retry.authority, ComponentSettlementFault::None).await
+}
+
+#[cfg(test)]
+pub(super) async fn settle_component_transaction_with_fault(
+    receipt: ComponentTransactionReceipt,
+    fault: ComponentSettlementFault,
+) -> ComponentSettlementResult {
+    settle_component_transaction_inner(receipt, fault).await
+}
+
+async fn settle_component_transaction_inner(
+    receipt: ComponentTransactionReceipt,
+    fault: ComponentSettlementFault,
+) -> ComponentSettlementResult {
+    let ComponentTransactionReceipt {
+        context,
+        outcome_guard,
+        terminal,
+    } = receipt;
+    run_component_settlement(
+        ComponentSettlementAuthority {
+            context,
+            outcome_guard,
+            terminal,
+            outcome: None,
+            settlement_identity: None,
+        },
+        fault,
+    )
+    .await
+}
+
+async fn run_component_settlement(
+    authority: ComponentSettlementAuthority,
+    fault: ComponentSettlementFault,
+) -> ComponentSettlementResult {
+    let shared = Arc::new(Mutex::new(Some(authority)));
+    let owner_authority = Arc::clone(&shared);
+    let owner = tokio::spawn(async move {
+        let worker_authority = Arc::clone(&owner_authority);
+        let disposition = match run_publication_blocking(move || {
+            let mut slot = worker_authority
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let Some(authority) = slot.as_mut() else {
+                return SettlementDisposition::Retry;
+            };
+            catch_unwind(AssertUnwindSafe(|| {
+                settle_component_transaction_blocking(authority, fault)
+            }))
+            .unwrap_or(SettlementDisposition::Retry)
+        })
+        .await
+        {
+            Ok(disposition) => disposition,
+            Err(_) => SettlementDisposition::Retry,
+        };
+        finish_settlement_disposition(&owner_authority, disposition)
+    });
+    match owner.await {
+        Ok(result) => result,
+        Err(_) => finish_settlement_disposition(&shared, SettlementDisposition::Retry),
     }
 }
 
@@ -292,6 +419,9 @@ async fn run_component_recovery(authority: ComponentRecoveryAuthority) -> Recove
                 Ok(Ok(RecoveryNormalization::NoTransaction)) => {
                     return BlockingDisposition::NoTransaction;
                 }
+                Ok(Ok(RecoveryNormalization::Settled(outcome))) => {
+                    return BlockingDisposition::Settled(outcome);
+                }
                 Ok(Ok(RecoveryNormalization::RetryIntent)) => {
                     return BlockingDisposition::RetryIntent;
                 }
@@ -331,6 +461,9 @@ fn normalize_recovery_authority(
             return Ok(RecoveryNormalization::Published);
         }
         ComponentRecoveryAuthority::Restart { lease, component } => {
+            if let Some(outcome) = recover_restart_component_settlement(lease, *component)? {
+                return Ok(RecoveryNormalization::Settled(outcome));
+            }
             match admit_restart_context(lease, *component, None, true)? {
                 Some(admission) => admission,
                 None => return Ok(RecoveryNormalization::NoTransaction),
@@ -2506,6 +2639,1304 @@ fn sync_transaction_roots(
     published.lease.revalidate().map_err(tx)
 }
 
+fn settle_component_transaction_blocking(
+    authority: &mut ComponentSettlementAuthority,
+    fault: ComponentSettlementFault,
+) -> SettlementDisposition {
+    match settle_component_transaction_attempt(authority, fault) {
+        Ok(()) => SettlementDisposition::Settled,
+        Err(_) => SettlementDisposition::Retry,
+    }
+}
+
+fn settle_component_transaction_attempt(
+    authority: &mut ComponentSettlementAuthority,
+    fault: ComponentSettlementFault,
+) -> Result<(), ComponentTransactionError> {
+    authority.context.lease.revalidate().map_err(tx)?;
+    if let Some((settlement, guard)) = read_component_settlement(&authority.context.lane)? {
+        if authority
+            .settlement_identity
+            .is_some_and(|identity| identity != guard.identity())
+        {
+            return Err(ComponentTransactionError);
+        }
+        authority.settlement_identity = Some(guard.identity());
+        validate_live_settlement_authority(authority, &settlement)?;
+        authority.outcome = Some(settlement.outcome.clone());
+        cleanup_component_settlement(
+            &authority.context.lane,
+            &authority.context.lease,
+            &settlement,
+            &guard,
+            fault,
+        )?;
+        return Ok(());
+    }
+
+    let lane_names =
+        exact_entry_names(&authority.context.lane.lane, MAX_COMPONENT_LANE_ENTRIES + 1)
+            .map_err(tx)?;
+    let intent_present = lane_names.contains(COMPONENT_INTENT_FILE);
+    let outcome_present = lane_names.contains(COMPONENT_OUTCOME_FILE);
+    if !intent_present && !outcome_present {
+        let outcome = authority
+            .outcome
+            .as_ref()
+            .ok_or(ComponentTransactionError)?;
+        validate_marker_free_settlement_shape(
+            &authority.context.lane,
+            &authority.context.lease,
+            outcome,
+        )?;
+        sync_component_lane_roots(&authority.context.lane, &authority.context.lease)?;
+        return Ok(());
+    }
+    if !intent_present || !outcome_present {
+        return Err(ComponentTransactionError);
+    }
+
+    let (outcome, observed_outcome_guard) =
+        read_recovery_outcome(&authority.context, Some(&authority.outcome_guard))?
+            .ok_or(ComponentTransactionError)?;
+    if observed_outcome_guard.identity() != authority.outcome_guard.identity()
+        || outcome.terminal != authority.terminal
+    {
+        return Err(ComponentTransactionError);
+    }
+    prove_terminal_for_settlement(&authority.context, &outcome)?;
+    authority.outcome = Some(outcome.clone());
+    let encoded =
+        encode_component_settlement(&outcome, &authority.context.encoded_intent).map_err(tx)?;
+    let write = authority
+        .context
+        .lane
+        .lane
+        .write_new_exact_retained(COMPONENT_SETTLEMENT_FILE, &encoded);
+    let settlement_guard = match write {
+        Ok(guard) => guard,
+        Err(ManagedCreateOnlyWriteFailure::BeforePromotion(_)) => {
+            return Err(ComponentTransactionError);
+        }
+        Err(ManagedCreateOnlyWriteFailure::PromotionAttempted { final_guard, .. }) => {
+            authority.settlement_identity = final_guard.as_ref().map(ManagedFileGuard::identity);
+            return Err(ComponentTransactionError);
+        }
+    };
+    authority.settlement_identity = Some(settlement_guard.identity());
+    let durable = authority
+        .context
+        .lane
+        .lane
+        .read_guarded_file_bounded(
+            COMPONENT_SETTLEMENT_FILE,
+            &settlement_guard,
+            MAX_COMPONENT_SETTLEMENT_BYTES as u64,
+        )
+        .map_err(tx)?;
+    if durable != encoded {
+        return Err(ComponentTransactionError);
+    }
+    let settlement = decode_component_settlement(&durable).map_err(tx)?;
+    validate_live_settlement_authority(authority, &settlement)?;
+    sync_component_lane_roots(&authority.context.lane, &authority.context.lease)?;
+    if fault == ComponentSettlementFault::AfterSettlementPromotion {
+        return Err(ComponentTransactionError);
+    }
+    cleanup_component_settlement(
+        &authority.context.lane,
+        &authority.context.lease,
+        &settlement,
+        &settlement_guard,
+        fault,
+    )
+}
+
+fn prove_terminal_for_settlement(
+    published: &ComponentIntentPublished,
+    outcome: &ComponentOutcomeRecord,
+) -> Result<(), ComponentTransactionError> {
+    outcome
+        .binds_intent(&published.manifest, &published.encoded_intent)
+        .map_err(tx)?;
+    let summary = validate_published_and_replay(published, true)?;
+    let authority = ComponentAncestorJournalAuthority::new(
+        &published.encoded_intent,
+        &summary.created_ancestors,
+    )
+    .map_err(tx)?;
+    postcheck_with_outcome(
+        published,
+        &authority,
+        &summary.created_ancestors,
+        match outcome.terminal {
+            ComponentTerminalOutcome::Committed => ComponentRecoveryDecision::Commit,
+            ComponentTerminalOutcome::RolledBack => ComponentRecoveryDecision::Rollback,
+        },
+        true,
+    )
+}
+
+fn validate_live_settlement_authority(
+    authority: &ComponentSettlementAuthority,
+    settlement: &ComponentSettlementRecord,
+) -> Result<(), ComponentTransactionError> {
+    if settlement.intent != authority.context.manifest
+        || settlement.encoded_intent != authority.context.encoded_intent
+        || settlement.outcome.terminal != authority.terminal
+        || settlement.outcome.component != authority.context.lane.component
+        || settlement
+            .outcome
+            .binds_intent(
+                &authority.context.manifest,
+                &authority.context.encoded_intent,
+            )
+            .is_err()
+    {
+        return Err(ComponentTransactionError);
+    }
+    if let Some(intent) = authority
+        .context
+        .lane
+        .lane
+        .inspect_regular_file(COMPONENT_INTENT_FILE)
+        .map_err(tx)?
+        && intent.identity() != authority.context.intent_guard.identity()
+    {
+        return Err(ComponentTransactionError);
+    }
+    if let Some(outcome) = authority
+        .context
+        .lane
+        .lane
+        .inspect_regular_file(COMPONENT_OUTCOME_FILE)
+        .map_err(tx)?
+        && outcome.identity() != authority.outcome_guard.identity()
+    {
+        return Err(ComponentTransactionError);
+    }
+    authority.context.lease.revalidate().map_err(tx)?;
+    if settlement.intent.root_binding_sha256
+        != component_root_binding_sha256(authority.context.lease.root()).map_err(tx)?
+    {
+        return Err(ComponentTransactionError);
+    }
+    Ok(())
+}
+
+fn read_component_settlement(
+    lane: &ComponentLane,
+) -> Result<Option<(ComponentSettlementRecord, ManagedFileGuard)>, ComponentTransactionError> {
+    let Some(guard) = lane
+        .lane
+        .inspect_regular_file(COMPONENT_SETTLEMENT_FILE)
+        .map_err(tx)?
+    else {
+        return Ok(None);
+    };
+    if guard.size() > MAX_COMPONENT_SETTLEMENT_BYTES as u64 {
+        return Err(ComponentTransactionError);
+    }
+    let bytes = lane
+        .lane
+        .read_guarded_file_bounded(
+            COMPONENT_SETTLEMENT_FILE,
+            &guard,
+            MAX_COMPONENT_SETTLEMENT_BYTES as u64,
+        )
+        .map_err(tx)?;
+    let settlement = decode_component_settlement(&bytes).map_err(tx)?;
+    Ok(Some((settlement, guard)))
+}
+
+fn recover_restart_component_settlement(
+    lease: &ManagedRootPublicationLease,
+    component: ManagedComponentKind,
+) -> Result<Option<ComponentOutcomeRecord>, ComponentTransactionError> {
+    lease.revalidate().map_err(tx)?;
+    let publication = lease.publication_directory();
+    let lane_name = component_lane_name(component);
+    if !publication
+        .has_portably_exact_child_name(lane_name)
+        .map_err(tx)?
+    {
+        return Ok(None);
+    }
+    let marker_lane = publication.open_child(lane_name).map_err(tx)?;
+    if !marker_lane
+        .has_portably_exact_child_name(COMPONENT_SETTLEMENT_FILE)
+        .map_err(tx)?
+    {
+        return Ok(None);
+    }
+    drop(marker_lane);
+    let lane = open_component_settlement_lane(lease, component)?;
+    let (settlement, guard) = read_component_settlement(&lane)?.ok_or(ComponentTransactionError)?;
+    if settlement.intent.component != component
+        || settlement.intent.root_binding_sha256
+            != component_root_binding_sha256(lease.root()).map_err(tx)?
+    {
+        return Err(ComponentTransactionError);
+    }
+    cleanup_component_settlement(
+        &lane,
+        lease,
+        &settlement,
+        &guard,
+        ComponentSettlementFault::None,
+    )?;
+    Ok(Some(settlement.outcome))
+}
+
+fn open_component_settlement_lane(
+    lease: &ManagedRootPublicationLease,
+    component: ManagedComponentKind,
+) -> Result<ComponentLane, ComponentTransactionError> {
+    lease.revalidate().map_err(tx)?;
+    let lane = lease
+        .publication_directory()
+        .open_child(component_lane_name(component))
+        .map_err(tx)?;
+    let table = lane.open_child(COMPONENT_TABLE_DIRECTORY).map_err(tx)?;
+    let staging = lane.open_child(COMPONENT_STAGING_DIRECTORY).map_err(tx)?;
+    let quarantine = lane
+        .open_child(COMPONENT_QUARANTINE_DIRECTORY)
+        .map_err(tx)?;
+    let ancestors = lane.open_child(COMPONENT_ANCESTORS_DIRECTORY).map_err(tx)?;
+    let ancestor_records = ancestors
+        .open_child(COMPONENT_ANCESTOR_RECORDS_DIRECTORY)
+        .map_err(tx)?;
+    let ancestor_staging = ancestors
+        .open_child(COMPONENT_ANCESTOR_STAGING_DIRECTORY)
+        .map_err(tx)?;
+    let opened = ComponentLane {
+        component,
+        lane,
+        table,
+        staging,
+        quarantine,
+        ancestors,
+        ancestor_records,
+        ancestor_staging,
+    };
+    require_exact_ancestor_scaffold(&opened)?;
+    lease.revalidate().map_err(tx)?;
+    Ok(opened)
+}
+
+fn component_settled_outcome(
+    lease: ManagedRootPublicationLease,
+    outcome: ComponentOutcomeRecord,
+) -> ComponentSettledOutcome {
+    match outcome.terminal {
+        ComponentTerminalOutcome::Committed => ComponentSettledOutcome::Committed(lease),
+        ComponentTerminalOutcome::RolledBack => ComponentSettledOutcome::RolledBack {
+            lease,
+            effect: outcome.effect,
+        },
+    }
+}
+
+fn cleanup_component_settlement(
+    lane: &ComponentLane,
+    lease: &ManagedRootPublicationLease,
+    settlement: &ComponentSettlementRecord,
+    settlement_guard: &ManagedFileGuard,
+    fault: ComponentSettlementFault,
+) -> Result<(), ComponentTransactionError> {
+    validate_settlement_marker_shape(lane, lease, settlement, settlement_guard)?;
+
+    let ancestor_plan = admit_settlement_ancestors(lane, lease, settlement)?;
+    let row_plan = admit_settlement_rows(lane, lease, settlement)?;
+    for shard_index in (0..ancestor_plan.record_count).rev() {
+        cleanup_one_settlement_ancestor_shard(
+            lane,
+            lease,
+            settlement,
+            &ancestor_plan.created_ancestors,
+            shard_index,
+            fault,
+        )?;
+    }
+    require_empty_ancestor_scaffold(lane)?;
+
+    for shard_index in (0..row_plan.table_count).rev() {
+        cleanup_one_settlement_row_shard(lane, lease, settlement, shard_index, fault)?;
+    }
+
+    validate_settled_data_scaffold(lane, lease, settlement)?;
+    validate_settlement_marker_shape(lane, lease, settlement, settlement_guard)?;
+    if let Some(guard) = exact_encoded_marker(
+        &lane.lane,
+        COMPONENT_OUTCOME_FILE,
+        &encode_component_outcome(&settlement.outcome).map_err(tx)?,
+        COMPONENT_OUTCOME_BYTES as u64,
+    )? {
+        lane.lane
+            .remove_guarded_file(COMPONENT_OUTCOME_FILE, &guard)
+            .map_err(tx)?;
+        sync_component_lane_roots(lane, lease)?;
+        if fault == ComponentSettlementFault::AfterOutcomeRemoval {
+            return Err(ComponentTransactionError);
+        }
+    }
+    validate_settlement_marker_shape(lane, lease, settlement, settlement_guard)?;
+    if let Some(guard) = exact_encoded_marker(
+        &lane.lane,
+        COMPONENT_INTENT_FILE,
+        &settlement.encoded_intent,
+        MAX_COMPONENT_INTENT_BYTES as u64,
+    )? {
+        lane.lane
+            .remove_guarded_file(COMPONENT_INTENT_FILE, &guard)
+            .map_err(tx)?;
+        sync_component_lane_roots(lane, lease)?;
+        if fault == ComponentSettlementFault::AfterIntentRemoval {
+            return Err(ComponentTransactionError);
+        }
+    }
+    validate_settlement_marker_shape(lane, lease, settlement, settlement_guard)?;
+    if !lane
+        .lane
+        .file_guard_matches(COMPONENT_SETTLEMENT_FILE, settlement_guard)
+        .map_err(tx)?
+    {
+        return Err(ComponentTransactionError);
+    }
+    lane.lane
+        .remove_guarded_file(COMPONENT_SETTLEMENT_FILE, settlement_guard)
+        .map_err(tx)?;
+    sync_component_lane_roots(lane, lease)?;
+    if fault == ComponentSettlementFault::AfterSettlementRemoval {
+        return Err(ComponentTransactionError);
+    }
+    validate_marker_free_settlement_shape(lane, lease, &settlement.outcome)
+}
+
+fn validate_settlement_marker_shape(
+    lane: &ComponentLane,
+    lease: &ManagedRootPublicationLease,
+    settlement: &ComponentSettlementRecord,
+    settlement_guard: &ManagedFileGuard,
+) -> Result<(), ComponentTransactionError> {
+    lease.revalidate().map_err(tx)?;
+    if settlement.intent.component != lane.component
+        || settlement.intent.root_binding_sha256
+            != component_root_binding_sha256(lease.root()).map_err(tx)?
+        || settlement
+            .outcome
+            .binds_intent(&settlement.intent, &settlement.encoded_intent)
+            .is_err()
+        || !lane
+            .lane
+            .file_guard_matches(COMPONENT_SETTLEMENT_FILE, settlement_guard)
+            .map_err(tx)?
+    {
+        return Err(ComponentTransactionError);
+    }
+    let names = exact_entry_names(&lane.lane, MAX_COMPONENT_LANE_ENTRIES + 1).map_err(tx)?;
+    let intent_present = names.contains(COMPONENT_INTENT_FILE);
+    let outcome_present = names.contains(COMPONENT_OUTCOME_FILE);
+    if outcome_present && !intent_present {
+        return Err(ComponentTransactionError);
+    }
+    let mut expected = BTreeSet::from([
+        COMPONENT_ANCESTORS_DIRECTORY.to_string(),
+        COMPONENT_QUARANTINE_DIRECTORY.to_string(),
+        COMPONENT_SETTLEMENT_FILE.to_string(),
+        COMPONENT_STAGING_DIRECTORY.to_string(),
+        COMPONENT_TABLE_DIRECTORY.to_string(),
+    ]);
+    if intent_present {
+        expected.insert(COMPONENT_INTENT_FILE.to_string());
+    }
+    if outcome_present {
+        expected.insert(COMPONENT_OUTCOME_FILE.to_string());
+    }
+    if names != expected {
+        return Err(ComponentTransactionError);
+    }
+    if intent_present
+        && exact_encoded_marker(
+            &lane.lane,
+            COMPONENT_INTENT_FILE,
+            &settlement.encoded_intent,
+            MAX_COMPONENT_INTENT_BYTES as u64,
+        )?
+        .is_none()
+    {
+        return Err(ComponentTransactionError);
+    }
+    if outcome_present
+        && exact_encoded_marker(
+            &lane.lane,
+            COMPONENT_OUTCOME_FILE,
+            &encode_component_outcome(&settlement.outcome).map_err(tx)?,
+            COMPONENT_OUTCOME_BYTES as u64,
+        )?
+        .is_none()
+    {
+        return Err(ComponentTransactionError);
+    }
+    require_exact_ancestor_scaffold(lane)?;
+    lease.revalidate().map_err(tx)
+}
+
+fn exact_encoded_marker(
+    directory: &ManagedDir,
+    name: &str,
+    expected: &[u8],
+    maximum: u64,
+) -> Result<Option<ManagedFileGuard>, ComponentTransactionError> {
+    let Some(guard) = directory.inspect_regular_file(name).map_err(tx)? else {
+        return Ok(None);
+    };
+    if guard.size() != expected.len() as u64
+        || directory
+            .read_guarded_file_bounded(name, &guard, maximum)
+            .map_err(tx)?
+            != expected
+    {
+        return Err(ComponentTransactionError);
+    }
+    Ok(Some(guard))
+}
+
+fn require_exact_ancestor_scaffold(lane: &ComponentLane) -> Result<(), ComponentTransactionError> {
+    if exact_entry_names(&lane.ancestors, 3).map_err(tx)?
+        != BTreeSet::from([
+            COMPONENT_ANCESTOR_RECORDS_DIRECTORY.to_string(),
+            COMPONENT_ANCESTOR_STAGING_DIRECTORY.to_string(),
+        ])
+    {
+        return Err(ComponentTransactionError);
+    }
+    Ok(())
+}
+
+fn require_empty_ancestor_scaffold(lane: &ComponentLane) -> Result<(), ComponentTransactionError> {
+    require_exact_ancestor_scaffold(lane)?;
+    if !exact_entry_names(&lane.ancestor_records, 1)
+        .map_err(tx)?
+        .is_empty()
+        || !exact_entry_names(&lane.ancestor_staging, 1)
+            .map_err(tx)?
+            .is_empty()
+    {
+        return Err(ComponentTransactionError);
+    }
+    Ok(())
+}
+
+fn sync_component_lane_roots(
+    lane: &ComponentLane,
+    lease: &ManagedRootPublicationLease,
+) -> Result<(), ComponentTransactionError> {
+    lane.lane.sync().map_err(tx)?;
+    lease.publication_directory().sync().map_err(tx)?;
+    lease.root().sync().map_err(tx)?;
+    lease.revalidate().map_err(tx)
+}
+
+fn admit_settlement_ancestors(
+    lane: &ComponentLane,
+    lease: &ManagedRootPublicationLease,
+    settlement: &ComponentSettlementRecord,
+) -> Result<SettlementAncestorPlan, ComponentTransactionError> {
+    let record_names =
+        exact_entry_names(&lane.ancestor_records, MAX_COMPONENT_ANCESTOR_SHARDS + 1).map_err(tx)?;
+    let record_count = exact_prefix_len(
+        &record_names,
+        MAX_COMPONENT_ANCESTOR_SHARDS,
+        component_ancestor_record_file_name,
+    )?;
+    let mut bucket_names =
+        exact_entry_names(&lane.ancestor_staging, MAX_COMPONENT_ANCESTOR_SHARDS + 2).map_err(tx)?;
+    let parked_bucket = admit_empty_recovery_park(
+        &lane.ancestor_staging,
+        &mut bucket_names,
+        COMPONENT_BUCKET_PARK_A,
+        COMPONENT_BUCKET_PARK_B,
+    )?;
+    let bucket_count = exact_prefix_len(
+        &bucket_names,
+        MAX_COMPONENT_ANCESTOR_SHARDS,
+        component_ancestor_bucket_name,
+    )?;
+    if bucket_count > record_count
+        || bucket_count.saturating_add(1) < record_count
+        || parked_bucket.is_some() && bucket_count.saturating_add(1) != record_count
+    {
+        return Err(ComponentTransactionError);
+    }
+    if record_count == 0 {
+        if bucket_count != 0 || parked_bucket.is_some() {
+            return Err(ComponentTransactionError);
+        }
+        return Ok(SettlementAncestorPlan {
+            record_count: 0,
+            created_ancestors: Vec::new(),
+        });
+    }
+
+    let summary = replay_complete_settlement_table(lane, settlement)?;
+    let authority = ComponentAncestorJournalAuthority::new(
+        &settlement.encoded_intent,
+        &summary.created_ancestors,
+    )
+    .map_err(tx)?;
+    if record_count > authority.shard_count()
+        || settlement.outcome.terminal == ComponentTerminalOutcome::Committed
+            && record_count != authority.shard_count()
+    {
+        return Err(ComponentTransactionError);
+    }
+    for shard_index in 0..record_count {
+        let record_name = component_ancestor_record_file_name(shard_index).map_err(tx)?;
+        let record_guard = lane
+            .ancestor_records
+            .inspect_regular_file(&record_name)
+            .map_err(tx)?
+            .ok_or(ComponentTransactionError)?;
+        let encoded = lane
+            .ancestor_records
+            .read_guarded_file_bounded(
+                &record_name,
+                &record_guard,
+                MAX_COMPONENT_ANCESTOR_JOURNAL_SHARD_BYTES as u64,
+            )
+            .map_err(tx)?;
+        let journal = authority.decode_shard(&encoded).map_err(tx)?;
+        if journal.shard_index() != shard_index {
+            return Err(ComponentTransactionError);
+        }
+        let bucket_name = component_ancestor_bucket_name(shard_index).map_err(tx)?;
+        let bucket = (shard_index < bucket_count)
+            .then(|| lane.ancestor_staging.open_child(&bucket_name).map_err(tx))
+            .transpose()?;
+        if let Some(bucket) = bucket.as_ref() {
+            let mut names =
+                exact_entry_names(bucket, COMPONENT_ANCESTOR_RECORDS_PER_SHARD + 2).map_err(tx)?;
+            let parked_slot = admit_empty_recovery_park(
+                bucket,
+                &mut names,
+                ANCESTOR_SLOT_PARK_A,
+                ANCESTOR_SLOT_PARK_B,
+            )?;
+            let slot_count =
+                exact_prefix_len(&names, journal.records().len(), component_slot_name)?;
+            let is_current = shard_index + 1 == record_count;
+            let expected_slot_count = match settlement.outcome.terminal {
+                ComponentTerminalOutcome::Committed => 0,
+                ComponentTerminalOutcome::RolledBack => journal.records().len(),
+            };
+            if slot_count > expected_slot_count
+                || !is_current && slot_count != expected_slot_count
+                || parked_slot.is_some()
+                    && (!is_current || slot_count.saturating_add(1) > expected_slot_count)
+            {
+                return Err(ComponentTransactionError);
+            }
+            if let Some(parked) = parked_slot.as_ref() {
+                let record = journal
+                    .records()
+                    .get(slot_count)
+                    .ok_or(ComponentTransactionError)?;
+                if !record.matches_identity(parked.directory.identity().map_err(tx)?) {
+                    return Err(ComponentTransactionError);
+                }
+            }
+            for (row_in_shard, record) in journal.records().iter().take(slot_count).enumerate() {
+                let name = component_slot_name(row_in_shard).map_err(tx)?;
+                let slot = bucket.open_child(&name).map_err(tx)?;
+                if !record.matches_identity(slot.identity().map_err(tx)?)
+                    || !exact_entry_names(&slot, 1).map_err(tx)?.is_empty()
+                {
+                    return Err(ComponentTransactionError);
+                }
+            }
+        } else if shard_index + 1 != record_count {
+            return Err(ComponentTransactionError);
+        }
+
+        for record in journal.records() {
+            let canonical =
+                open_settlement_canonical_ancestor(lease, lane.component, record.target())?;
+            match settlement.outcome.terminal {
+                ComponentTerminalOutcome::Committed => {
+                    let canonical = canonical.ok_or(ComponentTransactionError)?;
+                    if !record.matches_identity(canonical.identity().map_err(tx)?) {
+                        return Err(ComponentTransactionError);
+                    }
+                }
+                ComponentTerminalOutcome::RolledBack => {
+                    if canonical.is_some() {
+                        return Err(ComponentTransactionError);
+                    }
+                }
+            }
+        }
+    }
+    lease.revalidate().map_err(tx)?;
+    Ok(SettlementAncestorPlan {
+        record_count,
+        created_ancestors: summary.created_ancestors,
+    })
+}
+
+fn replay_complete_settlement_table(
+    lane: &ComponentLane,
+    settlement: &ComponentSettlementRecord,
+) -> Result<ComponentTableSummary, ComponentTransactionError> {
+    let expected = (0..settlement.intent.shards.len())
+        .map(component_table_file_name)
+        .collect::<Result<BTreeSet<_>, _>>()
+        .map_err(tx)?;
+    if exact_entry_names(&lane.table, MAX_COMPONENT_TABLE_SHARDS + 1).map_err(tx)? != expected {
+        return Err(ComponentTransactionError);
+    }
+    let mut parser = ComponentTableParser::new(settlement.intent.clone()).map_err(tx)?;
+    for shard_index in 0..settlement.intent.shards.len() {
+        let (shard, _) = read_settlement_table_shard(lane, &settlement.intent, shard_index)?;
+        parser
+            .parse_next(
+                &crate::managed_component_table::encode_component_table_shard(&shard)
+                    .map_err(tx)?,
+            )
+            .map_err(tx)?;
+    }
+    parser.finish().map_err(tx)
+}
+
+fn cleanup_one_settlement_ancestor_shard(
+    lane: &ComponentLane,
+    lease: &ManagedRootPublicationLease,
+    settlement: &ComponentSettlementRecord,
+    created_ancestors: &[ComponentCreatedAncestor],
+    shard_index: usize,
+    fault: ComponentSettlementFault,
+) -> Result<(), ComponentTransactionError> {
+    let authority =
+        ComponentAncestorJournalAuthority::new(&settlement.encoded_intent, created_ancestors)
+            .map_err(tx)?;
+    let record_names =
+        exact_entry_names(&lane.ancestor_records, MAX_COMPONENT_ANCESTOR_SHARDS + 1).map_err(tx)?;
+    if exact_prefix_len(
+        &record_names,
+        authority.shard_count(),
+        component_ancestor_record_file_name,
+    )? != shard_index + 1
+    {
+        return Err(ComponentTransactionError);
+    }
+    let record_name = component_ancestor_record_file_name(shard_index).map_err(tx)?;
+    let record_guard = lane
+        .ancestor_records
+        .inspect_regular_file(&record_name)
+        .map_err(tx)?
+        .ok_or(ComponentTransactionError)?;
+    let encoded = lane
+        .ancestor_records
+        .read_guarded_file_bounded(
+            &record_name,
+            &record_guard,
+            MAX_COMPONENT_ANCESTOR_JOURNAL_SHARD_BYTES as u64,
+        )
+        .map_err(tx)?;
+    let journal = authority.decode_shard(&encoded).map_err(tx)?;
+    if journal.shard_index() != shard_index {
+        return Err(ComponentTransactionError);
+    }
+
+    let mut bucket_names =
+        exact_entry_names(&lane.ancestor_staging, MAX_COMPONENT_ANCESTOR_SHARDS + 2).map_err(tx)?;
+    let parked_bucket = admit_empty_recovery_park(
+        &lane.ancestor_staging,
+        &mut bucket_names,
+        COMPONENT_BUCKET_PARK_A,
+        COMPONENT_BUCKET_PARK_B,
+    )?;
+    let bucket_count = exact_prefix_len(
+        &bucket_names,
+        authority.shard_count(),
+        component_ancestor_bucket_name,
+    )?;
+    if bucket_count > shard_index + 1
+        || bucket_count < shard_index
+        || parked_bucket.is_some() && bucket_count != shard_index
+    {
+        return Err(ComponentTransactionError);
+    }
+    let bucket_name = component_ancestor_bucket_name(shard_index).map_err(tx)?;
+    if bucket_count == shard_index + 1 {
+        let bucket = lane.ancestor_staging.open_child(&bucket_name).map_err(tx)?;
+        let mut names =
+            exact_entry_names(&bucket, COMPONENT_ANCESTOR_RECORDS_PER_SHARD + 2).map_err(tx)?;
+        let parked_slot = admit_empty_recovery_park(
+            &bucket,
+            &mut names,
+            ANCESTOR_SLOT_PARK_A,
+            ANCESTOR_SLOT_PARK_B,
+        )?;
+        let expected_slots = match settlement.outcome.terminal {
+            ComponentTerminalOutcome::Committed => 0,
+            ComponentTerminalOutcome::RolledBack => journal.records().len(),
+        };
+        let slot_count = exact_prefix_len(&names, expected_slots, component_slot_name)?;
+        if let Some(parked) = parked_slot.as_ref() {
+            let record = journal
+                .records()
+                .get(slot_count)
+                .ok_or(ComponentTransactionError)?;
+            if !record.matches_identity(parked.directory.identity().map_err(tx)?) {
+                return Err(ComponentTransactionError);
+            }
+        }
+        for (row_in_shard, record) in journal.records().iter().take(slot_count).enumerate() {
+            let name = component_slot_name(row_in_shard).map_err(tx)?;
+            let slot = bucket.open_child(&name).map_err(tx)?;
+            if !record.matches_identity(slot.identity().map_err(tx)?)
+                || !exact_entry_names(&slot, 1).map_err(tx)?.is_empty()
+            {
+                return Err(ComponentTransactionError);
+            }
+        }
+        for record in journal.records() {
+            validate_settlement_ancestor_terminal(
+                lease,
+                lane.component,
+                record,
+                settlement.outcome.terminal,
+            )?;
+        }
+        if let Some(parked) = parked_slot {
+            finish_empty_recovery_park(&bucket, parked)?;
+        }
+        for row_in_shard in (0..slot_count).rev() {
+            let name = component_slot_name(row_in_shard).map_err(tx)?;
+            let slot = bucket.open_child(&name).map_err(tx)?;
+            if !journal.records()[row_in_shard].matches_identity(slot.identity().map_err(tx)?)
+                || bucket
+                    .remove_empty_child_guarded(&name, ANCESTOR_SLOT_PARK_A, slot)
+                    .map_err(tx)?
+                    != ManagedEmptyChildRemoval::Removed
+            {
+                return Err(ComponentTransactionError);
+            }
+            bucket.sync().map_err(tx)?;
+        }
+        if lane
+            .ancestor_staging
+            .remove_empty_child_guarded(
+                &bucket_name,
+                if shard_index % 2 == 0 {
+                    COMPONENT_BUCKET_PARK_A
+                } else {
+                    COMPONENT_BUCKET_PARK_B
+                },
+                bucket,
+            )
+            .map_err(tx)?
+            != ManagedEmptyChildRemoval::Removed
+        {
+            return Err(ComponentTransactionError);
+        }
+        lane.ancestor_staging.sync().map_err(tx)?;
+    } else {
+        for record in journal.records() {
+            validate_settlement_ancestor_terminal(
+                lease,
+                lane.component,
+                record,
+                settlement.outcome.terminal,
+            )?;
+        }
+    }
+    if let Some(parked) = parked_bucket {
+        finish_empty_recovery_park(&lane.ancestor_staging, parked)?;
+    }
+    sync_component_lane_roots(lane, lease)?;
+    if fault == ComponentSettlementFault::AfterAncestorBucket {
+        return Err(ComponentTransactionError);
+    }
+    lane.ancestor_records
+        .remove_guarded_file(&record_name, &record_guard)
+        .map_err(tx)?;
+    lane.ancestor_records.sync().map_err(tx)?;
+    sync_component_lane_roots(lane, lease)?;
+    if fault == ComponentSettlementFault::AfterAncestorRecord {
+        return Err(ComponentTransactionError);
+    }
+    Ok(())
+}
+
+fn validate_settlement_ancestor_terminal(
+    lease: &ManagedRootPublicationLease,
+    component: ManagedComponentKind,
+    record: &ComponentAncestorJournalRecord,
+    terminal: ComponentTerminalOutcome,
+) -> Result<(), ComponentTransactionError> {
+    let canonical = open_settlement_canonical_ancestor(lease, component, record.target())?;
+    match terminal {
+        ComponentTerminalOutcome::Committed => {
+            let canonical = canonical.ok_or(ComponentTransactionError)?;
+            if !record.matches_identity(canonical.identity().map_err(tx)?) {
+                return Err(ComponentTransactionError);
+            }
+        }
+        ComponentTerminalOutcome::RolledBack if canonical.is_none() => {}
+        ComponentTerminalOutcome::RolledBack => return Err(ComponentTransactionError),
+    }
+    Ok(())
+}
+
+fn open_settlement_canonical_ancestor(
+    lease: &ManagedRootPublicationLease,
+    component: ManagedComponentKind,
+    target: &ComponentCreatedAncestor,
+) -> Result<Option<ManagedDir>, ComponentTransactionError> {
+    lease.revalidate().map_err(tx)?;
+    let root = lease.root();
+    let component_root = component_lane_name(component);
+    let result = (|| match target {
+        ComponentCreatedAncestor::ComponentRoot => {
+            if root
+                .has_portably_exact_child_name(component_root)
+                .map_err(tx)?
+            {
+                Ok(Some(root.open_child(component_root).map_err(tx)?))
+            } else {
+                Ok(None)
+            }
+        }
+        ComponentCreatedAncestor::Relative(path) => {
+            if !root
+                .has_portably_exact_child_name(component_root)
+                .map_err(tx)?
+            {
+                return Ok(None);
+            }
+            let mut current = root.open_child(component_root).map_err(tx)?;
+            for segment in path.as_str().split('/') {
+                if !current.has_portably_exact_child_name(segment).map_err(tx)? {
+                    return Ok(None);
+                }
+                current = current.open_child(segment).map_err(tx)?;
+            }
+            Ok(Some(current))
+        }
+    })()?;
+    lease.revalidate().map_err(tx)?;
+    Ok(result)
+}
+
+fn admit_settlement_rows(
+    lane: &ComponentLane,
+    lease: &ManagedRootPublicationLease,
+    settlement: &ComponentSettlementRecord,
+) -> Result<SettlementRowsPlan, ComponentTransactionError> {
+    let table_names = exact_entry_names(&lane.table, MAX_COMPONENT_TABLE_SHARDS + 1).map_err(tx)?;
+    let table_count = exact_prefix_len(
+        &table_names,
+        settlement.intent.shards.len(),
+        component_table_file_name,
+    )?;
+    let (staging_count, staging_park) =
+        admit_settlement_bucket_parent(&lane.staging, settlement.intent.shards.len())?;
+    let (quarantine_count, quarantine_park) =
+        admit_settlement_bucket_parent(&lane.quarantine, settlement.intent.shards.len())?;
+    if staging_count > table_count
+        || quarantine_count > table_count
+        || staging_count.saturating_add(1) < table_count
+        || quarantine_count.saturating_add(1) < table_count
+        || staging_count > quarantine_count
+        || staging_park.is_some() && staging_count.saturating_add(1) != table_count
+        || quarantine_park.is_some() && quarantine_count.saturating_add(1) != table_count
+        || staging_park.is_some() && quarantine_park.is_some()
+        || quarantine_count < table_count && staging_count == table_count
+    {
+        return Err(ComponentTransactionError);
+    }
+    if table_count == 0 {
+        if staging_count != 0
+            || quarantine_count != 0
+            || staging_park.is_some()
+            || quarantine_park.is_some()
+        {
+            return Err(ComponentTransactionError);
+        }
+        return Ok(SettlementRowsPlan { table_count: 0 });
+    }
+
+    for shard_index in 0..table_count {
+        let (shard, table_guard) =
+            read_settlement_table_shard(lane, &settlement.intent, shard_index)?;
+        let table_name = component_table_file_name(shard_index).map_err(tx)?;
+        let bucket_name = component_bucket_name(shard_index).map_err(tx)?;
+        let is_current = shard_index + 1 == table_count;
+        let staging_directory = (shard_index < staging_count)
+            .then(|| lane.staging.open_child(&bucket_name).map_err(tx))
+            .transpose()?;
+        let quarantine_directory = (shard_index < quarantine_count)
+            .then(|| lane.quarantine.open_child(&bucket_name).map_err(tx))
+            .transpose()?;
+
+        let mut expected_staging = Vec::new();
+        let mut expected_quarantine = Vec::new();
+        expected_staging
+            .try_reserve_exact(shard.rows.len())
+            .map_err(tx)?;
+        expected_quarantine
+            .try_reserve_exact(shard.rows.len())
+            .map_err(tx)?;
+        for (row_in_shard, row) in shard.rows.iter().enumerate() {
+            validate_settlement_canonical_row(
+                lease,
+                lane.component,
+                row,
+                settlement.outcome.terminal,
+            )?;
+            let slot = component_slot_name(row_in_shard).map_err(tx)?;
+            match settlement.outcome.terminal {
+                ComponentTerminalOutcome::Committed => {
+                    if let Some(prior) = row.prior.as_ref().filter(|_| !row.prior_is_final()) {
+                        expected_quarantine.push((slot, prior.size, prior.sha1));
+                    }
+                }
+                ComponentTerminalOutcome::RolledBack => {
+                    if !row.prior_is_final() {
+                        expected_staging.push((slot, row.final_size, row.final_sha1));
+                    }
+                }
+            }
+        }
+
+        let staging_files = validate_settlement_residue_bucket(
+            staging_directory.as_ref(),
+            &expected_staging,
+            is_current,
+        )?;
+        let quarantine_files = validate_settlement_residue_bucket(
+            quarantine_directory.as_ref(),
+            &expected_quarantine,
+            is_current,
+        )?;
+        if !is_current
+            && (staging_files != expected_staging.len()
+                || quarantine_files != expected_quarantine.len())
+        {
+            return Err(ComponentTransactionError);
+        }
+        drop((table_name, table_guard, bucket_name));
+    }
+    lease.revalidate().map_err(tx)?;
+    Ok(SettlementRowsPlan { table_count })
+}
+
+fn admit_settlement_bucket_parent(
+    parent: &ManagedDir,
+    maximum: usize,
+) -> Result<(usize, Option<EmptyRecoveryPark>), ComponentTransactionError> {
+    let mut names = exact_entry_names(parent, maximum + 2).map_err(tx)?;
+    let parked = admit_empty_recovery_park(
+        parent,
+        &mut names,
+        COMPONENT_BUCKET_PARK_A,
+        COMPONENT_BUCKET_PARK_B,
+    )?;
+    let count = exact_prefix_len(&names, maximum, component_bucket_name)?;
+    Ok((count, parked))
+}
+
+fn validate_settlement_residue_bucket(
+    directory: Option<&ManagedDir>,
+    expected: &[(String, u64, [u8; 20])],
+    allow_partial: bool,
+) -> Result<usize, ComponentTransactionError> {
+    let Some(directory) = directory else {
+        return Ok(0);
+    };
+    let names = exact_entry_names(directory, expected.len() + 1).map_err(tx)?;
+    let prefix = expected
+        .iter()
+        .take_while(|(name, _, _)| names.contains(name))
+        .count();
+    let expected_names = expected
+        .iter()
+        .take(prefix)
+        .map(|(name, _, _)| name.clone())
+        .collect::<BTreeSet<_>>();
+    if names != expected_names || !allow_partial && prefix != expected.len() {
+        return Err(ComponentTransactionError);
+    }
+    for (name, size, sha1) in expected.iter().take(prefix) {
+        let _ = exact_file(directory, name, *size, *sha1)?.ok_or(ComponentTransactionError)?;
+    }
+    Ok(prefix)
+}
+
+fn cleanup_one_settlement_row_shard(
+    lane: &ComponentLane,
+    lease: &ManagedRootPublicationLease,
+    settlement: &ComponentSettlementRecord,
+    shard_index: usize,
+    fault: ComponentSettlementFault,
+) -> Result<(), ComponentTransactionError> {
+    let table_names = exact_entry_names(&lane.table, MAX_COMPONENT_TABLE_SHARDS + 1).map_err(tx)?;
+    if exact_prefix_len(
+        &table_names,
+        settlement.intent.shards.len(),
+        component_table_file_name,
+    )? != shard_index + 1
+    {
+        return Err(ComponentTransactionError);
+    }
+    let (shard, table_guard) = read_settlement_table_shard(lane, &settlement.intent, shard_index)?;
+    let table_name = component_table_file_name(shard_index).map_err(tx)?;
+    let bucket_name = component_bucket_name(shard_index).map_err(tx)?;
+    let mut expected_staging = Vec::new();
+    let mut expected_quarantine = Vec::new();
+    expected_staging
+        .try_reserve_exact(shard.rows.len())
+        .map_err(tx)?;
+    expected_quarantine
+        .try_reserve_exact(shard.rows.len())
+        .map_err(tx)?;
+    for (row_in_shard, row) in shard.rows.iter().enumerate() {
+        validate_settlement_canonical_row(lease, lane.component, row, settlement.outcome.terminal)?;
+        let slot = component_slot_name(row_in_shard).map_err(tx)?;
+        match settlement.outcome.terminal {
+            ComponentTerminalOutcome::Committed => {
+                if let Some(prior) = row.prior.as_ref().filter(|_| !row.prior_is_final()) {
+                    expected_quarantine.push((slot, prior.size, prior.sha1));
+                }
+            }
+            ComponentTerminalOutcome::RolledBack => {
+                if !row.prior_is_final() {
+                    expected_staging.push((slot, row.final_size, row.final_sha1));
+                }
+            }
+        }
+    }
+    cleanup_one_settlement_residue_bucket(
+        &lane.staging,
+        settlement.intent.shards.len(),
+        shard_index,
+        &bucket_name,
+        &expected_staging,
+    )?;
+    sync_component_lane_roots(lane, lease)?;
+    if fault == ComponentSettlementFault::AfterStagingBucket {
+        return Err(ComponentTransactionError);
+    }
+    cleanup_one_settlement_residue_bucket(
+        &lane.quarantine,
+        settlement.intent.shards.len(),
+        shard_index,
+        &bucket_name,
+        &expected_quarantine,
+    )?;
+    sync_component_lane_roots(lane, lease)?;
+    if fault == ComponentSettlementFault::AfterQuarantineBucket {
+        return Err(ComponentTransactionError);
+    }
+    lane.table
+        .remove_guarded_file(&table_name, &table_guard)
+        .map_err(tx)?;
+    lane.table.sync().map_err(tx)?;
+    sync_component_lane_roots(lane, lease)?;
+    if fault == ComponentSettlementFault::AfterTableShard {
+        return Err(ComponentTransactionError);
+    }
+    Ok(())
+}
+
+fn cleanup_one_settlement_residue_bucket(
+    parent: &ManagedDir,
+    maximum_shards: usize,
+    shard_index: usize,
+    bucket_name: &str,
+    expected: &[(String, u64, [u8; 20])],
+) -> Result<(), ComponentTransactionError> {
+    let (bucket_count, parked) = admit_settlement_bucket_parent(parent, maximum_shards)?;
+    if bucket_count > shard_index + 1
+        || bucket_count < shard_index
+        || parked.is_some() && bucket_count != shard_index
+    {
+        return Err(ComponentTransactionError);
+    }
+    if bucket_count == shard_index + 1 {
+        let bucket = parent.open_child(bucket_name).map_err(tx)?;
+        let prefix = validate_settlement_residue_bucket(Some(&bucket), expected, true)?;
+        for (name, size, sha1) in expected.iter().take(prefix).rev() {
+            let guard =
+                exact_file(&bucket, name, *size, *sha1)?.ok_or(ComponentTransactionError)?;
+            bucket.remove_guarded_file(name, &guard).map_err(tx)?;
+            bucket.sync().map_err(tx)?;
+        }
+        if parent
+            .remove_empty_child_guarded(
+                bucket_name,
+                if shard_index % 2 == 0 {
+                    COMPONENT_BUCKET_PARK_A
+                } else {
+                    COMPONENT_BUCKET_PARK_B
+                },
+                bucket,
+            )
+            .map_err(tx)?
+            != ManagedEmptyChildRemoval::Removed
+        {
+            return Err(ComponentTransactionError);
+        }
+        parent.sync().map_err(tx)?;
+    }
+    if let Some(parked) = parked {
+        finish_empty_recovery_park(parent, parked)?;
+    }
+    Ok(())
+}
+
+fn validate_settlement_canonical_row(
+    lease: &ManagedRootPublicationLease,
+    component: ManagedComponentKind,
+    row: &ComponentTableRow,
+    terminal: ComponentTerminalOutcome,
+) -> Result<(), ComponentTransactionError> {
+    let plan = plan_component_canonical_path(lease.root(), component, &row.path).map_err(tx)?;
+    let observed = match plan.observe().map_err(tx)? {
+        ComponentCanonicalObservation::Absent => None,
+        ComponentCanonicalObservation::Regular(file) => Some(file),
+    };
+    let exact = match terminal {
+        ComponentTerminalOutcome::Committed => observed
+            .as_ref()
+            .is_some_and(|file| file.size == row.final_size && file.sha1 == row.final_sha1),
+        ComponentTerminalOutcome::RolledBack => match (&row.prior, observed.as_ref()) {
+            (None, None) => true,
+            (Some(prior), Some(file)) => file.size == prior.size && file.sha1 == prior.sha1,
+            _ => false,
+        },
+    };
+    if !exact {
+        return Err(ComponentTransactionError);
+    }
+    lease.revalidate().map_err(tx)
+}
+
+fn read_settlement_table_shard(
+    lane: &ComponentLane,
+    manifest: &ComponentIntentManifest,
+    shard_index: usize,
+) -> Result<(ComponentTableShard, ManagedFileGuard), ComponentTransactionError> {
+    let descriptor = manifest
+        .shards
+        .get(shard_index)
+        .ok_or(ComponentTransactionError)?;
+    let name = component_table_file_name(shard_index).map_err(tx)?;
+    let guard = lane
+        .table
+        .inspect_regular_file(&name)
+        .map_err(tx)?
+        .ok_or(ComponentTransactionError)?;
+    if guard.size() != u64::from(descriptor.byte_len)
+        || guard.size() > MAX_COMPONENT_TABLE_SHARD_BYTES as u64
+    {
+        return Err(ComponentTransactionError);
+    }
+    let bytes = lane
+        .table
+        .read_guarded_file_bounded(&name, &guard, MAX_COMPONENT_TABLE_SHARD_BYTES as u64)
+        .map_err(tx)?;
+    if <[u8; 32]>::from(Sha256::digest(&bytes)) != descriptor.sha256 {
+        return Err(ComponentTransactionError);
+    }
+    let shard = decode_component_table_shard(&bytes).map_err(tx)?;
+    if usize::try_from(shard.shard_index).map_err(tx)? != shard_index
+        || shard.shard_index != descriptor.shard_index
+        || shard.first_row != descriptor.first_row
+        || usize::try_from(descriptor.row_count).map_err(tx)? != shard.rows.len()
+        || shard.total_rows != manifest.total_rows
+        || shard.component != manifest.component
+        || shard.transaction_nonce != manifest.transaction_nonce
+        || shard.root_binding_sha256 != manifest.root_binding_sha256
+    {
+        return Err(ComponentTransactionError);
+    }
+    Ok((shard, guard))
+}
+
+fn validate_settled_data_scaffold(
+    lane: &ComponentLane,
+    lease: &ManagedRootPublicationLease,
+    settlement: &ComponentSettlementRecord,
+) -> Result<(), ComponentTransactionError> {
+    require_empty_ancestor_scaffold(lane)?;
+    if !exact_entry_names(&lane.table, 1).map_err(tx)?.is_empty()
+        || !exact_entry_names(&lane.staging, 1).map_err(tx)?.is_empty()
+        || !exact_entry_names(&lane.quarantine, 1)
+            .map_err(tx)?
+            .is_empty()
+        || settlement.intent.root_binding_sha256
+            != component_root_binding_sha256(lease.root()).map_err(tx)?
+    {
+        return Err(ComponentTransactionError);
+    }
+    lease.revalidate().map_err(tx)
+}
+
+fn validate_marker_free_settlement_shape(
+    lane: &ComponentLane,
+    lease: &ManagedRootPublicationLease,
+    outcome: &ComponentOutcomeRecord,
+) -> Result<(), ComponentTransactionError> {
+    let expected = BTreeSet::from([
+        COMPONENT_ANCESTORS_DIRECTORY.to_string(),
+        COMPONENT_QUARANTINE_DIRECTORY.to_string(),
+        COMPONENT_STAGING_DIRECTORY.to_string(),
+        COMPONENT_TABLE_DIRECTORY.to_string(),
+    ]);
+    if exact_entry_names(&lane.lane, MAX_COMPONENT_LANE_ENTRIES + 1).map_err(tx)? != expected
+        || outcome.component != lane.component
+        || outcome.root_binding_sha256 != component_root_binding_sha256(lease.root()).map_err(tx)?
+    {
+        return Err(ComponentTransactionError);
+    }
+    require_empty_ancestor_scaffold(lane)?;
+    if !exact_entry_names(&lane.table, 1).map_err(tx)?.is_empty()
+        || !exact_entry_names(&lane.staging, 1).map_err(tx)?.is_empty()
+        || !exact_entry_names(&lane.quarantine, 1)
+            .map_err(tx)?
+            .is_empty()
+    {
+        return Err(ComponentTransactionError);
+    }
+    lease.revalidate().map_err(tx)
+}
+
+fn finish_settlement_disposition(
+    shared: &Mutex<Option<ComponentSettlementAuthority>>,
+    disposition: SettlementDisposition,
+) -> ComponentSettlementResult {
+    let authority = shared
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take()
+        .expect("component settlement owner must retain its authority");
+    if disposition == SettlementDisposition::Retry {
+        return ComponentSettlementResult::Retry(ComponentSettlementRetry { authority });
+    }
+    let ComponentSettlementAuthority {
+        context,
+        outcome: Some(outcome),
+        ..
+    } = authority
+    else {
+        panic!("settled component must retain its terminal outcome")
+    };
+    ComponentSettlementResult::Settled(component_settled_outcome(context.lease, outcome))
+}
+
 fn finish_disposition(
     shared: &Mutex<Option<ComponentIntentPublished>>,
     disposition: BlockingDisposition,
@@ -2516,19 +3947,23 @@ fn finish_disposition(
         .take()
         .expect("component terminal owner must retain its context");
     match disposition {
-        BlockingDisposition::NoTransaction | BlockingDisposition::RetryIntent => {
+        BlockingDisposition::NoTransaction
+        | BlockingDisposition::RetryIntent
+        | BlockingDisposition::Settled(_) => {
             unreachable!("live execution cannot return a recovery admission disposition")
         }
         BlockingDisposition::Committed(outcome_guard) => {
-            ComponentExecutionResult::Committed(ComponentCommitReceipt {
+            ComponentExecutionResult::Committed(ComponentTransactionReceipt {
                 context,
                 outcome_guard,
+                terminal: ComponentTerminalOutcome::Committed,
             })
         }
         BlockingDisposition::RolledBack(outcome_guard) => {
-            ComponentExecutionResult::RolledBack(ComponentRollbackReceipt {
+            ComponentExecutionResult::RolledBack(ComponentTransactionReceipt {
                 context,
                 outcome_guard,
+                terminal: ComponentTerminalOutcome::RolledBack,
             })
         }
         BlockingDisposition::RecoveryRequired(outcome_guard) => {
@@ -2556,6 +3991,10 @@ fn finish_recovery_disposition(
             RecoveryOwnerResult::NoTransaction(lease)
         }
         (
+            BlockingDisposition::Settled(outcome),
+            ComponentRecoveryAuthority::Restart { lease, .. },
+        ) => RecoveryOwnerResult::Settled(component_settled_outcome(lease, outcome)),
+        (
             BlockingDisposition::RetryIntent,
             ComponentRecoveryAuthority::IntentPromotionAttempted(
                 ComponentIntentPublishFailure::PromotionAttempted { candidate, .. },
@@ -2565,18 +4004,20 @@ fn finish_recovery_disposition(
             BlockingDisposition::Committed(outcome_guard),
             ComponentRecoveryAuthority::Published { context, .. },
         ) => RecoveryOwnerResult::Transaction(ComponentExecutionResult::Committed(
-            ComponentCommitReceipt {
+            ComponentTransactionReceipt {
                 context,
                 outcome_guard,
+                terminal: ComponentTerminalOutcome::Committed,
             },
         )),
         (
             BlockingDisposition::RolledBack(outcome_guard),
             ComponentRecoveryAuthority::Published { context, .. },
         ) => RecoveryOwnerResult::Transaction(ComponentExecutionResult::RolledBack(
-            ComponentRollbackReceipt {
+            ComponentTransactionReceipt {
                 context,
                 outcome_guard,
+                terminal: ComponentTerminalOutcome::RolledBack,
             },
         )),
         (BlockingDisposition::RecoveryRequired(outcome_guard), authority) => {
@@ -2605,4 +4046,41 @@ fn directory_move_error(_: ManagedDirectoryMoveFailure) -> ComponentTransactionE
 
 fn tx<T>(_: T) -> ComponentTransactionError {
     ComponentTransactionError
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod settlement_resource_tests {
+    use super::*;
+    use std::fs;
+
+    fn open_fds_beneath(root: &std::path::Path) -> usize {
+        fs::read_dir("/proc/self/fd")
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter_map(|entry| fs::read_link(entry.path()).ok())
+            .filter(|target| target.starts_with(root))
+            .count()
+    }
+
+    #[test]
+    fn maximum_settlement_shard_frontier_retains_constant_handles() {
+        let temporary = tempfile::tempdir().unwrap();
+        for shard_index in 0..MAX_COMPONENT_TABLE_SHARDS {
+            fs::create_dir(
+                temporary
+                    .path()
+                    .join(component_bucket_name(shard_index).unwrap()),
+            )
+            .unwrap();
+        }
+        let parent = ManagedDir::open_root(temporary.path()).unwrap();
+        let before = open_fds_beneath(temporary.path());
+
+        let (count, parked) = admit_settlement_bucket_parent(&parent, MAX_COMPONENT_TABLE_SHARDS)
+            .unwrap_or_else(|_| panic!("maximum settlement bucket frontier must be admitted"));
+
+        assert_eq!(count, MAX_COMPONENT_TABLE_SHARDS);
+        assert!(parked.is_none());
+        assert!(open_fds_beneath(temporary.path()) <= before + 1);
+    }
 }
