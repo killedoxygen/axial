@@ -115,7 +115,7 @@ fn windows_device_name(segment: &str) -> bool {
 
     let bytes = basename.as_bytes();
     bytes.len() == 4
-        && matches!(bytes[3], b'1'..=b'9')
+        && matches!(bytes[3], b'0'..=b'9')
         && (bytes[..3].eq_ignore_ascii_case(b"COM") || bytes[..3].eq_ignore_ascii_case(b"LPT"))
 }
 
@@ -241,8 +241,12 @@ mod tests {
             "conin$.txt",
             "CONOUT$",
             "conout$.log",
+            "com0",
+            "COM0.zip",
             "com1",
             "COM9.zip",
+            "lpt0",
+            "LPT0.tar.gz",
             "lpt1",
             "LpT9.tar.gz",
         ] {
@@ -254,7 +258,7 @@ mod tests {
             );
         }
 
-        for value in ["com0", "com10.jar", "lpt0", "lpt10.jar", "clock"] {
+        for value in ["com10.jar", "lpt10.jar", "clock"] {
             let path = ArtifactRelativePath::new(value).expect("general canonical path");
             assert_eq!(
                 path.portable_persisted_key(),
