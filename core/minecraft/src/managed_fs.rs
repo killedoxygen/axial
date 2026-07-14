@@ -13,7 +13,7 @@ use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
 const TEMP_PREFIX: &str = ".axial-loader-tmp-";
-const MAX_TEMP_SWEEP_ENTRIES: usize = 128;
+pub(crate) const MAX_MANAGED_TEMP_ENTRIES: usize = 128;
 pub(crate) const MAX_MANAGED_DIRECTORY_ENTRIES: usize = 4096;
 const MAX_MANAGED_READ_BYTES: u64 = 512 << 20;
 const MAX_MANAGED_TREE_ENTRIES: usize = MAX_MANAGED_DIRECTORY_ENTRIES;
@@ -36,6 +36,9 @@ impl ManagedDirectoryIdentity {
         platform::directory_identity_binding(self.0)
     }
 }
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct ManagedFileIdentity(platform::FileIdentity);
 
 pub(crate) struct ManagedPersistentFile {
     directory: ManagedDir,
@@ -97,6 +100,10 @@ impl std::fmt::Debug for ManagedFileGuard {
 impl ManagedFileGuard {
     pub(crate) fn size(&self) -> u64 {
         self.size
+    }
+
+    pub(crate) fn identity(&self) -> ManagedFileIdentity {
+        ManagedFileIdentity(self.identity)
     }
 }
 
@@ -747,6 +754,49 @@ impl ManagedDir {
         };
         Ok(platform::file_identity(&current)? == guard.identity
             && platform::file_identity(&guard.file)? == guard.identity)
+    }
+
+    pub(crate) fn managed_temp_is_orphan(
+        &self,
+        name: &str,
+        guard: &ManagedFileGuard,
+    ) -> Result<bool, LoaderError> {
+        let owner_pid = temp_owner_pid(name)
+            .ok_or_else(|| LoaderError::Verify("managed temp name is malformed".to_string()))?;
+        if !self.file_guard_matches(name, guard)? {
+            return Err(LoaderError::Verify(
+                "managed temp identity changed during admission".to_string(),
+            ));
+        }
+        let mut system = System::new();
+        Ok(
+            self.managed_temp_is_orphan_with(OsStr::new(name), owner_pid, |pid| {
+                temp_owner_is_live(&mut system, pid)
+            }),
+        )
+    }
+
+    fn managed_temp_is_orphan_with(
+        &self,
+        name: &OsStr,
+        owner_pid: u32,
+        mut owner_is_live: impl FnMut(u32) -> bool,
+    ) -> bool {
+        let key = ActiveTempKey {
+            directory: self.inner.identity,
+            name: name.to_os_string(),
+        };
+        if active_temps()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(&key)
+        {
+            return false;
+        }
+        if owner_pid == std::process::id() {
+            return true;
+        }
+        !owner_is_live(owner_pid)
     }
 
     pub(crate) fn sha1_guarded_file(
@@ -2196,24 +2246,13 @@ impl ManagedDir {
             })?;
             reserved.push((name, owner_pid));
         }
-        if reserved.len() > MAX_TEMP_SWEEP_ENTRIES {
+        if reserved.len() > MAX_MANAGED_TEMP_ENTRIES {
             return Err(LoaderError::Verify(
                 "managed loader directory exceeds the bounded temp sweep".to_string(),
             ));
         }
         for (name, owner_pid) in reserved {
-            let key = ActiveTempKey {
-                directory: self.inner.identity,
-                name: name.clone(),
-            };
-            if active_temps()
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .contains(&key)
-            {
-                continue;
-            }
-            if owner_pid != std::process::id() && owner_is_live(owner_pid) {
+            if !self.managed_temp_is_orphan_with(&name, owner_pid, &mut owner_is_live) {
                 continue;
             }
             match platform::entry_kind(&self.inner.handle, &self.inner.path, &name)? {
@@ -2362,6 +2401,15 @@ fn temp_owner_pid(name: &str) -> Option<u32> {
         && format!("{nanos:x}") == nanos_text
         && format!("{sequence:x}") == sequence_text)
         .then_some(pid)
+}
+
+pub(crate) fn validate_managed_temp_name(name: &str) -> Result<bool, LoaderError> {
+    if !name.starts_with(TEMP_PREFIX) {
+        return Ok(false);
+    }
+    temp_owner_pid(name)
+        .map(|_| true)
+        .ok_or_else(|| LoaderError::Verify("managed temp name is malformed".to_string()))
 }
 
 fn temp_owner_is_live(system: &mut System, pid: u32) -> bool {
@@ -2828,11 +2876,26 @@ mod tests {
         .expect("active temp");
         file.write_all(b"active").expect("active bytes");
         drop(file);
+        let guard = directory
+            .inspect_regular_file(&name)
+            .expect("inspect active temp")
+            .expect("active temp guard");
 
+        assert!(
+            !directory
+                .managed_temp_is_orphan(&name, &guard)
+                .expect("classify registered temp")
+        );
         directory.sweep_orphan_temps().expect("skip active temp");
         assert!(root.join(&name).is_file());
 
         drop(active);
+        assert!(
+            directory
+                .managed_temp_is_orphan(&name, &guard)
+                .expect("classify unregistered temp")
+        );
+        drop(guard);
         directory
             .sweep_orphan_temps_with(|_| false)
             .expect("sweep dead-owner orphan");
@@ -3172,7 +3235,7 @@ mod tests {
     async fn ordinary_entries_do_not_consume_the_temp_sweep_bound() {
         let root = test_root("temp-sweep-ordinary-entries");
         fs::create_dir_all(&root).expect("root");
-        for index in 0..=MAX_TEMP_SWEEP_ENTRIES {
+        for index in 0..=MAX_MANAGED_TEMP_ENTRIES {
             fs::write(root.join(format!("artifact-{index}")), b"retained").expect("artifact");
         }
         let directory = ManagedDir::open_root(&root).expect("managed root");
@@ -3306,7 +3369,7 @@ mod tests {
         fs::create_dir_all(&root).expect("root");
         let directory = ManagedDir::open_root(&root).expect("managed root");
         let foreign_pid = std::process::id().wrapping_add(1);
-        let names = (0..=MAX_TEMP_SWEEP_ENTRIES)
+        let names = (0..=MAX_MANAGED_TEMP_ENTRIES)
             .map(|index| format!("{TEMP_PREFIX}{foreign_pid}-{:x}-0", index + 1))
             .collect::<Vec<_>>();
         for name in &names {

@@ -1,9 +1,8 @@
 use crate::artifact_path::ArtifactRelativePath;
-use crate::known_good::MAX_TIER2_ARTIFACT_BYTES;
+use crate::known_good::{MAX_TIER2_AGGREGATE_BYTES, MAX_TIER2_ARTIFACT_BYTES, MAX_TIER2_ENTRIES};
 use crate::loaders::types::LoaderError;
 use crate::managed_component_publication::{
-    COMPONENT_INTENT_FILE, COMPONENT_OUTCOME_FILE, COMPONENT_QUARANTINE_DIRECTORY,
-    COMPONENT_SETTLEMENT_FILE, COMPONENT_STAGING_DIRECTORY, COMPONENT_TABLE_DIRECTORY,
+    COMPONENT_QUARANTINE_DIRECTORY, COMPONENT_STAGING_DIRECTORY, COMPONENT_TABLE_DIRECTORY,
     component_lane_name,
 };
 use crate::managed_component_spool::{ComponentTableReplay, ComponentTableSpoolError};
@@ -12,11 +11,16 @@ use crate::managed_component_table::{
     MAX_COMPONENT_TABLE_SHARD_BYTES, MAX_COMPONENT_TABLE_SHARDS, ManagedComponentKind,
     component_table_path, decode_component_table_shard,
 };
-use crate::managed_fs::{ManagedDir, ManagedFileGuard};
+use crate::managed_fs::{
+    MAX_MANAGED_TEMP_ENTRIES, ManagedDir, ManagedDirectoryIdentity, ManagedEmptyChildRemoval,
+    ManagedFileGuard, ManagedFileIdentity, validate_managed_temp_name,
+};
 use crate::managed_publication::{ManagedPublicationError, ManagedRootPublicationLease};
 use std::collections::BTreeSet;
 
 const MAX_COMPONENT_LANE_ENTRIES: usize = 6;
+const COMPONENT_BUCKET_PARK_A: &str = "bucket-park-a";
+const COMPONENT_BUCKET_PARK_B: &str = "bucket-park-b";
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum ComponentEffectsError {
@@ -42,7 +46,55 @@ pub(crate) struct ComponentLane {
 
 pub(crate) struct ComponentDurableTable {
     summary: ComponentTableSummary,
-    shard_guards: Vec<ManagedFileGuard>,
+    shard_count: usize,
+}
+
+pub(crate) struct ComponentShardBuckets {
+    staging: ManagedDir,
+    quarantine: ManagedDir,
+}
+
+struct ComponentPreintentCleanupPlan {
+    table: Option<ComponentTableCleanupPlan>,
+    staging: Option<ComponentBucketCleanupPlan>,
+    quarantine: Option<ComponentBucketCleanupPlan>,
+}
+
+struct ComponentTableCleanupPlan {
+    directory: ManagedDir,
+    component: ManagedComponentKind,
+    files: Vec<ComponentPlannedFile>,
+    temporary: Vec<ComponentPlannedFile>,
+}
+
+struct ComponentBucketCleanupPlan {
+    directory: ManagedDir,
+    buckets: Vec<ComponentGuardedBucket>,
+    parked: Option<ComponentParkedBucket>,
+}
+
+struct ComponentGuardedBucket {
+    name: String,
+    identity: ManagedDirectoryIdentity,
+    files: Vec<ComponentPlannedFile>,
+    temporary: Vec<ComponentPlannedFile>,
+}
+
+struct ComponentParkedBucket {
+    name: &'static str,
+    alternate: &'static str,
+    identity: ManagedDirectoryIdentity,
+}
+
+struct ComponentPlannedFile {
+    name: String,
+    size: u64,
+    identity: ManagedFileIdentity,
+}
+
+struct ComponentDirectoryFilePlan {
+    owned: Vec<ComponentPlannedFile>,
+    temporary: Vec<ComponentPlannedFile>,
 }
 
 pub(crate) struct ComponentCanonicalPathPlan {
@@ -70,33 +122,47 @@ impl ComponentLane {
         lease: &ManagedRootPublicationLease,
         component: ManagedComponentKind,
     ) -> Result<Self, ComponentEffectsError> {
+        Self::prepare_fresh_inner(lease, component, || {})
+    }
+
+    #[cfg(test)]
+    fn prepare_fresh_with_cleanup_hook(
+        lease: &ManagedRootPublicationLease,
+        component: ManagedComponentKind,
+        after_cleanup_admission: impl FnOnce(),
+    ) -> Result<Self, ComponentEffectsError> {
+        Self::prepare_fresh_inner(lease, component, after_cleanup_admission)
+    }
+
+    fn prepare_fresh_inner(
+        lease: &ManagedRootPublicationLease,
+        component: ManagedComponentKind,
+        after_cleanup_admission: impl FnOnce(),
+    ) -> Result<Self, ComponentEffectsError> {
         lease.revalidate()?;
         let publication = lease.publication_directory();
         let lane_name = component_lane_name(component);
         let lane = open_or_create_exact_child(publication, lane_name)?;
-        let names = exact_entry_names(&lane, MAX_COMPONENT_LANE_ENTRIES + 1)?;
-        if names
-            .iter()
-            .any(|name| !component_lane_entry_is_known(name))
-            || names.contains(COMPONENT_INTENT_FILE)
-            || names.contains(COMPONENT_OUTCOME_FILE)
-            || names.contains(COMPONENT_SETTLEMENT_FILE)
-        {
-            return Err(ComponentEffectsError::Topology);
-        }
-
+        let cleanup = ComponentPreintentCleanupPlan::admit(&lane, component)?;
+        after_cleanup_admission();
+        lease.revalidate()?;
+        cleanup.execute(&lane)?;
         let table = open_or_create_exact_child(&lane, COMPONENT_TABLE_DIRECTORY)?;
         let staging = open_or_create_exact_child(&lane, COMPONENT_STAGING_DIRECTORY)?;
         let quarantine = open_or_create_exact_child(&lane, COMPONENT_QUARANTINE_DIRECTORY)?;
-        if !exact_entry_names(&staging, 1)?.is_empty()
+        if !exact_entry_names(&table, 1)?.is_empty()
+            || !exact_entry_names(&staging, 1)?.is_empty()
             || !exact_entry_names(&quarantine, 1)?.is_empty()
         {
             return Err(ComponentEffectsError::Topology);
         }
-        cleanup_preintent_table(&table, component)?;
+        table.sync()?;
+        staging.sync()?;
+        quarantine.sync()?;
         lane.sync()?;
         publication.sync()?;
         lease.root().sync()?;
+        lease.revalidate()?;
 
         Ok(Self {
             component,
@@ -123,6 +189,22 @@ impl ComponentLane {
         &self.quarantine
     }
 
+    pub(crate) fn create_shard_buckets(
+        &self,
+        shard_index: usize,
+    ) -> Result<ComponentShardBuckets, ComponentEffectsError> {
+        let name = component_bucket_name(shard_index)?;
+        let staging = self.staging.create_child_new(&name)?;
+        self.staging.sync()?;
+        let quarantine = self.quarantine.create_child_new(&name)?;
+        self.quarantine.sync()?;
+        self.lane.sync()?;
+        Ok(ComponentShardBuckets {
+            staging,
+            quarantine,
+        })
+    }
+
     pub(crate) fn publish_table(
         &self,
         mut replay: ComponentTableReplay,
@@ -131,11 +213,7 @@ impl ComponentLane {
         if manifest.component != self.component || !exact_entry_names(&self.table, 1)?.is_empty() {
             return Err(ComponentEffectsError::Topology);
         }
-        let _validated_manifest = ComponentTableParser::new(manifest.clone())?;
-        let mut shard_guards = Vec::new();
-        shard_guards
-            .try_reserve_exact(manifest.shards.len())
-            .map_err(|_| ComponentEffectsError::Topology)?;
+        let mut parser = ComponentTableParser::new(manifest.clone())?;
         let mut next_shard = 0_usize;
         while let Some((descriptor, encoded)) = replay.next()? {
             let expected = manifest
@@ -147,18 +225,36 @@ impl ComponentLane {
             }
             let name = component_table_file_name(next_shard)?;
             let guard = self.table.write_new_exact_guarded(&name, &encoded)?;
-            self.table.sync()?;
-            if !self.table.file_guard_matches(&name, &guard)? {
-                return Err(ComponentEffectsError::Topology);
+            let validation = (|| -> Result<(), ComponentEffectsError> {
+                if guard.size() != u64::from(descriptor.byte_len)
+                    || guard.size() > MAX_COMPONENT_TABLE_SHARD_BYTES as u64
+                {
+                    return Err(ComponentEffectsError::Topology);
+                }
+                let durable = self.table.read_guarded_file_bounded(
+                    &name,
+                    &guard,
+                    MAX_COMPONENT_TABLE_SHARD_BYTES as u64,
+                )?;
+                parser.parse_next(&durable)?;
+                Ok(())
+            })();
+            if let Err(error) = validation {
+                self.table.remove_guarded_file(&name, &guard)?;
+                self.table.sync()?;
+                return Err(error);
             }
-            shard_guards.push(guard);
+            self.table.sync()?;
             next_shard += 1;
         }
         if next_shard != manifest.shards.len() {
             return Err(ComponentEffectsError::Topology);
         }
         self.lane.sync()?;
-        self.validate_table_guards(manifest, shard_guards)
+        Ok(ComponentDurableTable {
+            summary: parser.finish()?,
+            shard_count: next_shard,
+        })
     }
 
     pub(crate) fn read_table(
@@ -177,32 +273,13 @@ impl ComponentLane {
             return Err(ComponentEffectsError::Topology);
         }
 
-        let mut shard_guards = Vec::new();
-        shard_guards
-            .try_reserve_exact(manifest.shards.len())
-            .map_err(|_| ComponentEffectsError::Topology)?;
-        for index in 0..manifest.shards.len() {
+        let mut parser = ComponentTableParser::new(manifest.clone())?;
+        for (index, descriptor) in manifest.shards.iter().enumerate() {
             let name = component_table_file_name(index)?;
             let guard = self
                 .table
                 .inspect_regular_file(&name)?
                 .ok_or(ComponentEffectsError::Topology)?;
-            shard_guards.push(guard);
-        }
-        self.validate_table_guards(manifest, shard_guards)
-    }
-
-    fn validate_table_guards(
-        &self,
-        manifest: &ComponentIntentManifest,
-        shard_guards: Vec<ManagedFileGuard>,
-    ) -> Result<ComponentDurableTable, ComponentEffectsError> {
-        if shard_guards.len() != manifest.shards.len() {
-            return Err(ComponentEffectsError::Topology);
-        }
-        let mut parser = ComponentTableParser::new(manifest.clone())?;
-        for (index, (descriptor, guard)) in manifest.shards.iter().zip(&shard_guards).enumerate() {
-            let name = component_table_file_name(index)?;
             if guard.size() != u64::from(descriptor.byte_len)
                 || guard.size() > MAX_COMPONENT_TABLE_SHARD_BYTES as u64
             {
@@ -217,8 +294,18 @@ impl ComponentLane {
         }
         Ok(ComponentDurableTable {
             summary: parser.finish()?,
-            shard_guards,
+            shard_count: manifest.shards.len(),
         })
+    }
+}
+
+impl ComponentShardBuckets {
+    pub(crate) fn staging(&self) -> &ManagedDir {
+        &self.staging
+    }
+
+    pub(crate) fn quarantine(&self) -> &ManagedDir {
+        &self.quarantine
     }
 }
 
@@ -228,7 +315,7 @@ impl ComponentDurableTable {
     }
 
     pub(crate) fn shard_count(&self) -> usize {
-        self.shard_guards.len()
+        self.shard_count
     }
 }
 
@@ -385,28 +472,205 @@ fn copy_bounded_string(value: &str) -> Result<String, ComponentEffectsError> {
     Ok(copied)
 }
 
-fn cleanup_preintent_table(
-    table: &ManagedDir,
-    component: ManagedComponentKind,
-) -> Result<(), ComponentEffectsError> {
-    let names = exact_entry_names(table, MAX_COMPONENT_TABLE_SHARDS + 1)?;
-    let mut guarded = Vec::new();
-    guarded
-        .try_reserve_exact(names.len())
-        .map_err(|_| ComponentEffectsError::Topology)?;
-    let mut transaction_binding = None;
-    for (index, name) in names.into_iter().enumerate() {
-        if name != component_table_file_name(index)? {
+impl ComponentPreintentCleanupPlan {
+    fn admit(
+        lane: &ManagedDir,
+        component: ManagedComponentKind,
+    ) -> Result<Self, ComponentEffectsError> {
+        let names = exact_entry_names(lane, MAX_COMPONENT_LANE_ENTRIES + 1)?;
+        if names
+            .iter()
+            .any(|name| !component_preintent_lane_entry_is_known(name))
+        {
             return Err(ComponentEffectsError::Topology);
         }
-        let guard = table
-            .inspect_regular_file(&name)?
-            .ok_or(ComponentEffectsError::Topology)?;
+        let table = names
+            .contains(COMPONENT_TABLE_DIRECTORY)
+            .then(|| lane.open_child(COMPONENT_TABLE_DIRECTORY))
+            .transpose()?
+            .map(|directory| ComponentTableCleanupPlan::admit(directory, component))
+            .transpose()?;
+        let staging = names
+            .contains(COMPONENT_STAGING_DIRECTORY)
+            .then(|| lane.open_child(COMPONENT_STAGING_DIRECTORY))
+            .transpose()?
+            .map(ComponentBucketCleanupPlan::admit)
+            .transpose()?;
+        let quarantine = names
+            .contains(COMPONENT_QUARANTINE_DIRECTORY)
+            .then(|| lane.open_child(COMPONENT_QUARANTINE_DIRECTORY))
+            .transpose()?
+            .map(ComponentBucketCleanupPlan::admit)
+            .transpose()?;
+        let plan = Self {
+            table,
+            staging,
+            quarantine,
+        };
+        plan.revalidate_with_temps(lane)?;
+        Ok(plan)
+    }
+
+    fn remove_temps(&self) -> Result<(), ComponentEffectsError> {
+        if let Some(table) = &self.table {
+            table.remove_temps()?;
+        }
+        if let Some(staging) = &self.staging {
+            staging.remove_temps()?;
+        }
+        if let Some(quarantine) = &self.quarantine {
+            quarantine.remove_temps()?;
+        }
+        Ok(())
+    }
+
+    fn revalidate_lane(&self, lane: &ManagedDir) -> Result<(), ComponentEffectsError> {
+        let mut expected = BTreeSet::new();
+        if self.table.is_some() {
+            expected.insert(COMPONENT_TABLE_DIRECTORY.to_string());
+        }
+        if self.staging.is_some() {
+            expected.insert(COMPONENT_STAGING_DIRECTORY.to_string());
+        }
+        if self.quarantine.is_some() {
+            expected.insert(COMPONENT_QUARANTINE_DIRECTORY.to_string());
+        }
+        if exact_entry_names(lane, MAX_COMPONENT_LANE_ENTRIES + 1)? != expected {
+            return Err(ComponentEffectsError::Topology);
+        }
+        Ok(())
+    }
+
+    fn revalidate_with_temps(&self, lane: &ManagedDir) -> Result<(), ComponentEffectsError> {
+        self.revalidate_lane(lane)?;
+        if let Some(table) = &self.table {
+            table.revalidate_with_temps()?;
+        }
+        if let Some(staging) = &self.staging {
+            staging.revalidate_with_temps()?;
+        }
+        if let Some(quarantine) = &self.quarantine {
+            quarantine.revalidate_with_temps()?;
+        }
+        Ok(())
+    }
+
+    fn revalidate(&self, lane: &ManagedDir) -> Result<(), ComponentEffectsError> {
+        self.revalidate_lane(lane)?;
+        if let Some(table) = &self.table {
+            table.revalidate()?;
+        }
+        if let Some(staging) = &self.staging {
+            staging.revalidate()?;
+        }
+        if let Some(quarantine) = &self.quarantine {
+            quarantine.revalidate()?;
+        }
+        Ok(())
+    }
+
+    fn execute(self, lane: &ManagedDir) -> Result<(), ComponentEffectsError> {
+        self.revalidate_with_temps(lane)?;
+        self.remove_temps()?;
+        self.revalidate(lane)?;
+        if let Some(table) = self.table {
+            table.execute()?;
+        }
+        if let Some(quarantine) = self.quarantine {
+            quarantine.execute()?;
+        }
+        if let Some(staging) = self.staging {
+            staging.execute()?;
+        }
+        Ok(())
+    }
+}
+
+impl ComponentTableCleanupPlan {
+    fn admit(
+        directory: ManagedDir,
+        component: ManagedComponentKind,
+    ) -> Result<Self, ComponentEffectsError> {
+        let planned = plan_directory_files(
+            &directory,
+            MAX_COMPONENT_TABLE_SHARDS,
+            MAX_COMPONENT_TABLE_SHARD_BYTES as u64,
+            |name| parse_component_table_file_name(name).is_some(),
+        )?;
+        validate_component_table_prefix(&directory, component, &planned.owned)?;
+        Ok(Self {
+            directory,
+            component,
+            files: planned.owned,
+            temporary: planned.temporary,
+        })
+    }
+
+    fn revalidate_with_temps(&self) -> Result<(), ComponentEffectsError> {
+        validate_planned_file_entries(
+            &self.directory,
+            &self.files,
+            &self.temporary,
+            MAX_COMPONENT_TABLE_SHARDS,
+            true,
+        )?;
+        validate_component_table_prefix(&self.directory, self.component, &self.files)
+    }
+
+    fn revalidate(&self) -> Result<(), ComponentEffectsError> {
+        validate_planned_file_entries(
+            &self.directory,
+            &self.files,
+            &[],
+            MAX_COMPONENT_TABLE_SHARDS,
+            false,
+        )?;
+        validate_component_table_prefix(&self.directory, self.component, &self.files)
+    }
+
+    fn remove_temps(&self) -> Result<(), ComponentEffectsError> {
+        remove_planned_temps(&self.directory, &self.temporary)
+    }
+
+    fn execute(self) -> Result<(), ComponentEffectsError> {
+        self.revalidate()?;
+        for (index, file) in self.files.iter().enumerate().rev() {
+            let guard = inspect_planned_file(&self.directory, file)?;
+            let encoded = self.directory.read_guarded_file_bounded(
+                &file.name,
+                &guard,
+                MAX_COMPONENT_TABLE_SHARD_BYTES as u64,
+            )?;
+            let shard = decode_component_table_shard(&encoded)?;
+            if usize::try_from(shard.shard_index).map_err(|_| ComponentEffectsError::Topology)?
+                != index
+            {
+                return Err(ComponentEffectsError::Topology);
+            }
+            let guard = inspect_planned_file(&self.directory, file)?;
+            self.directory.remove_guarded_file(&file.name, &guard)?;
+            self.directory.sync()?;
+        }
+        Ok(())
+    }
+}
+
+fn validate_component_table_prefix(
+    directory: &ManagedDir,
+    component: ManagedComponentKind,
+    files: &[ComponentPlannedFile],
+) -> Result<(), ComponentEffectsError> {
+    let mut transaction_binding = None;
+    for (index, file) in files.iter().enumerate() {
+        if file.name != component_table_file_name(index)? {
+            return Err(ComponentEffectsError::Topology);
+        }
+        let guard = inspect_planned_file(directory, file)?;
         if guard.size() > MAX_COMPONENT_TABLE_SHARD_BYTES as u64 {
             return Err(ComponentEffectsError::Topology);
         }
-        let encoded = table.read_guarded_file_bounded(
-            &name,
+        let encoded = directory.read_guarded_file_bounded(
+            &file.name,
             &guard,
             MAX_COMPONENT_TABLE_SHARD_BYTES as u64,
         )?;
@@ -427,13 +691,165 @@ fn cleanup_preintent_table(
             return Err(ComponentEffectsError::Topology);
         }
         transaction_binding.get_or_insert(binding);
-        guarded.push((name, guard));
+    }
+    Ok(())
+}
+
+impl ComponentBucketCleanupPlan {
+    fn admit(directory: ManagedDir) -> Result<Self, ComponentEffectsError> {
+        let names = exact_entry_names(&directory, MAX_COMPONENT_TABLE_SHARDS + 2)?;
+        let mut buckets = Vec::new();
+        buckets
+            .try_reserve_exact(names.len().min(MAX_COMPONENT_TABLE_SHARDS))
+            .map_err(|_| ComponentEffectsError::Topology)?;
+        let mut parked = None;
+        let mut total_slots = 0_usize;
+        let mut total_bytes = 0_u64;
+        for name in names {
+            if name == COMPONENT_BUCKET_PARK_A || name == COMPONENT_BUCKET_PARK_B {
+                if parked.is_some() {
+                    return Err(ComponentEffectsError::Topology);
+                }
+                let (name, alternate) = if name == COMPONENT_BUCKET_PARK_A {
+                    (COMPONENT_BUCKET_PARK_A, COMPONENT_BUCKET_PARK_B)
+                } else {
+                    (COMPONENT_BUCKET_PARK_B, COMPONENT_BUCKET_PARK_A)
+                };
+                let child = directory.open_child(name)?;
+                if !exact_entry_names(&child, 1)?.is_empty() {
+                    return Err(ComponentEffectsError::Topology);
+                }
+                parked = Some(ComponentParkedBucket {
+                    name,
+                    alternate,
+                    identity: child.identity()?,
+                });
+                continue;
+            }
+            let shard_index =
+                parse_component_bucket_name(&name).ok_or(ComponentEffectsError::Topology)?;
+            let child = directory.open_child(&name)?;
+            let identity = child.identity()?;
+            let planned = plan_directory_files(&child, 256, MAX_TIER2_ARTIFACT_BYTES, |slot| {
+                parse_component_slot_name(slot).is_some()
+            })?;
+            for file in &planned.owned {
+                total_slots = total_slots
+                    .checked_add(1)
+                    .filter(|count| *count <= MAX_TIER2_ENTRIES)
+                    .ok_or(ComponentEffectsError::Topology)?;
+                total_bytes = total_bytes
+                    .checked_add(file.size)
+                    .filter(|bytes| *bytes <= MAX_TIER2_AGGREGATE_BYTES)
+                    .ok_or(ComponentEffectsError::Topology)?;
+            }
+            if shard_index >= MAX_COMPONENT_TABLE_SHARDS {
+                return Err(ComponentEffectsError::Topology);
+            }
+            buckets.push(ComponentGuardedBucket {
+                name,
+                identity,
+                files: planned.owned,
+                temporary: planned.temporary,
+            });
+        }
+        Ok(Self {
+            directory,
+            buckets,
+            parked,
+        })
     }
 
-    // Durable reverse-prefix cleanup makes every crash point another valid prefix.
-    for (name, guard) in guarded.iter().rev() {
-        table.remove_guarded_file(name, guard)?;
-        table.sync()?;
+    fn remove_temps(&self) -> Result<(), ComponentEffectsError> {
+        for bucket in &self.buckets {
+            let directory = open_planned_child(&self.directory, &bucket.name, bucket.identity)?;
+            remove_planned_temps(&directory, &bucket.temporary)?;
+        }
+        self.directory.sync()?;
+        Ok(())
+    }
+
+    fn validate_exact(&self, include_temporary: bool) -> Result<(), ComponentEffectsError> {
+        let mut expected = self
+            .buckets
+            .iter()
+            .map(|bucket| bucket.name.clone())
+            .collect::<BTreeSet<_>>();
+        if let Some(parked) = &self.parked {
+            expected.insert(parked.name.to_string());
+        }
+        if exact_entry_names(&self.directory, MAX_COMPONENT_TABLE_SHARDS + 2)? != expected {
+            return Err(ComponentEffectsError::Topology);
+        }
+        for bucket in &self.buckets {
+            let directory = open_planned_child(&self.directory, &bucket.name, bucket.identity)?;
+            let temporary = include_temporary
+                .then_some(bucket.temporary.as_slice())
+                .unwrap_or_default();
+            validate_planned_file_entries(
+                &directory,
+                &bucket.files,
+                temporary,
+                256,
+                include_temporary,
+            )?;
+        }
+        if let Some(parked) = &self.parked {
+            let directory = open_planned_child(&self.directory, parked.name, parked.identity)?;
+            if !exact_entry_names(&directory, 1)?.is_empty() {
+                return Err(ComponentEffectsError::Topology);
+            }
+        }
+        Ok(())
+    }
+
+    fn revalidate_with_temps(&self) -> Result<(), ComponentEffectsError> {
+        self.validate_exact(true)
+    }
+
+    fn revalidate(&self) -> Result<(), ComponentEffectsError> {
+        self.validate_exact(false)
+    }
+
+    fn execute(self) -> Result<(), ComponentEffectsError> {
+        self.revalidate()?;
+        for bucket in self.buckets.iter().rev() {
+            let directory = open_planned_child(&self.directory, &bucket.name, bucket.identity)?;
+            for file in bucket.files.iter().rev() {
+                let guard = inspect_planned_file(&directory, file)?;
+                directory.remove_guarded_file(&file.name, &guard)?;
+                directory.sync()?;
+            }
+        }
+        if let Some(parked) = self.parked {
+            let directory = open_planned_child(&self.directory, parked.name, parked.identity)?;
+            remove_component_bucket(&self.directory, parked.name, parked.alternate, directory)?;
+        }
+        for bucket in self.buckets.into_iter().rev() {
+            let shard_index =
+                parse_component_bucket_name(&bucket.name).ok_or(ComponentEffectsError::Topology)?;
+            let park = if shard_index % 2 == 0 {
+                COMPONENT_BUCKET_PARK_A
+            } else {
+                COMPONENT_BUCKET_PARK_B
+            };
+            let directory = open_planned_child(&self.directory, &bucket.name, bucket.identity)?;
+            remove_component_bucket(&self.directory, &bucket.name, park, directory)?;
+        }
+        Ok(())
+    }
+}
+
+fn remove_component_bucket(
+    parent: &ManagedDir,
+    name: &str,
+    park_name: &str,
+    directory: ManagedDir,
+) -> Result<(), ComponentEffectsError> {
+    let outcome = parent.remove_empty_child_guarded(name, park_name, directory)?;
+    parent.sync()?;
+    if outcome != ManagedEmptyChildRemoval::Removed {
+        return Err(ComponentEffectsError::Topology);
     }
     Ok(())
 }
@@ -469,16 +885,190 @@ fn exact_entry_names(
         .collect()
 }
 
-fn component_lane_entry_is_known(name: &str) -> bool {
+fn plan_directory_files(
+    directory: &ManagedDir,
+    maximum_owned: usize,
+    maximum_file_bytes: u64,
+    owned_name: impl Fn(&str) -> bool,
+) -> Result<ComponentDirectoryFilePlan, ComponentEffectsError> {
+    let limit = maximum_owned
+        .checked_add(MAX_MANAGED_TEMP_ENTRIES)
+        .and_then(|entries| entries.checked_add(1))
+        .ok_or(ComponentEffectsError::Topology)?;
+    let entries = directory.entries_bounded(limit)?;
+    if entries.len() >= limit {
+        return Err(ComponentEffectsError::Topology);
+    }
+    let mut owned = Vec::new();
+    owned
+        .try_reserve_exact(entries.len().min(maximum_owned))
+        .map_err(|_| ComponentEffectsError::Topology)?;
+    let mut temporary = Vec::new();
+    temporary
+        .try_reserve_exact(entries.len().min(MAX_MANAGED_TEMP_ENTRIES))
+        .map_err(|_| ComponentEffectsError::Topology)?;
+    for name in entries {
+        let name = name
+            .into_string()
+            .map_err(|_| ComponentEffectsError::Topology)?;
+        let guard = directory
+            .inspect_regular_file(&name)?
+            .ok_or(ComponentEffectsError::Topology)?;
+        if guard.size() > maximum_file_bytes || !directory.file_guard_matches(&name, &guard)? {
+            return Err(ComponentEffectsError::Topology);
+        }
+        let planned = ComponentPlannedFile {
+            name,
+            size: guard.size(),
+            identity: guard.identity(),
+        };
+        if validate_managed_temp_name(&planned.name)? {
+            if temporary.len() >= MAX_MANAGED_TEMP_ENTRIES
+                || !directory.managed_temp_is_orphan(&planned.name, &guard)?
+            {
+                return Err(ComponentEffectsError::Topology);
+            }
+            temporary.push(planned);
+        } else if owned_name(&planned.name) {
+            if owned.len() >= maximum_owned {
+                return Err(ComponentEffectsError::Topology);
+            }
+            owned.push(planned);
+        } else {
+            return Err(ComponentEffectsError::Topology);
+        }
+    }
+    owned.sort_unstable_by(|left, right| left.name.cmp(&right.name));
+    temporary.sort_unstable_by(|left, right| left.name.cmp(&right.name));
+    Ok(ComponentDirectoryFilePlan { owned, temporary })
+}
+
+fn validate_planned_file_entries(
+    directory: &ManagedDir,
+    owned: &[ComponentPlannedFile],
+    temporary: &[ComponentPlannedFile],
+    maximum_owned: usize,
+    include_temporary: bool,
+) -> Result<(), ComponentEffectsError> {
+    if owned.len() > maximum_owned
+        || temporary.len() > MAX_MANAGED_TEMP_ENTRIES
+        || (!include_temporary && !temporary.is_empty())
+    {
+        return Err(ComponentEffectsError::Topology);
+    }
+    let expected_count = owned
+        .len()
+        .checked_add(temporary.len())
+        .ok_or(ComponentEffectsError::Topology)?;
+    let limit = maximum_owned
+        .checked_add(if include_temporary {
+            MAX_MANAGED_TEMP_ENTRIES
+        } else {
+            0
+        })
+        .and_then(|entries| entries.checked_add(1))
+        .ok_or(ComponentEffectsError::Topology)?;
+    let names = exact_entry_names(directory, limit)?;
+    if names.len() != expected_count
+        || owned.iter().any(|file| !names.contains(&file.name))
+        || temporary.iter().any(|file| !names.contains(&file.name))
+    {
+        return Err(ComponentEffectsError::Topology);
+    }
+    for file in owned {
+        let _ = inspect_planned_file(directory, file)?;
+    }
+    for file in temporary {
+        let guard = inspect_planned_file(directory, file)?;
+        if !validate_managed_temp_name(&file.name)?
+            || !directory.managed_temp_is_orphan(&file.name, &guard)?
+        {
+            return Err(ComponentEffectsError::Topology);
+        }
+    }
+    Ok(())
+}
+
+fn remove_planned_temps(
+    directory: &ManagedDir,
+    temporary: &[ComponentPlannedFile],
+) -> Result<(), ComponentEffectsError> {
+    for file in temporary.iter().rev() {
+        let guard = inspect_planned_file(directory, file)?;
+        if !directory.managed_temp_is_orphan(&file.name, &guard)? {
+            return Err(ComponentEffectsError::Topology);
+        }
+        directory.remove_guarded_file(&file.name, &guard)?;
+        directory.sync()?;
+    }
+    Ok(())
+}
+
+fn inspect_planned_file(
+    directory: &ManagedDir,
+    planned: &ComponentPlannedFile,
+) -> Result<ManagedFileGuard, ComponentEffectsError> {
+    let guard = directory
+        .inspect_regular_file(&planned.name)?
+        .ok_or(ComponentEffectsError::Topology)?;
+    if guard.size() != planned.size || guard.identity() != planned.identity {
+        return Err(ComponentEffectsError::Topology);
+    }
+    Ok(guard)
+}
+
+fn open_planned_child(
+    parent: &ManagedDir,
+    name: &str,
+    identity: ManagedDirectoryIdentity,
+) -> Result<ManagedDir, ComponentEffectsError> {
+    let directory = parent.open_child(name)?;
+    if directory.identity()? != identity {
+        return Err(ComponentEffectsError::Topology);
+    }
+    Ok(directory)
+}
+
+fn component_preintent_lane_entry_is_known(name: &str) -> bool {
     matches!(
         name,
-        COMPONENT_TABLE_DIRECTORY
-            | COMPONENT_STAGING_DIRECTORY
-            | COMPONENT_QUARANTINE_DIRECTORY
-            | COMPONENT_INTENT_FILE
-            | COMPONENT_OUTCOME_FILE
-            | COMPONENT_SETTLEMENT_FILE
+        COMPONENT_TABLE_DIRECTORY | COMPONENT_STAGING_DIRECTORY | COMPONENT_QUARANTINE_DIRECTORY
     )
+}
+
+fn component_bucket_name(index: usize) -> Result<String, ComponentEffectsError> {
+    if index >= MAX_COMPONENT_TABLE_SHARDS {
+        return Err(ComponentEffectsError::Topology);
+    }
+    Ok(format!("{index:06}"))
+}
+
+pub(crate) fn component_slot_name(index: usize) -> Result<String, ComponentEffectsError> {
+    if index >= 256 {
+        return Err(ComponentEffectsError::Topology);
+    }
+    Ok(format!("{index:03}"))
+}
+
+fn parse_component_bucket_name(name: &str) -> Option<usize> {
+    let index = parse_fixed_decimal(name, 6)?;
+    (component_bucket_name(index).ok()?.as_str() == name).then_some(index)
+}
+
+fn parse_component_slot_name(name: &str) -> Option<usize> {
+    let index = parse_fixed_decimal(name, 3)?;
+    (component_slot_name(index).ok()?.as_str() == name).then_some(index)
+}
+
+fn parse_component_table_file_name(name: &str) -> Option<usize> {
+    let index = parse_fixed_decimal(name.strip_suffix(".tbl")?, 6)?;
+    (component_table_file_name(index).ok()?.as_str() == name).then_some(index)
+}
+
+fn parse_fixed_decimal(value: &str, width: usize) -> Option<usize> {
+    (value.len() == width && value.bytes().all(|byte| byte.is_ascii_digit()))
+        .then(|| value.parse::<usize>().ok())
+        .flatten()
 }
 
 fn component_table_file_name(index: usize) -> Result<String, ComponentEffectsError> {
@@ -493,9 +1083,34 @@ mod tests {
     use super::*;
     use crate::managed_component_spool::ComponentTableSpool;
     use crate::managed_component_table::{
-        ComponentPriorFile, ComponentTableBuilder, ComponentTableRow, ManagedComponentArtifactKind,
+        COMPONENT_TABLE_HEADER_BYTES, ComponentIntentManifest, ComponentPriorFile,
+        ComponentShardDescriptor, ComponentTableBuilder, ComponentTableRow,
+        ManagedComponentArtifactKind,
     };
+    use sha2::{Digest as _, Sha256};
     use std::fs;
+
+    fn single_valid_table_shard() -> Vec<u8> {
+        let digest = [0x51; 20];
+        let mut builder =
+            ComponentTableBuilder::new(ManagedComponentKind::Libraries, 1, [0x61; 16], [0x71; 32])
+                .unwrap();
+        builder
+            .push_shard(vec![ComponentTableRow {
+                inventory_ordinal: 0,
+                final_size: 1,
+                final_sha1: digest,
+                kind: ManagedComponentArtifactKind::Library,
+                path: ArtifactRelativePath::new("replacement.jar").unwrap(),
+                first_created_depth: None,
+                prior: Some(ComponentPriorFile {
+                    size: 1,
+                    sha1: digest,
+                }),
+            }])
+            .unwrap()
+            .0
+    }
 
     #[tokio::test]
     async fn fresh_lane_has_only_the_closed_create_only_topology() {
@@ -548,6 +1163,349 @@ mod tests {
             ComponentLane::prepare_fresh(&lease, ManagedComponentKind::Libraries),
             Err(ComponentEffectsError::Topology)
         ));
+    }
+
+    #[tokio::test]
+    async fn unknown_residue_prevents_every_cleanup_including_temp_sweeping() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = ManagedDir::open_root(temporary.path()).unwrap();
+        let lease = ManagedRootPublicationLease::acquire(root).await.unwrap();
+        let lane = ComponentLane::prepare_fresh(&lease, ManagedComponentKind::Libraries).unwrap();
+        let buckets = lane.create_shard_buckets(0).unwrap();
+        buckets
+            .staging()
+            .write_new_exact(&component_slot_name(0).unwrap(), b"owned-stage")
+            .unwrap();
+        buckets
+            .quarantine()
+            .write_new_exact("sentinel", b"unknown")
+            .unwrap();
+        let temp_name = format!(".axial-loader-tmp-{}-1-0", std::process::id());
+        fs::write(lane.table.path().join(&temp_name), b"dead-temp").unwrap();
+
+        assert!(ComponentLane::prepare_fresh(&lease, ManagedComponentKind::Libraries).is_err());
+        assert_eq!(
+            fs::read(buckets.staging().path().join("000")).unwrap(),
+            b"owned-stage"
+        );
+        assert_eq!(
+            fs::read(buckets.quarantine().path().join("sentinel")).unwrap(),
+            b"unknown"
+        );
+        assert_eq!(
+            fs::read(lane.table.path().join(temp_name)).unwrap(),
+            b"dead-temp"
+        );
+    }
+
+    #[tokio::test]
+    async fn valid_sparse_bucket_residue_is_cleaned_and_retry_is_idempotent() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = ManagedDir::open_root(temporary.path()).unwrap();
+        let lease = ManagedRootPublicationLease::acquire(root).await.unwrap();
+        let lane = ComponentLane::prepare_fresh(&lease, ManagedComponentKind::Libraries).unwrap();
+        let digest = [0x42; 20];
+        let mut builder = ComponentTableBuilder::new(
+            ManagedComponentKind::Libraries,
+            257,
+            [0x11; 16],
+            [0x22; 32],
+        )
+        .unwrap();
+        let (first_table, _) = builder
+            .push_shard(
+                (0..256)
+                    .map(|index| ComponentTableRow {
+                        inventory_ordinal: index,
+                        final_size: 1,
+                        final_sha1: digest,
+                        kind: ManagedComponentArtifactKind::Library,
+                        path: ArtifactRelativePath::new(&format!("{index:03}.jar")).unwrap(),
+                        first_created_depth: None,
+                        prior: Some(ComponentPriorFile {
+                            size: 1,
+                            sha1: digest,
+                        }),
+                    })
+                    .collect(),
+            )
+            .unwrap();
+        lane.table
+            .write_new_exact("000000.tbl", &first_table)
+            .unwrap();
+        let first = lane.create_shard_buckets(0).unwrap();
+        first
+            .staging()
+            .write_new_exact(&component_slot_name(5).unwrap(), b"stage-five")
+            .unwrap();
+        let dead_temp = format!(".axial-loader-tmp-{}-2-0", std::process::id());
+        fs::write(first.staging().path().join(dead_temp), b"dead-temp").unwrap();
+        let later = lane.create_shard_buckets(7).unwrap();
+        later
+            .quarantine()
+            .write_new_exact(&component_slot_name(255).unwrap(), b"prior-last")
+            .unwrap();
+        drop((first, later, lane));
+
+        let cleaned =
+            ComponentLane::prepare_fresh(&lease, ManagedComponentKind::Libraries).unwrap();
+        assert!(exact_entry_names(&cleaned.table, 1).unwrap().is_empty());
+        assert!(exact_entry_names(cleaned.staging(), 1).unwrap().is_empty());
+        assert!(
+            exact_entry_names(cleaned.quarantine(), 1)
+                .unwrap()
+                .is_empty()
+        );
+        drop(cleaned);
+        ComponentLane::prepare_fresh(&lease, ManagedComponentKind::Libraries).unwrap();
+    }
+
+    #[tokio::test]
+    async fn either_deterministic_park_is_recovered_before_fresh_preparation() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = ManagedDir::open_root(temporary.path()).unwrap();
+        let lease = ManagedRootPublicationLease::acquire(root).await.unwrap();
+
+        for (index, park, quarantine) in [
+            (0, COMPONENT_BUCKET_PARK_A, false),
+            (1, COMPONENT_BUCKET_PARK_B, true),
+        ] {
+            let lane =
+                ComponentLane::prepare_fresh(&lease, ManagedComponentKind::Libraries).unwrap();
+            let buckets = lane.create_shard_buckets(index).unwrap();
+            let source = if quarantine {
+                buckets.quarantine().path()
+            } else {
+                buckets.staging().path()
+            }
+            .to_path_buf();
+            let parent = source.parent().unwrap().to_path_buf();
+            drop(buckets);
+            fs::rename(&source, parent.join(park)).unwrap();
+            drop(lane);
+
+            let cleaned =
+                ComponentLane::prepare_fresh(&lease, ManagedComponentKind::Libraries).unwrap();
+            assert!(!cleaned.staging().path().join(park).exists());
+            assert!(!cleaned.quarantine().path().join(park).exists());
+        }
+    }
+
+    #[tokio::test]
+    async fn oversized_or_wrong_kind_slots_fail_without_cleanup_effects() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = ManagedDir::open_root(temporary.path()).unwrap();
+        let lease = ManagedRootPublicationLease::acquire(root).await.unwrap();
+        let lane = ComponentLane::prepare_fresh(&lease, ManagedComponentKind::Libraries).unwrap();
+        let buckets = lane.create_shard_buckets(0).unwrap();
+        let slot = buckets.staging().path().join("000");
+        let oversized = fs::File::create(&slot).unwrap();
+        oversized.set_len(MAX_TIER2_ARTIFACT_BYTES + 1).unwrap();
+        drop(oversized);
+        buckets
+            .quarantine()
+            .write_new_exact("001", b"must-remain")
+            .unwrap();
+
+        assert!(ComponentLane::prepare_fresh(&lease, ManagedComponentKind::Libraries).is_err());
+        assert_eq!(
+            fs::metadata(&slot).unwrap().len(),
+            MAX_TIER2_ARTIFACT_BYTES + 1
+        );
+        assert_eq!(
+            fs::read(buckets.quarantine().path().join("001")).unwrap(),
+            b"must-remain"
+        );
+
+        fs::remove_file(&slot).unwrap();
+        fs::create_dir(&slot).unwrap();
+        assert!(ComponentLane::prepare_fresh(&lease, ManagedComponentKind::Libraries).is_err());
+        assert!(slot.is_dir());
+        assert_eq!(
+            fs::read(buckets.quarantine().path().join("001")).unwrap(),
+            b"must-remain"
+        );
+    }
+
+    #[tokio::test]
+    async fn shard_bucket_creation_is_create_only_and_exactly_bounded() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = ManagedDir::open_root(temporary.path()).unwrap();
+        let lease = ManagedRootPublicationLease::acquire(root).await.unwrap();
+        let lane = ComponentLane::prepare_fresh(&lease, ManagedComponentKind::Libraries).unwrap();
+        let buckets = lane
+            .create_shard_buckets(MAX_COMPONENT_TABLE_SHARDS - 1)
+            .unwrap();
+
+        assert!(buckets.staging().path().ends_with("000781"));
+        assert!(buckets.quarantine().path().ends_with("000781"));
+        assert!(
+            lane.create_shard_buckets(MAX_COMPONENT_TABLE_SHARDS - 1)
+                .is_err()
+        );
+        assert!(
+            lane.create_shard_buckets(MAX_COMPONENT_TABLE_SHARDS)
+                .is_err()
+        );
+        assert_eq!(component_slot_name(0).unwrap(), "000");
+        assert_eq!(component_slot_name(255).unwrap(), "255");
+        assert!(component_slot_name(256).is_err());
+    }
+
+    #[tokio::test]
+    async fn admitted_same_size_table_replacement_is_not_deleted() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = ManagedDir::open_root(temporary.path()).unwrap();
+        let lease = ManagedRootPublicationLease::acquire(root).await.unwrap();
+        let lane = ComponentLane::prepare_fresh(&lease, ManagedComponentKind::Libraries).unwrap();
+        let encoded = single_valid_table_shard();
+        lane.table.write_new_exact("000000.tbl", &encoded).unwrap();
+        let table_file = lane.table.path().join("000000.tbl");
+        let saved_file = temporary.path().join("saved-admitted-table");
+        drop(lane);
+        let replacement = encoded.clone();
+
+        let result = ComponentLane::prepare_fresh_with_cleanup_hook(
+            &lease,
+            ManagedComponentKind::Libraries,
+            || {
+                fs::rename(&table_file, &saved_file).unwrap();
+                fs::write(&table_file, &replacement).unwrap();
+            },
+        );
+
+        assert!(result.is_err());
+        assert_eq!(fs::read(table_file).unwrap(), encoded);
+        assert_eq!(fs::read(saved_file).unwrap(), encoded);
+    }
+
+    #[tokio::test]
+    async fn admitted_same_size_slot_replacement_is_not_deleted() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = ManagedDir::open_root(temporary.path()).unwrap();
+        let lease = ManagedRootPublicationLease::acquire(root).await.unwrap();
+        let lane = ComponentLane::prepare_fresh(&lease, ManagedComponentKind::Libraries).unwrap();
+        let buckets = lane.create_shard_buckets(0).unwrap();
+        buckets
+            .staging()
+            .write_new_exact("000", b"original")
+            .unwrap();
+        let slot = buckets.staging().path().join("000");
+        let saved_slot = temporary.path().join("saved-admitted-slot");
+        drop((buckets, lane));
+
+        let result = ComponentLane::prepare_fresh_with_cleanup_hook(
+            &lease,
+            ManagedComponentKind::Libraries,
+            || {
+                fs::rename(&slot, &saved_slot).unwrap();
+                fs::write(&slot, b"replaced").unwrap();
+            },
+        );
+
+        assert!(result.is_err());
+        assert_eq!(fs::read(slot).unwrap(), b"replaced");
+        assert_eq!(fs::read(saved_slot).unwrap(), b"original");
+    }
+
+    #[tokio::test]
+    async fn admitted_same_size_temp_replacement_is_not_deleted() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = ManagedDir::open_root(temporary.path()).unwrap();
+        let lease = ManagedRootPublicationLease::acquire(root).await.unwrap();
+        let lane = ComponentLane::prepare_fresh(&lease, ManagedComponentKind::Libraries).unwrap();
+        let temp_name = format!(".axial-loader-tmp-{}-41-0", std::process::id());
+        let temp_file = lane.table.path().join(&temp_name);
+        let saved_temp = temporary.path().join("saved-admitted-temp");
+        fs::write(&temp_file, b"original").unwrap();
+        drop(lane);
+
+        let result = ComponentLane::prepare_fresh_with_cleanup_hook(
+            &lease,
+            ManagedComponentKind::Libraries,
+            || {
+                fs::rename(&temp_file, &saved_temp).unwrap();
+                fs::write(&temp_file, b"replaced").unwrap();
+            },
+        );
+
+        assert!(result.is_err());
+        assert_eq!(fs::read(temp_file).unwrap(), b"replaced");
+        assert_eq!(fs::read(saved_temp).unwrap(), b"original");
+    }
+
+    #[tokio::test]
+    async fn admitted_empty_bucket_replacement_is_not_deleted() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = ManagedDir::open_root(temporary.path()).unwrap();
+        let lease = ManagedRootPublicationLease::acquire(root).await.unwrap();
+        let lane = ComponentLane::prepare_fresh(&lease, ManagedComponentKind::Libraries).unwrap();
+        let buckets = lane.create_shard_buckets(0).unwrap();
+        let bucket = buckets.staging().path().to_path_buf();
+        let saved_bucket = temporary.path().join("saved-admitted-bucket");
+        drop((buckets, lane));
+
+        let result = ComponentLane::prepare_fresh_with_cleanup_hook(
+            &lease,
+            ManagedComponentKind::Libraries,
+            || {
+                fs::rename(&bucket, &saved_bucket).unwrap();
+                fs::create_dir(&bucket).unwrap();
+            },
+        );
+
+        assert!(result.is_err());
+        assert!(bucket.is_dir());
+        assert!(saved_bucket.is_dir());
+    }
+
+    #[tokio::test]
+    async fn temp_added_after_admission_is_not_swept() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = ManagedDir::open_root(temporary.path()).unwrap();
+        let lease = ManagedRootPublicationLease::acquire(root).await.unwrap();
+        let lane = ComponentLane::prepare_fresh(&lease, ManagedComponentKind::Libraries).unwrap();
+        let buckets = lane.create_shard_buckets(0).unwrap();
+        let temp_file = buckets
+            .staging()
+            .path()
+            .join(format!(".axial-loader-tmp-{}-42-0", std::process::id()));
+        drop((buckets, lane));
+
+        let result = ComponentLane::prepare_fresh_with_cleanup_hook(
+            &lease,
+            ManagedComponentKind::Libraries,
+            || fs::write(&temp_file, b"new-temp").unwrap(),
+        );
+
+        assert!(result.is_err());
+        assert_eq!(fs::read(temp_file).unwrap(), b"new-temp");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn maximum_bucket_admission_does_not_retain_per_bucket_handles() {
+        let temporary = tempfile::tempdir().unwrap();
+        let directory = ManagedDir::open_root(temporary.path()).unwrap();
+        for index in 0..MAX_COMPONENT_TABLE_SHARDS {
+            fs::create_dir(temporary.path().join(component_bucket_name(index).unwrap())).unwrap();
+        }
+        let temp_name = format!(".axial-loader-tmp-{}-1-0", std::process::id());
+        fs::write(
+            temporary
+                .path()
+                .join(component_bucket_name(MAX_COMPONENT_TABLE_SHARDS - 1).unwrap())
+                .join(temp_name),
+            b"dead-temp",
+        )
+        .unwrap();
+        let open_fds = || fs::read_dir("/proc/self/fd").unwrap().count();
+        let before = open_fds();
+
+        let plan = ComponentBucketCleanupPlan::admit(directory).unwrap();
+
+        assert_eq!(plan.buckets.len(), MAX_COMPONENT_TABLE_SHARDS);
+        assert!(open_fds() <= before + 2);
     }
 
     #[test]
@@ -727,5 +1685,40 @@ mod tests {
             ComponentLane::prepare_fresh(&lease, ManagedComponentKind::Libraries),
             Err(ComponentEffectsError::Table(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn invalid_new_table_shard_is_guarded_removed_before_returning() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = ManagedDir::open_root(temporary.path()).unwrap();
+        let lease = ManagedRootPublicationLease::acquire(root).await.unwrap();
+        let lane = ComponentLane::prepare_fresh(&lease, ManagedComponentKind::Libraries).unwrap();
+        let encoded = vec![0_u8; COMPONENT_TABLE_HEADER_BYTES];
+        let descriptor = ComponentShardDescriptor {
+            shard_index: 0,
+            first_row: 0,
+            row_count: 1,
+            byte_len: u32::try_from(encoded.len()).unwrap(),
+            final_bytes: 1,
+            prior_bytes: 0,
+            sha256: Sha256::digest(&encoded).into(),
+        };
+        let manifest = ComponentIntentManifest {
+            component: ManagedComponentKind::Libraries,
+            total_rows: 1,
+            final_bytes: 1,
+            prior_bytes: 0,
+            transaction_nonce: [0x11; 16],
+            root_binding_sha256: [0x22; 32],
+            logical_rows_sha256: [0x33; 32],
+            projection_sha256: [0x44; 32],
+            shards: vec![descriptor.clone()],
+        };
+        let mut spool = ComponentTableSpool::new(1).unwrap();
+        spool.append(encoded, descriptor).unwrap();
+        let replay = spool.finish(&manifest).unwrap();
+
+        assert!(lane.publish_table(replay, &manifest).is_err());
+        assert!(exact_entry_names(&lane.table, 1).unwrap().is_empty());
     }
 }
