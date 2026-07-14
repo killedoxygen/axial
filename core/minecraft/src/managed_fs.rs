@@ -413,6 +413,12 @@ impl PendingCreatedFile {
     fn disarm(&mut self) {
         self.guard = None;
     }
+
+    fn take_guard(&mut self) -> ManagedFileGuard {
+        self.guard
+            .take()
+            .expect("pending created file retains its guard until disarmed")
+    }
 }
 
 impl Drop for PendingCreatedFile {
@@ -749,6 +755,21 @@ impl ManagedDir {
         guard: &ManagedFileGuard,
         max_size: u64,
     ) -> Result<String, LoaderError> {
+        let digest = self.sha1_guarded_file_bytes(name, guard, max_size)?;
+        use std::fmt::Write as _;
+        let mut encoded = String::with_capacity(40);
+        for byte in digest {
+            let _ = write!(encoded, "{byte:02x}");
+        }
+        Ok(encoded)
+    }
+
+    pub(crate) fn sha1_guarded_file_bytes(
+        &self,
+        name: &str,
+        guard: &ManagedFileGuard,
+        max_size: u64,
+    ) -> Result<[u8; 20], LoaderError> {
         validate_segment(name)?;
         if guard.size > max_size || !self.file_guard_matches(name, guard)? {
             return Err(LoaderError::Verify(
@@ -786,7 +807,7 @@ impl ManagedDir {
                 "managed guarded hash source changed during hashing".to_string(),
             ));
         }
-        Ok(format!("{:x}", hasher.finalize()))
+        Ok(hasher.finalize().into())
     }
 
     pub(crate) fn read_guarded_file_bounded(
@@ -1266,6 +1287,14 @@ impl ManagedDir {
     }
 
     pub(crate) fn write_new_exact(&self, name: &str, bytes: &[u8]) -> Result<(), LoaderError> {
+        self.write_new_exact_guarded(name, bytes).map(drop)
+    }
+
+    pub(crate) fn write_new_exact_guarded(
+        &self,
+        name: &str,
+        bytes: &[u8],
+    ) -> Result<ManagedFileGuard, LoaderError> {
         validate_segment(name)?;
         let temp_name = temp_name();
         self.sweep_orphan_temps()?;
@@ -1280,9 +1309,7 @@ impl ManagedDir {
         file.flush()?;
         file.sync_all()?;
         file.seek(SeekFrom::Start(0))?;
-        let write_result = verify_reader_exact_bytes(&mut file, bytes);
-        drop(file);
-        match write_result {
+        match verify_reader_exact_bytes(&mut file, bytes) {
             Ok(true) => {}
             Ok(false) => {
                 return Err(LoaderError::Verify(
@@ -1291,6 +1318,13 @@ impl ManagedDir {
             }
             Err(error) => return Err(LoaderError::Io(error)),
         }
+        let guard = ManagedFileGuard {
+            identity: platform::file_identity(&file)?,
+            file,
+            size: u64::try_from(bytes.len()).map_err(|_| {
+                LoaderError::Verify("managed transaction artifact size overflowed".to_string())
+            })?,
+        };
         platform::rename_entry_no_replace(
             &self.inner.handle,
             &self.inner.path,
@@ -1299,9 +1333,19 @@ impl ManagedDir {
             &self.inner.path,
             OsStr::new(name),
         )?;
+        let mut published = PendingCreatedFile::arm(self.clone(), name.to_string(), guard);
         pending.disarm();
-        self.verify_exact_bytes(name, bytes)?;
-        self.revalidate()
+        let guard = published
+            .guard
+            .as_ref()
+            .expect("pending created file is armed during verification");
+        if self.read_guarded_file_bounded(name, guard, guard.size)? != bytes {
+            return Err(LoaderError::Verify(
+                "managed transaction artifact changed after promotion".to_string(),
+            ));
+        }
+        self.revalidate()?;
+        Ok(published.take_guard())
     }
 
     pub(crate) fn verify_authenticated(
@@ -1356,34 +1400,6 @@ impl ManagedDir {
         {
             return Err(LoaderError::Verify(
                 "managed authenticated file identity changed".to_string(),
-            ));
-        }
-        self.revalidate()
-    }
-
-    fn verify_exact_bytes(&self, name: &str, expected: &[u8]) -> Result<(), LoaderError> {
-        validate_segment(name)?;
-        self.revalidate()?;
-        let mut file =
-            platform::open_file_read(&self.inner.handle, &self.inner.path, OsStr::new(name))?;
-        let identity = platform::file_identity(&file)?;
-        let expected_size = u64::try_from(expected.len()).map_err(|_| {
-            LoaderError::Verify("managed transaction artifact size overflowed".to_string())
-        })?;
-        if file.metadata()?.len() != expected_size
-            || !verify_reader_exact_bytes(&mut file, expected)?
-        {
-            return Err(LoaderError::Verify(
-                "managed transaction artifact changed after promotion".to_string(),
-            ));
-        }
-        let current =
-            platform::open_file_read(&self.inner.handle, &self.inner.path, OsStr::new(name))?;
-        if platform::file_identity(&current)? != identity
-            || platform::file_identity(&file)? != identity
-        {
-            return Err(LoaderError::Verify(
-                "managed transaction artifact identity changed".to_string(),
             ));
         }
         self.revalidate()
