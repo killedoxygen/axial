@@ -9,12 +9,14 @@ use crate::state::contracts::{
     OperationStepResult, OwnershipClass, ReconciliationComponent, ReconciliationRung,
     ReconciliationScope, ReconciliationTerminal, RollbackState, StabilizationSystem, TargetKind,
 };
+use crate::state::failure_memory::{FailureMemoryStoreError, GuardianFailureMemoryEntry};
 use crate::state::{
     MAX_OPERATION_JOURNAL_STEP_FACTS, OperationJournalStoreError, ReconciliationAttemptReservation,
     RegisteredComponentRebuildAdmission, commit_reconciliation_memory,
     operation_journal_completed_step_is_visible, operation_journal_plan_is_visible,
     reconciliation_attempt_key, reconciliation_instance_target, reconciliation_journal_attempt,
     reconciliation_memory_entry, reserve_reconciliation_attempt, settle_reconciliation_memory,
+    validate_reconciliation_memory,
 };
 use axial_minecraft::runtime::{
     ManagedRuntimeCommitReceipt, ManagedRuntimeFailureReceipt, RuntimeId,
@@ -26,6 +28,9 @@ use std::sync::Arc;
 const COMPONENT_REBUILD_START_STEP: &str = "journal_component_rebuild_start";
 const COMPONENT_QUARANTINE_STEP: &str = "quarantine_launcher_managed_target";
 const RUNTIME_COMPONENT_REBUILD_STEP: &str = "rebuild_managed_runtime_component";
+const COMPONENT_MEMORY_RETRY_INITIAL_DELAY: std::time::Duration =
+    std::time::Duration::from_millis(20);
+const COMPONENT_MEMORY_RETRY_MAX_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
 
 pub(crate) struct ManagedRuntimeComponentRebuildEffect {
     admission: RegisteredComponentRebuildAdmission,
@@ -355,7 +360,7 @@ fn component_rebuild_plan(
 
 async fn record_component_quarantine_checkpoint(
     admission: &RegisteredComponentRebuildAdmission,
-) -> Result<Option<OperationJournalStoreError>, OperationJournalStoreError> {
+) -> Result<(), OperationJournalStoreError> {
     let journals = admission.journals();
     let attempt = admission.attempt();
     let operation_id = attempt.operation_id();
@@ -371,7 +376,7 @@ async fn record_component_quarantine_checkpoint(
             .record_checkpoint(operation_id, checkpoint.clone())
             .await
         {
-            Ok(()) => return Ok(None),
+            Ok(()) => return Ok(()),
             Err(error) => {
                 match reconcile_guardian_journal_error(journals, operation_id, error, |entry| {
                     entry.operation_id == *operation_id
@@ -384,10 +389,8 @@ async fn record_component_quarantine_checkpoint(
                 })
                 .await?
                 {
-                    GuardianJournalReconciliation::MutationCommitted => return Ok(None),
-                    GuardianJournalReconciliation::AcceptedFailure(error) => {
-                        return Ok(Some(error));
-                    }
+                    GuardianJournalReconciliation::MutationCommitted
+                    | GuardianJournalReconciliation::AcceptedFailure(_) => return Ok(()),
                     GuardianJournalReconciliation::RetryMutation => {}
                 }
             }
@@ -494,11 +497,9 @@ async fn terminalize_component_rebuild(
             )
         }
     };
-    let checkpoint_error = if typed_terminal.quarantined_target().is_some() {
-        record_component_quarantine_checkpoint(&admission).await?
-    } else {
-        None
-    };
+    if typed_terminal.quarantined_target().is_some() {
+        record_component_quarantine_checkpoint(&admission).await?;
+    }
     persist_component_rebuild_terminal(
         &admission,
         &reservation,
@@ -510,7 +511,6 @@ async fn terminalize_component_rebuild(
             rollback,
             status,
             facts,
-            checkpoint_error,
             publication_lease,
         },
     )
@@ -525,7 +525,6 @@ struct ComponentRebuildTerminalRecord {
     rollback: RollbackState,
     status: GuardianRuntimeComponentRebuildStatus,
     facts: Vec<String>,
-    checkpoint_error: Option<OperationJournalStoreError>,
     publication_lease: Option<ComponentRebuildPublicationLease>,
 }
 
@@ -542,12 +541,20 @@ async fn persist_component_rebuild_terminal(
         rollback,
         status,
         facts,
-        checkpoint_error,
         publication_lease,
     } = record;
     let attempt = admission.attempt();
     let operation_id = attempt.operation_id().clone();
-    let journal_error = record_reconciliation_terminal_reconciled(
+    let memory = reconciliation_memory_entry(terminal.clone()).map_err(|_| {
+        invalid_component_rebuild_error(
+            std::io::ErrorKind::InvalidData,
+            "runtime component rebuild memory terminal is invalid",
+        )
+    })?;
+    validate_reconciliation_memory(admission.failure_memory(), &memory, reservation)
+        .map_err(component_rebuild_memory_error)?;
+
+    let _journal_persistence_error = record_reconciliation_terminal_reconciled(
         admission.journals(),
         &operation_id,
         repair_step_with_rollback(
@@ -562,19 +569,7 @@ async fn persist_component_rebuild_terminal(
         None,
     )
     .await?;
-
-    let memory = reconciliation_memory_entry(terminal).map_err(|_| {
-        invalid_component_rebuild_error(
-            std::io::ErrorKind::InvalidData,
-            "runtime component rebuild memory terminal is invalid",
-        )
-    })?;
-    commit_reconciliation_memory(admission.failure_memory(), memory, reservation)
-        .await
-        .map_err(component_rebuild_memory_error)?;
-    if let Some(error) = journal_error.or(checkpoint_error) {
-        return Err(error);
-    }
+    persist_exact_component_rebuild_memory(admission, reservation, &memory).await?;
 
     if let Some(publication_lease) = publication_lease {
         publication_lease.release();
@@ -587,6 +582,43 @@ async fn persist_component_rebuild_terminal(
     })
 }
 
+async fn persist_exact_component_rebuild_memory(
+    admission: &RegisteredComponentRebuildAdmission,
+    reservation: &ReconciliationAttemptReservation,
+    expected: &GuardianFailureMemoryEntry,
+) -> Result<(), OperationJournalStoreError> {
+    let mut delay = COMPONENT_MEMORY_RETRY_INITIAL_DELAY;
+    loop {
+        if admission.failure_memory().get(&expected.key).as_ref() == Some(expected) {
+            return Ok(());
+        }
+        match commit_reconciliation_memory(
+            admission.failure_memory(),
+            expected.clone(),
+            reservation,
+        )
+        .await
+        {
+            Ok(()) => {
+                if admission.failure_memory().get(&expected.key).as_ref() == Some(expected) {
+                    return Ok(());
+                }
+                return Err(invalid_component_rebuild_error(
+                    std::io::ErrorKind::InvalidData,
+                    "runtime component rebuild memory commit did not publish the exact terminal",
+                ));
+            }
+            Err(FailureMemoryStoreError::Persistence(_)) => {
+                tokio::time::sleep(delay).await;
+                delay = delay
+                    .saturating_mul(2)
+                    .min(COMPONENT_MEMORY_RETRY_MAX_DELAY);
+            }
+            Err(error) => return Err(component_rebuild_memory_error(error)),
+        }
+    }
+}
+
 fn bounded_fact_ids(facts: impl IntoIterator<Item = String>) -> Vec<String> {
     facts
         .into_iter()
@@ -595,7 +627,7 @@ fn bounded_fact_ids(facts: impl IntoIterator<Item = String>) -> Vec<String> {
         .collect()
 }
 
-fn component_rebuild_memory_error(error: impl std::fmt::Display) -> OperationJournalStoreError {
+fn component_rebuild_memory_error(error: FailureMemoryStoreError) -> OperationJournalStoreError {
     invalid_component_rebuild_error(
         std::io::ErrorKind::Other,
         format!("runtime component rebuild memory failed: {error}"),
@@ -615,6 +647,7 @@ mod tests {
         GuardianRuntimeComponentRebuildStatus, bounded_fact_ids, component_rebuild_plan,
         execute_managed_runtime_component_rebuild,
     };
+    use crate::execution::persistence::{AtomicWriteBackend, PersistenceCoordinator};
     use crate::guardian::{DiagnosisId, GuardianDomain, GuardianMode};
     use crate::state::contracts::{
         CommandKind, JournalId, OperationId, OperationJournalEntry, OperationJournalStep,
@@ -632,14 +665,98 @@ mod tests {
         reserve_reconciliation_attempt,
     };
     use axial_config::{AppPaths, InstanceRegistrySnapshot};
+    use axial_minecraft::RuntimeId;
+    use axial_minecraft::known_good::{KnownGoodInventory, TestKnownGoodEntry};
     use std::fs;
-    use std::path::PathBuf;
+    use std::io;
+    use std::path::{Path, PathBuf};
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
     const INSTANCE_ID: &str = "0000000000000001";
     const RUNTIME_COMPONENT: &str = "java-runtime-gamma";
     const DIAGNOSIS_ID: DiagnosisId = DiagnosisId::LauncherManagedArtifactCorrupt;
+
+    #[derive(Default)]
+    struct ControlledWriteBackend {
+        attempts: AtomicUsize,
+        failed_attempt: AtomicUsize,
+        gated_attempt: AtomicUsize,
+        release_gate: AtomicBool,
+    }
+
+    impl ControlledWriteBackend {
+        fn fail_attempt(&self, attempt: usize) {
+            self.failed_attempt.store(attempt, Ordering::SeqCst);
+        }
+
+        fn gate_attempt(&self, attempt: usize) {
+            self.gated_attempt.store(attempt, Ordering::SeqCst);
+            self.release_gate.store(false, Ordering::SeqCst);
+        }
+
+        fn next_attempt(&self) -> usize {
+            self.attempts.load(Ordering::SeqCst) + 1
+        }
+
+        fn release(&self) {
+            self.release_gate.store(true, Ordering::SeqCst);
+        }
+
+        async fn wait_for_attempt(&self, expected: usize) {
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                while self.attempts.load(Ordering::SeqCst) < expected {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("component rebuild persistence attempt");
+        }
+
+        async fn wait_for_gate_armed(&self) -> usize {
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                loop {
+                    let attempt = self.gated_attempt.load(Ordering::SeqCst);
+                    if attempt != 0 {
+                        return attempt;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("component rebuild persistence retry gate")
+        }
+    }
+
+    impl AtomicWriteBackend for ControlledWriteBackend {
+        fn write(
+            &self,
+            target: &TargetDescriptor,
+            destination: &Path,
+            contents: &[u8],
+        ) -> io::Result<()> {
+            let attempt = self.attempts.fetch_add(1, Ordering::SeqCst) + 1;
+            if self.gated_attempt.load(Ordering::SeqCst) == attempt {
+                while !self.release_gate.load(Ordering::SeqCst) {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+            }
+            if self.failed_attempt.load(Ordering::SeqCst) == attempt {
+                return Err(io::Error::other(
+                    "injected component rebuild persistence failure",
+                ));
+            }
+            crate::execution::file::write_file_atomically(
+                crate::execution::file::FileWriteRequest::new(
+                    target.clone(),
+                    destination,
+                    contents,
+                ),
+            )
+            .map(|_| ())
+            .map_err(io::Error::from)
+        }
+    }
 
     struct Fixture {
         state: AppState,
@@ -649,6 +766,14 @@ mod tests {
     }
 
     fn fixture(label: &str) -> Fixture {
+        fixture_with_backends(label, None, None)
+    }
+
+    fn fixture_with_backends(
+        label: &str,
+        journal_backend: Option<Arc<ControlledWriteBackend>>,
+        memory_backend: Option<Arc<ControlledWriteBackend>>,
+    ) -> Fixture {
         static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(1);
 
         let root = std::env::temp_dir().join(format!(
@@ -689,8 +814,30 @@ mod tests {
             )
             .expect("test instance store"),
         );
-        let journals = Arc::new(OperationJournalStore::new());
-        let failure_memory = Arc::new(GuardianFailureMemoryStore::new());
+        let journals = Arc::new(match journal_backend {
+            Some(backend) => OperationJournalStore::try_load_from_paths_with_coordinator(
+                &paths,
+                PersistenceCoordinator::for_test(
+                    backend,
+                    std::time::Duration::from_millis(1),
+                    std::time::Duration::from_millis(5),
+                ),
+            )
+            .expect("persistent component rebuild journals"),
+            None => OperationJournalStore::new(),
+        });
+        let failure_memory = Arc::new(match memory_backend {
+            Some(backend) => GuardianFailureMemoryStore::try_load_from_paths_with_coordinator(
+                &paths,
+                PersistenceCoordinator::for_test(
+                    backend,
+                    std::time::Duration::from_millis(1),
+                    std::time::Duration::from_millis(5),
+                ),
+            )
+            .expect("persistent component rebuild memory"),
+            None => GuardianFailureMemoryStore::new(),
+        });
         let state = AppState::new(AppStateInit {
             app_name: "Axial".to_string(),
             version: "test".to_string(),
@@ -707,6 +854,11 @@ mod tests {
         })
         .with_reconciliation_stores(journals.clone(), failure_memory.clone());
         state.set_library_dir_for_test(paths.library_dir.to_string_lossy().into_owned());
+        state.activate_known_good_inventory_for_test(
+            INSTANCE_ID,
+            KnownGoodInventory::from_test_entries(Vec::<TestKnownGoodEntry>::new())
+                .expect("empty component rebuild inventory"),
+        );
         Fixture {
             state,
             journals,
@@ -726,6 +878,16 @@ mod tests {
             .close_instance_registry()
             .await
             .expect("close instance registry");
+        fixture
+            .journals
+            .close()
+            .await
+            .expect("close component rebuild journals");
+        fixture
+            .failure_memory
+            .close()
+            .await
+            .expect("close component rebuild memory");
         let Fixture {
             state,
             journals,
@@ -869,6 +1031,103 @@ mod tests {
         refused
     }
 
+    async fn assert_receipt_is_retained_until_persistence_retry(
+        fixture: &Fixture,
+        backend: Arc<ControlledWriteBackend>,
+        operation_suffix: &str,
+        terminal_visible_while_retrying: bool,
+    ) {
+        let (admission, _) =
+            component_admission(fixture, GuardianMode::Managed, operation_suffix).await;
+        let operation_id = admission.attempt().operation_id().clone();
+        let memory_key = reconciliation_attempt_key(admission.attempt());
+        let runtime_cache = fixture.state.managed_runtime_cache().clone();
+        let effect_cache = runtime_cache.clone();
+        let effect_backend = backend.clone();
+        let rebuild = execute_managed_runtime_component_rebuild(admission, move |effect| {
+            let component = effect.component();
+            async move {
+                let receipt = axial_minecraft::rebuild_managed_runtime_fixture_for_test(
+                    &effect_cache,
+                    component,
+                )
+                .await
+                .expect("sealed managed Runtime fixture receipt");
+                let failed_attempt = effect_backend.next_attempt();
+                effect_backend.fail_attempt(failed_attempt);
+                effect_backend.gate_attempt(failed_attempt + 1);
+                effect.succeeded(receipt, vec!["runtime_component_rebuilt".to_string()])
+            }
+        });
+        let settlement_complete = Arc::new(AtomicBool::new(false));
+        let rebuild_complete = settlement_complete.clone();
+        let rebuild = async move {
+            let outcome = rebuild.await;
+            rebuild_complete.store(true, Ordering::Release);
+            outcome
+        };
+        let control = async {
+            let gated_attempt = backend.wait_for_gate_armed().await;
+            backend.wait_for_attempt(gated_attempt).await;
+            assert!(
+                !settlement_complete.load(Ordering::Acquire),
+                "component rebuild future must remain pending during persistence retry"
+            );
+            assert_eq!(
+                fixture
+                    .journals
+                    .get(&operation_id)
+                    .and_then(|entry| entry.reconciliation_terminal().cloned())
+                    .is_some(),
+                terminal_visible_while_retrying
+            );
+            assert!(fixture.failure_memory.get(&memory_key).is_none());
+
+            let mut competing_rebuild =
+                Box::pin(axial_minecraft::rebuild_managed_runtime_fixture_for_test(
+                    &runtime_cache,
+                    RuntimeId::from(RUNTIME_COMPONENT),
+                ));
+            assert!(
+                tokio::time::timeout(
+                    std::time::Duration::from_millis(100),
+                    &mut competing_rebuild,
+                )
+                .await
+                .is_err(),
+                "publication receipt must retain Runtime exclusion during persistence retry"
+            );
+
+            backend.release();
+            let competing_receipt =
+                tokio::time::timeout(std::time::Duration::from_secs(2), competing_rebuild)
+                    .await
+                    .expect("competing Runtime rebuild resumes after settlement")
+                    .expect("competing Runtime rebuild receipt");
+            drop(competing_receipt);
+        };
+        let (outcome, ()) = tokio::join!(rebuild, control);
+        let outcome = outcome.expect("component rebuild settles after persistence retry");
+        assert!(settlement_complete.load(Ordering::Acquire));
+
+        assert_eq!(
+            outcome.status,
+            GuardianRuntimeComponentRebuildStatus::Rebuilt
+        );
+        let terminal = fixture
+            .journals
+            .get(&operation_id)
+            .and_then(|entry| entry.reconciliation_terminal().cloned())
+            .expect("exact component terminal journal");
+        assert_eq!(
+            fixture
+                .failure_memory
+                .get(&memory_key)
+                .and_then(|entry| entry.reconciliation_terminal().cloned()),
+            Some(terminal)
+        );
+    }
+
     #[test]
     fn effect_facts_are_redacted_and_bounded_before_journaling() {
         let mut facts = (0..MAX_OPERATION_JOURNAL_STEP_FACTS + 4)
@@ -922,6 +1181,33 @@ mod tests {
             .get(&component_key)
             .expect("component memory is immediate");
         assert_eq!(memory.reconciliation_terminal(), Some(terminal));
+
+        cleanup(fixture).await;
+    }
+
+    #[tokio::test]
+    async fn journal_persistence_retry_retains_runtime_receipt_until_terminal_is_durable() {
+        let backend = Arc::new(ControlledWriteBackend::default());
+        let fixture = fixture_with_backends("journal-retry", Some(backend.clone()), None);
+
+        assert_receipt_is_retained_until_persistence_retry(
+            &fixture,
+            backend,
+            "journal-retry",
+            false,
+        )
+        .await;
+
+        cleanup(fixture).await;
+    }
+
+    #[tokio::test]
+    async fn memory_persistence_retry_retains_runtime_receipt_after_terminal_is_durable() {
+        let backend = Arc::new(ControlledWriteBackend::default());
+        let fixture = fixture_with_backends("memory-retry", None, Some(backend.clone()));
+
+        assert_receipt_is_retained_until_persistence_retry(&fixture, backend, "memory-retry", true)
+            .await;
 
         cleanup(fixture).await;
     }

@@ -474,6 +474,7 @@ pub(super) struct ReconciliationAttemptReservation {
 pub(super) enum ReconciliationAttemptReserveError {
     PersistencePending,
     AlreadyReserved,
+    CapacityExhausted,
 }
 
 impl Drop for ReconciliationAttemptReservation {
@@ -517,7 +518,7 @@ impl GuardianFailureMemoryStore {
         Self::try_load_from_paths_with_coordinator(paths, PersistenceCoordinator::global())
     }
 
-    fn try_load_from_paths_with_coordinator(
+    pub(crate) fn try_load_from_paths_with_coordinator(
         paths: &AppPaths,
         coordinator: PersistenceCoordinator,
     ) -> Result<Self, FailureMemoryStoreError> {
@@ -621,20 +622,12 @@ impl GuardianFailureMemoryStore {
         entry: GuardianFailureMemoryEntry,
         reservation: &ReconciliationAttemptReservation,
     ) -> Result<(), FailureMemoryStoreError> {
-        if entry.reconciliation_terminal().is_none() {
-            return Err(FailureMemoryValidationError::InvalidReconciliationTerminal.into());
-        }
+        self.validate_reconciliation_terminal(&entry, reservation)?;
         let key = entry.key.clone();
-        if reservation.key != key || !Arc::ptr_eq(&reservation.attempts, &self.attempts) {
-            return Err(FailureMemoryValidationError::MemoryKeyMismatch.into());
-        }
-        if let Some(stored) = self.get(&key) {
-            if stored == entry {
-                return Ok(());
-            }
-            if !reconciliation_entry_can_be_superseded(&stored, &entry) {
-                return Err(FailureMemoryValidationError::ReconciliationTerminalMismatch.into());
-            }
+        if let Some(stored) = self.get(&key)
+            && stored == entry
+        {
+            return Ok(());
         }
         if self
             .records
@@ -644,18 +637,52 @@ impl GuardianFailureMemoryStore {
             .is_some()
         {
             self.retry().await?;
-            if let Some(stored) = self.get(&key) {
-                if stored == entry {
-                    return Ok(());
-                }
-                if !reconciliation_entry_can_be_superseded(&stored, &entry) {
-                    return Err(FailureMemoryValidationError::ReconciliationTerminalMismatch.into());
-                }
+            self.validate_reconciliation_terminal(&entry, reservation)?;
+            if let Some(stored) = self.get(&key)
+                && stored == entry
+            {
+                return Ok(());
             }
         }
         let pending =
             self.record_with(entry, apply_reconciliation_record, WriteUrgency::Immediate)?;
         self.await_commit(pending).await
+    }
+
+    pub(super) fn validate_reconciliation_terminal(
+        &self,
+        entry: &GuardianFailureMemoryEntry,
+        reservation: &ReconciliationAttemptReservation,
+    ) -> Result<(), FailureMemoryStoreError> {
+        if entry.reconciliation_terminal().is_none() {
+            return Err(FailureMemoryValidationError::InvalidReconciliationTerminal.into());
+        }
+        entry.validate()?;
+        if reservation.key != entry.key || !Arc::ptr_eq(&reservation.attempts, &self.attempts) {
+            return Err(FailureMemoryValidationError::MemoryKeyMismatch.into());
+        }
+
+        let records = self.records.read().expect(FAILURE_MEMORY_LOCK_INVARIANT);
+        let attempts = self
+            .attempts
+            .lock()
+            .expect("Guardian reconciliation attempts lock poisoned");
+        if !attempts.contains(entry.key.as_str()) {
+            return Err(FailureMemoryValidationError::MemoryKeyMismatch.into());
+        }
+        if let Some(stored) = records.visible.get(entry.key.as_str())
+            && stored != entry
+            && !reconciliation_entry_can_be_superseded(stored, entry)
+        {
+            return Err(FailureMemoryValidationError::ReconciliationTerminalMismatch.into());
+        }
+
+        let mut candidate = records.visible.clone();
+        apply_reconciliation_record(&mut candidate, entry.clone());
+        if !prune_records(&mut candidate, self.max_entries, Some(entry.key.as_str())) {
+            return Err(FailureMemoryStoreError::CapacityExhausted);
+        }
+        Ok(())
     }
 
     pub(super) fn reserve_reconciliation_attempt(
@@ -670,9 +697,21 @@ impl GuardianFailureMemoryStore {
             .attempts
             .lock()
             .expect("Guardian reconciliation attempts lock poisoned");
-        if !attempts.insert(key.as_str().to_string()) {
+        if attempts.contains(key.as_str()) {
             return Err(ReconciliationAttemptReserveError::AlreadyReserved);
         }
+        let mut occupied_keys = attempts.clone();
+        occupied_keys.extend(
+            records
+                .visible
+                .values()
+                .filter(|entry| active_reconciliation_terminal(entry))
+                .map(|entry| entry.key.as_str().to_string()),
+        );
+        if !occupied_keys.contains(key.as_str()) && occupied_keys.len() >= self.max_entries {
+            return Err(ReconciliationAttemptReserveError::CapacityExhausted);
+        }
+        attempts.insert(key.as_str().to_string());
         drop(records);
         Ok(ReconciliationAttemptReservation {
             key,
@@ -985,6 +1024,7 @@ mod tests {
     use super::{
         FailureMemoryActionOutcome, FailureMemoryLoadError, FailureMemorySnapshot,
         FailureMemoryStoreError, GuardianFailureMemoryEntry, GuardianFailureMemoryStore,
+        ReconciliationAttemptReserveError,
     };
     use crate::execution::file::{FileWriteRequest, write_file_atomically};
     use crate::execution::persistence::{AtomicWriteBackend, PersistenceCoordinator};
@@ -1005,6 +1045,7 @@ mod tests {
     use std::io;
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
+    use std::sync::Barrier;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
@@ -1466,6 +1507,134 @@ mod tests {
         }
 
         assert_eq!(store.list().len(), DEFAULT_OPERATION_JOURNAL_LIMIT);
+    }
+
+    #[test]
+    fn exact_reconciliation_validation_is_non_mutating_and_reservation_bound() {
+        let store = GuardianFailureMemoryStore::with_max_entries(1);
+        let entry = active_reconciliation_entry(0);
+        let key = entry.key.clone();
+        let reservation = store
+            .reserve_reconciliation_attempt(key.clone())
+            .expect("reserve exact reconciliation slot");
+
+        store
+            .validate_reconciliation_terminal(&entry, &reservation)
+            .expect("exact terminal and reservation validate");
+        assert!(store.get(&key).is_none());
+
+        let foreign_store = GuardianFailureMemoryStore::with_max_entries(1);
+        let foreign_reservation = foreign_store
+            .reserve_reconciliation_attempt(key)
+            .expect("reserve foreign reconciliation slot");
+        assert!(matches!(
+            store.validate_reconciliation_terminal(&entry, &foreign_reservation),
+            Err(FailureMemoryStoreError::Validation(
+                super::FailureMemoryValidationError::MemoryKeyMismatch
+            ))
+        ));
+    }
+
+    #[test]
+    fn concurrent_reconciliation_reservations_cannot_overbook_capacity() {
+        let store = Arc::new(GuardianFailureMemoryStore::with_max_entries(1));
+        let barrier = Arc::new(Barrier::new(3));
+        let keys = [
+            active_reconciliation_entry(0).key,
+            active_reconciliation_entry(1).key,
+        ];
+        let reservations = std::thread::scope(|scope| {
+            let handles = keys.map(|key| {
+                let store = store.clone();
+                let barrier = barrier.clone();
+                scope.spawn(move || {
+                    barrier.wait();
+                    store.reserve_reconciliation_attempt(key)
+                })
+            });
+            barrier.wait();
+            handles.map(|handle| handle.join().expect("reservation worker"))
+        });
+
+        assert_eq!(
+            reservations.iter().filter(|result| result.is_ok()).count(),
+            1
+        );
+        assert_eq!(
+            reservations
+                .iter()
+                .filter(|result| {
+                    matches!(
+                        result,
+                        Err(ReconciliationAttemptReserveError::CapacityExhausted)
+                    )
+                })
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn active_same_key_reconciliation_reservation_reuses_its_capacity_slot() {
+        let store = GuardianFailureMemoryStore::with_max_entries(1);
+        let active = active_reconciliation_entry(0);
+        let active_key = active.key.clone();
+        let initial = store
+            .reserve_reconciliation_attempt(active_key.clone())
+            .expect("reserve initial reconciliation slot");
+        store
+            .record_reconciliation_terminal(active, &initial)
+            .await
+            .expect("record active reconciliation terminal");
+        drop(initial);
+
+        let replacement = store
+            .reserve_reconciliation_attempt(active_key)
+            .expect("active key reuses its occupied slot");
+        assert!(matches!(
+            store.reserve_reconciliation_attempt(active_reconciliation_entry(1).key),
+            Err(ReconciliationAttemptReserveError::CapacityExhausted)
+        ));
+        drop(replacement);
+    }
+
+    #[test]
+    fn dropped_reconciliation_reservation_releases_capacity() {
+        let store = GuardianFailureMemoryStore::with_max_entries(1);
+        let first = store
+            .reserve_reconciliation_attempt(active_reconciliation_entry(0).key)
+            .expect("reserve only slot");
+        let second_key = active_reconciliation_entry(1).key;
+        assert!(matches!(
+            store.reserve_reconciliation_attempt(second_key.clone()),
+            Err(ReconciliationAttemptReserveError::CapacityExhausted)
+        ));
+
+        drop(first);
+        let second = store
+            .reserve_reconciliation_attempt(second_key)
+            .expect("released slot can be reserved");
+        drop(second);
+    }
+
+    #[tokio::test]
+    async fn ordinary_prunable_memory_does_not_consume_reconciliation_capacity() {
+        let store = GuardianFailureMemoryStore::with_max_entries(1);
+        let ordinary = retry_entry("2026-06-15T10:00:00Z");
+        let ordinary_key = ordinary.key.clone();
+        store.record(ordinary).expect("seed ordinary memory");
+        let terminal = active_reconciliation_entry(0);
+        let terminal_key = terminal.key.clone();
+        let reservation = store
+            .reserve_reconciliation_attempt(terminal_key.clone())
+            .expect("ordinary memory leaves reconciliation capacity available");
+        store
+            .record_reconciliation_terminal(terminal, &reservation)
+            .await
+            .expect("active terminal displaces ordinary memory");
+
+        assert!(store.get(&ordinary_key).is_none());
+        assert!(store.get(&terminal_key).is_some());
     }
 
     #[test]

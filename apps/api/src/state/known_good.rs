@@ -219,6 +219,26 @@ impl<T> ActiveInventories<T> {
         }
     }
 
+    fn remove_exact_inventory(
+        &mut self,
+        instance_id: &str,
+        version_id: &str,
+        created_at: &str,
+        library_root: &Path,
+        expected_inventory: &Arc<T>,
+    ) -> bool {
+        let matches = self.by_instance.get(instance_id).is_some_and(|active| {
+            active.version_id == version_id
+                && active.created_at == created_at
+                && active.library_root == library_root
+                && Arc::ptr_eq(&active.inventory, expected_inventory)
+        });
+        if matches {
+            self.by_instance.remove(instance_id);
+        }
+        matches
+    }
+
     fn remove_incarnation(&mut self, instance_id: &str, version_id: &str, created_at: &str) {
         if self.by_instance.get(instance_id).is_some_and(|active| {
             active.version_id == version_id && active.created_at == created_at
@@ -413,6 +433,32 @@ impl KnownGoodInventoryStore {
             created_at,
             normalized_root.as_deref(),
         );
+    }
+
+    pub(super) fn deactivate_exact_inventory(
+        &self,
+        instance_id: &str,
+        version_id: &str,
+        created_at: &str,
+        library_root: &Path,
+        expected_inventory: &Arc<KnownGoodInventory>,
+    ) -> bool {
+        if validate_identity(instance_id, version_id).is_err() {
+            return false;
+        }
+        let Ok(library_root) = normalize_library_root(library_root) else {
+            return false;
+        };
+        self.active
+            .lock()
+            .expect(STORE_LOCK_INVARIANT)
+            .remove_exact_inventory(
+                instance_id,
+                version_id,
+                created_at,
+                &library_root,
+                expected_inventory,
+            )
     }
 
     pub(super) fn clear_active(&self) {
@@ -1567,6 +1613,58 @@ mod tests {
                 .expect("replacement authority survives stale cleanup"),
             &replacement
         ));
+    }
+
+    #[test]
+    fn exact_inventory_removal_retains_a_replacement_arc() {
+        let instance_id = "0000000000000001";
+        let version_id = "1.21.5";
+        let created_at = "created-1";
+        let root = PathBuf::from("/library");
+        let expected = Arc::new(1_u8);
+        let replacement = Arc::new(2_u8);
+        let mut active = ActiveInventories::default();
+
+        active.activate(
+            instance_id,
+            version_id,
+            created_at,
+            root.clone(),
+            expected.clone(),
+        );
+        active.activate(
+            instance_id,
+            version_id,
+            created_at,
+            root.clone(),
+            replacement.clone(),
+        );
+
+        assert!(!active.remove_exact_inventory(
+            instance_id,
+            version_id,
+            created_at,
+            &root,
+            &expected,
+        ));
+        assert!(Arc::ptr_eq(
+            &active
+                .get(instance_id, version_id, created_at, &root)
+                .expect("replacement authority survives stale exact-Arc cleanup"),
+            &replacement,
+        ));
+        assert!(active.remove_exact_inventory(
+            instance_id,
+            version_id,
+            created_at,
+            &root,
+            &replacement,
+        ));
+        assert!(
+            active
+                .get(instance_id, version_id, created_at, &root)
+                .is_none()
+        );
     }
 
     #[test]

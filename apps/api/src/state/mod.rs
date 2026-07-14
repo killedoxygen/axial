@@ -105,7 +105,7 @@ pub(crate) use reconciliation::{
     reconciliation_attempt_key, reconciliation_instance_target, reconciliation_journal_attempt,
     reconciliation_memory_entry, reconciliation_terminal, record_guardian_repair_refusal,
     record_reconciliation_journal_failure, record_reconciliation_journal_success,
-    reserve_reconciliation_attempt, settle_reconciliation_memory,
+    reserve_reconciliation_attempt, settle_reconciliation_memory, validate_reconciliation_memory,
 };
 pub(crate) use remote_flags::{
     RemoteFlagRefreshOutcome, RemoteFlagStore, ResolvedFlagSource, resolve_flag,

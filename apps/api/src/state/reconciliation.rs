@@ -33,7 +33,19 @@ pub(crate) struct RegisteredComponentRebuildAdmission {
     authority: RegisteredReconciliationAuthority,
     attempt: ReconciliationAttempt,
     _predecessor: ReconciliationTerminal,
+    known_good: RegisteredKnownGoodInventory,
+    postcondition_failure_inventory:
+        std::sync::OnceLock<std::sync::Arc<axial_minecraft::known_good::KnownGoodInventory>>,
     _component_mutation: SharedComponentMutationLease,
+    _library_root_mutation: tokio::sync::OwnedMutexGuard<()>,
+}
+
+struct RegisteredKnownGoodInventory {
+    instance_id: String,
+    version_id: String,
+    created_at: String,
+    library_root: PathBuf,
+    inventory: std::sync::Arc<axial_minecraft::known_good::KnownGoodInventory>,
 }
 
 pub(crate) struct ReconciliationAttemptReservation {
@@ -49,6 +61,7 @@ pub(crate) struct RegisteredReconciliationAuthority {
 pub(crate) enum ReconciliationAttemptRejection {
     PersistencePending,
     AlreadyReserved,
+    CapacityExhausted,
     AmbiguousPriorAttempt,
 }
 
@@ -56,6 +69,7 @@ struct RecordedReconciliationFailure {
     terminal: ReconciliationTerminal,
     lifecycle: InstanceLifecycleLease,
     roots: ReconciliationRoots,
+    inventory: std::sync::Arc<axial_minecraft::known_good::KnownGoodInventory>,
 }
 
 #[derive(Eq, PartialEq)]
@@ -123,7 +137,19 @@ impl RegisteredComponentRebuildAdmission {
         &self,
         receipt: &ManagedRuntimeCommitReceipt,
     ) -> Result<ReconciliationTerminal, ReconciliationEvidenceRejection> {
-        let inventory = self.validate_runtime_receipt_identity(receipt)?;
+        self.succeeded_terminal_with_activation_observer(receipt, || {})
+            .await
+    }
+
+    async fn succeeded_terminal_with_activation_observer<AfterActivation>(
+        &self,
+        receipt: &ManagedRuntimeCommitReceipt,
+        after_activation: AfterActivation,
+    ) -> Result<ReconciliationTerminal, ReconciliationEvidenceRejection>
+    where
+        AfterActivation: FnOnce(),
+    {
+        self.validate_runtime_receipt_identity(receipt)?;
         if !receipt
             .revalidate(
                 &self.authority.state.managed_runtime_cache,
@@ -133,61 +159,70 @@ impl RegisteredComponentRebuildAdmission {
         {
             return Err(ReconciliationEvidenceRejection::JournalMismatch);
         }
-        let current_inventory = self.validate_runtime_receipt_identity(receipt)?;
-        if !std::sync::Arc::ptr_eq(&inventory, &current_inventory) {
-            return Err(ReconciliationEvidenceRejection::IncarnationMismatch);
-        }
+        self.validate_runtime_receipt_identity(receipt)?;
         let refreshed_inventory = std::sync::Arc::new(
             receipt
-                .replace_known_good_runtime_projection(&inventory)
+                .replace_known_good_runtime_projection(&self.known_good.inventory)
                 .map_err(|_| ReconciliationEvidenceRejection::JournalMismatch)?,
         );
         if !receipt.matches_known_good_inventory(&refreshed_inventory) {
             return Err(ReconciliationEvidenceRejection::JournalMismatch);
         }
-        let ReconciliationScope::RegisteredInstance { instance_id, .. } = self.attempt.scope()
-        else {
-            return Err(ReconciliationEvidenceRejection::ScopeMismatch);
-        };
-        let current = self
-            .authority
-            .state
-            .current_reconciliation_incarnation(instance_id)?;
-        let instance = self
-            .authority
-            .state
-            .instances
-            .get(instance_id)
-            .filter(|instance| instance.id == *instance_id)
-            .ok_or(ReconciliationEvidenceRejection::InstanceNotRegistered)?;
+        let quarantined_target =
+            self.validated_quarantine_target(receipt.component(), receipt.quarantine_obligation())?;
         self.authority
             .state
             .known_good
             .reconcile(
-                &instance.id,
-                &instance.version_id,
-                &instance.created_at,
-                &current.roots.library,
+                &self.known_good.instance_id,
+                &self.known_good.version_id,
+                &self.known_good.created_at,
+                &self.known_good.library_root,
                 refreshed_inventory.clone(),
             )
             .await
             .map_err(|_| ReconciliationEvidenceRejection::RootAuthorityUnavailable)?;
-        let activated_inventory = self.validate_runtime_receipt_identity(receipt)?;
+        after_activation();
+        let activated_inventory = match self.validate_runtime_identity_against(
+            receipt.component(),
+            receipt.matches_cache(&self.authority.state.managed_runtime_cache),
+            &refreshed_inventory,
+        ) {
+            Ok(inventory) => inventory,
+            Err(rejection) => {
+                self.seal_failed_runtime_projection(refreshed_inventory)?;
+                return Err(rejection);
+            }
+        };
         if !std::sync::Arc::ptr_eq(&refreshed_inventory, &activated_inventory)
             || !receipt.matches_known_good_inventory(&activated_inventory)
-            || !receipt
-                .revalidate(
-                    &self.authority.state.managed_runtime_cache,
-                    receipt.component(),
-                )
-                .await
         {
+            self.seal_failed_runtime_projection(refreshed_inventory)?;
+            return Err(ReconciliationEvidenceRejection::JournalMismatch);
+        }
+        let receipt_is_current = receipt
+            .revalidate(
+                &self.authority.state.managed_runtime_cache,
+                receipt.component(),
+            )
+            .await;
+        let active_after_postcheck = self.validate_runtime_identity_against(
+            receipt.component(),
+            receipt.matches_cache(&self.authority.state.managed_runtime_cache),
+            &refreshed_inventory,
+        );
+        if let Err(rejection) = active_after_postcheck {
+            self.seal_failed_runtime_projection(refreshed_inventory)?;
+            return Err(rejection);
+        }
+        if !receipt_is_current {
+            self.seal_failed_runtime_projection(refreshed_inventory)?;
             return Err(ReconciliationEvidenceRejection::JournalMismatch);
         }
         Ok(ReconciliationTerminal::from_attempt(
             self.attempt.clone(),
             ReconciliationTerminalOutcome::Succeeded,
-            self.validated_quarantine_target(receipt.component(), receipt.quarantine_obligation())?,
+            quarantined_target,
         ))
     }
 
@@ -195,11 +230,23 @@ impl RegisteredComponentRebuildAdmission {
         &self,
         receipt: &ManagedRuntimeCommitReceipt,
     ) -> Result<ReconciliationTerminal, ReconciliationEvidenceRejection> {
-        self.validate_runtime_receipt_identity(receipt)?;
+        if let Some(refreshed_inventory) = self.postcondition_failure_inventory.get() {
+            self.validate_runtime_receipt_capability(
+                receipt.component(),
+                receipt.matches_cache(&self.authority.state.managed_runtime_cache),
+            )?;
+            if !receipt.matches_known_good_inventory(refreshed_inventory) {
+                return Err(ReconciliationEvidenceRejection::JournalMismatch);
+            }
+        } else {
+            self.validate_runtime_receipt_identity(receipt)?;
+        }
+        let quarantined_target =
+            self.validated_quarantine_target(receipt.component(), receipt.quarantine_obligation())?;
         Ok(ReconciliationTerminal::from_attempt(
             self.attempt.clone(),
             ReconciliationTerminalOutcome::Failed,
-            self.validated_quarantine_target(receipt.component(), receipt.quarantine_obligation())?,
+            quarantined_target,
         ))
     }
 
@@ -239,13 +286,36 @@ impl RegisteredComponentRebuildAdmission {
         std::sync::Arc<axial_minecraft::known_good::KnownGoodInventory>,
         ReconciliationEvidenceRejection,
     > {
-        if self.attempt.component() != ReconciliationComponent::Runtime
-            || self.attempt.target().kind != TargetKind::Runtime
-            || self.attempt.target().id != component.as_str()
-            || !matches_cache
-        {
-            return Err(ReconciliationEvidenceRejection::JournalMismatch);
+        self.validate_runtime_identity_against(component, matches_cache, &self.known_good.inventory)
+    }
+
+    fn validate_runtime_identity_against(
+        &self,
+        component: &RuntimeId,
+        matches_cache: bool,
+        expected_inventory: &std::sync::Arc<axial_minecraft::known_good::KnownGoodInventory>,
+    ) -> Result<
+        std::sync::Arc<axial_minecraft::known_good::KnownGoodInventory>,
+        ReconciliationEvidenceRejection,
+    > {
+        let inventory = self
+            .current_runtime_inventory(component, matches_cache)?
+            .ok_or(ReconciliationEvidenceRejection::RootAuthorityUnavailable)?;
+        if !std::sync::Arc::ptr_eq(&inventory, expected_inventory) {
+            return Err(ReconciliationEvidenceRejection::IncarnationMismatch);
         }
+        Ok(inventory)
+    }
+
+    fn current_runtime_inventory(
+        &self,
+        component: &RuntimeId,
+        matches_cache: bool,
+    ) -> Result<
+        Option<std::sync::Arc<axial_minecraft::known_good::KnownGoodInventory>>,
+        ReconciliationEvidenceRejection,
+    > {
+        self.validate_runtime_receipt_capability(component, matches_cache)?;
         let ReconciliationScope::RegisteredInstance {
             instance_id,
             fingerprint,
@@ -267,16 +337,51 @@ impl RegisteredComponentRebuildAdmission {
             .get(instance_id)
             .filter(|instance| instance.id == *instance_id)
             .ok_or(ReconciliationEvidenceRejection::InstanceNotRegistered)?;
-        self.authority
-            .state
-            .known_good
-            .active_inventory(
-                &instance.id,
-                &instance.version_id,
-                &instance.created_at,
-                &current.roots.library,
-            )
-            .ok_or(ReconciliationEvidenceRejection::RootAuthorityUnavailable)
+        let inventory = self.authority.state.known_good.active_inventory(
+            &instance.id,
+            &instance.version_id,
+            &instance.created_at,
+            &current.roots.library,
+        );
+        Ok(inventory)
+    }
+
+    fn validate_runtime_receipt_capability(
+        &self,
+        component: &RuntimeId,
+        matches_cache: bool,
+    ) -> Result<(), ReconciliationEvidenceRejection> {
+        if self.attempt.component() != ReconciliationComponent::Runtime
+            || self.attempt.target().kind != TargetKind::Runtime
+            || self.attempt.target().id != component.as_str()
+            || !matches_cache
+        {
+            return Err(ReconciliationEvidenceRejection::JournalMismatch);
+        }
+        let ReconciliationScope::RegisteredInstance { instance_id, .. } = self.attempt.scope()
+        else {
+            return Err(ReconciliationEvidenceRejection::ScopeMismatch);
+        };
+        if instance_id != &self.known_good.instance_id {
+            return Err(ReconciliationEvidenceRejection::IncarnationMismatch);
+        }
+        Ok(())
+    }
+
+    fn seal_failed_runtime_projection(
+        &self,
+        refreshed_inventory: std::sync::Arc<axial_minecraft::known_good::KnownGoodInventory>,
+    ) -> Result<(), ReconciliationEvidenceRejection> {
+        let _removed = self.authority.state.known_good.deactivate_exact_inventory(
+            &self.known_good.instance_id,
+            &self.known_good.version_id,
+            &self.known_good.created_at,
+            &self.known_good.library_root,
+            &refreshed_inventory,
+        );
+        self.postcondition_failure_inventory
+            .set(refreshed_inventory)
+            .map_err(|_| ReconciliationEvidenceRejection::JournalMismatch)
     }
 
     fn validated_quarantine_target(
@@ -314,6 +419,13 @@ impl RegisteredComponentRebuildAdmission {
     #[cfg(test)]
     fn predecessor(&self) -> &ReconciliationTerminal {
         &self._predecessor
+    }
+
+    #[cfg(test)]
+    fn admitted_inventory(
+        &self,
+    ) -> &std::sync::Arc<axial_minecraft::known_good::KnownGoodInventory> {
+        &self.known_good.inventory
     }
 }
 
@@ -503,6 +615,14 @@ pub(crate) async fn commit_reconciliation_memory(
         .await
 }
 
+pub(crate) fn validate_reconciliation_memory(
+    failure_memory: &GuardianFailureMemoryStore,
+    entry: &GuardianFailureMemoryEntry,
+    reservation: &ReconciliationAttemptReservation,
+) -> Result<(), FailureMemoryStoreError> {
+    failure_memory.validate_reconciliation_terminal(entry, &reservation.reservation)
+}
+
 pub(crate) async fn settle_reconciliation_memory(
     failure_memory: &GuardianFailureMemoryStore,
 ) -> Result<(), FailureMemoryStoreError> {
@@ -534,6 +654,9 @@ pub(crate) fn reserve_reconciliation_attempt(
             }
             ReconciliationAttemptReserveError::AlreadyReserved => {
                 ReconciliationAttemptRejection::AlreadyReserved
+            }
+            ReconciliationAttemptReserveError::CapacityExhausted => {
+                ReconciliationAttemptRejection::CapacityExhausted
             }
         })
 }
@@ -824,25 +947,84 @@ impl AppState {
         operation_id: OperationId,
         suppression_for: chrono::Duration,
     ) -> Result<RegisteredComponentRebuildAdmission, ReconciliationEvidenceRejection> {
+        self.admit_component_rebuild_with_config_observer(
+            evidence,
+            operation_id,
+            suppression_for,
+            || {},
+        )
+        .await
+    }
+
+    async fn admit_component_rebuild_with_config_observer<AfterConfig>(
+        &self,
+        evidence: RecordedArtifactRepairFailure,
+        operation_id: OperationId,
+        suppression_for: chrono::Duration,
+        after_config: AfterConfig,
+    ) -> Result<RegisteredComponentRebuildAdmission, ReconciliationEvidenceRejection>
+    where
+        AfterConfig: FnOnce(),
+    {
         if operation_id == *evidence.evidence.terminal.operation_id() {
             return Err(ReconciliationEvidenceRejection::JournalMismatch);
         }
-        let predecessor = self.recorded_reconciliation_failure_at(
+        let predecessor_before_wait = self.recorded_reconciliation_failure_at(
             &evidence.evidence.lifecycle,
             evidence.evidence.terminal.operation_id(),
             ReconciliationRung::RepairArtifact,
             chrono::Utc::now().fixed_offset(),
         )?;
-        if predecessor.terminal != evidence.evidence.terminal
-            || predecessor.roots != evidence.evidence.roots
+        if predecessor_before_wait.terminal != evidence.evidence.terminal
+            || predecessor_before_wait.roots != evidence.evidence.roots
         {
             return Err(ReconciliationEvidenceRejection::JournalMismatch);
         }
+        if !std::sync::Arc::ptr_eq(
+            &predecessor_before_wait.inventory,
+            &evidence.evidence.inventory,
+        ) {
+            return Err(ReconciliationEvidenceRejection::IncarnationMismatch);
+        }
+        // Config precedes the shared-component writer: config mutations never acquire
+        // session admission, while session admission owns only the component reader.
+        let library_root_mutation = self
+            .config
+            .acquire_mutation()
+            .await
+            .map_err(|_| ReconciliationEvidenceRejection::RootAuthorityUnavailable)?;
+        after_config();
         let component_mutation = self
             .sessions
             .acquire_shared_component_mutation()
             .await
             .ok_or(ReconciliationEvidenceRejection::ActiveSession)?;
+        let predecessor = self.recorded_reconciliation_failure_at(
+            &predecessor_before_wait.lifecycle,
+            predecessor_before_wait.terminal.operation_id(),
+            ReconciliationRung::RepairArtifact,
+            chrono::Utc::now().fixed_offset(),
+        )?;
+        if predecessor.terminal != predecessor_before_wait.terminal
+            || predecessor.roots != predecessor_before_wait.roots
+        {
+            return Err(ReconciliationEvidenceRejection::JournalMismatch);
+        }
+        if !std::sync::Arc::ptr_eq(&predecessor.inventory, &predecessor_before_wait.inventory) {
+            return Err(ReconciliationEvidenceRejection::IncarnationMismatch);
+        }
+        let instance = self
+            .instances
+            .get(&predecessor.lifecycle.instance_id)
+            .filter(|instance| instance.id == predecessor.lifecycle.instance_id.as_str())
+            .ok_or(ReconciliationEvidenceRejection::InstanceNotRegistered)?;
+        let known_good = RegisteredKnownGoodInventory {
+            instance_id: instance.id,
+            version_id: instance.version_id,
+            created_at: instance.created_at,
+            library_root: predecessor.roots.library.clone(),
+            inventory: predecessor.inventory.clone(),
+        };
         let authority = self.registered_reconciliation_authority(&predecessor.lifecycle)?;
         let prior = predecessor.terminal;
         let observed_at = chrono::Utc::now().fixed_offset();
@@ -867,7 +1049,10 @@ impl AppState {
             authority,
             attempt,
             _predecessor: prior,
+            known_good,
+            postcondition_failure_inventory: std::sync::OnceLock::new(),
             _component_mutation: component_mutation,
+            _library_root_mutation: library_root_mutation,
         })
     }
 
@@ -1052,10 +1237,25 @@ impl AppState {
         if before.fingerprint != after.fingerprint || before.roots != after.roots {
             return Err(ReconciliationEvidenceRejection::IncarnationMismatch);
         }
+        let instance = self
+            .instances
+            .get(instance_id)
+            .filter(|instance| instance.id == instance_id)
+            .ok_or(ReconciliationEvidenceRejection::InstanceNotRegistered)?;
+        let inventory = self
+            .known_good
+            .active_inventory(
+                &instance.id,
+                &instance.version_id,
+                &instance.created_at,
+                &after.roots.library,
+            )
+            .ok_or(ReconciliationEvidenceRejection::RootAuthorityUnavailable)?;
         Ok(RecordedReconciliationFailure {
             terminal,
             lifecycle: lifecycle.retained(),
             roots: after.roots,
+            inventory,
         })
     }
 
@@ -1282,6 +1482,7 @@ mod tests {
     use crate::state::failure_memory::FailureMemorySnapshot;
     use crate::state::{AppStateInit, InstallStore, SessionStore, new_instance};
     use axial_config::{AppPaths, InstanceRegistrySnapshot};
+    use axial_minecraft::known_good::{KnownGoodInventory, TestKnownGoodEntry};
     use std::fs;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -1385,12 +1586,33 @@ mod tests {
         })
         .with_reconciliation_stores(journals.clone(), failure_memory.clone());
         state.set_library_dir_for_test(paths.library_dir.to_string_lossy().into_owned());
+        activate_empty_inventory(&state, INSTANCE_ID);
         Fixture {
             state,
             journals,
             failure_memory,
             root,
         }
+    }
+
+    fn empty_inventory() -> KnownGoodInventory {
+        KnownGoodInventory::from_test_entries(Vec::<TestKnownGoodEntry>::new())
+            .expect("empty known-good inventory")
+    }
+
+    fn activate_empty_inventory(state: &AppState, instance_id: &str) -> Arc<KnownGoodInventory> {
+        state.activate_known_good_inventory_for_test(instance_id, empty_inventory());
+        let instance = state.instances().get(instance_id).expect("test instance");
+        let library_root = PathBuf::from(state.library_dir().expect("test library root"));
+        state
+            .known_good
+            .active_inventory(
+                &instance.id,
+                &instance.version_id,
+                &instance.created_at,
+                &library_root,
+            )
+            .expect("active test known-good inventory")
     }
 
     async fn cleanup(fixture: Fixture) {
@@ -2036,6 +2258,421 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn component_rebuild_admission_revalidates_root_after_both_mutation_waits() {
+        let fixture = fixture("component-admission-root-drift");
+        let (evidence, _) = recorded_runtime_artifact_failure(
+            &fixture,
+            INSTANCE_ID,
+            "component-admission-root-drift-artifact",
+        )
+        .await;
+        let component_writer = fixture
+            .state
+            .sessions
+            .acquire_shared_component_mutation()
+            .await
+            .expect("hold component writer");
+        let (config_acquired_tx, config_acquired_rx) = tokio::sync::oneshot::channel();
+        let state = fixture.state.clone();
+        let admission = tokio::spawn(async move {
+            state
+                .admit_component_rebuild_with_config_observer(
+                    evidence,
+                    OperationId::new("component-admission-root-drift-rebuild"),
+                    chrono::Duration::minutes(30),
+                    move || {
+                        let _ = config_acquired_tx.send(());
+                    },
+                )
+                .await
+        });
+        config_acquired_rx
+            .await
+            .expect("admission owns config before waiting for component writer");
+
+        let replacement_library = fixture.root.join("replacement-library-during-admission");
+        fs::create_dir_all(&replacement_library).expect("replacement library root");
+        fixture
+            .state
+            .set_library_dir_for_test(replacement_library.to_string_lossy().into_owned());
+        drop(component_writer);
+
+        assert_eq!(
+            admission.await.expect("admission task").err(),
+            Some(ReconciliationEvidenceRejection::IncarnationMismatch)
+        );
+        cleanup(fixture).await;
+    }
+
+    #[tokio::test]
+    async fn component_rebuild_admission_rejects_inventory_replacement_during_wait() {
+        let fixture = fixture("component-admission-inventory-wait-drift");
+        let original_inventory = {
+            let instance = fixture
+                .state
+                .instances()
+                .get(INSTANCE_ID)
+                .expect("test instance");
+            fixture
+                .state
+                .known_good
+                .active_inventory(
+                    &instance.id,
+                    &instance.version_id,
+                    &instance.created_at,
+                    &PathBuf::from(fixture.state.library_dir().expect("library root")),
+                )
+                .expect("original inventory")
+        };
+        let (evidence, _) = recorded_runtime_artifact_failure(
+            &fixture,
+            INSTANCE_ID,
+            "component-admission-inventory-artifact",
+        )
+        .await;
+        let component_writer = fixture
+            .state
+            .sessions
+            .acquire_shared_component_mutation()
+            .await
+            .expect("hold component writer");
+        let (config_acquired_tx, config_acquired_rx) = tokio::sync::oneshot::channel();
+        let state = fixture.state.clone();
+        let admission = tokio::spawn(async move {
+            state
+                .admit_component_rebuild_with_config_observer(
+                    evidence,
+                    OperationId::new("component-admission-inventory-rebuild"),
+                    chrono::Duration::minutes(30),
+                    move || {
+                        let _ = config_acquired_tx.send(());
+                    },
+                )
+                .await
+        });
+        config_acquired_rx
+            .await
+            .expect("admission owns config before waiting for component writer");
+        let admitted_inventory = activate_empty_inventory(&fixture.state, INSTANCE_ID);
+        assert!(!Arc::ptr_eq(&original_inventory, &admitted_inventory));
+        drop(component_writer);
+
+        assert_eq!(
+            admission.await.expect("admission task").err(),
+            Some(ReconciliationEvidenceRejection::IncarnationMismatch)
+        );
+        cleanup(fixture).await;
+    }
+
+    #[tokio::test]
+    async fn component_rebuild_admission_pins_inventory_after_admission() {
+        let fixture = fixture("component-admission-inventory-post-admission-drift");
+        let (evidence, _) = recorded_runtime_artifact_failure(
+            &fixture,
+            INSTANCE_ID,
+            "component-admission-inventory-post-admission-artifact",
+        )
+        .await;
+        let admission = fixture
+            .state
+            .admit_component_rebuild(
+                evidence,
+                OperationId::new("component-admission-inventory-post-admission-rebuild"),
+                chrono::Duration::minutes(30),
+            )
+            .await
+            .expect("component admission");
+        let admitted_inventory = admission.admitted_inventory().clone();
+        admission
+            .validate_runtime_identity(&RuntimeId::from("java-runtime-delta"), true)
+            .expect("admitted Runtime inventory is current");
+
+        let later_inventory = activate_empty_inventory(&fixture.state, INSTANCE_ID);
+        assert!(!Arc::ptr_eq(&admitted_inventory, &later_inventory));
+        assert_eq!(
+            admission
+                .validate_runtime_identity(&RuntimeId::from("java-runtime-delta"), true)
+                .err(),
+            Some(ReconciliationEvidenceRejection::IncarnationMismatch)
+        );
+
+        drop(admission);
+        cleanup(fixture).await;
+    }
+
+    #[tokio::test]
+    async fn component_rebuild_postactivation_failure_invalidates_refreshed_inventory() {
+        let fixture = fixture("component-postactivation-failure");
+        let (evidence, _) = recorded_runtime_artifact_failure(
+            &fixture,
+            INSTANCE_ID,
+            "component-postactivation-failure-artifact",
+        )
+        .await;
+        let admission = fixture
+            .state
+            .admit_component_rebuild(
+                evidence,
+                OperationId::new("component-postactivation-failure-rebuild"),
+                chrono::Duration::minutes(30),
+            )
+            .await
+            .expect("component admission");
+        let component = RuntimeId::from("java-runtime-delta");
+        let receipt = axial_minecraft::rebuild_managed_runtime_fixture_for_test(
+            fixture.state.managed_runtime_cache(),
+            component.clone(),
+        )
+        .await
+        .expect("sealed Runtime rebuild receipt");
+        let runtime_root = fixture
+            .state
+            .managed_runtime_cache()
+            .component_root(component.as_str())
+            .expect("managed Runtime root");
+        let java = if cfg!(target_os = "windows") {
+            runtime_root.join("bin").join("javaw.exe")
+        } else if cfg!(target_os = "macos") {
+            runtime_root
+                .join("jre.bundle")
+                .join("Contents")
+                .join("Home")
+                .join("bin")
+                .join("java")
+        } else {
+            runtime_root.join("bin").join("java")
+        };
+
+        assert_eq!(
+            admission
+                .succeeded_terminal_with_activation_observer(&receipt, || {
+                    fs::write(&java, b"invalidated after known-good activation")
+                        .expect("invalidate sealed Runtime receipt");
+                })
+                .await
+                .err(),
+            Some(ReconciliationEvidenceRejection::JournalMismatch)
+        );
+        assert!(admission.postcondition_failure_inventory.get().is_some());
+        let instance = fixture
+            .state
+            .instances()
+            .get(INSTANCE_ID)
+            .expect("test instance");
+        assert!(
+            fixture
+                .state
+                .known_good
+                .active_inventory(
+                    &instance.id,
+                    &instance.version_id,
+                    &instance.created_at,
+                    &PathBuf::from(fixture.state.library_dir().expect("library root")),
+                )
+                .is_none(),
+            "failed refreshed projection must not remain live authority"
+        );
+        let terminal = admission
+            .failed_postcondition_terminal(&receipt)
+            .expect("failed terminal retains exact refreshed projection proof");
+        assert_eq!(terminal.outcome(), ReconciliationTerminalOutcome::Failed);
+
+        drop((receipt, admission));
+        cleanup(fixture).await;
+    }
+
+    #[tokio::test]
+    async fn component_rebuild_postactivation_cleanup_retains_replacement_inventory() {
+        let fixture = fixture("component-postactivation-inventory-replacement");
+        let (evidence, _) = recorded_runtime_artifact_failure(
+            &fixture,
+            INSTANCE_ID,
+            "component-postactivation-inventory-replacement-artifact",
+        )
+        .await;
+        let admission = fixture
+            .state
+            .admit_component_rebuild(
+                evidence,
+                OperationId::new("component-postactivation-inventory-replacement-rebuild"),
+                chrono::Duration::minutes(30),
+            )
+            .await
+            .expect("component admission");
+        let component = RuntimeId::from("java-runtime-delta");
+        let receipt = axial_minecraft::rebuild_managed_runtime_fixture_for_test(
+            fixture.state.managed_runtime_cache(),
+            component,
+        )
+        .await
+        .expect("sealed Runtime rebuild receipt");
+        let replacement = Arc::new(std::sync::Mutex::new(None));
+        let observed_replacement = replacement.clone();
+        let state = fixture.state.clone();
+
+        assert_eq!(
+            admission
+                .succeeded_terminal_with_activation_observer(&receipt, move || {
+                    let inventory = activate_empty_inventory(&state, INSTANCE_ID);
+                    *observed_replacement
+                        .lock()
+                        .expect("replacement inventory observation") = Some(inventory);
+                })
+                .await
+                .err(),
+            Some(ReconciliationEvidenceRejection::IncarnationMismatch)
+        );
+        let replacement = replacement
+            .lock()
+            .expect("replacement inventory observation")
+            .clone()
+            .expect("replacement inventory");
+        let active = fixture
+            .state
+            .known_good
+            .active_inventory(
+                &admission.known_good.instance_id,
+                &admission.known_good.version_id,
+                &admission.known_good.created_at,
+                &admission.known_good.library_root,
+            )
+            .expect("replacement remains active");
+        assert!(Arc::ptr_eq(&active, &replacement));
+        assert!(admission.postcondition_failure_inventory.get().is_some());
+        let terminal = admission
+            .failed_postcondition_terminal(&receipt)
+            .expect("sealed failure proof does not adopt the replacement");
+        assert_eq!(terminal.outcome(), ReconciliationTerminalOutcome::Failed);
+        assert!(Arc::ptr_eq(
+            &fixture
+                .state
+                .known_good
+                .active_inventory(
+                    &admission.known_good.instance_id,
+                    &admission.known_good.version_id,
+                    &admission.known_good.created_at,
+                    &admission.known_good.library_root,
+                )
+                .expect("replacement remains active after terminalization"),
+            &replacement,
+        ));
+
+        drop((receipt, admission));
+        cleanup(fixture).await;
+    }
+
+    #[tokio::test]
+    async fn component_rebuild_postactivation_root_drift_keeps_sealed_failure_proof() {
+        let fixture = fixture("component-postactivation-root-drift");
+        let (evidence, _) = recorded_runtime_artifact_failure(
+            &fixture,
+            INSTANCE_ID,
+            "component-postactivation-root-drift-artifact",
+        )
+        .await;
+        let admission = fixture
+            .state
+            .admit_component_rebuild(
+                evidence,
+                OperationId::new("component-postactivation-root-drift-rebuild"),
+                chrono::Duration::minutes(30),
+            )
+            .await
+            .expect("component admission");
+        let component = RuntimeId::from("java-runtime-delta");
+        let receipt = axial_minecraft::rebuild_managed_runtime_fixture_for_test(
+            fixture.state.managed_runtime_cache(),
+            component,
+        )
+        .await
+        .expect("sealed Runtime rebuild receipt");
+        let replacement_library = fixture.root.join("postactivation-replacement-library");
+        fs::create_dir_all(&replacement_library).expect("replacement library root");
+        let replacement_library = replacement_library.to_string_lossy().into_owned();
+        let state = fixture.state.clone();
+
+        assert_eq!(
+            admission
+                .succeeded_terminal_with_activation_observer(&receipt, move || {
+                    state.set_library_dir_for_test(replacement_library);
+                })
+                .await
+                .err(),
+            Some(ReconciliationEvidenceRejection::IncarnationMismatch)
+        );
+        assert!(admission.postcondition_failure_inventory.get().is_some());
+        assert!(
+            fixture
+                .state
+                .known_good
+                .active_inventory(
+                    &admission.known_good.instance_id,
+                    &admission.known_good.version_id,
+                    &admission.known_good.created_at,
+                    &admission.known_good.library_root,
+                )
+                .is_none(),
+            "cleanup uses the admitted root binding after config drift"
+        );
+        let terminal = admission
+            .failed_postcondition_terminal(&receipt)
+            .expect("sealed failure proof survives current root drift");
+        assert_eq!(terminal.outcome(), ReconciliationTerminalOutcome::Failed);
+
+        drop((receipt, admission));
+        cleanup(fixture).await;
+    }
+
+    #[tokio::test]
+    async fn component_rebuild_admission_retains_library_root_mutation_until_drop() {
+        let fixture = fixture("component-admission-config-retention");
+        let (evidence, _) = recorded_runtime_artifact_failure(
+            &fixture,
+            INSTANCE_ID,
+            "component-admission-config-retention-artifact",
+        )
+        .await;
+        let admission = fixture
+            .state
+            .admit_component_rebuild(
+                evidence,
+                OperationId::new("component-admission-config-retention-rebuild"),
+                chrono::Duration::minutes(30),
+            )
+            .await
+            .expect("component admission");
+        let replacement_library = fixture.root.join("replacement-library-after-admission");
+        fs::create_dir_all(&replacement_library).expect("replacement library root");
+        let replacement_library = replacement_library.to_string_lossy().into_owned();
+        let (mutation_entered_tx, mut mutation_entered_rx) = tokio::sync::oneshot::channel();
+        let state = fixture.state.clone();
+        let mutation = tokio::spawn(async move {
+            state
+                .mutate_config(move |config| {
+                    let _ = mutation_entered_tx.send(());
+                    config.library_dir = replacement_library;
+                    Ok(())
+                })
+                .await
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            mutation_entered_rx.try_recv().is_err(),
+            "config mutation must not enter while component admission is live"
+        );
+
+        drop(admission);
+        mutation_entered_rx
+            .await
+            .expect("config mutation enters after admission drops");
+        mutation
+            .await
+            .expect("config mutation task")
+            .expect("config mutation commits");
+        cleanup(fixture).await;
+    }
+
+    #[tokio::test]
     async fn shared_runtime_terminal_suppresses_queued_cross_instance_rebuild() {
         let fixture = fixture("component-admission-shared-runtime");
         let second = fixture
@@ -2043,6 +2680,7 @@ mod tests {
             .instances()
             .insert_for_test("Second Runtime instance", "1.21.1")
             .expect("register second instance");
+        activate_empty_inventory(&fixture.state, &second.id);
         let (first_evidence, _) = recorded_runtime_artifact_failure(
             &fixture,
             INSTANCE_ID,
