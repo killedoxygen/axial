@@ -6,8 +6,18 @@ use crate::known_good::{
 };
 use crate::loaders::LoaderError;
 use crate::managed_fs::{ManagedDir, ManagedDirectoryIdentity, ManagedFileGuard};
-use crate::managed_publication::{ManagedRootPublicationLease, run_publication_blocking};
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use crate::managed_publication::{
+    ManagedCanonicalState, ManagedPriorFingerprint as PriorFingerprint,
+    ManagedPublicationDataError, ManagedRootPublicationLease, ManagedTargetPathError,
+    authenticate_guarded_publication_file, bounded_marker_bytes, committed_terminal_shape_is_valid,
+    exact_portable_names as exact_names, managed_directory_path_exists, open_managed_target_parent,
+    portable_fold, read_bounded_marker, rollback_terminal_shape_is_reachable,
+    run_publication_blocking,
+    settled_terminal_shape_is_valid as managed_settled_terminal_shape_is_valid,
+    valid_publication_nonce as valid_nonce, valid_publication_root_binding as valid_root_binding,
+    valid_publication_sha1 as valid_sha1,
+};
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 #[cfg(test)]
 use std::collections::HashMap;
@@ -102,23 +112,6 @@ struct CanonicalTarget {
     name: String,
     previous: Option<ManagedFileGuard>,
     prior_fingerprint: PriorFingerprint,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
-enum PriorFingerprint {
-    Absent,
-    ExistingFile { sha1: String, size: u64 },
-}
-
-impl PriorFingerprint {
-    fn matches_source(&self, source: &EntryFingerprint) -> bool {
-        matches!(
-            self,
-            Self::ExistingFile { sha1, size }
-                if *size == source.size && sha1 == &source.digest
-        )
-    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -373,6 +366,12 @@ impl ManagedVersionBundlePublicationError {
     }
 }
 
+impl From<ManagedPublicationDataError> for ManagedVersionBundlePublicationError {
+    fn from(_: ManagedPublicationDataError) -> Self {
+        Self::RecoveryAmbiguous
+    }
+}
+
 impl ManagedVersionBundleCommitReceipt {
     pub fn dispositions(&self) -> &[ManagedVersionBundleOrdinalDisposition] {
         &self.dispositions
@@ -612,7 +611,8 @@ fn prepare_transaction(
         .map_err(|_| ManagedVersionBundlePublicationError::Preparation)?
         .persistent_binding();
     let intent = persisted_intent(&version_id, &root_binding, &planned, created_ancestors)?;
-    let intent_bytes = marker_bytes(&intent)?;
+    let intent_bytes = bounded_marker_bytes(&intent, MAX_MARKER_BYTES)
+        .map_err(|_| ManagedVersionBundlePublicationError::Preparation)?;
     lane.write_new_exact(INTENT_NAME, &intent_bytes)
         .map_err(|_| ManagedVersionBundlePublicationError::Preparation)?;
     lane.sync()
@@ -1001,63 +1001,6 @@ fn intent_matches_projection(
                 .collect::<Vec<_>>())
 }
 
-fn valid_sha1(value: &str) -> bool {
-    value.len() == 40
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-}
-
-fn valid_nonce(value: &str) -> bool {
-    value.len() == 32
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-}
-
-#[cfg(unix)]
-fn valid_root_binding(value: &str) -> bool {
-    let mut fields = value.split(':');
-    fields.next() == Some("unix")
-        && fields.next().is_some_and(valid_fixed_hex_16)
-        && fields.next().is_some_and(valid_fixed_hex_16)
-        && fields.next().is_none()
-}
-
-#[cfg(windows)]
-fn valid_root_binding(value: &str) -> bool {
-    let mut fields = value.split(':');
-    fields.next() == Some("windows")
-        && fields.next().is_some_and(valid_fixed_hex_16)
-        && fields.next().is_some_and(|id| {
-            id.len() == 32
-                && id
-                    .bytes()
-                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-        })
-        && fields.next().is_none()
-}
-
-fn valid_fixed_hex_16(value: &str) -> bool {
-    value.len() == 16
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-}
-
-fn portable_fold(value: &str) -> String {
-    value.chars().flat_map(char::to_lowercase).collect()
-}
-
-fn marker_bytes<T: Serialize>(marker: &T) -> Result<Vec<u8>, ManagedVersionBundlePublicationError> {
-    let bytes = serde_json::to_vec(marker)
-        .map_err(|_| ManagedVersionBundlePublicationError::Preparation)?;
-    if bytes.len() > MAX_MARKER_BYTES {
-        return Err(ManagedVersionBundlePublicationError::Preparation);
-    }
-    Ok(bytes)
-}
-
 fn open_lane(
     lease: &ManagedRootPublicationLease,
 ) -> Result<ManagedDir, ManagedVersionBundlePublicationError> {
@@ -1174,85 +1117,26 @@ fn open_or_create_slots_after_intent(
     Ok((staging, quarantine))
 }
 
-fn exact_names(
-    directory: &ManagedDir,
-    allowed: &[&str],
-    max_entries: usize,
-) -> Result<BTreeSet<String>, ManagedVersionBundlePublicationError> {
-    let entries = directory
-        .entries_bounded(max_entries + 1)
-        .map_err(|_| ManagedVersionBundlePublicationError::RecoveryAmbiguous)?;
-    if entries.len() > max_entries {
-        return Err(ManagedVersionBundlePublicationError::RecoveryAmbiguous);
-    }
-    let allowed_folded = allowed
-        .iter()
-        .map(|name| (portable_fold(name), *name))
-        .collect::<Vec<_>>();
-    let mut names = BTreeSet::new();
-    let mut folded = BTreeSet::new();
-    for entry in entries {
-        let entry = entry
-            .to_str()
-            .ok_or(ManagedVersionBundlePublicationError::RecoveryAmbiguous)?;
-        let entry_folded = portable_fold(entry);
-        let Some((_, exact)) = allowed_folded
-            .iter()
-            .find(|(allowed, _)| allowed == &entry_folded)
-        else {
-            return Err(ManagedVersionBundlePublicationError::RecoveryAmbiguous);
-        };
-        if entry != *exact || !folded.insert(entry_folded) {
-            return Err(ManagedVersionBundlePublicationError::RecoveryAmbiguous);
-        }
-        names.insert(entry.to_string());
-    }
-    Ok(names)
-}
-
 fn read_intent(
     lane: &ManagedDir,
 ) -> Result<Option<(PersistedIntent, ManagedFileGuard)>, ManagedVersionBundlePublicationError> {
-    read_marker(lane, INTENT_NAME)
+    Ok(read_bounded_marker(lane, INTENT_NAME, MAX_MARKER_BYTES)?)
 }
 
 fn read_outcome(
     lane: &ManagedDir,
 ) -> Result<Option<(PersistedOutcome, ManagedFileGuard)>, ManagedVersionBundlePublicationError> {
-    read_marker(lane, OUTCOME_NAME)
+    Ok(read_bounded_marker(lane, OUTCOME_NAME, MAX_MARKER_BYTES)?)
 }
 
 fn read_settlement(
     lane: &ManagedDir,
 ) -> Result<Option<(PersistedSettlement, ManagedFileGuard)>, ManagedVersionBundlePublicationError> {
-    read_marker(lane, SETTLEMENT_NAME)
-}
-
-fn read_marker<T: DeserializeOwned + Serialize>(
-    lane: &ManagedDir,
-    name: &str,
-) -> Result<Option<(T, ManagedFileGuard)>, ManagedVersionBundlePublicationError> {
-    let Some(guard) = lane
-        .inspect_regular_file(name)
-        .map_err(|_| ManagedVersionBundlePublicationError::RecoveryAmbiguous)?
-    else {
-        return Ok(None);
-    };
-    if guard.size() == 0 || guard.size() > MAX_MARKER_BYTES as u64 {
-        return Err(ManagedVersionBundlePublicationError::RecoveryAmbiguous);
-    }
-    let bytes = lane
-        .read_guarded_file_bounded(name, &guard, MAX_MARKER_BYTES as u64)
-        .map_err(|_| ManagedVersionBundlePublicationError::RecoveryAmbiguous)?;
-    let marker = serde_json::from_slice(&bytes)
-        .map_err(|_| ManagedVersionBundlePublicationError::RecoveryAmbiguous)?;
-    if serde_json::to_vec(&marker)
-        .map_err(|_| ManagedVersionBundlePublicationError::RecoveryAmbiguous)?
-        != bytes
-    {
-        return Err(ManagedVersionBundlePublicationError::RecoveryAmbiguous);
-    }
-    Ok(Some((marker, guard)))
+    Ok(read_bounded_marker(
+        lane,
+        SETTLEMENT_NAME,
+        MAX_MARKER_BYTES,
+    )?)
 }
 
 fn validate_outcome(
@@ -1306,29 +1190,17 @@ fn validate_existing_portable_paths(
     fingerprints: &[EntryFingerprint],
 ) -> Result<(), ManagedVersionBundlePublicationError> {
     for fingerprint in fingerprints {
-        let root_name = fingerprint.root.directory_name();
-        if !root
-            .has_portably_exact_child_name(root_name)
-            .map_err(|_| ManagedVersionBundlePublicationError::PortablePathAlias)?
-        {
-            continue;
-        }
-        let mut directory = root
-            .open_child(root_name)
-            .map_err(|_| ManagedVersionBundlePublicationError::Preparation)?;
-        let mut segments = fingerprint.path.as_str().split('/').peekable();
-        while let Some(segment) = segments.next() {
-            let exists = directory
-                .has_portably_exact_child_name(segment)
-                .map_err(|_| ManagedVersionBundlePublicationError::PortablePathAlias)?;
-            if !exists {
-                break;
-            }
-            if segments.peek().is_some() {
-                directory = directory
-                    .open_child(segment)
-                    .map_err(|_| ManagedVersionBundlePublicationError::Preparation)?;
-            }
+        if let Err(error) = crate::managed_publication::validate_existing_managed_target_path(
+            root,
+            fingerprint.root.directory_name(),
+            fingerprint.path.as_str(),
+        ) {
+            return Err(match error {
+                ManagedTargetPathError::PortableAlias => {
+                    ManagedVersionBundlePublicationError::PortablePathAlias
+                }
+                ManagedTargetPathError::Access => ManagedVersionBundlePublicationError::Preparation,
+            });
         }
     }
     Ok(())
@@ -1391,66 +1263,11 @@ fn open_canonical_parent(
     root: &ManagedDir,
     fingerprint: &EntryFingerprint,
 ) -> Result<Option<(ManagedDir, String)>, ManagedVersionBundlePublicationError> {
-    let root_name = fingerprint.root.directory_name();
-    if !root
-        .has_portably_exact_child_name(root_name)
-        .map_err(|_| ManagedVersionBundlePublicationError::RecoveryAmbiguous)?
-    {
-        return Ok(None);
-    }
-    let mut directory = root
-        .open_child(root_name)
-        .map_err(|_| ManagedVersionBundlePublicationError::RecoveryAmbiguous)?;
-    let mut segments = fingerprint.path.as_str().split('/').peekable();
-    while let Some(segment) = segments.next() {
-        if segments.peek().is_none() {
-            directory
-                .has_portably_exact_child_name(segment)
-                .map_err(|_| ManagedVersionBundlePublicationError::RecoveryAmbiguous)?;
-            return Ok(Some((directory, segment.to_string())));
-        }
-        if !directory
-            .has_portably_exact_child_name(segment)
-            .map_err(|_| ManagedVersionBundlePublicationError::RecoveryAmbiguous)?
-        {
-            return Ok(None);
-        }
-        directory = directory
-            .open_child(segment)
-            .map_err(|_| ManagedVersionBundlePublicationError::RecoveryAmbiguous)?;
-    }
-    Err(ManagedVersionBundlePublicationError::RecoveryAmbiguous)
-}
-
-fn managed_directory_path_exists(
-    root: &ManagedDir,
-    path: &str,
-) -> Result<bool, ManagedVersionBundlePublicationError> {
-    let mut segments = path.split('/');
-    let first = segments
-        .next()
-        .ok_or(ManagedVersionBundlePublicationError::RecoveryAmbiguous)?;
-    if !root
-        .has_portably_exact_child_name(first)
-        .map_err(|_| ManagedVersionBundlePublicationError::RecoveryAmbiguous)?
-    {
-        return Ok(false);
-    }
-    let mut directory = root
-        .open_child(first)
-        .map_err(|_| ManagedVersionBundlePublicationError::RecoveryAmbiguous)?;
-    for segment in segments {
-        if !directory
-            .has_portably_exact_child_name(segment)
-            .map_err(|_| ManagedVersionBundlePublicationError::RecoveryAmbiguous)?
-        {
-            return Ok(false);
-        }
-        directory = directory
-            .open_child(segment)
-            .map_err(|_| ManagedVersionBundlePublicationError::RecoveryAmbiguous)?;
-    }
-    Ok(true)
+    Ok(open_managed_target_parent(
+        root,
+        fingerprint.root.directory_name(),
+        fingerprint.path.as_str(),
+    )?)
 }
 
 fn context_from_prepared(
@@ -1483,11 +1300,13 @@ fn context_from_prepared(
             .map_err(|_| ManagedVersionBundlePublicationError::RecoveryAmbiguous)?
         {
             Some(guard) => {
-                authenticate_guarded(
+                authenticate_guarded_publication_file(
                     &staging,
                     &persisted.staging_slot,
                     &guard,
-                    &planned.fingerprint,
+                    &planned.fingerprint.digest,
+                    planned.fingerprint.size,
+                    MAX_TIER2_ARTIFACT_BYTES,
                 )?;
                 guard
             }
@@ -1587,7 +1406,14 @@ fn rolled_back_targets(
         match (&persisted.prior, previous.as_ref()) {
             (PriorFingerprint::Absent, None) => {}
             (PriorFingerprint::ExistingFile { sha1, size }, Some(guard)) => {
-                authenticate_prior(&parent, &name, guard, sha1, *size)?;
+                authenticate_guarded_publication_file(
+                    &parent,
+                    &name,
+                    guard,
+                    sha1,
+                    *size,
+                    MAX_TIER2_ARTIFACT_BYTES,
+                )?;
             }
             _ => return Err(ManagedVersionBundlePublicationError::RecoveryAmbiguous),
         }
@@ -1599,41 +1425,6 @@ fn rolled_back_targets(
         }));
     }
     Ok(targets)
-}
-
-fn authenticate_guarded(
-    directory: &ManagedDir,
-    name: &str,
-    guard: &ManagedFileGuard,
-    fingerprint: &EntryFingerprint,
-) -> Result<(), ManagedVersionBundlePublicationError> {
-    if guard.size() != fingerprint.size
-        || directory
-            .sha1_guarded_file(name, guard, MAX_TIER2_ARTIFACT_BYTES)
-            .map_err(|_| ManagedVersionBundlePublicationError::RecoveryAmbiguous)?
-            != fingerprint.digest
-    {
-        return Err(ManagedVersionBundlePublicationError::RecoveryAmbiguous);
-    }
-    Ok(())
-}
-
-fn authenticate_prior(
-    directory: &ManagedDir,
-    name: &str,
-    guard: &ManagedFileGuard,
-    sha1: &str,
-    size: u64,
-) -> Result<(), ManagedVersionBundlePublicationError> {
-    if guard.size() != size
-        || directory
-            .sha1_guarded_file(name, guard, MAX_TIER2_ARTIFACT_BYTES)
-            .map_err(|_| ManagedVersionBundlePublicationError::RecoveryAmbiguous)?
-            != sha1
-    {
-        return Err(ManagedVersionBundlePublicationError::RecoveryAmbiguous);
-    }
-    Ok(())
 }
 
 fn prepare_canonical_targets(context: &mut TransactionContext) -> Result<(), LoaderError> {
@@ -1711,31 +1502,28 @@ fn open_canonical_parent_loader(
     root: &ManagedDir,
     fingerprint: &EntryFingerprint,
 ) -> Result<Option<(ManagedDir, String)>, LoaderError> {
-    let root_name = fingerprint.root.directory_name();
-    if !root.has_portably_exact_child_name(root_name)? {
-        return Ok(None);
-    }
-    let mut directory = root.open_child(root_name)?;
-    let mut segments = fingerprint.path.as_str().split('/').peekable();
-    while let Some(segment) = segments.next() {
-        if segments.peek().is_none() {
-            directory.has_portably_exact_child_name(segment)?;
-            return Ok(Some((directory, segment.to_string())));
-        }
-        if !directory.has_portably_exact_child_name(segment)? {
-            return Ok(None);
-        }
-        directory = directory.open_child(segment)?;
-    }
-    Err(LoaderError::Verify(
-        "version bundle path has no file name".to_string(),
-    ))
+    open_managed_target_parent(
+        root,
+        fingerprint.root.directory_name(),
+        fingerprint.path.as_str(),
+    )
+    .map_err(|_| LoaderError::Verify("version bundle target path changed".to_string()))
 }
 
 enum ObservedCanonical {
     Absent,
     Source(ManagedFileGuard),
     Prior(ManagedFileGuard),
+}
+
+impl ObservedCanonical {
+    fn state(&self) -> ManagedCanonicalState {
+        match self {
+            Self::Absent => ManagedCanonicalState::Absent,
+            Self::Source(_) => ManagedCanonicalState::Source,
+            Self::Prior(_) => ManagedCanonicalState::Prior,
+        }
+    }
 }
 
 struct RecoveryObservation {
@@ -1796,7 +1584,14 @@ fn observe_recovery_entry(
         .inspect_regular_file(&persisted.staging_slot)
         .map_err(|_| ManagedVersionBundlePublicationError::RecoveryAmbiguous)?;
     if let Some(stage) = stage.as_ref() {
-        authenticate_guarded(staging, &persisted.staging_slot, stage, fingerprint)?;
+        authenticate_guarded_publication_file(
+            staging,
+            &persisted.staging_slot,
+            stage,
+            &fingerprint.digest,
+            fingerprint.size,
+            MAX_TIER2_ARTIFACT_BYTES,
+        )?;
     }
     let quarantined = quarantine
         .inspect_regular_file(&persisted.quarantine_slot)
@@ -1804,7 +1599,14 @@ fn observe_recovery_entry(
     match (&persisted.prior, quarantined.as_ref()) {
         (_, None) => {}
         (PriorFingerprint::ExistingFile { sha1, size }, Some(guard)) => {
-            authenticate_prior(quarantine, &persisted.quarantine_slot, guard, sha1, *size)?;
+            authenticate_guarded_publication_file(
+                quarantine,
+                &persisted.quarantine_slot,
+                guard,
+                sha1,
+                *size,
+                MAX_TIER2_ARTIFACT_BYTES,
+            )?;
         }
         (PriorFingerprint::Absent, Some(_)) => {
             return Err(ManagedVersionBundlePublicationError::RecoveryAmbiguous);
@@ -1844,7 +1646,14 @@ fn reconcile_unfinished_moves(
         .iter()
         .zip(fingerprints.iter().zip(&intent.entries))
         .all(|(observed, (fingerprint, persisted))| {
-            committed_shape(observed, fingerprint, persisted)
+            committed_terminal_shape_is_valid(
+                &persisted.prior,
+                &fingerprint.digest,
+                fingerprint.size,
+                observed.canonical.state(),
+                observed.stage.is_some(),
+                observed.quarantine.is_some(),
+            )
         })
     {
         return Ok(UnfinishedMoveOutcome::Committed);
@@ -1853,7 +1662,14 @@ fn reconcile_unfinished_moves(
         .iter()
         .zip(fingerprints.iter().zip(&intent.entries))
         .all(|(observed, (fingerprint, persisted))| {
-            rollback_shape_is_reachable(observed, fingerprint, persisted)
+            rollback_terminal_shape_is_reachable(
+                &persisted.prior,
+                &fingerprint.digest,
+                fingerprint.size,
+                observed.canonical.state(),
+                observed.stage.is_some(),
+                observed.quarantine.is_some(),
+            )
         })
     {
         return Err(ManagedVersionBundlePublicationError::RecoveryAmbiguous);
@@ -1899,7 +1715,9 @@ fn reconcile_unfinished_moves(
                 }
             }
             PriorFingerprint::ExistingFile { sha1, size }
-                if persisted.prior.matches_source(fingerprint) =>
+                if persisted
+                    .prior
+                    .matches_source(&fingerprint.digest, fingerprint.size) =>
             {
                 if observed.quarantine.is_some()
                     || !matches!(&observed.canonical, ObservedCanonical::Source(_))
@@ -1913,7 +1731,14 @@ fn reconcile_unfinished_moves(
                 let ObservedCanonical::Source(guard) = &observed.canonical else {
                     unreachable!("matched source state")
                 };
-                authenticate_prior(parent, &observed.name, guard, sha1, *size)?;
+                authenticate_guarded_publication_file(
+                    parent,
+                    &observed.name,
+                    guard,
+                    sha1,
+                    *size,
+                    MAX_TIER2_ARTIFACT_BYTES,
+                )?;
             }
             PriorFingerprint::ExistingFile { .. } => match &observed.canonical {
                 ObservedCanonical::Source(source) => {
@@ -2035,53 +1860,6 @@ fn recover_unfinished_commit(
     Ok(false)
 }
 
-fn committed_shape(
-    observed: &RecoveryObservation,
-    fingerprint: &EntryFingerprint,
-    persisted: &PersistedEntry,
-) -> bool {
-    if !matches!(&observed.canonical, ObservedCanonical::Source(_)) {
-        return false;
-    }
-    match &persisted.prior {
-        PriorFingerprint::Absent => observed.stage.is_none() && observed.quarantine.is_none(),
-        PriorFingerprint::ExistingFile { .. } if persisted.prior.matches_source(fingerprint) => {
-            observed.stage.is_some() && observed.quarantine.is_none()
-        }
-        PriorFingerprint::ExistingFile { .. } => {
-            observed.stage.is_none() && observed.quarantine.is_some()
-        }
-    }
-}
-
-fn rollback_shape_is_reachable(
-    observed: &RecoveryObservation,
-    fingerprint: &EntryFingerprint,
-    persisted: &PersistedEntry,
-) -> bool {
-    match &persisted.prior {
-        PriorFingerprint::Absent => {
-            observed.quarantine.is_none()
-                && match &observed.canonical {
-                    ObservedCanonical::Source(_) => observed.stage.is_none(),
-                    ObservedCanonical::Absent => true,
-                    ObservedCanonical::Prior(_) => false,
-                }
-        }
-        PriorFingerprint::ExistingFile { .. } if persisted.prior.matches_source(fingerprint) => {
-            observed.quarantine.is_none()
-                && matches!(&observed.canonical, ObservedCanonical::Source(_))
-        }
-        PriorFingerprint::ExistingFile { .. } => match &observed.canonical {
-            ObservedCanonical::Source(_) => {
-                observed.stage.is_none() && observed.quarantine.is_some()
-            }
-            ObservedCanonical::Absent => observed.stage.is_some() && observed.quarantine.is_some(),
-            ObservedCanonical::Prior(_) => observed.quarantine.is_none(),
-        },
-    }
-}
-
 fn write_outcome(
     lane: &ManagedDir,
     intent: &PersistedIntent,
@@ -2092,8 +1870,12 @@ fn write_outcome(
         transaction_nonce: intent.transaction_nonce.clone(),
         outcome,
     };
-    lane.write_new_exact(OUTCOME_NAME, &marker_bytes(&marker)?)
-        .map_err(|_| ManagedVersionBundlePublicationError::Preparation)?;
+    lane.write_new_exact(
+        OUTCOME_NAME,
+        &bounded_marker_bytes(&marker, MAX_MARKER_BYTES)
+            .map_err(|_| ManagedVersionBundlePublicationError::Preparation)?,
+    )
+    .map_err(|_| ManagedVersionBundlePublicationError::Preparation)?;
     lane.sync()
         .map_err(|_| ManagedVersionBundlePublicationError::Preparation)?;
     lane.inspect_regular_file(OUTCOME_NAME)
@@ -2146,16 +1928,13 @@ fn reconstruct_terminal_context(
         } = observed;
         let (state, target, canonical_guard, stage_guard) = match outcome.outcome {
             PersistedTerminalOutcome::Committed => {
-                if !committed_shape(
-                    &RecoveryObservation {
-                        parent: parent.clone(),
-                        name: name.clone(),
-                        canonical,
-                        stage,
-                        quarantine: quarantined,
-                    },
-                    &fingerprint,
-                    persisted,
+                if !committed_terminal_shape_is_valid(
+                    &persisted.prior,
+                    &fingerprint.digest,
+                    fingerprint.size,
+                    canonical.state(),
+                    stage.is_some(),
+                    quarantined.is_some(),
                 ) {
                     return Err(ManagedVersionBundlePublicationError::RecoveryAmbiguous);
                 }
@@ -2182,7 +1961,9 @@ fn reconstruct_terminal_context(
                 let (state, previous) = match &persisted.prior {
                     PriorFingerprint::Absent => (EntryState::PublishedNew, None),
                     PriorFingerprint::ExistingFile { .. }
-                        if persisted.prior.matches_source(&fingerprint) =>
+                        if persisted
+                            .prior
+                            .matches_source(&fingerprint.digest, fingerprint.size) =>
                     {
                         (EntryState::AlreadyExact, None)
                     }
@@ -2229,7 +2010,9 @@ fn reconstruct_terminal_context(
                         })
                     }
                     (PriorFingerprint::ExistingFile { .. }, ObservedCanonical::Source(guard))
-                        if persisted.prior.matches_source(&fingerprint) =>
+                        if persisted
+                            .prior
+                            .matches_source(&fingerprint.digest, fingerprint.size) =>
                     {
                         Some(CanonicalTarget {
                             parent: parent
@@ -2445,7 +2228,10 @@ fn promote_entry(context: &mut TransactionContext, index: usize) -> Result<(), L
         .target
         .as_mut()
         .ok_or_else(|| LoaderError::Verify("version bundle target was not prepared".to_string()))?;
-    if target.prior_fingerprint.matches_source(&entry.fingerprint) {
+    if target
+        .prior_fingerprint
+        .matches_source(&entry.fingerprint.digest, entry.fingerprint.size)
+    {
         let previous = target.previous.as_ref().ok_or_else(|| {
             LoaderError::Verify("version bundle exact prior guard is absent".to_string())
         })?;
@@ -3119,7 +2905,9 @@ fn settle_context(
     };
     context.lane.write_new_exact(
         SETTLEMENT_NAME,
-        &marker_bytes(&settlement).map_err(publication_error_as_loader)?,
+        &bounded_marker_bytes(&settlement, MAX_MARKER_BYTES).map_err(|_| {
+            publication_error_as_loader(ManagedVersionBundlePublicationError::Preparation)
+        })?,
     )?;
     context.lane.sync()?;
     context.lease.publication_directory().sync()?;
@@ -3260,25 +3048,24 @@ fn validate_exact_terminal_shape(
         )
         .map_err(publication_error_as_loader)?;
         let exact = match outcome {
-            PersistedTerminalOutcome::Committed => {
-                committed_shape(&observed, fingerprint, persisted)
-            }
+            PersistedTerminalOutcome::Committed => committed_terminal_shape_is_valid(
+                &persisted.prior,
+                &fingerprint.digest,
+                fingerprint.size,
+                observed.canonical.state(),
+                observed.stage.is_some(),
+                observed.quarantine.is_some(),
+            ),
             PersistedTerminalOutcome::RolledBack { .. } => {
                 observed.stage.is_some()
-                    && observed.quarantine.is_none()
-                    && match &persisted.prior {
-                        PriorFingerprint::Absent => {
-                            matches!(&observed.canonical, ObservedCanonical::Absent)
-                        }
-                        PriorFingerprint::ExistingFile { .. }
-                            if persisted.prior.matches_source(fingerprint) =>
-                        {
-                            matches!(&observed.canonical, ObservedCanonical::Source(_))
-                        }
-                        PriorFingerprint::ExistingFile { .. } => {
-                            matches!(&observed.canonical, ObservedCanonical::Prior(_))
-                        }
-                    }
+                    && managed_settled_terminal_shape_is_valid(
+                        false,
+                        &persisted.prior,
+                        &fingerprint.digest,
+                        fingerprint.size,
+                        observed.canonical.state(),
+                        observed.quarantine.is_some(),
+                    )
             }
         };
         if !exact {
@@ -3369,11 +3156,13 @@ fn cleanup_settled_lane(
         .zip(&settlement.intent.entries)
         .zip(&observations)
     {
-        if !settled_terminal_shape_is_valid(
-            settlement.outcome.outcome,
-            fingerprint,
-            persisted,
-            observed,
+        if !managed_settled_terminal_shape_is_valid(
+            settlement.outcome.outcome == PersistedTerminalOutcome::Committed,
+            &persisted.prior,
+            &fingerprint.digest,
+            fingerprint.size,
+            observed.canonical.state(),
+            observed.quarantine.is_some(),
         ) {
             return Err(ManagedVersionBundlePublicationError::RecoveryAmbiguous);
         }
@@ -3454,51 +3243,20 @@ fn validate_marker_free_settlement_shape(
             persisted,
         )
         .map_err(publication_error_as_loader)?;
-        if !settled_terminal_shape_is_valid(expected_outcome, fingerprint, persisted, &observed) {
+        if !managed_settled_terminal_shape_is_valid(
+            expected_outcome == PersistedTerminalOutcome::Committed,
+            &persisted.prior,
+            &fingerprint.digest,
+            fingerprint.size,
+            observed.canonical.state(),
+            observed.quarantine.is_some(),
+        ) {
             return Err(LoaderError::Verify(
                 "version bundle marker-free settlement terminal shape changed".to_string(),
             ));
         }
     }
     Ok(())
-}
-
-fn settled_terminal_shape_is_valid(
-    outcome: PersistedTerminalOutcome,
-    fingerprint: &EntryFingerprint,
-    persisted: &PersistedEntry,
-    observed: &RecoveryObservation,
-) -> bool {
-    match outcome {
-        PersistedTerminalOutcome::Committed => {
-            matches!(&observed.canonical, ObservedCanonical::Source(_))
-                && match &persisted.prior {
-                    PriorFingerprint::Absent => observed.quarantine.is_none(),
-                    PriorFingerprint::ExistingFile { .. }
-                        if persisted.prior.matches_source(fingerprint) =>
-                    {
-                        observed.quarantine.is_none()
-                    }
-                    PriorFingerprint::ExistingFile { .. } => true,
-                }
-        }
-        PersistedTerminalOutcome::RolledBack { .. } => {
-            observed.quarantine.is_none()
-                && match &persisted.prior {
-                    PriorFingerprint::Absent => {
-                        matches!(&observed.canonical, ObservedCanonical::Absent)
-                    }
-                    PriorFingerprint::ExistingFile { .. }
-                        if persisted.prior.matches_source(fingerprint) =>
-                    {
-                        matches!(&observed.canonical, ObservedCanonical::Source(_))
-                    }
-                    PriorFingerprint::ExistingFile { .. } => {
-                        matches!(&observed.canonical, ObservedCanonical::Prior(_))
-                    }
-                }
-        }
-    }
 }
 
 fn publication_as_loader(
@@ -3630,7 +3388,7 @@ mod settlement_tests {
         let lane = open_lane(&lease).expect("open settlement retry lane");
         lane.write_new_exact(
             INTENT_NAME,
-            &marker_bytes(&intent).expect("serialize settlement intent"),
+            &bounded_marker_bytes(&intent, MAX_MARKER_BYTES).expect("serialize settlement intent"),
         )
         .expect("write settlement intent");
         lane.sync().expect("sync settlement intent");
