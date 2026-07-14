@@ -13,7 +13,8 @@ pub(crate) const COMPONENT_INTENT_FILE: &str = "intent.bin";
 pub(crate) const COMPONENT_OUTCOME_FILE: &str = "outcome.bin";
 pub(crate) const COMPONENT_SETTLEMENT_FILE: &str = "settlement.bin";
 
-pub(crate) const COMPONENT_OUTCOME_BYTES: usize = 192;
+const COMPONENT_OUTCOME_BODY_BYTES: usize = 184;
+pub(crate) const COMPONENT_OUTCOME_BYTES: usize = COMPONENT_OUTCOME_BODY_BYTES + 32;
 pub(crate) const COMPONENT_SETTLEMENT_HEADER_BYTES: usize = 96;
 pub(crate) const MAX_COMPONENT_SETTLEMENT_BYTES: usize =
     COMPONENT_SETTLEMENT_HEADER_BYTES + COMPONENT_OUTCOME_BYTES + MAX_COMPONENT_INTENT_BYTES;
@@ -21,6 +22,7 @@ pub(crate) const MAX_COMPONENT_SETTLEMENT_BYTES: usize =
 const OUTCOME_MAGIC: &[u8; 8] = b"AXCPOUT\0";
 const SETTLEMENT_MAGIC: &[u8; 8] = b"AXCPSET\0";
 const FORMAT_VERSION: u16 = 1;
+const OUTCOME_CHECKSUM_DOMAIN: &[u8] = b"axial.component.outcome.v1\0";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
@@ -199,10 +201,11 @@ pub(crate) fn encode_component_outcome(
     bytes.extend_from_slice(&outcome.intent_sha256);
     bytes.extend_from_slice(&outcome.logical_rows_sha256);
     bytes.extend_from_slice(&outcome.projection_sha256);
-    put_u64(&mut bytes, 0);
-    if bytes.len() != COMPONENT_OUTCOME_BYTES {
+    if bytes.len() != COMPONENT_OUTCOME_BODY_BYTES {
         return Err(ComponentPublicationRecordError);
     }
+    let checksum = outcome_checksum(&bytes);
+    bytes.extend_from_slice(&checksum);
     Ok(bytes)
 }
 
@@ -212,7 +215,12 @@ pub(crate) fn decode_component_outcome(
     if bytes.len() != COMPONENT_OUTCOME_BYTES {
         return Err(ComponentPublicationRecordError);
     }
-    let mut cursor = ByteCursor::new(bytes);
+    let (body, encoded_checksum) = bytes.split_at(COMPONENT_OUTCOME_BODY_BYTES);
+    let expected_checksum = outcome_checksum(body);
+    if encoded_checksum != expected_checksum.as_slice() {
+        return Err(ComponentPublicationRecordError);
+    }
+    let mut cursor = ByteCursor::new(body);
     cursor.expect(OUTCOME_MAGIC)?;
     if cursor.u16()? != FORMAT_VERSION {
         return Err(ComponentPublicationRecordError);
@@ -237,7 +245,7 @@ pub(crate) fn decode_component_outcome(
         logical_rows_sha256: cursor.array()?,
         projection_sha256: cursor.array()?,
     };
-    if cursor.u64()? != 0 || !cursor.finished() {
+    if !cursor.finished() {
         return Err(ComponentPublicationRecordError);
     }
     validate_outcome(&outcome)?;
@@ -504,6 +512,13 @@ fn put_u64(output: &mut Vec<u8>, value: u64) {
     output.extend_from_slice(&value.to_le_bytes());
 }
 
+fn outcome_checksum(body: &[u8]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(OUTCOME_CHECKSUM_DOMAIN);
+    hasher.update(body);
+    hasher.finalize().into()
+}
+
 struct ByteCursor<'a> {
     bytes: &'a [u8],
     position: usize,
@@ -564,7 +579,8 @@ mod tests {
     use super::*;
     use crate::artifact_path::ArtifactRelativePath;
     use crate::managed_component_table::{
-        ComponentPriorFile, ComponentTableShard, ManagedComponentArtifactKind,
+        COMPONENT_TABLE_HEADER_BYTES, COMPONENT_TABLE_ROWS_PER_SHARD, ComponentPriorFile,
+        ComponentShardDescriptor, ComponentTableShard, ManagedComponentArtifactKind,
         build_component_intent_manifest, encode_component_intent_manifest,
         encode_component_table_shard,
     };
@@ -601,6 +617,39 @@ mod tests {
         )
         .unwrap();
         encode_component_intent_manifest(&manifest).unwrap()
+    }
+
+    fn maximum_intent_bytes() -> Vec<u8> {
+        let shard_count = expected_shard_count(MAX_COMPONENT_TABLE_ROWS).unwrap();
+        let shards = (0..shard_count)
+            .map(|index| {
+                let first_row = index * COMPONENT_TABLE_ROWS_PER_SHARD;
+                ComponentShardDescriptor {
+                    shard_index: u32::try_from(index).unwrap(),
+                    first_row: u32::try_from(first_row).unwrap(),
+                    row_count: u32::try_from(
+                        (MAX_COMPONENT_TABLE_ROWS - first_row).min(COMPONENT_TABLE_ROWS_PER_SHARD),
+                    )
+                    .unwrap(),
+                    byte_len: u32::try_from(COMPONENT_TABLE_HEADER_BYTES).unwrap(),
+                    final_bytes: 0,
+                    prior_bytes: 0,
+                    sha256: [u8::try_from(index % 251).unwrap(); 32],
+                }
+            })
+            .collect();
+        encode_component_intent_manifest(&ComponentIntentManifest {
+            component: ManagedComponentKind::Assets,
+            total_rows: u32::try_from(MAX_COMPONENT_TABLE_ROWS).unwrap(),
+            final_bytes: 0,
+            prior_bytes: 0,
+            transaction_nonce: [0x55; 16],
+            root_binding_sha256: [0x66; 32],
+            logical_rows_sha256: [0x77; 32],
+            projection_sha256: [0x88; 32],
+            shards,
+        })
+        .unwrap()
     }
 
     fn observation(
@@ -664,6 +713,53 @@ mod tests {
                 Err(ComponentPublicationRecordError)
             );
         }
+    }
+
+    #[test]
+    fn outcome_checksum_rejects_every_single_bit_drift() {
+        let intent = intent_bytes();
+        let outcome = ComponentOutcomeRecord::for_intent(
+            &intent,
+            ComponentTerminalOutcome::Committed,
+            ComponentRollbackEffect::None,
+        )
+        .unwrap();
+        let original = encode_component_outcome(&outcome).unwrap();
+        for offset in 0..original.len() {
+            for bit in 0..u8::BITS {
+                let mut corrupted = original.clone();
+                corrupted[offset] ^= 1 << bit;
+                assert_eq!(
+                    decode_component_outcome(&corrupted),
+                    Err(ComponentPublicationRecordError),
+                    "accepted outcome drift at byte {offset}, bit {bit}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn settlement_accepts_the_exact_maximum_bound_and_rejects_oversize() {
+        let intent = maximum_intent_bytes();
+        assert_eq!(intent.len(), MAX_COMPONENT_INTENT_BYTES);
+        let outcome = ComponentOutcomeRecord::for_intent(
+            &intent,
+            ComponentTerminalOutcome::RolledBack,
+            ComponentRollbackEffect::Reconciliation,
+        )
+        .unwrap();
+        let settlement = encode_component_settlement(&outcome, &intent).unwrap();
+        assert_eq!(settlement.len(), MAX_COMPONENT_SETTLEMENT_BYTES);
+        assert_eq!(
+            decode_component_settlement(&settlement)
+                .unwrap()
+                .encoded_intent,
+            intent,
+        );
+        assert_eq!(
+            decode_component_settlement(&vec![0; MAX_COMPONENT_SETTLEMENT_BYTES + 1]),
+            Err(ComponentPublicationRecordError),
+        );
     }
 
     #[test]
@@ -860,6 +956,7 @@ mod tests {
         assert_eq!(COMPONENT_INTENT_FILE, "intent.bin");
         assert_eq!(COMPONENT_OUTCOME_FILE, "outcome.bin");
         assert_eq!(COMPONENT_SETTLEMENT_FILE, "settlement.bin");
-        assert_eq!(MAX_COMPONENT_SETTLEMENT_BYTES, 50_496);
+        assert_eq!(COMPONENT_OUTCOME_BYTES, 216);
+        assert_eq!(MAX_COMPONENT_SETTLEMENT_BYTES, 50_520);
     }
 }
