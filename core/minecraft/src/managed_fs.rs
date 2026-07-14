@@ -53,6 +53,28 @@ pub(crate) struct ManagedFileGuard {
     size: u64,
 }
 
+#[derive(Debug)]
+pub(crate) enum ManagedCreateOnlyWriteFailure {
+    BeforePromotion(LoaderError),
+    PromotionAttempted {
+        final_guard: Option<ManagedFileGuard>,
+        cause: LoaderError,
+    },
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ManagedCreateOnlyWriteFault {
+    AfterTempCreated,
+    AfterBytesWritten,
+    AfterFileSynced,
+    AfterTempVerified,
+    AfterPromotion,
+    AfterDirectorySynced,
+    AfterFinalVerified,
+    AfterRevalidated,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum ManagedEmptyChildRemoval {
     Removed,
@@ -321,6 +343,13 @@ struct PendingTemp {
     armed: bool,
 }
 
+struct PendingExactTemp {
+    directory: ManagedDir,
+    name: String,
+    _active: ActiveTemp,
+    guard: Option<ManagedFileGuard>,
+}
+
 struct PendingCreatedFile {
     directory: ManagedDir,
     name: String,
@@ -404,6 +433,42 @@ impl Drop for PendingTemp {
                 &self.directory.inner.path,
                 &self.name,
             );
+        }
+    }
+}
+
+impl PendingExactTemp {
+    fn arm(
+        directory: ManagedDir,
+        name: String,
+        active: ActiveTemp,
+        guard: ManagedFileGuard,
+    ) -> Self {
+        Self {
+            directory,
+            name,
+            _active: active,
+            guard: Some(guard),
+        }
+    }
+
+    fn guard_mut(&mut self) -> &mut ManagedFileGuard {
+        self.guard
+            .as_mut()
+            .expect("pending exact temp retains its guard until promotion")
+    }
+
+    fn take_guard(&mut self) -> ManagedFileGuard {
+        self.guard
+            .take()
+            .expect("pending exact temp retains its guard until promotion")
+    }
+}
+
+impl Drop for PendingExactTemp {
+    fn drop(&mut self) {
+        if let Some(guard) = self.guard.as_ref() {
+            let _ = self.directory.remove_guarded_file(&self.name, guard);
         }
     }
 }
@@ -1338,6 +1403,221 @@ impl ManagedDir {
 
     pub(crate) fn write_new_exact(&self, name: &str, bytes: &[u8]) -> Result<(), LoaderError> {
         self.write_new_exact_guarded(name, bytes).map(drop)
+    }
+
+    pub(crate) fn write_new_exact_retained(
+        &self,
+        name: &str,
+        bytes: &[u8],
+    ) -> Result<ManagedFileGuard, ManagedCreateOnlyWriteFailure> {
+        self.write_new_exact_retained_inner(
+            name,
+            bytes,
+            #[cfg(test)]
+            None,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn write_new_exact_retained_with_fault(
+        &self,
+        name: &str,
+        bytes: &[u8],
+        fault: ManagedCreateOnlyWriteFault,
+    ) -> Result<ManagedFileGuard, ManagedCreateOnlyWriteFailure> {
+        self.write_new_exact_retained_inner(name, bytes, Some(fault))
+    }
+
+    fn write_new_exact_retained_inner(
+        &self,
+        name: &str,
+        bytes: &[u8],
+        #[cfg(test)] fault: Option<ManagedCreateOnlyWriteFault>,
+    ) -> Result<ManagedFileGuard, ManagedCreateOnlyWriteFailure> {
+        validate_segment(name).map_err(ManagedCreateOnlyWriteFailure::BeforePromotion)?;
+        let size = u64::try_from(bytes.len()).map_err(|_| {
+            ManagedCreateOnlyWriteFailure::BeforePromotion(LoaderError::Verify(
+                "managed retained artifact size overflowed".to_string(),
+            ))
+        })?;
+        if size > MAX_MANAGED_READ_BYTES {
+            return Err(ManagedCreateOnlyWriteFailure::BeforePromotion(
+                LoaderError::Verify(
+                    "managed retained artifact exceeds the bounded file limit".to_string(),
+                ),
+            ));
+        }
+        self.revalidate()
+            .map_err(ManagedCreateOnlyWriteFailure::BeforePromotion)?;
+        let temp_name = temp_name();
+        let active = ActiveTemp::register(self.inner.identity, &temp_name);
+        let file =
+            platform::create_new_file(&self.inner.handle, &self.inner.path, OsStr::new(&temp_name))
+                .map_err(LoaderError::Io)
+                .map_err(ManagedCreateOnlyWriteFailure::BeforePromotion)?;
+        let identity = platform::file_identity(&file)
+            .map_err(LoaderError::Io)
+            .map_err(ManagedCreateOnlyWriteFailure::BeforePromotion)?;
+        let mut pending = PendingExactTemp::arm(
+            self.clone(),
+            temp_name.clone(),
+            active,
+            ManagedFileGuard {
+                identity,
+                file,
+                size: 0,
+            },
+        );
+        #[cfg(test)]
+        if fault == Some(ManagedCreateOnlyWriteFault::AfterTempCreated) {
+            return Err(ManagedCreateOnlyWriteFailure::BeforePromotion(
+                injected_create_only_write_failure(),
+            ));
+        }
+        {
+            let guard = pending.guard_mut();
+            guard
+                .file
+                .write_all(bytes)
+                .map_err(LoaderError::Io)
+                .map_err(ManagedCreateOnlyWriteFailure::BeforePromotion)?;
+            guard.size = size;
+        }
+        #[cfg(test)]
+        if fault == Some(ManagedCreateOnlyWriteFault::AfterBytesWritten) {
+            return Err(ManagedCreateOnlyWriteFailure::BeforePromotion(
+                injected_create_only_write_failure(),
+            ));
+        }
+        {
+            let guard = pending.guard_mut();
+            guard
+                .file
+                .flush()
+                .and_then(|()| guard.file.sync_all())
+                .map_err(LoaderError::Io)
+                .map_err(ManagedCreateOnlyWriteFailure::BeforePromotion)?;
+        }
+        #[cfg(test)]
+        if fault == Some(ManagedCreateOnlyWriteFault::AfterFileSynced) {
+            return Err(ManagedCreateOnlyWriteFailure::BeforePromotion(
+                injected_create_only_write_failure(),
+            ));
+        }
+        {
+            let guard = pending.guard_mut();
+            guard
+                .file
+                .seek(SeekFrom::Start(0))
+                .map_err(LoaderError::Io)
+                .map_err(ManagedCreateOnlyWriteFailure::BeforePromotion)?;
+            if !verify_reader_exact_bytes(&mut guard.file, bytes)
+                .map_err(LoaderError::Io)
+                .map_err(ManagedCreateOnlyWriteFailure::BeforePromotion)?
+            {
+                return Err(ManagedCreateOnlyWriteFailure::BeforePromotion(
+                    LoaderError::Verify(
+                        "managed retained temp bytes changed before promotion".to_string(),
+                    ),
+                ));
+            }
+        }
+        #[cfg(test)]
+        if fault == Some(ManagedCreateOnlyWriteFault::AfterTempVerified) {
+            return Err(ManagedCreateOnlyWriteFailure::BeforePromotion(
+                injected_create_only_write_failure(),
+            ));
+        }
+        self.revalidate()
+            .map_err(ManagedCreateOnlyWriteFailure::BeforePromotion)?;
+
+        // From this point onward the destination may exist even when the operation reports failure.
+        if let Err(error) = platform::rename_entry_no_replace(
+            &self.inner.handle,
+            &self.inner.path,
+            OsStr::new(&temp_name),
+            &self.inner.handle,
+            &self.inner.path,
+            OsStr::new(name),
+        ) {
+            let final_matches = self
+                .file_guard_matches(
+                    name,
+                    pending
+                        .guard
+                        .as_ref()
+                        .expect("pending exact temp retains promotion authority"),
+                )
+                .unwrap_or(false);
+            let final_guard = final_matches.then(|| pending.take_guard());
+            return Err(ManagedCreateOnlyWriteFailure::PromotionAttempted {
+                final_guard,
+                cause: LoaderError::Io(error),
+            });
+        }
+        let guard = pending.take_guard();
+        #[cfg(test)]
+        if fault == Some(ManagedCreateOnlyWriteFault::AfterPromotion) {
+            return Err(promotion_attempted_failure(
+                self,
+                name,
+                guard,
+                injected_create_only_write_failure(),
+            ));
+        }
+        if let Err(cause) = self.sync() {
+            return Err(promotion_attempted_failure(self, name, guard, cause));
+        }
+        #[cfg(test)]
+        if fault == Some(ManagedCreateOnlyWriteFault::AfterDirectorySynced) {
+            return Err(promotion_attempted_failure(
+                self,
+                name,
+                guard,
+                injected_create_only_write_failure(),
+            ));
+        }
+        let verified = self
+            .read_guarded_file_bounded(name, &guard, size)
+            .map(|written| written == bytes);
+        match verified {
+            Ok(true) => {}
+            Ok(false) => {
+                return Err(promotion_attempted_failure(
+                    self,
+                    name,
+                    guard,
+                    LoaderError::Verify(
+                        "managed retained artifact changed after promotion".to_string(),
+                    ),
+                ));
+            }
+            Err(cause) => {
+                return Err(promotion_attempted_failure(self, name, guard, cause));
+            }
+        }
+        #[cfg(test)]
+        if fault == Some(ManagedCreateOnlyWriteFault::AfterFinalVerified) {
+            return Err(promotion_attempted_failure(
+                self,
+                name,
+                guard,
+                injected_create_only_write_failure(),
+            ));
+        }
+        if let Err(cause) = self.revalidate() {
+            return Err(promotion_attempted_failure(self, name, guard, cause));
+        }
+        #[cfg(test)]
+        if fault == Some(ManagedCreateOnlyWriteFault::AfterRevalidated) {
+            return Err(promotion_attempted_failure(
+                self,
+                name,
+                guard,
+                injected_create_only_write_failure(),
+            ));
+        }
+        Ok(guard)
     }
 
     pub(crate) fn write_new_exact_guarded(
@@ -2382,6 +2662,24 @@ fn temp_name() -> String {
     format!("{TEMP_PREFIX}{}-{nanos:x}-{sequence:x}", std::process::id())
 }
 
+fn promotion_attempted_failure(
+    directory: &ManagedDir,
+    name: &str,
+    guard: ManagedFileGuard,
+    cause: LoaderError,
+) -> ManagedCreateOnlyWriteFailure {
+    let final_guard = directory
+        .file_guard_matches(name, &guard)
+        .unwrap_or(false)
+        .then_some(guard);
+    ManagedCreateOnlyWriteFailure::PromotionAttempted { final_guard, cause }
+}
+
+#[cfg(test)]
+fn injected_create_only_write_failure() -> LoaderError {
+    LoaderError::Verify("injected retained create-only write failure".to_string())
+}
+
 fn directory_park_name() -> String {
     format!(".axial-loader-dir-{}", uuid::Uuid::new_v4().simple())
 }
@@ -2900,6 +3198,120 @@ mod tests {
             .sweep_orphan_temps_with(|_| false)
             .expect("sweep dead-owner orphan");
         assert!(!root.join(&name).exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn retained_create_only_write_classifies_every_pre_promotion_fault() {
+        let root = test_root("retained-write-before-promotion");
+        fs::create_dir_all(&root).expect("root");
+        let directory = ManagedDir::open_root(&root).expect("managed root");
+
+        for (index, fault) in [
+            ManagedCreateOnlyWriteFault::AfterTempCreated,
+            ManagedCreateOnlyWriteFault::AfterBytesWritten,
+            ManagedCreateOnlyWriteFault::AfterFileSynced,
+            ManagedCreateOnlyWriteFault::AfterTempVerified,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let name = format!("intent-{index}.bin");
+            assert!(matches!(
+                directory.write_new_exact_retained_with_fault(&name, b"intent", fault),
+                Err(ManagedCreateOnlyWriteFailure::BeforePromotion(_))
+            ));
+            assert!(!root.join(name).exists());
+            assert!(fs::read_dir(&root).expect("root entries").all(|entry| {
+                !entry
+                    .expect("root entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(TEMP_PREFIX)
+            }));
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn retained_create_only_write_retains_every_post_promotion_fault() {
+        let root = test_root("retained-write-after-promotion");
+        fs::create_dir_all(&root).expect("root");
+        let directory = ManagedDir::open_root(&root).expect("managed root");
+
+        for (index, fault) in [
+            ManagedCreateOnlyWriteFault::AfterPromotion,
+            ManagedCreateOnlyWriteFault::AfterDirectorySynced,
+            ManagedCreateOnlyWriteFault::AfterFinalVerified,
+            ManagedCreateOnlyWriteFault::AfterRevalidated,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let name = format!("intent-{index}.bin");
+            let failure = directory
+                .write_new_exact_retained_with_fault(&name, b"intent", fault)
+                .expect_err("injected post-promotion failure");
+            let ManagedCreateOnlyWriteFailure::PromotionAttempted {
+                final_guard: Some(guard),
+                cause: _,
+            } = failure
+            else {
+                panic!("post-promotion failure lost exact final authority")
+            };
+            assert_eq!(guard.size(), 6);
+            assert!(directory.file_guard_matches(&name, &guard).unwrap());
+            drop(guard);
+            assert_eq!(fs::read(root.join(name)).unwrap(), b"intent");
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn retained_create_only_write_attempt_collision_preserves_foreign_final() {
+        let root = test_root("retained-write-collision");
+        fs::create_dir_all(&root).expect("root");
+        fs::write(root.join("intent.bin"), b"foreign").expect("foreign marker");
+        let directory = ManagedDir::open_root(&root).expect("managed root");
+
+        let failure = directory
+            .write_new_exact_retained("intent.bin", b"owned")
+            .expect_err("no-replace collision");
+
+        assert!(matches!(
+            failure,
+            ManagedCreateOnlyWriteFailure::PromotionAttempted {
+                final_guard: None,
+                ..
+            }
+        ));
+        assert_eq!(fs::read(root.join("intent.bin")).unwrap(), b"foreign");
+        assert!(fs::read_dir(&root).expect("root entries").all(|entry| {
+            !entry
+                .expect("root entry")
+                .file_name()
+                .to_string_lossy()
+                .starts_with(TEMP_PREFIX)
+        }));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn retained_create_only_write_never_broad_sweeps_or_deletes_on_guard_drop() {
+        let root = test_root("retained-write-no-sweep");
+        fs::create_dir_all(&root).expect("root");
+        let orphan = format!("{TEMP_PREFIX}{}-51-0", std::process::id());
+        fs::write(root.join(&orphan), b"unrelated").expect("unrelated orphan temp");
+        let directory = ManagedDir::open_root(&root).expect("managed root");
+
+        let guard = directory
+            .write_new_exact_retained("intent.bin", b"intent")
+            .expect("retained marker");
+        assert!(directory.file_guard_matches("intent.bin", &guard).unwrap());
+        drop(guard);
+
+        assert_eq!(fs::read(root.join("intent.bin")).unwrap(), b"intent");
+        assert_eq!(fs::read(root.join(orphan)).unwrap(), b"unrelated");
         let _ = fs::remove_dir_all(root);
     }
 
