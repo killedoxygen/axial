@@ -177,7 +177,7 @@ impl ExactLibraryCacheAdmission {
             .and_then(decode_sha1)
             .ok_or(LibraryPlanError::InvalidChecksum)?;
         let Some(allocation) = source_pool
-            .try_retain_authenticated_component_reader(reader, expected_size, expected_sha1)
+            .try_retain_authenticated_jar_reader(reader, expected_size, expected_sha1)
             .await?
         else {
             return Ok(None);
@@ -203,10 +203,10 @@ impl ExactLibraryCacheAdmission {
             return Ok(None);
         };
         let expected_size = job.expected.size.ok_or(LibraryPlanError::InvalidChecksum)?;
-        let reader = source
-            .guard
-            .into_bounded_reader(expected_size)
-            .map_err(cache_admission_error)?;
+        let reader = match source.guard.into_bounded_reader(expected_size) {
+            Ok(reader) => reader,
+            Err(_) => return Ok(None),
+        };
         Ok(Some(ExactLibraryCacheSource { reader }))
     }
 
@@ -484,7 +484,7 @@ where
     F: FnMut(DownloadProgress),
 {
     let client = standard_minecraft_download_client();
-    let source_pool = LibrarySourcePool::for_component_retention()?;
+    let source_pool = LibrarySourcePool::new()?;
     send(progress(phase, 0, jobs.len() as i32, None));
     let total_jobs = jobs.len() as i32;
     let mut completed_jobs = 0;
@@ -540,7 +540,7 @@ where
     F: FnMut(DownloadProgress),
 {
     let client = standard_minecraft_download_client();
-    let source_pool = LibrarySourcePool::for_component_retention()?;
+    let source_pool = LibrarySourcePool::new()?;
     let cache_admission = ExactLibraryCacheAdmission::bind(mc_dir).await?;
     send(progress(phase, 0, jobs.len() as i32, None));
     let total_jobs = jobs.len() as i32;
@@ -895,7 +895,7 @@ mod tests {
     };
     use crate::artifact_path::ArtifactRelativePath;
     use crate::download::ExpectedIntegrity;
-    use crate::download::library_source::LibrarySourcePool;
+    use crate::download::library_source::{LIBRARY_SOURCE_MAX_BYTES, LibrarySourcePool};
     use crate::known_good_libraries::{ClassifiedLibraryDownload, LibraryAcquisition};
     use crate::launch::{Library, LibraryArtifact, LibraryDownload};
     use sha1::{Digest as _, Sha1};
@@ -958,7 +958,8 @@ mod tests {
         writer
             .start_file(
                 "fixture/Library.class",
-                zip::write::SimpleFileOptions::default(),
+                zip::write::SimpleFileOptions::default()
+                    .compression_method(zip::CompressionMethod::Stored),
             )
             .expect("start test JAR entry");
         writer.write_all(payload).expect("write test JAR entry");
@@ -1086,11 +1087,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn valid_installer_exact_cache_retains_without_http_and_replays_fully() {
+        let root = temp_root("installer-valid-exact-retention");
+        let body = jar_bytes(b"valid exact installer source");
+        let mut job = exact_job(&body);
+        let path = exact_path(&root, &job);
+        fs::create_dir_all(path.parent().expect("artifact parent"))
+            .expect("create artifact parent");
+        fs::write(&path, &body).expect("seed valid exact cache");
+        let (url, requests, stop, task) = retained_test_server(body.clone()).await;
+        job.url = url;
+        let admission = ExactLibraryCacheAdmission::bind(&root)
+            .await
+            .expect("bind installer exact cache");
+        let pool = LibrarySourcePool::new().expect("retained source pool");
+        let (_, _, source) = acquire_retained_installer_library(
+            &reqwest::Client::new(),
+            ClassifiedLibraryDownload::from_test(job, LibraryAcquisition::ExactDeclaration),
+            &admission,
+            &pool,
+            None,
+        )
+        .await
+        .expect("retain valid exact installer source");
+
+        assert_eq!(requests.load(Ordering::SeqCst), 0);
+        assert_eq!(fs::read(&path).expect("canonical exact cache"), body);
+        assert_eq!(
+            pool.retained_available_bytes(),
+            crate::known_good::MAX_TIER2_AGGREGATE_BYTES - body.len() as u64
+        );
+        assert_eq!(pool.available_bytes(), LIBRARY_SOURCE_MAX_BYTES);
+        let (mut replay, size, sha1) = source
+            .replay()
+            .expect("replay valid exact source")
+            .into_parts();
+        let mut replayed = Vec::new();
+        replay
+            .read_to_end(&mut replayed)
+            .expect("read valid exact source");
+        assert_eq!(replayed, body);
+        assert_eq!(size, body.len() as u64);
+        assert_eq!(sha1, <[u8; 20]>::from(Sha1::digest(&body)));
+
+        let _ = stop.send(());
+        task.await.expect("stop retained test server");
+        drop(admission);
+        fs::remove_dir_all(root).expect("remove valid-exact-retention root");
+    }
+
+    #[tokio::test]
     async fn corrupt_installer_exact_cache_falls_back_to_retention_without_canonical_prewrite() {
         let root = temp_root("installer-corrupt-fallback");
-        let body = jar_bytes(b"authenticated installer source");
-        let mut corrupt = body.clone();
-        corrupt[0] ^= 0xff;
+        let payload = b"authenticated installer source";
+        let body = jar_bytes(payload);
+        let corrupt = jar_bytes(&vec![b'x'; payload.len()]);
+        assert_eq!(corrupt.len(), body.len(), "exercise generic SHA rejection");
         let mut job = exact_job(&body);
         let path = exact_path(&root, &job);
         fs::create_dir_all(path.parent().expect("artifact parent"))
@@ -1101,7 +1153,7 @@ mod tests {
         let admission = ExactLibraryCacheAdmission::bind(&root)
             .await
             .expect("bind installer exact cache");
-        let pool = LibrarySourcePool::for_component_retention().expect("retained source pool");
+        let pool = LibrarySourcePool::new().expect("retained source pool");
         let (_, _, source) = acquire_retained_installer_library(
             &reqwest::Client::new(),
             ClassifiedLibraryDownload::from_test(job.clone(), LibraryAcquisition::ExactDeclaration),
@@ -1116,8 +1168,9 @@ mod tests {
         assert_eq!(fs::read(&path).expect("canonical corrupt cache"), corrupt);
         assert_eq!(
             pool.retained_available_bytes(),
-            Some(crate::known_good::MAX_TIER2_AGGREGATE_BYTES - body.len() as u64)
+            crate::known_good::MAX_TIER2_AGGREGATE_BYTES - body.len() as u64
         );
+        assert_eq!(pool.available_bytes(), LIBRARY_SOURCE_MAX_BYTES);
         let (mut replay, size, sha1) = source
             .replay()
             .expect("replay retained fallback")
@@ -1134,6 +1187,48 @@ mod tests {
         task.await.expect("stop retained test server");
         drop(admission);
         fs::remove_dir_all(root).expect("remove corrupt-fallback root");
+    }
+
+    #[tokio::test]
+    async fn invalid_installer_exact_cache_falls_back_once_without_retained_or_canonical_effects() {
+        let root = temp_root("installer-invalid-jar-fallback");
+        let body = b"not-a-jar".to_vec();
+        let mut job = exact_job(&body);
+        let path = exact_path(&root, &job);
+        fs::create_dir_all(path.parent().expect("artifact parent"))
+            .expect("create artifact parent");
+        fs::write(&path, &body).expect("seed invalid exact cache JAR");
+        let (url, requests, stop, task) = retained_test_server(body.clone()).await;
+        job.url = url;
+        let admission = ExactLibraryCacheAdmission::bind(&root)
+            .await
+            .expect("bind installer exact cache");
+        let pool = LibrarySourcePool::new().expect("retained source pool");
+
+        assert!(
+            acquire_retained_installer_library(
+                &reqwest::Client::new(),
+                ClassifiedLibraryDownload::from_test(job, LibraryAcquisition::ExactDeclaration,),
+                &admission,
+                &pool,
+                None,
+            )
+            .await
+            .is_err()
+        );
+
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+        assert_eq!(fs::read(&path).expect("canonical invalid cache JAR"), body);
+        assert_eq!(
+            pool.retained_available_bytes(),
+            crate::known_good::MAX_TIER2_AGGREGATE_BYTES
+        );
+        assert_eq!(pool.available_bytes(), LIBRARY_SOURCE_MAX_BYTES);
+
+        let _ = stop.send(());
+        task.await.expect("stop retained test server");
+        drop(admission);
+        fs::remove_dir_all(root).expect("remove invalid-jar-fallback root");
     }
 
     #[tokio::test]

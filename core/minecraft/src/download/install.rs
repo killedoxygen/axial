@@ -814,7 +814,7 @@ impl Downloader {
             .acquire_vanilla_plan(version_id, version_manifest_entry, None)
             .await?;
         let mut library_proofs = Vec::new();
-        let source_pool = LibrarySourcePool::for_component_retention()?;
+        let source_pool = LibrarySourcePool::new()?;
         for classified in library_jobs {
             let (job, acquisition) = classified.into_parts();
             if acquisition == LibraryAcquisition::ExactDeclaration {
@@ -1129,7 +1129,7 @@ impl Downloader {
             );
             send(progress("libraries", 0, library_jobs.len() as i32, None));
             let client = self.client.clone();
-            let source_pool = LibrarySourcePool::for_component_retention()?;
+            let source_pool = LibrarySourcePool::new()?;
             let total_library_jobs = library_jobs.len() as i32;
             let mut completed_library_jobs = 0;
             let library_result = async {
@@ -1512,7 +1512,7 @@ pub(crate) async fn reconstruct_profile_library_declarations(
         ))
     })?;
     let client = standard_minecraft_download_client();
-    let source_pool = LibrarySourcePool::for_component_retention()?;
+    let source_pool = LibrarySourcePool::new()?;
     let mut proofs = Vec::new();
     for classified in classified {
         let (job, acquisition) = classified.into_parts();
@@ -1570,7 +1570,7 @@ async fn reconstruct_installer_library_declarations_inner(
         ));
     }
     let client = standard_minecraft_download_client();
-    let source_pool = LibrarySourcePool::for_component_retention()?;
+    let source_pool = LibrarySourcePool::new()?;
     let mut proofs = Vec::new();
     for classified in jobs {
         let (plan, acquisition) = classified.into_parts();

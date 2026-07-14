@@ -12,6 +12,7 @@ mod managed_component_ancestor_journal;
 mod managed_component_effects;
 mod managed_component_lifecycle;
 mod managed_component_publication;
+mod managed_component_source_spool;
 mod managed_component_spool;
 mod managed_component_table;
 mod managed_fs;
