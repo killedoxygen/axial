@@ -2153,6 +2153,53 @@ fn authenticate_vanilla_authority(
 }
 
 impl PendingKnownGoodInstallAuthority {
+    #[cfg(test)]
+    pub(crate) fn libraries_for_test(
+        entries: impl IntoIterator<Item = (String, KnownGoodArtifactKind, [u8; 20], u64)>,
+    ) -> Self {
+        let mut inventory = InventoryBuilder::default();
+        for (path, kind, digest, size) in entries {
+            inventory
+                .insert(KnownGoodEntry {
+                    root: KnownGoodRoot::Libraries,
+                    path: KnownGoodRelativePath::new(&path).expect("test Libraries path"),
+                    kind,
+                    integrity: KnownGoodIntegrity::Sha1 {
+                        digest: sha1_array_digest(&digest),
+                        size,
+                    },
+                })
+                .expect("unique test Libraries entry");
+        }
+        let version_id = KnownGoodId::new("test-libraries-intent").expect("test version id");
+        Self {
+            authenticated: AuthenticatedKnownGoodReceipt {
+                version_id: version_id.clone(),
+                inventory: inventory.finish(),
+                effective_version: VersionJson {
+                    id: version_id.0,
+                    inherits_from: String::new(),
+                    materialized: false,
+                    kind: "release".to_string(),
+                    main_class: String::new(),
+                    minimum_launcher_version: 0,
+                    compliance_level: 0,
+                    release_time: String::new(),
+                    time: String::new(),
+                    arguments: None,
+                    minecraft_arguments: String::new(),
+                    asset_index: crate::launch::AssetIndex::default(),
+                    assets: String::new(),
+                    downloads: crate::launch::Downloads::default(),
+                    java_version: crate::launch::JavaVersion::default(),
+                    libraries: Vec::new(),
+                    logging: None,
+                },
+                environment: crate::rules::default_environment(),
+            },
+        }
+    }
+
     pub(crate) fn version_id(&self) -> &str {
         self.authenticated.version_id.as_str()
     }

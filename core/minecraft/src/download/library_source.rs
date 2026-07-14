@@ -9,7 +9,11 @@ use super::model::{
 use crate::artifact_path::ArtifactRelativePath;
 use crate::known_good::MAX_TIER2_AGGREGATE_BYTES;
 use crate::loaders::types::LoaderError;
+use crate::managed_component_table::ManagedComponentArtifactKind;
 use crate::managed_fs::ManagedDir;
+use crate::managed_libraries_publication::{
+    LibrariesPublicationSourceIdentity, RetainedLibrariesPublicationSource,
+};
 use crate::managed_publication::ManagedPublicationLifetimeGuard;
 use futures_util::StreamExt as _;
 use sha1::{Digest as _, Sha1};
@@ -520,36 +524,13 @@ pub(crate) struct RetainedLibraryComponentSource {
     kind: LibraryComponentSourceKind,
 }
 
-pub(crate) struct StagedLibraryComponentSource {
-    relative_path: ArtifactRelativePath,
-    observed_size: u64,
-    observed_sha1: [u8; 20],
-    kind: LibraryComponentSourceKind,
-}
-
 impl RetainedLibraryComponentSource {
-    pub(crate) fn relative_path(&self) -> &ArtifactRelativePath {
-        &self.relative_path
-    }
-
-    pub(crate) fn observed_size(&self) -> u64 {
-        self.observed_size
-    }
-
-    pub(crate) fn observed_sha1(&self) -> [u8; 20] {
-        self.observed_sha1
-    }
-
     pub(crate) fn expected(&self) -> &ExpectedIntegrity {
         &self.expected
     }
 
     pub(crate) fn provider_url(&self) -> &str {
         &self.provider_url
-    }
-
-    pub(super) fn kind(&self) -> LibraryComponentSourceKind {
-        self.kind
     }
 
     pub(crate) fn exact_download_proof(&self) -> ExactLibraryDownloadProof {
@@ -563,39 +544,6 @@ impl RetainedLibraryComponentSource {
         )
     }
 
-    pub(crate) async fn stage_create_new(
-        self,
-        staging_bucket: &ManagedDir,
-        slot: &str,
-        lifetime_guard: ManagedPublicationLifetimeGuard,
-    ) -> Result<StagedLibraryComponentSource, LoaderError> {
-        let Self {
-            allocation,
-            relative_path,
-            observed_size,
-            observed_sha1,
-            expected: _,
-            provider_url: _,
-            kind,
-        } = self;
-        let reader = allocation.into_reader()?;
-        staging_bucket
-            .import_authenticated_create_new(
-                slot,
-                reader,
-                observed_size,
-                observed_sha1,
-                lifetime_guard,
-            )
-            .await?;
-        Ok(StagedLibraryComponentSource {
-            relative_path,
-            observed_size,
-            observed_sha1,
-            kind,
-        })
-    }
-
     #[cfg(test)]
     async fn stage_create_new_with_hook(
         self,
@@ -603,7 +551,7 @@ impl RetainedLibraryComponentSource {
         slot: &str,
         lifetime_guard: ManagedPublicationLifetimeGuard,
         blocking_hook: BlockingValidationHook,
-    ) -> Result<StagedLibraryComponentSource, LoaderError> {
+    ) -> Result<LibrariesPublicationSourceIdentity, LoaderError> {
         let Self {
             allocation,
             relative_path,
@@ -624,30 +572,70 @@ impl RetainedLibraryComponentSource {
                 blocking_hook,
             )
             .await?;
-        Ok(StagedLibraryComponentSource {
+        Ok(LibrariesPublicationSourceIdentity::new(
             relative_path,
+            component_source_kind(kind),
             observed_size,
             observed_sha1,
-            kind,
-        })
+        ))
     }
 }
 
-impl StagedLibraryComponentSource {
-    pub(crate) fn relative_path(&self) -> &ArtifactRelativePath {
+impl RetainedLibrariesPublicationSource for RetainedLibraryComponentSource {
+    fn relative_path(&self) -> &ArtifactRelativePath {
         &self.relative_path
     }
 
-    pub(super) fn kind(&self) -> LibraryComponentSourceKind {
-        self.kind
+    fn kind(&self) -> ManagedComponentArtifactKind {
+        component_source_kind(self.kind)
     }
 
-    pub(crate) fn observed_size(&self) -> u64 {
+    fn observed_size(&self) -> u64 {
         self.observed_size
     }
 
-    pub(crate) fn observed_sha1(&self) -> [u8; 20] {
+    fn observed_sha1(&self) -> [u8; 20] {
         self.observed_sha1
+    }
+
+    async fn stage_create_new(
+        self,
+        staging_bucket: &ManagedDir,
+        slot: &str,
+        lifetime_guard: ManagedPublicationLifetimeGuard,
+    ) -> Result<LibrariesPublicationSourceIdentity, LoaderError> {
+        let Self {
+            allocation,
+            relative_path,
+            observed_size,
+            observed_sha1,
+            expected: _,
+            provider_url: _,
+            kind,
+        } = self;
+        let reader = allocation.into_reader()?;
+        staging_bucket
+            .import_authenticated_create_new(
+                slot,
+                reader,
+                observed_size,
+                observed_sha1,
+                lifetime_guard,
+            )
+            .await?;
+        Ok(LibrariesPublicationSourceIdentity::new(
+            relative_path,
+            component_source_kind(kind),
+            observed_size,
+            observed_sha1,
+        ))
+    }
+}
+
+fn component_source_kind(kind: LibraryComponentSourceKind) -> ManagedComponentArtifactKind {
+    match kind {
+        LibraryComponentSourceKind::Library => ManagedComponentArtifactKind::Library,
+        LibraryComponentSourceKind::NativeLibrary => ManagedComponentArtifactKind::NativeLibrary,
     }
 }
 
@@ -1865,7 +1853,7 @@ mod tests {
         assert_eq!(source.observed_sha1(), sha1_bytes(&body));
         assert_eq!(source.expected(), &ExpectedIntegrity::default());
         assert_eq!(source.provider_url(), url);
-        assert_eq!(source.kind(), LibraryComponentSourceKind::NativeLibrary);
+        assert_eq!(source.kind(), ManagedComponentArtifactKind::NativeLibrary);
 
         let temp = tempfile::tempdir().expect("component staging root");
         let root = ManagedDir::open_root(temp.path()).expect("managed component staging root");
@@ -1880,10 +1868,15 @@ mod tests {
             .stage_create_new(&bucket, slot, lease.lifetime_guard())
             .await
             .expect("stage retained component source");
-        assert_eq!(staged.relative_path(), &fixture_relative_path());
-        assert_eq!(staged.kind(), LibraryComponentSourceKind::NativeLibrary);
-        assert_eq!(staged.observed_size(), body.len() as u64);
-        assert_eq!(staged.observed_sha1(), sha1_bytes(&body));
+        assert_eq!(
+            staged,
+            LibrariesPublicationSourceIdentity::new(
+                fixture_relative_path(),
+                ManagedComponentArtifactKind::NativeLibrary,
+                body.len() as u64,
+                sha1_bytes(&body),
+            )
+        );
         assert_eq!(
             std::fs::read(bucket.path().join(slot)).expect("read staged source"),
             body

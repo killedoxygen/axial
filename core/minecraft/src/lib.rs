@@ -13,6 +13,7 @@ mod managed_component_publication;
 mod managed_component_spool;
 mod managed_component_table;
 mod managed_fs;
+mod managed_libraries_publication;
 mod managed_publication;
 pub mod manifest;
 pub mod paths;
