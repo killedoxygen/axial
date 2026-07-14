@@ -2,21 +2,26 @@ use crate::artifact_path::ArtifactRelativePath;
 use crate::known_good::{MAX_TIER2_AGGREGATE_BYTES, MAX_TIER2_ARTIFACT_BYTES, MAX_TIER2_ENTRIES};
 use crate::loaders::types::LoaderError;
 use crate::managed_component_publication::{
-    COMPONENT_QUARANTINE_DIRECTORY, COMPONENT_STAGING_DIRECTORY, COMPONENT_TABLE_DIRECTORY,
-    component_lane_name,
+    COMPONENT_INTENT_FILE, COMPONENT_QUARANTINE_DIRECTORY, COMPONENT_STAGING_DIRECTORY,
+    COMPONENT_TABLE_DIRECTORY, component_lane_name,
 };
 use crate::managed_component_spool::{ComponentTableReplay, ComponentTableSpoolError};
 use crate::managed_component_table::{
-    ComponentIntentManifest, ComponentTableError, ComponentTableParser, ComponentTableSummary,
-    MAX_COMPONENT_TABLE_SHARD_BYTES, MAX_COMPONENT_TABLE_SHARDS, ManagedComponentKind,
-    component_table_path, decode_component_table_shard,
+    ComponentIntentManifest, ComponentTableError, ComponentTableParser, ComponentTableRow,
+    ComponentTableSummary, MAX_COMPONENT_INTENT_BYTES, MAX_COMPONENT_TABLE_SHARD_BYTES,
+    MAX_COMPONENT_TABLE_SHARDS, ManagedComponentKind, component_table_path,
+    decode_component_table_shard, encode_component_intent_manifest,
 };
 use crate::managed_fs::{
-    MAX_MANAGED_TEMP_ENTRIES, ManagedDir, ManagedDirectoryIdentity, ManagedEmptyChildRemoval,
-    ManagedFileGuard, ManagedFileIdentity, validate_managed_temp_name,
+    MAX_MANAGED_TEMP_ENTRIES, ManagedCreateOnlyWriteFailure, ManagedDir, ManagedDirectoryIdentity,
+    ManagedEmptyChildRemoval, ManagedFileGuard, ManagedFileIdentity, validate_managed_temp_name,
 };
 use crate::managed_publication::{ManagedPublicationError, ManagedRootPublicationLease};
+use sha2::{Digest as _, Sha256};
 use std::collections::BTreeSet;
+
+#[cfg(test)]
+use crate::managed_fs::ManagedCreateOnlyWriteFault;
 
 const MAX_COMPONENT_LANE_ENTRIES: usize = 6;
 const COMPONENT_BUCKET_PARK_A: &str = "bucket-park-a";
@@ -54,10 +59,79 @@ pub(crate) struct ComponentShardBuckets {
     quarantine: ManagedDir,
 }
 
+pub(crate) struct ComponentIntentCandidate {
+    lane: ComponentLane,
+    lease: ManagedRootPublicationLease,
+    manifest: ComponentIntentManifest,
+    encoded_intent: Vec<u8>,
+    summary: ComponentTableSummary,
+    authority: ComponentPreintentAuthority,
+}
+
+pub(crate) struct ComponentIntentPublished {
+    candidate: ComponentIntentCandidate,
+    intent_guard: ManagedFileGuard,
+}
+
+pub(crate) enum ComponentIntentPublishFailure {
+    BeforePromotion {
+        candidate: Box<ComponentIntentCandidate>,
+        cause: ComponentEffectsError,
+    },
+    PromotionAttempted {
+        candidate: Box<ComponentIntentCandidate>,
+        intent_guard: Option<ManagedFileGuard>,
+        cause: ComponentEffectsError,
+    },
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ComponentIntentPublishFault {
+    BeforeMarkerPromotion,
+    AfterMarkerPromotion,
+    AfterLaneSynced,
+    AfterPublicationSynced,
+    AfterRootSynced,
+    AfterLeaseRevalidated,
+}
+
+#[derive(Eq, PartialEq)]
+struct ComponentPreintentAuthority {
+    root: ManagedDirectoryIdentity,
+    publication: ManagedDirectoryIdentity,
+    lane: ManagedDirectoryIdentity,
+    table: ManagedDirectoryIdentity,
+    staging: ManagedDirectoryIdentity,
+    quarantine: ManagedDirectoryIdentity,
+    shards: Vec<ComponentPreintentShardAuthority>,
+}
+
+#[derive(Eq, PartialEq)]
+struct ComponentPreintentShardAuthority {
+    table: ManagedFileIdentity,
+    staging: ManagedDirectoryIdentity,
+    quarantine: ManagedDirectoryIdentity,
+    rows: Vec<ComponentPreintentRowAuthority>,
+}
+
+#[derive(Eq, PartialEq)]
+struct ComponentPreintentRowAuthority {
+    staging: Option<ManagedFileIdentity>,
+    canonical_anchor: ManagedDirectoryIdentity,
+    canonical: Option<ManagedFileIdentity>,
+}
+
 struct ComponentPreintentCleanupPlan {
+    temporary: Vec<ComponentPlannedFile>,
     table: Option<ComponentTableCleanupPlan>,
     staging: Option<ComponentBucketCleanupPlan>,
     quarantine: Option<ComponentBucketCleanupPlan>,
+}
+
+struct ComponentLaneEntryPlan {
+    directories: BTreeSet<String>,
+    temporary: Vec<ComponentPlannedFile>,
 }
 
 struct ComponentTableCleanupPlan {
@@ -257,44 +331,29 @@ impl ComponentLane {
         })
     }
 
-    pub(crate) fn read_table(
-        &self,
-        manifest: &ComponentIntentManifest,
-    ) -> Result<ComponentDurableTable, ComponentEffectsError> {
-        if manifest.component != self.component {
-            return Err(ComponentEffectsError::Topology);
-        }
-        let expected_names = (0..manifest.shards.len())
-            .map(component_table_file_name)
-            .collect::<Result<BTreeSet<_>, _>>()?;
-        if exact_entry_names(&self.table, manifest.shards.len().saturating_add(1))?
-            != expected_names
+    pub(crate) fn into_intent_candidate(
+        self,
+        lease: ManagedRootPublicationLease,
+        manifest: ComponentIntentManifest,
+    ) -> Result<ComponentIntentCandidate, ComponentEffectsError> {
+        lease.revalidate()?;
+        let expected_lane = lease
+            .publication_directory()
+            .open_child(component_lane_name(self.component))?;
+        if expected_lane.identity()? != self.lane.identity()?
+            || manifest.component != self.component
         {
             return Err(ComponentEffectsError::Topology);
         }
-
-        let mut parser = ComponentTableParser::new(manifest.clone())?;
-        for (index, descriptor) in manifest.shards.iter().enumerate() {
-            let name = component_table_file_name(index)?;
-            let guard = self
-                .table
-                .inspect_regular_file(&name)?
-                .ok_or(ComponentEffectsError::Topology)?;
-            if guard.size() != u64::from(descriptor.byte_len)
-                || guard.size() > MAX_COMPONENT_TABLE_SHARD_BYTES as u64
-            {
-                return Err(ComponentEffectsError::Topology);
-            }
-            let encoded = self.table.read_guarded_file_bounded(
-                &name,
-                &guard,
-                MAX_COMPONENT_TABLE_SHARD_BYTES as u64,
-            )?;
-            parser.parse_next(&encoded)?;
-        }
-        Ok(ComponentDurableTable {
-            summary: parser.finish()?,
-            shard_count: manifest.shards.len(),
+        let encoded_intent = encode_component_intent_manifest(&manifest)?;
+        let (summary, authority) = admit_component_preintent(&self, &lease, &manifest)?;
+        Ok(ComponentIntentCandidate {
+            lane: self,
+            lease,
+            manifest,
+            encoded_intent,
+            summary,
+            authority,
         })
     }
 }
@@ -316,6 +375,149 @@ impl ComponentDurableTable {
 
     pub(crate) fn shard_count(&self) -> usize {
         self.shard_count
+    }
+}
+
+impl ComponentIntentCandidate {
+    pub(crate) fn manifest(&self) -> &ComponentIntentManifest {
+        &self.manifest
+    }
+
+    pub(crate) fn summary(&self) -> &ComponentTableSummary {
+        &self.summary
+    }
+
+    pub(crate) fn publish_intent(
+        self,
+    ) -> Result<ComponentIntentPublished, ComponentIntentPublishFailure> {
+        self.publish_intent_inner(
+            #[cfg(test)]
+            None,
+        )
+    }
+
+    #[cfg(test)]
+    fn publish_intent_with_fault(
+        self,
+        fault: ComponentIntentPublishFault,
+    ) -> Result<ComponentIntentPublished, ComponentIntentPublishFailure> {
+        self.publish_intent_inner(Some(fault))
+    }
+
+    fn publish_intent_inner(
+        self,
+        #[cfg(test)] fault: Option<ComponentIntentPublishFault>,
+    ) -> Result<ComponentIntentPublished, ComponentIntentPublishFailure> {
+        let (summary, authority) =
+            match admit_component_preintent(&self.lane, &self.lease, &self.manifest) {
+                Ok(admitted) => admitted,
+                Err(cause) => {
+                    return Err(ComponentIntentPublishFailure::BeforePromotion {
+                        candidate: Box::new(self),
+                        cause,
+                    });
+                }
+            };
+        if summary != self.summary || authority != self.authority {
+            return Err(ComponentIntentPublishFailure::BeforePromotion {
+                candidate: Box::new(self),
+                cause: ComponentEffectsError::Topology,
+            });
+        }
+        #[cfg(test)]
+        let marker_result = match fault {
+            Some(ComponentIntentPublishFault::BeforeMarkerPromotion) => {
+                self.lane.lane.write_new_exact_retained_with_fault(
+                    COMPONENT_INTENT_FILE,
+                    &self.encoded_intent,
+                    ManagedCreateOnlyWriteFault::AfterTempVerified,
+                )
+            }
+            Some(ComponentIntentPublishFault::AfterMarkerPromotion) => {
+                self.lane.lane.write_new_exact_retained_with_fault(
+                    COMPONENT_INTENT_FILE,
+                    &self.encoded_intent,
+                    ManagedCreateOnlyWriteFault::AfterPromotion,
+                )
+            }
+            _ => self
+                .lane
+                .lane
+                .write_new_exact_retained(COMPONENT_INTENT_FILE, &self.encoded_intent),
+        };
+        #[cfg(not(test))]
+        let marker_result = self
+            .lane
+            .lane
+            .write_new_exact_retained(COMPONENT_INTENT_FILE, &self.encoded_intent);
+        let intent_guard = match marker_result {
+            Ok(guard) => guard,
+            Err(ManagedCreateOnlyWriteFailure::BeforePromotion(cause)) => {
+                return Err(ComponentIntentPublishFailure::BeforePromotion {
+                    candidate: Box::new(self),
+                    cause: cause.into(),
+                });
+            }
+            Err(ManagedCreateOnlyWriteFailure::PromotionAttempted { final_guard, cause }) => {
+                return Err(ComponentIntentPublishFailure::PromotionAttempted {
+                    candidate: Box::new(self),
+                    intent_guard: final_guard,
+                    cause: cause.into(),
+                });
+            }
+        };
+        if let Err(cause) = finish_component_intent_publication(
+            &self,
+            &intent_guard,
+            #[cfg(test)]
+            fault,
+        ) {
+            return Err(ComponentIntentPublishFailure::PromotionAttempted {
+                candidate: Box::new(self),
+                intent_guard: Some(intent_guard),
+                cause,
+            });
+        }
+        Ok(ComponentIntentPublished {
+            candidate: self,
+            intent_guard,
+        })
+    }
+}
+
+impl ComponentIntentPublished {
+    pub(crate) fn candidate(&self) -> &ComponentIntentCandidate {
+        &self.candidate
+    }
+
+    pub(crate) fn intent_guard(&self) -> &ManagedFileGuard {
+        &self.intent_guard
+    }
+
+    pub(crate) fn into_parts(self) -> (ComponentIntentCandidate, ManagedFileGuard) {
+        (self.candidate, self.intent_guard)
+    }
+}
+
+impl ComponentIntentPublishFailure {
+    pub(crate) fn cause(&self) -> &ComponentEffectsError {
+        match self {
+            Self::BeforePromotion { cause, .. } | Self::PromotionAttempted { cause, .. } => cause,
+        }
+    }
+
+    pub(crate) fn candidate(&self) -> &ComponentIntentCandidate {
+        match self {
+            Self::BeforePromotion { candidate, .. }
+            | Self::PromotionAttempted { candidate, .. } => candidate,
+        }
+    }
+
+    pub(crate) fn intent_guard(&self) -> Option<&ManagedFileGuard> {
+        match self {
+            Self::BeforePromotion { .. } => None,
+            Self::PromotionAttempted { intent_guard, .. } => intent_guard.as_ref(),
+        }
     }
 }
 
@@ -463,6 +665,270 @@ pub(crate) fn plan_component_canonical_path(
     })
 }
 
+pub(crate) fn component_root_binding_sha256(
+    root: &ManagedDir,
+) -> Result<[u8; 32], ComponentEffectsError> {
+    let binding = root.identity()?.persistent_binding();
+    Ok(Sha256::digest(binding.as_bytes()).into())
+}
+
+fn admit_component_preintent(
+    lane: &ComponentLane,
+    lease: &ManagedRootPublicationLease,
+    manifest: &ComponentIntentManifest,
+) -> Result<(ComponentTableSummary, ComponentPreintentAuthority), ComponentEffectsError> {
+    lease.revalidate()?;
+    if manifest.component != lane.component
+        || component_root_binding_sha256(lease.root())? != manifest.root_binding_sha256
+    {
+        return Err(ComponentEffectsError::Topology);
+    }
+    let expected_lane = BTreeSet::from([
+        COMPONENT_QUARANTINE_DIRECTORY.to_string(),
+        COMPONENT_STAGING_DIRECTORY.to_string(),
+        COMPONENT_TABLE_DIRECTORY.to_string(),
+    ]);
+    if exact_entry_names(&lane.lane, MAX_COMPONENT_LANE_ENTRIES + 1)? != expected_lane {
+        return Err(ComponentEffectsError::Topology);
+    }
+    validate_indexed_names(
+        &lane.table,
+        manifest.shards.len(),
+        MAX_COMPONENT_TABLE_SHARDS,
+        component_table_file_name,
+    )?;
+    validate_indexed_names(
+        &lane.staging,
+        manifest.shards.len(),
+        MAX_COMPONENT_TABLE_SHARDS,
+        component_bucket_name,
+    )?;
+    validate_indexed_names(
+        &lane.quarantine,
+        manifest.shards.len(),
+        MAX_COMPONENT_TABLE_SHARDS,
+        component_bucket_name,
+    )?;
+
+    let mut parser = ComponentTableParser::new(manifest.clone())?;
+    let mut shard_authority = Vec::new();
+    shard_authority
+        .try_reserve_exact(manifest.shards.len())
+        .map_err(|_| ComponentEffectsError::Topology)?;
+    for (shard_index, descriptor) in manifest.shards.iter().enumerate() {
+        let table_name = component_table_file_name(shard_index)?;
+        let table_guard = lane
+            .table
+            .inspect_regular_file(&table_name)?
+            .ok_or(ComponentEffectsError::Topology)?;
+        if table_guard.size() != u64::from(descriptor.byte_len)
+            || table_guard.size() > MAX_COMPONENT_TABLE_SHARD_BYTES as u64
+        {
+            return Err(ComponentEffectsError::Topology);
+        }
+        let encoded = lane.table.read_guarded_file_bounded(
+            &table_name,
+            &table_guard,
+            MAX_COMPONENT_TABLE_SHARD_BYTES as u64,
+        )?;
+        let shard = parser.parse_next(&encoded)?;
+        let table_identity = table_guard.identity();
+        drop(table_guard);
+
+        let bucket_name = component_bucket_name(shard_index)?;
+        let staging = lane.staging.open_child(&bucket_name)?;
+        let quarantine = lane.quarantine.open_child(&bucket_name)?;
+        let staging_identity = staging.identity()?;
+        let quarantine_identity = quarantine.identity()?;
+        let staging_names = exact_entry_names(&staging, 257)?;
+        if !exact_entry_names(&quarantine, 1)?.is_empty() {
+            return Err(ComponentEffectsError::Topology);
+        }
+        let mut expected_staged = 0_usize;
+        let mut row_authority = Vec::new();
+        row_authority
+            .try_reserve_exact(shard.rows.len())
+            .map_err(|_| ComponentEffectsError::Topology)?;
+        for (row_index, row) in shard.rows.iter().enumerate() {
+            row_authority.push(admit_component_preintent_row(
+                lease.root(),
+                lane.component,
+                row,
+                &staging,
+                &staging_names,
+                row_index,
+            )?);
+            if !row.prior_is_final() {
+                expected_staged += 1;
+            }
+        }
+        if staging_names.len() != expected_staged {
+            return Err(ComponentEffectsError::Topology);
+        }
+        staging.sync()?;
+        quarantine.sync()?;
+        shard_authority.push(ComponentPreintentShardAuthority {
+            table: table_identity,
+            staging: staging_identity,
+            quarantine: quarantine_identity,
+            rows: row_authority,
+        });
+    }
+    let summary = parser.finish()?;
+    lane.table.sync()?;
+    lane.staging.sync()?;
+    lane.quarantine.sync()?;
+    lane.lane.sync()?;
+    lease.publication_directory().sync()?;
+    lease.root().sync()?;
+    lease.revalidate()?;
+    if component_root_binding_sha256(lease.root())? != manifest.root_binding_sha256 {
+        return Err(ComponentEffectsError::Topology);
+    }
+    Ok((
+        summary,
+        ComponentPreintentAuthority {
+            root: lease.root().identity()?,
+            publication: lease.publication_directory().identity()?,
+            lane: lane.lane.identity()?,
+            table: lane.table.identity()?,
+            staging: lane.staging.identity()?,
+            quarantine: lane.quarantine.identity()?,
+            shards: shard_authority,
+        },
+    ))
+}
+
+fn admit_component_preintent_row(
+    root: &ManagedDir,
+    component: ManagedComponentKind,
+    row: &ComponentTableRow,
+    staging: &ManagedDir,
+    staging_names: &BTreeSet<String>,
+    row_index: usize,
+) -> Result<ComponentPreintentRowAuthority, ComponentEffectsError> {
+    let slot_name = component_slot_name(row_index)?;
+    let staged = staging_names.contains(&slot_name);
+    let mut staging_identity = None;
+    if row.prior_is_final() {
+        if staged {
+            return Err(ComponentEffectsError::Topology);
+        }
+    } else {
+        if !staged {
+            return Err(ComponentEffectsError::Topology);
+        }
+        let guard = staging
+            .inspect_regular_file(&slot_name)?
+            .ok_or(ComponentEffectsError::Topology)?;
+        if guard.size() != row.final_size
+            || staging.sha1_guarded_file_bytes(&slot_name, &guard, MAX_TIER2_ARTIFACT_BYTES)?
+                != row.final_sha1
+        {
+            return Err(ComponentEffectsError::Topology);
+        }
+        staging_identity = Some(guard.identity());
+    }
+
+    let canonical = plan_component_canonical_path(root, component, &row.path)?;
+    if canonical.first_created_depth() != row.first_created_depth {
+        return Err(ComponentEffectsError::Topology);
+    }
+    let canonical_anchor = canonical.creation_anchor().identity()?;
+    let canonical_identity = match (&row.prior, canonical.observe()?) {
+        (None, ComponentCanonicalObservation::Absent) => None,
+        (Some(prior), ComponentCanonicalObservation::Regular(observed))
+            if observed.size() == prior.size && observed.sha1() == prior.sha1 =>
+        {
+            Some(observed.guard().identity())
+        }
+        _ => return Err(ComponentEffectsError::Topology),
+    };
+    Ok(ComponentPreintentRowAuthority {
+        staging: staging_identity,
+        canonical_anchor,
+        canonical: canonical_identity,
+    })
+}
+
+fn validate_indexed_names(
+    directory: &ManagedDir,
+    expected_count: usize,
+    maximum: usize,
+    expected_name: impl Fn(usize) -> Result<String, ComponentEffectsError>,
+) -> Result<(), ComponentEffectsError> {
+    if expected_count > maximum {
+        return Err(ComponentEffectsError::Topology);
+    }
+    let names = exact_entry_names(directory, maximum + 1)?;
+    if names.len() != expected_count {
+        return Err(ComponentEffectsError::Topology);
+    }
+    for (index, name) in names.iter().enumerate() {
+        if *name != expected_name(index)? {
+            return Err(ComponentEffectsError::Topology);
+        }
+    }
+    Ok(())
+}
+
+fn finish_component_intent_publication(
+    candidate: &ComponentIntentCandidate,
+    intent_guard: &ManagedFileGuard,
+    #[cfg(test)] fault: Option<ComponentIntentPublishFault>,
+) -> Result<(), ComponentEffectsError> {
+    if intent_guard.size()
+        != u64::try_from(candidate.encoded_intent.len())
+            .map_err(|_| ComponentEffectsError::Topology)?
+        || candidate.lane.lane.read_guarded_file_bounded(
+            COMPONENT_INTENT_FILE,
+            intent_guard,
+            MAX_COMPONENT_INTENT_BYTES as u64,
+        )? != candidate.encoded_intent
+    {
+        return Err(ComponentEffectsError::Topology);
+    }
+    let expected_lane = BTreeSet::from([
+        COMPONENT_INTENT_FILE.to_string(),
+        COMPONENT_QUARANTINE_DIRECTORY.to_string(),
+        COMPONENT_STAGING_DIRECTORY.to_string(),
+        COMPONENT_TABLE_DIRECTORY.to_string(),
+    ]);
+    if exact_entry_names(&candidate.lane.lane, MAX_COMPONENT_LANE_ENTRIES + 1)? != expected_lane {
+        return Err(ComponentEffectsError::Topology);
+    }
+    candidate.lane.lane.sync()?;
+    #[cfg(test)]
+    if fault == Some(ComponentIntentPublishFault::AfterLaneSynced) {
+        return Err(ComponentEffectsError::Topology);
+    }
+    candidate.lease.publication_directory().sync()?;
+    #[cfg(test)]
+    if fault == Some(ComponentIntentPublishFault::AfterPublicationSynced) {
+        return Err(ComponentEffectsError::Topology);
+    }
+    candidate.lease.root().sync()?;
+    #[cfg(test)]
+    if fault == Some(ComponentIntentPublishFault::AfterRootSynced) {
+        return Err(ComponentEffectsError::Topology);
+    }
+    candidate.lease.revalidate()?;
+    #[cfg(test)]
+    if fault == Some(ComponentIntentPublishFault::AfterLeaseRevalidated) {
+        return Err(ComponentEffectsError::Topology);
+    }
+    if component_root_binding_sha256(candidate.lease.root())?
+        != candidate.manifest.root_binding_sha256
+        || !candidate
+            .lane
+            .lane
+            .file_guard_matches(COMPONENT_INTENT_FILE, intent_guard)?
+    {
+        return Err(ComponentEffectsError::Topology);
+    }
+    Ok(())
+}
+
 fn copy_bounded_string(value: &str) -> Result<String, ComponentEffectsError> {
     let mut copied = String::new();
     copied
@@ -477,13 +943,8 @@ impl ComponentPreintentCleanupPlan {
         lane: &ManagedDir,
         component: ManagedComponentKind,
     ) -> Result<Self, ComponentEffectsError> {
-        let names = exact_entry_names(lane, MAX_COMPONENT_LANE_ENTRIES + 1)?;
-        if names
-            .iter()
-            .any(|name| !component_preintent_lane_entry_is_known(name))
-        {
-            return Err(ComponentEffectsError::Topology);
-        }
+        let entries = plan_component_lane_entries(lane)?;
+        let names = &entries.directories;
         let table = names
             .contains(COMPONENT_TABLE_DIRECTORY)
             .then(|| lane.open_child(COMPONENT_TABLE_DIRECTORY))
@@ -503,25 +964,13 @@ impl ComponentPreintentCleanupPlan {
             .map(ComponentBucketCleanupPlan::admit)
             .transpose()?;
         let plan = Self {
+            temporary: entries.temporary,
             table,
             staging,
             quarantine,
         };
         plan.revalidate_with_temps(lane)?;
         Ok(plan)
-    }
-
-    fn remove_temps(&self) -> Result<(), ComponentEffectsError> {
-        if let Some(table) = &self.table {
-            table.remove_temps()?;
-        }
-        if let Some(staging) = &self.staging {
-            staging.remove_temps()?;
-        }
-        if let Some(quarantine) = &self.quarantine {
-            quarantine.remove_temps()?;
-        }
-        Ok(())
     }
 
     fn revalidate_lane(&self, lane: &ManagedDir) -> Result<(), ComponentEffectsError> {
@@ -541,8 +990,40 @@ impl ComponentPreintentCleanupPlan {
         Ok(())
     }
 
+    fn revalidate_lane_with_temps(&self, lane: &ManagedDir) -> Result<(), ComponentEffectsError> {
+        let mut expected = BTreeSet::new();
+        if self.table.is_some() {
+            expected.insert(COMPONENT_TABLE_DIRECTORY.to_string());
+        }
+        if self.staging.is_some() {
+            expected.insert(COMPONENT_STAGING_DIRECTORY.to_string());
+        }
+        if self.quarantine.is_some() {
+            expected.insert(COMPONENT_QUARANTINE_DIRECTORY.to_string());
+        }
+        for file in &self.temporary {
+            expected.insert(file.name.clone());
+        }
+        if exact_entry_names(
+            lane,
+            MAX_COMPONENT_LANE_ENTRIES + MAX_MANAGED_TEMP_ENTRIES + 1,
+        )? != expected
+        {
+            return Err(ComponentEffectsError::Topology);
+        }
+        for file in &self.temporary {
+            let guard = inspect_planned_file(lane, file)?;
+            if !validate_managed_temp_name(&file.name)?
+                || !lane.managed_temp_is_orphan(&file.name, &guard)?
+            {
+                return Err(ComponentEffectsError::Topology);
+            }
+        }
+        Ok(())
+    }
+
     fn revalidate_with_temps(&self, lane: &ManagedDir) -> Result<(), ComponentEffectsError> {
-        self.revalidate_lane(lane)?;
+        self.revalidate_lane_with_temps(lane)?;
         if let Some(table) = &self.table {
             table.revalidate_with_temps()?;
         }
@@ -571,7 +1052,16 @@ impl ComponentPreintentCleanupPlan {
 
     fn execute(self, lane: &ManagedDir) -> Result<(), ComponentEffectsError> {
         self.revalidate_with_temps(lane)?;
-        self.remove_temps()?;
+        remove_planned_temps(lane, &self.temporary)?;
+        if let Some(table) = &self.table {
+            table.remove_temps()?;
+        }
+        if let Some(staging) = &self.staging {
+            staging.remove_temps()?;
+        }
+        if let Some(quarantine) = &self.quarantine {
+            quarantine.remove_temps()?;
+        }
         self.revalidate(lane)?;
         if let Some(table) = self.table {
             table.execute()?;
@@ -885,6 +1375,54 @@ fn exact_entry_names(
         .collect()
 }
 
+fn plan_component_lane_entries(
+    lane: &ManagedDir,
+) -> Result<ComponentLaneEntryPlan, ComponentEffectsError> {
+    let limit = MAX_COMPONENT_LANE_ENTRIES
+        .checked_add(MAX_MANAGED_TEMP_ENTRIES)
+        .and_then(|entries| entries.checked_add(1))
+        .ok_or(ComponentEffectsError::Topology)?;
+    let entries = lane.entries_bounded(limit)?;
+    if entries.len() >= limit {
+        return Err(ComponentEffectsError::Topology);
+    }
+    let mut directories = BTreeSet::new();
+    let mut temporary = Vec::new();
+    temporary
+        .try_reserve_exact(entries.len().min(MAX_MANAGED_TEMP_ENTRIES))
+        .map_err(|_| ComponentEffectsError::Topology)?;
+    for name in entries {
+        let name = name
+            .into_string()
+            .map_err(|_| ComponentEffectsError::Topology)?;
+        if component_preintent_lane_entry_is_known(&name) {
+            directories.insert(name);
+            continue;
+        }
+        if !validate_managed_temp_name(&name)? || temporary.len() >= MAX_MANAGED_TEMP_ENTRIES {
+            return Err(ComponentEffectsError::Topology);
+        }
+        let guard = lane
+            .inspect_regular_file(&name)?
+            .ok_or(ComponentEffectsError::Topology)?;
+        if guard.size() > MAX_COMPONENT_INTENT_BYTES as u64
+            || !lane.managed_temp_is_orphan(&name, &guard)?
+        {
+            return Err(ComponentEffectsError::Topology);
+        }
+        temporary.push(ComponentPlannedFile {
+            name,
+            size: guard.size(),
+            identity: guard.identity(),
+        });
+    }
+    temporary.sort_unstable_by(|left, right| left.name.cmp(&right.name));
+    Ok(ComponentLaneEntryPlan {
+        directories,
+        temporary,
+    })
+}
+
 fn plan_directory_files(
     directory: &ManagedDir,
     maximum_owned: usize,
@@ -1087,8 +1625,17 @@ mod tests {
         ComponentShardDescriptor, ComponentTableBuilder, ComponentTableRow,
         ManagedComponentArtifactKind,
     };
-    use sha2::{Digest as _, Sha256};
     use std::fs;
+
+    #[cfg(target_os = "linux")]
+    fn open_fds_beneath(root: &std::path::Path) -> usize {
+        fs::read_dir("/proc/self/fd")
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter_map(|entry| fs::read_link(entry.path()).ok())
+            .filter(|target| target.starts_with(root))
+            .count()
+    }
 
     fn single_valid_table_shard() -> Vec<u8> {
         let digest = [0x51; 20];
@@ -1110,6 +1657,101 @@ mod tests {
             }])
             .unwrap()
             .0
+    }
+
+    async fn single_absent_row_candidate(
+        temporary: &tempfile::TempDir,
+    ) -> ComponentIntentCandidate {
+        let root = ManagedDir::open_root(temporary.path()).unwrap();
+        let lease = ManagedRootPublicationLease::acquire(root).await.unwrap();
+        let root_binding = component_root_binding_sha256(lease.root()).unwrap();
+        let lane = ComponentLane::prepare_fresh(&lease, ManagedComponentKind::Libraries).unwrap();
+        let staged = b"staged-final";
+        let final_sha1 = sha1::Sha1::digest(staged).into();
+        let mut builder = ComponentTableBuilder::new(
+            ManagedComponentKind::Libraries,
+            1,
+            [0x81; 16],
+            root_binding,
+        )
+        .unwrap();
+        let (encoded, descriptor) = builder
+            .push_shard(vec![ComponentTableRow {
+                inventory_ordinal: 0,
+                final_size: staged.len() as u64,
+                final_sha1,
+                kind: ManagedComponentArtifactKind::Library,
+                path: ArtifactRelativePath::new("new/library.jar").unwrap(),
+                first_created_depth: Some(0),
+                prior: None,
+            }])
+            .unwrap();
+        let (manifest, _) = builder.finish().unwrap();
+        let mut spool = ComponentTableSpool::new(1).unwrap();
+        spool.append(encoded, descriptor).unwrap();
+        let replay = spool.finish(&manifest).unwrap();
+        lane.publish_table(replay, &manifest).unwrap();
+        let buckets = lane.create_shard_buckets(0).unwrap();
+        buckets.staging().write_new_exact("000", staged).unwrap();
+        drop(buckets);
+        lane.into_intent_candidate(lease, manifest).unwrap()
+    }
+
+    async fn two_shard_empty_file_candidate(
+        temporary: &tempfile::TempDir,
+    ) -> (
+        ComponentLane,
+        ManagedRootPublicationLease,
+        ComponentIntentManifest,
+    ) {
+        let root = ManagedDir::open_root(temporary.path()).unwrap();
+        let lease = ManagedRootPublicationLease::acquire(root).await.unwrap();
+        let root_binding = component_root_binding_sha256(lease.root()).unwrap();
+        let lane = ComponentLane::prepare_fresh(&lease, ManagedComponentKind::Libraries).unwrap();
+        let total_rows = 257_usize;
+        let mut builder = ComponentTableBuilder::new(
+            ManagedComponentKind::Libraries,
+            total_rows,
+            [0x82; 16],
+            root_binding,
+        )
+        .unwrap();
+        let mut spool = ComponentTableSpool::new(total_rows).unwrap();
+        let empty_sha1 = sha1::Sha1::digest([]).into();
+        for shard_index in 0..2 {
+            let first = shard_index * 256;
+            let count = (total_rows - first).min(256);
+            let mut rows = Vec::new();
+            rows.try_reserve_exact(count).unwrap();
+            for index in first..first + count {
+                rows.push(ComponentTableRow {
+                    inventory_ordinal: index as u32,
+                    final_size: 0,
+                    final_sha1: empty_sha1,
+                    kind: ManagedComponentArtifactKind::Library,
+                    path: ArtifactRelativePath::new(&format!("artifact/{index:06}.jar")).unwrap(),
+                    first_created_depth: Some(0),
+                    prior: None,
+                });
+            }
+            let (encoded, descriptor) = builder.push_shard(rows).unwrap();
+            spool.append(encoded, descriptor).unwrap();
+        }
+        let (manifest, _) = builder.finish().unwrap();
+        let replay = spool.finish(&manifest).unwrap();
+        lane.publish_table(replay, &manifest).unwrap();
+        for shard_index in 0..2 {
+            let buckets = lane.create_shard_buckets(shard_index).unwrap();
+            let first = shard_index * 256;
+            let count = (total_rows - first).min(256);
+            for row_index in 0..count {
+                buckets
+                    .staging()
+                    .write_new_exact(&component_slot_name(row_index).unwrap(), b"")
+                    .unwrap();
+            }
+        }
+        (lane, lease, manifest)
     }
 
     #[tokio::test]
@@ -1482,6 +2124,287 @@ mod tests {
         assert_eq!(fs::read(temp_file).unwrap(), b"new-temp");
     }
 
+    #[tokio::test]
+    async fn orphaned_lane_marker_temp_is_exactly_recovered() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = ManagedDir::open_root(temporary.path()).unwrap();
+        let lease = ManagedRootPublicationLease::acquire(root).await.unwrap();
+        let lane = ComponentLane::prepare_fresh(&lease, ManagedComponentKind::Libraries).unwrap();
+        let temp_file = lane
+            .lane()
+            .path()
+            .join(format!(".axial-loader-tmp-{}-61-0", std::process::id()));
+        fs::write(&temp_file, b"partial-intent").unwrap();
+        drop(lane);
+
+        let recovered =
+            ComponentLane::prepare_fresh(&lease, ManagedComponentKind::Libraries).unwrap();
+
+        assert!(!temp_file.exists());
+        assert_eq!(
+            exact_entry_names(recovered.lane(), MAX_COMPONENT_LANE_ENTRIES + 1).unwrap(),
+            BTreeSet::from([
+                COMPONENT_QUARANTINE_DIRECTORY.to_string(),
+                COMPONENT_STAGING_DIRECTORY.to_string(),
+                COMPONENT_TABLE_DIRECTORY.to_string(),
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn replaced_lane_marker_temp_is_never_deleted() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = ManagedDir::open_root(temporary.path()).unwrap();
+        let lease = ManagedRootPublicationLease::acquire(root).await.unwrap();
+        let lane = ComponentLane::prepare_fresh(&lease, ManagedComponentKind::Libraries).unwrap();
+        let temp_file = lane
+            .lane()
+            .path()
+            .join(format!(".axial-loader-tmp-{}-62-0", std::process::id()));
+        let saved_temp = temporary.path().join("saved-lane-marker-temp");
+        fs::write(&temp_file, b"original").unwrap();
+        drop(lane);
+
+        let result = ComponentLane::prepare_fresh_with_cleanup_hook(
+            &lease,
+            ManagedComponentKind::Libraries,
+            || {
+                fs::rename(&temp_file, &saved_temp).unwrap();
+                fs::write(&temp_file, b"replaced").unwrap();
+            },
+        );
+
+        assert!(result.is_err());
+        assert_eq!(fs::read(temp_file).unwrap(), b"replaced");
+        assert_eq!(fs::read(saved_temp).unwrap(), b"original");
+    }
+
+    #[tokio::test]
+    async fn intent_candidate_publishes_exact_marker_last_and_is_send() {
+        fn assert_send<T: Send>() {}
+        assert_send::<ComponentIntentCandidate>();
+        assert_send::<ComponentIntentPublished>();
+        assert_send::<ComponentIntentPublishFailure>();
+        let temporary = tempfile::tempdir().unwrap();
+        let candidate = single_absent_row_candidate(&temporary).await;
+        let encoded = candidate.encoded_intent.clone();
+        assert!(
+            !candidate
+                .lane
+                .lane
+                .path()
+                .join(COMPONENT_INTENT_FILE)
+                .exists()
+        );
+
+        let published = match candidate.publish_intent() {
+            Ok(published) => published,
+            Err(_) => panic!("publish exact component intent"),
+        };
+
+        assert_eq!(published.candidate().manifest().total_rows, 1);
+        assert_eq!(published.candidate().summary().row_count, 1);
+        assert!(
+            published
+                .candidate()
+                .lane
+                .lane
+                .file_guard_matches(COMPONENT_INTENT_FILE, published.intent_guard())
+                .unwrap()
+        );
+        let (candidate, guard) = published.into_parts();
+        drop(guard);
+        assert_eq!(
+            fs::read(candidate.lane.lane.path().join(COMPONENT_INTENT_FILE)).unwrap(),
+            encoded
+        );
+    }
+
+    #[tokio::test]
+    async fn intent_publication_distinguishes_before_and_attempted_faults() {
+        let temporary = tempfile::tempdir().unwrap();
+        let candidate = single_absent_row_candidate(&temporary).await;
+        let lane_path = candidate.lane.lane.path().to_path_buf();
+        let before = match candidate
+            .publish_intent_with_fault(ComponentIntentPublishFault::BeforeMarkerPromotion)
+        {
+            Err(failure) => failure,
+            Ok(_) => panic!("injected pre-promotion failure was ignored"),
+        };
+        assert!(matches!(
+            &before,
+            ComponentIntentPublishFailure::BeforePromotion { .. }
+        ));
+        assert!(before.intent_guard().is_none());
+        let _ = before.cause();
+        let _ = before.candidate();
+        assert!(!lane_path.join(COMPONENT_INTENT_FILE).exists());
+
+        for fault in [
+            ComponentIntentPublishFault::AfterMarkerPromotion,
+            ComponentIntentPublishFault::AfterLaneSynced,
+            ComponentIntentPublishFault::AfterPublicationSynced,
+            ComponentIntentPublishFault::AfterRootSynced,
+            ComponentIntentPublishFault::AfterLeaseRevalidated,
+        ] {
+            let temporary = tempfile::tempdir().unwrap();
+            let candidate = single_absent_row_candidate(&temporary).await;
+            let lane_path = candidate.lane.lane.path().to_path_buf();
+            let attempted = match candidate.publish_intent_with_fault(fault) {
+                Err(failure) => failure,
+                Ok(_) => panic!("injected post-promotion failure was ignored"),
+            };
+            assert!(matches!(
+                &attempted,
+                ComponentIntentPublishFailure::PromotionAttempted { .. }
+            ));
+            let guard = attempted
+                .intent_guard()
+                .expect("attempt retains exact intent guard");
+            assert!(
+                attempted
+                    .candidate()
+                    .lane
+                    .lane
+                    .file_guard_matches(COMPONENT_INTENT_FILE, guard)
+                    .unwrap()
+            );
+            let _ = attempted.cause();
+            drop(attempted);
+            assert!(lane_path.join(COMPONENT_INTENT_FILE).is_file());
+        }
+    }
+
+    #[tokio::test]
+    async fn candidate_rejects_same_byte_table_and_stage_replacements_before_marker() {
+        for replace_table in [true, false] {
+            let temporary = tempfile::tempdir().unwrap();
+            let candidate = single_absent_row_candidate(&temporary).await;
+            let target = if replace_table {
+                candidate.lane.table.path().join("000000.tbl")
+            } else {
+                candidate.lane.staging.path().join("000000/000")
+            };
+            let saved = temporary.path().join(if replace_table {
+                "saved-table-file"
+            } else {
+                "saved-stage-file"
+            });
+            let bytes = fs::read(&target).unwrap();
+            fs::rename(&target, &saved).unwrap();
+            fs::write(&target, &bytes).unwrap();
+            let lane_path = candidate.lane.lane.path().to_path_buf();
+
+            let failure = match candidate.publish_intent() {
+                Err(failure) => failure,
+                Ok(_) => panic!("identity replacement did not invalidate candidate"),
+            };
+
+            assert!(matches!(
+                failure,
+                ComponentIntentPublishFailure::BeforePromotion { .. }
+            ));
+            assert!(!lane_path.join(COMPONENT_INTENT_FILE).exists());
+            assert_eq!(fs::read(target).unwrap(), bytes);
+            assert_eq!(fs::read(saved).unwrap(), bytes);
+        }
+    }
+
+    #[tokio::test]
+    async fn candidate_rejects_canonical_sentinel_and_child_directory_drift() {
+        let temporary = tempfile::tempdir().unwrap();
+        let candidate = single_absent_row_candidate(&temporary).await;
+        fs::create_dir_all(temporary.path().join("libraries/new")).unwrap();
+        fs::write(
+            temporary.path().join("libraries/new/library.jar"),
+            b"canonical-drift",
+        )
+        .unwrap();
+        let lane_path = candidate.lane.lane.path().to_path_buf();
+        let failure = match candidate.publish_intent() {
+            Err(failure) => failure,
+            Ok(_) => panic!("canonical absence sentinel drift was accepted"),
+        };
+        assert!(matches!(
+            &failure,
+            ComponentIntentPublishFailure::BeforePromotion { .. }
+        ));
+        assert!(!lane_path.join(COMPONENT_INTENT_FILE).exists());
+
+        let temporary = tempfile::tempdir().unwrap();
+        let candidate = single_absent_row_candidate(&temporary).await;
+        let table = candidate.lane.table.path().to_path_buf();
+        let saved_table = temporary.path().join("saved-table-directory");
+        let encoded = fs::read(table.join("000000.tbl")).unwrap();
+        fs::rename(&table, &saved_table).unwrap();
+        fs::create_dir(&table).unwrap();
+        fs::write(table.join("000000.tbl"), encoded).unwrap();
+        let lane_path = candidate.lane.lane.path().to_path_buf();
+        let failure = match candidate.publish_intent() {
+            Err(failure) => failure,
+            Ok(_) => panic!("table directory identity drift was accepted"),
+        };
+        assert!(matches!(
+            &failure,
+            ComponentIntentPublishFailure::BeforePromotion { .. }
+        ));
+        assert!(!lane_path.join(COMPONENT_INTENT_FILE).exists());
+        assert!(table.is_dir());
+        assert!(saved_table.is_dir());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn candidate_rejects_root_binding_replacement_before_marker() {
+        let temporary = tempfile::tempdir().unwrap();
+        let candidate = single_absent_row_candidate(&temporary).await;
+        let original_root = temporary.path().to_path_buf();
+        let saved_root = original_root.with_extension("saved-component-root");
+        fs::rename(&original_root, &saved_root).unwrap();
+        fs::create_dir(&original_root).unwrap();
+
+        let failure = match candidate.publish_intent() {
+            Err(failure) => failure,
+            Ok(_) => panic!("root identity replacement was accepted"),
+        };
+
+        assert!(matches!(
+            failure,
+            ComponentIntentPublishFailure::BeforePromotion { .. }
+        ));
+        assert!(
+            !original_root
+                .join(".axial-publication/libraries/intent.bin")
+                .exists()
+        );
+        drop(failure);
+        fs::remove_dir(&original_root).unwrap();
+        fs::rename(&saved_root, &original_root).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn streamed_candidate_authority_has_constant_fd_growth_across_shards() {
+        let temporary = tempfile::tempdir().unwrap();
+        let (lane, lease, manifest) = two_shard_empty_file_candidate(&temporary).await;
+        let before = open_fds_beneath(temporary.path());
+
+        let candidate = lane.into_intent_candidate(lease, manifest).unwrap();
+
+        assert!(open_fds_beneath(temporary.path()) <= before + 1);
+        assert_eq!(candidate.authority.shards.len(), 2);
+        assert_eq!(
+            candidate
+                .authority
+                .shards
+                .iter()
+                .map(|shard| shard.rows.len())
+                .sum::<usize>(),
+            257
+        );
+        // The 782-shard bound repeats this same one-shard-at-a-time handle lifetime.
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn maximum_bucket_admission_does_not_retain_per_bucket_handles() {
@@ -1499,13 +2422,12 @@ mod tests {
             b"dead-temp",
         )
         .unwrap();
-        let open_fds = || fs::read_dir("/proc/self/fd").unwrap().count();
-        let before = open_fds();
+        let before = open_fds_beneath(temporary.path());
 
         let plan = ComponentBucketCleanupPlan::admit(directory).unwrap();
 
         assert_eq!(plan.buckets.len(), MAX_COMPONENT_TABLE_SHARDS);
-        assert!(open_fds() <= before + 2);
+        assert!(open_fds_beneath(temporary.path()) <= before + 2);
     }
 
     #[test]
@@ -1669,10 +2591,7 @@ mod tests {
         let durable = lane.publish_table(replay, &manifest).unwrap();
         assert_eq!(durable.summary(), &expected_summary);
         assert_eq!(durable.shard_count(), 1);
-        let reopened = lane.read_table(&manifest).unwrap();
-        assert_eq!(reopened.summary(), &expected_summary);
-        assert_eq!(reopened.shard_count(), 1);
-        drop((durable, reopened, lane));
+        drop((durable, lane));
 
         let cleaned =
             ComponentLane::prepare_fresh(&lease, ManagedComponentKind::Libraries).unwrap();
