@@ -1,7 +1,7 @@
 use axial_content::ContentKind;
 use axial_minecraft::{LoaderComponentId, download::DownloadProgress};
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     future::Future,
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
@@ -591,7 +591,9 @@ impl InstallStore {
         {
             return None;
         }
-        queue.active.take()
+        let cleared = queue.active.take();
+        prune_queue_outcomes(&mut queue);
+        cleared
     }
 
     pub async fn complete_active_queued_install(
@@ -652,6 +654,7 @@ impl InstallStore {
             return false;
         }
         queue.active.take();
+        prune_queue_outcomes(&mut queue);
         true
     }
 
@@ -661,7 +664,9 @@ impl InstallStore {
             .pending
             .iter()
             .position(|entry| entry.queue_id == queue_id)?;
-        queue.pending.remove(position)
+        let removed = queue.pending.remove(position);
+        prune_queue_outcomes(&mut queue);
+        removed
     }
 
     pub async fn queue_snapshot(&self) -> InstallQueueSnapshot {
@@ -713,10 +718,36 @@ fn record_queue_outcome(queue: &mut InstallQueueInner, queue_id: &str, succeeded
         .retain(|completed_id| completed_id != queue_id);
     queue.completed.insert(queue_id.to_string(), succeeded);
     queue.completed_order.push_back(queue_id.to_string());
+    prune_queue_outcomes(queue);
+}
+
+fn prune_queue_outcomes(queue: &mut InstallQueueInner) {
+    let referenced: HashSet<String> = queue
+        .active
+        .iter()
+        .map(|entry| &entry.spec)
+        .chain(queue.pending.iter().map(|entry| &entry.spec))
+        .filter_map(|spec| match spec {
+            InstallQueueSpec::Content {
+                prerequisite_queue_id,
+                ..
+            } => prerequisite_queue_id.clone(),
+            _ => None,
+        })
+        .collect();
     while queue.completed_order.len() > MAX_COMPLETED_QUEUE_OUTCOMES {
-        if let Some(expired) = queue.completed_order.pop_front() {
-            queue.completed.remove(&expired);
-        }
+        let Some(position) = queue
+            .completed_order
+            .iter()
+            .position(|queue_id| !referenced.contains(queue_id))
+        else {
+            break;
+        };
+        let expired = queue
+            .completed_order
+            .remove(position)
+            .expect("completed outcome position is valid");
+        queue.completed.remove(&expired);
     }
 }
 
@@ -753,6 +784,60 @@ mod tests {
         assert_eq!(queue.completed_order.len(), MAX_COMPLETED_QUEUE_OUTCOMES);
         assert!(!queue.completed.contains_key("older-0"));
         assert_eq!(queue.completed.get("newest"), Some(&true));
+    }
+
+    #[tokio::test]
+    async fn queue_outcomes_remain_until_pending_dependents_finish() {
+        let store = InstallStore::new();
+        store
+            .enqueue_queued_install(
+                "dependent".to_string(),
+                InstallQueueSpec::Content {
+                    instance_id: "instance".to_string(),
+                    label: "Dependent content".to_string(),
+                    action: ContentQueueAction::Install {
+                        selections: Vec::new(),
+                        allow_incompatible: false,
+                        remove_instance_on_failure: false,
+                    },
+                    prerequisite_queue_id: Some("prerequisite".to_string()),
+                },
+                InstallQueuePlacement::Back,
+            )
+            .await;
+        {
+            let mut queue = store.queue.write().await;
+            record_queue_outcome(&mut queue, "prerequisite", true);
+            for index in 0..MAX_COMPLETED_QUEUE_OUTCOMES {
+                record_queue_outcome(&mut queue, &format!("newer-{index}"), true);
+            }
+            assert_eq!(queue.completed_order.len(), MAX_COMPLETED_QUEUE_OUTCOMES);
+        }
+
+        assert_eq!(
+            store.queued_install_succeeded("prerequisite").await,
+            Some(true)
+        );
+        let dependent = store
+            .reserve_next_queued_install()
+            .await
+            .expect("reserve dependent");
+        assert_eq!(dependent.queue_id, "dependent");
+        assert_eq!(
+            store.queued_install_succeeded("prerequisite").await,
+            Some(true),
+            "the active dependent must retain its prerequisite outcome"
+        );
+
+        store
+            .complete_reserved_queued_install("dependent", true)
+            .await
+            .expect("complete dependent");
+        assert_eq!(store.queued_install_succeeded("prerequisite").await, None);
+        assert_eq!(
+            store.queue.read().await.completed_order.len(),
+            MAX_COMPLETED_QUEUE_OUTCOMES
+        );
     }
 
     #[tokio::test]
