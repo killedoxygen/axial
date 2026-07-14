@@ -9,11 +9,11 @@ use super::model::{
 use crate::artifact_path::ArtifactRelativePath;
 use crate::known_good::MAX_TIER2_AGGREGATE_BYTES;
 use crate::loaders::types::LoaderError;
+use crate::managed_component_lifecycle::{
+    ComponentPublicationSourceIdentity, RetainedComponentPublicationSource,
+};
 use crate::managed_component_table::ManagedComponentArtifactKind;
 use crate::managed_fs::ManagedDir;
-use crate::managed_libraries_publication::{
-    LibrariesPublicationSourceIdentity, RetainedLibrariesPublicationSource,
-};
 use crate::managed_publication::ManagedPublicationLifetimeGuard;
 use futures_util::StreamExt as _;
 use sha1::{Digest as _, Sha1};
@@ -824,7 +824,7 @@ impl RetainedLibraryComponentSource {
         slot: &str,
         lifetime_guard: ManagedPublicationLifetimeGuard,
         blocking_hook: BlockingValidationHook,
-    ) -> Result<LibrariesPublicationSourceIdentity, LoaderError> {
+    ) -> Result<ComponentPublicationSourceIdentity, LoaderError> {
         let Self {
             storage,
             relative_path,
@@ -844,7 +844,7 @@ impl RetainedLibraryComponentSource {
                 blocking_hook,
             )
             .await?;
-        Ok(LibrariesPublicationSourceIdentity::new(
+        Ok(ComponentPublicationSourceIdentity::new(
             relative_path,
             component_source_kind(kind),
             observed_size,
@@ -853,7 +853,7 @@ impl RetainedLibraryComponentSource {
     }
 }
 
-impl RetainedLibrariesPublicationSource for RetainedLibraryComponentSource {
+impl RetainedComponentPublicationSource for RetainedLibraryComponentSource {
     fn relative_path(&self) -> &ArtifactRelativePath {
         &self.relative_path
     }
@@ -875,7 +875,7 @@ impl RetainedLibrariesPublicationSource for RetainedLibraryComponentSource {
         staging_bucket: &ManagedDir,
         slot: &str,
         lifetime_guard: ManagedPublicationLifetimeGuard,
-    ) -> Result<LibrariesPublicationSourceIdentity, LoaderError> {
+    ) -> Result<ComponentPublicationSourceIdentity, LoaderError> {
         let Self {
             storage,
             relative_path,
@@ -894,7 +894,7 @@ impl RetainedLibrariesPublicationSource for RetainedLibraryComponentSource {
                 lifetime_guard,
             )
             .await?;
-        Ok(LibrariesPublicationSourceIdentity::new(
+        Ok(ComponentPublicationSourceIdentity::new(
             relative_path,
             component_source_kind(kind),
             observed_size,
@@ -2190,7 +2190,7 @@ mod tests {
             .expect("stage retained component source");
         assert_eq!(
             staged,
-            LibrariesPublicationSourceIdentity::new(
+            ComponentPublicationSourceIdentity::new(
                 fixture_relative_path(),
                 ManagedComponentArtifactKind::NativeLibrary,
                 body.len() as u64,
@@ -2632,6 +2632,35 @@ mod tests {
 
         assert_source(&source, &body, &expected, "library:429");
         assert_eq!(requests.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn rejects_zero_length_library_contract_before_network_or_retention() {
+        let (url, requests) = spawn_server(vec![ScriptedResponse::full(Vec::new())]).await;
+        let pool = LibrarySourcePool::for_test();
+
+        let error = rejected(
+            acquire(
+                &url,
+                &ExpectedIntegrity {
+                    size: Some(0),
+                    sha1: Some(sha1_hex(&[])),
+                },
+                LIBRARY_SOURCE_MAX_BYTES,
+                "library:zero-length",
+                &pool,
+            )
+            .await,
+            "expected zero-length library rejection",
+        );
+
+        assert!(error.to_string().contains("scratch limit"));
+        assert_eq!(requests.load(Ordering::SeqCst), 0);
+        assert_eq!(pool.available_bytes(), LIBRARY_SOURCE_MAX_BYTES);
+        assert_eq!(
+            pool.retained_available_bytes(),
+            Some(MAX_TIER2_AGGREGATE_BYTES)
+        );
     }
 
     #[tokio::test]

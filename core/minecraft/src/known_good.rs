@@ -2129,24 +2129,24 @@ fn authenticate_vanilla_authority(
 
 impl PendingKnownGoodInstallAuthority {
     #[cfg(test)]
-    pub(crate) fn libraries_for_test(
-        entries: impl IntoIterator<Item = (String, KnownGoodArtifactKind, [u8; 20], u64)>,
+    pub(crate) fn component_for_test(
+        entries: impl IntoIterator<Item = (KnownGoodRoot, String, KnownGoodArtifactKind, [u8; 20], u64)>,
     ) -> Self {
         let mut inventory = InventoryBuilder::default();
-        for (path, kind, digest, size) in entries {
+        for (root, path, kind, digest, size) in entries {
             inventory
                 .insert(KnownGoodEntry {
-                    root: KnownGoodRoot::Libraries,
-                    path: KnownGoodRelativePath::new(&path).expect("test Libraries path"),
+                    root,
+                    path: KnownGoodRelativePath::new(&path).expect("test component path"),
                     kind,
                     integrity: KnownGoodIntegrity::Sha1 {
                         digest: sha1_array_digest(&digest),
                         size,
                     },
                 })
-                .expect("unique test Libraries entry");
+                .expect("unique test component entry");
         }
-        let version_id = KnownGoodId::new("test-libraries-intent").expect("test version id");
+        let version_id = KnownGoodId::new("test-component-intent").expect("test version id");
         Self {
             authenticated: AuthenticatedKnownGoodReceipt {
                 version_id: version_id.clone(),
@@ -2187,12 +2187,13 @@ impl PendingKnownGoodInstallAuthority {
             .managed_component_projection(ManagedKnownGoodComponent::VersionBundle)
     }
 
-    pub(crate) fn libraries_projection(
+    pub(crate) fn component_projection(
         &self,
+        component: ManagedKnownGoodComponent,
     ) -> Result<ManagedComponentProjection<'_>, ManagedComponentProjectionError> {
         self.authenticated
             .inventory
-            .managed_component_projection(ManagedKnownGoodComponent::Libraries)
+            .managed_component_projection(component)
     }
 
     pub(crate) fn seal_after_version_bundle_commit(self) -> KnownGoodInstallReceipt {
@@ -3254,7 +3255,7 @@ mod tests {
         );
         assert_eq!(projection.entry_count(), 2);
         let libraries = pending
-            .libraries_projection()
+            .component_projection(ManagedKnownGoodComponent::Libraries)
             .expect("pending profile Libraries projection");
         assert_eq!(libraries.component(), ManagedKnownGoodComponent::Libraries);
         assert!(!libraries.entries().is_empty());

@@ -1465,7 +1465,7 @@ impl ManagedDir {
         R: Read + Seek + Send + 'static,
         G: Send + 'static,
     {
-        if expected_size == 0 || expected_size > MAX_MANAGED_READ_BYTES {
+        if expected_size > MAX_MANAGED_READ_BYTES {
             return Err(LoaderError::Verify(
                 "managed retained source exceeds the bounded file limit".to_string(),
             ));
@@ -1499,7 +1499,7 @@ impl ManagedDir {
         R: Read + Seek + Send + 'static,
         G: Send + 'static,
     {
-        if expected_size == 0 || expected_size > MAX_MANAGED_READ_BYTES {
+        if expected_size > MAX_MANAGED_READ_BYTES {
             return Err(LoaderError::Verify(
                 "managed retained source exceeds the bounded file limit".to_string(),
             ));

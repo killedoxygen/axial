@@ -42,8 +42,9 @@ use crate::known_good_libraries::{
     seal_vanilla_exact_library_declarations,
 };
 use crate::launch::{VersionJson, effective_java_version_for};
+use crate::managed_component_lifecycle::{ComponentLifecycleError, publish_managed_component};
+use crate::managed_component_table::ManagedComponentKind;
 use crate::managed_fs::ManagedDir;
-use crate::managed_libraries_publication::{LibrariesLifecycleError, publish_libraries_component};
 use crate::managed_publication::{ManagedRootPublicationLease, run_publication_blocking};
 use crate::manifest::{ManifestEntry, VersionManifest, fetch_fresh_install_version_manifest};
 use crate::paths::assets_dir;
@@ -1973,9 +1974,14 @@ pub(crate) async fn publish_prepared_managed_install(
             library_sources,
         } = prepared;
         let lease = acquire_managed_install_publication_lease(managed_root, &observer_key).await?;
-        let lease = publish_libraries_component(lease, &authority, library_sources)
-            .await
-            .map_err(managed_libraries_install_error)?;
+        let lease = publish_managed_component(
+            lease,
+            &authority,
+            ManagedComponentKind::Libraries,
+            library_sources,
+        )
+        .await
+        .map_err(managed_libraries_install_error)?;
         complete_prepared_version_bundle_install(lease, authority, version_bundle_source).await
     });
     owner.await.map_err(managed_install_owner_error)?
@@ -2088,7 +2094,7 @@ fn version_bundle_install_error(message: impl Into<String>) -> DownloadError {
     DownloadError::ResolveManifest(message.into())
 }
 
-fn managed_libraries_install_error(_error: LibrariesLifecycleError) -> DownloadError {
+fn managed_libraries_install_error(_error: ComponentLifecycleError) -> DownloadError {
     version_bundle_install_error("managed Libraries publication failed")
 }
 
