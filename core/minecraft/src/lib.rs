@@ -8,6 +8,7 @@ mod known_good_reconstruction;
 pub mod launch;
 pub mod lifecycle;
 pub mod loaders;
+mod managed_component_publication;
 mod managed_component_table;
 mod managed_fs;
 mod managed_publication;

@@ -101,7 +101,7 @@ pub(crate) struct ComponentIntentManifest {
 pub(crate) struct ComponentTableError;
 
 impl ManagedComponentKind {
-    fn from_byte(value: u8) -> Result<Self, ComponentTableError> {
+    pub(crate) fn from_byte(value: u8) -> Result<Self, ComponentTableError> {
         match value {
             1 => Ok(Self::Libraries),
             2 => Ok(Self::Assets),
@@ -137,7 +137,7 @@ impl ManagedComponentArtifactKind {
 }
 
 impl ComponentTableRow {
-    fn prior_is_final(&self) -> bool {
+    pub(crate) fn prior_is_final(&self) -> bool {
         self.prior
             .as_ref()
             .is_some_and(|prior| prior.size == self.final_size && prior.sha1 == self.final_sha1)
@@ -176,7 +176,7 @@ pub(crate) fn component_entry_slot(
     Ok(format!("{shard_index:06}/{row_in_shard:03}"))
 }
 
-fn expected_shard_count(total_rows: usize) -> Result<usize, ComponentTableError> {
+pub(crate) fn expected_shard_count(total_rows: usize) -> Result<usize, ComponentTableError> {
     if total_rows > MAX_COMPONENT_TABLE_ROWS {
         return Err(ComponentTableError);
     }
