@@ -2620,45 +2620,62 @@ async fn startup_fails_effect_started_checkpoint_without_replaying_effect() {
 }
 
 #[tokio::test]
-async fn startup_fails_critical_status_when_journal_is_missing_or_corrupt() {
-    for (name, corrupt) in [
-        ("restart-missing-critical-journal", false),
-        ("restart-corrupt-critical-journal", true),
-    ] {
-        let (root, install_id, _, lock_path) =
-            seed_restart_checkpoint(name, RestartCheckpoint::EffectStarted).await;
-        let journal_path = operation_journal_snapshot_path(&root);
-        if corrupt {
-            fs::write(&journal_path, b"{not-valid-json").expect("corrupt journal snapshot");
-        } else {
-            fs::remove_file(&journal_path).expect("remove journal snapshot");
-        }
+async fn startup_fails_critical_status_when_journal_is_missing() {
+    let (root, install_id, _, lock_path) = seed_restart_checkpoint(
+        "restart-missing-critical-journal",
+        RestartCheckpoint::EffectStarted,
+    )
+    .await;
+    fs::remove_file(operation_journal_snapshot_path(&root)).expect("remove journal snapshot");
 
-        let state = build_test_state(&root, None, None);
-        assert_eq!(
-            resume_pending_performance_operations(state.clone()).await,
-            1
-        );
-        assert!(lock_path.is_file(), "critical status cannot replay effect");
-        assert_eq!(
-            state
-                .performance_operations()
-                .get(&install_id)
-                .await
-                .expect("critical status retained")
-                .state,
-            "failed"
-        );
-        assert!(
-            state
-                .journals()
-                .get(&crate::state::contracts::OperationId::new(install_id))
-                .is_some_and(|journal| {
-                    journal.status == crate::state::contracts::OperationStatus::Failed
-                })
-        );
-        let _ = fs::remove_dir_all(root);
-    }
+    let state = build_test_state(&root, None, None);
+    assert_eq!(
+        resume_pending_performance_operations(state.clone()).await,
+        1
+    );
+    assert!(lock_path.is_file(), "critical status cannot replay effect");
+    assert_eq!(
+        state
+            .performance_operations()
+            .get(&install_id)
+            .await
+            .expect("critical status retained")
+            .state,
+        "failed"
+    );
+    assert!(
+        state
+            .journals()
+            .get(&crate::state::contracts::OperationId::new(install_id))
+            .is_some_and(|journal| {
+                journal.status == crate::state::contracts::OperationStatus::Failed
+            })
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn startup_rejects_corrupt_journal_before_replaying_critical_status() {
+    let (root, _, _, lock_path) = seed_restart_checkpoint(
+        "restart-corrupt-critical-journal",
+        RestartCheckpoint::EffectStarted,
+    )
+    .await;
+    fs::write(operation_journal_snapshot_path(&root), b"{not-valid-json")
+        .expect("corrupt journal snapshot");
+
+    let startup = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        build_test_state(&root, None, None)
+    }));
+    assert!(
+        startup.is_err(),
+        "corrupt journals must reject State startup"
+    );
+    assert!(
+        lock_path.is_file(),
+        "rejected startup cannot replay the uncertain effect"
+    );
+    let _ = fs::remove_dir_all(root);
 }
 
 #[tokio::test]

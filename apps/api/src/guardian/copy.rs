@@ -1216,9 +1216,7 @@ impl GuardianRuntimeRepairCopy {
             GuardianRepairStatus::Repaired => {
                 repaired_runtime_guardian_summary(current, &self.user_outcome)
             }
-            GuardianRepairStatus::Blocked
-            | GuardianRepairStatus::Failed
-            | GuardianRepairStatus::Suppressed => {
+            GuardianRepairStatus::Blocked | GuardianRepairStatus::Failed => {
                 blocked_runtime_guardian_summary(current, &self.user_outcome)
             }
         }
@@ -1853,11 +1851,9 @@ enum CopyContextKey {
     RuntimeRepaired,
     RuntimeBlocked,
     RuntimeFailed,
-    RuntimeSuppressed,
     ArtifactRepaired,
     ArtifactBlocked,
     ArtifactFailed,
-    ArtifactSuppressed,
     InstallFailure,
     PerformanceUnsafeOwnership,
     PerformanceMissingJournal,
@@ -1973,21 +1969,6 @@ const GUARDIAN_COPY_RULES: &[GuardianCopyRule] = &[
     ),
     fixed_rule(
         key(
-            Some(DiagnosisId::ManagedRuntimeCorrupt),
-            GuardianActionKind::Block,
-            CopyContextKey::RuntimeSuppressed,
-        ),
-        OperationPhase::Repairing,
-        "Guardian blocked launch preflight.",
-        &[CopyLine::Static(
-            "Guardian suppressed managed Java runtime repair because the same repair failed recently.",
-        )],
-        &[CopyLine::Static(
-            "Reinstall or repair the affected version/runtime before launching again.",
-        )],
-    ),
-    fixed_rule(
-        key(
             Some(DiagnosisId::LauncherManagedArtifactCorrupt),
             GuardianActionKind::Repair,
             CopyContextKey::ArtifactRepaired,
@@ -2020,19 +2001,6 @@ const GUARDIAN_COPY_RULES: &[GuardianCopyRule] = &[
         ),
         OperationPhase::Repairing,
         "Guardian could not repair the launcher-managed install artifact.",
-        &[CopyLine::Static(
-            "Check connection and storage permissions before trying again.",
-        )],
-        &[],
-    ),
-    fixed_rule(
-        key(
-            Some(DiagnosisId::LauncherManagedArtifactCorrupt),
-            GuardianActionKind::Block,
-            CopyContextKey::ArtifactSuppressed,
-        ),
-        OperationPhase::Repairing,
-        "Guardian paused automatic install repair after repeated failure.",
         &[CopyLine::Static(
             "Check connection and storage permissions before trying again.",
         )],
@@ -2941,13 +2909,11 @@ impl GuardianCopyContext<'_> {
                 GuardianRepairStatus::Repaired => CopyContextKey::RuntimeRepaired,
                 GuardianRepairStatus::Blocked => CopyContextKey::RuntimeBlocked,
                 GuardianRepairStatus::Failed => CopyContextKey::RuntimeFailed,
-                GuardianRepairStatus::Suppressed => CopyContextKey::RuntimeSuppressed,
             }),
             Self::ArtifactRepair { status } => Some(match status {
                 GuardianArtifactRepairStatus::Repaired => CopyContextKey::ArtifactRepaired,
                 GuardianArtifactRepairStatus::Blocked => CopyContextKey::ArtifactBlocked,
                 GuardianArtifactRepairStatus::Failed => CopyContextKey::ArtifactFailed,
-                GuardianArtifactRepairStatus::Suppressed => CopyContextKey::ArtifactSuppressed,
             }),
             Self::InstallFailure { .. } => Some(CopyContextKey::InstallFailure),
             Self::PerformanceRejection { rejection, .. } => Some(match rejection {
@@ -4353,7 +4319,7 @@ mod tests {
 
     #[test]
     fn copy_rule_table_is_unique_and_covers_the_five_migrated_families() {
-        assert_eq!(GUARDIAN_COPY_RULES.len(), 28);
+        assert_eq!(GUARDIAN_COPY_RULES.len(), 26);
         for (index, rule) in GUARDIAN_COPY_RULES.iter().enumerate() {
             assert!(
                 GUARDIAN_COPY_RULES[index + 1..]
@@ -4368,12 +4334,10 @@ mod tests {
             let index = match rule.key.context {
                 CopyContextKey::RuntimeRepaired
                 | CopyContextKey::RuntimeBlocked
-                | CopyContextKey::RuntimeFailed
-                | CopyContextKey::RuntimeSuppressed => 0,
+                | CopyContextKey::RuntimeFailed => 0,
                 CopyContextKey::ArtifactRepaired
                 | CopyContextKey::ArtifactBlocked
-                | CopyContextKey::ArtifactFailed
-                | CopyContextKey::ArtifactSuppressed => 1,
+                | CopyContextKey::ArtifactFailed => 1,
                 CopyContextKey::InstallFailure => 2,
                 CopyContextKey::PerformanceUnsafeOwnership
                 | CopyContextKey::PerformanceMissingJournal
@@ -4388,7 +4352,7 @@ mod tests {
             assert!(rule.details.len() <= MAX_COLLECTION_LINES);
             assert!(rule.guidance.len() <= MAX_COLLECTION_LINES);
         }
-        assert_eq!(counts, [4, 4, 13, 6, 1]);
+        assert_eq!(counts, [3, 3, 13, 6, 1]);
     }
 
     #[test]

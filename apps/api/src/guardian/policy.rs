@@ -185,7 +185,6 @@ enum PolicyRejection {
     JournalUnavailable,
     ProtectedOwnershipMutation,
     ExplicitUserIntent,
-    CustomRepairOwnership,
     ActionUnavailableInMode,
     UnknownOwnershipIntervention,
 }
@@ -193,7 +192,6 @@ enum PolicyRejection {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ModeActionPermission {
     Always,
-    CustomRepair,
     CustomAttempt,
     Unavailable,
 }
@@ -349,7 +347,7 @@ const CUSTOM_MODE_ACTIONS: [ModeActionRule; 11] = [
     mode_action(GuardianActionKind::Allow, ModeActionPermission::Always),
     mode_action(
         GuardianActionKind::Repair,
-        ModeActionPermission::CustomRepair,
+        ModeActionPermission::Unavailable,
     ),
     mode_action(
         GuardianActionKind::Fallback,
@@ -541,6 +539,18 @@ fn select_policy_action(
         };
     }
 
+    if mode == GuardianMode::Managed
+        && diagnosis
+            .candidate_actions()
+            .contains(&GuardianActionKind::Repair)
+        && hard_invariant_rejection(diagnosis, GuardianActionKind::Repair, context).is_some()
+    {
+        return SelectedPolicyAction {
+            kind: GuardianActionKind::Block,
+            prerequisite,
+        };
+    }
+
     if (diagnosis.severity() == GuardianSeverity::Info
         || matches!(diagnosis.id(), super::DiagnosisId::UnknownFailure(_)))
         && diagnosis
@@ -625,17 +635,6 @@ fn reject_candidate(
     }
     match rule.permission {
         ModeActionPermission::Always => {}
-        ModeActionPermission::CustomRepair => {
-            if context.explicit_user_intent {
-                return Err(PolicyRejection::ExplicitUserIntent);
-            }
-            if !matches!(
-                diagnosis.ownership(),
-                OwnershipClass::LauncherManaged | OwnershipClass::CompositionManaged
-            ) {
-                return Err(PolicyRejection::CustomRepairOwnership);
-            }
-        }
         ModeActionPermission::CustomAttempt => {
             if context.explicit_user_intent {
                 return Err(PolicyRejection::ExplicitUserIntent);
@@ -1304,6 +1303,24 @@ mod tests {
     }
 
     #[test]
+    fn custom_corruption_offer_does_not_require_mutation_admission() {
+        let diagnosis = rule_diagnosis(
+            GuardianFactId::ManagedRuntimeReadyMarkerMissing,
+            GuardianDomain::Runtime,
+            OperationPhase::Preparing,
+            OwnershipClass::LauncherManaged,
+        );
+        let safety_case = safety_case(GuardianMode::Custom, diagnosis);
+
+        let decision = decide_guardian_policy(
+            &safety_case,
+            GuardianPolicyContext::current_operation().with_missing_journal(),
+        );
+
+        assert_eq!(decision.kind, GuardianActionKind::AskUser);
+    }
+
+    #[test]
     fn unredacted_public_boundary_blocks_before_action_planning() {
         let diagnosis = rule_diagnosis(
             GuardianFactId::ManagedRuntimeReadyMarkerMissing,
@@ -1363,7 +1380,7 @@ mod tests {
                 GuardianMode::Managed => [ModeActionPermission::Always; 11],
                 GuardianMode::Custom => [
                     ModeActionPermission::Always,
-                    ModeActionPermission::CustomRepair,
+                    ModeActionPermission::Unavailable,
                     ModeActionPermission::CustomAttempt,
                     ModeActionPermission::Unavailable,
                     ModeActionPermission::Unavailable,
@@ -1649,18 +1666,6 @@ mod tests {
 
         let permission_rejection = match (mode, action) {
             (GuardianMode::Managed, _) => None,
-            (GuardianMode::Custom, GuardianActionKind::Repair) => {
-                if context.explicit_user_intent {
-                    Some(PolicyRejection::ExplicitUserIntent)
-                } else if matches!(
-                    ownership,
-                    OwnershipClass::LauncherManaged | OwnershipClass::CompositionManaged
-                ) {
-                    None
-                } else {
-                    Some(PolicyRejection::CustomRepairOwnership)
-                }
-            }
             (GuardianMode::Custom, GuardianActionKind::Fallback | GuardianActionKind::Retry)
                 if context.explicit_user_intent =>
             {
@@ -1668,7 +1673,8 @@ mod tests {
             }
             (
                 GuardianMode::Custom,
-                GuardianActionKind::Strip
+                GuardianActionKind::Repair
+                | GuardianActionKind::Strip
                 | GuardianActionKind::Downgrade
                 | GuardianActionKind::Quarantine,
             ) => Some(PolicyRejection::ActionUnavailableInMode),

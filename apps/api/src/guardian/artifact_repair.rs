@@ -16,22 +16,25 @@ use crate::execution::file::{QuarantineFileRequest, quarantine_launcher_managed_
 use crate::observability::{RedactionAudience, sanitize_evidence_token};
 use crate::state::contracts::{
     CommandKind, JournalId, OperationId, OperationJournalEntry, OperationJournalStep,
-    OperationOutcome, OperationPhase, OperationStatus, OperationStepResult, RollbackState,
-    StabilizationSystem, TargetDescriptor,
+    OperationOutcome, OperationPhase, OperationStatus, OperationStepResult, ReconciliationAttempt,
+    ReconciliationTerminal, ReconciliationTerminalOutcome, RollbackState, StabilizationSystem,
+    TargetDescriptor,
 };
-use crate::state::failure_memory::{
-    FailureMemoryActionOutcome, GuardianFailureMemoryEntry, GuardianFailureMemoryStore,
-};
+use crate::state::failure_memory::GuardianFailureMemoryStore;
 use crate::state::{
     OperationJournalReconciliation, OperationJournalStore, OperationJournalStoreError,
-    operation_journal_completed_step_is_visible, operation_journal_plan_is_visible,
-    operation_journal_terminal_is_visible,
+    ReconciliationAttemptReservation, commit_reconciliation_memory,
+    install_operation_reconciliation_attempt, operation_journal_completed_step_is_visible,
+    operation_journal_plan_is_visible, operation_journal_terminal_is_visible,
+    reconciliation_attempt_key, reconciliation_journal_attempt, reconciliation_memory_entry,
+    reconciliation_terminal, record_reconciliation_journal_failure,
+    record_reconciliation_journal_success, reserve_reconciliation_attempt,
+    settle_reconciliation_memory,
 };
 use chrono::{DateTime, Duration};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::time::Duration as StdDuration;
-use tracing::warn;
 
 const DEFAULT_ARTIFACT_REPAIR_SUPPRESSION_MINUTES: i64 = 15;
 const ARTIFACT_JOURNAL_RETRY_INITIAL_DELAY: StdDuration = StdDuration::from_millis(20);
@@ -67,7 +70,6 @@ pub enum GuardianArtifactRepairStatus {
     Repaired,
     Blocked,
     Failed,
-    Suppressed,
 }
 
 impl GuardianArtifactRepairStatus {
@@ -76,7 +78,6 @@ impl GuardianArtifactRepairStatus {
             Self::Repaired => "repaired",
             Self::Blocked => "blocked",
             Self::Failed => "failed",
-            Self::Suppressed => "suppressed",
         }
     }
 
@@ -85,7 +86,6 @@ impl GuardianArtifactRepairStatus {
             "repaired" => Some(Self::Repaired),
             "blocked" => Some(Self::Blocked),
             "failed" => Some(Self::Failed),
-            "suppressed" => Some(Self::Suppressed),
             _ => None,
         }
     }
@@ -93,7 +93,6 @@ impl GuardianArtifactRepairStatus {
 
 enum ArtifactTerminal {
     Blocked(&'static str),
-    Suppressed(String),
     Repaired {
         step_id: &'static str,
         facts: Vec<String>,
@@ -104,6 +103,7 @@ enum ArtifactTerminal {
         rollback: RollbackState,
         facts: Vec<String>,
         summary: &'static str,
+        quarantined_target: Option<TargetDescriptor>,
     },
 }
 
@@ -120,6 +120,8 @@ struct ArtifactRepairContext<'a> {
     failure_memory: &'a GuardianFailureMemoryStore,
     observed_at: &'a str,
     quarantines_existing: bool,
+    attempt: Option<ReconciliationAttempt>,
+    reservation: Option<ReconciliationAttemptReservation>,
 }
 
 struct ArtifactAuthorization {
@@ -129,7 +131,6 @@ struct ArtifactAuthorization {
     mode: GuardianMode,
     action: GuardianActionKind,
     max_attempts: u32,
-    suppression_key: crate::state::failure_memory::FailureMemoryKey,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -184,15 +185,15 @@ async fn execute_artifact_repair_kernel<K: ArtifactRepairKind>(
     let operation_id = operation_id.unwrap_or_else(new_repair_operation_id);
     let authorization = authorization.into_parts();
     let descriptor = authorization.kind.into_descriptor();
-    let context = ArtifactRepairContext {
+    let reconciliation_target = descriptor.reconciliation_target().clone();
+    let mut context = ArtifactRepairContext {
         authorization: ArtifactAuthorization {
             diagnosis_id: authorization.diagnosis_id,
-            target: authorization.target,
+            target: reconciliation_target,
             ownership: authorization.ownership,
             mode: authorization.mode,
             action: authorization.action,
             max_attempts: authorization.max_attempts,
-            suppression_key: authorization.suppression_key,
         },
         descriptor,
         client,
@@ -200,20 +201,23 @@ async fn execute_artifact_repair_kernel<K: ArtifactRepairKind>(
         failure_memory,
         observed_at,
         quarantines_existing: K::QUARANTINES_EXISTING,
+        attempt: None,
+        reservation: None,
     };
     let target = context.authorization.target.clone();
 
-    let checksum = match validate_artifact_repair_input(&context) {
-        Ok(checksum) => checksum,
-        Err(block_reason) => {
-            return finish_artifact_repair(
-                &context,
-                operation_id,
-                ArtifactTerminal::Blocked(block_reason),
-            )
-            .await;
-        }
-    };
+    let checksum =
+        match validate_artifact_repair_input(&context.descriptor, context.quarantines_existing) {
+            Ok(checksum) => checksum,
+            Err(block_reason) => {
+                return finish_artifact_repair(
+                    &context,
+                    operation_id,
+                    ArtifactTerminal::Blocked(block_reason),
+                )
+                .await;
+            }
+        };
 
     if context.authorization.max_attempts == 0 {
         return finish_artifact_repair(
@@ -223,30 +227,56 @@ async fn execute_artifact_repair_kernel<K: ArtifactRepairKind>(
         )
         .await;
     }
-    if let Some(suppression_until) = context
-        .failure_memory
-        .get(&context.authorization.suppression_key)
-        .and_then(|entry| {
-            super::repair_terminal::active_repair_suppression_until(&entry, context.observed_at)
-        })
-    {
-        return finish_artifact_repair(
-            &context,
-            operation_id,
-            ArtifactTerminal::Suppressed(suppression_until),
-        )
-        .await;
+    settle_reconciliation_memory(context.failure_memory)
+        .await
+        .map_err(artifact_memory_error)?;
+    let suppression_until = default_suppression_until(context.observed_at).ok_or_else(|| {
+        OperationJournalStoreError::Persistence(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Guardian artifact repair observation timestamp is invalid",
+        ))
+    })?;
+    let attempt = install_operation_reconciliation_attempt(
+        operation_id.clone(),
+        context.authorization.diagnosis_id,
+        GuardianDomain::Install,
+        context.descriptor.component(),
+        context.authorization.target.clone(),
+        context.authorization.mode,
+        context.observed_at,
+        &suppression_until,
+    )
+    .map_err(artifact_reconciliation_error)?;
+    let attempt_key = reconciliation_attempt_key(&attempt);
+    let reservation = reserve_reconciliation_attempt(
+        context.failure_memory,
+        context.journals,
+        attempt_key.clone(),
+    )
+    .map_err(|_| {
+        OperationJournalStoreError::Persistence(std::io::Error::new(
+            std::io::ErrorKind::WouldBlock,
+            "Guardian artifact reconciliation attempt is already active",
+        ))
+    })?;
+    context.attempt = Some(attempt);
+    context.reservation = Some(reservation);
+    if let Some(outcome) = recover_artifact_evidence(&context, &attempt_key).await? {
+        return Ok(outcome);
     }
-
     if let Some(error) =
         create_planned_journal_reconciled(context.journals, &operation_id, &context).await?
     {
-        terminalize_recovered_artifact_journal(
-            context.journals,
-            &operation_id,
-            &target,
-            RollbackState::Unavailable,
-            "guardian_artifact_repair_initialization_failed",
+        finish_artifact_repair(
+            &context,
+            operation_id.clone(),
+            ArtifactTerminal::Failed {
+                step_id: "journal_repair_start",
+                rollback: RollbackState::NotApplicable,
+                facts: Vec::new(),
+                summary: "guardian_artifact_repair_initialization_failed",
+                quarantined_target: None,
+            },
         )
         .await?;
         return Err(error);
@@ -269,12 +299,19 @@ async fn execute_artifact_repair_kernel<K: ArtifactRepairKind>(
                         rollback: RollbackState::Unavailable,
                         facts: fact_ids,
                         summary: "guardian_artifact_quarantine_failed",
+                        quarantined_target: None,
                     },
                 )
                 .await;
             }
         };
         let quarantine_facts = fact_ids(&quarantine_report.facts);
+        let quarantined_target = TargetDescriptor::new(
+            StabilizationSystem::Execution,
+            target.kind,
+            format!("quarantine-{}", target.id),
+            target.ownership,
+        );
         let quarantine_checkpoint = repair_step(
             "quarantine_launcher_managed_target",
             OperationStepResult::Completed,
@@ -313,12 +350,16 @@ async fn execute_artifact_repair_kernel<K: ArtifactRepairKind>(
                 {
                     ArtifactJournalReconciliation::MutationCommitted => break,
                     ArtifactJournalReconciliation::AcceptedFailure(error) => {
-                        terminalize_recovered_artifact_journal(
-                            context.journals,
-                            &operation_id,
-                            &target,
-                            RollbackState::Available,
-                            "guardian_artifact_quarantine_checkpoint_failed",
+                        finish_artifact_repair(
+                            &context,
+                            operation_id.clone(),
+                            ArtifactTerminal::Failed {
+                                step_id: "record_quarantine_checkpoint",
+                                rollback: RollbackState::Available,
+                                facts: Vec::new(),
+                                summary: "guardian_artifact_repair_checkpoint_failed",
+                                quarantined_target: Some(quarantined_target),
+                            },
                         )
                         .await?;
                         return Err(error);
@@ -327,12 +368,7 @@ async fn execute_artifact_repair_kernel<K: ArtifactRepairKind>(
                 },
             }
         }
-        Some(TargetDescriptor::new(
-            StabilizationSystem::Execution,
-            target.kind,
-            format!("quarantine-{}", target.id),
-            target.ownership,
-        ))
+        Some(quarantined_target)
     } else {
         None
     };
@@ -377,6 +413,7 @@ async fn execute_artifact_repair_kernel<K: ArtifactRepairKind>(
                     },
                     facts: fact_ids,
                     summary: "guardian_artifact_redownload_failed",
+                    quarantined_target,
                 },
             )
             .await
@@ -389,7 +426,7 @@ async fn finish_artifact_repair(
     operation_id: OperationId,
     terminal: ArtifactTerminal,
 ) -> Result<GuardianArtifactRepairOutcome, OperationJournalStoreError> {
-    let (journal, memory_outcome, status, facts, summary, suppression_until, quarantined) =
+    let (journal, reconciliation_outcome, status, facts, summary, suppression_until, quarantined) =
         match terminal {
             ArtifactTerminal::Blocked(summary) => (
                 ArtifactTerminalJournal::Create(OperationOutcome::Blocked),
@@ -400,26 +437,24 @@ async fn finish_artifact_repair(
                 None,
                 None,
             ),
-            ArtifactTerminal::Suppressed(suppression_until) => (
-                ArtifactTerminalJournal::Create(OperationOutcome::Suppressed),
-                None,
-                GuardianArtifactRepairStatus::Suppressed,
-                Vec::new(),
-                "guardian_artifact_repair_suppressed",
-                Some(suppression_until),
-                None,
-            ),
             ArtifactTerminal::Repaired {
                 step_id,
                 facts,
                 quarantined_target,
             } => (
                 ArtifactTerminalJournal::Record(step_id, RollbackState::Available, None),
-                Some(FailureMemoryActionOutcome::Repaired),
+                Some(ReconciliationTerminalOutcome::Succeeded),
                 GuardianArtifactRepairStatus::Repaired,
                 facts,
                 "guardian_artifact_repaired",
-                default_suppression_until(context.observed_at),
+                Some(
+                    context
+                        .attempt
+                        .as_ref()
+                        .expect("attempted repair has typed attempt")
+                        .suppression_until()
+                        .to_string(),
+                ),
                 quarantined_target,
             ),
             ArtifactTerminal::Failed {
@@ -427,18 +462,47 @@ async fn finish_artifact_repair(
                 rollback,
                 facts,
                 summary,
+                quarantined_target,
             } => (
                 ArtifactTerminalJournal::Record(step_id, rollback, Some(step_id)),
-                Some(FailureMemoryActionOutcome::Failed),
+                Some(ReconciliationTerminalOutcome::Failed),
                 GuardianArtifactRepairStatus::Failed,
                 facts,
                 summary,
-                default_suppression_until(context.observed_at),
-                None,
+                Some(
+                    context
+                        .attempt
+                        .as_ref()
+                        .expect("attempted repair has typed attempt")
+                        .suppression_until()
+                        .to_string(),
+                ),
+                quarantined_target,
             ),
         };
+    let reconciliation_terminal = match reconciliation_outcome {
+        Some(outcome) => {
+            let _suppression_until = suppression_until.as_deref().ok_or_else(|| {
+                OperationJournalStoreError::Persistence(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "Guardian artifact repair has no valid suppression window",
+                ))
+            })?;
+            Some(reconciliation_terminal(
+                context
+                    .attempt
+                    .as_ref()
+                    .expect("attempted repair has typed attempt")
+                    .clone(),
+                outcome,
+                quarantined.clone(),
+            ))
+        }
+        None => None,
+    };
     let journal_operation_id = operation_id.clone();
     let journal_facts = facts.clone();
+    let journal_terminal = reconciliation_terminal.clone();
     let complete_journal = async move {
         match journal {
             ArtifactTerminalJournal::Create(outcome) => {
@@ -470,54 +534,194 @@ async fn finish_artifact_repair(
                         rollback,
                     ),
                     failure_point,
+                    journal_terminal
+                        .as_ref()
+                        .expect("attempted repair has typed terminal"),
                 )
                 .await
             }
         }
     };
-    super::repair_terminal::complete_repair_terminal(
-        complete_journal,
-        || {
-            if let Some(memory_outcome) = memory_outcome {
-                record_artifact_repair_memory(
-                    context.failure_memory,
-                    &context.authorization.diagnosis_id,
-                    context.authorization.mode,
-                    &context.authorization.target,
-                    memory_outcome,
-                    context.observed_at,
-                    suppression_until.as_deref(),
-                    context.authorization.max_attempts > 0,
-                    quarantined,
-                );
-            }
-        },
-        || {
-            artifact_repair_outcome(
-                operation_id,
-                context.authorization.diagnosis_id,
-                context.authorization.action,
-                status,
-                facts,
-                summary,
-            )
-        },
-    )
-    .await
+    if let Some(error) = complete_journal.await? {
+        return Err(error);
+    }
+    if let Some(terminal) = reconciliation_terminal {
+        let memory = reconciliation_memory_entry(terminal).map_err(|_| {
+            OperationJournalStoreError::Persistence(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Guardian artifact repair memory terminal is invalid",
+            ))
+        })?;
+        commit_reconciliation_memory(
+            context.failure_memory,
+            memory,
+            context
+                .reservation
+                .as_ref()
+                .expect("attempted repair owns memory reservation"),
+        )
+        .await
+        .map_err(|error| {
+            OperationJournalStoreError::Persistence(std::io::Error::other(format!(
+                "Guardian artifact repair memory commit failed: {}",
+                error.class()
+            )))
+        })?;
+    }
+    Ok(artifact_repair_outcome(
+        operation_id,
+        context.authorization.diagnosis_id,
+        context.authorization.action,
+        status,
+        facts,
+        summary,
+    ))
 }
 
-fn validate_artifact_repair_input<'a>(
-    context: &'a ArtifactRepairContext<'a>,
-) -> Result<DownloadChecksum<'a>, &'static str> {
-    if !context.quarantines_existing {
-        match context.descriptor.destination().try_exists() {
+async fn recover_artifact_evidence(
+    context: &ArtifactRepairContext<'_>,
+    key: &crate::state::failure_memory::FailureMemoryKey,
+) -> Result<Option<GuardianArtifactRepairOutcome>, OperationJournalStoreError> {
+    let now = chrono::Utc::now();
+    let operation_id = context
+        .attempt
+        .as_ref()
+        .expect("artifact recovery has typed attempt")
+        .operation_id();
+    let mut active_terminal_candidate = None;
+    for journal in context.journals.list() {
+        let Some(attempt) = journal.reconciliation_attempt() else {
+            continue;
+        };
+        if &reconciliation_attempt_key(attempt) != key
+            || attempt.diagnosis_id() != context.authorization.diagnosis_id
+        {
+            continue;
+        }
+        if let Some(terminal) = journal.reconciliation_terminal().cloned() {
+            if &journal.operation_id == operation_id {
+                return reconcile_same_operation_artifact_terminal(context, journal, terminal)
+                    .await
+                    .map(Some);
+            }
+            let active = DateTime::parse_from_rfc3339(terminal.suppression_until())
+                .is_ok_and(|until| until > now);
+            if active
+                && active_terminal_candidate.as_ref().is_none_or(
+                    |current: &ReconciliationTerminal| {
+                        current.observed_at() < terminal.observed_at()
+                    },
+                )
+            {
+                active_terminal_candidate = Some(terminal);
+            }
+        }
+    }
+    let Some(terminal) = active_terminal_candidate else {
+        return Ok(None);
+    };
+    reconcile_artifact_terminal_memory(context, terminal).await?;
+    finish_artifact_repair(
+        context,
+        operation_id.clone(),
+        ArtifactTerminal::Blocked("guardian_artifact_repair_blocked_by_active_terminal"),
+    )
+    .await
+    .map(Some)
+}
+
+async fn reconcile_same_operation_artifact_terminal(
+    context: &ArtifactRepairContext<'_>,
+    journal: OperationJournalEntry,
+    terminal: ReconciliationTerminal,
+) -> Result<GuardianArtifactRepairOutcome, OperationJournalStoreError> {
+    reconcile_artifact_terminal_memory(context, terminal.clone()).await?;
+    let (status, summary) = match terminal.outcome() {
+        ReconciliationTerminalOutcome::Succeeded => (
+            GuardianArtifactRepairStatus::Repaired,
+            "guardian_artifact_repaired",
+        ),
+        ReconciliationTerminalOutcome::Failed => (
+            GuardianArtifactRepairStatus::Failed,
+            match journal.failure_point.as_deref() {
+                Some("journal_repair_start") => "guardian_artifact_repair_initialization_failed",
+                Some("quarantine_launcher_managed_target") => "guardian_artifact_quarantine_failed",
+                Some("record_quarantine_checkpoint") => {
+                    "guardian_artifact_repair_checkpoint_failed"
+                }
+                _ => "guardian_artifact_redownload_failed",
+            },
+        ),
+    };
+    let facts = journal
+        .completed_steps
+        .last()
+        .map(|step| step.generated_facts.clone())
+        .unwrap_or_default();
+    Ok(artifact_repair_outcome(
+        journal.operation_id,
+        context.authorization.diagnosis_id,
+        context.authorization.action,
+        status,
+        facts,
+        summary,
+    ))
+}
+
+async fn reconcile_artifact_terminal_memory(
+    context: &ArtifactRepairContext<'_>,
+    terminal: ReconciliationTerminal,
+) -> Result<(), OperationJournalStoreError> {
+    let memory = reconciliation_memory_entry(terminal.clone()).map_err(|_| {
+        OperationJournalStoreError::Persistence(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "Guardian artifact repair journal terminal cannot reconcile memory",
+        ))
+    })?;
+    commit_reconciliation_memory(
+        context.failure_memory,
+        memory,
+        context
+            .reservation
+            .as_ref()
+            .expect("artifact replay owns memory reservation"),
+    )
+    .await
+    .map_err(|error| {
+        OperationJournalStoreError::Persistence(std::io::Error::other(format!(
+            "Guardian artifact repair memory reconciliation failed: {}",
+            error.class()
+        )))
+    })?;
+    Ok(())
+}
+
+fn validate_artifact_repair_input(
+    descriptor: &GuardianMinecraftArtifactRepairDescriptor,
+    quarantines_existing: bool,
+) -> Result<DownloadChecksum<'_>, &'static str> {
+    if !quarantines_existing {
+        match descriptor.destination().try_exists() {
             Ok(false) => {}
             Ok(true) => return Err("guardian_missing_artifact_repair_blocked_target_exists"),
             Err(_) => return Err("guardian_missing_artifact_repair_blocked_target_unreadable"),
         }
     }
-    let source = context.descriptor.repair_source();
+    let source = descriptor.repair_source();
     source_download_checksum(&source).ok_or("guardian_artifact_repair_blocked_invalid_checksum")
+}
+
+fn artifact_memory_error(error: impl std::fmt::Display) -> OperationJournalStoreError {
+    OperationJournalStoreError::Persistence(std::io::Error::other(format!(
+        "Guardian artifact reconciliation memory failed: {error}"
+    )))
+}
+
+fn artifact_reconciliation_error(_error: impl std::fmt::Debug) -> OperationJournalStoreError {
+    OperationJournalStoreError::Persistence(std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        "Guardian artifact reconciliation evidence is invalid",
+    ))
 }
 
 fn source_download_checksum<'a>(
@@ -555,7 +759,14 @@ fn planned_artifact_journal(
     entry
         .guardian_diagnosis_ids
         .push(context.authorization.diagnosis_id);
-    entry
+    reconciliation_journal_attempt(
+        entry,
+        context
+            .attempt
+            .as_ref()
+            .expect("planned repair has typed attempt")
+            .clone(),
+    )
 }
 
 async fn reconcile_artifact_journal_error(
@@ -663,34 +874,51 @@ async fn record_artifact_terminal_reconciled(
     operation_id: &OperationId,
     step: OperationJournalStep,
     failure_point: Option<&str>,
+    terminal: &ReconciliationTerminal,
 ) -> Result<Option<OperationJournalStoreError>, OperationJournalStoreError> {
     loop {
         let result = if let Some(failure_point) = failure_point {
-            journals
-                .record_failure(
-                    operation_id,
-                    step.clone(),
-                    failure_point,
-                    OperationOutcome::Failed,
-                )
-                .await
+            record_reconciliation_journal_failure(
+                journals,
+                operation_id,
+                step.clone(),
+                failure_point,
+                terminal.clone(),
+            )
+            .await
         } else {
-            journals
-                .record_success(operation_id, step.clone(), OperationOutcome::Succeeded)
-                .await
+            record_reconciliation_journal_success(
+                journals,
+                operation_id,
+                step.clone(),
+                terminal.clone(),
+            )
+            .await
         };
         match result {
             Ok(()) => return Ok(None),
             Err(OperationJournalStoreError::AlreadyTerminal)
                 if journals.get(operation_id).is_some_and(|entry| {
-                    artifact_terminal_transition_matches(&entry, operation_id, failure_point, &step)
+                    artifact_terminal_transition_matches(
+                        &entry,
+                        operation_id,
+                        failure_point,
+                        &step,
+                        terminal,
+                    )
                 }) =>
             {
                 return Ok(None);
             }
             Err(error) => {
                 match reconcile_artifact_journal_error(journals, operation_id, error, |entry| {
-                    artifact_terminal_transition_matches(entry, operation_id, failure_point, &step)
+                    artifact_terminal_transition_matches(
+                        entry,
+                        operation_id,
+                        failure_point,
+                        &step,
+                        terminal,
+                    )
                 })
                 .await?
                 {
@@ -698,63 +926,6 @@ async fn record_artifact_terminal_reconciled(
                     ArtifactJournalReconciliation::AcceptedFailure(error) => {
                         return Ok(Some(error));
                     }
-                    ArtifactJournalReconciliation::RetryMutation => {}
-                }
-            }
-        }
-    }
-}
-
-async fn terminalize_recovered_artifact_journal(
-    journals: &OperationJournalStore,
-    operation_id: &OperationId,
-    target: &TargetDescriptor,
-    rollback: RollbackState,
-    failure_point: &str,
-) -> Result<(), OperationJournalStoreError> {
-    let step = repair_step(
-        failure_point,
-        OperationStepResult::Failed,
-        Some(target.clone()),
-        Vec::new(),
-        rollback,
-    );
-    loop {
-        let result = journals
-            .record_failure(
-                operation_id,
-                step.clone(),
-                failure_point,
-                OperationOutcome::Failed,
-            )
-            .await;
-        match result {
-            Ok(()) => return Ok(()),
-            Err(OperationJournalStoreError::AlreadyTerminal)
-                if journals.get(operation_id).is_some_and(|entry| {
-                    artifact_terminal_transition_matches(
-                        &entry,
-                        operation_id,
-                        Some(failure_point),
-                        &step,
-                    )
-                }) =>
-            {
-                return Ok(());
-            }
-            Err(error) => {
-                match reconcile_artifact_journal_error(journals, operation_id, error, |entry| {
-                    artifact_terminal_transition_matches(
-                        entry,
-                        operation_id,
-                        Some(failure_point),
-                        &step,
-                    )
-                })
-                .await?
-                {
-                    ArtifactJournalReconciliation::MutationCommitted => return Ok(()),
-                    ArtifactJournalReconciliation::AcceptedFailure(_) => return Ok(()),
                     ArtifactJournalReconciliation::RetryMutation => {}
                 }
             }
@@ -811,6 +982,7 @@ fn artifact_terminal_transition_matches(
     operation_id: &OperationId,
     failure_point: Option<&str>,
     step: &OperationJournalStep,
+    terminal: &ReconciliationTerminal,
 ) -> bool {
     let (status, outcome) = if failure_point.is_some() {
         (OperationStatus::Failed, OperationOutcome::Failed)
@@ -824,6 +996,7 @@ fn artifact_terminal_transition_matches(
         && entry.status == status
         && entry.outcome == Some(outcome)
         && entry.failure_point.as_deref() == failure_point
+        && entry.reconciliation_terminal() == Some(terminal)
         && operation_journal_completed_step_is_visible(entry, step)
 }
 
@@ -853,12 +1026,13 @@ fn repair_step(
 }
 
 fn artifact_repair_steps(quarantines_existing: bool) -> &'static [(&'static str, RollbackState)] {
-    const QUARANTINE_REDOWNLOAD: [(&str, RollbackState); 6] = [
+    const QUARANTINE_REDOWNLOAD: [(&str, RollbackState); 7] = [
         ("journal_repair_start", RollbackState::NotApplicable),
         (
             "quarantine_launcher_managed_target",
             RollbackState::Available,
         ),
+        ("record_quarantine_checkpoint", RollbackState::Available),
         ("download_artifact_to_temp", RollbackState::Available),
         ("verify_artifact_checksum", RollbackState::NotApplicable),
         ("promote_verified_artifact", RollbackState::Available),
@@ -875,44 +1049,6 @@ fn artifact_repair_steps(quarantines_existing: bool) -> &'static [(&'static str,
         &QUARANTINE_REDOWNLOAD
     } else {
         &MISSING_DOWNLOAD
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn record_artifact_repair_memory(
-    failure_memory: &GuardianFailureMemoryStore,
-    diagnosis_id: &DiagnosisId,
-    mode: GuardianMode,
-    target: &TargetDescriptor,
-    outcome: FailureMemoryActionOutcome,
-    observed_at: &str,
-    suppression_until: Option<&str>,
-    repair_attempt: bool,
-    quarantined_target: Option<TargetDescriptor>,
-) {
-    let mut entry = GuardianFailureMemoryEntry::observed(
-        *diagnosis_id,
-        GuardianDomain::Install,
-        target.clone(),
-        mode,
-        None,
-        observed_at,
-    )
-    .with_action(GuardianActionKind::Repair, outcome);
-    if repair_attempt {
-        entry = entry.with_repair_attempt();
-    }
-    if let Some(suppression_until) = suppression_until {
-        entry = entry.with_suppression_until(suppression_until);
-    }
-    if let Some(quarantined_target) = quarantined_target {
-        entry = entry.with_quarantined_target(quarantined_target);
-    }
-    if let Err(error) = failure_memory.record(entry) {
-        warn!(
-            error_kind = error.class(),
-            "failed to record Guardian artifact-repair failure memory"
-        );
     }
 }
 
@@ -968,18 +1104,18 @@ mod tests {
     use crate::guardian::{
         ActionPlanPrerequisite, DiagnosisId, GuardianAction, GuardianActionKind,
         GuardianActionPlan, GuardianConfidence, GuardianDecision,
-        GuardianMinecraftArtifactRepairDescriptor, GuardianMode, RepairAuthorizationContext,
-        RepairAuthorizationRejection, authorize_launcher_managed_artifact_repair,
+        GuardianMinecraftArtifactRepairDescriptor, GuardianMode, RepairAuthorizationRejection,
+        authorize_launcher_managed_artifact_repair,
         authorize_launcher_managed_missing_artifact_repair,
     };
     use crate::state::OperationJournalStore;
     use crate::state::contracts::{
         OperationId, OperationOutcome, OperationStatus, OperationStepResult, OwnershipClass,
-        RollbackState, StabilizationSystem, TargetDescriptor, TargetKind,
+        ReconciliationTerminalOutcome, RollbackState, StabilizationSystem, TargetDescriptor,
+        TargetKind,
     };
     use crate::state::failure_memory::{
-        FailureMemoryActionOutcome, FailureMemoryKey, GuardianFailureMemoryEntry,
-        GuardianFailureMemoryStore,
+        FailureMemoryActionOutcome, FailureMemorySnapshot, GuardianFailureMemoryStore,
     };
     use axial_config::AppPaths;
     use reqwest::Client;
@@ -1001,7 +1137,6 @@ mod tests {
             GuardianArtifactRepairStatus::Repaired,
             GuardianArtifactRepairStatus::Blocked,
             GuardianArtifactRepairStatus::Failed,
-            GuardianArtifactRepairStatus::Suppressed,
         ] {
             assert_eq!(
                 GuardianArtifactRepairStatus::from_persisted_id(status.as_persisted_id()),
@@ -1109,6 +1244,153 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn active_success_terminal_blocks_a_different_operation_without_effects() {
+        let root = test_root("active-success-blocks-new-operation");
+        fs::create_dir_all(&root).expect("root");
+        let destination = root.join("bad.jar");
+        fs::write(&destination, b"initial corruption").expect("corrupt artifact");
+        let replacement = b"fresh artifact".to_vec();
+        let server = TestByteServer::start(replacement.clone());
+        let stores = stores();
+        let observed_at = chrono::Utc::now().to_rfc3339();
+
+        let first = execute_quarantine_with_operation_id(
+            quarantine_input(
+                &destination,
+                &server.url,
+                &sha256_hex(&replacement),
+                Some(replacement.len() as u64),
+                &stores,
+                &observed_at,
+            ),
+            "guardian-artifact-repair-first",
+        )
+        .await
+        .expect("first repair");
+        assert_eq!(first.status, GuardianArtifactRepairStatus::Repaired);
+
+        fs::write(&destination, b"renewed corruption").expect("renew corruption");
+        let journals_before = stores.journals.list();
+        let prior_journal = stores
+            .journals
+            .get(&first.operation_id)
+            .expect("prior successful terminal");
+        let memory_before = stores.failure_memory.list();
+        stores
+            .failure_memory
+            .load_snapshot(FailureMemorySnapshot::new(Vec::new()).expect("empty memory snapshot"))
+            .expect("simulate missing terminal memory");
+        assert!(stores.failure_memory.list().is_empty());
+        let quarantines_before = quarantine_count(&root);
+
+        let second = execute_quarantine_with_operation_id(
+            quarantine_input(
+                &destination,
+                &server.url,
+                &sha256_hex(&replacement),
+                Some(replacement.len() as u64),
+                &stores,
+                &observed_at,
+            ),
+            "guardian-artifact-repair-second",
+        )
+        .await
+        .expect("active terminal refusal");
+
+        assert_eq!(second.status, GuardianArtifactRepairStatus::Blocked);
+        assert_eq!(
+            second.operation_id,
+            OperationId::new("guardian-artifact-repair-second")
+        );
+        assert_eq!(
+            second.summary,
+            "guardian_artifact_repair_blocked_by_active_terminal"
+        );
+        assert_eq!(
+            fs::read(&destination).expect("renewed corruption remains"),
+            b"renewed corruption"
+        );
+        assert_eq!(server.request_count(), 1);
+        assert_eq!(quarantine_count(&root), quarantines_before);
+        assert_eq!(stores.journals.list().len(), journals_before.len() + 1);
+        assert_eq!(
+            stores
+                .journals
+                .get(&first.operation_id)
+                .expect("prior successful terminal remains"),
+            prior_journal
+        );
+        let blocked_journal = stores
+            .journals
+            .get(&second.operation_id)
+            .expect("current blocked journal");
+        assert_eq!(blocked_journal.status, OperationStatus::Blocked);
+        assert_eq!(blocked_journal.outcome, Some(OperationOutcome::Blocked));
+        assert!(blocked_journal.reconciliation_terminal().is_none());
+        assert_eq!(stores.failure_memory.list(), memory_before);
+
+        server.stop();
+        cleanup(&root);
+    }
+
+    #[tokio::test]
+    async fn expired_success_terminal_still_replays_the_same_operation() {
+        let root = test_root("expired-success-replays-same-operation");
+        fs::create_dir_all(&root).expect("root");
+        let destination = root.join("bad.jar");
+        fs::write(&destination, b"initial corruption").expect("corrupt artifact");
+        let replacement = b"fresh artifact".to_vec();
+        let server = TestByteServer::start(replacement.clone());
+        let stores = stores();
+        let observed_at = (chrono::Utc::now() - chrono::Duration::hours(2)).to_rfc3339();
+
+        let first = execute_quarantine_with_operation_id(
+            quarantine_input(
+                &destination,
+                &server.url,
+                &sha256_hex(&replacement),
+                Some(replacement.len() as u64),
+                &stores,
+                &observed_at,
+            ),
+            "guardian-artifact-repair-replay",
+        )
+        .await
+        .expect("first repair");
+        fs::write(&destination, b"renewed corruption").expect("renew corruption");
+        let journals_before = stores.journals.list();
+        let memory_before = stores.failure_memory.list();
+        let quarantines_before = quarantine_count(&root);
+
+        let replay = execute_quarantine_with_operation_id(
+            quarantine_input(
+                &destination,
+                &server.url,
+                &sha256_hex(&replacement),
+                Some(replacement.len() as u64),
+                &stores,
+                &observed_at,
+            ),
+            "guardian-artifact-repair-replay",
+        )
+        .await
+        .expect("same operation replay");
+
+        assert_eq!(replay, first);
+        assert_eq!(
+            fs::read(&destination).expect("renewed corruption remains"),
+            b"renewed corruption"
+        );
+        assert_eq!(server.request_count(), 1);
+        assert_eq!(quarantine_count(&root), quarantines_before);
+        assert_eq!(stores.journals.list(), journals_before);
+        assert_eq!(stores.failure_memory.list(), memory_before);
+
+        server.stop();
+        cleanup(&root);
+    }
+
+    #[tokio::test]
     async fn planned_commit_failure_prevents_artifact_mutation() {
         let root = test_root("planned-commit-gate");
         fs::create_dir_all(&root).expect("root");
@@ -1138,6 +1420,13 @@ mod tests {
             .expect("recovered repair journal");
         assert_eq!(journal.status, OperationStatus::Failed);
         assert_eq!(journal.outcome, Some(OperationOutcome::Failed));
+        assert_eq!(
+            journal
+                .reconciliation_terminal()
+                .expect("typed initialization terminal")
+                .outcome(),
+            ReconciliationTerminalOutcome::Failed
+        );
         assert!(!stores.journals.has_retry_candidate());
 
         server.stop();
@@ -1174,6 +1463,20 @@ mod tests {
             .expect("terminalized checkpoint journal");
         assert_eq!(journal.status, OperationStatus::Failed);
         assert_eq!(journal.outcome, Some(OperationOutcome::Failed));
+        assert_eq!(
+            journal
+                .reconciliation_terminal()
+                .expect("typed checkpoint terminal")
+                .quarantined_target(),
+            stores.failure_memory.list()[0].quarantined_target.as_ref()
+        );
+        assert!(
+            journal
+                .reconciliation_terminal()
+                .expect("typed checkpoint terminal")
+                .quarantined_target()
+                .is_some()
+        );
         assert!(journal.completed_steps.iter().any(|step| {
             step.step_id == "quarantine_launcher_managed_target"
                 && step.result == OperationStepResult::Completed
@@ -1302,6 +1605,101 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn active_failure_terminal_replays_same_operation_and_blocks_a_different_one() {
+        let root = test_root("active-failure-recovery");
+        fs::create_dir_all(&root).expect("root");
+        let destination = root.join("bad.jar");
+        fs::write(&destination, b"initial corruption").expect("corrupt artifact");
+        let replacement = b"fresh artifact".to_vec();
+        let server = TestByteServer::start(replacement);
+        let stores = stores();
+        let observed_at = chrono::Utc::now().to_rfc3339();
+
+        let first = execute_quarantine_with_operation_id(
+            quarantine_input(
+                &destination,
+                &server.url,
+                &sha256_hex(b"different artifact"),
+                None,
+                &stores,
+                &observed_at,
+            ),
+            "guardian-artifact-repair-failed",
+        )
+        .await
+        .expect("failed repair terminal");
+        assert_eq!(first.status, GuardianArtifactRepairStatus::Failed);
+
+        fs::write(&destination, b"renewed corruption").expect("renew corruption");
+        let journals_before = stores.journals.list();
+        let prior_journal = stores
+            .journals
+            .get(&first.operation_id)
+            .expect("prior failed terminal");
+        let memory_before = stores.failure_memory.list();
+        let quarantines_before = quarantine_count(&root);
+
+        let replay = execute_quarantine_with_operation_id(
+            quarantine_input(
+                &destination,
+                &server.url,
+                &sha256_hex(b"different artifact"),
+                None,
+                &stores,
+                &observed_at,
+            ),
+            "guardian-artifact-repair-failed",
+        )
+        .await
+        .expect("same failed operation replay");
+        let blocked = execute_quarantine_with_operation_id(
+            quarantine_input(
+                &destination,
+                &server.url,
+                &sha256_hex(b"different artifact"),
+                None,
+                &stores,
+                &observed_at,
+            ),
+            "guardian-artifact-repair-after-failure",
+        )
+        .await
+        .expect("active failed terminal refusal");
+
+        assert_eq!(replay, first);
+        assert_eq!(blocked.status, GuardianArtifactRepairStatus::Blocked);
+        assert_eq!(
+            blocked.operation_id,
+            OperationId::new("guardian-artifact-repair-after-failure")
+        );
+        assert_eq!(
+            fs::read(&destination).expect("renewed corruption remains"),
+            b"renewed corruption"
+        );
+        assert_eq!(server.request_count(), 1);
+        assert_eq!(quarantine_count(&root), quarantines_before);
+        assert_eq!(stores.journals.list().len(), journals_before.len() + 1);
+        assert_eq!(
+            stores
+                .journals
+                .get(&first.operation_id)
+                .expect("prior failed terminal remains"),
+            prior_journal
+        );
+        let blocked_journal = stores
+            .journals
+            .get(&blocked.operation_id)
+            .expect("current blocked journal");
+        assert_eq!(blocked_journal.status, OperationStatus::Blocked);
+        assert_eq!(blocked_journal.outcome, Some(OperationOutcome::Blocked));
+        assert!(blocked_journal.reconciliation_terminal().is_none());
+        assert_eq!(stores.failure_memory.list(), memory_before);
+
+        server.stop();
+        cleanup(&root);
+    }
+
+    #[tokio::test]
     async fn missing_artifact_download_failure_records_unavailable_rollback() {
         let root = test_root("missing-checksum-failure");
         fs::create_dir_all(&root).expect("root");
@@ -1348,236 +1746,6 @@ mod tests {
         cleanup(&root);
     }
 
-    #[tokio::test]
-    async fn suppression_blocks_before_filesystem_or_network_mutation() {
-        let root = test_root("suppressed");
-        fs::create_dir_all(&root).expect("root");
-        let destination = root.join("bad.jar");
-        fs::write(&destination, b"corrupt").expect("corrupt artifact");
-        let replacement = b"fresh artifact".to_vec();
-        let server = TestByteServer::start(replacement.clone());
-        let stores = stores();
-        stores
-            .failure_memory
-            .record(
-                GuardianFailureMemoryEntry::observed(
-                    DiagnosisId::LauncherManagedArtifactCorrupt,
-                    crate::guardian::GuardianDomain::Install,
-                    artifact_repair_target(),
-                    GuardianMode::Managed,
-                    None,
-                    "2026-06-15T09:00:00Z",
-                )
-                .with_action(
-                    crate::guardian::GuardianActionKind::Repair,
-                    FailureMemoryActionOutcome::Failed,
-                )
-                .with_repair_attempt()
-                .with_suppression_until("2026-06-15T10:30:00Z"),
-            )
-            .expect("memory");
-
-        let outcome = execute_quarantine(quarantine_input(
-            &destination,
-            &server.url,
-            &sha256_hex(&replacement),
-            Some(replacement.len() as u64),
-            &stores,
-            "2026-06-15T10:00:00Z",
-        ))
-        .await;
-
-        assert_eq!(outcome.status, GuardianArtifactRepairStatus::Suppressed);
-        assert_eq!(fs::read(&destination).expect("original"), b"corrupt");
-        assert_eq!(server.request_count(), 0);
-        let key = FailureMemoryKey::for_observation(
-            crate::guardian::GuardianDomain::Install,
-            &DiagnosisId::LauncherManagedArtifactCorrupt,
-            &artifact_repair_target(),
-            GuardianMode::Managed,
-            None,
-        );
-        let memory = stores.failure_memory.get(&key).expect("memory");
-        assert_eq!(
-            memory.last_action_outcome,
-            Some(FailureMemoryActionOutcome::Failed)
-        );
-        assert_eq!(memory.occurrence_count, 1);
-        assert_eq!(memory.repair_attempt_count, 1);
-
-        server.stop();
-        cleanup(&root);
-    }
-
-    #[tokio::test]
-    async fn historical_artifact_attempt_without_cooldown_allows_safe_retry() {
-        let root = test_root("historical-attempt-without-cooldown");
-        fs::create_dir_all(&root).expect("root");
-        let destination = root.join("bad.jar");
-        fs::write(&destination, b"corrupt").expect("corrupt artifact");
-        let replacement = b"fresh artifact".to_vec();
-        let server = TestByteServer::start(replacement.clone());
-        let stores = stores();
-        stores
-            .failure_memory
-            .record(
-                GuardianFailureMemoryEntry::observed(
-                    DiagnosisId::LauncherManagedArtifactCorrupt,
-                    crate::guardian::GuardianDomain::Install,
-                    artifact_repair_target(),
-                    GuardianMode::Managed,
-                    None,
-                    "2026-06-15T09:00:00Z",
-                )
-                .with_action(
-                    crate::guardian::GuardianActionKind::Repair,
-                    FailureMemoryActionOutcome::Failed,
-                )
-                .with_repair_attempt(),
-            )
-            .expect("memory");
-
-        let outcome = execute_quarantine(quarantine_input(
-            &destination,
-            &server.url,
-            &sha256_hex(&replacement),
-            Some(replacement.len() as u64),
-            &stores,
-            "2026-06-15T10:00:00Z",
-        ))
-        .await;
-
-        assert_eq!(outcome.status, GuardianArtifactRepairStatus::Repaired);
-        assert_eq!(fs::read(&destination).expect("replacement"), replacement);
-        assert_eq!(server.request_count(), 1);
-        let memory = stores.failure_memory.list();
-        assert_eq!(memory[0].repair_attempt_count, 2);
-        assert_eq!(
-            memory[0].last_action_outcome,
-            Some(FailureMemoryActionOutcome::Repaired)
-        );
-        assert!(memory[0].suppression_until.is_some());
-
-        server.stop();
-        cleanup(&root);
-    }
-
-    #[tokio::test]
-    async fn expired_artifact_repair_cooldown_allows_new_safe_attempt() {
-        let root = test_root("expired-artifact-cooldown");
-        fs::create_dir_all(&root).expect("root");
-        let destination = root.join("bad.jar");
-        fs::write(&destination, b"corrupt").expect("corrupt artifact");
-        let replacement = b"fresh artifact after cooldown".to_vec();
-        let server = TestByteServer::start(replacement.clone());
-        let stores = stores();
-        stores
-            .failure_memory
-            .record(
-                GuardianFailureMemoryEntry::observed(
-                    DiagnosisId::LauncherManagedArtifactCorrupt,
-                    crate::guardian::GuardianDomain::Install,
-                    artifact_repair_target(),
-                    GuardianMode::Managed,
-                    None,
-                    "2026-06-15T09:00:00Z",
-                )
-                .with_action(
-                    crate::guardian::GuardianActionKind::Repair,
-                    FailureMemoryActionOutcome::Failed,
-                )
-                .with_repair_attempt()
-                .with_suppression_until("2026-06-15T09:30:00Z"),
-            )
-            .expect("memory");
-
-        let outcome = execute_quarantine(quarantine_input(
-            &destination,
-            &server.url,
-            &sha256_hex(&replacement),
-            Some(replacement.len() as u64),
-            &stores,
-            "2026-06-15T10:00:00Z",
-        ))
-        .await;
-
-        assert_eq!(outcome.status, GuardianArtifactRepairStatus::Repaired);
-        assert_eq!(fs::read(&destination).expect("replacement"), replacement);
-        assert!(root_contains_quarantine(&root, b"corrupt"));
-        assert_eq!(server.request_count(), 1);
-        let memory = stores.failure_memory.list();
-        assert_eq!(memory[0].repair_attempt_count, 2);
-        assert_eq!(
-            memory[0].last_action_outcome,
-            Some(FailureMemoryActionOutcome::Repaired)
-        );
-        assert_ne!(
-            memory[0].suppression_until.as_deref(),
-            Some("2026-06-15T09:30:00Z")
-        );
-
-        server.stop();
-        cleanup(&root);
-    }
-
-    #[tokio::test]
-    async fn expired_missing_artifact_repair_cooldown_allows_new_safe_attempt() {
-        let root = test_root("expired-missing-artifact-cooldown");
-        fs::create_dir_all(&root).expect("root");
-        let destination = root.join("missing.jar");
-        let replacement = b"fresh missing artifact after cooldown".to_vec();
-        let server = TestByteServer::start(replacement.clone());
-        let stores = stores();
-        stores
-            .failure_memory
-            .record(
-                GuardianFailureMemoryEntry::observed(
-                    DiagnosisId::LauncherManagedArtifactCorrupt,
-                    crate::guardian::GuardianDomain::Install,
-                    artifact_repair_target(),
-                    GuardianMode::Managed,
-                    None,
-                    "2026-06-15T09:00:00Z",
-                )
-                .with_action(
-                    crate::guardian::GuardianActionKind::Repair,
-                    FailureMemoryActionOutcome::Failed,
-                )
-                .with_repair_attempt()
-                .with_suppression_until("2026-06-15T09:30:00Z"),
-            )
-            .expect("memory");
-
-        let outcome = execute_missing(missing_input_with_checksum(
-            &destination,
-            &server.url,
-            "sha1",
-            &sha1_hex(&replacement),
-            Some(replacement.len() as u64),
-            &stores,
-            "2026-06-15T10:00:00Z",
-        ))
-        .await;
-
-        assert_eq!(outcome.status, GuardianArtifactRepairStatus::Repaired);
-        assert_eq!(fs::read(&destination).expect("replacement"), replacement);
-        assert!(!root_contains_quarantine(
-            &root,
-            b"fresh missing artifact after cooldown"
-        ));
-        assert_eq!(server.request_count(), 1);
-        let memory = stores.failure_memory.list();
-        assert_eq!(memory[0].repair_attempt_count, 2);
-        assert_eq!(
-            memory[0].last_action_outcome,
-            Some(FailureMemoryActionOutcome::Repaired)
-        );
-        assert!(memory[0].quarantined_target.is_none());
-
-        server.stop();
-        cleanup(&root);
-    }
-
     #[test]
     fn descriptor_target_mismatch_rejects_without_journal_or_effect() {
         let root = test_root("descriptor-target-mismatch");
@@ -1604,7 +1772,6 @@ mod tests {
 
         let error = match authorize_launcher_managed_artifact_repair(
             &artifact_repair_decision(),
-            RepairAuthorizationContext::current_operation(),
             descriptor,
         ) {
             Ok(_) => panic!("descriptor target mismatch must reject"),
@@ -1731,20 +1898,24 @@ mod tests {
     async fn execute_quarantine_result(
         input: ArtifactRepairTestInput<'_>,
     ) -> Result<GuardianArtifactRepairOutcome, crate::state::OperationJournalStoreError> {
+        execute_quarantine_with_operation_id(input, "guardian-artifact-repair-test").await
+    }
+
+    async fn execute_quarantine_with_operation_id(
+        input: ArtifactRepairTestInput<'_>,
+        operation_id: &str,
+    ) -> Result<GuardianArtifactRepairOutcome, crate::state::OperationJournalStoreError> {
         let ArtifactRepairTestInput {
             descriptor,
             stores,
             observed_at,
         } = input;
-        let authorization = authorize_launcher_managed_artifact_repair(
-            &artifact_repair_decision(),
-            RepairAuthorizationContext::current_operation(),
-            descriptor,
-        )
-        .expect("quarantine-redownload authorization");
+        let authorization =
+            authorize_launcher_managed_artifact_repair(&artifact_repair_decision(), descriptor)
+                .expect("quarantine-redownload authorization");
         super::execute_guardian_quarantine_redownload(
             authorization,
-            Some(OperationId::new("guardian-artifact-repair-test")),
+            Some(OperationId::new(operation_id)),
             &stores.client,
             &stores.journals,
             &stores.failure_memory,
@@ -1761,7 +1932,6 @@ mod tests {
         } = input;
         let authorization = authorize_launcher_managed_missing_artifact_repair(
             &artifact_repair_decision(),
-            RepairAuthorizationContext::current_operation(),
             descriptor,
         )
         .expect("missing-download authorization");
@@ -1878,6 +2048,14 @@ mod tests {
                 entry.file_name().to_string_lossy().contains(".quarantine-")
                     && fs::read(entry.path()).is_ok_and(|value| value == bytes)
             })
+    }
+
+    fn quarantine_count(root: &std::path::Path) -> usize {
+        fs::read_dir(root)
+            .expect("read root")
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().contains(".quarantine-"))
+            .count()
     }
 
     fn test_root(prefix: &str) -> PathBuf {

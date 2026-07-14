@@ -1,0 +1,418 @@
+{
+  "schema": "axial.state.operation_journals.v2",
+  "entries": [
+    {
+      "journal_id": "guardian-vocabulary-journal-01",
+      "operation_id": "guardian-vocabulary-operation-01",
+      "command": "ValidateInstance",
+      "status": "Planned",
+      "owner": "Guardian",
+      "ownership": "LauncherManaged",
+      "targets": [],
+      "planned_steps": [
+        {
+          "step_id": "pin_guardian_diagnoses_01",
+          "phase": "Planning",
+          "result": "Planned",
+          "changed_target": null,
+          "generated_facts": [],
+          "rollback": "NotApplicable"
+        }
+      ],
+      "completed_steps": [],
+      "failure_point": null,
+      "rollback": "NotApplicable",
+      "guardian_diagnosis_ids": [
+        "artifact_ownership_unsafe",
+        "atomic_promotion_failed",
+        "download_unavailable",
+        "filesystem_locked",
+        "filesystem_permission_denied",
+        "install_artifact_metadata_invalid",
+        "install_dependency_failed",
+        "install_execution_failed",
+        "install_processor_failed",
+        "java_override_unavailable",
+        "java_probe_failed",
+        "java_runtime_major_mismatch",
+        "java_runtime_update_too_old",
+        "jvm_arg_unsafe_override",
+        "jvm_arg_unsupported",
+        "jvm_args_empty",
+        "jvm_args_malformed",
+        "launch_command_invalid",
+        "launch_command_prepared",
+        "launcher_managed_artifact_corrupt",
+        "launcher_managed_artifact_signature_corrupt",
+        "managed_runtime_corrupt",
+        "managed_runtime_missing",
+        "managed_runtime_rosetta_required",
+        "managed_runtime_unavailable_for_platform",
+        "performance_fallback_selected",
+        "performance_rules_invalid",
+        "performance_user_owned_conflict"
+      ],
+      "outcome": null,
+      "reconciliation_attempt": null,
+      "reconciliation_terminal": null
+    },
+    {
+      "journal_id": "guardian-vocabulary-journal-02",
+      "operation_id": "guardian-vocabulary-operation-02",
+      "command": "ValidateInstance",
+      "status": "Planned",
+      "owner": "Guardian",
+      "ownership": "LauncherManaged",
+      "targets": [],
+      "planned_steps": [
+        {
+          "step_id": "pin_guardian_diagnoses_02",
+          "phase": "Planning",
+          "result": "Planned",
+          "changed_target": null,
+          "generated_facts": [],
+          "rollback": "NotApplicable"
+        }
+      ],
+      "completed_steps": [],
+      "failure_point": null,
+      "rollback": "NotApplicable",
+      "guardian_diagnosis_ids": [
+        "persisted_state_schema_invalid",
+        "process_lifecycle_observed",
+        "temp_file_write_failed",
+        "installed_version_metadata_missing",
+        "parent_version_metadata_missing",
+        "install_incomplete",
+        "client_jar_missing",
+        "libraries_missing",
+        "asset_index_missing",
+        "launch_memory_min_clamped",
+        "launch_memory_allocation_low",
+        "launch_resource_memory_pressure",
+        "launch_resource_cpu_pressure",
+        "launch_resource_install_pressure",
+        "launch_resource_disk_pressure",
+        "custom_java_override_present",
+        "custom_jvm_preset_present",
+        "custom_jvm_args_present",
+        "performance_health_degraded",
+        "performance_health_invalid",
+        "jvm_preset_adjusted",
+        "launch_prepare_failed",
+        "startup_stalled",
+        "out_of_memory",
+        "graphics_driver_crash",
+        "missing_dependency"
+      ],
+      "outcome": null,
+      "reconciliation_attempt": null,
+      "reconciliation_terminal": null
+    },
+    {
+      "journal_id": "guardian-vocabulary-journal-03",
+      "operation_id": "guardian-vocabulary-operation-03",
+      "command": "ValidateInstance",
+      "status": "Planned",
+      "owner": "Guardian",
+      "ownership": "LauncherManaged",
+      "targets": [],
+      "planned_steps": [
+        {
+          "step_id": "pin_guardian_diagnoses_03",
+          "phase": "Planning",
+          "result": "Planned",
+          "changed_target": null,
+          "generated_facts": [],
+          "rollback": "NotApplicable"
+        }
+      ],
+      "completed_steps": [],
+      "failure_point": null,
+      "rollback": "NotApplicable",
+      "guardian_diagnosis_ids": [
+        "mod_transformation_failure",
+        "mod_attributed_crash",
+        "classpath_module_conflict",
+        "auth_mode_incompatible",
+        "loader_bootstrap_failure",
+        "startup_failed_unknown",
+        "java_runtime_recovery",
+        "jvm_preset_recovery",
+        "unknown",
+        "jvm_unsupported_option",
+        "jvm_experimental_unlock",
+        "jvm_option_ordering",
+        "java_runtime_mismatch",
+        "launcher_managed_artifact_signature",
+        "unknown_failure_startup",
+        "unknown_failure_planning",
+        "unknown_failure_validating",
+        "unknown_failure_downloading",
+        "unknown_failure_installing",
+        "unknown_failure_preparing",
+        "unknown_failure_launching",
+        "unknown_failure_running",
+        "unknown_failure_repairing",
+        "unknown_failure_rolling_back",
+        "unknown_failure_completed",
+        "unknown_failure_failed"
+      ],
+      "outcome": null,
+      "reconciliation_attempt": null,
+      "reconciliation_terminal": null
+    },
+    {
+      "journal_id": "guardian-reconciliation-journal-artifact",
+      "operation_id": "guardian-reconciliation-operation-artifact",
+      "command": "RepairInstance",
+      "status": "Failed",
+      "owner": "Guardian",
+      "ownership": "LauncherManaged",
+      "targets": [
+        {
+          "system": "Guardian",
+          "kind": "Artifact",
+          "id": "fixture_target_10",
+          "ownership": "LauncherManaged"
+        }
+      ],
+      "planned_steps": [
+        {
+          "step_id": "repair_launcher_managed_artifact",
+          "phase": "Repairing",
+          "result": "Planned",
+          "changed_target": null,
+          "generated_facts": [],
+          "rollback": "NotApplicable"
+        }
+      ],
+      "completed_steps": [
+        {
+          "step_id": "repair_launcher_managed_artifact",
+          "phase": "Repairing",
+          "result": "Failed",
+          "changed_target": {
+            "system": "Guardian",
+            "kind": "Artifact",
+            "id": "fixture_target_10",
+            "ownership": "LauncherManaged"
+          },
+          "generated_facts": [],
+          "rollback": "NotApplicable"
+        }
+      ],
+      "failure_point": "artifact_repair_failed",
+      "rollback": "NotApplicable",
+      "guardian_diagnosis_ids": [
+        "launcher_managed_artifact_corrupt"
+      ],
+      "outcome": "Failed",
+      "reconciliation_attempt": {
+        "operation_id": "guardian-reconciliation-operation-artifact",
+        "diagnosis_id": "launcher_managed_artifact_corrupt",
+        "domain": "Install",
+        "rung": "RepairArtifact",
+        "scope": "InstallOperation",
+        "component": "Libraries",
+        "target": {
+          "system": "Guardian",
+          "kind": "Artifact",
+          "id": "fixture_target_10",
+          "ownership": "LauncherManaged"
+        },
+        "mode": "Managed",
+        "ownership": "LauncherManaged",
+        "observed_at": "2026-07-01T00:10:00Z",
+        "suppression_until": "2026-07-01T01:10:00Z"
+      },
+      "reconciliation_terminal": {
+        "attempt": {
+          "operation_id": "guardian-reconciliation-operation-artifact",
+          "diagnosis_id": "launcher_managed_artifact_corrupt",
+          "domain": "Install",
+          "rung": "RepairArtifact",
+          "scope": "InstallOperation",
+          "component": "Libraries",
+          "target": {
+            "system": "Guardian",
+            "kind": "Artifact",
+            "id": "fixture_target_10",
+            "ownership": "LauncherManaged"
+          },
+          "mode": "Managed",
+          "ownership": "LauncherManaged",
+          "observed_at": "2026-07-01T00:10:00Z",
+          "suppression_until": "2026-07-01T01:10:00Z"
+        },
+        "outcome": "Failed",
+        "quarantined_target": null
+      }
+    },
+    {
+      "journal_id": "guardian-reconciliation-journal-component",
+      "operation_id": "guardian-reconciliation-operation-component",
+      "command": "RepairInstance",
+      "status": "Succeeded",
+      "owner": "Guardian",
+      "ownership": "LauncherManaged",
+      "targets": [
+        {
+          "system": "Guardian",
+          "kind": "Runtime",
+          "id": "fixture_target_03",
+          "ownership": "LauncherManaged"
+        },
+        {
+          "system": "State",
+          "kind": "Instance",
+          "id": "0123456789abcdef",
+          "ownership": "LauncherManaged"
+        }
+      ],
+      "planned_steps": [
+        {
+          "step_id": "rebuild_launcher_managed_runtime",
+          "phase": "Repairing",
+          "result": "Planned",
+          "changed_target": null,
+          "generated_facts": [],
+          "rollback": "NotApplicable"
+        }
+      ],
+      "completed_steps": [
+        {
+          "step_id": "quarantine_launcher_managed_target",
+          "phase": "Repairing",
+          "result": "Completed",
+          "changed_target": {
+            "system": "Guardian",
+            "kind": "Runtime",
+            "id": "fixture_target_03",
+            "ownership": "LauncherManaged"
+          },
+          "generated_facts": [],
+          "rollback": "NotApplicable"
+        }
+      ],
+      "failure_point": null,
+      "rollback": "NotApplicable",
+      "guardian_diagnosis_ids": [
+        "managed_runtime_corrupt"
+      ],
+      "outcome": "Succeeded",
+      "reconciliation_attempt": {
+        "operation_id": "guardian-reconciliation-operation-component",
+        "diagnosis_id": "managed_runtime_corrupt",
+        "domain": "Runtime",
+        "rung": "RebuildComponent",
+        "scope": {
+          "RegisteredInstance": {
+            "instance_id": "0123456789abcdef",
+            "fingerprint": "sha256.aaaaaaaa.bbbbbbbb.cccccccc.dddddddd.eeeeeeee.ffffffff.01234567.89abcdef"
+          }
+        },
+        "component": "Runtime",
+        "target": {
+          "system": "Guardian",
+          "kind": "Runtime",
+          "id": "fixture_target_03",
+          "ownership": "LauncherManaged"
+        },
+        "mode": "Managed",
+        "ownership": "LauncherManaged",
+        "observed_at": "2026-07-01T00:03:00Z",
+        "suppression_until": "2026-07-01T01:03:00Z"
+      },
+      "reconciliation_terminal": {
+        "attempt": {
+          "operation_id": "guardian-reconciliation-operation-component",
+          "diagnosis_id": "managed_runtime_corrupt",
+          "domain": "Runtime",
+          "rung": "RebuildComponent",
+          "scope": {
+            "RegisteredInstance": {
+              "instance_id": "0123456789abcdef",
+              "fingerprint": "sha256.aaaaaaaa.bbbbbbbb.cccccccc.dddddddd.eeeeeeee.ffffffff.01234567.89abcdef"
+            }
+          },
+          "component": "Runtime",
+          "target": {
+            "system": "Guardian",
+            "kind": "Runtime",
+            "id": "fixture_target_03",
+            "ownership": "LauncherManaged"
+          },
+          "mode": "Managed",
+          "ownership": "LauncherManaged",
+          "observed_at": "2026-07-01T00:03:00Z",
+          "suppression_until": "2026-07-01T01:03:00Z"
+        },
+        "outcome": "Succeeded",
+        "quarantined_target": {
+          "system": "Execution",
+          "kind": "Runtime",
+          "id": "quarantine-fixture_target_03",
+          "ownership": "LauncherManaged"
+        }
+      }
+    },
+    {
+      "journal_id": "guardian-reconciliation-journal-instance",
+      "operation_id": "guardian-reconciliation-operation-instance",
+      "command": "RepairInstance",
+      "status": "Planned",
+      "owner": "Guardian",
+      "ownership": "LauncherManaged",
+      "targets": [
+        {
+          "system": "State",
+          "kind": "Instance",
+          "id": "fedcba9876543210",
+          "ownership": "LauncherManaged"
+        }
+      ],
+      "planned_steps": [
+        {
+          "step_id": "rematerialize_launcher_managed_instance",
+          "phase": "Planning",
+          "result": "Planned",
+          "changed_target": null,
+          "generated_facts": [],
+          "rollback": "NotApplicable"
+        }
+      ],
+      "completed_steps": [],
+      "failure_point": null,
+      "rollback": "NotApplicable",
+      "guardian_diagnosis_ids": [
+        "install_incomplete"
+      ],
+      "outcome": null,
+      "reconciliation_attempt": {
+        "operation_id": "guardian-reconciliation-operation-instance",
+        "diagnosis_id": "install_incomplete",
+        "domain": "Install",
+        "rung": "RematerializeInstance",
+        "scope": {
+          "RegisteredInstance": {
+            "instance_id": "fedcba9876543210",
+            "fingerprint": "sha256.11111111.22222222.33333333.44444444.55555555.66666666.77777777.88888888"
+          }
+        },
+        "component": "WholeInstance",
+        "target": {
+          "system": "State",
+          "kind": "Instance",
+          "id": "fedcba9876543210",
+          "ownership": "LauncherManaged"
+        },
+        "mode": "Managed",
+        "ownership": "LauncherManaged",
+        "observed_at": "2026-07-01T02:03:00Z",
+        "suppression_until": "2026-07-01T03:03:00Z"
+      },
+      "reconciliation_terminal": null
+    }
+  ]
+}

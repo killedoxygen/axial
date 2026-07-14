@@ -1,5 +1,5 @@
 {
-  "schema": "axial.guardian.failure_memory.v1",
+  "schema": "axial.guardian.failure_memory.v2",
   "entries": [
     {
       "key": "Launch:launch_command_prepared:Guardian.Config.fixture_target_01:Managed:intent_01",
@@ -22,7 +22,8 @@
       "quarantined_target": null,
       "suppression_until": null,
       "target_content_hash": null,
-      "user_intent_hash": "intent_01"
+      "user_intent_hash": "intent_01",
+      "reconciliation_terminal": null
     },
     {
       "key": "Jvm:custom_jvm_args_present:Guardian.Config.fixture_target_02:Custom:intent_02",
@@ -45,16 +46,17 @@
       "quarantined_target": null,
       "suppression_until": null,
       "target_content_hash": null,
-      "user_intent_hash": "intent_02"
+      "user_intent_hash": "intent_02",
+      "reconciliation_terminal": null
     },
     {
-      "key": "Runtime:managed_runtime_corrupt:Guardian.Config.fixture_target_03:Managed:intent_03",
+      "key": "Runtime:managed_runtime_corrupt:Guardian.Runtime.fixture_target_03:Managed:no_intent:rung.RebuildComponent:component.Runtime:scope.registered.0123456789abcdef.sha256.aaaaaaaa.bbbbbbbb.cccccccc.dddddddd.eeeeeeee.ffffffff.01234567.89abcdef",
       "diagnosis_id": "managed_runtime_corrupt",
       "domain": "Runtime",
       "mode": "Managed",
       "target": {
         "system": "Guardian",
-        "kind": "Config",
+        "kind": "Runtime",
         "id": "fixture_target_03",
         "ownership": "LauncherManaged"
       },
@@ -66,14 +68,46 @@
       "last_action_outcome": "Repaired",
       "repair_attempt_count": 1,
       "quarantined_target": {
-        "system": "Guardian",
-        "kind": "Config",
-        "id": "fixture_quarantine_03",
+        "system": "Execution",
+        "kind": "Runtime",
+        "id": "quarantine-fixture_target_03",
         "ownership": "LauncherManaged"
       },
-      "suppression_until": null,
+      "suppression_until": "2026-07-01T01:03:00Z",
       "target_content_hash": "content_hash_03",
-      "user_intent_hash": "intent_03"
+      "user_intent_hash": null,
+      "reconciliation_terminal": {
+        "attempt": {
+          "operation_id": "guardian-reconciliation-operation-component",
+          "diagnosis_id": "managed_runtime_corrupt",
+          "domain": "Runtime",
+          "rung": "RebuildComponent",
+          "scope": {
+            "RegisteredInstance": {
+              "instance_id": "0123456789abcdef",
+              "fingerprint": "sha256.aaaaaaaa.bbbbbbbb.cccccccc.dddddddd.eeeeeeee.ffffffff.01234567.89abcdef"
+            }
+          },
+          "component": "Runtime",
+          "target": {
+            "system": "Guardian",
+            "kind": "Runtime",
+            "id": "fixture_target_03",
+            "ownership": "LauncherManaged"
+          },
+          "mode": "Managed",
+          "ownership": "LauncherManaged",
+          "observed_at": "2026-07-01T00:03:00Z",
+          "suppression_until": "2026-07-01T01:03:00Z"
+        },
+        "outcome": "Succeeded",
+        "quarantined_target": {
+          "system": "Execution",
+          "kind": "Runtime",
+          "id": "quarantine-fixture_target_03",
+          "ownership": "LauncherManaged"
+        }
+      }
     },
     {
       "key": "Startup:startup_stalled:Guardian.Config.fixture_target_04:Managed:intent_04",
@@ -96,7 +130,8 @@
       "quarantined_target": null,
       "suppression_until": "2026-07-01T01:04:00Z",
       "target_content_hash": null,
-      "user_intent_hash": "intent_04"
+      "user_intent_hash": "intent_04",
+      "reconciliation_terminal": null
     },
     {
       "key": "Jvm:jvm_args_malformed:Guardian.Config.fixture_target_06:Custom:intent_06",
@@ -119,7 +154,8 @@
       "quarantined_target": null,
       "suppression_until": null,
       "target_content_hash": null,
-      "user_intent_hash": "intent_06"
+      "user_intent_hash": "intent_06",
+      "reconciliation_terminal": null
     },
     {
       "key": "Launch:jvm_arg_unsupported:Guardian.Instance.fixture_target_07:Managed:intent_07",
@@ -142,7 +178,8 @@
       "quarantined_target": null,
       "suppression_until": "2026-07-01T01:07:00Z",
       "target_content_hash": null,
-      "user_intent_hash": "intent_07"
+      "user_intent_hash": "intent_07",
+      "reconciliation_terminal": null
     },
     {
       "key": "Runtime:java_override_unavailable:Guardian.Config.fixture_target_09:Managed:intent_09",
@@ -165,12 +202,13 @@
       "quarantined_target": null,
       "suppression_until": "2026-07-01T01:09:00Z",
       "target_content_hash": null,
-      "user_intent_hash": "intent_09"
+      "user_intent_hash": "intent_09",
+      "reconciliation_terminal": null
     },
     {
-      "key": "Library:launcher_managed_artifact_corrupt:Guardian.Artifact.fixture_target_10:Managed:intent_10",
+      "key": "Install:launcher_managed_artifact_corrupt:Guardian.Artifact.fixture_target_10:Managed:no_intent:rung.RepairArtifact:component.Libraries:scope.install",
       "diagnosis_id": "launcher_managed_artifact_corrupt",
-      "domain": "Library",
+      "domain": "Install",
       "mode": "Managed",
       "target": {
         "system": "Guardian",
@@ -186,9 +224,31 @@
       "last_action_outcome": "Failed",
       "repair_attempt_count": 1,
       "quarantined_target": null,
-      "suppression_until": null,
+      "suppression_until": "2026-07-01T01:10:00Z",
       "target_content_hash": null,
-      "user_intent_hash": "intent_10"
+      "user_intent_hash": null,
+      "reconciliation_terminal": {
+        "attempt": {
+          "operation_id": "guardian-reconciliation-operation-artifact",
+          "diagnosis_id": "launcher_managed_artifact_corrupt",
+          "domain": "Install",
+          "rung": "RepairArtifact",
+          "scope": "InstallOperation",
+          "component": "Libraries",
+          "target": {
+            "system": "Guardian",
+            "kind": "Artifact",
+            "id": "fixture_target_10",
+            "ownership": "LauncherManaged"
+          },
+          "mode": "Managed",
+          "ownership": "LauncherManaged",
+          "observed_at": "2026-07-01T00:10:00Z",
+          "suppression_until": "2026-07-01T01:10:00Z"
+        },
+        "outcome": "Failed",
+        "quarantined_target": null
+      }
     },
     {
       "key": "Config:custom_java_override_present:Guardian.Config.fixture_target_12:Custom:intent_12",
@@ -211,7 +271,8 @@
       "quarantined_target": null,
       "suppression_until": null,
       "target_content_hash": null,
-      "user_intent_hash": "intent_12"
+      "user_intent_hash": "intent_12",
+      "reconciliation_terminal": null
     },
     {
       "key": "State:persisted_state_schema_invalid:Guardian.Config.fixture_target_13:Disabled:intent_13",
@@ -234,7 +295,8 @@
       "quarantined_target": null,
       "suppression_until": null,
       "target_content_hash": null,
-      "user_intent_hash": "intent_13"
+      "user_intent_hash": "intent_13",
+      "reconciliation_terminal": null
     },
     {
       "key": "Unknown:unknown_failure_failed:Guardian.Config.fixture_target_14:Disabled:intent_14",
@@ -257,7 +319,8 @@
       "quarantined_target": null,
       "suppression_until": null,
       "target_content_hash": null,
-      "user_intent_hash": "intent_14"
+      "user_intent_hash": "intent_14",
+      "reconciliation_terminal": null
     }
   ]
 }

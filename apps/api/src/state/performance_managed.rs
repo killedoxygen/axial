@@ -530,6 +530,7 @@ mod tests {
         {
             let lifecycle = super::super::InstanceLifecycleLease::bind(
                 instance_id,
+                self.instance_lifecycle.clone(),
                 self.instance_lifecycle.acquire(instance_id).await,
             );
             self.owner

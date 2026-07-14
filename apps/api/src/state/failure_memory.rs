@@ -3,24 +3,31 @@
 //! This module owns the bounded records Guardian consumes for loop suppression
 //! and later-operation guidance. It stores memory; it does not decide policy.
 
-use super::contracts::{OwnershipClass, TargetDescriptor, sanitize_target_id};
+use super::contracts::{
+    OwnershipClass, RECONCILIATION_EVIDENCE_CAPACITY, TargetDescriptor, sanitize_target_id,
+};
+use super::contracts::{
+    ReconciliationComponent, ReconciliationRung, ReconciliationScope, ReconciliationTerminal,
+    ReconciliationTerminalOutcome,
+};
 use super::ownership::{CurrentArtifact, classify_current_artifact};
 use crate::execution::persistence::{
-    AtomicSnapshotWriter, PersistenceCoordinator, PersistenceOwnerLease, WriteUrgency,
+    AcceptedWrite, AtomicSnapshotWriter, PersistenceCoordinator, PersistenceOwnerLease,
+    WriteUrgency,
 };
 use crate::guardian::{DiagnosisId, GuardianActionKind, GuardianDomain, GuardianMode};
 use axial_config::AppPaths;
 use chrono::{DateTime, FixedOffset};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::RwLock;
-use tracing::warn;
+use std::sync::{Arc, Mutex, RwLock};
 
-pub const FAILURE_MEMORY_SCHEMA: &str = "axial.guardian.failure_memory.v1";
-pub const DEFAULT_FAILURE_MEMORY_LIMIT: usize = 64;
+pub const FAILURE_MEMORY_SCHEMA: &str = "axial.guardian.failure_memory.v2";
+pub const DEFAULT_FAILURE_MEMORY_LIMIT: usize = RECONCILIATION_EVIDENCE_CAPACITY;
 const FAILURE_MEMORY_FILE: &str = "failure-memory.json";
 const FAILURE_MEMORY_LOCK_INVARIANT: &str =
     "Guardian failure-memory records lock poisoned; in-memory and persisted state may diverge";
@@ -51,6 +58,48 @@ impl FailureMemoryKey {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    pub(super) fn for_reconciliation(
+        domain: GuardianDomain,
+        diagnosis_id: &DiagnosisId,
+        target: &TargetDescriptor,
+        terminal: &ReconciliationTerminal,
+    ) -> Self {
+        Self::for_reconciliation_parts(
+            domain,
+            diagnosis_id,
+            target,
+            terminal.mode(),
+            terminal.rung(),
+            terminal.component(),
+            terminal.scope(),
+        )
+    }
+
+    pub(super) fn for_reconciliation_parts(
+        domain: GuardianDomain,
+        diagnosis_id: &DiagnosisId,
+        target: &TargetDescriptor,
+        mode: GuardianMode,
+        rung: ReconciliationRung,
+        component: ReconciliationComponent,
+        reconciliation_scope: &ReconciliationScope,
+    ) -> Self {
+        let scope = match reconciliation_scope {
+            ReconciliationScope::InstallOperation => "install".to_string(),
+            ReconciliationScope::RegisteredInstance {
+                instance_id,
+                fingerprint,
+            } => format!("registered.{instance_id}.{}", fingerprint.as_str()),
+        };
+        let base = Self::for_observation(domain, diagnosis_id, target, mode, None);
+        Self(format!(
+            "{}:rung.{:?}:component.{:?}:scope.{scope}",
+            base.as_str(),
+            rung,
+            component,
+        ))
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -72,6 +121,7 @@ pub struct GuardianFailureMemoryEntry {
     pub suppression_until: Option<String>,
     pub target_content_hash: Option<String>,
     pub user_intent_hash: Option<String>,
+    reconciliation_terminal: Option<ReconciliationTerminal>,
 }
 
 impl GuardianFailureMemoryEntry {
@@ -111,6 +161,7 @@ impl GuardianFailureMemoryEntry {
             suppression_until: None,
             target_content_hash: None,
             user_intent_hash,
+            reconciliation_terminal: None,
         }
     }
 
@@ -149,19 +200,49 @@ impl GuardianFailureMemoryEntry {
         safe_optional_fragment(current_hash, "target_hash") != self.target_content_hash
     }
 
+    pub fn reconciliation_terminal(&self) -> Option<&ReconciliationTerminal> {
+        self.reconciliation_terminal.as_ref()
+    }
+
+    pub(super) fn with_reconciliation_terminal(mut self, terminal: ReconciliationTerminal) -> Self {
+        self.mode = terminal.mode();
+        self.ownership = terminal.ownership();
+        self.target.ownership = terminal.ownership();
+        self.user_intent_hash = None;
+        self.key = FailureMemoryKey::for_reconciliation(
+            self.domain,
+            &self.diagnosis_id,
+            &self.target,
+            &terminal,
+        );
+        self.reconciliation_terminal = Some(terminal);
+        self
+    }
+
     pub fn validate(&self) -> Result<(), FailureMemoryValidationError> {
         if !is_safe_memory_fragment(self.key.as_str()) {
             return Err(FailureMemoryValidationError::UnsafeKey);
         }
-        if self.key
-            != FailureMemoryKey::for_observation(
-                self.domain,
-                &self.diagnosis_id,
-                &self.target,
-                self.mode,
-                self.user_intent_hash.as_deref(),
-            )
-        {
+        let expected_key = self.reconciliation_terminal.as_ref().map_or_else(
+            || {
+                FailureMemoryKey::for_observation(
+                    self.domain,
+                    &self.diagnosis_id,
+                    &self.target,
+                    self.mode,
+                    self.user_intent_hash.as_deref(),
+                )
+            },
+            |terminal| {
+                FailureMemoryKey::for_reconciliation(
+                    self.domain,
+                    &self.diagnosis_id,
+                    &self.target,
+                    terminal,
+                )
+            },
+        );
+        if self.key != expected_key {
             return Err(FailureMemoryValidationError::MemoryKeyMismatch);
         }
         if !is_safe_memory_fragment(&self.target.id) {
@@ -199,6 +280,35 @@ impl GuardianFailureMemoryEntry {
             && !is_safe_memory_fragment(user_intent_hash)
         {
             return Err(FailureMemoryValidationError::UnsafeUserIntentHash);
+        }
+        if let Some(terminal) = &self.reconciliation_terminal {
+            terminal
+                .validate()
+                .map_err(|_| FailureMemoryValidationError::InvalidReconciliationTerminal)?;
+            if self.mode != terminal.mode()
+                || self.diagnosis_id != terminal.diagnosis_id()
+                || self.domain != terminal.domain()
+                || self.ownership != terminal.ownership()
+                || self.target.ownership != terminal.ownership()
+                || &self.target != terminal.target()
+                || self.user_intent_hash.is_some()
+                || self.last_action_kind != Some(GuardianActionKind::Repair)
+                || self.repair_attempt_count == 0
+                || self.last_observed_at != terminal.observed_at()
+                || self.suppression_until.as_deref() != Some(terminal.suppression_until())
+                || self.quarantined_target.as_ref() != terminal.quarantined_target()
+            {
+                return Err(FailureMemoryValidationError::ReconciliationTerminalMismatch);
+            }
+            let expected_outcome = match terminal.outcome() {
+                ReconciliationTerminalOutcome::Succeeded => FailureMemoryActionOutcome::Repaired,
+                ReconciliationTerminalOutcome::Failed => FailureMemoryActionOutcome::Failed,
+            };
+            if self.last_action_outcome != Some(expected_outcome)
+                || self.suppression_until.is_none()
+            {
+                return Err(FailureMemoryValidationError::ReconciliationTerminalMismatch);
+            }
         }
         Ok(())
     }
@@ -246,8 +356,12 @@ impl FailureMemorySnapshot {
         if self.entries.len() > DEFAULT_FAILURE_MEMORY_LIMIT {
             return Err(FailureMemoryLoadError::TooManyEntries);
         }
+        let mut keys = BTreeSet::new();
         for entry in &self.entries {
             entry.validate()?;
+            if !keys.insert(entry.key.as_str()) {
+                return Err(FailureMemoryLoadError::DuplicateKey);
+            }
         }
         Ok(())
     }
@@ -259,6 +373,7 @@ pub enum FailureMemoryLoadError {
     InvalidSchema,
     TooManyEntries,
     InvalidEntry(FailureMemoryValidationError),
+    DuplicateKey,
 }
 
 impl From<serde_json::Error> for FailureMemoryLoadError {
@@ -284,6 +399,8 @@ pub enum FailureMemoryValidationError {
     ZeroOccurrences,
     InvalidObservedTimestamp,
     InvalidSuppressionTimestamp,
+    InvalidReconciliationTerminal,
+    ReconciliationTerminalMismatch,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -294,6 +411,8 @@ pub enum FailureMemoryStoreError {
     Snapshot(FailureMemoryLoadError),
     #[error("Guardian failure-memory persistence failed: {0}")]
     Persistence(#[source] io::Error),
+    #[error("Guardian failure-memory capacity is exhausted by active reconciliation evidence")]
+    CapacityExhausted,
 }
 
 impl FailureMemoryStoreError {
@@ -302,6 +421,7 @@ impl FailureMemoryStoreError {
             Self::Validation(_) => "validation",
             Self::Snapshot(_) => "snapshot",
             Self::Persistence(_) => "persistence",
+            Self::CapacityExhausted => "capacity_exhausted",
         }
     }
 }
@@ -339,9 +459,44 @@ impl FailureMemoryPersistence {
 }
 
 pub struct GuardianFailureMemoryStore {
-    records: RwLock<BTreeMap<String, GuardianFailureMemoryEntry>>,
+    records: Arc<RwLock<FailureMemoryRecords>>,
+    attempts: Arc<Mutex<BTreeSet<String>>>,
     max_entries: usize,
     persistence: Option<FailureMemoryPersistence>,
+}
+
+pub(super) struct ReconciliationAttemptReservation {
+    key: FailureMemoryKey,
+    attempts: Arc<Mutex<BTreeSet<String>>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum ReconciliationAttemptReserveError {
+    PersistencePending,
+    AlreadyReserved,
+}
+
+impl Drop for ReconciliationAttemptReservation {
+    fn drop(&mut self) {
+        self.attempts
+            .lock()
+            .expect("Guardian reconciliation attempts lock poisoned")
+            .remove(self.key.as_str());
+    }
+}
+
+#[derive(Default)]
+struct FailureMemoryRecords {
+    visible: BTreeMap<String, GuardianFailureMemoryEntry>,
+    visible_revision: u64,
+    retry_candidate: Option<(u64, BTreeMap<String, GuardianFailureMemoryEntry>)>,
+    critical_pending: bool,
+}
+
+struct PendingFailureMemoryCommit {
+    ticket: AcceptedWrite,
+    revision: u64,
+    candidate: BTreeMap<String, GuardianFailureMemoryEntry>,
 }
 
 impl GuardianFailureMemoryStore {
@@ -351,16 +506,11 @@ impl GuardianFailureMemoryStore {
 
     pub fn with_max_entries(max_entries: usize) -> Self {
         Self {
-            records: RwLock::new(BTreeMap::new()),
+            records: Arc::new(RwLock::new(FailureMemoryRecords::default())),
+            attempts: Arc::new(Mutex::new(BTreeSet::new())),
             max_entries: max_entries.clamp(1, DEFAULT_FAILURE_MEMORY_LIMIT),
             persistence: None,
         }
-    }
-
-    pub fn load_from_paths(paths: &AppPaths) -> Self {
-        Self::try_load_from_paths(paths).unwrap_or_else(|error| {
-            panic!("failed to initialize Guardian failure-memory persistence: {error}")
-        })
     }
 
     pub fn try_load_from_paths(paths: &AppPaths) -> Result<Self, FailureMemoryStoreError> {
@@ -378,29 +528,9 @@ impl GuardianFailureMemoryStore {
         );
 
         match fs::read_to_string(&storage_path) {
-            Ok(data) => match FailureMemorySnapshot::from_json(&data) {
-                Ok(snapshot) => {
-                    if let Err(error) = store.load_snapshot(snapshot) {
-                        warn!(
-                            error = ?error,
-                            "failed to load persisted Guardian failure memory snapshot"
-                        );
-                    }
-                }
-                Err(error) => {
-                    warn!(
-                        error = ?error,
-                        "failed to parse persisted Guardian failure memory snapshot"
-                    );
-                }
-            },
+            Ok(data) => store.load_snapshot(FailureMemorySnapshot::from_json(&data)?)?,
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => {
-                warn!(
-                    error = %error,
-                    "failed to read persisted Guardian failure memory snapshot"
-                );
-            }
+            Err(error) => return Err(FailureMemoryStoreError::Persistence(error)),
         }
 
         Ok(store)
@@ -411,7 +541,8 @@ impl GuardianFailureMemoryStore {
         persistence: Option<FailureMemoryPersistence>,
     ) -> Self {
         Self {
-            records: RwLock::new(BTreeMap::new()),
+            records: Arc::new(RwLock::new(FailureMemoryRecords::default())),
+            attempts: Arc::new(Mutex::new(BTreeSet::new())),
             max_entries: max_entries.clamp(1, DEFAULT_FAILURE_MEMORY_LIMIT),
             persistence,
         }
@@ -422,15 +553,8 @@ impl GuardianFailureMemoryStore {
     /// Success means the revision is owned by the persistence coordinator. Call
     /// [`Self::flush`] when the physical write must be observed before continuing.
     pub fn record(&self, entry: GuardianFailureMemoryEntry) -> Result<(), FailureMemoryStoreError> {
-        self.record_with(entry, apply_record)
-    }
-
-    /// Records an actionless observation without clearing current loop-control state.
-    pub(crate) fn record_observation_preserving_loop_control(
-        &self,
-        observation: GuardianFailureMemoryEntry,
-    ) -> Result<(), FailureMemoryStoreError> {
-        self.record_with(observation, apply_observation_preserving_loop_control)
+        self.record_with(entry, apply_record, WriteUrgency::Debounced)
+            .map(|pending| debug_assert!(pending.is_none()))
     }
 
     fn record_with(
@@ -440,27 +564,146 @@ impl GuardianFailureMemoryStore {
             &mut BTreeMap<String, GuardianFailureMemoryEntry>,
             GuardianFailureMemoryEntry,
         ),
-    ) -> Result<(), FailureMemoryStoreError> {
+        urgency: WriteUrgency,
+    ) -> Result<Option<PendingFailureMemoryCommit>, FailureMemoryStoreError> {
         let mut records = self.records.write().expect(FAILURE_MEMORY_LOCK_INVARIANT);
+        if records.retry_candidate.is_some() || records.critical_pending {
+            return Err(FailureMemoryStoreError::Persistence(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "Guardian failure-memory persistence requires retry",
+            )));
+        }
         entry.validate()?;
-        let mut candidate = records.clone();
+        let protected_key = entry
+            .reconciliation_terminal()
+            .map(|_| entry.key.as_str().to_string());
+        let mut candidate = records.visible.clone();
         apply(&mut candidate, entry);
-        prune_records(&mut candidate, self.max_entries);
+        if !prune_records(&mut candidate, self.max_entries, protected_key.as_deref()) {
+            return Err(FailureMemoryStoreError::CapacityExhausted);
+        }
         let snapshot = FailureMemorySnapshot::new(candidate.values().cloned().collect())?;
-        if let Some(persistence) = &self.persistence {
+        if urgency == WriteUrgency::Immediate && self.persistence.is_some() {
+            records.critical_pending = true;
+        }
+        let ticket = match self.persistence.as_ref().map(|persistence| {
             persistence
                 .writer
-                .accept(snapshot, WriteUrgency::Debounced, encode_snapshot)
-                .map_err(|error| FailureMemoryStoreError::Persistence(error.into()))?;
+                .accept(snapshot, urgency, encode_snapshot)
+                .map_err(|error| FailureMemoryStoreError::Persistence(error.into()))
+        }) {
+            Some(Ok(ticket)) => Some(ticket),
+            Some(Err(error)) => {
+                records.critical_pending = false;
+                return Err(error);
+            }
+            None => None,
+        };
+        let Some(ticket) = ticket else {
+            records.visible = candidate;
+            return Ok(None);
+        };
+        let revision = ticket.revision().get();
+        if urgency == WriteUrgency::Debounced {
+            records.visible = candidate;
+            records.visible_revision = revision;
+            return Ok(None);
         }
-        *records = candidate;
-        Ok(())
+        Ok(Some(PendingFailureMemoryCommit {
+            ticket,
+            revision,
+            candidate,
+        }))
+    }
+
+    pub(super) async fn record_reconciliation_terminal(
+        &self,
+        entry: GuardianFailureMemoryEntry,
+        reservation: &ReconciliationAttemptReservation,
+    ) -> Result<(), FailureMemoryStoreError> {
+        if entry.reconciliation_terminal().is_none() {
+            return Err(FailureMemoryValidationError::InvalidReconciliationTerminal.into());
+        }
+        let key = entry.key.clone();
+        if reservation.key != key || !Arc::ptr_eq(&reservation.attempts, &self.attempts) {
+            return Err(FailureMemoryValidationError::MemoryKeyMismatch.into());
+        }
+        if let Some(stored) = self.get(&key) {
+            if stored == entry {
+                return Ok(());
+            }
+            if !reconciliation_entry_can_be_superseded(&stored, &entry) {
+                return Err(FailureMemoryValidationError::ReconciliationTerminalMismatch.into());
+            }
+        }
+        if self
+            .records
+            .read()
+            .expect(FAILURE_MEMORY_LOCK_INVARIANT)
+            .retry_candidate
+            .is_some()
+        {
+            self.retry().await?;
+            if let Some(stored) = self.get(&key) {
+                if stored == entry {
+                    return Ok(());
+                }
+                if !reconciliation_entry_can_be_superseded(&stored, &entry) {
+                    return Err(FailureMemoryValidationError::ReconciliationTerminalMismatch.into());
+                }
+            }
+        }
+        let pending =
+            self.record_with(entry, apply_reconciliation_record, WriteUrgency::Immediate)?;
+        self.await_commit(pending).await
+    }
+
+    pub(super) fn reserve_reconciliation_attempt(
+        &self,
+        key: FailureMemoryKey,
+    ) -> Result<ReconciliationAttemptReservation, ReconciliationAttemptReserveError> {
+        let records = self.records.read().expect(FAILURE_MEMORY_LOCK_INVARIANT);
+        if records.critical_pending || records.retry_candidate.is_some() {
+            return Err(ReconciliationAttemptReserveError::PersistencePending);
+        }
+        let mut attempts = self
+            .attempts
+            .lock()
+            .expect("Guardian reconciliation attempts lock poisoned");
+        if !attempts.insert(key.as_str().to_string()) {
+            return Err(ReconciliationAttemptReserveError::AlreadyReserved);
+        }
+        drop(records);
+        Ok(ReconciliationAttemptReservation {
+            key,
+            attempts: self.attempts.clone(),
+        })
+    }
+
+    pub(super) async fn settle_reconciliation_pending(
+        &self,
+    ) -> Result<(), FailureMemoryStoreError> {
+        let (critical_pending, retry_pending) = {
+            let records = self.records.read().expect(FAILURE_MEMORY_LOCK_INVARIANT);
+            (records.critical_pending, records.retry_candidate.is_some())
+        };
+        if !critical_pending {
+            return Ok(());
+        }
+        if retry_pending {
+            return self.retry().await;
+        }
+        match self.flush().await {
+            Ok(()) => Ok(()),
+            Err(_) => self.retry().await,
+        }
     }
 
     pub fn get(&self, key: &FailureMemoryKey) -> Option<GuardianFailureMemoryEntry> {
         self.records
             .read()
             .expect(FAILURE_MEMORY_LOCK_INVARIANT)
+            .visible
             .get(key.as_str())
             .cloned()
     }
@@ -469,6 +712,7 @@ impl GuardianFailureMemoryStore {
         self.records
             .read()
             .expect(FAILURE_MEMORY_LOCK_INVARIANT)
+            .visible
             .values()
             .cloned()
             .collect()
@@ -483,12 +727,18 @@ impl GuardianFailureMemoryStore {
         snapshot: FailureMemorySnapshot,
     ) -> Result<(), FailureMemoryLoadError> {
         snapshot.validate()?;
-        let mut records = self.records.write().expect(FAILURE_MEMORY_LOCK_INVARIANT);
-        records.clear();
+        let mut candidate = BTreeMap::new();
         for entry in snapshot.entries {
-            records.insert(entry.key.as_str().to_string(), entry);
+            candidate.insert(entry.key.as_str().to_string(), entry);
         }
-        prune_records(&mut records, self.max_entries);
+        if !prune_records(&mut candidate, self.max_entries, None) {
+            return Err(FailureMemoryLoadError::TooManyEntries);
+        }
+        let mut records = self.records.write().expect(FAILURE_MEMORY_LOCK_INVARIANT);
+        records.visible = candidate;
+        records.visible_revision = 0;
+        records.retry_candidate = None;
+        records.critical_pending = false;
         Ok(())
     }
 
@@ -505,15 +755,75 @@ impl GuardianFailureMemoryStore {
 
     pub async fn retry(&self) -> Result<(), FailureMemoryStoreError> {
         if let Some(persistence) = &self.persistence {
-            persistence
+            let ticket = persistence
                 .writer
                 .retry()
-                .map_err(|error| FailureMemoryStoreError::Persistence(error.into()))?
-                .persisted()
-                .await
                 .map_err(|error| FailureMemoryStoreError::Persistence(error.into()))?;
+            let revision = ticket.revision().get();
+            let candidate = self
+                .records
+                .read()
+                .expect(FAILURE_MEMORY_LOCK_INVARIANT)
+                .retry_candidate
+                .as_ref()
+                .filter(|(candidate_revision, _)| *candidate_revision == revision)
+                .map(|(_, candidate)| candidate.clone());
+            if let Some(candidate) = candidate {
+                self.await_commit(Some(PendingFailureMemoryCommit {
+                    ticket,
+                    revision,
+                    candidate,
+                }))
+                .await?;
+            } else {
+                ticket
+                    .persisted()
+                    .await
+                    .map_err(|error| FailureMemoryStoreError::Persistence(error.into()))?;
+            }
         }
         Ok(())
+    }
+
+    async fn await_commit(
+        &self,
+        commit: Option<PendingFailureMemoryCommit>,
+    ) -> Result<(), FailureMemoryStoreError> {
+        let Some(commit) = commit else {
+            return Ok(());
+        };
+        let records = self.records.clone();
+        let (completed_tx, completed_rx) = tokio::sync::oneshot::channel();
+        commit.ticket.observe(move |result| {
+            let result = match result {
+                Ok(_) => {
+                    let mut records = records.write().expect(FAILURE_MEMORY_LOCK_INVARIANT);
+                    if records.visible_revision < commit.revision {
+                        records.visible = commit.candidate;
+                        records.visible_revision = commit.revision;
+                    }
+                    records.retry_candidate = None;
+                    records.critical_pending = false;
+                    Ok(())
+                }
+                Err(error) => {
+                    records
+                        .write()
+                        .expect(FAILURE_MEMORY_LOCK_INVARIANT)
+                        .retry_candidate = Some((commit.revision, commit.candidate));
+                    Err(error)
+                }
+            };
+            let _ = completed_tx.send(result);
+        });
+        completed_rx
+            .await
+            .map_err(|_| {
+                FailureMemoryStoreError::Persistence(io::Error::other(
+                    "Guardian failure-memory commit observer stopped",
+                ))
+            })?
+            .map_err(|error| FailureMemoryStoreError::Persistence(error.into()))
     }
 
     pub async fn close(&self) -> Result<(), FailureMemoryStoreError> {
@@ -539,13 +849,20 @@ impl Default for GuardianFailureMemoryStore {
     }
 }
 
-fn prune_records(records: &mut BTreeMap<String, GuardianFailureMemoryEntry>, max_entries: usize) {
+fn prune_records(
+    records: &mut BTreeMap<String, GuardianFailureMemoryEntry>,
+    max_entries: usize,
+    protected_key: Option<&str>,
+) -> bool {
     if records.len() <= max_entries {
-        return;
+        return true;
     }
 
     let mut ordered = records
         .values()
+        .filter(|entry| {
+            protected_key != Some(entry.key.as_str()) && !active_reconciliation_terminal(entry)
+        })
         .map(|entry| {
             (
                 parse_timestamp(&entry.last_observed_at)
@@ -560,6 +877,14 @@ fn prune_records(records: &mut BTreeMap<String, GuardianFailureMemoryEntry>, max
     for (_, key) in ordered.into_iter().take(remove_count) {
         records.remove(&key);
     }
+    records.len() <= max_entries
+}
+
+fn active_reconciliation_terminal(entry: &GuardianFailureMemoryEntry) -> bool {
+    entry
+        .reconciliation_terminal()
+        .and_then(|terminal| DateTime::parse_from_rfc3339(terminal.suppression_until()).ok())
+        .is_some_and(|until| until > chrono::Utc::now())
 }
 
 fn apply_record(
@@ -584,20 +909,35 @@ fn apply_record(
     }
 }
 
-fn apply_observation_preserving_loop_control(
+fn apply_reconciliation_record(
     records: &mut BTreeMap<String, GuardianFailureMemoryEntry>,
-    observation: GuardianFailureMemoryEntry,
+    entry: GuardianFailureMemoryEntry,
 ) {
-    let key = observation.key.as_str().to_string();
-    let Some(existing) = records.get_mut(&key) else {
-        records.insert(key, observation);
-        return;
-    };
+    records.insert(entry.key.as_str().to_string(), entry);
+}
 
-    existing.last_observed_at = observation.last_observed_at;
-    existing.occurrence_count = existing
-        .occurrence_count
-        .saturating_add(observation.occurrence_count.max(1));
+fn reconciliation_entry_can_be_superseded(
+    existing: &GuardianFailureMemoryEntry,
+    replacement: &GuardianFailureMemoryEntry,
+) -> bool {
+    let (Some(existing_terminal), Some(replacement_terminal)) = (
+        existing.reconciliation_terminal(),
+        replacement.reconciliation_terminal(),
+    ) else {
+        return false;
+    };
+    if existing_terminal == replacement_terminal {
+        return false;
+    }
+    let Ok(existing_until) = DateTime::parse_from_rfc3339(existing_terminal.suppression_until())
+    else {
+        return false;
+    };
+    let Ok(replacement_observed) = DateTime::parse_from_rfc3339(replacement_terminal.observed_at())
+    else {
+        return false;
+    };
+    existing_until <= replacement_observed
 }
 
 fn safe_optional_fragment(value: &str, fallback: &str) -> Option<String> {
@@ -643,28 +983,34 @@ fn encode_snapshot(snapshot: FailureMemorySnapshot) -> io::Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        FailureMemoryActionOutcome, FailureMemorySnapshot, FailureMemoryStoreError,
-        GuardianFailureMemoryEntry, GuardianFailureMemoryStore,
+        FailureMemoryActionOutcome, FailureMemoryLoadError, FailureMemorySnapshot,
+        FailureMemoryStoreError, GuardianFailureMemoryEntry, GuardianFailureMemoryStore,
     };
     use crate::execution::file::{FileWriteRequest, write_file_atomically};
     use crate::execution::persistence::{AtomicWriteBackend, PersistenceCoordinator};
     use crate::guardian::{DiagnosisId, GuardianActionKind, GuardianDomain, GuardianMode};
     use crate::state::contracts::{
-        OwnershipClass, StabilizationSystem, TargetDescriptor, TargetKind,
+        OperationId, OwnershipClass, ReconciliationComponent, ReconciliationRung,
+        ReconciliationScope, ReconciliationTerminalOutcome, StabilizationSystem, TargetDescriptor,
+        TargetKind,
     };
+    use crate::state::journals::DEFAULT_OPERATION_JOURNAL_LIMIT;
     use crate::state::ownership::{CurrentArtifact, classify_current_artifact};
+    use crate::state::{
+        install_operation_reconciliation_attempt, reconciliation_memory_entry,
+        reconciliation_terminal,
+    };
     use axial_config::AppPaths;
     use std::fs;
     use std::io;
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::thread;
     use std::time::Duration;
 
-    const FAILURE_MEMORY_V1_FIXTURE: &str = include_str!(concat!(
+    const FAILURE_MEMORY_V2_FIXTURE: &str = include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/tests/fixtures/guardian/failure-memory-v1.json"
+        "/tests/fixtures/guardian/failure-memory-v2.json"
     ));
 
     struct CountingFileBackend {
@@ -773,14 +1119,14 @@ mod tests {
     }
 
     #[test]
-    fn checked_in_failure_memory_v1_fixture_is_byte_stable() {
+    fn checked_in_failure_memory_v2_fixture_is_byte_stable() {
         let snapshot =
-            FailureMemorySnapshot::from_json(FAILURE_MEMORY_V1_FIXTURE).expect("strict fixture");
+            FailureMemorySnapshot::from_json(FAILURE_MEMORY_V2_FIXTURE).expect("strict fixture");
         assert_eq!(
             super::FAILURE_MEMORY_SCHEMA,
-            "axial.guardian.failure_memory.v1"
+            "axial.guardian.failure_memory.v2"
         );
-        assert_eq!(snapshot.schema, "axial.guardian.failure_memory.v1");
+        assert_eq!(snapshot.schema, "axial.guardian.failure_memory.v2");
         let action_kinds = snapshot
             .entries
             .iter()
@@ -814,8 +1160,63 @@ mod tests {
             ])
         );
 
+        let terminals = snapshot
+            .entries
+            .iter()
+            .filter_map(GuardianFailureMemoryEntry::reconciliation_terminal)
+            .collect::<Vec<_>>();
+        assert_eq!(terminals.len(), 2, "fixture must exercise typed terminals");
+        assert_eq!(
+            terminals
+                .iter()
+                .map(|terminal| terminal.outcome())
+                .collect::<Vec<_>>(),
+            vec![
+                ReconciliationTerminalOutcome::Succeeded,
+                ReconciliationTerminalOutcome::Failed,
+            ]
+        );
+        assert_eq!(
+            terminals
+                .iter()
+                .map(|terminal| terminal.rung())
+                .collect::<Vec<_>>(),
+            vec![
+                ReconciliationRung::RebuildComponent,
+                ReconciliationRung::RepairArtifact,
+            ]
+        );
+        assert_eq!(
+            terminals
+                .iter()
+                .map(|terminal| terminal.component())
+                .collect::<Vec<_>>(),
+            vec![
+                ReconciliationComponent::Runtime,
+                ReconciliationComponent::Libraries,
+            ]
+        );
+        let ReconciliationScope::RegisteredInstance {
+            instance_id,
+            fingerprint,
+        } = terminals[0].scope()
+        else {
+            panic!("fixture must exercise registered-instance scope");
+        };
+        assert_eq!(instance_id, "0123456789abcdef");
+        assert_eq!(
+            fingerprint.as_str(),
+            "sha256.aaaaaaaa.bbbbbbbb.cccccccc.dddddddd.eeeeeeee.ffffffff.01234567.89abcdef"
+        );
+        assert!(terminals[0].quarantined_target().is_some());
+        assert!(matches!(
+            terminals[1].scope(),
+            ReconciliationScope::InstallOperation
+        ));
+        assert!(terminals[1].quarantined_target().is_none());
+
         let pretty = serde_json::to_string_pretty(&snapshot).expect("pretty fixture json");
-        assert_eq!(format!("{pretty}\n"), FAILURE_MEMORY_V1_FIXTURE);
+        assert_eq!(format!("{pretty}\n"), FAILURE_MEMORY_V2_FIXTURE);
 
         let compact = snapshot.to_json().expect("compact fixture json");
         let decoded = FailureMemorySnapshot::from_json(&compact).expect("decode compact fixture");
@@ -860,6 +1261,7 @@ mod tests {
                 "suppression_until": null,
                 "target_content_hash": null,
                 "user_intent_hash": "intent",
+                "reconciliation_terminal": null,
                 "unexpected": true
             }]
         });
@@ -890,7 +1292,8 @@ mod tests {
                 "quarantined_target": null,
                 "suppression_until": null,
                 "target_content_hash": null,
-                "user_intent_hash": "intent"
+                "user_intent_hash": "intent",
+                "reconciliation_terminal": null
             }]
         });
         assert!(FailureMemorySnapshot::from_json(&nested_unknown_field.to_string()).is_err());
@@ -979,60 +1382,6 @@ mod tests {
     }
 
     #[test]
-    fn concurrent_actionless_observation_cannot_revert_newer_loop_control() {
-        let store = Arc::new(GuardianFailureMemoryStore::new());
-        let newer_action = retry_entry("2026-06-15T10:01:00Z")
-            .with_action(
-                GuardianActionKind::Repair,
-                FailureMemoryActionOutcome::Repaired,
-            )
-            .with_repair_attempt()
-            .with_suppression_until("2026-06-15T11:00:00Z");
-        let key = newer_action.key.clone();
-        let stale_observation = GuardianFailureMemoryEntry::observed(
-            newer_action.diagnosis_id,
-            newer_action.domain,
-            newer_action.target.clone(),
-            newer_action.mode,
-            newer_action.user_intent_hash.as_deref(),
-            "2026-06-15T10:02:00Z",
-        );
-        let (action_recorded, await_action) = std::sync::mpsc::sync_channel(0);
-
-        let action_store = Arc::clone(&store);
-        let action_thread = thread::spawn(move || {
-            action_store
-                .record(newer_action)
-                .expect("record newer action");
-            action_recorded.send(()).expect("signal newer action");
-        });
-        let observation_store = Arc::clone(&store);
-        let observation_thread = thread::spawn(move || {
-            await_action.recv().expect("await newer action");
-            observation_store
-                .record_observation_preserving_loop_control(stale_observation)
-                .expect("record stale actionless observation");
-        });
-
-        action_thread.join().expect("newer action thread");
-        observation_thread
-            .join()
-            .expect("actionless observation thread");
-        let stored = store.get(&key).expect("stored memory");
-        assert_eq!(stored.occurrence_count, 2);
-        assert_eq!(stored.repair_attempt_count, 1);
-        assert_eq!(stored.last_action_kind, Some(GuardianActionKind::Repair));
-        assert_eq!(
-            stored.last_action_outcome,
-            Some(FailureMemoryActionOutcome::Repaired)
-        );
-        assert_eq!(
-            stored.suppression_until.as_deref(),
-            Some("2026-06-15T11:00:00Z")
-        );
-    }
-
-    #[test]
     fn changed_target_hash_reset_shape_is_explicit() {
         let entry = retry_entry("2026-06-15T12:00:00Z").with_target_content_hash("sha256_old123");
 
@@ -1095,6 +1444,46 @@ mod tests {
                 .iter()
                 .all(|entry| entry.diagnosis_id != DiagnosisId::LaunchPrepareFailed)
         );
+    }
+
+    #[tokio::test]
+    async fn active_reconciliation_memory_matches_the_journal_capacity() {
+        assert_eq!(
+            super::DEFAULT_FAILURE_MEMORY_LIMIT,
+            DEFAULT_OPERATION_JOURNAL_LIMIT
+        );
+        let store = GuardianFailureMemoryStore::new();
+
+        for index in 0..DEFAULT_OPERATION_JOURNAL_LIMIT {
+            let entry = active_reconciliation_entry(index);
+            let reservation = store
+                .reserve_reconciliation_attempt(entry.key.clone())
+                .expect("reserve reconciliation memory slot");
+            store
+                .record_reconciliation_terminal(entry, &reservation)
+                .await
+                .expect("journal-capacity terminal fits failure memory");
+        }
+
+        assert_eq!(store.list().len(), DEFAULT_OPERATION_JOURNAL_LIMIT);
+    }
+
+    #[test]
+    fn rejected_active_snapshot_preserves_visible_memory() {
+        let store = GuardianFailureMemoryStore::with_max_entries(2);
+        let prior = retry_entry("2026-06-15T10:00:00Z");
+        store.record(prior.clone()).expect("seed visible memory");
+        let before = store.list();
+        let snapshot =
+            FailureMemorySnapshot::new((0..3).map(active_reconciliation_entry).collect())
+                .expect("globally bounded active snapshot");
+
+        assert!(matches!(
+            store.load_snapshot(snapshot),
+            Err(FailureMemoryLoadError::TooManyEntries)
+        ));
+        assert_eq!(store.list(), before);
+        assert_eq!(store.get(&prior.key), Some(prior));
     }
 
     #[tokio::test]
@@ -1268,7 +1657,8 @@ mod tests {
     async fn failure_memory_store_persists_snapshot_for_restart_reasoning() {
         let root = test_root("persisted-snapshot");
         let paths = test_paths(&root);
-        let store = GuardianFailureMemoryStore::load_from_paths(&paths);
+        let store = GuardianFailureMemoryStore::try_load_from_paths(&paths)
+            .expect("load Guardian failure-memory persistence");
         let entry =
             retry_entry("2026-06-15T10:00:00Z").with_suppression_until("2026-06-15T10:30:00Z");
         let key = entry.key.clone();
@@ -1327,6 +1717,34 @@ mod tests {
             GuardianActionKind::Retry,
             FailureMemoryActionOutcome::Failed,
         )
+    }
+
+    fn active_reconciliation_entry(index: usize) -> GuardianFailureMemoryEntry {
+        let observed_at = chrono::Utc::now().fixed_offset();
+        let suppression_until = observed_at + chrono::Duration::minutes(15);
+        let target = TargetDescriptor::new(
+            StabilizationSystem::Execution,
+            TargetKind::Artifact,
+            format!("library-artifact-{index}"),
+            OwnershipClass::LauncherManaged,
+        );
+        let attempt = install_operation_reconciliation_attempt(
+            OperationId::new(format!("reconciliation-capacity-{index}")),
+            DiagnosisId::LauncherManagedArtifactCorrupt,
+            GuardianDomain::Install,
+            ReconciliationComponent::Libraries,
+            target,
+            GuardianMode::Managed,
+            &observed_at.to_rfc3339(),
+            &suppression_until.to_rfc3339(),
+        )
+        .expect("valid reconciliation attempt");
+        reconciliation_memory_entry(reconciliation_terminal(
+            attempt,
+            ReconciliationTerminalOutcome::Failed,
+            None,
+        ))
+        .expect("valid reconciliation memory")
     }
 
     fn test_root(name: &str) -> PathBuf {

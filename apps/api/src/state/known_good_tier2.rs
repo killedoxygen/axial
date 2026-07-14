@@ -50,6 +50,7 @@ impl AppState {
         }
         let lifecycle = InstanceLifecycleLease::bind(
             instance_id,
+            self.instance_lifecycle_gates.clone(),
             self.instance_lifecycle_gates.acquire(instance_id).await,
         );
         if !reservation.is_current() {

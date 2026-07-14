@@ -128,18 +128,14 @@ impl GuardianInstallAssessment {
         self,
         descriptor: super::GuardianMinecraftArtifactRepairDescriptor,
     ) -> Result<RepairAuthorization<QuarantineRedownload>, RepairAuthorizationRejection> {
-        authorize_launcher_managed_artifact_repair(&self.decision, Default::default(), descriptor)
+        authorize_launcher_managed_artifact_repair(&self.decision, descriptor)
     }
 
     pub(crate) fn into_missing_repair_authorization(
         self,
         descriptor: super::GuardianMinecraftArtifactRepairDescriptor,
     ) -> Result<RepairAuthorization<MissingDownload>, RepairAuthorizationRejection> {
-        authorize_launcher_managed_missing_artifact_repair(
-            &self.decision,
-            Default::default(),
-            descriptor,
-        )
+        authorize_launcher_managed_missing_artifact_repair(&self.decision, descriptor)
     }
 }
 

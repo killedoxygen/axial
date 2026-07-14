@@ -1,0 +1,1439 @@
+use super::contracts::{
+    CommandKind, OperationId, OperationJournalEntry, OperationJournalStep, OperationOutcome,
+    OperationStatus, OwnershipClass, ReconciliationAttempt, ReconciliationComponent,
+    ReconciliationIncarnationFingerprint, ReconciliationRung, ReconciliationScope,
+    ReconciliationTerminal, ReconciliationTerminalOutcome, StabilizationSystem, TargetDescriptor,
+    TargetKind,
+};
+use super::failure_memory::{
+    FailureMemoryActionOutcome, FailureMemoryKey, FailureMemoryStoreError,
+    GuardianFailureMemoryEntry, GuardianFailureMemoryStore,
+    ReconciliationAttemptReservation as StoreReconciliationAttemptReservation,
+    ReconciliationAttemptReserveError,
+};
+use super::{AppState, InstanceLifecycleLease, OperationJournalStore, OperationJournalStoreError};
+use crate::guardian::{DiagnosisId, GuardianActionKind, GuardianDomain, GuardianMode};
+use axial_config::is_canonical_instance_id;
+use sha2::{Digest, Sha256};
+use std::io;
+use std::path::{Path, PathBuf};
+
+const RECONCILIATION_FINGERPRINT_DOMAIN: &[u8] = b"axial.guardian.reconciliation.incarnation.v1";
+
+pub(crate) struct RecordedArtifactRepairFailure {
+    evidence: RecordedReconciliationFailure,
+}
+
+pub(crate) struct RecordedComponentRebuildFailure {
+    evidence: RecordedReconciliationFailure,
+}
+
+pub(crate) struct ReconciliationAttemptReservation {
+    reservation: StoreReconciliationAttemptReservation,
+}
+
+pub(crate) struct RegisteredReconciliationAuthority {
+    state: AppState,
+    lifecycle: InstanceLifecycleLease,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ReconciliationAttemptRejection {
+    PersistencePending,
+    AlreadyReserved,
+    AmbiguousPriorAttempt,
+}
+
+struct RecordedReconciliationFailure {
+    terminal: ReconciliationTerminal,
+    _lifecycle: InstanceLifecycleLease,
+    _roots: ReconciliationRoots,
+}
+
+#[derive(Eq, PartialEq)]
+struct ReconciliationRoots {
+    instance: PathBuf,
+    library: PathBuf,
+    runtime: PathBuf,
+}
+
+struct CurrentReconciliationIncarnation {
+    fingerprint: ReconciliationIncarnationFingerprint,
+    roots: ReconciliationRoots,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ReconciliationEvidenceRejection {
+    InvalidInstanceIdentity,
+    InstanceNotRegistered,
+    RootAuthorityUnavailable,
+    MemoryMissing,
+    MemoryNotFailed,
+    MemoryWindowInactive,
+    JournalMissing,
+    JournalMismatch,
+    NonAdjacentRung,
+    ScopeMismatch,
+    ComponentMismatch,
+    IncarnationMismatch,
+    OwnershipMismatch,
+}
+
+impl RecordedArtifactRepairFailure {
+    pub(crate) fn terminal(&self) -> &ReconciliationTerminal {
+        &self.evidence.terminal
+    }
+}
+
+impl RecordedComponentRebuildFailure {
+    pub(crate) fn terminal(&self) -> &ReconciliationTerminal {
+        &self.evidence.terminal
+    }
+}
+
+impl RegisteredReconciliationAuthority {
+    pub(crate) fn journals(&self) -> &OperationJournalStore {
+        self.state.journals.as_ref()
+    }
+
+    pub(crate) fn failure_memory(&self) -> &GuardianFailureMemoryStore {
+        self.state.failure_memory.as_ref()
+    }
+
+    pub(crate) fn owns_runtime_root(
+        &self,
+        runtime_root: &crate::execution::runtime::ManagedRuntimeRoot<'_>,
+    ) -> bool {
+        runtime_root.belongs_to(&self.state.managed_runtime_cache)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn attempt(
+        &self,
+        operation_id: OperationId,
+        diagnosis_id: DiagnosisId,
+        domain: GuardianDomain,
+        rung: ReconciliationRung,
+        component: ReconciliationComponent,
+        target: TargetDescriptor,
+        mode: GuardianMode,
+        suppression_for: chrono::Duration,
+    ) -> Result<ReconciliationAttempt, ReconciliationEvidenceRejection> {
+        let observed_at = chrono::Utc::now().fixed_offset();
+        let suppression_until = observed_at
+            .checked_add_signed(suppression_for)
+            .filter(|until| *until > observed_at)
+            .ok_or(ReconciliationEvidenceRejection::JournalMismatch)?;
+        self.state.registered_reconciliation_attempt_at(
+            &self.lifecycle,
+            operation_id,
+            diagnosis_id,
+            domain,
+            rung,
+            component,
+            target,
+            mode,
+            observed_at,
+            suppression_until,
+        )
+    }
+
+    pub(crate) fn terminal(
+        &self,
+        attempt: ReconciliationAttempt,
+        outcome: ReconciliationTerminalOutcome,
+    ) -> Result<ReconciliationTerminal, ReconciliationEvidenceRejection> {
+        let current = self
+            .state
+            .current_reconciliation_incarnation(&self.lifecycle.instance_id)?;
+        match attempt.scope() {
+            ReconciliationScope::RegisteredInstance {
+                instance_id,
+                fingerprint,
+            } if instance_id == &self.lifecycle.instance_id
+                && fingerprint == &current.fingerprint => {}
+            _ => return Err(ReconciliationEvidenceRejection::IncarnationMismatch),
+        }
+        Ok(ReconciliationTerminal::from_attempt(attempt, outcome, None))
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn install_operation_reconciliation_attempt(
+    operation_id: OperationId,
+    diagnosis_id: DiagnosisId,
+    domain: GuardianDomain,
+    component: ReconciliationComponent,
+    target: TargetDescriptor,
+    mode: GuardianMode,
+    observed_at: &str,
+    suppression_until: &str,
+) -> Result<ReconciliationAttempt, ReconciliationEvidenceRejection> {
+    let attempt = ReconciliationAttempt::new(
+        operation_id,
+        diagnosis_id,
+        domain,
+        ReconciliationRung::RepairArtifact,
+        ReconciliationScope::InstallOperation,
+        component,
+        target,
+        mode,
+        OwnershipClass::LauncherManaged,
+        observed_at,
+        suppression_until,
+    );
+    attempt
+        .validate()
+        .map_err(|_| ReconciliationEvidenceRejection::JournalMismatch)?;
+    Ok(attempt)
+}
+
+pub(crate) fn reconciliation_terminal(
+    attempt: ReconciliationAttempt,
+    outcome: ReconciliationTerminalOutcome,
+    quarantined_target: Option<TargetDescriptor>,
+) -> ReconciliationTerminal {
+    ReconciliationTerminal::from_attempt(attempt, outcome, quarantined_target)
+}
+
+pub(crate) fn reconciliation_journal_attempt(
+    mut entry: OperationJournalEntry,
+    attempt: ReconciliationAttempt,
+) -> OperationJournalEntry {
+    entry.reconciliation_attempt = Some(attempt);
+    entry
+}
+
+pub(crate) fn reconciliation_attempt_key(attempt: &ReconciliationAttempt) -> FailureMemoryKey {
+    FailureMemoryKey::for_reconciliation_parts(
+        attempt.domain(),
+        &attempt.diagnosis_id(),
+        attempt.target(),
+        attempt.mode(),
+        attempt.rung(),
+        attempt.component(),
+        attempt.scope(),
+    )
+}
+
+pub(crate) fn reconciliation_memory_entry(
+    terminal: ReconciliationTerminal,
+) -> Result<GuardianFailureMemoryEntry, ReconciliationEvidenceRejection> {
+    let outcome = match terminal.outcome() {
+        ReconciliationTerminalOutcome::Succeeded => FailureMemoryActionOutcome::Repaired,
+        ReconciliationTerminalOutcome::Failed => FailureMemoryActionOutcome::Failed,
+    };
+    let quarantined_target = terminal.quarantined_target().cloned();
+    let mut entry = GuardianFailureMemoryEntry::observed(
+        terminal.diagnosis_id(),
+        terminal.domain(),
+        terminal.target().clone(),
+        terminal.mode(),
+        None,
+        terminal.observed_at(),
+    )
+    .with_action(GuardianActionKind::Repair, outcome)
+    .with_repair_attempt()
+    .with_suppression_until(terminal.suppression_until())
+    .with_reconciliation_terminal(terminal);
+    if let Some(quarantined_target) = quarantined_target {
+        entry = entry.with_quarantined_target(quarantined_target);
+    }
+    entry
+        .validate()
+        .map_err(|_| ReconciliationEvidenceRejection::MemoryNotFailed)?;
+    Ok(entry)
+}
+
+pub(crate) async fn record_reconciliation_journal_success(
+    journals: &OperationJournalStore,
+    operation_id: &OperationId,
+    completed_step: OperationJournalStep,
+    terminal: ReconciliationTerminal,
+) -> Result<(), OperationJournalStoreError> {
+    journals
+        .record_reconciliation_success(operation_id, completed_step, terminal)
+        .await
+}
+
+pub(crate) async fn record_reconciliation_journal_failure(
+    journals: &OperationJournalStore,
+    operation_id: &OperationId,
+    failure_step: OperationJournalStep,
+    failure_point: &str,
+    terminal: ReconciliationTerminal,
+) -> Result<(), OperationJournalStoreError> {
+    journals
+        .record_reconciliation_failure(operation_id, failure_step, failure_point, terminal)
+        .await
+}
+
+pub(crate) async fn commit_reconciliation_memory(
+    failure_memory: &GuardianFailureMemoryStore,
+    entry: GuardianFailureMemoryEntry,
+    reservation: &ReconciliationAttemptReservation,
+) -> Result<(), FailureMemoryStoreError> {
+    failure_memory
+        .record_reconciliation_terminal(entry, &reservation.reservation)
+        .await
+}
+
+pub(crate) async fn settle_reconciliation_memory(
+    failure_memory: &GuardianFailureMemoryStore,
+) -> Result<(), FailureMemoryStoreError> {
+    failure_memory.settle_reconciliation_pending().await
+}
+
+pub(crate) fn reserve_reconciliation_attempt(
+    failure_memory: &GuardianFailureMemoryStore,
+    journals: &OperationJournalStore,
+    key: FailureMemoryKey,
+) -> Result<ReconciliationAttemptReservation, ReconciliationAttemptRejection> {
+    if journals.list().iter().any(|journal| {
+        matches!(
+            journal.status,
+            OperationStatus::Planned | OperationStatus::Running
+        ) && journal.reconciliation_terminal().is_none()
+            && journal
+                .reconciliation_attempt()
+                .is_some_and(|attempt| reconciliation_attempt_key(attempt) == key)
+    }) {
+        return Err(ReconciliationAttemptRejection::AmbiguousPriorAttempt);
+    }
+    failure_memory
+        .reserve_reconciliation_attempt(key)
+        .map(|reservation| ReconciliationAttemptReservation { reservation })
+        .map_err(|error| match error {
+            ReconciliationAttemptReserveError::PersistencePending => {
+                ReconciliationAttemptRejection::PersistencePending
+            }
+            ReconciliationAttemptReserveError::AlreadyReserved => {
+                ReconciliationAttemptRejection::AlreadyReserved
+            }
+        })
+}
+
+pub(crate) async fn record_guardian_repair_refusal(
+    journals: &OperationJournalStore,
+    operation_id: &OperationId,
+    skipped_step: OperationJournalStep,
+) -> Result<(), OperationJournalStoreError> {
+    journals
+        .record_guardian_repair_refusal(operation_id, skipped_step)
+        .await
+}
+
+impl AppState {
+    pub(crate) async fn reconcile_reconciliation_startup(&self) -> io::Result<()> {
+        self.failure_memory
+            .settle_reconciliation_pending()
+            .await
+            .map_err(|error| {
+                io::Error::other(format!(
+                    "Guardian reconciliation memory settlement failed: {}",
+                    error.class()
+                ))
+            })?;
+        let now = chrono::Utc::now();
+        let mut newest = std::collections::BTreeMap::new();
+        let journals = self.journals.list();
+        for journal in &journals {
+            let Some(terminal) = journal.reconciliation_terminal().cloned() else {
+                continue;
+            };
+            if !chrono::DateTime::parse_from_rfc3339(terminal.suppression_until())
+                .is_ok_and(|until| until > now)
+            {
+                continue;
+            }
+            let key = reconciliation_attempt_key(terminal.attempt());
+            if newest
+                .insert(key.as_str().to_string(), (key, terminal))
+                .is_some()
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "overlapping active reconciliation terminals share one memory key",
+                ));
+            }
+        }
+        for memory in self.failure_memory.list() {
+            let Some(terminal) = memory.reconciliation_terminal() else {
+                continue;
+            };
+            if !chrono::DateTime::parse_from_rfc3339(terminal.suppression_until())
+                .is_ok_and(|until| until > now)
+            {
+                continue;
+            }
+            let exact_journal = journals.iter().any(|journal| {
+                journal.operation_id == *terminal.operation_id()
+                    && journal.reconciliation_terminal() == Some(terminal)
+            });
+            let canonical = reconciliation_memory_entry(terminal.clone()).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "active reconciliation memory cannot be derived from its terminal",
+                )
+            })?;
+            if !exact_journal || canonical != memory {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "active reconciliation memory has no exact journal terminal",
+                ));
+            }
+        }
+        for (_, (key, terminal)) in newest {
+            let memory = reconciliation_memory_entry(terminal).map_err(|_| {
+                io::Error::other("typed reconciliation journal cannot rebuild failure memory")
+            })?;
+            if self.failure_memory.get(&memory.key).as_ref() == Some(&memory) {
+                continue;
+            }
+            if let Some(existing) = self.failure_memory.get(&memory.key) {
+                let prior_until = existing
+                    .suppression_until
+                    .as_deref()
+                    .and_then(|until| chrono::DateTime::parse_from_rfc3339(until).ok());
+                let next_observed = chrono::DateTime::parse_from_rfc3339(&memory.last_observed_at)
+                    .map_err(|_| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "typed reconciliation observation timestamp is invalid",
+                        )
+                    })?;
+                if prior_until.is_none_or(|until| until > next_observed) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "overlapping reconciliation memory cannot be superseded",
+                    ));
+                }
+            }
+            let reservation = reserve_reconciliation_attempt(
+                self.failure_memory.as_ref(),
+                self.journals.as_ref(),
+                key,
+            )
+            .map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "typed reconciliation startup attempt is already reserved",
+                )
+            })?;
+            commit_reconciliation_memory(self.failure_memory.as_ref(), memory, &reservation)
+                .await
+                .map_err(|error| {
+                    io::Error::other(format!(
+                        "typed reconciliation startup memory commit failed: {}",
+                        error.class()
+                    ))
+                })?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn registered_reconciliation_authority(
+        &self,
+        lifecycle: &InstanceLifecycleLease,
+    ) -> Result<RegisteredReconciliationAuthority, ReconciliationEvidenceRejection> {
+        if !self.instance_lifecycle_gates.owns(&lifecycle.owner) {
+            return Err(ReconciliationEvidenceRejection::ScopeMismatch);
+        }
+        self.current_reconciliation_incarnation(&lifecycle.instance_id)?;
+        Ok(RegisteredReconciliationAuthority {
+            state: self.clone(),
+            lifecycle: lifecycle.retained(),
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn registered_reconciliation_attempt_at(
+        &self,
+        lifecycle: &InstanceLifecycleLease,
+        operation_id: OperationId,
+        diagnosis_id: DiagnosisId,
+        domain: GuardianDomain,
+        rung: ReconciliationRung,
+        component: ReconciliationComponent,
+        target: TargetDescriptor,
+        mode: GuardianMode,
+        observed_at: chrono::DateTime<chrono::FixedOffset>,
+        suppression_until: chrono::DateTime<chrono::FixedOffset>,
+    ) -> Result<ReconciliationAttempt, ReconciliationEvidenceRejection> {
+        if !self.instance_lifecycle_gates.owns(&lifecycle.owner) {
+            return Err(ReconciliationEvidenceRejection::ScopeMismatch);
+        }
+        let incarnation = self.current_reconciliation_incarnation(&lifecycle.instance_id)?;
+        let attempt = ReconciliationAttempt::new(
+            operation_id,
+            diagnosis_id,
+            domain,
+            rung,
+            ReconciliationScope::RegisteredInstance {
+                instance_id: lifecycle.instance_id.clone(),
+                fingerprint: incarnation.fingerprint,
+            },
+            component,
+            target,
+            mode,
+            OwnershipClass::LauncherManaged,
+            observed_at.to_rfc3339(),
+            suppression_until.to_rfc3339(),
+        );
+        attempt
+            .validate()
+            .map_err(|_| ReconciliationEvidenceRejection::JournalMismatch)?;
+        Ok(attempt)
+    }
+
+    pub(crate) async fn recorded_artifact_repair_failure(
+        &self,
+        instance_id: &str,
+        component: ReconciliationComponent,
+        key: &FailureMemoryKey,
+    ) -> Result<RecordedArtifactRepairFailure, ReconciliationEvidenceRejection> {
+        self.recorded_reconciliation_failure_at(
+            instance_id,
+            component,
+            key,
+            ReconciliationRung::RepairArtifact,
+            chrono::Utc::now().fixed_offset(),
+        )
+        .await
+        .map(|evidence| RecordedArtifactRepairFailure { evidence })
+    }
+
+    pub(crate) async fn recorded_component_rebuild_failure(
+        &self,
+        instance_id: &str,
+        component: ReconciliationComponent,
+        key: &FailureMemoryKey,
+    ) -> Result<RecordedComponentRebuildFailure, ReconciliationEvidenceRejection> {
+        self.recorded_reconciliation_failure_at(
+            instance_id,
+            component,
+            key,
+            ReconciliationRung::RebuildComponent,
+            chrono::Utc::now().fixed_offset(),
+        )
+        .await
+        .map(|evidence| RecordedComponentRebuildFailure { evidence })
+    }
+
+    async fn recorded_reconciliation_failure_at(
+        &self,
+        instance_id: &str,
+        component: ReconciliationComponent,
+        key: &FailureMemoryKey,
+        expected_rung: ReconciliationRung,
+        observed_at: chrono::DateTime<chrono::FixedOffset>,
+    ) -> Result<RecordedReconciliationFailure, ReconciliationEvidenceRejection> {
+        if !is_canonical_instance_id(instance_id) {
+            return Err(ReconciliationEvidenceRejection::InvalidInstanceIdentity);
+        }
+        let lifecycle = self.acquire_instance_lifecycle(instance_id).await;
+        let before = self.current_reconciliation_incarnation(instance_id)?;
+        let memory = self
+            .failure_memory
+            .get(key)
+            .ok_or(ReconciliationEvidenceRejection::MemoryMissing)?;
+        let terminal = memory
+            .reconciliation_terminal()
+            .cloned()
+            .ok_or(ReconciliationEvidenceRejection::MemoryNotFailed)?;
+        if terminal.rung() != expected_rung {
+            return Err(ReconciliationEvidenceRejection::NonAdjacentRung);
+        }
+        if terminal.component() != component {
+            return Err(ReconciliationEvidenceRejection::ComponentMismatch);
+        }
+        if terminal.outcome() != ReconciliationTerminalOutcome::Failed
+            || memory.last_action_kind != Some(GuardianActionKind::Repair)
+            || memory.last_action_outcome != Some(FailureMemoryActionOutcome::Failed)
+            || memory.repair_attempt_count == 0
+        {
+            return Err(ReconciliationEvidenceRejection::MemoryNotFailed);
+        }
+        let expected_key = FailureMemoryKey::for_reconciliation(
+            memory.domain,
+            &memory.diagnosis_id,
+            &memory.target,
+            &terminal,
+        );
+        if &expected_key != key {
+            return Err(ReconciliationEvidenceRejection::MemoryNotFailed);
+        }
+        if memory.ownership != OwnershipClass::LauncherManaged
+            || memory.target.ownership != OwnershipClass::LauncherManaged
+            || terminal.ownership() != OwnershipClass::LauncherManaged
+        {
+            return Err(ReconciliationEvidenceRejection::OwnershipMismatch);
+        }
+        let last_observed_at = chrono::DateTime::parse_from_rfc3339(&memory.last_observed_at)
+            .map_err(|_| ReconciliationEvidenceRejection::MemoryWindowInactive)?;
+        let suppression_until = chrono::DateTime::parse_from_rfc3339(
+            memory
+                .suppression_until
+                .as_deref()
+                .ok_or(ReconciliationEvidenceRejection::MemoryWindowInactive)?,
+        )
+        .map_err(|_| ReconciliationEvidenceRejection::MemoryWindowInactive)?;
+        if observed_at < last_observed_at || observed_at >= suppression_until {
+            return Err(ReconciliationEvidenceRejection::MemoryWindowInactive);
+        }
+        match terminal.scope() {
+            ReconciliationScope::InstallOperation => {
+                return Err(ReconciliationEvidenceRejection::ScopeMismatch);
+            }
+            ReconciliationScope::RegisteredInstance {
+                instance_id: terminal_instance_id,
+                fingerprint,
+            } if terminal_instance_id == instance_id && fingerprint == &before.fingerprint => {}
+            ReconciliationScope::RegisteredInstance { .. } => {
+                return Err(ReconciliationEvidenceRejection::IncarnationMismatch);
+            }
+        }
+        let journal = self
+            .journals
+            .get(terminal.operation_id())
+            .ok_or(ReconciliationEvidenceRejection::JournalMissing)?;
+        if journal.operation_id != *terminal.operation_id()
+            || journal.command != CommandKind::RepairInstance
+            || journal.owner != StabilizationSystem::Guardian
+            || journal.ownership != OwnershipClass::LauncherManaged
+            || journal.status != OperationStatus::Failed
+            || journal.outcome != Some(OperationOutcome::Failed)
+            || journal.failure_point.is_none()
+            || journal.reconciliation_terminal() != Some(&terminal)
+            || !journal.targets.contains(terminal.target())
+            || !journal
+                .targets
+                .contains(&reconciliation_instance_target(instance_id))
+        {
+            return Err(ReconciliationEvidenceRejection::JournalMismatch);
+        }
+        let after = self.current_reconciliation_incarnation(instance_id)?;
+        if before.fingerprint != after.fingerprint || before.roots != after.roots {
+            return Err(ReconciliationEvidenceRejection::IncarnationMismatch);
+        }
+        Ok(RecordedReconciliationFailure {
+            terminal,
+            _lifecycle: lifecycle,
+            _roots: after.roots,
+        })
+    }
+
+    fn current_reconciliation_incarnation(
+        &self,
+        instance_id: &str,
+    ) -> Result<CurrentReconciliationIncarnation, ReconciliationEvidenceRejection> {
+        let instance = self
+            .instances
+            .get(instance_id)
+            .filter(|instance| instance.id == instance_id && is_canonical_instance_id(&instance.id))
+            .ok_or(ReconciliationEvidenceRejection::InstanceNotRegistered)?;
+        let instance_root = canonical_directory(&self.instances.game_dir(instance_id))
+            .map_err(|_| ReconciliationEvidenceRejection::RootAuthorityUnavailable)?;
+        let library_root = self
+            .library_dir()
+            .map(PathBuf::from)
+            .ok_or(ReconciliationEvidenceRejection::RootAuthorityUnavailable)
+            .and_then(|root| {
+                canonical_directory(&root)
+                    .map_err(|_| ReconciliationEvidenceRejection::RootAuthorityUnavailable)
+            })?;
+        let runtime_root = canonical_directory(self.managed_runtime_cache.root())
+            .map_err(|_| ReconciliationEvidenceRejection::RootAuthorityUnavailable)?;
+        let roots = ReconciliationRoots {
+            instance: instance_root,
+            library: library_root,
+            runtime: runtime_root,
+        };
+        let fingerprint = reconciliation_fingerprint(
+            &instance.id,
+            &instance.version_id,
+            &instance.created_at,
+            &roots,
+        );
+        Ok(CurrentReconciliationIncarnation { fingerprint, roots })
+    }
+}
+
+pub(crate) fn reconciliation_instance_target(instance_id: &str) -> TargetDescriptor {
+    TargetDescriptor::new(
+        StabilizationSystem::State,
+        TargetKind::Instance,
+        instance_id,
+        OwnershipClass::LauncherManaged,
+    )
+}
+
+fn canonical_directory(path: &Path) -> io::Result<PathBuf> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    if absolute.components().any(|component| {
+        matches!(
+            component,
+            std::path::Component::CurDir | std::path::Component::ParentDir
+        )
+    }) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "reconciliation root cannot contain relative traversal",
+        ));
+    }
+    let mut ancestor = absolute.as_path();
+    let mut missing = Vec::new();
+    loop {
+        match std::fs::symlink_metadata(ancestor) {
+            Ok(metadata) => {
+                if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "reconciliation root ancestor must be a real directory",
+                    ));
+                }
+                let mut canonical = std::fs::canonicalize(ancestor)?;
+                if !same_canonical_directory(&canonical, ancestor) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "reconciliation root cannot traverse filesystem indirection",
+                    ));
+                }
+                for component in missing.iter().rev() {
+                    canonical.push(component);
+                }
+                return Ok(canonical);
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                let component = ancestor.file_name().ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::NotFound,
+                        "reconciliation root has no existing trusted ancestor",
+                    )
+                })?;
+                missing.push(component.to_os_string());
+                ancestor = ancestor.parent().ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::NotFound,
+                        "reconciliation root has no existing trusted ancestor",
+                    )
+                })?;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn same_canonical_directory(canonical: &Path, configured: &Path) -> bool {
+    canonical == configured
+}
+
+#[cfg(windows)]
+fn same_canonical_directory(canonical: &Path, configured: &Path) -> bool {
+    use std::path::{Component, Prefix};
+
+    #[derive(Eq, PartialEq)]
+    enum PrefixIdentity<'a> {
+        Disk(u8),
+        Unc(&'a std::ffi::OsStr, &'a std::ffi::OsStr),
+        Verbatim(&'a std::ffi::OsStr),
+        DeviceNamespace(&'a std::ffi::OsStr),
+    }
+
+    fn identity(prefix: Prefix<'_>) -> PrefixIdentity<'_> {
+        match prefix {
+            Prefix::Disk(drive) | Prefix::VerbatimDisk(drive) => {
+                PrefixIdentity::Disk(drive.to_ascii_uppercase())
+            }
+            Prefix::UNC(server, share) | Prefix::VerbatimUNC(server, share) => {
+                PrefixIdentity::Unc(server, share)
+            }
+            Prefix::Verbatim(value) => PrefixIdentity::Verbatim(value),
+            Prefix::DeviceNS(value) => PrefixIdentity::DeviceNamespace(value),
+        }
+    }
+
+    let mut canonical_components = canonical.components();
+    let mut configured_components = configured.components();
+    let (Some(Component::Prefix(canonical_prefix)), Some(Component::Prefix(configured_prefix))) =
+        (canonical_components.next(), configured_components.next())
+    else {
+        return false;
+    };
+
+    identity(canonical_prefix.kind()) == identity(configured_prefix.kind())
+        && canonical_components.eq(configured_components)
+}
+
+fn reconciliation_fingerprint(
+    instance_id: &str,
+    version_id: &str,
+    created_at: &str,
+    roots: &ReconciliationRoots,
+) -> ReconciliationIncarnationFingerprint {
+    let mut hasher = Sha256::new();
+    update_frame(&mut hasher, b"domain", RECONCILIATION_FINGERPRINT_DOMAIN);
+    update_frame(&mut hasher, b"instance_id", instance_id.as_bytes());
+    update_frame(&mut hasher, b"version_id", version_id.as_bytes());
+    update_frame(&mut hasher, b"created_at", created_at.as_bytes());
+    update_path_frame(&mut hasher, b"instance_root", &roots.instance);
+    update_path_frame(&mut hasher, b"library_root", &roots.library);
+    update_path_frame(&mut hasher, b"runtime_root", &roots.runtime);
+    let hex = format!("{:x}", hasher.finalize());
+    let dotted = hex
+        .as_bytes()
+        .chunks(8)
+        .map(|chunk| std::str::from_utf8(chunk).expect("SHA-256 hex is ASCII"))
+        .collect::<Vec<_>>()
+        .join(".");
+    ReconciliationIncarnationFingerprint::from_digest(format!("sha256.{dotted}"))
+}
+
+fn update_frame(hasher: &mut Sha256, label: &[u8], value: &[u8]) {
+    hasher.update((label.len() as u64).to_le_bytes());
+    hasher.update(label);
+    hasher.update((value.len() as u64).to_le_bytes());
+    hasher.update(value);
+}
+
+#[cfg(unix)]
+fn update_path_frame(hasher: &mut Sha256, label: &[u8], path: &Path) {
+    use std::os::unix::ffi::OsStrExt;
+    update_frame(hasher, label, path.as_os_str().as_bytes());
+}
+
+#[cfg(windows)]
+fn update_path_frame(hasher: &mut Sha256, label: &[u8], path: &Path) {
+    use std::os::windows::ffi::OsStrExt;
+    let encoded = path
+        .as_os_str()
+        .encode_wide()
+        .flat_map(u16::to_le_bytes)
+        .collect::<Vec<_>>();
+    update_frame(hasher, label, &encoded);
+}
+
+#[cfg(not(any(unix, windows)))]
+fn update_path_frame(hasher: &mut Sha256, label: &[u8], path: &Path) {
+    update_frame(hasher, label, path.to_string_lossy().as_bytes());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::state::contracts::{JournalId, OperationPhase, OperationStepResult, RollbackState};
+    use crate::state::failure_memory::FailureMemorySnapshot;
+    use crate::state::{AppStateInit, InstallStore, SessionStore, new_instance};
+    use axial_config::{AppPaths, InstanceRegistrySnapshot};
+    use std::fs;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    const INSTANCE_ID: &str = "0000000000000001";
+    const DIAGNOSIS_ID: DiagnosisId = DiagnosisId::LauncherManagedArtifactCorrupt;
+
+    struct Fixture {
+        state: AppState,
+        journals: Arc<OperationJournalStore>,
+        failure_memory: Arc<GuardianFailureMemoryStore>,
+        root: PathBuf,
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn canonical_directory_identity_accepts_windows_verbatim_prefixes() {
+        assert!(same_canonical_directory(
+            Path::new(r"\\?\C:\Users\Alice\Axial"),
+            Path::new(r"c:\Users\Alice\Axial"),
+        ));
+        assert!(same_canonical_directory(
+            Path::new(r"\\?\UNC\server\share\Axial"),
+            Path::new(r"\\server\share\Axial"),
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn canonical_directory_identity_rejects_distinct_windows_locations() {
+        assert!(!same_canonical_directory(
+            Path::new(r"\\?\C:\Users\Alice\Axial"),
+            Path::new(r"C:\Users\Alice\Other"),
+        ));
+        assert!(!same_canonical_directory(
+            Path::new(r"\\?\UNC\server\share\Axial"),
+            Path::new(r"\\server\other-share\Axial"),
+        ));
+        assert!(!same_canonical_directory(
+            Path::new(r"\\?\C:\Users\Alice\Axial"),
+            Path::new(r"C:\Users\alice\Axial"),
+        ));
+    }
+
+    fn fixture(label: &str) -> Fixture {
+        static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(1);
+
+        let root = std::env::temp_dir().join(format!(
+            "axial-reconciliation-{label}-{}-{}",
+            std::process::id(),
+            NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let config_dir = root.join("config");
+        let paths = AppPaths {
+            config_file: config_dir.join("config.json"),
+            instances_file: config_dir.join("instances.json"),
+            instances_dir: root.join("instances"),
+            music_dir: root.join("music"),
+            library_dir: root.join("library"),
+            config_dir,
+        };
+        fs::create_dir_all(paths.instances_dir.join(INSTANCE_ID)).expect("instance root");
+        fs::create_dir_all(&paths.library_dir).expect("library root");
+        let config = Arc::new(
+            axial_config::ConfigStore::load_from(paths.clone()).expect("load test config"),
+        );
+        let instances = Arc::new(
+            axial_config::InstanceStore::from_snapshot(
+                paths.clone(),
+                InstanceRegistrySnapshot::new(
+                    vec![new_instance(
+                        INSTANCE_ID.to_string(),
+                        "Reconciliation Test".to_string(),
+                        "1.21.1".to_string(),
+                        String::new(),
+                        String::new(),
+                    )],
+                    INSTANCE_ID.to_string(),
+                    Vec::new(),
+                )
+                .expect("registered instance snapshot"),
+            )
+            .expect("load test instances"),
+        );
+        let journals = Arc::new(OperationJournalStore::new());
+        let failure_memory = Arc::new(GuardianFailureMemoryStore::new());
+        let state = AppState::new(AppStateInit {
+            app_name: "Axial".to_string(),
+            version: "test".to_string(),
+            config,
+            instances,
+            installs: Arc::new(InstallStore::new()),
+            sessions: Arc::new(SessionStore::new()),
+            performance: Arc::new(
+                axial_performance::PerformanceManager::load_for_startup(&paths.config_dir)
+                    .expect("load test performance state"),
+            ),
+            startup_warnings: Vec::new(),
+            frontend_dir: root.join("frontend"),
+        })
+        .with_reconciliation_stores(journals.clone(), failure_memory.clone());
+        state.set_library_dir_for_test(paths.library_dir.to_string_lossy().into_owned());
+        Fixture {
+            state,
+            journals,
+            failure_memory,
+            root,
+        }
+    }
+
+    async fn cleanup(fixture: Fixture) {
+        fixture
+            .state
+            .close_known_good_inventories()
+            .await
+            .expect("close known-good store");
+        fixture
+            .state
+            .close_instance_registry()
+            .await
+            .expect("close instance registry");
+        let Fixture {
+            state,
+            journals,
+            failure_memory,
+            root,
+        } = fixture;
+        drop((state, journals, failure_memory));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    fn artifact_target() -> TargetDescriptor {
+        TargetDescriptor::new(
+            StabilizationSystem::Execution,
+            TargetKind::Artifact,
+            "version-bundle",
+            OwnershipClass::LauncherManaged,
+        )
+    }
+
+    async fn registered_attempt(
+        fixture: &Fixture,
+        operation_id: &str,
+        rung: ReconciliationRung,
+        component: ReconciliationComponent,
+    ) -> (ReconciliationAttempt, ReconciliationTerminal) {
+        let lifecycle = fixture.state.acquire_instance_lifecycle(INSTANCE_ID).await;
+        let authority = fixture
+            .state
+            .registered_reconciliation_authority(&lifecycle)
+            .expect("registered authority");
+        let attempt = authority
+            .attempt(
+                OperationId::new(operation_id),
+                DIAGNOSIS_ID,
+                GuardianDomain::Launch,
+                rung,
+                component,
+                artifact_target(),
+                GuardianMode::Managed,
+                chrono::Duration::minutes(30),
+            )
+            .expect("typed reconciliation attempt");
+        let terminal = authority
+            .terminal(attempt.clone(), ReconciliationTerminalOutcome::Failed)
+            .expect("typed reconciliation terminal");
+        (attempt, terminal)
+    }
+
+    fn planned_journal(attempt: &ReconciliationAttempt) -> OperationJournalEntry {
+        let mut entry = OperationJournalEntry::new(
+            JournalId::new(format!("journal-{}", attempt.operation_id().as_str())),
+            attempt.operation_id().clone(),
+            CommandKind::RepairInstance,
+            StabilizationSystem::Guardian,
+            OwnershipClass::LauncherManaged,
+            RollbackState::Available,
+        );
+        entry.targets.push(attempt.target().clone());
+        if let ReconciliationScope::RegisteredInstance { instance_id, .. } = attempt.scope() {
+            entry
+                .targets
+                .push(reconciliation_instance_target(instance_id));
+        }
+        let mut step = OperationJournalStep::new("repair_artifact", OperationPhase::Repairing);
+        step.changed_target = Some(attempt.target().clone());
+        entry.planned_steps.push(step);
+        entry.guardian_diagnosis_ids.push(attempt.diagnosis_id());
+        reconciliation_journal_attempt(entry, attempt.clone())
+    }
+
+    fn failed_step(target: &TargetDescriptor) -> OperationJournalStep {
+        let mut step = OperationJournalStep::new("repair_artifact", OperationPhase::Failed);
+        step.result = OperationStepResult::Failed;
+        step.changed_target = Some(target.clone());
+        step
+    }
+
+    async fn persist_failed_journal(
+        fixture: &Fixture,
+        attempt: &ReconciliationAttempt,
+        terminal: ReconciliationTerminal,
+    ) {
+        fixture
+            .journals
+            .create(planned_journal(attempt))
+            .await
+            .expect("persist planned reconciliation");
+        record_reconciliation_journal_failure(
+            fixture.journals.as_ref(),
+            attempt.operation_id(),
+            failed_step(attempt.target()),
+            "repair_failed",
+            terminal,
+        )
+        .await
+        .expect("persist failed reconciliation");
+    }
+
+    #[tokio::test]
+    async fn registered_authority_rejects_foreign_lifecycle_and_changed_root() {
+        let owner = fixture("authority-owner");
+        let foreign = fixture("authority-foreign");
+        let owner_lifecycle = owner.state.acquire_instance_lifecycle(INSTANCE_ID).await;
+        let foreign_lifecycle = foreign.state.acquire_instance_lifecycle(INSTANCE_ID).await;
+
+        assert_eq!(
+            foreign
+                .state
+                .registered_reconciliation_authority(&owner_lifecycle)
+                .err(),
+            Some(ReconciliationEvidenceRejection::ScopeMismatch)
+        );
+        assert_eq!(
+            owner
+                .state
+                .registered_reconciliation_authority(&foreign_lifecycle)
+                .err(),
+            Some(ReconciliationEvidenceRejection::ScopeMismatch)
+        );
+
+        let authority = owner
+            .state
+            .registered_reconciliation_authority(&owner_lifecycle)
+            .expect("owner authority");
+        let attempt = authority
+            .attempt(
+                OperationId::new("authority-root-change"),
+                DIAGNOSIS_ID,
+                GuardianDomain::Launch,
+                ReconciliationRung::RepairArtifact,
+                ReconciliationComponent::VersionBundle,
+                artifact_target(),
+                GuardianMode::Managed,
+                chrono::Duration::minutes(30),
+            )
+            .expect("attempt before root change");
+        let replacement_library = owner.root.join("replacement-library");
+        fs::create_dir_all(&replacement_library).expect("replacement library root");
+        owner
+            .state
+            .set_library_dir_for_test(replacement_library.to_string_lossy().into_owned());
+        assert_eq!(
+            authority
+                .terminal(attempt, ReconciliationTerminalOutcome::Failed)
+                .err(),
+            Some(ReconciliationEvidenceRejection::IncarnationMismatch)
+        );
+
+        drop((authority, owner_lifecycle, foreign_lifecycle));
+        cleanup(owner).await;
+        cleanup(foreign).await;
+    }
+
+    #[tokio::test]
+    async fn ambiguous_running_attempt_survives_startup_and_blocks_a_new_operation() {
+        let fixture = fixture("ambiguous-running");
+        let (first, _) = registered_attempt(
+            &fixture,
+            "ambiguous-first",
+            ReconciliationRung::RepairArtifact,
+            ReconciliationComponent::VersionBundle,
+        )
+        .await;
+        fixture
+            .journals
+            .create(planned_journal(&first))
+            .await
+            .expect("persist ambiguous plan");
+        let mut checkpoint = OperationJournalStep::new("effect_started", OperationPhase::Repairing);
+        checkpoint.result = OperationStepResult::Completed;
+        fixture
+            .journals
+            .record_checkpoint(first.operation_id(), checkpoint)
+            .await
+            .expect("persist running transition");
+
+        fixture
+            .state
+            .reconcile_reconciliation_startup()
+            .await
+            .expect("nonterminal startup scan");
+        assert_eq!(
+            fixture
+                .journals
+                .get(first.operation_id())
+                .expect("running attempt survives")
+                .status,
+            OperationStatus::Running
+        );
+
+        let (second, _) = registered_attempt(
+            &fixture,
+            "ambiguous-second",
+            ReconciliationRung::RepairArtifact,
+            ReconciliationComponent::VersionBundle,
+        )
+        .await;
+        assert_eq!(
+            reconciliation_attempt_key(&first),
+            reconciliation_attempt_key(&second)
+        );
+        assert_eq!(
+            reserve_reconciliation_attempt(
+                fixture.failure_memory.as_ref(),
+                fixture.journals.as_ref(),
+                reconciliation_attempt_key(&second),
+            )
+            .err(),
+            Some(ReconciliationAttemptRejection::AmbiguousPriorAttempt)
+        );
+
+        cleanup(fixture).await;
+    }
+
+    #[tokio::test]
+    async fn startup_replays_exact_active_terminal_once() {
+        let fixture = fixture("terminal-replay");
+        let (attempt, terminal) = registered_attempt(
+            &fixture,
+            "terminal-replay",
+            ReconciliationRung::RepairArtifact,
+            ReconciliationComponent::VersionBundle,
+        )
+        .await;
+        let expected_memory = reconciliation_memory_entry(terminal.clone()).expect("typed memory");
+        persist_failed_journal(&fixture, &attempt, terminal).await;
+        assert!(fixture.failure_memory.get(&expected_memory.key).is_none());
+
+        fixture
+            .state
+            .reconcile_reconciliation_startup()
+            .await
+            .expect("replay terminal into memory");
+        assert_eq!(
+            fixture.failure_memory.get(&expected_memory.key),
+            Some(expected_memory.clone())
+        );
+        let first_replay = fixture.failure_memory.list();
+        fixture
+            .state
+            .reconcile_reconciliation_startup()
+            .await
+            .expect("idempotent second replay");
+        assert_eq!(fixture.failure_memory.list(), first_replay);
+
+        cleanup(fixture).await;
+    }
+
+    #[tokio::test]
+    async fn startup_rejects_orphan_memory_and_overlapping_active_terminals() {
+        let orphan = fixture("orphan-memory");
+        let (_, orphan_terminal) = registered_attempt(
+            &orphan,
+            "orphan-memory",
+            ReconciliationRung::RepairArtifact,
+            ReconciliationComponent::VersionBundle,
+        )
+        .await;
+        let orphan_memory = reconciliation_memory_entry(orphan_terminal).expect("orphan memory");
+        orphan
+            .failure_memory
+            .load_snapshot(
+                FailureMemorySnapshot::new(vec![orphan_memory]).expect("valid memory snapshot"),
+            )
+            .expect("load orphan memory");
+        assert_eq!(
+            orphan
+                .state
+                .reconcile_reconciliation_startup()
+                .await
+                .expect_err("orphan active memory must fail startup")
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+        cleanup(orphan).await;
+
+        let overlap = fixture("overlapping-terminals");
+        let (first, first_terminal) = registered_attempt(
+            &overlap,
+            "overlap-first",
+            ReconciliationRung::RepairArtifact,
+            ReconciliationComponent::VersionBundle,
+        )
+        .await;
+        let (second, second_terminal) = registered_attempt(
+            &overlap,
+            "overlap-second",
+            ReconciliationRung::RepairArtifact,
+            ReconciliationComponent::VersionBundle,
+        )
+        .await;
+        assert_eq!(
+            reconciliation_attempt_key(&first),
+            reconciliation_attempt_key(&second)
+        );
+        persist_failed_journal(&overlap, &first, first_terminal).await;
+        persist_failed_journal(&overlap, &second, second_terminal).await;
+        assert_eq!(
+            overlap
+                .state
+                .reconcile_reconciliation_startup()
+                .await
+                .expect_err("overlapping active terminals must fail startup")
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+        cleanup(overlap).await;
+    }
+
+    #[tokio::test]
+    async fn artifact_failure_proof_requires_exact_current_adjacent_evidence() {
+        let fixture = fixture("artifact-proof");
+        let (attempt, terminal) = registered_attempt(
+            &fixture,
+            "artifact-proof",
+            ReconciliationRung::RepairArtifact,
+            ReconciliationComponent::VersionBundle,
+        )
+        .await;
+        let key = reconciliation_attempt_key(&attempt);
+        let reservation = reserve_reconciliation_attempt(
+            fixture.failure_memory.as_ref(),
+            fixture.journals.as_ref(),
+            key.clone(),
+        )
+        .expect("reserve before the effect");
+        persist_failed_journal(&fixture, &attempt, terminal.clone()).await;
+        commit_reconciliation_memory(
+            fixture.failure_memory.as_ref(),
+            reconciliation_memory_entry(terminal.clone()).expect("typed failed memory"),
+            &reservation,
+        )
+        .await
+        .expect("commit failed memory");
+        drop(reservation);
+
+        let evidence = fixture
+            .state
+            .recorded_artifact_repair_failure(
+                INSTANCE_ID,
+                ReconciliationComponent::VersionBundle,
+                &key,
+            )
+            .await
+            .expect("exact current evidence mints proof");
+        assert_eq!(evidence.terminal(), &terminal);
+        drop(evidence);
+
+        let missing_memory = fixture.state.clone().with_reconciliation_stores(
+            fixture.journals.clone(),
+            Arc::new(GuardianFailureMemoryStore::new()),
+        );
+        assert_eq!(
+            missing_memory
+                .recorded_artifact_repair_failure(
+                    INSTANCE_ID,
+                    ReconciliationComponent::VersionBundle,
+                    &key,
+                )
+                .await
+                .err(),
+            Some(ReconciliationEvidenceRejection::MemoryMissing)
+        );
+        drop(missing_memory);
+
+        let missing_journal = fixture.state.clone().with_reconciliation_stores(
+            Arc::new(OperationJournalStore::new()),
+            fixture.failure_memory.clone(),
+        );
+        assert_eq!(
+            missing_journal
+                .recorded_artifact_repair_failure(
+                    INSTANCE_ID,
+                    ReconciliationComponent::VersionBundle,
+                    &key,
+                )
+                .await
+                .err(),
+            Some(ReconciliationEvidenceRejection::JournalMissing)
+        );
+        drop(missing_journal);
+
+        assert_eq!(
+            fixture
+                .state
+                .recorded_artifact_repair_failure(
+                    INSTANCE_ID,
+                    ReconciliationComponent::Assets,
+                    &key,
+                )
+                .await
+                .err(),
+            Some(ReconciliationEvidenceRejection::ComponentMismatch)
+        );
+        assert_eq!(
+            fixture
+                .state
+                .recorded_component_rebuild_failure(
+                    INSTANCE_ID,
+                    ReconciliationComponent::VersionBundle,
+                    &key,
+                )
+                .await
+                .err(),
+            Some(ReconciliationEvidenceRejection::NonAdjacentRung)
+        );
+
+        let stale_at = chrono::DateTime::parse_from_rfc3339(terminal.suppression_until())
+            .expect("suppression timestamp");
+        assert_eq!(
+            fixture
+                .state
+                .recorded_reconciliation_failure_at(
+                    INSTANCE_ID,
+                    ReconciliationComponent::VersionBundle,
+                    &key,
+                    ReconciliationRung::RepairArtifact,
+                    stale_at,
+                )
+                .await
+                .err(),
+            Some(ReconciliationEvidenceRejection::MemoryWindowInactive)
+        );
+
+        let wrong_journals = Arc::new(OperationJournalStore::new());
+        let mut wrong_journal = OperationJournalEntry::new(
+            JournalId::new("journal-artifact-proof-wrong"),
+            attempt.operation_id().clone(),
+            CommandKind::InstallVersion,
+            StabilizationSystem::Application,
+            OwnershipClass::LauncherManaged,
+            RollbackState::NotApplicable,
+        );
+        wrong_journal.targets.push(attempt.target().clone());
+        wrong_journals
+            .create(wrong_journal)
+            .await
+            .expect("create mismatched journal");
+        wrong_journals
+            .record_failure(
+                attempt.operation_id(),
+                failed_step(attempt.target()),
+                "install_failed",
+                OperationOutcome::Failed,
+            )
+            .await
+            .expect("fail mismatched journal");
+        let mismatched_journal = fixture
+            .state
+            .clone()
+            .with_reconciliation_stores(wrong_journals, fixture.failure_memory.clone());
+        assert_eq!(
+            mismatched_journal
+                .recorded_artifact_repair_failure(
+                    INSTANCE_ID,
+                    ReconciliationComponent::VersionBundle,
+                    &key,
+                )
+                .await
+                .err(),
+            Some(ReconciliationEvidenceRejection::JournalMismatch)
+        );
+        drop(mismatched_journal);
+
+        let changed_library = fixture.root.join("changed-library");
+        fs::create_dir_all(&changed_library).expect("changed library root");
+        fixture
+            .state
+            .set_library_dir_for_test(changed_library.to_string_lossy().into_owned());
+        assert_eq!(
+            fixture
+                .state
+                .recorded_artifact_repair_failure(
+                    INSTANCE_ID,
+                    ReconciliationComponent::VersionBundle,
+                    &key,
+                )
+                .await
+                .err(),
+            Some(ReconciliationEvidenceRejection::IncarnationMismatch)
+        );
+
+        cleanup(fixture).await;
+    }
+}

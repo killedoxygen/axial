@@ -611,7 +611,7 @@ pub(super) const DIAGNOSIS_RULES: &[DiagnosisRule] = &[
         RuleDomain::Fixed(GuardianDomain::Runtime),
         RuleSeverity::Fixed(GuardianSeverity::Repairable),
         RuleConfidence::Fixed(GuardianConfidence::Confirmed),
-        [Repair, Block],
+        [Repair, AskUser, Block],
         "managed_runtime_needs_repair"
     ),
     rule!(
@@ -951,7 +951,7 @@ pub(super) const DIAGNOSIS_RULES: &[DiagnosisRule] = &[
                 confidence: GuardianConfidence::High,
             }],
         },
-        [Quarantine, Repair, Block],
+        [Quarantine, Repair, AskUser, Block],
         "managed_artifact_corrupt"
     ),
     rule!(

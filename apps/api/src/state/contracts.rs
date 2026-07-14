@@ -4,9 +4,11 @@
 //! This submodule exposes the durable vocabulary for journals, ownership,
 //! snapshots, and persistence boundaries used by the target systems.
 
-use crate::guardian::DiagnosisId;
+use crate::guardian::{DiagnosisId, GuardianDomain, GuardianMode};
 use crate::observability::evidence_text_looks_sensitive;
 use serde::{Deserialize, Serialize};
+
+pub(crate) const RECONCILIATION_EVIDENCE_CAPACITY: usize = 128;
 
 #[derive(Clone, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
 pub struct OperationId(pub String);
@@ -19,6 +21,353 @@ impl OperationId {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
+pub enum ReconciliationRung {
+    RepairArtifact,
+    RebuildComponent,
+    RematerializeInstance,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
+pub enum ReconciliationComponent {
+    VersionBundle,
+    Libraries,
+    Assets,
+    Runtime,
+    WholeInstance,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReconciliationIncarnationFingerprint(String);
+
+impl ReconciliationIncarnationFingerprint {
+    pub(super) fn from_digest(digest: impl Into<String>) -> Self {
+        Self(digest.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub enum ReconciliationScope {
+    InstallOperation,
+    RegisteredInstance {
+        instance_id: String,
+        fingerprint: ReconciliationIncarnationFingerprint,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
+pub enum ReconciliationTerminalOutcome {
+    Succeeded,
+    Failed,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReconciliationAttempt {
+    operation_id: OperationId,
+    diagnosis_id: DiagnosisId,
+    domain: GuardianDomain,
+    rung: ReconciliationRung,
+    scope: ReconciliationScope,
+    component: ReconciliationComponent,
+    target: TargetDescriptor,
+    mode: GuardianMode,
+    ownership: OwnershipClass,
+    observed_at: String,
+    suppression_until: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReconciliationTerminal {
+    attempt: ReconciliationAttempt,
+    outcome: ReconciliationTerminalOutcome,
+    quarantined_target: Option<TargetDescriptor>,
+}
+
+impl ReconciliationAttempt {
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn new(
+        operation_id: OperationId,
+        diagnosis_id: DiagnosisId,
+        domain: GuardianDomain,
+        rung: ReconciliationRung,
+        scope: ReconciliationScope,
+        component: ReconciliationComponent,
+        target: TargetDescriptor,
+        mode: GuardianMode,
+        ownership: OwnershipClass,
+        observed_at: impl Into<String>,
+        suppression_until: impl Into<String>,
+    ) -> Self {
+        Self {
+            operation_id,
+            diagnosis_id,
+            domain,
+            rung,
+            scope,
+            component,
+            target,
+            mode,
+            ownership,
+            observed_at: observed_at.into(),
+            suppression_until: suppression_until.into(),
+        }
+    }
+
+    pub fn operation_id(&self) -> &OperationId {
+        &self.operation_id
+    }
+
+    pub const fn diagnosis_id(&self) -> DiagnosisId {
+        self.diagnosis_id
+    }
+
+    pub const fn domain(&self) -> GuardianDomain {
+        self.domain
+    }
+
+    pub const fn rung(&self) -> ReconciliationRung {
+        self.rung
+    }
+
+    pub fn scope(&self) -> &ReconciliationScope {
+        &self.scope
+    }
+
+    pub const fn component(&self) -> ReconciliationComponent {
+        self.component
+    }
+
+    pub fn target(&self) -> &TargetDescriptor {
+        &self.target
+    }
+
+    pub const fn mode(&self) -> GuardianMode {
+        self.mode
+    }
+
+    pub const fn ownership(&self) -> OwnershipClass {
+        self.ownership
+    }
+
+    pub fn observed_at(&self) -> &str {
+        &self.observed_at
+    }
+
+    pub fn suppression_until(&self) -> &str {
+        &self.suppression_until
+    }
+
+    pub(super) fn validate(&self) -> Result<(), ReconciliationTerminalValidationError> {
+        if !safe_reconciliation_token(self.operation_id.as_str(), 128) {
+            return Err(ReconciliationTerminalValidationError::UnsafeOperationId);
+        }
+        if self.ownership != OwnershipClass::LauncherManaged {
+            return Err(ReconciliationTerminalValidationError::UnsafeOwnership);
+        }
+        if self.target.ownership != self.ownership
+            || self.target.id.trim().is_empty()
+            || self.target.id.contains(['/', '\\'])
+        {
+            return Err(ReconciliationTerminalValidationError::UnsafeTarget);
+        }
+        if self.mode == GuardianMode::Disabled {
+            return Err(ReconciliationTerminalValidationError::DisabledMode);
+        }
+        let observed_at = chrono::DateTime::parse_from_rfc3339(&self.observed_at)
+            .map_err(|_| ReconciliationTerminalValidationError::InvalidWindow)?;
+        let suppression_until = chrono::DateTime::parse_from_rfc3339(&self.suppression_until)
+            .map_err(|_| ReconciliationTerminalValidationError::InvalidWindow)?;
+        if suppression_until <= observed_at {
+            return Err(ReconciliationTerminalValidationError::InvalidWindow);
+        }
+        match &self.scope {
+            ReconciliationScope::InstallOperation => {
+                if self.rung != ReconciliationRung::RepairArtifact
+                    || self.domain != GuardianDomain::Install
+                    || matches!(
+                        self.component,
+                        ReconciliationComponent::Runtime | ReconciliationComponent::WholeInstance
+                    )
+                {
+                    return Err(ReconciliationTerminalValidationError::ImpossibleScope);
+                }
+            }
+            ReconciliationScope::RegisteredInstance {
+                instance_id,
+                fingerprint,
+            } => {
+                if !axial_config::is_canonical_instance_id(instance_id) {
+                    return Err(ReconciliationTerminalValidationError::UnsafeInstanceId);
+                }
+                if !valid_reconciliation_fingerprint(fingerprint.as_str()) {
+                    return Err(ReconciliationTerminalValidationError::UnsafeFingerprint);
+                }
+            }
+        }
+        match (self.rung, self.component) {
+            (
+                ReconciliationRung::RepairArtifact | ReconciliationRung::RebuildComponent,
+                ReconciliationComponent::VersionBundle
+                | ReconciliationComponent::Libraries
+                | ReconciliationComponent::Assets
+                | ReconciliationComponent::Runtime,
+            )
+            | (ReconciliationRung::RematerializeInstance, ReconciliationComponent::WholeInstance) => {
+                Ok(())
+            }
+            _ => Err(ReconciliationTerminalValidationError::ImpossibleComponent),
+        }?;
+        match self.component {
+            ReconciliationComponent::VersionBundle
+                if matches!(self.target.kind, TargetKind::Artifact | TargetKind::Version) => {}
+            ReconciliationComponent::Libraries | ReconciliationComponent::Assets
+                if self.target.kind == TargetKind::Artifact => {}
+            ReconciliationComponent::Runtime if self.target.kind == TargetKind::Runtime => {}
+            ReconciliationComponent::WholeInstance => {
+                let ReconciliationScope::RegisteredInstance { instance_id, .. } = &self.scope
+                else {
+                    return Err(ReconciliationTerminalValidationError::ImpossibleComponent);
+                };
+                if self.target.system != StabilizationSystem::State
+                    || self.target.kind != TargetKind::Instance
+                    || self.target.id != *instance_id
+                {
+                    return Err(ReconciliationTerminalValidationError::ImpossibleComponent);
+                }
+            }
+            _ => return Err(ReconciliationTerminalValidationError::ImpossibleComponent),
+        }
+        Ok(())
+    }
+}
+
+impl ReconciliationTerminal {
+    pub(super) fn from_attempt(
+        attempt: ReconciliationAttempt,
+        outcome: ReconciliationTerminalOutcome,
+        quarantined_target: Option<TargetDescriptor>,
+    ) -> Self {
+        Self {
+            attempt,
+            outcome,
+            quarantined_target,
+        }
+    }
+
+    pub fn attempt(&self) -> &ReconciliationAttempt {
+        &self.attempt
+    }
+
+    pub fn operation_id(&self) -> &OperationId {
+        self.attempt.operation_id()
+    }
+
+    pub const fn diagnosis_id(&self) -> DiagnosisId {
+        self.attempt.diagnosis_id()
+    }
+
+    pub const fn domain(&self) -> GuardianDomain {
+        self.attempt.domain()
+    }
+
+    pub const fn rung(&self) -> ReconciliationRung {
+        self.attempt.rung()
+    }
+
+    pub fn scope(&self) -> &ReconciliationScope {
+        self.attempt.scope()
+    }
+
+    pub const fn component(&self) -> ReconciliationComponent {
+        self.attempt.component()
+    }
+
+    pub fn target(&self) -> &TargetDescriptor {
+        self.attempt.target()
+    }
+
+    pub const fn mode(&self) -> GuardianMode {
+        self.attempt.mode()
+    }
+
+    pub const fn ownership(&self) -> OwnershipClass {
+        self.attempt.ownership()
+    }
+
+    pub fn observed_at(&self) -> &str {
+        self.attempt.observed_at()
+    }
+
+    pub fn suppression_until(&self) -> &str {
+        self.attempt.suppression_until()
+    }
+
+    pub const fn outcome(&self) -> ReconciliationTerminalOutcome {
+        self.outcome
+    }
+
+    pub fn quarantined_target(&self) -> Option<&TargetDescriptor> {
+        self.quarantined_target.as_ref()
+    }
+
+    pub(super) fn validate(&self) -> Result<(), ReconciliationTerminalValidationError> {
+        self.attempt.validate()?;
+        if let Some(target) = &self.quarantined_target {
+            let expected = TargetDescriptor::new(
+                StabilizationSystem::Execution,
+                self.target().kind,
+                format!("quarantine-{}", self.target().id),
+                self.ownership(),
+            );
+            if target != &expected {
+                return Err(ReconciliationTerminalValidationError::UnsafeTarget);
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum ReconciliationTerminalValidationError {
+    UnsafeOperationId,
+    UnsafeInstanceId,
+    UnsafeFingerprint,
+    UnsafeOwnership,
+    UnsafeTarget,
+    DisabledMode,
+    InvalidWindow,
+    ImpossibleScope,
+    ImpossibleComponent,
+}
+
+fn safe_reconciliation_token(value: &str, max_chars: usize) -> bool {
+    let value = value.trim();
+    !value.is_empty()
+        && value.chars().count() <= max_chars
+        && value.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.' | ':' | '+')
+        })
+}
+
+fn valid_reconciliation_fingerprint(value: &str) -> bool {
+    let Some(digest) = value.strip_prefix("sha256.") else {
+        return false;
+    };
+    let segments = digest.split('.').collect::<Vec<_>>();
+    segments.len() == 8
+        && segments.iter().all(|segment| {
+            segment.len() == 8 && segment.bytes().all(|byte| byte.is_ascii_hexdigit())
+        })
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
@@ -195,6 +544,8 @@ pub struct OperationJournalEntry {
     pub rollback: RollbackState,
     pub guardian_diagnosis_ids: Vec<DiagnosisId>,
     pub outcome: Option<OperationOutcome>,
+    pub(super) reconciliation_attempt: Option<ReconciliationAttempt>,
+    pub(super) reconciliation_terminal: Option<ReconciliationTerminal>,
 }
 
 impl OperationJournalEntry {
@@ -220,7 +571,17 @@ impl OperationJournalEntry {
             rollback,
             guardian_diagnosis_ids: Vec::new(),
             outcome: None,
+            reconciliation_attempt: None,
+            reconciliation_terminal: None,
         }
+    }
+
+    pub(crate) fn reconciliation_terminal(&self) -> Option<&ReconciliationTerminal> {
+        self.reconciliation_terminal.as_ref()
+    }
+
+    pub(crate) fn reconciliation_attempt(&self) -> Option<&ReconciliationAttempt> {
+        self.reconciliation_attempt.as_ref()
     }
 }
 

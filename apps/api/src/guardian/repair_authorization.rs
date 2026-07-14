@@ -8,7 +8,6 @@ use super::{
     GuardianDecision, GuardianMinecraftArtifactRepairDescriptor, GuardianMode,
 };
 use crate::state::contracts::{OwnershipClass, StabilizationSystem, TargetDescriptor, TargetKind};
-use crate::state::failure_memory::FailureMemoryKey;
 
 const ARTIFACT_REPAIR_MAX_ATTEMPTS: u32 = 1;
 const RUNTIME_REPAIR_MAX_ATTEMPTS: u32 = 1;
@@ -32,55 +31,6 @@ pub(super) fn repair_hand_coverage() -> [(&'static str, DiagnosisId, u32); 3] {
             RUNTIME_REPAIR_MAX_ATTEMPTS,
         ),
     ]
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct RepairAuthorizationContext {
-    journal_available: bool,
-    executor_available: bool,
-    suppression_active: bool,
-    public_redaction_ready: bool,
-}
-
-impl RepairAuthorizationContext {
-    pub fn current_operation() -> Self {
-        Self {
-            journal_available: true,
-            executor_available: true,
-            suppression_active: false,
-            public_redaction_ready: true,
-        }
-    }
-
-    #[cfg(test)]
-    fn with_missing_journal(mut self) -> Self {
-        self.journal_available = false;
-        self
-    }
-
-    #[cfg(test)]
-    fn with_missing_executor(mut self) -> Self {
-        self.executor_available = false;
-        self
-    }
-
-    #[cfg(test)]
-    fn with_suppression(mut self) -> Self {
-        self.suppression_active = true;
-        self
-    }
-
-    #[cfg(test)]
-    fn with_unredacted_public_boundary(mut self) -> Self {
-        self.public_redaction_ready = false;
-        self
-    }
-}
-
-impl Default for RepairAuthorizationContext {
-    fn default() -> Self {
-        Self::current_operation()
-    }
 }
 
 pub(crate) struct QuarantineRedownload {
@@ -153,7 +103,6 @@ pub(crate) struct RepairAuthorization<K> {
     mode: GuardianMode,
     action: GuardianActionKind,
     max_attempts: u32,
-    suppression_key: FailureMemoryKey,
     kind: K,
 }
 
@@ -164,7 +113,6 @@ pub(crate) struct RepairAuthorizationParts<K> {
     pub mode: GuardianMode,
     pub action: GuardianActionKind,
     pub max_attempts: u32,
-    pub suppression_key: FailureMemoryKey,
     pub kind: K,
 }
 
@@ -177,19 +125,13 @@ impl<K> RepairAuthorization<K> {
             mode: self.mode,
             action: self.action,
             max_attempts: self.max_attempts,
-            suppression_key: self.suppression_key,
             kind: self.kind,
         }
     }
 
     #[cfg(test)]
-    fn parts(&self) -> (&DiagnosisId, &TargetDescriptor, u32, &FailureMemoryKey) {
-        (
-            &self.diagnosis_id,
-            &self.target,
-            self.max_attempts,
-            &self.suppression_key,
-        )
+    fn parts(&self) -> (&DiagnosisId, &TargetDescriptor, u32) {
+        (&self.diagnosis_id, &self.target, self.max_attempts)
     }
 }
 
@@ -200,35 +142,28 @@ pub(crate) enum RepairAuthorizationRejection {
     UnsupportedDiagnosis,
     MissingTarget,
     UnsafeOwnership,
-    MissingJournal,
-    MissingExecutorCapability,
-    Suppressed,
     UnsafePublicBoundary,
     DescriptorTargetMismatch,
 }
 
 pub(crate) fn authorize_launcher_managed_artifact_repair(
     decision: &GuardianDecision,
-    context: RepairAuthorizationContext,
     descriptor: GuardianMinecraftArtifactRepairDescriptor,
 ) -> Result<RepairAuthorization<QuarantineRedownload>, RepairAuthorizationRejection> {
-    authorize_artifact_repair(decision, context, QuarantineRedownload { descriptor })
+    authorize_artifact_repair(decision, QuarantineRedownload { descriptor })
 }
 
 pub(crate) fn authorize_launcher_managed_missing_artifact_repair(
     decision: &GuardianDecision,
-    context: RepairAuthorizationContext,
     descriptor: GuardianMinecraftArtifactRepairDescriptor,
 ) -> Result<RepairAuthorization<MissingDownload>, RepairAuthorizationRejection> {
-    authorize_artifact_repair(decision, context, MissingDownload { descriptor })
+    authorize_artifact_repair(decision, MissingDownload { descriptor })
 }
 
 pub(crate) fn authorize_managed_runtime_ready_marker_repair(
     decision: &GuardianDecision,
-    context: RepairAuthorizationContext,
 ) -> Result<RepairAuthorization<ReadyMarker>, RepairAuthorizationRejection> {
-    authorize_context(context)?;
-    if decision.kind() != GuardianActionKind::Repair || decision.mode() == GuardianMode::Disabled {
+    if decision.kind() != GuardianActionKind::Repair || decision.mode() != GuardianMode::Managed {
         return Err(RepairAuthorizationRejection::NonRepairDecision);
     }
 
@@ -256,13 +191,6 @@ pub(crate) fn authorize_managed_runtime_ready_marker_repair(
         mode: decision.mode(),
         action: action.kind,
         max_attempts: RUNTIME_REPAIR_MAX_ATTEMPTS,
-        suppression_key: FailureMemoryKey::for_observation(
-            super::GuardianDomain::Runtime,
-            &diagnosis_id,
-            &target,
-            decision.mode(),
-            None,
-        ),
         target,
         kind: ReadyMarker { _private: () },
     })
@@ -270,14 +198,12 @@ pub(crate) fn authorize_managed_runtime_ready_marker_repair(
 
 fn authorize_artifact_repair<K>(
     decision: &GuardianDecision,
-    context: RepairAuthorizationContext,
     kind: K,
 ) -> Result<RepairAuthorization<K>, RepairAuthorizationRejection>
 where
     K: ArtifactRepairKind,
 {
-    authorize_context(context)?;
-    if decision.kind() != GuardianActionKind::Repair {
+    if decision.kind() != GuardianActionKind::Repair || decision.mode() != GuardianMode::Managed {
         return Err(RepairAuthorizationRejection::NonRepairDecision);
     }
 
@@ -309,34 +235,9 @@ where
         mode: decision.mode(),
         action: action.kind,
         max_attempts: ARTIFACT_REPAIR_MAX_ATTEMPTS,
-        suppression_key: FailureMemoryKey::for_observation(
-            super::GuardianDomain::Install,
-            &diagnosis_id,
-            &target,
-            decision.mode(),
-            None,
-        ),
         target,
         kind,
     })
-}
-
-fn authorize_context(
-    context: RepairAuthorizationContext,
-) -> Result<(), RepairAuthorizationRejection> {
-    if !context.public_redaction_ready {
-        return Err(RepairAuthorizationRejection::UnsafePublicBoundary);
-    }
-    if !context.journal_available {
-        return Err(RepairAuthorizationRejection::MissingJournal);
-    }
-    if context.suppression_active {
-        return Err(RepairAuthorizationRejection::Suppressed);
-    }
-    if !context.executor_available {
-        return Err(RepairAuthorizationRejection::MissingExecutorCapability);
-    }
-    Ok(())
 }
 
 fn supported_artifact_diagnosis(
@@ -410,8 +311,7 @@ fn public_safe_target(
 #[cfg(test)]
 mod tests {
     use super::{
-        RepairAuthorizationContext, RepairAuthorizationRejection,
-        authorize_launcher_managed_artifact_repair,
+        RepairAuthorizationRejection, authorize_launcher_managed_artifact_repair,
         authorize_launcher_managed_missing_artifact_repair,
         authorize_managed_runtime_ready_marker_repair,
     };
@@ -442,13 +342,11 @@ mod tests {
         let decision = repair_decision(OwnershipClass::LauncherManaged);
         let quarantine = authorize_launcher_managed_artifact_repair(
             &decision,
-            RepairAuthorizationContext::current_operation(),
             artifact_descriptor("minecraft_client_1_21_5"),
         )
         .expect("quarantine-redownload authorization");
         let missing = authorize_launcher_managed_missing_artifact_repair(
             &decision,
-            RepairAuthorizationContext::current_operation(),
             artifact_descriptor("minecraft_client_1_21_5"),
         )
         .expect("missing-download authorization");
@@ -461,10 +359,6 @@ mod tests {
             assert_eq!(authorization.1.ownership, OwnershipClass::LauncherManaged);
             assert_eq!(authorization.1.system, StabilizationSystem::Execution);
             assert_eq!(authorization.2, 1);
-            assert_eq!(
-                authorization.3.as_str(),
-                "Install:launcher_managed_artifact_corrupt:Execution.Artifact.minecraft_client_1_21_5:Managed:no_intent"
-            );
         }
     }
 
@@ -472,57 +366,52 @@ mod tests {
     fn ready_marker_authorization_carries_exact_bounded_capability() {
         let authorization = authorize_managed_runtime_ready_marker_repair(
             &runtime_repair_decision(OwnershipClass::LauncherManaged),
-            RepairAuthorizationContext::current_operation(),
         )
         .expect("ready-marker authorization");
-        let (diagnosis_id, target, max_attempts, suppression_key) = authorization.parts();
+        let (diagnosis_id, target, max_attempts) = authorization.parts();
 
         assert_eq!(diagnosis_id, &DiagnosisId::ManagedRuntimeCorrupt);
         assert_eq!(target.kind, TargetKind::Runtime);
         assert_eq!(target.system, StabilizationSystem::Execution);
         assert_eq!(max_attempts, 1);
+    }
+
+    #[test]
+    fn custom_mode_repair_decisions_never_mint_executor_capabilities() {
+        let artifact = repair_decision(OwnershipClass::LauncherManaged);
+        let artifact = GuardianDecision::for_test(
+            artifact.operation_id().cloned(),
+            GuardianMode::Custom,
+            artifact.kind(),
+            artifact.diagnoses().to_vec(),
+            artifact.action_plan().cloned(),
+        );
         assert_eq!(
-            suppression_key.as_str(),
-            "Runtime:managed_runtime_corrupt:Execution.Runtime.java_runtime_delta:Managed:no_intent"
+            authorize_launcher_managed_artifact_repair(
+                &artifact,
+                artifact_descriptor("minecraft_client_1_21_5"),
+            )
+            .expect_error_without_debug("Custom artifact repair must remain offer-only"),
+            RepairAuthorizationRejection::NonRepairDecision,
+        );
+
+        let runtime = runtime_repair_decision(OwnershipClass::LauncherManaged);
+        let runtime = GuardianDecision::for_test(
+            runtime.operation_id().cloned(),
+            GuardianMode::Custom,
+            runtime.kind(),
+            runtime.diagnoses().to_vec(),
+            runtime.action_plan().cloned(),
+        );
+        assert_eq!(
+            authorize_managed_runtime_ready_marker_repair(&runtime)
+                .expect_error_without_debug("Custom runtime repair must remain offer-only"),
+            RepairAuthorizationRejection::NonRepairDecision,
         );
     }
 
     #[test]
-    fn authorization_rejects_missing_journal_executor_suppression_and_public_boundary() {
-        let decision = repair_decision(OwnershipClass::LauncherManaged);
-        for (context, expected) in [
-            (
-                RepairAuthorizationContext::current_operation().with_missing_journal(),
-                RepairAuthorizationRejection::MissingJournal,
-            ),
-            (
-                RepairAuthorizationContext::current_operation().with_missing_executor(),
-                RepairAuthorizationRejection::MissingExecutorCapability,
-            ),
-            (
-                RepairAuthorizationContext::current_operation().with_suppression(),
-                RepairAuthorizationRejection::Suppressed,
-            ),
-            (
-                RepairAuthorizationContext::current_operation().with_unredacted_public_boundary(),
-                RepairAuthorizationRejection::UnsafePublicBoundary,
-            ),
-        ] {
-            assert_eq!(
-                authorize_launcher_managed_artifact_repair(
-                    &decision,
-                    context,
-                    artifact_descriptor("minecraft_client_1_21_5"),
-                )
-                .expect_error_without_debug("context gate must reject"),
-                expected
-            );
-        }
-    }
-
-    #[test]
     fn authorization_rejects_non_repair_missing_plan_diagnosis_action_and_target() {
-        let context = RepairAuthorizationContext::current_operation();
         let decision = repair_decision(OwnershipClass::LauncherManaged);
         let non_repair = GuardianDecision::for_test(
             decision.operation_id().cloned(),
@@ -534,7 +423,6 @@ mod tests {
         assert_eq!(
             authorize_launcher_managed_artifact_repair(
                 &non_repair,
-                context,
                 artifact_descriptor("minecraft_client_1_21_5"),
             )
             .expect_error_without_debug("non-repair decision"),
@@ -552,7 +440,6 @@ mod tests {
         assert_eq!(
             authorize_launcher_managed_artifact_repair(
                 &missing_plan,
-                context,
                 artifact_descriptor("minecraft_client_1_21_5"),
             )
             .expect_error_without_debug("missing action plan"),
@@ -570,7 +457,6 @@ mod tests {
         assert_eq!(
             authorize_launcher_managed_artifact_repair(
                 &unsupported,
-                context,
                 artifact_descriptor("minecraft_client_1_21_5"),
             )
             .expect_error_without_debug("unsupported diagnosis"),
@@ -590,7 +476,6 @@ mod tests {
         assert_eq!(
             authorize_launcher_managed_artifact_repair(
                 &missing_action,
-                context,
                 artifact_descriptor("minecraft_client_1_21_5"),
             )
             .expect_error_without_debug("missing repair action"),
@@ -611,7 +496,6 @@ mod tests {
         assert_eq!(
             authorize_launcher_managed_artifact_repair(
                 &missing_target,
-                context,
                 artifact_descriptor("minecraft_client_1_21_5"),
             )
             .expect_error_without_debug("missing target"),
@@ -625,7 +509,6 @@ mod tests {
             assert_eq!(
                 authorize_launcher_managed_artifact_repair(
                     &repair_decision(ownership),
-                    RepairAuthorizationContext::current_operation(),
                     artifact_descriptor("minecraft_client_1_21_5"),
                 )
                 .expect_error_without_debug("unsafe ownership"),
@@ -642,7 +525,6 @@ mod tests {
         assert_eq!(
             authorize_launcher_managed_artifact_repair(
                 &unsafe_target,
-                RepairAuthorizationContext::current_operation(),
                 artifact_descriptor("minecraft_client_1_21_5"),
             )
             .expect_error_without_debug("unsafe target text"),
@@ -655,7 +537,6 @@ mod tests {
         let decision = repair_decision(OwnershipClass::LauncherManaged);
         let error = authorize_launcher_managed_artifact_repair(
             &decision,
-            RepairAuthorizationContext::current_operation(),
             artifact_descriptor("minecraft_client_other"),
         )
         .expect_error_without_debug("descriptor target mismatch");
@@ -668,7 +549,6 @@ mod tests {
 
     #[test]
     fn ready_marker_authorization_rejects_mode_confidence_reason_owner_and_target_shape() {
-        let context = RepairAuthorizationContext::current_operation();
         let decision = runtime_repair_decision(OwnershipClass::LauncherManaged);
         let disabled = GuardianDecision::for_test(
             decision.operation_id().cloned(),
@@ -678,7 +558,7 @@ mod tests {
             decision.action_plan().cloned(),
         );
         assert_eq!(
-            authorize_managed_runtime_ready_marker_repair(&disabled, context)
+            authorize_managed_runtime_ready_marker_repair(&disabled)
                 .expect_error_without_debug("disabled mode"),
             RepairAuthorizationRejection::NonRepairDecision
         );
@@ -694,7 +574,7 @@ mod tests {
             Some(action_plan),
         );
         assert_eq!(
-            authorize_managed_runtime_ready_marker_repair(&low_confidence, context)
+            authorize_managed_runtime_ready_marker_repair(&low_confidence)
                 .expect_error_without_debug("low confidence"),
             RepairAuthorizationRejection::UnsupportedDiagnosis
         );
@@ -710,7 +590,7 @@ mod tests {
             Some(action_plan),
         );
         assert_eq!(
-            authorize_managed_runtime_ready_marker_repair(&wrong_reason, context)
+            authorize_managed_runtime_ready_marker_repair(&wrong_reason)
                 .expect_error_without_debug("wrong action reason"),
             RepairAuthorizationRejection::UnsupportedDiagnosis
         );
@@ -726,18 +606,15 @@ mod tests {
             Some(action_plan),
         );
         assert_eq!(
-            authorize_managed_runtime_ready_marker_repair(&wrong_owner, context)
+            authorize_managed_runtime_ready_marker_repair(&wrong_owner)
                 .expect_error_without_debug("wrong action-plan owner"),
             RepairAuthorizationRejection::UnsupportedDiagnosis
         );
 
         for ownership in [OwnershipClass::UserOwned, OwnershipClass::Unknown] {
             assert_eq!(
-                authorize_managed_runtime_ready_marker_repair(
-                    &runtime_repair_decision(ownership),
-                    context,
-                )
-                .expect_error_without_debug("unsafe runtime ownership"),
+                authorize_managed_runtime_ready_marker_repair(&runtime_repair_decision(ownership),)
+                    .expect_error_without_debug("unsafe runtime ownership"),
                 RepairAuthorizationRejection::UnsafeOwnership
             );
         }
@@ -749,7 +626,7 @@ mod tests {
             OwnershipClass::LauncherManaged,
         ));
         assert_eq!(
-            authorize_managed_runtime_ready_marker_repair(&unsupported, context)
+            authorize_managed_runtime_ready_marker_repair(&unsupported)
                 .expect_error_without_debug("unsupported runtime target"),
             RepairAuthorizationRejection::UnsupportedDiagnosis
         );

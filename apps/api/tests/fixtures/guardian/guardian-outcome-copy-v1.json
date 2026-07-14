@@ -54,24 +54,6 @@
       }
     },
     {
-      "id": "runtime_repair.suppressed",
-      "input": {
-        "surface": "runtime_repair",
-        "status": "Suppressed"
-      },
-      "outcome": {
-        "decision": "Block",
-        "phase": "Repairing",
-        "summary": "Guardian blocked launch preflight.",
-        "details": [
-          "Guardian suppressed managed Java runtime repair because the same repair failed recently."
-        ],
-        "guidance": [
-          "Reinstall or repair the affected version/runtime before launching again."
-        ]
-      }
-    },
-    {
       "id": "install_artifact_repair.repaired",
       "input": {
         "surface": "install_artifact_repair",
@@ -113,22 +95,6 @@
         "decision": "Block",
         "phase": "Repairing",
         "summary": "Guardian could not repair the launcher-managed install artifact.",
-        "details": [
-          "Check connection and storage permissions before trying again."
-        ],
-        "guidance": []
-      }
-    },
-    {
-      "id": "install_artifact_repair.suppressed",
-      "input": {
-        "surface": "install_artifact_repair",
-        "status": "Suppressed"
-      },
-      "outcome": {
-        "decision": "Block",
-        "phase": "Repairing",
-        "summary": "Guardian paused automatic install repair after repeated failure.",
         "details": [
           "Check connection and storage permissions before trying again."
         ],

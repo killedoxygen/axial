@@ -183,6 +183,10 @@ impl<'a> ManagedRuntimeRoot<'a> {
     pub fn java_executable(&self) -> &Path {
         self.java_executable
     }
+
+    pub(crate) fn belongs_to(&self, runtime_cache: &ManagedRuntimeCache) -> bool {
+        self._runtime_cache.shares_identity_with(runtime_cache)
+    }
 }
 
 fn path_has_parent_component(path: &Path) -> bool {

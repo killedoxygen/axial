@@ -1765,7 +1765,6 @@ fn failure_state_id(
     if let Some(repair) = repair {
         return match repair.status.as_str() {
             "repaired" => "failed_repair_applied",
-            "suppressed" => "failed_repair_suppressed",
             "blocked" => "failed_repair_blocked",
             "failed" => "failed_repair_failed",
             _ => "failed_repair_recorded",
@@ -1830,7 +1829,6 @@ fn install_repair_action(repair: Option<&InstallGuardianRepairSummary>) -> Insta
         "repaired" => "Automatic repair applied",
         "blocked" => "Automatic repair blocked",
         "failed" => "Automatic repair failed",
-        "suppressed" => "Automatic repair paused",
         _ => "Automatic repair recorded",
     };
     InstallActionViewModel {

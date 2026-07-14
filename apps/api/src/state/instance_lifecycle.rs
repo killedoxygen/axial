@@ -8,6 +8,10 @@ pub(super) struct InstanceLifecycleGates {
 }
 
 impl InstanceLifecycleGates {
+    pub(super) fn owns(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.gates, &other.gates)
+    }
+
     pub(super) async fn acquire(&self, instance_id: &str) -> OwnedMutexGuard<()> {
         let gate = {
             let mut gates = self.gates.lock().await;

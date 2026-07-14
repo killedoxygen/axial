@@ -42,7 +42,6 @@ mod preflight_decision_snapshot;
 mod preset_stage_copy_snapshot;
 #[cfg(test)]
 mod projection_copy_snapshot;
-mod repair_terminal;
 mod rules;
 
 #[cfg(test)]
@@ -143,8 +142,8 @@ pub use preflight::{
 };
 pub(crate) use repair_authorization::{
     ArtifactRepairKind, MissingDownload, QuarantineRedownload, ReadyMarker, RepairAuthorization,
-    RepairAuthorizationContext, RepairAuthorizationRejection,
-    authorize_launcher_managed_artifact_repair, authorize_launcher_managed_missing_artifact_repair,
+    RepairAuthorizationRejection, authorize_launcher_managed_artifact_repair,
+    authorize_launcher_managed_missing_artifact_repair,
     authorize_managed_runtime_ready_marker_repair,
 };
 pub use state_evidence::{GuardianStateLoadOutcome, persisted_state_load_guardian_outcome};

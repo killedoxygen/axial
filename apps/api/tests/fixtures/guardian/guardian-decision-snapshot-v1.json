@@ -2197,6 +2197,7 @@
         "candidate_actions": [
           "Quarantine",
           "Repair",
+          "AskUser",
           "Block"
         ],
         "public_reason_template": "managed_artifact_corrupt"
@@ -2204,23 +2205,23 @@
       "ownership_profiles": [
         {
           "ownership": "LauncherManaged",
-          "policy_profile": "profile-39949cdc13023965"
+          "policy_profile": "profile-70b10c7669c708a4"
         },
         {
           "ownership": "CompositionManaged",
-          "policy_profile": "profile-39949cdc13023965"
+          "policy_profile": "profile-70b10c7669c708a4"
         },
         {
           "ownership": "UserOwned",
-          "policy_profile": "profile-b8097791b159425c"
+          "policy_profile": "profile-c8cf40d93a756e31"
         },
         {
           "ownership": "ExternalProviderDerived",
-          "policy_profile": "profile-3d8b7dc9a59e08bc"
+          "policy_profile": "profile-70b10c7669c708a4"
         },
         {
           "ownership": "Unknown",
-          "policy_profile": "profile-b8097791b159425c"
+          "policy_profile": "profile-c8cf40d93a756e31"
         }
       ]
     },
@@ -2251,6 +2252,7 @@
         "candidate_actions": [
           "Quarantine",
           "Repair",
+          "AskUser",
           "Block"
         ],
         "public_reason_template": "managed_artifact_corrupt"
@@ -2258,23 +2260,23 @@
       "ownership_profiles": [
         {
           "ownership": "LauncherManaged",
-          "policy_profile": "profile-39949cdc13023965"
+          "policy_profile": "profile-70b10c7669c708a4"
         },
         {
           "ownership": "CompositionManaged",
-          "policy_profile": "profile-39949cdc13023965"
+          "policy_profile": "profile-70b10c7669c708a4"
         },
         {
           "ownership": "UserOwned",
-          "policy_profile": "profile-b8097791b159425c"
+          "policy_profile": "profile-c8cf40d93a756e31"
         },
         {
           "ownership": "ExternalProviderDerived",
-          "policy_profile": "profile-3d8b7dc9a59e08bc"
+          "policy_profile": "profile-70b10c7669c708a4"
         },
         {
           "ownership": "Unknown",
-          "policy_profile": "profile-b8097791b159425c"
+          "policy_profile": "profile-c8cf40d93a756e31"
         }
       ]
     },
@@ -2305,6 +2307,7 @@
         "candidate_actions": [
           "Quarantine",
           "Repair",
+          "AskUser",
           "Block"
         ],
         "public_reason_template": "managed_artifact_corrupt"
@@ -2312,23 +2315,23 @@
       "ownership_profiles": [
         {
           "ownership": "LauncherManaged",
-          "policy_profile": "profile-39949cdc13023965"
+          "policy_profile": "profile-70b10c7669c708a4"
         },
         {
           "ownership": "CompositionManaged",
-          "policy_profile": "profile-39949cdc13023965"
+          "policy_profile": "profile-70b10c7669c708a4"
         },
         {
           "ownership": "UserOwned",
-          "policy_profile": "profile-b8097791b159425c"
+          "policy_profile": "profile-c8cf40d93a756e31"
         },
         {
           "ownership": "ExternalProviderDerived",
-          "policy_profile": "profile-3d8b7dc9a59e08bc"
+          "policy_profile": "profile-70b10c7669c708a4"
         },
         {
           "ownership": "Unknown",
-          "policy_profile": "profile-b8097791b159425c"
+          "policy_profile": "profile-c8cf40d93a756e31"
         }
       ]
     },
@@ -2462,6 +2465,7 @@
         ],
         "candidate_actions": [
           "Repair",
+          "AskUser",
           "Block"
         ],
         "public_reason_template": "managed_runtime_needs_repair"
@@ -2469,23 +2473,23 @@
       "ownership_profiles": [
         {
           "ownership": "LauncherManaged",
-          "policy_profile": "profile-39949cdc13023965"
+          "policy_profile": "profile-70b10c7669c708a4"
         },
         {
           "ownership": "CompositionManaged",
-          "policy_profile": "profile-39949cdc13023965"
+          "policy_profile": "profile-70b10c7669c708a4"
         },
         {
           "ownership": "UserOwned",
-          "policy_profile": "profile-b8097791b159425c"
+          "policy_profile": "profile-c8cf40d93a756e31"
         },
         {
           "ownership": "ExternalProviderDerived",
-          "policy_profile": "profile-3d8b7dc9a59e08bc"
+          "policy_profile": "profile-70b10c7669c708a4"
         },
         {
           "ownership": "Unknown",
-          "policy_profile": "profile-b8097791b159425c"
+          "policy_profile": "profile-c8cf40d93a756e31"
         }
       ]
     },
@@ -2515,6 +2519,7 @@
         ],
         "candidate_actions": [
           "Repair",
+          "AskUser",
           "Block"
         ],
         "public_reason_template": "managed_runtime_needs_repair"
@@ -2522,23 +2527,23 @@
       "ownership_profiles": [
         {
           "ownership": "LauncherManaged",
-          "policy_profile": "profile-39949cdc13023965"
+          "policy_profile": "profile-70b10c7669c708a4"
         },
         {
           "ownership": "CompositionManaged",
-          "policy_profile": "profile-39949cdc13023965"
+          "policy_profile": "profile-70b10c7669c708a4"
         },
         {
           "ownership": "UserOwned",
-          "policy_profile": "profile-b8097791b159425c"
+          "policy_profile": "profile-c8cf40d93a756e31"
         },
         {
           "ownership": "ExternalProviderDerived",
-          "policy_profile": "profile-3d8b7dc9a59e08bc"
+          "policy_profile": "profile-70b10c7669c708a4"
         },
         {
           "ownership": "Unknown",
-          "policy_profile": "profile-b8097791b159425c"
+          "policy_profile": "profile-c8cf40d93a756e31"
         }
       ]
     },
@@ -4688,526 +4693,6 @@
       ]
     },
     {
-      "id": "profile-39949cdc13023965",
-      "modes": [
-        {
-          "mode": "Managed",
-          "contexts": [
-            {
-              "decision_kind": "Block",
-              "plan_present": false,
-              "plan_integrity": true
-            },
-            {
-              "decision_kind": "Block",
-              "plan_present": false,
-              "plan_integrity": true
-            },
-            {
-              "decision_kind": "Block",
-              "plan_present": false,
-              "plan_integrity": true
-            },
-            {
-              "decision_kind": "Block",
-              "plan_present": false,
-              "plan_integrity": true
-            },
-            {
-              "decision_kind": "Block",
-              "plan_present": true,
-              "plan_integrity": true
-            },
-            {
-              "decision_kind": "Repair",
-              "plan_present": true,
-              "plan_integrity": true
-            },
-            {
-              "decision_kind": "Block",
-              "plan_present": true,
-              "plan_integrity": true
-            },
-            {
-              "decision_kind": "Block",
-              "plan_present": true,
-              "plan_integrity": true
-            },
-            {
-              "decision_kind": "Block",
-              "plan_present": false,
-              "plan_integrity": true
-            },
-            {
-              "decision_kind": "Block",
-              "plan_present": false,
-              "plan_integrity": true
-            },
-            {
-              "decision_kind": "Block",
-              "plan_present": false,
-              "plan_integrity": true
-            },
-            {
-              "decision_kind": "Block",
-              "plan_present": false,
-              "plan_integrity": true
-            },
-            {
-              "decision_kind": "Block",
-              "plan_present": true,
-              "plan_integrity": true
-            },
-            {
-              "decision_kind": "Repair",
-              "plan_present": true,
-              "plan_integrity": true
-            },
-            {
-              "decision_kind": "Block",
-              "plan_present": true,
-              "plan_integrity": true
-            },
-            {
-              "decision_kind": "Block",
-              "plan_present": true,
-              "plan_integrity": true
-            }
-          ]
-        },
-        {
-          "mode": "Custom",
-          "contexts": [
-            {
-              "decision_kind": "Block",
-              "plan_present": false,
-              "plan_integrity": true
-            },
-            {
-              "decision_kind": "Block",
-              "plan_present": false,
-              "plan_integrity": true
-            },
-            {
-              "decision_kind": "Block",
-              "plan_present": false,
-              "plan_integrity": true
-            },
-            {
-              "decision_kind": "Block",
-              "plan_present": false,
-              "plan_integrity": true
-            },
-            {
-              "decision_kind": "Block",
-              "plan_present": true,
-              "plan_integrity": true
-            },
-            {
-              "decision_kind": "Repair",
-              "plan_present": true,
-              "plan_integrity": true
-            },
-            {
-              "decision_kind": "Block",
-              "plan_present": true,
-              "plan_integrity": true
-            },
-            {
-              "decision_kind": "Block",
-              "plan_present": true,
-              "plan_integrity": true
-            },
-            {
-              "decision_kind": "Block",
-              "plan_present": false,
-              "plan_integrity": true
-            },
-            {
-              "decision_kind": "Block",
-              "plan_present": false,
-              "plan_integrity": true
-            },
-            {
-              "decision_kind": "Block",
-              "plan_present": false,
-              "plan_integrity": true
-            },
-            {
-              "decision_kind": "Block",
-              "plan_present": false,
-              "plan_integrity": true
-            },
-            {
-              "decision_kind": "Block",
-              "plan_present": true,
-              "plan_integrity": true
-            },
-            {
-              "decision_kind": "Block",
-              "plan_present": true,
-              "plan_integrity": true
-            },
-            {
-              "decision_kind": "Block",
-              "plan_present": true,
-              "plan_integrity": true
-            },
-            {
-              "decision_kind": "Block",
-              "plan_present": true,
-              "plan_integrity": true
-            }
-          ]
-        },
-        {
-          "mode": "Disabled",
-          "contexts": [
-            {
-              "decision_kind": "Block",
-              "plan_present": false,
-              "plan_integrity": true
-            },
-            {
-              "decision_kind": "Block",
-              "plan_present": false,
-              "plan_integrity": true
-            },
-            {
-              "decision_kind": "Block",
-              "plan_present": false,
-              "plan_integrity": true
-            },
-            {
-              "decision_kind": "Block",
-              "plan_present": false,
-              "plan_integrity": true
-            },
-            {
-              "decision_kind": "Block",
-              "plan_present": true,
-              "plan_integrity": true
-            },
-            {
-              "decision_kind": "RecordOnly",
-              "plan_present": true,
-              "plan_integrity": true
-            },
-            {
-              "decision_kind": "Block",
-              "plan_present": true,
-              "plan_integrity": true
-            },
-            {
-              "decision_kind": "RecordOnly",
-              "plan_present": true,
-              "plan_integrity": true
-            },
-            {
-              "decision_kind": "Block",
-              "plan_present": false,
-              "plan_integrity": true
-            },
-            {
-              "decision_kind": "Block",
-              "plan_present": false,
-              "plan_integrity": true
-            },
-            {
-              "decision_kind": "Block",
-              "plan_present": false,
-              "plan_integrity": true
-            },
-            {
-              "decision_kind": "Block",
-              "plan_present": false,
-              "plan_integrity": true
-            },
-            {
-              "decision_kind": "Block",
-              "plan_present": true,
-              "plan_integrity": true
-            },
-            {
-              "decision_kind": "RecordOnly",
-              "plan_present": true,
-              "plan_integrity": true
-            },
-            {
-              "decision_kind": "Block",
-              "plan_present": true,
-              "plan_integrity": true
-            },
-            {
-              "decision_kind": "RecordOnly",
-              "plan_present": true,
-              "plan_integrity": true
-            }
-          ]
-        }
-      ]
-    },
-    {
-      "id": "profile-3d8b7dc9a59e08bc",
-      "modes": [
-        {
-          "mode": "Managed",
-          "contexts": [
-            {
-              "decision_kind": "Block",
-              "plan_present": false,
-              "plan_integrity": true
-            },
-            {
-              "decision_kind": "Block",
-              "plan_present": false,
-              "plan_integrity": true
-            },
-            {
-              "decision_kind": "Block",
-              "plan_present": false,
-              "plan_integrity": true
-            },
-            {
-              "decision_kind": "Block",
-              "plan_present": false,
-              "plan_integrity": true
-            },
-            {
-              "decision_kind": "Block",
-              "plan_present": true,
-              "plan_integrity": true
-            },
-            {
-              "decision_kind": "Repair",
-              "plan_present": true,
-              "plan_integrity": true
-            },
-            {
-              "decision_kind": "Block",
-              "plan_present": true,
-              "plan_integrity": true
-            },
-            {
-              "decision_kind": "Block",
-              "plan_present": true,
-              "plan_integrity": true
-            },
-            {
-              "decision_kind": "Block",
-              "plan_present": false,
-              "plan_integrity": true
-            },
-            {
-              "decision_kind": "Block",
-              "plan_present": false,
-              "plan_integrity": true
-            },
-            {
-              "decision_kind": "Block",
-              "plan_present": false,
-              "plan_integrity": true
-            },
-            {
-              "decision_kind": "Block",
-              "plan_present": false,
-              "plan_integrity": true
-            },
-            {
-              "decision_kind": "Block",
-              "plan_present": true,
-              "plan_integrity": true
-            },
-            {
-              "decision_kind": "Repair",
-              "plan_present": true,
-              "plan_integrity": true
-            },
-            {
-              "decision_kind": "Block",
-              "plan_present": true,
-              "plan_integrity": true
-            },
-            {
-              "decision_kind": "Block",
-              "plan_present": true,
-              "plan_integrity": true
-            }
-          ]
-        },
-        {
-          "mode": "Custom",
-          "contexts": [
-            {
-              "decision_kind": "Block",
-              "plan_present": false,
-              "plan_integrity": true
-            },
-            {
-              "decision_kind": "Block",
-              "plan_present": false,
-              "plan_integrity": true
-            },
-            {
-              "decision_kind": "Block",
-              "plan_present": false,
-              "plan_integrity": true
-            },
-            {
-              "decision_kind": "Block",
-              "plan_present": false,
-              "plan_integrity": true
-            },
-            {
-              "decision_kind": "Block",
-              "plan_present": true,
-              "plan_integrity": true
-            },
-            {
-              "decision_kind": "Block",
-              "plan_present": true,
-              "plan_integrity": true
-            },
-            {
-              "decision_kind": "Block",
-              "plan_present": true,
-              "plan_integrity": true
-            },
-            {
-              "decision_kind": "Block",
-              "plan_present": true,
-              "plan_integrity": true
-            },
-            {
-              "decision_kind": "Block",
-              "plan_present": false,
-              "plan_integrity": true
-            },
-            {
-              "decision_kind": "Block",
-              "plan_present": false,
-              "plan_integrity": true
-            },
-            {
-              "decision_kind": "Block",
-              "plan_present": false,
-              "plan_integrity": true
-            },
-            {
-              "decision_kind": "Block",
-              "plan_present": false,
-              "plan_integrity": true
-            },
-            {
-              "decision_kind": "Block",
-              "plan_present": true,
-              "plan_integrity": true
-            },
-            {
-              "decision_kind": "Block",
-              "plan_present": true,
-              "plan_integrity": true
-            },
-            {
-              "decision_kind": "Block",
-              "plan_present": true,
-              "plan_integrity": true
-            },
-            {
-              "decision_kind": "Block",
-              "plan_present": true,
-              "plan_integrity": true
-            }
-          ]
-        },
-        {
-          "mode": "Disabled",
-          "contexts": [
-            {
-              "decision_kind": "Block",
-              "plan_present": false,
-              "plan_integrity": true
-            },
-            {
-              "decision_kind": "Block",
-              "plan_present": false,
-              "plan_integrity": true
-            },
-            {
-              "decision_kind": "Block",
-              "plan_present": false,
-              "plan_integrity": true
-            },
-            {
-              "decision_kind": "Block",
-              "plan_present": false,
-              "plan_integrity": true
-            },
-            {
-              "decision_kind": "Block",
-              "plan_present": true,
-              "plan_integrity": true
-            },
-            {
-              "decision_kind": "RecordOnly",
-              "plan_present": true,
-              "plan_integrity": true
-            },
-            {
-              "decision_kind": "Block",
-              "plan_present": true,
-              "plan_integrity": true
-            },
-            {
-              "decision_kind": "RecordOnly",
-              "plan_present": true,
-              "plan_integrity": true
-            },
-            {
-              "decision_kind": "Block",
-              "plan_present": false,
-              "plan_integrity": true
-            },
-            {
-              "decision_kind": "Block",
-              "plan_present": false,
-              "plan_integrity": true
-            },
-            {
-              "decision_kind": "Block",
-              "plan_present": false,
-              "plan_integrity": true
-            },
-            {
-              "decision_kind": "Block",
-              "plan_present": false,
-              "plan_integrity": true
-            },
-            {
-              "decision_kind": "Block",
-              "plan_present": true,
-              "plan_integrity": true
-            },
-            {
-              "decision_kind": "RecordOnly",
-              "plan_present": true,
-              "plan_integrity": true
-            },
-            {
-              "decision_kind": "Block",
-              "plan_present": true,
-              "plan_integrity": true
-            },
-            {
-              "decision_kind": "RecordOnly",
-              "plan_present": true,
-              "plan_integrity": true
-            }
-          ]
-        }
-      ]
-    },
-    {
       "id": "profile-4532283302ce02c5",
       "modes": [
         {
@@ -6248,6 +5733,266 @@
       ]
     },
     {
+      "id": "profile-70b10c7669c708a4",
+      "modes": [
+        {
+          "mode": "Managed",
+          "contexts": [
+            {
+              "decision_kind": "Block",
+              "plan_present": false,
+              "plan_integrity": true
+            },
+            {
+              "decision_kind": "Block",
+              "plan_present": false,
+              "plan_integrity": true
+            },
+            {
+              "decision_kind": "Block",
+              "plan_present": false,
+              "plan_integrity": true
+            },
+            {
+              "decision_kind": "Block",
+              "plan_present": false,
+              "plan_integrity": true
+            },
+            {
+              "decision_kind": "Block",
+              "plan_present": true,
+              "plan_integrity": true
+            },
+            {
+              "decision_kind": "Repair",
+              "plan_present": true,
+              "plan_integrity": true
+            },
+            {
+              "decision_kind": "Block",
+              "plan_present": true,
+              "plan_integrity": true
+            },
+            {
+              "decision_kind": "Block",
+              "plan_present": true,
+              "plan_integrity": true
+            },
+            {
+              "decision_kind": "Block",
+              "plan_present": false,
+              "plan_integrity": true
+            },
+            {
+              "decision_kind": "Block",
+              "plan_present": false,
+              "plan_integrity": true
+            },
+            {
+              "decision_kind": "Block",
+              "plan_present": false,
+              "plan_integrity": true
+            },
+            {
+              "decision_kind": "Block",
+              "plan_present": false,
+              "plan_integrity": true
+            },
+            {
+              "decision_kind": "Block",
+              "plan_present": true,
+              "plan_integrity": true
+            },
+            {
+              "decision_kind": "Repair",
+              "plan_present": true,
+              "plan_integrity": true
+            },
+            {
+              "decision_kind": "Block",
+              "plan_present": true,
+              "plan_integrity": true
+            },
+            {
+              "decision_kind": "Block",
+              "plan_present": true,
+              "plan_integrity": true
+            }
+          ]
+        },
+        {
+          "mode": "Custom",
+          "contexts": [
+            {
+              "decision_kind": "Block",
+              "plan_present": false,
+              "plan_integrity": true
+            },
+            {
+              "decision_kind": "Block",
+              "plan_present": false,
+              "plan_integrity": true
+            },
+            {
+              "decision_kind": "Block",
+              "plan_present": false,
+              "plan_integrity": true
+            },
+            {
+              "decision_kind": "Block",
+              "plan_present": false,
+              "plan_integrity": true
+            },
+            {
+              "decision_kind": "AskUser",
+              "plan_present": true,
+              "plan_integrity": true
+            },
+            {
+              "decision_kind": "AskUser",
+              "plan_present": true,
+              "plan_integrity": true
+            },
+            {
+              "decision_kind": "Block",
+              "plan_present": true,
+              "plan_integrity": true
+            },
+            {
+              "decision_kind": "Block",
+              "plan_present": true,
+              "plan_integrity": true
+            },
+            {
+              "decision_kind": "Block",
+              "plan_present": false,
+              "plan_integrity": true
+            },
+            {
+              "decision_kind": "Block",
+              "plan_present": false,
+              "plan_integrity": true
+            },
+            {
+              "decision_kind": "Block",
+              "plan_present": false,
+              "plan_integrity": true
+            },
+            {
+              "decision_kind": "Block",
+              "plan_present": false,
+              "plan_integrity": true
+            },
+            {
+              "decision_kind": "AskUser",
+              "plan_present": true,
+              "plan_integrity": true
+            },
+            {
+              "decision_kind": "AskUser",
+              "plan_present": true,
+              "plan_integrity": true
+            },
+            {
+              "decision_kind": "Block",
+              "plan_present": true,
+              "plan_integrity": true
+            },
+            {
+              "decision_kind": "Block",
+              "plan_present": true,
+              "plan_integrity": true
+            }
+          ]
+        },
+        {
+          "mode": "Disabled",
+          "contexts": [
+            {
+              "decision_kind": "Block",
+              "plan_present": false,
+              "plan_integrity": true
+            },
+            {
+              "decision_kind": "Block",
+              "plan_present": false,
+              "plan_integrity": true
+            },
+            {
+              "decision_kind": "Block",
+              "plan_present": false,
+              "plan_integrity": true
+            },
+            {
+              "decision_kind": "Block",
+              "plan_present": false,
+              "plan_integrity": true
+            },
+            {
+              "decision_kind": "Block",
+              "plan_present": true,
+              "plan_integrity": true
+            },
+            {
+              "decision_kind": "RecordOnly",
+              "plan_present": true,
+              "plan_integrity": true
+            },
+            {
+              "decision_kind": "Block",
+              "plan_present": true,
+              "plan_integrity": true
+            },
+            {
+              "decision_kind": "RecordOnly",
+              "plan_present": true,
+              "plan_integrity": true
+            },
+            {
+              "decision_kind": "Block",
+              "plan_present": false,
+              "plan_integrity": true
+            },
+            {
+              "decision_kind": "Block",
+              "plan_present": false,
+              "plan_integrity": true
+            },
+            {
+              "decision_kind": "Block",
+              "plan_present": false,
+              "plan_integrity": true
+            },
+            {
+              "decision_kind": "Block",
+              "plan_present": false,
+              "plan_integrity": true
+            },
+            {
+              "decision_kind": "Block",
+              "plan_present": true,
+              "plan_integrity": true
+            },
+            {
+              "decision_kind": "RecordOnly",
+              "plan_present": true,
+              "plan_integrity": true
+            },
+            {
+              "decision_kind": "Block",
+              "plan_present": true,
+              "plan_integrity": true
+            },
+            {
+              "decision_kind": "RecordOnly",
+              "plan_present": true,
+              "plan_integrity": true
+            }
+          ]
+        }
+      ]
+    },
+    {
       "id": "profile-785556223a7f102c",
       "modes": [
         {
@@ -6925,6 +6670,266 @@
             },
             {
               "decision_kind": "Block",
+              "plan_present": true,
+              "plan_integrity": true
+            },
+            {
+              "decision_kind": "Block",
+              "plan_present": true,
+              "plan_integrity": true
+            },
+            {
+              "decision_kind": "Block",
+              "plan_present": true,
+              "plan_integrity": true
+            }
+          ]
+        },
+        {
+          "mode": "Disabled",
+          "contexts": [
+            {
+              "decision_kind": "Block",
+              "plan_present": false,
+              "plan_integrity": true
+            },
+            {
+              "decision_kind": "Block",
+              "plan_present": false,
+              "plan_integrity": true
+            },
+            {
+              "decision_kind": "Block",
+              "plan_present": false,
+              "plan_integrity": true
+            },
+            {
+              "decision_kind": "Block",
+              "plan_present": false,
+              "plan_integrity": true
+            },
+            {
+              "decision_kind": "Block",
+              "plan_present": true,
+              "plan_integrity": true
+            },
+            {
+              "decision_kind": "Block",
+              "plan_present": true,
+              "plan_integrity": true
+            },
+            {
+              "decision_kind": "Block",
+              "plan_present": true,
+              "plan_integrity": true
+            },
+            {
+              "decision_kind": "Block",
+              "plan_present": true,
+              "plan_integrity": true
+            },
+            {
+              "decision_kind": "Block",
+              "plan_present": false,
+              "plan_integrity": true
+            },
+            {
+              "decision_kind": "Block",
+              "plan_present": false,
+              "plan_integrity": true
+            },
+            {
+              "decision_kind": "Block",
+              "plan_present": false,
+              "plan_integrity": true
+            },
+            {
+              "decision_kind": "Block",
+              "plan_present": false,
+              "plan_integrity": true
+            },
+            {
+              "decision_kind": "Block",
+              "plan_present": true,
+              "plan_integrity": true
+            },
+            {
+              "decision_kind": "Block",
+              "plan_present": true,
+              "plan_integrity": true
+            },
+            {
+              "decision_kind": "Block",
+              "plan_present": true,
+              "plan_integrity": true
+            },
+            {
+              "decision_kind": "Block",
+              "plan_present": true,
+              "plan_integrity": true
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "profile-c8cf40d93a756e31",
+      "modes": [
+        {
+          "mode": "Managed",
+          "contexts": [
+            {
+              "decision_kind": "Block",
+              "plan_present": false,
+              "plan_integrity": true
+            },
+            {
+              "decision_kind": "Block",
+              "plan_present": false,
+              "plan_integrity": true
+            },
+            {
+              "decision_kind": "Block",
+              "plan_present": false,
+              "plan_integrity": true
+            },
+            {
+              "decision_kind": "Block",
+              "plan_present": false,
+              "plan_integrity": true
+            },
+            {
+              "decision_kind": "Block",
+              "plan_present": true,
+              "plan_integrity": true
+            },
+            {
+              "decision_kind": "Block",
+              "plan_present": true,
+              "plan_integrity": true
+            },
+            {
+              "decision_kind": "Block",
+              "plan_present": true,
+              "plan_integrity": true
+            },
+            {
+              "decision_kind": "Block",
+              "plan_present": true,
+              "plan_integrity": true
+            },
+            {
+              "decision_kind": "Block",
+              "plan_present": false,
+              "plan_integrity": true
+            },
+            {
+              "decision_kind": "Block",
+              "plan_present": false,
+              "plan_integrity": true
+            },
+            {
+              "decision_kind": "Block",
+              "plan_present": false,
+              "plan_integrity": true
+            },
+            {
+              "decision_kind": "Block",
+              "plan_present": false,
+              "plan_integrity": true
+            },
+            {
+              "decision_kind": "Block",
+              "plan_present": true,
+              "plan_integrity": true
+            },
+            {
+              "decision_kind": "Block",
+              "plan_present": true,
+              "plan_integrity": true
+            },
+            {
+              "decision_kind": "Block",
+              "plan_present": true,
+              "plan_integrity": true
+            },
+            {
+              "decision_kind": "Block",
+              "plan_present": true,
+              "plan_integrity": true
+            }
+          ]
+        },
+        {
+          "mode": "Custom",
+          "contexts": [
+            {
+              "decision_kind": "Block",
+              "plan_present": false,
+              "plan_integrity": true
+            },
+            {
+              "decision_kind": "Block",
+              "plan_present": false,
+              "plan_integrity": true
+            },
+            {
+              "decision_kind": "Block",
+              "plan_present": false,
+              "plan_integrity": true
+            },
+            {
+              "decision_kind": "Block",
+              "plan_present": false,
+              "plan_integrity": true
+            },
+            {
+              "decision_kind": "AskUser",
+              "plan_present": true,
+              "plan_integrity": true
+            },
+            {
+              "decision_kind": "AskUser",
+              "plan_present": true,
+              "plan_integrity": true
+            },
+            {
+              "decision_kind": "Block",
+              "plan_present": true,
+              "plan_integrity": true
+            },
+            {
+              "decision_kind": "Block",
+              "plan_present": true,
+              "plan_integrity": true
+            },
+            {
+              "decision_kind": "Block",
+              "plan_present": false,
+              "plan_integrity": true
+            },
+            {
+              "decision_kind": "Block",
+              "plan_present": false,
+              "plan_integrity": true
+            },
+            {
+              "decision_kind": "Block",
+              "plan_present": false,
+              "plan_integrity": true
+            },
+            {
+              "decision_kind": "Block",
+              "plan_present": false,
+              "plan_integrity": true
+            },
+            {
+              "decision_kind": "AskUser",
+              "plan_present": true,
+              "plan_integrity": true
+            },
+            {
+              "decision_kind": "AskUser",
               "plan_present": true,
               "plan_integrity": true
             },

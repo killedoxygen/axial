@@ -1282,7 +1282,8 @@ mod tests {
         let root = test_root("restart-suppression");
         let paths = test_paths(&root);
         let journals = OperationJournalStore::new();
-        let first_memory = GuardianFailureMemoryStore::load_from_paths(&paths);
+        let first_memory = GuardianFailureMemoryStore::try_load_from_paths(&paths)
+            .expect("load Guardian failure-memory persistence");
         let initial_plan = plan("session-restart", RecoveryCase::DowngradePreset);
 
         record_launch_recovery_attempt(request(
@@ -1335,7 +1336,8 @@ mod tests {
         let root = test_root("expired-suppression");
         let paths = test_paths(&root);
         let journals = OperationJournalStore::new();
-        let first_memory = GuardianFailureMemoryStore::load_from_paths(&paths);
+        let first_memory = GuardianFailureMemoryStore::try_load_from_paths(&paths)
+            .expect("load Guardian failure-memory persistence");
         let initial_plan = plan("session-expired", RecoveryCase::SwitchManagedRuntime);
 
         record_launch_recovery_attempt(request(

@@ -264,7 +264,6 @@ mod tests {
         for status in [
             GuardianArtifactRepairStatus::Blocked,
             GuardianArtifactRepairStatus::Failed,
-            GuardianArtifactRepairStatus::Suppressed,
         ] {
             let mut resume = InstallRepairResume::default();
             assert!(!resume.resume_after(None));

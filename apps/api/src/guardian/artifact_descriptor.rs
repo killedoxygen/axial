@@ -9,14 +9,17 @@ use crate::execution::download::{
     DownloadChecksum, DownloadChecksumAlgorithm, valid_download_checksum_metadata,
 };
 use crate::state::contracts::{
-    OwnershipClass, StabilizationSystem, TargetDescriptor, TargetKind, sanitize_target_id,
+    OwnershipClass, ReconciliationComponent, StabilizationSystem, TargetDescriptor, TargetKind,
+    sanitize_target_id,
 };
-use axial_minecraft::download::SelectedDownloadArtifactDescriptor;
+use axial_minecraft::download::{SelectedDownloadArtifactDescriptor, SelectedDownloadArtifactKind};
+use sha2::{Digest, Sha256};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use url::Url;
 
 const MAX_MINECRAFT_REPAIR_ARTIFACT_BYTES: u64 = 512 << 20;
+const RECONCILIATION_TARGET_DOMAIN: &[u8] = b"axial.guardian.artifact-target.v1";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum GuardianArtifactDescriptorError {
@@ -37,6 +40,8 @@ pub(crate) enum GuardianArtifactDescriptorError {
 #[derive(Clone, Eq, PartialEq)]
 pub(crate) struct GuardianMinecraftArtifactRepairDescriptor {
     target: TargetDescriptor,
+    reconciliation_target: TargetDescriptor,
+    component: ReconciliationComponent,
     destination: PathBuf,
     source: GuardianMinecraftArtifactRepairSource,
 }
@@ -58,13 +63,26 @@ impl GuardianMinecraftArtifactRepairDescriptor {
             return Err(GuardianArtifactDescriptorError::ExpectedSizeExceedsMaxBytes);
         }
 
+        let target = TargetDescriptor::new(
+            StabilizationSystem::Execution,
+            TargetKind::Artifact,
+            target_id,
+            OwnershipClass::LauncherManaged,
+        );
+        let component = reconciliation_component(descriptor.kind);
+        let reconciliation_target = exact_reconciliation_target(
+            &target,
+            component,
+            descriptor.destination(),
+            DownloadChecksumAlgorithm::Sha1,
+            &sha1,
+            descriptor.expected_size,
+        );
+
         Ok(Self {
-            target: TargetDescriptor::new(
-                StabilizationSystem::Execution,
-                TargetKind::Artifact,
-                target_id,
-                OwnershipClass::LauncherManaged,
-            ),
+            target,
+            reconciliation_target,
+            component,
             destination: descriptor.destination().to_path_buf(),
             source: GuardianMinecraftArtifactRepairSource {
                 url: provider_url,
@@ -80,8 +98,16 @@ impl GuardianMinecraftArtifactRepairDescriptor {
         &self.target
     }
 
+    pub(super) fn reconciliation_target(&self) -> &TargetDescriptor {
+        &self.reconciliation_target
+    }
+
     pub(crate) fn destination(&self) -> &Path {
         &self.destination
+    }
+
+    pub(crate) const fn component(&self) -> ReconciliationComponent {
+        self.component
     }
 
     pub(super) fn repair_source(&self) -> GuardianArtifactRepairSource<'_> {
@@ -122,8 +148,19 @@ impl GuardianMinecraftArtifactRepairDescriptor {
         if expected_size.is_some_and(|expected_size| expected_size > max_bytes) {
             return Err(GuardianArtifactDescriptorError::ExpectedSizeExceedsMaxBytes);
         }
+        let component = ReconciliationComponent::VersionBundle;
+        let reconciliation_target = exact_reconciliation_target(
+            &target,
+            component,
+            destination,
+            checksum_algorithm,
+            checksum,
+            expected_size,
+        );
         Ok(Self {
             target,
+            reconciliation_target,
+            component,
             destination: destination.to_path_buf(),
             source: GuardianMinecraftArtifactRepairSource {
                 url: provider_url,
@@ -136,11 +173,107 @@ impl GuardianMinecraftArtifactRepairDescriptor {
     }
 }
 
+const fn reconciliation_component(kind: SelectedDownloadArtifactKind) -> ReconciliationComponent {
+    match kind {
+        SelectedDownloadArtifactKind::VersionJson
+        | SelectedDownloadArtifactKind::ClientJar
+        | SelectedDownloadArtifactKind::LogConfig => ReconciliationComponent::VersionBundle,
+        SelectedDownloadArtifactKind::Library => ReconciliationComponent::Libraries,
+        SelectedDownloadArtifactKind::AssetIndex | SelectedDownloadArtifactKind::AssetObject => {
+            ReconciliationComponent::Assets
+        }
+    }
+}
+
+fn exact_reconciliation_target(
+    target: &TargetDescriptor,
+    component: ReconciliationComponent,
+    destination: &Path,
+    checksum_algorithm: DownloadChecksumAlgorithm,
+    checksum: &str,
+    expected_size: Option<u64>,
+) -> TargetDescriptor {
+    let mut hasher = Sha256::new();
+    update_digest_frame(&mut hasher, b"domain", RECONCILIATION_TARGET_DOMAIN);
+    update_digest_frame(
+        &mut hasher,
+        b"component",
+        reconciliation_component_id(component).as_bytes(),
+    );
+    update_digest_frame(&mut hasher, b"public_target", target.id.as_bytes());
+    update_path_digest_frame(&mut hasher, b"destination", destination);
+    update_digest_frame(
+        &mut hasher,
+        b"checksum_algorithm",
+        checksum_algorithm.as_str().as_bytes(),
+    );
+    update_digest_frame(&mut hasher, b"checksum", checksum.as_bytes());
+    update_digest_frame(
+        &mut hasher,
+        b"expected_size",
+        &expected_size.unwrap_or(u64::MAX).to_le_bytes(),
+    );
+    let digest = format!("{:x}", hasher.finalize());
+    let digest = digest
+        .as_bytes()
+        .chunks(8)
+        .map(|chunk| std::str::from_utf8(chunk).expect("SHA-256 hex is ASCII"))
+        .collect::<Vec<_>>()
+        .join(".");
+    TargetDescriptor::new(
+        target.system,
+        target.kind,
+        format!("artifact.sha256.{digest}"),
+        target.ownership,
+    )
+}
+
+const fn reconciliation_component_id(component: ReconciliationComponent) -> &'static str {
+    match component {
+        ReconciliationComponent::VersionBundle => "version_bundle",
+        ReconciliationComponent::Libraries => "libraries",
+        ReconciliationComponent::Assets => "assets",
+        ReconciliationComponent::Runtime => "runtime",
+        ReconciliationComponent::WholeInstance => "whole_instance",
+    }
+}
+
+fn update_digest_frame(hasher: &mut Sha256, label: &[u8], value: &[u8]) {
+    hasher.update((label.len() as u64).to_le_bytes());
+    hasher.update(label);
+    hasher.update((value.len() as u64).to_le_bytes());
+    hasher.update(value);
+}
+
+#[cfg(unix)]
+fn update_path_digest_frame(hasher: &mut Sha256, label: &[u8], path: &Path) {
+    use std::os::unix::ffi::OsStrExt;
+    update_digest_frame(hasher, label, path.as_os_str().as_bytes());
+}
+
+#[cfg(windows)]
+fn update_path_digest_frame(hasher: &mut Sha256, label: &[u8], path: &Path) {
+    use std::os::windows::ffi::OsStrExt;
+    let encoded = path
+        .as_os_str()
+        .encode_wide()
+        .flat_map(u16::to_le_bytes)
+        .collect::<Vec<_>>();
+    update_digest_frame(hasher, label, &encoded);
+}
+
+#[cfg(not(any(unix, windows)))]
+fn update_path_digest_frame(hasher: &mut Sha256, label: &[u8], path: &Path) {
+    update_digest_frame(hasher, label, path.to_string_lossy().as_bytes());
+}
+
 impl fmt::Debug for GuardianMinecraftArtifactRepairDescriptor {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("GuardianMinecraftArtifactRepairDescriptor")
             .field("target", &self.target)
+            .field("reconciliation_target", &self.reconciliation_target)
+            .field("component", &self.component)
             .field("destination", &"<redacted>")
             .field("source", &self.source)
             .finish()
@@ -255,6 +388,13 @@ mod tests {
         .expect("guardian descriptor");
 
         assert_eq!(descriptor.target().id, "log4j2.xml");
+        assert!(
+            descriptor
+                .reconciliation_target()
+                .id
+                .starts_with("artifact.sha256.")
+        );
+        assert_ne!(descriptor.reconciliation_target(), descriptor.target());
         assert_eq!(
             descriptor.target().ownership,
             OwnershipClass::LauncherManaged
@@ -274,6 +414,50 @@ mod tests {
         assert!(!debug.contains(&checksum));
         assert!(debug.contains("log4j2.xml"));
         assert!(debug.contains("sha1"));
+    }
+
+    #[test]
+    fn reconciliation_target_binds_destination_and_expected_content_without_path_copy() {
+        let checksum = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let descriptor = |destination: &Path, checksum: &str| {
+            GuardianMinecraftArtifactRepairDescriptor::from_core_selected_descriptor(
+                &SelectedDownloadArtifactDescriptor::new(
+                    SelectedDownloadArtifactKind::Library,
+                    "minecraft_library_shared",
+                    destination,
+                    "https://example.invalid/shared.jar",
+                    checksum,
+                    Some(128),
+                    ONE_MIB,
+                ),
+            )
+            .expect("guardian descriptor")
+        };
+        let first = descriptor(Path::new("/managed/a/shared.jar"), checksum);
+        let second = descriptor(Path::new("/managed/b/shared.jar"), checksum);
+        let changed = descriptor(
+            Path::new("/managed/a/shared.jar"),
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        );
+
+        assert_eq!(first.target(), second.target());
+        assert_ne!(
+            first.reconciliation_target(),
+            second.reconciliation_target()
+        );
+        assert_ne!(
+            first.reconciliation_target(),
+            changed.reconciliation_target()
+        );
+        for exact in [
+            first.reconciliation_target(),
+            second.reconciliation_target(),
+        ] {
+            assert_eq!(exact.id.len(), 87);
+            assert!(!exact.id.contains("managed"));
+            assert!(!exact.id.contains("shared"));
+            assert!(!exact.id.contains(['/', '\\']));
+        }
     }
 
     #[test]

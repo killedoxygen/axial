@@ -1001,8 +1001,8 @@ async fn prepare_launch_session_queues_recoverable_non_executable_managed_runtim
 }
 
 #[tokio::test]
-async fn launch_preparation_blocks_when_managed_runtime_repair_is_suppressed() {
-    let fixture = TestFixture::new("prepare-blocks-suppressed-runtime-repair");
+async fn launch_preparation_blocks_on_active_prior_managed_runtime_repair() {
+    let fixture = TestFixture::new("prepare-blocks-active-prior-runtime-repair");
     let component = "java-runtime-delta";
     fixture.write_version_json(
         "1.21.1",
@@ -1077,6 +1077,8 @@ async fn launch_preparation_blocks_when_managed_runtime_repair_is_suppressed() {
         GuardianSummaryDecision::Intervened
     );
     fs::remove_file(runtime_root.join(".axial-ready")).expect("remove ready marker");
+    let prior_journals = fixture.state.journals().list();
+    let prior_memory = fixture.state.failure_memory().list();
 
     let error = match prepare_launch_session(
         &fixture.state,
@@ -1090,7 +1092,7 @@ async fn launch_preparation_blocks_when_managed_runtime_repair_is_suppressed() {
     )
     .await
     {
-        Ok(_) => panic!("suppressed repair should block launch preparation"),
+        Ok(_) => panic!("active prior repair should block launch preparation"),
         Err(error) => error,
     };
 
@@ -1108,7 +1110,29 @@ async fn launch_preparation_blocks_when_managed_runtime_repair_is_suppressed() {
             .has_active_instance(&instance_id)
             .await
     );
+    assert!(!runtime_root.join(".axial-ready").exists());
+    let current_journals = fixture.state.journals().list();
+    assert_eq!(current_journals.len(), prior_journals.len() + 1);
+    for prior_journal in &prior_journals {
+        assert_eq!(
+            fixture.state.journals().get(&prior_journal.operation_id),
+            Some(prior_journal.clone())
+        );
+    }
+    let blocked_journal = current_journals
+        .iter()
+        .find(|journal| {
+            prior_journals
+                .iter()
+                .all(|prior| prior.operation_id != journal.operation_id)
+        })
+        .expect("current blocked runtime repair journal");
+    assert_eq!(blocked_journal.status, OperationStatus::Blocked);
+    assert_eq!(blocked_journal.outcome, Some(OperationOutcome::Blocked));
+    assert!(blocked_journal.reconciliation_attempt().is_none());
+    assert!(blocked_journal.reconciliation_terminal().is_none());
     let memory = fixture.state.failure_memory().list();
+    assert_eq!(memory, prior_memory);
     assert_eq!(
         memory[0].last_action_outcome,
         Some(FailureMemoryActionOutcome::Repaired)

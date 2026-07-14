@@ -1,6 +1,8 @@
 use super::contracts::{
     CommandKind, OperationId, OperationJournalEntry, OperationJournalStep, OperationOutcome,
-    OperationPhase, OperationStatus, OperationStepResult, TargetDescriptor,
+    OperationPhase, OperationStatus, OperationStepResult, RECONCILIATION_EVIDENCE_CAPACITY,
+    ReconciliationAttempt, ReconciliationScope, ReconciliationTerminal,
+    ReconciliationTerminalOutcome, StabilizationSystem, TargetDescriptor, TargetKind,
 };
 use super::ownership::{CurrentArtifact, classify_current_artifact};
 #[cfg(test)]
@@ -14,7 +16,7 @@ use crate::observability::{
 };
 use axial_config::AppPaths;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -23,8 +25,8 @@ use std::time::Duration;
 use tokio::sync::Mutex as AsyncMutex;
 use tracing::warn;
 
-pub const OPERATION_JOURNAL_SCHEMA: &str = "axial.state.operation_journals.v1";
-pub const DEFAULT_OPERATION_JOURNAL_LIMIT: usize = 128;
+pub const OPERATION_JOURNAL_SCHEMA: &str = "axial.state.operation_journals.v2";
+pub const DEFAULT_OPERATION_JOURNAL_LIMIT: usize = RECONCILIATION_EVIDENCE_CAPACITY;
 pub(crate) const MAX_OPERATION_JOURNAL_STEP_FACTS: usize = 64;
 pub(crate) const MAX_OPERATION_JOURNAL_DIAGNOSES: usize = 32;
 const OPERATION_JOURNAL_FILE: &str = "operation-journals.json";
@@ -95,6 +97,8 @@ pub(crate) fn operation_journal_plan_is_visible(
         && entry.failure_point == expected.failure_point
         && entry.guardian_diagnosis_ids == expected.guardian_diagnosis_ids
         && entry.outcome == expected.outcome
+        && entry.reconciliation_attempt == expected.reconciliation_attempt
+        && entry.reconciliation_terminal == expected.reconciliation_terminal
 }
 
 fn operation_journal_identity_and_plan_match(
@@ -140,6 +144,8 @@ pub(crate) fn operation_journal_terminal_is_visible(
             .iter()
             .all(|diagnosis_id| entry.guardian_diagnosis_ids.contains(diagnosis_id))
         && entry.outcome == expected.outcome
+        && entry.reconciliation_attempt == expected.reconciliation_attempt
+        && entry.reconciliation_terminal == expected.reconciliation_terminal
         && expected
             .completed_steps
             .iter()
@@ -214,12 +220,6 @@ impl OperationJournalStore {
         }
     }
 
-    pub fn load_from_paths(paths: &AppPaths) -> Self {
-        Self::try_load_from_paths(paths).unwrap_or_else(|error| {
-            panic!("failed to initialize operation journal persistence: {error}")
-        })
-    }
-
     pub fn try_load_from_paths(paths: &AppPaths) -> Result<Self, OperationJournalStoreError> {
         let storage_path = operation_journal_path(paths);
         let store = Self::with_max_entries_and_persistence(
@@ -227,7 +227,7 @@ impl OperationJournalStore {
             Some(OperationJournalPersistence::claim(&storage_path)?),
         );
 
-        store.load_from_path(&storage_path);
+        store.load_from_path(&storage_path)?;
         Ok(store)
     }
 
@@ -244,36 +244,17 @@ impl OperationJournalStore {
                 coordinator,
             )?),
         );
-        store.load_from_path(&storage_path);
+        store.load_from_path(&storage_path)?;
         Ok(store)
     }
 
-    fn load_from_path(&self, storage_path: &Path) {
+    fn load_from_path(&self, storage_path: &Path) -> Result<(), OperationJournalStoreError> {
         match fs::read_to_string(storage_path) {
-            Ok(data) => match OperationJournalSnapshot::from_json(&data) {
-                Ok(snapshot) => {
-                    if let Err(error) = self.load_snapshot(snapshot) {
-                        warn!(
-                            error = ?error,
-                            "failed to load persisted operation journal snapshot"
-                        );
-                    }
-                }
-                Err(error) => {
-                    warn!(
-                        error = ?error,
-                        "failed to parse persisted operation journal snapshot"
-                    );
-                }
-            },
+            Ok(data) => self.load_snapshot(OperationJournalSnapshot::from_json(&data)?)?,
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => {
-                warn!(
-                    error = %error,
-                    "failed to read persisted operation journal snapshot"
-                );
-            }
+            Err(error) => return Err(OperationJournalStoreError::Persistence(error)),
         }
+        Ok(())
     }
 
     fn with_max_entries_and_persistence(
@@ -397,6 +378,88 @@ impl OperationJournalStore {
             entry.completed_steps.push(failure_step);
             entry.failure_point = Some(failure_point.into());
             entry.outcome = Some(outcome);
+            Ok(())
+        })?;
+        self.await_commit(ticket, mutation).await
+    }
+
+    pub(super) async fn record_reconciliation_success(
+        &self,
+        operation_id: &OperationId,
+        completed_step: OperationJournalStep,
+        terminal: ReconciliationTerminal,
+    ) -> Result<(), OperationJournalStoreError> {
+        if terminal.outcome() != ReconciliationTerminalOutcome::Succeeded {
+            return Err(OperationJournalValidationError::ReconciliationTerminalMismatch.into());
+        }
+        let mutation = self.mutation_gate.clone().lock_owned().await;
+        let ticket = self.update(operation_id, WriteUrgency::Immediate, |entry| {
+            if operation_journal_status_is_terminal(entry.status) {
+                return Err(OperationJournalStoreError::AlreadyTerminal);
+            }
+            if entry.reconciliation_attempt.as_ref() != Some(terminal.attempt()) {
+                return Err(OperationJournalValidationError::ReconciliationTerminalMismatch.into());
+            }
+            entry.status = OperationStatus::Succeeded;
+            entry.completed_steps.push(completed_step);
+            entry.failure_point = None;
+            entry.outcome = Some(OperationOutcome::Succeeded);
+            entry.reconciliation_terminal = Some(terminal);
+            Ok(())
+        })?;
+        self.await_commit(ticket, mutation).await
+    }
+
+    pub(super) async fn record_reconciliation_failure(
+        &self,
+        operation_id: &OperationId,
+        failure_step: OperationJournalStep,
+        failure_point: impl Into<String>,
+        terminal: ReconciliationTerminal,
+    ) -> Result<(), OperationJournalStoreError> {
+        if terminal.outcome() != ReconciliationTerminalOutcome::Failed {
+            return Err(OperationJournalValidationError::ReconciliationTerminalMismatch.into());
+        }
+        let mutation = self.mutation_gate.clone().lock_owned().await;
+        let ticket = self.update(operation_id, WriteUrgency::Immediate, |entry| {
+            if operation_journal_status_is_terminal(entry.status) {
+                return Err(OperationJournalStoreError::AlreadyTerminal);
+            }
+            if entry.reconciliation_attempt.as_ref() != Some(terminal.attempt()) {
+                return Err(OperationJournalValidationError::ReconciliationTerminalMismatch.into());
+            }
+            entry.status = OperationStatus::Failed;
+            entry.completed_steps.push(failure_step);
+            entry.failure_point = Some(failure_point.into());
+            entry.outcome = Some(OperationOutcome::Failed);
+            entry.reconciliation_terminal = Some(terminal);
+            Ok(())
+        })?;
+        self.await_commit(ticket, mutation).await
+    }
+
+    pub(super) async fn record_guardian_repair_refusal(
+        &self,
+        operation_id: &OperationId,
+        skipped_step: OperationJournalStep,
+    ) -> Result<(), OperationJournalStoreError> {
+        if skipped_step.result != OperationStepResult::Skipped {
+            return Err(OperationJournalValidationError::ReconciliationTerminalMismatch.into());
+        }
+        let mutation = self.mutation_gate.clone().lock_owned().await;
+        let ticket = self.update(operation_id, WriteUrgency::Immediate, |entry| {
+            if operation_journal_status_is_terminal(entry.status) {
+                return Err(OperationJournalStoreError::AlreadyTerminal);
+            }
+            if entry.command != CommandKind::RepairInstance
+                || entry.owner != StabilizationSystem::Guardian
+            {
+                return Err(OperationJournalValidationError::ReconciliationTerminalMismatch.into());
+            }
+            entry.status = OperationStatus::Blocked;
+            entry.completed_steps.push(skipped_step);
+            entry.failure_point = None;
+            entry.outcome = Some(OperationOutcome::Blocked);
             Ok(())
         })?;
         self.await_commit(ticket, mutation).await
@@ -831,8 +894,12 @@ impl OperationJournalSnapshot {
         if self.entries.len() > DEFAULT_OPERATION_JOURNAL_LIMIT {
             return Err(OperationJournalLoadError::TooManyEntries);
         }
+        let mut operation_ids = BTreeSet::new();
         for entry in &self.entries {
             validate_entry(entry)?;
+            if !operation_ids.insert(entry.operation_id.as_str()) {
+                return Err(OperationJournalLoadError::DuplicateOperationId);
+            }
         }
         Ok(())
     }
@@ -844,6 +911,7 @@ pub enum OperationJournalLoadError {
     InvalidSchema,
     TooManyEntries,
     InvalidEntry(OperationJournalValidationError),
+    DuplicateOperationId,
 }
 
 impl From<serde_json::Error> for OperationJournalLoadError {
@@ -872,6 +940,8 @@ pub enum OperationJournalValidationError {
     TooManyCompletedSteps,
     TooManyFacts,
     TooManyDiagnoses,
+    InvalidReconciliationTerminal,
+    ReconciliationTerminalMismatch,
 }
 
 fn validate_entry(entry: &OperationJournalEntry) -> Result<(), OperationJournalValidationError> {
@@ -906,6 +976,95 @@ fn validate_entry(entry: &OperationJournalEntry) -> Result<(), OperationJournalV
     }
     if entry.guardian_diagnosis_ids.len() > MAX_OPERATION_JOURNAL_DIAGNOSES {
         return Err(OperationJournalValidationError::TooManyDiagnoses);
+    }
+    if let Some(attempt) = entry.reconciliation_attempt() {
+        validate_reconciliation_attempt(entry, attempt)?;
+    }
+    if let Some(terminal) = entry.reconciliation_terminal() {
+        terminal
+            .validate()
+            .map_err(|_| OperationJournalValidationError::InvalidReconciliationTerminal)?;
+        if entry.reconciliation_attempt() != Some(terminal.attempt()) {
+            return Err(OperationJournalValidationError::ReconciliationTerminalMismatch);
+        }
+        let completed_quarantine = entry.completed_steps.iter().any(|step| {
+            step.step_id == "quarantine_launcher_managed_target"
+                && step.result == OperationStepResult::Completed
+        });
+        if completed_quarantine != terminal.quarantined_target().is_some() {
+            return Err(OperationJournalValidationError::ReconciliationTerminalMismatch);
+        }
+        let expected = match terminal.outcome() {
+            ReconciliationTerminalOutcome::Succeeded => {
+                (OperationStatus::Succeeded, OperationOutcome::Succeeded)
+            }
+            ReconciliationTerminalOutcome::Failed => {
+                (OperationStatus::Failed, OperationOutcome::Failed)
+            }
+        };
+        if (entry.status, entry.outcome) != (expected.0, Some(expected.1)) {
+            return Err(OperationJournalValidationError::ReconciliationTerminalMismatch);
+        }
+        match terminal.outcome() {
+            ReconciliationTerminalOutcome::Succeeded
+                if entry.failure_point.is_some()
+                    || !entry.completed_steps.last().is_some_and(|step| {
+                        step.result == OperationStepResult::Completed
+                            && step.changed_target.as_ref() == Some(terminal.target())
+                    }) =>
+            {
+                return Err(OperationJournalValidationError::ReconciliationTerminalMismatch);
+            }
+            ReconciliationTerminalOutcome::Failed
+                if entry.failure_point.is_none()
+                    || !entry.completed_steps.last().is_some_and(|step| {
+                        step.result == OperationStepResult::Failed
+                            && step.changed_target.as_ref() == Some(terminal.target())
+                    }) =>
+            {
+                return Err(OperationJournalValidationError::ReconciliationTerminalMismatch);
+            }
+            _ => {}
+        }
+    } else if entry.command == CommandKind::RepairInstance
+        && entry.owner == StabilizationSystem::Guardian
+        && matches!(
+            entry.status,
+            OperationStatus::Succeeded | OperationStatus::Failed
+        )
+    {
+        return Err(OperationJournalValidationError::ReconciliationTerminalMismatch);
+    }
+    Ok(())
+}
+
+fn validate_reconciliation_attempt(
+    entry: &OperationJournalEntry,
+    attempt: &ReconciliationAttempt,
+) -> Result<(), OperationJournalValidationError> {
+    attempt
+        .validate()
+        .map_err(|_| OperationJournalValidationError::InvalidReconciliationTerminal)?;
+    if attempt.operation_id() != &entry.operation_id
+        || entry.command != CommandKind::RepairInstance
+        || entry.owner != StabilizationSystem::Guardian
+        || attempt.ownership() != entry.ownership
+        || !entry.targets.contains(attempt.target())
+        || !entry
+            .guardian_diagnosis_ids
+            .contains(&attempt.diagnosis_id())
+    {
+        return Err(OperationJournalValidationError::ReconciliationTerminalMismatch);
+    }
+    if let ReconciliationScope::RegisteredInstance { instance_id, .. } = attempt.scope()
+        && !entry.targets.iter().any(|target| {
+            target.system == StabilizationSystem::State
+                && target.kind == TargetKind::Instance
+                && target.id == *instance_id
+                && target.ownership == attempt.ownership()
+        })
+    {
+        return Err(OperationJournalValidationError::ReconciliationTerminalMismatch);
     }
     Ok(())
 }
@@ -1034,7 +1193,8 @@ fn prune_records(
     while records.len() > max_entries {
         let Some(key) = records.iter().find_map(|(key, entry)| {
             (protected_key != Some(key.as_str())
-                && operation_journal_status_is_terminal(entry.status))
+                && operation_journal_status_is_terminal(entry.status)
+                && !active_reconciliation_terminal(entry))
             .then(|| key.clone())
         }) else {
             return false;
@@ -1042,6 +1202,15 @@ fn prune_records(
         records.remove(&key);
     }
     true
+}
+
+fn active_reconciliation_terminal(entry: &OperationJournalEntry) -> bool {
+    entry
+        .reconciliation_terminal()
+        .and_then(|terminal| {
+            chrono::DateTime::parse_from_rfc3339(terminal.suppression_until()).ok()
+        })
+        .is_some_and(|until| until > chrono::Utc::now())
 }
 
 pub fn operation_journal_path(paths: &AppPaths) -> PathBuf {
@@ -1075,7 +1244,8 @@ mod tests {
     use crate::guardian::DiagnosisId;
     use crate::state::contracts::{
         CommandKind, JournalId, OperationId, OperationJournalEntry, OperationJournalStep,
-        OperationOutcome, OperationPhase, OperationStatus, OwnershipClass, RollbackState,
+        OperationOutcome, OperationPhase, OperationStatus, OwnershipClass, ReconciliationComponent,
+        ReconciliationRung, ReconciliationScope, ReconciliationTerminalOutcome, RollbackState,
         StabilizationSystem, TargetDescriptor, TargetKind,
     };
     use axial_config::AppPaths;
@@ -1088,9 +1258,9 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
     use tokio::sync::Notify;
 
-    const OPERATION_JOURNALS_V1_FIXTURE: &str = include_str!(concat!(
+    const OPERATION_JOURNALS_V2_FIXTURE: &str = include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/tests/fixtures/guardian/operation-journals-v1.json"
+        "/tests/fixtures/guardian/operation-journals-v2.json"
     ));
 
     struct RecordingFileBackend {
@@ -1468,6 +1638,8 @@ mod tests {
                 "rollback": "NotApplicable",
                 "guardian_diagnosis_ids": [],
                 "outcome": "Succeeded",
+                "reconciliation_attempt": null,
+                "reconciliation_terminal": null,
                 "unexpected": true
             }]
         });
@@ -1475,24 +1647,89 @@ mod tests {
     }
 
     #[test]
-    fn checked_in_operation_journals_v1_fixture_is_byte_stable() {
-        let snapshot = OperationJournalSnapshot::from_json(OPERATION_JOURNALS_V1_FIXTURE)
+    fn checked_in_operation_journals_v2_fixture_is_byte_stable() {
+        let snapshot = OperationJournalSnapshot::from_json(OPERATION_JOURNALS_V2_FIXTURE)
             .expect("strict fixture");
         assert_eq!(
             super::OPERATION_JOURNAL_SCHEMA,
-            "axial.state.operation_journals.v1"
+            "axial.state.operation_journals.v2"
         );
-        assert_eq!(snapshot.schema, "axial.state.operation_journals.v1");
+        assert_eq!(snapshot.schema, "axial.state.operation_journals.v2");
         let diagnosis_ids = snapshot
             .entries
             .iter()
+            .take(3)
             .flat_map(|entry| entry.guardian_diagnosis_ids.iter())
             .copied()
             .collect::<Vec<_>>();
         assert_eq!(diagnosis_ids.as_slice(), DiagnosisId::ALL.as_slice());
 
+        let attempts = snapshot
+            .entries
+            .iter()
+            .filter_map(OperationJournalEntry::reconciliation_attempt)
+            .collect::<Vec<_>>();
+        assert_eq!(attempts.len(), 3, "fixture must exercise typed attempts");
+        assert_eq!(
+            attempts
+                .iter()
+                .map(|attempt| attempt.rung())
+                .collect::<Vec<_>>(),
+            vec![
+                ReconciliationRung::RepairArtifact,
+                ReconciliationRung::RebuildComponent,
+                ReconciliationRung::RematerializeInstance,
+            ]
+        );
+        assert_eq!(
+            attempts
+                .iter()
+                .map(|attempt| attempt.component())
+                .collect::<Vec<_>>(),
+            vec![
+                ReconciliationComponent::Libraries,
+                ReconciliationComponent::Runtime,
+                ReconciliationComponent::WholeInstance,
+            ]
+        );
+        assert!(matches!(
+            attempts[0].scope(),
+            ReconciliationScope::InstallOperation
+        ));
+        let ReconciliationScope::RegisteredInstance {
+            instance_id,
+            fingerprint,
+        } = attempts[1].scope()
+        else {
+            panic!("fixture must exercise registered-instance scope");
+        };
+        assert_eq!(instance_id, "0123456789abcdef");
+        assert_eq!(
+            fingerprint.as_str(),
+            "sha256.aaaaaaaa.bbbbbbbb.cccccccc.dddddddd.eeeeeeee.ffffffff.01234567.89abcdef"
+        );
+
+        let terminals = snapshot
+            .entries
+            .iter()
+            .filter_map(OperationJournalEntry::reconciliation_terminal)
+            .collect::<Vec<_>>();
+        assert_eq!(terminals.len(), 2, "fixture must exercise typed terminals");
+        assert_eq!(
+            terminals
+                .iter()
+                .map(|terminal| terminal.outcome())
+                .collect::<Vec<_>>(),
+            vec![
+                ReconciliationTerminalOutcome::Failed,
+                ReconciliationTerminalOutcome::Succeeded,
+            ]
+        );
+        assert!(terminals[0].quarantined_target().is_none());
+        assert!(terminals[1].quarantined_target().is_some());
+
         let mut unknown_snapshot =
-            serde_json::from_str::<serde_json::Value>(OPERATION_JOURNALS_V1_FIXTURE)
+            serde_json::from_str::<serde_json::Value>(OPERATION_JOURNALS_V2_FIXTURE)
                 .expect("fixture value");
         unknown_snapshot["entries"][0]["guardian_diagnosis_ids"][0] =
             serde_json::Value::String("future_diagnosis".to_string());
@@ -1502,7 +1739,7 @@ mod tests {
         assert!(!error.contains("future_diagnosis"));
 
         let pretty = serde_json::to_string_pretty(&snapshot).expect("pretty fixture json");
-        assert_eq!(format!("{pretty}\n"), OPERATION_JOURNALS_V1_FIXTURE);
+        assert_eq!(format!("{pretty}\n"), OPERATION_JOURNALS_V2_FIXTURE);
 
         let compact = snapshot.to_json().expect("compact fixture json");
         let decoded =
@@ -1564,7 +1801,8 @@ mod tests {
     async fn journal_store_persists_snapshot_for_restart_replay() {
         let root = test_root("persisted-journal");
         let paths = test_paths(&root);
-        let store = OperationJournalStore::load_from_paths(&paths);
+        let store = OperationJournalStore::try_load_from_paths(&paths)
+            .expect("load operation journal persistence");
         let operation_id = OperationId::new("install-operation-restart-replay");
         let mut entry = test_entry(operation_id.as_str());
         entry.operation_id = operation_id.clone();
@@ -1594,7 +1832,8 @@ mod tests {
 
         store.close().await.expect("close journal store");
         drop(store);
-        let reloaded = OperationJournalStore::load_from_paths(&paths);
+        let reloaded = OperationJournalStore::try_load_from_paths(&paths)
+            .expect("reload operation journal persistence");
         let loaded = reloaded.get(&operation_id).expect("reloaded journal");
         assert_eq!(loaded.operation_id, operation_id);
         assert_eq!(loaded.status, OperationStatus::Succeeded);

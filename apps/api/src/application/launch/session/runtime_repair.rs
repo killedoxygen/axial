@@ -6,11 +6,9 @@ use crate::execution::runtime::{
 };
 use crate::guardian::{
     GuardianPreflightOutcomeRequest, GuardianRepairStatus, GuardianRuntimeRepairCopy,
-    RepairAuthorizationContext, authorize_managed_runtime_ready_marker_repair,
-    execute_managed_runtime_ready_marker_repair, guardian_fact_from_execution,
-    guardian_preflight_outcome,
+    authorize_managed_runtime_ready_marker_repair, execute_managed_runtime_ready_marker_repair,
+    guardian_fact_from_execution, guardian_preflight_outcome,
 };
-use crate::logging::timestamp_utc;
 use crate::observability::telemetry::{
     TelemetryErrorArea, TelemetryErrorKind, TelemetryErrorLevel, TelemetryEvent,
 };
@@ -112,13 +110,17 @@ pub(super) async fn maybe_repair_managed_runtime_before_launch_owned(
         api_guardian_mode(preflight.guardian.mode),
         &guardian_facts,
     ));
-    let Ok(repair_authorization) = authorize_managed_runtime_ready_marker_repair(
-        &repair_outcome.guardian_decision,
-        RepairAuthorizationContext::current_operation(),
-    ) else {
+    let Ok(repair_authorization) =
+        authorize_managed_runtime_ready_marker_repair(&repair_outcome.guardian_decision)
+    else {
         return Ok(preflight);
     };
 
+    let Ok(reconciliation_authority) =
+        state.registered_reconciliation_authority(launch.instance_lifecycle)
+    else {
+        return Ok(preflight);
+    };
     let state_task = state.clone();
     let runtime_root_path = candidate.runtime_root.clone();
     let java_executable = candidate.java_executable.clone();
@@ -137,15 +139,11 @@ pub(super) async fn maybe_repair_managed_runtime_before_launch_owned(
             &java_executable,
         ) {
             Ok(runtime_root) => {
-                let observed_at = timestamp_utc();
                 execute_managed_runtime_ready_marker_repair(
                     repair_authorization,
                     operation_id,
+                    reconciliation_authority,
                     runtime_root,
-                    state_task.journals().as_ref(),
-                    state_task.failure_memory().as_ref(),
-                    observed_at.as_str(),
-                    None,
                     Some(abandoned.as_ref()),
                     Some(ready_tx),
                     Some(terminal_failure_task.as_ref()),
@@ -241,9 +239,7 @@ pub(super) async fn maybe_repair_managed_runtime_before_launch_owned(
             repaired.guardian_summary = repair_copy.guardian_summary(&repaired.guardian_summary);
             Ok(repaired)
         }
-        GuardianRepairStatus::Blocked
-        | GuardianRepairStatus::Failed
-        | GuardianRepairStatus::Suppressed => {
+        GuardianRepairStatus::Blocked | GuardianRepairStatus::Failed => {
             preflight.guardian_summary = repair_copy.guardian_summary(&preflight.guardian_summary);
             preflight.guardian_admission = repair_copy
                 .blocked_admission(&preflight.guardian_outcome)

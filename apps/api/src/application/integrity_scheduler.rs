@@ -1547,7 +1547,7 @@ mod tests {
 
         set_scheduler_config(&state, false, "managed");
         transactions.inner.terminal_gate.release();
-        wait_for_terminal_count(&state, 1).await;
+        transactions.wait_for_event("terminal_persisted").await;
         assert_eq!(
             terminal_integrity_journals(&state)[0].status,
             OperationStatus::Cancelled

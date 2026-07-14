@@ -23,6 +23,7 @@ mod performance_managed;
 pub mod performance_operations;
 mod performance_rules;
 pub mod presence;
+mod reconciliation;
 mod remote_flags;
 mod sessions;
 mod shutdown;
@@ -97,6 +98,14 @@ pub(crate) use performance_managed::{
     ManagedInstanceAdmissionError,
 };
 pub use performance_rules::AppPerformanceStore;
+pub(crate) use reconciliation::{
+    ReconciliationAttemptReservation, RegisteredReconciliationAuthority,
+    commit_reconciliation_memory, install_operation_reconciliation_attempt,
+    reconciliation_attempt_key, reconciliation_instance_target, reconciliation_journal_attempt,
+    reconciliation_memory_entry, reconciliation_terminal, record_guardian_repair_refusal,
+    record_reconciliation_journal_failure, record_reconciliation_journal_success,
+    reserve_reconciliation_attempt, settle_reconciliation_memory,
+};
 pub(crate) use remote_flags::{
     RemoteFlagRefreshOutcome, RemoteFlagStore, ResolvedFlagSource, resolve_flag,
 };
@@ -163,6 +172,7 @@ struct KnownGoodCandidateAdmission {
 
 pub(crate) struct InstanceLifecycleLease {
     instance_id: String,
+    owner: instance_lifecycle::InstanceLifecycleGates,
     _guard: Arc<tokio::sync::OwnedMutexGuard<()>>,
 }
 
@@ -201,9 +211,14 @@ impl ManagedLibrarySetupTarget {
 }
 
 impl InstanceLifecycleLease {
-    fn bind(instance_id: &str, guard: tokio::sync::OwnedMutexGuard<()>) -> Self {
+    fn bind(
+        instance_id: &str,
+        owner: instance_lifecycle::InstanceLifecycleGates,
+        guard: tokio::sync::OwnedMutexGuard<()>,
+    ) -> Self {
         Self {
             instance_id: instance_id.to_string(),
+            owner,
             _guard: Arc::new(guard),
         }
     }
@@ -212,9 +227,10 @@ impl InstanceLifecycleLease {
         self.instance_id == instance_id
     }
 
-    fn retained(&self) -> Self {
+    pub(crate) fn retained(&self) -> Self {
         Self {
             instance_id: self.instance_id.clone(),
+            owner: self.owner.clone(),
             _guard: self._guard.clone(),
         }
     }
@@ -348,6 +364,7 @@ impl AppState {
         if state.known_good.retry_retirements().await.is_err() {
             tracing::warn!("known-good restart cleanup remains pending");
         }
+        state.reconcile_reconciliation_startup().await?;
         Ok(state)
     }
 
@@ -380,6 +397,17 @@ impl AppState {
     ) -> Self {
         self.journals = journals;
         self.performance_operations = performance_operations;
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_reconciliation_stores(
+        mut self,
+        journals: Arc<OperationJournalStore>,
+        failure_memory: Arc<GuardianFailureMemoryStore>,
+    ) -> Self {
+        self.journals = journals;
+        self.failure_memory = failure_memory;
         self
     }
 
@@ -446,8 +474,16 @@ impl AppState {
         );
         let skins = Arc::new(skins::SavedSkinStore::load_from_paths(config.paths()));
         let accounts = Arc::new(LauncherAccountStore::load_from_paths(config.paths()));
-        let failure_memory = Arc::new(GuardianFailureMemoryStore::load_from_paths(config.paths()));
-        let journals = Arc::new(OperationJournalStore::load_from_paths(config.paths()));
+        let failure_memory = Arc::new(
+            GuardianFailureMemoryStore::try_load_from_paths(config.paths()).map_err(|error| {
+                std::io::Error::other(format!("failed to load Guardian failure memory: {error}"))
+            })?,
+        );
+        let journals = Arc::new(
+            OperationJournalStore::try_load_from_paths(config.paths()).map_err(|error| {
+                std::io::Error::other(format!("failed to load operation journals: {error}"))
+            })?,
+        );
         let known_good = Arc::new(known_good::KnownGoodInventoryStore::claim(config.paths())?);
         if instance_registry_authoritative {
             known_good.discover_absent_snapshot_obligations(
@@ -1153,6 +1189,7 @@ impl AppState {
     async fn acquire_instance_lifecycle(&self, instance_id: &str) -> InstanceLifecycleLease {
         InstanceLifecycleLease::bind(
             instance_id,
+            self.instance_lifecycle_gates.clone(),
             self.instance_lifecycle_gates.acquire(instance_id).await,
         )
     }
@@ -1164,6 +1201,7 @@ impl AppState {
     ) -> InstanceLifecycleLease {
         InstanceLifecycleLease::bind(
             instance_id,
+            self.instance_lifecycle_gates.clone(),
             self.instance_lifecycle_gates.acquire(instance_id).await,
         )
     }
@@ -1181,6 +1219,9 @@ impl AppState {
     ) -> Result<KnownGoodVerificationLease, KnownGoodVerificationUnavailable> {
         self.validate_integrity_foreground(foreground)
             .map_err(|_| KnownGoodVerificationUnavailable::LiveAuthorityUnavailable)?;
+        if !self.instance_lifecycle_gates.owns(&lifecycle.owner) {
+            return Err(KnownGoodVerificationUnavailable::LiveAuthorityUnavailable);
+        }
         let instance = self
             .instances
             .get(&lifecycle.instance_id)

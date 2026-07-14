@@ -1814,9 +1814,9 @@ async fn install_status_reconstructs_restart_loaded_journal_and_guardian_repair(
                 ),
                 diagnosis_id: DiagnosisId::LauncherManagedArtifactCorrupt,
                 action: GuardianActionKind::Repair,
-                status: GuardianArtifactRepairStatus::Suppressed,
+                status: GuardianArtifactRepairStatus::Failed,
                 facts: vec!["https://example.invalid/client.jar?token=secret".to_string()],
-                summary: "guardian_artifact_repair_suppressed".to_string(),
+                summary: "guardian_artifact_repair_failed".to_string(),
             },
         )
         .await
@@ -1837,12 +1837,12 @@ async fn install_status_reconstructs_restart_loaded_journal_and_guardian_repair(
         Some(INSTALL_FAILURE_MESSAGE)
     );
     let repair = response.guardian_repair.as_ref().expect("guardian repair");
-    assert_eq!(repair.status, "suppressed");
+    assert_eq!(repair.status, "failed");
     assert_eq!(
         repair.repair_operation_id.as_str(),
         "guardian-artifact-repair:123e4567-e89b-12d3-a456-426614174001"
     );
-    assert!(repair.label.contains("paused automatic install repair"));
+    assert!(repair.label.contains("could not repair"));
     let proof = response.proof.as_ref().expect("operation proof");
     assert_eq!(proof.operation_id, operation_id);
     assert_eq!(proof.command, CommandKind::InstallVersion);
@@ -1858,7 +1858,7 @@ async fn install_status_reconstructs_restart_loaded_journal_and_guardian_repair(
             .contains(&DiagnosisId::LauncherManagedArtifactCorrupt)
     );
     assert!(proof.fields.iter().any(|field| {
-        field.key == "generated_fact" && field.value == "guardian_repair_status:suppressed"
+        field.key == "generated_fact" && field.value == "guardian_repair_status:failed"
     }));
     assert_no_public_raw_fragments(&serde_json::to_string(&response).expect("status json"));
 
@@ -4753,9 +4753,9 @@ async fn install_journal_records_guardian_repair_summary_without_raw_details() {
             ),
             diagnosis_id: DiagnosisId::LauncherManagedArtifactCorrupt,
             action: GuardianActionKind::Repair,
-            status: GuardianArtifactRepairStatus::Suppressed,
+            status: GuardianArtifactRepairStatus::Failed,
             facts: vec!["https://example.invalid/artifact.jar?token=secret".to_string()],
-            summary: "guardian_artifact_repair_suppressed".to_string(),
+            summary: "guardian_artifact_repair_failed".to_string(),
         },
     )
     .await
@@ -4763,7 +4763,7 @@ async fn install_journal_records_guardian_repair_summary_without_raw_details() {
 
     let entry = journals.get(&operation_id).expect("journal");
     let summary = install_guardian_repair_summary_from_journal(&entry).expect("repair summary");
-    assert_eq!(summary.status, "suppressed");
+    assert_eq!(summary.status, "failed");
     assert_eq!(
         summary.repair_operation_id.as_str(),
         "guardian-artifact-repair:123e4567-e89b-12d3-a456-426614174000"
@@ -4772,7 +4772,7 @@ async fn install_journal_records_guardian_repair_summary_without_raw_details() {
         summary.diagnosis_id,
         DiagnosisId::LauncherManagedArtifactCorrupt
     );
-    assert!(summary.label.contains("paused automatic install repair"));
+    assert!(summary.label.contains("could not repair"));
     assert_no_sensitive_fragments(&serde_json::to_string(&entry).expect("journal json"));
     assert_no_sensitive_fragments(&serde_json::to_string(&summary).expect("summary json"));
 }

@@ -4519,6 +4519,7 @@
       "phases": [],
       "actions": [
         "Repair",
+        "AskUser",
         "Block"
       ],
       "memory_feedback": false
@@ -4880,6 +4881,7 @@
       "actions": [
         "Quarantine",
         "Repair",
+        "AskUser",
         "Block"
       ],
       "memory_feedback": false

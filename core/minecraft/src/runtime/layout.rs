@@ -39,6 +39,10 @@ impl ManagedRuntimeCache {
         &self.inner.root
     }
 
+    pub fn shares_identity_with(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
+
     #[cfg(any(test, feature = "test-support"))]
     pub fn isolated_for_test() -> std::io::Result<Self> {
         let test_root = tempfile::Builder::new()

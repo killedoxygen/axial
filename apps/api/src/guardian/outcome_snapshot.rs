@@ -14,16 +14,14 @@ const SNAPSHOT_FIXTURE: &str = include_str!(concat!(
     "/tests/fixtures/guardian/guardian-outcome-copy-v1.json"
 ));
 const REGENERATE_ENV: &str = "AXIAL_REGENERATE_GUARDIAN_OUTCOME_COPY_SNAPSHOT";
-const EXPECTED_CASE_COUNT: usize = 29;
+const EXPECTED_CASE_COUNT: usize = 27;
 const EXPECTED_CASE_IDS: [&str; EXPECTED_CASE_COUNT] = [
     "runtime_repair.repaired",
     "runtime_repair.blocked",
     "runtime_repair.failed",
-    "runtime_repair.suppressed",
     "install_artifact_repair.repaired",
     "install_artifact_repair.blocked",
     "install_artifact_repair.failed",
-    "install_artifact_repair.suppressed",
     "install_failure.download_retry",
     "install_failure.download_block",
     "install_failure.metadata_invalid",
@@ -331,7 +329,6 @@ fn repair_status_id(status: GuardianRepairStatus) -> &'static str {
         GuardianRepairStatus::Repaired => "repaired",
         GuardianRepairStatus::Blocked => "blocked",
         GuardianRepairStatus::Failed => "failed",
-        GuardianRepairStatus::Suppressed => "suppressed",
     }
 }
 
@@ -367,7 +364,7 @@ fn assert_snapshot_coverage(snapshot: &GuardianOutcomeCopySnapshot) {
         };
         axis_counts[axis] += 1;
     }
-    assert_eq!(axis_counts, [4, 4, 10, 4, 6, 1]);
+    assert_eq!(axis_counts, [3, 3, 10, 4, 6, 1]);
 }
 
 fn canonical_case_id(input: &GuardianOutcomeCopyInput) -> String {
