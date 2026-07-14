@@ -387,6 +387,16 @@ struct ComponentEntryRecoveryShape {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ComponentRecoveryEntryState {
+    Exact,
+    StagedNew,
+    CommittedNew,
+    StagedReplacement,
+    QuarantinedReplacement,
+    CommittedReplacement,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ComponentRecoveryDecision {
     Commit,
     Rollback,
@@ -420,15 +430,15 @@ impl ComponentRecoveryPlanner {
         &mut self,
         row: &ComponentTableRow,
         observation: ComponentRecoveryObservation,
-    ) -> Result<(), ComponentRecoveryAmbiguous> {
+    ) -> Result<ComponentRecoveryEntryState, ComponentRecoveryAmbiguous> {
         if self.observed_rows >= self.expected_rows {
             return Err(ComponentRecoveryAmbiguous);
         }
-        let shape = classify_component_recovery_shape(row, observation)?;
+        let (state, shape) = classify_component_recovery_shape(row, observation)?;
         self.all_commit_candidates &= shape.commit_candidate;
         self.all_rollback_reachable &= shape.rollback_reachable;
         self.observed_rows += 1;
-        Ok(())
+        Ok(state)
     }
 
     pub(crate) fn finish(self) -> Result<ComponentRecoveryDecision, ComponentRecoveryAmbiguous> {
@@ -443,12 +453,28 @@ impl ComponentRecoveryPlanner {
             Err(ComponentRecoveryAmbiguous)
         }
     }
+
+    pub(crate) fn prove(
+        self,
+        expected: ComponentRecoveryDecision,
+    ) -> Result<(), ComponentRecoveryAmbiguous> {
+        if self.observed_rows != self.expected_rows
+            || match expected {
+                ComponentRecoveryDecision::Commit => !self.all_commit_candidates,
+                ComponentRecoveryDecision::Rollback => !self.all_rollback_reachable,
+            }
+        {
+            return Err(ComponentRecoveryAmbiguous);
+        }
+        Ok(())
+    }
 }
 
 fn classify_component_recovery_shape(
     row: &ComponentTableRow,
     observation: ComponentRecoveryObservation,
-) -> Result<ComponentEntryRecoveryShape, ComponentRecoveryAmbiguous> {
+) -> Result<(ComponentRecoveryEntryState, ComponentEntryRecoveryShape), ComponentRecoveryAmbiguous>
+{
     use ComponentObservedCanonical::{Absent, Other, Prior, Source};
 
     if observation.canonical == Other {
@@ -459,10 +485,13 @@ fn classify_component_recovery_shape(
             && !observation.stage_present
             && !observation.quarantine_present;
         return exact
-            .then_some(ComponentEntryRecoveryShape {
-                commit_candidate: true,
-                rollback_reachable: true,
-            })
+            .then_some((
+                ComponentRecoveryEntryState::Exact,
+                ComponentEntryRecoveryShape {
+                    commit_candidate: true,
+                    rollback_reachable: true,
+                },
+            ))
             .ok_or(ComponentRecoveryAmbiguous);
     }
     match &row.prior {
@@ -471,14 +500,20 @@ fn classify_component_recovery_shape(
                 return Err(ComponentRecoveryAmbiguous);
             }
             match (observation.canonical, observation.stage_present) {
-                (Source, false) => Ok(ComponentEntryRecoveryShape {
-                    commit_candidate: true,
-                    rollback_reachable: true,
-                }),
-                (Absent, true) => Ok(ComponentEntryRecoveryShape {
-                    commit_candidate: false,
-                    rollback_reachable: true,
-                }),
+                (Source, false) => Ok((
+                    ComponentRecoveryEntryState::CommittedNew,
+                    ComponentEntryRecoveryShape {
+                        commit_candidate: true,
+                        rollback_reachable: true,
+                    },
+                )),
+                (Absent, true) => Ok((
+                    ComponentRecoveryEntryState::StagedNew,
+                    ComponentEntryRecoveryShape {
+                        commit_candidate: false,
+                        rollback_reachable: true,
+                    },
+                )),
                 _ => Err(ComponentRecoveryAmbiguous),
             }
         }
@@ -487,14 +522,27 @@ fn classify_component_recovery_shape(
             observation.stage_present,
             observation.quarantine_present,
         ) {
-            (Source, false, true) => Ok(ComponentEntryRecoveryShape {
-                commit_candidate: true,
-                rollback_reachable: true,
-            }),
-            (Absent, true, true) | (Prior, true, false) => Ok(ComponentEntryRecoveryShape {
-                commit_candidate: false,
-                rollback_reachable: true,
-            }),
+            (Source, false, true) => Ok((
+                ComponentRecoveryEntryState::CommittedReplacement,
+                ComponentEntryRecoveryShape {
+                    commit_candidate: true,
+                    rollback_reachable: true,
+                },
+            )),
+            (Absent, true, true) => Ok((
+                ComponentRecoveryEntryState::QuarantinedReplacement,
+                ComponentEntryRecoveryShape {
+                    commit_candidate: false,
+                    rollback_reachable: true,
+                },
+            )),
+            (Prior, true, false) => Ok((
+                ComponentRecoveryEntryState::StagedReplacement,
+                ComponentEntryRecoveryShape {
+                    commit_candidate: false,
+                    rollback_reachable: true,
+                },
+            )),
             _ => Err(ComponentRecoveryAmbiguous),
         },
     }
@@ -844,7 +892,7 @@ mod tests {
                     };
                     assert_eq!(
                         result
-                            .map(|shape| (shape.commit_candidate, shape.rollback_reachable))
+                            .map(|(_, shape)| (shape.commit_candidate, shape.rollback_reachable))
                             .ok(),
                         expected,
                         "{canonical:?}/{stage}/{quarantine}",
@@ -877,7 +925,7 @@ mod tests {
                             .then_some((true, true));
                     assert_eq!(
                         result
-                            .map(|shape| (shape.commit_candidate, shape.rollback_reachable))
+                            .map(|(_, shape)| (shape.commit_candidate, shape.rollback_reachable))
                             .ok(),
                         expected,
                         "{canonical:?}/{stage}/{quarantine}",
@@ -913,7 +961,7 @@ mod tests {
                     };
                     assert_eq!(
                         result
-                            .map(|shape| (shape.commit_candidate, shape.rollback_reachable))
+                            .map(|(_, shape)| (shape.commit_candidate, shape.rollback_reachable))
                             .ok(),
                         expected,
                         "{canonical:?}/{stage}/{quarantine}",

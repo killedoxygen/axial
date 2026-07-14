@@ -1,6 +1,7 @@
 use crate::artifact_path::ArtifactRelativePath;
 use crate::known_good::{MAX_TIER2_AGGREGATE_BYTES, MAX_TIER2_ARTIFACT_BYTES, MAX_TIER2_ENTRIES};
 use crate::loaders::types::LoaderError;
+use crate::managed_component_ancestor_journal::COMPONENT_ANCESTOR_RECORDS_PER_SHARD;
 use crate::managed_component_publication::{
     COMPONENT_INTENT_FILE, COMPONENT_QUARANTINE_DIRECTORY, COMPONENT_STAGING_DIRECTORY,
     COMPONENT_TABLE_DIRECTORY, component_lane_name,
@@ -9,7 +10,7 @@ use crate::managed_component_spool::{ComponentTableReplay, ComponentTableSpoolEr
 use crate::managed_component_table::{
     ComponentIntentManifest, ComponentTableError, ComponentTableParser, ComponentTableRow,
     ComponentTableSummary, MAX_COMPONENT_INTENT_BYTES, MAX_COMPONENT_TABLE_SHARD_BYTES,
-    MAX_COMPONENT_TABLE_SHARDS, ManagedComponentKind, component_table_path,
+    MAX_COMPONENT_TABLE_SHARDS, MAX_CREATED_ANCESTORS, ManagedComponentKind, component_table_path,
     decode_component_table_shard, encode_component_intent_manifest,
 };
 use crate::managed_fs::{
@@ -20,10 +21,23 @@ use crate::managed_publication::{ManagedPublicationError, ManagedRootPublication
 use sha2::{Digest as _, Sha256};
 use std::collections::BTreeSet;
 
+mod managed_component_transaction;
+
+pub(crate) use managed_component_transaction::{
+    ComponentCommitReceipt, ComponentExecutionResult, ComponentRecoveryRequired,
+    ComponentRollbackReceipt, execute_component_intent,
+};
+
 #[cfg(test)]
 use crate::managed_fs::ManagedCreateOnlyWriteFault;
 
-const MAX_COMPONENT_LANE_ENTRIES: usize = 6;
+const MAX_COMPONENT_LANE_ENTRIES: usize = 7;
+const COMPONENT_ANCESTORS_DIRECTORY: &str = "ancestors";
+const COMPONENT_ANCESTOR_RECORDS_DIRECTORY: &str = "records";
+const COMPONENT_ANCESTOR_STAGING_DIRECTORY: &str = "staging";
+const COMPONENT_ANCESTOR_RECORD_FILE_SUFFIX: &str = ".anc";
+const MAX_COMPONENT_ANCESTOR_SHARDS: usize =
+    MAX_CREATED_ANCESTORS.div_ceil(COMPONENT_ANCESTOR_RECORDS_PER_SHARD);
 const COMPONENT_BUCKET_PARK_A: &str = "bucket-park-a";
 const COMPONENT_BUCKET_PARK_B: &str = "bucket-park-b";
 
@@ -47,11 +61,9 @@ pub(crate) struct ComponentLane {
     table: ManagedDir,
     staging: ManagedDir,
     quarantine: ManagedDir,
-}
-
-pub(crate) struct ComponentDurableTable {
-    summary: ComponentTableSummary,
-    shard_count: usize,
+    ancestors: ManagedDir,
+    ancestor_records: ManagedDir,
+    ancestor_staging: ManagedDir,
 }
 
 pub(crate) struct ComponentShardBuckets {
@@ -69,7 +81,10 @@ pub(crate) struct ComponentIntentCandidate {
 }
 
 pub(crate) struct ComponentIntentPublished {
-    candidate: ComponentIntentCandidate,
+    lane: ComponentLane,
+    lease: ManagedRootPublicationLease,
+    manifest: ComponentIntentManifest,
+    encoded_intent: Vec<u8>,
     intent_guard: ManagedFileGuard,
 }
 
@@ -104,6 +119,9 @@ struct ComponentPreintentAuthority {
     table: ManagedDirectoryIdentity,
     staging: ManagedDirectoryIdentity,
     quarantine: ManagedDirectoryIdentity,
+    ancestors: ManagedDirectoryIdentity,
+    ancestor_records: ManagedDirectoryIdentity,
+    ancestor_staging: ManagedDirectoryIdentity,
     shards: Vec<ComponentPreintentShardAuthority>,
 }
 
@@ -127,6 +145,14 @@ struct ComponentPreintentCleanupPlan {
     table: Option<ComponentTableCleanupPlan>,
     staging: Option<ComponentBucketCleanupPlan>,
     quarantine: Option<ComponentBucketCleanupPlan>,
+    ancestors: Option<ComponentAncestorsCleanupPlan>,
+}
+
+struct ComponentAncestorsCleanupPlan {
+    ancestors: ManagedDir,
+    ancestors_identity: ManagedDirectoryIdentity,
+    records: Option<(ManagedDir, ManagedDirectoryIdentity)>,
+    staging: Option<(ManagedDir, ManagedDirectoryIdentity)>,
 }
 
 struct ComponentLaneEntryPlan {
@@ -224,15 +250,30 @@ impl ComponentLane {
         let table = open_or_create_exact_child(&lane, COMPONENT_TABLE_DIRECTORY)?;
         let staging = open_or_create_exact_child(&lane, COMPONENT_STAGING_DIRECTORY)?;
         let quarantine = open_or_create_exact_child(&lane, COMPONENT_QUARANTINE_DIRECTORY)?;
+        let ancestors = open_or_create_exact_child(&lane, COMPONENT_ANCESTORS_DIRECTORY)?;
+        let ancestor_records =
+            open_or_create_exact_child(&ancestors, COMPONENT_ANCESTOR_RECORDS_DIRECTORY)?;
+        let ancestor_staging =
+            open_or_create_exact_child(&ancestors, COMPONENT_ANCESTOR_STAGING_DIRECTORY)?;
         if !exact_entry_names(&table, 1)?.is_empty()
             || !exact_entry_names(&staging, 1)?.is_empty()
             || !exact_entry_names(&quarantine, 1)?.is_empty()
+            || exact_entry_names(&ancestors, 3)?
+                != BTreeSet::from([
+                    COMPONENT_ANCESTOR_RECORDS_DIRECTORY.to_string(),
+                    COMPONENT_ANCESTOR_STAGING_DIRECTORY.to_string(),
+                ])
+            || !exact_entry_names(&ancestor_records, 1)?.is_empty()
+            || !exact_entry_names(&ancestor_staging, 1)?.is_empty()
         {
             return Err(ComponentEffectsError::Topology);
         }
         table.sync()?;
         staging.sync()?;
         quarantine.sync()?;
+        ancestor_records.sync()?;
+        ancestor_staging.sync()?;
+        ancestors.sync()?;
         lane.sync()?;
         publication.sync()?;
         lease.root().sync()?;
@@ -244,6 +285,9 @@ impl ComponentLane {
             table,
             staging,
             quarantine,
+            ancestors,
+            ancestor_records,
+            ancestor_staging,
         })
     }
 
@@ -283,7 +327,7 @@ impl ComponentLane {
         &self,
         mut replay: ComponentTableReplay,
         manifest: &ComponentIntentManifest,
-    ) -> Result<ComponentDurableTable, ComponentEffectsError> {
+    ) -> Result<ComponentTableSummary, ComponentEffectsError> {
         if manifest.component != self.component || !exact_entry_names(&self.table, 1)?.is_empty() {
             return Err(ComponentEffectsError::Topology);
         }
@@ -325,10 +369,7 @@ impl ComponentLane {
             return Err(ComponentEffectsError::Topology);
         }
         self.lane.sync()?;
-        Ok(ComponentDurableTable {
-            summary: parser.finish()?,
-            shard_count: next_shard,
-        })
+        parser.finish().map_err(Into::into)
     }
 
     pub(crate) fn into_intent_candidate(
@@ -368,25 +409,7 @@ impl ComponentShardBuckets {
     }
 }
 
-impl ComponentDurableTable {
-    pub(crate) fn summary(&self) -> &ComponentTableSummary {
-        &self.summary
-    }
-
-    pub(crate) fn shard_count(&self) -> usize {
-        self.shard_count
-    }
-}
-
 impl ComponentIntentCandidate {
-    pub(crate) fn manifest(&self) -> &ComponentIntentManifest {
-        &self.manifest
-    }
-
-    pub(crate) fn summary(&self) -> &ComponentTableSummary {
-        &self.summary
-    }
-
     pub(crate) fn publish_intent(
         self,
     ) -> Result<ComponentIntentPublished, ComponentIntentPublishFailure> {
@@ -408,7 +431,7 @@ impl ComponentIntentCandidate {
         self,
         #[cfg(test)] fault: Option<ComponentIntentPublishFault>,
     ) -> Result<ComponentIntentPublished, ComponentIntentPublishFailure> {
-        let (summary, authority) =
+        let (current_summary, current_authority) =
             match admit_component_preintent(&self.lane, &self.lease, &self.manifest) {
                 Ok(admitted) => admitted,
                 Err(cause) => {
@@ -418,7 +441,7 @@ impl ComponentIntentCandidate {
                     });
                 }
             };
-        if summary != self.summary || authority != self.authority {
+        if current_summary != self.summary || current_authority != self.authority {
             return Err(ComponentIntentPublishFailure::BeforePromotion {
                 candidate: Box::new(self),
                 cause: ComponentEffectsError::Topology,
@@ -478,24 +501,23 @@ impl ComponentIntentCandidate {
                 cause,
             });
         }
+        drop((current_summary, current_authority));
+        let Self {
+            lane,
+            lease,
+            manifest,
+            encoded_intent,
+            summary,
+            authority,
+        } = self;
+        drop((summary, authority));
         Ok(ComponentIntentPublished {
-            candidate: self,
+            lane,
+            lease,
+            manifest,
+            encoded_intent,
             intent_guard,
         })
-    }
-}
-
-impl ComponentIntentPublished {
-    pub(crate) fn candidate(&self) -> &ComponentIntentCandidate {
-        &self.candidate
-    }
-
-    pub(crate) fn intent_guard(&self) -> &ManagedFileGuard {
-        &self.intent_guard
-    }
-
-    pub(crate) fn into_parts(self) -> (ComponentIntentCandidate, ManagedFileGuard) {
-        (self.candidate, self.intent_guard)
     }
 }
 
@@ -684,6 +706,7 @@ fn admit_component_preintent(
         return Err(ComponentEffectsError::Topology);
     }
     let expected_lane = BTreeSet::from([
+        COMPONENT_ANCESTORS_DIRECTORY.to_string(),
         COMPONENT_QUARANTINE_DIRECTORY.to_string(),
         COMPONENT_STAGING_DIRECTORY.to_string(),
         COMPONENT_TABLE_DIRECTORY.to_string(),
@@ -691,6 +714,7 @@ fn admit_component_preintent(
     if exact_entry_names(&lane.lane, MAX_COMPONENT_LANE_ENTRIES + 1)? != expected_lane {
         return Err(ComponentEffectsError::Topology);
     }
+    validate_empty_ancestor_topology(lane)?;
     validate_indexed_names(
         &lane.table,
         manifest.shards.len(),
@@ -778,6 +802,9 @@ fn admit_component_preintent(
     lane.table.sync()?;
     lane.staging.sync()?;
     lane.quarantine.sync()?;
+    lane.ancestor_records.sync()?;
+    lane.ancestor_staging.sync()?;
+    lane.ancestors.sync()?;
     lane.lane.sync()?;
     lease.publication_directory().sync()?;
     lease.root().sync()?;
@@ -794,6 +821,9 @@ fn admit_component_preintent(
             table: lane.table.identity()?,
             staging: lane.staging.identity()?,
             quarantine: lane.quarantine.identity()?,
+            ancestors: lane.ancestors.identity()?,
+            ancestor_records: lane.ancestor_records.identity()?,
+            ancestor_staging: lane.ancestor_staging.identity()?,
             shards: shard_authority,
         },
     ))
@@ -889,6 +919,7 @@ fn finish_component_intent_publication(
         return Err(ComponentEffectsError::Topology);
     }
     let expected_lane = BTreeSet::from([
+        COMPONENT_ANCESTORS_DIRECTORY.to_string(),
         COMPONENT_INTENT_FILE.to_string(),
         COMPONENT_QUARANTINE_DIRECTORY.to_string(),
         COMPONENT_STAGING_DIRECTORY.to_string(),
@@ -897,6 +928,7 @@ fn finish_component_intent_publication(
     if exact_entry_names(&candidate.lane.lane, MAX_COMPONENT_LANE_ENTRIES + 1)? != expected_lane {
         return Err(ComponentEffectsError::Topology);
     }
+    validate_empty_ancestor_topology(&candidate.lane)?;
     candidate.lane.lane.sync()?;
     #[cfg(test)]
     if fault == Some(ComponentIntentPublishFault::AfterLaneSynced) {
@@ -923,6 +955,26 @@ fn finish_component_intent_publication(
             .lane
             .lane
             .file_guard_matches(COMPONENT_INTENT_FILE, intent_guard)?
+    {
+        return Err(ComponentEffectsError::Topology);
+    }
+    Ok(())
+}
+
+fn validate_empty_ancestor_topology(lane: &ComponentLane) -> Result<(), ComponentEffectsError> {
+    let ancestors = lane.lane.open_child(COMPONENT_ANCESTORS_DIRECTORY)?;
+    let records = ancestors.open_child(COMPONENT_ANCESTOR_RECORDS_DIRECTORY)?;
+    let staging = ancestors.open_child(COMPONENT_ANCESTOR_STAGING_DIRECTORY)?;
+    if ancestors.identity()? != lane.ancestors.identity()?
+        || records.identity()? != lane.ancestor_records.identity()?
+        || staging.identity()? != lane.ancestor_staging.identity()?
+        || exact_entry_names(&ancestors, 3)?
+            != BTreeSet::from([
+                COMPONENT_ANCESTOR_RECORDS_DIRECTORY.to_string(),
+                COMPONENT_ANCESTOR_STAGING_DIRECTORY.to_string(),
+            ])
+        || !exact_entry_names(&records, 1)?.is_empty()
+        || !exact_entry_names(&staging, 1)?.is_empty()
     {
         return Err(ComponentEffectsError::Topology);
     }
@@ -963,11 +1015,16 @@ impl ComponentPreintentCleanupPlan {
             .transpose()?
             .map(ComponentBucketCleanupPlan::admit)
             .transpose()?;
+        let ancestors = names
+            .contains(COMPONENT_ANCESTORS_DIRECTORY)
+            .then(|| ComponentAncestorsCleanupPlan::admit(lane))
+            .transpose()?;
         let plan = Self {
             temporary: entries.temporary,
             table,
             staging,
             quarantine,
+            ancestors,
         };
         plan.revalidate_with_temps(lane)?;
         Ok(plan)
@@ -983,6 +1040,9 @@ impl ComponentPreintentCleanupPlan {
         }
         if self.quarantine.is_some() {
             expected.insert(COMPONENT_QUARANTINE_DIRECTORY.to_string());
+        }
+        if self.ancestors.is_some() {
+            expected.insert(COMPONENT_ANCESTORS_DIRECTORY.to_string());
         }
         if exact_entry_names(lane, MAX_COMPONENT_LANE_ENTRIES + 1)? != expected {
             return Err(ComponentEffectsError::Topology);
@@ -1000,6 +1060,9 @@ impl ComponentPreintentCleanupPlan {
         }
         if self.quarantine.is_some() {
             expected.insert(COMPONENT_QUARANTINE_DIRECTORY.to_string());
+        }
+        if self.ancestors.is_some() {
+            expected.insert(COMPONENT_ANCESTORS_DIRECTORY.to_string());
         }
         for file in &self.temporary {
             expected.insert(file.name.clone());
@@ -1033,6 +1096,9 @@ impl ComponentPreintentCleanupPlan {
         if let Some(quarantine) = &self.quarantine {
             quarantine.revalidate_with_temps()?;
         }
+        if let Some(ancestors) = &self.ancestors {
+            ancestors.revalidate(lane)?;
+        }
         Ok(())
     }
 
@@ -1046,6 +1112,9 @@ impl ComponentPreintentCleanupPlan {
         }
         if let Some(quarantine) = &self.quarantine {
             quarantine.revalidate()?;
+        }
+        if let Some(ancestors) = &self.ancestors {
+            ancestors.revalidate(lane)?;
         }
         Ok(())
     }
@@ -1071,6 +1140,78 @@ impl ComponentPreintentCleanupPlan {
         }
         if let Some(staging) = self.staging {
             staging.execute()?;
+        }
+        Ok(())
+    }
+}
+
+impl ComponentAncestorsCleanupPlan {
+    fn admit(lane: &ManagedDir) -> Result<Self, ComponentEffectsError> {
+        let ancestors = lane.open_child(COMPONENT_ANCESTORS_DIRECTORY)?;
+        let names = exact_entry_names(&ancestors, 3)?;
+        if names.iter().any(|name| {
+            name != COMPONENT_ANCESTOR_RECORDS_DIRECTORY
+                && name != COMPONENT_ANCESTOR_STAGING_DIRECTORY
+        }) {
+            return Err(ComponentEffectsError::Topology);
+        }
+        let records = names
+            .contains(COMPONENT_ANCESTOR_RECORDS_DIRECTORY)
+            .then(|| ancestors.open_child(COMPONENT_ANCESTOR_RECORDS_DIRECTORY))
+            .transpose()?
+            .map(|records| {
+                let identity = records.identity()?;
+                Ok::<_, ComponentEffectsError>((records, identity))
+            })
+            .transpose()?;
+        let staging = names
+            .contains(COMPONENT_ANCESTOR_STAGING_DIRECTORY)
+            .then(|| ancestors.open_child(COMPONENT_ANCESTOR_STAGING_DIRECTORY))
+            .transpose()?
+            .map(|staging| {
+                let identity = staging.identity()?;
+                Ok::<_, ComponentEffectsError>((staging, identity))
+            })
+            .transpose()?;
+        let plan = Self {
+            ancestors_identity: ancestors.identity()?,
+            ancestors,
+            records,
+            staging,
+        };
+        plan.revalidate(lane)?;
+        Ok(plan)
+    }
+
+    fn revalidate(&self, lane: &ManagedDir) -> Result<(), ComponentEffectsError> {
+        let ancestors = lane.open_child(COMPONENT_ANCESTORS_DIRECTORY)?;
+        let mut expected = BTreeSet::new();
+        if self.records.is_some() {
+            expected.insert(COMPONENT_ANCESTOR_RECORDS_DIRECTORY.to_string());
+        }
+        if self.staging.is_some() {
+            expected.insert(COMPONENT_ANCESTOR_STAGING_DIRECTORY.to_string());
+        }
+        if ancestors.identity()? != self.ancestors_identity
+            || self.ancestors.identity()? != self.ancestors_identity
+            || exact_entry_names(&ancestors, 3)? != expected
+        {
+            return Err(ComponentEffectsError::Topology);
+        }
+        for (name, retained) in [
+            (COMPONENT_ANCESTOR_RECORDS_DIRECTORY, &self.records),
+            (COMPONENT_ANCESTOR_STAGING_DIRECTORY, &self.staging),
+        ] {
+            let Some((retained, identity)) = retained else {
+                continue;
+            };
+            let current = ancestors.open_child(name)?;
+            if current.identity()? != *identity
+                || retained.identity()? != *identity
+                || !exact_entry_names(&current, 1)?.is_empty()
+            {
+                return Err(ComponentEffectsError::Topology);
+            }
         }
         Ok(())
     }
@@ -1570,7 +1711,10 @@ fn open_planned_child(
 fn component_preintent_lane_entry_is_known(name: &str) -> bool {
     matches!(
         name,
-        COMPONENT_TABLE_DIRECTORY | COMPONENT_STAGING_DIRECTORY | COMPONENT_QUARANTINE_DIRECTORY
+        COMPONENT_TABLE_DIRECTORY
+            | COMPONENT_STAGING_DIRECTORY
+            | COMPONENT_QUARANTINE_DIRECTORY
+            | COMPONENT_ANCESTORS_DIRECTORY
     )
 }
 
@@ -1579,6 +1723,20 @@ fn component_bucket_name(index: usize) -> Result<String, ComponentEffectsError> 
         return Err(ComponentEffectsError::Topology);
     }
     Ok(format!("{index:06}"))
+}
+
+fn component_ancestor_bucket_name(index: usize) -> Result<String, ComponentEffectsError> {
+    if index >= MAX_COMPONENT_ANCESTOR_SHARDS {
+        return Err(ComponentEffectsError::Topology);
+    }
+    Ok(format!("{index:06}"))
+}
+
+fn component_ancestor_record_file_name(index: usize) -> Result<String, ComponentEffectsError> {
+    Ok(format!(
+        "{}{COMPONENT_ANCESTOR_RECORD_FILE_SUFFIX}",
+        component_ancestor_bucket_name(index)?
+    ))
 }
 
 pub(crate) fn component_slot_name(index: usize) -> Result<String, ComponentEffectsError> {
@@ -1697,6 +1855,50 @@ mod tests {
         lane.into_intent_candidate(lease, manifest).unwrap()
     }
 
+    async fn single_replacement_row_candidate(
+        temporary: &tempfile::TempDir,
+    ) -> ComponentIntentCandidate {
+        let prior = b"prior-library";
+        let staged = b"replacement-library";
+        let canonical = temporary.path().join("libraries/replacement.jar");
+        fs::create_dir_all(canonical.parent().unwrap()).unwrap();
+        fs::write(&canonical, prior).unwrap();
+        let root = ManagedDir::open_root(temporary.path()).unwrap();
+        let lease = ManagedRootPublicationLease::acquire(root).await.unwrap();
+        let root_binding = component_root_binding_sha256(lease.root()).unwrap();
+        let lane = ComponentLane::prepare_fresh(&lease, ManagedComponentKind::Libraries).unwrap();
+        let mut builder = ComponentTableBuilder::new(
+            ManagedComponentKind::Libraries,
+            1,
+            [0x83; 16],
+            root_binding,
+        )
+        .unwrap();
+        let (encoded, descriptor) = builder
+            .push_shard(vec![ComponentTableRow {
+                inventory_ordinal: 0,
+                final_size: staged.len() as u64,
+                final_sha1: sha1::Sha1::digest(staged).into(),
+                kind: ManagedComponentArtifactKind::Library,
+                path: ArtifactRelativePath::new("replacement.jar").unwrap(),
+                first_created_depth: None,
+                prior: Some(ComponentPriorFile {
+                    size: prior.len() as u64,
+                    sha1: sha1::Sha1::digest(prior).into(),
+                }),
+            }])
+            .unwrap();
+        let (manifest, _) = builder.finish().unwrap();
+        let mut spool = ComponentTableSpool::new(1).unwrap();
+        spool.append(encoded, descriptor).unwrap();
+        let replay = spool.finish(&manifest).unwrap();
+        lane.publish_table(replay, &manifest).unwrap();
+        let buckets = lane.create_shard_buckets(0).unwrap();
+        buckets.staging().write_new_exact("000", staged).unwrap();
+        drop(buckets);
+        lane.into_intent_candidate(lease, manifest).unwrap()
+    }
+
     async fn two_shard_empty_file_candidate(
         temporary: &tempfile::TempDir,
     ) -> (
@@ -1764,6 +1966,7 @@ mod tests {
         assert_eq!(
             exact_entry_names(lane.lane(), MAX_COMPONENT_LANE_ENTRIES + 1).unwrap(),
             BTreeSet::from([
+                COMPONENT_ANCESTORS_DIRECTORY.to_string(),
                 COMPONENT_QUARANTINE_DIRECTORY.to_string(),
                 COMPONENT_STAGING_DIRECTORY.to_string(),
                 COMPONENT_TABLE_DIRECTORY.to_string(),
@@ -1772,10 +1975,100 @@ mod tests {
         assert_eq!(lane.component(), ManagedComponentKind::Libraries);
         assert!(lane.staging().entries_bounded(1).unwrap().is_empty());
         assert!(lane.quarantine().entries_bounded(1).unwrap().is_empty());
+        assert_eq!(
+            exact_entry_names(&lane.ancestors, 3).unwrap(),
+            BTreeSet::from([
+                COMPONENT_ANCESTOR_RECORDS_DIRECTORY.to_string(),
+                COMPONENT_ANCESTOR_STAGING_DIRECTORY.to_string(),
+            ])
+        );
+        assert!(lane.ancestor_records.entries_bounded(1).unwrap().is_empty());
+        assert!(lane.ancestor_staging.entries_bounded(1).unwrap().is_empty());
         assert!(
             ComponentLane::prepare_fresh(&lease, ManagedComponentKind::Libraries).is_ok(),
             "an exact empty fresh topology is reusable before intent"
         );
+    }
+
+    #[test]
+    fn ancestor_journal_names_are_canonical_and_bounded() {
+        assert_eq!(component_ancestor_bucket_name(0).unwrap(), "000000");
+        assert_eq!(
+            component_ancestor_record_file_name(0).unwrap(),
+            "000000.anc"
+        );
+        assert_eq!(
+            component_ancestor_bucket_name(MAX_COMPONENT_ANCESTOR_SHARDS - 1).unwrap(),
+            format!("{:06}", MAX_COMPONENT_ANCESTOR_SHARDS - 1)
+        );
+        assert!(component_ancestor_bucket_name(MAX_COMPONENT_ANCESTOR_SHARDS).is_err());
+        assert!(component_ancestor_record_file_name(MAX_COMPONENT_ANCESTOR_SHARDS).is_err());
+    }
+
+    #[tokio::test]
+    async fn fresh_lane_rejects_any_preintent_ancestor_residue() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = ManagedDir::open_root(temporary.path()).unwrap();
+        let lease = ManagedRootPublicationLease::acquire(root).await.unwrap();
+        let lane = ComponentLane::prepare_fresh(&lease, ManagedComponentKind::Libraries).unwrap();
+        lane.ancestor_staging.create_child_new("000000").unwrap();
+
+        assert!(matches!(
+            ComponentLane::prepare_fresh(&lease, ManagedComponentKind::Libraries),
+            Err(ComponentEffectsError::Topology)
+        ));
+    }
+
+    #[tokio::test]
+    async fn fresh_lane_completes_a_partial_empty_ancestor_scaffold() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = ManagedDir::open_root(temporary.path()).unwrap();
+        let lease = ManagedRootPublicationLease::acquire(root).await.unwrap();
+        let lane = ComponentLane::prepare_fresh(&lease, ManagedComponentKind::Libraries).unwrap();
+        fs::remove_dir(lane.ancestor_staging.path()).unwrap();
+        drop(lane);
+
+        let repaired =
+            ComponentLane::prepare_fresh(&lease, ManagedComponentKind::Libraries).unwrap();
+
+        assert!(
+            repaired
+                .ancestor_records
+                .entries_bounded(1)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            repaired
+                .ancestor_staging
+                .entries_bounded(1)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn admitted_ancestor_scaffold_replacement_is_rejected() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = ManagedDir::open_root(temporary.path()).unwrap();
+        let lease = ManagedRootPublicationLease::acquire(root).await.unwrap();
+        let lane = ComponentLane::prepare_fresh(&lease, ManagedComponentKind::Libraries).unwrap();
+        let records = lane.ancestor_records.path().to_path_buf();
+        let saved_records = temporary.path().join("saved-ancestor-records");
+        drop(lane);
+
+        let result = ComponentLane::prepare_fresh_with_cleanup_hook(
+            &lease,
+            ManagedComponentKind::Libraries,
+            || {
+                fs::rename(&records, &saved_records).unwrap();
+                fs::create_dir(&records).unwrap();
+            },
+        );
+
+        assert!(result.is_err());
+        assert!(records.is_dir());
+        assert!(saved_records.is_dir());
     }
 
     #[tokio::test]
@@ -2144,6 +2437,7 @@ mod tests {
         assert_eq!(
             exact_entry_names(recovered.lane(), MAX_COMPONENT_LANE_ENTRIES + 1).unwrap(),
             BTreeSet::from([
+                COMPONENT_ANCESTORS_DIRECTORY.to_string(),
                 COMPONENT_QUARANTINE_DIRECTORY.to_string(),
                 COMPONENT_STAGING_DIRECTORY.to_string(),
                 COMPONENT_TABLE_DIRECTORY.to_string(),
@@ -2202,21 +2496,169 @@ mod tests {
             Err(_) => panic!("publish exact component intent"),
         };
 
-        assert_eq!(published.candidate().manifest().total_rows, 1);
-        assert_eq!(published.candidate().summary().row_count, 1);
+        assert_eq!(published.manifest.total_rows, 1);
         assert!(
             published
-                .candidate()
                 .lane
                 .lane
-                .file_guard_matches(COMPONENT_INTENT_FILE, published.intent_guard())
+                .file_guard_matches(COMPONENT_INTENT_FILE, &published.intent_guard)
                 .unwrap()
         );
-        let (candidate, guard) = published.into_parts();
-        drop(guard);
+        published.lease.revalidate().unwrap();
+        assert_eq!(published.encoded_intent, encoded);
         assert_eq!(
-            fs::read(candidate.lane.lane.path().join(COMPONENT_INTENT_FILE)).unwrap(),
+            fs::read(published.lane.lane.path().join(COMPONENT_INTENT_FILE)).unwrap(),
             encoded
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_execution_commits_new_row_and_journaled_ancestors() {
+        let temporary = tempfile::tempdir().unwrap();
+        let published = single_absent_row_candidate(&temporary)
+            .await
+            .publish_intent()
+            .unwrap_or_else(|_| panic!("publish component intent"));
+
+        let result = managed_component_transaction::execute_component_intent(published).await;
+
+        assert!(matches!(result, ComponentExecutionResult::Committed(_)));
+        assert_eq!(
+            fs::read(temporary.path().join("libraries/new/library.jar")).unwrap(),
+            b"staged-final"
+        );
+        assert!(
+            temporary
+                .path()
+                .join(".axial-publication/libraries/ancestors/records/000000.anc")
+                .is_file()
+        );
+        assert!(
+            fs::read_dir(
+                temporary
+                    .path()
+                    .join(".axial-publication/libraries/ancestors/staging/000000")
+            )
+            .unwrap()
+            .next()
+            .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_execution_commits_replacement_and_retains_exact_prior() {
+        let temporary = tempfile::tempdir().unwrap();
+        let published = single_replacement_row_candidate(&temporary)
+            .await
+            .publish_intent()
+            .unwrap_or_else(|_| panic!("publish component intent"));
+
+        let result = managed_component_transaction::execute_component_intent(published).await;
+
+        assert!(matches!(result, ComponentExecutionResult::Committed(_)));
+        assert_eq!(
+            fs::read(temporary.path().join("libraries/replacement.jar")).unwrap(),
+            b"replacement-library"
+        );
+        assert_eq!(
+            fs::read(
+                temporary
+                    .path()
+                    .join(".axial-publication/libraries/quarantine/000000/000")
+            )
+            .unwrap(),
+            b"prior-library"
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_execution_rolls_back_rows_and_ancestors_after_live_failure() {
+        let temporary = tempfile::tempdir().unwrap();
+        let published = single_absent_row_candidate(&temporary)
+            .await
+            .publish_intent()
+            .unwrap_or_else(|_| panic!("publish component intent"));
+
+        let result = managed_component_transaction::execute_component_intent_with_fault(
+            published,
+            managed_component_transaction::ComponentExecutionFault::AfterFirstRow,
+        )
+        .await;
+
+        assert!(matches!(result, ComponentExecutionResult::RolledBack(_)));
+        assert!(!temporary.path().join("libraries").exists());
+        assert_eq!(
+            fs::read(
+                temporary
+                    .path()
+                    .join(".axial-publication/libraries/staging/000000/000")
+            )
+            .unwrap(),
+            b"staged-final"
+        );
+        assert!(
+            temporary
+                .path()
+                .join(".axial-publication/libraries/ancestors/staging/000000/000")
+                .is_dir()
+        );
+    }
+
+    #[tokio::test]
+    async fn attempted_outcome_publication_retains_recovery_guard() {
+        let temporary = tempfile::tempdir().unwrap();
+        let published = single_absent_row_candidate(&temporary)
+            .await
+            .publish_intent()
+            .unwrap_or_else(|_| panic!("publish component intent"));
+
+        let result = managed_component_transaction::execute_component_intent_with_fault(
+            published,
+            managed_component_transaction::ComponentExecutionFault::OutcomePromotionAttempted,
+        )
+        .await;
+
+        let ComponentExecutionResult::RecoveryRequired(recovery) = result else {
+            panic!("attempted outcome must retain recovery authority");
+        };
+        assert!(recovery.outcome_guard.is_some());
+        assert!(
+            recovery
+                .context
+                .lane
+                .lane
+                .path()
+                .join("outcome.bin")
+                .is_file()
+        );
+    }
+
+    #[tokio::test]
+    async fn caller_cancellation_does_not_cancel_terminal_owner() {
+        let temporary = tempfile::tempdir().unwrap();
+        let published = single_absent_row_candidate(&temporary)
+            .await
+            .publish_intent()
+            .unwrap_or_else(|_| panic!("publish component intent"));
+        let caller = tokio::spawn(managed_component_transaction::execute_component_intent(
+            published,
+        ));
+        tokio::task::yield_now().await;
+        caller.abort();
+
+        let outcome = temporary
+            .path()
+            .join(".axial-publication/libraries/outcome.bin");
+        for _ in 0..200 {
+            if outcome.is_file() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(outcome.is_file());
+        assert_eq!(
+            fs::read(temporary.path().join("libraries/new/library.jar")).unwrap(),
+            b"staged-final"
         );
     }
 
@@ -2308,6 +2750,28 @@ mod tests {
             assert_eq!(fs::read(target).unwrap(), bytes);
             assert_eq!(fs::read(saved).unwrap(), bytes);
         }
+    }
+
+    #[tokio::test]
+    async fn candidate_rejects_replaced_ancestor_scaffold_before_marker() {
+        let temporary = tempfile::tempdir().unwrap();
+        let candidate = single_absent_row_candidate(&temporary).await;
+        let records = candidate.lane.ancestor_records.path().to_path_buf();
+        let lane_path = candidate.lane.lane.path().to_path_buf();
+        let saved_records = temporary.path().join("saved-candidate-ancestor-records");
+        fs::rename(&records, &saved_records).unwrap();
+        fs::create_dir(&records).unwrap();
+
+        let failure = match candidate.publish_intent() {
+            Err(failure) => failure,
+            Ok(_) => panic!("replaced ancestor records directory was accepted"),
+        };
+
+        assert!(matches!(
+            failure,
+            ComponentIntentPublishFailure::BeforePromotion { .. }
+        ));
+        assert!(!lane_path.join(COMPONENT_INTENT_FILE).exists());
     }
 
     #[tokio::test]
@@ -2588,10 +3052,9 @@ mod tests {
         spool.append(encoded, descriptor).unwrap();
         let replay = spool.finish(&manifest).unwrap();
 
-        let durable = lane.publish_table(replay, &manifest).unwrap();
-        assert_eq!(durable.summary(), &expected_summary);
-        assert_eq!(durable.shard_count(), 1);
-        drop((durable, lane));
+        let durable_summary = lane.publish_table(replay, &manifest).unwrap();
+        assert_eq!(durable_summary, expected_summary);
+        drop((durable_summary, lane));
 
         let cleaned =
             ComponentLane::prepare_fresh(&lease, ManagedComponentKind::Libraries).unwrap();

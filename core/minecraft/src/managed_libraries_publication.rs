@@ -117,12 +117,6 @@ impl LibrariesPublicationSourceIdentity {
     }
 }
 
-impl PreparedLibrariesIntent {
-    pub(crate) fn into_parts(self) -> (PendingKnownGoodInstallAuthority, ComponentIntentPublished) {
-        (self.authority, self.publication)
-    }
-}
-
 impl PreparedLibrariesIntentCandidate {
     pub(crate) fn publish_intent(
         self,
@@ -141,17 +135,6 @@ impl PreparedLibrariesIntentCandidate {
                 publication,
             }),
         }
-    }
-}
-
-impl LibrariesIntentPublishFailure {
-    pub(crate) fn into_parts(
-        self,
-    ) -> (
-        PendingKnownGoodInstallAuthority,
-        ComponentIntentPublishFailure,
-    ) {
-        (self.authority, self.publication)
     }
 }
 
@@ -269,13 +252,8 @@ where
     let candidate = run_publication_blocking(move || {
         let (manifest, summary) = builder.finish()?;
         let replay = spool.finish(&manifest)?;
-        let durable = lane.publish_table(replay, &manifest)?;
-        validate_table_summary(
-            &summary,
-            durable.summary(),
-            durable.shard_count(),
-            &manifest,
-        )?;
+        let durable_summary = lane.publish_table(replay, &manifest)?;
+        validate_table_summary(&summary, &durable_summary, manifest.shards.len(), &manifest)?;
         Ok::<_, PrepareLibrariesIntentError>(lane.into_intent_candidate(lease, manifest)?)
     })
     .await??;
