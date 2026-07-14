@@ -1820,7 +1820,7 @@ fn selected_execution_download_facts(
         .collect()
 }
 
-pub async fn download_file_with_client_report(
+pub(super) async fn download_file_with_client_report(
     client: &reqwest::Client,
     url: &str,
     destination: &Path,

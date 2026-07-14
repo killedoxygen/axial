@@ -266,7 +266,7 @@ pub(super) fn unique_asset_object_jobs<'a>(
     Ok(jobs)
 }
 
-pub fn asset_object_hash_prefix(hash: &str) -> Result<&str, DownloadError> {
+pub(super) fn asset_object_hash_prefix(hash: &str) -> Result<&str, DownloadError> {
     const SHA1_HEX_LEN: usize = 40;
     if hash.len() != SHA1_HEX_LEN {
         return Err(DownloadError::Integrity(format!(
@@ -359,7 +359,10 @@ async fn virtual_asset_matches_source(src: &Path, dst: &Path) -> Result<bool, Do
     Ok(source.size == destination.size && source.sha1 == destination.sha1)
 }
 
-pub fn virtual_asset_destination(root: &Path, asset_name: &str) -> Result<PathBuf, DownloadError> {
+pub(super) fn virtual_asset_destination(
+    root: &Path,
+    asset_name: &str,
+) -> Result<PathBuf, DownloadError> {
     if asset_name.trim().is_empty() {
         return Err(unsafe_virtual_asset_path_error(asset_name));
     }

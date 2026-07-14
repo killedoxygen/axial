@@ -29,8 +29,9 @@ use super::transfer::{
     SelectedArtifactSourceRequest, SelectedPromotionTestControl, SelectedPromotionTestStage,
     acquire_authenticated_selected_artifact_source,
     acquire_authenticated_selected_artifact_source_with_retry_delays_for_test,
-    download_file_with_client, download_file_with_client_report_with_retry_delays,
-    download_temp_path, ensure_selected_artifact_with_client, execute_download_to_temp,
+    download_file_with_client, download_file_with_client_report,
+    download_file_with_client_report_with_retry_delays, download_temp_path,
+    ensure_selected_artifact_with_client, execute_download_to_temp,
     materialize_authenticated_library_source, materialize_authenticated_selected_artifact_source,
     materialize_authenticated_selected_artifact_source_with_control, prepare_library_publication,
     prepare_selected_artifact_install, publish_authenticated_retained_file_for_test,
@@ -1433,6 +1434,49 @@ async fn download_file_with_client_report_preserves_redacted_failure_facts() {
     assert!(!facts_json.contains("example.invalid"));
     assert!(!facts_json.contains("token"));
     assert!(!facts_json.contains("secret"));
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn download_file_with_client_report_discards_stale_temp_before_promotion() {
+    let root = temp_dir("download-report-stale-temp");
+    let destination = root.join("nested").join("artifact.jar");
+    let temp_path = download_temp_path(&destination);
+    fs::create_dir_all(destination.parent().expect("destination parent"))
+        .expect("create destination parent");
+    fs::write(&temp_path, b"partial bytes from interrupted worker").expect("write stale temp");
+    let body = b"fresh launcher managed artifact".to_vec();
+    let expected = ExpectedIntegrity::from_mojang(body.len() as i64, &sha1_hex(&body));
+    let url = spawn_download_response_server(
+        "200 OK",
+        vec![(
+            "Content-Type".to_string(),
+            "application/octet-stream".to_string(),
+        )],
+        body.clone(),
+        1,
+    )
+    .await;
+
+    let report = download_file_with_client_report(
+        &build_http_client(Duration::from_secs(5)),
+        &url,
+        &destination,
+        &expected,
+    )
+    .await
+    .expect("stale temp should be discarded before promotion");
+
+    for expected_kind in [
+        ExecutionDownloadFactKind::TempDiscarded,
+        ExecutionDownloadFactKind::WrittenToTemp,
+        ExecutionDownloadFactKind::Promoted,
+    ] {
+        assert!(report.facts.iter().any(|fact| fact.kind == expected_kind));
+    }
+    assert_eq!(fs::read(&destination).expect("promoted artifact"), body);
+    assert!(!temp_path.exists());
 
     let _ = fs::remove_dir_all(root);
 }

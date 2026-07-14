@@ -16,9 +16,8 @@ use crate::state::{
 };
 use axial_config::{AppPaths, ConfigStore, InstanceRegistrySnapshot, InstanceStore};
 use axial_minecraft::download::{
-    ExecutionDownloadFact, ExecutionDownloadFactKind, ExpectedIntegrity,
-    SelectedDownloadArtifactDescriptor, SelectedDownloadArtifactKind,
-    download_file_with_client_report,
+    ExecutionDownloadFact, ExecutionDownloadFactKind, SelectedDownloadArtifactDescriptor,
+    SelectedDownloadArtifactKind,
 };
 use axial_minecraft::{
     DownloadError, DownloadProgress, LoaderComponentId, LoaderError, LoaderInstallError,
@@ -1600,7 +1599,7 @@ async fn install_status_exposes_interrupted_install_as_redacted_terminal_state()
 }
 
 #[tokio::test]
-async fn restart_interrupted_install_retry_discards_stale_temp_without_promoting_partial_bytes() {
+async fn restart_interrupted_install_status_preserves_stale_temp_without_promoting_partial_bytes() {
     let root = temp_root("install-restart-stale-temp-retry");
     let install_id = "restart-stale-temp-retry-install";
     let operation_id = install_operation_id(install_id);
@@ -1673,50 +1672,13 @@ async fn restart_interrupted_install_retry_discards_stale_temp_without_promoting
         .expect("failure view model");
     assert!(failure_view_model.retry_action.enabled);
 
-    let fresh_body = b"fresh launcher managed artifact".to_vec();
-    let server = TestByteServer::start(fresh_body.clone());
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(5))
-        .build()
-        .expect("download client");
-    let expected = ExpectedIntegrity::from_mojang(fresh_body.len() as i64, &sha1_hex(&fresh_body));
-
-    let report = download_file_with_client_report(&client, &server.url, &destination, &expected)
-        .await
-        .expect("retry download should clean stale temp and promote fresh bytes");
-
-    assert!(
-        report
-            .facts
-            .iter()
-            .any(|fact| fact.kind == ExecutionDownloadFactKind::TempDiscarded)
-    );
-    assert!(
-        report
-            .facts
-            .iter()
-            .any(|fact| fact.kind == ExecutionDownloadFactKind::WrittenToTemp)
-    );
-    assert!(
-        report
-            .facts
-            .iter()
-            .any(|fact| fact.kind == ExecutionDownloadFactKind::Promoted)
-    );
-    assert_eq!(
-        fs::read(&destination).expect("promoted artifact"),
-        fresh_body
-    );
-    assert!(!temp_path.exists());
-    assert_eq!(server.request_count(), 1);
-
     let status_json = serde_json::to_string(&response).expect("status json");
-    let report_json = serde_json::to_string(&report).expect("report json");
     assert_no_public_raw_fragments(&status_json);
-    assert_no_public_raw_fragments(&report_json);
-    assert!(!report_json.contains(root.to_string_lossy().as_ref()));
-    assert!(!report_json.contains("partial bytes"));
-    server.stop();
+    assert!(!destination.exists());
+    assert_eq!(
+        fs::read(&temp_path).expect("restart-visible stale temp"),
+        b"partial bytes from interrupted worker"
+    );
 
     let _ = fs::remove_dir_all(root);
 }

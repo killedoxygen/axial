@@ -49,6 +49,13 @@ pub enum LaunchTier0RuntimeSelection<'a> {
     ExternalExecutable,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ManagedKnownGoodComponent {
+    VersionBundle,
+    Libraries,
+    Assets,
+}
+
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum KnownGoodRoot {
     Versions,
@@ -355,6 +362,88 @@ impl KnownGoodInventory {
         })
     }
 
+    pub fn managed_component_projection(
+        &self,
+        component: ManagedKnownGoodComponent,
+    ) -> Result<ManagedComponentProjection<'_>, ManagedComponentProjectionError> {
+        let selected_entry_count = self
+            .entries
+            .iter()
+            .filter(|entry| managed_component_for_kind(entry.kind()) == Some(component))
+            .count();
+        if selected_entry_count > MAX_TIER2_ENTRIES {
+            return Err(ManagedComponentProjectionError::TooManyEntries {
+                selected_entry_count,
+            });
+        }
+
+        let mut expected_content_byte_count = 0_u64;
+        let mut entries = Vec::with_capacity(selected_entry_count);
+        for (inventory_ordinal, entry) in self
+            .entries
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| managed_component_for_kind(entry.kind()) == Some(component))
+        {
+            if !managed_component_root_kind_is_supported(component, entry) {
+                return Err(ManagedComponentProjectionError::UnsupportedRootKind {
+                    selected_entry_count,
+                    inventory_ordinal,
+                });
+            }
+            let size = match entry.integrity() {
+                KnownGoodIntegrity::Sha1 { size, .. }
+                | KnownGoodIntegrity::ExactBytes { size, .. } => *size,
+                KnownGoodIntegrity::Directory | KnownGoodIntegrity::LinkTarget(_) => {
+                    return Err(ManagedComponentProjectionError::UnsupportedIntegrity {
+                        selected_entry_count,
+                        inventory_ordinal,
+                    });
+                }
+            };
+            if size > MAX_TIER2_ARTIFACT_BYTES {
+                return Err(ManagedComponentProjectionError::ArtifactByteLimitExceeded {
+                    selected_entry_count,
+                    inventory_ordinal,
+                    expected_byte_count: size,
+                });
+            }
+            expected_content_byte_count = expected_content_byte_count.checked_add(size).ok_or(
+                ManagedComponentProjectionError::AggregateByteCountOverflow {
+                    selected_entry_count,
+                    inventory_ordinal,
+                },
+            )?;
+            if expected_content_byte_count > MAX_TIER2_AGGREGATE_BYTES {
+                return Err(
+                    ManagedComponentProjectionError::AggregateByteLimitExceeded {
+                        selected_entry_count,
+                        expected_byte_count: expected_content_byte_count,
+                    },
+                );
+            }
+            entries.push(ManagedComponentProjectionEntry {
+                inventory_ordinal,
+                entry,
+            });
+        }
+
+        entries.sort_unstable_by(|left, right| {
+            left.entry
+                .root()
+                .cmp(right.entry.root())
+                .then_with(|| left.entry.path().cmp(right.entry.path()))
+                .then_with(|| left.inventory_ordinal.cmp(&right.inventory_ordinal))
+        });
+        validate_managed_component_path_tree(selected_entry_count, &entries)?;
+
+        Ok(ManagedComponentProjection {
+            component,
+            entries,
+            expected_content_byte_count,
+        })
+    }
+
     #[cfg(feature = "test-support")]
     pub fn from_test_entries(
         entries: impl IntoIterator<Item = TestKnownGoodEntry>,
@@ -392,6 +481,88 @@ impl KnownGoodInventory {
         }
         Ok(builder.finish())
     }
+}
+
+fn managed_component_for_kind(kind: KnownGoodArtifactKind) -> Option<ManagedKnownGoodComponent> {
+    match kind {
+        KnownGoodArtifactKind::VersionMetadata
+        | KnownGoodArtifactKind::ClientJar
+        | KnownGoodArtifactKind::LogConfig => Some(ManagedKnownGoodComponent::VersionBundle),
+        KnownGoodArtifactKind::Library | KnownGoodArtifactKind::NativeLibrary => {
+            Some(ManagedKnownGoodComponent::Libraries)
+        }
+        KnownGoodArtifactKind::AssetIndex | KnownGoodArtifactKind::AssetObject => {
+            Some(ManagedKnownGoodComponent::Assets)
+        }
+        KnownGoodArtifactKind::RuntimeManifestProof
+        | KnownGoodArtifactKind::RuntimeReadyMarker
+        | KnownGoodArtifactKind::RuntimeFile
+        | KnownGoodArtifactKind::RuntimeExecutable
+        | KnownGoodArtifactKind::RuntimeDirectory
+        | KnownGoodArtifactKind::RuntimeLink => None,
+    }
+}
+
+fn managed_component_root_kind_is_supported(
+    component: ManagedKnownGoodComponent,
+    entry: &KnownGoodEntry,
+) -> bool {
+    matches!(
+        (component, entry.root(), entry.kind()),
+        (
+            ManagedKnownGoodComponent::VersionBundle,
+            KnownGoodRoot::Versions,
+            KnownGoodArtifactKind::VersionMetadata | KnownGoodArtifactKind::ClientJar,
+        ) | (
+            ManagedKnownGoodComponent::VersionBundle,
+            KnownGoodRoot::Assets,
+            KnownGoodArtifactKind::LogConfig,
+        ) | (
+            ManagedKnownGoodComponent::Libraries,
+            KnownGoodRoot::Libraries,
+            KnownGoodArtifactKind::Library | KnownGoodArtifactKind::NativeLibrary,
+        ) | (
+            ManagedKnownGoodComponent::Assets,
+            KnownGoodRoot::Assets,
+            KnownGoodArtifactKind::AssetIndex | KnownGoodArtifactKind::AssetObject,
+        )
+    )
+}
+
+fn validate_managed_component_path_tree(
+    selected_entry_count: usize,
+    entries: &[ManagedComponentProjectionEntry<'_>],
+) -> Result<(), ManagedComponentProjectionError> {
+    let mut entries_by_path = BTreeMap::new();
+    for projected in entries {
+        let key = (projected.entry.root(), projected.entry.path().as_str());
+        if let Some(first_inventory_ordinal) =
+            entries_by_path.insert(key, projected.inventory_ordinal)
+        {
+            return Err(ManagedComponentProjectionError::PathCollision {
+                selected_entry_count,
+                first_inventory_ordinal,
+                second_inventory_ordinal: projected.inventory_ordinal,
+            });
+        }
+    }
+
+    for projected in entries {
+        for (separator, _) in projected.entry.path().as_str().match_indices('/') {
+            let ancestor_path = &projected.entry.path().as_str()[..separator];
+            if let Some(first_inventory_ordinal) = entries_by_path
+                .get(&(projected.entry.root(), ancestor_path))
+                .copied()
+            {
+                return Err(ManagedComponentProjectionError::PathCollision {
+                    selected_entry_count,
+                    first_inventory_ordinal,
+                    second_inventory_ordinal: projected.inventory_ordinal,
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 fn launch_tier1_root(entry: &KnownGoodEntry) -> Option<LaunchTier1PhysicalRoot> {
@@ -595,6 +766,114 @@ impl LaunchTier1ProjectionError {
                 ..
             }
             | Self::AggregateByteLimitExceeded {
+                selected_entry_count,
+                ..
+            } => selected_entry_count,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct ManagedComponentProjection<'a> {
+    component: ManagedKnownGoodComponent,
+    entries: Vec<ManagedComponentProjectionEntry<'a>>,
+    expected_content_byte_count: u64,
+}
+
+impl<'a> ManagedComponentProjection<'a> {
+    pub fn component(&self) -> ManagedKnownGoodComponent {
+        self.component
+    }
+
+    pub fn entries(&self) -> &[ManagedComponentProjectionEntry<'a>] {
+        &self.entries
+    }
+
+    pub fn entry_count(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn expected_content_byte_count(&self) -> u64 {
+        self.expected_content_byte_count
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct ManagedComponentProjectionEntry<'a> {
+    inventory_ordinal: usize,
+    entry: &'a KnownGoodEntry,
+}
+
+impl<'a> ManagedComponentProjectionEntry<'a> {
+    pub fn inventory_ordinal(self) -> usize {
+        self.inventory_ordinal
+    }
+
+    pub fn entry(self) -> &'a KnownGoodEntry {
+        self.entry
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ManagedComponentProjectionError {
+    TooManyEntries {
+        selected_entry_count: usize,
+    },
+    UnsupportedRootKind {
+        selected_entry_count: usize,
+        inventory_ordinal: usize,
+    },
+    UnsupportedIntegrity {
+        selected_entry_count: usize,
+        inventory_ordinal: usize,
+    },
+    ArtifactByteLimitExceeded {
+        selected_entry_count: usize,
+        inventory_ordinal: usize,
+        expected_byte_count: u64,
+    },
+    AggregateByteCountOverflow {
+        selected_entry_count: usize,
+        inventory_ordinal: usize,
+    },
+    AggregateByteLimitExceeded {
+        selected_entry_count: usize,
+        expected_byte_count: u64,
+    },
+    PathCollision {
+        selected_entry_count: usize,
+        first_inventory_ordinal: usize,
+        second_inventory_ordinal: usize,
+    },
+}
+
+impl ManagedComponentProjectionError {
+    pub fn selected_entry_count(self) -> usize {
+        match self {
+            Self::TooManyEntries {
+                selected_entry_count,
+            }
+            | Self::UnsupportedRootKind {
+                selected_entry_count,
+                ..
+            }
+            | Self::UnsupportedIntegrity {
+                selected_entry_count,
+                ..
+            }
+            | Self::ArtifactByteLimitExceeded {
+                selected_entry_count,
+                ..
+            }
+            | Self::AggregateByteCountOverflow {
+                selected_entry_count,
+                ..
+            }
+            | Self::AggregateByteLimitExceeded {
+                selected_entry_count,
+                ..
+            }
+            | Self::PathCollision {
                 selected_entry_count,
                 ..
             } => selected_entry_count,
@@ -3522,6 +3801,348 @@ mod tests {
             LaunchTier1ProjectionError::AggregateByteLimitExceeded {
                 selected_entry_count: 5,
                 expected_byte_count,
+            }
+        );
+    }
+
+    #[test]
+    fn managed_component_kind_mapping_is_total_and_closed() {
+        for (kind, expected) in [
+            (
+                KnownGoodArtifactKind::VersionMetadata,
+                Some(ManagedKnownGoodComponent::VersionBundle),
+            ),
+            (
+                KnownGoodArtifactKind::ClientJar,
+                Some(ManagedKnownGoodComponent::VersionBundle),
+            ),
+            (
+                KnownGoodArtifactKind::LogConfig,
+                Some(ManagedKnownGoodComponent::VersionBundle),
+            ),
+            (
+                KnownGoodArtifactKind::Library,
+                Some(ManagedKnownGoodComponent::Libraries),
+            ),
+            (
+                KnownGoodArtifactKind::NativeLibrary,
+                Some(ManagedKnownGoodComponent::Libraries),
+            ),
+            (
+                KnownGoodArtifactKind::AssetIndex,
+                Some(ManagedKnownGoodComponent::Assets),
+            ),
+            (
+                KnownGoodArtifactKind::AssetObject,
+                Some(ManagedKnownGoodComponent::Assets),
+            ),
+            (KnownGoodArtifactKind::RuntimeManifestProof, None),
+            (KnownGoodArtifactKind::RuntimeReadyMarker, None),
+            (KnownGoodArtifactKind::RuntimeFile, None),
+            (KnownGoodArtifactKind::RuntimeExecutable, None),
+            (KnownGoodArtifactKind::RuntimeDirectory, None),
+            (KnownGoodArtifactKind::RuntimeLink, None),
+        ] {
+            assert_eq!(managed_component_for_kind(kind), expected);
+        }
+    }
+
+    #[test]
+    fn managed_component_projections_are_sorted_exact_and_component_local() {
+        let runtime_root = KnownGoodRoot::ManagedRuntime {
+            component: KnownGoodId::new("java-runtime-delta").expect("component"),
+        };
+        let inventory = KnownGoodInventory {
+            entries: vec![
+                tier_one_sha1_entry(
+                    KnownGoodRoot::Assets,
+                    "log_configs/client.xml",
+                    KnownGoodArtifactKind::LogConfig,
+                    3,
+                ),
+                tier_one_sha1_entry(
+                    KnownGoodRoot::Versions,
+                    "1.21.1/1.21.1.jar",
+                    KnownGoodArtifactKind::ClientJar,
+                    2,
+                ),
+                tier_one_entry(
+                    KnownGoodRoot::Versions,
+                    "1.21.1/1.21.1.json",
+                    KnownGoodArtifactKind::VersionMetadata,
+                    KnownGoodIntegrity::ExactBytes {
+                        digest: Sha1Digest::from_metadata(SHA_B).expect("digest"),
+                        size: 1,
+                    },
+                ),
+                tier_one_sha1_entry(
+                    KnownGoodRoot::Libraries,
+                    "com/example/library.jar",
+                    KnownGoodArtifactKind::Library,
+                    4,
+                ),
+                tier_one_sha1_entry(
+                    KnownGoodRoot::Assets,
+                    "objects/aa/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    KnownGoodArtifactKind::AssetObject,
+                    5,
+                ),
+                tier_one_sha1_entry(
+                    runtime_root,
+                    "bin/java",
+                    KnownGoodArtifactKind::RuntimeExecutable,
+                    6,
+                ),
+            ],
+        };
+
+        let version = inventory
+            .managed_component_projection(ManagedKnownGoodComponent::VersionBundle)
+            .expect("version bundle projection");
+        assert_eq!(
+            version.component(),
+            ManagedKnownGoodComponent::VersionBundle
+        );
+        assert_eq!(version.entry_count(), 3);
+        assert_eq!(version.expected_content_byte_count(), 6);
+        assert_eq!(
+            version
+                .entries()
+                .iter()
+                .copied()
+                .map(ManagedComponentProjectionEntry::inventory_ordinal)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 0]
+        );
+        assert_eq!(
+            version
+                .entries()
+                .iter()
+                .map(|projected| projected.entry().root().clone())
+                .collect::<Vec<_>>(),
+            vec![
+                KnownGoodRoot::Versions,
+                KnownGoodRoot::Versions,
+                KnownGoodRoot::Assets,
+            ]
+        );
+
+        let libraries = inventory
+            .managed_component_projection(ManagedKnownGoodComponent::Libraries)
+            .expect("libraries projection");
+        assert_eq!(libraries.entry_count(), 1);
+        assert_eq!(
+            libraries.entries()[0].entry().kind(),
+            KnownGoodArtifactKind::Library
+        );
+
+        let assets = inventory
+            .managed_component_projection(ManagedKnownGoodComponent::Assets)
+            .expect("assets projection");
+        assert_eq!(assets.entry_count(), 1);
+        assert_eq!(
+            assets.entries()[0].entry().kind(),
+            KnownGoodArtifactKind::AssetObject
+        );
+    }
+
+    #[test]
+    fn managed_component_projection_rejects_selected_cross_root_kinds() {
+        for (component, root, kind) in [
+            (
+                ManagedKnownGoodComponent::VersionBundle,
+                KnownGoodRoot::Assets,
+                KnownGoodArtifactKind::VersionMetadata,
+            ),
+            (
+                ManagedKnownGoodComponent::VersionBundle,
+                KnownGoodRoot::Versions,
+                KnownGoodArtifactKind::LogConfig,
+            ),
+            (
+                ManagedKnownGoodComponent::Libraries,
+                KnownGoodRoot::Assets,
+                KnownGoodArtifactKind::Library,
+            ),
+            (
+                ManagedKnownGoodComponent::Assets,
+                KnownGoodRoot::Libraries,
+                KnownGoodArtifactKind::AssetObject,
+            ),
+        ] {
+            assert_eq!(
+                KnownGoodInventory {
+                    entries: vec![tier_one_sha1_entry(root, "private/entry", kind, 1)],
+                }
+                .managed_component_projection(component)
+                .expect_err("cross-root selected entry must be refused"),
+                ManagedComponentProjectionError::UnsupportedRootKind {
+                    selected_entry_count: 1,
+                    inventory_ordinal: 0,
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn managed_component_projection_rejects_non_file_integrity() {
+        for (component, root, kind, integrity) in [
+            (
+                ManagedKnownGoodComponent::VersionBundle,
+                KnownGoodRoot::Versions,
+                KnownGoodArtifactKind::VersionMetadata,
+                KnownGoodIntegrity::Directory,
+            ),
+            (
+                ManagedKnownGoodComponent::Libraries,
+                KnownGoodRoot::Libraries,
+                KnownGoodArtifactKind::Library,
+                KnownGoodIntegrity::LinkTarget(
+                    KnownGoodLinkTarget::new("entry", "target").expect("link target"),
+                ),
+            ),
+            (
+                ManagedKnownGoodComponent::Assets,
+                KnownGoodRoot::Assets,
+                KnownGoodArtifactKind::AssetIndex,
+                KnownGoodIntegrity::Directory,
+            ),
+        ] {
+            assert_eq!(
+                KnownGoodInventory {
+                    entries: vec![tier_one_entry(root, "entry", kind, integrity)],
+                }
+                .managed_component_projection(component)
+                .expect_err("non-file component entry must be refused"),
+                ManagedComponentProjectionError::UnsupportedIntegrity {
+                    selected_entry_count: 1,
+                    inventory_ordinal: 0,
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn managed_component_projection_rejects_duplicate_and_ancestor_paths() {
+        let entry = tier_one_sha1_entry(
+            KnownGoodRoot::Libraries,
+            "shared/library.jar",
+            KnownGoodArtifactKind::Library,
+            1,
+        );
+        assert_eq!(
+            KnownGoodInventory {
+                entries: vec![entry.clone(), entry],
+            }
+            .managed_component_projection(ManagedKnownGoodComponent::Libraries)
+            .expect_err("duplicate path must be refused"),
+            ManagedComponentProjectionError::PathCollision {
+                selected_entry_count: 2,
+                first_inventory_ordinal: 0,
+                second_inventory_ordinal: 1,
+            }
+        );
+
+        assert_eq!(
+            KnownGoodInventory {
+                entries: vec![
+                    tier_one_sha1_entry(
+                        KnownGoodRoot::Libraries,
+                        "shared",
+                        KnownGoodArtifactKind::Library,
+                        1,
+                    ),
+                    tier_one_sha1_entry(
+                        KnownGoodRoot::Libraries,
+                        "shared/library.jar",
+                        KnownGoodArtifactKind::Library,
+                        1,
+                    ),
+                ],
+            }
+            .managed_component_projection(ManagedKnownGoodComponent::Libraries)
+            .expect_err("file ancestor must be refused"),
+            ManagedComponentProjectionError::PathCollision {
+                selected_entry_count: 2,
+                first_inventory_ordinal: 0,
+                second_inventory_ordinal: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn managed_component_projection_enforces_tier_two_bounds() {
+        let bounded = tier_one_sha1_entry(
+            KnownGoodRoot::Libraries,
+            "bounded/library.jar",
+            KnownGoodArtifactKind::Library,
+            0,
+        );
+        assert_eq!(
+            KnownGoodInventory {
+                entries: vec![bounded; MAX_TIER2_ENTRIES + 1],
+            }
+            .managed_component_projection(ManagedKnownGoodComponent::Libraries)
+            .expect_err("entry bound must be refused"),
+            ManagedComponentProjectionError::TooManyEntries {
+                selected_entry_count: MAX_TIER2_ENTRIES + 1,
+            }
+        );
+
+        let oversized = MAX_TIER2_ARTIFACT_BYTES + 1;
+        assert_eq!(
+            KnownGoodInventory {
+                entries: vec![tier_one_sha1_entry(
+                    KnownGoodRoot::Assets,
+                    "objects/aa/oversized",
+                    KnownGoodArtifactKind::AssetObject,
+                    oversized,
+                )],
+            }
+            .managed_component_projection(ManagedKnownGoodComponent::Assets)
+            .expect_err("artifact byte bound must be refused"),
+            ManagedComponentProjectionError::ArtifactByteLimitExceeded {
+                selected_entry_count: 1,
+                inventory_ordinal: 0,
+                expected_byte_count: oversized,
+            }
+        );
+
+        let entry_count = usize::try_from(MAX_TIER2_AGGREGATE_BYTES / MAX_TIER2_ARTIFACT_BYTES)
+            .expect("bounded entry count");
+        let entries = (0..entry_count)
+            .map(|ordinal| {
+                tier_one_sha1_entry(
+                    KnownGoodRoot::Libraries,
+                    &format!("aggregate/library-{ordinal}.jar"),
+                    KnownGoodArtifactKind::Library,
+                    MAX_TIER2_ARTIFACT_BYTES,
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            KnownGoodInventory {
+                entries: entries.clone(),
+            }
+            .managed_component_projection(ManagedKnownGoodComponent::Libraries)
+            .expect("exact aggregate bound")
+            .expected_content_byte_count(),
+            MAX_TIER2_AGGREGATE_BYTES
+        );
+        let mut above = entries;
+        above.push(tier_one_sha1_entry(
+            KnownGoodRoot::Libraries,
+            "aggregate/overflow.jar",
+            KnownGoodArtifactKind::Library,
+            1,
+        ));
+        assert_eq!(
+            KnownGoodInventory { entries: above }
+                .managed_component_projection(ManagedKnownGoodComponent::Libraries)
+                .expect_err("aggregate byte bound must be refused"),
+            ManagedComponentProjectionError::AggregateByteLimitExceeded {
+                selected_entry_count: entry_count + 1,
+                expected_byte_count: MAX_TIER2_AGGREGATE_BYTES + 1,
             }
         );
     }

@@ -14,9 +14,7 @@ mod transfer;
 mod transfer_failure;
 
 pub(crate) use assets::parse_asset_index;
-pub use assets::{
-    asset_object_hash_prefix, repair_virtual_assets_from_index, virtual_asset_destination,
-};
+pub use assets::repair_virtual_assets_from_index;
 pub use install::Downloader;
 pub(crate) use install::{
     CompletedVanillaInstallAuthority, PendingVanillaInstallSourceAuthority,
@@ -44,7 +42,6 @@ pub use model::{
 };
 pub(crate) use model::{ExactLibraryDownloadProof, MaterializedLibraryIdentity};
 pub(crate) use transfer::AuthenticatedSelectedArtifactSource;
-pub use transfer::download_file_with_client_report;
 #[cfg(test)]
 pub(crate) use transfer::promote_launcher_managed_artifact_temp_once;
 pub(crate) use transfer::write_launcher_managed_artifact_bytes_to_temp;
