@@ -1137,58 +1137,140 @@ pub(crate) struct ComponentTableSummary {
     pub(crate) projection_sha256: [u8; 32],
 }
 
+pub(crate) struct ComponentTableBuilder {
+    sequence: ComponentTableSequenceValidator,
+    descriptors: Vec<ComponentShardDescriptor>,
+    poisoned: bool,
+}
+
+impl ComponentTableBuilder {
+    pub(crate) fn new(
+        component: ManagedComponentKind,
+        total_rows: usize,
+        transaction_nonce: [u8; 16],
+        root_binding_sha256: [u8; 32],
+    ) -> Result<Self, ComponentTableError> {
+        let total_rows = u32::try_from(total_rows).map_err(|_| ComponentTableError)?;
+        let sequence = ComponentTableSequenceValidator::new(
+            component,
+            total_rows,
+            transaction_nonce,
+            root_binding_sha256,
+        )?;
+        let mut descriptors = Vec::new();
+        descriptors
+            .try_reserve_exact(sequence.shard_count)
+            .map_err(|_| ComponentTableError)?;
+        Ok(Self {
+            sequence,
+            descriptors,
+            poisoned: false,
+        })
+    }
+
+    pub(crate) fn push_shard(
+        &mut self,
+        rows: Vec<ComponentTableRow>,
+    ) -> Result<(Vec<u8>, ComponentShardDescriptor), ComponentTableError> {
+        if self.poisoned || self.sequence.next_shard >= self.sequence.shard_count {
+            return Err(ComponentTableError);
+        }
+        let expected_rows = expected_shard_row_count(
+            usize::try_from(self.sequence.total_rows).map_err(|_| ComponentTableError)?,
+            self.sequence.next_shard,
+        )?;
+        if rows.len() != expected_rows || rows.len() > COMPONENT_TABLE_ROWS_PER_SHARD {
+            return Err(ComponentTableError);
+        }
+        let shard_index = self.sequence.next_shard;
+        let shard = ComponentTableShard {
+            component: self.sequence.component,
+            shard_index: u32::try_from(shard_index).map_err(|_| ComponentTableError)?,
+            shard_count: u32::try_from(self.sequence.shard_count)
+                .map_err(|_| ComponentTableError)?,
+            first_row: u32::try_from(
+                shard_index
+                    .checked_mul(COMPONENT_TABLE_ROWS_PER_SHARD)
+                    .ok_or(ComponentTableError)?,
+            )
+            .map_err(|_| ComponentTableError)?,
+            total_rows: self.sequence.total_rows,
+            transaction_nonce: self.sequence.transaction_nonce,
+            root_binding_sha256: self.sequence.root_binding_sha256,
+            rows,
+        };
+        let encoded = encode_component_table_shard(&shard)?;
+        let (final_bytes, prior_bytes) = table_shard_totals(&shard)?;
+        let descriptor = ComponentShardDescriptor {
+            shard_index: shard.shard_index,
+            first_row: shard.first_row,
+            row_count: u32::try_from(shard.rows.len()).map_err(|_| ComponentTableError)?,
+            byte_len: u32::try_from(encoded.len()).map_err(|_| ComponentTableError)?,
+            final_bytes,
+            prior_bytes,
+            sha256: Sha256::digest(&encoded).into(),
+        };
+
+        self.poisoned = true;
+        self.sequence.push(&shard, &encoded)?;
+        self.descriptors.push(descriptor.clone());
+        self.poisoned = false;
+        Ok((encoded, descriptor))
+    }
+
+    pub(crate) fn finish(
+        self,
+    ) -> Result<(ComponentIntentManifest, ComponentTableSummary), ComponentTableError> {
+        if self.poisoned {
+            return Err(ComponentTableError);
+        }
+        let component = self.sequence.component;
+        let total_rows = self.sequence.total_rows;
+        let transaction_nonce = self.sequence.transaction_nonce;
+        let root_binding_sha256 = self.sequence.root_binding_sha256;
+        let summary = self.sequence.finish()?;
+        let manifest = ComponentIntentManifest {
+            component,
+            total_rows,
+            final_bytes: summary.final_bytes,
+            prior_bytes: summary.prior_bytes,
+            transaction_nonce,
+            root_binding_sha256,
+            logical_rows_sha256: summary.logical_rows_sha256,
+            projection_sha256: summary.projection_sha256,
+            shards: self.descriptors,
+        };
+        validate_manifest(&manifest)?;
+        Ok((manifest, summary))
+    }
+}
+
+#[cfg(test)]
 pub(crate) fn build_component_intent_manifest(
     component: ManagedComponentKind,
     transaction_nonce: [u8; 16],
     root_binding_sha256: [u8; 32],
     encoded_shards: &[Vec<u8>],
 ) -> Result<(ComponentIntentManifest, ComponentTableSummary), ComponentTableError> {
-    if encoded_shards.len() > MAX_COMPONENT_TABLE_SHARDS {
-        return Err(ComponentTableError);
-    }
     let total_rows = if let Some(first) = encoded_shards.first() {
         decode_component_table_shard(first)?.total_rows
     } else {
         0
     };
-    let mut sequence = ComponentTableSequenceValidator::new(
+    let mut builder = ComponentTableBuilder::new(
         component,
-        total_rows,
+        usize::try_from(total_rows).map_err(|_| ComponentTableError)?,
         transaction_nonce,
         root_binding_sha256,
     )?;
-    let mut descriptors = Vec::new();
-    descriptors
-        .try_reserve_exact(encoded_shards.len())
-        .map_err(|_| ComponentTableError)?;
     for bytes in encoded_shards {
         let shard = decode_component_table_shard(bytes)?;
-        sequence.push(&shard, bytes)?;
-        let (final_bytes, prior_bytes) = table_shard_totals(&shard)?;
-        descriptors.push(ComponentShardDescriptor {
-            shard_index: shard.shard_index,
-            first_row: shard.first_row,
-            row_count: u32::try_from(shard.rows.len()).map_err(|_| ComponentTableError)?,
-            byte_len: u32::try_from(bytes.len()).map_err(|_| ComponentTableError)?,
-            final_bytes,
-            prior_bytes,
-            sha256: Sha256::digest(bytes).into(),
-        });
+        let (rebuilt, _) = builder.push_shard(shard.rows)?;
+        if rebuilt != *bytes {
+            return Err(ComponentTableError);
+        }
     }
-    let summary = sequence.finish()?;
-    let manifest = ComponentIntentManifest {
-        component,
-        total_rows,
-        final_bytes: summary.final_bytes,
-        prior_bytes: summary.prior_bytes,
-        transaction_nonce,
-        root_binding_sha256,
-        logical_rows_sha256: summary.logical_rows_sha256,
-        projection_sha256: summary.projection_sha256,
-        shards: descriptors,
-    };
-    validate_manifest(&manifest)?;
-    Ok((manifest, summary))
+    builder.finish()
 }
 
 fn table_shard_totals(shard: &ComponentTableShard) -> Result<(u64, u64), ComponentTableError> {
@@ -1294,6 +1376,19 @@ mod tests {
             first_created_depth: None,
             prior: None,
         }
+    }
+
+    fn asset_rows(start: u32, end: u32) -> Vec<ComponentTableRow> {
+        (start..end)
+            .map(|index| {
+                row(
+                    index,
+                    &format!("objects/{index:06}"),
+                    ManagedComponentArtifactKind::AssetObject,
+                    1,
+                )
+            })
+            .collect()
     }
 
     fn shard(
@@ -1691,31 +1786,31 @@ mod tests {
     }
 
     #[test]
-    fn binary_intent_roundtrips_and_stream_parser_binds_shard_order_and_hashes() {
-        let mut rows = Vec::new();
-        rows.try_reserve_exact(257).unwrap();
-        for index in 0..257_u32 {
-            rows.push(row(
-                index,
-                &format!("objects/{index:06}"),
-                ManagedComponentArtifactKind::AssetObject,
-                1,
-            ));
-        }
-        let second_rows = rows.split_off(COMPONENT_TABLE_ROWS_PER_SHARD);
-        let encoded = vec![
-            encode_component_table_shard(&shard(ManagedComponentKind::Assets, 0, 257, rows))
-                .unwrap(),
-            encode_component_table_shard(&shard(ManagedComponentKind::Assets, 1, 257, second_rows))
-                .unwrap(),
-        ];
-        let (manifest, expected_summary) = build_component_intent_manifest(
-            ManagedComponentKind::Assets,
-            [0x11; 16],
-            [0x22; 32],
-            &encoded,
-        )
-        .unwrap();
+    fn incremental_builder_and_stream_parser_bind_shard_order_and_hashes() {
+        let mut builder =
+            ComponentTableBuilder::new(ManagedComponentKind::Assets, 257, [0x11; 16], [0x22; 32])
+                .unwrap();
+        let (first, first_descriptor) = builder.push_shard(asset_rows(0, 256)).unwrap();
+        assert_eq!(first_descriptor.shard_index, 0);
+        assert_eq!(first_descriptor.first_row, 0);
+        assert_eq!(first_descriptor.row_count, 256);
+        assert_eq!(first_descriptor.byte_len as usize, first.len());
+        assert_eq!(
+            first_descriptor.sha256,
+            <[u8; 32]>::from(Sha256::digest(&first))
+        );
+        let (second, second_descriptor) = builder.push_shard(asset_rows(256, 257)).unwrap();
+        assert_eq!(second_descriptor.shard_index, 1);
+        assert_eq!(second_descriptor.first_row, 256);
+        assert_eq!(second_descriptor.row_count, 1);
+        assert_eq!(second_descriptor.byte_len as usize, second.len());
+        assert_eq!(
+            second_descriptor.sha256,
+            <[u8; 32]>::from(Sha256::digest(&second))
+        );
+        let (manifest, expected_summary) = builder.finish().unwrap();
+        assert_eq!(manifest.shards, vec![first_descriptor, second_descriptor]);
+        let encoded = [first, second];
         let intent_bytes = encode_component_intent_manifest(&manifest).unwrap();
         assert_eq!(intent_bytes.len(), 160 + 2 * 64);
         assert_eq!(
@@ -1729,6 +1824,46 @@ mod tests {
         parser.parse_next(&encoded[0]).unwrap();
         parser.parse_next(&encoded[1]).unwrap();
         assert_eq!(parser.finish().unwrap(), expected_summary);
+    }
+
+    #[test]
+    fn incremental_builder_enforces_exact_boundaries_and_poisoned_global_order() {
+        let mut builder =
+            ComponentTableBuilder::new(ManagedComponentKind::Assets, 257, [0x11; 16], [0x22; 32])
+                .unwrap();
+        assert_eq!(
+            builder.push_shard(asset_rows(0, 255)),
+            Err(ComponentTableError)
+        );
+        builder.push_shard(asset_rows(0, 256)).unwrap();
+        builder.push_shard(asset_rows(256, 257)).unwrap();
+        assert_eq!(builder.push_shard(Vec::new()), Err(ComponentTableError));
+        builder.finish().expect("complete builder remains valid");
+
+        let mut incomplete =
+            ComponentTableBuilder::new(ManagedComponentKind::Assets, 257, [0x11; 16], [0x22; 32])
+                .unwrap();
+        incomplete.push_shard(asset_rows(0, 256)).unwrap();
+        assert_eq!(incomplete.finish(), Err(ComponentTableError));
+
+        let mut out_of_order =
+            ComponentTableBuilder::new(ManagedComponentKind::Assets, 257, [0x11; 16], [0x22; 32])
+                .unwrap();
+        out_of_order.push_shard(asset_rows(0, 256)).unwrap();
+        assert_eq!(
+            out_of_order.push_shard(vec![row(
+                256,
+                "a-before-objects",
+                ManagedComponentArtifactKind::AssetObject,
+                1,
+            )]),
+            Err(ComponentTableError)
+        );
+        assert_eq!(
+            out_of_order.push_shard(asset_rows(256, 257)),
+            Err(ComponentTableError)
+        );
+        assert_eq!(out_of_order.finish(), Err(ComponentTableError));
     }
 
     #[test]
@@ -1774,11 +1909,11 @@ mod tests {
 
     #[test]
     fn logical_and_projection_hashes_have_golden_domain_separated_encodings() {
-        let table = encode_component_table_shard(&shard(
-            ManagedComponentKind::Libraries,
-            0,
-            1,
-            vec![ComponentTableRow {
+        let mut builder =
+            ComponentTableBuilder::new(ManagedComponentKind::Libraries, 1, [0x11; 16], [0x22; 32])
+                .unwrap();
+        builder
+            .push_shard(vec![ComponentTableRow {
                 inventory_ordinal: 7,
                 final_size: 11,
                 final_sha1: [0x11; 20],
@@ -1786,16 +1921,9 @@ mod tests {
                 path: path("a.jar"),
                 first_created_depth: None,
                 prior: None,
-            }],
-        ))
-        .unwrap();
-        let (manifest, _) = build_component_intent_manifest(
-            ManagedComponentKind::Libraries,
-            [0x11; 16],
-            [0x22; 32],
-            &[table],
-        )
-        .unwrap();
+            }])
+            .unwrap();
+        let (manifest, _) = builder.finish().unwrap();
         assert_eq!(
             digest_hex(manifest.logical_rows_sha256),
             "9c8263a8cf4be4cf2d32bb67a7bdfeadfc435e6d388378ecd70dc11268caead0"
