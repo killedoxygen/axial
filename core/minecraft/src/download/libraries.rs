@@ -1,19 +1,13 @@
 use super::client::{library_download_concurrency, standard_minecraft_download_client};
-use super::facts::{selected_download_source_label, selected_download_target_label};
+use super::facts::selected_download_source_label;
 use super::integrity::is_sha1_hex;
 use super::library_source::{
     LIBRARY_SOURCE_MAX_BYTES, LibraryComponentSourceKind, LibrarySourcePool, LibrarySourceRequest,
-    RetainedLibraryComponentSource, acquire_authenticated_library_source,
-    acquire_retained_library_component_source,
+    RetainedLibraryComponentSource, acquire_retained_library_component_source,
 };
 use super::model::{
     DownloadError, DownloadProgress, ExactLibraryDownloadProof, ExecutionDownloadFact,
-    ExpectedIntegrity, LibraryPlanError, MaterializedLibraryIdentity, SelectedDownloadArtifactKind,
-    progress,
-};
-use super::transfer::{
-    ensure_selected_artifact_with_client_and_observed_size,
-    materialize_authenticated_library_source, prepare_library_publication,
+    ExpectedIntegrity, LibraryPlanError, SelectedDownloadArtifactKind, progress,
 };
 use crate::artifact_path::ArtifactRelativePath;
 use crate::known_good_libraries::{
@@ -22,7 +16,7 @@ use crate::known_good_libraries::{
 };
 use crate::launch::{Library, maven_to_path};
 use crate::loaders::types::LoaderError;
-use crate::managed_fs::ManagedDir;
+use crate::managed_fs::{ManagedBoundedFileReader, ManagedDir};
 use crate::paths::libraries_dir;
 use crate::rules::{Environment, evaluate_rules};
 use futures_util::StreamExt;
@@ -96,6 +90,16 @@ pub(crate) struct ExactLibraryCacheAdmission {
     libraries: Option<ManagedDir>,
 }
 
+struct ExactLibraryCacheSource {
+    reader: ManagedBoundedFileReader,
+}
+
+struct ExactLibraryCacheGuard {
+    directory: ManagedDir,
+    name: String,
+    guard: crate::managed_fs::ManagedFileGuard,
+}
+
 impl ExactLibraryCacheAdmission {
     pub(crate) async fn bind(managed_root: &Path) -> Result<Self, DownloadError> {
         let managed_root = managed_root.to_path_buf();
@@ -133,19 +137,96 @@ impl ExactLibraryCacheAdmission {
         job: &DownloadJob,
     ) -> Result<bool, DownloadError> {
         let expected_size = job.expected.size.ok_or(LibraryPlanError::InvalidChecksum)?;
-        if expected_size == 0 || expected_size > LIBRARY_SOURCE_MAX_BYTES {
-            return Err(DownloadError::Integrity(
-                "exact library cache contract exceeds the admitted size bound".to_string(),
-            ));
-        }
         let expected_sha1 = job
             .expected
             .sha1
             .as_deref()
             .and_then(decode_sha1)
             .ok_or(LibraryPlanError::InvalidChecksum)?;
-        let Some(libraries) = self.libraries.clone() else {
+        let Some(source) = self.exact_guard(job).await? else {
             return Ok(true);
+        };
+        tokio::task::spawn_blocking(move || {
+            let observed = source
+                .directory
+                .sha1_guarded_file_bytes(&source.name, &source.guard, expected_size)
+                .map_err(cache_admission_error)?;
+            Ok(observed != expected_sha1)
+        })
+        .await
+        .map_err(|error| {
+            DownloadError::FileOperation(io::Error::other(format!(
+                "library cache authentication task stopped unexpectedly: {error}"
+            )))
+        })?
+    }
+
+    async fn retain_installer_source(
+        &self,
+        job: &DownloadJob,
+        source_pool: &LibrarySourcePool,
+        kind: LibraryComponentSourceKind,
+    ) -> Result<Option<RetainedLibraryComponentSource>, DownloadError> {
+        let Some(source) = self.exact_source(job).await? else {
+            return Ok(None);
+        };
+        let ExactLibraryCacheSource { reader } = source;
+        let expected_size = job.expected.size.ok_or(LibraryPlanError::InvalidChecksum)?;
+        let expected_sha1 = job
+            .expected
+            .sha1
+            .as_deref()
+            .and_then(decode_sha1)
+            .ok_or(LibraryPlanError::InvalidChecksum)?;
+        let Some(allocation) = source_pool
+            .try_retain_authenticated_component_reader(reader, expected_size, expected_sha1)
+            .await?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(
+            RetainedLibraryComponentSource::from_authenticated_allocation(
+                allocation,
+                job.relative_path.clone(),
+                expected_size,
+                expected_sha1,
+                job.expected.clone(),
+                job.url.clone(),
+                kind,
+            ),
+        ))
+    }
+
+    async fn exact_source(
+        &self,
+        job: &DownloadJob,
+    ) -> Result<Option<ExactLibraryCacheSource>, DownloadError> {
+        let Some(source) = self.exact_guard(job).await? else {
+            return Ok(None);
+        };
+        let expected_size = job.expected.size.ok_or(LibraryPlanError::InvalidChecksum)?;
+        let reader = source
+            .guard
+            .into_bounded_reader(expected_size)
+            .map_err(cache_admission_error)?;
+        Ok(Some(ExactLibraryCacheSource { reader }))
+    }
+
+    async fn exact_guard(
+        &self,
+        job: &DownloadJob,
+    ) -> Result<Option<ExactLibraryCacheGuard>, DownloadError> {
+        let expected_size = job.expected.size.ok_or(LibraryPlanError::InvalidChecksum)?;
+        if expected_size == 0 || expected_size > LIBRARY_SOURCE_MAX_BYTES {
+            return Err(DownloadError::Integrity(
+                "exact library cache contract exceeds the admitted size bound".to_string(),
+            ));
+        }
+        if job.expected.sha1.as_deref().and_then(decode_sha1).is_none() {
+            return Err(LibraryPlanError::InvalidChecksum.into());
+        }
+        let Some(libraries) = self.libraries.clone() else {
+            return Ok(None);
         };
         let relative_path = job.relative_path.clone();
         tokio::task::spawn_blocking(move || {
@@ -157,7 +238,7 @@ impl ExactLibraryCacheAdmission {
                         .has_portably_exact_child_name(segment)
                         .map_err(cache_admission_error)?
                     {
-                        return Ok(true);
+                        return Ok(None);
                     }
                     let guard = directory
                         .inspect_regular_file(segment)
@@ -168,18 +249,19 @@ impl ExactLibraryCacheAdmission {
                             )
                         })?;
                     if guard.size() != expected_size {
-                        return Ok(true);
+                        return Ok(None);
                     }
-                    let observed = directory
-                        .sha1_guarded_file_bytes(segment, &guard, expected_size)
-                        .map_err(cache_admission_error)?;
-                    return Ok(observed != expected_sha1);
+                    return Ok(Some(ExactLibraryCacheGuard {
+                        directory,
+                        name: segment.to_string(),
+                        guard,
+                    }));
                 }
                 if !directory
                     .has_portably_exact_child_name(segment)
                     .map_err(cache_admission_error)?
                 {
-                    return Ok(true);
+                    return Ok(None);
                 }
                 directory = directory
                     .open_child(segment)
@@ -263,6 +345,52 @@ pub(super) async fn acquire_retained_classified_library(
     })
 }
 
+async fn acquire_retained_installer_library(
+    client: &reqwest::Client,
+    classified: ClassifiedLibraryDownload,
+    cache_admission: &ExactLibraryCacheAdmission,
+    source_pool: &LibrarySourcePool,
+    fact_tx: Option<&mpsc::UnboundedSender<ExecutionDownloadFact>>,
+) -> Result<(ArtifactRelativePath, String, RetainedLibraryComponentSource), DownloadError> {
+    let (job, acquisition) = classified.into_parts();
+    let kind = if job.is_native {
+        LibraryComponentSourceKind::NativeLibrary
+    } else {
+        LibraryComponentSourceKind::Library
+    };
+    let cached = if acquisition == LibraryAcquisition::ExactDeclaration {
+        cache_admission
+            .retain_installer_source(&job, source_pool, kind)
+            .await?
+    } else {
+        None
+    };
+    let source = match cached {
+        Some(source) => source,
+        None => {
+            let target = selected_download_source_label(
+                SelectedDownloadArtifactKind::Library,
+                job.relative_path.as_str(),
+            );
+            acquire_retained_library_component_source(
+                LibrarySourceRequest {
+                    client,
+                    url: &job.url,
+                    expected: &job.expected,
+                    relative_path: &job.relative_path,
+                    max_bytes: LIBRARY_SOURCE_MAX_BYTES,
+                    target: &target,
+                    pool: source_pool,
+                    fact_tx,
+                },
+                kind,
+            )
+            .await?
+        }
+    };
+    Ok((job.relative_path, job.name, source))
+}
+
 pub(crate) async fn download_profile_retained_libraries_with_declarations_and_facts<F, G>(
     mc_dir: &Path,
     declarations: PendingExactLibraryDeclarations,
@@ -316,7 +444,7 @@ pub(crate) async fn download_installer_libraries_with_declarations_and_facts<F, 
 ) -> Result<
     (
         crate::loaders::PendingForgeInstallExecution,
-        Vec<MaterializedLibraryIdentity>,
+        Vec<RetainedLibraryComponentSource>,
     ),
     DownloadError,
 >
@@ -402,96 +530,43 @@ async fn download_installer_classified_library_jobs<F>(
     phase: &str,
     mut send: F,
     fact_tx: Option<mpsc::UnboundedSender<ExecutionDownloadFact>>,
-) -> Result<Vec<MaterializedLibraryIdentity>, DownloadError>
+) -> Result<Vec<RetainedLibraryComponentSource>, DownloadError>
 where
     F: FnMut(DownloadProgress),
 {
     let client = standard_minecraft_download_client();
-    let source_pool = LibrarySourcePool::new();
-    let mc_dir = mc_dir.to_path_buf();
+    let source_pool = LibrarySourcePool::for_component_retention()?;
+    let cache_admission = ExactLibraryCacheAdmission::bind(mc_dir).await?;
     send(progress(phase, 0, jobs.len() as i32, None));
     let total_jobs = jobs.len() as i32;
     let mut completed_jobs = 0;
-    let mut authorities = BTreeMap::new();
+    let mut sources = BTreeMap::new();
     let mut downloads = futures_util::stream::iter(jobs.into_iter().map(|classified| {
-        let (job, acquisition) = classified.into_parts();
         let client = client.clone();
         let fact_tx = fact_tx.clone();
         let source_pool = source_pool.clone();
-        let mc_dir = mc_dir.clone();
+        let cache_admission = cache_admission.clone();
         async move {
-            let (authority, path) = if acquisition == LibraryAcquisition::ExactDeclaration {
-                let (_, observed_size) = ensure_selected_artifact_with_client_and_observed_size(
-                    SelectedDownloadArtifactKind::Library,
-                    &client,
-                    &job.url,
-                    &job.path,
-                    &job.expected,
-                    fact_tx.as_ref(),
-                )
-                .await?;
-                let sha1 = decode_sha1(
-                    job.expected
-                        .sha1
-                        .as_deref()
-                        .ok_or(LibraryPlanError::InvalidChecksum)?,
-                )
-                .ok_or(LibraryPlanError::InvalidChecksum)?;
-                let proof = MaterializedLibraryIdentity::new(
-                    job.relative_path.clone(),
-                    job.path.clone(),
-                    job.is_native,
-                    job.url.clone(),
-                    job.expected.clone(),
-                    observed_size,
-                    sha1,
-                );
-                (Some(proof), job.relative_path)
-            } else {
-                let target = selected_download_target_label(
-                    SelectedDownloadArtifactKind::Library,
-                    Path::new(job.relative_path.as_str()),
-                );
-                let source = acquire_authenticated_library_source(LibrarySourceRequest {
-                    client: &client,
-                    url: &job.url,
-                    expected: &job.expected,
-                    relative_path: &job.relative_path,
-                    max_bytes: LIBRARY_SOURCE_MAX_BYTES,
-                    target: &target,
-                    pool: &source_pool,
-                    fact_tx: fact_tx.as_ref(),
-                })
-                .await?;
-                let prepared = prepare_library_publication(
-                    &mc_dir,
-                    job.relative_path.clone(),
-                    &job.url,
-                    &job.expected,
-                    job.is_native,
-                    fact_tx.as_ref(),
-                )
-                .await?;
-                let (authority, _) =
-                    materialize_authenticated_library_source(prepared, source, fact_tx.as_ref())
-                        .await?;
-                (Some(authority), job.relative_path)
-            };
-            Ok::<_, DownloadError>((path, job.name, authority))
+            acquire_retained_installer_library(
+                &client,
+                classified,
+                &cache_admission,
+                &source_pool,
+                fact_tx.as_ref(),
+            )
+            .await
         }
     }))
     .buffer_unordered(library_download_concurrency());
     while let Some(result) = downloads.next().await {
-        let (path, name, authority) = result?;
+        let (path, name, source) = result?;
         completed_jobs += 1;
         send(progress(phase, completed_jobs, total_jobs, Some(name)));
-        if let Some(authority) = authority
-            && authorities.insert(path, authority).is_some()
-        {
+        if sources.insert(path, source).is_some() {
             return Err(LibraryPlanError::ConflictingArtifactPath.into());
         }
     }
-    Ok(authorities.into_values().collect())
+    Ok(sources.into_values().collect())
 }
 
 pub(crate) fn decode_sha1(value: &str) -> Option<[u8; 20]> {
@@ -810,15 +885,24 @@ fn native_name_matches_env(name: &str, env: &crate::rules::Environment) -> bool 
 
 #[cfg(test)]
 mod tests {
-    use super::{DownloadJob, ExactLibraryCacheAdmission, library_artifact_plans_for};
+    use super::{
+        DownloadJob, ExactLibraryCacheAdmission, acquire_retained_installer_library,
+        library_artifact_plans_for,
+    };
     use crate::artifact_path::ArtifactRelativePath;
     use crate::download::ExpectedIntegrity;
+    use crate::download::library_source::LibrarySourcePool;
+    use crate::known_good_libraries::{ClassifiedLibraryDownload, LibraryAcquisition};
     use crate::launch::{Library, LibraryArtifact, LibraryDownload};
     use sha1::{Digest as _, Sha1};
     use std::collections::HashMap;
     use std::fs;
+    use std::io::{Read as _, Write as _};
     use std::path::{Path, PathBuf};
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    use tokio::sync::oneshot;
 
     static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -860,6 +944,63 @@ mod tests {
             },
             is_native: false,
         }
+    }
+
+    fn jar_bytes(payload: &[u8]) -> Vec<u8> {
+        let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        writer
+            .start_file(
+                "fixture/Library.class",
+                zip::write::SimpleFileOptions::default(),
+            )
+            .expect("start test JAR entry");
+        writer.write_all(payload).expect("write test JAR entry");
+        writer.finish().expect("finish test JAR").into_inner()
+    }
+
+    async fn retained_test_server(
+        body: Vec<u8>,
+    ) -> (
+        String,
+        Arc<AtomicUsize>,
+        oneshot::Sender<()>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind retained test server");
+        let address = listener.local_addr().expect("retained test address");
+        let requests = Arc::new(AtomicUsize::new(0));
+        let server_requests = Arc::clone(&requests);
+        let (stop_tx, mut stop_rx) = oneshot::channel();
+        let task = tokio::spawn(async move {
+            loop {
+                let accepted = tokio::select! {
+                    _ = &mut stop_rx => break,
+                    accepted = listener.accept() => accepted,
+                };
+                let Ok((mut stream, _)) = accepted else {
+                    break;
+                };
+                let mut request = [0_u8; 4096];
+                let _ = stream.read(&mut request).await;
+                server_requests.fetch_add(1, Ordering::SeqCst);
+                let header = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                if stream.write_all(header.as_bytes()).await.is_err() {
+                    continue;
+                }
+                let _ = stream.write_all(&body).await;
+            }
+        });
+        (
+            format!("http://{address}/library.jar"),
+            requests,
+            stop_tx,
+            task,
+        )
     }
 
     #[test]
@@ -934,6 +1075,59 @@ mod tests {
         );
         drop(admission);
         fs::remove_dir_all(root).expect("remove exact-corrupt test root");
+    }
+
+    #[tokio::test]
+    async fn corrupt_installer_exact_cache_falls_back_to_retention_without_canonical_prewrite() {
+        let root = temp_root("installer-corrupt-fallback");
+        let body = jar_bytes(b"authenticated installer source");
+        let mut corrupt = body.clone();
+        corrupt[0] ^= 0xff;
+        let mut job = exact_job(&root, &body);
+        fs::create_dir_all(job.path.parent().expect("artifact parent"))
+            .expect("create artifact parent");
+        fs::write(&job.path, &corrupt).expect("seed same-size corrupt exact cache");
+        let (url, requests, stop, task) = retained_test_server(body.clone()).await;
+        job.url = url;
+        let admission = ExactLibraryCacheAdmission::bind(&root)
+            .await
+            .expect("bind installer exact cache");
+        let pool = LibrarySourcePool::for_component_retention().expect("retained source pool");
+        let (_, _, source) = acquire_retained_installer_library(
+            &reqwest::Client::new(),
+            ClassifiedLibraryDownload::from_test(job.clone(), LibraryAcquisition::ExactDeclaration),
+            &admission,
+            &pool,
+            None,
+        )
+        .await
+        .expect("fallback retained installer source");
+
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            fs::read(&job.path).expect("canonical corrupt cache"),
+            corrupt
+        );
+        assert_eq!(
+            pool.retained_available_bytes(),
+            Some(crate::known_good::MAX_TIER2_AGGREGATE_BYTES - body.len() as u64)
+        );
+        let (mut replay, size, sha1) = source
+            .replay()
+            .expect("replay retained fallback")
+            .into_parts();
+        let mut replayed = Vec::new();
+        replay
+            .read_to_end(&mut replayed)
+            .expect("read retained fallback");
+        assert_eq!(replayed, body);
+        assert_eq!(size, body.len() as u64);
+        assert_eq!(sha1, <[u8; 20]>::from(Sha1::digest(&body)));
+
+        let _ = stop.send(());
+        task.await.expect("stop retained test server");
+        drop(admission);
+        fs::remove_dir_all(root).expect("remove corrupt-fallback root");
     }
 
     #[tokio::test]

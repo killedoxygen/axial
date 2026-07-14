@@ -294,18 +294,18 @@ impl PendingForgeNetworkInstall {
 impl PendingForgeInstallExecution {
     pub(crate) fn complete_network(
         self,
-        materialized: Vec<crate::download::MaterializedLibraryIdentity>,
+        sources: Vec<crate::download::library_source::RetainedLibraryComponentSource>,
     ) -> Result<BoundForgeInstallExecution, ForgeInstallerError> {
         match self.execution {
             BoundForgeInstallExecution::Run(execution) => {
                 let BoundForgeProcessorExecution { plan, continuation } = *execution;
-                let continuation = continuation.complete_network(materialized)?;
+                let continuation = continuation.complete_network(sources)?;
                 Ok(BoundForgeInstallExecution::Run(Box::new(
                     BoundForgeProcessorExecution { plan, continuation },
                 )))
             }
             BoundForgeInstallExecution::Continue(continuation) => {
-                let continuation = continuation.complete_network(materialized)?;
+                let continuation = continuation.complete_network(sources)?;
                 Ok(BoundForgeInstallExecution::Continue(Box::new(continuation)))
             }
             BoundForgeInstallExecution::UnsupportedMissingOutputs => {
@@ -460,6 +460,11 @@ pub(super) struct BoundProcessorInputContract {
 pub(super) enum BoundProcessorInputSource {
     Download,
     Embedded,
+}
+
+pub(super) enum BoundProcessorNetworkInput {
+    Retained(crate::download::library_source::RetainedLibrarySourceReplay),
+    ReconstructionWorkspace,
 }
 
 #[derive(Clone, Copy)]
@@ -665,6 +670,32 @@ impl BoundForgeInstallerContinuation {
         }
     }
 
+    pub(super) fn network_input_source(
+        &self,
+        path: &ArtifactRelativePath,
+    ) -> Result<BoundProcessorNetworkInput, crate::loaders::types::LoaderError> {
+        match &self.library_declarations {
+            InstallerDeclarationState::TerminalPending(declarations) => declarations
+                .replay_network_source(path)?
+                .map(BoundProcessorNetworkInput::Retained)
+                .ok_or_else(|| {
+                    crate::loaders::types::LoaderError::Verify(
+                        "retained processor network source is missing".to_string(),
+                    )
+                }),
+            InstallerDeclarationState::ReconstructionTerminal(_) => {
+                Ok(BoundProcessorNetworkInput::ReconstructionWorkspace)
+            }
+            InstallerDeclarationState::Bound(_)
+            | InstallerDeclarationState::NetworkPending(_)
+            | InstallerDeclarationState::ReconstructionPending(_) => {
+                Err(crate::loaders::types::LoaderError::Verify(
+                    "processor network source authority is incomplete".to_string(),
+                ))
+            }
+        }
+    }
+
     pub(super) fn matches_execution_identity(
         &self,
         target_version_id: &str,
@@ -831,7 +862,7 @@ impl BoundForgeInstallerContinuation {
 
     fn complete_network(
         self,
-        materialized: Vec<crate::download::MaterializedLibraryIdentity>,
+        sources: Vec<crate::download::library_source::RetainedLibraryComponentSource>,
     ) -> Result<Self, ForgeInstallerError> {
         let Self {
             source,
@@ -844,7 +875,7 @@ impl BoundForgeInstallerContinuation {
             return Err(ForgeInstallerError::InvalidForgeProcessorArtifactContract);
         };
         let library_declarations = library_declarations
-            .complete_network(materialized)
+            .complete_network(sources)
             .map_err(|_| ForgeInstallerError::InvalidForgeProcessorArtifactContract)?;
         Ok(Self {
             source,
@@ -2894,8 +2925,8 @@ fn normalize_legacy_forge_version_id(path: &str, minecraft: &str) -> Option<Stri
 mod tests {
     use super::{
         AuthenticatedForgeInstallerPlan, BoundForgeInstallExecution, BoundForgeInstallerPlan,
-        BoundProcessorDisposition, BoundProcessorPlan, ForgeInstallerError,
-        MAX_INSTALLER_EMBEDDED_ENTRY_BYTES, MAX_INSTALLER_PROFILE_ENTRY_BYTES,
+        BoundProcessorDisposition, BoundProcessorNetworkInput, BoundProcessorPlan,
+        ForgeInstallerError, MAX_INSTALLER_EMBEDDED_ENTRY_BYTES, MAX_INSTALLER_PROFILE_ENTRY_BYTES,
         bind_authenticated_installer_plan, merge_libraries_by_name, normalize_legacy_forge_library,
         normalize_legacy_forge_version_id, plan_authenticated_installer,
     };
@@ -3208,6 +3239,12 @@ mod tests {
         else {
             panic!("typed processor reconstruction");
         };
+        let processor_path = ArtifactRelativePath::new("example/processor/1.0/processor-1.0.jar")
+            .expect("processor path");
+        assert!(matches!(
+            execution.continuation.network_input_source(&processor_path),
+            Ok(BoundProcessorNetworkInput::ReconstructionWorkspace)
+        ));
         let continuation = match execution.into_declared_reconstruction() {
             Ok(continuation) => continuation,
             Err(_) => panic!("exact terminal reconstruction"),
@@ -3226,6 +3263,52 @@ mod tests {
                 )
                 .map(|(_, _, size, _)| size),
             Some(9)
+        );
+    }
+
+    #[test]
+    fn live_processor_network_input_requires_its_retained_source() {
+        let (record, version, install) = forge_processor_fixture();
+        let execution = bind_modern_fixture_with_entries(&record, &version, &install, &[])
+            .expect("live processor authority")
+            .into_install_execution()
+            .expect("live processor execution");
+        let network = execution
+            .into_network_install(Path::new("/managed/libraries"))
+            .expect("live network transition");
+        let (pending, jobs) = network.into_parts();
+        let sources = jobs
+            .into_iter()
+            .map(|classified| {
+                let (job, _) = classified.into_parts();
+                let sha1 = if job.expected.sha1.is_some() {
+                    [0xbb; 20]
+                } else {
+                    [5; 20]
+                };
+                crate::download::library_source::RetainedLibraryComponentSource::from_test_identity(
+                    job.relative_path,
+                    job.is_native,
+                    job.url,
+                    job.expected.clone(),
+                    job.expected.size.unwrap_or(7),
+                    sha1,
+                )
+            })
+            .collect();
+        let BoundForgeInstallExecution::Run(execution) = pending
+            .complete_network(sources)
+            .expect("complete live retained sources")
+        else {
+            panic!("live processor execution");
+        };
+        let missing = ArtifactRelativePath::new("example/missing/1/missing-1.jar")
+            .expect("missing processor path");
+        assert!(
+            execution
+                .continuation
+                .network_input_source(&missing)
+                .is_err()
         );
     }
 

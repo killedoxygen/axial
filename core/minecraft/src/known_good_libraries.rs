@@ -1,4 +1,8 @@
 use crate::artifact_path::ArtifactRelativePath;
+use crate::download::library_source::{
+    LibraryComponentSourceKind, RetainedLibraryComponentSource,
+    RetainedLibrarySourceMaterialization, RetainedLibrarySourceReplay,
+};
 use crate::download::{
     AuthenticatedSelectedArtifactSource, DownloadJob, ExactLibraryDownloadProof,
     LibraryArtifactPlan, MaterializedLibraryIdentity, library_artifact_plans_for,
@@ -113,13 +117,12 @@ pub(crate) struct PendingInstallerTerminalDeclarations {
     embedded: BTreeMap<ArtifactRelativePath, AuthenticatedEmbeddedMavenArtifact>,
     workspace_embedded: Vec<AuthenticatedEmbeddedMavenArtifact>,
     structure: InstallerLibraryStructure,
-    materialized_network: BTreeSet<ArtifactRelativePath>,
+    network_sources: Vec<RetainedInstallerLibrarySource>,
     libraries_root: PathBuf,
 }
 
 pub(crate) struct PendingInstallerPublications {
     expected: BTreeMap<ArtifactRelativePath, SealedExactLibraryDeclaration>,
-    already_materialized: BTreeSet<ArtifactRelativePath>,
     sources: Vec<RetainedInstallerLibrarySource>,
     libraries_root: PathBuf,
 }
@@ -129,7 +132,6 @@ struct ObservedInstallerMaterialization {
     destination: PathBuf,
     kind: SealedLibraryKind,
     provider_url: Option<String>,
-    expected: crate::download::ExpectedIntegrity,
     sha1: [u8; 20],
     size: u64,
 }
@@ -147,8 +149,14 @@ pub(crate) struct RetainedInstallerLibrarySource {
 }
 
 enum RetainedInstallerLibraryBytes {
+    Network(RetainedLibraryComponentSource),
     Embedded(AuthenticatedEmbeddedMavenArtifact),
     Terminal(RetainedInstallerTerminalOutput),
+}
+
+pub(crate) enum RetainedInstallerLibraryMaterialization {
+    Network(RetainedLibrarySourceMaterialization),
+    Bytes(Arc<[u8]>),
 }
 
 struct InstallerSelectedLibrary {
@@ -202,6 +210,11 @@ impl ClassifiedLibraryDownload {
     pub(crate) fn into_parts(self) -> (DownloadJob, LibraryAcquisition) {
         (self.job, self.acquisition)
     }
+
+    #[cfg(test)]
+    pub(crate) fn from_test(job: DownloadJob, acquisition: LibraryAcquisition) -> Self {
+        Self { job, acquisition }
+    }
 }
 
 impl ClassifiedLibraryReconstruction {
@@ -252,7 +265,7 @@ impl ObservedInstallerMaterialization {
     fn from_download(
         identity: MaterializedLibraryIdentity,
     ) -> Result<Self, SealedLibraryDeclarationError> {
-        let (path, destination, is_native, provider_url, expected, size, sha1) =
+        let (path, destination, is_native, provider_url, _expected, size, sha1) =
             identity.into_parts();
         if size == 0 {
             return Err(SealedLibraryDeclarationError::InvalidExactDeclaration);
@@ -266,7 +279,6 @@ impl ObservedInstallerMaterialization {
                 SealedLibraryKind::Library
             },
             provider_url: (!provider_url.is_empty()).then_some(provider_url),
-            expected,
             sha1,
             size,
         })
@@ -276,31 +288,90 @@ impl ObservedInstallerMaterialization {
 impl RetainedInstallerLibrarySource {
     pub(crate) fn path(&self) -> &ArtifactRelativePath {
         match &self.source {
+            RetainedInstallerLibraryBytes::Network(source) => source.relative_path(),
             RetainedInstallerLibraryBytes::Embedded(artifact) => artifact.relative_path(),
             RetainedInstallerLibraryBytes::Terminal(output) => &output.path,
         }
     }
 
-    pub(crate) fn bytes(&self) -> &[u8] {
+    #[cfg(test)]
+    fn test_identity_parts(&self) -> (ArtifactRelativePath, bool, [u8; 20], u64) {
+        let is_native = self.kind == SealedLibraryKind::Native;
         match &self.source {
-            RetainedInstallerLibraryBytes::Embedded(artifact) => artifact.bytes(),
-            RetainedInstallerLibraryBytes::Terminal(output) => &output.bytes,
+            RetainedInstallerLibraryBytes::Network(source) => (
+                source.relative_path().clone(),
+                is_native,
+                source.observed_sha1(),
+                source.observed_size(),
+            ),
+            RetainedInstallerLibraryBytes::Embedded(artifact) => (
+                artifact.relative_path().clone(),
+                is_native,
+                Sha1::digest(artifact.bytes()).into(),
+                artifact.bytes().len() as u64,
+            ),
+            RetainedInstallerLibraryBytes::Terminal(output) => {
+                (output.path.clone(), is_native, output.sha1, output.size)
+            }
         }
     }
 
-    pub(crate) fn into_materialized_parts(self) -> (ArtifactRelativePath, bool, [u8; 20], u64) {
+    pub(crate) fn replay_network(
+        &self,
+    ) -> Result<Option<RetainedLibrarySourceReplay>, crate::loaders::types::LoaderError> {
+        match &self.source {
+            RetainedInstallerLibraryBytes::Network(source) => source.replay().map(Some),
+            RetainedInstallerLibraryBytes::Embedded(_)
+            | RetainedInstallerLibraryBytes::Terminal(_) => Ok(None),
+        }
+    }
+
+    pub(crate) fn into_materialization(
+        self,
+    ) -> Result<
+        (
+            ArtifactRelativePath,
+            bool,
+            [u8; 20],
+            u64,
+            RetainedInstallerLibraryMaterialization,
+        ),
+        crate::loaders::types::LoaderError,
+    > {
         let is_native = self.kind == SealedLibraryKind::Native;
-        let (path, sha1, size) = match self.source {
+        let (path, sha1, size, materialization) = match self.source {
+            RetainedInstallerLibraryBytes::Network(source) => {
+                let path = source.relative_path().clone();
+                let sha1 = source.observed_sha1();
+                let size = source.observed_size();
+                (
+                    path,
+                    sha1,
+                    size,
+                    RetainedInstallerLibraryMaterialization::Network(
+                        source.into_materialization()?,
+                    ),
+                )
+            }
             RetainedInstallerLibraryBytes::Embedded(artifact) => {
                 let (path, bytes) = artifact.into_parts();
                 let sha1 = Sha1::digest(&bytes).into();
-                (path, sha1, bytes.len() as u64)
+                let size = bytes.len() as u64;
+                (
+                    path,
+                    sha1,
+                    size,
+                    RetainedInstallerLibraryMaterialization::Bytes(Arc::from(bytes)),
+                )
             }
-            RetainedInstallerLibraryBytes::Terminal(output) => {
-                (output.path, output.sha1, output.size)
-            }
+            RetainedInstallerLibraryBytes::Terminal(output) => (
+                output.path,
+                output.sha1,
+                output.size,
+                RetainedInstallerLibraryMaterialization::Bytes(output.bytes),
+            ),
         };
-        (path, is_native, sha1, size)
+        Ok((path, is_native, sha1, size, materialization))
     }
 }
 
@@ -561,57 +632,67 @@ impl PendingInstallerNetworkDeclarations {
 
     pub(crate) fn complete_network(
         self,
-        materialized: Vec<MaterializedLibraryIdentity>,
+        sources: Vec<RetainedLibraryComponentSource>,
     ) -> Result<PendingInstallerTerminalDeclarations, SealedLibraryDeclarationError> {
-        let mut materialized = materialized
-            .into_iter()
-            .map(ObservedInstallerMaterialization::from_download)
-            .collect::<Result<Vec<_>, _>>()?
-            .into_iter()
-            .map(|identity| (identity.path.clone(), identity))
-            .try_fold(BTreeMap::new(), |mut identities, (path, identity)| {
-                if identities.insert(path, identity).is_some() {
-                    return Err(SealedLibraryDeclarationError::DuplicateDeclaration);
-                }
-                Ok(identities)
-            })?;
+        let mut sources =
+            sources
+                .into_iter()
+                .try_fold(BTreeMap::new(), |mut sources, source| {
+                    let path = source.relative_path().clone();
+                    if sources.insert(path, source).is_some() {
+                        return Err(SealedLibraryDeclarationError::DuplicateDeclaration);
+                    }
+                    Ok(sources)
+                })?;
         let mut entries = self.entries;
-        let mut materialized_network = BTreeSet::new();
+        let mut network_sources = Vec::new();
         for (path, selected) in &self.selected {
             let exact = matches!(selected.producer, InstallerLibraryProducer::ExactNetwork);
             if !exact && !matches!(selected.producer, InstallerLibraryProducer::FreshNetwork) {
                 continue;
             }
-            let identity = materialized
+            let source = sources
                 .remove(path)
                 .ok_or(SealedLibraryDeclarationError::MissingDeclaration)?;
-            if identity.kind != kind_for_plan(&selected.plan)
-                || identity.destination != path.join_under(&self.libraries_root)
-                || identity.provider_url.as_ref() != selected.plan.source_url.as_ref()
-                || identity.expected != selected.plan.expected
+            let kind = match source.source_kind() {
+                LibraryComponentSourceKind::Library => SealedLibraryKind::Library,
+                LibraryComponentSourceKind::NativeLibrary => SealedLibraryKind::Native,
+            };
+            if kind != kind_for_plan(&selected.plan)
+                || source.provider_url() != selected.plan.source_url.as_deref().unwrap_or_default()
+                || source.expected() != &selected.plan.expected
             {
                 return Err(SealedLibraryDeclarationError::ContractDrift);
             }
-            validate_plan_contract(&selected.plan, identity.sha1, identity.size)?;
+            validate_plan_contract(
+                &selected.plan,
+                source.observed_sha1(),
+                source.observed_size(),
+            )?;
             if exact {
                 let declaration = entries
                     .get(path)
                     .ok_or(SealedLibraryDeclarationError::MissingDeclaration)?;
-                if declaration.sha1 != identity.sha1 || declaration.size != identity.size {
+                if declaration.sha1 != source.observed_sha1()
+                    || declaration.size != source.observed_size()
+                {
                     return Err(SealedLibraryDeclarationError::ContractDrift);
                 }
             } else {
                 insert_exact_declaration(
                     &mut entries,
                     &selected.plan,
-                    identity.sha1,
-                    identity.size,
+                    source.observed_sha1(),
+                    source.observed_size(),
                     true,
                 )?;
             }
-            materialized_network.insert(path.clone());
+            network_sources.push(RetainedInstallerLibrarySource {
+                kind,
+                source: RetainedInstallerLibraryBytes::Network(source),
+            });
         }
-        if !materialized.is_empty() {
+        if !sources.is_empty() {
             return Err(SealedLibraryDeclarationError::ExtraDeclaration);
         }
         Ok(PendingInstallerTerminalDeclarations {
@@ -620,7 +701,7 @@ impl PendingInstallerNetworkDeclarations {
             embedded: self.embedded,
             workspace_embedded: self.workspace_embedded,
             structure: self.structure,
-            materialized_network,
+            network_sources,
             libraries_root: self.libraries_root,
         })
     }
@@ -786,6 +867,20 @@ impl PendingInstallerTerminalDeclarations {
         })
     }
 
+    pub(crate) fn replay_network_source(
+        &self,
+        path: &ArtifactRelativePath,
+    ) -> Result<Option<RetainedLibrarySourceReplay>, crate::loaders::types::LoaderError> {
+        let Some(source) = self
+            .network_sources
+            .iter()
+            .find(|source| source.path() == path)
+        else {
+            return Ok(None);
+        };
+        source.replay_network()
+    }
+
     pub(crate) fn seal_terminal_outputs(
         self,
         outputs: VerifiedProcessorOutputs,
@@ -794,14 +889,12 @@ impl PendingInstallerTerminalDeclarations {
         SealedLibraryDeclarationError,
     > {
         let libraries_root = self.libraries_root.clone();
-        let already_materialized = self.materialized_network.clone();
         let (declarations, sources) = self.seal_outputs(outputs)?;
         let expected = declarations_clone_entries(&declarations);
         Ok((
             declarations,
             PendingInstallerPublications {
                 expected,
-                already_materialized,
                 sources,
                 libraries_root,
             },
@@ -827,7 +920,7 @@ impl PendingInstallerTerminalDeclarations {
             structure: LibraryStructure::Installer(Box::new(self.structure)),
         };
         let expected = declarations_clone_entries(&declarations);
-        let mut sources = Vec::new();
+        let mut sources = self.network_sources;
         for (path, artifact) in self.embedded {
             if !matches!(
                 self.selected.get(&path).map(|selected| &selected.producer),
@@ -848,7 +941,6 @@ impl PendingInstallerTerminalDeclarations {
             declarations,
             PendingInstallerPublications {
                 expected,
-                already_materialized: self.materialized_network,
                 sources,
                 libraries_root: self.libraries_root,
             },
@@ -886,7 +978,7 @@ impl PendingInstallerTerminalDeclarations {
             })
             .collect::<Result<BTreeMap<_, _>, _>>()?;
         let mut entries = self.entries;
-        let mut sources = Vec::new();
+        let mut sources = self.network_sources;
         for (path, selected) in &self.selected {
             let InstallerLibraryProducer::Terminal(contract) = &selected.producer else {
                 continue;
@@ -968,14 +1060,12 @@ impl PendingInstallerPublications {
     pub(crate) fn into_sources(self) -> (Self, Vec<RetainedInstallerLibrarySource>) {
         let Self {
             expected,
-            already_materialized,
             sources,
             libraries_root,
         } = self;
         (
             Self {
                 expected,
-                already_materialized,
                 sources: Vec::new(),
                 libraries_root,
             },
@@ -990,7 +1080,7 @@ impl PendingInstallerPublications {
         if !self.sources.is_empty() {
             return Err(SealedLibraryDeclarationError::MissingDeclaration);
         }
-        let mut completed = self.already_materialized;
+        let mut completed = BTreeSet::new();
         for identity in materialized {
             let identity = ObservedInstallerMaterialization::from_download(identity)?;
             let expected = self
@@ -1815,17 +1905,32 @@ mod tests {
         library
     }
 
-    fn materialized_identity(
+    fn retained_network_source(
         classified: &ClassifiedLibraryDownload,
         sha1: [u8; 20],
         size: u64,
-    ) -> MaterializedLibraryIdentity {
-        MaterializedLibraryIdentity::from_test(
+    ) -> RetainedLibraryComponentSource {
+        RetainedLibraryComponentSource::from_test_identity(
             classified.job.relative_path.clone(),
-            classified.job.path.clone(),
             classified.job.is_native,
             classified.job.url.clone(),
             classified.job.expected.clone(),
+            size,
+            sha1,
+        )
+    }
+
+    fn final_materialized_identity(
+        source: &RetainedInstallerLibrarySource,
+        path: ArtifactRelativePath,
+    ) -> MaterializedLibraryIdentity {
+        let (_, is_native, sha1, size) = source.test_identity_parts();
+        MaterializedLibraryIdentity::from_test(
+            path.clone(),
+            path.join_under(Path::new("/managed/libraries")),
+            is_native,
+            String::new(),
+            ExpectedIntegrity::default(),
             size,
             sha1,
         )
@@ -2399,10 +2504,10 @@ mod tests {
         assert_eq!(fresh.acquisition, LibraryAcquisition::FreshStream);
         let pending = pending
             .complete_network(vec![
-                materialized_identity(exact, [1; 20], 7),
-                materialized_identity(fresh, [2; 20], 8),
+                retained_network_source(exact, [1; 20], 7),
+                retained_network_source(fresh, [2; 20], 8),
             ])
-            .expect("network materializations");
+            .expect("retained network sources");
         let (sealed, publications) = pending
             .seal_terminal_outputs(VerifiedProcessorOutputs::from_test_terminal(vec![(
                 terminal_path.clone(),
@@ -2423,20 +2528,10 @@ mod tests {
         assert_eq!(sealed.get(&embedded_path).and_then(|entry| entry.3), None);
         assert_eq!(sealed.get(&terminal_path).and_then(|entry| entry.3), None);
         let (publications, sources) = publications.into_sources();
-        assert_eq!(sources.len(), 2);
+        assert_eq!(sources.len(), 4);
         let identities = sources
             .iter()
-            .map(|source| {
-                MaterializedLibraryIdentity::from_test(
-                    source.path().clone(),
-                    source.path().join_under(Path::new("/managed/libraries")),
-                    false,
-                    String::new(),
-                    ExpectedIntegrity::default(),
-                    source.bytes().len() as u64,
-                    Sha1::digest(source.bytes()).into(),
-                )
-            })
+            .map(|source| final_materialized_identity(source, source.path().clone()))
             .collect();
         publications
             .complete(identities)
@@ -2641,7 +2736,7 @@ mod tests {
     }
 
     #[test]
-    fn installer_network_completion_rejects_missing_duplicate_extra_and_all_contract_drift() {
+    fn installer_network_completion_rejects_missing_duplicate_extra_and_source_contract_drift() {
         let build = || {
             let bound = bind_installer_library_declarations(
                 AuthenticatedInstallerLibraryInputs::from_test(
@@ -2667,11 +2762,10 @@ mod tests {
             Err(SealedLibraryDeclarationError::MissingDeclaration)
         ));
         let (_, jobs) = build();
-        let valid = materialized_identity(&jobs[0], [4; 20], 9);
+        let valid = retained_network_source(&jobs[0], [4; 20], 9);
         let (pending, _) = build();
-        let duplicate = MaterializedLibraryIdentity::from_test(
+        let duplicate = RetainedLibraryComponentSource::from_test_identity(
             jobs[0].job.relative_path.clone(),
-            jobs[0].job.path.clone(),
             false,
             jobs[0].job.url.clone(),
             jobs[0].job.expected.clone(),
@@ -2683,10 +2777,9 @@ mod tests {
             Err(SealedLibraryDeclarationError::DuplicateDeclaration)
         ));
         let (pending, jobs) = build();
-        let valid = materialized_identity(&jobs[0], [4; 20], 9);
-        let extra = MaterializedLibraryIdentity::from_test(
+        let valid = retained_network_source(&jobs[0], [4; 20], 9);
+        let extra = RetainedLibraryComponentSource::from_test_identity(
             ArtifactRelativePath::new("example/extra/1/extra-1.jar").unwrap(),
-            Path::new("/managed/libraries/example/extra/1/extra-1.jar").to_path_buf(),
             false,
             jobs[0].job.url.clone(),
             jobs[0].job.expected.clone(),
@@ -2697,16 +2790,11 @@ mod tests {
             pending.complete_network(vec![valid, extra]),
             Err(SealedLibraryDeclarationError::ExtraDeclaration)
         ));
-        for drift in 0..4 {
+        for drift in 0..3 {
             let (pending, jobs) = build();
             let job = &jobs[0].job;
-            let identity = MaterializedLibraryIdentity::from_test(
+            let source = RetainedLibraryComponentSource::from_test_identity(
                 job.relative_path.clone(),
-                if drift == 3 {
-                    Path::new("/different/library.jar").to_path_buf()
-                } else {
-                    job.path.clone()
-                },
                 drift == 1,
                 if drift == 0 {
                     "https://different.invalid/library.jar".to_string()
@@ -2725,7 +2813,7 @@ mod tests {
                 [4; 20],
             );
             assert!(matches!(
-                pending.complete_network(vec![identity]),
+                pending.complete_network(vec![source]),
                 Err(SealedLibraryDeclarationError::ContractDrift)
             ));
         }
@@ -2750,7 +2838,7 @@ mod tests {
                 .into_network_jobs(Path::new("/managed/libraries"))
                 .unwrap();
             assert!(matches!(
-                pending.complete_network(vec![materialized_identity(&jobs[0], sha1, size)]),
+                pending.complete_network(vec![retained_network_source(&jobs[0], sha1, size)]),
                 Err(SealedLibraryDeclarationError::ContractDrift)
             ));
         }
@@ -2791,15 +2879,7 @@ mod tests {
             Err(SealedLibraryDeclarationError::MissingDeclaration)
         ));
         let identity_for = |source: &RetainedInstallerLibrarySource, path: ArtifactRelativePath| {
-            MaterializedLibraryIdentity::from_test(
-                path.clone(),
-                path.join_under(Path::new("/managed/libraries")),
-                false,
-                String::new(),
-                ExpectedIntegrity::default(),
-                source.bytes().len() as u64,
-                Sha1::digest(source.bytes()).into(),
-            )
+            final_materialized_identity(source, path)
         };
         let (gate, sources) = build();
         let extra = identity_for(

@@ -7,7 +7,7 @@ use super::workspace::cleanup::{ProcessorWorkspace, ProcessorWorkspaceOwner};
 use crate::artifact_path::ArtifactRelativePath;
 use crate::download::{AuthenticatedSelectedArtifactSource, ExpectedIntegrity};
 use crate::launch::VersionJson;
-use crate::managed_fs::{ManagedDir, ManagedTreeSnapshot};
+use crate::managed_fs::ManagedTreeSnapshot;
 use crate::runtime::{ProcessorRuntime, RuntimeSourceReceipt};
 use sha1::{Digest as _, Sha1};
 use std::collections::{BTreeMap, BTreeSet};
@@ -393,7 +393,6 @@ pub(crate) struct AuthenticatedProcessorSources {
     base_version: VersionJson,
     client: ProcessorClientSource,
     runtime_source: Option<RuntimeSourceReceipt>,
-    installed_root: Option<ManagedDir>,
 }
 
 enum ProcessorClientSource {
@@ -406,14 +405,12 @@ impl AuthenticatedProcessorSources {
         base_version: VersionJson,
         client_bytes: Vec<u8>,
         runtime_source: RuntimeSourceReceipt,
-        installed_root: ManagedDir,
     ) -> Result<Self, BoundProcessorError> {
         validate_client_source(&base_version, &client_bytes)?;
         Ok(Self {
             base_version,
             client: ProcessorClientSource::Installed(client_bytes),
             runtime_source: Some(runtime_source),
-            installed_root: Some(installed_root),
         })
     }
 
@@ -436,7 +433,6 @@ impl AuthenticatedProcessorSources {
             base_version,
             client: ProcessorClientSource::Reconstructed(client_source),
             runtime_source: Some(runtime_source),
-            installed_root: None,
         })
     }
 
@@ -778,28 +774,34 @@ async fn stage_inputs(
     let mut libraries = BTreeMap::new();
     for (path, contract) in &plan.input_artifacts {
         check_cancel(cancel)?;
-        let bytes = match contract.source {
+        let authenticated = match contract.source {
             super::forge_installer::BoundProcessorInputSource::Download => {
-                if let Some(installed_root) = &sources.installed_root {
-                    let bytes = installed_root
-                        .open_child("libraries")
-                        .and_then(|libraries| {
-                            libraries.read_relative_authenticated(
-                                path,
-                                contract.size,
-                                &contract.sha1,
-                            )
-                        })
-                        .map_err(|_| BoundProcessorError::Authority)?;
-                    workspace
-                        .write_library_exact(path, &bytes)
-                        .await
-                        .map_err(|_| BoundProcessorError::Stage)?;
-                    bytes
-                } else {
-                    workspace
-                        .read_library_authenticated(path, contract.size, &contract.sha1)
-                        .map_err(|_| BoundProcessorError::Authority)?
+                match continuation
+                    .network_input_source(path)
+                    .map_err(|_| BoundProcessorError::Authority)?
+                {
+                    super::forge_installer::BoundProcessorNetworkInput::Retained(source) => {
+                        let (reader, size, sha1) = source.into_parts();
+                        if sha1 != contract.sha1
+                            || contract.size.is_some_and(|expected| expected != size)
+                        {
+                            return Err(BoundProcessorError::Authority);
+                        }
+                        workspace
+                            .import_library_authenticated(path, reader, size, sha1)
+                            .await
+                            .map_err(|_| BoundProcessorError::Stage)?;
+                        AuthenticatedBytes { size, sha1 }
+                    }
+                    super::forge_installer::BoundProcessorNetworkInput::ReconstructionWorkspace => {
+                        let bytes = workspace
+                            .read_library_authenticated(path, contract.size, &contract.sha1)
+                            .map_err(|_| BoundProcessorError::Authority)?;
+                        AuthenticatedBytes {
+                            size: bytes.len() as u64,
+                            sha1: contract.sha1,
+                        }
+                    }
                 }
             }
             super::forge_installer::BoundProcessorInputSource::Embedded => {
@@ -811,16 +813,13 @@ async fn stage_inputs(
                     .write_library_exact(path, &bytes)
                     .await
                     .map_err(|_| BoundProcessorError::Stage)?;
-                bytes
+                AuthenticatedBytes {
+                    size: bytes.len() as u64,
+                    sha1: contract.sha1,
+                }
             }
         };
-        libraries.insert(
-            path.clone(),
-            AuthenticatedBytes {
-                size: bytes.len() as u64,
-                sha1: contract.sha1,
-            },
-        );
+        libraries.insert(path.clone(), authenticated);
     }
 
     let client_name = format!("{}.jar", sources.base_version.id);

@@ -2,6 +2,7 @@ use crate::artifact_path::ArtifactRelativePath;
 use crate::loaders::types::LoaderError;
 use crate::loaders::validate_version_id;
 use crate::managed_fs::{ManagedDir, ManagedTreeLimits, ManagedTreeSnapshot};
+use std::io::{Read, Seek};
 use std::path::Path;
 use tempfile::TempDir;
 
@@ -201,13 +202,16 @@ impl ProcessorWorkspace {
         self.libraries.write_relative_exact(relative, bytes).await
     }
 
-    pub(crate) async fn import_library_authenticated(
+    pub(crate) async fn import_library_authenticated<R>(
         &self,
         relative: &ArtifactRelativePath,
-        source: std::fs::File,
+        source: R,
         expected_size: u64,
         expected_sha1: [u8; 20],
-    ) -> Result<(), LoaderError> {
+    ) -> Result<(), LoaderError>
+    where
+        R: Read + Seek + Send + 'static,
+    {
         self.libraries
             .import_relative_authenticated(relative, source, expected_size, expected_sha1)
             .await

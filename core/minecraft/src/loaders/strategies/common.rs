@@ -640,7 +640,7 @@ where
         send,
     ))
     .await?;
-    let (pending_execution, materialized_network) =
+    let (pending_execution, network_sources) =
         Box::pin(download_installer_libraries_with_evidence(
             library_dir,
             network_install,
@@ -649,7 +649,7 @@ where
         ))
         .await?;
     let execution = pending_execution
-        .complete_network(materialized_network)
+        .complete_network(network_sources)
         .map_err(|error| installer_extract_error(&plan.record.component_name, error))?;
     Box::pin(finish_supported_installer_install(
         library_dir,
@@ -680,12 +680,10 @@ where
                 acquire_preferred_runtime_source(&base_receipt.effective_version().java_version)
                     .await
                     .map_err(|error| LoaderError::ProcessorFailed(error.to_string()))?;
-            let installed_root = ManagedDir::open_root(library_dir)?;
             let processor_sources = AuthenticatedProcessorSources::from_installed(
                 base_receipt.effective_version().clone(),
                 base_client_bytes,
                 runtime_source,
-                installed_root,
             )
             .map_err(|error| LoaderError::ProcessorFailed(error.to_string()))?;
             send(progress(
@@ -1115,7 +1113,7 @@ async fn download_installer_libraries_with_evidence<F>(
 ) -> Result<
     (
         PendingForgeInstallExecution,
-        Vec<MaterializedLibraryIdentity>,
+        Vec<crate::download::library_source::RetainedLibraryComponentSource>,
     ),
     LoaderError,
 >
@@ -1445,8 +1443,6 @@ mod tests {
         LoaderInstallability,
     };
     use crate::loaders::{build_id_for, installed_version_id_for, validate_version_id};
-    #[cfg(unix)]
-    use crate::managed_fs::ManagedDir;
     use crate::manifest::VersionManifest;
     use crate::paths::versions_dir;
     use crate::rules::default_environment;
@@ -1686,12 +1682,31 @@ mod tests {
         )
         .await;
         let installer_plan = bind_test_installer(installer_source, &record);
-        let execution = materialize_test_installer_network(
+        let installer_exact_path = root.join("libraries/example/exact/1.0/exact-1.0.jar");
+        fs::create_dir_all(
+            installer_exact_path
+                .parent()
+                .expect("installer exact parent"),
+        )
+        .expect("create installer exact parent");
+        fs::write(&installer_exact_path, &installer_exact).expect("seed installer exact cache");
+        let installer_fresh_path = root.join("libraries/example/fresh/1.0/fresh-1.0.jar");
+        let execution = retain_test_installer_network(
             &root,
             installer_plan,
             &mut |_progress: DownloadProgress| {},
         )
         .await;
+        assert_eq!(installer_exact_server.request_count(), 0);
+        assert_eq!(installer_fresh_server.request_count(), 1);
+        assert_eq!(
+            fs::read(&installer_exact_path).expect("retained exact cache bytes"),
+            installer_exact
+        );
+        assert!(
+            !installer_fresh_path.exists(),
+            "network retention must not prewrite canonical Libraries"
+        );
         let install_receipt = finish_supported_installer_install(
             &root,
             &plan,
@@ -1803,7 +1818,7 @@ mod tests {
         )
         .await;
         let installer_plan = bind_test_installer(installer_source, &record);
-        let execution = materialize_test_installer_network(
+        let execution = retain_test_installer_network(
             &root,
             installer_plan,
             &mut |_progress: DownloadProgress| {},
@@ -3167,7 +3182,7 @@ printf '%s' 'processor-terminal' > "$last"
         };
         let installer_source =
             verified_test_source(&installer_server.url, "loader installer").await;
-        let execution = materialize_test_installer_network(
+        let execution = retain_test_installer_network(
             &root,
             bind_test_installer(installer_source, &record),
             &mut |_| {},
@@ -3203,7 +3218,7 @@ printf '%s' 'processor-terminal' > "$last"
         };
         let installer_source =
             verified_test_source(&installer_server.url, "loader installer").await;
-        let execution = materialize_test_installer_network(
+        let execution = retain_test_installer_network(
             &root,
             bind_test_installer(installer_source, &record),
             &mut |_| {},
@@ -4445,7 +4460,7 @@ esac
         base_receipt: KnownGoodInstallReceipt,
         runtime: &TestRuntimeSourceDescriptor,
     ) -> KnownGoodInstallReceipt {
-        let execution = materialize_test_installer_network(
+        let execution = retain_test_installer_network(
             root,
             installer_plan,
             &mut |_progress: DownloadProgress| {},
@@ -4464,7 +4479,6 @@ esac
             base_receipt.effective_version().clone(),
             base_client_bytes,
             runtime_source,
-            ManagedDir::open_root(root).expect("managed install root"),
         )
         .expect("authenticated installed processor sources");
         let result = spawn_bound_processor_execution(
@@ -4819,7 +4833,7 @@ esac
         installer_plan: BoundForgeInstallerPlan,
         send: &mut impl FnMut(DownloadProgress),
     ) -> KnownGoodInstallReceipt {
-        let execution = materialize_test_installer_network(root, installer_plan, send).await;
+        let execution = retain_test_installer_network(root, installer_plan, send).await;
         finish_supported_installer_install(
             root,
             plan,
@@ -4831,7 +4845,7 @@ esac
         .expect("finish installer install")
     }
 
-    async fn materialize_test_installer_network(
+    async fn retain_test_installer_network(
         root: &std::path::Path,
         installer_plan: BoundForgeInstallerPlan,
         send: &mut impl FnMut(DownloadProgress),
@@ -4842,16 +4856,16 @@ esac
         let network_install = execution
             .into_network_install(&crate::paths::libraries_dir(root))
             .expect("classified installer network");
-        let (pending, materialized) = download_installer_libraries_with_evidence(
+        let (pending, sources) = download_installer_libraries_with_evidence(
             root,
             network_install,
             "loader_libraries",
             send,
         )
         .await
-        .expect("materialized installer network");
+        .expect("retained installer network");
         pending
-            .complete_network(materialized)
+            .complete_network(sources)
             .expect("completed installer network")
     }
 

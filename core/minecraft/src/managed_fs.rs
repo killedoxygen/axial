@@ -1,5 +1,7 @@
 use crate::artifact_path::{ArtifactRelativePath, validate_artifact_path_segment};
-use crate::known_good_libraries::RetainedInstallerLibrarySource;
+use crate::known_good_libraries::{
+    RetainedInstallerLibraryMaterialization, RetainedInstallerLibrarySource,
+};
 use crate::loaders::types::LoaderError;
 use sha1::{Digest as _, Sha1};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -53,6 +55,13 @@ pub(crate) struct ManagedFileGuard {
     size: u64,
 }
 
+pub(crate) struct ManagedBoundedFileReader {
+    identity: platform::FileIdentity,
+    file: std::fs::File,
+    size: u64,
+    position: u64,
+}
+
 #[derive(Debug)]
 pub(crate) enum ManagedCreateOnlyWriteFailure {
     BeforePromotion(LoaderError),
@@ -99,13 +108,22 @@ pub(crate) enum ManagedDirectoryMoveFailure {
 }
 
 pub(crate) struct MaterializedInstallerLibrary {
-    source: RetainedInstallerLibrarySource,
+    path: ArtifactRelativePath,
     destination: PathBuf,
+    is_native: bool,
+    sha1: [u8; 20],
+    size: u64,
 }
 
 impl MaterializedInstallerLibrary {
-    pub(crate) fn into_parts(self) -> (RetainedInstallerLibrarySource, PathBuf) {
-        (self.source, self.destination)
+    pub(crate) fn into_parts(self) -> (ArtifactRelativePath, PathBuf, bool, [u8; 20], u64) {
+        (
+            self.path,
+            self.destination,
+            self.is_native,
+            self.sha1,
+            self.size,
+        )
     }
 }
 
@@ -142,6 +160,98 @@ impl ManagedFileGuard {
 
     pub(crate) fn identity(&self) -> ManagedFileIdentity {
         ManagedFileIdentity(self.identity)
+    }
+
+    pub(crate) fn into_bounded_reader(
+        mut self,
+        max_size: u64,
+    ) -> Result<ManagedBoundedFileReader, LoaderError> {
+        if self.size == 0
+            || self.size > max_size
+            || platform::file_identity(&self.file)? != self.identity
+            || self.file.metadata()?.len() != self.size
+        {
+            return Err(LoaderError::Verify(
+                "managed guarded reader source is invalid or exceeds its bound".to_string(),
+            ));
+        }
+        self.file.seek(SeekFrom::Start(0))?;
+        Ok(ManagedBoundedFileReader {
+            identity: self.identity,
+            file: self.file,
+            size: self.size,
+            position: 0,
+        })
+    }
+}
+
+impl ManagedBoundedFileReader {
+    fn validate_handle(&self) -> io::Result<()> {
+        if platform::file_identity(&self.file)? != self.identity
+            || self.file.metadata()?.len() != self.size
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "managed bounded reader identity changed",
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl Read for ManagedBoundedFileReader {
+    fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+        self.validate_handle()?;
+        let remaining = self.size.saturating_sub(self.position);
+        if remaining == 0 || output.is_empty() {
+            return Ok(0);
+        }
+        let bound = usize::try_from(remaining.min(output.len() as u64)).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidInput, "managed bounded read overflow")
+        })?;
+        let read = self.file.read(&mut output[..bound])?;
+        if read == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "managed bounded reader ended before its captured size",
+            ));
+        }
+        self.position = self.position.checked_add(read as u64).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "managed bounded reader position overflow",
+            )
+        })?;
+        if self.position == self.size {
+            self.validate_handle()?;
+        }
+        Ok(read)
+    }
+}
+
+impl Seek for ManagedBoundedFileReader {
+    fn seek(&mut self, position: SeekFrom) -> io::Result<u64> {
+        self.validate_handle()?;
+        let next = match position {
+            SeekFrom::Start(position) => i128::from(position),
+            SeekFrom::End(delta) => i128::from(self.size) + i128::from(delta),
+            SeekFrom::Current(delta) => i128::from(self.position) + i128::from(delta),
+        };
+        if !(0..=i128::from(self.size)).contains(&next) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "managed bounded reader seek escaped its captured range",
+            ));
+        }
+        let next = u64::try_from(next).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "managed bounded reader seek overflow",
+            )
+        })?;
+        self.file.seek(SeekFrom::Start(next))?;
+        self.position = next;
+        Ok(next)
     }
 }
 
@@ -1334,13 +1444,16 @@ impl ManagedDir {
         parent.write_exact(&name, bytes).await
     }
 
-    pub(crate) async fn import_relative_authenticated(
+    pub(crate) async fn import_relative_authenticated<R>(
         &self,
         relative: &ArtifactRelativePath,
-        source: std::fs::File,
+        source: R,
         expected_size: u64,
         expected_sha1: [u8; 20],
-    ) -> Result<(), LoaderError> {
+    ) -> Result<(), LoaderError>
+    where
+        R: Read + Seek + Send + 'static,
+    {
         if expected_size == 0 || expected_size > MAX_MANAGED_TREE_FILE_BYTES {
             return Err(LoaderError::Verify(
                 "managed loader source exceeds the processor stage file bound".to_string(),
@@ -1361,6 +1474,77 @@ impl ManagedDir {
                 false,
             )
             .await
+    }
+
+    async fn import_retained_library_authenticated<R>(
+        &self,
+        relative: &ArtifactRelativePath,
+        source: R,
+        expected_size: u64,
+        expected_sha1: [u8; 20],
+    ) -> Result<(), LoaderError>
+    where
+        R: Read + Seek + Send + 'static,
+    {
+        if expected_size == 0 || expected_size > MAX_MANAGED_READ_BYTES {
+            return Err(LoaderError::Verify(
+                "managed retained library exceeds the bounded file limit".to_string(),
+            ));
+        }
+        let (parent, name) = self.open_or_create_relative_parent(relative)?;
+        parent
+            .import_authenticated_inner(
+                &name,
+                source,
+                expected_size,
+                expected_sha1,
+                true,
+                (),
+                #[cfg(test)]
+                None,
+                #[cfg(test)]
+                false,
+            )
+            .await
+    }
+
+    pub(crate) async fn materialize_installer_library(
+        &self,
+        source: RetainedInstallerLibrarySource,
+    ) -> Result<MaterializedInstallerLibrary, LoaderError> {
+        let (path, is_native, sha1, size, materialization) = source.into_materialization()?;
+        let destination = path.join_under(&self.inner.path);
+        match materialization {
+            RetainedInstallerLibraryMaterialization::Network(source) => {
+                let (reader, source_path, source_size, source_sha1, source_kind) =
+                    source.into_parts();
+                let source_is_native = matches!(
+                    source_kind,
+                    crate::download::library_source::LibraryComponentSourceKind::NativeLibrary
+                );
+                if source_path != path
+                    || source_size != size
+                    || source_sha1 != sha1
+                    || source_is_native != is_native
+                {
+                    return Err(LoaderError::Verify(
+                        "retained installer network source identity changed".to_string(),
+                    ));
+                }
+                self.import_retained_library_authenticated(&path, reader, size, sha1)
+                    .await?;
+            }
+            RetainedInstallerLibraryMaterialization::Bytes(bytes) => {
+                self.write_relative_exact(&path, &bytes).await?;
+            }
+        }
+        Ok(MaterializedInstallerLibrary {
+            path,
+            destination,
+            is_native,
+            sha1,
+            size,
+        })
     }
 
     pub(crate) async fn import_authenticated_create_new<R, G>(
@@ -1613,19 +1797,6 @@ impl ManagedDir {
             promoted.disarm();
         }
         Ok(())
-    }
-
-    pub(crate) async fn materialize_installer_library(
-        &self,
-        source: RetainedInstallerLibrarySource,
-    ) -> Result<MaterializedInstallerLibrary, LoaderError> {
-        let destination = source.path().join_under(&self.inner.path);
-        self.write_relative_exact(source.path(), source.bytes())
-            .await?;
-        Ok(MaterializedInstallerLibrary {
-            source,
-            destination,
-        })
     }
 
     pub(crate) async fn write_exact(&self, name: &str, bytes: &[u8]) -> Result<(), LoaderError> {

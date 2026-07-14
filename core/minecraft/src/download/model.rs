@@ -126,8 +126,7 @@ impl MaterializedLibraryIdentity {
     pub(crate) fn from_installer_publication(
         publication: crate::loaders::MaterializedInstallerLibrary,
     ) -> Self {
-        let (source, destination) = publication.into_parts();
-        let (path, is_native, sha1, size) = source.into_materialized_parts();
+        let (path, destination, is_native, sha1, size) = publication.into_parts();
         Self {
             path,
             destination,
