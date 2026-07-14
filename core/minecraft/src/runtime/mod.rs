@@ -21,9 +21,15 @@ pub use discovery::{
     runtime_component_ready_without_probe, runtime_component_structurally_ready_without_probe,
     runtime_executable_ready_without_probe, runtime_requirement,
 };
-pub use ensure::ensure_runtime_with_events;
+#[cfg(feature = "test-support")]
+pub use ensure::rebuild_managed_runtime_fixture_for_test;
 pub(crate) use ensure::{
     ProcessorRuntime, materialize_ephemeral_processor_runtime, materialize_preferred_runtime_source,
+};
+pub use ensure::{ensure_runtime_with_events, rebuild_managed_runtime_component};
+pub use install::{
+    ManagedRuntimeCommitReceipt, ManagedRuntimeFailureReceipt, ManagedRuntimeQuarantineObligation,
+    ManagedRuntimeRebuildError,
 };
 pub use layout::ManagedRuntimeCache;
 pub(crate) use layout::runtime_java_relative_path;
@@ -41,8 +47,6 @@ pub use probe::{
 #[cfg(test)]
 use discovery::detect_runtime_state;
 #[cfg(test)]
-use ensure::runtime_install_lock_file_path;
-#[cfg(test)]
 use ensure::runtime_record_matches_source_for_test;
 #[cfg(test)]
 use file_download::{
@@ -54,12 +58,19 @@ use file_download::{
 pub(crate) use install::plan_runtime_manifest_files;
 #[cfg(test)]
 use install::{
-    install_managed_runtime, install_runtime_manifest_file, install_runtime_manifest_files,
-    remove_runtime_install_path, remove_runtime_install_path_async,
-    validate_ephemeral_processor_manifest_for_test,
+    install_runtime_manifest_file, install_runtime_manifest_files, publish_staged_managed_runtime,
+    publish_staged_managed_runtime_and_finalize,
+    publish_staged_managed_runtime_with_displacement_failure_for_test,
+    publish_staged_managed_runtime_with_finalization_failure_for_test,
+    publish_staged_managed_runtime_with_promotion_failure_for_test,
+    publish_staged_managed_runtime_with_restoration_failure_for_test,
+    publish_staged_managed_runtime_with_rotation_failure_for_test, runtime_install_lock_file_path,
+    stage_managed_runtime, validate_ephemeral_processor_manifest_for_test,
 };
 #[cfg(test)]
 use layout::{java_executable, java_executable_for_os, runtime_os_arch_for};
+#[cfg(test)]
+use manifest::authenticated_runtime_source_from_manifest_for_test;
 pub(crate) use manifest::{
     COMPONENT_MANIFEST_PROOF_FILE, ComponentManifest, RuntimeSourceReceipt,
     component_manifest_proof_bytes,

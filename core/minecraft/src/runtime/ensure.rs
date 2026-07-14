@@ -3,13 +3,13 @@ use super::discovery::{
     resolve_axial_cached_runtime, resolve_component_runtime, resolve_managed_runtime,
     resolve_override_runtime, runtime_requirement,
 };
-use super::file_download::runtime_filesystem_path;
-use super::install::{install_ephemeral_processor_runtime, install_managed_runtime};
-use super::layout::{ManagedRuntimeCache, runtime_os_arch};
-use super::manifest::{
-    COMPONENT_MANIFEST_PROOF_FILE, RuntimeSourceReceipt, acquire_runtime_source,
-    component_manifest_proof_bytes,
+use super::install::{
+    ManagedRuntimeCommitReceipt, ManagedRuntimeRebuildError, install_ephemeral_processor_runtime,
+    publish_staged_managed_runtime, publish_staged_managed_runtime_and_finalize,
+    stage_managed_runtime,
 };
+use super::layout::{ManagedRuntimeCache, runtime_os_arch};
+use super::manifest::{RuntimeSourceReceipt, acquire_runtime_source};
 use super::model::{
     JavaRuntimeLookupError, RuntimeEnsureEvent, RuntimeEnsureResult, RuntimeId, RuntimeOverride,
     RuntimeProbeUsage, RuntimeRecord, RuntimeRequirement, RuntimeSource,
@@ -31,6 +31,135 @@ impl ProcessorRuntime {
     pub(crate) fn into_source_receipt(self) -> RuntimeSourceReceipt {
         self._source_receipt
     }
+}
+
+pub async fn rebuild_managed_runtime_component<F>(
+    cache: &ManagedRuntimeCache,
+    component: RuntimeId,
+    mut observer: F,
+) -> Result<ManagedRuntimeCommitReceipt, ManagedRuntimeRebuildError>
+where
+    F: FnMut(RuntimeEnsureEvent),
+{
+    if !is_known_runtime_component(component.as_str()) {
+        return Err(ManagedRuntimeRebuildError::Preparation(
+            JavaRuntimeLookupError::Download(
+                "runtime rebuild target is outside the closed managed component vocabulary"
+                    .to_string(),
+            ),
+        ));
+    }
+    observer(RuntimeEnsureEvent::DownloadingManagedRuntime {
+        component: component.as_str().to_string(),
+    });
+    let source_receipt = acquire_runtime_source(&component, &runtime_os_arch())
+        .await
+        .map_err(ManagedRuntimeRebuildError::Preparation)?;
+    let receipt = rebuild_managed_runtime_component_from_source(
+        cache,
+        &component,
+        source_receipt,
+        &mut observer,
+    )
+    .await?;
+    if !receipt.revalidate(cache, &component).await {
+        return Err(receipt.into_failure(JavaRuntimeLookupError::Download(
+            "rebuilt runtime failed exact commit receipt verification".to_string(),
+        )));
+    }
+    observer(RuntimeEnsureEvent::ManagedRuntimeReady {
+        component: component.as_str().to_string(),
+    });
+    Ok(receipt)
+}
+
+#[cfg(feature = "test-support")]
+pub async fn rebuild_managed_runtime_fixture_for_test(
+    cache: &ManagedRuntimeCache,
+    component: RuntimeId,
+) -> Result<ManagedRuntimeCommitReceipt, ManagedRuntimeRebuildError> {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    const JAVA_BYTES: &[u8] = b"axial managed runtime fixture";
+    if !is_known_runtime_component(component.as_str()) {
+        return Err(ManagedRuntimeRebuildError::Preparation(
+            JavaRuntimeLookupError::Download(
+                "runtime rebuild fixture target is outside the closed component vocabulary"
+                    .to_string(),
+            ),
+        ));
+    }
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .map_err(|error| {
+            ManagedRuntimeRebuildError::Preparation(JavaRuntimeLookupError::Download(
+                error.to_string(),
+            ))
+        })?;
+    let address = listener.local_addr().map_err(|error| {
+        ManagedRuntimeRebuildError::Preparation(JavaRuntimeLookupError::Download(error.to_string()))
+    })?;
+    tokio::spawn(async move {
+        let Ok((mut socket, _)) = listener.accept().await else {
+            return;
+        };
+        let mut request = [0_u8; 1024];
+        let _ = socket.read(&mut request).await;
+        let headers = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            JAVA_BYTES.len()
+        );
+        if socket.write_all(headers.as_bytes()).await.is_ok() {
+            let _ = socket.write_all(JAVA_BYTES).await;
+        }
+    });
+    let source = super::manifest::authenticated_runtime_rebuild_fixture_source(
+        component.clone(),
+        format!("http://{address}/java"),
+        JAVA_BYTES,
+    )
+    .map_err(ManagedRuntimeRebuildError::Preparation)?;
+    let inventory = crate::known_good::runtime_inventory_from_source(&source).map_err(|_| {
+        ManagedRuntimeRebuildError::Preparation(JavaRuntimeLookupError::Download(
+            "runtime rebuild fixture inventory derivation failed".to_string(),
+        ))
+    })?;
+    let mut observer = |_| {};
+    let receipt =
+        rebuild_managed_runtime_component_from_source(cache, &component, source, &mut observer)
+            .await?;
+    if !receipt.revalidate(cache, &component).await
+        || !receipt.matches_known_good_inventory(&inventory)
+    {
+        return Err(receipt.into_failure(JavaRuntimeLookupError::Download(
+            "runtime rebuild fixture failed sealed postcondition verification".to_string(),
+        )));
+    }
+    Ok(receipt)
+}
+
+async fn rebuild_managed_runtime_component_from_source(
+    cache: &ManagedRuntimeCache,
+    component: &RuntimeId,
+    source_receipt: RuntimeSourceReceipt,
+    observer: &mut impl FnMut(RuntimeEnsureEvent),
+) -> Result<ManagedRuntimeCommitReceipt, ManagedRuntimeRebuildError> {
+    let staged = stage_managed_runtime(cache, component, source_receipt, observer)
+        .await
+        .map_err(ManagedRuntimeRebuildError::Preparation)?;
+    publish_staged_managed_runtime(staged).await
+}
+
+async fn install_managed_runtime_component_from_source(
+    cache: &ManagedRuntimeCache,
+    component: &RuntimeId,
+    source_receipt: RuntimeSourceReceipt,
+    observer: &mut impl FnMut(RuntimeEnsureEvent),
+) -> Result<ManagedRuntimeCommitReceipt, ManagedRuntimeRebuildError> {
+    let staged = stage_managed_runtime(cache, component, source_receipt, observer)
+        .await
+        .map_err(ManagedRuntimeRebuildError::Preparation)?;
+    publish_staged_managed_runtime_and_finalize(staged).await
 }
 
 pub(crate) async fn materialize_ephemeral_processor_runtime(
@@ -97,23 +226,22 @@ where
             "runtime source does not match the preferred managed component".to_string(),
         ));
     }
-    let install_root = cache
-        .component_root(component.as_str())
-        .expect("validated managed runtime component has a cache root");
-    let install_lock = cache.install_lock(component.as_str());
-    let _guard = install_lock.lock().await;
-    let _file_lock = acquire_runtime_install_file_lock(&install_root).await?;
     let current = resolve_axial_cached_runtime(cache, &component, java_version.major_version).ok();
     let matches_source = match current.as_ref() {
         Some(runtime) => runtime_record_matches_source(runtime, &source_receipt).await,
         None => false,
     };
-    if !matches_source {
+    let source_receipt = if matches_source {
+        source_receipt
+    } else {
         observer(RuntimeEnsureEvent::DownloadingManagedRuntime {
             component: component.as_str().to_string(),
         });
-        install_managed_runtime(&component, &install_root, &source_receipt, observer).await?;
-    }
+        install_managed_runtime_component_from_source(cache, &component, source_receipt, observer)
+            .await
+            .map_err(ManagedRuntimeRebuildError::into_lookup_error)?
+            .into_source_receipt()
+    };
     let runtime = resolve_axial_cached_runtime(cache, &component, java_version.major_version)?;
     if !runtime_record_matches_source(&runtime, &source_receipt).await {
         return Err(JavaRuntimeLookupError::Download(
@@ -236,13 +364,6 @@ where
     // runtime install paths. The same parsed receipt is consumed below.
     let source_receipt = acquire_runtime_source(preferred, &runtime_os_arch()).await?;
 
-    let install_root = cache
-        .component_root(preferred.as_str())
-        .expect("validated managed runtime component has a cache root");
-    let install_lock = cache.install_lock(preferred.as_str());
-    let _guard = install_lock.lock().await;
-    let _file_lock = acquire_runtime_install_file_lock(&install_root).await?;
-
     match resolve_managed_runtime(cache, preferred) {
         Ok(runtime) => {
             if runtime_record_matches_source(&runtime, &source_receipt).await {
@@ -259,7 +380,11 @@ where
     observer(RuntimeEnsureEvent::DownloadingManagedRuntime {
         component: preferred.as_str().to_string(),
     });
-    install_managed_runtime(preferred, &install_root, &source_receipt, observer).await?;
+    let source_receipt =
+        install_managed_runtime_component_from_source(cache, preferred, source_receipt, observer)
+            .await
+            .map_err(ManagedRuntimeRebuildError::into_lookup_error)?
+            .into_source_receipt();
     let runtime =
         resolve_component_runtime(cache, preferred, requirement.required_java.major_version)?;
     if !runtime_record_matches_source(&runtime, &source_receipt).await {
@@ -267,6 +392,9 @@ where
             "installed runtime does not match its authenticated source".to_string(),
         ));
     }
+    observer(RuntimeEnsureEvent::ManagedRuntimeReady {
+        component: preferred.as_str().to_string(),
+    });
     Ok(ManagedEnsure { effective: runtime })
 }
 
@@ -293,12 +421,6 @@ where
 
     let source_receipt = acquire_runtime_source(&runtime.id, &runtime_os_arch()).await?;
     let component = runtime.id.clone();
-    let install_root = cache
-        .component_root(component.as_str())
-        .expect("validated managed runtime component has a cache root");
-    let install_lock = cache.install_lock(component.as_str());
-    let _guard = install_lock.lock().await;
-    let _file_lock = acquire_runtime_install_file_lock(&install_root).await?;
     if let Ok(current) = resolve_component_runtime(cache, &component, required_major)
         && runtime_record_matches_source(&current, &source_receipt).await
     {
@@ -311,13 +433,20 @@ where
     observer(RuntimeEnsureEvent::DownloadingManagedRuntime {
         component: component.as_str().to_string(),
     });
-    install_managed_runtime(&component, &install_root, &source_receipt, observer).await?;
+    let source_receipt =
+        install_managed_runtime_component_from_source(cache, &component, source_receipt, observer)
+            .await
+            .map_err(ManagedRuntimeRebuildError::into_lookup_error)?
+            .into_source_receipt();
     let effective = resolve_component_runtime(cache, &component, required_major)?;
     if !runtime_record_matches_source(&effective, &source_receipt).await {
         return Err(JavaRuntimeLookupError::Download(
             "installed runtime does not match its authenticated source".to_string(),
         ));
     }
+    observer(RuntimeEnsureEvent::ManagedRuntimeReady {
+        component: component.as_str().to_string(),
+    });
     Ok(RefreshedRuntime {
         effective,
         install_performed: true,
@@ -331,24 +460,7 @@ async fn runtime_record_matches_source(
     if runtime.source != RuntimeSource::Managed || &runtime.id != source.component() {
         return false;
     }
-    let Ok(expected) = component_manifest_proof_bytes(source.manifest()) else {
-        return false;
-    };
-    let proof_path = PathBuf::from(&runtime.root_dir).join(COMPONENT_MANIFEST_PROOF_FILE);
-    let Ok(metadata) =
-        tokio::fs::symlink_metadata(runtime_filesystem_path(&proof_path).as_ref()).await
-    else {
-        return false;
-    };
-    if metadata.file_type().is_symlink()
-        || !metadata.is_file()
-        || metadata.len() != expected.len() as u64
-    {
-        return false;
-    }
-    tokio::fs::read(runtime_filesystem_path(&proof_path).as_ref())
-        .await
-        .is_ok_and(|actual| actual == expected)
+    super::install::runtime_tree_matches_source(Path::new(&runtime.root_dir), source).await
 }
 
 #[cfg(test)]
@@ -357,45 +469,4 @@ pub(super) async fn runtime_record_matches_source_for_test(
     source: &RuntimeSourceReceipt,
 ) -> bool {
     runtime_record_matches_source(runtime, source).await
-}
-
-struct RuntimeInstallFileLock {
-    file: std::fs::File,
-}
-
-impl Drop for RuntimeInstallFileLock {
-    fn drop(&mut self) {
-        let _ = self.file.unlock();
-    }
-}
-
-async fn acquire_runtime_install_file_lock(
-    install_root: &Path,
-) -> Result<RuntimeInstallFileLock, JavaRuntimeLookupError> {
-    let lock_path = runtime_install_lock_file_path(install_root);
-    tokio::task::spawn_blocking(move || {
-        if let Some(parent) = lock_path.parent() {
-            std::fs::create_dir_all(runtime_filesystem_path(parent).as_ref())?;
-        }
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(runtime_filesystem_path(&lock_path).as_ref())?;
-        file.lock()?;
-        Ok::<_, std::io::Error>(RuntimeInstallFileLock { file })
-    })
-    .await
-    .map_err(|error| JavaRuntimeLookupError::Download(error.to_string()))?
-    .map_err(|error| JavaRuntimeLookupError::Download(error.to_string()))
-}
-
-pub(super) fn runtime_install_lock_file_path(install_root: &Path) -> PathBuf {
-    let mut name = install_root
-        .file_name()
-        .unwrap_or_else(|| std::ffi::OsStr::new("runtime"))
-        .to_os_string();
-    name.push(".install.lock");
-    install_root.with_file_name(name)
 }

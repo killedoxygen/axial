@@ -6,6 +6,7 @@
 
 mod artifact_descriptor;
 mod artifact_repair;
+mod component_rebuild;
 mod copy;
 mod directive;
 mod healing;
@@ -42,6 +43,7 @@ mod preflight_decision_snapshot;
 mod preset_stage_copy_snapshot;
 #[cfg(test)]
 mod projection_copy_snapshot;
+mod reconciliation_journal;
 mod rules;
 
 #[cfg(test)]
@@ -51,6 +53,10 @@ pub(crate) use artifact_descriptor::GuardianMinecraftArtifactRepairDescriptor;
 pub use artifact_repair::{GuardianArtifactRepairOutcome, GuardianArtifactRepairStatus};
 pub(crate) use artifact_repair::{
     execute_guardian_missing_download, execute_guardian_quarantine_redownload,
+};
+pub(crate) use component_rebuild::{
+    GuardianRuntimeComponentRebuildOutcome, GuardianRuntimeComponentRebuildStatus,
+    execute_managed_runtime_component_rebuild,
 };
 pub(crate) use copy::GuardianSummaryDecision;
 pub(crate) use copy::{

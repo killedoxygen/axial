@@ -5,19 +5,23 @@ use crate::execution::runtime::{
     ManagedRuntimeRoot, ManagedRuntimeVerificationRequest, verify_managed_runtime,
 };
 use crate::guardian::{
-    GuardianPreflightOutcomeRequest, GuardianRepairStatus, GuardianRuntimeRepairCopy,
-    authorize_managed_runtime_ready_marker_repair, execute_managed_runtime_ready_marker_repair,
+    DiagnosisId, GuardianPreflightOutcomeRequest, GuardianRepairStatus,
+    GuardianRuntimeComponentRebuildOutcome, GuardianRuntimeComponentRebuildStatus,
+    GuardianRuntimeRepairCopy, authorize_managed_runtime_ready_marker_repair,
+    execute_managed_runtime_component_rebuild, execute_managed_runtime_ready_marker_repair,
     guardian_fact_from_execution, guardian_preflight_outcome,
 };
 use crate::observability::telemetry::{
     TelemetryErrorArea, TelemetryErrorKind, TelemetryErrorLevel, TelemetryEvent,
 };
-use crate::state::contracts::OperationPhase;
+use crate::state::contracts::{OperationId, OperationPhase};
 use crate::state::{
     AppState, InstanceLifecycleLease, IntegrityForegroundLease, OperationJournalStoreError,
+    ReconciliationEvidenceRejection, RegisteredComponentRebuildAdmission,
 };
 use axial_config::Instance;
 use axial_launcher::GuardianMode;
+use axial_minecraft::runtime::{ManagedRuntimeRebuildError, RuntimeEnsureEvent};
 use axial_minecraft::{ManagedRuntimeCache, preferred_runtime_component, resolve_version};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -25,6 +29,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 const RUNTIME_REPAIR_RESPONSE_TIMEOUT: Duration = Duration::from_millis(500);
+const RUNTIME_COMPONENT_REBUILD_SUPPRESSION_MINUTES: i64 = 15;
 
 struct RuntimeRepairRequestGuard {
     abandoned: Arc<AtomicBool>,
@@ -69,8 +74,46 @@ pub(super) async fn maybe_repair_managed_runtime_before_launch_owned(
     state: &AppState,
     producer: &crate::state::ProducerLease,
     foreground: &IntegrityForegroundLease,
-    mut preflight: LaunchPreflightFacts,
+    preflight: LaunchPreflightFacts,
     launch: ManagedRuntimeRepairLaunch<'_>,
+) -> Result<LaunchPreflightFacts, OperationJournalStoreError> {
+    maybe_repair_managed_runtime_before_launch_with_source(
+        state,
+        producer,
+        foreground,
+        preflight,
+        launch,
+        RuntimeComponentRebuildSource::Production,
+    )
+    .await
+}
+
+#[cfg(test)]
+pub(super) async fn maybe_repair_managed_runtime_before_launch_with_fixture(
+    state: &AppState,
+    producer: &crate::state::ProducerLease,
+    foreground: &IntegrityForegroundLease,
+    preflight: LaunchPreflightFacts,
+    launch: ManagedRuntimeRepairLaunch<'_>,
+) -> Result<LaunchPreflightFacts, OperationJournalStoreError> {
+    maybe_repair_managed_runtime_before_launch_with_source(
+        state,
+        producer,
+        foreground,
+        preflight,
+        launch,
+        RuntimeComponentRebuildSource::Fixture,
+    )
+    .await
+}
+
+async fn maybe_repair_managed_runtime_before_launch_with_source(
+    state: &AppState,
+    producer: &crate::state::ProducerLease,
+    foreground: &IntegrityForegroundLease,
+    preflight: LaunchPreflightFacts,
+    launch: ManagedRuntimeRepairLaunch<'_>,
+    rebuild_source: RuntimeComponentRebuildSource,
 ) -> Result<LaunchPreflightFacts, OperationJournalStoreError> {
     if preflight.guardian.mode != GuardianMode::Managed
         || !readiness_has_managed_runtime_missing(&preflight.readiness)
@@ -110,6 +153,72 @@ pub(super) async fn maybe_repair_managed_runtime_before_launch_owned(
         api_guardian_mode(preflight.guardian.mode),
         &guardian_facts,
     ));
+    match state.active_recorded_runtime_artifact_failure(launch.instance_lifecycle) {
+        Ok(evidence) => {
+            let diagnosis_id = Some(evidence.diagnosis_id());
+            let admission = state
+                .admit_component_rebuild(
+                    evidence,
+                    new_runtime_component_rebuild_operation_id(),
+                    chrono::Duration::minutes(RUNTIME_COMPONENT_REBUILD_SUPPRESSION_MINUTES),
+                )
+                .await;
+            let repair_foreground = foreground.retained();
+            let (effective_status, repair_foreground) = match admission {
+                Ok(admission) => {
+                    let (component_outcome, repair_foreground) =
+                        execute_owned_runtime_component_rebuild(
+                            state,
+                            producer,
+                            admission,
+                            repair_foreground,
+                            rebuild_source,
+                        )
+                        .await?;
+                    (
+                        component_rebuild_repair_status(component_outcome.status),
+                        repair_foreground,
+                    )
+                }
+                Err(_) => (GuardianRepairStatus::Blocked, repair_foreground),
+            };
+            return finish_managed_runtime_repair(
+                state,
+                producer,
+                ManagedRuntimeRepairCompletion {
+                    foreground,
+                    preflight,
+                    launch,
+                    diagnosis_id,
+                    effective_status,
+                    repair_foreground,
+                },
+            )
+            .await;
+        }
+        Err(ReconciliationEvidenceRejection::MemoryMissing) => {}
+        Err(_) => {
+            let diagnosis_id = repair_outcome
+                .guardian_decision
+                .diagnoses()
+                .first()
+                .copied();
+            return finish_managed_runtime_repair(
+                state,
+                producer,
+                ManagedRuntimeRepairCompletion {
+                    foreground,
+                    preflight,
+                    launch,
+                    diagnosis_id,
+                    effective_status: GuardianRepairStatus::Blocked,
+                    repair_foreground: foreground.retained(),
+                },
+            )
+            .await;
+        }
+    }
+
     let Ok(repair_authorization) =
         authorize_managed_runtime_ready_marker_repair(&repair_outcome.guardian_decision)
     else {
@@ -202,22 +311,99 @@ pub(super) async fn maybe_repair_managed_runtime_before_launch_owned(
     };
     let (outcome, repair_foreground) = response;
     let outcome = outcome?;
+    let diagnosis_id = outcome.diagnosis_id;
+    let component_evidence = match outcome.status {
+        GuardianRepairStatus::Failed => state
+            .recorded_artifact_repair_failure(launch.instance_lifecycle, &outcome.operation_id)
+            .ok(),
+        GuardianRepairStatus::Blocked => state
+            .active_recorded_runtime_artifact_failure(launch.instance_lifecycle)
+            .ok(),
+        GuardianRepairStatus::Repaired => None,
+    };
+    let (effective_status, repair_foreground) = match component_evidence {
+        Some(evidence) => {
+            let admission = state
+                .admit_component_rebuild(
+                    evidence,
+                    new_runtime_component_rebuild_operation_id(),
+                    chrono::Duration::minutes(RUNTIME_COMPONENT_REBUILD_SUPPRESSION_MINUTES),
+                )
+                .await;
+            match admission {
+                Ok(admission) => {
+                    let (component_outcome, repair_foreground) =
+                        execute_owned_runtime_component_rebuild(
+                            state,
+                            producer,
+                            admission,
+                            repair_foreground,
+                            rebuild_source,
+                        )
+                        .await?;
+                    (
+                        component_rebuild_repair_status(component_outcome.status),
+                        repair_foreground,
+                    )
+                }
+                Err(_) => (GuardianRepairStatus::Blocked, repair_foreground),
+            }
+        }
+        None => (outcome.status, repair_foreground),
+    };
 
-    if outcome.status == GuardianRepairStatus::Failed {
+    finish_managed_runtime_repair(
+        state,
+        producer,
+        ManagedRuntimeRepairCompletion {
+            foreground,
+            preflight,
+            launch,
+            diagnosis_id,
+            effective_status,
+            repair_foreground,
+        },
+    )
+    .await
+}
+
+struct ManagedRuntimeRepairCompletion<'a, 'b> {
+    foreground: &'a IntegrityForegroundLease,
+    preflight: LaunchPreflightFacts,
+    launch: ManagedRuntimeRepairLaunch<'b>,
+    diagnosis_id: Option<DiagnosisId>,
+    effective_status: GuardianRepairStatus,
+    repair_foreground: IntegrityForegroundLease,
+}
+
+async fn finish_managed_runtime_repair(
+    state: &AppState,
+    producer: &crate::state::ProducerLease,
+    completion: ManagedRuntimeRepairCompletion<'_, '_>,
+) -> Result<LaunchPreflightFacts, OperationJournalStoreError> {
+    let ManagedRuntimeRepairCompletion {
+        foreground,
+        mut preflight,
+        launch,
+        diagnosis_id,
+        effective_status,
+        repair_foreground,
+    } = completion;
+    if effective_status == GuardianRepairStatus::Failed {
         state.telemetry().emit(TelemetryEvent::error_captured(
             TelemetryErrorKind::GuardianRepairFailed,
             TelemetryErrorArea::Guardian,
             TelemetryErrorLevel::Error,
-            outcome.summary.as_str(),
+            "managed_runtime_component_rebuild_failed",
         ));
     }
-    let repair_copy = GuardianRuntimeRepairCopy::author(outcome.diagnosis_id, outcome.status)
+    let repair_copy = GuardianRuntimeRepairCopy::author(diagnosis_id, effective_status)
         .ok_or_else(|| {
             OperationJournalStoreError::Persistence(std::io::Error::other(
                 "managed-runtime repair outcome is missing its supported diagnosis",
             ))
         })?;
-    let result = match outcome.status {
+    let result = match effective_status {
         GuardianRepairStatus::Repaired => {
             let prior_java_probe_receipt = preflight.java_probe_receipt.take();
             let mut repaired = build_launch_preflight_facts(
@@ -251,6 +437,12 @@ pub(super) async fn maybe_repair_managed_runtime_before_launch_owned(
     result
 }
 
+enum RuntimeComponentRebuildSource {
+    Production,
+    #[cfg(test)]
+    Fixture,
+}
+
 struct ManagedRuntimeRepairCandidate {
     runtime_root: PathBuf,
     java_executable: PathBuf,
@@ -275,6 +467,119 @@ fn managed_runtime_ready_marker_repair_candidate(
         runtime_root,
         java_executable,
     })
+}
+
+async fn execute_owned_runtime_component_rebuild(
+    state: &AppState,
+    producer: &crate::state::ProducerLease,
+    admission: RegisteredComponentRebuildAdmission,
+    foreground: IntegrityForegroundLease,
+    rebuild_source: RuntimeComponentRebuildSource,
+) -> Result<
+    (
+        GuardianRuntimeComponentRebuildOutcome,
+        IntegrityForegroundLease,
+    ),
+    OperationJournalStoreError,
+> {
+    let state_task = state.clone();
+    let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+    producer.spawn_child(async move {
+        let result =
+            execute_managed_runtime_component_rebuild(admission, move |effect| async move {
+                let component = effect.component();
+                let mut progress = RuntimeComponentRebuildProgress::default();
+                let rebuild = match rebuild_source {
+                    RuntimeComponentRebuildSource::Production => {
+                        axial_minecraft::runtime::rebuild_managed_runtime_component(
+                            state_task.managed_runtime_cache(),
+                            component,
+                            |event| progress.observe(&event),
+                        )
+                        .await
+                    }
+                    #[cfg(test)]
+                    RuntimeComponentRebuildSource::Fixture => {
+                        axial_minecraft::rebuild_managed_runtime_fixture_for_test(
+                            state_task.managed_runtime_cache(),
+                            component,
+                        )
+                        .await
+                    }
+                };
+                match rebuild {
+                    Ok(receipt) => effect.succeeded(receipt, progress.fact_ids()),
+                    Err(ManagedRuntimeRebuildError::Preparation(_)) => effect.failed_before_effect(
+                        progress.failed_fact_ids("runtime_component_rebuild_preparation_failed"),
+                    ),
+                    Err(ManagedRuntimeRebuildError::Effect(receipt)) => effect.failed_after_effect(
+                        receipt,
+                        progress.failed_fact_ids("runtime_component_rebuild_effect_failed"),
+                    ),
+                }
+            })
+            .await;
+        let _ = result_tx.send((result, foreground));
+    });
+    let (result, foreground) = result_rx.await.map_err(|_| {
+        OperationJournalStoreError::Persistence(std::io::Error::other(
+            "runtime component rebuild owner stopped before settlement",
+        ))
+    })?;
+    result.map(|outcome| (outcome, foreground))
+}
+
+fn component_rebuild_repair_status(
+    status: GuardianRuntimeComponentRebuildStatus,
+) -> GuardianRepairStatus {
+    match status {
+        GuardianRuntimeComponentRebuildStatus::Rebuilt => GuardianRepairStatus::Repaired,
+        GuardianRuntimeComponentRebuildStatus::Failed => GuardianRepairStatus::Failed,
+    }
+}
+
+#[derive(Default)]
+struct RuntimeComponentRebuildProgress {
+    downloading: bool,
+    installing: bool,
+    ready: bool,
+}
+
+impl RuntimeComponentRebuildProgress {
+    fn observe(&mut self, event: &RuntimeEnsureEvent) {
+        match event {
+            RuntimeEnsureEvent::DownloadingManagedRuntime { .. } => self.downloading = true,
+            RuntimeEnsureEvent::InstallingManagedRuntimeFiles { .. } => self.installing = true,
+            RuntimeEnsureEvent::ManagedRuntimeReady { .. } => self.ready = true,
+        }
+    }
+
+    fn fact_ids(&self) -> Vec<String> {
+        let mut facts = Vec::with_capacity(3);
+        if self.downloading {
+            facts.push("runtime_component_rebuild_downloading".to_string());
+        }
+        if self.installing {
+            facts.push("runtime_component_rebuild_installing".to_string());
+        }
+        if self.ready {
+            facts.push("runtime_component_rebuild_ready".to_string());
+        }
+        facts
+    }
+
+    fn failed_fact_ids(&self, failure: &'static str) -> Vec<String> {
+        let mut facts = self.fact_ids();
+        facts.push(failure.to_string());
+        facts
+    }
+}
+
+fn new_runtime_component_rebuild_operation_id() -> OperationId {
+    OperationId::new(format!(
+        "guardian-runtime-component-rebuild-{}",
+        uuid::Uuid::new_v4()
+    ))
 }
 
 fn managed_runtime_java_executable(runtime_root: &Path) -> PathBuf {

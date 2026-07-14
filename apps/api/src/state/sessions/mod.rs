@@ -22,7 +22,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::process::Command;
-use tokio::sync::{Mutex, Notify, OwnedMutexGuard, RwLock, Semaphore, broadcast};
+use tokio::sync::{
+    Mutex, Notify, OwnedMutexGuard, OwnedRwLockWriteGuard, RwLock, Semaphore, broadcast,
+};
 
 const MAX_GUARDIAN_STAGE_DETAILS: usize = 8;
 const MAX_STAGE_EVIDENCE: usize = 16;
@@ -184,6 +186,7 @@ fn boot_promotion_gate(
 
 pub struct SessionStore {
     sessions: RwLock<HashMap<String, SessionEntry>>,
+    shared_component_mutation: Arc<RwLock<()>>,
     active_processes: Mutex<HashMap<u64, supervisor::ProcessControlHandle>>,
     process_owner_changes: Notify,
     lifecycle_transition: Arc<Mutex<()>>,
@@ -192,6 +195,10 @@ pub struct SessionStore {
     next_attempt_id: AtomicU64,
     next_terminal_sequence: AtomicU64,
     crash_collection_permits: Arc<Semaphore>,
+}
+
+pub(super) struct SharedComponentMutationLease {
+    _guard: OwnedRwLockWriteGuard<()>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -506,6 +513,7 @@ impl SessionStore {
         let (changes, _) = broadcast::channel(64);
         Self {
             sessions: RwLock::new(HashMap::new()),
+            shared_component_mutation: Arc::new(RwLock::new(())),
             active_processes: Mutex::new(HashMap::new()),
             process_owner_changes: Notify::new(),
             lifecycle_transition: Arc::new(Mutex::new(())),
@@ -565,6 +573,7 @@ impl SessionStore {
         &self,
         mut record: LaunchSessionRecord,
     ) -> Result<(), SessionAdmissionError> {
+        let _component_admission = self.shared_component_mutation.read().await;
         let _lifecycle_transition = self.lifecycle_transition.lock().await;
         if self.shutdown_started.load(Ordering::Acquire) {
             return Err(SessionAdmissionError);
@@ -599,6 +608,16 @@ impl SessionStore {
         }
         self.notify_changed();
         Ok(())
+    }
+
+    pub(super) async fn acquire_shared_component_mutation(
+        self: &Arc<Self>,
+    ) -> Option<SharedComponentMutationLease> {
+        let guard = self.shared_component_mutation.clone().write_owned().await;
+        if self.active_session_count().await != 0 {
+            return None;
+        }
+        Some(SharedComponentMutationLease { _guard: guard })
     }
 
     pub async fn get(&self, session_id: &str) -> Option<LaunchSessionRecord> {
@@ -1082,6 +1101,7 @@ impl SessionStore {
         mut record: LaunchSessionRecord,
         mut command: Command,
     ) -> std::io::Result<LaunchSessionRecord> {
+        let _component_admission = self.shared_component_mutation.read().await;
         let _lifecycle_transition = self.lifecycle_transition.lock().await;
         if self.shutdown_started.load(Ordering::Acquire) {
             return Err(session_shutdown_error());
@@ -2220,6 +2240,78 @@ mod tests {
     use serde_json::json;
     use std::sync::Arc;
     use tokio::process::Command;
+
+    #[tokio::test]
+    async fn shared_component_mutation_excludes_session_insertion_and_active_sessions() {
+        let store = Arc::new(SessionStore::new());
+        let mutation = store
+            .acquire_shared_component_mutation()
+            .await
+            .expect("empty store admits component mutation");
+        let inserting_store = store.clone();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let mut insert = tokio::spawn(async move {
+            let _ = started_tx.send(());
+            inserting_store
+                .insert(test_record("blocked-by-component-mutation"))
+                .await
+        });
+        started_rx
+            .await
+            .expect("insertion task reaches component admission");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut insert)
+                .await
+                .is_err(),
+            "session insertion must wait while component mutation owns the exclusive gate"
+        );
+        drop(mutation);
+        tokio::time::timeout(Duration::from_secs(1), insert)
+            .await
+            .expect("blocked insertion resumes after component mutation")
+            .expect("insertion task completes")
+            .expect("session insertion succeeds");
+        assert!(store.acquire_shared_component_mutation().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn shared_component_mutation_excludes_direct_process_start() {
+        let store = Arc::new(SessionStore::new());
+        let mutation = store
+            .acquire_shared_component_mutation()
+            .await
+            .expect("empty store admits component mutation");
+        let session_id = "process-blocked-by-component-mutation";
+        let mut command = Command::new(std::env::current_exe().expect("current test binary"));
+        command.arg("--help");
+        let starting_store = store.clone();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let mut start = tokio::spawn(async move {
+            let _ = started_tx.send(());
+            starting_store
+                .start_process(test_record(session_id), command)
+                .await
+        });
+        started_rx
+            .await
+            .expect("process task reaches component admission");
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut start)
+                .await
+                .is_err(),
+            "process start must wait while component mutation owns the exclusive gate"
+        );
+        assert!(store.get(session_id).await.is_none());
+
+        drop(mutation);
+        let record = tokio::time::timeout(Duration::from_secs(1), start)
+            .await
+            .expect("blocked process start resumes after component mutation")
+            .expect("process task completes")
+            .expect("process starts");
+        assert_eq!(record.session_id.0, session_id);
+    }
 
     #[tokio::test]
     async fn launch_terminal_session_retention_bounds_repeated_transitions_and_keeps_active() {

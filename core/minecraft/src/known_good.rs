@@ -2086,6 +2086,57 @@ fn add_runtime(
     Ok(())
 }
 
+pub(crate) fn runtime_inventory_from_source(
+    source: &RuntimeSourceReceipt,
+) -> Result<KnownGoodInventory, KnownGoodInventoryError> {
+    let mut builder = InventoryBuilder::default();
+    add_runtime(
+        &mut builder,
+        source.component(),
+        source.bytes(),
+        &ExpectedIntegrity {
+            size: Some(source.expected_size()),
+            sha1: Some(source.expected_sha1().to_string()),
+        },
+    )?;
+    Ok(builder.finish())
+}
+
+pub(crate) fn replace_runtime_projection(
+    active: &KnownGoodInventory,
+    runtime_only: KnownGoodInventory,
+    component: &RuntimeId,
+) -> Result<KnownGoodInventory, KnownGoodInventoryError> {
+    if runtime_only.entries.iter().any(|entry| {
+        !matches!(
+            &entry.root,
+            KnownGoodRoot::ManagedRuntime { component: observed }
+                if observed.as_str() == component.as_str()
+        )
+    }) {
+        return Err(KnownGoodInventoryError::RuntimeIdentityMismatch);
+    }
+    if active.entries.iter().any(|entry| {
+        matches!(
+            &entry.root,
+            KnownGoodRoot::ManagedRuntime { component: observed }
+                if observed.as_str() != component.as_str()
+        )
+    }) {
+        return Err(KnownGoodInventoryError::RuntimeIdentityMismatch);
+    }
+    let mut builder = InventoryBuilder::default();
+    for entry in active
+        .entries
+        .iter()
+        .filter(|entry| !matches!(entry.root, KnownGoodRoot::ManagedRuntime { .. }))
+        .chain(runtime_only.entries.iter())
+    {
+        builder.insert(entry.clone())?;
+    }
+    Ok(builder.finish())
+}
+
 fn validate_runtime_path_tree(entries: &[KnownGoodEntry]) -> Result<(), KnownGoodInventoryError> {
     let mut entries_by_path = BTreeMap::new();
     for entry in entries {

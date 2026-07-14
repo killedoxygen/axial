@@ -272,6 +272,62 @@ pub(super) fn authenticated_runtime_source_fixture_for_test(
 }
 
 #[cfg(test)]
+pub(super) fn authenticated_runtime_source_from_manifest_for_test(
+    component: super::model::RuntimeId,
+    manifest: ComponentManifest,
+) -> Result<RuntimeSourceReceipt, JavaRuntimeLookupError> {
+    let bytes = serde_json::to_vec(&manifest)
+        .map_err(|error| JavaRuntimeLookupError::Download(error.to_string()))?;
+    authenticate_runtime_source_bytes(
+        component,
+        RuntimeDownloadManifest {
+            url: "https://fixtures.invalid/runtime-manifest.json".to_string(),
+            sha1: format!("{:x}", Sha1::digest(&bytes)),
+            size: bytes.len() as u64,
+        },
+        bytes,
+    )
+}
+
+#[cfg(feature = "test-support")]
+pub(super) fn authenticated_runtime_rebuild_fixture_source(
+    component: super::model::RuntimeId,
+    java_url: String,
+    java_bytes: &[u8],
+) -> Result<RuntimeSourceReceipt, JavaRuntimeLookupError> {
+    let java_relative_path = super::layout::runtime_java_relative_path().to_string();
+    let manifest = ComponentManifest {
+        files: HashMap::from([(
+            java_relative_path,
+            ComponentManifestFile {
+                kind: "file".to_string(),
+                executable: true,
+                downloads: Some(ComponentManifestDownloads {
+                    raw: Some(ComponentManifestDownload {
+                        url: java_url,
+                        sha1: Some(format!("{:x}", Sha1::digest(java_bytes))),
+                        size: Some(java_bytes.len() as u64),
+                    }),
+                    lzma: None,
+                }),
+                target: None,
+            },
+        )]),
+    };
+    let bytes = serde_json::to_vec(&manifest)
+        .map_err(|error| JavaRuntimeLookupError::Download(error.to_string()))?;
+    authenticate_runtime_source_bytes(
+        component,
+        RuntimeDownloadManifest {
+            url: "https://fixtures.invalid/runtime-manifest.json".to_string(),
+            sha1: format!("{:x}", Sha1::digest(&bytes)),
+            size: bytes.len() as u64,
+        },
+        bytes,
+    )
+}
+
+#[cfg(test)]
 pub(super) async fn fetch_runtime_manifest_bytes_for_test(
     url: &str,
 ) -> Result<Vec<u8>, JavaRuntimeLookupError> {

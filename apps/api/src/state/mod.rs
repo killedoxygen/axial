@@ -99,7 +99,8 @@ pub(crate) use performance_managed::{
 };
 pub use performance_rules::AppPerformanceStore;
 pub(crate) use reconciliation::{
-    ReconciliationAttemptReservation, RegisteredReconciliationAuthority,
+    ReconciliationAttemptReservation, ReconciliationEvidenceRejection,
+    RegisteredComponentRebuildAdmission, RegisteredReconciliationAuthority,
     commit_reconciliation_memory, install_operation_reconciliation_attempt,
     reconciliation_attempt_key, reconciliation_instance_target, reconciliation_journal_attempt,
     reconciliation_memory_entry, reconciliation_terminal, record_guardian_repair_refusal,

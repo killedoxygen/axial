@@ -300,15 +300,8 @@ pub(super) fn resolve_override_runtime(
     })
 }
 pub(super) fn detect_runtime_state(runtime_root: &Path) -> RuntimeInstallState {
-    let installing_marker = runtime_root.join(".axial-installing");
     let ready_marker = runtime_root.join(".axial-ready");
 
-    if runtime_filesystem_path(&installing_marker)
-        .as_ref()
-        .exists()
-    {
-        return RuntimeInstallState::Installing;
-    }
     if runtime_filesystem_path(&ready_marker).as_ref().is_file()
         && runtime_filesystem_path(&runtime_root.join(COMPONENT_MANIFEST_PROOF_FILE))
             .as_ref()

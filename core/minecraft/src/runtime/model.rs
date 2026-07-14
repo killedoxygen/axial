@@ -62,7 +62,6 @@ impl RuntimeSource {
 #[serde(rename_all = "snake_case")]
 pub enum RuntimeInstallState {
     Missing,
-    Installing,
     Ready,
     Broken,
 }

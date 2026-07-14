@@ -6,7 +6,7 @@ use crate::guardian::{
 };
 use crate::state::contracts::{OwnershipClass, StabilizationSystem, TargetDescriptor, TargetKind};
 use crate::state::failure_memory::{FailureMemoryActionOutcome, GuardianFailureMemoryEntry};
-use axial_launcher::LaunchFailureClass;
+use axial_launcher::{LaunchFailureClass, LaunchStatusEvent};
 use chrono::{Duration, SecondsFormat, Utc};
 use sha1::Sha1;
 
@@ -879,6 +879,324 @@ async fn launch_preparation_repairs_corrupt_managed_runtime_ready_marker_before_
     }));
     let payload = serde_json::to_string(&repaired.guardian_summary).expect("guardian summary json");
     assert!(!payload.contains(&fixture.root.to_string_lossy().to_string()));
+}
+
+#[tokio::test]
+async fn launch_preparation_blocks_component_rebuild_while_a_session_is_active() {
+    let fixture = TestFixture::new("prepare-blocks-runtime-rebuild-during-active-session");
+    let component = "java-runtime-delta";
+    fixture.write_version_json(
+        "1.21.1",
+        serde_json::json!({
+            "id": "1.21.1",
+            "type": "release",
+            "mainClass": "net.minecraft.client.main.Main",
+            "assetIndex": {},
+            "javaVersion": { "component": component, "majorVersion": 21 },
+            "libraries": []
+        }),
+    );
+    let version_dir = fixture.paths.library_dir.join("versions").join("1.21.1");
+    fs::write(version_dir.join("1.21.1.jar"), b"client jar").expect("client jar");
+    let runtime_root = fixture
+        .state
+        .managed_runtime_cache()
+        .component_root(component)
+        .expect("runtime root");
+    fs::create_dir_all(&runtime_root).expect("incomplete runtime root");
+    let instance_id = fixture.add_instance("Survival", "1.21.1");
+    let instance = fixture
+        .state
+        .instances()
+        .get(&instance_id)
+        .expect("instance");
+    let config = fixture.state.config().current();
+    let game_dir = fixture.state.instances().game_dir(&instance.id);
+    let lifecycle = fixture.state.acquire_instance_lifecycle(&instance.id).await;
+    let producer = fixture
+        .state
+        .try_claim_producer()
+        .expect("claim runtime repair producer");
+    let integrity_foreground = fixture
+        .state
+        .register_integrity_foreground()
+        .expect("register runtime repair foreground")
+        .wait_for_settlement()
+        .await;
+    let preflight = build_launch_preflight_facts(
+        &fixture.state,
+        &producer,
+        LaunchPreflightBuild {
+            integrity_foreground: &integrity_foreground,
+            instance_lifecycle: &lifecycle,
+            instance: &instance,
+            config: &config,
+            library_dir: &fixture.paths.library_dir,
+            game_dir: &game_dir,
+            requested_max_memory_mb: None,
+            requested_min_memory_mb: None,
+        },
+        None,
+    )
+    .await;
+    assert!(readiness_has_managed_runtime_missing(&preflight.readiness));
+    fixture.add_active_launch("other", 1024).await;
+
+    let blocked = maybe_repair_managed_runtime_before_launch_owned(
+        &fixture.state,
+        &producer,
+        &integrity_foreground,
+        preflight,
+        ManagedRuntimeRepairLaunch {
+            instance_lifecycle: &lifecycle,
+            instance: &instance,
+            library_dir: &fixture.paths.library_dir,
+            game_dir: &game_dir,
+            requested_max_memory_mb: None,
+            requested_min_memory_mb: None,
+        },
+    )
+    .await
+    .expect("active session refusal preserves a bounded blocked preflight");
+
+    assert_eq!(
+        blocked.guardian_summary.decision(),
+        GuardianSummaryDecision::Blocked
+    );
+    assert_eq!(fixture.state.sessions().active_session_count().await, 1);
+    assert!(!runtime_root.join(".axial-ready").exists());
+    let journals = fixture.state.journals().list();
+    assert_eq!(journals.len(), 1, "rung two must not start a journal");
+    let terminal = journals[0]
+        .reconciliation_terminal()
+        .expect("rung-one failure terminal");
+    assert_eq!(
+        terminal.rung(),
+        crate::state::contracts::ReconciliationRung::RepairArtifact
+    );
+    assert_eq!(
+        terminal.outcome(),
+        crate::state::contracts::ReconciliationTerminalOutcome::Failed
+    );
+    let memory = fixture.state.failure_memory().list();
+    assert_eq!(memory.len(), 1);
+    assert_eq!(
+        memory[0].last_action_outcome,
+        Some(FailureMemoryActionOutcome::Failed)
+    );
+
+    fixture
+        .state
+        .sessions()
+        .emit_status(
+            "other",
+            LaunchStatusEvent {
+                state: "exited".to_string(),
+                benchmark: None,
+                pid: None,
+                exit_code: Some(0),
+                failure_class: None,
+                failure_detail: None,
+                crash_evidence: None,
+                healing: None,
+                guardian: None,
+                outcome: None,
+                notice: None,
+                evidence: Vec::new(),
+                stages: Vec::new(),
+            },
+        )
+        .await;
+    assert_eq!(fixture.state.sessions().active_session_count().await, 0);
+
+    let repaired = maybe_repair_managed_runtime_before_launch_with_fixture(
+        &fixture.state,
+        &producer,
+        &integrity_foreground,
+        blocked,
+        ManagedRuntimeRepairLaunch {
+            instance_lifecycle: &lifecycle,
+            instance: &instance,
+            library_dir: &fixture.paths.library_dir,
+            game_dir: &game_dir,
+            requested_max_memory_mb: None,
+            requested_min_memory_mb: None,
+        },
+    )
+    .await
+    .expect("prior exact rung-one failure admits immediate retry after session exit");
+
+    assert!(!readiness_has_managed_runtime_missing(&repaired.readiness));
+    assert_eq!(
+        repaired.guardian_summary.decision(),
+        GuardianSummaryDecision::Intervened
+    );
+    assert!(runtime_root.join(".axial-ready").is_file());
+    let journals = fixture.state.journals().list();
+    assert_eq!(journals.len(), 2);
+    assert_eq!(
+        journals
+            .iter()
+            .filter(|journal| {
+                journal.reconciliation_terminal().is_some_and(|terminal| {
+                    terminal.rung() == crate::state::contracts::ReconciliationRung::RebuildComponent
+                        && terminal.outcome()
+                            == crate::state::contracts::ReconciliationTerminalOutcome::Succeeded
+                })
+            })
+            .count(),
+        1,
+        "immediate retry must execute rung two exactly once"
+    );
+}
+
+#[tokio::test]
+async fn launch_preparation_rebuilds_failed_runtime_component_once_from_exact_inventory() {
+    let fixture = TestFixture::new("prepare-rebuilds-runtime-component");
+    let component = "java-runtime-delta";
+    fixture.write_version_json(
+        "1.21.1",
+        serde_json::json!({
+            "id": "1.21.1",
+            "type": "release",
+            "mainClass": "net.minecraft.client.main.Main",
+            "assetIndex": {},
+            "javaVersion": { "component": component, "majorVersion": 21 },
+            "libraries": []
+        }),
+    );
+    let version_dir = fixture.paths.library_dir.join("versions").join("1.21.1");
+    fs::write(version_dir.join("1.21.1.jar"), b"client jar").expect("client jar");
+    let runtime_root = fixture
+        .state
+        .managed_runtime_cache()
+        .component_root(component)
+        .expect("runtime root");
+    fs::create_dir_all(&runtime_root).expect("incomplete runtime root");
+    let instance_id = fixture.add_instance("Survival", "1.21.1");
+    let instance = fixture
+        .state
+        .instances()
+        .get(&instance_id)
+        .expect("instance");
+    let config = fixture.state.config().current();
+    let game_dir = fixture.state.instances().game_dir(&instance.id);
+    let lifecycle = fixture.state.acquire_instance_lifecycle(&instance.id).await;
+    let producer = fixture
+        .state
+        .try_claim_producer()
+        .expect("claim runtime rebuild producer");
+    let integrity_foreground = fixture
+        .state
+        .register_integrity_foreground()
+        .expect("register runtime rebuild foreground")
+        .wait_for_settlement()
+        .await;
+    let preflight = build_launch_preflight_facts(
+        &fixture.state,
+        &producer,
+        LaunchPreflightBuild {
+            integrity_foreground: &integrity_foreground,
+            instance_lifecycle: &lifecycle,
+            instance: &instance,
+            config: &config,
+            library_dir: &fixture.paths.library_dir,
+            game_dir: &game_dir,
+            requested_max_memory_mb: None,
+            requested_min_memory_mb: None,
+        },
+        None,
+    )
+    .await;
+    assert!(readiness_has_managed_runtime_missing(&preflight.readiness));
+    assert_eq!(fixture.state.installed_versions_walk_count(), 1);
+
+    let repaired = maybe_repair_managed_runtime_before_launch_with_fixture(
+        &fixture.state,
+        &producer,
+        &integrity_foreground,
+        preflight,
+        ManagedRuntimeRepairLaunch {
+            instance_lifecycle: &lifecycle,
+            instance: &instance,
+            library_dir: &fixture.paths.library_dir,
+            game_dir: &game_dir,
+            requested_max_memory_mb: None,
+            requested_min_memory_mb: None,
+        },
+    )
+    .await
+    .expect("component rebuild settles both reconciliation rungs");
+
+    assert_eq!(fixture.state.installed_versions_walk_count(), 1);
+    assert!(!readiness_has_managed_runtime_missing(&repaired.readiness));
+    assert_eq!(
+        repaired.guardian_summary.decision(),
+        GuardianSummaryDecision::Intervened
+    );
+    assert!(runtime_root.join(".axial-ready").is_file());
+    assert!(runtime_root.join(".axial-runtime-manifest.json").is_file());
+    assert!(managed_runtime_java_path(&runtime_root).is_file());
+    let journals = fixture.state.journals().list();
+    assert_eq!(journals.len(), 2);
+    let terminals = journals
+        .iter()
+        .map(|journal| {
+            journal
+                .reconciliation_terminal()
+                .expect("settled reconciliation terminal")
+        })
+        .collect::<Vec<_>>();
+    assert!(terminals.iter().any(|terminal| {
+        terminal.rung() == crate::state::contracts::ReconciliationRung::RepairArtifact
+            && terminal.outcome() == crate::state::contracts::ReconciliationTerminalOutcome::Failed
+    }));
+    let rebuild_journal = journals
+        .iter()
+        .find(|journal| {
+            journal.reconciliation_terminal().is_some_and(|terminal| {
+                terminal.rung() == crate::state::contracts::ReconciliationRung::RebuildComponent
+                    && terminal.outcome()
+                        == crate::state::contracts::ReconciliationTerminalOutcome::Succeeded
+            })
+        })
+        .expect("successful component rebuild journal");
+    let rebuild_terminal = rebuild_journal
+        .reconciliation_terminal()
+        .expect("successful component rebuild terminal");
+    assert_eq!(
+        rebuild_terminal.quarantined_target(),
+        Some(&TargetDescriptor::new(
+            StabilizationSystem::Execution,
+            TargetKind::Runtime,
+            format!("quarantine-{component}"),
+            OwnershipClass::LauncherManaged,
+        ))
+    );
+    assert!(rebuild_journal.completed_steps.iter().any(|step| {
+        step.step_id == "quarantine_launcher_managed_target"
+            && step.result == crate::state::contracts::OperationStepResult::Completed
+            && step.rollback == crate::state::contracts::RollbackState::Available
+    }));
+    assert!(
+        runtime_root
+            .with_file_name(format!("{component}.quarantine"))
+            .is_dir()
+    );
+    let memory = fixture.state.failure_memory().list();
+    assert_eq!(memory.len(), 2);
+    assert!(memory.iter().any(|entry| {
+        entry.last_action_outcome == Some(FailureMemoryActionOutcome::Failed)
+            && entry.reconciliation_terminal().is_some_and(|terminal| {
+                terminal.rung() == crate::state::contracts::ReconciliationRung::RepairArtifact
+            })
+    }));
+    assert!(memory.iter().any(|entry| {
+        entry.last_action_outcome == Some(FailureMemoryActionOutcome::Repaired)
+            && entry.reconciliation_terminal().is_some_and(|terminal| {
+                terminal.rung() == crate::state::contracts::ReconciliationRung::RebuildComponent
+            })
+    }));
 }
 
 #[tokio::test]

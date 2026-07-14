@@ -61,6 +61,8 @@ use resources::{
 };
 #[cfg(test)]
 use resources::{LaunchCpuLoadEvidence, LaunchDiskEvidence, load_to_x100};
+#[cfg(test)]
+use runtime_repair::maybe_repair_managed_runtime_before_launch_with_fixture;
 use runtime_repair::{
     ManagedRuntimeRepairLaunch, maybe_repair_managed_runtime_before_launch_owned,
 };

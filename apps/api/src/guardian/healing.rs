@@ -1,3 +1,7 @@
+use super::reconciliation_journal::{
+    GuardianJournalReconciliation, reconcile_guardian_journal_error,
+    record_reconciliation_terminal_reconciled, repair_step,
+};
 use super::{DiagnosisId, GuardianActionKind, GuardianDomain, ReadyMarker, RepairAuthorization};
 use crate::execution::ExecutionFact;
 use crate::execution::runtime::{
@@ -7,38 +11,27 @@ use crate::execution::runtime::{
 use crate::observability::{RedactionAudience, sanitize_evidence_token};
 use crate::state::contracts::{
     CommandKind, JournalId, OperationId, OperationJournalEntry, OperationJournalStep,
-    OperationOutcome, OperationPhase, OperationStatus, OperationStepResult, OwnershipClass,
-    ReconciliationAttempt, ReconciliationComponent, ReconciliationRung, ReconciliationScope,
-    ReconciliationTerminal, ReconciliationTerminalOutcome, RollbackState, StabilizationSystem,
-    TargetDescriptor, TargetKind,
+    OperationOutcome, OperationStatus, OperationStepResult, OwnershipClass, ReconciliationAttempt,
+    ReconciliationComponent, ReconciliationScope, ReconciliationTerminal,
+    ReconciliationTerminalOutcome, RollbackState, StabilizationSystem, TargetDescriptor,
+    TargetKind,
 };
 use crate::state::failure_memory::GuardianFailureMemoryStore;
 use crate::state::{
-    OperationJournalReconciliation, OperationJournalStore, OperationJournalStoreError,
-    ReconciliationAttemptReservation, RegisteredReconciliationAuthority,
-    commit_reconciliation_memory, operation_journal_completed_step_is_visible,
-    operation_journal_plan_is_visible, operation_journal_terminal_is_visible,
-    reconciliation_attempt_key, reconciliation_instance_target, reconciliation_journal_attempt,
-    reconciliation_memory_entry, record_guardian_repair_refusal,
-    record_reconciliation_journal_failure, record_reconciliation_journal_success,
-    reserve_reconciliation_attempt, settle_reconciliation_memory,
+    OperationJournalStore, OperationJournalStoreError, ReconciliationAttemptReservation,
+    RegisteredReconciliationAuthority, commit_reconciliation_memory,
+    operation_journal_completed_step_is_visible, operation_journal_plan_is_visible,
+    operation_journal_terminal_is_visible, reconciliation_attempt_key,
+    reconciliation_instance_target, reconciliation_journal_attempt, reconciliation_memory_entry,
+    record_guardian_repair_refusal, reserve_reconciliation_attempt, settle_reconciliation_memory,
 };
 use chrono::{DateTime, Duration};
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration as StdDuration;
 
 const READY_MARKER_REPAIR_STEP: &str = "recreate_managed_runtime_ready_marker";
 const RUNTIME_REPAIR_START_STEP: &str = "journal_repair_start";
 const DEFAULT_REPAIR_SUPPRESSION_MINUTES: i64 = 15;
-const RUNTIME_JOURNAL_RETRY_INITIAL_DELAY: StdDuration = StdDuration::from_millis(20);
-const RUNTIME_JOURNAL_RETRY_MAX_DELAY: StdDuration = StdDuration::from_secs(1);
-
-enum RuntimeJournalReconciliation {
-    MutationCommitted,
-    AcceptedFailure(OperationJournalStoreError),
-    RetryMutation,
-}
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct GuardianRepairOutcome {
@@ -137,11 +130,10 @@ pub(crate) async fn execute_managed_runtime_ready_marker_repair(
         .await
         .map_err(failure_memory_error)?;
     let attempt = authority
-        .attempt(
+        .repair_artifact_attempt(
             operation_id.clone(),
             authorization.diagnosis_id,
             GuardianDomain::Runtime,
-            ReconciliationRung::RepairArtifact,
             ReconciliationComponent::Runtime,
             target.clone(),
             authorization.mode,
@@ -407,7 +399,7 @@ async fn finish_runtime_repair(
     let complete_journal = async move {
         match journal {
             RuntimeTerminalJournal::Record(step_id, step_result, failure_point) => {
-                record_runtime_terminal_reconciled(
+                record_reconciliation_terminal_reconciled(
                     context.journals,
                     &journal_operation_id,
                     repair_step(
@@ -536,34 +528,6 @@ fn planned_runtime_journal(
     reconciliation_journal_attempt(entry, attempt.clone())
 }
 
-async fn reconcile_runtime_journal_error(
-    journals: &OperationJournalStore,
-    operation_id: &OperationId,
-    error: OperationJournalStoreError,
-    expected: impl Fn(&OperationJournalEntry) -> bool,
-) -> Result<RuntimeJournalReconciliation, OperationJournalStoreError> {
-    match journals
-        .reconcile_transition(
-            operation_id,
-            error,
-            RUNTIME_JOURNAL_RETRY_INITIAL_DELAY,
-            RUNTIME_JOURNAL_RETRY_MAX_DELAY,
-            expected,
-        )
-        .await?
-    {
-        OperationJournalReconciliation::CommittedAfterPersistenceFailure(error) => {
-            Ok(RuntimeJournalReconciliation::AcceptedFailure(error))
-        }
-        OperationJournalReconciliation::RequestedTransitionAlreadyCommitted => {
-            Ok(RuntimeJournalReconciliation::MutationCommitted)
-        }
-        OperationJournalReconciliation::RetryRequestedTransition => {
-            Ok(RuntimeJournalReconciliation::RetryMutation)
-        }
-    }
-}
-
 async fn create_planned_journal_reconciled(
     journals: &OperationJournalStore,
     operation_id: &OperationId,
@@ -583,14 +547,16 @@ async fn create_planned_journal_reconciled(
                 return Ok(None);
             }
             Err(error) => {
-                match reconcile_runtime_journal_error(journals, operation_id, error, |entry| {
+                match reconcile_guardian_journal_error(journals, operation_id, error, |entry| {
                     operation_journal_plan_is_visible(entry, &expected)
                 })
                 .await?
                 {
-                    RuntimeJournalReconciliation::MutationCommitted => return Ok(None),
-                    RuntimeJournalReconciliation::AcceptedFailure(error) => return Ok(Some(error)),
-                    RuntimeJournalReconciliation::RetryMutation => {}
+                    GuardianJournalReconciliation::MutationCommitted => return Ok(None),
+                    GuardianJournalReconciliation::AcceptedFailure(error) => {
+                        return Ok(Some(error));
+                    }
+                    GuardianJournalReconciliation::RetryMutation => {}
                 }
             }
         }
@@ -628,84 +594,16 @@ async fn create_terminal_journal_reconciled(
                 return Ok(None);
             }
             Err(error) => {
-                match reconcile_runtime_journal_error(journals, operation_id, error, |entry| {
+                match reconcile_guardian_journal_error(journals, operation_id, error, |entry| {
                     operation_journal_terminal_is_visible(entry, &expected)
                 })
                 .await?
                 {
-                    RuntimeJournalReconciliation::MutationCommitted => return Ok(None),
-                    RuntimeJournalReconciliation::AcceptedFailure(error) => return Ok(Some(error)),
-                    RuntimeJournalReconciliation::RetryMutation => {}
-                }
-            }
-        }
-    }
-}
-
-async fn record_runtime_terminal_reconciled(
-    journals: &OperationJournalStore,
-    operation_id: &OperationId,
-    step: OperationJournalStep,
-    failure_point: Option<&str>,
-    terminal: &ReconciliationTerminal,
-    terminal_failure: Option<&tokio::sync::Notify>,
-) -> Result<Option<OperationJournalStoreError>, OperationJournalStoreError> {
-    loop {
-        let result = if let Some(failure_point) = failure_point {
-            record_reconciliation_journal_failure(
-                journals,
-                operation_id,
-                step.clone(),
-                failure_point,
-                terminal.clone(),
-            )
-            .await
-        } else {
-            record_reconciliation_journal_success(
-                journals,
-                operation_id,
-                step.clone(),
-                terminal.clone(),
-            )
-            .await
-        };
-        match result {
-            Ok(()) => return Ok(None),
-            Err(OperationJournalStoreError::AlreadyTerminal)
-                if journals.get(operation_id).is_some_and(|entry| {
-                    runtime_terminal_transition_matches(
-                        &entry,
-                        operation_id,
-                        failure_point,
-                        &step,
-                        terminal,
-                    )
-                }) =>
-            {
-                return Ok(None);
-            }
-            Err(error) => {
-                if matches!(error, OperationJournalStoreError::Persistence(_))
-                    && let Some(terminal_failure) = terminal_failure
-                {
-                    terminal_failure.notify_one();
-                }
-                match reconcile_runtime_journal_error(journals, operation_id, error, |entry| {
-                    runtime_terminal_transition_matches(
-                        entry,
-                        operation_id,
-                        failure_point,
-                        &step,
-                        terminal,
-                    )
-                })
-                .await?
-                {
-                    RuntimeJournalReconciliation::MutationCommitted => return Ok(None),
-                    RuntimeJournalReconciliation::AcceptedFailure(error) => {
+                    GuardianJournalReconciliation::MutationCommitted => return Ok(None),
+                    GuardianJournalReconciliation::AcceptedFailure(error) => {
                         return Ok(Some(error));
                     }
-                    RuntimeJournalReconciliation::RetryMutation => {}
+                    GuardianJournalReconciliation::RetryMutation => {}
                 }
             }
         }
@@ -734,14 +632,14 @@ async fn terminalize_recovered_runtime_journal(
                 return Ok(());
             }
             Err(error) => {
-                match reconcile_runtime_journal_error(journals, operation_id, error, |entry| {
+                match reconcile_guardian_journal_error(journals, operation_id, error, |entry| {
                     runtime_refusal_transition_matches(entry, operation_id, &step)
                 })
                 .await?
                 {
-                    RuntimeJournalReconciliation::MutationCommitted => return Ok(()),
-                    RuntimeJournalReconciliation::AcceptedFailure(_) => return Ok(()),
-                    RuntimeJournalReconciliation::RetryMutation => {}
+                    GuardianJournalReconciliation::MutationCommitted => return Ok(()),
+                    GuardianJournalReconciliation::AcceptedFailure(_) => return Ok(()),
+                    GuardianJournalReconciliation::RetryMutation => {}
                 }
             }
         }
@@ -810,31 +708,6 @@ fn terminal_runtime_journal(
     entry
 }
 
-fn runtime_terminal_transition_matches(
-    entry: &OperationJournalEntry,
-    operation_id: &OperationId,
-    failure_point: Option<&str>,
-    step: &OperationJournalStep,
-    terminal: &ReconciliationTerminal,
-) -> bool {
-    let (status, outcome) = if failure_point.is_some() {
-        (OperationStatus::Failed, OperationOutcome::Failed)
-    } else {
-        (OperationStatus::Succeeded, OperationOutcome::Succeeded)
-    };
-    entry.operation_id == *operation_id
-        && entry.command == CommandKind::RepairInstance
-        && entry.owner == StabilizationSystem::Guardian
-        && step.changed_target.as_ref().is_some_and(|target| {
-            entry.targets.contains(target) && entry.ownership == target.ownership
-        })
-        && entry.status == status
-        && entry.outcome == Some(outcome)
-        && entry.failure_point.as_deref() == failure_point
-        && entry.reconciliation_terminal() == Some(terminal)
-        && operation_journal_completed_step_is_visible(entry, step)
-}
-
 fn runtime_refusal_transition_matches(
     entry: &OperationJournalEntry,
     operation_id: &OperationId,
@@ -848,20 +721,6 @@ fn runtime_refusal_transition_matches(
         && entry.failure_point.is_none()
         && entry.reconciliation_terminal().is_none()
         && operation_journal_completed_step_is_visible(entry, step)
-}
-
-fn repair_step(
-    step_id: &str,
-    result: OperationStepResult,
-    target: Option<TargetDescriptor>,
-    facts: Vec<String>,
-) -> OperationJournalStep {
-    let mut step = OperationJournalStep::new(step_id, OperationPhase::Repairing);
-    step.result = result;
-    step.changed_target = target;
-    step.generated_facts = facts;
-    step.rollback = RollbackState::NotApplicable;
-    step
 }
 
 fn fact_ids(facts: &[ExecutionFact]) -> Vec<String> {
@@ -881,7 +740,7 @@ fn repair_outcome(
     summary: &str,
 ) -> GuardianRepairOutcome {
     GuardianRepairOutcome {
-        operation_id: safe_operation_id(&operation_id),
+        operation_id,
         diagnosis_id,
         action,
         status,
@@ -1491,15 +1350,19 @@ mod tests {
     }
 
     #[test]
-    fn public_repair_outcome_ids_are_sanitized() {
+    fn public_repair_outcome_preserves_sanitized_journal_authority() {
         let root = test_root("safe-outcome-ids");
         let stores = stores();
         let runtime_root = managed_runtime_root(&stores, "java-runtime-delta");
         let java_executable = write_fake_java(&runtime_root);
         write_runtime_manifest_proof(&runtime_root, &java_executable);
         let decision = repair_decision(OwnershipClass::LauncherManaged);
+        let hostile_operation_id = format!(
+            "/home/alice/token/operation\n{}",
+            "secret0123456789".repeat(12)
+        );
         let decision = GuardianDecision::for_test(
-            Some(OperationId::new("/home/alice/token/operation")),
+            Some(OperationId::new(hostile_operation_id)),
             decision.mode(),
             decision.kind(),
             decision.diagnoses().to_vec(),
@@ -1511,6 +1374,18 @@ mod tests {
         let lower = encoded.to_ascii_lowercase();
 
         assert_eq!(outcome.status, GuardianRepairStatus::Repaired);
+        let journals = stores.journals.list();
+        assert_eq!(journals.len(), 1);
+        let journal = &journals[0];
+        let terminal = journal
+            .reconciliation_terminal()
+            .expect("typed repair terminal");
+        assert_eq!(outcome.operation_id, journal.operation_id);
+        assert_eq!(&outcome.operation_id, terminal.operation_id());
+        assert!(outcome.operation_id.as_str().chars().count() <= 96);
+        assert!(outcome.operation_id.as_str().chars().all(|value| {
+            value.is_ascii_alphanumeric() || matches!(value, '-' | '_' | '.' | '+' | ':')
+        }));
         assert!(!lower.contains("/home"));
         assert!(!lower.contains("alice"));
         assert!(!lower.contains("token"));

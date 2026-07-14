@@ -1,21 +1,27 @@
 use super::{
     ComponentManifest, ComponentManifestDownload, ComponentManifestDownloads,
     ComponentManifestFile, JavaRuntimeInfo, JavaRuntimeLookupError, MachOArm64Compatibility,
-    ManagedRuntimeCache, RosettaRuntimeDecision, RuntimeDownloadActual, RuntimeDownloadEvidence,
-    RuntimeDownloadIntegrityError, RuntimeDownloadManifest, RuntimeEnsureEvent, RuntimeId,
-    RuntimeInstallState, RuntimeManifest, RuntimeRecord, RuntimeSource,
-    acquire_runtime_source_for_test, component_manifest_destination,
-    component_manifest_proof_bytes, detect_distribution, detect_runtime_state,
-    ensure_runtime_with_events, fetch_runtime_file, fetch_runtime_manifest_bytes_for_test,
-    install_managed_runtime, install_runtime_manifest_file, install_runtime_manifest_files,
-    java_executable, java_executable_for_os, managed_runtime_contents_verified_without_probe,
-    parse_mach_o_arm64_compatibility, plan_runtime_manifest_files, remove_runtime_install_path,
-    remove_runtime_install_path_async, rosetta_requirement_for_managed_runtime,
-    runtime_download_client, runtime_file_download_concurrency_for, runtime_install_lock_file_path,
-    runtime_os_arch_for, runtime_record_matches_source_for_test,
-    runtime_source_url_is_secure_for_test, runtime_windows_verbatim_path_string,
-    select_runtime_manifest, validate_ephemeral_processor_manifest_for_test,
-    verify_runtime_download,
+    ManagedRuntimeCache, ManagedRuntimeRebuildError, RosettaRuntimeDecision, RuntimeDownloadActual,
+    RuntimeDownloadEvidence, RuntimeDownloadIntegrityError, RuntimeDownloadManifest,
+    RuntimeEnsureEvent, RuntimeId, RuntimeInstallState, RuntimeManifest, RuntimeRecord,
+    RuntimeSource, RuntimeSourceReceipt, acquire_runtime_source_for_test,
+    authenticated_runtime_source_from_manifest_for_test, component_manifest_destination,
+    detect_distribution, detect_runtime_state, ensure_runtime_with_events, fetch_runtime_file,
+    fetch_runtime_manifest_bytes_for_test, install_runtime_manifest_file,
+    install_runtime_manifest_files, java_executable, java_executable_for_os,
+    managed_runtime_contents_verified_without_probe, parse_mach_o_arm64_compatibility,
+    plan_runtime_manifest_files, publish_staged_managed_runtime,
+    publish_staged_managed_runtime_and_finalize,
+    publish_staged_managed_runtime_with_displacement_failure_for_test,
+    publish_staged_managed_runtime_with_finalization_failure_for_test,
+    publish_staged_managed_runtime_with_promotion_failure_for_test,
+    publish_staged_managed_runtime_with_restoration_failure_for_test,
+    publish_staged_managed_runtime_with_rotation_failure_for_test,
+    rosetta_requirement_for_managed_runtime, runtime_download_client,
+    runtime_file_download_concurrency_for, runtime_install_lock_file_path, runtime_os_arch_for,
+    runtime_record_matches_source_for_test, runtime_source_url_is_secure_for_test,
+    runtime_windows_verbatim_path_string, select_runtime_manifest, stage_managed_runtime,
+    validate_ephemeral_processor_manifest_for_test, verify_runtime_download,
 };
 use crate::JavaVersion;
 use serde::Deserialize;
@@ -565,50 +571,39 @@ async fn runtime_source_receipt_preserves_verified_authored_bytes() {
 }
 
 #[tokio::test]
-async fn ready_managed_runtime_matches_only_the_exact_receipt_proof() {
-    let root = unique_temp_root("axial-runtime-exact-receipt-proof");
-    fs::create_dir_all(&root).expect("runtime root");
-    let manifest = ComponentManifest {
-        files: HashMap::new(),
-    };
-    let bytes = serde_json::to_vec(&manifest).expect("component manifest");
-    let receipt = acquire_runtime_source_for_test(
-        RuntimeId::from("java-runtime-delta"),
-        RuntimeDownloadManifest {
-            url: serve_runtime_json(200, bytes.clone(), None).await,
-            sha1: sha1_hex(&bytes),
-            size: bytes.len() as u64,
-        },
-    )
-    .await
-    .expect("runtime source receipt");
-    let proof = component_manifest_proof_bytes(&manifest).expect("canonical proof");
-    fs::write(root.join(super::COMPONENT_MANIFEST_PROOF_FILE), &proof)
-        .expect("persist exact proof");
+async fn ready_managed_runtime_matches_the_full_authenticated_source() {
+    let cache = ManagedRuntimeCache::isolated_for_test().expect("runtime cache");
+    let component = RuntimeId::from("jre-legacy");
+    let root = cache
+        .component_root(component.as_str())
+        .expect("managed runtime component root");
+    let source = runtime_source_receipt_fixture(&component, &root, b"authenticated java").await;
+    let staged = stage_managed_runtime(&cache, &component, source, &mut |_| {})
+        .await
+        .expect("managed runtime stage");
+    let source = publish_staged_managed_runtime(staged)
+        .await
+        .expect("managed runtime publish")
+        .into_source_receipt();
     let runtime = RuntimeRecord {
-        id: RuntimeId::from("java-runtime-delta"),
-        java_path: root.join("bin/java").to_string_lossy().into_owned(),
+        id: component,
+        java_path: java_executable(&root).to_string_lossy().into_owned(),
         info: JavaRuntimeInfo {
-            id: "java-runtime-delta".to_string(),
-            major: 21,
+            id: "jre-legacy".to_string(),
+            major: 8,
             update: 0,
             distribution: "test".to_string(),
-            path: root.join("bin/java").to_string_lossy().into_owned(),
+            path: java_executable(&root).to_string_lossy().into_owned(),
         },
         source: RuntimeSource::Managed,
         install_state: RuntimeInstallState::Ready,
         root_dir: root.to_string_lossy().into_owned(),
     };
 
-    assert!(runtime_record_matches_source_for_test(&runtime, &receipt).await);
-    fs::write(
-        root.join(super::COMPONENT_MANIFEST_PROOF_FILE),
-        b"different authenticated generation",
-    )
-    .expect("replace proof");
-    assert!(!runtime_record_matches_source_for_test(&runtime, &receipt).await);
-
-    let _ = fs::remove_dir_all(root);
+    assert!(runtime_record_matches_source_for_test(&runtime, &source).await);
+    fs::write(java_executable(&root), b"tampered java").expect("tamper runtime file");
+    make_executable(&java_executable(&root));
+    assert!(!runtime_record_matches_source_for_test(&runtime, &source).await);
 }
 
 #[tokio::test]
@@ -789,10 +784,6 @@ fn managed_runtime_requires_ready_marker_even_when_java_exists() {
 
     assert_eq!(detect_runtime_state(&root), RuntimeInstallState::Broken);
 
-    fs::write(root.join(".axial-installing"), b"installing").expect("installing marker");
-    assert_eq!(detect_runtime_state(&root), RuntimeInstallState::Installing);
-
-    fs::remove_file(root.join(".axial-installing")).expect("remove installing marker");
     fs::write(root.join(".axial-ready"), b"ready").expect("ready marker");
     assert_eq!(detect_runtime_state(&root), RuntimeInstallState::Broken);
     write_runtime_manifest_proof_for_java(&root);
@@ -871,72 +862,6 @@ fn explicit_full_runtime_verifier_detects_manifest_link_drift() {
     assert!(!managed_runtime_contents_verified_without_probe(&root));
 
     let _ = fs::remove_dir_all(root);
-}
-
-#[test]
-fn runtime_install_cleanup_removes_stale_directory_destination() {
-    let root = unique_temp_root("axial-runtime-cleanup-dir-test");
-    fs::create_dir_all(root.join("bin")).expect("create stale runtime dir");
-    fs::write(root.join("bin").join("java"), b"stale").expect("write stale java");
-
-    remove_runtime_install_path(&root).expect("remove stale runtime dir");
-
-    assert!(!root.exists());
-}
-
-#[test]
-fn runtime_install_cleanup_removes_stale_file_destination() {
-    let root = unique_temp_root("axial-runtime-cleanup-file-test");
-    fs::write(&root, b"blocking file").expect("write stale runtime file");
-
-    remove_runtime_install_path(&root).expect("remove stale runtime file");
-
-    assert!(!root.exists());
-}
-
-#[test]
-fn runtime_install_cleanup_accepts_missing_destination() {
-    let root = unique_temp_root("axial-runtime-cleanup-missing-test");
-
-    remove_runtime_install_path(&root).expect("missing runtime path is clean");
-
-    assert!(!root.exists());
-}
-
-#[tokio::test]
-async fn async_runtime_install_cleanup_removes_stale_directory_destination() {
-    let root = unique_temp_root("axial-runtime-async-cleanup-dir-test");
-    fs::create_dir_all(root.join("bin")).expect("create stale runtime dir");
-    fs::write(root.join("bin").join("java"), b"stale").expect("write stale java");
-
-    remove_runtime_install_path_async(&root)
-        .await
-        .expect("remove stale runtime dir");
-
-    assert!(!root.exists());
-}
-
-#[tokio::test]
-async fn async_runtime_install_cleanup_removes_stale_file_destination() {
-    let root = unique_temp_root("axial-runtime-async-cleanup-file-test");
-    fs::write(&root, b"blocking file").expect("write stale runtime file");
-
-    remove_runtime_install_path_async(&root)
-        .await
-        .expect("remove stale runtime file");
-
-    assert!(!root.exists());
-}
-
-#[tokio::test]
-async fn async_runtime_install_cleanup_accepts_missing_destination() {
-    let root = unique_temp_root("axial-runtime-async-cleanup-missing-test");
-
-    remove_runtime_install_path_async(&root)
-        .await
-        .expect("missing runtime path is clean");
-
-    assert!(!root.exists());
 }
 
 #[test]
@@ -1174,8 +1099,11 @@ fn fat_arch64_be(cputype: u32) -> [u8; 32] {
 
 #[tokio::test]
 async fn fallback_selected_runtime_install_is_ready_with_manifest_proof() {
-    let root = unique_temp_root("axial-runtime-fallback-install-test");
+    let cache = ManagedRuntimeCache::isolated_for_test().expect("runtime cache");
     let component = RuntimeId::from("jre-legacy");
+    let root = cache
+        .component_root(component.as_str())
+        .expect("managed runtime component root");
     let java_bytes = b"fallback java".to_vec();
     let cfg_bytes = b"fallback cfg".to_vec();
     let java_url = serve_runtime_download(java_bytes.clone()).await;
@@ -1221,19 +1149,629 @@ async fn fallback_selected_runtime_install_is_ready_with_manifest_proof() {
         .expect("verified runtime source receipt");
     let mut events = Vec::new();
 
-    install_managed_runtime(&component, &root, &receipt, &mut |event| events.push(event))
+    let staged =
+        stage_managed_runtime(&cache, &component, receipt, &mut |event| events.push(event))
+            .await
+            .expect("fallback runtime stage");
+    assert!(!root.exists());
+    publish_staged_managed_runtime(staged)
         .await
-        .expect("fallback runtime install");
+        .expect("fallback runtime publish");
 
     assert_eq!(detect_runtime_state(&root), RuntimeInstallState::Ready);
     assert!(root.join(".axial-runtime-manifest.json").is_file());
-    assert_eq!(
-        events.last(),
-        Some(&RuntimeEnsureEvent::ManagedRuntimeReady {
-            component: "jre-legacy".to_string()
-        })
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, RuntimeEnsureEvent::ManagedRuntimeReady { .. }))
     );
-    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn managed_runtime_promotion_failure_restores_canonical_tree() {
+    let cache = ManagedRuntimeCache::isolated_for_test().expect("runtime cache");
+    let component = RuntimeId::from("jre-legacy");
+    let root = cache
+        .component_root(component.as_str())
+        .expect("managed runtime component root");
+    fs::create_dir(&root).expect("canonical runtime root");
+    fs::write(root.join("sentinel"), b"original").expect("canonical sentinel");
+    let source = runtime_source_receipt_fixture(&component, &root, b"replacement java").await;
+    let staged = stage_managed_runtime(&cache, &component, source, &mut |_| {})
+        .await
+        .expect("managed runtime stage");
+    let staging_root = staged.staging_root_for_test().to_path_buf();
+
+    let error = publish_staged_managed_runtime_with_promotion_failure_for_test(staged)
+        .await
+        .expect_err("injected promotion failure");
+
+    let ManagedRuntimeRebuildError::Effect(effect) = error else {
+        panic!("canonical displacement must return sealed effect evidence");
+    };
+    assert_eq!(effect.component(), &component);
+    assert!(effect.matches_cache(&cache));
+    assert!(effect.quarantine_obligation().is_none());
+    assert_eq!(
+        fs::read(root.join("sentinel")).expect("restored sentinel"),
+        b"original"
+    );
+    assert!(!staging_root.exists());
+    assert!(!root.with_file_name("jre-legacy.quarantine").exists());
+}
+
+#[tokio::test]
+async fn atomic_displacement_failure_without_prior_effect_is_preparation() {
+    let cache = ManagedRuntimeCache::isolated_for_test().expect("runtime cache");
+    let component = RuntimeId::from("jre-legacy");
+    let root = cache
+        .component_root(component.as_str())
+        .expect("managed runtime component root");
+    fs::create_dir(&root).expect("canonical runtime root");
+    fs::write(root.join("sentinel"), b"original").expect("canonical sentinel");
+    let source = runtime_source_receipt_fixture(&component, &root, b"replacement java").await;
+    let staged = stage_managed_runtime(&cache, &component, source, &mut |_| {})
+        .await
+        .expect("managed runtime stage");
+    let staging_root = staged.staging_root_for_test().to_path_buf();
+
+    let error = publish_staged_managed_runtime_with_displacement_failure_for_test(staged)
+        .await
+        .expect_err("injected atomic displacement failure");
+
+    assert!(matches!(error, ManagedRuntimeRebuildError::Preparation(_)));
+    assert_eq!(
+        fs::read(root.join("sentinel")).expect("unchanged canonical sentinel"),
+        b"original"
+    );
+    assert!(!staging_root.exists());
+    assert!(!root.with_file_name("jre-legacy.quarantine").exists());
+}
+
+#[tokio::test]
+async fn managed_runtime_restoration_failure_retains_sealed_quarantine_evidence() {
+    let cache = ManagedRuntimeCache::isolated_for_test().expect("runtime cache");
+    let component = RuntimeId::from("jre-legacy");
+    let root = cache
+        .component_root(component.as_str())
+        .expect("managed runtime component root");
+    fs::create_dir(&root).expect("canonical runtime root");
+    fs::write(root.join("sentinel"), b"original").expect("canonical sentinel");
+    let source = runtime_source_receipt_fixture(&component, &root, b"replacement java").await;
+    let staged = stage_managed_runtime(&cache, &component, source, &mut |_| {})
+        .await
+        .expect("managed runtime stage");
+    let staging_root = staged.staging_root_for_test().to_path_buf();
+
+    let error = publish_staged_managed_runtime_with_restoration_failure_for_test(staged)
+        .await
+        .expect_err("injected restoration failure");
+
+    let ManagedRuntimeRebuildError::Effect(effect) = error else {
+        panic!("failed restoration must return sealed effect evidence");
+    };
+    let obligation = effect
+        .quarantine_obligation()
+        .expect("retained quarantine obligation");
+    assert_eq!(obligation.component(), &component);
+    assert!(obligation.matches_cache(&cache));
+    assert!(obligation.is_present());
+    assert!(!root.exists());
+    assert!(!staging_root.exists());
+    assert_eq!(
+        fs::read(
+            root.with_file_name("jre-legacy.quarantine")
+                .join("sentinel")
+        )
+        .expect("quarantined canonical sentinel"),
+        b"original"
+    );
+}
+
+#[tokio::test]
+async fn ordinary_managed_runtime_publish_finalizes_displaced_quarantine() {
+    let cache = ManagedRuntimeCache::isolated_for_test().expect("runtime cache");
+    let component = RuntimeId::from("jre-legacy");
+    let root = cache
+        .component_root(component.as_str())
+        .expect("managed runtime component root");
+    fs::create_dir(&root).expect("canonical runtime root");
+    fs::write(root.join("sentinel"), b"original").expect("canonical sentinel");
+    let source = runtime_source_receipt_fixture(&component, &root, b"replacement java").await;
+    let staged = stage_managed_runtime(&cache, &component, source, &mut |_| {})
+        .await
+        .expect("managed runtime stage");
+
+    let receipt = publish_staged_managed_runtime_and_finalize(staged)
+        .await
+        .expect("ordinary managed runtime publish");
+
+    assert!(receipt.quarantine_obligation().is_none());
+    assert!(receipt.revalidate(&cache, &component).await);
+    assert!(!root.with_file_name("jre-legacy.quarantine").exists());
+}
+
+#[tokio::test]
+async fn ordinary_quarantine_finalization_failure_retains_effect_evidence() {
+    let cache = ManagedRuntimeCache::isolated_for_test().expect("runtime cache");
+    let component = RuntimeId::from("jre-legacy");
+    let root = cache
+        .component_root(component.as_str())
+        .expect("managed runtime component root");
+    fs::create_dir(&root).expect("canonical runtime root");
+    fs::write(root.join("sentinel"), b"original").expect("canonical sentinel");
+    let source = runtime_source_receipt_fixture(&component, &root, b"replacement java").await;
+    let staged = stage_managed_runtime(&cache, &component, source, &mut |_| {})
+        .await
+        .expect("managed runtime stage");
+
+    let error = publish_staged_managed_runtime_with_finalization_failure_for_test(staged)
+        .await
+        .expect_err("injected quarantine finalization failure");
+
+    let ManagedRuntimeRebuildError::Effect(effect) = error else {
+        panic!("finalization failure must retain sealed effect truth");
+    };
+    let obligation = effect
+        .quarantine_obligation()
+        .expect("retained finalization obligation");
+    assert!(obligation.matches_cache(&cache));
+    assert!(obligation.is_present());
+    assert!(managed_runtime_contents_verified_without_probe(&root));
+    assert_eq!(
+        fs::read(
+            root.with_file_name("jre-legacy.quarantine")
+                .join("sentinel")
+        )
+        .expect("retained displaced sentinel"),
+        b"original"
+    );
+}
+
+#[tokio::test]
+async fn managed_runtime_abandoned_stage_uses_one_recoverable_fixed_slot() {
+    let cache = ManagedRuntimeCache::isolated_for_test().expect("runtime cache");
+    let component = RuntimeId::from("jre-legacy");
+    let root = cache
+        .component_root(component.as_str())
+        .expect("managed runtime component root");
+    fs::create_dir(&root).expect("canonical runtime root");
+    fs::write(root.join("sentinel"), b"original").expect("canonical sentinel");
+
+    let abandoned_source =
+        runtime_source_receipt_fixture(&component, &root, b"abandoned java").await;
+    let abandoned = stage_managed_runtime(&cache, &component, abandoned_source, &mut |_| {})
+        .await
+        .expect("abandoned managed runtime stage");
+    let staging_root = abandoned.staging_root_for_test().to_path_buf();
+    drop(abandoned);
+    assert!(staging_root.exists());
+    assert_eq!(
+        fs::read(java_executable(&staging_root)).expect("abandoned staged java"),
+        b"abandoned java"
+    );
+
+    let replacement_source =
+        runtime_source_receipt_fixture(&component, &root, b"replacement java").await;
+    let replacement = stage_managed_runtime(&cache, &component, replacement_source, &mut |_| {})
+        .await
+        .expect("replacement managed runtime stage");
+    assert_eq!(replacement.staging_root_for_test(), staging_root);
+    assert_eq!(
+        fs::read(java_executable(&staging_root)).expect("replacement staged java"),
+        b"replacement java"
+    );
+    let staging_slots = fs::read_dir(cache.root())
+        .expect("runtime cache entries")
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_name() == "jre-legacy.staging")
+        .count();
+    assert_eq!(staging_slots, 1);
+
+    publish_staged_managed_runtime(replacement)
+        .await
+        .expect("replacement runtime publish");
+    assert!(!staging_root.exists());
+    assert_eq!(
+        fs::read(
+            root.with_file_name("jre-legacy.quarantine")
+                .join("sentinel")
+        )
+        .expect("displaced canonical sentinel"),
+        b"original"
+    );
+}
+
+#[tokio::test]
+async fn quarantine_rotation_failure_before_displacement_is_post_effect() {
+    let cache = ManagedRuntimeCache::isolated_for_test().expect("runtime cache");
+    let component = RuntimeId::from("jre-legacy");
+    let root = cache
+        .component_root(component.as_str())
+        .expect("managed runtime component root");
+    fs::create_dir(&root).expect("canonical runtime root");
+    fs::write(root.join("sentinel"), b"original").expect("canonical sentinel");
+
+    let first_source = runtime_source_receipt_fixture(&component, &root, b"first java").await;
+    let first_stage = stage_managed_runtime(&cache, &component, first_source, &mut |_| {})
+        .await
+        .expect("first managed runtime stage");
+    let first_commit = publish_staged_managed_runtime(first_stage)
+        .await
+        .expect("first retained managed runtime publish");
+    let quarantine = first_commit
+        .quarantine_root_for_test()
+        .expect("retained quarantine");
+    drop(first_commit);
+
+    let second_source = runtime_source_receipt_fixture(&component, &root, b"second java").await;
+    let second_stage = stage_managed_runtime(&cache, &component, second_source, &mut |_| {})
+        .await
+        .expect("second managed runtime stage");
+    let staging_root = second_stage.staging_root_for_test().to_path_buf();
+    let error = publish_staged_managed_runtime_with_rotation_failure_for_test(second_stage)
+        .await
+        .expect_err("injected quarantine rotation failure");
+
+    let ManagedRuntimeRebuildError::Effect(effect) = error else {
+        panic!("quarantine rotation attempt must cross the effect boundary");
+    };
+    let obligation = effect
+        .quarantine_obligation()
+        .expect("retained quarantine evidence");
+    assert_eq!(obligation.component(), &component);
+    assert!(obligation.matches_cache(&cache));
+    assert!(obligation.is_present());
+    assert_eq!(
+        fs::read(java_executable(&root)).expect("unchanged canonical java"),
+        b"first java"
+    );
+    assert_eq!(
+        fs::read(quarantine.join("sentinel")).expect("retained prior quarantine"),
+        b"original"
+    );
+    assert!(!staging_root.exists());
+}
+
+#[tokio::test]
+async fn managed_runtime_quarantine_rotation_is_bounded_across_repairs() {
+    let cache = ManagedRuntimeCache::isolated_for_test().expect("runtime cache");
+    let component = RuntimeId::from("jre-legacy");
+    let root = cache
+        .component_root(component.as_str())
+        .expect("managed runtime component root");
+    fs::create_dir(&root).expect("canonical runtime root");
+    fs::write(root.join("sentinel"), b"original").expect("canonical sentinel");
+
+    let first_source = runtime_source_receipt_fixture(&component, &root, b"first java").await;
+    let first_stage = stage_managed_runtime(&cache, &component, first_source, &mut |_| {})
+        .await
+        .expect("first managed runtime stage");
+    let first_commit = publish_staged_managed_runtime(first_stage)
+        .await
+        .expect("first managed runtime publish");
+    let quarantine = first_commit
+        .quarantine_root_for_test()
+        .expect("first quarantine obligation");
+    assert_eq!(
+        fs::read(quarantine.join("sentinel")).expect("first displaced sentinel"),
+        b"original"
+    );
+    drop(first_commit);
+
+    let first_java = java_executable(&root);
+    assert_eq!(
+        fs::read(&first_java).expect("first canonical java"),
+        b"first java"
+    );
+    let second_source = runtime_source_receipt_fixture(&component, &root, b"second java").await;
+    let second_stage = stage_managed_runtime(&cache, &component, second_source, &mut |_| {})
+        .await
+        .expect("second managed runtime stage");
+    let second_commit = publish_staged_managed_runtime(second_stage)
+        .await
+        .expect("second managed runtime publish");
+
+    assert_eq!(
+        fs::read(java_executable(&root)).expect("second canonical java"),
+        b"second java"
+    );
+    assert_eq!(
+        fs::read(java_executable(&quarantine)).expect("rotated displaced java"),
+        b"first java"
+    );
+    assert_eq!(
+        second_commit.quarantine_root_for_test(),
+        Some(quarantine.clone())
+    );
+    let sidecars = fs::read_dir(cache.root())
+        .expect("runtime cache entries")
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            matches!(
+                entry.file_name().to_str(),
+                Some("jre-legacy.staging" | "jre-legacy.quarantine")
+            )
+        })
+        .map(|entry| entry.file_name())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        sidecars,
+        vec![std::ffi::OsString::from("jre-legacy.quarantine")]
+    );
+}
+
+#[tokio::test]
+async fn managed_runtime_publication_receipt_holds_the_component_lease() {
+    let cache = ManagedRuntimeCache::isolated_for_test().expect("runtime cache");
+    let component = RuntimeId::from("jre-legacy");
+    let root = cache
+        .component_root(component.as_str())
+        .expect("managed runtime component root");
+    let first_source = runtime_source_receipt_fixture(&component, &root, b"first java").await;
+    let first_stage = stage_managed_runtime(&cache, &component, first_source, &mut |_| {})
+        .await
+        .expect("first managed runtime stage");
+    let first_receipt = publish_staged_managed_runtime(first_stage)
+        .await
+        .expect("first managed runtime publish");
+    let second_source = runtime_source_receipt_fixture(&component, &root, b"second java").await;
+    let second_cache = cache.clone();
+    let second_component = component.clone();
+    let mut second_stage_task = tokio::spawn(async move {
+        stage_managed_runtime(&second_cache, &second_component, second_source, &mut |_| {}).await
+    });
+
+    assert!(
+        tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            &mut second_stage_task
+        )
+        .await
+        .is_err(),
+        "a second stage must remain pending while the sealed receipt owns the lease"
+    );
+    drop(first_receipt);
+
+    let second_stage = tokio::time::timeout(std::time::Duration::from_secs(2), second_stage_task)
+        .await
+        .expect("second stage resumes after receipt drop")
+        .expect("second stage task")
+        .expect("second managed runtime stage");
+    let second_receipt = publish_staged_managed_runtime(second_stage)
+        .await
+        .expect("second managed runtime publish");
+    assert!(second_receipt.revalidate(&cache, &component).await);
+}
+
+#[tokio::test]
+async fn managed_runtime_admission_rejects_unsafe_sizes_before_effects() {
+    let (oversized_url, oversized_requests) =
+        serve_runtime_retry_responses(vec![(200, b"unused".to_vec())]).await;
+    let oversized = ComponentManifest {
+        files: HashMap::from([(
+            runtime_java_manifest_path(),
+            downloadable_manifest_file(
+                &oversized_url,
+                (128 << 20) + 1,
+                "0000000000000000000000000000000000000000",
+            ),
+        )]),
+    };
+    assert_managed_manifest_rejection_preserves_state(oversized, oversized_requests).await;
+
+    let (missing_size_url, missing_size_requests) =
+        serve_runtime_retry_responses(vec![(200, b"unused".to_vec())]).await;
+    let mut missing_size = downloadable_manifest_file(
+        &missing_size_url,
+        1,
+        "0000000000000000000000000000000000000000",
+    );
+    missing_size
+        .downloads
+        .as_mut()
+        .expect("download proof")
+        .raw
+        .as_mut()
+        .expect("raw proof")
+        .size = None;
+    let missing_size = ComponentManifest {
+        files: HashMap::from([(runtime_java_manifest_path(), missing_size)]),
+    };
+    assert_managed_manifest_rejection_preserves_state(missing_size, missing_size_requests).await;
+}
+
+#[tokio::test]
+async fn managed_runtime_admission_rejects_over_entry_manifest_before_effects() {
+    let (url, requests) = serve_runtime_retry_responses(vec![(200, b"unused".to_vec())]).await;
+    let mut files = (0..4096)
+        .map(|index| (format!("entry-{index}"), manifest_file("directory")))
+        .collect::<HashMap<_, _>>();
+    files.insert(
+        runtime_java_manifest_path(),
+        downloadable_manifest_file(&url, 1, "0000000000000000000000000000000000000000"),
+    );
+
+    assert_managed_manifest_rejection_preserves_state(ComponentManifest { files }, requests).await;
+}
+
+#[tokio::test]
+async fn managed_runtime_stage_rejects_extra_tree_entries_before_displacement() {
+    let cache = ManagedRuntimeCache::isolated_for_test().expect("runtime cache");
+    let component = RuntimeId::from("jre-legacy");
+    let root = cache
+        .component_root(component.as_str())
+        .expect("managed runtime component root");
+    fs::create_dir(&root).expect("canonical runtime root");
+    fs::write(root.join("sentinel"), b"original").expect("canonical sentinel");
+    let source = runtime_source_receipt_fixture(&component, &root, b"replacement java").await;
+    let staged = stage_managed_runtime(&cache, &component, source, &mut |_| {})
+        .await
+        .expect("managed runtime stage");
+    let staging_root = staged.staging_root_for_test().to_path_buf();
+    fs::write(staging_root.join("undeclared"), b"extra").expect("undeclared staged file");
+
+    let error = publish_staged_managed_runtime(staged)
+        .await
+        .expect_err("extra staged entry must fail exact verification");
+
+    assert!(matches!(error, ManagedRuntimeRebuildError::Preparation(_)));
+    assert_eq!(
+        fs::read(root.join("sentinel")).expect("untouched sentinel"),
+        b"original"
+    );
+    assert!(!staging_root.exists());
+}
+
+#[tokio::test]
+async fn managed_runtime_commit_revalidation_rejects_ready_marker_tampering() {
+    let cache = ManagedRuntimeCache::isolated_for_test().expect("runtime cache");
+    let component = RuntimeId::from("jre-legacy");
+    let root = cache
+        .component_root(component.as_str())
+        .expect("managed runtime component root");
+    let source = runtime_source_receipt_fixture(&component, &root, b"authenticated java").await;
+    let staged = stage_managed_runtime(&cache, &component, source, &mut |_| {})
+        .await
+        .expect("managed runtime stage");
+    let receipt = publish_staged_managed_runtime(staged)
+        .await
+        .expect("managed runtime publish");
+    assert!(receipt.revalidate(&cache, &component).await);
+
+    fs::write(root.join(".axial-ready"), b"nope").expect("tamper ready marker");
+
+    assert!(!receipt.revalidate(&cache, &component).await);
+}
+
+async fn runtime_source_receipt_fixture(
+    component: &RuntimeId,
+    runtime_root: &Path,
+    java_bytes: &[u8],
+) -> RuntimeSourceReceipt {
+    let java_url = serve_runtime_download(java_bytes.to_vec()).await;
+    let java_relative_path = java_executable(runtime_root)
+        .strip_prefix(runtime_root)
+        .expect("java path under runtime root")
+        .to_string_lossy()
+        .replace('\\', "/");
+    let mut java_file =
+        downloadable_manifest_file(&java_url, java_bytes.len() as u64, &sha1_hex(java_bytes));
+    java_file.executable = true;
+    let component_manifest = ComponentManifest {
+        files: HashMap::from([(java_relative_path, java_file)]),
+    };
+    let manifest_bytes =
+        serde_json::to_vec(&component_manifest).expect("component manifest fixture");
+    let manifest_url = serve_runtime_json(200, manifest_bytes.clone(), None).await;
+    acquire_runtime_source_for_test(
+        component.clone(),
+        RuntimeDownloadManifest {
+            url: manifest_url,
+            sha1: sha1_hex(&manifest_bytes),
+            size: manifest_bytes.len() as u64,
+        },
+    )
+    .await
+    .expect("authenticated runtime source fixture")
+}
+
+fn runtime_java_manifest_path() -> String {
+    java_executable(Path::new("runtime"))
+        .strip_prefix("runtime")
+        .expect("runtime Java remains below the fixture root")
+        .to_string_lossy()
+        .replace('\\', "/")
+}
+
+async fn assert_managed_manifest_rejection_preserves_state(
+    manifest: ComponentManifest,
+    requests: Arc<AtomicUsize>,
+) {
+    let cache = ManagedRuntimeCache::isolated_for_test().expect("runtime cache");
+    let component = RuntimeId::from("jre-legacy");
+    let root = cache
+        .component_root(component.as_str())
+        .expect("managed runtime component root");
+    let staging_root = root.with_file_name("jre-legacy.staging");
+    fs::create_dir(&root).expect("canonical runtime root");
+    fs::write(root.join("sentinel"), b"canonical").expect("canonical sentinel");
+    fs::create_dir(&staging_root).expect("existing fixed staging root");
+    fs::write(staging_root.join("sentinel"), b"staging").expect("staging sentinel");
+    let source = authenticated_runtime_source_from_manifest_for_test(component.clone(), manifest)
+        .expect("authenticated invalid runtime source fixture");
+    let mut events = Vec::new();
+
+    let result =
+        stage_managed_runtime(&cache, &component, source, &mut |event| events.push(event)).await;
+
+    assert!(matches!(result, Err(JavaRuntimeLookupError::Download(_))));
+    tokio::task::yield_now().await;
+    assert_eq!(requests.load(Ordering::SeqCst), 0);
+    assert!(events.is_empty());
+    assert_eq!(
+        fs::read(root.join("sentinel")).expect("unchanged canonical sentinel"),
+        b"canonical"
+    );
+    assert_eq!(
+        fs::read(staging_root.join("sentinel")).expect("unchanged staging sentinel"),
+        b"staging"
+    );
+    assert!(!runtime_install_lock_file_path(&root).exists());
+    assert!(!root.with_file_name("jre-legacy.quarantine").exists());
+}
+
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn sealed_runtime_fixture_replaces_only_active_runtime_projection() {
+    use crate::known_good::{
+        KnownGoodArtifactKind, KnownGoodInventory, KnownGoodRoot, TestKnownGoodEntry,
+        TestKnownGoodIntegrity, TestKnownGoodRoot,
+    };
+
+    let cache = ManagedRuntimeCache::isolated_for_test().expect("runtime cache");
+    let component = RuntimeId::from("jre-legacy");
+    let active = KnownGoodInventory::from_test_entries([TestKnownGoodEntry {
+        root: TestKnownGoodRoot::Versions,
+        path: "fixture/fixture.json".to_string(),
+        kind: KnownGoodArtifactKind::VersionMetadata,
+        integrity: TestKnownGoodIntegrity::File { size: 1 },
+    }])
+    .expect("active known-good fixture");
+    let receipt = super::rebuild_managed_runtime_fixture_for_test(&cache, component.clone())
+        .await
+        .expect("sealed runtime rebuild fixture");
+
+    let merged = receipt
+        .replace_known_good_runtime_projection(&active)
+        .expect("replace sealed runtime projection");
+
+    assert!(receipt.matches_known_good_inventory(&merged));
+    assert!(merged.entries().iter().any(|entry| {
+        matches!(entry.root(), KnownGoodRoot::Versions)
+            && entry.path().as_str() == "fixture/fixture.json"
+    }));
+    assert!(merged.entries().iter().any(|entry| matches!(
+        entry.root(),
+        KnownGoodRoot::ManagedRuntime { component: observed }
+            if observed.as_str() == component.as_str()
+    )));
+
+    let foreign_active = KnownGoodInventory::from_test_entries([TestKnownGoodEntry {
+        root: TestKnownGoodRoot::ManagedRuntime {
+            component: "java-runtime-gamma".to_string(),
+        },
+        path: "bin/java".to_string(),
+        kind: KnownGoodArtifactKind::RuntimeExecutable,
+        integrity: TestKnownGoodIntegrity::File { size: 1 },
+    }])
+    .expect("foreign active Runtime projection fixture");
+    assert!(
+        receipt
+            .replace_known_good_runtime_projection(&foreign_active)
+            .is_err(),
+        "a sealed receipt must not retain a foreign active Runtime projection"
+    );
 }
 
 #[test]
@@ -1369,6 +1907,24 @@ async fn ephemeral_processor_runtime_rejects_oversized_file_before_request() {
     assert!(validate_ephemeral_processor_manifest_for_test(&manifest, 1).is_err());
     tokio::task::yield_now().await;
     assert_eq!(requests.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn runtime_manifest_admission_rejects_checked_byte_overflow() {
+    let manifest = ComponentManifest {
+        files: HashMap::from([(
+            "bin/java".to_string(),
+            downloadable_manifest_file(
+                "https://example.invalid/java",
+                1,
+                "0000000000000000000000000000000000000000",
+            ),
+        )]),
+    };
+
+    let error = validate_ephemeral_processor_manifest_for_test(&manifest, u64::MAX)
+        .expect_err("manifest admission total must use checked arithmetic");
+    assert!(error.to_string().contains("overflowed"));
 }
 
 #[test]
