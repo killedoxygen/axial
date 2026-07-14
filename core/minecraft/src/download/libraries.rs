@@ -15,8 +15,8 @@ use crate::known_good_libraries::{
     PendingStreamedLibraryDeclarations, SealedLibraryDeclarationError,
 };
 use crate::launch::{Library, maven_to_path};
-use crate::loaders::types::LoaderError;
-use crate::managed_fs::{ManagedBoundedFileReader, ManagedDir};
+use crate::managed_component_cache::{ManagedComponentExactCache, ManagedComponentExactCacheError};
+use crate::managed_component_table::ManagedComponentKind;
 use crate::paths::libraries_dir;
 use crate::rules::{Environment, evaluate_rules};
 use futures_util::StreamExt;
@@ -85,78 +85,29 @@ impl LibraryArtifactPlan {
 
 #[derive(Clone)]
 pub(crate) struct ExactLibraryCacheAdmission {
-    libraries: Option<ManagedDir>,
-}
-
-struct ExactLibraryCacheSource {
-    reader: ManagedBoundedFileReader,
-}
-
-struct ExactLibraryCacheGuard {
-    directory: ManagedDir,
-    name: String,
-    guard: crate::managed_fs::ManagedFileGuard,
+    cache: ManagedComponentExactCache,
 }
 
 impl ExactLibraryCacheAdmission {
     pub(crate) async fn bind(managed_root: &Path) -> Result<Self, DownloadError> {
-        let managed_root = managed_root.to_path_buf();
-        tokio::task::spawn_blocking(move || {
-            let root = match ManagedDir::open_root(&managed_root) {
-                Ok(root) => root,
-                Err(LoaderError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
-                    return Ok(Self { libraries: None });
-                }
-                Err(error) => return Err(cache_admission_error(error)),
-            };
-            if !root
-                .has_portably_exact_child_name("libraries")
-                .map_err(cache_admission_error)?
-            {
-                return Ok(Self { libraries: None });
-            }
-            let libraries = root
-                .open_child("libraries")
-                .map_err(cache_admission_error)?;
-            Ok(Self {
-                libraries: Some(libraries),
-            })
+        Ok(Self {
+            cache: ManagedComponentExactCache::bind(managed_root, ManagedComponentKind::Libraries)
+                .await
+                .map_err(cache_admission_error)?,
         })
-        .await
-        .map_err(|error| {
-            DownloadError::FileOperation(io::Error::other(format!(
-                "library cache admission task stopped unexpectedly: {error}"
-            )))
-        })?
     }
 
     pub(crate) async fn requires_retained_source(
         &self,
         job: &DownloadJob,
     ) -> Result<bool, DownloadError> {
-        let expected_size = job.expected.size.ok_or(LibraryPlanError::InvalidChecksum)?;
-        let expected_sha1 = job
-            .expected
-            .sha1
-            .as_deref()
-            .and_then(decode_sha1)
-            .ok_or(LibraryPlanError::InvalidChecksum)?;
-        let Some(source) = self.exact_guard(job).await? else {
-            return Ok(true);
-        };
-        tokio::task::spawn_blocking(move || {
-            let observed = source
-                .directory
-                .sha1_guarded_file_bytes(&source.name, &source.guard, expected_size)
-                .map_err(cache_admission_error)?;
-            Ok(observed != expected_sha1)
-        })
-        .await
-        .map_err(|error| {
-            DownloadError::FileOperation(io::Error::other(format!(
-                "library cache authentication task stopped unexpectedly: {error}"
-            )))
-        })?
+        let (expected_size, expected_sha1) = exact_library_cache_contract(job)?;
+        let observed = self
+            .cache
+            .full_sha1(&job.relative_path, expected_size)
+            .await
+            .map_err(cache_admission_error)?;
+        Ok(observed != Some(expected_sha1))
     }
 
     async fn retain_installer_source(
@@ -165,17 +116,15 @@ impl ExactLibraryCacheAdmission {
         source_pool: &LibrarySourcePool,
         kind: LibraryComponentSourceKind,
     ) -> Result<Option<RetainedLibraryComponentSource>, DownloadError> {
-        let Some(source) = self.exact_source(job).await? else {
+        let (expected_size, expected_sha1) = exact_library_cache_contract(job)?;
+        let Some(reader) = self
+            .cache
+            .bounded_reader(&job.relative_path, expected_size)
+            .await
+            .map_err(cache_admission_error)?
+        else {
             return Ok(None);
         };
-        let ExactLibraryCacheSource { reader } = source;
-        let expected_size = job.expected.size.ok_or(LibraryPlanError::InvalidChecksum)?;
-        let expected_sha1 = job
-            .expected
-            .sha1
-            .as_deref()
-            .and_then(decode_sha1)
-            .ok_or(LibraryPlanError::InvalidChecksum)?;
         let Some(allocation) = source_pool
             .try_retain_authenticated_jar_reader(reader, expected_size, expected_sha1)
             .await?
@@ -194,92 +143,33 @@ impl ExactLibraryCacheAdmission {
             ),
         ))
     }
-
-    async fn exact_source(
-        &self,
-        job: &DownloadJob,
-    ) -> Result<Option<ExactLibraryCacheSource>, DownloadError> {
-        let Some(source) = self.exact_guard(job).await? else {
-            return Ok(None);
-        };
-        let expected_size = job.expected.size.ok_or(LibraryPlanError::InvalidChecksum)?;
-        let reader = match source.guard.into_bounded_reader(expected_size) {
-            Ok(reader) => reader,
-            Err(_) => return Ok(None),
-        };
-        Ok(Some(ExactLibraryCacheSource { reader }))
-    }
-
-    async fn exact_guard(
-        &self,
-        job: &DownloadJob,
-    ) -> Result<Option<ExactLibraryCacheGuard>, DownloadError> {
-        let expected_size = job.expected.size.ok_or(LibraryPlanError::InvalidChecksum)?;
-        if expected_size == 0 || expected_size > LIBRARY_SOURCE_MAX_BYTES {
-            return Err(DownloadError::Integrity(
-                "exact library cache contract exceeds the admitted size bound".to_string(),
-            ));
-        }
-        if job.expected.sha1.as_deref().and_then(decode_sha1).is_none() {
-            return Err(LibraryPlanError::InvalidChecksum.into());
-        }
-        let Some(libraries) = self.libraries.clone() else {
-            return Ok(None);
-        };
-        let relative_path = job.relative_path.clone();
-        tokio::task::spawn_blocking(move || {
-            let mut segments = relative_path.as_str().split('/').peekable();
-            let mut directory = libraries;
-            while let Some(segment) = segments.next() {
-                if segments.peek().is_none() {
-                    if !directory
-                        .has_portably_exact_child_name(segment)
-                        .map_err(cache_admission_error)?
-                    {
-                        return Ok(None);
-                    }
-                    let guard = directory
-                        .inspect_regular_file(segment)
-                        .map_err(cache_admission_error)?
-                        .ok_or_else(|| {
-                            DownloadError::Integrity(
-                                "library cache identity changed during admission".to_string(),
-                            )
-                        })?;
-                    if guard.size() != expected_size {
-                        return Ok(None);
-                    }
-                    return Ok(Some(ExactLibraryCacheGuard {
-                        directory,
-                        name: segment.to_string(),
-                        guard,
-                    }));
-                }
-                if !directory
-                    .has_portably_exact_child_name(segment)
-                    .map_err(cache_admission_error)?
-                {
-                    return Ok(None);
-                }
-                directory = directory
-                    .open_child(segment)
-                    .map_err(cache_admission_error)?;
-            }
-            Err(DownloadError::Integrity(
-                "library cache admission received an empty artifact path".to_string(),
-            ))
-        })
-        .await
-        .map_err(|error| {
-            DownloadError::FileOperation(io::Error::other(format!(
-                "library cache inspection task stopped unexpectedly: {error}"
-            )))
-        })?
-    }
 }
 
-fn cache_admission_error(error: LoaderError) -> DownloadError {
-    DownloadError::Integrity(format!("library cache admission failed: {error}"))
+fn exact_library_cache_contract(job: &DownloadJob) -> Result<(u64, [u8; 20]), DownloadError> {
+    let expected_size = job.expected.size.ok_or(LibraryPlanError::InvalidChecksum)?;
+    if expected_size == 0 || expected_size > LIBRARY_SOURCE_MAX_BYTES {
+        return Err(DownloadError::Integrity(
+            "exact library cache contract exceeds the admitted size bound".to_string(),
+        ));
+    }
+    let expected_sha1 = job
+        .expected
+        .sha1
+        .as_deref()
+        .and_then(decode_sha1)
+        .ok_or(LibraryPlanError::InvalidChecksum)?;
+    Ok((expected_size, expected_sha1))
+}
+
+fn cache_admission_error(error: ManagedComponentExactCacheError) -> DownloadError {
+    match error {
+        ManagedComponentExactCacheError::Admission => {
+            DownloadError::Integrity("library cache admission failed".to_string())
+        }
+        ManagedComponentExactCacheError::TaskStopped => DownloadError::FileOperation(
+            io::Error::other("library cache admission task stopped unexpectedly"),
+        ),
+    }
 }
 
 pub(super) struct RetainedClassifiedLibraryAcquisition {
@@ -1243,7 +1133,7 @@ mod tests {
             .requires_retained_source(&job)
             .await
             .expect_err("directory final must fail closed");
-        assert!(error.to_string().contains("unsupported type"));
+        assert!(error.to_string().contains("library cache admission failed"));
         drop(admission);
         fs::remove_dir_all(root).expect("remove invalid-topology test root");
     }

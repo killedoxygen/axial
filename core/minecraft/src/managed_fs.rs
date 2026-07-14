@@ -143,8 +143,7 @@ impl ManagedFileGuard {
         mut self,
         max_size: u64,
     ) -> Result<ManagedBoundedFileReader, LoaderError> {
-        if self.size == 0
-            || self.size > max_size
+        if self.size > max_size
             || platform::file_identity(&self.file)? != self.identity
             || self.file.metadata()?.len() != self.size
         {
