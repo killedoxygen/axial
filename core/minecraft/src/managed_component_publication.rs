@@ -475,7 +475,7 @@ fn classify_component_recovery_shape(
                     commit_candidate: true,
                     rollback_reachable: true,
                 }),
-                (Absent, _) => Ok(ComponentEntryRecoveryShape {
+                (Absent, true) => Ok(ComponentEntryRecoveryShape {
                     commit_candidate: false,
                     rollback_reachable: true,
                 }),
@@ -491,7 +491,7 @@ fn classify_component_recovery_shape(
                 commit_candidate: true,
                 rollback_reachable: true,
             }),
-            (Absent, _, true) | (Prior, _, false) => Ok(ComponentEntryRecoveryShape {
+            (Absent, true, true) | (Prior, true, false) => Ok(ComponentEntryRecoveryShape {
                 commit_candidate: false,
                 rollback_reachable: true,
             }),
@@ -823,7 +823,7 @@ mod tests {
     }
 
     #[test]
-    fn absent_truth_table_is_exact() {
+    fn new_file_truth_table_requires_the_staged_source_for_rollback() {
         let row = row(None);
         for canonical in [
             ComponentObservedCanonical::Absent,
@@ -837,10 +837,18 @@ mod tests {
                         &row,
                         observation(canonical, stage, quarantine),
                     );
-                    let valid = !quarantine
-                        && (canonical == ComponentObservedCanonical::Absent
-                            || (canonical == ComponentObservedCanonical::Source && !stage));
-                    assert_eq!(result.is_ok(), valid, "{canonical:?}/{stage}/{quarantine}");
+                    let expected = match (canonical, stage, quarantine) {
+                        (ComponentObservedCanonical::Source, false, false) => Some((true, true)),
+                        (ComponentObservedCanonical::Absent, true, false) => Some((false, true)),
+                        _ => None,
+                    };
+                    assert_eq!(
+                        result
+                            .map(|shape| (shape.commit_candidate, shape.rollback_reachable))
+                            .ok(),
+                        expected,
+                        "{canonical:?}/{stage}/{quarantine}",
+                    );
                 }
             }
         }
@@ -864,9 +872,15 @@ mod tests {
                         &exact,
                         observation(canonical, stage, quarantine),
                     );
+                    let expected =
+                        (canonical == ComponentObservedCanonical::Source && !stage && !quarantine)
+                            .then_some((true, true));
                     assert_eq!(
-                        result.is_ok(),
-                        canonical == ComponentObservedCanonical::Source && !stage && !quarantine,
+                        result
+                            .map(|shape| (shape.commit_candidate, shape.rollback_reachable))
+                            .ok(),
+                        expected,
+                        "{canonical:?}/{stage}/{quarantine}",
                     );
                 }
             }
@@ -874,7 +888,7 @@ mod tests {
     }
 
     #[test]
-    fn replacement_truth_table_accepts_only_committed_or_rollback_reachable_shapes() {
+    fn replacement_truth_table_requires_the_staged_source_for_rollback() {
         let replacement = row(Some(ComponentPriorFile {
             size: 9,
             sha1: [0x44; 20],
@@ -891,13 +905,19 @@ mod tests {
                         &replacement,
                         observation(canonical, stage, quarantine),
                     );
-                    let valid = matches!(
-                        (canonical, stage, quarantine),
-                        (ComponentObservedCanonical::Source, false, true)
-                            | (ComponentObservedCanonical::Absent, _, true)
-                            | (ComponentObservedCanonical::Prior, _, false)
+                    let expected = match (canonical, stage, quarantine) {
+                        (ComponentObservedCanonical::Source, false, true) => Some((true, true)),
+                        (ComponentObservedCanonical::Absent, true, true)
+                        | (ComponentObservedCanonical::Prior, true, false) => Some((false, true)),
+                        _ => None,
+                    };
+                    assert_eq!(
+                        result
+                            .map(|shape| (shape.commit_candidate, shape.rollback_reachable))
+                            .ok(),
+                        expected,
+                        "{canonical:?}/{stage}/{quarantine}",
                     );
-                    assert_eq!(result.is_ok(), valid, "{canonical:?}/{stage}/{quarantine}");
                 }
             }
         }
