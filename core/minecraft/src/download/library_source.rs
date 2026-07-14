@@ -525,14 +525,6 @@ pub(crate) struct RetainedLibraryComponentSource {
 }
 
 impl RetainedLibraryComponentSource {
-    pub(crate) fn expected(&self) -> &ExpectedIntegrity {
-        &self.expected
-    }
-
-    pub(crate) fn provider_url(&self) -> &str {
-        &self.provider_url
-    }
-
     pub(crate) fn exact_download_proof(&self) -> ExactLibraryDownloadProof {
         ExactLibraryDownloadProof::new(
             self.relative_path.clone(),
@@ -1851,8 +1843,6 @@ mod tests {
         assert_eq!(source.relative_path(), &fixture_relative_path());
         assert_eq!(source.observed_size(), body.len() as u64);
         assert_eq!(source.observed_sha1(), sha1_bytes(&body));
-        assert_eq!(source.expected(), &ExpectedIntegrity::default());
-        assert_eq!(source.provider_url(), url);
         assert_eq!(source.kind(), ManagedComponentArtifactKind::NativeLibrary);
 
         let temp = tempfile::tempdir().expect("component staging root");
