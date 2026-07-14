@@ -2165,6 +2165,14 @@ impl PendingKnownGoodInstallAuthority {
             .managed_component_projection(ManagedKnownGoodComponent::VersionBundle)
     }
 
+    pub(crate) fn libraries_projection(
+        &self,
+    ) -> Result<ManagedComponentProjection<'_>, ManagedComponentProjectionError> {
+        self.authenticated
+            .inventory
+            .managed_component_projection(ManagedKnownGoodComponent::Libraries)
+    }
+
     pub(crate) fn seal_after_version_bundle_commit(self) -> KnownGoodInstallReceipt {
         KnownGoodInstallReceipt {
             authenticated: self.authenticated,
@@ -2224,6 +2232,22 @@ impl Sha1Digest {
 
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+
+    pub(crate) fn to_bytes(&self) -> [u8; 20] {
+        let mut decoded = [0_u8; 20];
+        for (index, pair) in self.0.as_bytes().chunks_exact(2).enumerate() {
+            decoded[index] = (sha1_hex_nibble(pair[0]) << 4) | sha1_hex_nibble(pair[1]);
+        }
+        decoded
+    }
+}
+
+fn sha1_hex_nibble(value: u8) -> u8 {
+    match value {
+        b'0'..=b'9' => value - b'0',
+        b'a'..=b'f' => value - b'a' + 10,
+        _ => unreachable!("Sha1Digest stores canonical lowercase hexadecimal"),
     }
 }
 
@@ -3183,6 +3207,14 @@ mod tests {
     }
 
     #[test]
+    fn sha1_digest_exposes_its_canonical_exact_bytes() {
+        let digest = Sha1Digest::from_metadata(&"AA".repeat(20)).expect("uppercase digest");
+
+        assert_eq!(digest.as_str(), "aa".repeat(20));
+        assert_eq!(digest.to_bytes(), [0xaa; 20]);
+    }
+
+    #[test]
     fn profile_receipt_binds_authored_recombination_and_exact_base_shadowing() {
         let (base, record, declarations, resolved, version_bytes) = profile_receipt_fixture();
         let pending = KnownGoodInstallReceipt::from_verified_profile_source(
@@ -3202,6 +3234,21 @@ mod tests {
             ManagedKnownGoodComponent::VersionBundle
         );
         assert_eq!(projection.entry_count(), 2);
+        let libraries = pending
+            .libraries_projection()
+            .expect("pending profile Libraries projection");
+        assert_eq!(libraries.component(), ManagedKnownGoodComponent::Libraries);
+        assert!(!libraries.entries().is_empty());
+        assert!(libraries.entries().windows(2).all(|entries| {
+            entries[0].entry().path().as_str() < entries[1].entry().path().as_str()
+        }));
+        assert!(libraries.entries().iter().all(|projected| {
+            projected.entry().root() == &KnownGoodRoot::Libraries
+                && matches!(
+                    projected.entry().kind(),
+                    KnownGoodArtifactKind::Library | KnownGoodArtifactKind::NativeLibrary
+                )
+        }));
         let inventory = pending
             .seal_after_version_bundle_commit()
             .into_activation_source()
