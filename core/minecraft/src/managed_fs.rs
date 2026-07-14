@@ -833,15 +833,16 @@ impl ManagedDir {
         .await
     }
 
-    pub(crate) async fn import_relative_authenticated_create_new<G>(
+    pub(crate) async fn import_relative_authenticated_create_new<R, G>(
         &self,
         relative: &ArtifactRelativePath,
-        source: std::fs::File,
+        source: R,
         expected_size: u64,
         expected_sha1: [u8; 20],
         lifetime_guard: G,
     ) -> Result<(), LoaderError>
     where
+        R: Read + Seek + Send + 'static,
         G: Send + 'static,
     {
         if expected_size == 0 || expected_size > MAX_MANAGED_READ_BYTES {
@@ -865,16 +866,17 @@ impl ManagedDir {
     }
 
     #[cfg(test)]
-    pub(crate) async fn import_relative_authenticated_create_new_with_hook<G>(
+    pub(crate) async fn import_relative_authenticated_create_new_with_hook<R, G>(
         &self,
         relative: &ArtifactRelativePath,
-        source: std::fs::File,
+        source: R,
         expected_size: u64,
         expected_sha1: [u8; 20],
         lifetime_guard: G,
         blocking_hook: Box<dyn FnOnce() + Send + 'static>,
     ) -> Result<(), LoaderError>
     where
+        R: Read + Seek + Send + 'static,
         G: Send + 'static,
     {
         if expected_size == 0 || expected_size > MAX_MANAGED_READ_BYTES {
@@ -896,15 +898,16 @@ impl ManagedDir {
     }
 
     #[cfg(test)]
-    async fn import_relative_authenticated_create_new_with_post_promotion_failure<G>(
+    async fn import_relative_authenticated_create_new_with_post_promotion_failure<R, G>(
         &self,
         relative: &ArtifactRelativePath,
-        source: std::fs::File,
+        source: R,
         expected_size: u64,
         expected_sha1: [u8; 20],
         lifetime_guard: G,
     ) -> Result<(), LoaderError>
     where
+        R: Read + Seek + Send + 'static,
         G: Send + 'static,
     {
         self.import_relative_authenticated_inner(
@@ -920,10 +923,10 @@ impl ManagedDir {
         .await
     }
 
-    async fn import_relative_authenticated_inner<G>(
+    async fn import_relative_authenticated_inner<R, G>(
         &self,
         relative: &ArtifactRelativePath,
-        source: std::fs::File,
+        source: R,
         expected_size: u64,
         expected_sha1: [u8; 20],
         replace_existing: bool,
@@ -932,6 +935,7 @@ impl ManagedDir {
         #[cfg(test)] fail_after_promotion: bool,
     ) -> Result<(), LoaderError>
     where
+        R: Read + Seek + Send + 'static,
         G: Send + 'static,
     {
         let (parent, name) = self.open_or_create_relative_parent(relative)?;
@@ -959,10 +963,10 @@ impl ManagedDir {
         })?
     }
 
-    fn import_authenticated(
+    fn import_authenticated<R: Read + Seek>(
         &self,
         name: &str,
-        mut source: std::fs::File,
+        mut source: R,
         expected_size: u64,
         expected_sha1: [u8; 20],
         replace_existing: bool,

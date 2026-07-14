@@ -13,7 +13,7 @@ use crate::managed_fs::ManagedDir;
 use futures_util::StreamExt as _;
 use sha1::{Digest as _, Sha1};
 use std::fs::File;
-use std::io::{Read as _, Seek as _, SeekFrom};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::AsyncWriteExt as _;
@@ -46,71 +46,289 @@ pub(super) struct LibrarySourcePool {
 #[derive(Clone)]
 enum LibrarySourceRetention {
     DirectWriter,
-    Component { budget: Arc<RetainedSourceBudget> },
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum LibrarySourceRetentionKind {
-    DirectWriter,
-    Component,
+    Component { spool: Arc<RetainedSourceSpool> },
 }
 
 struct RetainedSourceBudget {
-    available_bytes: Mutex<u64>,
+    remaining_bytes: Mutex<u64>,
 }
 
-struct RetainedSourcePermit {
-    budget: Arc<RetainedSourceBudget>,
-    bytes: u64,
+struct RetainedSourceSpool {
+    budget: RetainedSourceBudget,
+    state: Mutex<RetainedSourceSpoolState>,
 }
 
-pub(super) struct LibrarySourcePermit(LibrarySourcePermitInner);
+struct RetainedSourceSpoolState {
+    file: File,
+    high_water: u64,
+    valid: bool,
+}
 
-enum LibrarySourcePermitInner {
-    DirectWriter { _permit: OwnedSemaphorePermit },
-    Component { permit: RetainedSourcePermit },
+struct RetainedSourceAllocation {
+    spool: Arc<RetainedSourceSpool>,
+    offset: u64,
+    length: u64,
+}
+
+struct RetainedSourceReader {
+    allocation: RetainedSourceAllocation,
+    position: u64,
+}
+
+pub(super) struct LibrarySourcePermit {
+    _permit: OwnedSemaphorePermit,
+}
+
+enum LibrarySourceStorage {
+    Direct {
+        file: File,
+        permit: LibrarySourcePermit,
+    },
+    Component(RetainedSourceAllocation),
 }
 
 impl RetainedSourceBudget {
-    fn new(bytes: u64) -> Arc<Self> {
-        Arc::new(Self {
-            available_bytes: Mutex::new(bytes),
-        })
+    fn new(bytes: u64) -> Self {
+        Self {
+            remaining_bytes: Mutex::new(bytes),
+        }
     }
 
-    fn try_reserve(self: &Arc<Self>, bytes: u64) -> Result<RetainedSourcePermit, DownloadError> {
+    fn try_reserve(&self, bytes: u64) -> Result<(), DownloadError> {
         let mut available = self
-            .available_bytes
+            .remaining_bytes
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         *available = available
             .checked_sub(bytes)
             .ok_or_else(|| source_integrity_error("exceeds the aggregate retained-source limit"))?;
-        Ok(RetainedSourcePermit {
-            budget: Arc::clone(self),
-            bytes,
-        })
+        Ok(())
     }
 
     #[cfg(test)]
     fn available_bytes(&self) -> u64 {
         *self
-            .available_bytes
+            .remaining_bytes
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 }
 
-impl Drop for RetainedSourcePermit {
-    fn drop(&mut self) {
-        let mut available = self
-            .budget
-            .available_bytes
+impl RetainedSourceSpoolState {
+    fn validate_integrity(&mut self) -> io::Result<()> {
+        if !self.valid {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "retained source spool is invalid",
+            ));
+        }
+        let physical_length = match self.file.metadata() {
+            Ok(metadata) => metadata.len(),
+            Err(error) => {
+                self.valid = false;
+                return Err(error);
+            }
+        };
+        if physical_length != self.high_water {
+            self.valid = false;
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "retained source spool length changed",
+            ));
+        }
+        Ok(())
+    }
+
+    fn poison(&mut self, error: io::Error) -> io::Error {
+        self.valid = false;
+        error
+    }
+}
+
+impl RetainedSourceSpool {
+    fn new(bytes: u64) -> Result<Arc<Self>, DownloadError> {
+        if bytes == 0 {
+            return Err(source_integrity_error(
+                "aggregate retained-source limit is empty",
+            ));
+        }
+        Ok(Arc::new(Self {
+            budget: RetainedSourceBudget::new(bytes),
+            state: Mutex::new(RetainedSourceSpoolState {
+                file: tempfile::tempfile()?,
+                high_water: 0,
+                valid: true,
+            }),
+        }))
+    }
+
+    fn append_authenticated(
+        self: &Arc<Self>,
+        mut source: File,
+        expected_size: u64,
+        expected_sha1: [u8; 20],
+    ) -> Result<RetainedSourceAllocation, DownloadError> {
+        let mut state = self
+            .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        *available = available
-            .checked_add(self.bytes)
-            .expect("retained library source budget overflow");
+        state.validate_integrity()?;
+        self.budget.try_reserve(expected_size)?;
+        let offset = state.high_water;
+        let end = offset
+            .checked_add(expected_size)
+            .ok_or_else(|| source_integrity_error("retained source spool size overflow"))?;
+        source.seek(SeekFrom::Start(0))?;
+        if let Err(error) = state.file.seek(SeekFrom::Start(offset)) {
+            return Err(state.poison(error).into());
+        }
+        let copied = (|| -> io::Result<()> {
+            let mut observed = 0_u64;
+            let mut hasher = Sha1::new();
+            let mut chunk = [0_u8; 64 * 1024];
+            loop {
+                let read = source.read(&mut chunk)?;
+                if read == 0 {
+                    break;
+                }
+                observed = observed.checked_add(read as u64).ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "retained source size overflow")
+                })?;
+                if observed > expected_size {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "retained source exceeded its authenticated size",
+                    ));
+                }
+                state.file.write_all(&chunk[..read])?;
+                hasher.update(&chunk[..read]);
+            }
+            if observed != expected_size || <[u8; 20]>::from(hasher.finalize()) != expected_sha1 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "retained source failed spool authentication",
+                ));
+            }
+            state.file.flush()?;
+            if state.file.metadata()?.len() != end {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "retained source spool length changed during append",
+                ));
+            }
+            Ok(())
+        })();
+        if let Err(error) = copied {
+            let error = state.poison(error);
+            let _ = state.file.set_len(offset);
+            return Err(error.into());
+        }
+        state.high_water = end;
+        Ok(RetainedSourceAllocation {
+            spool: Arc::clone(self),
+            offset,
+            length: expected_size,
+        })
+    }
+
+    #[cfg(test)]
+    fn available_bytes(&self) -> u64 {
+        self.budget.available_bytes()
+    }
+}
+
+impl RetainedSourceAllocation {
+    fn into_reader(self) -> Result<RetainedSourceReader, LoaderError> {
+        let mut state = self
+            .spool
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let end = self.offset.checked_add(self.length).ok_or_else(|| {
+            LoaderError::Verify("retained source slice size overflowed".to_string())
+        })?;
+        state.validate_integrity()?;
+        if end > state.high_water {
+            state.valid = false;
+            return Err(LoaderError::Verify(
+                "retained source spool identity changed".to_string(),
+            ));
+        }
+        drop(state);
+        Ok(RetainedSourceReader {
+            allocation: self,
+            position: 0,
+        })
+    }
+}
+
+impl Read for RetainedSourceReader {
+    fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+        let remaining = self.allocation.length.saturating_sub(self.position);
+        if remaining == 0 || output.is_empty() {
+            return Ok(0);
+        }
+        let read_bound = usize::try_from(remaining.min(output.len() as u64)).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidInput, "retained source read overflow")
+        })?;
+        let mut state = self
+            .allocation
+            .spool
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.validate_integrity()?;
+        let offset = self
+            .allocation
+            .offset
+            .checked_add(self.position)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "retained source offset overflow",
+                )
+            })?;
+        if let Err(error) = state.file.seek(SeekFrom::Start(offset)) {
+            return Err(state.poison(error));
+        }
+        let read = match state.file.read(&mut output[..read_bound]) {
+            Ok(read) => read,
+            Err(error) => return Err(state.poison(error)),
+        };
+        if read == 0 {
+            let error = io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "retained source spool ended inside an admitted slice",
+            );
+            return Err(state.poison(error));
+        }
+        self.position = self.position.checked_add(read as u64).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "retained source position overflow",
+            )
+        })?;
+        Ok(read)
+    }
+}
+
+impl Seek for RetainedSourceReader {
+    fn seek(&mut self, position: SeekFrom) -> io::Result<u64> {
+        let next = match position {
+            SeekFrom::Start(position) => i128::from(position),
+            SeekFrom::End(delta) => i128::from(self.allocation.length) + i128::from(delta),
+            SeekFrom::Current(delta) => i128::from(self.position) + i128::from(delta),
+        };
+        if !(0..=i128::from(self.allocation.length)).contains(&next) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "retained source seek escaped its admitted slice",
+            ));
+        }
+        self.position = u64::try_from(next).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidInput, "retained source seek overflow")
+        })?;
+        Ok(self.position)
     }
 }
 
@@ -122,17 +340,17 @@ impl LibrarySourcePool {
         }
     }
 
-    pub(super) fn for_component_retention() -> Self {
+    pub(super) fn for_component_retention() -> Result<Self, DownloadError> {
         Self::for_component_retention_bytes(MAX_TIER2_AGGREGATE_BYTES)
     }
 
-    fn for_component_retention_bytes(retained_bytes: u64) -> Self {
-        Self {
+    fn for_component_retention_bytes(retained_bytes: u64) -> Result<Self, DownloadError> {
+        Ok(Self {
             acquisition_permits: Arc::new(Semaphore::new(LIBRARY_SOURCE_BUDGET_UNITS as usize)),
             retention: LibrarySourceRetention::Component {
-                budget: RetainedSourceBudget::new(retained_bytes),
+                spool: RetainedSourceSpool::new(retained_bytes)?,
             },
-        }
+        })
     }
 
     async fn reserve(&self, hard_limit: u64) -> Result<OwnedSemaphorePermit, DownloadError> {
@@ -146,27 +364,34 @@ impl LibrarySourcePool {
             .map_err(|_| source_integrity_error("scratch budget is closed"))
     }
 
-    fn retain_validated(
+    async fn retain_validated(
         &self,
+        file: File,
         observed_size: u64,
+        observed_sha1: [u8; 20],
         acquisition_permit: OwnedSemaphorePermit,
-    ) -> Result<(LibrarySourcePermit, LibrarySourceRetentionKind), DownloadError> {
-        let LibrarySourceRetention::Component { budget } = &self.retention else {
-            return Ok((
-                LibrarySourcePermit(LibrarySourcePermitInner::DirectWriter {
+    ) -> Result<LibrarySourceStorage, DownloadError> {
+        let LibrarySourceRetention::Component { spool } = &self.retention else {
+            return Ok(LibrarySourceStorage::Direct {
+                file,
+                permit: LibrarySourcePermit {
                     _permit: acquisition_permit,
-                }),
-                LibrarySourceRetentionKind::DirectWriter,
-            ));
+                },
+            });
         };
-        let retained_permit = budget.try_reserve(observed_size)?;
-        drop(acquisition_permit);
-        Ok((
-            LibrarySourcePermit(LibrarySourcePermitInner::Component {
-                permit: retained_permit,
-            }),
-            LibrarySourceRetentionKind::Component,
-        ))
+        let spool = Arc::clone(spool);
+        let allocation = tokio::task::spawn_blocking(move || {
+            let allocation = spool.append_authenticated(file, observed_size, observed_sha1);
+            drop(acquisition_permit);
+            allocation
+        })
+        .await
+        .map_err(|error| {
+            DownloadError::FileOperation(io::Error::other(format!(
+                "retained source spool task stopped unexpectedly: {error}"
+            )))
+        })??;
+        Ok(LibrarySourceStorage::Component(allocation))
     }
 
     #[cfg(test)]
@@ -178,27 +403,30 @@ impl LibrarySourcePool {
     fn retained_available_bytes(&self) -> Option<u64> {
         match &self.retention {
             LibrarySourceRetention::DirectWriter => None,
-            LibrarySourceRetention::Component { budget } => Some(budget.available_bytes()),
+            LibrarySourceRetention::Component { spool } => Some(spool.available_bytes()),
         }
     }
 }
 
 pub(super) struct AuthenticatedLibrarySource {
-    file: File,
+    storage: LibrarySourceStorage,
     relative_path: ArtifactRelativePath,
     observed_size: u64,
     observed_sha1: [u8; 20],
     expected: ExpectedIntegrity,
     target: String,
     provider_url: String,
-    _permit: LibrarySourcePermit,
-    retention_kind: LibrarySourceRetentionKind,
 }
 
 impl AuthenticatedLibrarySource {
     #[cfg(test)]
     pub(super) fn file(&self) -> &File {
-        &self.file
+        match &self.storage {
+            LibrarySourceStorage::Direct { file, .. } => file,
+            LibrarySourceStorage::Component(_) => {
+                panic!("component source does not expose its retained spool")
+            }
+        }
     }
 
     #[cfg(test)]
@@ -248,15 +476,18 @@ impl AuthenticatedLibrarySource {
         String,
         LibrarySourcePermit,
     ) {
+        let LibrarySourceStorage::Direct { file, permit } = self.storage else {
+            panic!("component source cannot enter the direct writer")
+        };
         (
-            self.file,
+            file,
             self.relative_path,
             self.observed_size,
             self.observed_sha1,
             self.expected,
             self.target,
             self.provider_url,
-            self._permit,
+            permit,
         )
     }
 
@@ -279,14 +510,13 @@ pub(super) enum LibraryComponentSourceKind {
 }
 
 pub(crate) struct RetainedLibraryComponentSource {
-    _file: File,
+    allocation: RetainedSourceAllocation,
     relative_path: ArtifactRelativePath,
     observed_size: u64,
     observed_sha1: [u8; 20],
     expected: ExpectedIntegrity,
     provider_url: String,
     kind: LibraryComponentSourceKind,
-    _permit: RetainedSourcePermit,
 }
 
 pub(crate) struct StagedLibraryComponentSource {
@@ -338,22 +568,22 @@ impl RetainedLibraryComponentSource {
         slot: &ArtifactRelativePath,
     ) -> Result<StagedLibraryComponentSource, LoaderError> {
         let Self {
-            _file: file,
+            allocation,
             relative_path,
             observed_size,
             observed_sha1,
             expected: _,
             provider_url: _,
             kind,
-            _permit: permit,
         } = self;
+        let reader = allocation.into_reader()?;
         staging
             .import_relative_authenticated_create_new(
                 slot,
-                file,
+                reader,
                 observed_size,
                 observed_sha1,
-                permit,
+                (),
             )
             .await?;
         Ok(StagedLibraryComponentSource {
@@ -372,22 +602,22 @@ impl RetainedLibraryComponentSource {
         blocking_hook: BlockingValidationHook,
     ) -> Result<StagedLibraryComponentSource, LoaderError> {
         let Self {
-            _file: file,
+            allocation,
             relative_path,
             observed_size,
             observed_sha1,
             expected: _,
             provider_url: _,
             kind,
-            _permit: permit,
         } = self;
+        let reader = allocation.into_reader()?;
         staging
             .import_relative_authenticated_create_new_with_hook(
                 slot,
-                file,
+                reader,
                 observed_size,
                 observed_sha1,
-                permit,
+                (),
                 blocking_hook,
             )
             .await?;
@@ -449,25 +679,19 @@ pub(super) async fn acquire_retained_library_component_source(
         ));
     }
     let source = acquire_authenticated_library_source(request).await?;
-    if source.retention_kind != LibrarySourceRetentionKind::Component {
+    let LibrarySourceStorage::Component(allocation) = source.storage else {
         return Err(source_integrity_error(
-            "component source did not retain its aggregate budget",
-        ));
-    }
-    let LibrarySourcePermit(LibrarySourcePermitInner::Component { permit }) = source._permit else {
-        return Err(source_integrity_error(
-            "component source retained the wrong budget kind",
+            "component source did not retain its aggregate spool",
         ));
     };
     Ok(RetainedLibraryComponentSource {
-        _file: source.file,
+        allocation,
         relative_path: source.relative_path,
         observed_size: source.observed_size,
         observed_sha1: source.observed_sha1,
         expected: source.expected,
         provider_url: source.provider_url,
         kind,
-        _permit: permit,
     })
 }
 
@@ -746,21 +970,20 @@ async fn acquire_authenticated_library_source_attempt_inner(
         )));
     }
 
-    let (permit, retention_kind) = request
+    let storage = request
         .pool
-        .retain_validated(observed_size, permit)
+        .retain_validated(file, observed_size, observed_sha1, permit)
+        .await
         .map_err(nonretryable)?;
 
     Ok(AuthenticatedLibrarySource {
-        file,
+        storage,
         relative_path: request.relative_path.clone(),
         observed_size,
         observed_sha1,
         expected: request.expected.clone(),
         target: request.target.to_string(),
         provider_url: request.url.to_string(),
-        _permit: permit,
-        retention_kind,
     })
 }
 
@@ -1008,7 +1231,6 @@ mod tests {
     use super::*;
     use sha1::Sha1;
     use std::collections::VecDeque;
-    use std::io::Write as _;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Condvar, Mutex};
     use tokio::io::AsyncReadExt as _;
@@ -1428,7 +1650,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn component_retention_releases_acquisition_charge_and_uses_exact_observed_bytes() {
+    async fn component_spool_releases_acquisition_charge_and_charges_exact_bytes_monotonically() {
         let first_body = jar_bytes(b"first-checksumless-component-source");
         let second_body = jar_bytes(b"second-checksumless-component-source");
         let (url, _) = spawn_server(vec![
@@ -1436,7 +1658,7 @@ mod tests {
             ScriptedResponse::full(second_body.clone()),
         ])
         .await;
-        let pool = LibrarySourcePool::for_component_retention();
+        let pool = LibrarySourcePool::for_component_retention().expect("component source pool");
 
         let first = acquire_component(
             &url,
@@ -1473,12 +1695,18 @@ mod tests {
             pool.retained_available_bytes(),
             Some(MAX_TIER2_AGGREGATE_BYTES - first_body.len() as u64 - second_body.len() as u64)
         );
+        assert!(Arc::ptr_eq(
+            &first.allocation.spool,
+            &second.allocation.spool
+        ));
+        assert_eq!(first.allocation.offset, 0);
+        assert_eq!(second.allocation.offset, first_body.len() as u64);
 
         drop((first, second));
         assert_eq!(pool.available_bytes(), LIBRARY_SOURCE_MAX_BYTES);
         assert_eq!(
             pool.retained_available_bytes(),
-            Some(MAX_TIER2_AGGREGATE_BYTES)
+            Some(MAX_TIER2_AGGREGATE_BYTES - first_body.len() as u64 - second_body.len() as u64)
         );
     }
 
@@ -1490,7 +1718,8 @@ mod tests {
             ScriptedResponse::full(body.clone()),
         ])
         .await;
-        let pool = LibrarySourcePool::for_component_retention_bytes(body.len() as u64);
+        let pool = LibrarySourcePool::for_component_retention_bytes(body.len() as u64)
+            .expect("bounded component source pool");
         let first = acquire_component(
             &url,
             &ExpectedIntegrity::default(),
@@ -1529,23 +1758,83 @@ mod tests {
         assert_eq!(pool.available_bytes(), LIBRARY_SOURCE_MAX_BYTES);
         assert_eq!(pool.retained_available_bytes(), Some(0));
         drop(first);
-        assert_eq!(pool.retained_available_bytes(), Some(body.len() as u64));
+        assert_eq!(pool.retained_available_bytes(), Some(0));
     }
 
     #[test]
     fn exact_retention_budget_accepts_the_maximum_count_of_one_byte_sources() {
         let budget = RetainedSourceBudget::new(crate::known_good::MAX_TIER2_ENTRIES as u64);
-        let permits = (0..crate::known_good::MAX_TIER2_ENTRIES)
-            .map(|_| budget.try_reserve(1).expect("one-byte retained source"))
-            .collect::<Vec<_>>();
+        for _ in 0..crate::known_good::MAX_TIER2_ENTRIES {
+            budget.try_reserve(1).expect("one-byte retained source");
+        }
 
         assert_eq!(budget.available_bytes(), 0);
         assert!(budget.try_reserve(1).is_err());
-        drop(permits);
-        assert_eq!(
-            budget.available_bytes(),
-            crate::known_good::MAX_TIER2_ENTRIES as u64
+        assert_eq!(budget.available_bytes(), 0);
+    }
+
+    #[test]
+    fn spool_length_corruption_poisoning_invalidates_every_descriptor_and_later_append() {
+        let first = b"first retained spool allocation";
+        let second = b"second retained spool allocation";
+        let third = b"later retained spool allocation";
+        let capacity = (first.len() + second.len() + third.len()) as u64;
+        let spool = RetainedSourceSpool::new(capacity).expect("retained source spool");
+        let allocation = |bytes: &[u8]| {
+            let mut source = tempfile::tempfile().expect("spool source");
+            source.write_all(bytes).expect("write spool source");
+            spool
+                .append_authenticated(
+                    source,
+                    bytes.len() as u64,
+                    <[u8; 20]>::from(Sha1::digest(bytes)),
+                )
+                .expect("append spool source")
+        };
+        let first_allocation = allocation(first);
+        let second_allocation = allocation(second);
+        assert_eq!(first_allocation.offset, 0);
+        assert_eq!(second_allocation.offset, first.len() as u64);
+        let mut first_reader = first_allocation
+            .into_reader()
+            .expect("admit first spool reader");
+        let remaining_before_corruption = spool.available_bytes();
+
+        {
+            let state = spool
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let corrupt_length = state.high_water + 1;
+            state
+                .file
+                .set_len(corrupt_length)
+                .expect("corrupt spool length");
+        }
+
+        let mut byte = [0_u8; 1];
+        assert!(first_reader.read(&mut byte).is_err());
+        assert!(second_allocation.into_reader().is_err());
+        let mut third_source = tempfile::tempfile().expect("later spool source");
+        third_source
+            .write_all(third)
+            .expect("write later spool source");
+        assert!(
+            spool
+                .append_authenticated(
+                    third_source,
+                    third.len() as u64,
+                    <[u8; 20]>::from(Sha1::digest(third)),
+                )
+                .is_err()
         );
+        assert_eq!(spool.available_bytes(), remaining_before_corruption);
+        let state = spool
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(!state.valid);
+        assert_eq!(state.high_water, (first.len() + second.len()) as u64);
     }
 
     #[tokio::test]
@@ -1556,7 +1845,7 @@ mod tests {
             ScriptedResponse::full(body.clone()),
         ])
         .await;
-        let pool = LibrarySourcePool::for_component_retention();
+        let pool = LibrarySourcePool::for_component_retention().expect("component source pool");
         let source = acquire_component(
             &url,
             &ExpectedIntegrity::default(),
@@ -1592,7 +1881,7 @@ mod tests {
         );
         assert_eq!(
             pool.retained_available_bytes(),
-            Some(MAX_TIER2_AGGREGATE_BYTES)
+            Some(MAX_TIER2_AGGREGATE_BYTES - body.len() as u64)
         );
 
         let (path, is_native, provider_url, expected, size, sha1) = proof.into_parts();
@@ -1624,15 +1913,75 @@ mod tests {
         );
         assert_eq!(
             pool.retained_available_bytes(),
-            Some(MAX_TIER2_AGGREGATE_BYTES)
+            Some(MAX_TIER2_AGGREGATE_BYTES - 2 * body.len() as u64)
         );
     }
 
     #[tokio::test]
-    async fn cancelled_staging_keeps_retained_budget_until_blocking_copy_finishes() {
+    async fn component_spool_stages_adjacent_slices_without_crossing_boundaries() {
+        let first_body = jar_bytes(b"first-adjacent-spool-slice");
+        let second_body = jar_bytes(b"second-adjacent-spool-slice-with-a-different-length");
+        let (url, _) = spawn_server(vec![
+            ScriptedResponse::full(first_body.clone()),
+            ScriptedResponse::full(second_body.clone()),
+        ])
+        .await;
+        let pool = LibrarySourcePool::for_component_retention_bytes(
+            first_body.len() as u64 + second_body.len() as u64,
+        )
+        .expect("adjacent component source pool");
+        let first = acquire_component(
+            &url,
+            &ExpectedIntegrity::default(),
+            LIBRARY_SOURCE_MAX_BYTES,
+            "library:spool-first-slice",
+            &pool,
+            LibraryComponentSourceKind::Library,
+        )
+        .await
+        .expect("first spool slice");
+        let second = acquire_component(
+            &url,
+            &ExpectedIntegrity::default(),
+            LIBRARY_SOURCE_MAX_BYTES,
+            "library:spool-second-slice",
+            &pool,
+            LibraryComponentSourceKind::NativeLibrary,
+        )
+        .await
+        .expect("second spool slice");
+        assert_eq!(pool.retained_available_bytes(), Some(0));
+
+        let temp = tempfile::tempdir().expect("adjacent spool staging root");
+        let staging = ManagedDir::open_root(temp.path()).expect("managed adjacent spool root");
+        let first_slot = ArtifactRelativePath::new("000000/000010").expect("first spool slot");
+        let second_slot = ArtifactRelativePath::new("000000/000011").expect("second spool slot");
+        first
+            .stage_create_new(&staging, &first_slot)
+            .await
+            .expect("stage first spool slice");
+        second
+            .stage_create_new(&staging, &second_slot)
+            .await
+            .expect("stage second spool slice");
+
+        assert_eq!(
+            std::fs::read(first_slot.join_under(temp.path())).expect("read first spool slice"),
+            first_body
+        );
+        assert_eq!(
+            std::fs::read(second_slot.join_under(temp.path())).expect("read second spool slice"),
+            second_body
+        );
+        assert_eq!(pool.retained_available_bytes(), Some(0));
+    }
+
+    #[tokio::test]
+    async fn cancelled_staging_keeps_spool_slice_alive_until_blocking_copy_finishes() {
         let body = jar_bytes(b"cancelled-component-staging");
         let (url, _) = spawn_server(vec![ScriptedResponse::full(body.clone())]).await;
-        let pool = LibrarySourcePool::for_component_retention_bytes(body.len() as u64);
+        let pool = LibrarySourcePool::for_component_retention_bytes(body.len() as u64)
+            .expect("bounded component source pool");
         let source = acquire_component(
             &url,
             &ExpectedIntegrity::default(),
@@ -1682,17 +2031,18 @@ mod tests {
         *lock.lock().expect("staging release lock") = true;
         condition.notify_one();
         for _ in 0..100 {
-            if pool.retained_available_bytes() == Some(body.len() as u64) {
+            if slot.join_under(temp.path()).exists() {
                 assert_eq!(
                     std::fs::read(slot.join_under(temp.path()))
                         .expect("completed detached staging copy"),
                     body
                 );
+                assert_eq!(pool.retained_available_bytes(), Some(0));
                 return;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        assert_eq!(pool.retained_available_bytes(), Some(body.len() as u64));
+        panic!("detached staging did not finish");
     }
 
     #[tokio::test]
