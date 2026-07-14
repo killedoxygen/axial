@@ -87,7 +87,6 @@ pub(crate) struct AuthenticatedVersionBundleSource {
 }
 
 impl AuthenticatedVersionBundleSource {
-    #[cfg(test)]
     pub(crate) fn version_id(&self) -> &str {
         &self.version_id
     }
@@ -2150,13 +2149,29 @@ mod tests {
         assert_eq!(
             directory_entry_names(&lane),
             vec![
-                "manifest.json".to_string(),
+                "intent.json".to_string(),
+                "outcome.json".to_string(),
                 "quarantine".to_string(),
                 "staging".to_string(),
             ]
         );
         assert!(directory_entry_names(&lane.join("staging")).is_empty());
         assert!(directory_entry_names(&lane.join("quarantine")).is_empty());
+
+        std::fs::write(lane.join("staging/foreign"), b"foreign")
+            .expect("inject settlement obstruction");
+        let settlement = receipt
+            .settle()
+            .await
+            .expect_err("foreign lane entry keeps settlement retryable");
+        assert!(!lane.join("settlement.json").exists());
+        assert!(lane.join("outcome.json").is_file());
+        std::fs::remove_file(lane.join("staging/foreign")).expect("remove settlement obstruction");
+        settlement.retry().await.expect("retry settlement");
+        assert_eq!(
+            directory_entry_names(&lane),
+            vec!["quarantine".to_string(), "staging".to_string()]
+        );
     }
 
     fn directory_entry_names(path: &Path) -> Vec<String> {
@@ -2237,8 +2252,21 @@ mod tests {
         );
         assert!(
             library_root
-                .join(".axial-publication/version-bundle/manifest.json")
+                .join(".axial-publication/version-bundle/intent.json")
                 .is_file()
+        );
+        assert!(
+            library_root
+                .join(".axial-publication/version-bundle/outcome.json")
+                .is_file()
+        );
+        receipt
+            .settle()
+            .await
+            .expect("rolled-back publication settles durably");
+        assert_eq!(
+            directory_entry_names(&library_root.join(".axial-publication/version-bundle")),
+            vec!["quarantine".to_string(), "staging".to_string()]
         );
     }
 
@@ -2371,27 +2399,227 @@ mod tests {
         );
         assert!(
             library_root
-                .join(".axial-publication/version-bundle/manifest.json")
+                .join(".axial-publication/version-bundle/outcome.json")
                 .is_file()
         );
 
         let second_projection = inventory
             .managed_component_projection(ManagedKnownGoodComponent::VersionBundle)
             .expect("second version bundle projection");
-        let second_error = downloader
+        let recovered = downloader
             .rebuild_managed_vanilla_version_bundle(version_id, second_projection)
             .await
-            .expect_err("retained lane must fail closed");
-        let ManagedVersionBundleRebuildError::Publication(second_error) = second_error else {
-            panic!("second attempt failure classification");
-        };
+            .expect("detached terminal publication is recovered");
+        assert!(recovered.revalidate().await);
+        recovered
+            .settle()
+            .await
+            .expect("recovered publication settles durably");
         assert_eq!(
-            second_error.failure_phase(),
-            crate::version_bundle_publication::ManagedVersionBundleFailurePhase::PreEffect
+            directory_entry_names(&library_root.join(".axial-publication/version-bundle")),
+            vec!["quarantine".to_string(), "staging".to_string()]
         );
+    }
+
+    #[derive(Clone, Copy)]
+    enum VersionBundleCrashShape {
+        AbsentPriorAfterPromotion,
+        ReplacementAfterPromotion,
+        ReplacementAfterQuarantine,
+        MissingPriorAfterQuarantine,
+    }
+
+    fn persisted_version_metadata_slots(library_root: &Path) -> (String, String) {
+        let intent: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(library_root.join(".axial-publication/version-bundle/intent.json"))
+                .expect("persisted crash intent"),
+        )
+        .expect("valid persisted crash intent");
+        let entry = intent["entries"]
+            .as_array()
+            .expect("persisted crash entries")
+            .iter()
+            .find(|entry| entry["kind"].as_str() == Some("version_metadata"))
+            .expect("persisted version metadata entry");
+        (
+            entry["staging_slot"]
+                .as_str()
+                .expect("version metadata staging slot")
+                .to_string(),
+            entry["quarantine_slot"]
+                .as_str()
+                .expect("version metadata quarantine slot")
+                .to_string(),
+        )
+    }
+
+    async fn assert_version_bundle_crash_shape(shape: VersionBundleCrashShape) {
+        let version_id = match shape {
+            VersionBundleCrashShape::AbsentPriorAfterPromotion => "crash-absent-promoted",
+            VersionBundleCrashShape::ReplacementAfterPromotion => "crash-replacement-promoted",
+            VersionBundleCrashShape::ReplacementAfterQuarantine => "crash-quarantined",
+            VersionBundleCrashShape::MissingPriorAfterQuarantine => "crash-missing-prior",
+        };
+        let fixture = version_bundle_server(version_id, false).await;
+        let temporary = tempfile::TempDir::new().expect("version bundle crash root");
+        let library_root = temporary.path().join("library");
+        let version_root = library_root.join("versions").join(version_id);
+        let replacement = !matches!(shape, VersionBundleCrashShape::AbsentPriorAfterPromotion);
+        if replacement {
+            std::fs::create_dir_all(&version_root).expect("existing version root");
+            std::fs::write(
+                version_root.join(format!("{version_id}.json")),
+                b"prior-version-json",
+            )
+            .expect("prior version json");
+            std::fs::write(
+                version_root.join(format!("{version_id}.jar")),
+                b"prior-client-jar",
+            )
+            .expect("prior client jar");
+        } else {
+            std::fs::create_dir(&library_root).expect("library root");
+        }
+        let inventory = crate::known_good::KnownGoodInventory::version_bundle_for_test(
+            version_id,
+            &fixture.version_json,
+            &fixture.client_jar,
+            None,
+        );
+        match shape {
+            VersionBundleCrashShape::AbsentPriorAfterPromotion
+            | VersionBundleCrashShape::ReplacementAfterPromotion => {
+                crate::version_bundle_publication::crash_after_artifact_promotion_for_test(
+                    version_id,
+                    crate::known_good::KnownGoodArtifactKind::VersionMetadata,
+                );
+            }
+            VersionBundleCrashShape::ReplacementAfterQuarantine
+            | VersionBundleCrashShape::MissingPriorAfterQuarantine => {
+                crate::version_bundle_publication::crash_after_artifact_quarantine_for_test(
+                    version_id,
+                    crate::known_good::KnownGoodArtifactKind::VersionMetadata,
+                );
+            }
+        }
+        let downloader = Downloader::with_test_install_manifest(&library_root, fixture.manifest);
+        let first_projection = inventory
+            .managed_component_projection(ManagedKnownGoodComponent::VersionBundle)
+            .expect("first crash projection");
+        let first = downloader
+            .rebuild_managed_vanilla_version_bundle(version_id, first_projection)
+            .await;
         assert!(matches!(
-            second_error,
-            crate::version_bundle_publication::ManagedVersionBundlePublicationError::LaneOccupied
+            first,
+            Err(ManagedVersionBundleRebuildError::Publication(
+                crate::version_bundle_publication::ManagedVersionBundlePublicationError::TaskStopped
+            ))
         ));
+
+        let canonical_json = version_root.join(format!("{version_id}.json"));
+        let (staging_slot, quarantine_slot) = persisted_version_metadata_slots(&library_root);
+        let stage_json = library_root
+            .join(".axial-publication/version-bundle/staging")
+            .join(staging_slot);
+        let quarantine_json = library_root
+            .join(".axial-publication/version-bundle/quarantine")
+            .join(quarantine_slot);
+        match shape {
+            VersionBundleCrashShape::AbsentPriorAfterPromotion => {
+                assert_eq!(
+                    std::fs::read(&canonical_json).expect("promoted canonical source"),
+                    fixture.version_json
+                );
+                assert!(!stage_json.exists());
+                assert!(!quarantine_json.exists());
+            }
+            VersionBundleCrashShape::ReplacementAfterPromotion => {
+                assert_eq!(
+                    std::fs::read(&canonical_json).expect("replacement canonical source"),
+                    fixture.version_json
+                );
+                assert!(!stage_json.exists());
+                assert_eq!(
+                    std::fs::read(&quarantine_json).expect("quarantined prior"),
+                    b"prior-version-json"
+                );
+            }
+            VersionBundleCrashShape::ReplacementAfterQuarantine
+            | VersionBundleCrashShape::MissingPriorAfterQuarantine => {
+                assert!(!canonical_json.exists());
+                assert_eq!(
+                    std::fs::read(&stage_json).expect("retained staged source"),
+                    fixture.version_json
+                );
+                assert_eq!(
+                    std::fs::read(&quarantine_json).expect("quarantined prior"),
+                    b"prior-version-json"
+                );
+            }
+        }
+
+        if matches!(shape, VersionBundleCrashShape::MissingPriorAfterQuarantine) {
+            std::fs::remove_file(&quarantine_json).expect("remove authenticated prior fixture");
+        }
+
+        let retry_projection = inventory
+            .managed_component_projection(ManagedKnownGoodComponent::VersionBundle)
+            .expect("retry crash projection");
+        let retry = downloader
+            .rebuild_managed_vanilla_version_bundle(version_id, retry_projection)
+            .await;
+        if matches!(shape, VersionBundleCrashShape::MissingPriorAfterQuarantine) {
+            assert!(matches!(
+                retry,
+                Err(ManagedVersionBundleRebuildError::Publication(
+                    crate::version_bundle_publication::ManagedVersionBundlePublicationError::RecoveryAmbiguous
+                ))
+            ));
+            assert!(!version_root.join(format!("{version_id}.json")).exists());
+            assert!(stage_json.is_file());
+            return;
+        }
+
+        let receipt = retry.expect("crash shape reconciles and republishes");
+        assert!(receipt.revalidate().await);
+        assert_eq!(
+            receipt
+                .settle()
+                .await
+                .expect("settle recovered crash shape"),
+            crate::version_bundle_publication::ManagedVersionBundleSettlementOutcome::Committed
+        );
+        assert_eq!(
+            std::fs::read(version_root.join(format!("{version_id}.json")))
+                .expect("recovered version json"),
+            fixture.version_json
+        );
+        assert_eq!(
+            std::fs::read(version_root.join(format!("{version_id}.jar")))
+                .expect("recovered client jar"),
+            fixture.client_jar
+        );
+    }
+
+    #[tokio::test]
+    async fn recovers_absent_prior_after_canonical_promotion() {
+        assert_version_bundle_crash_shape(VersionBundleCrashShape::AbsentPriorAfterPromotion).await;
+    }
+
+    #[tokio::test]
+    async fn recovers_replacement_after_canonical_promotion() {
+        assert_version_bundle_crash_shape(VersionBundleCrashShape::ReplacementAfterPromotion).await;
+    }
+
+    #[tokio::test]
+    async fn recovers_replacement_after_quarantine_before_promotion() {
+        assert_version_bundle_crash_shape(VersionBundleCrashShape::ReplacementAfterQuarantine)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn missing_quarantined_prior_blocks_recovery_without_other_moves() {
+        assert_version_bundle_crash_shape(VersionBundleCrashShape::MissingPriorAfterQuarantine)
+            .await;
     }
 }

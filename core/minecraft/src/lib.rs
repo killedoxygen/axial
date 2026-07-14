@@ -79,7 +79,8 @@ pub use version_bundle_publication::{
     ManagedVersionBundleCommitReceipt, ManagedVersionBundleDisposition, ManagedVersionBundleEffect,
     ManagedVersionBundleFailurePhase, ManagedVersionBundleFailureReceipt,
     ManagedVersionBundleOrdinalDisposition, ManagedVersionBundlePublicationError,
-    ManagedVersionBundleRebuildError,
+    ManagedVersionBundleRebuildError, ManagedVersionBundleSettlementFailure,
+    ManagedVersionBundleSettlementOutcome,
 };
 pub use version_meta::{
     MinecraftVersionMeta, ReleaseReference, analyze_minecraft_version, apply_version_analysis,

@@ -31,6 +31,12 @@ pub(crate) struct ManagedDir {
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct ManagedDirectoryIdentity(platform::DirectoryIdentity);
 
+impl ManagedDirectoryIdentity {
+    pub(crate) fn persistent_binding(self) -> String {
+        platform::directory_identity_binding(self.0)
+    }
+}
+
 pub(crate) struct ManagedPersistentFile {
     directory: ManagedDir,
     name: OsString,
@@ -578,6 +584,94 @@ impl ManagedDir {
         };
         Ok(platform::file_identity(&current)? == guard.identity
             && platform::file_identity(&guard.file)? == guard.identity)
+    }
+
+    pub(crate) fn sha1_guarded_file(
+        &self,
+        name: &str,
+        guard: &ManagedFileGuard,
+        max_size: u64,
+    ) -> Result<String, LoaderError> {
+        validate_segment(name)?;
+        if guard.size > max_size || !self.file_guard_matches(name, guard)? {
+            return Err(LoaderError::Verify(
+                "managed guarded hash source is invalid or exceeds its bound".to_string(),
+            ));
+        }
+        let mut file =
+            platform::open_file_read(&self.inner.handle, &self.inner.path, OsStr::new(name))?;
+        if platform::file_identity(&file)? != guard.identity || file.metadata()?.len() != guard.size
+        {
+            return Err(LoaderError::Verify(
+                "managed guarded hash source identity changed".to_string(),
+            ));
+        }
+        let mut observed = 0_u64;
+        let mut hasher = Sha1::new();
+        let mut chunk = [0_u8; 64 * 1024];
+        loop {
+            let read = file.read(&mut chunk)?;
+            if read == 0 {
+                break;
+            }
+            observed = observed.checked_add(read as u64).ok_or_else(|| {
+                LoaderError::Verify("managed guarded hash size overflowed".to_string())
+            })?;
+            if observed > guard.size {
+                return Err(LoaderError::Verify(
+                    "managed guarded hash source exceeded its admitted size".to_string(),
+                ));
+            }
+            hasher.update(&chunk[..read]);
+        }
+        if observed != guard.size || !self.file_guard_matches(name, guard)? {
+            return Err(LoaderError::Verify(
+                "managed guarded hash source changed during hashing".to_string(),
+            ));
+        }
+        Ok(format!("{:x}", hasher.finalize()))
+    }
+
+    pub(crate) fn read_guarded_file_bounded(
+        &self,
+        name: &str,
+        guard: &ManagedFileGuard,
+        max_size: u64,
+    ) -> Result<Vec<u8>, LoaderError> {
+        validate_segment(name)?;
+        if guard.size > max_size || !self.file_guard_matches(name, guard)? {
+            return Err(LoaderError::Verify(
+                "managed guarded read source is invalid or exceeds its bound".to_string(),
+            ));
+        }
+        let mut file = guard.file.try_clone()?;
+        if platform::file_identity(&file)? != guard.identity || file.metadata()?.len() != guard.size
+        {
+            return Err(LoaderError::Verify(
+                "managed guarded read source identity changed".to_string(),
+            ));
+        }
+        file.seek(SeekFrom::Start(0))?;
+        let capacity = usize::try_from(guard.size)
+            .map_err(|_| LoaderError::Verify("managed guarded read size overflowed".to_string()))?;
+        let mut bytes = Vec::with_capacity(capacity);
+        Read::by_ref(&mut file)
+            .take(max_size.saturating_add(1))
+            .read_to_end(&mut bytes)?;
+        file.seek(SeekFrom::Start(0))?;
+        let mut stable = Vec::with_capacity(capacity);
+        Read::by_ref(&mut file)
+            .take(max_size.saturating_add(1))
+            .read_to_end(&mut stable)?;
+        if bytes.len() as u64 != guard.size
+            || stable != bytes
+            || !self.file_guard_matches(name, guard)?
+        {
+            return Err(LoaderError::Verify(
+                "managed guarded read source changed during reading".to_string(),
+            ));
+        }
+        Ok(bytes)
     }
 
     pub(crate) fn rename_guarded_file_no_replace(
@@ -1411,6 +1505,26 @@ impl ManagedDir {
         }
     }
 
+    pub(crate) fn remove_guarded_file(
+        &self,
+        name: &str,
+        guard: &ManagedFileGuard,
+    ) -> Result<(), LoaderError> {
+        validate_segment(name)?;
+        if !self.file_guard_matches(name, guard)? {
+            return Err(LoaderError::Verify(
+                "managed cleanup source identity changed".to_string(),
+            ));
+        }
+        platform::remove_file(&self.inner.handle, &self.inner.path, OsStr::new(name))?;
+        if platform::entry_kind(&self.inner.handle, &self.inner.path, OsStr::new(name))?.is_some() {
+            return Err(LoaderError::Verify(
+                "managed cleanup source remained after removal".to_string(),
+            ));
+        }
+        self.revalidate()
+    }
+
     pub(crate) fn clear_owned_contents(self) -> Result<(), LoaderError> {
         if !matches!(&self.inner.binding, DirectoryBinding::Child { .. }) {
             return Err(LoaderError::Verify(
@@ -1569,7 +1683,7 @@ impl ManagedDir {
         Ok(())
     }
 
-    fn sweep_orphan_temps(&self) -> Result<(), LoaderError> {
+    pub(crate) fn sweep_orphan_temps(&self) -> Result<(), LoaderError> {
         let mut system = System::new();
         self.sweep_orphan_temps_with(|pid| temp_owner_is_live(&mut system, pid))
     }
@@ -1778,6 +1892,10 @@ mod platform {
     pub(super) struct DirectoryIdentity {
         device: u64,
         inode: u64,
+    }
+
+    pub(super) fn directory_identity_binding(identity: DirectoryIdentity) -> String {
+        format!("unix:{:016x}:{:016x}", identity.device, identity.inode)
     }
 
     fn directory_flags() -> OFlags {
@@ -2738,6 +2856,15 @@ mod platform {
     pub(super) struct DirectoryIdentity {
         volume: u64,
         id: [u8; 16],
+    }
+
+    pub(super) fn directory_identity_binding(identity: DirectoryIdentity) -> String {
+        let id = identity
+            .id
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        format!("windows:{:016x}:{id}", identity.volume)
     }
 
     pub(super) fn open_exact_directory(
