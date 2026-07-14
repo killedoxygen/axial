@@ -1,5 +1,5 @@
 use crate::error::{ContentError, ContentResult};
-use crate::manifest::{ContentManifest, ManifestEntry, entry_path_matches};
+use crate::manifest::{ContentManifest, ManifestEntry, entry_file_present, entry_path_matches};
 use crate::model::{CanonicalId, ContentDependency, ContentKind, FileRef, ProviderId};
 use crate::transaction::{FileTransaction, StagingGuard, contained_path};
 use axial_minecraft::download::{
@@ -252,6 +252,18 @@ pub fn uninstall(game_dir: &Path, canonical_id: &CanonicalId) -> ContentResult<b
     let Some(entry) = manifest.find(canonical_id).cloned() else {
         return Ok(false);
     };
+    if manifest.entries.iter().any(|dependent| {
+        dependent.canonical_id != entry.canonical_id
+            && entry_file_present(game_dir, dependent)
+            && dependent
+                .dependencies
+                .iter()
+                .any(|dependency| dependency.requires_project(&entry.project_id, &entry.version_id))
+    }) {
+        return Err(ContentError::Invalid(
+            "content is required by another installed item".to_string(),
+        ));
+    }
     let removable = verified_removable_variants(game_dir, &entry, &[])?;
     manifest.remove(canonical_id);
     let mut transaction = FileTransaction::empty(game_dir)?;
@@ -624,5 +636,45 @@ mod tests {
                 .is_some()
         );
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn uninstall_rejects_removing_a_live_required_dependency() {
+        for version_only in [false, true] {
+            let root = test_root(if version_only {
+                "uninstall-required-version-only"
+            } else {
+                "uninstall-required-project"
+            });
+            fs::create_dir_all(root.join("mods")).expect("mods");
+            fs::write(root.join("mods/dependency.jar"), b"dependency").expect("dependency file");
+            fs::write(root.join("mods/dependent.jar"), b"dependent").expect("dependent file");
+
+            let dependency = recorded("dependency", "dependency.jar");
+            let dependency_id = dependency.canonical_id.clone();
+            let mut dependent = recorded("dependent", "dependent.jar");
+            dependent.dependencies.push(ContentDependency {
+                project_id: (!version_only).then(|| dependency.project_id.clone()),
+                version_id: Some(dependency.version_id.clone()),
+                kind: crate::model::DependencyKind::Required,
+            });
+            let mut manifest = ContentManifest::default();
+            manifest.upsert(dependency);
+            manifest.upsert(dependent);
+            manifest.save(&root).expect("save manifest");
+
+            let error = uninstall(&root, &dependency_id)
+                .expect_err("a live required dependency must not be removed");
+            assert!(error.to_string().contains("required"));
+            assert!(root.join("mods/dependency.jar").is_file());
+            assert_eq!(
+                ContentManifest::load(&root)
+                    .expect("reload manifest")
+                    .entries
+                    .len(),
+                2
+            );
+            let _ = fs::remove_dir_all(root);
+        }
     }
 }

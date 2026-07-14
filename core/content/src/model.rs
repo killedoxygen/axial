@@ -123,6 +123,36 @@ pub struct ContentDependency {
     pub kind: DependencyKind,
 }
 
+impl ContentDependency {
+    /// Whether this record requires the given project. Version-only provider
+    /// records can identify it through the version currently installed for
+    /// that project.
+    pub fn requires_project(&self, project_id: &str, current_version_id: &str) -> bool {
+        if self.kind != DependencyKind::Required {
+            return false;
+        }
+        match self.project_id.as_deref() {
+            Some(required_project) => required_project == project_id,
+            None => self.version_id.as_deref() == Some(current_version_id),
+        }
+    }
+
+    /// Whether replacing the current project with `candidate_version_id`
+    /// would violate this dependency's exact version requirement.
+    pub fn rejects_required_version(
+        &self,
+        project_id: &str,
+        current_version_id: &str,
+        candidate_version_id: &str,
+    ) -> bool {
+        self.requires_project(project_id, current_version_id)
+            && self
+                .version_id
+                .as_deref()
+                .is_some_and(|required| required != candidate_version_id)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReleaseChannel {

@@ -216,21 +216,33 @@ pub async fn resolve(
         return Err(json_error(StatusCode::BAD_REQUEST, "no content selected"));
     }
     let mut exact_requirements = HashMap::new();
+    let replacing: HashSet<CanonicalId> = selections
+        .iter()
+        .map(|selection| CanonicalId(selection.canonical_id.clone()))
+        .collect();
+    for (canonical_id, version_id) in
+        installed_exact_requirements(state, target, manifest, &replacing).await?
+    {
+        if let Some(conflict) =
+            insert_exact_requirement(&mut exact_requirements, canonical_id, version_id)
+        {
+            return Ok(Resolution {
+                items: Vec::new(),
+                conflicts: vec![conflict],
+            });
+        }
+    }
     for selection in selections {
         let Some(version_id) = selection.version_id.as_ref() else {
             continue;
         };
         let canonical_id = CanonicalId(selection.canonical_id.clone());
-        if let Some(existing) = exact_requirements.insert(canonical_id.clone(), version_id.clone())
-            && existing != *version_id
+        if let Some(conflict) =
+            insert_exact_requirement(&mut exact_requirements, canonical_id, version_id.clone())
         {
             return Ok(Resolution {
                 items: Vec::new(),
-                conflicts: vec![exact_dependency_conflict(
-                    &canonical_id,
-                    &existing,
-                    version_id,
-                )],
+                conflicts: vec![conflict],
             });
         }
     }
@@ -251,6 +263,86 @@ pub async fn resolve(
             detail: "could not stabilize exact dependency requirements".to_string(),
         }],
     })
+}
+
+fn insert_exact_requirement(
+    requirements: &mut HashMap<CanonicalId, String>,
+    canonical_id: CanonicalId,
+    version_id: String,
+) -> Option<PlanConflict> {
+    let previous = requirements.insert(canonical_id.clone(), version_id.clone())?;
+    (previous != version_id)
+        .then(|| exact_dependency_conflict(&canonical_id, &previous, &version_id))
+}
+
+async fn installed_exact_requirements(
+    state: &AppState,
+    target: &ResolveTarget,
+    manifest: &ContentManifest,
+    replacing: &HashSet<CanonicalId>,
+) -> Result<Vec<(CanonicalId, String)>, ContentApiError> {
+    let live_entries: Vec<&ManifestEntry> = manifest
+        .entries
+        .iter()
+        .filter(|entry| !replacing.contains(&entry.canonical_id))
+        .filter(|entry| installed_entry_present(entry, target.game_dir.as_deref()))
+        .collect();
+    let installed_versions: HashMap<&str, &ManifestEntry> = live_entries
+        .iter()
+        .map(|entry| (entry.version_id.as_str(), *entry))
+        .collect();
+    let unresolved_version_ids: Vec<String> = live_entries
+        .iter()
+        .flat_map(|entry| entry.dependencies.iter())
+        .filter(|dependency| dependency.kind == DependencyKind::Required)
+        .filter(|dependency| dependency.project_id.is_none())
+        .filter_map(|dependency| dependency.version_id.as_deref())
+        .filter(|version_id| !installed_versions.contains_key(version_id))
+        .map(str::to_string)
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect();
+    let version_identities = if unresolved_version_ids.is_empty() {
+        HashMap::new()
+    } else {
+        state
+            .content()
+            .version_identities(&unresolved_version_ids)
+            .await
+            .map_err(content_error_response)?
+    };
+
+    let mut requirements = Vec::new();
+    for entry in live_entries {
+        for dependency in entry
+            .dependencies
+            .iter()
+            .filter(|dependency| dependency.kind == DependencyKind::Required)
+        {
+            let Some(version_id) = dependency.version_id.clone() else {
+                continue;
+            };
+            let canonical_id = match dependency.project_id.as_deref() {
+                Some(project_id) => CanonicalId::for_project(ProviderId::Modrinth, project_id),
+                None => installed_versions
+                    .get(version_id.as_str())
+                    .map(|installed| installed.canonical_id.clone())
+                    .or_else(|| {
+                        version_identities.get(&version_id).map(|identity| {
+                            CanonicalId::for_project(identity.provider, &identity.project_id)
+                        })
+                    })
+                    .ok_or_else(|| {
+                        json_error(
+                            StatusCode::CONFLICT,
+                            "an installed exact dependency could not be identified",
+                        )
+                    })?,
+            };
+            requirements.push((canonical_id, version_id));
+        }
+    }
+    Ok(requirements)
 }
 
 async fn resolve_pass(
@@ -291,6 +383,19 @@ async fn resolve_pass(
         .collect();
 
     while let Some((canonical_id, forced_version, reason)) = queue.pop_front() {
+        let pinned_version = exact_requirements.get(&canonical_id);
+        if let (Some(forced_version), Some(pinned_version)) =
+            (forced_version.as_deref(), pinned_version)
+            && forced_version != pinned_version
+        {
+            conflicts.push(exact_dependency_conflict(
+                &canonical_id,
+                forced_version,
+                pinned_version,
+            ));
+            continue;
+        }
+        let forced_version = forced_version.or_else(|| pinned_version.cloned());
         if let Some(chosen_version) = resolved_versions.get(&canonical_id) {
             if let Some(required_version) = forced_version.as_deref()
                 && required_version != chosen_version
@@ -618,13 +723,18 @@ pub fn newer_version<'a>(
 }
 
 /// Whether moving to this version would introduce a declared incompatibility
-/// with something the instance already has. The entry being updated is exempt:
-/// it is being replaced, not conflicted with.
+/// or violate an installed dependent's exact requirement. The entry being
+/// updated is exempt from incompatibility checks because it is being replaced.
 pub fn version_conflicts_with_installed(
     version: &ContentVersion,
     own_id: &CanonicalId,
     installed: &[ManifestEntry],
 ) -> bool {
+    let current_version_id = installed
+        .iter()
+        .find(|entry| entry.canonical_id == *own_id)
+        .map(|entry| entry.version_id.as_str())
+        .unwrap_or("");
     let candidate_declares_conflict = version.dependencies.iter().any(|dependency| {
         installed.iter().any(|entry| {
             entry.canonical_id != *own_id
@@ -639,6 +749,11 @@ pub fn version_conflicts_with_installed(
         entry.canonical_id != *own_id
             && entry.dependencies.iter().any(|dependency| {
                 incompatible_dependency_matches(dependency, own_id.project_id(), &version.id)
+                    || dependency.rejects_required_version(
+                        own_id.project_id(),
+                        current_version_id,
+                        &version.id,
+                    )
             })
     })
 }
@@ -993,6 +1108,59 @@ mod tests {
             installed_entries_incompatible_with(&manifest, &candidate, "candidate-v2", None,)
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn reverse_exact_requirements_block_dependency_version_replacement() {
+        let candidate = CanonicalId::for_project(ProviderId::Modrinth, "candidate");
+        let installed_candidate = ManifestEntry::managed(
+            candidate.clone(),
+            ProviderId::Modrinth,
+            "candidate".to_string(),
+            "candidate-v1".to_string(),
+            ContentKind::Mod,
+            &file("candidate.jar", None),
+            Vec::new(),
+            Some("Candidate".to_string()),
+        );
+        for version_only in [false, true] {
+            let dependent = ManifestEntry::managed(
+                CanonicalId::for_project(ProviderId::Modrinth, "dependent"),
+                ProviderId::Modrinth,
+                "dependent".to_string(),
+                "dependent-v1".to_string(),
+                ContentKind::Mod,
+                &file("dependent.jar", None),
+                vec![ContentDependency {
+                    project_id: (!version_only).then(|| "candidate".to_string()),
+                    version_id: Some("candidate-v1".to_string()),
+                    kind: DependencyKind::Required,
+                }],
+                Some("Dependent".to_string()),
+            );
+            let installed = [installed_candidate.clone(), dependent];
+            let candidate_v1 = version(
+                "candidate-v1",
+                ReleaseChannel::Release,
+                vec![file("candidate.jar", None)],
+            );
+            let candidate_v2 = version(
+                "candidate-v2",
+                ReleaseChannel::Release,
+                vec![file("candidate.jar", None)],
+            );
+
+            assert!(!version_conflicts_with_installed(
+                &candidate_v1,
+                &candidate,
+                &installed,
+            ));
+            assert!(version_conflicts_with_installed(
+                &candidate_v2,
+                &candidate,
+                &installed,
+            ));
+        }
     }
 
     #[test]
