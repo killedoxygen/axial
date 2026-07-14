@@ -87,6 +87,7 @@ pub(crate) struct AuthenticatedVersionBundleSource {
 }
 
 impl AuthenticatedVersionBundleSource {
+    #[cfg(test)]
     pub(crate) fn version_id(&self) -> &str {
         &self.version_id
     }
