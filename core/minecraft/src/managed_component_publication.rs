@@ -126,7 +126,7 @@ impl ComponentOutcomeRecord {
         Ok(outcome)
     }
 
-    fn binds_intent(
+    pub(crate) fn binds_intent(
         &self,
         intent: &ComponentIntentManifest,
         encoded_intent: &[u8],
@@ -384,6 +384,7 @@ pub(crate) struct ComponentRecoveryObservation {
 struct ComponentEntryRecoveryShape {
     commit_candidate: bool,
     rollback_reachable: bool,
+    pristine: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -402,6 +403,13 @@ pub(crate) enum ComponentRecoveryDecision {
     Rollback,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ComponentRecoveryPlan {
+    pub(crate) decision: ComponentRecoveryDecision,
+    pub(crate) rollback_reachable: bool,
+    pub(crate) all_pristine: bool,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
 #[error("managed component recovery state is ambiguous")]
 pub(crate) struct ComponentRecoveryAmbiguous;
@@ -411,6 +419,7 @@ pub(crate) struct ComponentRecoveryPlanner {
     observed_rows: usize,
     all_commit_candidates: bool,
     all_rollback_reachable: bool,
+    all_pristine: bool,
 }
 
 impl ComponentRecoveryPlanner {
@@ -423,6 +432,7 @@ impl ComponentRecoveryPlanner {
             observed_rows: 0,
             all_commit_candidates: true,
             all_rollback_reachable: true,
+            all_pristine: true,
         })
     }
 
@@ -437,36 +447,27 @@ impl ComponentRecoveryPlanner {
         let (state, shape) = classify_component_recovery_shape(row, observation)?;
         self.all_commit_candidates &= shape.commit_candidate;
         self.all_rollback_reachable &= shape.rollback_reachable;
+        self.all_pristine &= shape.pristine;
         self.observed_rows += 1;
         Ok(state)
     }
 
-    pub(crate) fn finish(self) -> Result<ComponentRecoveryDecision, ComponentRecoveryAmbiguous> {
+    pub(crate) fn finish(self) -> Result<ComponentRecoveryPlan, ComponentRecoveryAmbiguous> {
         if self.observed_rows != self.expected_rows {
             return Err(ComponentRecoveryAmbiguous);
         }
-        if self.all_commit_candidates {
-            Ok(ComponentRecoveryDecision::Commit)
+        let decision = if self.all_commit_candidates {
+            ComponentRecoveryDecision::Commit
         } else if self.all_rollback_reachable {
-            Ok(ComponentRecoveryDecision::Rollback)
+            ComponentRecoveryDecision::Rollback
         } else {
-            Err(ComponentRecoveryAmbiguous)
-        }
-    }
-
-    pub(crate) fn prove(
-        self,
-        expected: ComponentRecoveryDecision,
-    ) -> Result<(), ComponentRecoveryAmbiguous> {
-        if self.observed_rows != self.expected_rows
-            || match expected {
-                ComponentRecoveryDecision::Commit => !self.all_commit_candidates,
-                ComponentRecoveryDecision::Rollback => !self.all_rollback_reachable,
-            }
-        {
             return Err(ComponentRecoveryAmbiguous);
-        }
-        Ok(())
+        };
+        Ok(ComponentRecoveryPlan {
+            decision,
+            rollback_reachable: self.all_rollback_reachable,
+            all_pristine: self.all_pristine,
+        })
     }
 }
 
@@ -490,6 +491,7 @@ fn classify_component_recovery_shape(
                 ComponentEntryRecoveryShape {
                     commit_candidate: true,
                     rollback_reachable: true,
+                    pristine: true,
                 },
             ))
             .ok_or(ComponentRecoveryAmbiguous);
@@ -505,6 +507,7 @@ fn classify_component_recovery_shape(
                     ComponentEntryRecoveryShape {
                         commit_candidate: true,
                         rollback_reachable: true,
+                        pristine: false,
                     },
                 )),
                 (Absent, true) => Ok((
@@ -512,6 +515,7 @@ fn classify_component_recovery_shape(
                     ComponentEntryRecoveryShape {
                         commit_candidate: false,
                         rollback_reachable: true,
+                        pristine: true,
                     },
                 )),
                 _ => Err(ComponentRecoveryAmbiguous),
@@ -527,6 +531,7 @@ fn classify_component_recovery_shape(
                 ComponentEntryRecoveryShape {
                     commit_candidate: true,
                     rollback_reachable: true,
+                    pristine: false,
                 },
             )),
             (Absent, true, true) => Ok((
@@ -534,6 +539,7 @@ fn classify_component_recovery_shape(
                 ComponentEntryRecoveryShape {
                     commit_candidate: false,
                     rollback_reachable: true,
+                    pristine: false,
                 },
             )),
             (Prior, true, false) => Ok((
@@ -541,6 +547,7 @@ fn classify_component_recovery_shape(
                 ComponentEntryRecoveryShape {
                     commit_candidate: false,
                     rollback_reachable: true,
+                    pristine: true,
                 },
             )),
             _ => Err(ComponentRecoveryAmbiguous),
@@ -991,7 +998,14 @@ mod tests {
         planner
             .observe(&replacement, replacement_committed)
             .unwrap();
-        assert_eq!(planner.finish(), Ok(ComponentRecoveryDecision::Commit));
+        assert_eq!(
+            planner.finish(),
+            Ok(ComponentRecoveryPlan {
+                decision: ComponentRecoveryDecision::Commit,
+                rollback_reachable: true,
+                all_pristine: false,
+            })
+        );
 
         let mut planner = ComponentRecoveryPlanner::new(3).unwrap();
         planner
@@ -1004,7 +1018,37 @@ mod tests {
         planner
             .observe(&replacement, replacement_committed)
             .unwrap();
-        assert_eq!(planner.finish(), Ok(ComponentRecoveryDecision::Rollback));
+        assert_eq!(
+            planner.finish(),
+            Ok(ComponentRecoveryPlan {
+                decision: ComponentRecoveryDecision::Rollback,
+                rollback_reachable: true,
+                all_pristine: false,
+            })
+        );
+
+        let mut planner = ComponentRecoveryPlanner::new(3).unwrap();
+        planner
+            .observe(
+                &absent,
+                observation(ComponentObservedCanonical::Absent, true, false),
+            )
+            .unwrap();
+        planner.observe(&exact, committed).unwrap();
+        planner
+            .observe(
+                &replacement,
+                observation(ComponentObservedCanonical::Prior, true, false),
+            )
+            .unwrap();
+        assert_eq!(
+            planner.finish(),
+            Ok(ComponentRecoveryPlan {
+                decision: ComponentRecoveryDecision::Rollback,
+                rollback_reachable: true,
+                all_pristine: true,
+            })
+        );
 
         let mut planner = ComponentRecoveryPlanner::new(2).unwrap();
         planner.observe(&absent, committed).unwrap();

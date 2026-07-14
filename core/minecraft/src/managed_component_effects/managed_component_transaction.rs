@@ -4,14 +4,16 @@ use crate::managed_component_ancestor_journal::{
     ComponentAncestorJournalRecord, MAX_COMPONENT_ANCESTOR_JOURNAL_SHARD_BYTES,
 };
 use crate::managed_component_publication::{
-    COMPONENT_OUTCOME_FILE, ComponentObservedCanonical, ComponentOutcomeRecord,
-    ComponentRecoveryDecision, ComponentRecoveryEntryState, ComponentRecoveryObservation,
+    COMPONENT_OUTCOME_BYTES, COMPONENT_OUTCOME_FILE, COMPONENT_SETTLEMENT_FILE,
+    ComponentObservedCanonical, ComponentOutcomeRecord, ComponentRecoveryDecision,
+    ComponentRecoveryEntryState, ComponentRecoveryObservation, ComponentRecoveryPlan,
     ComponentRecoveryPlanner, ComponentRollbackEffect, ComponentTerminalOutcome,
-    encode_component_outcome,
+    decode_component_outcome, encode_component_outcome,
 };
 use crate::managed_component_table::{
     ComponentCreatedAncestor, ComponentTableParser, ComponentTableRow, ComponentTableShard,
-    MAX_COMPONENT_TABLE_SHARD_BYTES, decode_component_table_shard,
+    MAX_COMPONENT_TABLE_SHARD_BYTES, decode_component_intent_manifest,
+    decode_component_table_shard,
 };
 use crate::managed_fs::{
     ManagedCreateOnlyWriteFailure, ManagedDirectoryMoveFailure, ManagedFileGuard,
@@ -22,12 +24,29 @@ use std::collections::BTreeSet;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Arc, Mutex};
 
-const ANCESTOR_SLOT_PARK: &str = "slot-park";
+const ANCESTOR_SLOT_PARK_A: &str = "slot-park-a";
+const ANCESTOR_SLOT_PARK_B: &str = "slot-park-b";
 
 pub(crate) enum ComponentExecutionResult {
     Committed(ComponentCommitReceipt),
     RolledBack(ComponentRollbackReceipt),
     RecoveryRequired(ComponentRecoveryRequired),
+}
+
+pub(crate) enum ComponentStartupRecoveryResult {
+    NoTransaction(ManagedRootPublicationLease),
+    Transaction(ComponentExecutionResult),
+}
+
+pub(crate) enum ComponentIntentPublicationRecovery {
+    Retry(ComponentIntentCandidate),
+    Transaction(ComponentExecutionResult),
+}
+
+pub(crate) enum ComponentRecoveryRetryResult {
+    NoTransaction(ManagedRootPublicationLease),
+    RetryIntent(ComponentIntentCandidate),
+    Transaction(ComponentExecutionResult),
 }
 
 pub(crate) struct ComponentCommitReceipt {
@@ -41,8 +60,55 @@ pub(crate) struct ComponentRollbackReceipt {
 }
 
 pub(crate) struct ComponentRecoveryRequired {
-    pub(super) context: ComponentIntentPublished,
-    pub(super) outcome_guard: Option<ManagedFileGuard>,
+    authority: ComponentRecoveryAuthority,
+}
+
+#[cfg(test)]
+impl ComponentCommitReceipt {
+    pub(super) fn into_restart_seed(self) -> (ManagedRootPublicationLease, ManagedComponentKind) {
+        let component = self.context.manifest.component;
+        drop(self.outcome_guard);
+        (self.context.lease, component)
+    }
+}
+
+#[cfg(test)]
+impl ComponentRollbackReceipt {
+    pub(super) fn into_restart_seed(self) -> (ManagedRootPublicationLease, ManagedComponentKind) {
+        let component = self.context.manifest.component;
+        drop(self.outcome_guard);
+        (self.context.lease, component)
+    }
+}
+
+#[cfg(test)]
+impl ComponentRecoveryRequired {
+    pub(super) fn into_restart_seed(self) -> (ManagedRootPublicationLease, ManagedComponentKind) {
+        let ComponentRecoveryAuthority::Published { context, .. } = self.authority else {
+            panic!("test recovery authority was not a published intent")
+        };
+        (context.lease, context.manifest.component)
+    }
+}
+
+enum ComponentRecoveryAuthority {
+    Published {
+        context: ComponentIntentPublished,
+        outcome_guard: Option<ManagedFileGuard>,
+    },
+    Restart {
+        lease: ManagedRootPublicationLease,
+        component: ManagedComponentKind,
+    },
+    IntentPromotionAttempted(ComponentIntentPublishFailure),
+}
+
+struct ComponentRestartAdmission {
+    lane: ComponentLane,
+    manifest: ComponentIntentManifest,
+    encoded_intent: Vec<u8>,
+    intent_guard: ManagedFileGuard,
+    outcome_guard: Option<ManagedFileGuard>,
 }
 
 #[derive(Clone, Copy)]
@@ -54,15 +120,44 @@ enum OutcomePublicationFailure {
 }
 
 enum BlockingDisposition {
+    NoTransaction,
+    RetryIntent,
     Committed(ManagedFileGuard),
     RolledBack(ManagedFileGuard),
     RecoveryRequired(Option<ManagedFileGuard>),
+}
+
+enum RecoveryOwnerResult {
+    NoTransaction(ManagedRootPublicationLease),
+    RetryIntent(ComponentIntentCandidate),
+    Transaction(ComponentExecutionResult),
+}
+
+enum RecoveryNormalization {
+    Published,
+    NoTransaction,
+    RetryIntent,
+}
+
+struct AncestorRecoveryPlan {
+    durable_shards: usize,
+    canonical_records: usize,
+}
+
+struct EmptyRecoveryPark {
+    name: &'static str,
+    alternate: &'static str,
+    directory: ManagedDir,
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 pub(super) enum ComponentExecutionFault {
     None,
     AfterFirstRow,
+    CrashAfterFirstRow,
+    CrashAfterFirstReplacementQuarantine,
+    CrashAfterFirstAncestor,
+    CrashBeforeOutcome,
     OutcomePromotionAttempted,
 }
 
@@ -77,6 +172,67 @@ pub(crate) async fn execute_component_intent(
     published: ComponentIntentPublished,
 ) -> ComponentExecutionResult {
     execute_component_intent_inner(published, ComponentExecutionFault::None).await
+}
+
+pub(crate) async fn recover_component_transaction(
+    lease: ManagedRootPublicationLease,
+    component: ManagedComponentKind,
+) -> ComponentStartupRecoveryResult {
+    match run_component_recovery(ComponentRecoveryAuthority::Restart { lease, component }).await {
+        RecoveryOwnerResult::NoTransaction(lease) => {
+            ComponentStartupRecoveryResult::NoTransaction(lease)
+        }
+        RecoveryOwnerResult::Transaction(result) => {
+            ComponentStartupRecoveryResult::Transaction(result)
+        }
+        RecoveryOwnerResult::RetryIntent(_) => {
+            unreachable!("restart recovery cannot yield an intent retry")
+        }
+    }
+}
+
+pub(crate) async fn recover_component_intent_publication(
+    failure: ComponentIntentPublishFailure,
+) -> Result<ComponentIntentPublicationRecovery, ComponentIntentPublishFailure> {
+    if matches!(
+        &failure,
+        ComponentIntentPublishFailure::BeforePromotion { .. }
+    ) {
+        return Err(failure);
+    }
+    Ok(
+        match run_component_recovery(ComponentRecoveryAuthority::IntentPromotionAttempted(
+            failure,
+        ))
+        .await
+        {
+            RecoveryOwnerResult::RetryIntent(candidate) => {
+                ComponentIntentPublicationRecovery::Retry(candidate)
+            }
+            RecoveryOwnerResult::Transaction(result) => {
+                ComponentIntentPublicationRecovery::Transaction(result)
+            }
+            RecoveryOwnerResult::NoTransaction(_) => {
+                unreachable!("attempted publication recovery cannot lose its candidate")
+            }
+        },
+    )
+}
+
+pub(crate) async fn retry_component_recovery(
+    recovery: ComponentRecoveryRequired,
+) -> ComponentRecoveryRetryResult {
+    match run_component_recovery(recovery.authority).await {
+        RecoveryOwnerResult::NoTransaction(lease) => {
+            ComponentRecoveryRetryResult::NoTransaction(lease)
+        }
+        RecoveryOwnerResult::Transaction(result) => {
+            ComponentRecoveryRetryResult::Transaction(result)
+        }
+        RecoveryOwnerResult::RetryIntent(candidate) => {
+            ComponentRecoveryRetryResult::RetryIntent(candidate)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -120,11 +276,549 @@ async fn execute_component_intent_inner(
     }
 }
 
+async fn run_component_recovery(authority: ComponentRecoveryAuthority) -> RecoveryOwnerResult {
+    let shared = Arc::new(Mutex::new(Some(authority)));
+    let owner_authority = Arc::clone(&shared);
+    let owner = tokio::spawn(async move {
+        let worker_authority = Arc::clone(&owner_authority);
+        let disposition = match run_publication_blocking(move || {
+            let mut slot = worker_authority
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let normalized =
+                catch_unwind(AssertUnwindSafe(|| normalize_recovery_authority(&mut slot)));
+            match normalized {
+                Ok(Ok(RecoveryNormalization::Published)) => {}
+                Ok(Ok(RecoveryNormalization::NoTransaction)) => {
+                    return BlockingDisposition::NoTransaction;
+                }
+                Ok(Ok(RecoveryNormalization::RetryIntent)) => {
+                    return BlockingDisposition::RetryIntent;
+                }
+                Ok(Err(_)) | Err(_) => return BlockingDisposition::RecoveryRequired(None),
+            }
+            let Some(ComponentRecoveryAuthority::Published {
+                context,
+                outcome_guard,
+            }) = slot.as_mut()
+            else {
+                return BlockingDisposition::RecoveryRequired(None);
+            };
+            let disposition = catch_unwind(AssertUnwindSafe(|| {
+                recover_component_transaction_blocking(context, outcome_guard.as_ref())
+            }))
+            .unwrap_or(BlockingDisposition::RecoveryRequired(None));
+            disposition
+        })
+        .await
+        {
+            Ok(disposition) => disposition,
+            Err(_) => BlockingDisposition::RecoveryRequired(None),
+        };
+        finish_recovery_disposition(&owner_authority, disposition)
+    });
+    match owner.await {
+        Ok(result) => result,
+        Err(_) => finish_recovery_disposition(&shared, BlockingDisposition::RecoveryRequired(None)),
+    }
+}
+
+fn normalize_recovery_authority(
+    slot: &mut Option<ComponentRecoveryAuthority>,
+) -> Result<RecoveryNormalization, ComponentTransactionError> {
+    let admission = match slot.as_ref().ok_or(ComponentTransactionError)? {
+        ComponentRecoveryAuthority::Published { .. } => {
+            return Ok(RecoveryNormalization::Published);
+        }
+        ComponentRecoveryAuthority::Restart { lease, component } => {
+            match admit_restart_context(lease, *component, None, true)? {
+                Some(admission) => admission,
+                None => return Ok(RecoveryNormalization::NoTransaction),
+            }
+        }
+        ComponentRecoveryAuthority::IntentPromotionAttempted(failure) => {
+            let ComponentIntentPublishFailure::PromotionAttempted {
+                candidate,
+                intent_guard,
+                ..
+            } = failure
+            else {
+                return Err(ComponentTransactionError);
+            };
+            let Some(admission) = admit_restart_context(
+                &candidate.lease,
+                candidate.manifest.component,
+                intent_guard.as_ref(),
+                false,
+            )?
+            else {
+                let (current_summary, current_authority) = admit_component_preintent(
+                    &candidate.lane,
+                    &candidate.lease,
+                    &candidate.manifest,
+                )
+                .map_err(tx)?;
+                if current_summary != candidate.summary || current_authority != candidate.authority
+                {
+                    return Err(ComponentTransactionError);
+                }
+                return Ok(RecoveryNormalization::RetryIntent);
+            };
+            if admission.outcome_guard.is_some()
+                || admission.manifest != candidate.manifest
+                || admission.encoded_intent != candidate.encoded_intent
+                || !same_lane_identity(&admission.lane, &candidate.lane)?
+            {
+                return Err(ComponentTransactionError);
+            }
+            admission
+        }
+    };
+
+    let authority = slot.take().ok_or(ComponentTransactionError)?;
+    let context = match authority {
+        ComponentRecoveryAuthority::Restart {
+            lease,
+            component: _,
+        } => ComponentIntentPublished {
+            lane: admission.lane,
+            lease,
+            manifest: admission.manifest,
+            encoded_intent: admission.encoded_intent,
+            intent_guard: admission.intent_guard,
+        },
+        ComponentRecoveryAuthority::IntentPromotionAttempted(
+            ComponentIntentPublishFailure::PromotionAttempted { candidate, .. },
+        ) => {
+            let ComponentIntentCandidate {
+                lane: _,
+                lease,
+                manifest: _,
+                encoded_intent: _,
+                summary,
+                authority,
+            } = *candidate;
+            drop((summary, authority));
+            ComponentIntentPublished {
+                lane: admission.lane,
+                lease,
+                manifest: admission.manifest,
+                encoded_intent: admission.encoded_intent,
+                intent_guard: admission.intent_guard,
+            }
+        }
+        other => {
+            *slot = Some(other);
+            return Err(ComponentTransactionError);
+        }
+    };
+    *slot = Some(ComponentRecoveryAuthority::Published {
+        context,
+        outcome_guard: admission.outcome_guard,
+    });
+    Ok(RecoveryNormalization::Published)
+}
+
+fn same_lane_identity(
+    left: &ComponentLane,
+    right: &ComponentLane,
+) -> Result<bool, ComponentTransactionError> {
+    Ok(left.component == right.component
+        && left.lane.identity().map_err(tx)? == right.lane.identity().map_err(tx)?
+        && left.table.identity().map_err(tx)? == right.table.identity().map_err(tx)?
+        && left.staging.identity().map_err(tx)? == right.staging.identity().map_err(tx)?
+        && left.quarantine.identity().map_err(tx)? == right.quarantine.identity().map_err(tx)?
+        && left.ancestors.identity().map_err(tx)? == right.ancestors.identity().map_err(tx)?
+        && left.ancestor_records.identity().map_err(tx)?
+            == right.ancestor_records.identity().map_err(tx)?
+        && left.ancestor_staging.identity().map_err(tx)?
+            == right.ancestor_staging.identity().map_err(tx)?)
+}
+
+fn admit_restart_context(
+    lease: &ManagedRootPublicationLease,
+    component: ManagedComponentKind,
+    retained_intent_guard: Option<&ManagedFileGuard>,
+    clean_marker_free_lane: bool,
+) -> Result<Option<ComponentRestartAdmission>, ComponentTransactionError> {
+    lease.revalidate().map_err(tx)?;
+    let publication = lease.publication_directory();
+    let lane_name = component_lane_name(component);
+    if !publication
+        .has_portably_exact_child_name(lane_name)
+        .map_err(tx)?
+    {
+        publication.sync().map_err(tx)?;
+        lease.root().sync().map_err(tx)?;
+        lease.revalidate().map_err(tx)?;
+        if publication
+            .has_portably_exact_child_name(lane_name)
+            .map_err(tx)?
+        {
+            return Err(ComponentTransactionError);
+        }
+        return Ok(None);
+    }
+    let marker_lane = publication.open_child(lane_name).map_err(tx)?;
+    let marker_limit = MAX_COMPONENT_LANE_ENTRIES
+        .checked_add(MAX_MANAGED_TEMP_ENTRIES)
+        .and_then(|entries| entries.checked_add(1))
+        .ok_or(ComponentTransactionError)?;
+    let marker_entries = marker_lane.entries_bounded(marker_limit).map_err(tx)?;
+    if marker_entries.len() >= marker_limit {
+        return Err(ComponentTransactionError);
+    }
+    let intent_present = marker_entries
+        .iter()
+        .any(|name| name.as_os_str() == std::ffi::OsStr::new(COMPONENT_INTENT_FILE));
+    let outcome_present = marker_entries
+        .iter()
+        .any(|name| name.as_os_str() == std::ffi::OsStr::new(COMPONENT_OUTCOME_FILE));
+    let settlement_present = marker_entries
+        .iter()
+        .any(|name| name.as_os_str() == std::ffi::OsStr::new(COMPONENT_SETTLEMENT_FILE));
+    if settlement_present || (!intent_present && outcome_present) {
+        return Err(ComponentTransactionError);
+    }
+    if !intent_present {
+        if retained_intent_guard.is_some() {
+            return Err(ComponentTransactionError);
+        }
+        drop(marker_lane);
+        if clean_marker_free_lane {
+            admit_empty_marker_free_lane(lease, component)?;
+        } else {
+            cleanup_recovery_marker_temps(lease, component)?;
+        }
+        return Ok(None);
+    }
+    drop(marker_lane);
+    cleanup_recovery_marker_temps(lease, component)?;
+    let lane = publication.open_child(lane_name).map_err(tx)?;
+    let table = lane.open_child(COMPONENT_TABLE_DIRECTORY).map_err(tx)?;
+    let staging = lane.open_child(COMPONENT_STAGING_DIRECTORY).map_err(tx)?;
+    let quarantine = lane
+        .open_child(COMPONENT_QUARANTINE_DIRECTORY)
+        .map_err(tx)?;
+    let ancestors = lane.open_child(COMPONENT_ANCESTORS_DIRECTORY).map_err(tx)?;
+    let ancestor_records = ancestors
+        .open_child(COMPONENT_ANCESTOR_RECORDS_DIRECTORY)
+        .map_err(tx)?;
+    let ancestor_staging = ancestors
+        .open_child(COMPONENT_ANCESTOR_STAGING_DIRECTORY)
+        .map_err(tx)?;
+    let lane = ComponentLane {
+        component,
+        lane,
+        table,
+        staging,
+        quarantine,
+        ancestors,
+        ancestor_records,
+        ancestor_staging,
+    };
+    let names = exact_entry_names(&lane.lane, MAX_COMPONENT_LANE_ENTRIES + 1).map_err(tx)?;
+    let mut expected = BTreeSet::from([
+        COMPONENT_ANCESTORS_DIRECTORY.to_string(),
+        COMPONENT_INTENT_FILE.to_string(),
+        COMPONENT_QUARANTINE_DIRECTORY.to_string(),
+        COMPONENT_STAGING_DIRECTORY.to_string(),
+        COMPONENT_TABLE_DIRECTORY.to_string(),
+    ]);
+    let outcome_present = names.contains(COMPONENT_OUTCOME_FILE);
+    if outcome_present {
+        expected.insert(COMPONENT_OUTCOME_FILE.to_string());
+    }
+    if names != expected
+        || exact_entry_names(&lane.ancestors, 3).map_err(tx)?
+            != BTreeSet::from([
+                COMPONENT_ANCESTOR_RECORDS_DIRECTORY.to_string(),
+                COMPONENT_ANCESTOR_STAGING_DIRECTORY.to_string(),
+            ])
+    {
+        return Err(ComponentTransactionError);
+    }
+    let intent_guard = lane
+        .lane
+        .inspect_regular_file(COMPONENT_INTENT_FILE)
+        .map_err(tx)?
+        .ok_or(ComponentTransactionError)?;
+    if let Some(retained) = retained_intent_guard {
+        if retained.identity() != intent_guard.identity()
+            || !lane
+                .lane
+                .file_guard_matches(COMPONENT_INTENT_FILE, retained)
+                .map_err(tx)?
+        {
+            return Err(ComponentTransactionError);
+        }
+    }
+    let encoded_intent = lane
+        .lane
+        .read_guarded_file_bounded(
+            COMPONENT_INTENT_FILE,
+            &intent_guard,
+            MAX_COMPONENT_INTENT_BYTES as u64,
+        )
+        .map_err(tx)?;
+    let manifest = decode_component_intent_manifest(&encoded_intent).map_err(tx)?;
+    if manifest.component != component
+        || manifest.root_binding_sha256
+            != component_root_binding_sha256(lease.root()).map_err(tx)?
+    {
+        return Err(ComponentTransactionError);
+    }
+    let outcome_guard = outcome_present
+        .then(|| {
+            lane.lane
+                .inspect_regular_file(COMPONENT_OUTCOME_FILE)
+                .map_err(tx)?
+                .ok_or(ComponentTransactionError)
+        })
+        .transpose()?;
+    lease.revalidate().map_err(tx)?;
+    Ok(Some(ComponentRestartAdmission {
+        lane,
+        manifest,
+        encoded_intent,
+        intent_guard,
+        outcome_guard,
+    }))
+}
+
+fn admit_empty_marker_free_lane(
+    lease: &ManagedRootPublicationLease,
+    component: ManagedComponentKind,
+) -> Result<(), ComponentTransactionError> {
+    lease.revalidate().map_err(tx)?;
+    let publication = lease.publication_directory();
+    let lane_name = component_lane_name(component);
+    let lane = publication.open_child(lane_name).map_err(tx)?;
+    let names = exact_entry_names(&lane, MAX_COMPONENT_LANE_ENTRIES + 1).map_err(tx)?;
+    let allowed = BTreeSet::from([
+        COMPONENT_TABLE_DIRECTORY.to_string(),
+        COMPONENT_STAGING_DIRECTORY.to_string(),
+        COMPONENT_QUARANTINE_DIRECTORY.to_string(),
+        COMPONENT_ANCESTORS_DIRECTORY.to_string(),
+    ]);
+    if !names.is_subset(&allowed) {
+        return Err(ComponentTransactionError);
+    }
+    for name in [
+        COMPONENT_TABLE_DIRECTORY,
+        COMPONENT_STAGING_DIRECTORY,
+        COMPONENT_QUARANTINE_DIRECTORY,
+    ] {
+        if names.contains(name) {
+            let child = lane.open_child(name).map_err(tx)?;
+            if !exact_entry_names(&child, 1).map_err(tx)?.is_empty() {
+                return Err(ComponentTransactionError);
+            }
+        }
+    }
+    if names.contains(COMPONENT_ANCESTORS_DIRECTORY) {
+        let ancestors = lane.open_child(COMPONENT_ANCESTORS_DIRECTORY).map_err(tx)?;
+        let ancestor_names = exact_entry_names(&ancestors, 3).map_err(tx)?;
+        let allowed_ancestors = BTreeSet::from([
+            COMPONENT_ANCESTOR_RECORDS_DIRECTORY.to_string(),
+            COMPONENT_ANCESTOR_STAGING_DIRECTORY.to_string(),
+        ]);
+        if !ancestor_names.is_subset(&allowed_ancestors) {
+            return Err(ComponentTransactionError);
+        }
+        for name in [
+            COMPONENT_ANCESTOR_RECORDS_DIRECTORY,
+            COMPONENT_ANCESTOR_STAGING_DIRECTORY,
+        ] {
+            if ancestor_names.contains(name) {
+                let child = ancestors.open_child(name).map_err(tx)?;
+                if !exact_entry_names(&child, 1).map_err(tx)?.is_empty() {
+                    return Err(ComponentTransactionError);
+                }
+            }
+        }
+    }
+
+    lease.revalidate().map_err(tx)?;
+    let table = open_or_create_exact_child(&lane, COMPONENT_TABLE_DIRECTORY).map_err(tx)?;
+    let staging = open_or_create_exact_child(&lane, COMPONENT_STAGING_DIRECTORY).map_err(tx)?;
+    let quarantine =
+        open_or_create_exact_child(&lane, COMPONENT_QUARANTINE_DIRECTORY).map_err(tx)?;
+    let ancestors = open_or_create_exact_child(&lane, COMPONENT_ANCESTORS_DIRECTORY).map_err(tx)?;
+    let records =
+        open_or_create_exact_child(&ancestors, COMPONENT_ANCESTOR_RECORDS_DIRECTORY).map_err(tx)?;
+    let ancestor_staging =
+        open_or_create_exact_child(&ancestors, COMPONENT_ANCESTOR_STAGING_DIRECTORY).map_err(tx)?;
+    if !exact_entry_names(&table, 1).map_err(tx)?.is_empty()
+        || !exact_entry_names(&staging, 1).map_err(tx)?.is_empty()
+        || !exact_entry_names(&quarantine, 1).map_err(tx)?.is_empty()
+        || !exact_entry_names(&records, 1).map_err(tx)?.is_empty()
+        || !exact_entry_names(&ancestor_staging, 1)
+            .map_err(tx)?
+            .is_empty()
+        || exact_entry_names(&ancestors, 3).map_err(tx)?
+            != BTreeSet::from([
+                COMPONENT_ANCESTOR_RECORDS_DIRECTORY.to_string(),
+                COMPONENT_ANCESTOR_STAGING_DIRECTORY.to_string(),
+            ])
+        || exact_entry_names(&lane, MAX_COMPONENT_LANE_ENTRIES + 1).map_err(tx)? != allowed
+    {
+        return Err(ComponentTransactionError);
+    }
+    table.sync().map_err(tx)?;
+    staging.sync().map_err(tx)?;
+    quarantine.sync().map_err(tx)?;
+    records.sync().map_err(tx)?;
+    ancestor_staging.sync().map_err(tx)?;
+    ancestors.sync().map_err(tx)?;
+    lane.sync().map_err(tx)?;
+    publication.sync().map_err(tx)?;
+    lease.root().sync().map_err(tx)?;
+    lease.revalidate().map_err(tx)
+}
+
+fn cleanup_recovery_marker_temps(
+    lease: &ManagedRootPublicationLease,
+    component: ManagedComponentKind,
+) -> Result<(), ComponentTransactionError> {
+    lease.revalidate().map_err(tx)?;
+    let publication = lease.publication_directory();
+    let lane_name = component_lane_name(component);
+    if !publication
+        .has_portably_exact_child_name(lane_name)
+        .map_err(tx)?
+    {
+        return Err(ComponentTransactionError);
+    }
+    let lane = publication.open_child(lane_name).map_err(tx)?;
+    let limit = MAX_COMPONENT_LANE_ENTRIES
+        .checked_add(MAX_MANAGED_TEMP_ENTRIES)
+        .and_then(|entries| entries.checked_add(1))
+        .ok_or(ComponentTransactionError)?;
+    let entries = lane.entries_bounded(limit).map_err(tx)?;
+    if entries.len() >= limit {
+        return Err(ComponentTransactionError);
+    }
+    let mut temporary = Vec::new();
+    temporary
+        .try_reserve_exact(entries.len().min(MAX_MANAGED_TEMP_ENTRIES))
+        .map_err(tx)?;
+    let mut known = BTreeSet::new();
+    for name in entries {
+        let name = name.into_string().map_err(tx)?;
+        if matches!(
+            name.as_str(),
+            COMPONENT_TABLE_DIRECTORY
+                | COMPONENT_STAGING_DIRECTORY
+                | COMPONENT_QUARANTINE_DIRECTORY
+                | COMPONENT_ANCESTORS_DIRECTORY
+                | COMPONENT_INTENT_FILE
+                | COMPONENT_OUTCOME_FILE
+                | COMPONENT_SETTLEMENT_FILE
+        ) {
+            known.insert(name);
+            continue;
+        }
+        if !validate_managed_temp_name(&name).map_err(tx)?
+            || temporary.len() >= MAX_MANAGED_TEMP_ENTRIES
+        {
+            return Err(ComponentTransactionError);
+        }
+        let guard = lane
+            .inspect_regular_file(&name)
+            .map_err(tx)?
+            .ok_or(ComponentTransactionError)?;
+        if guard.size() > MAX_COMPONENT_INTENT_BYTES as u64
+            || !lane.managed_temp_is_orphan(&name, &guard).map_err(tx)?
+        {
+            return Err(ComponentTransactionError);
+        }
+        temporary.push(ComponentPlannedFile {
+            name,
+            size: guard.size(),
+            identity: guard.identity(),
+        });
+    }
+    let mut expected_known = BTreeSet::from([
+        COMPONENT_TABLE_DIRECTORY.to_string(),
+        COMPONENT_STAGING_DIRECTORY.to_string(),
+        COMPONENT_QUARANTINE_DIRECTORY.to_string(),
+        COMPONENT_ANCESTORS_DIRECTORY.to_string(),
+    ]);
+    if known.contains(COMPONENT_INTENT_FILE) {
+        expected_known.insert(COMPONENT_INTENT_FILE.to_string());
+    }
+    if known.contains(COMPONENT_OUTCOME_FILE) {
+        expected_known.insert(COMPONENT_OUTCOME_FILE.to_string());
+    }
+    if known != expected_known {
+        return Err(ComponentTransactionError);
+    }
+    let _table = lane.open_child(COMPONENT_TABLE_DIRECTORY).map_err(tx)?;
+    let _staging = lane.open_child(COMPONENT_STAGING_DIRECTORY).map_err(tx)?;
+    let _quarantine = lane
+        .open_child(COMPONENT_QUARANTINE_DIRECTORY)
+        .map_err(tx)?;
+    let ancestors = lane.open_child(COMPONENT_ANCESTORS_DIRECTORY).map_err(tx)?;
+    let records = ancestors
+        .open_child(COMPONENT_ANCESTOR_RECORDS_DIRECTORY)
+        .map_err(tx)?;
+    let ancestor_staging = ancestors
+        .open_child(COMPONENT_ANCESTOR_STAGING_DIRECTORY)
+        .map_err(tx)?;
+    if exact_entry_names(&ancestors, 3).map_err(tx)?
+        != BTreeSet::from([
+            COMPONENT_ANCESTOR_RECORDS_DIRECTORY.to_string(),
+            COMPONENT_ANCESTOR_STAGING_DIRECTORY.to_string(),
+        ])
+    {
+        return Err(ComponentTransactionError);
+    }
+    ancestor_staging.revalidate().map_err(tx)?;
+    let records_plan = plan_directory_files(
+        &records,
+        MAX_COMPONENT_ANCESTOR_SHARDS,
+        MAX_COMPONENT_ANCESTOR_JOURNAL_SHARD_BYTES as u64,
+        |name| {
+            name.strip_suffix(COMPONENT_ANCESTOR_RECORD_FILE_SUFFIX)
+                .and_then(|index| parse_fixed_decimal(index, 6))
+                .and_then(|index| component_ancestor_bucket_name(index).ok().map(|_| index))
+                .is_some()
+        },
+    )
+    .map_err(tx)?;
+    for planned in &temporary {
+        let guard = inspect_planned_file(&lane, planned).map_err(tx)?;
+        if !lane
+            .managed_temp_is_orphan(&planned.name, &guard)
+            .map_err(tx)?
+        {
+            return Err(ComponentTransactionError);
+        }
+    }
+    validate_planned_file_entries(
+        &records,
+        &records_plan.owned,
+        &records_plan.temporary,
+        MAX_COMPONENT_ANCESTOR_SHARDS,
+        true,
+    )
+    .map_err(tx)?;
+    remove_planned_temps(&lane, &temporary).map_err(tx)?;
+    remove_planned_temps(&records, &records_plan.temporary).map_err(tx)?;
+    records.sync().map_err(tx)?;
+    ancestors.sync().map_err(tx)?;
+    lane.sync().map_err(tx)?;
+    publication.sync().map_err(tx)?;
+    lease.root().sync().map_err(tx)?;
+    lease.revalidate().map_err(tx)
+}
+
 fn execute_component_intent_blocking(
     published: &ComponentIntentPublished,
     fault: ComponentExecutionFault,
 ) -> BlockingDisposition {
-    let summary = match validate_published_and_replay(published) {
+    let summary = match validate_published_and_replay(published, false) {
         Ok(summary) => summary,
         Err(_) => return BlockingDisposition::RecoveryRequired(None),
     };
@@ -139,8 +833,8 @@ fn execute_component_intent_blocking(
         };
 
     let execution =
-        create_and_promote_ancestors(published, &ancestor_authority, &created_ancestors).and_then(
-            |()| {
+        create_and_promote_ancestors(published, &ancestor_authority, &created_ancestors, fault)
+            .and_then(|()| {
                 observe_all_rows(published, ComponentRecoveryDecision::Rollback, true)?;
                 execute_rows_forward(published, fault)?;
                 postcheck(
@@ -149,8 +843,17 @@ fn execute_component_intent_blocking(
                     &created_ancestors,
                     ComponentRecoveryDecision::Commit,
                 )
-            },
-        );
+            });
+
+    if matches!(
+        fault,
+        ComponentExecutionFault::CrashAfterFirstRow
+            | ComponentExecutionFault::CrashAfterFirstReplacementQuarantine
+            | ComponentExecutionFault::CrashAfterFirstAncestor
+            | ComponentExecutionFault::CrashBeforeOutcome
+    ) {
+        return BlockingDisposition::RecoveryRequired(None);
+    }
 
     if execution.is_ok() {
         match publish_outcome(
@@ -186,8 +889,196 @@ fn execute_component_intent_blocking(
     }
 }
 
+fn recover_component_transaction_blocking(
+    published: &ComponentIntentPublished,
+    retained_outcome_guard: Option<&ManagedFileGuard>,
+) -> BlockingDisposition {
+    let outcome = match read_recovery_outcome(published, retained_outcome_guard) {
+        Ok(outcome) => outcome,
+        Err(_) => return BlockingDisposition::RecoveryRequired(None),
+    };
+    let summary = match validate_published_and_replay(published, outcome.is_some()) {
+        Ok(summary) => summary,
+        Err(_) => return BlockingDisposition::RecoveryRequired(outcome.map(|(_, guard)| guard)),
+    };
+    let ComponentTableSummary {
+        created_ancestors, ..
+    } = summary;
+    let ancestor_authority =
+        match ComponentAncestorJournalAuthority::new(&published.encoded_intent, &created_ancestors)
+        {
+            Ok(authority) => authority,
+            Err(_) => {
+                return BlockingDisposition::RecoveryRequired(outcome.map(|(_, guard)| guard));
+            }
+        };
+    let row_plan = match plan_all_rows(published) {
+        Ok(plan) => plan,
+        Err(_) => return BlockingDisposition::RecoveryRequired(outcome.map(|(_, guard)| guard)),
+    };
+    let ancestor_plan = match admit_ancestor_recovery(
+        published,
+        &ancestor_authority,
+        &created_ancestors,
+        outcome.is_none(),
+    ) {
+        Ok(plan) => plan,
+        Err(_) => {
+            return BlockingDisposition::RecoveryRequired(outcome.map(|(_, guard)| guard));
+        }
+    };
+    let all_ancestors_committed = ancestor_plan.durable_shards == ancestor_authority.shard_count()
+        && ancestor_plan.canonical_records == ancestor_authority.total_records();
+    if !all_ancestors_committed && !row_plan.all_pristine {
+        return BlockingDisposition::RecoveryRequired(outcome.map(|(_, guard)| guard));
+    }
+
+    if let Some((record, guard)) = outcome {
+        let terminal_is_exact = match record.terminal {
+            ComponentTerminalOutcome::Committed => {
+                record.effect == ComponentRollbackEffect::None
+                    && all_ancestors_committed
+                    && row_plan.decision == ComponentRecoveryDecision::Commit
+                    && postcheck_with_outcome(
+                        published,
+                        &ancestor_authority,
+                        &created_ancestors,
+                        ComponentRecoveryDecision::Commit,
+                        true,
+                    )
+                    .is_ok()
+            }
+            ComponentTerminalOutcome::RolledBack => {
+                matches!(
+                    record.effect,
+                    ComponentRollbackEffect::Execution | ComponentRollbackEffect::Reconciliation
+                ) && row_plan.all_pristine
+                    && ancestor_plan.canonical_records == 0
+                    && postcheck_with_outcome(
+                        published,
+                        &ancestor_authority,
+                        &created_ancestors,
+                        ComponentRecoveryDecision::Rollback,
+                        true,
+                    )
+                    .is_ok()
+            }
+        };
+        if !terminal_is_exact {
+            return BlockingDisposition::RecoveryRequired(Some(guard));
+        }
+        return match record.terminal {
+            ComponentTerminalOutcome::Committed => BlockingDisposition::Committed(guard),
+            ComponentTerminalOutcome::RolledBack => BlockingDisposition::RolledBack(guard),
+        };
+    }
+
+    if all_ancestors_committed && row_plan.decision == ComponentRecoveryDecision::Commit {
+        if postcheck(
+            published,
+            &ancestor_authority,
+            &created_ancestors,
+            ComponentRecoveryDecision::Commit,
+        )
+        .is_err()
+        {
+            return BlockingDisposition::RecoveryRequired(None);
+        }
+        return match publish_outcome(
+            published,
+            ComponentTerminalOutcome::Committed,
+            ComponentRollbackEffect::None,
+            ComponentExecutionFault::None,
+        ) {
+            Ok(guard) => BlockingDisposition::Committed(guard),
+            Err(OutcomePublicationFailure::PromotionAttempted(guard)) => {
+                BlockingDisposition::RecoveryRequired(guard)
+            }
+            Err(OutcomePublicationFailure::BeforePromotion) => {
+                BlockingDisposition::RecoveryRequired(None)
+            }
+        };
+    }
+
+    let rows_rolled_back = rollback_rows(published).is_ok()
+        && matches!(plan_all_rows(published), Ok(plan) if plan.all_pristine);
+    if !row_plan.rollback_reachable
+        || !rows_rolled_back
+        || rollback_ancestors(published, &ancestor_authority, &created_ancestors).is_err()
+        || postcheck(
+            published,
+            &ancestor_authority,
+            &created_ancestors,
+            ComponentRecoveryDecision::Rollback,
+        )
+        .is_err()
+    {
+        return BlockingDisposition::RecoveryRequired(None);
+    }
+    match publish_outcome(
+        published,
+        ComponentTerminalOutcome::RolledBack,
+        ComponentRollbackEffect::Reconciliation,
+        ComponentExecutionFault::None,
+    ) {
+        Ok(guard) => BlockingDisposition::RolledBack(guard),
+        Err(OutcomePublicationFailure::PromotionAttempted(guard)) => {
+            BlockingDisposition::RecoveryRequired(guard)
+        }
+        Err(OutcomePublicationFailure::BeforePromotion) => {
+            BlockingDisposition::RecoveryRequired(None)
+        }
+    }
+}
+
+fn read_recovery_outcome(
+    published: &ComponentIntentPublished,
+    retained: Option<&ManagedFileGuard>,
+) -> Result<Option<(ComponentOutcomeRecord, ManagedFileGuard)>, ComponentTransactionError> {
+    let Some(guard) = published
+        .lane
+        .lane
+        .inspect_regular_file(COMPONENT_OUTCOME_FILE)
+        .map_err(tx)?
+    else {
+        if retained.is_some() {
+            return Err(ComponentTransactionError);
+        }
+        return Ok(None);
+    };
+    if let Some(retained) = retained {
+        if retained.identity() != guard.identity()
+            || !published
+                .lane
+                .lane
+                .file_guard_matches(COMPONENT_OUTCOME_FILE, retained)
+                .map_err(tx)?
+        {
+            return Err(ComponentTransactionError);
+        }
+    }
+    if guard.size() != COMPONENT_OUTCOME_BYTES as u64 {
+        return Err(ComponentTransactionError);
+    }
+    let bytes = published
+        .lane
+        .lane
+        .read_guarded_file_bounded(
+            COMPONENT_OUTCOME_FILE,
+            &guard,
+            COMPONENT_OUTCOME_BYTES as u64,
+        )
+        .map_err(tx)?;
+    let outcome = decode_component_outcome(&bytes).map_err(tx)?;
+    outcome
+        .binds_intent(&published.manifest, &published.encoded_intent)
+        .map_err(tx)?;
+    Ok(Some((outcome, guard)))
+}
+
 fn validate_published_and_replay(
     published: &ComponentIntentPublished,
+    outcome_present: bool,
 ) -> Result<ComponentTableSummary, ComponentTransactionError> {
     published.lease.revalidate().map_err(tx)?;
     if published.manifest.component != published.lane.component
@@ -206,7 +1097,12 @@ fn validate_published_and_replay(
     {
         return Err(ComponentTransactionError);
     }
-    validate_terminal_topology(published, false)?;
+    if component_root_binding_sha256(published.lease.root()).map_err(tx)?
+        != published.manifest.root_binding_sha256
+    {
+        return Err(ComponentTransactionError);
+    }
+    validate_terminal_topology(published, outcome_present)?;
     let mut parser = ComponentTableParser::new(published.manifest.clone()).map_err(tx)?;
     for shard_index in 0..published.manifest.shards.len() {
         let bytes = read_table_shard_bytes(published, shard_index)?;
@@ -221,6 +1117,7 @@ fn create_and_promote_ancestors(
     published: &ComponentIntentPublished,
     authority: &ComponentAncestorJournalAuthority<'_>,
     targets: &[ComponentCreatedAncestor],
+    fault: ComponentExecutionFault,
 ) -> Result<(), ComponentTransactionError> {
     for shard_index in 0..authority.shard_count() {
         let first = shard_index
@@ -320,6 +1217,12 @@ fn create_and_promote_ancestors(
             moved.sync().map_err(tx)?;
             drop(moved);
             sync_transaction_roots(published)?;
+            if fault == ComponentExecutionFault::CrashAfterFirstAncestor
+                && shard_index == 0
+                && row_in_shard == 0
+            {
+                return Err(ComponentTransactionError);
+            }
         }
     }
     prove_ancestors_committed(published, authority, targets)
@@ -334,7 +1237,7 @@ fn cleanup_unjournaled_bucket(
     for (index, slot) in slots.into_iter().enumerate().rev() {
         let name = component_slot_name(index).map_err(tx)?;
         if bucket
-            .remove_empty_child_guarded(&name, ANCESTOR_SLOT_PARK, slot)
+            .remove_empty_child_guarded(&name, ANCESTOR_SLOT_PARK_A, slot)
             .map_err(tx)?
             != ManagedEmptyChildRemoval::Removed
         {
@@ -410,6 +1313,12 @@ fn execute_rows_forward(
                     if intermediate.state != ComponentRecoveryEntryState::QuarantinedReplacement {
                         return Err(ComponentTransactionError);
                     }
+                    if fault == ComponentExecutionFault::CrashAfterFirstReplacementQuarantine
+                        && shard_index == 0
+                        && row_in_shard == 0
+                    {
+                        return Err(ComponentTransactionError);
+                    }
                     move_staged_to_canonical(
                         published,
                         row,
@@ -420,8 +1329,11 @@ fn execute_rows_forward(
                 }
                 _ => return Err(ComponentTransactionError),
             }
-            if fault == ComponentExecutionFault::AfterFirstRow
-                && shard_index == 0
+            if matches!(
+                fault,
+                ComponentExecutionFault::AfterFirstRow
+                    | ComponentExecutionFault::CrashAfterFirstRow
+            ) && shard_index == 0
                 && row_in_shard == 0
             {
                 return Err(ComponentTransactionError);
@@ -593,6 +1505,21 @@ fn observe_all_rows(
     expected: ComponentRecoveryDecision,
     require_pristine_rollback: bool,
 ) -> Result<(), ComponentTransactionError> {
+    let plan = plan_all_rows(published)?;
+    if (require_pristine_rollback && !plan.all_pristine)
+        || match expected {
+            ComponentRecoveryDecision::Commit => plan.decision != ComponentRecoveryDecision::Commit,
+            ComponentRecoveryDecision::Rollback => !plan.rollback_reachable,
+        }
+    {
+        return Err(ComponentTransactionError);
+    }
+    Ok(())
+}
+
+fn plan_all_rows(
+    published: &ComponentIntentPublished,
+) -> Result<ComponentRecoveryPlan, ComponentTransactionError> {
     let expected_rows = usize::try_from(published.manifest.total_rows).map_err(tx)?;
     let mut planner = ComponentRecoveryPlanner::new(expected_rows).map_err(tx)?;
     let mut parser = ComponentTableParser::new(published.manifest.clone()).map_err(tx)?;
@@ -615,17 +1542,7 @@ fn observe_all_rows(
         for (row_in_shard, row) in shard.rows.iter().enumerate() {
             let observed = observe_row(published, row, &staging, &quarantine, row_in_shard)?;
             let observation = recovery_observation(row, &observed)?;
-            let state = planner.observe(row, observation).map_err(tx)?;
-            if require_pristine_rollback
-                && !matches!(
-                    state,
-                    ComponentRecoveryEntryState::Exact
-                        | ComponentRecoveryEntryState::StagedNew
-                        | ComponentRecoveryEntryState::StagedReplacement
-                )
-            {
-                return Err(ComponentTransactionError);
-            }
+            planner.observe(row, observation).map_err(tx)?;
             let slot_name = component_slot_name(row_in_shard).map_err(tx)?;
             if observed.staging.is_some() {
                 staging_names.insert(slot_name.clone());
@@ -641,8 +1558,9 @@ fn observe_all_rows(
         }
     }
     parser.finish().map_err(tx)?;
-    planner.prove(expected).map_err(tx)?;
-    sync_transaction_roots(published)
+    let plan = planner.finish().map_err(tx)?;
+    sync_transaction_roots(published)?;
+    Ok(plan)
 }
 
 fn observe_row(
@@ -961,6 +1879,279 @@ fn durable_ancestor_prefix(
     Ok(prefix)
 }
 
+fn admit_ancestor_recovery(
+    published: &ComponentIntentPublished,
+    authority: &ComponentAncestorJournalAuthority<'_>,
+    targets: &[ComponentCreatedAncestor],
+    allow_unjournaled_cleanup: bool,
+) -> Result<AncestorRecoveryPlan, ComponentTransactionError> {
+    let record_names = exact_entry_names(
+        &published.lane.ancestor_records,
+        MAX_COMPONENT_ANCESTOR_SHARDS + 1,
+    )
+    .map_err(tx)?;
+    let durable_shards = exact_prefix_len(
+        &record_names,
+        authority.shard_count(),
+        component_ancestor_record_file_name,
+    )?;
+    let mut bucket_names = exact_entry_names(
+        &published.lane.ancestor_staging,
+        MAX_COMPONENT_ANCESTOR_SHARDS + 2,
+    )
+    .map_err(tx)?;
+    let parked_bucket = admit_empty_recovery_park(
+        &published.lane.ancestor_staging,
+        &mut bucket_names,
+        COMPONENT_BUCKET_PARK_A,
+        COMPONENT_BUCKET_PARK_B,
+    )?;
+    let bucket_prefix = exact_prefix_len(
+        &bucket_names,
+        authority.shard_count(),
+        component_ancestor_bucket_name,
+    )?;
+    if bucket_prefix < durable_shards || bucket_prefix > durable_shards.saturating_add(1) {
+        return Err(ComponentTransactionError);
+    }
+    if parked_bucket.is_some()
+        && (!allow_unjournaled_cleanup
+            || durable_shards >= authority.shard_count()
+            || bucket_prefix != durable_shards)
+    {
+        return Err(ComponentTransactionError);
+    }
+    let mut canonical_records = 0_usize;
+    let mut staged_suffix_started = false;
+    let mut journaled_records = 0_usize;
+    for shard_index in 0..durable_shards {
+        let shard = read_ancestor_journal(published, authority, shard_index)?;
+        let bucket_name = component_ancestor_bucket_name(shard_index).map_err(tx)?;
+        let bucket = published
+            .lane
+            .ancestor_staging
+            .open_child(&bucket_name)
+            .map_err(tx)?;
+        let mut expected_staged = BTreeSet::new();
+        for record in shard.records() {
+            journaled_records = journaled_records
+                .checked_add(1)
+                .ok_or(ComponentTransactionError)?;
+            let slot_name =
+                component_slot_name(record.ordinal() % COMPONENT_ANCESTOR_RECORDS_PER_SHARD)
+                    .map_err(tx)?;
+            let canonical = open_canonical_ancestor(published, record.target())?;
+            let staged = if bucket
+                .has_portably_exact_child_name(&slot_name)
+                .map_err(tx)?
+            {
+                Some(bucket.open_child(&slot_name).map_err(tx)?)
+            } else {
+                None
+            };
+            match (canonical, staged) {
+                (Some(canonical), None)
+                    if !staged_suffix_started
+                        && record.matches_identity(canonical.identity().map_err(tx)?) =>
+                {
+                    canonical_records = canonical_records
+                        .checked_add(1)
+                        .ok_or(ComponentTransactionError)?;
+                }
+                (None, Some(staged))
+                    if record.matches_identity(staged.identity().map_err(tx)?)
+                        && exact_entry_names(&staged, 1).map_err(tx)?.is_empty() =>
+                {
+                    staged_suffix_started = true;
+                    expected_staged.insert(slot_name);
+                }
+                _ => return Err(ComponentTransactionError),
+            }
+        }
+        if exact_entry_names(&bucket, COMPONENT_ANCESTOR_RECORDS_PER_SHARD + 1).map_err(tx)?
+            != expected_staged
+        {
+            return Err(ComponentTransactionError);
+        }
+    }
+    for target in targets.iter().skip(journaled_records) {
+        if open_canonical_ancestor(published, target)?.is_some() {
+            return Err(ComponentTransactionError);
+        }
+    }
+    if bucket_prefix == durable_shards + 1 {
+        if !allow_unjournaled_cleanup {
+            return Err(ComponentTransactionError);
+        }
+        cleanup_unjournaled_ancestor_bucket(published, authority, targets, durable_shards)?;
+    }
+    if let Some(parked) = parked_bucket {
+        finish_empty_recovery_park(&published.lane.ancestor_staging, parked)?;
+        sync_transaction_roots(published)?;
+    }
+    sync_transaction_roots(published)?;
+    Ok(AncestorRecoveryPlan {
+        durable_shards,
+        canonical_records,
+    })
+}
+
+fn exact_prefix_len(
+    names: &BTreeSet<String>,
+    maximum: usize,
+    expected_name: impl Fn(usize) -> Result<String, ComponentEffectsError>,
+) -> Result<usize, ComponentTransactionError> {
+    if names.len() > maximum {
+        return Err(ComponentTransactionError);
+    }
+    let expected = (0..names.len())
+        .map(expected_name)
+        .collect::<Result<BTreeSet<_>, _>>()
+        .map_err(tx)?;
+    if *names != expected {
+        return Err(ComponentTransactionError);
+    }
+    Ok(names.len())
+}
+
+fn admit_empty_recovery_park(
+    parent: &ManagedDir,
+    names: &mut BTreeSet<String>,
+    first: &'static str,
+    second: &'static str,
+) -> Result<Option<EmptyRecoveryPark>, ComponentTransactionError> {
+    let (name, alternate) = match (names.remove(first), names.remove(second)) {
+        (false, false) => return Ok(None),
+        (true, false) => (first, second),
+        (false, true) => (second, first),
+        (true, true) => return Err(ComponentTransactionError),
+    };
+    let directory = parent.open_child(name).map_err(tx)?;
+    if !exact_entry_names(&directory, 1).map_err(tx)?.is_empty() {
+        return Err(ComponentTransactionError);
+    }
+    Ok(Some(EmptyRecoveryPark {
+        name,
+        alternate,
+        directory,
+    }))
+}
+
+fn finish_empty_recovery_park(
+    parent: &ManagedDir,
+    parked: EmptyRecoveryPark,
+) -> Result<(), ComponentTransactionError> {
+    if parent
+        .remove_empty_child_guarded(parked.name, parked.alternate, parked.directory)
+        .map_err(tx)?
+        != ManagedEmptyChildRemoval::Removed
+    {
+        return Err(ComponentTransactionError);
+    }
+    parent.sync().map_err(tx)
+}
+
+fn cleanup_unjournaled_ancestor_bucket(
+    published: &ComponentIntentPublished,
+    authority: &ComponentAncestorJournalAuthority<'_>,
+    targets: &[ComponentCreatedAncestor],
+    shard_index: usize,
+) -> Result<(), ComponentTransactionError> {
+    if shard_index >= authority.shard_count() {
+        return Err(ComponentTransactionError);
+    }
+    let first = shard_index
+        .checked_mul(COMPONENT_ANCESTOR_RECORDS_PER_SHARD)
+        .ok_or(ComponentTransactionError)?;
+    let expected_slots = (targets.len() - first).min(COMPONENT_ANCESTOR_RECORDS_PER_SHARD);
+    let bucket_name = component_ancestor_bucket_name(shard_index).map_err(tx)?;
+    let bucket = published
+        .lane
+        .ancestor_staging
+        .open_child(&bucket_name)
+        .map_err(tx)?;
+    let mut names = exact_entry_names(&bucket, expected_slots + 2).map_err(tx)?;
+    let parked_slot = admit_empty_recovery_park(
+        &bucket,
+        &mut names,
+        ANCESTOR_SLOT_PARK_A,
+        ANCESTOR_SLOT_PARK_B,
+    )?;
+    let slot_prefix = exact_prefix_len(&names, expected_slots, component_slot_name)?;
+    let mut slots = Vec::new();
+    slots.try_reserve_exact(slot_prefix).map_err(tx)?;
+    for row_in_shard in 0..slot_prefix {
+        let ordinal = first
+            .checked_add(row_in_shard)
+            .ok_or(ComponentTransactionError)?;
+        if open_canonical_ancestor(
+            published,
+            targets.get(ordinal).ok_or(ComponentTransactionError)?,
+        )?
+        .is_some()
+        {
+            return Err(ComponentTransactionError);
+        }
+        let slot_name = component_slot_name(row_in_shard).map_err(tx)?;
+        let slot = bucket.open_child(&slot_name).map_err(tx)?;
+        if !exact_entry_names(&slot, 1).map_err(tx)?.is_empty() {
+            return Err(ComponentTransactionError);
+        }
+        slots.push(slot);
+    }
+    if let Some(parked) = parked_slot {
+        finish_empty_recovery_park(&bucket, parked)?;
+    }
+    cleanup_unjournaled_bucket(
+        &published.lane.ancestor_staging,
+        &bucket_name,
+        bucket,
+        slots,
+    )?;
+    sync_transaction_roots(published)
+}
+
+fn open_canonical_ancestor(
+    published: &ComponentIntentPublished,
+    target: &ComponentCreatedAncestor,
+) -> Result<Option<ManagedDir>, ComponentTransactionError> {
+    published.lease.revalidate().map_err(tx)?;
+    let root = published.lease.root();
+    let component_root = component_lane_name(published.lane.component);
+    let result = (|| -> Result<Option<ManagedDir>, ComponentTransactionError> {
+        match target {
+            ComponentCreatedAncestor::ComponentRoot => {
+                if root
+                    .has_portably_exact_child_name(component_root)
+                    .map_err(tx)?
+                {
+                    Ok(Some(root.open_child(component_root).map_err(tx)?))
+                } else {
+                    Ok(None)
+                }
+            }
+            ComponentCreatedAncestor::Relative(path) => {
+                if !root
+                    .has_portably_exact_child_name(component_root)
+                    .map_err(tx)?
+                {
+                    return Ok(None);
+                }
+                let mut current = root.open_child(component_root).map_err(tx)?;
+                for segment in path.as_str().split('/') {
+                    if !current.has_portably_exact_child_name(segment).map_err(tx)? {
+                        return Ok(None);
+                    }
+                    current = current.open_child(segment).map_err(tx)?;
+                }
+                Ok(Some(current))
+            }
+        }
+    })()?;
+    published.lease.revalidate().map_err(tx)?;
+    Ok(result)
+}
+
 fn read_ancestor_journal(
     published: &ComponentIntentPublished,
     authority: &ComponentAncestorJournalAuthority<'_>,
@@ -1032,8 +2223,18 @@ fn postcheck(
     targets: &[ComponentCreatedAncestor],
     expected: ComponentRecoveryDecision,
 ) -> Result<(), ComponentTransactionError> {
+    postcheck_with_outcome(published, authority, targets, expected, false)
+}
+
+fn postcheck_with_outcome(
+    published: &ComponentIntentPublished,
+    authority: &ComponentAncestorJournalAuthority<'_>,
+    targets: &[ComponentCreatedAncestor],
+    expected: ComponentRecoveryDecision,
+    outcome_present: bool,
+) -> Result<(), ComponentTransactionError> {
     validate_published_marker(published)?;
-    validate_terminal_topology(published, false)?;
+    validate_terminal_topology(published, outcome_present)?;
     observe_all_rows(
         published,
         expected,
@@ -1315,6 +2516,9 @@ fn finish_disposition(
         .take()
         .expect("component terminal owner must retain its context");
     match disposition {
+        BlockingDisposition::NoTransaction | BlockingDisposition::RetryIntent => {
+            unreachable!("live execution cannot return a recovery admission disposition")
+        }
         BlockingDisposition::Committed(outcome_guard) => {
             ComponentExecutionResult::Committed(ComponentCommitReceipt {
                 context,
@@ -1329,10 +2533,69 @@ fn finish_disposition(
         }
         BlockingDisposition::RecoveryRequired(outcome_guard) => {
             ComponentExecutionResult::RecoveryRequired(ComponentRecoveryRequired {
-                context,
-                outcome_guard,
+                authority: ComponentRecoveryAuthority::Published {
+                    context,
+                    outcome_guard,
+                },
             })
         }
+    }
+}
+
+fn finish_recovery_disposition(
+    shared: &Mutex<Option<ComponentRecoveryAuthority>>,
+    disposition: BlockingDisposition,
+) -> RecoveryOwnerResult {
+    let authority = shared
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take()
+        .expect("component recovery owner must retain its authority");
+    match (disposition, authority) {
+        (BlockingDisposition::NoTransaction, ComponentRecoveryAuthority::Restart { lease, .. }) => {
+            RecoveryOwnerResult::NoTransaction(lease)
+        }
+        (
+            BlockingDisposition::RetryIntent,
+            ComponentRecoveryAuthority::IntentPromotionAttempted(
+                ComponentIntentPublishFailure::PromotionAttempted { candidate, .. },
+            ),
+        ) => RecoveryOwnerResult::RetryIntent(*candidate),
+        (
+            BlockingDisposition::Committed(outcome_guard),
+            ComponentRecoveryAuthority::Published { context, .. },
+        ) => RecoveryOwnerResult::Transaction(ComponentExecutionResult::Committed(
+            ComponentCommitReceipt {
+                context,
+                outcome_guard,
+            },
+        )),
+        (
+            BlockingDisposition::RolledBack(outcome_guard),
+            ComponentRecoveryAuthority::Published { context, .. },
+        ) => RecoveryOwnerResult::Transaction(ComponentExecutionResult::RolledBack(
+            ComponentRollbackReceipt {
+                context,
+                outcome_guard,
+            },
+        )),
+        (BlockingDisposition::RecoveryRequired(outcome_guard), authority) => {
+            let authority = match authority {
+                ComponentRecoveryAuthority::Published { context, .. } => {
+                    ComponentRecoveryAuthority::Published {
+                        context,
+                        outcome_guard,
+                    }
+                }
+                authority => authority,
+            };
+            RecoveryOwnerResult::Transaction(ComponentExecutionResult::RecoveryRequired(
+                ComponentRecoveryRequired { authority },
+            ))
+        }
+        (_, authority) => RecoveryOwnerResult::Transaction(
+            ComponentExecutionResult::RecoveryRequired(ComponentRecoveryRequired { authority }),
+        ),
     }
 }
 

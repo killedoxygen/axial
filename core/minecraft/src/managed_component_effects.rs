@@ -24,8 +24,10 @@ use std::collections::BTreeSet;
 mod managed_component_transaction;
 
 pub(crate) use managed_component_transaction::{
-    ComponentCommitReceipt, ComponentExecutionResult, ComponentRecoveryRequired,
-    ComponentRollbackReceipt, execute_component_intent,
+    ComponentCommitReceipt, ComponentExecutionResult, ComponentIntentPublicationRecovery,
+    ComponentRecoveryRequired, ComponentRecoveryRetryResult, ComponentRollbackReceipt,
+    ComponentStartupRecoveryResult, execute_component_intent, recover_component_intent_publication,
+    recover_component_transaction, retry_component_recovery,
 };
 
 #[cfg(test)]
@@ -104,6 +106,7 @@ pub(crate) enum ComponentIntentPublishFailure {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ComponentIntentPublishFault {
     BeforeMarkerPromotion,
+    PromotionAttemptedWithoutMarker,
     AfterMarkerPromotion,
     AfterLaneSynced,
     AfterPublicationSynced,
@@ -448,6 +451,14 @@ impl ComponentIntentCandidate {
             });
         }
         #[cfg(test)]
+        if fault == Some(ComponentIntentPublishFault::PromotionAttemptedWithoutMarker) {
+            return Err(ComponentIntentPublishFailure::PromotionAttempted {
+                candidate: Box::new(self),
+                intent_guard: None,
+                cause: ComponentEffectsError::Topology,
+            });
+        }
+        #[cfg(test)]
         let marker_result = match fault {
             Some(ComponentIntentPublishFault::BeforeMarkerPromotion) => {
                 self.lane.lane.write_new_exact_retained_with_fault(
@@ -518,28 +529,6 @@ impl ComponentIntentCandidate {
             encoded_intent,
             intent_guard,
         })
-    }
-}
-
-impl ComponentIntentPublishFailure {
-    pub(crate) fn cause(&self) -> &ComponentEffectsError {
-        match self {
-            Self::BeforePromotion { cause, .. } | Self::PromotionAttempted { cause, .. } => cause,
-        }
-    }
-
-    pub(crate) fn candidate(&self) -> &ComponentIntentCandidate {
-        match self {
-            Self::BeforePromotion { candidate, .. }
-            | Self::PromotionAttempted { candidate, .. } => candidate,
-        }
-    }
-
-    pub(crate) fn intent_guard(&self) -> Option<&ManagedFileGuard> {
-        match self {
-            Self::BeforePromotion { .. } => None,
-            Self::PromotionAttempted { intent_guard, .. } => intent_guard.as_ref(),
-        }
     }
 }
 
@@ -1899,6 +1888,49 @@ mod tests {
         lane.into_intent_candidate(lease, manifest).unwrap()
     }
 
+    async fn two_absent_row_candidate(temporary: &tempfile::TempDir) -> ComponentIntentCandidate {
+        let root = ManagedDir::open_root(temporary.path()).unwrap();
+        let lease = ManagedRootPublicationLease::acquire(root).await.unwrap();
+        let root_binding = component_root_binding_sha256(lease.root()).unwrap();
+        let lane = ComponentLane::prepare_fresh(&lease, ManagedComponentKind::Libraries).unwrap();
+        let staged = [b"first-staged".as_slice(), b"second-staged".as_slice()];
+        let mut builder = ComponentTableBuilder::new(
+            ManagedComponentKind::Libraries,
+            staged.len(),
+            [0x84; 16],
+            root_binding,
+        )
+        .unwrap();
+        let rows = staged
+            .iter()
+            .enumerate()
+            .map(|(index, bytes)| ComponentTableRow {
+                inventory_ordinal: index as u32,
+                final_size: bytes.len() as u64,
+                final_sha1: sha1::Sha1::digest(*bytes).into(),
+                kind: ManagedComponentArtifactKind::Library,
+                path: ArtifactRelativePath::new(&format!("new/{index}.jar")).unwrap(),
+                first_created_depth: Some(0),
+                prior: None,
+            })
+            .collect();
+        let (encoded, descriptor) = builder.push_shard(rows).unwrap();
+        let (manifest, _) = builder.finish().unwrap();
+        let mut spool = ComponentTableSpool::new(staged.len()).unwrap();
+        spool.append(encoded, descriptor).unwrap();
+        let replay = spool.finish(&manifest).unwrap();
+        lane.publish_table(replay, &manifest).unwrap();
+        let buckets = lane.create_shard_buckets(0).unwrap();
+        for (index, bytes) in staged.into_iter().enumerate() {
+            buckets
+                .staging()
+                .write_new_exact(&component_slot_name(index).unwrap(), bytes)
+                .unwrap();
+        }
+        drop(buckets);
+        lane.into_intent_candidate(lease, manifest).unwrap()
+    }
+
     async fn two_shard_empty_file_candidate(
         temporary: &tempfile::TempDir,
     ) -> (
@@ -2618,17 +2650,13 @@ mod tests {
         )
         .await;
 
-        let ComponentExecutionResult::RecoveryRequired(recovery) = result else {
+        let ComponentExecutionResult::RecoveryRequired(_) = result else {
             panic!("attempted outcome must retain recovery authority");
         };
-        assert!(recovery.outcome_guard.is_some());
         assert!(
-            recovery
-                .context
-                .lane
-                .lane
+            temporary
                 .path()
-                .join("outcome.bin")
+                .join(".axial-publication/libraries/outcome.bin")
                 .is_file()
         );
     }
@@ -2663,6 +2691,421 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn startup_recovery_returns_lease_when_no_transaction_exists() {
+        let temporary = tempfile::tempdir().unwrap();
+        let lease =
+            ManagedRootPublicationLease::acquire(ManagedDir::open_root(temporary.path()).unwrap())
+                .await
+                .unwrap();
+
+        let ComponentStartupRecoveryResult::NoTransaction(lease) =
+            recover_component_transaction(lease, ManagedComponentKind::Libraries).await
+        else {
+            panic!("marker-free root must not synthesize a transaction")
+        };
+
+        lease.revalidate().unwrap();
+
+        let lane = ComponentLane::prepare_fresh(&lease, ManagedComponentKind::Libraries).unwrap();
+        fs::remove_dir(lane.ancestor_staging.path()).unwrap();
+        drop(lane);
+        let ComponentStartupRecoveryResult::NoTransaction(lease) =
+            recover_component_transaction(lease, ManagedComponentKind::Libraries).await
+        else {
+            panic!("marker-free partial scaffold must use pre-intent recovery")
+        };
+        assert!(
+            lease
+                .publication_directory()
+                .path()
+                .join("libraries/ancestors/staging")
+                .is_dir()
+        );
+    }
+
+    #[tokio::test]
+    async fn startup_recovery_rejects_outcome_without_intent_and_any_settlement() {
+        for marker in [
+            crate::managed_component_publication::COMPONENT_OUTCOME_FILE,
+            crate::managed_component_publication::COMPONENT_SETTLEMENT_FILE,
+        ] {
+            let temporary = tempfile::tempdir().unwrap();
+            let lease = ManagedRootPublicationLease::acquire(
+                ManagedDir::open_root(temporary.path()).unwrap(),
+            )
+            .await
+            .unwrap();
+            let lane =
+                ComponentLane::prepare_fresh(&lease, ManagedComponentKind::Libraries).unwrap();
+            lane.lane
+                .write_new_exact(marker, b"attempted-marker")
+                .unwrap();
+            drop(lane);
+
+            assert!(matches!(
+                recover_component_transaction(lease, ManagedComponentKind::Libraries).await,
+                ComponentStartupRecoveryResult::Transaction(
+                    ComponentExecutionResult::RecoveryRequired(_)
+                )
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn restart_recovery_rolls_back_pristine_and_partial_new_rows() {
+        let temporary = tempfile::tempdir().unwrap();
+        let published = single_absent_row_candidate(&temporary)
+            .await
+            .publish_intent()
+            .unwrap_or_else(|_| panic!("publish component intent"));
+        let ComponentIntentPublished { lease, .. } = published;
+        assert!(matches!(
+            recover_component_transaction(lease, ManagedComponentKind::Libraries).await,
+            ComponentStartupRecoveryResult::Transaction(ComponentExecutionResult::RolledBack(_))
+        ));
+        assert!(!temporary.path().join("libraries").exists());
+
+        let temporary = tempfile::tempdir().unwrap();
+        let published = two_absent_row_candidate(&temporary)
+            .await
+            .publish_intent()
+            .unwrap_or_else(|_| panic!("publish component intent"));
+        let crashed = managed_component_transaction::execute_component_intent_with_fault(
+            published,
+            managed_component_transaction::ComponentExecutionFault::CrashAfterFirstRow,
+        )
+        .await;
+        let ComponentExecutionResult::RecoveryRequired(recovery) = crashed else {
+            panic!("injected row crash must retain recovery authority")
+        };
+        assert!(temporary.path().join("libraries/new/0.jar").is_file());
+        let (lease, component) = recovery.into_restart_seed();
+        assert!(matches!(
+            recover_component_transaction(lease, component).await,
+            ComponentStartupRecoveryResult::Transaction(ComponentExecutionResult::RolledBack(_))
+        ));
+        assert!(!temporary.path().join("libraries").exists());
+        assert_eq!(
+            fs::read(
+                temporary
+                    .path()
+                    .join(".axial-publication/libraries/staging/000000/000")
+            )
+            .unwrap(),
+            b"first-staged"
+        );
+    }
+
+    #[tokio::test]
+    async fn restart_recovery_reverses_partial_replacement() {
+        let temporary = tempfile::tempdir().unwrap();
+        let published = single_replacement_row_candidate(&temporary)
+            .await
+            .publish_intent()
+            .unwrap_or_else(|_| panic!("publish component intent"));
+        let crashed = managed_component_transaction::execute_component_intent_with_fault(
+            published,
+            managed_component_transaction::ComponentExecutionFault::CrashAfterFirstReplacementQuarantine,
+        )
+        .await;
+        let ComponentExecutionResult::RecoveryRequired(recovery) = crashed else {
+            panic!("injected replacement crash must retain recovery authority")
+        };
+        assert!(!temporary.path().join("libraries/replacement.jar").exists());
+        let (lease, component) = recovery.into_restart_seed();
+
+        assert!(matches!(
+            recover_component_transaction(lease, component).await,
+            ComponentStartupRecoveryResult::Transaction(ComponentExecutionResult::RolledBack(_))
+        ));
+        assert_eq!(
+            fs::read(temporary.path().join("libraries/replacement.jar")).unwrap(),
+            b"prior-library"
+        );
+
+        let temporary = tempfile::tempdir().unwrap();
+        let published = single_replacement_row_candidate(&temporary)
+            .await
+            .publish_intent()
+            .unwrap_or_else(|_| panic!("publish component intent"));
+        let crashed = managed_component_transaction::execute_component_intent_with_fault(
+            published,
+            managed_component_transaction::ComponentExecutionFault::CrashAfterFirstReplacementQuarantine,
+        )
+        .await;
+        let ComponentExecutionResult::RecoveryRequired(recovery) = crashed else {
+            panic!("injected replacement crash must retain recovery authority")
+        };
+        let (lease, component) = recovery.into_restart_seed();
+        fs::remove_file(
+            temporary
+                .path()
+                .join(".axial-publication/libraries/intent.bin"),
+        )
+        .unwrap();
+        assert!(matches!(
+            recover_component_transaction(lease, component).await,
+            ComponentStartupRecoveryResult::Transaction(
+                ComponentExecutionResult::RecoveryRequired(_)
+            )
+        ));
+        assert_eq!(
+            fs::read(
+                temporary
+                    .path()
+                    .join(".axial-publication/libraries/quarantine/000000/000")
+            )
+            .unwrap(),
+            b"prior-library"
+        );
+    }
+
+    #[tokio::test]
+    async fn restart_recovery_completes_committed_intent_and_replays_outcomes() {
+        let temporary = tempfile::tempdir().unwrap();
+        let published = single_absent_row_candidate(&temporary)
+            .await
+            .publish_intent()
+            .unwrap_or_else(|_| panic!("publish component intent"));
+        let crashed = managed_component_transaction::execute_component_intent_with_fault(
+            published,
+            managed_component_transaction::ComponentExecutionFault::CrashBeforeOutcome,
+        )
+        .await;
+        let ComponentExecutionResult::RecoveryRequired(recovery) = crashed else {
+            panic!("pre-outcome crash must retain recovery authority")
+        };
+        let (lease, component) = recovery.into_restart_seed();
+        let completed = recover_component_transaction(lease, component).await;
+        let ComponentStartupRecoveryResult::Transaction(ComponentExecutionResult::Committed(
+            receipt,
+        )) = completed
+        else {
+            panic!("fully committed intent must publish its outcome")
+        };
+        let (lease, component) = receipt.into_restart_seed();
+        assert!(matches!(
+            recover_component_transaction(lease, component).await,
+            ComponentStartupRecoveryResult::Transaction(ComponentExecutionResult::Committed(_))
+        ));
+
+        let temporary = tempfile::tempdir().unwrap();
+        let published = single_absent_row_candidate(&temporary)
+            .await
+            .publish_intent()
+            .unwrap_or_else(|_| panic!("publish component intent"));
+        let rolled_back = managed_component_transaction::execute_component_intent_with_fault(
+            published,
+            managed_component_transaction::ComponentExecutionFault::AfterFirstRow,
+        )
+        .await;
+        let ComponentExecutionResult::RolledBack(receipt) = rolled_back else {
+            panic!("live failure must publish rolled-back outcome")
+        };
+        let (lease, component) = receipt.into_restart_seed();
+        assert!(matches!(
+            recover_component_transaction(lease, component).await,
+            ComponentStartupRecoveryResult::Transaction(ComponentExecutionResult::RolledBack(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn restart_recovery_rolls_back_partial_ancestor_prefix_and_rejects_replacement() {
+        let temporary = tempfile::tempdir().unwrap();
+        let published = single_absent_row_candidate(&temporary)
+            .await
+            .publish_intent()
+            .unwrap_or_else(|_| panic!("publish component intent"));
+        let crashed = managed_component_transaction::execute_component_intent_with_fault(
+            published,
+            managed_component_transaction::ComponentExecutionFault::CrashAfterFirstAncestor,
+        )
+        .await;
+        let ComponentExecutionResult::RecoveryRequired(recovery) = crashed else {
+            panic!("ancestor crash must retain recovery authority")
+        };
+        let (lease, component) = recovery.into_restart_seed();
+        assert!(matches!(
+            recover_component_transaction(lease, component).await,
+            ComponentStartupRecoveryResult::Transaction(ComponentExecutionResult::RolledBack(_))
+        ));
+        assert!(!temporary.path().join("libraries").exists());
+
+        let temporary = tempfile::tempdir().unwrap();
+        let published = single_absent_row_candidate(&temporary)
+            .await
+            .publish_intent()
+            .unwrap_or_else(|_| panic!("publish component intent"));
+        let crashed = managed_component_transaction::execute_component_intent_with_fault(
+            published,
+            managed_component_transaction::ComponentExecutionFault::CrashAfterFirstAncestor,
+        )
+        .await;
+        let ComponentExecutionResult::RecoveryRequired(recovery) = crashed else {
+            panic!("ancestor crash must retain recovery authority")
+        };
+        let (lease, component) = recovery.into_restart_seed();
+        let slot = temporary
+            .path()
+            .join(".axial-publication/libraries/ancestors/staging/000000/001");
+        let saved = temporary.path().join("saved-journaled-ancestor");
+        fs::rename(&slot, &saved).unwrap();
+        fs::create_dir(&slot).unwrap();
+        let failed = recover_component_transaction(lease, component).await;
+        let ComponentStartupRecoveryResult::Transaction(
+            ComponentExecutionResult::RecoveryRequired(recovery),
+        ) = failed
+        else {
+            panic!("replaced journaled ancestor identity must fail closed")
+        };
+        assert!(matches!(
+            retry_component_recovery(recovery).await,
+            ComponentRecoveryRetryResult::Transaction(ComponentExecutionResult::RecoveryRequired(
+                _
+            ))
+        ));
+        assert!(slot.is_dir());
+        assert!(saved.is_dir());
+    }
+
+    #[tokio::test]
+    async fn restart_recovery_cleans_only_exact_empty_unjournaled_ancestor_prefix() {
+        let temporary = tempfile::tempdir().unwrap();
+        let published = single_absent_row_candidate(&temporary)
+            .await
+            .publish_intent()
+            .unwrap_or_else(|_| panic!("publish component intent"));
+        let bucket = published
+            .lane
+            .ancestor_staging
+            .create_child_new("000000")
+            .unwrap();
+        bucket.create_child_new("000").unwrap();
+        let bucket_path = bucket.path().to_path_buf();
+        drop(bucket);
+        let ComponentIntentPublished { lease, .. } = published;
+        assert!(matches!(
+            recover_component_transaction(lease, ManagedComponentKind::Libraries).await,
+            ComponentStartupRecoveryResult::Transaction(ComponentExecutionResult::RolledBack(_))
+        ));
+        assert!(!bucket_path.exists());
+
+        let temporary = tempfile::tempdir().unwrap();
+        let published = single_absent_row_candidate(&temporary)
+            .await
+            .publish_intent()
+            .unwrap_or_else(|_| panic!("publish component intent"));
+        let bucket = published
+            .lane
+            .ancestor_staging
+            .create_child_new("000000")
+            .unwrap();
+        let slot = bucket.create_child_new("000").unwrap();
+        slot.write_new_exact("foreign", b"do-not-delete").unwrap();
+        let slot_path = slot.path().to_path_buf();
+        drop((slot, bucket));
+        let ComponentIntentPublished { lease, .. } = published;
+        assert!(matches!(
+            recover_component_transaction(lease, ManagedComponentKind::Libraries).await,
+            ComponentStartupRecoveryResult::Transaction(
+                ComponentExecutionResult::RecoveryRequired(_)
+            )
+        ));
+        assert_eq!(
+            fs::read(slot_path.join("foreign")).unwrap(),
+            b"do-not-delete"
+        );
+
+        for park_slot in [true, false] {
+            let temporary = tempfile::tempdir().unwrap();
+            let published = single_absent_row_candidate(&temporary)
+                .await
+                .publish_intent()
+                .unwrap_or_else(|_| panic!("publish component intent"));
+            let bucket = published
+                .lane
+                .ancestor_staging
+                .create_child_new("000000")
+                .unwrap();
+            if park_slot {
+                bucket.create_child_new("000").unwrap();
+                fs::rename(bucket.path().join("000"), bucket.path().join("slot-park-a")).unwrap();
+                drop(bucket);
+            } else {
+                let bucket_path = bucket.path().to_path_buf();
+                drop(bucket);
+                fs::rename(
+                    &bucket_path,
+                    published
+                        .lane
+                        .ancestor_staging
+                        .path()
+                        .join(COMPONENT_BUCKET_PARK_A),
+                )
+                .unwrap();
+            }
+            let ComponentIntentPublished { lease, .. } = published;
+            assert!(matches!(
+                recover_component_transaction(lease, ManagedComponentKind::Libraries).await,
+                ComponentStartupRecoveryResult::Transaction(ComponentExecutionResult::RolledBack(
+                    _
+                ))
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn restart_recovery_cleans_authenticated_orphan_marker_temps() {
+        let temporary = tempfile::tempdir().unwrap();
+        let published = single_absent_row_candidate(&temporary)
+            .await
+            .publish_intent()
+            .unwrap_or_else(|_| panic!("publish component intent"));
+        let lane_temp = format!(".axial-loader-tmp-{}-900001-0", std::process::id());
+        let record_temp = format!(".axial-loader-tmp-{}-900002-0", std::process::id());
+        let lane_temp_path = published.lane.lane.path().join(&lane_temp);
+        let record_temp_path = published.lane.ancestor_records.path().join(&record_temp);
+        fs::write(&lane_temp_path, b"orphan-intent-temp").unwrap();
+        fs::write(&record_temp_path, b"orphan-record-temp").unwrap();
+        let ComponentIntentPublished { lease, .. } = published;
+
+        assert!(matches!(
+            recover_component_transaction(lease, ManagedComponentKind::Libraries).await,
+            ComponentStartupRecoveryResult::Transaction(ComponentExecutionResult::RolledBack(_))
+        ));
+        assert!(!lane_temp_path.exists());
+        assert!(!record_temp_path.exists());
+    }
+
+    #[tokio::test]
+    async fn caller_cancellation_does_not_abandon_restart_recovery() {
+        let temporary = tempfile::tempdir().unwrap();
+        let published = single_absent_row_candidate(&temporary)
+            .await
+            .publish_intent()
+            .unwrap_or_else(|_| panic!("publish component intent"));
+        let ComponentIntentPublished { lease, .. } = published;
+        let caller = tokio::spawn(recover_component_transaction(
+            lease,
+            ManagedComponentKind::Libraries,
+        ));
+        tokio::task::yield_now().await;
+        caller.abort();
+
+        let outcome = temporary
+            .path()
+            .join(".axial-publication/libraries/outcome.bin");
+        for _ in 0..200 {
+            if outcome.is_file() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(outcome.is_file());
+        assert!(!temporary.path().join("libraries").exists());
+    }
+
+    #[tokio::test]
     async fn intent_publication_distinguishes_before_and_attempted_faults() {
         let temporary = tempfile::tempdir().unwrap();
         let candidate = single_absent_row_candidate(&temporary).await;
@@ -2677,10 +3120,26 @@ mod tests {
             &before,
             ComponentIntentPublishFailure::BeforePromotion { .. }
         ));
-        assert!(before.intent_guard().is_none());
-        let _ = before.cause();
-        let _ = before.candidate();
         assert!(!lane_path.join(COMPONENT_INTENT_FILE).exists());
+        drop(before);
+
+        let temporary = tempfile::tempdir().unwrap();
+        let candidate = single_absent_row_candidate(&temporary).await;
+        let lane_path = candidate.lane.lane.path().to_path_buf();
+        let attempted = match candidate
+            .publish_intent_with_fault(ComponentIntentPublishFault::PromotionAttemptedWithoutMarker)
+        {
+            Err(failure) => failure,
+            Ok(_) => panic!("injected attempted promotion without a marker was ignored"),
+        };
+        let recovered = recover_component_intent_publication(attempted)
+            .await
+            .unwrap_or_else(|_| panic!("attempted promotion is semantically recoverable"));
+        let ComponentIntentPublicationRecovery::Retry(candidate) = recovered else {
+            panic!("exact marker absence must return the retained retry candidate")
+        };
+        assert!(!lane_path.join(COMPONENT_INTENT_FILE).exists());
+        assert!(candidate.publish_intent().is_ok());
 
         for fault in [
             ComponentIntentPublishFault::AfterMarkerPromotion,
@@ -2700,21 +3159,41 @@ mod tests {
                 &attempted,
                 ComponentIntentPublishFailure::PromotionAttempted { .. }
             ));
-            let guard = attempted
-                .intent_guard()
-                .expect("attempt retains exact intent guard");
-            assert!(
-                attempted
-                    .candidate()
-                    .lane
-                    .lane
-                    .file_guard_matches(COMPONENT_INTENT_FILE, guard)
-                    .unwrap()
-            );
-            let _ = attempted.cause();
-            drop(attempted);
             assert!(lane_path.join(COMPONENT_INTENT_FILE).is_file());
+            assert!(matches!(
+                recover_component_intent_publication(attempted)
+                    .await
+                    .unwrap_or_else(|_| {
+                        panic!("attempted marker promotion enters semantic recovery")
+                    }),
+                ComponentIntentPublicationRecovery::Transaction(
+                    ComponentExecutionResult::RolledBack(_)
+                )
+            ));
         }
+
+        let temporary = tempfile::tempdir().unwrap();
+        let candidate = single_absent_row_candidate(&temporary).await;
+        let intent = candidate.lane.lane.path().join(COMPONENT_INTENT_FILE);
+        let saved = temporary.path().join("saved-attempted-intent");
+        let attempted = match candidate
+            .publish_intent_with_fault(ComponentIntentPublishFault::AfterMarkerPromotion)
+        {
+            Err(failure) => failure,
+            Ok(_) => panic!("injected attempted marker promotion was ignored"),
+        };
+        fs::rename(&intent, &saved).unwrap();
+        fs::write(&intent, b"replacement").unwrap();
+        assert!(matches!(
+            recover_component_intent_publication(attempted)
+                .await
+                .unwrap_or_else(|_| panic!("attempted publication remains semantically owned")),
+            ComponentIntentPublicationRecovery::Transaction(
+                ComponentExecutionResult::RecoveryRequired(_)
+            )
+        ));
+        assert_eq!(fs::read(intent).unwrap(), b"replacement");
+        assert!(saved.is_file());
     }
 
     #[tokio::test]
