@@ -77,6 +77,7 @@ pub(super) enum DecisionPriorityBand {
     RepairCorruptionConfirmed,
     BlockingConfirmed,
     LaunchBlockingConfirmed,
+    RegisteredArtifactRepair,
     OwnershipBoundaryConfirmed,
     Critical,
 }
@@ -933,15 +934,25 @@ pub(super) const DIAGNOSIS_RULES: &[DiagnosisRule] = &[
         )],
         "launcher_managed_artifact_signature_corrupt"
     ),
-    rule!(
+    full_rule!(
         LauncherManagedArtifactCorrupt,
-        [
+        triggers: [
             ArtifactChecksumMismatch,
             ArtifactHashMismatch,
             ArtifactSizeDrift,
             ArtifactSizeMismatch,
             ArtifactMissing,
         ],
+        evidence: [
+            ArtifactChecksumMismatch,
+            ArtifactHashMismatch,
+            ArtifactSizeDrift,
+            ArtifactSizeMismatch,
+            ArtifactMissing,
+        ],
+        phases: &[],
+        required: &[],
+        suppressions: &[],
         RuleDomain::SupportingFact,
         RuleSeverity::Fixed(GuardianSeverity::Repairable),
         RuleConfidence::BySource {
@@ -952,6 +963,41 @@ pub(super) const DIAGNOSIS_RULES: &[DiagnosisRule] = &[
             }],
         },
         [Quarantine, Repair, AskUser, Block],
+        clauses: &[
+            context_clause(
+                OperationPhase::Launching,
+                &[
+                    GuardianFactId::LaunchFailureClassified,
+                    GuardianFactId::ProcessExitedBeforeBoot,
+                    GuardianFactId::RegisteredArtifactRepairAvailable,
+                ],
+                None,
+                &[
+                    GuardianActionKind::Quarantine,
+                    GuardianActionKind::Repair,
+                    GuardianActionKind::AskUser,
+                    GuardianActionKind::Block,
+                ],
+                None,
+                Some(DecisionPriorityBand::RegisteredArtifactRepair),
+            ),
+            context_clause(
+                OperationPhase::Launching,
+                &[
+                    GuardianFactId::LaunchFailureClassified,
+                    GuardianFactId::ProcessExitedBeforeBoot,
+                ],
+                None,
+                &[
+                    GuardianActionKind::Quarantine,
+                    GuardianActionKind::Repair,
+                    GuardianActionKind::AskUser,
+                    GuardianActionKind::Block,
+                ],
+                None,
+                Some(DecisionPriorityBand::RepairCorruptionHigh),
+            ),
+        ],
         "managed_artifact_corrupt"
     ),
     rule!(

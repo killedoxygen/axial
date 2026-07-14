@@ -396,6 +396,7 @@ fn render_output(
                     observation: (*observation).into(),
                     crash_evidence: crash_evidence.as_ref(),
                     integrity_facts: &[],
+                    registered_artifact_repair_target: None,
                     target_version_id,
                     runtime_major: *runtime_major,
                     requested_java_present: *requested_java_present,

@@ -11,7 +11,8 @@ use crate::state::contracts::{OwnershipClass, StabilizationSystem, TargetDescrip
 use crate::state::{
     AppState, IdleSweepCancellation, IdleSweepReservation, IdleSweepSettlement, IdleSweepTerminal,
     InstanceLifecycleLease, IntegrityForegroundLease, KnownGoodTier2Ticket,
-    KnownGoodVerificationLease, KnownGoodVerificationUnavailable,
+    KnownGoodVerificationLease, KnownGoodVerificationUnavailable, RegisteredArtifactCondition,
+    RegisteredArtifactFindings, RegisteredArtifactObservation,
 };
 use axial_minecraft::ManagedRuntimeCache;
 #[cfg(test)]
@@ -1757,6 +1758,13 @@ struct Tier1HashJob {
     file: LaunchTier1AdmittedFile,
     inventory_ordinal: usize,
     path: KnownGoodPhysicalPath,
+    repairable: bool,
+}
+
+#[derive(Debug)]
+struct Tier1RepairableObservation {
+    fact_index: usize,
+    observation: RegisteredArtifactObservation,
 }
 
 #[derive(Debug, Default)]
@@ -1765,6 +1773,41 @@ pub(crate) struct IntegrityTier1Report {
     pub(crate) hashed_entry_count: usize,
     pub(crate) content_read_byte_count: u64,
     pub(crate) suppressed_fact_count: usize,
+    repairable_observations: Vec<Tier1RepairableObservation>,
+}
+
+pub(crate) struct AdmittedIntegrityTier1Report {
+    report: IntegrityTier1Report,
+    findings: RegisteredArtifactFindings,
+}
+
+impl std::fmt::Debug for AdmittedIntegrityTier1Report {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AdmittedIntegrityTier1Report")
+            .field("report", &self.report)
+            .field("finding_count", &self.findings.len())
+            .finish()
+    }
+}
+
+impl AdmittedIntegrityTier1Report {
+    #[cfg(test)]
+    pub(crate) fn findings(&self) -> &RegisteredArtifactFindings {
+        &self.findings
+    }
+
+    pub(crate) fn into_parts(self) -> (IntegrityTier1Report, RegisteredArtifactFindings) {
+        (self.report, self.findings)
+    }
+}
+
+impl std::ops::Deref for AdmittedIntegrityTier1Report {
+    type Target = IntegrityTier1Report;
+
+    fn deref(&self) -> &Self::Target {
+        &self.report
+    }
 }
 
 pub(crate) async fn sense_integrity_tier1(
@@ -1772,7 +1815,7 @@ pub(crate) async fn sense_integrity_tier1(
     foreground: &IntegrityForegroundLease,
     lifecycle: &InstanceLifecycleLease,
     expected_library_root: &Path,
-) -> Result<IntegrityTier1Report, KnownGoodVerificationUnavailable> {
+) -> Result<AdmittedIntegrityTier1Report, KnownGoodVerificationUnavailable> {
     sense_integrity_tier1_with_reader_factory(
         state,
         foreground,
@@ -1789,7 +1832,7 @@ async fn sense_integrity_tier1_with_reader_factory<Factory, Reader>(
     lifecycle: &InstanceLifecycleLease,
     expected_library_root: &Path,
     reader_factory: Factory,
-) -> Result<IntegrityTier1Report, KnownGoodVerificationUnavailable>
+) -> Result<AdmittedIntegrityTier1Report, KnownGoodVerificationUnavailable>
 where
     Factory: FnOnce() -> Reader + Send + 'static,
     Reader: ContentReader,
@@ -1797,7 +1840,7 @@ where
     let lease =
         state.mint_known_good_verification_lease(foreground, lifecycle, expected_library_root)?;
     let prepared = prepare_tier1_jobs(&lease);
-    let (lease, report) = match prepared {
+    let (lease, mut report) = match prepared {
         Ok(jobs) => tokio::task::spawn_blocking(move || {
             let report = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let reader = reader_factory();
@@ -1813,7 +1856,16 @@ where
     if !state.known_good_verification_lease_is_current(&lease) {
         return Err(KnownGoodVerificationUnavailable::LiveAuthorityUnavailable);
     }
-    Ok(report)
+    let observations = report
+        .repairable_observations
+        .iter()
+        .map(|observed| observed.observation)
+        .collect();
+    let findings = state.seal_registered_artifact_findings(lease, observations)?;
+    if !report.bind_registered_artifact_targets(&findings) {
+        return Err(KnownGoodVerificationUnavailable::LiveAuthorityUnavailable);
+    }
+    Ok(AdmittedIntegrityTier1Report { report, findings })
 }
 
 #[cfg(test)]
@@ -1844,10 +1896,17 @@ fn prepare_tier1_jobs(
     let mut jobs = Vec::with_capacity(projected_entries.len());
     for projected in projected_entries {
         let (inventory_ordinal, file) = projected.into_parts();
+        let repairable = lease
+            .registered_artifact_observation(
+                inventory_ordinal,
+                RegisteredArtifactCondition::Corrupt,
+            )
+            .is_some();
         jobs.push(Tier1HashJob {
             path: file.physical_path(library_root),
             file,
             inventory_ordinal,
+            repairable,
         });
     }
     Ok(jobs)
@@ -1873,23 +1932,34 @@ fn run_tier1_jobs(jobs: Vec<Tier1HashJob>, reader: &impl ContentReader) -> Integ
         };
         report.content_read_byte_count = content_read_byte_count;
         if result.bytes_read > byte_budget {
-            sensed_facts.push(tier1_integrity_fact(
-                &job.file,
-                job.inventory_ordinal,
-                ExecutionFactKind::PrimitiveRefused,
-                "content_budget_exceeded",
+            sensed_facts.push((
+                tier1_integrity_fact(
+                    &job.file,
+                    job.inventory_ordinal,
+                    ExecutionFactKind::PrimitiveRefused,
+                    "content_budget_exceeded",
+                ),
+                None,
             ));
             break;
         }
-        let fact = match result.observation {
+        let sensed = match result.observation {
             Ok(ContentHashObservation::Hashed { digest }) => {
                 report.hashed_entry_count += 1;
                 (digest != job.file.digest().as_str()).then(|| {
-                    tier1_integrity_fact(
-                        &job.file,
-                        job.inventory_ordinal,
-                        ExecutionFactKind::ArtifactHashMismatch,
-                        "hash_mismatch",
+                    (
+                        tier1_integrity_fact(
+                            &job.file,
+                            job.inventory_ordinal,
+                            ExecutionFactKind::ArtifactHashMismatch,
+                            "hash_mismatch",
+                        ),
+                        job.repairable.then(|| {
+                            RegisteredArtifactObservation::new(
+                                job.inventory_ordinal,
+                                RegisteredArtifactCondition::Corrupt,
+                            )
+                        }),
                     )
                 })
             }
@@ -1904,62 +1974,108 @@ fn run_tier1_jobs(jobs: Vec<Tier1HashJob>, reader: &impl ContentReader) -> Integ
                     public_field("expected_size", job.file.size().to_string()),
                     public_field("observed_size", observed_size.to_string()),
                 ]);
-                Some(fact)
+                Some((
+                    fact,
+                    job.repairable.then(|| {
+                        RegisteredArtifactObservation::new(
+                            job.inventory_ordinal,
+                            RegisteredArtifactCondition::Corrupt,
+                        )
+                    }),
+                ))
             }
-            Ok(ContentHashObservation::WrongType) => Some(tier1_integrity_fact(
-                &job.file,
-                job.inventory_ordinal,
-                ExecutionFactKind::ArtifactMissing,
-                "wrong_type",
+            Ok(ContentHashObservation::WrongType) => Some((
+                tier1_integrity_fact(
+                    &job.file,
+                    job.inventory_ordinal,
+                    ExecutionFactKind::ArtifactMissing,
+                    "wrong_type",
+                ),
+                job.repairable.then(|| {
+                    RegisteredArtifactObservation::new(
+                        job.inventory_ordinal,
+                        RegisteredArtifactCondition::Corrupt,
+                    )
+                }),
             )),
-            Ok(ContentHashObservation::ChangedDuringRead) => Some(tier1_integrity_fact(
-                &job.file,
-                job.inventory_ordinal,
-                ExecutionFactKind::PrimitiveRefused,
-                "content_changed_during_read",
+            Ok(ContentHashObservation::ChangedDuringRead) => Some((
+                tier1_integrity_fact(
+                    &job.file,
+                    job.inventory_ordinal,
+                    ExecutionFactKind::PrimitiveRefused,
+                    "content_changed_during_read",
+                ),
+                None,
             )),
-            Ok(ContentHashObservation::BudgetRefused) => Some(tier1_integrity_fact(
-                &job.file,
-                job.inventory_ordinal,
-                ExecutionFactKind::PrimitiveRefused,
-                "content_budget_refused",
+            Ok(ContentHashObservation::BudgetRefused) => Some((
+                tier1_integrity_fact(
+                    &job.file,
+                    job.inventory_ordinal,
+                    ExecutionFactKind::PrimitiveRefused,
+                    "content_budget_refused",
+                ),
+                None,
             )),
-            Ok(ContentHashObservation::Cancelled) => Some(tier1_integrity_fact(
-                &job.file,
-                job.inventory_ordinal,
-                ExecutionFactKind::PrimitiveRefused,
-                "content_read_cancelled",
+            Ok(ContentHashObservation::Cancelled) => Some((
+                tier1_integrity_fact(
+                    &job.file,
+                    job.inventory_ordinal,
+                    ExecutionFactKind::PrimitiveRefused,
+                    "content_read_cancelled",
+                ),
+                None,
             )),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Some(tier1_integrity_fact(
-                &job.file,
-                job.inventory_ordinal,
-                ExecutionFactKind::ArtifactMissing,
-                "missing",
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Some((
+                tier1_integrity_fact(
+                    &job.file,
+                    job.inventory_ordinal,
+                    ExecutionFactKind::ArtifactMissing,
+                    "missing",
+                ),
+                job.repairable.then(|| {
+                    RegisteredArtifactObservation::new(
+                        job.inventory_ordinal,
+                        RegisteredArtifactCondition::Missing,
+                    )
+                }),
             )),
-            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
-                Some(tier1_integrity_fact(
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => Some((
+                tier1_integrity_fact(
                     &job.file,
                     job.inventory_ordinal,
                     ExecutionFactKind::FilePermissionDenied,
                     "content_permission_denied",
-                ))
-            }
-            Err(_) => Some(tier1_integrity_fact(
-                &job.file,
-                job.inventory_ordinal,
-                ExecutionFactKind::PrimitiveRefused,
-                "content_unavailable",
+                ),
+                None,
+            )),
+            Err(_) => Some((
+                tier1_integrity_fact(
+                    &job.file,
+                    job.inventory_ordinal,
+                    ExecutionFactKind::PrimitiveRefused,
+                    "content_unavailable",
+                ),
+                None,
             )),
         };
-        if let Some(fact) = fact {
-            sensed_facts.push(fact);
+        if let Some(sensed) = sensed {
+            sensed_facts.push(sensed);
         }
     }
     if reader.revalidate().is_err() {
         push_bounded_tier1_fact(&mut report, tier1_confinement_refused_fact());
     } else {
-        for fact in sensed_facts {
-            push_bounded_tier1_fact(&mut report, fact);
+        for (fact, observation) in sensed_facts {
+            if let Some(fact_index) = push_bounded_tier1_fact(&mut report, fact)
+                && let Some(observation) = observation
+            {
+                report
+                    .repairable_observations
+                    .push(Tier1RepairableObservation {
+                        fact_index,
+                        observation,
+                    });
+            }
         }
     }
     report
@@ -2032,11 +2148,33 @@ fn tier1_budget_accounting_refused_fact() -> ExecutionFact {
     }
 }
 
-fn push_bounded_tier1_fact(report: &mut IntegrityTier1Report, fact: ExecutionFact) {
+fn push_bounded_tier1_fact(
+    report: &mut IntegrityTier1Report,
+    fact: ExecutionFact,
+) -> Option<usize> {
     if report.facts.len() < MAX_INTEGRITY_TIER1_FACTS {
+        let fact_index = report.facts.len();
         report.facts.push(fact);
+        Some(fact_index)
     } else {
         report.suppressed_fact_count += 1;
+        None
+    }
+}
+
+impl IntegrityTier1Report {
+    fn bind_registered_artifact_targets(&mut self, findings: &RegisteredArtifactFindings) -> bool {
+        for observed in &self.repairable_observations {
+            let Some(fact) = self.facts.get_mut(observed.fact_index) else {
+                return false;
+            };
+            let Some(target) = findings.target_for(observed.observation) else {
+                return false;
+            };
+            fact.target = Some(target.clone());
+        }
+        self.repairable_observations.clear();
+        true
     }
 }
 
@@ -3001,7 +3139,19 @@ fn push_bounded_fact(report: &mut IntegrityTier0Report, fact: ExecutionFact) {
 mod tests {
     use super::*;
     use crate::application::timing::INTEGRITY_TIER0_CEILING_MS;
-    use crate::state::{AppState, AppStateInit, InstallStore, SessionStore};
+    use crate::guardian::{
+        ActionPlanPrerequisite, DiagnosisId, GuardianAction, GuardianActionKind,
+        GuardianActionPlan, GuardianArtifactRepairStatus, GuardianConfidence, GuardianDecision,
+        GuardianMode, execute_registered_guardian_artifact_repair,
+    };
+    use crate::state::contracts::{
+        OperationId, ReconciliationComponent, ReconciliationRung, ReconciliationScope,
+        StabilizationSystem,
+    };
+    use crate::state::{
+        AppState, AppStateInit, InstallStore, RegisteredArtifactRepairAuthorizationRejection,
+        SessionStore,
+    };
     use axial_config::{AppConfig, AppPaths, ConfigStore, InstanceRegistrySnapshot, InstanceStore};
     use axial_minecraft::known_good::{
         KnownGoodInventory, TestKnownGoodEntry, TestKnownGoodIntegrity, TestKnownGoodRoot,
@@ -3009,8 +3159,11 @@ mod tests {
     use axial_performance::PerformanceManager;
     use std::collections::HashMap;
     use std::fs;
+    use std::io::Write as _;
+    use std::net::{TcpListener, TcpStream};
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
-    use std::sync::{Arc, Condvar, Mutex};
+    use std::sync::{Arc, Condvar, Mutex, mpsc};
+    use std::thread;
     use std::time::{Duration, Instant};
 
     #[test]
@@ -3713,6 +3866,85 @@ mod tests {
 
     const ZERO_SHA1: &str = "0000000000000000000000000000000000000000";
     const NONZERO_SHA1: &str = "1111111111111111111111111111111111111111";
+
+    struct RegisteredArtifactServer {
+        url: String,
+        stop: mpsc::Sender<()>,
+        worker: thread::JoinHandle<()>,
+    }
+
+    impl RegisteredArtifactServer {
+        fn start(body: Vec<u8>) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind artifact server");
+            listener
+                .set_nonblocking(true)
+                .expect("nonblocking artifact server");
+            let url = format!(
+                "http://{}/artifact.jar",
+                listener.local_addr().expect("artifact server address")
+            );
+            let (stop, stopped) = mpsc::channel();
+            let worker = thread::spawn(move || {
+                loop {
+                    match listener.accept() {
+                        Ok((stream, _)) => respond_registered_artifact(stream, &body),
+                        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                            if stopped.try_recv().is_ok() {
+                                break;
+                            }
+                            thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(error) => panic!("artifact server accept: {error}"),
+                    }
+                }
+            });
+            Self { url, stop, worker }
+        }
+
+        fn close(self) {
+            self.stop.send(()).expect("stop artifact server");
+            self.worker.join().expect("join artifact server");
+        }
+    }
+
+    fn respond_registered_artifact(mut stream: TcpStream, body: &[u8]) {
+        let mut request = [0_u8; 1024];
+        let _ = stream.read(&mut request);
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        )
+        .expect("artifact response header");
+        stream.write_all(body).expect("artifact response body");
+    }
+
+    fn registered_artifact_decision(
+        target: TargetDescriptor,
+        mode: GuardianMode,
+    ) -> GuardianDecision {
+        GuardianDecision::for_test(
+            None,
+            mode,
+            GuardianActionKind::Repair,
+            vec![DiagnosisId::LauncherManagedArtifactCorrupt],
+            Some(GuardianActionPlan::new(
+                StabilizationSystem::Guardian,
+                ActionPlanPrerequisite {
+                    diagnosis_id: DiagnosisId::LauncherManagedArtifactCorrupt,
+                    ownership: OwnershipClass::LauncherManaged,
+                    confidence: GuardianConfidence::Confirmed,
+                    affected_targets: vec![target.clone()],
+                    candidate_actions: vec![GuardianActionKind::Repair],
+                },
+                vec![GuardianAction {
+                    kind: GuardianActionKind::Repair,
+                    target: Some(target),
+                    reason: DiagnosisId::LauncherManagedArtifactCorrupt,
+                }],
+            )),
+        )
+    }
 
     #[test]
     fn exact_content_reader_never_consumes_bytes_beyond_the_admitted_size() {
@@ -4607,6 +4839,694 @@ mod tests {
         assert!(!exported.contains(NONZERO_SHA1));
         drop(lease);
         drop(lifecycle);
+        close_fixture(state, root).await;
+    }
+
+    #[tokio::test]
+    async fn tier_one_seals_exact_repairable_findings_and_retains_live_authority() {
+        let (state, root) = state_fixture("tier1-sealed-findings", None);
+        let instance = state
+            .instances()
+            .insert_for_test("Tier one sealed findings", "1.21.5")
+            .expect("instance");
+        let inventory = KnownGoodInventory::from_test_entries([
+            entry(
+                TestKnownGoodRoot::Versions,
+                "1.21.5/1.21.5.jar",
+                KnownGoodArtifactKind::ClientJar,
+                TestKnownGoodIntegrity::File { size: 7 },
+            ),
+            entry(
+                TestKnownGoodRoot::Libraries,
+                "private/missing.jar",
+                KnownGoodArtifactKind::Library,
+                TestKnownGoodIntegrity::File { size: 7 },
+            ),
+            entry(
+                TestKnownGoodRoot::Libraries,
+                "private/corrupt.jar",
+                KnownGoodArtifactKind::NativeLibrary,
+                TestKnownGoodIntegrity::File { size: 7 },
+            ),
+            entry(
+                TestKnownGoodRoot::Libraries,
+                "private/permission.jar",
+                KnownGoodArtifactKind::Library,
+                TestKnownGoodIntegrity::File { size: 7 },
+            ),
+        ])
+        .expect("inventory");
+        state.activate_known_good_inventory_for_test(&instance.id, inventory);
+        let foreground = test_integrity_foreground(&state).await;
+        let lifecycle = state.acquire_instance_lifecycle(&instance.id).await;
+
+        let report = sense_integrity_tier1_with_reader_factory(
+            &state,
+            &foreground,
+            &lifecycle,
+            &root.join("private-library-root"),
+            || {
+                ScriptedContentReader::new([
+                    (
+                        "1.21.5/1.21.5.jar",
+                        ScriptedContent::Hashed(NONZERO_SHA1, 7),
+                    ),
+                    (
+                        "private/missing.jar",
+                        ScriptedContent::Error(io::ErrorKind::NotFound),
+                    ),
+                    (
+                        "private/corrupt.jar",
+                        ScriptedContent::Hashed(NONZERO_SHA1, 7),
+                    ),
+                    (
+                        "private/permission.jar",
+                        ScriptedContent::Error(io::ErrorKind::PermissionDenied),
+                    ),
+                ])
+            },
+        )
+        .await
+        .expect("admitted Tier one report");
+
+        assert_eq!(report.findings().len(), 2);
+        assert!(!report.findings().is_empty());
+        assert!(state.registered_artifact_findings_are_current(report.findings()));
+        let missing = RegisteredArtifactObservation::new(1, RegisteredArtifactCondition::Missing);
+        let corrupt = RegisteredArtifactObservation::new(2, RegisteredArtifactCondition::Corrupt);
+        let missing_target = report
+            .findings()
+            .target_for(missing)
+            .expect("missing target");
+        let corrupt_target = report
+            .findings()
+            .target_for(corrupt)
+            .expect("corrupt target");
+        assert_ne!(missing_target, corrupt_target);
+        for target in [missing_target, corrupt_target] {
+            assert_eq!(target.system, StabilizationSystem::Execution);
+            assert_eq!(target.kind, TargetKind::Artifact);
+            assert_eq!(target.ownership, OwnershipClass::LauncherManaged);
+            assert_eq!(target.id.len(), 78);
+            assert!(target.id.starts_with("sha256."));
+        }
+        let fact_for = |observation| {
+            report
+                .facts
+                .iter()
+                .find(|fact| fact_field(fact, "observation") == Some(observation))
+                .unwrap_or_else(|| panic!("missing {observation} fact"))
+        };
+        assert_eq!(fact_for("missing").target.as_ref(), Some(missing_target));
+        assert_eq!(
+            report
+                .facts
+                .iter()
+                .find(|fact| {
+                    fact_field(fact, "entry_ordinal") == Some("2")
+                        && fact_field(fact, "observation") == Some("hash_mismatch")
+                })
+                .and_then(|fact| fact.target.as_ref()),
+            Some(corrupt_target)
+        );
+        assert_eq!(
+            fact_for("content_permission_denied")
+                .target
+                .as_ref()
+                .map(|target| target.id.as_str()),
+            Some("known_good_libraries_library_3")
+        );
+        assert_eq!(
+            report
+                .facts
+                .iter()
+                .find(|fact| {
+                    fact_field(fact, "inventory_root") == Some("versions")
+                        && fact_field(fact, "observation") == Some("hash_mismatch")
+                })
+                .and_then(|fact| fact.target.as_ref())
+                .map(|target| target.id.as_str()),
+            Some("known_good_versions_client_jar_0")
+        );
+        assert_eq!(
+            report
+                .findings()
+                .observations_for_test()
+                .map(|(observation, _)| {
+                    (observation.inventory_ordinal(), observation.condition())
+                })
+                .collect::<Vec<_>>(),
+            vec![
+                (1, RegisteredArtifactCondition::Missing),
+                (2, RegisteredArtifactCondition::Corrupt),
+            ]
+        );
+
+        drop(lifecycle);
+        drop(foreground);
+        assert!(!state.subscribe_integrity_idle().borrow().is_stably_idle());
+        let mut lifecycle_wait = Box::pin(state.acquire_instance_lifecycle(&instance.id));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut lifecycle_wait)
+                .await
+                .is_err(),
+            "sealed findings must retain exact lifecycle authority"
+        );
+        drop(report);
+        let released = tokio::time::timeout(Duration::from_secs(2), &mut lifecycle_wait)
+            .await
+            .expect("findings release lifecycle authority");
+        drop(released);
+        drop(lifecycle_wait);
+        assert!(state.subscribe_integrity_idle().borrow().is_stably_idle());
+        close_fixture(state, root).await;
+    }
+
+    #[tokio::test]
+    async fn registered_artifact_authorization_is_managed_exact_and_source_backed() {
+        let (state, root) = state_fixture("registered-artifact-authorization", None);
+        let instance = state
+            .instances()
+            .insert_for_test("Registered artifact authorization", "1.21.5")
+            .expect("instance");
+        let inventory = KnownGoodInventory::from_test_entries([entry(
+            TestKnownGoodRoot::Libraries,
+            "exact/library.jar",
+            KnownGoodArtifactKind::Library,
+            TestKnownGoodIntegrity::Sha1 {
+                digest: ZERO_SHA1.to_string(),
+                size: 7,
+            },
+        )])
+        .expect("inventory")
+        .with_test_standalone_leaf_repair_source(0, "https://example.invalid/exact-library.jar")
+        .expect("repair source");
+        state.activate_known_good_inventory_for_test(&instance.id, inventory);
+        let foreground = test_integrity_foreground(&state).await;
+        let lifecycle = state.acquire_instance_lifecycle(&instance.id).await;
+
+        for mode in [GuardianMode::Custom, GuardianMode::Disabled] {
+            let report = sense_integrity_tier1(
+                &state,
+                &foreground,
+                &lifecycle,
+                &root.join("private-library-root"),
+            )
+            .await
+            .expect("Tier one report");
+            let (_, findings) = report.into_parts();
+            let target = findings
+                .repair_target()
+                .expect("exact repair target")
+                .clone();
+            assert!(matches!(
+                findings.authorize_repair(&registered_artifact_decision(target, mode)),
+                Err(RegisteredArtifactRepairAuthorizationRejection::NonManagedRepair)
+            ));
+        }
+
+        let report = sense_integrity_tier1(
+            &state,
+            &foreground,
+            &lifecycle,
+            &root.join("private-library-root"),
+        )
+        .await
+        .expect("managed Tier one report");
+        let (_, findings) = report.into_parts();
+        assert!(findings.repair_target().is_some());
+        let selected = findings.repair_target().expect("selected target").clone();
+        let authorization = findings
+            .authorize_repair(&registered_artifact_decision(
+                selected,
+                GuardianMode::Managed,
+            ))
+            .expect("managed authorization");
+        drop(authorization);
+
+        let inventory = KnownGoodInventory::from_test_entries([entry(
+            TestKnownGoodRoot::Libraries,
+            "exact/library.jar",
+            KnownGoodArtifactKind::Library,
+            TestKnownGoodIntegrity::Sha1 {
+                digest: ZERO_SHA1.to_string(),
+                size: 7,
+            },
+        )])
+        .expect("inventory without repair source");
+        state.activate_known_good_inventory_for_test(&instance.id, inventory);
+        let report = sense_integrity_tier1(
+            &state,
+            &foreground,
+            &lifecycle,
+            &root.join("private-library-root"),
+        )
+        .await
+        .expect("source-less Tier one report");
+        let (_, findings) = report.into_parts();
+        assert!(findings.repair_target().is_none());
+        let target = findings
+            .observations_for_test()
+            .next()
+            .expect("source-less finding")
+            .1
+            .clone();
+        assert!(matches!(
+            findings
+                .authorize_repair(&registered_artifact_decision(target, GuardianMode::Managed,)),
+            Err(RegisteredArtifactRepairAuthorizationRejection::RepairSourceUnavailable)
+        ));
+
+        drop(lifecycle);
+        drop(foreground);
+        close_fixture(state, root).await;
+    }
+
+    #[tokio::test]
+    async fn registered_artifact_missing_and_corrupt_repairs_settle_exact_registered_terminal() {
+        for (label, corrupt) in [("missing", false), ("corrupt", true)] {
+            let body = format!("registered-{label}-artifact").into_bytes();
+            let digest = format!("{:x}", Sha1::digest(&body));
+            let server = RegisteredArtifactServer::start(body.clone());
+            let (state, root) = state_fixture(&format!("registered-artifact-{label}"), None);
+            let instance = state
+                .instances()
+                .insert_for_test("Registered artifact repair", "1.21.5")
+                .expect("instance");
+            let inventory = KnownGoodInventory::from_test_entries([entry(
+                TestKnownGoodRoot::Libraries,
+                "exact/library.jar",
+                KnownGoodArtifactKind::Library,
+                TestKnownGoodIntegrity::Sha1 {
+                    digest,
+                    size: body.len() as u64,
+                },
+            )])
+            .expect("inventory")
+            .with_test_standalone_leaf_repair_source(0, &server.url)
+            .expect("repair source");
+            state.activate_known_good_inventory_for_test(&instance.id, inventory);
+            let destination = root.join("private-library-root/libraries/exact/library.jar");
+            fs::create_dir_all(destination.parent().expect("library parent"))
+                .expect("library parent");
+            if corrupt {
+                fs::write(&destination, vec![b'x'; body.len()]).expect("corrupt library");
+            }
+            let foreground = test_integrity_foreground(&state).await;
+            let lifecycle = state.acquire_instance_lifecycle(&instance.id).await;
+            let report = sense_integrity_tier1(
+                &state,
+                &foreground,
+                &lifecycle,
+                &root.join("private-library-root"),
+            )
+            .await
+            .expect("Tier one report");
+            let (_, findings) = report.into_parts();
+            let target = findings.repair_target().expect("repair target").clone();
+            let authorization = findings
+                .authorize_repair(&registered_artifact_decision(
+                    target.clone(),
+                    GuardianMode::Managed,
+                ))
+                .expect("repair authorization");
+            let operation_id = OperationId::new(format!("registered-artifact-{label}"));
+            let admission = state
+                .admit_registered_artifact_repair(
+                    authorization,
+                    operation_id.clone(),
+                    chrono::Duration::minutes(15),
+                )
+                .await
+                .expect("repair admission");
+            let outcome =
+                execute_registered_guardian_artifact_repair(admission, &reqwest::Client::new())
+                    .await
+                    .expect("registered artifact repair");
+
+            assert_eq!(outcome.status, GuardianArtifactRepairStatus::Repaired);
+            assert_eq!(fs::read(&destination).expect("repaired artifact"), body);
+            let journal = state.journals().get(&operation_id).expect("repair journal");
+            let terminal = journal.reconciliation_terminal().expect("typed terminal");
+            assert_eq!(terminal.rung(), ReconciliationRung::RepairArtifact);
+            assert_eq!(terminal.component(), ReconciliationComponent::Libraries);
+            assert_eq!(terminal.target(), &target);
+            assert!(matches!(
+                terminal.scope(),
+                ReconciliationScope::RegisteredInstance { instance_id, .. }
+                    if instance_id == &instance.id
+            ));
+            assert_eq!(terminal.quarantined_target().is_some(), corrupt);
+
+            fs::write(&destination, vec![b'y'; body.len()]).expect("repeat corruption");
+            let report = sense_integrity_tier1(
+                &state,
+                &foreground,
+                &lifecycle,
+                &root.join("private-library-root"),
+            )
+            .await
+            .expect("repeat Tier one report");
+            let (_, findings) = report.into_parts();
+            let target = findings.repair_target().expect("repeat target").clone();
+            let authorization = findings
+                .authorize_repair(&registered_artifact_decision(target, GuardianMode::Managed))
+                .expect("repeat authorization");
+            assert_eq!(
+                state
+                    .admit_registered_artifact_repair(
+                        authorization,
+                        OperationId::new(format!("registered-artifact-{label}-suppressed")),
+                        chrono::Duration::minutes(15),
+                    )
+                    .await
+                    .err(),
+                Some(crate::state::ReconciliationEvidenceRejection::SuppressedPriorAttempt)
+            );
+
+            drop(lifecycle);
+            drop(foreground);
+            server.close();
+            close_fixture(state, root).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn registered_artifact_repaired_while_waiting_settles_without_network_or_quarantine() {
+        let body = b"already-repaired-registered-artifact".to_vec();
+        let digest = format!("{:x}", Sha1::digest(&body));
+        let (state, root) = state_fixture("registered-artifact-already-repaired", None);
+        let instance = state
+            .instances()
+            .insert_for_test("Registered artifact already repaired", "1.21.5")
+            .expect("instance");
+        let inventory = KnownGoodInventory::from_test_entries([entry(
+            TestKnownGoodRoot::Libraries,
+            "exact/library.jar",
+            KnownGoodArtifactKind::Library,
+            TestKnownGoodIntegrity::Sha1 {
+                digest,
+                size: body.len() as u64,
+            },
+        )])
+        .expect("inventory")
+        .with_test_standalone_leaf_repair_source(0, "http://127.0.0.1:0/unreachable")
+        .expect("repair source");
+        state.activate_known_good_inventory_for_test(&instance.id, inventory);
+        let destination = root.join("private-library-root/libraries/exact/library.jar");
+        fs::create_dir_all(destination.parent().expect("library parent")).expect("library parent");
+        let foreground = test_integrity_foreground(&state).await;
+        let lifecycle = state.acquire_instance_lifecycle(&instance.id).await;
+        let report = sense_integrity_tier1(
+            &state,
+            &foreground,
+            &lifecycle,
+            &root.join("private-library-root"),
+        )
+        .await
+        .expect("Tier one report");
+        let (_, findings) = report.into_parts();
+        let target = findings.repair_target().expect("repair target").clone();
+        let authorization = findings
+            .authorize_repair(&registered_artifact_decision(
+                target.clone(),
+                GuardianMode::Managed,
+            ))
+            .expect("repair authorization");
+        let operation_id = OperationId::new("registered-artifact-already-repaired");
+        let admission = state
+            .admit_registered_artifact_repair(
+                authorization,
+                operation_id.clone(),
+                chrono::Duration::minutes(15),
+            )
+            .await
+            .expect("repair admission");
+
+        fs::write(&destination, &body).expect("shared repair completed while waiting");
+        let outcome =
+            execute_registered_guardian_artifact_repair(admission, &reqwest::Client::new())
+                .await
+                .expect("already repaired outcome");
+
+        assert_eq!(outcome.status, GuardianArtifactRepairStatus::Repaired);
+        assert!(outcome.facts.is_empty());
+        let journal = state.journals().get(&operation_id).expect("repair journal");
+        assert_eq!(
+            journal
+                .completed_steps
+                .last()
+                .expect("completed no-op")
+                .step_id,
+            "registered_artifact_already_exact"
+        );
+        let terminal = journal.reconciliation_terminal().expect("typed terminal");
+        assert_eq!(terminal.target(), &target);
+        assert!(terminal.quarantined_target().is_none());
+
+        drop(lifecycle);
+        drop(foreground);
+        close_fixture(state, root).await;
+    }
+
+    #[tokio::test]
+    async fn registered_artifact_admission_revalidates_inventory_after_config_wait() {
+        let (state, root) = state_fixture("registered-artifact-config-wait", None);
+        let instance = state
+            .instances()
+            .insert_for_test("Registered artifact config wait", "1.21.5")
+            .expect("instance");
+        let inventory = || {
+            KnownGoodInventory::from_test_entries([entry(
+                TestKnownGoodRoot::Libraries,
+                "exact/library.jar",
+                KnownGoodArtifactKind::Library,
+                TestKnownGoodIntegrity::Sha1 {
+                    digest: ZERO_SHA1.to_string(),
+                    size: 7,
+                },
+            )])
+            .expect("inventory")
+            .with_test_standalone_leaf_repair_source(0, "https://example.invalid/exact-library.jar")
+            .expect("repair source")
+        };
+        state.activate_known_good_inventory_for_test(&instance.id, inventory());
+        let foreground = test_integrity_foreground(&state).await;
+        let lifecycle = state.acquire_instance_lifecycle(&instance.id).await;
+        let report = sense_integrity_tier1(
+            &state,
+            &foreground,
+            &lifecycle,
+            &root.join("private-library-root"),
+        )
+        .await
+        .expect("Tier one report");
+        let (_, findings) = report.into_parts();
+        let target = findings.repair_target().expect("repair target").clone();
+        let authorization = findings
+            .authorize_repair(&registered_artifact_decision(target, GuardianMode::Managed))
+            .expect("repair authorization");
+        let config_gate = state
+            .config()
+            .acquire_mutation()
+            .await
+            .expect("config gate");
+        let mut admission = Box::pin(state.admit_registered_artifact_repair(
+            authorization,
+            OperationId::new("registered-artifact-config-wait"),
+            chrono::Duration::minutes(15),
+        ));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), &mut admission)
+                .await
+                .is_err()
+        );
+        state.activate_known_good_inventory_for_test(&instance.id, inventory());
+        drop(config_gate);
+        assert_eq!(
+            admission.await.err(),
+            Some(crate::state::ReconciliationEvidenceRejection::IncarnationMismatch)
+        );
+
+        drop(lifecycle);
+        drop(foreground);
+        close_fixture(state, root).await;
+    }
+
+    #[tokio::test]
+    async fn registered_artifact_hash_failure_records_failed_rung_one_terminal() {
+        let expected = b"expected-registered-artifact".to_vec();
+        let served = b"rejected-registered-artifact".to_vec();
+        assert_eq!(expected.len(), served.len());
+        let server = RegisteredArtifactServer::start(served);
+        let (state, root) = state_fixture("registered-artifact-hash-failure", None);
+        let instance = state
+            .instances()
+            .insert_for_test("Registered artifact hash failure", "1.21.5")
+            .expect("instance");
+        let inventory = KnownGoodInventory::from_test_entries([entry(
+            TestKnownGoodRoot::Libraries,
+            "exact/library.jar",
+            KnownGoodArtifactKind::Library,
+            TestKnownGoodIntegrity::Sha1 {
+                digest: format!("{:x}", Sha1::digest(&expected)),
+                size: expected.len() as u64,
+            },
+        )])
+        .expect("inventory")
+        .with_test_standalone_leaf_repair_source(0, &server.url)
+        .expect("repair source");
+        state.activate_known_good_inventory_for_test(&instance.id, inventory);
+        fs::create_dir_all(root.join("private-library-root/libraries/exact"))
+            .expect("library parent");
+        let foreground = test_integrity_foreground(&state).await;
+        let lifecycle = state.acquire_instance_lifecycle(&instance.id).await;
+        let report = sense_integrity_tier1(
+            &state,
+            &foreground,
+            &lifecycle,
+            &root.join("private-library-root"),
+        )
+        .await
+        .expect("Tier one report");
+        let (_, findings) = report.into_parts();
+        let target = findings.repair_target().expect("repair target").clone();
+        let authorization = findings
+            .authorize_repair(&registered_artifact_decision(
+                target.clone(),
+                GuardianMode::Managed,
+            ))
+            .expect("repair authorization");
+        let operation_id = OperationId::new("registered-artifact-hash-failure");
+        let admission = state
+            .admit_registered_artifact_repair(
+                authorization,
+                operation_id.clone(),
+                chrono::Duration::minutes(15),
+            )
+            .await
+            .expect("repair admission");
+        let outcome =
+            execute_registered_guardian_artifact_repair(admission, &reqwest::Client::new())
+                .await
+                .expect("failed repair outcome");
+
+        assert_eq!(outcome.status, GuardianArtifactRepairStatus::Failed);
+        let terminal = state
+            .journals()
+            .get(&operation_id)
+            .and_then(|journal| journal.reconciliation_terminal().cloned())
+            .expect("failed typed terminal");
+        assert_eq!(terminal.target(), &target);
+        assert_eq!(
+            terminal.outcome(),
+            crate::state::contracts::ReconciliationTerminalOutcome::Failed
+        );
+        assert!(
+            state
+                .failure_memory()
+                .get(&crate::state::reconciliation_attempt_key(
+                    terminal.attempt()
+                ))
+                .is_some()
+        );
+
+        drop(lifecycle);
+        drop(foreground);
+        server.close();
+        close_fixture(state, root).await;
+    }
+
+    #[tokio::test]
+    async fn tier_one_rejects_inventory_replacement_before_findings_are_sealed() {
+        let (state, root) = state_fixture("tier1-finding-inventory-drift", None);
+        let instance = state
+            .instances()
+            .insert_for_test("Tier one inventory drift", "1.21.5")
+            .expect("instance");
+        let inventory = || {
+            KnownGoodInventory::from_test_entries([entry(
+                TestKnownGoodRoot::Libraries,
+                "drift/library.jar",
+                KnownGoodArtifactKind::Library,
+                TestKnownGoodIntegrity::File { size: 7 },
+            )])
+            .expect("inventory")
+        };
+        state.activate_known_good_inventory_for_test(&instance.id, inventory());
+        let foreground = test_integrity_foreground(&state).await;
+        let lifecycle = state.acquire_instance_lifecycle(&instance.id).await;
+        let (gate, started) = BlockingContentGate::new();
+        let sensing_gate = gate.clone();
+        let sensing_state = state.clone();
+        let sensing_root = root.join("private-library-root");
+        let sensing = tokio::spawn(async move {
+            sense_integrity_tier1_with_reader_factory(
+                &sensing_state,
+                &foreground,
+                &lifecycle,
+                &sensing_root,
+                move || BlockingContentReader { gate: sensing_gate },
+            )
+            .await
+        });
+
+        started.await.expect("Tier one worker started");
+        state.activate_known_good_inventory_for_test(&instance.id, inventory());
+        gate.release();
+        assert!(matches!(
+            sensing.await.expect("Tier one task"),
+            Err(KnownGoodVerificationUnavailable::LiveAuthorityUnavailable)
+        ));
+        assert!(state.subscribe_integrity_idle().borrow().is_stably_idle());
+        close_fixture(state, root).await;
+    }
+
+    #[tokio::test]
+    async fn tier_one_rejects_instance_incarnation_drift_before_findings_are_sealed() {
+        let (state, root) = state_fixture("tier1-finding-incarnation-drift", None);
+        let instance = state
+            .instances()
+            .insert_for_test("Tier one incarnation drift", "1.21.5")
+            .expect("instance");
+        let inventory = KnownGoodInventory::from_test_entries([entry(
+            TestKnownGoodRoot::Libraries,
+            "drift/library.jar",
+            KnownGoodArtifactKind::Library,
+            TestKnownGoodIntegrity::File { size: 7 },
+        )])
+        .expect("inventory");
+        state.activate_known_good_inventory_for_test(&instance.id, inventory);
+        let foreground = test_integrity_foreground(&state).await;
+        let lifecycle = state.acquire_instance_lifecycle(&instance.id).await;
+        let (gate, started) = BlockingContentGate::new();
+        let sensing_gate = gate.clone();
+        let sensing_state = state.clone();
+        let sensing_root = root.join("private-library-root");
+        let sensing = tokio::spawn(async move {
+            sense_integrity_tier1_with_reader_factory(
+                &sensing_state,
+                &foreground,
+                &lifecycle,
+                &sensing_root,
+                move || BlockingContentReader { gate: sensing_gate },
+            )
+            .await
+        });
+
+        started.await.expect("Tier one worker started");
+        let mut replacement = instance.clone();
+        replacement.version_id = "1.21.6".to_string();
+        state
+            .instances()
+            .replace_for_test(replacement)
+            .expect("replace instance incarnation");
+        gate.release();
+        assert!(matches!(
+            sensing.await.expect("Tier one task"),
+            Err(KnownGoodVerificationUnavailable::LiveAuthorityUnavailable)
+        ));
+        assert!(state.subscribe_integrity_idle().borrow().is_stably_idle());
         close_fixture(state, root).await;
     }
 

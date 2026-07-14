@@ -24,6 +24,7 @@ pub mod performance_operations;
 mod performance_rules;
 pub mod presence;
 mod reconciliation;
+mod registered_artifact_findings;
 mod remote_flags;
 mod sessions;
 mod shutdown;
@@ -106,6 +107,12 @@ pub(crate) use reconciliation::{
     reconciliation_memory_entry, reconciliation_terminal, record_guardian_repair_refusal,
     record_reconciliation_journal_failure, record_reconciliation_journal_success,
     reserve_reconciliation_attempt, settle_reconciliation_memory, validate_reconciliation_memory,
+};
+#[cfg(test)]
+pub(crate) use registered_artifact_findings::RegisteredArtifactRepairAuthorizationRejection;
+pub(crate) use registered_artifact_findings::{
+    RegisteredArtifactCondition, RegisteredArtifactFindings, RegisteredArtifactObservation,
+    RegisteredArtifactRepairAdmission, RegisteredArtifactRepairEffect,
 };
 pub(crate) use remote_flags::{
     RemoteFlagRefreshOutcome, RemoteFlagStore, ResolvedFlagSource, resolve_flag,

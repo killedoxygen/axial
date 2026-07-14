@@ -1214,10 +1214,10 @@ impl GuardianRuntimeRepairCopy {
     pub(crate) fn guardian_summary(&self, current: &GuardianSummary) -> GuardianSummary {
         match self.status {
             GuardianRepairStatus::Repaired => {
-                repaired_runtime_guardian_summary(current, &self.user_outcome)
+                repaired_guardian_summary(current, &self.user_outcome)
             }
             GuardianRepairStatus::Blocked | GuardianRepairStatus::Failed => {
-                blocked_runtime_guardian_summary(current, &self.user_outcome)
+                blocked_repair_guardian_summary(current, &self.user_outcome)
             }
         }
     }
@@ -1248,7 +1248,7 @@ impl GuardianRuntimeRepairCopy {
     }
 }
 
-fn repaired_runtime_guardian_summary(
+fn repaired_guardian_summary(
     current: &GuardianSummary,
     outcome: &GuardianUserOutcome,
 ) -> GuardianSummary {
@@ -1274,7 +1274,7 @@ fn repaired_runtime_guardian_summary(
     summary
 }
 
-fn blocked_runtime_guardian_summary(
+fn blocked_repair_guardian_summary(
     current: &GuardianSummary,
     outcome: &GuardianUserOutcome,
 ) -> GuardianSummary {
@@ -1394,6 +1394,17 @@ pub(crate) fn guardian_summary_with_observed_outcome(
     projected.details = details;
     projected.guidance = guidance;
     projected
+}
+
+pub(crate) fn guardian_summary_with_artifact_repair_outcome(
+    current: &GuardianSummary,
+    outcome: &GuardianUserOutcome,
+) -> GuardianSummary {
+    if outcome.decision == GuardianActionKind::Repair {
+        repaired_guardian_summary(current, outcome)
+    } else {
+        blocked_repair_guardian_summary(current, outcome)
+    }
 }
 
 pub(crate) fn guardian_summary_from_admission(
@@ -1974,9 +1985,9 @@ const GUARDIAN_COPY_RULES: &[GuardianCopyRule] = &[
             CopyContextKey::ArtifactRepaired,
         ),
         OperationPhase::Repairing,
-        "Guardian repaired a launcher-managed install artifact.",
+        "Guardian repaired a launcher-managed artifact.",
         &[CopyLine::Static(
-            "Retry the install to continue from the repaired state.",
+            "The launcher can continue from the repaired state.",
         )],
         &[],
     ),
@@ -1987,7 +1998,7 @@ const GUARDIAN_COPY_RULES: &[GuardianCopyRule] = &[
             CopyContextKey::ArtifactBlocked,
         ),
         OperationPhase::Repairing,
-        "Guardian blocked automatic install repair because it was unsafe.",
+        "Guardian blocked automatic artifact repair because it was unsafe.",
         &[CopyLine::Static(
             "The launcher did not mutate files that were not proven launcher-managed.",
         )],
@@ -2000,7 +2011,7 @@ const GUARDIAN_COPY_RULES: &[GuardianCopyRule] = &[
             CopyContextKey::ArtifactFailed,
         ),
         OperationPhase::Repairing,
-        "Guardian could not repair the launcher-managed install artifact.",
+        "Guardian could not repair the launcher-managed artifact.",
         &[CopyLine::Static(
             "Check connection and storage permissions before trying again.",
         )],
@@ -3853,10 +3864,11 @@ mod tests {
         guardian_summary_for_test, guardian_summary_from_persisted_value,
     };
     use crate::guardian::{
-        DiagnosisId, GuardianActionKind, GuardianInstallArtifactFailureEvidence,
-        GuardianInstallArtifactFailureKind, GuardianJvmPresetId, GuardianLaunchAdmission,
-        GuardianManagedJavaReason, GuardianPerformanceSupervisionRejection, GuardianRepairStatus,
-        GuardianStripJvmArgsReason, GuardianUserOutcome, SafetyOutcome,
+        DiagnosisId, GuardianActionKind, GuardianArtifactRepairStatus,
+        GuardianInstallArtifactFailureEvidence, GuardianInstallArtifactFailureKind,
+        GuardianJvmPresetId, GuardianLaunchAdmission, GuardianManagedJavaReason,
+        GuardianPerformanceSupervisionRejection, GuardianRepairStatus, GuardianStripJvmArgsReason,
+        GuardianUserOutcome, SafetyOutcome,
     };
     use crate::state::contracts::OperationPhase;
     use axial_launcher::{
@@ -4655,6 +4667,41 @@ mod tests {
                     .guidance
                     .iter()
                     .all(|line| line.len() <= MAX_LINE_BYTES)
+            );
+        }
+    }
+
+    #[test]
+    fn artifact_repair_summary_projects_repaired_and_terminal_states() {
+        let current = warning_summary();
+        for (status, expected_decision) in [
+            (
+                GuardianArtifactRepairStatus::Repaired,
+                GuardianSummaryDecision::Intervened,
+            ),
+            (
+                GuardianArtifactRepairStatus::Blocked,
+                GuardianSummaryDecision::Blocked,
+            ),
+            (
+                GuardianArtifactRepairStatus::Failed,
+                GuardianSummaryDecision::Blocked,
+            ),
+        ] {
+            let outcome = author_guardian_copy(GuardianCopyRequest::artifact_repair(
+                DiagnosisId::LauncherManagedArtifactCorrupt,
+                status,
+            ))
+            .expect("artifact repair copy");
+            let projected =
+                super::guardian_summary_with_artifact_repair_outcome(&current, &outcome);
+            assert_eq!(projected.decision, expected_decision);
+            assert_eq!(projected.message.as_deref(), Some(outcome.summary()));
+            assert!(
+                projected
+                    .details
+                    .iter()
+                    .all(|detail| detail.len() <= MAX_LINE_BYTES)
             );
         }
     }

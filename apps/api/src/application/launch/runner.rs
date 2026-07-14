@@ -13,24 +13,27 @@ use crate::execution::launch::{
     LaunchCommandPreparationRequest, launch_command_stage_evidence, prepare_launch_command,
 };
 use crate::guardian::{
-    GuardianCopyRequest, GuardianFact, GuardianLaunchRecoveryPlan,
-    GuardianObservedLaunchFailurePhase, GuardianPrepareFailureRequest,
-    GuardianPresetAdjustmentRequest, GuardianStartupFailureObservation,
-    GuardianStartupFailureRequest, GuardianSummary, author_guardian_copy,
+    DiagnosisId, GuardianActionKind, GuardianArtifactRepairStatus, GuardianCopyRequest,
+    GuardianFact, GuardianLaunchRecoveryPlan, GuardianObservedLaunchFailurePhase,
+    GuardianPrepareFailureRequest, GuardianPresetAdjustmentRequest,
+    GuardianStartupFailureObservation, GuardianStartupFailureRequest, GuardianSummary,
+    author_guardian_copy, execute_registered_guardian_artifact_repair,
     guardian_fact_from_execution, guardian_prelaunch_preset_adjustment_directive,
     guardian_prepare_failure_outcome, guardian_startup_failure_outcome,
-    guardian_summary_with_blocked_outcome, guardian_summary_with_observed_outcome,
-    is_guardian_launch_crash_class, record_launch_failure_observation,
+    guardian_summary_with_artifact_repair_outcome, guardian_summary_with_blocked_outcome,
+    guardian_summary_with_observed_outcome, is_guardian_launch_crash_class,
+    record_launch_failure_observation,
 };
 use crate::logging::{append_trace, timestamp_utc};
 use crate::observability::telemetry::{
     TelemetryErrorArea, TelemetryErrorKind, TelemetryErrorLevel, TelemetryEvent,
     TelemetryLaunchOutcome,
 };
+use crate::state::contracts::OperationId;
 use crate::state::launch_reports::LaunchProofContext;
 use crate::state::{
     AppState, LaunchEvent, LaunchFailureTermination, LaunchFailureTerminationErrorClass,
-    LaunchStatusEvent, OperationJournalStoreError, StartupOutcome,
+    LaunchStatusEvent, OperationJournalStoreError, RegisteredArtifactFindings, StartupOutcome,
 };
 use axial_launcher::{
     LaunchFailureClass, LaunchSessionExitReason, LaunchSessionOutcome, LaunchSessionOutcomeKind,
@@ -78,6 +81,7 @@ pub(super) async fn persist_launch_proof_for_reservation_failure(
 const STARTUP_OBSERVATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 const SESSION_TERMINAL_REATTACH_DELAY: std::time::Duration = std::time::Duration::from_millis(25);
 const MAX_RECOVERY_ATTEMPTS: u8 = 3;
+const REGISTERED_ARTIFACT_REPAIR_SUPPRESSION_MINUTES: i64 = 15;
 
 pub struct LaunchSuccess {
     pub session_id: String,
@@ -260,7 +264,12 @@ async fn own_terminal_observation(
             Ok(LaunchEvent::Status(status))
                 if matches!(status.state.as_str(), "failed" | "exited") =>
             {
-                break state.sessions().get(&session_id).await;
+                let record = state.sessions().get(&session_id).await;
+                if record.as_ref().is_some_and(|record| {
+                    matches!(record.state, LaunchState::Failed | LaunchState::Exited)
+                }) {
+                    break record;
+                }
             }
             Ok(_) => {}
             Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
@@ -646,6 +655,7 @@ async fn launch_session_inner_with_control(
     let mut attempt = axial_launcher::service::AttemptOverrides::default();
     let mut last_recovery_plan: Option<GuardianLaunchRecoveryPlan> = None;
     let mut recovery_attempts = 0_u8;
+    let mut registered_artifact_process_retry_used = false;
     let mut launch_completion_pending = false;
     emit_launch_started(
         &state,
@@ -1184,25 +1194,33 @@ async fn launch_session_inner_with_control(
                 } else {
                     GuardianStartupFailureObservation::Exited { failure_class }
                 };
-                let integrity_facts = sense_startup_failure_integrity(
-                    &state,
-                    integrity_foreground
-                        .as_ref()
-                        .expect("preboot launch must retain foreground authority"),
-                    &intent.instance_id,
-                    &intent.library_dir,
-                    failure_class,
-                )
-                .await;
+                let integrity = if registered_artifact_process_retry_used {
+                    StartupFailureIntegrity::default()
+                } else {
+                    sense_startup_failure_integrity(
+                        &state,
+                        integrity_foreground
+                            .as_ref()
+                            .expect("preboot launch must retain foreground authority"),
+                        &intent.instance_id,
+                        &intent.library_dir,
+                        failure_class,
+                    )
+                    .await
+                };
                 let guardian_mode = api_guardian_mode(intent.guardian.mode);
-                let startup_outcome =
+                let startup_outcome = {
+                    let repair_target = (!registered_artifact_process_retry_used)
+                        .then(|| integrity.repair_target())
+                        .flatten();
                     guardian_startup_failure_outcome(GuardianStartupFailureRequest {
                         mode: guardian_mode,
                         observation,
                         crash_evidence: terminal_record
                             .as_ref()
                             .and_then(|record| record.crash_evidence.as_ref()),
-                        integrity_facts: &integrity_facts,
+                        integrity_facts: &integrity.facts,
+                        registered_artifact_repair_target: repair_target,
                         target_version_id: &intent.target_version_id,
                         runtime_major: prepared.runtime.effective_info.major,
                         requested_java_present: !intent.requested_java.trim().is_empty(),
@@ -1213,7 +1231,8 @@ async fn launch_session_inner_with_control(
                         startup_recovery_applied: attempt.startup_recovery_applied,
                         disable_custom_gc: attempt.disable_custom_gc,
                         effective_preset: &prepared.effective_preset,
-                    });
+                    })
+                };
                 let failure_class = startup_outcome.failure_class;
                 if is_guardian_launch_crash_class(failure_class) {
                     let observed_at = timestamp_utc();
@@ -1247,6 +1266,210 @@ async fn launch_session_inner_with_control(
                     TelemetryErrorLevel::Error,
                     failure_class.as_str(),
                 ));
+
+                match registered_artifact_startup_disposition(
+                    guardian_mode,
+                    startup_outcome.guardian_decision.kind(),
+                    registered_artifact_process_retry_used,
+                ) {
+                    RegisteredArtifactStartupDisposition::TerminalizeRetryFailure => {
+                        let healing =
+                            startup_failure_healing(&intent, &prepared, &attempt, failure_class);
+                        guardian = guardian_summary_with_blocked_outcome(
+                            &guardian,
+                            &startup_outcome.user_outcome,
+                        );
+                        return Err(finish_launch_failure(
+                            &state,
+                            producer,
+                            &session_id,
+                            &mut launch_completion_pending,
+                            LaunchFailure {
+                                proof_context: Some(&proof_context),
+                                class: failure_class,
+                                message: startup_outcome.user_outcome.summary(),
+                                healing,
+                                guardian: Some(guardian.clone()),
+                                outcome: None,
+                            },
+                        )
+                        .await);
+                    }
+                    RegisteredArtifactStartupDisposition::ExecuteRepair => {
+                        let healing =
+                            startup_failure_healing(&intent, &prepared, &attempt, failure_class);
+                        let Some(findings) = integrity.into_findings() else {
+                            trace_launch_event(
+                                &session_id,
+                                "registered artifact repair evidence was unavailable",
+                            );
+                            return Err(finish_registered_artifact_repair_failure(
+                                &state,
+                                producer,
+                                &session_id,
+                                &mut launch_completion_pending,
+                                &proof_context,
+                                failure_class,
+                                healing,
+                                guardian,
+                                DiagnosisId::LauncherManagedArtifactCorrupt,
+                                GuardianArtifactRepairStatus::Blocked,
+                            )
+                            .await);
+                        };
+                        let authorization =
+                            match findings.authorize_repair(&startup_outcome.guardian_decision) {
+                                Ok(authorization) => authorization,
+                                Err(_) => {
+                                    trace_launch_event(
+                                        &session_id,
+                                        "registered artifact repair authorization was rejected",
+                                    );
+                                    return Err(finish_registered_artifact_repair_failure(
+                                        &state,
+                                        producer,
+                                        &session_id,
+                                        &mut launch_completion_pending,
+                                        &proof_context,
+                                        failure_class,
+                                        healing,
+                                        guardian,
+                                        DiagnosisId::LauncherManagedArtifactCorrupt,
+                                        GuardianArtifactRepairStatus::Blocked,
+                                    )
+                                    .await);
+                                }
+                            };
+                        let operation_id = startup_outcome
+                            .guardian_decision
+                            .operation_id()
+                            .cloned()
+                            .unwrap_or_else(new_registered_artifact_repair_operation_id);
+                        let admission = match state
+                            .admit_registered_artifact_repair(
+                                authorization,
+                                operation_id,
+                                chrono::Duration::minutes(
+                                    REGISTERED_ARTIFACT_REPAIR_SUPPRESSION_MINUTES,
+                                ),
+                            )
+                            .await
+                        {
+                            Ok(admission) => admission,
+                            Err(_) => {
+                                trace_launch_event(
+                                    &session_id,
+                                    "registered artifact repair admission was rejected",
+                                );
+                                return Err(finish_registered_artifact_repair_failure(
+                                    &state,
+                                    producer,
+                                    &session_id,
+                                    &mut launch_completion_pending,
+                                    &proof_context,
+                                    failure_class,
+                                    healing,
+                                    guardian,
+                                    DiagnosisId::LauncherManagedArtifactCorrupt,
+                                    GuardianArtifactRepairStatus::Blocked,
+                                )
+                                .await);
+                            }
+                        };
+                        let repair_task = producer.claim_child().spawn_joinable(async move {
+                            let client = reqwest::Client::new();
+                            execute_registered_guardian_artifact_repair(admission, &client).await
+                        });
+                        let repair_outcome = match repair_task.await {
+                            Ok(Ok(outcome)) => outcome,
+                            Ok(Err(_)) | Err(_) => {
+                                trace_launch_event(
+                                    &session_id,
+                                    "registered artifact repair execution failed",
+                                );
+                                return Err(finish_registered_artifact_repair_failure(
+                                    &state,
+                                    producer,
+                                    &session_id,
+                                    &mut launch_completion_pending,
+                                    &proof_context,
+                                    failure_class,
+                                    healing,
+                                    guardian,
+                                    DiagnosisId::LauncherManagedArtifactCorrupt,
+                                    GuardianArtifactRepairStatus::Failed,
+                                )
+                                .await);
+                            }
+                        };
+                        if repair_outcome.action != GuardianActionKind::Repair
+                            || repair_outcome.diagnosis_id
+                                != DiagnosisId::LauncherManagedArtifactCorrupt
+                        {
+                            trace_launch_event(
+                                &session_id,
+                                "registered artifact repair returned an invalid outcome",
+                            );
+                            return Err(finish_registered_artifact_repair_failure(
+                                &state,
+                                producer,
+                                &session_id,
+                                &mut launch_completion_pending,
+                                &proof_context,
+                                failure_class,
+                                healing,
+                                guardian,
+                                DiagnosisId::LauncherManagedArtifactCorrupt,
+                                GuardianArtifactRepairStatus::Failed,
+                            )
+                            .await);
+                        }
+                        let repair_user_outcome =
+                            author_guardian_copy(GuardianCopyRequest::artifact_repair(
+                                repair_outcome.diagnosis_id,
+                                repair_outcome.status,
+                            ))
+                            .expect("registered artifact repair copy request is closed");
+                        guardian = guardian_summary_with_artifact_repair_outcome(
+                            &guardian,
+                            &repair_user_outcome,
+                        );
+                        state
+                            .sessions()
+                            .emit_log(
+                                &session_id,
+                                "system",
+                                repair_user_outcome.summary().to_string(),
+                            )
+                            .await;
+                        match repair_outcome.status {
+                            GuardianArtifactRepairStatus::Repaired => {
+                                registered_artifact_process_retry_used = true;
+                                continue;
+                            }
+                            GuardianArtifactRepairStatus::Blocked
+                            | GuardianArtifactRepairStatus::Failed => {
+                                return Err(finish_launch_failure(
+                                    &state,
+                                    producer,
+                                    &session_id,
+                                    &mut launch_completion_pending,
+                                    LaunchFailure {
+                                        proof_context: Some(&proof_context),
+                                        class: failure_class,
+                                        message: repair_user_outcome.summary(),
+                                        healing,
+                                        guardian: Some(guardian.clone()),
+                                        outcome: None,
+                                    },
+                                )
+                                .await);
+                            }
+                        }
+                    }
+                    RegisteredArtifactStartupDisposition::ContinueStartupRecovery => {}
+                }
+
                 if let Some(directive) = startup_outcome.directive.clone() {
                     let failure_message =
                         match handle_recovery_directive(RecoveryDirectiveRequest {
@@ -1415,6 +1638,47 @@ fn guardian_journal_error(_error: OperationJournalStoreError) -> LaunchRequestEr
     }
 }
 
+fn new_registered_artifact_repair_operation_id() -> OperationId {
+    OperationId::new(format!(
+        "guardian-registered-artifact-repair:{}",
+        uuid::Uuid::new_v4()
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn finish_registered_artifact_repair_failure(
+    state: &AppState,
+    producer: &crate::state::ProducerLease,
+    session_id: &str,
+    launch_completion_pending: &mut bool,
+    proof_context: &LaunchProofContext,
+    failure_class: LaunchFailureClass,
+    healing: Option<axial_launcher::LaunchHealingSummary>,
+    guardian: GuardianSummary,
+    diagnosis_id: DiagnosisId,
+    status: GuardianArtifactRepairStatus,
+) -> LaunchRequestError {
+    let user_outcome =
+        author_guardian_copy(GuardianCopyRequest::artifact_repair(diagnosis_id, status))
+            .expect("registered artifact repair copy request is closed");
+    let guardian = guardian_summary_with_artifact_repair_outcome(&guardian, &user_outcome);
+    finish_launch_failure(
+        state,
+        producer,
+        session_id,
+        launch_completion_pending,
+        LaunchFailure {
+            proof_context: Some(proof_context),
+            class: failure_class,
+            message: user_outcome.summary(),
+            healing,
+            guardian: Some(guardian),
+            outcome: None,
+        },
+    )
+    .await
+}
+
 async fn finish_launch_failure(
     state: &AppState,
     producer: &crate::state::ProducerLease,
@@ -1537,27 +1801,65 @@ fn failure_class_needs_tier1_integrity(failure_class: LaunchFailureClass) -> boo
     )
 }
 
+#[derive(Default)]
+struct StartupFailureIntegrity {
+    facts: Vec<GuardianFact>,
+    findings: Option<RegisteredArtifactFindings>,
+}
+
+impl StartupFailureIntegrity {
+    fn repair_target(&self) -> Option<&crate::state::contracts::TargetDescriptor> {
+        self.findings.as_ref()?.repair_target()
+    }
+
+    fn into_findings(self) -> Option<RegisteredArtifactFindings> {
+        self.findings
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RegisteredArtifactStartupDisposition {
+    ContinueStartupRecovery,
+    ExecuteRepair,
+    TerminalizeRetryFailure,
+}
+
+fn registered_artifact_startup_disposition(
+    mode: crate::guardian::GuardianMode,
+    decision: GuardianActionKind,
+    process_retry_used: bool,
+) -> RegisteredArtifactStartupDisposition {
+    if process_retry_used {
+        return RegisteredArtifactStartupDisposition::TerminalizeRetryFailure;
+    }
+    if mode == crate::guardian::GuardianMode::Managed && decision == GuardianActionKind::Repair {
+        return RegisteredArtifactStartupDisposition::ExecuteRepair;
+    }
+    RegisteredArtifactStartupDisposition::ContinueStartupRecovery
+}
+
 async fn sense_startup_failure_integrity(
     state: &AppState,
     integrity_foreground: &crate::state::IntegrityForegroundLease,
     instance_id: &str,
     library_dir: &std::path::Path,
     failure_class: LaunchFailureClass,
-) -> Vec<GuardianFact> {
+) -> StartupFailureIntegrity {
     if !failure_class_needs_tier1_integrity(failure_class) {
-        return Vec::new();
+        return StartupFailureIntegrity::default();
     }
 
     let Ok(lifecycle) = state
         .acquire_integrity_instance_lifecycle(integrity_foreground, instance_id)
         .await
     else {
-        return Vec::new();
+        return StartupFailureIntegrity::default();
     };
     sense_integrity_tier1(state, integrity_foreground, &lifecycle, library_dir)
         .await
-        .map(|report| {
-            report
+        .map(|admitted| {
+            let (report, findings) = admitted.into_parts();
+            let facts = report
                 .facts
                 .iter()
                 .map(|fact| {
@@ -1566,7 +1868,11 @@ async fn sense_startup_failure_integrity(
                         crate::state::contracts::OperationPhase::Launching,
                     )
                 })
-                .collect()
+                .collect();
+            StartupFailureIntegrity {
+                facts,
+                findings: Some(findings),
+            }
         })
         .unwrap_or_default()
 }
@@ -1639,6 +1945,98 @@ mod tests {
                 failure_class.as_str()
             );
         }
+    }
+
+    #[test]
+    fn registered_artifact_repair_starts_exactly_one_process_retry() {
+        let mut process_starts = 0;
+        let mut repair_executions = 0;
+        let mut process_retry_used = false;
+
+        loop {
+            process_starts += 1;
+            let decision = if process_starts == 1 {
+                GuardianActionKind::Repair
+            } else {
+                GuardianActionKind::Fallback
+            };
+            match registered_artifact_startup_disposition(
+                GuardianMode::Managed,
+                decision,
+                process_retry_used,
+            ) {
+                RegisteredArtifactStartupDisposition::ExecuteRepair => {
+                    repair_executions += 1;
+                    process_retry_used = true;
+                }
+                RegisteredArtifactStartupDisposition::TerminalizeRetryFailure => break,
+                RegisteredArtifactStartupDisposition::ContinueStartupRecovery => {
+                    panic!("post-repair startup failure must not enter unrelated recovery")
+                }
+            }
+        }
+
+        assert_eq!(process_starts, 2);
+        assert_eq!(repair_executions, 1);
+    }
+
+    #[test]
+    fn non_managed_modes_never_execute_registered_artifact_repair() {
+        for mode in [GuardianMode::Custom, GuardianMode::Disabled] {
+            assert_eq!(
+                registered_artifact_startup_disposition(mode, GuardianActionKind::Repair, false,),
+                RegisteredArtifactStartupDisposition::ContinueStartupRecovery
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn dropping_outer_launch_owner_keeps_owned_repair_settlement_alive() {
+        let root = unique_test_dir("owned-launch-repair-settlement");
+        let state = test_app_state(&root);
+        let producer = state
+            .try_claim_producer()
+            .expect("claim outer launch producer");
+        let foreground = state
+            .register_integrity_foreground()
+            .expect("register repair integrity foreground")
+            .wait_for_settlement()
+            .await;
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (finish_tx, finish_rx) = tokio::sync::oneshot::channel();
+        let settled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let child_settled = settled.clone();
+        let outer = tokio::spawn(async move {
+            let _repair = producer.claim_child().spawn_joinable(async move {
+                let _foreground = foreground;
+                let _ = started_tx.send(());
+                let _ = finish_rx.await;
+                child_settled.store(true, std::sync::atomic::Ordering::Release);
+            });
+            std::future::pending::<()>().await;
+        });
+
+        tokio::time::timeout(Duration::from_secs(2), started_rx)
+            .await
+            .expect("owned repair child start deadline")
+            .expect("owned repair child started");
+        outer.abort();
+        let _ = outer.await;
+        assert!(
+            !state.subscribe_integrity_idle().borrow().is_stably_idle(),
+            "repair child must retain lifecycle ownership after launch cancellation"
+        );
+        finish_tx.send(()).expect("release repair settlement");
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !settled.load(std::sync::atomic::Ordering::Acquire)
+                || !state.subscribe_integrity_idle().borrow().is_stably_idle()
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("owned repair settlement deadline");
+        let _ = fs::remove_dir_all(root);
     }
 
     fn empty_guardian_summary(mode: axial_launcher::GuardianMode) -> GuardianSummary {
@@ -2563,6 +2961,104 @@ mod tests {
             Some(0)
         );
         assert!(state.failure_memory().list().is_empty());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn terminal_observer_ignores_queued_terminal_event_after_retry_started() {
+        let root = unique_test_dir("stale-terminal-observer-event");
+        let state = test_app_state(&root);
+        let session_id = "stale-terminal-observer-event";
+        state
+            .sessions()
+            .insert(test_record(session_id))
+            .await
+            .expect("insert stale-event session");
+        let events = state
+            .sessions()
+            .subscribe(session_id)
+            .await
+            .expect("subscribe stale-event observer");
+        let (handoff_tx, handoff_rx) = tokio::sync::oneshot::channel();
+        let producer = state
+            .try_claim_producer()
+            .expect("claim stale-event producer");
+        let task = test_recovery_launch_task(&state, session_id, &root).await;
+        let proof_context = LaunchProofContext::from_intent(&task.intent);
+        drop(task);
+        drop(producer);
+        let observer_state = state.clone();
+        let mut observer = tokio::spawn(own_terminal_observation(
+            observer_state,
+            session_id.to_string(),
+            "instance".to_string(),
+            GuardianMode::Managed,
+            "2026-01-01T00:00:00.000Z".to_string(),
+            proof_context,
+            events,
+            handoff_rx,
+        ));
+
+        emit_status(
+            &state,
+            session_id,
+            LaunchState::Exited,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+        emit_status(
+            &state,
+            session_id,
+            LaunchState::Preparing,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+        assert!(
+            handoff_tx
+                .send(TerminalObservationHandoff::Observe {
+                    guardian: empty_guardian_summary(axial_launcher::GuardianMode::Managed),
+                })
+                .is_ok(),
+            "handoff retry observer"
+        );
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut observer)
+                .await
+                .is_err(),
+            "queued attempt-1 terminal event must not settle the retry session"
+        );
+
+        emit_status(
+            &state,
+            session_id,
+            LaunchState::Exited,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+        tokio::time::timeout(Duration::from_secs(2), observer)
+            .await
+            .expect("fresh terminal observation deadline")
+            .expect("fresh terminal observer task");
+
+        assert_eq!(
+            state
+                .sessions()
+                .get(session_id)
+                .await
+                .expect("fresh terminal session")
+                .state,
+            LaunchState::Exited
+        );
         let _ = fs::remove_dir_all(root);
     }
 

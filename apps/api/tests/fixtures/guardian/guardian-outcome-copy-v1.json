@@ -62,9 +62,9 @@
       "outcome": {
         "decision": "Repair",
         "phase": "Repairing",
-        "summary": "Guardian repaired a launcher-managed install artifact.",
+        "summary": "Guardian repaired a launcher-managed artifact.",
         "details": [
-          "Retry the install to continue from the repaired state."
+          "The launcher can continue from the repaired state."
         ],
         "guidance": []
       }
@@ -78,7 +78,7 @@
       "outcome": {
         "decision": "Block",
         "phase": "Repairing",
-        "summary": "Guardian blocked automatic install repair because it was unsafe.",
+        "summary": "Guardian blocked automatic artifact repair because it was unsafe.",
         "details": [
           "The launcher did not mutate files that were not proven launcher-managed."
         ],
@@ -94,7 +94,7 @@
       "outcome": {
         "decision": "Block",
         "phase": "Repairing",
-        "summary": "Guardian could not repair the launcher-managed install artifact.",
+        "summary": "Guardian could not repair the launcher-managed artifact.",
         "details": [
           "Check connection and storage permissions before trying again."
         ],

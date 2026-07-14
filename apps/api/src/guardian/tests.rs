@@ -227,7 +227,7 @@ async fn startup_integrity_facts_share_one_policy_evaluation() {
         confidence: None,
         ownership: OwnershipClass::LauncherManaged,
         target: Some(target(
-            "known_good_library",
+            "sha256.01234567.89abcdef.01234567.89abcdef.01234567.89abcdef.01234567.89abcdef",
             TargetKind::Artifact,
             OwnershipClass::LauncherManaged,
         )),
@@ -241,6 +241,7 @@ async fn startup_integrity_facts_share_one_policy_evaluation() {
             },
             crash_evidence: None,
             integrity_facts: &integrity_facts,
+            registered_artifact_repair_target: integrity_facts[0].target.as_ref(),
             target_version_id: "1.21.1",
             runtime_major: 21,
             requested_java_present: false,
@@ -255,6 +256,16 @@ async fn startup_integrity_facts_share_one_policy_evaluation() {
     .await;
 
     assert_eq!(evaluations, 1);
+    assert_eq!(outcome.guardian_decision.kind(), GuardianActionKind::Repair);
+    assert_eq!(
+        outcome
+            .guardian_decision
+            .action_plan()
+            .expect("registered artifact repair plan")
+            .prerequisite
+            .diagnosis_id,
+        DiagnosisId::LauncherManagedArtifactCorrupt
+    );
     assert_eq!(outcome.safety_case.phase, OperationPhase::Launching);
     assert!(
         outcome
@@ -472,6 +483,7 @@ fn declarative_rules_have_unique_ids_and_keep_conditions_out_of_evidence() {
         GuardianFactId::LaunchRuntimeFallbackAvailable,
         GuardianFactId::LaunchJvmStripAvailable,
         GuardianFactId::LaunchJvmPresetDowngradeAvailable,
+        GuardianFactId::RegisteredArtifactRepairAvailable,
     ];
 
     assert_eq!(DIAGNOSIS_RULES.len(), 60);
@@ -1430,6 +1442,7 @@ fn condition_only_input_falls_back_without_public_condition_evidence() {
         GuardianFactId::LaunchRuntimeFallbackAvailable,
         GuardianFactId::LaunchJvmStripAvailable,
         GuardianFactId::LaunchJvmPresetDowngradeAvailable,
+        GuardianFactId::RegisteredArtifactRepairAvailable,
     ]
     .map(|id| {
         guardian_test_fact(
@@ -1739,6 +1752,7 @@ impl NamedPolicyBoundaryCase {
                     observation: GuardianStartupFailureObservation::Stalled,
                     crash_evidence: None,
                     integrity_facts: &[],
+                    registered_artifact_repair_target: None,
                     target_version_id: "1.21.1",
                     runtime_major: 21,
                     requested_java_present: false,

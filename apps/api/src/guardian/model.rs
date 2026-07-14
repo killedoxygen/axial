@@ -124,6 +124,7 @@ pub enum GuardianFactId {
     ProviderDataInvalid,
     RecentRepairFailed,
     RecentStartupFailure,
+    RegisteredArtifactRepairAvailable,
     RepairSuppressedUntil,
     StartupWindowExpired,
     TempFileObserved,
@@ -135,7 +136,7 @@ pub enum GuardianFactId {
 }
 
 impl GuardianFactId {
-    pub const ALL: [Self; 121] = [
+    pub const ALL: [Self; 122] = [
         Self::AgentHookFailed,
         Self::AgentUnavailable,
         Self::ArtifactChecksumMismatch,
@@ -249,6 +250,7 @@ impl GuardianFactId {
         Self::ProviderDataInvalid,
         Self::RecentRepairFailed,
         Self::RecentStartupFailure,
+        Self::RegisteredArtifactRepairAvailable,
         Self::RepairSuppressedUntil,
         Self::StartupWindowExpired,
         Self::TempFileObserved,
@@ -380,6 +382,7 @@ impl GuardianFactId {
             Self::ProviderDataInvalid => "provider_data_invalid",
             Self::RecentRepairFailed => "recent_repair_failed",
             Self::RecentStartupFailure => "recent_startup_failure",
+            Self::RegisteredArtifactRepairAvailable => "registered_artifact_repair_available",
             Self::RepairSuppressedUntil => "repair_suppressed_until",
             Self::StartupWindowExpired => "startup_window_expired",
             Self::TempFileObserved => "temp_file_observed",

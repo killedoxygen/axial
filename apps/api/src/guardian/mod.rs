@@ -53,6 +53,7 @@ pub(crate) use artifact_descriptor::GuardianMinecraftArtifactRepairDescriptor;
 pub use artifact_repair::{GuardianArtifactRepairOutcome, GuardianArtifactRepairStatus};
 pub(crate) use artifact_repair::{
     execute_guardian_missing_download, execute_guardian_quarantine_redownload,
+    execute_registered_guardian_artifact_repair,
 };
 pub(crate) use component_rebuild::{
     GuardianRuntimeComponentRebuildOutcome, GuardianRuntimeComponentRebuildStatus,
@@ -65,10 +66,10 @@ pub(crate) use copy::{
     guardian_install_outcome_fact_group, guardian_install_outcome_from_persisted_group,
     guardian_install_outcome_persistence_facts, guardian_launch_stage_evidence,
     guardian_proof_evidence, guardian_summary_from_admission,
-    guardian_summary_from_persisted_export_value, guardian_summary_with_blocked_outcome,
-    guardian_summary_with_intervention, guardian_summary_with_observed_outcome,
-    guardian_summary_with_suppressed_outcome, launch_notice, launch_notice_from_values,
-    launch_session_outcome, launch_status_snapshot,
+    guardian_summary_from_persisted_export_value, guardian_summary_with_artifact_repair_outcome,
+    guardian_summary_with_blocked_outcome, guardian_summary_with_intervention,
+    guardian_summary_with_observed_outcome, guardian_summary_with_suppressed_outcome,
+    launch_notice, launch_notice_from_values, launch_session_outcome, launch_status_snapshot,
 };
 pub use copy::{
     GuardianInstallOutcomeSummary, GuardianJvmPresetNotice, GuardianJvmPresetOption,

@@ -29,7 +29,7 @@ This document is a deterministic human-readable projection of Guardian's strict 
 | Kernel cells | 540 |
 | Public kernel cells | 90 |
 | Diagnosis rules | 60 |
-| Registered facts | 121 |
+| Registered facts | 122 |
 | Preflight senses | 7 |
 | Adapter sources | 103 |
 | Repair hands | 3 |

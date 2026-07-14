@@ -12,6 +12,7 @@ pub mod launch;
 mod low_priority;
 pub(crate) mod persistence;
 pub mod process;
+pub(crate) mod registered_artifact;
 pub mod runtime;
 
 use crate::observability::{

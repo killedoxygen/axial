@@ -5954,6 +5954,11 @@
       "referenced_by_rule": false
     },
     {
+      "fact": "registered_artifact_repair_available",
+      "availability": "registered_current",
+      "referenced_by_rule": true
+    },
+    {
       "fact": "repair_suppressed_until",
       "availability": "registered_current",
       "referenced_by_rule": false

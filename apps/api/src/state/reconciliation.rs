@@ -438,6 +438,29 @@ impl RegisteredReconciliationAuthority {
         self.state.failure_memory.as_ref()
     }
 
+    pub(crate) fn registered_artifact_findings_are_current(
+        &self,
+        findings: &super::RegisteredArtifactFindings,
+    ) -> bool {
+        self.state
+            .registered_artifact_findings_are_current(findings)
+    }
+
+    pub(crate) fn attempt_is_current(&self, attempt: &ReconciliationAttempt) -> bool {
+        self.state
+            .current_reconciliation_incarnation(&self.lifecycle.instance_id)
+            .is_ok_and(|current| {
+                matches!(
+                    attempt.scope(),
+                    ReconciliationScope::RegisteredInstance {
+                        instance_id,
+                        fingerprint,
+                    } if instance_id == &self.lifecycle.instance_id
+                        && fingerprint == &current.fingerprint
+                )
+            })
+    }
+
     pub(crate) fn owns_runtime_root(
         &self,
         runtime_root: &crate::execution::runtime::ManagedRuntimeRoot<'_>,
@@ -480,6 +503,35 @@ impl RegisteredReconciliationAuthority {
         attempt: ReconciliationAttempt,
         outcome: ReconciliationTerminalOutcome,
     ) -> Result<ReconciliationTerminal, ReconciliationEvidenceRejection> {
+        self.terminal_with_quarantine(attempt, outcome, None)
+    }
+
+    pub(crate) fn artifact_terminal(
+        &self,
+        attempt: ReconciliationAttempt,
+        outcome: ReconciliationTerminalOutcome,
+        quarantined_target: Option<TargetDescriptor>,
+    ) -> Result<ReconciliationTerminal, ReconciliationEvidenceRejection> {
+        if attempt.rung() != ReconciliationRung::RepairArtifact
+            || attempt.component() != ReconciliationComponent::Libraries
+            || attempt.domain() != GuardianDomain::Library
+            || attempt.mode() != GuardianMode::Managed
+            || attempt.ownership() != OwnershipClass::LauncherManaged
+            || attempt.target().system != StabilizationSystem::Execution
+            || attempt.target().kind != TargetKind::Artifact
+            || attempt.target().ownership != OwnershipClass::LauncherManaged
+        {
+            return Err(ReconciliationEvidenceRejection::ScopeMismatch);
+        }
+        self.terminal_with_quarantine(attempt, outcome, quarantined_target)
+    }
+
+    fn terminal_with_quarantine(
+        &self,
+        attempt: ReconciliationAttempt,
+        outcome: ReconciliationTerminalOutcome,
+        quarantined_target: Option<TargetDescriptor>,
+    ) -> Result<ReconciliationTerminal, ReconciliationEvidenceRejection> {
         let current = self
             .state
             .current_reconciliation_incarnation(&self.lifecycle.instance_id)?;
@@ -491,7 +543,24 @@ impl RegisteredReconciliationAuthority {
                 && fingerprint == &current.fingerprint => {}
             _ => return Err(ReconciliationEvidenceRejection::IncarnationMismatch),
         }
-        Ok(ReconciliationTerminal::from_attempt(attempt, outcome, None))
+        if let Some(quarantined_target) = &quarantined_target {
+            let expected = TargetDescriptor::new(
+                StabilizationSystem::Execution,
+                attempt.target().kind,
+                format!("quarantine-{}", attempt.target().id),
+                attempt.ownership(),
+            );
+            if quarantined_target != &expected
+                || quarantined_target.ownership != OwnershipClass::LauncherManaged
+            {
+                return Err(ReconciliationEvidenceRejection::OwnershipMismatch);
+            }
+        }
+        Ok(ReconciliationTerminal::from_attempt(
+            attempt,
+            outcome,
+            quarantined_target,
+        ))
     }
 }
 
@@ -1070,6 +1139,31 @@ impl AppState {
                     reconciliation_attempt_key(candidate) == reconciliation_attempt_key(attempt)
                 }
         };
+        self.refuse_active_reconciliation_window(observed_at, matches_suppression)
+    }
+
+    pub(crate) fn refuse_active_artifact_repair_window(
+        &self,
+        attempt: &ReconciliationAttempt,
+    ) -> Result<(), ReconciliationEvidenceRejection> {
+        let key = reconciliation_attempt_key(attempt);
+        self.refuse_active_reconciliation_window(
+            chrono::Utc::now().fixed_offset(),
+            move |candidate| {
+                candidate.rung() == ReconciliationRung::RepairArtifact
+                    && reconciliation_attempt_key(candidate) == key
+            },
+        )
+    }
+
+    fn refuse_active_reconciliation_window<Matches>(
+        &self,
+        observed_at: chrono::DateTime<chrono::FixedOffset>,
+        matches_suppression: Matches,
+    ) -> Result<(), ReconciliationEvidenceRejection>
+    where
+        Matches: Fn(&ReconciliationAttempt) -> bool,
+    {
         let journals = self.journals.list();
         if journals.iter().any(|journal| {
             matches!(

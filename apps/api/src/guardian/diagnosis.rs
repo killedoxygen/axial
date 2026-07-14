@@ -137,6 +137,18 @@ fn diagnosis_for_rule(
         .collect::<Vec<_>>();
     let ownership = conservative_ownership(&supporting_facts);
     let resolved = rule.resolve(&supporting_facts, facts, phase);
+    let affected_target_facts = if resolved.priority
+        == DecisionPriorityBand::RegisteredArtifactRepair
+    {
+        facts
+            .iter()
+            .filter(|fact| {
+                fact.id == GuardianFactId::RegisteredArtifactRepairAvailable && fact.phase == phase
+            })
+            .collect::<Vec<_>>()
+    } else {
+        supporting_facts.clone()
+    };
     let evidence_facts = resolved
         .evidence_fact_ids
         .iter()
@@ -159,7 +171,7 @@ fn diagnosis_for_rule(
                 .filter(|fact_id| evidence_facts.iter().any(|fact| fact.id == *fact_id))
                 .collect(),
             affected_targets: affected_targets_for_rule(
-                &supporting_facts,
+                &affected_target_facts,
                 rule.domain(&supporting_facts),
                 ownership,
                 phase,
@@ -239,6 +251,7 @@ fn is_condition_fact(id: GuardianFactId) -> bool {
             | GuardianFactId::LaunchRuntimeFallbackAvailable
             | GuardianFactId::LaunchJvmStripAvailable
             | GuardianFactId::LaunchJvmPresetDowngradeAvailable
+            | GuardianFactId::RegisteredArtifactRepairAvailable
     )
 }
 

@@ -17,17 +17,18 @@ use crate::observability::{RedactionAudience, sanitize_evidence_token};
 use crate::state::contracts::{
     CommandKind, JournalId, OperationId, OperationJournalEntry, OperationJournalStep,
     OperationOutcome, OperationPhase, OperationStatus, OperationStepResult, ReconciliationAttempt,
-    ReconciliationTerminal, ReconciliationTerminalOutcome, RollbackState, StabilizationSystem,
-    TargetDescriptor,
+    ReconciliationScope, ReconciliationTerminal, ReconciliationTerminalOutcome, RollbackState,
+    StabilizationSystem, TargetDescriptor,
 };
 use crate::state::failure_memory::GuardianFailureMemoryStore;
 use crate::state::{
     OperationJournalReconciliation, OperationJournalStore, OperationJournalStoreError,
-    ReconciliationAttemptReservation, commit_reconciliation_memory,
+    ReconciliationAttemptReservation, RegisteredArtifactRepairAdmission,
+    RegisteredArtifactRepairEffect, commit_reconciliation_memory,
     install_operation_reconciliation_attempt, operation_journal_completed_step_is_visible,
     operation_journal_plan_is_visible, operation_journal_terminal_is_visible,
-    reconciliation_attempt_key, reconciliation_journal_attempt, reconciliation_memory_entry,
-    reconciliation_terminal, record_reconciliation_journal_failure,
+    reconciliation_attempt_key, reconciliation_instance_target, reconciliation_journal_attempt,
+    reconciliation_memory_entry, reconciliation_terminal, record_reconciliation_journal_failure,
     record_reconciliation_journal_success, reserve_reconciliation_attempt,
     settle_reconciliation_memory,
 };
@@ -114,14 +115,15 @@ enum ArtifactTerminalJournal {
 
 struct ArtifactRepairContext<'a> {
     authorization: ArtifactAuthorization,
-    descriptor: GuardianMinecraftArtifactRepairDescriptor,
+    descriptor: Option<GuardianMinecraftArtifactRepairDescriptor>,
     client: &'a Client,
     journals: &'a OperationJournalStore,
     failure_memory: &'a GuardianFailureMemoryStore,
-    observed_at: &'a str,
+    observed_at: String,
     quarantines_existing: bool,
     attempt: Option<ReconciliationAttempt>,
     reservation: Option<ReconciliationAttemptReservation>,
+    registered_admission: Option<&'a RegisteredArtifactRepairAdmission>,
 }
 
 struct ArtifactAuthorization {
@@ -195,29 +197,30 @@ async fn execute_artifact_repair_kernel<K: ArtifactRepairKind>(
             action: authorization.action,
             max_attempts: authorization.max_attempts,
         },
-        descriptor,
+        descriptor: Some(descriptor),
         client,
         journals,
         failure_memory,
-        observed_at,
+        observed_at: observed_at.to_string(),
         quarantines_existing: K::QUARANTINES_EXISTING,
         attempt: None,
         reservation: None,
+        registered_admission: None,
     };
-    let target = context.authorization.target.clone();
-
-    let checksum =
-        match validate_artifact_repair_input(&context.descriptor, context.quarantines_existing) {
-            Ok(checksum) => checksum,
-            Err(block_reason) => {
-                return finish_artifact_repair(
-                    &context,
-                    operation_id,
-                    ArtifactTerminal::Blocked(block_reason),
-                )
-                .await;
-            }
-        };
+    if let Err(block_reason) = validate_artifact_repair_input(
+        context
+            .descriptor
+            .as_ref()
+            .expect("install repair has descriptor"),
+        context.quarantines_existing,
+    ) {
+        return finish_artifact_repair(
+            &context,
+            operation_id,
+            ArtifactTerminal::Blocked(block_reason),
+        )
+        .await;
+    }
 
     if context.authorization.max_attempts == 0 {
         return finish_artifact_repair(
@@ -230,7 +233,7 @@ async fn execute_artifact_repair_kernel<K: ArtifactRepairKind>(
     settle_reconciliation_memory(context.failure_memory)
         .await
         .map_err(artifact_memory_error)?;
-    let suppression_until = default_suppression_until(context.observed_at).ok_or_else(|| {
+    let suppression_until = default_suppression_until(&context.observed_at).ok_or_else(|| {
         OperationJournalStoreError::Persistence(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             "Guardian artifact repair observation timestamp is invalid",
@@ -240,10 +243,14 @@ async fn execute_artifact_repair_kernel<K: ArtifactRepairKind>(
         operation_id.clone(),
         context.authorization.diagnosis_id,
         GuardianDomain::Install,
-        context.descriptor.component(),
+        context
+            .descriptor
+            .as_ref()
+            .expect("install repair has descriptor")
+            .component(),
         context.authorization.target.clone(),
         context.authorization.mode,
-        context.observed_at,
+        &context.observed_at,
         &suppression_until,
     )
     .map_err(artifact_reconciliation_error)?;
@@ -261,6 +268,69 @@ async fn execute_artifact_repair_kernel<K: ArtifactRepairKind>(
     })?;
     context.attempt = Some(attempt);
     context.reservation = Some(reservation);
+    execute_admitted_artifact_repair(context, operation_id).await
+}
+
+pub(crate) async fn execute_registered_guardian_artifact_repair(
+    admission: RegisteredArtifactRepairAdmission,
+    client: &Client,
+) -> Result<GuardianArtifactRepairOutcome, OperationJournalStoreError> {
+    let attempt = admission.attempt().clone();
+    let operation_id = attempt.operation_id().clone();
+    let quarantines_existing =
+        admission.effect() == RegisteredArtifactRepairEffect::QuarantineRedownload;
+    let mut context = ArtifactRepairContext {
+        authorization: ArtifactAuthorization {
+            diagnosis_id: attempt.diagnosis_id(),
+            target: attempt.target().clone(),
+            ownership: attempt.ownership(),
+            mode: attempt.mode(),
+            action: GuardianActionKind::Repair,
+            max_attempts: 1,
+        },
+        descriptor: None,
+        client,
+        journals: admission.authority().journals(),
+        failure_memory: admission.authority().failure_memory(),
+        observed_at: attempt.observed_at().to_string(),
+        quarantines_existing,
+        attempt: Some(attempt),
+        reservation: None,
+        registered_admission: Some(&admission),
+    };
+
+    settle_reconciliation_memory(context.failure_memory)
+        .await
+        .map_err(artifact_memory_error)?;
+    let attempt_key = reconciliation_attempt_key(
+        context
+            .attempt
+            .as_ref()
+            .expect("registered repair has typed attempt"),
+    );
+    context.reservation = Some(
+        reserve_reconciliation_attempt(context.failure_memory, context.journals, attempt_key)
+            .map_err(|_| {
+                OperationJournalStoreError::Persistence(std::io::Error::new(
+                    std::io::ErrorKind::WouldBlock,
+                    "Guardian registered artifact reconciliation attempt is already active",
+                ))
+            })?,
+    );
+    execute_admitted_artifact_repair(context, operation_id).await
+}
+
+async fn execute_admitted_artifact_repair(
+    context: ArtifactRepairContext<'_>,
+    operation_id: OperationId,
+) -> Result<GuardianArtifactRepairOutcome, OperationJournalStoreError> {
+    let target = context.authorization.target.clone();
+    let attempt_key = reconciliation_attempt_key(
+        context
+            .attempt
+            .as_ref()
+            .expect("admitted repair has typed attempt"),
+    );
     if let Some(outcome) = recover_artifact_evidence(&context, &attempt_key).await? {
         return Ok(outcome);
     }
@@ -282,30 +352,131 @@ async fn execute_artifact_repair_kernel<K: ArtifactRepairKind>(
         return Err(error);
     }
 
-    let quarantined_target = if context.quarantines_existing {
-        let quarantine_report = match quarantine_launcher_managed_file(QuarantineFileRequest {
-            operation_id: Some(operation_id.clone()),
-            target: target.clone(),
-            source: context.descriptor.destination(),
-        }) {
-            Ok(report) => report,
-            Err(error) => {
-                let fact_ids = fact_ids(&error.facts);
+    if let Some(admission) = context.registered_admission {
+        if !admission.evidence_is_current() {
+            return finish_artifact_repair(
+                &context,
+                operation_id,
+                ArtifactTerminal::Failed {
+                    step_id: "revalidate_registered_artifact_authority",
+                    rollback: RollbackState::NotApplicable,
+                    facts: Vec::new(),
+                    summary: "guardian_artifact_repair_authority_changed",
+                    quarantined_target: None,
+                },
+            )
+            .await;
+        }
+        let state = admission.physical_state().await;
+        if state
+            == Some(crate::execution::registered_artifact::RegisteredArtifactPhysicalState::Exact)
+        {
+            let (_, expected_sha1, expected_size) = admission.download_contract();
+            if admission
+                .mutation()
+                .verify_exact(expected_sha1, expected_size)
+                .await
+                && admission.evidence_is_current()
+            {
+                return finish_artifact_repair(
+                    &context,
+                    operation_id,
+                    ArtifactTerminal::Repaired {
+                        step_id: "registered_artifact_already_exact",
+                        facts: Vec::new(),
+                        quarantined_target: None,
+                    },
+                )
+                .await;
+            }
+        }
+        let expected = match admission.effect() {
+            RegisteredArtifactRepairEffect::DownloadMissing => {
+                crate::execution::registered_artifact::RegisteredArtifactPhysicalState::Missing
+            }
+            RegisteredArtifactRepairEffect::QuarantineRedownload => {
+                crate::execution::registered_artifact::RegisteredArtifactPhysicalState::Corrupt
+            }
+            RegisteredArtifactRepairEffect::AlreadyExact => {
                 return finish_artifact_repair(
                     &context,
                     operation_id,
                     ArtifactTerminal::Failed {
-                        step_id: "quarantine_launcher_managed_target",
-                        rollback: RollbackState::Unavailable,
-                        facts: fact_ids,
-                        summary: "guardian_artifact_quarantine_failed",
+                        step_id: "revalidate_registered_artifact_condition",
+                        rollback: RollbackState::NotApplicable,
+                        facts: Vec::new(),
+                        summary: "guardian_artifact_repair_condition_changed",
                         quarantined_target: None,
                     },
                 )
                 .await;
             }
         };
-        let quarantine_facts = fact_ids(&quarantine_report.facts);
+        if state != Some(expected) {
+            return finish_artifact_repair(
+                &context,
+                operation_id,
+                ArtifactTerminal::Failed {
+                    step_id: "revalidate_registered_artifact_condition",
+                    rollback: RollbackState::NotApplicable,
+                    facts: Vec::new(),
+                    summary: "guardian_artifact_repair_condition_changed",
+                    quarantined_target: None,
+                },
+            )
+            .await;
+        }
+    }
+
+    let quarantined_target = if context.quarantines_existing {
+        let quarantine_facts = if let Some(admission) = context.registered_admission {
+            match admission
+                .mutation()
+                .quarantine_existing(&operation_id, &target)
+            {
+                Ok(report) => fact_ids(&report.facts),
+                Err(error) => {
+                    return finish_artifact_repair(
+                        &context,
+                        operation_id,
+                        ArtifactTerminal::Failed {
+                            step_id: "quarantine_launcher_managed_target",
+                            rollback: RollbackState::Unavailable,
+                            facts: fact_ids(&error.facts),
+                            summary: "guardian_artifact_quarantine_failed",
+                            quarantined_target: None,
+                        },
+                    )
+                    .await;
+                }
+            }
+        } else {
+            let descriptor = context
+                .descriptor
+                .as_ref()
+                .expect("install repair has descriptor");
+            match quarantine_launcher_managed_file(QuarantineFileRequest {
+                operation_id: Some(operation_id.clone()),
+                target: target.clone(),
+                source: descriptor.destination(),
+            }) {
+                Ok(report) => fact_ids(&report.facts),
+                Err(error) => {
+                    return finish_artifact_repair(
+                        &context,
+                        operation_id,
+                        ArtifactTerminal::Failed {
+                            step_id: "quarantine_launcher_managed_target",
+                            rollback: RollbackState::Unavailable,
+                            facts: fact_ids(&error.facts),
+                            summary: "guardian_artifact_quarantine_failed",
+                            quarantined_target: None,
+                        },
+                    )
+                    .await;
+                }
+            }
+        };
         let quarantined_target = TargetDescriptor::new(
             StabilizationSystem::Execution,
             target.kind,
@@ -373,21 +544,82 @@ async fn execute_artifact_repair_kernel<K: ArtifactRepairKind>(
         None
     };
 
-    let source = context.descriptor.repair_source();
-    let mut download_request =
-        DownloadToTempRequest::new(target.clone(), context.descriptor.destination(), source.url)
-            .with_expected_checksum(checksum);
-    if let Some(max_bytes) = source.max_bytes {
-        download_request = download_request.with_max_bytes(max_bytes);
-    }
-    if let Some(expected_size) = source.expected_size {
-        download_request = download_request.with_expected_size(expected_size);
-    }
-    download_request.operation_id = Some(operation_id.clone());
+    let download_result = if let Some(admission) = context.registered_admission {
+        if !admission.evidence_is_current() {
+            Err(Vec::new())
+        } else {
+            let (provider_url, expected_sha1, expected_size) = admission.download_contract();
+            admission
+                .mutation()
+                .download_verify_promote(
+                    &operation_id,
+                    &target,
+                    provider_url,
+                    expected_sha1,
+                    expected_size,
+                    context.client,
+                )
+                .await
+                .map(|report| report.facts)
+                .map_err(|error| error.facts)
+        }
+    } else {
+        let descriptor = context
+            .descriptor
+            .as_ref()
+            .expect("install repair has descriptor");
+        let source = descriptor.repair_source();
+        let checksum = source_download_checksum(&source).ok_or_else(|| {
+            OperationJournalStoreError::Persistence(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Guardian admitted artifact repair checksum is invalid",
+            ))
+        })?;
+        let mut request =
+            DownloadToTempRequest::new(target.clone(), descriptor.destination(), source.url)
+                .with_expected_checksum(checksum);
+        if let Some(max_bytes) = source.max_bytes {
+            request = request.with_max_bytes(max_bytes);
+        }
+        if let Some(expected_size) = source.expected_size {
+            request = request.with_expected_size(expected_size);
+        }
+        request.operation_id = Some(operation_id.clone());
+        download_url_to_temp(request, context.client)
+            .await
+            .map(|report| report.facts)
+            .map_err(|error| error.facts)
+    };
 
-    match download_url_to_temp(download_request, context.client).await {
-        Ok(report) => {
-            let fact_ids = fact_ids(&report.facts);
+    match download_result {
+        Ok(facts) => {
+            let fact_ids = fact_ids(&facts);
+            if let Some(admission) = context.registered_admission {
+                let (_, expected_sha1, expected_size) = admission.download_contract();
+                if !admission
+                    .mutation()
+                    .verify_exact(expected_sha1, expected_size)
+                    .await
+                    || !admission.evidence_is_current()
+                {
+                    return finish_artifact_repair(
+                        &context,
+                        operation_id,
+                        ArtifactTerminal::Failed {
+                            step_id: "verify_registered_artifact_postcondition",
+                            rollback: if context.quarantines_existing {
+                                RollbackState::Available
+                            } else {
+                                RollbackState::Unavailable
+                            },
+                            facts: fact_ids,
+                            summary: "guardian_artifact_repair_postcondition_failed",
+                            quarantined_target,
+                        },
+                    )
+                    .await;
+                }
+            }
             finish_artifact_repair(
                 &context,
                 operation_id,
@@ -399,8 +631,29 @@ async fn execute_artifact_repair_kernel<K: ArtifactRepairKind>(
             )
             .await
         }
-        Err(error) => {
-            let fact_ids = fact_ids(&error.facts);
+        Err(facts) => {
+            let fact_ids = fact_ids(&facts);
+            if context
+                .registered_admission
+                .is_some_and(|admission| !admission.evidence_is_current())
+            {
+                return finish_artifact_repair(
+                    &context,
+                    operation_id,
+                    ArtifactTerminal::Failed {
+                        step_id: "revalidate_registered_artifact_authority",
+                        rollback: if context.quarantines_existing {
+                            RollbackState::Available
+                        } else {
+                            RollbackState::Unavailable
+                        },
+                        facts: fact_ids,
+                        summary: "guardian_artifact_repair_authority_changed",
+                        quarantined_target,
+                    },
+                )
+                .await;
+            }
             finish_artifact_repair(
                 &context,
                 operation_id,
@@ -488,15 +741,18 @@ async fn finish_artifact_repair(
                     "Guardian artifact repair has no valid suppression window",
                 ))
             })?;
-            Some(reconciliation_terminal(
-                context
-                    .attempt
-                    .as_ref()
-                    .expect("attempted repair has typed attempt")
-                    .clone(),
-                outcome,
-                quarantined.clone(),
-            ))
+            let attempt = context
+                .attempt
+                .as_ref()
+                .expect("attempted repair has typed attempt")
+                .clone();
+            Some(if let Some(admission) = context.registered_admission {
+                admission
+                    .terminal(attempt, outcome, quarantined.clone())
+                    .map_err(artifact_reconciliation_error)?
+            } else {
+                reconciliation_terminal(attempt, outcome, quarantined.clone())
+            })
         }
         None => None,
     };
@@ -743,8 +999,8 @@ fn planned_artifact_journal(
         context.authorization.ownership,
         RollbackState::Available,
     );
-    entry.targets.push(context.authorization.target.clone());
-    entry.planned_steps = artifact_repair_steps(context.quarantines_existing)
+    append_artifact_journal_targets(&mut entry, context);
+    entry.planned_steps = artifact_repair_steps(context)
         .iter()
         .map(|(step_id, rollback)| {
             repair_step(
@@ -950,8 +1206,8 @@ fn terminal_artifact_journal(
         RollbackState::Available,
     );
     entry.status = status;
-    entry.targets.push(context.authorization.target.clone());
-    entry.planned_steps = artifact_repair_steps(context.quarantines_existing)
+    append_artifact_journal_targets(&mut entry, context);
+    entry.planned_steps = artifact_repair_steps(context)
         .iter()
         .map(|(step_id, rollback)| {
             repair_step(
@@ -975,6 +1231,20 @@ fn terminal_artifact_journal(
         .push(context.authorization.diagnosis_id);
     entry.outcome = Some(outcome);
     entry
+}
+
+fn append_artifact_journal_targets(
+    entry: &mut OperationJournalEntry,
+    context: &ArtifactRepairContext<'_>,
+) {
+    entry.targets.push(context.authorization.target.clone());
+    if let Some(ReconciliationScope::RegisteredInstance { instance_id, .. }) =
+        context.attempt.as_ref().map(ReconciliationAttempt::scope)
+    {
+        entry
+            .targets
+            .push(reconciliation_instance_target(instance_id));
+    }
 }
 
 fn artifact_terminal_transition_matches(
@@ -1025,7 +1295,9 @@ fn repair_step(
     step
 }
 
-fn artifact_repair_steps(quarantines_existing: bool) -> &'static [(&'static str, RollbackState)] {
+fn artifact_repair_steps(
+    context: &ArtifactRepairContext<'_>,
+) -> &'static [(&'static str, RollbackState)] {
     const QUARANTINE_REDOWNLOAD: [(&str, RollbackState); 7] = [
         ("journal_repair_start", RollbackState::NotApplicable),
         (
@@ -1045,7 +1317,38 @@ fn artifact_repair_steps(quarantines_existing: bool) -> &'static [(&'static str,
         ("promote_verified_artifact", RollbackState::Available),
         ("record_repair_outcome", RollbackState::NotApplicable),
     ];
-    if quarantines_existing {
+    const REGISTERED_QUARANTINE_REDOWNLOAD: [(&str, RollbackState); 8] = [
+        ("journal_repair_start", RollbackState::NotApplicable),
+        (
+            "registered_artifact_already_exact",
+            RollbackState::NotApplicable,
+        ),
+        (
+            "quarantine_launcher_managed_target",
+            RollbackState::Available,
+        ),
+        ("record_quarantine_checkpoint", RollbackState::Available),
+        ("download_artifact_to_temp", RollbackState::Available),
+        ("verify_artifact_checksum", RollbackState::NotApplicable),
+        ("promote_verified_artifact", RollbackState::Available),
+        ("record_repair_outcome", RollbackState::NotApplicable),
+    ];
+    const REGISTERED_MISSING_DOWNLOAD: [(&str, RollbackState); 6] = [
+        ("journal_repair_start", RollbackState::NotApplicable),
+        (
+            "registered_artifact_already_exact",
+            RollbackState::NotApplicable,
+        ),
+        ("download_artifact_to_temp", RollbackState::Available),
+        ("verify_artifact_checksum", RollbackState::NotApplicable),
+        ("promote_verified_artifact", RollbackState::Available),
+        ("record_repair_outcome", RollbackState::NotApplicable),
+    ];
+    if context.registered_admission.is_some() && context.quarantines_existing {
+        &REGISTERED_QUARANTINE_REDOWNLOAD
+    } else if context.registered_admission.is_some() {
+        &REGISTERED_MISSING_DOWNLOAD
+    } else if context.quarantines_existing {
         &QUARANTINE_REDOWNLOAD
     } else {
         &MISSING_DOWNLOAD

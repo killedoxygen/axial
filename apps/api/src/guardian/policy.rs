@@ -758,6 +758,54 @@ mod tests {
                 None,
             )
         };
+        let registered_artifact_repair = |coarse_id, coarse_domain, artifact_id| {
+            let exact_target = TargetDescriptor::new(
+                StabilizationSystem::Execution,
+                TargetKind::Artifact,
+                "sha256.01234567.89abcdef.01234567.89abcdef.01234567.89abcdef.01234567.89abcdef",
+                OwnershipClass::LauncherManaged,
+            );
+            let mut availability = condition(
+                GuardianFactId::RegisteredArtifactRepairAvailable,
+                OperationPhase::Launching,
+            );
+            availability.domain = GuardianDomain::Library;
+            availability.ownership = OwnershipClass::LauncherManaged;
+            availability.target = Some(exact_target.clone());
+            let mut artifact = fact(
+                artifact_id,
+                GuardianDomain::Library,
+                OperationPhase::Launching,
+                OwnershipClass::LauncherManaged,
+                None,
+                None,
+            );
+            artifact.target = Some(exact_target);
+            Case {
+                facts: vec![
+                    fact(
+                        coarse_id,
+                        coarse_domain,
+                        OperationPhase::Launching,
+                        OwnershipClass::LauncherManaged,
+                        None,
+                        None,
+                    ),
+                    condition(
+                        GuardianFactId::LaunchFailureClassified,
+                        OperationPhase::Launching,
+                    ),
+                    condition(
+                        GuardianFactId::ProcessExitedBeforeBoot,
+                        OperationPhase::Launching,
+                    ),
+                    availability,
+                    artifact,
+                ],
+                phase: OperationPhase::Launching,
+                expected: DiagnosisId::LauncherManagedArtifactCorrupt,
+            }
+        };
 
         let cases = [
             Case {
@@ -917,6 +965,21 @@ mod tests {
                 phase: OperationPhase::Launching,
                 expected: DiagnosisId::StartupStalled,
             },
+            registered_artifact_repair(
+                GuardianFactId::MissingDependency,
+                GuardianDomain::Startup,
+                GuardianFactId::ArtifactMissing,
+            ),
+            registered_artifact_repair(
+                GuardianFactId::ClasspathModuleConflict,
+                GuardianDomain::Startup,
+                GuardianFactId::ArtifactMissing,
+            ),
+            registered_artifact_repair(
+                GuardianFactId::LauncherManagedArtifactSignatureCorruption,
+                GuardianDomain::Download,
+                GuardianFactId::ArtifactHashMismatch,
+            ),
         ];
 
         for case in cases {

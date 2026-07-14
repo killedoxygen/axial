@@ -112,6 +112,7 @@
   "provider_data_invalid",
   "recent_repair_failed",
   "recent_startup_failure",
+  "registered_artifact_repair_available",
   "repair_suppressed_until",
   "startup_window_expired",
   "temp_file_observed",
