@@ -81,7 +81,7 @@ pub(crate) struct ComponentRecoveryRequired {
 
 #[cfg(test)]
 impl ComponentTransactionReceipt {
-    pub(super) fn into_restart_seed(self) -> (ManagedRootPublicationLease, ManagedComponentKind) {
+    pub(crate) fn into_restart_seed(self) -> (ManagedRootPublicationLease, ManagedComponentKind) {
         let component = self.context.manifest.component;
         drop(self.outcome_guard);
         (self.context.lease, component)
@@ -90,7 +90,7 @@ impl ComponentTransactionReceipt {
 
 #[cfg(test)]
 impl ComponentRecoveryRequired {
-    pub(super) fn into_restart_seed(self) -> (ManagedRootPublicationLease, ManagedComponentKind) {
+    pub(crate) fn into_restart_seed(self) -> (ManagedRootPublicationLease, ManagedComponentKind) {
         let ComponentRecoveryAuthority::Published { context, .. } = self.authority else {
             panic!("test recovery authority was not a published intent")
         };
@@ -184,7 +184,7 @@ struct SettlementRowsPlan {
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
-pub(super) enum ComponentExecutionFault {
+pub(crate) enum ComponentExecutionFault {
     None,
     AfterFirstRow,
     CrashAfterFirstRow,
@@ -195,7 +195,7 @@ pub(super) enum ComponentExecutionFault {
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
-pub(super) enum ComponentSettlementFault {
+pub(crate) enum ComponentSettlementFault {
     None,
     AfterSettlementPromotion,
     AfterAncestorBucket,
@@ -300,7 +300,7 @@ pub(crate) async fn retry_component_settlement(
 }
 
 #[cfg(test)]
-pub(super) async fn settle_component_transaction_with_fault(
+pub(crate) async fn settle_component_transaction_with_fault(
     receipt: ComponentTransactionReceipt,
     fault: ComponentSettlementFault,
 ) -> ComponentSettlementResult {
@@ -363,7 +363,7 @@ async fn run_component_settlement(
 }
 
 #[cfg(test)]
-pub(super) async fn execute_component_intent_with_fault(
+pub(crate) async fn execute_component_intent_with_fault(
     published: ComponentIntentPublished,
     fault: ComponentExecutionFault,
 ) -> ComponentExecutionResult {
@@ -1317,7 +1317,7 @@ fn create_and_promote_ancestors(
                 )?;
                 return Err(ComponentTransactionError);
             }
-            Err(ManagedCreateOnlyWriteFailure::PromotionAttempted { .. }) => {
+            Err(ManagedCreateOnlyWriteFailure::PromotionAttempted { final_guard: _ }) => {
                 return Err(ComponentTransactionError);
             }
         };
@@ -2439,7 +2439,7 @@ fn publish_outcome(
         Err(ManagedCreateOnlyWriteFailure::BeforePromotion(_)) => {
             return Err(OutcomePublicationFailure::BeforePromotion);
         }
-        Err(ManagedCreateOnlyWriteFailure::PromotionAttempted { final_guard, .. }) => {
+        Err(ManagedCreateOnlyWriteFailure::PromotionAttempted { final_guard }) => {
             return Err(OutcomePublicationFailure::PromotionAttempted(final_guard));
         }
     };
@@ -2718,7 +2718,7 @@ fn settle_component_transaction_attempt(
         Err(ManagedCreateOnlyWriteFailure::BeforePromotion(_)) => {
             return Err(ComponentTransactionError);
         }
-        Err(ManagedCreateOnlyWriteFailure::PromotionAttempted { final_guard, .. }) => {
+        Err(ManagedCreateOnlyWriteFailure::PromotionAttempted { final_guard }) => {
             authority.settlement_identity = final_guard.as_ref().map(ManagedFileGuard::identity);
             return Err(ComponentTransactionError);
         }

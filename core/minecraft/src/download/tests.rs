@@ -454,6 +454,7 @@ async fn normal_install_publishes_and_settles_three_member_version_bundle() {
 
     assert_eq!(receipt.version_id(), version_id);
     assert_normal_bundle_contents(&root, version_id, true);
+    assert_settled_libraries_lane(&root);
     assert_settled_version_bundle_lane(&root);
     let requests = std::iter::from_fn(|| requests.try_recv().ok()).collect::<Vec<_>>();
     for path in ["/version.json", "/client.jar", "/log-config.xml"] {
@@ -610,6 +611,7 @@ async fn cancelling_normal_install_does_not_cancel_started_bundle_publication() 
     timeout(Duration::from_secs(10), async {
         loop {
             if normal_bundle_contents_match(&root, version_id, true)
+                && libraries_lane_is_settled(&root)
                 && version_bundle_lane_is_settled(&root)
             {
                 break;
@@ -2836,6 +2838,39 @@ fn assert_settled_version_bundle_lane(root: &Path) {
         version_bundle_lane_is_settled(root),
         "version bundle lane must be terminally settled"
     );
+}
+
+fn assert_settled_libraries_lane(root: &Path) {
+    assert!(
+        libraries_lane_is_settled(root),
+        "Libraries lane must be terminally settled"
+    );
+}
+
+fn libraries_lane_is_settled(root: &Path) -> bool {
+    let lane = root.join(".axial-publication/libraries");
+    let Ok(entries) = fs::read_dir(&lane) else {
+        return false;
+    };
+    let mut names = entries
+        .filter_map(Result::ok)
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    names.sort();
+    names
+        == vec![
+            "ancestors".to_string(),
+            "quarantine".to_string(),
+            "staging".to_string(),
+            "table".to_string(),
+        ]
+        && ["quarantine", "staging", "table"].into_iter().all(|name| {
+            fs::read_dir(lane.join(name)).is_ok_and(|mut entries| entries.next().is_none())
+        })
+        && ["records", "staging"].into_iter().all(|name| {
+            fs::read_dir(lane.join("ancestors").join(name))
+                .is_ok_and(|mut entries| entries.next().is_none())
+        })
 }
 
 fn version_bundle_lane_is_settled(root: &Path) -> bool {

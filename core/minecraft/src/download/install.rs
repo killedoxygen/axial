@@ -7,7 +7,7 @@ use super::facts::selected_download_source_label;
 use super::libraries::library_jobs_for;
 use super::library_source::{
     LIBRARY_SOURCE_MAX_BYTES, LibrarySourcePool, LibrarySourceRequest,
-    acquire_authenticated_library_source,
+    RetainedLibraryComponentSource, acquire_authenticated_library_source,
 };
 use super::model::{
     DownloadError, DownloadProgress, ExactLibraryDownloadProof, ExecutionDownloadFact,
@@ -41,6 +41,9 @@ use crate::known_good_libraries::{
 };
 use crate::launch::{VersionJson, effective_java_version_for};
 use crate::managed_fs::ManagedDir;
+use crate::managed_libraries_publication::{
+    LibrariesLifecycleError, RetainedLibrariesPublicationSource, publish_libraries_component,
+};
 use crate::managed_publication::{ManagedRootPublicationLease, run_publication_blocking};
 use crate::manifest::{ManifestEntry, VersionManifest, fetch_fresh_install_version_manifest};
 use crate::paths::{assets_dir, libraries_dir};
@@ -903,9 +906,12 @@ impl Downloader {
                 )
                 .await?;
             let lease = acquire_version_bundle_publication_lease(managed_root, version_id).await?;
-            let publication =
-                tokio::spawn(publish_prepared_version_bundle_install(lease, prepared));
-            publication.await.map_err(version_bundle_task_error)?
+            publish_prepared_managed_install(
+                lease,
+                prepared,
+                Vec::<RetainedLibraryComponentSource>::new(),
+            )
+            .await
         }
         .await;
 
@@ -1976,7 +1982,24 @@ pub(crate) fn prepare_local_version_bundle_publication(
     Ok(PreparedVersionBundlePublication { authority, source })
 }
 
-pub(crate) async fn publish_prepared_version_bundle_install(
+pub(crate) async fn publish_prepared_managed_install<S>(
+    lease: ManagedRootPublicationLease,
+    prepared: PreparedVersionBundlePublication,
+    sources: Vec<S>,
+) -> Result<KnownGoodInstallReceipt, DownloadError>
+where
+    S: RetainedLibrariesPublicationSource + 'static,
+{
+    let owner = tokio::spawn(async move {
+        let lease = publish_libraries_component(lease, &prepared.authority, sources)
+            .await
+            .map_err(managed_libraries_install_error)?;
+        complete_prepared_version_bundle_install(lease, prepared).await
+    });
+    owner.await.map_err(managed_install_owner_error)?
+}
+
+async fn complete_prepared_version_bundle_install(
     lease: ManagedRootPublicationLease,
     prepared: PreparedVersionBundlePublication,
 ) -> Result<KnownGoodInstallReceipt, DownloadError> {
@@ -2083,6 +2106,10 @@ fn version_bundle_install_error(message: impl Into<String>) -> DownloadError {
     DownloadError::ResolveManifest(message.into())
 }
 
+fn managed_libraries_install_error(_error: LibrariesLifecycleError) -> DownloadError {
+    version_bundle_install_error("managed Libraries publication failed")
+}
+
 async fn await_selected_source_task(
     task: tokio::task::JoinHandle<Result<AuthenticatedSelectedArtifactSource, DownloadError>>,
     label: &'static str,
@@ -2102,7 +2129,7 @@ fn selected_source_task_error(error: tokio::task::JoinError, label: &str) -> Dow
     DownloadError::FileOperation(io::Error::other(format!("{label} source task {reason}")))
 }
 
-fn version_bundle_task_error(error: tokio::task::JoinError) -> DownloadError {
+fn managed_install_owner_error(error: tokio::task::JoinError) -> DownloadError {
     let reason = if error.is_cancelled() {
         "cancelled"
     } else if error.is_panic() {
@@ -2110,7 +2137,7 @@ fn version_bundle_task_error(error: tokio::task::JoinError) -> DownloadError {
     } else {
         "failed"
     };
-    version_bundle_install_error(format!("version bundle publication task {reason}"))
+    version_bundle_install_error(format!("managed install publication task {reason}"))
 }
 
 #[cfg(test)]

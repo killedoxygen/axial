@@ -5,9 +5,18 @@ use crate::known_good::{
 };
 use crate::loaders::types::LoaderError;
 use crate::managed_component_effects::{
-    ComponentCanonicalObservation, ComponentEffectsError, ComponentIntentCandidate,
-    ComponentIntentPublishFailure, ComponentIntentPublished, ComponentLane,
-    component_root_binding_sha256, component_slot_name, plan_component_canonical_path,
+    ComponentCanonicalObservation, ComponentEffectsError, ComponentExecutionResult,
+    ComponentIntentCandidate, ComponentIntentPublicationRecovery, ComponentIntentPublishFailure,
+    ComponentLane, ComponentRecoveryRetryResult, ComponentSettledOutcome,
+    ComponentSettlementResult, ComponentStartupRecoveryResult, component_root_binding_sha256,
+    component_slot_name, execute_component_intent, plan_component_canonical_path,
+    recover_component_intent_publication, recover_component_transaction, retry_component_recovery,
+    retry_component_settlement, settle_component_transaction,
+};
+#[cfg(test)]
+use crate::managed_component_effects::{
+    ComponentExecutionFault, ComponentIntentPublishFault, ComponentSettlementFault,
+    execute_component_intent_with_fault, settle_component_transaction_with_fault,
 };
 use crate::managed_component_spool::{ComponentTableSpool, ComponentTableSpoolError};
 use crate::managed_component_table::{
@@ -22,6 +31,10 @@ use crate::managed_publication::{
 };
 use std::collections::{BTreeMap, VecDeque};
 use std::future::Future;
+use std::time::Duration;
+
+const LIBRARIES_RETRY_INITIAL_DELAY: Duration = Duration::from_millis(25);
+const LIBRARIES_RETRY_MAXIMUM_DELAY: Duration = Duration::from_secs(1);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct LibrariesPublicationSourceIdentity {
@@ -45,21 +58,6 @@ pub(crate) trait RetainedLibrariesPublicationSource: Send + Sized {
     ) -> impl Future<Output = Result<LibrariesPublicationSourceIdentity, LoaderError>> + Send;
 }
 
-pub(crate) struct PreparedLibrariesIntent {
-    authority: PendingKnownGoodInstallAuthority,
-    publication: ComponentIntentPublished,
-}
-
-pub(crate) struct PreparedLibrariesIntentCandidate {
-    authority: PendingKnownGoodInstallAuthority,
-    candidate: ComponentIntentCandidate,
-}
-
-pub(crate) struct LibrariesIntentPublishFailure {
-    authority: PendingKnownGoodInstallAuthority,
-    publication: ComponentIntentPublishFailure,
-}
-
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum PrepareLibrariesIntentError {
     #[error("authenticated Libraries projection is invalid")]
@@ -80,12 +78,16 @@ pub(crate) enum PrepareLibrariesIntentError {
     Publication(#[from] ManagedPublicationError),
 }
 
-impl std::fmt::Debug for LibrariesIntentPublishFailure {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("LibrariesIntentPublishFailure")
-            .finish_non_exhaustive()
-    }
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum LibrariesLifecycleError {
+    #[error(transparent)]
+    Prepare(#[from] PrepareLibrariesIntentError),
+    #[error("managed Libraries intent failed before canonical effects")]
+    BeforeEffects(#[source] ComponentEffectsError),
+    #[error("managed Libraries recovery lost the admitted current transaction")]
+    CurrentTransactionLost,
+    #[error("managed Libraries transaction rolled back")]
+    RolledBack,
 }
 
 impl LibrariesPublicationSourceIdentity {
@@ -117,27 +119,6 @@ impl LibrariesPublicationSourceIdentity {
     }
 }
 
-impl PreparedLibrariesIntentCandidate {
-    pub(crate) fn publish_intent(
-        self,
-    ) -> Result<PreparedLibrariesIntent, LibrariesIntentPublishFailure> {
-        let Self {
-            authority,
-            candidate,
-        } = self;
-        match candidate.publish_intent() {
-            Ok(publication) => Ok(PreparedLibrariesIntent {
-                authority,
-                publication,
-            }),
-            Err(publication) => Err(LibrariesIntentPublishFailure {
-                authority,
-                publication,
-            }),
-        }
-    }
-}
-
 struct LibrariesProjectionRow {
     inventory_ordinal: u32,
     path: ArtifactRelativePath,
@@ -151,11 +132,280 @@ struct SparseSourceCounts {
     supplied_exact: usize,
 }
 
-pub(crate) async fn prepare_libraries_intent<S>(
+struct LibrariesRetryBackoff {
+    delay: Duration,
+}
+
+enum NormalizedComponentState {
+    NoTransaction(ManagedRootPublicationLease),
+    Settled(ComponentSettledOutcome),
+}
+
+enum ComponentProgress {
+    Execution(ComponentExecutionResult),
+    Recovery(crate::managed_component_effects::ComponentRecoveryRequired),
+    Settlement(ComponentSettlementResult),
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct LibrariesLifecycleTestFaults {
+    intent: Option<ComponentIntentPublishFault>,
+    execution: Option<ComponentExecutionFault>,
+    settlement: Option<ComponentSettlementFault>,
+}
+
+impl LibrariesRetryBackoff {
+    fn new() -> Self {
+        Self {
+            delay: LIBRARIES_RETRY_INITIAL_DELAY,
+        }
+    }
+
+    async fn wait(&mut self) {
+        tokio::time::sleep(self.delay).await;
+        self.delay = self
+            .delay
+            .saturating_mul(2)
+            .min(LIBRARIES_RETRY_MAXIMUM_DELAY);
+    }
+}
+
+pub(crate) async fn publish_libraries_component<S>(
     lease: ManagedRootPublicationLease,
-    authority: PendingKnownGoodInstallAuthority,
+    authority: &PendingKnownGoodInstallAuthority,
     sources: Vec<S>,
-) -> Result<PreparedLibrariesIntentCandidate, PrepareLibrariesIntentError>
+) -> Result<ManagedRootPublicationLease, LibrariesLifecycleError>
+where
+    S: RetainedLibrariesPublicationSource + 'static,
+{
+    publish_libraries_component_inner(
+        lease,
+        authority,
+        sources,
+        #[cfg(test)]
+        None,
+    )
+    .await
+}
+
+#[cfg(test)]
+async fn publish_libraries_component_with_faults<S>(
+    lease: ManagedRootPublicationLease,
+    authority: &PendingKnownGoodInstallAuthority,
+    sources: Vec<S>,
+    faults: &mut LibrariesLifecycleTestFaults,
+) -> Result<ManagedRootPublicationLease, LibrariesLifecycleError>
+where
+    S: RetainedLibrariesPublicationSource + 'static,
+{
+    publish_libraries_component_inner(lease, authority, sources, Some(faults)).await
+}
+
+async fn publish_libraries_component_inner<S>(
+    lease: ManagedRootPublicationLease,
+    authority: &PendingKnownGoodInstallAuthority,
+    sources: Vec<S>,
+    #[cfg(test)] mut faults: Option<&mut LibrariesLifecycleTestFaults>,
+) -> Result<ManagedRootPublicationLease, LibrariesLifecycleError>
+where
+    S: RetainedLibrariesPublicationSource + 'static,
+{
+    let lease = settle_prior_libraries_transaction(lease).await?;
+    let candidate = prepare_libraries_intent(lease, authority, sources).await?;
+    let mut backoff = LibrariesRetryBackoff::new();
+    let execution = publish_current_libraries_intent(
+        candidate,
+        &mut backoff,
+        #[cfg(test)]
+        faults.as_deref_mut(),
+    )
+    .await?;
+    match normalize_component_transaction(
+        execution,
+        &mut backoff,
+        #[cfg(test)]
+        faults.as_deref_mut(),
+    )
+    .await?
+    {
+        NormalizedComponentState::NoTransaction(_) => {
+            Err(LibrariesLifecycleError::CurrentTransactionLost)
+        }
+        NormalizedComponentState::Settled(ComponentSettledOutcome::Committed(lease)) => Ok(lease),
+        NormalizedComponentState::Settled(ComponentSettledOutcome::RolledBack { .. }) => {
+            Err(LibrariesLifecycleError::RolledBack)
+        }
+    }
+}
+
+async fn settle_prior_libraries_transaction(
+    lease: ManagedRootPublicationLease,
+) -> Result<ManagedRootPublicationLease, LibrariesLifecycleError> {
+    let recovered = recover_component_transaction(lease, ManagedComponentKind::Libraries).await;
+    let mut backoff = LibrariesRetryBackoff::new();
+    let normalized = match recovered {
+        ComponentStartupRecoveryResult::NoTransaction(lease) => {
+            NormalizedComponentState::NoTransaction(lease)
+        }
+        ComponentStartupRecoveryResult::Settled(outcome) => {
+            NormalizedComponentState::Settled(outcome)
+        }
+        ComponentStartupRecoveryResult::Transaction(execution) => {
+            normalize_component_transaction(
+                execution,
+                &mut backoff,
+                #[cfg(test)]
+                None,
+            )
+            .await?
+        }
+    };
+    Ok(match normalized {
+        NormalizedComponentState::NoTransaction(lease)
+        | NormalizedComponentState::Settled(ComponentSettledOutcome::Committed(lease))
+        | NormalizedComponentState::Settled(ComponentSettledOutcome::RolledBack {
+            lease, ..
+        }) => lease,
+    })
+}
+
+async fn publish_current_libraries_intent(
+    mut candidate: ComponentIntentCandidate,
+    backoff: &mut LibrariesRetryBackoff,
+    #[cfg(test)] mut faults: Option<&mut LibrariesLifecycleTestFaults>,
+) -> Result<ComponentExecutionResult, LibrariesLifecycleError> {
+    loop {
+        #[cfg(test)]
+        let publication = match faults
+            .as_deref_mut()
+            .and_then(|faults| faults.intent.take())
+        {
+            Some(fault) => candidate.publish_intent_with_fault(fault),
+            None => candidate.publish_intent(),
+        };
+        #[cfg(not(test))]
+        let publication = candidate.publish_intent();
+        match publication {
+            Ok(published) => {
+                return Ok(execute_current_libraries_intent(
+                    published,
+                    #[cfg(test)]
+                    faults.as_deref_mut(),
+                )
+                .await);
+            }
+            Err(ComponentIntentPublishFailure::BeforePromotion { candidate, cause }) => {
+                drop(candidate);
+                return Err(LibrariesLifecycleError::BeforeEffects(cause));
+            }
+            Err(failure @ ComponentIntentPublishFailure::PromotionAttempted { .. }) => {
+                match recover_component_intent_publication(failure).await {
+                    Ok(ComponentIntentPublicationRecovery::Retry(retry)) => {
+                        candidate = retry;
+                        backoff.wait().await;
+                    }
+                    Ok(ComponentIntentPublicationRecovery::Transaction(execution)) => {
+                        return Ok(execution);
+                    }
+                    Err(ComponentIntentPublishFailure::BeforePromotion { candidate, cause }) => {
+                        drop(candidate);
+                        return Err(LibrariesLifecycleError::BeforeEffects(cause));
+                    }
+                    Err(ComponentIntentPublishFailure::PromotionAttempted { .. }) => {
+                        return Err(LibrariesLifecycleError::CurrentTransactionLost);
+                    }
+                }
+            }
+        }
+    }
+}
+
+async fn normalize_component_transaction(
+    execution: ComponentExecutionResult,
+    backoff: &mut LibrariesRetryBackoff,
+    #[cfg(test)] mut faults: Option<&mut LibrariesLifecycleTestFaults>,
+) -> Result<NormalizedComponentState, LibrariesLifecycleError> {
+    let mut progress = ComponentProgress::Execution(execution);
+    loop {
+        progress = match progress {
+            ComponentProgress::Execution(ComponentExecutionResult::Committed(receipt))
+            | ComponentProgress::Execution(ComponentExecutionResult::RolledBack(receipt)) => {
+                ComponentProgress::Settlement(
+                    settle_current_libraries_transaction(
+                        receipt,
+                        #[cfg(test)]
+                        faults.as_deref_mut(),
+                    )
+                    .await,
+                )
+            }
+            ComponentProgress::Execution(ComponentExecutionResult::RecoveryRequired(recovery)) => {
+                ComponentProgress::Recovery(recovery)
+            }
+            ComponentProgress::Recovery(recovery) => {
+                backoff.wait().await;
+                match retry_component_recovery(recovery).await {
+                    ComponentRecoveryRetryResult::NoTransaction(lease) => {
+                        return Ok(NormalizedComponentState::NoTransaction(lease));
+                    }
+                    ComponentRecoveryRetryResult::Settled(outcome) => {
+                        return Ok(NormalizedComponentState::Settled(outcome));
+                    }
+                    ComponentRecoveryRetryResult::RetryIntent(candidate) => {
+                        ComponentProgress::Execution(
+                            publish_current_libraries_intent(
+                                candidate,
+                                backoff,
+                                #[cfg(test)]
+                                faults.as_deref_mut(),
+                            )
+                            .await?,
+                        )
+                    }
+                    ComponentRecoveryRetryResult::Transaction(execution) => {
+                        ComponentProgress::Execution(execution)
+                    }
+                }
+            }
+            ComponentProgress::Settlement(ComponentSettlementResult::Settled(outcome)) => {
+                return Ok(NormalizedComponentState::Settled(outcome));
+            }
+            ComponentProgress::Settlement(ComponentSettlementResult::Retry(retry)) => {
+                backoff.wait().await;
+                ComponentProgress::Settlement(retry_component_settlement(retry).await)
+            }
+        };
+    }
+}
+
+async fn execute_current_libraries_intent(
+    published: crate::managed_component_effects::ComponentIntentPublished,
+    #[cfg(test)] faults: Option<&mut LibrariesLifecycleTestFaults>,
+) -> ComponentExecutionResult {
+    #[cfg(test)]
+    if let Some(fault) = faults.and_then(|faults| faults.execution.take()) {
+        return execute_component_intent_with_fault(published, fault).await;
+    }
+    execute_component_intent(published).await
+}
+
+async fn settle_current_libraries_transaction(
+    receipt: crate::managed_component_effects::ComponentTransactionReceipt,
+    #[cfg(test)] faults: Option<&mut LibrariesLifecycleTestFaults>,
+) -> ComponentSettlementResult {
+    #[cfg(test)]
+    if let Some(fault) = faults.and_then(|faults| faults.settlement.take()) {
+        return settle_component_transaction_with_fault(receipt, fault).await;
+    }
+    settle_component_transaction(receipt).await
+}
+
+async fn prepare_libraries_intent<S>(
+    lease: ManagedRootPublicationLease,
+    authority: &PendingKnownGoodInstallAuthority,
+    sources: Vec<S>,
+) -> Result<ComponentIntentCandidate, PrepareLibrariesIntentError>
 where
     S: RetainedLibrariesPublicationSource + 'static,
 {
@@ -265,10 +515,7 @@ where
         Ok::<_, PrepareLibrariesIntentError>(lane.into_intent_candidate(lease, manifest)?)
     })
     .await??;
-    Ok(PreparedLibrariesIntentCandidate {
-        authority,
-        candidate,
-    })
+    Ok(candidate)
 }
 
 fn projection_rows(
@@ -559,6 +806,210 @@ mod tests {
             .expect("test publication lease")
     }
 
+    fn assert_libraries_lane_settled(temporary: &tempfile::TempDir) {
+        let lane = temporary.path().join(".axial-publication/libraries");
+        for directory in [
+            "table",
+            "staging",
+            "quarantine",
+            "ancestors/records",
+            "ancestors/staging",
+        ] {
+            assert!(
+                fs::read_dir(lane.join(directory)).unwrap().next().is_none(),
+                "settled Libraries directory {directory} retained residue"
+            );
+        }
+        for marker in ["intent.bin", "outcome.bin", "settlement.bin"] {
+            assert!(!lane.join(marker).exists());
+        }
+    }
+
+    #[tokio::test]
+    async fn lifecycle_recovers_attempted_intent_and_retries_committed_settlement() {
+        let temporary = tempfile::tempdir().expect("test root");
+        let source = test_source(
+            "org/example/current.jar",
+            ManagedComponentArtifactKind::Library,
+            b"current-library".to_vec(),
+        );
+        let authority = test_authority(std::slice::from_ref(&source));
+        let mut faults = LibrariesLifecycleTestFaults {
+            intent: Some(ComponentIntentPublishFault::PromotionAttemptedWithoutMarker),
+            settlement: Some(ComponentSettlementFault::AfterSettlementPromotion),
+            ..LibrariesLifecycleTestFaults::default()
+        };
+
+        let lease = publish_libraries_component_with_faults(
+            test_lease(&temporary).await,
+            &authority,
+            vec![source],
+            &mut faults,
+        )
+        .await
+        .expect("recover and settle current Libraries transaction");
+
+        lease.revalidate().expect("returned publication lease");
+        assert_eq!(
+            fs::read(temporary.path().join("libraries/org/example/current.jar")).unwrap(),
+            b"current-library"
+        );
+        assert!(faults.intent.is_none());
+        assert!(faults.settlement.is_none());
+        assert_libraries_lane_settled(&temporary);
+    }
+
+    #[tokio::test]
+    async fn lifecycle_settles_current_rollback_as_terminal_error() {
+        let temporary = tempfile::tempdir().expect("test root");
+        let source = test_source(
+            "org/example/rollback.jar",
+            ManagedComponentArtifactKind::Library,
+            b"rollback-library".to_vec(),
+        );
+        let authority = test_authority(std::slice::from_ref(&source));
+        let mut faults = LibrariesLifecycleTestFaults {
+            execution: Some(ComponentExecutionFault::AfterFirstRow),
+            ..LibrariesLifecycleTestFaults::default()
+        };
+
+        let error = match publish_libraries_component_with_faults(
+            test_lease(&temporary).await,
+            &authority,
+            vec![source],
+            &mut faults,
+        )
+        .await
+        {
+            Err(error) => error,
+            Ok(_) => panic!("current rollback must terminate the Libraries lifecycle"),
+        };
+
+        assert!(matches!(error, LibrariesLifecycleError::RolledBack));
+        assert!(!temporary.path().join("libraries").exists());
+        assert!(faults.execution.is_none());
+        assert_libraries_lane_settled(&temporary);
+    }
+
+    #[tokio::test]
+    async fn lifecycle_retries_crash_recovery_and_rolled_back_settlement() {
+        let temporary = tempfile::tempdir().expect("test root");
+        let sources = vec![
+            test_source(
+                "org/example/0.jar",
+                ManagedComponentArtifactKind::Library,
+                b"first-library".to_vec(),
+            ),
+            test_source(
+                "org/example/1.jar",
+                ManagedComponentArtifactKind::Library,
+                b"second-library".to_vec(),
+            ),
+        ];
+        let authority = test_authority(&sources);
+        let mut faults = LibrariesLifecycleTestFaults {
+            execution: Some(ComponentExecutionFault::CrashAfterFirstRow),
+            settlement: Some(ComponentSettlementFault::AfterSettlementPromotion),
+            ..LibrariesLifecycleTestFaults::default()
+        };
+
+        let error = match publish_libraries_component_with_faults(
+            test_lease(&temporary).await,
+            &authority,
+            sources,
+            &mut faults,
+        )
+        .await
+        {
+            Err(error) => error,
+            Ok(_) => panic!("reconciled current rollback must remain terminal"),
+        };
+
+        assert!(matches!(error, LibrariesLifecycleError::RolledBack));
+        assert!(!temporary.path().join("libraries").exists());
+        assert!(faults.execution.is_none());
+        assert!(faults.settlement.is_none());
+        assert_libraries_lane_settled(&temporary);
+    }
+
+    #[tokio::test]
+    async fn lifecycle_classifies_before_promotion_as_preeffect() {
+        let temporary = tempfile::tempdir().expect("test root");
+        let source = test_source(
+            "org/example/preeffect.jar",
+            ManagedComponentArtifactKind::Library,
+            b"preeffect-library".to_vec(),
+        );
+        let authority = test_authority(std::slice::from_ref(&source));
+        let mut faults = LibrariesLifecycleTestFaults {
+            intent: Some(ComponentIntentPublishFault::BeforeMarkerPromotion),
+            ..LibrariesLifecycleTestFaults::default()
+        };
+
+        let error = match publish_libraries_component_with_faults(
+            test_lease(&temporary).await,
+            &authority,
+            vec![source],
+            &mut faults,
+        )
+        .await
+        {
+            Err(error) => error,
+            Ok(_) => panic!("before-promotion failure must not enter recovery"),
+        };
+
+        assert!(matches!(error, LibrariesLifecycleError::BeforeEffects(_)));
+        assert!(!temporary.path().join("libraries").exists());
+        assert!(
+            !temporary
+                .path()
+                .join(".axial-publication/libraries/intent.bin")
+                .exists()
+        );
+    }
+
+    #[tokio::test]
+    async fn lifecycle_settles_different_prior_commit_before_current_replacement() {
+        let temporary = tempfile::tempdir().expect("test root");
+        let prior = test_source(
+            "org/example/replaced.jar",
+            ManagedComponentArtifactKind::Library,
+            b"prior-library".to_vec(),
+        );
+        let prior_authority = test_authority(std::slice::from_ref(&prior));
+        let prior_candidate =
+            prepare_libraries_intent(test_lease(&temporary).await, &prior_authority, vec![prior])
+                .await
+                .expect("prepare prior transaction");
+        let prior_published = prior_candidate
+            .publish_intent()
+            .unwrap_or_else(|_| panic!("publish prior transaction"));
+        let ComponentExecutionResult::Committed(prior_receipt) =
+            execute_component_intent(prior_published).await
+        else {
+            panic!("prior transaction must reach committed outcome")
+        };
+        let (lease, component) = prior_receipt.into_restart_seed();
+        assert_eq!(component, ManagedComponentKind::Libraries);
+
+        let current = test_source(
+            "org/example/replaced.jar",
+            ManagedComponentArtifactKind::Library,
+            b"current-library".to_vec(),
+        );
+        let current_authority = test_authority(std::slice::from_ref(&current));
+        let lease = publish_libraries_component(lease, &current_authority, vec![current])
+            .await
+            .expect("settle prior and publish current transaction");
+
+        lease.revalidate().expect("returned current lease");
+        assert_eq!(
+            fs::read(temporary.path().join("libraries/org/example/replaced.jar")).unwrap(),
+            b"current-library"
+        );
+        assert_libraries_lane_settled(&temporary);
+    }
+
     #[tokio::test]
     async fn sparse_sources_keep_projection_slots_across_shard_boundary() {
         let temporary = tempfile::tempdir().expect("test root");
@@ -585,7 +1036,7 @@ mod tests {
         }
         let authority = test_authority(&expected);
         let sparse = vec![expected[256].clone(), expected[255].clone()];
-        let candidate = prepare_libraries_intent(test_lease(&temporary).await, authority, sparse)
+        let candidate = prepare_libraries_intent(test_lease(&temporary).await, &authority, sparse)
             .await
             .expect("prepared sparse Libraries intent candidate");
         let lane = temporary.path().join(".axial-publication/libraries");
@@ -607,7 +1058,7 @@ mod tests {
 
         let prepared = candidate
             .publish_intent()
-            .expect("durable Libraries intent");
+            .unwrap_or_else(|_| panic!("durable Libraries intent"));
         assert!(lane.join(COMPONENT_INTENT_FILE).is_file());
         drop(prepared);
     }
@@ -638,7 +1089,7 @@ mod tests {
         .unwrap();
         let sources = vec![exact, replacement];
         let authority = test_authority(&sources);
-        let candidate = prepare_libraries_intent(test_lease(&temporary).await, authority, sources)
+        let candidate = prepare_libraries_intent(test_lease(&temporary).await, &authority, sources)
             .await
             .expect("prepared mixed-prior candidate");
         let lane = temporary.path().join(".axial-publication/libraries");
@@ -690,7 +1141,7 @@ mod tests {
 
         let candidate = prepare_libraries_intent::<TestSource>(
             test_lease(&temporary).await,
-            authority,
+            &authority,
             Vec::new(),
         )
         .await
@@ -723,7 +1174,7 @@ mod tests {
 
         let error = match prepare_libraries_intent::<TestSource>(
             test_lease(&temporary).await,
-            authority,
+            &authority,
             Vec::new(),
         )
         .await
@@ -768,7 +1219,7 @@ mod tests {
         let authority = test_authority(&expected);
         let sparse = vec![expected[2].clone(), expected[1].clone()];
 
-        let candidate = prepare_libraries_intent(test_lease(&temporary).await, authority, sparse)
+        let candidate = prepare_libraries_intent(test_lease(&temporary).await, &authority, sparse)
             .await
             .expect("sparse mixed projection");
         let lane = temporary.path().join(".axial-publication/libraries");
@@ -793,7 +1244,7 @@ mod tests {
         let authority = PendingKnownGoodInstallAuthority::libraries_for_test([]);
         let candidate = prepare_libraries_intent::<TestSource>(
             test_lease(&temporary).await,
-            authority,
+            &authority,
             Vec::new(),
         )
         .await
@@ -803,7 +1254,9 @@ mod tests {
         assert_eq!(fs::read_dir(lane.join("table")).unwrap().count(), 0);
         assert_eq!(fs::read_dir(lane.join("staging")).unwrap().count(), 0);
         assert_eq!(fs::read_dir(lane.join("quarantine")).unwrap().count(), 0);
-        let prepared = candidate.publish_intent().expect("empty durable intent");
+        let prepared = candidate
+            .publish_intent()
+            .unwrap_or_else(|_| panic!("empty durable intent"));
         assert!(lane.join(COMPONENT_INTENT_FILE).is_file());
         drop(prepared);
     }
@@ -865,7 +1318,7 @@ mod tests {
             }
 
             let error =
-                match prepare_libraries_intent(test_lease(&temporary).await, authority, sources)
+                match prepare_libraries_intent(test_lease(&temporary).await, &authority, sources)
                     .await
                 {
                     Err(error) => error,

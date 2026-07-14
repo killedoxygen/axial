@@ -4,7 +4,7 @@ use crate::download::{
     acquire_version_bundle_publication_lease,
     download_installer_libraries_with_declarations_and_facts,
     download_profile_libraries_with_declarations_and_facts,
-    prepare_local_version_bundle_publication, publish_prepared_version_bundle_install,
+    prepare_local_version_bundle_publication, publish_prepared_managed_install,
     reconstruct_installer_library_declarations, reconstruct_profile_library_declarations,
 };
 use crate::known_good::{
@@ -883,21 +883,13 @@ async fn publish_loader_version_bundle(
     let lease = acquire_version_bundle_publication_lease(library_dir.to_path_buf(), version_id)
         .await
         .map_err(loader_version_bundle_error)?;
-    tokio::spawn(publish_prepared_version_bundle_install(lease, prepared))
-        .await
-        .map_err(|error| {
-            let reason = if error.is_cancelled() {
-                "cancelled"
-            } else if error.is_panic() {
-                "panicked"
-            } else {
-                "failed"
-            };
-            LoaderError::InstallExecutionFailed(format!(
-                "loader version bundle publication task {reason}"
-            ))
-        })?
-        .map_err(loader_version_bundle_error)
+    publish_prepared_managed_install(
+        lease,
+        prepared,
+        Vec::<crate::download::library_source::RetainedLibraryComponentSource>::new(),
+    )
+    .await
+    .map_err(loader_version_bundle_error)
 }
 
 fn loader_version_bundle_error(_error: crate::download::DownloadError) -> LoaderError {

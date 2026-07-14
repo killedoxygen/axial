@@ -23,12 +23,17 @@ use std::collections::BTreeSet;
 
 mod managed_component_transaction;
 
+#[cfg(test)]
+pub(crate) use managed_component_transaction::{
+    ComponentExecutionFault, ComponentSettlementFault, execute_component_intent_with_fault,
+    settle_component_transaction_with_fault,
+};
 pub(crate) use managed_component_transaction::{
     ComponentExecutionResult, ComponentIntentPublicationRecovery, ComponentRecoveryRequired,
     ComponentRecoveryRetryResult, ComponentSettledOutcome, ComponentSettlementResult,
-    ComponentSettlementRetry, ComponentStartupRecoveryResult, ComponentTransactionReceipt,
-    execute_component_intent, recover_component_intent_publication, recover_component_transaction,
-    retry_component_recovery, retry_component_settlement, settle_component_transaction,
+    ComponentStartupRecoveryResult, ComponentTransactionReceipt, execute_component_intent,
+    recover_component_intent_publication, recover_component_transaction, retry_component_recovery,
+    retry_component_settlement, settle_component_transaction,
 };
 
 #[cfg(test)]
@@ -99,13 +104,12 @@ pub(crate) enum ComponentIntentPublishFailure {
     PromotionAttempted {
         candidate: Box<ComponentIntentCandidate>,
         intent_guard: Option<ManagedFileGuard>,
-        cause: ComponentEffectsError,
     },
 }
 
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ComponentIntentPublishFault {
+pub(crate) enum ComponentIntentPublishFault {
     BeforeMarkerPromotion,
     PromotionAttemptedWithoutMarker,
     AfterMarkerPromotion,
@@ -424,7 +428,7 @@ impl ComponentIntentCandidate {
     }
 
     #[cfg(test)]
-    fn publish_intent_with_fault(
+    pub(crate) fn publish_intent_with_fault(
         self,
         fault: ComponentIntentPublishFault,
     ) -> Result<ComponentIntentPublished, ComponentIntentPublishFailure> {
@@ -456,7 +460,6 @@ impl ComponentIntentCandidate {
             return Err(ComponentIntentPublishFailure::PromotionAttempted {
                 candidate: Box::new(self),
                 intent_guard: None,
-                cause: ComponentEffectsError::Topology,
             });
         }
         #[cfg(test)]
@@ -493,24 +496,24 @@ impl ComponentIntentCandidate {
                     cause: cause.into(),
                 });
             }
-            Err(ManagedCreateOnlyWriteFailure::PromotionAttempted { final_guard, cause }) => {
+            Err(ManagedCreateOnlyWriteFailure::PromotionAttempted { final_guard }) => {
                 return Err(ComponentIntentPublishFailure::PromotionAttempted {
                     candidate: Box::new(self),
                     intent_guard: final_guard,
-                    cause: cause.into(),
                 });
             }
         };
-        if let Err(cause) = finish_component_intent_publication(
+        if finish_component_intent_publication(
             &self,
             &intent_guard,
             #[cfg(test)]
             fault,
-        ) {
+        )
+        .is_err()
+        {
             return Err(ComponentIntentPublishFailure::PromotionAttempted {
                 candidate: Box::new(self),
                 intent_guard: Some(intent_guard),
-                cause,
             });
         }
         drop((current_summary, current_authority));

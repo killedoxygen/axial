@@ -20,7 +20,7 @@ pub(crate) use install::{
     AuthenticatedVanillaInstallSources, AuthenticatedVersionBundleMemberSource,
     AuthenticatedVersionBundleSource, PreparedVersionBundlePublication,
     ReconstructedVanillaAuthority, acquire_version_bundle_publication_lease,
-    prepare_local_version_bundle_publication, publish_prepared_version_bundle_install,
+    prepare_local_version_bundle_publication, publish_prepared_managed_install,
 };
 pub(crate) use install::{
     reconstruct_installer_library_declarations, reconstruct_installer_processor_sources,

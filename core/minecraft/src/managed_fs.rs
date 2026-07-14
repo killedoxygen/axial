@@ -58,7 +58,6 @@ pub(crate) enum ManagedCreateOnlyWriteFailure {
     BeforePromotion(LoaderError),
     PromotionAttempted {
         final_guard: Option<ManagedFileGuard>,
-        cause: LoaderError,
     },
 }
 
@@ -84,7 +83,7 @@ pub(crate) enum ManagedEmptyChildRemoval {
 
 #[derive(Debug)]
 pub(crate) enum ManagedDirectoryMoveFailure {
-    BeforeMove(LoaderError),
+    BeforeMove,
     MoveAttempted {
         expected_identity: ManagedDirectoryIdentity,
         cause: LoaderError,
@@ -1099,77 +1098,51 @@ impl ManagedDir {
         before_move: impl FnOnce(),
         after_move: impl FnOnce(),
     ) -> Result<ManagedDir, ManagedDirectoryMoveFailure> {
-        validate_segment(name).map_err(ManagedDirectoryMoveFailure::BeforeMove)?;
-        validate_segment(destination_name).map_err(ManagedDirectoryMoveFailure::BeforeMove)?;
+        validate_segment(name).map_err(|_| ManagedDirectoryMoveFailure::BeforeMove)?;
+        validate_segment(destination_name).map_err(|_| ManagedDirectoryMoveFailure::BeforeMove)?;
         let DirectoryBinding::Child {
             parent,
             name: child_name,
         } = &child.inner.binding
         else {
-            return Err(ManagedDirectoryMoveFailure::BeforeMove(
-                LoaderError::Verify(
-                    "managed directory move source is not a child directory".to_string(),
-                ),
-            ));
+            return Err(ManagedDirectoryMoveFailure::BeforeMove);
         };
         if !Arc::ptr_eq(parent, &self.inner) || child_name.as_os_str() != OsStr::new(name) {
-            return Err(ManagedDirectoryMoveFailure::BeforeMove(
-                LoaderError::Verify(
-                    "managed directory move source binding does not match its parent".to_string(),
-                ),
-            ));
+            return Err(ManagedDirectoryMoveFailure::BeforeMove);
         }
         if Arc::strong_count(&child.inner) != 1 {
-            return Err(ManagedDirectoryMoveFailure::BeforeMove(
-                LoaderError::Verify(
-                    "managed directory move source capability is not uniquely owned".to_string(),
-                ),
-            ));
+            return Err(ManagedDirectoryMoveFailure::BeforeMove);
         }
         self.revalidate()
-            .map_err(ManagedDirectoryMoveFailure::BeforeMove)?;
+            .map_err(|_| ManagedDirectoryMoveFailure::BeforeMove)?;
         destination
             .revalidate()
-            .map_err(ManagedDirectoryMoveFailure::BeforeMove)?;
+            .map_err(|_| ManagedDirectoryMoveFailure::BeforeMove)?;
         if self.inner.identity == destination.inner.identity
             && portable_case_fold(name) == portable_case_fold(destination_name)
         {
-            return Err(ManagedDirectoryMoveFailure::BeforeMove(
-                LoaderError::Verify(
-                    "managed directory move destination aliases its source".to_string(),
-                ),
-            ));
+            return Err(ManagedDirectoryMoveFailure::BeforeMove);
         }
         if !self
             .has_portably_exact_child_name(name)
-            .map_err(ManagedDirectoryMoveFailure::BeforeMove)?
+            .map_err(|_| ManagedDirectoryMoveFailure::BeforeMove)?
         {
-            return Err(ManagedDirectoryMoveFailure::BeforeMove(
-                LoaderError::Verify("managed directory move source is absent".to_string()),
-            ));
+            return Err(ManagedDirectoryMoveFailure::BeforeMove);
         }
         let (destination_exists, destination_entries) = destination
             .portable_child_name_state(destination_name)
-            .map_err(ManagedDirectoryMoveFailure::BeforeMove)?;
+            .map_err(|_| ManagedDirectoryMoveFailure::BeforeMove)?;
         if destination_exists {
-            return Err(ManagedDirectoryMoveFailure::BeforeMove(
-                LoaderError::Verify(
-                    "managed directory move destination is already occupied".to_string(),
-                ),
-            ));
+            return Err(ManagedDirectoryMoveFailure::BeforeMove);
         }
         if self.inner.identity != destination.inner.identity
             && destination_entries >= MAX_MANAGED_DIRECTORY_ENTRIES
         {
-            return Err(ManagedDirectoryMoveFailure::BeforeMove(
-                LoaderError::Verify(
-                    "managed directory move destination is at capacity".to_string(),
-                ),
-            ));
+            return Err(ManagedDirectoryMoveFailure::BeforeMove);
         }
         child
             .revalidate()
-            .map_err(ManagedDirectoryMoveFailure::BeforeMove)?;
+            .map_err(|_| ManagedDirectoryMoveFailure::BeforeMove)?;
         let expected_identity = ManagedDirectoryIdentity(child.inner.identity);
         before_move();
         platform::rename_entry_no_replace(
@@ -1841,14 +1814,16 @@ impl ManagedDir {
             .map_err(ManagedCreateOnlyWriteFailure::BeforePromotion)?;
 
         // From this point onward the destination may exist even when the operation reports failure.
-        if let Err(error) = platform::rename_entry_no_replace(
+        if platform::rename_entry_no_replace(
             &self.inner.handle,
             &self.inner.path,
             OsStr::new(&temp_name),
             &self.inner.handle,
             &self.inner.path,
             OsStr::new(name),
-        ) {
+        )
+        .is_err()
+        {
             let final_matches = self
                 .file_guard_matches(
                     name,
@@ -1859,32 +1834,19 @@ impl ManagedDir {
                 )
                 .unwrap_or(false);
             let final_guard = final_matches.then(|| pending.take_guard());
-            return Err(ManagedCreateOnlyWriteFailure::PromotionAttempted {
-                final_guard,
-                cause: LoaderError::Io(error),
-            });
+            return Err(ManagedCreateOnlyWriteFailure::PromotionAttempted { final_guard });
         }
         let guard = pending.take_guard();
         #[cfg(test)]
         if fault == Some(ManagedCreateOnlyWriteFault::AfterPromotion) {
-            return Err(promotion_attempted_failure(
-                self,
-                name,
-                guard,
-                injected_create_only_write_failure(),
-            ));
+            return Err(promotion_attempted_failure(self, name, guard));
         }
-        if let Err(cause) = self.sync() {
-            return Err(promotion_attempted_failure(self, name, guard, cause));
+        if self.sync().is_err() {
+            return Err(promotion_attempted_failure(self, name, guard));
         }
         #[cfg(test)]
         if fault == Some(ManagedCreateOnlyWriteFault::AfterDirectorySynced) {
-            return Err(promotion_attempted_failure(
-                self,
-                name,
-                guard,
-                injected_create_only_write_failure(),
-            ));
+            return Err(promotion_attempted_failure(self, name, guard));
         }
         let verified = self
             .read_guarded_file_bounded(name, &guard, size)
@@ -1892,39 +1854,22 @@ impl ManagedDir {
         match verified {
             Ok(true) => {}
             Ok(false) => {
-                return Err(promotion_attempted_failure(
-                    self,
-                    name,
-                    guard,
-                    LoaderError::Verify(
-                        "managed retained artifact changed after promotion".to_string(),
-                    ),
-                ));
+                return Err(promotion_attempted_failure(self, name, guard));
             }
-            Err(cause) => {
-                return Err(promotion_attempted_failure(self, name, guard, cause));
+            Err(_) => {
+                return Err(promotion_attempted_failure(self, name, guard));
             }
         }
         #[cfg(test)]
         if fault == Some(ManagedCreateOnlyWriteFault::AfterFinalVerified) {
-            return Err(promotion_attempted_failure(
-                self,
-                name,
-                guard,
-                injected_create_only_write_failure(),
-            ));
+            return Err(promotion_attempted_failure(self, name, guard));
         }
-        if let Err(cause) = self.revalidate() {
-            return Err(promotion_attempted_failure(self, name, guard, cause));
+        if self.revalidate().is_err() {
+            return Err(promotion_attempted_failure(self, name, guard));
         }
         #[cfg(test)]
         if fault == Some(ManagedCreateOnlyWriteFault::AfterRevalidated) {
-            return Err(promotion_attempted_failure(
-                self,
-                name,
-                guard,
-                injected_create_only_write_failure(),
-            ));
+            return Err(promotion_attempted_failure(self, name, guard));
         }
         Ok(guard)
     }
@@ -2975,13 +2920,12 @@ fn promotion_attempted_failure(
     directory: &ManagedDir,
     name: &str,
     guard: ManagedFileGuard,
-    cause: LoaderError,
 ) -> ManagedCreateOnlyWriteFailure {
     let final_guard = directory
         .file_guard_matches(name, &guard)
         .unwrap_or(false)
         .then_some(guard);
-    ManagedCreateOnlyWriteFailure::PromotionAttempted { final_guard, cause }
+    ManagedCreateOnlyWriteFailure::PromotionAttempted { final_guard }
 }
 
 #[cfg(test)]
@@ -3404,7 +3348,7 @@ mod tests {
                 &destination,
                 "Occupied",
             ),
-            Err(ManagedDirectoryMoveFailure::BeforeMove(_))
+            Err(ManagedDirectoryMoveFailure::BeforeMove)
         ));
         assert!(root.join("source/replacement").is_dir());
         assert!(root.join("destination/Occupied").is_dir());
@@ -3412,14 +3356,14 @@ mod tests {
         let alias = source.create_child_new("alias").expect("alias source");
         assert!(matches!(
             source.move_child_guarded_no_replace("alias", alias, &destination, "occupied"),
-            Err(ManagedDirectoryMoveFailure::BeforeMove(_))
+            Err(ManagedDirectoryMoveFailure::BeforeMove)
         ));
         assert!(root.join("source/alias").is_dir());
 
         let wrong = other.create_child_new("wrong").expect("wrong-bound child");
         assert!(matches!(
             source.move_child_guarded_no_replace("wrong", wrong, &destination, "wrong"),
-            Err(ManagedDirectoryMoveFailure::BeforeMove(_))
+            Err(ManagedDirectoryMoveFailure::BeforeMove)
         ));
         assert!(root.join("other/wrong").is_dir());
 
@@ -3427,7 +3371,7 @@ mod tests {
         let retained = shared.clone();
         assert!(matches!(
             source.move_child_guarded_no_replace("shared", shared, &destination, "shared"),
-            Err(ManagedDirectoryMoveFailure::BeforeMove(_))
+            Err(ManagedDirectoryMoveFailure::BeforeMove)
         ));
         retained.revalidate().expect("retained exact capability");
 
@@ -3441,7 +3385,7 @@ mod tests {
                 &source,
                 "SAME-PARENT"
             ),
-            Err(ManagedDirectoryMoveFailure::BeforeMove(_))
+            Err(ManagedDirectoryMoveFailure::BeforeMove)
         ));
         assert!(root.join("source/same-parent").is_dir());
         let _ = fs::remove_dir_all(root);
@@ -3852,7 +3796,6 @@ mod tests {
                 .expect_err("injected post-promotion failure");
             let ManagedCreateOnlyWriteFailure::PromotionAttempted {
                 final_guard: Some(guard),
-                cause: _,
             } = failure
             else {
                 panic!("post-promotion failure lost exact final authority")
@@ -3878,10 +3821,7 @@ mod tests {
 
         assert!(matches!(
             failure,
-            ManagedCreateOnlyWriteFailure::PromotionAttempted {
-                final_guard: None,
-                ..
-            }
+            ManagedCreateOnlyWriteFailure::PromotionAttempted { final_guard: None }
         ));
         assert_eq!(fs::read(root.join("intent.bin")).unwrap(), b"foreign");
         assert!(fs::read_dir(&root).expect("root entries").all(|entry| {
