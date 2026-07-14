@@ -32,7 +32,6 @@ use crate::loaders::forge_installer::{
 use crate::loaders::http::fetch_bytes;
 #[cfg(test)]
 use crate::loaders::http::fetch_bytes_for_test as fetch_bytes;
-use crate::loaders::managed_fs::ManagedDir;
 use crate::loaders::providers::{self, ProfileInstallProof};
 use crate::loaders::source::{VerifiedLoaderSource, fetch_sha1_verified_source};
 use crate::loaders::types::{
@@ -40,6 +39,7 @@ use crate::loaders::types::{
     LoaderInstallSource, LoaderInstallStrategy,
 };
 use crate::loaders::{validate_provider_version_id, validate_version_id};
+use crate::managed_fs::ManagedDir;
 use crate::paths::versions_dir;
 use crate::runtime::{ManagedRuntimeCache, acquire_preferred_runtime_source};
 use sha1::{Digest as _, Sha1};
@@ -1456,8 +1456,6 @@ mod tests {
         BoundForgeInstallExecution, BoundForgeInstallerPlan, bind_authenticated_installer_plan,
         plan_authenticated_installer,
     };
-    #[cfg(unix)]
-    use crate::loaders::managed_fs::ManagedDir;
     use crate::loaders::providers::{ProfileInstallProof, ProfileLibraryProof};
     use crate::loaders::source::VerifiedLoaderSource;
     use crate::loaders::types::LoaderError;
@@ -1467,6 +1465,8 @@ mod tests {
         LoaderInstallability,
     };
     use crate::loaders::{build_id_for, installed_version_id_for, validate_version_id};
+    #[cfg(unix)]
+    use crate::managed_fs::ManagedDir;
     use crate::manifest::VersionManifest;
     use crate::paths::versions_dir;
     use crate::rules::default_environment;

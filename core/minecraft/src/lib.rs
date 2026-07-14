@@ -8,12 +8,15 @@ mod known_good_reconstruction;
 pub mod launch;
 pub mod lifecycle;
 pub mod loaders;
+mod managed_fs;
+mod managed_publication;
 pub mod manifest;
 pub mod paths;
 pub mod rules;
 pub mod runtime;
 pub mod types;
 pub mod version;
+mod version_bundle_publication;
 pub mod version_meta;
 
 pub use asset_index::{AssetIndexFlagsError, asset_index_requires_virtual_repair};
@@ -71,6 +74,12 @@ pub use version::{
     VersionScanDependencyStamp, VersionScanIssue, VersionScanIssueKind, VersionScanReport,
     VersionScanSnapshot, VersionScanState, scan_versions, scan_versions_report,
     scan_versions_snapshot,
+};
+pub use version_bundle_publication::{
+    ManagedVersionBundleCommitReceipt, ManagedVersionBundleDisposition, ManagedVersionBundleEffect,
+    ManagedVersionBundleFailurePhase, ManagedVersionBundleFailureReceipt,
+    ManagedVersionBundleOrdinalDisposition, ManagedVersionBundlePublicationError,
+    ManagedVersionBundleRebuildError,
 };
 pub use version_meta::{
     MinecraftVersionMeta, ReleaseReference, analyze_minecraft_version, apply_version_analysis,

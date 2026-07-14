@@ -28,10 +28,11 @@ use super::transfer::{
 };
 use crate::artifact_path::validate_artifact_path_segment;
 use crate::known_good::{
-    KnownGoodInstallReceipt, KnownGoodReconstructionReceipt, MAX_KNOWN_GOOD_ASSET_INDEX_BYTES,
-    MAX_KNOWN_GOOD_VERSION_JSON_BYTES, PendingVanillaInstallReceipt,
-    authenticate_pending_vanilla_install, seal_completed_vanilla_install,
-    seal_reconstructed_vanilla,
+    KnownGoodArtifactKind, KnownGoodInstallReceipt, KnownGoodIntegrity,
+    KnownGoodReconstructionReceipt, KnownGoodRoot, MAX_KNOWN_GOOD_ASSET_INDEX_BYTES,
+    MAX_KNOWN_GOOD_VERSION_JSON_BYTES, MAX_TIER2_ARTIFACT_BYTES, ManagedComponentProjection,
+    ManagedKnownGoodComponent, PendingVanillaInstallReceipt, authenticate_pending_vanilla_install,
+    seal_completed_vanilla_install, seal_reconstructed_vanilla,
 };
 use crate::known_good_libraries::{
     ClassifiedLibraryDownload, LibraryAcquisition, PendingExactLibraryDeclarations,
@@ -39,6 +40,8 @@ use crate::known_good_libraries::{
     seal_vanilla_exact_library_declarations,
 };
 use crate::launch::{VersionJson, effective_java_version_for};
+use crate::managed_fs::ManagedDir;
+use crate::managed_publication::{ManagedRootPublicationLease, run_publication_blocking};
 use crate::manifest::{ManifestEntry, VersionManifest, fetch_fresh_install_version_manifest};
 use crate::paths::{assets_dir, libraries_dir, versions_dir};
 use crate::rules::{Environment, default_environment};
@@ -46,6 +49,10 @@ use crate::runtime::{ManagedRuntimeCache, RuntimeSourceReceipt, acquire_preferre
 #[cfg(test)]
 use crate::runtime::{
     TestRuntimeSourceDescriptor, acquire_test_runtime_source, authenticated_test_runtime_source,
+};
+use crate::version_bundle_publication::{
+    ManagedVersionBundleCommitReceipt, ManagedVersionBundleFailureReceipt,
+    ManagedVersionBundleRebuildError, publish_version_bundle,
 };
 use futures_util::StreamExt;
 use std::io;
@@ -70,6 +77,39 @@ enum DownloaderRoot {
         runtime_cache: ManagedRuntimeCache,
     },
     SourceOnly,
+}
+
+pub(crate) struct AuthenticatedVersionBundleSource {
+    version_id: String,
+    version_json: AuthenticatedSelectedArtifactSource,
+    client_jar: AuthenticatedSelectedArtifactSource,
+    log_config: Option<AuthenticatedSelectedArtifactSource>,
+}
+
+impl AuthenticatedVersionBundleSource {
+    pub(crate) fn version_id(&self) -> &str {
+        &self.version_id
+    }
+
+    pub(crate) fn matches_projection(&self, projection: &ManagedComponentProjection<'_>) -> bool {
+        version_bundle_sources_match_projection(
+            &self.version_id,
+            projection,
+            &self.version_json,
+            &self.client_jar,
+            self.log_config.as_ref(),
+        )
+    }
+
+    pub(crate) fn into_sources(
+        self,
+    ) -> (
+        AuthenticatedSelectedArtifactSource,
+        AuthenticatedSelectedArtifactSource,
+        Option<AuthenticatedSelectedArtifactSource>,
+    ) {
+        (self.version_json, self.client_jar, self.log_config)
+    }
 }
 
 pub(crate) struct ReconstructedVanillaClientAuthority {
@@ -143,6 +183,12 @@ struct AuthenticatedVanillaPlan {
     version_json_source: AuthenticatedSelectedArtifactSource,
     asset_index_source: Option<AuthenticatedSelectedArtifactSource>,
     runtime_source: Option<RuntimeSourceReceipt>,
+}
+
+struct AuthenticatedVanillaVersionSource {
+    version: VersionJson,
+    environment: Environment,
+    version_json_source: AuthenticatedSelectedArtifactSource,
 }
 
 struct VanillaAuthorityParts {
@@ -293,6 +339,16 @@ impl Downloader {
     }
 
     #[cfg(test)]
+    fn source_only_with_test_install_manifest(manifest: VersionManifest) -> Self {
+        Self {
+            root: DownloaderRoot::SourceOnly,
+            client: standard_minecraft_download_client(),
+            install_manifest: Some(manifest),
+            runtime_source: None,
+        }
+    }
+
+    #[cfg(test)]
     pub(crate) fn with_test_install_manifest(
         mc_dir: impl Into<PathBuf>,
         manifest: VersionManifest,
@@ -323,6 +379,63 @@ impl Downloader {
             unreachable!("source-only downloader cannot materialize an installation");
         };
         library_root
+    }
+
+    async fn managed_root_identity(&self) -> Option<crate::managed_fs::ManagedDirectoryIdentity> {
+        let DownloaderRoot::Managed { library_root, .. } = &self.root else {
+            return None;
+        };
+        let library_root = library_root.clone();
+        run_publication_blocking(move || ManagedDir::open_root(&library_root)?.identity())
+            .await
+            .ok()?
+            .ok()
+    }
+
+    pub async fn owns_managed_version_bundle_commit_receipt(
+        &self,
+        receipt: &ManagedVersionBundleCommitReceipt,
+    ) -> bool {
+        self.managed_root_identity()
+            .await
+            .is_some_and(|identity| receipt.matches_root_identity(identity))
+    }
+
+    pub async fn owns_managed_version_bundle_failure_receipt(
+        &self,
+        receipt: &ManagedVersionBundleFailureReceipt,
+    ) -> bool {
+        self.managed_root_identity()
+            .await
+            .is_some_and(|identity| receipt.matches_root_identity(identity))
+    }
+
+    pub async fn rebuild_managed_vanilla_version_bundle(
+        &self,
+        version_id: &str,
+        projection: ManagedComponentProjection<'_>,
+    ) -> Result<ManagedVersionBundleCommitReceipt, ManagedVersionBundleRebuildError> {
+        if crate::loaders::api::is_reserved_installed_loader_id(version_id) {
+            return Err(ManagedVersionBundleRebuildError::SourceUnavailable);
+        }
+        let DownloaderRoot::Managed { library_root, .. } = &self.root else {
+            return Err(ManagedVersionBundleRebuildError::RootUnavailable);
+        };
+        let source = self
+            .reconstruct_vanilla_version_bundle_source(version_id)
+            .await
+            .map_err(|_| ManagedVersionBundleRebuildError::SourceUnavailable)?;
+        let library_root = library_root.clone();
+        let root = run_publication_blocking(move || ManagedDir::open_root(&library_root))
+            .await
+            .map_err(|_| ManagedVersionBundleRebuildError::RootUnavailable)?
+            .map_err(|_| ManagedVersionBundleRebuildError::RootUnavailable)?;
+        let lease = ManagedRootPublicationLease::acquire(root)
+            .await
+            .map_err(|_| ManagedVersionBundleRebuildError::RootUnavailable)?;
+        publish_version_bundle(lease, source, projection)
+            .await
+            .map_err(ManagedVersionBundleRebuildError::Publication)
     }
 
     fn managed_runtime_cache(&self) -> &ManagedRuntimeCache {
@@ -414,49 +527,103 @@ impl Downloader {
         })
     }
 
-    async fn reconstruct_version_with_client_authority(
+    async fn reconstruct_vanilla_version_bundle_source(
         &self,
         version_id: &str,
-    ) -> Result<(VanillaAuthorityParts, AuthenticatedSelectedArtifactSource), DownloadError> {
-        const MAX_RECONSTRUCTED_CLIENT_BYTES: usize = 512 << 20;
-
+    ) -> Result<AuthenticatedVersionBundleSource, DownloadError> {
         validate_install_version_id(version_id)?;
         let version_manifest_entry = self.resolve_manifest_entry(version_id).await?;
-        let authority = self
-            .reconstruct_vanilla_authority(version_id, &version_manifest_entry)
+        let AuthenticatedVanillaVersionSource {
+            version,
+            environment: _,
+            version_json_source,
+        } = self
+            .acquire_vanilla_version_source(version_id, &version_manifest_entry, None)
             .await?;
-        let client = authority.version.downloads.client.as_ref().ok_or_else(|| {
+        let client_jar = self
+            .acquire_version_bundle_client_source(version_id, &version)
+            .await?;
+        let log_config = self
+            .acquire_version_bundle_log_config_source(&version)
+            .await?;
+
+        Ok(AuthenticatedVersionBundleSource {
+            version_id: version_id.to_string(),
+            version_json: version_json_source,
+            client_jar,
+            log_config,
+        })
+    }
+
+    async fn acquire_version_bundle_client_source(
+        &self,
+        version_id: &str,
+        version: &VersionJson,
+    ) -> Result<AuthenticatedSelectedArtifactSource, DownloadError> {
+        let client = version.downloads.client.as_ref().ok_or_else(|| {
             DownloadError::ResolveManifest(
                 "authenticated version has no exact client artifact".to_string(),
             )
         })?;
         let expected = ExpectedIntegrity::from_mojang(client.size, &client.sha1);
-        let expected_size = expected.size.ok_or_else(|| {
-            DownloadError::ResolveManifest(
-                "authenticated version has no exact client size".to_string(),
-            )
-        })?;
-        let max_bytes = usize::try_from(expected_size)
-            .ok()
-            .filter(|size| *size <= MAX_RECONSTRUCTED_CLIENT_BYTES)
-            .ok_or_else(|| {
-                DownloadError::ResolveManifest(
-                    "authenticated client exceeds the reconstruction source limit".to_string(),
-                )
-            })?;
+        let max_bytes = exact_version_bundle_source_limit(client.size, "client")?;
         let target =
             selected_download_source_label(SelectedDownloadArtifactKind::ClientJar, version_id);
-        let client_source =
-            acquire_authenticated_selected_artifact_source(SelectedArtifactSourceRequest {
-                client: &self.client,
-                kind: SelectedDownloadArtifactKind::ClientJar,
-                url: &client.url,
-                logical_identity: version_id,
-                expected: &expected,
-                max_bytes,
-                target: &target,
-                fact_tx: None,
-            })
+        acquire_authenticated_selected_artifact_source(SelectedArtifactSourceRequest {
+            client: &self.client,
+            kind: SelectedDownloadArtifactKind::ClientJar,
+            url: &client.url,
+            logical_identity: version_id,
+            expected: &expected,
+            max_bytes,
+            target: &target,
+            fact_tx: None,
+        })
+        .await
+    }
+
+    async fn acquire_version_bundle_log_config_source(
+        &self,
+        version: &VersionJson,
+    ) -> Result<Option<AuthenticatedSelectedArtifactSource>, DownloadError> {
+        let Some(logging) = version
+            .logging
+            .as_ref()
+            .and_then(|logging| logging.client.as_ref())
+        else {
+            return Ok(None);
+        };
+        let expected = ExpectedIntegrity::from_mojang(logging.file.size, &logging.file.sha1);
+        let max_bytes = exact_version_bundle_source_limit(logging.file.size, "log config")?;
+        let target = selected_download_source_label(
+            SelectedDownloadArtifactKind::LogConfig,
+            &logging.file.id,
+        );
+        acquire_authenticated_selected_artifact_source(SelectedArtifactSourceRequest {
+            client: &self.client,
+            kind: SelectedDownloadArtifactKind::LogConfig,
+            url: &logging.file.url,
+            logical_identity: &logging.file.id,
+            expected: &expected,
+            max_bytes,
+            target: &target,
+            fact_tx: None,
+        })
+        .await
+        .map(Some)
+    }
+
+    async fn reconstruct_version_with_client_authority(
+        &self,
+        version_id: &str,
+    ) -> Result<(VanillaAuthorityParts, AuthenticatedSelectedArtifactSource), DownloadError> {
+        validate_install_version_id(version_id)?;
+        let version_manifest_entry = self.resolve_manifest_entry(version_id).await?;
+        let authority = self
+            .reconstruct_vanilla_authority(version_id, &version_manifest_entry)
+            .await?;
+        let client_source = self
+            .acquire_version_bundle_client_source(version_id, &authority.version)
             .await?;
         Ok((authority, client_source))
     }
@@ -998,32 +1165,21 @@ impl Downloader {
         version_manifest_entry: &ManifestEntry,
         fact_tx: Option<&mpsc::UnboundedSender<ExecutionDownloadFact>>,
     ) -> Result<AuthenticatedVanillaPlan, DownloadError> {
-        let expected = ExpectedIntegrity::from_sha1(&version_manifest_entry.sha1);
-        let source_target =
-            selected_download_source_label(SelectedDownloadArtifactKind::VersionJson, version_id);
-        let source =
-            acquire_authenticated_selected_artifact_source(SelectedArtifactSourceRequest {
-                client: &self.client,
-                kind: SelectedDownloadArtifactKind::VersionJson,
-                url: &version_manifest_entry.url,
-                logical_identity: version_id,
-                expected: &expected,
-                max_bytes: MAX_KNOWN_GOOD_VERSION_JSON_BYTES,
-                target: &source_target,
-                fact_tx,
-            })
+        let AuthenticatedVanillaVersionSource {
+            version,
+            environment,
+            version_json_source,
+        } = self
+            .acquire_vanilla_version_source(version_id, version_manifest_entry, fact_tx)
             .await?;
-        let version = parse_vanilla_version_source(source.bytes(), version_id)?;
-        validate_vanilla_exact_artifact_contracts(&version)?;
-        let environment = default_environment();
+        validate_vanilla_asset_index_contract(&version)?;
         let declaration_source =
-            seal_vanilla_exact_library_declarations(source, &version, &environment).map_err(
-                |error| {
+            seal_vanilla_exact_library_declarations(version_json_source, &version, &environment)
+                .map_err(|error| {
                     DownloadError::ResolveManifest(format!(
                         "authenticated library declarations could not be sealed: {error:?}"
                     ))
-                },
-            )?;
+                })?;
         let (library_declarations, version_json_source) = declaration_source.into_parts();
         let (pending_library_declarations, library_jobs) = library_declarations
             .classify_jobs(
@@ -1053,6 +1209,37 @@ impl Downloader {
             version_json_source,
             asset_index_source,
             runtime_source,
+        })
+    }
+
+    async fn acquire_vanilla_version_source(
+        &self,
+        version_id: &str,
+        version_manifest_entry: &ManifestEntry,
+        fact_tx: Option<&mpsc::UnboundedSender<ExecutionDownloadFact>>,
+    ) -> Result<AuthenticatedVanillaVersionSource, DownloadError> {
+        let expected = ExpectedIntegrity::from_sha1(&version_manifest_entry.sha1);
+        let source_target =
+            selected_download_source_label(SelectedDownloadArtifactKind::VersionJson, version_id);
+        let version_json_source =
+            acquire_authenticated_selected_artifact_source(SelectedArtifactSourceRequest {
+                client: &self.client,
+                kind: SelectedDownloadArtifactKind::VersionJson,
+                url: &version_manifest_entry.url,
+                logical_identity: version_id,
+                expected: &expected,
+                max_bytes: MAX_KNOWN_GOOD_VERSION_JSON_BYTES,
+                target: &source_target,
+                fact_tx,
+            })
+            .await?;
+        let version = parse_vanilla_version_source(version_json_source.bytes(), version_id)?;
+        validate_vanilla_version_bundle_contracts(&version)?;
+        let environment = default_environment();
+        Ok(AuthenticatedVanillaVersionSource {
+            version,
+            environment,
+            version_json_source,
         })
     }
 
@@ -1328,6 +1515,96 @@ async fn reconstruct_installer_library_declarations_inner(
     })
 }
 
+fn exact_version_bundle_source_limit(size: i64, label: &str) -> Result<usize, DownloadError> {
+    u64::try_from(size)
+        .ok()
+        .filter(|size| *size > 0 && *size <= MAX_TIER2_ARTIFACT_BYTES)
+        .and_then(|size| usize::try_from(size).ok())
+        .ok_or_else(|| {
+            DownloadError::ResolveManifest(format!(
+                "authenticated {label} exceeds the reconstruction source limit"
+            ))
+        })
+}
+
+fn version_bundle_sources_match_projection(
+    version_id: &str,
+    projection: &ManagedComponentProjection<'_>,
+    version_json: &AuthenticatedSelectedArtifactSource,
+    client_jar: &AuthenticatedSelectedArtifactSource,
+    log_config: Option<&AuthenticatedSelectedArtifactSource>,
+) -> bool {
+    if projection.component() != ManagedKnownGoodComponent::VersionBundle
+        || projection.entry_count() != 2 + usize::from(log_config.is_some())
+    {
+        return false;
+    }
+    let version_json_path = format!("{version_id}/{version_id}.json");
+    let client_jar_path = format!("{version_id}/{version_id}.jar");
+    if !source_matches_version_bundle_entry(
+        projection,
+        version_json,
+        SelectedDownloadArtifactKind::VersionJson,
+        KnownGoodArtifactKind::VersionMetadata,
+        &KnownGoodRoot::Versions,
+        &version_json_path,
+    ) || !source_matches_version_bundle_entry(
+        projection,
+        client_jar,
+        SelectedDownloadArtifactKind::ClientJar,
+        KnownGoodArtifactKind::ClientJar,
+        &KnownGoodRoot::Versions,
+        &client_jar_path,
+    ) {
+        return false;
+    }
+    match log_config {
+        Some(source) => source_matches_version_bundle_entry(
+            projection,
+            source,
+            SelectedDownloadArtifactKind::LogConfig,
+            KnownGoodArtifactKind::LogConfig,
+            &KnownGoodRoot::Assets,
+            &format!("log_configs/{}", source.logical_identity()),
+        ),
+        None => true,
+    }
+}
+
+fn source_matches_version_bundle_entry(
+    projection: &ManagedComponentProjection<'_>,
+    source: &AuthenticatedSelectedArtifactSource,
+    source_kind: SelectedDownloadArtifactKind,
+    artifact_kind: KnownGoodArtifactKind,
+    root: &KnownGoodRoot,
+    path: &str,
+) -> bool {
+    if source.kind() != source_kind {
+        return false;
+    }
+    let Some(projected) = projection.entries().iter().find(|projected| {
+        let entry = projected.entry();
+        entry.kind() == artifact_kind && entry.root() == root && entry.path().as_str() == path
+    }) else {
+        return false;
+    };
+    let (digest, size) = match projected.entry().integrity() {
+        KnownGoodIntegrity::Sha1 { digest, size }
+        | KnownGoodIntegrity::ExactBytes { digest, size } => (digest, *size),
+        KnownGoodIntegrity::Directory | KnownGoodIntegrity::LinkTarget(_) => return false,
+    };
+    u64::try_from(source.bytes().len()).is_ok_and(|observed| observed == size)
+        && source
+            .expected()
+            .size
+            .is_none_or(|expected| expected == size)
+        && source
+            .expected()
+            .sha1
+            .as_deref()
+            .is_some_and(|expected| expected.eq_ignore_ascii_case(digest.as_str()))
+}
+
 fn validate_install_version_id(version_id: &str) -> Result<(), DownloadError> {
     let json_name = format!("{version_id}.json");
     if version_id != version_id.trim()
@@ -1341,7 +1618,7 @@ fn validate_install_version_id(version_id: &str) -> Result<(), DownloadError> {
     Ok(())
 }
 
-fn validate_vanilla_exact_artifact_contracts(version: &VersionJson) -> Result<(), DownloadError> {
+fn validate_vanilla_version_bundle_contracts(version: &VersionJson) -> Result<(), DownloadError> {
     let client = version.downloads.client.as_ref().ok_or_else(|| {
         DownloadError::ResolveManifest(
             "authenticated version has no exact client artifact".to_string(),
@@ -1367,6 +1644,10 @@ fn validate_vanilla_exact_artifact_contracts(version: &VersionJson) -> Result<()
         }
         validate_exact_mojang_contract(logging.file.size, &logging.file.sha1, "log config")?;
     }
+    Ok(())
+}
+
+fn validate_vanilla_asset_index_contract(version: &VersionJson) -> Result<(), DownloadError> {
     let asset_index = &version.asset_index;
     let absent_asset_index = asset_index.id.is_empty()
         && asset_index.url.is_empty()
@@ -1472,6 +1753,155 @@ fn client_jar_task_error(error: tokio::task::JoinError) -> DownloadError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sha1::{Digest as _, Sha1};
+    use std::collections::HashMap;
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    struct VersionBundleServerFixture {
+        manifest: VersionManifest,
+        requests: mpsc::UnboundedReceiver<String>,
+        version_json: Vec<u8>,
+        client_jar: Vec<u8>,
+        log_config: Option<Vec<u8>>,
+    }
+
+    async fn version_bundle_server(
+        version_id: &str,
+        with_log_config: bool,
+    ) -> VersionBundleServerFixture {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind version bundle server");
+        let base_url = format!("http://{}", listener.local_addr().expect("server address"));
+        let client_jar = b"authenticated-client".to_vec();
+        let log_config = with_log_config.then(|| b"<log4j/>".to_vec());
+        let mut version = serde_json::json!({
+            "id": version_id,
+            "downloads": { "client": {
+                "url": format!("{base_url}/client.jar"),
+                "sha1": test_sha1(&client_jar),
+                "size": client_jar.len()
+            }},
+            "assetIndex": {
+                "id": "unreachable-assets",
+                "url": "http://127.0.0.1:1/unreachable-assets.json",
+                "sha1": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "size": 16,
+                "totalSize": 16
+            },
+            "javaVersion": {
+                "component": "java-runtime-delta",
+                "majorVersion": 21
+            },
+            "libraries": [
+                {
+                    "name": "org.example:unreachable-exact:1.0.0",
+                    "downloads": { "artifact": {
+                        "path": "org/example/unreachable-exact/1.0.0/unreachable-exact-1.0.0.jar",
+                        "url": "http://127.0.0.1:1/unreachable-exact.jar",
+                        "sha1": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                        "size": 16
+                    }}
+                },
+                {
+                    "name": "org.example:unreachable-fresh:1.0.0",
+                    "url": "http://127.0.0.1:1/maven/",
+                    "size": 16
+                }
+            ]
+        });
+        if let Some(bytes) = log_config.as_ref() {
+            version["logging"] = serde_json::json!({
+                "client": {
+                    "argument": "-Dlog4j.configurationFile=${path}",
+                    "file": {
+                        "id": "client.xml",
+                        "url": format!("{base_url}/log-config.xml"),
+                        "sha1": test_sha1(bytes),
+                        "size": bytes.len()
+                    },
+                    "type": "log4j2-xml"
+                }
+            });
+        }
+        let version_json = version.to_string().into_bytes();
+        let manifest = serde_json::from_value(serde_json::json!({
+            "latest": { "release": version_id, "snapshot": version_id },
+            "versions": [{
+                "id": version_id,
+                "type": "release",
+                "url": format!("{base_url}/version.json"),
+                "sha1": test_sha1(&version_json),
+                "complianceLevel": 1
+            }]
+        }))
+        .expect("test manifest");
+        let mut responses = HashMap::from([
+            ("/version.json".to_string(), version_json.clone()),
+            ("/client.jar".to_string(), client_jar.clone()),
+        ]);
+        if let Some(bytes) = log_config.as_ref() {
+            responses.insert("/log-config.xml".to_string(), bytes.clone());
+        }
+        let responses = std::sync::Arc::new(responses);
+        let (request_tx, requests) = mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let responses = std::sync::Arc::clone(&responses);
+                let request_tx = request_tx.clone();
+                tokio::spawn(async move {
+                    let mut request = Vec::new();
+                    let mut chunk = [0_u8; 1024];
+                    loop {
+                        let Ok(read) = socket.read(&mut chunk).await else {
+                            return;
+                        };
+                        if read == 0 {
+                            return;
+                        }
+                        request.extend_from_slice(&chunk[..read]);
+                        if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+                    let Some(path) = String::from_utf8_lossy(&request)
+                        .lines()
+                        .next()
+                        .and_then(|line| line.split_whitespace().nth(1))
+                        .map(str::to_string)
+                    else {
+                        return;
+                    };
+                    let _ = request_tx.send(path.clone());
+                    let (status, body) = responses
+                        .get(&path)
+                        .map(|body| ("200 OK", body.as_slice()))
+                        .unwrap_or(("404 Not Found", b"not found"));
+                    let headers = format!(
+                        "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = socket.write_all(headers.as_bytes()).await;
+                    let _ = socket.write_all(body).await;
+                });
+            }
+        });
+
+        VersionBundleServerFixture {
+            manifest,
+            requests,
+            version_json,
+            client_jar,
+            log_config,
+        }
+    }
+
+    fn test_sha1(bytes: &[u8]) -> String {
+        format!("{:x}", Sha1::digest(bytes))
+    }
 
     fn exact_contract_version() -> serde_json::Value {
         serde_json::json!({
@@ -1503,7 +1933,7 @@ mod tests {
                     .remove(field);
             }
             let version: VersionJson = serde_json::from_value(value).expect("version metadata");
-            assert!(validate_vanilla_exact_artifact_contracts(&version).is_err());
+            assert!(validate_vanilla_version_bundle_contracts(&version).is_err());
         }
     }
 
@@ -1515,7 +1945,7 @@ mod tests {
                 value["logging"] = logging;
             }
             let version: VersionJson = serde_json::from_value(value).expect("version metadata");
-            validate_vanilla_exact_artifact_contracts(&version).expect("absent logging");
+            validate_vanilla_version_bundle_contracts(&version).expect("absent logging");
         }
 
         for file in [
@@ -1540,7 +1970,7 @@ mod tests {
                 "client": { "argument": "", "file": file, "type": "log4j2-xml" }
             });
             let version: VersionJson = serde_json::from_value(value).expect("version metadata");
-            assert!(validate_vanilla_exact_artifact_contracts(&version).is_err());
+            assert!(validate_vanilla_version_bundle_contracts(&version).is_err());
         }
     }
 
@@ -1567,5 +1997,400 @@ mod tests {
         };
 
         assert!(validate_version_manifest_entry(entry).is_err());
+    }
+
+    #[tokio::test]
+    async fn version_bundle_source_ignores_unrelated_component_sources() {
+        let mut fixture = version_bundle_server("bundle-source", true).await;
+        let downloader = Downloader::source_only_with_test_install_manifest(fixture.manifest);
+        assert!(matches!(&downloader.root, DownloaderRoot::SourceOnly));
+
+        let source = downloader
+            .reconstruct_vanilla_version_bundle_source("bundle-source")
+            .await
+            .expect("authenticated version bundle source");
+
+        assert_eq!(source.version_id(), "bundle-source");
+        let (version_json, client_jar, log_config) = source.into_sources();
+        assert_eq!(
+            version_json.kind(),
+            SelectedDownloadArtifactKind::VersionJson
+        );
+        assert_eq!(version_json.logical_identity(), "bundle-source");
+        assert_eq!(version_json.bytes(), fixture.version_json);
+        assert_eq!(client_jar.kind(), SelectedDownloadArtifactKind::ClientJar);
+        assert_eq!(client_jar.logical_identity(), "bundle-source");
+        assert_eq!(client_jar.bytes(), fixture.client_jar);
+        let log_config = log_config.expect("retained log config");
+        assert_eq!(log_config.kind(), SelectedDownloadArtifactKind::LogConfig);
+        assert_eq!(log_config.logical_identity(), "client.xml");
+        assert_eq!(
+            log_config.bytes(),
+            fixture.log_config.as_deref().expect("fixture log config")
+        );
+
+        let mut requests =
+            std::iter::from_fn(|| fixture.requests.try_recv().ok()).collect::<Vec<_>>();
+        requests.sort();
+        assert_eq!(
+            requests,
+            vec!["/client.jar", "/log-config.xml", "/version.json"]
+        );
+    }
+
+    #[tokio::test]
+    async fn version_bundle_source_omits_absent_log_config_without_a_request() {
+        let mut fixture = version_bundle_server("bundle-without-log", false).await;
+        let downloader = Downloader::source_only_with_test_install_manifest(fixture.manifest);
+
+        let source = downloader
+            .reconstruct_vanilla_version_bundle_source("bundle-without-log")
+            .await
+            .expect("authenticated version bundle source");
+
+        let (_, _, log_config) = source.into_sources();
+        assert!(log_config.is_none());
+        let mut requests =
+            std::iter::from_fn(|| fixture.requests.try_recv().ok()).collect::<Vec<_>>();
+        requests.sort();
+        assert_eq!(requests, vec!["/client.jar", "/version.json"]);
+    }
+
+    #[tokio::test]
+    async fn loader_version_bundle_rebuild_is_refused_before_source_resolution() {
+        let version_id = "loader-v2-invalid";
+        let inventory = crate::known_good::KnownGoodInventory::version_bundle_for_test(
+            version_id, b"{}", b"client", None,
+        );
+        let projection = inventory
+            .managed_component_projection(ManagedKnownGoodComponent::VersionBundle)
+            .expect("version bundle projection");
+        let result = Downloader::source_only()
+            .rebuild_managed_vanilla_version_bundle(version_id, projection)
+            .await;
+        assert!(matches!(
+            result,
+            Err(ManagedVersionBundleRebuildError::SourceUnavailable)
+        ));
+    }
+
+    #[tokio::test]
+    async fn version_bundle_publication_success_retains_exact_receipt_and_lane() {
+        let version_id = "bundle-success";
+        let fixture = version_bundle_server(version_id, false).await;
+        let temporary = tempfile::TempDir::new().expect("version bundle root");
+        let library_root = temporary.path().join("library");
+        std::fs::create_dir(&library_root).expect("library root");
+        let inventory = crate::known_good::KnownGoodInventory::version_bundle_for_test(
+            version_id,
+            &fixture.version_json,
+            &fixture.client_jar,
+            None,
+        );
+        let projection = inventory
+            .managed_component_projection(ManagedKnownGoodComponent::VersionBundle)
+            .expect("version bundle projection");
+        let downloader = Downloader::with_test_install_manifest(&library_root, fixture.manifest);
+
+        let receipt = downloader
+            .rebuild_managed_vanilla_version_bundle(version_id, projection)
+            .await
+            .expect("version bundle publication");
+
+        assert!(receipt.revalidate().await);
+        assert!(
+            downloader
+                .owns_managed_version_bundle_commit_receipt(&receipt)
+                .await
+        );
+        let fresh_projection = inventory
+            .managed_component_projection(ManagedKnownGoodComponent::VersionBundle)
+            .expect("fresh version bundle projection");
+        assert!(receipt.matches_projection(&fresh_projection));
+        assert_eq!(
+            receipt
+                .dispositions()
+                .iter()
+                .copied()
+                .map(|disposition| (
+                    disposition.inventory_ordinal(),
+                    disposition.disposition()
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    0,
+                    crate::version_bundle_publication::ManagedVersionBundleDisposition::PublishedNew,
+                ),
+                (
+                    1,
+                    crate::version_bundle_publication::ManagedVersionBundleDisposition::PublishedNew,
+                ),
+            ]
+        );
+        let version_root = library_root.join("versions").join(version_id);
+        assert_eq!(
+            std::fs::read(version_root.join(format!("{version_id}.json")))
+                .expect("published version json"),
+            fixture.version_json
+        );
+        assert_eq!(
+            std::fs::read(version_root.join(format!("{version_id}.jar")))
+                .expect("published client jar"),
+            fixture.client_jar
+        );
+
+        let publication_root = library_root.join(".axial-publication");
+        let lane = publication_root.join("version-bundle");
+        assert_eq!(
+            directory_entry_names(&publication_root),
+            vec!["publication.lock".to_string(), "version-bundle".to_string()]
+        );
+        assert_eq!(
+            directory_entry_names(&lane),
+            vec![
+                "manifest.json".to_string(),
+                "quarantine".to_string(),
+                "staging".to_string(),
+            ]
+        );
+        assert!(directory_entry_names(&lane.join("staging")).is_empty());
+        assert!(directory_entry_names(&lane.join("quarantine")).is_empty());
+    }
+
+    fn directory_entry_names(path: &Path) -> Vec<String> {
+        let mut entries = std::fs::read_dir(path)
+            .expect("publication directory")
+            .map(|entry| {
+                entry
+                    .expect("publication entry")
+                    .file_name()
+                    .into_string()
+                    .expect("portable publication entry")
+            })
+            .collect::<Vec<_>>();
+        entries.sort();
+        entries
+    }
+
+    #[tokio::test]
+    async fn version_bundle_publication_rolls_back_in_reverse_after_an_effect_failure() {
+        let version_id = "bundle-rollback";
+        let fixture = version_bundle_server(version_id, false).await;
+        let temporary = tempfile::TempDir::new().expect("version bundle root");
+        let library_root = temporary.path().join("library");
+        std::fs::create_dir(&library_root).expect("library root");
+        let inventory = crate::known_good::KnownGoodInventory::version_bundle_for_test(
+            version_id,
+            &fixture.version_json,
+            &fixture.client_jar,
+            None,
+        );
+        let projection = inventory
+            .managed_component_projection(ManagedKnownGoodComponent::VersionBundle)
+            .expect("version bundle projection");
+        crate::version_bundle_publication::fail_after_promotions_for_test(version_id, 1);
+        let downloader = Downloader::with_test_install_manifest(&library_root, fixture.manifest);
+
+        let error = downloader
+            .rebuild_managed_vanilla_version_bundle(version_id, projection)
+            .await
+            .expect_err("injected promotion failure");
+        let ManagedVersionBundleRebuildError::Publication(publication) = error else {
+            panic!("effect failure classification");
+        };
+        assert_eq!(
+            publication.failure_phase(),
+            crate::version_bundle_publication::ManagedVersionBundleFailurePhase::Effect
+        );
+        let receipt = publication
+            .into_effect_receipt()
+            .expect("effect failure receipt");
+        assert_eq!(
+            receipt.effect(),
+            crate::version_bundle_publication::ManagedVersionBundleEffect::Promotion
+        );
+        assert!(receipt.revalidate().await);
+        assert!(
+            downloader
+                .owns_managed_version_bundle_failure_receipt(&receipt)
+                .await
+        );
+        let fresh_projection = inventory
+            .managed_component_projection(ManagedKnownGoodComponent::VersionBundle)
+            .expect("fresh version bundle projection");
+        assert!(receipt.matches_projection(&fresh_projection));
+        assert!(
+            !library_root
+                .join("versions")
+                .join(version_id)
+                .join(format!("{version_id}.json"))
+                .exists()
+        );
+        assert!(
+            !library_root
+                .join("versions")
+                .join(version_id)
+                .join(format!("{version_id}.jar"))
+                .exists()
+        );
+        assert!(
+            library_root
+                .join(".axial-publication/version-bundle/manifest.json")
+                .is_file()
+        );
+    }
+
+    #[tokio::test]
+    async fn version_bundle_publication_restores_quarantined_replacements() {
+        let version_id = "bundle-replacement-rollback";
+        let fixture = version_bundle_server(version_id, false).await;
+        let temporary = tempfile::TempDir::new().expect("version bundle root");
+        let library_root = temporary.path().join("library");
+        let version_root = library_root.join("versions").join(version_id);
+        std::fs::create_dir_all(&version_root).expect("existing version root");
+        let previous_json = b"previous-version-json";
+        let previous_client = b"previous-client-jar";
+        std::fs::write(
+            version_root.join(format!("{version_id}.json")),
+            previous_json,
+        )
+        .expect("previous version json");
+        std::fs::write(
+            version_root.join(format!("{version_id}.jar")),
+            previous_client,
+        )
+        .expect("previous client jar");
+        let inventory = crate::known_good::KnownGoodInventory::version_bundle_for_test(
+            version_id,
+            &fixture.version_json,
+            &fixture.client_jar,
+            None,
+        );
+        let projection = inventory
+            .managed_component_projection(ManagedKnownGoodComponent::VersionBundle)
+            .expect("version bundle projection");
+        crate::version_bundle_publication::fail_after_promotions_for_test(version_id, 2);
+        let downloader = Downloader::with_test_install_manifest(&library_root, fixture.manifest);
+
+        let error = downloader
+            .rebuild_managed_vanilla_version_bundle(version_id, projection)
+            .await
+            .expect_err("injected replacement failure");
+        let ManagedVersionBundleRebuildError::Publication(publication) = error else {
+            panic!("effect failure classification");
+        };
+        let receipt = publication
+            .into_effect_receipt()
+            .expect("effect failure receipt");
+        assert_eq!(
+            receipt.effect(),
+            crate::version_bundle_publication::ManagedVersionBundleEffect::Promotion
+        );
+        assert!(receipt.revalidate().await);
+        assert_eq!(
+            std::fs::read(version_root.join(format!("{version_id}.json")))
+                .expect("restored version json"),
+            previous_json
+        );
+        assert_eq!(
+            std::fs::read(version_root.join(format!("{version_id}.jar")))
+                .expect("restored client jar"),
+            previous_client
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelling_version_bundle_caller_does_not_cancel_started_mutation() {
+        let version_id = "bundle-cancellation";
+        let fixture = version_bundle_server(version_id, false).await;
+        let temporary = tempfile::TempDir::new().expect("version bundle root");
+        let library_root = temporary.path().join("library");
+        std::fs::create_dir(&library_root).expect("library root");
+        let inventory = crate::known_good::KnownGoodInventory::version_bundle_for_test(
+            version_id,
+            &fixture.version_json,
+            &fixture.client_jar,
+            None,
+        );
+        let projection = inventory
+            .managed_component_projection(ManagedKnownGoodComponent::VersionBundle)
+            .expect("version bundle projection");
+        let (reached, release) =
+            crate::version_bundle_publication::pause_after_promotions_for_test(version_id, 1);
+        let downloader = Downloader::with_test_install_manifest(&library_root, fixture.manifest);
+
+        {
+            let publication =
+                downloader.rebuild_managed_vanilla_version_bundle(version_id, projection);
+            tokio::pin!(publication);
+            tokio::select! {
+                reached = reached => reached.expect("mutation reached first promotion"),
+                result = &mut publication => panic!("publication completed before pause: {result:?}"),
+            }
+        }
+        release.send(()).expect("release detached mutation");
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            let version_directory = library_root.join("versions").join(version_id);
+            loop {
+                if version_directory
+                    .join(format!("{version_id}.json"))
+                    .is_file()
+                    && version_directory
+                        .join(format!("{version_id}.jar"))
+                        .is_file()
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("detached mutation completed");
+        assert_eq!(
+            std::fs::read(
+                library_root
+                    .join("versions")
+                    .join(version_id)
+                    .join(format!("{version_id}.json"))
+            )
+            .expect("published version json"),
+            fixture.version_json
+        );
+        assert_eq!(
+            std::fs::read(
+                library_root
+                    .join("versions")
+                    .join(version_id)
+                    .join(format!("{version_id}.jar"))
+            )
+            .expect("published client jar"),
+            fixture.client_jar
+        );
+        assert!(
+            library_root
+                .join(".axial-publication/version-bundle/manifest.json")
+                .is_file()
+        );
+
+        let second_projection = inventory
+            .managed_component_projection(ManagedKnownGoodComponent::VersionBundle)
+            .expect("second version bundle projection");
+        let second_error = downloader
+            .rebuild_managed_vanilla_version_bundle(version_id, second_projection)
+            .await
+            .expect_err("retained lane must fail closed");
+        let ManagedVersionBundleRebuildError::Publication(second_error) = second_error else {
+            panic!("second attempt failure classification");
+        };
+        assert_eq!(
+            second_error.failure_phase(),
+            crate::version_bundle_publication::ManagedVersionBundleFailurePhase::PreEffect
+        );
+        assert!(matches!(
+            second_error,
+            crate::version_bundle_publication::ManagedVersionBundlePublicationError::LaneOccupied
+        ));
     }
 }

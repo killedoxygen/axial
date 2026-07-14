@@ -28,6 +28,22 @@ pub(crate) struct ManagedDir {
     inner: Arc<ManagedDirInner>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct ManagedDirectoryIdentity(platform::DirectoryIdentity);
+
+pub(crate) struct ManagedPersistentFile {
+    directory: ManagedDir,
+    name: OsString,
+    identity: platform::FileIdentity,
+    file: std::fs::File,
+}
+
+pub(crate) struct ManagedFileGuard {
+    identity: platform::FileIdentity,
+    file: std::fs::File,
+    size: u64,
+}
+
 pub(crate) struct MaterializedInstallerLibrary {
     source: RetainedInstallerLibrarySource,
     destination: PathBuf,
@@ -45,6 +61,29 @@ impl std::fmt::Debug for ManagedDir {
             .debug_struct("ManagedDir")
             .field("path", &self.inner.path)
             .finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for ManagedPersistentFile {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ManagedPersistentFile")
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for ManagedFileGuard {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ManagedFileGuard")
+            .field("size", &self.size)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ManagedFileGuard {
+    pub(crate) fn size(&self) -> u64 {
+        self.size
     }
 }
 
@@ -364,17 +403,27 @@ impl ManagedDir {
         &self.inner.path
     }
 
+    pub(crate) fn identity(&self) -> Result<ManagedDirectoryIdentity, LoaderError> {
+        self.revalidate()?;
+        Ok(ManagedDirectoryIdentity(self.inner.identity))
+    }
+
     pub(crate) fn open_or_create_child(&self, name: &str) -> Result<Self, LoaderError> {
         validate_segment(name)?;
+        self.revalidate()?;
         match platform::open_child_directory(&self.inner.handle, &self.inner.path, OsStr::new(name))
         {
             Ok((handle, identity)) => self.child(name, handle, identity),
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                platform::create_child_directory(
+                match platform::create_child_directory(
                     &self.inner.handle,
                     &self.inner.path,
                     OsStr::new(name),
-                )?;
+                ) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+                    Err(error) => return Err(LoaderError::Io(error)),
+                }
                 let (handle, identity) = platform::open_child_directory(
                     &self.inner.handle,
                     &self.inner.path,
@@ -386,11 +435,187 @@ impl ManagedDir {
         }
     }
 
+    pub(crate) fn open_or_create_persistent_file(
+        &self,
+        name: &str,
+    ) -> Result<ManagedPersistentFile, LoaderError> {
+        validate_segment(name)?;
+        self.revalidate()?;
+        let name = OsString::from(name);
+        let file = match platform::open_file_read_write(&self.inner.handle, &self.inner.path, &name)
+        {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                match platform::create_new_file(&self.inner.handle, &self.inner.path, &name) {
+                    Ok(file) => drop(file),
+                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+                    Err(error) => return Err(LoaderError::Io(error)),
+                }
+                platform::open_file_read_write(&self.inner.handle, &self.inner.path, &name)?
+            }
+            Err(error) => return Err(LoaderError::Io(error)),
+        };
+        let persistent = ManagedPersistentFile {
+            directory: self.clone(),
+            name,
+            identity: platform::file_identity(&file)?,
+            file,
+        };
+        persistent.revalidate()?;
+        Ok(persistent)
+    }
+
     pub(crate) fn open_child(&self, name: &str) -> Result<Self, LoaderError> {
         validate_segment(name)?;
         let (handle, identity) =
             platform::open_child_directory(&self.inner.handle, &self.inner.path, OsStr::new(name))?;
         self.child(name, handle, identity)
+    }
+
+    pub(crate) fn entries_bounded(&self, limit: usize) -> Result<Vec<OsString>, LoaderError> {
+        if limit == 0 || limit > MAX_MANAGED_DIRECTORY_ENTRIES + 1 {
+            return Err(LoaderError::Verify(
+                "managed directory listing bound is invalid".to_string(),
+            ));
+        }
+        self.revalidate()?;
+        Ok(platform::entry_names(
+            &self.inner.handle,
+            &self.inner.path,
+            limit,
+        )?)
+    }
+
+    pub(crate) fn has_portably_exact_child_name(
+        &self,
+        expected: &str,
+    ) -> Result<bool, LoaderError> {
+        validate_segment(expected)?;
+        let expected_folded = expected
+            .chars()
+            .flat_map(char::to_lowercase)
+            .collect::<String>();
+        let entries = self.entries_bounded(MAX_MANAGED_DIRECTORY_ENTRIES + 1)?;
+        if entries.len() > MAX_MANAGED_DIRECTORY_ENTRIES {
+            return Err(LoaderError::Verify(
+                "managed directory exceeds the portable alias scan bound".to_string(),
+            ));
+        }
+        let mut matching_name = None;
+        for entry in entries {
+            let Some(entry) = entry.to_str() else {
+                return Err(LoaderError::Verify(
+                    "managed directory contains a non-portable entry name".to_string(),
+                ));
+            };
+            let folded = entry
+                .chars()
+                .flat_map(char::to_lowercase)
+                .collect::<String>();
+            if folded != expected_folded {
+                continue;
+            }
+            if matching_name.replace(entry.to_string()).is_some() || entry != expected {
+                return Err(LoaderError::Verify(
+                    "managed directory contains a portable case alias".to_string(),
+                ));
+            }
+        }
+        Ok(matching_name.is_some())
+    }
+
+    pub(crate) fn inspect_regular_file(
+        &self,
+        name: &str,
+    ) -> Result<Option<ManagedFileGuard>, LoaderError> {
+        validate_segment(name)?;
+        self.revalidate()?;
+        match platform::entry_kind(&self.inner.handle, &self.inner.path, OsStr::new(name))? {
+            None => Ok(None),
+            Some(EntryKind::File) => {
+                let file = platform::open_file_read(
+                    &self.inner.handle,
+                    &self.inner.path,
+                    OsStr::new(name),
+                )?;
+                let guard = ManagedFileGuard {
+                    identity: platform::file_identity(&file)?,
+                    size: file.metadata()?.len(),
+                    file,
+                };
+                if !self.file_guard_matches(name, &guard)? {
+                    return Err(LoaderError::Verify(
+                        "managed file identity changed during admission".to_string(),
+                    ));
+                }
+                Ok(Some(guard))
+            }
+            Some(EntryKind::Directory | EntryKind::Link) => Err(LoaderError::Verify(
+                "managed file entry has an unsupported type".to_string(),
+            )),
+            #[cfg(unix)]
+            Some(EntryKind::Other) => Err(LoaderError::Verify(
+                "managed file entry has an unsupported type".to_string(),
+            )),
+        }
+    }
+
+    pub(crate) fn file_guard_matches(
+        &self,
+        name: &str,
+        guard: &ManagedFileGuard,
+    ) -> Result<bool, LoaderError> {
+        validate_segment(name)?;
+        self.revalidate()?;
+        let current = match platform::open_file_read(
+            &self.inner.handle,
+            &self.inner.path,
+            OsStr::new(name),
+        ) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(LoaderError::Io(error)),
+        };
+        Ok(platform::file_identity(&current)? == guard.identity
+            && platform::file_identity(&guard.file)? == guard.identity)
+    }
+
+    pub(crate) fn rename_guarded_file_no_replace(
+        &self,
+        name: &str,
+        guard: &ManagedFileGuard,
+        destination: &ManagedDir,
+        destination_name: &str,
+    ) -> Result<(), LoaderError> {
+        validate_segment(name)?;
+        validate_segment(destination_name)?;
+        if !self.file_guard_matches(name, guard)? {
+            return Err(LoaderError::Verify(
+                "managed rename source identity changed".to_string(),
+            ));
+        }
+        destination.revalidate()?;
+        platform::rename_entry_no_replace(
+            &self.inner.handle,
+            &self.inner.path,
+            OsStr::new(name),
+            &destination.inner.handle,
+            &destination.inner.path,
+            OsStr::new(destination_name),
+        )?;
+        if !destination.file_guard_matches(destination_name, guard)? {
+            return Err(LoaderError::Verify(
+                "managed rename destination identity changed".to_string(),
+            ));
+        }
+        self.revalidate()?;
+        Ok(())
+    }
+
+    pub(crate) fn sync(&self) -> Result<(), LoaderError> {
+        self.revalidate()?;
+        platform::sync_directory(&self.inner.handle)?;
+        self.revalidate()
     }
 
     fn child(
@@ -607,6 +832,130 @@ impl ManagedDir {
             let _ = platform::remove_file(&self.inner.handle, &self.inner.path, OsStr::new(name));
             return Err(LoaderError::Verify(
                 "installed loader artifact differs from authenticated bytes".to_string(),
+            ));
+        }
+        self.revalidate()
+    }
+
+    pub(crate) fn write_new_exact(&self, name: &str, bytes: &[u8]) -> Result<(), LoaderError> {
+        validate_segment(name)?;
+        let temp_name = temp_name();
+        self.sweep_orphan_temps()?;
+        let active = ActiveTemp::register(self.inner.identity, &temp_name);
+        let mut file = platform::create_new_file(
+            &self.inner.handle,
+            &self.inner.path,
+            OsStr::new(&temp_name),
+        )?;
+        let mut pending = PendingTemp::arm(self.clone(), &temp_name, active);
+        file.write_all(bytes)?;
+        file.flush()?;
+        file.sync_all()?;
+        file.seek(SeekFrom::Start(0))?;
+        let write_result = verify_reader_exact_bytes(&mut file, bytes);
+        drop(file);
+        match write_result {
+            Ok(true) => {}
+            Ok(false) => {
+                return Err(LoaderError::Verify(
+                    "managed transaction temp bytes changed before promotion".to_string(),
+                ));
+            }
+            Err(error) => return Err(LoaderError::Io(error)),
+        }
+        platform::rename_entry_no_replace(
+            &self.inner.handle,
+            &self.inner.path,
+            OsStr::new(&temp_name),
+            &self.inner.handle,
+            &self.inner.path,
+            OsStr::new(name),
+        )?;
+        pending.disarm();
+        self.verify_exact_bytes(name, bytes)?;
+        self.revalidate()
+    }
+
+    pub(crate) fn verify_authenticated(
+        &self,
+        name: &str,
+        expected_size: u64,
+        expected_sha1: &str,
+    ) -> Result<(), LoaderError> {
+        if expected_size > MAX_MANAGED_READ_BYTES {
+            return Err(LoaderError::Verify(
+                "managed authenticated verification exceeds the admitted size bound".to_string(),
+            ));
+        }
+        validate_segment(name)?;
+        self.revalidate()?;
+        let mut file =
+            platform::open_file_read(&self.inner.handle, &self.inner.path, OsStr::new(name))?;
+        let identity = platform::file_identity(&file)?;
+        if file.metadata()?.len() != expected_size {
+            return Err(LoaderError::Verify(
+                "managed authenticated file size changed".to_string(),
+            ));
+        }
+        let mut observed = 0_u64;
+        let mut hasher = Sha1::new();
+        let mut chunk = [0_u8; 64 * 1024];
+        loop {
+            let read = file.read(&mut chunk)?;
+            if read == 0 {
+                break;
+            }
+            observed = observed.checked_add(read as u64).ok_or_else(|| {
+                LoaderError::Verify("managed authenticated file size overflowed".to_string())
+            })?;
+            if observed > expected_size {
+                return Err(LoaderError::Verify(
+                    "managed authenticated file exceeds its admitted size".to_string(),
+                ));
+            }
+            hasher.update(&chunk[..read]);
+        }
+        let digest = format!("{:x}", hasher.finalize());
+        if observed != expected_size || !digest.eq_ignore_ascii_case(expected_sha1) {
+            return Err(LoaderError::Verify(
+                "managed authenticated file failed integrity verification".to_string(),
+            ));
+        }
+        let current =
+            platform::open_file_read(&self.inner.handle, &self.inner.path, OsStr::new(name))?;
+        if platform::file_identity(&current)? != identity
+            || platform::file_identity(&file)? != identity
+        {
+            return Err(LoaderError::Verify(
+                "managed authenticated file identity changed".to_string(),
+            ));
+        }
+        self.revalidate()
+    }
+
+    fn verify_exact_bytes(&self, name: &str, expected: &[u8]) -> Result<(), LoaderError> {
+        validate_segment(name)?;
+        self.revalidate()?;
+        let mut file =
+            platform::open_file_read(&self.inner.handle, &self.inner.path, OsStr::new(name))?;
+        let identity = platform::file_identity(&file)?;
+        let expected_size = u64::try_from(expected.len()).map_err(|_| {
+            LoaderError::Verify("managed transaction artifact size overflowed".to_string())
+        })?;
+        if file.metadata()?.len() != expected_size
+            || !verify_reader_exact_bytes(&mut file, expected)?
+        {
+            return Err(LoaderError::Verify(
+                "managed transaction artifact changed after promotion".to_string(),
+            ));
+        }
+        let current =
+            platform::open_file_read(&self.inner.handle, &self.inner.path, OsStr::new(name))?;
+        if platform::file_identity(&current)? != identity
+            || platform::file_identity(&file)? != identity
+        {
+            return Err(LoaderError::Verify(
+                "managed transaction artifact identity changed".to_string(),
             ));
         }
         self.revalidate()
@@ -1294,6 +1643,60 @@ impl ManagedDir {
     }
 }
 
+impl ManagedPersistentFile {
+    pub(crate) fn revalidate(&self) -> Result<(), LoaderError> {
+        self.directory.revalidate()?;
+        let current = platform::open_file_read_write(
+            &self.directory.inner.handle,
+            &self.directory.inner.path,
+            &self.name,
+        )?;
+        if platform::file_identity(&current)? != self.identity {
+            return Err(LoaderError::Verify(
+                "managed persistent file identity changed".to_string(),
+            ));
+        }
+        self.directory.revalidate()
+    }
+
+    pub(crate) fn try_lock_exclusive(&self) -> Result<bool, LoaderError> {
+        self.revalidate()?;
+        match self.file.try_lock() {
+            Ok(()) => {
+                if let Err(error) = self.revalidate() {
+                    let _ = self.file.unlock();
+                    return Err(error);
+                }
+                Ok(true)
+            }
+            Err(std::fs::TryLockError::WouldBlock) => Ok(false),
+            Err(std::fs::TryLockError::Error(error)) => Err(LoaderError::Io(error)),
+        }
+    }
+
+    pub(crate) fn unlock(&self) -> io::Result<()> {
+        self.file.unlock()
+    }
+}
+
+fn verify_reader_exact_bytes(reader: &mut std::fs::File, expected: &[u8]) -> io::Result<bool> {
+    let mut offset = 0_usize;
+    let mut chunk = [0_u8; 64 * 1024];
+    loop {
+        let read = reader.read(&mut chunk)?;
+        if read == 0 {
+            return Ok(offset == expected.len());
+        }
+        let Some(end) = offset.checked_add(read) else {
+            return Ok(false);
+        };
+        if end > expected.len() || chunk[..read] != expected[offset..end] {
+            return Ok(false);
+        }
+        offset = end;
+    }
+}
+
 fn validate_segment(name: &str) -> Result<(), LoaderError> {
     validate_artifact_path_segment(name).map_err(|_| {
         LoaderError::Verify("managed loader path segment is not canonical".to_string())
@@ -1442,6 +1845,27 @@ mod platform {
         Ok(fs::File::from(fd))
     }
 
+    pub(super) fn open_file_read_write(
+        parent: &DirectoryHandle,
+        _parent_path: &Path,
+        name: &OsStr,
+    ) -> io::Result<fs::File> {
+        let fd = rfs::openat(
+            parent,
+            name,
+            OFlags::RDWR | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )?;
+        let stat = rfs::fstat(&fd)?;
+        if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "entry is not a file",
+            ));
+        }
+        Ok(fs::File::from(fd))
+    }
+
     pub(super) fn file_identity(file: &fs::File) -> io::Result<FileIdentity> {
         Ok(identity_from_stat(rfs::fstat(file)?))
     }
@@ -1457,12 +1881,63 @@ mod platform {
         Ok(rfs::renameat(from_parent, from, to_parent, to)?)
     }
 
+    pub(super) fn rename_entry_no_replace(
+        from_parent: &DirectoryHandle,
+        _from_path: &Path,
+        from: &OsStr,
+        to_parent: &DirectoryHandle,
+        _to_path: &Path,
+        to: &OsStr,
+    ) -> io::Result<()> {
+        #[cfg(any(
+            target_os = "android",
+            target_os = "ios",
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "redox",
+            target_os = "tvos",
+            target_os = "visionos",
+            target_os = "watchos"
+        ))]
+        {
+            Ok(rfs::renameat_with(
+                from_parent,
+                from,
+                to_parent,
+                to,
+                rfs::RenameFlags::NOREPLACE,
+            )?)
+        }
+        #[cfg(not(any(
+            target_os = "android",
+            target_os = "ios",
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "redox",
+            target_os = "tvos",
+            target_os = "visionos",
+            target_os = "watchos"
+        )))]
+        {
+            rfs::linkat(from_parent, from, to_parent, to, AtFlags::empty())?;
+            if let Err(error) = rfs::unlinkat(from_parent, from, AtFlags::empty()) {
+                let _ = rfs::unlinkat(to_parent, to, AtFlags::empty());
+                return Err(error.into());
+            }
+            Ok(())
+        }
+    }
+
     pub(super) fn remove_file(
         parent: &DirectoryHandle,
         _parent_path: &Path,
         name: &OsStr,
     ) -> io::Result<()> {
         Ok(rfs::unlinkat(parent, name, AtFlags::empty())?)
+    }
+
+    pub(super) fn sync_directory(directory: &DirectoryHandle) -> io::Result<()> {
+        Ok(rfs::fsync(directory)?)
     }
 
     pub(super) fn entry_kind(
@@ -2244,6 +2719,7 @@ mod platform {
     use std::fs;
     use std::io;
     use std::mem::size_of;
+    use std::os::windows::ffi::OsStrExt;
     use std::os::windows::fs::OpenOptionsExt;
     use std::os::windows::io::AsRawHandle;
     use std::path::Path;
@@ -2252,7 +2728,7 @@ mod platform {
         FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_ID_INFO,
         FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ,
         FILE_SHARE_WRITE, FILE_STANDARD_INFO, FileBasicInfo, FileIdInfo, FileStandardInfo,
-        GetFileInformationByHandleEx,
+        GetFileInformationByHandleEx, MoveFileExW,
     };
 
     pub(super) type DirectoryHandle = fs::File;
@@ -2337,6 +2813,30 @@ mod platform {
         Ok(file)
     }
 
+    pub(super) fn open_file_read_write(
+        _parent: &DirectoryHandle,
+        parent_path: &Path,
+        name: &OsStr,
+    ) -> io::Result<fs::File> {
+        let file = open_no_follow(
+            &parent_path.join(name),
+            windows_sys::Win32::Foundation::GENERIC_READ
+                | windows_sys::Win32::Foundation::GENERIC_WRITE,
+            false,
+        )?;
+        let basic: FILE_BASIC_INFO = query(&file, FileBasicInfo)?;
+        let standard: FILE_STANDARD_INFO = query(&file, FileStandardInfo)?;
+        if basic.FileAttributes & (FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DIRECTORY) != 0
+            || standard.Directory
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "entry is not an exact file",
+            ));
+        }
+        Ok(file)
+    }
+
     pub(super) fn file_identity(file: &fs::File) -> io::Result<FileIdentity> {
         directory_identity(file)
     }
@@ -2352,12 +2852,34 @@ mod platform {
         fs::rename(from_path.join(from), to_path.join(to))
     }
 
+    pub(super) fn rename_entry_no_replace(
+        _from_parent: &DirectoryHandle,
+        from_path: &Path,
+        from: &OsStr,
+        _to_parent: &DirectoryHandle,
+        to_path: &Path,
+        to: &OsStr,
+    ) -> io::Result<()> {
+        let source = wide_path(&from_path.join(from));
+        let destination = wide_path(&to_path.join(to));
+        let result = unsafe { MoveFileExW(source.as_ptr(), destination.as_ptr(), 0) };
+        if result == 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    }
+
     pub(super) fn remove_file(
         _parent: &DirectoryHandle,
         parent_path: &Path,
         name: &OsStr,
     ) -> io::Result<()> {
         fs::remove_file(parent_path.join(name))
+    }
+
+    pub(super) fn sync_directory(directory: &DirectoryHandle) -> io::Result<()> {
+        directory.sync_all()
     }
 
     pub(super) fn entry_kind(
@@ -2411,7 +2933,7 @@ mod platform {
         options
             .read(true)
             .access_mode(access)
-            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
             .custom_flags(
                 FILE_FLAG_OPEN_REPARSE_POINT
                     | if include_directories {
@@ -2421,6 +2943,10 @@ mod platform {
                     },
             );
         options.open(path)
+    }
+
+    fn wide_path(path: &Path) -> Vec<u16> {
+        path.as_os_str().encode_wide().chain(Some(0)).collect()
     }
 
     fn directory_identity(file: &fs::File) -> io::Result<DirectoryIdentity> {

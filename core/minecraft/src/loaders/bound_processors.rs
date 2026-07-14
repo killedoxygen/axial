@@ -3,11 +3,11 @@ use super::forge_installer::{
     BoundProcessorArgument, BoundProcessorArgumentPart, BoundProcessorArtifact, BoundProcessorData,
     BoundProcessorOutputRole, BoundProcessorPlan, BoundProcessorStep, ProcessorBuiltinToken,
 };
-use super::managed_fs::{ManagedDir, ManagedTreeSnapshot};
 use super::workspace::cleanup::{ProcessorWorkspace, ProcessorWorkspaceOwner};
 use crate::artifact_path::ArtifactRelativePath;
 use crate::download::{AuthenticatedSelectedArtifactSource, ExpectedIntegrity};
 use crate::launch::VersionJson;
+use crate::managed_fs::{ManagedDir, ManagedTreeSnapshot};
 use crate::runtime::{ProcessorRuntime, RuntimeSourceReceipt};
 use sha1::{Digest as _, Sha1};
 use std::collections::{BTreeMap, BTreeSet};

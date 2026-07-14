@@ -481,6 +481,51 @@ impl KnownGoodInventory {
         }
         Ok(builder.finish())
     }
+
+    #[cfg(test)]
+    pub(crate) fn version_bundle_for_test(
+        version_id: &str,
+        version_json: &[u8],
+        client_jar: &[u8],
+        log_config: Option<(&str, &[u8])>,
+    ) -> Self {
+        let mut builder = InventoryBuilder::default();
+        let mut insert = |root, path: String, kind, bytes: &[u8]| {
+            builder
+                .insert(KnownGoodEntry {
+                    root,
+                    path: KnownGoodRelativePath::new(&path).expect("test version bundle path"),
+                    kind,
+                    integrity: KnownGoodIntegrity::Sha1 {
+                        digest: Sha1Digest::from_metadata(&format!("{:x}", Sha1::digest(bytes)))
+                            .expect("test version bundle digest"),
+                        size: u64::try_from(bytes.len()).expect("test version bundle size"),
+                    },
+                })
+                .expect("unique test version bundle entry");
+        };
+        insert(
+            KnownGoodRoot::Versions,
+            format!("{version_id}/{version_id}.json"),
+            KnownGoodArtifactKind::VersionMetadata,
+            version_json,
+        );
+        insert(
+            KnownGoodRoot::Versions,
+            format!("{version_id}/{version_id}.jar"),
+            KnownGoodArtifactKind::ClientJar,
+            client_jar,
+        );
+        if let Some((name, bytes)) = log_config {
+            insert(
+                KnownGoodRoot::Assets,
+                format!("log_configs/{name}"),
+                KnownGoodArtifactKind::LogConfig,
+                bytes,
+            );
+        }
+        builder.finish()
+    }
 }
 
 fn managed_component_for_kind(kind: KnownGoodArtifactKind) -> Option<ManagedKnownGoodComponent> {

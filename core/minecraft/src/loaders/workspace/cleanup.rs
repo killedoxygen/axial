@@ -1,7 +1,7 @@
 use crate::artifact_path::ArtifactRelativePath;
-use crate::loaders::managed_fs::{ManagedDir, ManagedTreeLimits, ManagedTreeSnapshot};
 use crate::loaders::types::LoaderError;
 use crate::loaders::validate_version_id;
+use crate::managed_fs::{ManagedDir, ManagedTreeLimits, ManagedTreeSnapshot};
 use std::path::Path;
 use tempfile::TempDir;
 

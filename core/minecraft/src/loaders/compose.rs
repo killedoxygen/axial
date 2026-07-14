@@ -6,9 +6,9 @@ use crate::launch::{
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
-use super::managed_fs::ManagedDir;
 use super::types::LoaderError;
 use super::validate_version_id;
+use crate::managed_fs::ManagedDir;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct LoaderProfileFragment {
