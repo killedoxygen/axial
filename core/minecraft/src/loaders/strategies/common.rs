@@ -1,7 +1,6 @@
 use crate::download::{
     AuthenticatedSelectedArtifactSource, DownloadProgress, Downloader, ExactLibraryDownloadProof,
-    MaterializedLibraryIdentity, PreparedManagedInstall,
-    download_installer_libraries_with_declarations_and_facts,
+    PreparedManagedInstall, download_installer_libraries_with_declarations_and_facts,
     download_profile_retained_libraries_with_declarations_and_facts, prepare_local_managed_install,
     publish_prepared_managed_install, reconstruct_installer_library_declarations,
     reconstruct_profile_library_declarations,
@@ -13,7 +12,7 @@ use crate::known_good::{
 };
 use crate::known_good_libraries::{
     PendingExactLibraryDeclarations, PendingStreamedLibraryDeclarations,
-    RetainedInstallerLibrarySource, seal_profile_exact_library_declarations,
+    seal_profile_exact_library_declarations,
 };
 use crate::loaders::api::validate_loader_build_record_identity;
 use crate::loaders::bound_processors::{
@@ -631,7 +630,7 @@ where
         ));
     }
     let network_install = execution
-        .into_network_install(&crate::paths::libraries_dir(library_dir))
+        .into_network_install()
         .map_err(|error| installer_extract_error(&plan.record.component_name, error))?;
     let base_receipt = Box::pin(ensure_base_version(
         library_dir,
@@ -772,18 +771,13 @@ where
         ));
     }
     let child_client_bytes = child_client.into_bytes();
-    let (pending_receipt, retained_sources) = pending_receipt.into_publications();
-    let materialized =
-        materialize_retained_installer_libraries(library_dir, retained_sources).await?;
-    let authority = pending_receipt.complete(materialized).map_err(|error| {
-        LoaderError::Verify(format!("complete installer materializations: {error:?}"))
-    })?;
+    let (authority, library_sources) = pending_receipt.into_parts();
     let prepared = prepare_local_managed_install(
         authority,
         version_bytes,
         child_client_bytes,
         log_config_bytes,
-        Vec::new(),
+        library_sources,
     )
     .map_err(loader_managed_install_error)?;
     let receipt = publish_loader_managed_install(library_dir, prepared).await?;
@@ -1184,22 +1178,6 @@ async fn extract_installer_blocking(
     .map_err(|error| LoaderError::InstallExecutionFailed(error.to_string()))?
 }
 
-async fn materialize_retained_installer_libraries(
-    library_dir: &Path,
-    sources: Vec<RetainedInstallerLibrarySource>,
-) -> Result<Vec<MaterializedLibraryIdentity>, LoaderError> {
-    let root = ManagedDir::open_root(library_dir)?.open_or_create_child("libraries")?;
-    let mut materialized = Vec::with_capacity(sources.len());
-    for source in sources {
-        let publication = root.materialize_installer_library(source).await?;
-        materialized.push(MaterializedLibraryIdentity::from_installer_publication(
-            publication,
-        ));
-    }
-    root.revalidate()?;
-    Ok(materialized)
-}
-
 async fn overlay_legacy_archive_bytes_blocking(
     base_client_bytes: Vec<u8>,
     archive_data: Vec<u8>,
@@ -1411,8 +1389,7 @@ fn done() -> DownloadProgress {
 mod tests {
     #[cfg(unix)]
     use super::{
-        AuthenticatedProcessorSources, materialize_retained_installer_libraries,
-        read_installed_base_client, spawn_bound_processor_execution,
+        AuthenticatedProcessorSources, read_installed_base_client, spawn_bound_processor_execution,
     };
     use super::{
         base_version_install_lock_from_map, download_installer_libraries_with_evidence,
@@ -4532,19 +4509,13 @@ esac
         )
         .expect("derive installed processor receipt");
         let child_client_bytes = child_client.into_bytes();
-        let (pending, retained_sources) = pending.into_publications();
-        let materialized = materialize_retained_installer_libraries(root, retained_sources)
-            .await
-            .expect("publish installed processor outputs");
-        let authority = pending
-            .complete(materialized)
-            .expect("complete installed processor receipt");
+        let (authority, library_sources) = pending.into_parts();
         let prepared = super::prepare_local_managed_install(
             authority,
             version_bytes,
             child_client_bytes,
             log_config_bytes,
-            Vec::new(),
+            library_sources,
         )
         .expect("prepare installed processor bundle");
         super::publish_loader_managed_install(root, prepared)
@@ -4854,7 +4825,7 @@ esac
             .into_install_execution()
             .expect("installer execution");
         let network_install = execution
-            .into_network_install(&crate::paths::libraries_dir(root))
+            .into_network_install()
             .expect("classified installer network");
         let (pending, sources) = download_installer_libraries_with_evidence(
             root,

@@ -27,7 +27,6 @@ use tokio::sync::mpsc;
 #[derive(Debug, Clone)]
 pub(crate) struct DownloadJob {
     pub(crate) relative_path: ArtifactRelativePath,
-    pub(crate) path: PathBuf,
     pub(crate) url: String,
     pub(crate) name: String,
     pub(crate) expected: ExpectedIntegrity,
@@ -70,13 +69,12 @@ impl LibraryArtifactPlan {
         }
     }
 
-    fn into_download_job(self, mc_dir: &Path) -> Result<DownloadJob, LibraryPlanError> {
+    fn into_download_job(self) -> Result<DownloadJob, LibraryPlanError> {
         let url = self
             .source_url
             .ok_or(LibraryPlanError::MissingDownloadSource)?;
         Ok(DownloadJob {
-            relative_path: self.relative_path.clone(),
-            path: self.relative_path.join_under(&libraries_dir(mc_dir)),
+            relative_path: self.relative_path,
             url,
             name: self.name,
             expected: self.expected,
@@ -330,8 +328,15 @@ pub(super) async fn acquire_retained_classified_library(
         )
         .await?;
         let observed_size = source.observed_size();
-        let proof =
-            (acquisition == LibraryAcquisition::FreshStream).then(|| source.exact_download_proof());
+        let proof = if acquisition == LibraryAcquisition::FreshStream {
+            Some(source.exact_download_proof().ok_or_else(|| {
+                DownloadError::Integrity(
+                    "retained network source lost its authenticated origin".to_string(),
+                )
+            })?)
+        } else {
+            None
+        };
         (observed_size, proof, Some(source))
     } else {
         (job.expected.size.unwrap_or(0), None, None)
@@ -413,10 +418,10 @@ where
         let (libraries, environment) = declarations.profile_plan_inputs().ok_or_else(|| {
             profile_declaration_error(SealedLibraryDeclarationError::AncestorMismatch)
         })?;
-        library_jobs_for(mc_dir, libraries, environment)?
+        library_jobs_for(libraries, environment)?
     };
     let (declarations, jobs) = declarations
-        .classify_jobs(&libraries_dir(mc_dir), jobs)
+        .classify_jobs(jobs)
         .map_err(profile_declaration_error)?;
     let cache_admission = ExactLibraryCacheAdmission::bind(mc_dir).await?;
     let (fact_tx, mut fact_rx) = mpsc::unbounded_channel();
@@ -789,13 +794,12 @@ fn native_classifier_candidates(lib: &Library, os_name: &str, os_arch: &str) -> 
 }
 
 pub(crate) fn library_jobs_for(
-    mc_dir: &Path,
     libraries: &[Library],
     env: &Environment,
 ) -> Result<Vec<DownloadJob>, LibraryPlanError> {
     library_artifact_plans_for(libraries, env)?
         .into_iter()
-        .map(|plan| plan.into_download_job(mc_dir))
+        .map(LibraryArtifactPlan::into_download_job)
         .collect()
 }
 
@@ -930,11 +934,10 @@ mod tests {
         ))
     }
 
-    fn exact_job(root: &Path, bytes: &[u8]) -> DownloadJob {
+    fn exact_job(bytes: &[u8]) -> DownloadJob {
         let relative_path =
             ArtifactRelativePath::new("org/example/exact/1/exact-1.jar").expect("artifact path");
         DownloadJob {
-            path: relative_path.join_under(&root.join("libraries")),
             relative_path,
             url: "https://example.invalid/exact.jar".to_string(),
             name: "exact-1.jar".to_string(),
@@ -944,6 +947,10 @@ mod tests {
             },
             is_native: false,
         }
+    }
+
+    fn exact_path(root: &Path, job: &DownloadJob) -> PathBuf {
+        job.relative_path.join_under(&root.join("libraries"))
     }
 
     fn jar_bytes(payload: &[u8]) -> Vec<u8> {
@@ -1020,7 +1027,7 @@ mod tests {
     #[tokio::test]
     async fn exact_cache_admission_treats_missing_root_and_library_tree_as_misses() {
         let root = temp_root("missing");
-        let job = exact_job(&root, b"exact bytes");
+        let job = exact_job(b"exact bytes");
         let missing_root = ExactLibraryCacheAdmission::bind(&root)
             .await
             .expect("bind missing root");
@@ -1050,10 +1057,11 @@ mod tests {
     async fn exact_cache_admission_omits_exact_and_retains_corrupt_files() {
         let root = temp_root("exact-corrupt");
         let bytes = b"exact library bytes";
-        let job = exact_job(&root, bytes);
-        fs::create_dir_all(job.path.parent().expect("artifact parent"))
+        let job = exact_job(bytes);
+        let path = exact_path(&root, &job);
+        fs::create_dir_all(path.parent().expect("artifact parent"))
             .expect("create artifact parent");
-        fs::write(&job.path, bytes).expect("write exact library");
+        fs::write(&path, bytes).expect("write exact library");
         let admission = ExactLibraryCacheAdmission::bind(&root)
             .await
             .expect("bind exact Libraries tree");
@@ -1066,7 +1074,7 @@ mod tests {
 
         let corrupt = b"wrong library bytes";
         assert_eq!(corrupt.len(), bytes.len(), "exercise guarded hashing");
-        fs::write(&job.path, corrupt).expect("replace same-size corrupt library");
+        fs::write(&path, corrupt).expect("replace same-size corrupt library");
         assert!(
             admission
                 .requires_retained_source(&job)
@@ -1083,10 +1091,11 @@ mod tests {
         let body = jar_bytes(b"authenticated installer source");
         let mut corrupt = body.clone();
         corrupt[0] ^= 0xff;
-        let mut job = exact_job(&root, &body);
-        fs::create_dir_all(job.path.parent().expect("artifact parent"))
+        let mut job = exact_job(&body);
+        let path = exact_path(&root, &job);
+        fs::create_dir_all(path.parent().expect("artifact parent"))
             .expect("create artifact parent");
-        fs::write(&job.path, &corrupt).expect("seed same-size corrupt exact cache");
+        fs::write(&path, &corrupt).expect("seed same-size corrupt exact cache");
         let (url, requests, stop, task) = retained_test_server(body.clone()).await;
         job.url = url;
         let admission = ExactLibraryCacheAdmission::bind(&root)
@@ -1104,10 +1113,7 @@ mod tests {
         .expect("fallback retained installer source");
 
         assert_eq!(requests.load(Ordering::SeqCst), 1);
-        assert_eq!(
-            fs::read(&job.path).expect("canonical corrupt cache"),
-            corrupt
-        );
+        assert_eq!(fs::read(&path).expect("canonical corrupt cache"), corrupt);
         assert_eq!(
             pool.retained_available_bytes(),
             Some(crate::known_good::MAX_TIER2_AGGREGATE_BYTES - body.len() as u64)
@@ -1133,8 +1139,8 @@ mod tests {
     #[tokio::test]
     async fn exact_cache_admission_rejects_invalid_final_topology() {
         let root = temp_root("invalid-topology");
-        let job = exact_job(&root, b"exact library bytes");
-        fs::create_dir_all(&job.path).expect("create directory at artifact path");
+        let job = exact_job(b"exact library bytes");
+        fs::create_dir_all(exact_path(&root, &job)).expect("create directory at artifact path");
         let admission = ExactLibraryCacheAdmission::bind(&root)
             .await
             .expect("bind Libraries tree");

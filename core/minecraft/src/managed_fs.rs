@@ -1,7 +1,4 @@
 use crate::artifact_path::{ArtifactRelativePath, validate_artifact_path_segment};
-use crate::known_good_libraries::{
-    RetainedInstallerLibraryMaterialization, RetainedInstallerLibrarySource,
-};
 use crate::loaders::types::LoaderError;
 use sha1::{Digest as _, Sha1};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -105,26 +102,6 @@ pub(crate) enum ManagedDirectoryMoveFailure {
         expected_identity: ManagedDirectoryIdentity,
         cause: LoaderError,
     },
-}
-
-pub(crate) struct MaterializedInstallerLibrary {
-    path: ArtifactRelativePath,
-    destination: PathBuf,
-    is_native: bool,
-    sha1: [u8; 20],
-    size: u64,
-}
-
-impl MaterializedInstallerLibrary {
-    pub(crate) fn into_parts(self) -> (ArtifactRelativePath, PathBuf, bool, [u8; 20], u64) {
-        (
-            self.path,
-            self.destination,
-            self.is_native,
-            self.sha1,
-            self.size,
-        )
-    }
 }
 
 impl std::fmt::Debug for ManagedDir {
@@ -1474,77 +1451,6 @@ impl ManagedDir {
                 false,
             )
             .await
-    }
-
-    async fn import_retained_library_authenticated<R>(
-        &self,
-        relative: &ArtifactRelativePath,
-        source: R,
-        expected_size: u64,
-        expected_sha1: [u8; 20],
-    ) -> Result<(), LoaderError>
-    where
-        R: Read + Seek + Send + 'static,
-    {
-        if expected_size == 0 || expected_size > MAX_MANAGED_READ_BYTES {
-            return Err(LoaderError::Verify(
-                "managed retained library exceeds the bounded file limit".to_string(),
-            ));
-        }
-        let (parent, name) = self.open_or_create_relative_parent(relative)?;
-        parent
-            .import_authenticated_inner(
-                &name,
-                source,
-                expected_size,
-                expected_sha1,
-                true,
-                (),
-                #[cfg(test)]
-                None,
-                #[cfg(test)]
-                false,
-            )
-            .await
-    }
-
-    pub(crate) async fn materialize_installer_library(
-        &self,
-        source: RetainedInstallerLibrarySource,
-    ) -> Result<MaterializedInstallerLibrary, LoaderError> {
-        let (path, is_native, sha1, size, materialization) = source.into_materialization()?;
-        let destination = path.join_under(&self.inner.path);
-        match materialization {
-            RetainedInstallerLibraryMaterialization::Network(source) => {
-                let (reader, source_path, source_size, source_sha1, source_kind) =
-                    source.into_parts();
-                let source_is_native = matches!(
-                    source_kind,
-                    crate::download::library_source::LibraryComponentSourceKind::NativeLibrary
-                );
-                if source_path != path
-                    || source_size != size
-                    || source_sha1 != sha1
-                    || source_is_native != is_native
-                {
-                    return Err(LoaderError::Verify(
-                        "retained installer network source identity changed".to_string(),
-                    ));
-                }
-                self.import_retained_library_authenticated(&path, reader, size, sha1)
-                    .await?;
-            }
-            RetainedInstallerLibraryMaterialization::Bytes(bytes) => {
-                self.write_relative_exact(&path, &bytes).await?;
-            }
-        }
-        Ok(MaterializedInstallerLibrary {
-            path,
-            destination,
-            is_native,
-            sha1,
-            size,
-        })
     }
 
     pub(crate) async fn import_authenticated_create_new<R, G>(

@@ -1,15 +1,13 @@
 use crate::artifact_path::{
     ArtifactRelativePath, MAX_ARTIFACT_PATH_SEGMENT_BYTES, MAX_ARTIFACT_RELATIVE_PATH_BYTES,
 };
+use crate::download::library_source::RetainedLibraryComponentSource;
 use crate::download::{
     AuthenticatedSelectedArtifactSource, AuthenticatedVanillaInstallSources, ExpectedIntegrity,
     LibraryArtifactPlan, ReconstructedVanillaAuthority, SelectedDownloadArtifactKind,
     library_artifact_plans_for, parse_asset_index,
 };
-use crate::known_good_libraries::{
-    PendingInstallerPublications, RetainedInstallerLibrarySource, SealedExactLibraryDeclarations,
-    SealedLibraryKind,
-};
+use crate::known_good_libraries::{SealedExactLibraryDeclarations, SealedLibraryKind};
 use crate::launch::{Library, VersionJson, effective_java_version_for};
 use crate::loaders::{
     AuthenticatedInstallerReceiptInput, AuthenticatedInstallerReconstructionAuthority,
@@ -1224,41 +1222,17 @@ pub(crate) struct PendingKnownGoodInstallAuthority {
 
 pub(crate) struct PendingInstallerReceipt {
     authority: PendingKnownGoodInstallAuthority,
-    publications: PendingInstallerPublications,
-}
-
-pub(crate) struct PendingInstallerReceiptPublication {
-    authority: PendingKnownGoodInstallAuthority,
-    publications: PendingInstallerPublications,
+    library_sources: Vec<RetainedLibraryComponentSource>,
 }
 
 impl PendingInstallerReceipt {
-    pub(crate) fn into_publications(
+    pub(crate) fn into_parts(
         self,
     ) -> (
-        PendingInstallerReceiptPublication,
-        Vec<RetainedInstallerLibrarySource>,
+        PendingKnownGoodInstallAuthority,
+        Vec<RetainedLibraryComponentSource>,
     ) {
-        let (publications, sources) = self.publications.into_sources();
-        (
-            PendingInstallerReceiptPublication {
-                authority: self.authority,
-                publications,
-            },
-            sources,
-        )
-    }
-}
-
-impl PendingInstallerReceiptPublication {
-    pub(crate) fn complete(
-        self,
-        materialized: Vec<crate::download::MaterializedLibraryIdentity>,
-    ) -> Result<PendingKnownGoodInstallAuthority, KnownGoodInventoryError> {
-        self.publications
-            .complete(materialized)
-            .map_err(|_| KnownGoodInventoryError::InstallerLibraryProofMismatch)?;
-        Ok(self.authority)
+        (self.authority, self.library_sources)
     }
 }
 
@@ -1441,7 +1415,8 @@ impl KnownGoodInstallReceipt {
         base_client_bytes: &[u8],
         child_client: &VerifiedInstallerClientBytes,
     ) -> Result<PendingInstallerReceipt, KnownGoodInventoryError> {
-        let (source, library_declarations, pending_publications) = input.into_parts();
+        let (source, libraries) = input.into_parts();
+        let (library_declarations, library_sources) = libraries.into_parts();
         let authenticated = derive_installer_receipt(
             base.authenticated,
             record,
@@ -1456,7 +1431,7 @@ impl KnownGoodInstallReceipt {
         )?;
         Ok(PendingInstallerReceipt {
             authority: PendingKnownGoodInstallAuthority { authenticated },
-            publications: pending_publications,
+            library_sources,
         })
     }
 }
@@ -3104,7 +3079,6 @@ mod tests {
     };
     use crate::rules::Rule;
     use std::collections::HashMap;
-    use std::path::PathBuf;
 
     fn profile_receipt_fixture() -> (
         KnownGoodInstallReceipt,
@@ -3205,14 +3179,12 @@ mod tests {
             &base.authenticated.environment,
         )
         .expect("profile declarations");
-        let root = PathBuf::from("/managed/libraries");
         let (libraries, environment) = pending.profile_plan_inputs().expect("profile plan inputs");
         let jobs = library_artifact_plans_for(libraries, environment)
             .expect("profile plans")
             .into_iter()
             .map(|plan| crate::download::DownloadJob {
-                relative_path: plan.relative_path.clone(),
-                path: plan.relative_path.join_under(&root),
+                relative_path: plan.relative_path,
                 url: plan.source_url.expect("profile URL"),
                 name: plan.name,
                 expected: plan.expected,
@@ -3220,7 +3192,7 @@ mod tests {
             })
             .collect();
         let (pending, classified) = pending
-            .classify_jobs(&root, jobs)
+            .classify_jobs(jobs)
             .expect("classified profile plans");
         let streamed = classified
             .into_iter()

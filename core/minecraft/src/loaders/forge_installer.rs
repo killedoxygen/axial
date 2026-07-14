@@ -9,9 +9,9 @@ use crate::artifact_path::ArtifactRelativePath;
 use crate::download::{DownloadError, library_artifact_plans_for};
 use crate::known_good_libraries::{
     BoundInstallerLibraryDeclarations, ClassifiedLibraryDownload, ClassifiedLibraryReconstruction,
-    PendingInstallerNetworkDeclarations, PendingInstallerPublications,
-    PendingInstallerReconstructionDeclarations, PendingInstallerReconstructionTerminalDeclarations,
-    PendingInstallerTerminalDeclarations, SealedExactLibraryDeclarations,
+    PendingInstallerNetworkDeclarations, PendingInstallerReconstructionDeclarations,
+    PendingInstallerReconstructionTerminalDeclarations, PendingInstallerTerminalDeclarations,
+    SealedExactLibraryDeclarations, SealedInstallerLibrarySources,
     bind_installer_library_declarations,
 };
 use crate::launch::{Library, maven_to_path};
@@ -210,12 +210,11 @@ pub(crate) struct PendingForgeReconstructionExecution {
 impl BoundForgeInstallExecution {
     pub(crate) fn into_network_install(
         self,
-        libraries_root: &Path,
     ) -> Result<PendingForgeNetworkInstall, ForgeInstallerError> {
         let (execution, jobs) = match self {
             Self::Run(execution) => {
                 let BoundForgeProcessorExecution { plan, continuation } = *execution;
-                let (continuation, jobs) = continuation.into_network_install(libraries_root)?;
+                let (continuation, jobs) = continuation.into_network_install()?;
                 (
                     Self::Run(Box::new(BoundForgeProcessorExecution {
                         plan,
@@ -225,7 +224,7 @@ impl BoundForgeInstallExecution {
                 )
             }
             Self::Continue(continuation) => {
-                let (continuation, jobs) = continuation.into_network_install(libraries_root)?;
+                let (continuation, jobs) = continuation.into_network_install()?;
                 (Self::Continue(Box::new(continuation)), jobs)
             }
             Self::UnsupportedMissingOutputs => {
@@ -365,8 +364,7 @@ pub(crate) struct VerifiedInstallerReceiptSource {
 
 pub(crate) struct AuthenticatedInstallerReceiptInput {
     source: VerifiedInstallerReceiptSource,
-    library_declarations: SealedExactLibraryDeclarations,
-    pending_publications: PendingInstallerPublications,
+    libraries: SealedInstallerLibrarySources,
 }
 
 pub(crate) struct AuthenticatedInstallerReconstructionInput {
@@ -736,7 +734,7 @@ impl BoundForgeInstallerContinuation {
             Some(outputs) => library_declarations.seal_terminal_outputs(outputs),
             None => library_declarations.seal_without_terminal_outputs(),
         };
-        let (library_declarations, pending_publications) =
+        let libraries =
             sealed.map_err(|_| ForgeInstallerError::InvalidForgeProcessorFinalOutput)?;
         Ok(AuthenticatedInstallerReceiptInput {
             source: VerifiedInstallerReceiptSource {
@@ -744,8 +742,7 @@ impl BoundForgeInstallerContinuation {
                 version,
                 strip_client_meta,
             },
-            library_declarations,
-            pending_publications,
+            libraries,
         })
     }
 
@@ -806,7 +803,6 @@ impl BoundForgeInstallerContinuation {
 
     fn into_network_install(
         self,
-        libraries_root: &Path,
     ) -> Result<(Self, Vec<ClassifiedLibraryDownload>), ForgeInstallerError> {
         let Self {
             source,
@@ -817,10 +813,9 @@ impl BoundForgeInstallerContinuation {
         let InstallerDeclarationState::Bound(library_declarations) = library_declarations else {
             return Err(ForgeInstallerError::InvalidForgeProcessorArtifactContract);
         };
-        let (library_declarations, jobs) =
-            library_declarations
-                .into_network_jobs(libraries_root)
-                .map_err(|_| ForgeInstallerError::InvalidForgeProcessorArtifactContract)?;
+        let (library_declarations, jobs) = library_declarations
+            .into_network_jobs()
+            .map_err(|_| ForgeInstallerError::InvalidForgeProcessorArtifactContract)?;
         Ok((
             Self {
                 source,
@@ -931,14 +926,9 @@ impl AuthenticatedInstallerReceiptInput {
         self,
     ) -> (
         VerifiedInstallerReceiptSource,
-        SealedExactLibraryDeclarations,
-        PendingInstallerPublications,
+        SealedInstallerLibrarySources,
     ) {
-        (
-            self.source,
-            self.library_declarations,
-            self.pending_publications,
-        )
+        (self.source, self.libraries)
     }
 }
 
@@ -2941,7 +2931,6 @@ mod tests {
     };
     use crate::loaders::{build_id_for, installed_version_id_for};
     use std::io::{Cursor, Read, Write};
-    use std::path::Path;
     use std::time::{SystemTime, UNIX_EPOCH};
     use zip::write::SimpleFileOptions;
 
@@ -2956,7 +2945,7 @@ mod tests {
         bound
             .into_install_execution()
             .expect("bind installer declarations")
-            .into_network_install(Path::new("/tmp/axial-installer-declaration-fixture"))
+            .into_network_install()
             .expect("classify installer declarations without I/O");
     }
 
@@ -3274,7 +3263,7 @@ mod tests {
             .into_install_execution()
             .expect("live processor execution");
         let network = execution
-            .into_network_install(Path::new("/managed/libraries"))
+            .into_network_install()
             .expect("live network transition");
         let (pending, jobs) = network.into_parts();
         let sources = jobs
@@ -3589,7 +3578,7 @@ mod tests {
         ));
         let execution = bound.into_install_execution().expect("install execution");
         let (_, jobs) = execution
-            .into_network_install(std::path::Path::new("/managed/libraries"))
+            .into_network_install()
             .expect("classified network install")
             .into_parts();
         assert!(!jobs.iter().any(|classified| {
@@ -3647,7 +3636,7 @@ mod tests {
         ));
         let execution = bound.into_install_execution().expect("install execution");
         let (_, jobs) = execution
-            .into_network_install(std::path::Path::new("/managed/libraries"))
+            .into_network_install()
             .expect("classified network install")
             .into_parts();
         assert!(!jobs.iter().any(|classified| {

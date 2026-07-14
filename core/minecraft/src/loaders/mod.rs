@@ -11,7 +11,6 @@ mod strategies;
 pub mod types;
 pub mod workspace;
 
-pub(crate) use crate::managed_fs::MaterializedInstallerLibrary;
 pub use api::{
     MaterializedLoaderProfile, build_id_for, installed_version_id_for, loader_components,
     parse_build_id, validate_materialized_loader_profile,

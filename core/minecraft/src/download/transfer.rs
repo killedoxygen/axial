@@ -7,11 +7,10 @@ use super::integrity::{
     ExistingArtifactIntegrity, download_size_mismatch, existing_artifact_integrity,
     existing_content_addressed_asset_integrity, is_sha1_hex, verify_download_integrity,
 };
-use super::library_source::AuthenticatedLibrarySource;
 use super::model::{
     ActualIntegrity, DownloadError, DownloadIntegrityError, ExecutionDownloadError,
     ExecutionDownloadFact, ExecutionDownloadFactKind, ExecutionDownloadReport, ExpectedIntegrity,
-    MaterializedLibraryIdentity, SelectedDownloadArtifactKind,
+    SelectedDownloadArtifactKind,
 };
 use super::path_safety::{
     bounded_download_file_label, filesystem_path, safe_download_target_label,
@@ -24,8 +23,6 @@ use super::transfer_failure::{
     finish_execution_error, finish_execution_error_after_temp_discard,
     finish_io_failure_after_temp_discard, record_io_failure_fact_pair,
 };
-use crate::artifact_path::ArtifactRelativePath;
-use crate::paths::libraries_dir;
 use futures_util::StreamExt;
 use sha1::{Digest as _, Sha1};
 use std::ffi::OsStr;
@@ -132,25 +129,6 @@ pub(super) struct PreparedSelectedArtifactInstall {
     logical_identity: String,
     expected: ExpectedIntegrity,
     target: String,
-}
-
-pub(super) struct PreparedLibraryPublication {
-    relative_path: ArtifactRelativePath,
-    is_native: bool,
-    selected: PreparedSelectedArtifactInstall,
-    provider_url: String,
-}
-
-impl PreparedLibraryPublication {
-    #[cfg(test)]
-    pub(super) fn expected(&self) -> &ExpectedIntegrity {
-        &self.selected.expected
-    }
-
-    #[cfg(test)]
-    pub(super) fn target(&self) -> &str {
-        &self.selected.target
-    }
 }
 
 impl PreparedSelectedArtifactInstall {
@@ -291,113 +269,6 @@ pub(super) async fn prepare_selected_artifact_install(
         expected: expected.clone(),
         target: selected_download_target_label(kind, destination),
     })
-}
-
-pub(super) async fn prepare_library_publication(
-    mc_dir: &Path,
-    relative_path: ArtifactRelativePath,
-    url: &str,
-    expected: &ExpectedIntegrity,
-    is_native: bool,
-    fact_tx: Option<&mpsc::UnboundedSender<ExecutionDownloadFact>>,
-) -> Result<PreparedLibraryPublication, DownloadError> {
-    let destination = relative_path.join_under(&libraries_dir(mc_dir));
-    guard_existing_unsupported_selected_artifact(
-        SelectedDownloadArtifactKind::Library,
-        &destination,
-        fact_tx,
-    )
-    .await?;
-    let selected = PreparedSelectedArtifactInstall {
-        target: selected_download_target_label(SelectedDownloadArtifactKind::Library, &destination),
-        destination,
-        kind: SelectedDownloadArtifactKind::Library,
-        provider_url: url.to_string(),
-        logical_identity: relative_path.as_str().to_string(),
-        expected: expected.clone(),
-    };
-    Ok(PreparedLibraryPublication {
-        relative_path,
-        is_native,
-        selected,
-        provider_url: url.to_string(),
-    })
-}
-
-pub(super) async fn materialize_authenticated_library_source(
-    prepared: PreparedLibraryPublication,
-    source: AuthenticatedLibrarySource,
-    fact_tx: Option<&mpsc::UnboundedSender<ExecutionDownloadFact>>,
-) -> Result<(MaterializedLibraryIdentity, ExactPublicationOutcome), DownloadError> {
-    if source.relative_path() != &prepared.relative_path
-        || source.expected() != &prepared.selected.expected
-        || source.provider_url() != prepared.provider_url
-    {
-        return Err(DownloadError::Integrity(
-            "authenticated library source does not match its prepared publication contract"
-                .to_string(),
-        ));
-    }
-    let (
-        file,
-        source_relative_path,
-        observed_size,
-        observed_sha1,
-        expected,
-        _source_target,
-        source_provider_url,
-        permit,
-    ) = source.into_parts();
-    if source_relative_path != prepared.relative_path
-        || expected != prepared.selected.expected
-        || source_provider_url != prepared.provider_url
-    {
-        return Err(DownloadError::Integrity(
-            "authenticated library source changed while consuming its publication contract"
-                .to_string(),
-        ));
-    }
-    let exact_expected = ExpectedIntegrity {
-        size: Some(observed_size),
-        sha1: Some(hex_sha1(&observed_sha1)),
-    };
-    emit_selected_artifact_missing_fact_if_absent(
-        fact_tx,
-        SelectedDownloadArtifactKind::Library,
-        &prepared.selected.destination,
-        &exact_expected,
-    )
-    .await;
-    let target = prepared.selected.target;
-    let destination = prepared.selected.destination.clone();
-    let outcome = publish_authenticated_retained_file(
-        RetainedExactSource::new(file, observed_size, observed_sha1, permit),
-        prepared.selected.destination,
-        target.clone(),
-        fact_tx.cloned(),
-        #[cfg(test)]
-        None,
-    )
-    .await?;
-    let mut facts = metadata_facts(&exact_expected, &target);
-    facts.push(execution_download_fact(
-        ExecutionDownloadFactKind::ArtifactVerified,
-        &target,
-        no_download_fact_fields(),
-    ));
-    emit_execution_download_facts(fact_tx, &facts);
-    Ok((
-        MaterializedLibraryIdentity::new(
-            prepared.relative_path,
-            destination,
-            prepared.is_native,
-            prepared.provider_url,
-            expected,
-            observed_size,
-            observed_sha1,
-        ),
-        outcome,
-    ))
 }
 
 pub(super) async fn materialize_authenticated_selected_artifact_source(

@@ -11,41 +11,37 @@ use super::integrity::{
     observe_hash_file_calls, verify_download_integrity,
 };
 use super::libraries::{library_jobs_for, library_verification_plans_for};
-use super::library_source::{
-    LibrarySourcePool, LibrarySourceRequest, acquire_authenticated_library_source,
-};
 use super::model::{ActualIntegrity, DownloadIntegrityError};
 use super::path_safety::{
     bounded_download_file_label, safe_download_target_label, windows_verbatim_path_string,
 };
 use super::promotion::{
-    promotion_backup_path, selected_promotion_temp_path, sweep_stale_promotion_backups,
+    selected_promotion_temp_path, sweep_stale_promotion_backups,
     sweep_stale_selected_promotion_temps,
 };
 use super::runtime::{
     RuntimeEnsurePipeline, finish_runtime_pipeline_after_artifacts, runtime_ensure_progress,
 };
 use super::transfer::{
-    AuthenticatedSelectedArtifactSource, ExactPublicationOutcome, PreparedSelectedArtifactInstall,
+    AuthenticatedSelectedArtifactSource, PreparedSelectedArtifactInstall,
     SelectedArtifactSourceRequest, SelectedPromotionTestControl, SelectedPromotionTestStage,
     acquire_authenticated_selected_artifact_source,
     acquire_authenticated_selected_artifact_source_with_retry_delays_for_test,
     download_file_with_client, download_file_with_client_report,
     download_file_with_client_report_with_retry_delays, download_temp_path,
     ensure_selected_artifact_with_client, execute_download_to_temp,
-    materialize_authenticated_library_source, materialize_authenticated_selected_artifact_source,
-    materialize_authenticated_selected_artifact_source_with_control, prepare_library_publication,
+    materialize_authenticated_selected_artifact_source,
+    materialize_authenticated_selected_artifact_source_with_control,
     prepare_selected_artifact_install, publish_authenticated_retained_file_for_test,
     remove_stale_download_temp,
 };
 use super::*;
-use crate::artifact_path::ArtifactRelativePath;
 use crate::known_good::{KnownGoodArtifactKind, KnownGoodIntegrity};
 use crate::launch::{JavaVersion, Library, LibraryArtifact, LibraryDownload, maven_to_path};
 use crate::managed_fs::ManagedDir;
 use crate::managed_publication::ManagedRootPublicationLease;
 use crate::manifest::VersionManifest;
-use crate::paths::{assets_dir, libraries_dir, versions_dir};
+use crate::paths::{assets_dir, versions_dir};
 use crate::rules::Environment;
 use crate::runtime::{
     RuntimeEnsureEvent, RuntimeId, RuntimeSourceReceipt, TestRuntimeSourceDescriptor,
@@ -1076,14 +1072,13 @@ fn mixed_windows_native_libraries_only_download_matching_arch() {
         os_version: String::new(),
         features: HashMap::new(),
     };
-    let mc_dir = Path::new("/tmp/axial-test");
     let libraries = vec![
         native_library("org.lwjgl:lwjgl:3.3.3:natives-windows-arm64"),
         native_library("org.lwjgl:lwjgl:3.3.3:natives-windows-x86"),
         native_library("org.lwjgl:lwjgl:3.3.3:natives-windows"),
     ];
 
-    let jobs = strict_library_jobs(mc_dir, &libraries, &env);
+    let jobs = strict_library_jobs(&libraries, &env);
     let names = jobs.into_iter().map(|job| job.name).collect::<Vec<_>>();
 
     assert!(
@@ -1130,7 +1125,7 @@ fn legacy_native_classifier_prefers_windows_generic_classifier() {
         os_version: String::new(),
         features: HashMap::new(),
     };
-    let job = strict_library_jobs(Path::new("/tmp/axial-test"), &[lib], &env)
+    let job = strict_library_jobs(&[lib], &env)
         .into_iter()
         .next()
         .expect("native download");
@@ -1149,27 +1144,26 @@ fn adaptive_download_concurrency_scales_with_bounds() {
 }
 
 #[test]
-fn library_jobs_deduplicate_same_destination() {
+fn library_jobs_deduplicate_same_relative_path() {
     let env = Environment {
         os_name: "linux".to_string(),
         os_arch: "x86_64".to_string(),
         os_version: String::new(),
         features: HashMap::new(),
     };
-    let mc_dir = Path::new("/tmp/axial-test");
     let libraries = vec![
         normal_library("org.example:duplicate:1.0.0"),
         normal_library("org.example:duplicate:1.0.0"),
     ];
 
-    let jobs = strict_library_jobs(mc_dir, &libraries, &env);
+    let jobs = strict_library_jobs(&libraries, &env);
 
     assert_eq!(jobs.len(), 1);
     assert!(jobs[0].name.contains("duplicate-1.0.0.jar"));
 }
 
 #[test]
-fn library_jobs_reject_conflicting_destination_contracts() {
+fn library_jobs_reject_conflicting_relative_path_contracts() {
     let env = Environment {
         os_name: "linux".to_string(),
         os_arch: "x86_64".to_string(),
@@ -1193,8 +1187,7 @@ fn library_jobs_reject_conflicting_destination_contracts() {
         .expect("artifact")
         .url = "https://mirror.invalid/conflict.jar".to_string();
 
-    let error = library_jobs_for(Path::new("/tmp/axial-test"), &[first, second], &env)
-        .expect_err("conflicting plan");
+    let error = library_jobs_for(&[first, second], &env).expect_err("conflicting plan");
 
     assert_eq!(error, LibraryPlanError::ConflictingArtifactPath);
 }
@@ -1259,8 +1252,7 @@ fn url_less_library_is_inventory_and_verification_visible_but_not_downloadable()
         Path::new("/tmp/axial-test").join("libraries").join(path)
     );
 
-    let error =
-        library_jobs_for(Path::new("/tmp/axial-test"), &[lib], &env).expect_err("missing source");
+    let error = library_jobs_for(&[lib], &env).expect_err("missing source");
     assert_eq!(error, LibraryPlanError::MissingDownloadSource);
 }
 
@@ -1272,12 +1264,8 @@ fn library_planning_rejects_invalid_nonempty_checksum() {
     legacy.checksums = vec!["not-a-sha1".to_string()];
 
     for lib in [direct, legacy] {
-        let error = library_jobs_for(
-            Path::new("/tmp/axial-test"),
-            &[lib],
-            &crate::rules::default_environment(),
-        )
-        .expect_err("invalid checksum");
+        let error = library_jobs_for(&[lib], &crate::rules::default_environment())
+            .expect_err("invalid checksum");
 
         assert_eq!(error, LibraryPlanError::InvalidChecksum);
     }
@@ -1308,7 +1296,7 @@ fn native_selection_uses_supplied_environment_architecture() {
         features: HashMap::new(),
     };
 
-    let jobs = strict_library_jobs(Path::new("/tmp/axial-test"), &[lib], &env);
+    let jobs = strict_library_jobs(&[lib], &env);
 
     assert_eq!(jobs.len(), 1);
     assert!(jobs[0].name.ends_with("arm64.jar"));
@@ -2604,14 +2592,10 @@ fn library_artifact_job_carries_expected_integrity() {
         ..Library::default()
     };
 
-    let job = strict_library_jobs(
-        Path::new("/tmp/axial-test"),
-        &[lib],
-        &crate::rules::default_environment(),
-    )
-    .into_iter()
-    .next()
-    .expect("library job");
+    let job = strict_library_jobs(&[lib], &crate::rules::default_environment())
+        .into_iter()
+        .next()
+        .expect("library job");
 
     assert_eq!(job.expected, ExpectedIntegrity::from_mojang(1234, sha1));
 }
@@ -2635,14 +2619,10 @@ fn library_job_uses_legacy_checksums_when_mojang_sha1_is_missing() {
         ..Library::default()
     };
 
-    let job = strict_library_jobs(
-        Path::new("/tmp/axial-test"),
-        &[lib],
-        &crate::rules::default_environment(),
-    )
-    .into_iter()
-    .next()
-    .expect("library job");
+    let job = strict_library_jobs(&[lib], &crate::rules::default_environment())
+        .into_iter()
+        .next()
+        .expect("library job");
 
     assert_eq!(job.expected, ExpectedIntegrity::from_sha1(sha1));
 }
@@ -2679,7 +2659,7 @@ fn native_classifier_job_carries_expected_integrity() {
         os_version: String::new(),
         features: HashMap::new(),
     };
-    let job = strict_library_jobs(Path::new("/tmp/axial-test"), &[lib], &env)
+    let job = strict_library_jobs(&[lib], &env)
         .into_iter()
         .next()
         .expect("native job");
@@ -2695,14 +2675,10 @@ fn library_maven_fallback_job_reuses_when_metadata_missing() {
         ..Library::default()
     };
 
-    let job = strict_library_jobs(
-        Path::new("/tmp/axial-test"),
-        &[lib],
-        &crate::rules::default_environment(),
-    )
-    .into_iter()
-    .next()
-    .expect("library job");
+    let job = strict_library_jobs(&[lib], &crate::rules::default_environment())
+        .into_iter()
+        .next()
+        .expect("library job");
 
     assert_eq!(job.expected, ExpectedIntegrity::default());
     assert!(!job.expected.has_evidence());
@@ -2785,12 +2761,8 @@ fn sha1_hex(bytes: &[u8]) -> String {
     format!("{:x}", hasher.finalize())
 }
 
-fn strict_library_jobs(
-    mc_dir: &Path,
-    libraries: &[Library],
-    env: &Environment,
-) -> Vec<DownloadJob> {
-    library_jobs_for(mc_dir, libraries, env).expect("valid library plan")
+fn strict_library_jobs(libraries: &[Library], env: &Environment) -> Vec<DownloadJob> {
+    library_jobs_for(libraries, env).expect("valid library plan")
 }
 
 fn native_library(name: &str) -> Library {
@@ -4400,235 +4372,6 @@ async fn retained_file_publisher_owns_publication_after_caller_cancellation() {
     .await
     .expect("owned publisher must settle after caller cancellation");
     assert_eq!(selected_reserved_backups(&destination).len(), 1);
-    let _ = fs::remove_dir_all(root);
-}
-
-#[tokio::test]
-async fn prepared_library_publication_reuses_exact_destination_with_occupied_backup() {
-    let root = temp_dir("prepared-library-publication-noop");
-    let relative_path =
-        ArtifactRelativePath::from_path(Path::new("org/example/demo/1.0.0/demo-1.0.0.jar"))
-            .expect("safe relative path");
-    let destination = relative_path.join_under(&libraries_dir(&root));
-    let body = checksumless_test_jar();
-    let expected = ExpectedIntegrity {
-        size: Some(body.len() as u64),
-        sha1: None,
-    };
-    let (url, _) = spawn_scripted_download_server(vec![
-        ScriptedDownloadResponse::full("200 OK", body.clone()),
-        ScriptedDownloadResponse::full("200 OK", body.clone()),
-    ])
-    .await;
-    let client = build_http_client(Duration::from_secs(5));
-    let pool = LibrarySourcePool::new();
-    let (fact_tx, mut fact_rx) = mpsc::unbounded_channel();
-
-    let prepared = prepare_library_publication(
-        &root,
-        relative_path.clone(),
-        &url,
-        &expected,
-        false,
-        Some(&fact_tx),
-    )
-    .await
-    .expect("prepare first publication");
-    let source = acquire_authenticated_library_source(LibrarySourceRequest {
-        client: &client,
-        url: &url,
-        expected: prepared.expected(),
-        relative_path: &relative_path,
-        max_bytes: 1024 * 1024,
-        target: prepared.target(),
-        pool: &pool,
-        fact_tx: None,
-    })
-    .await
-    .expect("first authenticated source");
-    let (proof, outcome) =
-        materialize_authenticated_library_source(prepared, source, Some(&fact_tx))
-            .await
-            .expect("publish first source");
-    assert_eq!(outcome, ExactPublicationOutcome::Promoted);
-    assert_eq!(proof.into_parts().0, relative_path);
-    assert_eq!(fs::read(&destination).expect("published library"), body);
-
-    let occupied_backup = promotion_backup_path(&destination);
-    fs::write(&occupied_backup, b"occupied-backup").expect("occupied retained backup");
-    let prepared = prepare_library_publication(
-        &root,
-        relative_path.clone(),
-        &url,
-        &expected,
-        false,
-        Some(&fact_tx),
-    )
-    .await
-    .expect("prepare repeated publication");
-    let source = acquire_authenticated_library_source(LibrarySourceRequest {
-        client: &client,
-        url: &url,
-        expected: prepared.expected(),
-        relative_path: &relative_path,
-        max_bytes: 1024 * 1024,
-        target: prepared.target(),
-        pool: &pool,
-        fact_tx: None,
-    })
-    .await
-    .expect("repeated authenticated source");
-    let (_, outcome) = materialize_authenticated_library_source(prepared, source, Some(&fact_tx))
-        .await
-        .expect("reuse exact destination");
-    assert_eq!(outcome, ExactPublicationOutcome::AlreadyExact);
-    assert_eq!(
-        fs::read(&occupied_backup).expect("untouched backup"),
-        b"occupied-backup"
-    );
-    let facts = std::iter::from_fn(|| fact_rx.try_recv().ok()).collect::<Vec<_>>();
-    assert_eq!(
-        facts
-            .iter()
-            .filter(|fact| fact.kind == ExecutionDownloadFactKind::Promoted)
-            .count(),
-        1
-    );
-    let _ = fs::remove_dir_all(root);
-}
-
-#[tokio::test]
-async fn prepared_library_publication_rejects_mismatched_source_contract() {
-    let root = temp_dir("prepared-library-publication-mismatch");
-    let relative_path =
-        ArtifactRelativePath::from_path(Path::new("org/example/demo/1.0.0/demo-1.0.0.jar"))
-            .expect("safe relative path");
-    let destination = relative_path.join_under(&libraries_dir(&root));
-    let body = checksumless_test_jar();
-    let prepared_expected = ExpectedIntegrity::default();
-    let source_expected = ExpectedIntegrity {
-        size: Some(body.len() as u64),
-        sha1: None,
-    };
-    let (url, _) =
-        spawn_scripted_download_server(vec![ScriptedDownloadResponse::full("200 OK", body)]).await;
-    let client = build_http_client(Duration::from_secs(5));
-    let pool = LibrarySourcePool::new();
-    let prepared = prepare_library_publication(
-        &root,
-        relative_path.clone(),
-        &url,
-        &prepared_expected,
-        false,
-        None,
-    )
-    .await
-    .expect("prepare destination contract");
-    let source = acquire_authenticated_library_source(LibrarySourceRequest {
-        client: &client,
-        url: &url,
-        expected: &source_expected,
-        relative_path: &relative_path,
-        max_bytes: 1024 * 1024,
-        target: prepared.target(),
-        pool: &pool,
-        fact_tx: None,
-    })
-    .await
-    .expect("authenticated mismatched source");
-
-    materialize_authenticated_library_source(prepared, source, None)
-        .await
-        .err()
-        .expect("mismatched expected contract must fail");
-    assert!(!destination.exists());
-    let _ = fs::remove_dir_all(root);
-}
-
-#[tokio::test]
-async fn prepared_library_publication_rejects_colliding_relative_path() {
-    let root = temp_dir("prepared-library-relative-path-mismatch");
-    let prepared_path =
-        ArtifactRelativePath::from_path(Path::new("org/example/first/1.0.0/shared.jar"))
-            .expect("safe prepared path");
-    let source_path =
-        ArtifactRelativePath::from_path(Path::new("org/example/second/1.0.0/shared.jar"))
-            .expect("safe source path");
-    let destination = prepared_path.join_under(&libraries_dir(&root));
-    let body = checksumless_test_jar();
-    let expected = ExpectedIntegrity {
-        size: Some(body.len() as u64),
-        sha1: None,
-    };
-    let (url, _) =
-        spawn_scripted_download_server(vec![ScriptedDownloadResponse::full("200 OK", body)]).await;
-    let client = build_http_client(Duration::from_secs(5));
-    let pool = LibrarySourcePool::new();
-    let prepared = prepare_library_publication(&root, prepared_path, &url, &expected, false, None)
-        .await
-        .expect("prepare destination contract");
-    let source = acquire_authenticated_library_source(LibrarySourceRequest {
-        client: &client,
-        url: &url,
-        expected: &expected,
-        relative_path: &source_path,
-        max_bytes: 1024 * 1024,
-        target: prepared.target(),
-        pool: &pool,
-        fact_tx: None,
-    })
-    .await
-    .expect("authenticated colliding source");
-
-    materialize_authenticated_library_source(prepared, source, None)
-        .await
-        .err()
-        .expect("colliding target label must not replace the logical path key");
-    assert!(!destination.exists());
-    let _ = fs::remove_dir_all(root);
-}
-
-#[tokio::test]
-async fn prepared_library_publication_rejects_provider_url_substitution() {
-    let root = temp_dir("prepared-library-provider-mismatch");
-    let relative_path =
-        ArtifactRelativePath::from_path(Path::new("org/example/provider/1.0.0/provider.jar"))
-            .expect("safe relative path");
-    let destination = relative_path.join_under(&libraries_dir(&root));
-    let body = checksumless_test_jar();
-    let expected = ExpectedIntegrity::default();
-    let (source_url, _) =
-        spawn_scripted_download_server(vec![ScriptedDownloadResponse::full("200 OK", body)]).await;
-    let prepared = prepare_library_publication(
-        &root,
-        relative_path.clone(),
-        "https://provider-b.invalid/library.jar",
-        &expected,
-        false,
-        None,
-    )
-    .await
-    .expect("prepare provider-bound contract");
-    let client = build_http_client(Duration::from_secs(5));
-    let pool = LibrarySourcePool::new();
-    let source = acquire_authenticated_library_source(LibrarySourceRequest {
-        client: &client,
-        url: &source_url,
-        expected: &expected,
-        relative_path: &relative_path,
-        max_bytes: 1024 * 1024,
-        target: prepared.target(),
-        pool: &pool,
-        fact_tx: None,
-    })
-    .await
-    .expect("authenticated provider-A source");
-
-    materialize_authenticated_library_source(prepared, source, None)
-        .await
-        .err()
-        .expect("provider substitution must fail");
-    assert!(!destination.exists());
     let _ = fs::remove_dir_all(root);
 }
 

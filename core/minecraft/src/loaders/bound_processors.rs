@@ -371,7 +371,7 @@ pub(crate) struct VerifiedProcessorOutputs {
 }
 
 pub(crate) struct VerifiedProcessorOutput {
-    bytes: Arc<[u8]>,
+    bytes: Vec<u8>,
     size: u64,
     sha1: [u8; 20],
 }
@@ -733,7 +733,7 @@ async fn execute_in_workspace(
                 verified.insert(
                     path,
                     VerifiedProcessorOutput {
-                        bytes: Arc::from(bytes),
+                        bytes,
                         size: output.size,
                         sha1: output.sha1,
                     },
@@ -1713,9 +1713,8 @@ impl VerifiedProcessorOutputs {
             entries: entries
                 .into_iter()
                 .map(|(path, bytes)| {
-                    let bytes = Arc::<[u8]>::from(bytes);
                     let size = bytes.len() as u64;
-                    let sha1 = Sha1::digest(bytes.as_ref()).into();
+                    let sha1 = Sha1::digest(&bytes).into();
                     (path, VerifiedProcessorOutput { bytes, size, sha1 })
                 })
                 .collect(),
@@ -1724,7 +1723,7 @@ impl VerifiedProcessorOutputs {
 }
 
 impl VerifiedProcessorOutput {
-    pub(crate) fn into_parts(self) -> (Arc<[u8]>, u64, [u8; 20]) {
+    pub(crate) fn into_parts(self) -> (Vec<u8>, u64, [u8; 20]) {
         (self.bytes, self.size, self.sha1)
     }
 }

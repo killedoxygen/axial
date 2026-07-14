@@ -35,12 +35,12 @@ pub(crate) use libraries::{
 pub use libraries::{
     LibraryVerificationIntegrity, LibraryVerificationPlan, library_verification_plans_for,
 };
+pub(crate) use model::ExactLibraryDownloadProof;
 pub use model::{
     DownloadError, DownloadProgress, ExecutionDownloadError, ExecutionDownloadFact,
     ExecutionDownloadFactKind, ExecutionDownloadOwnership, ExecutionDownloadReport,
     ExpectedIntegrity, LibraryPlanError, SelectedDownloadArtifactKind,
 };
-pub(crate) use model::{ExactLibraryDownloadProof, MaterializedLibraryIdentity};
 pub(crate) use transfer::AuthenticatedSelectedArtifactSource;
 #[cfg(test)]
 pub(crate) use transfer::promote_launcher_managed_artifact_temp_once;

@@ -9,8 +9,8 @@ use super::libraries::{
     acquire_retained_classified_library, library_jobs_for,
 };
 use super::library_source::{
-    LIBRARY_SOURCE_MAX_BYTES, LibrarySourcePool, LibrarySourceRequest,
-    RetainedLibraryComponentSource, acquire_authenticated_library_source,
+    LIBRARY_SOURCE_MAX_BYTES, LibraryComponentSourceKind, LibrarySourcePool, LibrarySourceRequest,
+    RetainedLibraryComponentSource, acquire_retained_library_component_source,
 };
 use super::model::{
     DownloadError, DownloadProgress, ExactLibraryDownloadProof, ExecutionDownloadFact,
@@ -46,7 +46,7 @@ use crate::managed_fs::ManagedDir;
 use crate::managed_libraries_publication::{LibrariesLifecycleError, publish_libraries_component};
 use crate::managed_publication::{ManagedRootPublicationLease, run_publication_blocking};
 use crate::manifest::{ManifestEntry, VersionManifest, fetch_fresh_install_version_manifest};
-use crate::paths::{assets_dir, libraries_dir};
+use crate::paths::assets_dir;
 use crate::rules::{Environment, default_environment};
 use crate::runtime::{ManagedRuntimeCache, RuntimeSourceReceipt, acquire_preferred_runtime_source};
 #[cfg(test)]
@@ -621,14 +621,6 @@ impl Downloader {
         runtime_cache
     }
 
-    fn library_plan_root(&self) -> &Path {
-        // Source-only plans bind safe relative library identities without granting a managed root.
-        match &self.root {
-            DownloaderRoot::Managed { library_root, .. } => library_root,
-            DownloaderRoot::SourceOnly => Path::new(""),
-        }
-    }
-
     pub async fn install_version<F>(
         &self,
         version_id: &str,
@@ -821,7 +813,7 @@ impl Downloader {
             .acquire_vanilla_plan(version_id, version_manifest_entry, None)
             .await?;
         let mut library_proofs = Vec::new();
-        let source_pool = LibrarySourcePool::new();
+        let source_pool = LibrarySourcePool::for_component_retention()?;
         for classified in library_jobs {
             let (job, acquisition) = classified.into_parts();
             if acquisition == LibraryAcquisition::ExactDeclaration {
@@ -831,18 +823,21 @@ impl Downloader {
                 SelectedDownloadArtifactKind::Library,
                 job.relative_path.as_str(),
             );
-            let source = acquire_authenticated_library_source(LibrarySourceRequest {
-                client: &self.client,
-                url: &job.url,
-                expected: &job.expected,
-                relative_path: &job.relative_path,
-                max_bytes: LIBRARY_SOURCE_MAX_BYTES,
-                target: &target,
-                pool: &source_pool,
-                fact_tx: None,
-            })
+            let source = acquire_retained_library_component_source(
+                LibrarySourceRequest {
+                    client: &self.client,
+                    url: &job.url,
+                    expected: &job.expected,
+                    relative_path: &job.relative_path,
+                    max_bytes: LIBRARY_SOURCE_MAX_BYTES,
+                    target: &target,
+                    pool: &source_pool,
+                    fact_tx: None,
+                },
+                component_source_kind(job.is_native),
+            )
             .await?;
-            library_proofs.push(source.into_exact_download_proof(job.is_native));
+            library_proofs.push(reconstruction_download_proof(&source)?);
         }
         let library_declarations = pending_library_declarations
             .seal_streamed(library_proofs)
@@ -1319,10 +1314,7 @@ impl Downloader {
                 })?;
         let (library_declarations, version_json_source) = declaration_source.into_parts();
         let (pending_library_declarations, library_jobs) = library_declarations
-            .classify_jobs(
-                &libraries_dir(self.library_plan_root()),
-                library_jobs_for(self.library_plan_root(), &version.libraries, &environment)?,
-            )
+            .classify_jobs(library_jobs_for(&version.libraries, &environment)?)
             .map_err(|error| {
                 DownloadError::ResolveManifest(format!(
                     "library declaration classification failed: {error:?}"
@@ -1511,17 +1503,15 @@ pub(crate) async fn reconstruct_profile_library_declarations(
                 "profile library reconstruction contract is missing".to_string(),
             )
         })?;
-        library_jobs_for(Path::new(""), libraries, environment)?
+        library_jobs_for(libraries, environment)?
     };
-    let (pending, classified) = declarations
-        .classify_jobs(&libraries_dir(Path::new("")), jobs)
-        .map_err(|error| {
-            DownloadError::ResolveManifest(format!(
-                "profile library reconstruction classification failed: {error:?}"
-            ))
-        })?;
+    let (pending, classified) = declarations.classify_jobs(jobs).map_err(|error| {
+        DownloadError::ResolveManifest(format!(
+            "profile library reconstruction classification failed: {error:?}"
+        ))
+    })?;
     let client = standard_minecraft_download_client();
-    let source_pool = LibrarySourcePool::new();
+    let source_pool = LibrarySourcePool::for_component_retention()?;
     let mut proofs = Vec::new();
     for classified in classified {
         let (job, acquisition) = classified.into_parts();
@@ -1532,18 +1522,21 @@ pub(crate) async fn reconstruct_profile_library_declarations(
             SelectedDownloadArtifactKind::Library,
             job.relative_path.as_str(),
         );
-        let source = acquire_authenticated_library_source(LibrarySourceRequest {
-            client: &client,
-            url: &job.url,
-            expected: &job.expected,
-            relative_path: &job.relative_path,
-            max_bytes: LIBRARY_SOURCE_MAX_BYTES,
-            target: &target,
-            pool: &source_pool,
-            fact_tx: None,
-        })
+        let source = acquire_retained_library_component_source(
+            LibrarySourceRequest {
+                client: &client,
+                url: &job.url,
+                expected: &job.expected,
+                relative_path: &job.relative_path,
+                max_bytes: LIBRARY_SOURCE_MAX_BYTES,
+                target: &target,
+                pool: &source_pool,
+                fact_tx: None,
+            },
+            component_source_kind(job.is_native),
+        )
         .await?;
-        proofs.push(source.into_exact_download_proof(job.is_native));
+        proofs.push(reconstruction_download_proof(&source)?);
     }
     pending.seal_streamed(proofs).map_err(|error| {
         DownloadError::ResolveManifest(format!(
@@ -1576,7 +1569,7 @@ async fn reconstruct_installer_library_declarations_inner(
         ));
     }
     let client = standard_minecraft_download_client();
-    let source_pool = LibrarySourcePool::new();
+    let source_pool = LibrarySourcePool::for_component_retention()?;
     let mut proofs = Vec::new();
     for classified in jobs {
         let (plan, acquisition) = classified.into_parts();
@@ -1594,48 +1587,46 @@ async fn reconstruct_installer_library_declarations_inner(
         } else {
             LIBRARY_SOURCE_MAX_BYTES
         };
-        let source = acquire_authenticated_library_source(LibrarySourceRequest {
-            client: &client,
-            url: plan.source_url.as_deref().ok_or_else(|| {
-                DownloadError::ResolveManifest(
-                    "installer reconstruction library source is missing".to_string(),
-                )
-            })?,
-            expected: &plan.expected,
-            relative_path: &plan.relative_path,
-            max_bytes,
-            target: &target,
-            pool: &source_pool,
-            fact_tx: None,
-        })
+        let source = acquire_retained_library_component_source(
+            LibrarySourceRequest {
+                client: &client,
+                url: plan.source_url.as_deref().ok_or_else(|| {
+                    DownloadError::ResolveManifest(
+                        "installer reconstruction library source is missing".to_string(),
+                    )
+                })?,
+                expected: &plan.expected,
+                relative_path: &plan.relative_path,
+                max_bytes,
+                target: &target,
+                pool: &source_pool,
+                fact_tx: None,
+            },
+            component_source_kind(plan.is_native),
+        )
         .await?;
         if stage_in_workspace {
-            let (file, path, size, sha1, expected, _target, provider_url, permit) =
-                source.into_parts();
+            let path = source.relative_path().clone();
+            let (reader, size, sha1) = source
+                .replay()
+                .map_err(|error| DownloadError::FileOperation(io::Error::other(error.to_string())))?
+                .into_parts();
             workspace
                 .ok_or_else(|| {
                     DownloadError::ResolveManifest(
                         "processor reconstruction workspace is missing".to_string(),
                     )
                 })?
-                .import_library_authenticated(&path, file, size, sha1)
+                .import_library_authenticated(&path, reader, size, sha1)
                 .await
                 .map_err(|error| {
                     DownloadError::FileOperation(io::Error::other(error.to_string()))
                 })?;
-            drop(permit);
             if acquisition == LibraryAcquisition::FreshStream {
-                proofs.push(ExactLibraryDownloadProof::new(
-                    path,
-                    plan.is_native,
-                    provider_url,
-                    expected,
-                    size,
-                    sha1,
-                ));
+                proofs.push(reconstruction_download_proof(&source)?);
             }
         } else {
-            proofs.push(source.into_exact_download_proof(plan.is_native));
+            proofs.push(reconstruction_download_proof(&source)?);
         }
     }
     if !required_execution_inputs.is_empty() {
@@ -1647,6 +1638,24 @@ async fn reconstruct_installer_library_declarations_inner(
         DownloadError::ResolveManifest(format!(
             "installer library reconstruction could not be completed: {error}"
         ))
+    })
+}
+
+fn component_source_kind(is_native: bool) -> LibraryComponentSourceKind {
+    if is_native {
+        LibraryComponentSourceKind::NativeLibrary
+    } else {
+        LibraryComponentSourceKind::Library
+    }
+}
+
+fn reconstruction_download_proof(
+    source: &RetainedLibraryComponentSource,
+) -> Result<ExactLibraryDownloadProof, DownloadError> {
+    source.exact_download_proof().ok_or_else(|| {
+        DownloadError::Integrity(
+            "reconstruction source lost its authenticated network origin".to_string(),
+        )
     })
 }
 
