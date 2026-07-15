@@ -4,6 +4,11 @@ use std::ffi::{OsStr, OsString};
 use std::io;
 use std::path::Path;
 
+use sha2::{Digest as _, Sha256};
+
+const RESTART_IDENTITY_DOMAIN: &[u8] = b"axial.persisted-state-restart-record-identity.v1\0";
+const RESTART_IDENTITY_EDGE_SAMPLE_BYTES: usize = 4 * 1024;
+
 #[path = "registered_artifact.rs"]
 pub(crate) mod registered_artifact;
 
@@ -11,6 +16,8 @@ pub(crate) struct AnchoredRecordIdentity {
     leaf: AnchoredLeaf,
     file: AnchoredRegularFile,
 }
+
+pub(crate) struct AnchoredRecordRestartDigest([u8; 32]);
 
 pub(crate) struct AnchoredRecordDirectory(platform::Directory);
 
@@ -65,10 +72,43 @@ impl AnchoredRecordObservation {
         matches!(self, Self::Oversized { .. })
     }
 
+    #[cfg(test)]
     pub(crate) fn into_identity(self) -> AnchoredRecordIdentity {
         match self {
             Self::Bytes { identity, .. } | Self::Oversized { identity } => identity,
         }
+    }
+
+    pub(crate) fn into_restart_identity(
+        self,
+    ) -> io::Result<(AnchoredRecordIdentity, AnchoredRecordRestartDigest)> {
+        let (mut identity, bytes) = match self {
+            Self::Bytes { bytes, identity } => (identity, Some(bytes)),
+            Self::Oversized { identity } => (identity, None),
+        };
+        identity.revalidate()?;
+        let mut hasher = Sha256::new();
+        hasher.update(RESTART_IDENTITY_DOMAIN);
+        identity.leaf.update_restart_identity(&mut hasher);
+        identity
+            .file
+            .update_restart_identity(&mut hasher, bytes.as_deref())?;
+        identity.revalidate()?;
+        Ok((
+            identity,
+            AnchoredRecordRestartDigest(hasher.finalize().into()),
+        ))
+    }
+}
+
+impl AnchoredRecordRestartDigest {
+    pub(crate) fn into_bytes(self) -> [u8; 32] {
+        self.0
+    }
+
+    #[cfg(test)]
+    fn bytes(&self) -> &[u8; 32] {
+        &self.0
     }
 }
 
@@ -132,6 +172,10 @@ impl AnchoredLeaf {
         self.0.revalidate()
     }
 
+    fn update_restart_identity(&self, hasher: &mut Sha256) {
+        self.0.update_restart_identity(hasher);
+    }
+
     fn target_is_missing(&self) -> io::Result<bool> {
         self.0.target_is_missing()
     }
@@ -181,6 +225,14 @@ impl AnchoredRegularFile {
             .map(|(bytes, file)| (bytes, Self(file)))
     }
 
+    fn update_restart_identity(
+        &mut self,
+        hasher: &mut Sha256,
+        full_bytes: Option<&[u8]>,
+    ) -> io::Result<()> {
+        self.0.update_restart_identity(hasher, full_bytes)
+    }
+
     fn revalidate(&self) -> bool {
         self.0.revalidate()
     }
@@ -202,6 +254,7 @@ mod platform {
     use rustix::fd::OwnedFd;
     use rustix::fs::{AtFlags, FileType, Mode, OFlags, RenameFlags};
     use sha1::{Digest as _, Sha1};
+    use sha2::Sha256;
     use std::ffi::{OsStr, OsString};
     use std::io::{self, Read as _, Seek as _, SeekFrom};
     use std::os::unix::ffi::OsStringExt as _;
@@ -370,6 +423,15 @@ mod platform {
 
         pub(super) fn revalidate(&self) -> io::Result<()> {
             revalidate_directory_chain(&self.root_path, &self.directories)
+        }
+
+        pub(super) fn update_restart_identity(&self, hasher: &mut Sha256) {
+            hasher.update(b"unix-directory-chain-v1\0");
+            hasher.update((self.directories.len() as u64).to_le_bytes());
+            for directory in &self.directories {
+                hasher.update(directory.device.to_le_bytes());
+                hasher.update(directory.inode.to_le_bytes());
+            }
         }
 
         pub(super) fn target_is_missing(&self) -> io::Result<bool> {
@@ -597,6 +659,55 @@ mod platform {
             Ok((bytes, self))
         }
 
+        pub(super) fn update_restart_identity(
+            &mut self,
+            hasher: &mut Sha256,
+            full_bytes: Option<&[u8]>,
+        ) -> io::Result<()> {
+            hasher.update(b"unix-regular-file-v1\0");
+            hasher.update(self.device.to_le_bytes());
+            hasher.update(self.inode.to_le_bytes());
+            hasher.update(self.size.to_le_bytes());
+            hasher.update(self.modified_seconds.to_le_bytes());
+            hasher.update(self.modified_nanoseconds.to_le_bytes());
+            hasher.update(self.changed_seconds.to_le_bytes());
+            hasher.update(self.changed_nanoseconds.to_le_bytes());
+            match full_bytes {
+                Some(bytes) => {
+                    if u64::try_from(bytes.len()).ok() != Some(self.size) {
+                        return Err(identity_changed(
+                            "anchored record bytes do not match held identity",
+                        ));
+                    }
+                    hasher.update(b"full-record-v1\0");
+                    hasher.update(self.size.to_le_bytes());
+                    hasher.update(bytes);
+                }
+                None => {
+                    let sample_len = super::RESTART_IDENTITY_EDGE_SAMPLE_BYTES;
+                    let tail_offset =
+                        self.size.checked_sub(sample_len as u64).ok_or_else(|| {
+                            io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "oversized anchored record is too short for fixed edge samples",
+                            )
+                        })?;
+                    let mut head = [0_u8; super::RESTART_IDENTITY_EDGE_SAMPLE_BYTES];
+                    let mut tail = [0_u8; super::RESTART_IDENTITY_EDGE_SAMPLE_BYTES];
+                    self.file.seek(SeekFrom::Start(0))?;
+                    self.file.read_exact(&mut head)?;
+                    self.file.seek(SeekFrom::Start(tail_offset))?;
+                    self.file.read_exact(&mut tail)?;
+                    hasher.update(b"fixed-edge-samples-v1\0");
+                    hasher.update((sample_len as u64).to_le_bytes());
+                    hasher.update(head);
+                    hasher.update((sample_len as u64).to_le_bytes());
+                    hasher.update(tail);
+                }
+            }
+            Ok(())
+        }
+
         pub(super) fn revalidate(&self) -> bool {
             let Ok(held) = rustix::fs::fstat(&self.file) else {
                 return false;
@@ -761,6 +872,7 @@ mod platform {
 #[cfg(windows)]
 mod platform {
     use sha1::{Digest as _, Sha1};
+    use sha2::Sha256;
     use std::ffi::{OsStr, OsString};
     use std::fs;
     use std::io::{self, Read as _, Seek as _, SeekFrom};
@@ -995,6 +1107,15 @@ mod platform {
 
         pub(super) fn revalidate(&self) -> io::Result<()> {
             revalidate_directory_chain(&self.root_path, &self.directories)
+        }
+
+        pub(super) fn update_restart_identity(&self, hasher: &mut Sha256) {
+            hasher.update(b"windows-directory-chain-v1\0");
+            hasher.update((self.directories.len() as u64).to_le_bytes());
+            for directory in &self.directories {
+                hasher.update(directory.volume.to_le_bytes());
+                hasher.update(directory.id);
+            }
         }
 
         pub(super) fn target_is_missing(&self) -> io::Result<bool> {
@@ -1238,6 +1359,58 @@ mod platform {
                 return Err(identity_changed("anchored record changed during reading"));
             }
             Ok((bytes, self))
+        }
+
+        pub(super) fn update_restart_identity(
+            &mut self,
+            hasher: &mut Sha256,
+            full_bytes: Option<&[u8]>,
+        ) -> io::Result<()> {
+            hasher.update(b"windows-regular-file-v1\0");
+            hasher.update(self.volume.to_le_bytes());
+            hasher.update(self.id);
+            hasher.update(self.size.to_le_bytes());
+            hasher.update(self.modified.to_le_bytes());
+            hasher.update(self.changed.to_le_bytes());
+            match full_bytes {
+                Some(bytes) => {
+                    if usize::try_from(self.size).ok() != Some(bytes.len()) {
+                        return Err(identity_changed(
+                            "anchored record bytes do not match held identity",
+                        ));
+                    }
+                    hasher.update(b"full-record-v1\0");
+                    hasher.update(self.size.to_le_bytes());
+                    hasher.update(bytes);
+                }
+                None => {
+                    let sample_len = super::RESTART_IDENTITY_EDGE_SAMPLE_BYTES;
+                    let size = u64::try_from(self.size).map_err(|_| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "anchored record size is invalid",
+                        )
+                    })?;
+                    let tail_offset = size.checked_sub(sample_len as u64).ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "oversized anchored record is too short for fixed edge samples",
+                        )
+                    })?;
+                    let mut head = [0_u8; super::RESTART_IDENTITY_EDGE_SAMPLE_BYTES];
+                    let mut tail = [0_u8; super::RESTART_IDENTITY_EDGE_SAMPLE_BYTES];
+                    self.file.seek(SeekFrom::Start(0))?;
+                    self.file.read_exact(&mut head)?;
+                    self.file.seek(SeekFrom::Start(tail_offset))?;
+                    self.file.read_exact(&mut tail)?;
+                    hasher.update(b"fixed-edge-samples-v1\0");
+                    hasher.update((sample_len as u64).to_le_bytes());
+                    hasher.update(head);
+                    hasher.update((sample_len as u64).to_le_bytes());
+                    hasher.update(tail);
+                }
+            }
+            Ok(())
         }
 
         pub(super) fn revalidate(&self) -> bool {
@@ -1636,7 +1809,10 @@ mod platform {
 
 #[cfg(all(test, unix))]
 mod tests {
-    use super::{AnchoredRecordDirectory, AnchoredRecordIdentity, AnchoredRecordObservation};
+    use super::{
+        AnchoredRecordDirectory, AnchoredRecordIdentity, AnchoredRecordObservation,
+        AnchoredRecordRestartDigest, RESTART_IDENTITY_EDGE_SAMPLE_BYTES,
+    };
     use static_assertions::assert_not_impl_any;
     use std::fs;
     use std::os::unix::fs::symlink;
@@ -1659,6 +1835,136 @@ mod tests {
             serde::Serialize,
             serde::de::DeserializeOwned
     );
+    assert_not_impl_any!(
+        AnchoredRecordRestartDigest:
+            Clone,
+            std::fmt::Debug,
+            serde::Serialize,
+            serde::de::DeserializeOwned,
+            AsRef<Path>,
+            AsRef<[u8]>
+    );
+
+    #[test]
+    fn ordinary_restart_identity_is_deterministic_and_mutation_invalidates_admission() {
+        let root = test_root("restart-determinism");
+        fs::create_dir_all(&root).expect("create anchored root");
+        let path = root.join("record.json");
+        fs::write(&path, b"same record").expect("write record");
+        let first = AnchoredRecordObservation::read(&root, Path::new("record.json"), 64)
+            .expect("read first record");
+        let second = AnchoredRecordObservation::read(&root, Path::new("record.json"), 64)
+            .expect("read second record");
+
+        let (_, first_digest) = first
+            .into_restart_identity()
+            .expect("derive first restart identity");
+        let (_, second_digest) = second
+            .into_restart_identity()
+            .expect("derive second restart identity");
+        assert_eq!(first_digest.bytes(), second_digest.bytes());
+
+        let stale = AnchoredRecordObservation::read(&root, Path::new("record.json"), 64)
+            .expect("retain record before mutation");
+        fs::write(&path, b"new! record").expect("mutate record in place");
+        assert!(stale.into_restart_identity().is_err());
+        cleanup(&root);
+    }
+
+    #[test]
+    fn byte_identical_replacement_cannot_retain_restart_identity() {
+        let root = test_root("restart-identical-replacement");
+        fs::create_dir_all(&root).expect("create anchored root");
+        let path = root.join("record.json");
+        fs::write(&path, b"same bytes").expect("write record");
+        let (_, original_digest) =
+            AnchoredRecordObservation::read(&root, Path::new("record.json"), 64)
+                .expect("read original record")
+                .into_restart_identity()
+                .expect("derive original restart identity");
+        let stale = AnchoredRecordObservation::read(&root, Path::new("record.json"), 64)
+            .expect("retain original record");
+
+        fs::rename(&path, root.join("old.json")).expect("move original record");
+        fs::write(&path, b"same bytes").expect("write byte-identical replacement");
+
+        assert!(stale.into_restart_identity().is_err());
+        let (_, replacement_digest) =
+            AnchoredRecordObservation::read(&root, Path::new("record.json"), 64)
+                .expect("read byte-identical replacement")
+                .into_restart_identity()
+                .expect("derive replacement restart identity");
+        assert_ne!(original_digest.bytes(), replacement_digest.bytes());
+        cleanup(&root);
+    }
+
+    #[test]
+    fn oversized_restart_identity_uses_deterministic_fixed_edge_samples() {
+        const RECORD_LIMIT: usize = 256 * 1024;
+        let root = test_root("restart-oversized");
+        fs::create_dir_all(&root).expect("create anchored root");
+        let path = root.join("record.json");
+        let mut bytes = vec![b'm'; RECORD_LIMIT + 1];
+        bytes[..RESTART_IDENTITY_EDGE_SAMPLE_BYTES].fill(b'h');
+        bytes[RECORD_LIMIT + 1 - RESTART_IDENTITY_EDGE_SAMPLE_BYTES..].fill(b't');
+        fs::write(&path, &bytes).expect("write oversized record");
+
+        let first =
+            AnchoredRecordObservation::read(&root, Path::new("record.json"), RECORD_LIMIT as u64)
+                .expect("read first oversized record");
+        let second =
+            AnchoredRecordObservation::read(&root, Path::new("record.json"), RECORD_LIMIT as u64)
+                .expect("read second oversized record");
+        assert_eq!(first.bytes(), None);
+        let (_, first_digest) = first
+            .into_restart_identity()
+            .expect("derive first oversized identity");
+        let (_, second_digest) = second
+            .into_restart_identity()
+            .expect("derive second oversized identity");
+        assert_eq!(first_digest.bytes(), second_digest.bytes());
+
+        bytes[0] = b'x';
+        fs::write(&path, &bytes).expect("mutate sampled edge");
+        let (_, changed_digest) =
+            AnchoredRecordObservation::read(&root, Path::new("record.json"), RECORD_LIMIT as u64)
+                .expect("read changed oversized record")
+                .into_restart_identity()
+                .expect("derive changed oversized identity");
+        assert_ne!(first_digest.bytes(), changed_digest.bytes());
+        cleanup(&root);
+    }
+
+    #[test]
+    fn replacement_directory_changes_restart_identity_for_the_same_leaf_inode() {
+        let root = test_root("restart-ancestor");
+        let replacement = root.with_extension("replacement");
+        let old = root.with_extension("old");
+        fs::create_dir_all(&root).expect("create anchored root");
+        fs::create_dir_all(&replacement).expect("create replacement root");
+        let path = root.join("record.json");
+        fs::write(&path, b"same record").expect("write record");
+        let (first_identity, first_digest) =
+            AnchoredRecordObservation::read(&root, Path::new("record.json"), 64)
+                .expect("read record below original ancestor")
+                .into_restart_identity()
+                .expect("derive original restart identity");
+
+        fs::rename(&path, replacement.join("record.json"))
+            .expect("move same inode below replacement ancestor");
+        fs::rename(&root, &old).expect("move original ancestor");
+        fs::rename(&replacement, &root).expect("publish replacement ancestor");
+        let (second_identity, second_digest) =
+            AnchoredRecordObservation::read(&root, Path::new("record.json"), 64)
+                .expect("read same inode below replacement ancestor")
+                .into_restart_identity()
+                .expect("derive replacement restart identity");
+
+        assert!(first_identity.same_file(&second_identity));
+        assert_ne!(first_digest.bytes(), second_digest.bytes());
+        cleanup(&root);
+        cleanup(&old);
+    }
 
     #[test]
     fn bounded_read_retains_exact_identity_and_rejects_replacement() {
@@ -1806,10 +2112,74 @@ mod tests {
 
 #[cfg(all(test, windows))]
 mod windows_tests {
-    use super::AnchoredRecordDirectory;
+    use super::{AnchoredRecordDirectory, AnchoredRecordObservation};
     use std::ffi::OsStr;
     use std::fs;
     use std::path::Path;
+
+    #[test]
+    fn restart_identity_is_deterministic_and_rejects_in_place_mutation() {
+        let root = std::env::temp_dir().join(format!(
+            "axial-anchored-record-windows-restart-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&root).expect("create anchored root");
+        let path = root.join("record.json");
+        fs::write(&path, b"same record").expect("write record");
+        let first = AnchoredRecordObservation::read(&root, Path::new("record.json"), 64)
+            .expect("read first record");
+        let second = AnchoredRecordObservation::read(&root, Path::new("record.json"), 64)
+            .expect("read second record");
+        let (_, first_digest) = first
+            .into_restart_identity()
+            .expect("derive first restart identity");
+        let (_, second_digest) = second
+            .into_restart_identity()
+            .expect("derive second restart identity");
+        assert_eq!(first_digest.bytes(), second_digest.bytes());
+
+        let directory = AnchoredRecordDirectory::open(&root).expect("hold anchored directory");
+        let stale = directory
+            .read_for_mutation(OsStr::new("record.json"), 64)
+            .expect("retain mutation-compatible record");
+        fs::write(&path, b"new! record").expect("mutate record in place");
+        assert!(stale.into_restart_identity().is_err());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn replacement_directory_changes_restart_identity_for_the_same_leaf_file() {
+        let root = std::env::temp_dir().join(format!(
+            "axial-anchored-record-windows-restart-ancestor-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let replacement = root.with_extension("replacement");
+        let old = root.with_extension("old");
+        fs::create_dir_all(&root).expect("create anchored root");
+        fs::create_dir_all(&replacement).expect("create replacement root");
+        let path = root.join("record.json");
+        fs::write(&path, b"same record").expect("write record");
+        let (first_identity, first_digest) =
+            AnchoredRecordObservation::read(&root, Path::new("record.json"), 64)
+                .expect("read original record")
+                .into_restart_identity()
+                .expect("derive original restart identity");
+        drop(first_identity);
+
+        fs::rename(&path, replacement.join("record.json"))
+            .expect("move same file below replacement ancestor");
+        fs::rename(&root, &old).expect("move original ancestor");
+        fs::rename(&replacement, &root).expect("publish replacement ancestor");
+        let (_, second_digest) =
+            AnchoredRecordObservation::read(&root, Path::new("record.json"), 64)
+                .expect("read same file below replacement ancestor")
+                .into_restart_identity()
+                .expect("derive replacement restart identity");
+
+        assert_ne!(first_digest.bytes(), second_digest.bytes());
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&old);
+    }
 
     #[test]
     fn mutation_compatible_identity_allows_external_exact_rename() {
@@ -1854,6 +2224,7 @@ mod windows_tests {
 
 #[cfg(not(any(unix, windows)))]
 mod platform {
+    use sha2::Sha256;
     use std::ffi::{OsStr, OsString};
     use std::io;
     use std::path::Path;
@@ -1901,6 +2272,8 @@ mod platform {
             ))
         }
 
+        pub(super) fn update_restart_identity(&self, _hasher: &mut Sha256) {}
+
         pub(super) fn target_is_missing(&self) -> io::Result<bool> {
             self.revalidate().map(|()| false)
         }
@@ -1940,6 +2313,17 @@ mod platform {
             Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "anchored records are unavailable on this platform",
+            ))
+        }
+
+        pub(super) fn update_restart_identity(
+            &mut self,
+            _hasher: &mut Sha256,
+            _full_bytes: Option<&[u8]>,
+        ) -> io::Result<()> {
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "restart-stable record identity is unavailable on this platform",
             ))
         }
 

@@ -12,10 +12,11 @@ use crate::observability::{
 use crate::state::benchmark_suites::{
     BenchmarkSuiteRetentionClaims, BenchmarkSuiteRetentionHandle,
 };
+use crate::state::contracts::PersistedStateRecordStore;
 use crate::state::ownership::{CurrentArtifact, classify_current_artifact};
 use crate::state::persisted_state_load::{
     MAX_REJECTED_RESTART_RECORDS_PER_STORE, MAX_RESTART_RECORD_BYTES,
-    PersistedStateRecordRejection, PersistedStateRecordStore, PersistedStateRejectedRecord,
+    PersistedStateRecordRejection, PersistedStateRejectedRecord,
 };
 use axial_config::AppPaths;
 use chrono::{DateTime, SecondsFormat, Utc};
@@ -1900,11 +1901,22 @@ fn retain_driver_rejected_records(
             record_load_issue(issues, BenchmarkSuiteDriverLoadIssueKind::StatusUnreadable);
             continue;
         }
+        let (identity, restart_digest) = match observation.into_restart_identity() {
+            Ok(identity) => identity,
+            Err(error) => {
+                warn!(
+                    error_kind = ?error.kind(),
+                    "failed to derive rejected benchmark suite driver restart identity"
+                );
+                continue;
+            }
+        };
         retained.push(PersistedStateRejectedRecord::new(
             PersistedStateRecordStore::BenchmarkSuiteDriver,
             rejection,
             rejected_benchmark_suite_driver_target(physical_id),
-            observation.into_identity(),
+            identity,
+            restart_digest,
         ));
     }
     retained
@@ -5023,6 +5035,17 @@ mod tests {
             load_state.rejected_records[0].evidence().rejection(),
             PersistedStateRecordRejection::InvalidSchema
         );
+        let restart_identity = load_state.rejected_records[0].restart_identity().clone();
+        let encoded_identity =
+            serde_json::to_string(&restart_identity).expect("serialize restart identity");
+        assert!(encoded_identity.starts_with("\"sha256."));
+        assert_eq!(encoded_identity.len(), 80);
+        assert!(!format!("{:?}", load_state.rejected_records[0].evidence()).contains("sha256."));
+        let reloaded = load_persisted_driver_inner(&dir);
+        assert_eq!(
+            reloaded.rejected_records[0].restart_identity(),
+            &restart_identity
+        );
         cleanup(&root);
     }
 
@@ -5162,7 +5185,14 @@ mod tests {
             PersistedStateRecordRejection::Oversized
         );
         assert_eq!(evidence.target().id, id);
+        let restart_identity = load_state.rejected_records[0].restart_identity().clone();
+        let reloaded = load_persisted_driver_inner(&dir);
+        assert_eq!(
+            reloaded.rejected_records[0].restart_identity(),
+            &restart_identity
+        );
         drop(load_state);
+        drop(reloaded);
         cleanup(&root);
     }
 

@@ -11,6 +11,66 @@ use serde::{Deserialize, Serialize};
 pub(crate) const RECONCILIATION_EVIDENCE_CAPACITY: usize = 128;
 pub const RECONCILIATION_QUARANTINE_CAPACITY: usize = 8;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum PersistedStateRecordStore {
+    PerformanceOperation,
+    BenchmarkSuiteDriver,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Hash, Serialize)]
+#[serde(transparent)]
+pub(crate) struct RestartStableRecordIdentity(String);
+
+impl RestartStableRecordIdentity {
+    pub(crate) fn from_digest(digest: [u8; 32]) -> Self {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+
+        let mut value = String::with_capacity(78);
+        value.push_str("sha256");
+        for chunk in digest.chunks_exact(4) {
+            value.push('.');
+            for byte in chunk {
+                value.push(HEX[(byte >> 4) as usize] as char);
+                value.push(HEX[(byte & 0x0f) as usize] as char);
+            }
+        }
+        debug_assert!(valid_restart_stable_record_identity(&value));
+        Self(value)
+    }
+}
+
+impl<'de> Deserialize<'de> for RestartStableRecordIdentity {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        if valid_restart_stable_record_identity(&value) {
+            Ok(Self(value))
+        } else {
+            Err(serde::de::Error::custom(
+                "restart-stable record identity must be a canonical SHA-256 digest",
+            ))
+        }
+    }
+}
+
+fn valid_restart_stable_record_identity(value: &str) -> bool {
+    let Some(digest) = value.strip_prefix("sha256.") else {
+        return false;
+    };
+    let mut segments = digest.split('.');
+    (0..8).all(|_| {
+        segments.next().is_some_and(|segment| {
+            segment.len() == 8
+                && segment
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        })
+    }) && segments.next().is_none()
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
 pub struct OperationId(pub String);
 
@@ -798,15 +858,63 @@ pub struct SnapshotDescriptor {
 mod tests {
     use super::{
         CommandKind, JournalId, OperationId, OperationJournalEntry, OperationJournalStep,
-        OperationOutcome, OperationPhase, OperationStatus, OwnershipClass, ReconciliationAttempt,
-        ReconciliationComponent, ReconciliationIncarnationFingerprint,
-        ReconciliationInventoryFingerprint, ReconciliationLineage,
-        ReconciliationQuarantineCheckpoint, ReconciliationQuarantineRecord, ReconciliationRung,
-        ReconciliationScope, ReconciliationTerminal, ReconciliationTerminalOutcome,
-        ReconciliationTerminalValidationError, RollbackState, StabilizationSystem,
-        TargetDescriptor, TargetKind,
+        OperationOutcome, OperationPhase, OperationStatus, OwnershipClass,
+        PersistedStateRecordStore, ReconciliationAttempt, ReconciliationComponent,
+        ReconciliationIncarnationFingerprint, ReconciliationInventoryFingerprint,
+        ReconciliationLineage, ReconciliationQuarantineCheckpoint, ReconciliationQuarantineRecord,
+        ReconciliationRung, ReconciliationScope, ReconciliationTerminal,
+        ReconciliationTerminalOutcome, ReconciliationTerminalValidationError,
+        RestartStableRecordIdentity, RollbackState, StabilizationSystem, TargetDescriptor,
+        TargetKind,
     };
     use crate::guardian::{DiagnosisId, GuardianDomain, GuardianMode};
+    use static_assertions::assert_not_impl_any;
+    use std::path::Path;
+
+    assert_not_impl_any!(
+        RestartStableRecordIdentity:
+            AsRef<Path>,
+            AsRef<[u8]>
+    );
+
+    #[test]
+    fn restart_record_identity_and_store_have_strict_durable_shapes() {
+        let identity = RestartStableRecordIdentity::from_digest([0xab; 32]);
+        let encoded = serde_json::to_string(&identity).expect("serialize restart identity");
+        assert_eq!(
+            encoded,
+            "\"sha256.abababab.abababab.abababab.abababab.abababab.abababab.abababab.abababab\""
+        );
+        assert_eq!(
+            serde_json::from_str::<RestartStableRecordIdentity>(&encoded)
+                .expect("deserialize canonical restart identity"),
+            identity
+        );
+        for invalid in [
+            "sha256.abababababababababababababababababababababababababababababababab",
+            "sha256.ABABABAB.abababab.abababab.abababab.abababab.abababab.abababab.abababab",
+            "sha256.abababab.abababab.abababab.abababab.abababab.abababab.abababab",
+        ] {
+            assert!(
+                serde_json::from_value::<RestartStableRecordIdentity>(serde_json::json!(invalid))
+                    .is_err()
+            );
+        }
+
+        assert_eq!(
+            serde_json::to_string(&PersistedStateRecordStore::PerformanceOperation)
+                .expect("serialize performance store"),
+            "\"performance_operation\""
+        );
+        assert_eq!(
+            serde_json::to_string(&PersistedStateRecordStore::BenchmarkSuiteDriver)
+                .expect("serialize driver store"),
+            "\"benchmark_suite_driver\""
+        );
+        assert!(
+            serde_json::from_str::<PersistedStateRecordStore>("\"PerformanceOperation\"").is_err()
+        );
+    }
 
     fn reconciliation_attempt(
         rung: ReconciliationRung,

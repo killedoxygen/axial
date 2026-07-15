@@ -1,14 +1,10 @@
-use crate::execution::anchored_record::AnchoredRecordIdentity;
-use crate::state::contracts::TargetDescriptor;
+use crate::execution::anchored_record::{AnchoredRecordIdentity, AnchoredRecordRestartDigest};
+use crate::state::contracts::{
+    PersistedStateRecordStore, RestartStableRecordIdentity, TargetDescriptor,
+};
 
 pub(super) const MAX_REJECTED_RESTART_RECORDS_PER_STORE: usize = 8;
 pub(super) const MAX_RESTART_RECORD_BYTES: u64 = 256 * 1024;
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum PersistedStateRecordStore {
-    PerformanceOperation,
-    BenchmarkSuiteDriver,
-}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum PersistedStateRecordRejection {
@@ -42,6 +38,7 @@ impl PersistedStateRejectedRecordEvidence {
 pub(super) struct PersistedStateRejectedRecord {
     evidence: PersistedStateRejectedRecordEvidence,
     _identity: AnchoredRecordIdentity,
+    _restart_identity: RestartStableRecordIdentity,
 }
 
 impl PersistedStateRejectedRecord {
@@ -50,6 +47,7 @@ impl PersistedStateRejectedRecord {
         rejection: PersistedStateRecordRejection,
         target: TargetDescriptor,
         identity: AnchoredRecordIdentity,
+        restart_digest: AnchoredRecordRestartDigest,
     ) -> Self {
         Self {
             evidence: PersistedStateRejectedRecordEvidence {
@@ -58,11 +56,19 @@ impl PersistedStateRejectedRecord {
                 target,
             },
             _identity: identity,
+            _restart_identity: RestartStableRecordIdentity::from_digest(
+                restart_digest.into_bytes(),
+            ),
         }
     }
 
     pub(super) fn evidence(&self) -> PersistedStateRejectedRecordEvidence {
         self.evidence.clone()
+    }
+
+    #[cfg(test)]
+    pub(super) fn restart_identity(&self) -> &RestartStableRecordIdentity {
+        &self._restart_identity
     }
 }
 
