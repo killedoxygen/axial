@@ -1,6 +1,9 @@
 use super::{
-    AppState, IdleSweepAuthority, InstanceLifecycleLease, KnownGoodVerificationUnavailable,
+    AppState, IdleSweepAuthority, InstanceLifecycleLease, KnownGoodVerificationLease,
+    KnownGoodVerificationOwner, KnownGoodVerificationUnavailable, RegisteredArtifactFindings,
+    RegisteredArtifactObservation,
 };
+use crate::execution::integrity::Tier2RegisteredArtifactSealRequest;
 use axial_config::is_canonical_instance_id;
 use axial_minecraft::{ManagedRuntimeCache, known_good::KnownGoodInventory};
 use std::path::{Path, PathBuf};
@@ -104,6 +107,66 @@ impl AppState {
     pub(crate) fn known_good_tier2_ticket_is_active(&self, ticket: &KnownGoodTier2Ticket) -> bool {
         self.known_good_tier2_ticket_identity_is_current(ticket)
             && self.idle_sweep_authority_is_active(&ticket.sweep_authority)
+    }
+
+    pub(crate) async fn seal_tier2_registered_artifact_request(
+        &self,
+        request: Tier2RegisteredArtifactSealRequest,
+    ) -> Result<RegisteredArtifactFindings, KnownGoodVerificationUnavailable> {
+        let (ticket, observations) = request.into_parts();
+        self.seal_tier2_registered_artifact_findings_with_observer(ticket, observations, || {})
+            .await
+    }
+
+    async fn seal_tier2_registered_artifact_findings_with_observer<BeforeSeal>(
+        &self,
+        ticket: KnownGoodTier2Ticket,
+        observations: Vec<RegisteredArtifactObservation>,
+        before_seal: BeforeSeal,
+    ) -> Result<RegisteredArtifactFindings, KnownGoodVerificationUnavailable>
+    where
+        BeforeSeal: FnOnce(),
+    {
+        if !self.known_good_tier2_ticket_is_current(&ticket) {
+            return Err(KnownGoodVerificationUnavailable::SweepAuthorityUnavailable);
+        }
+        let lifecycle = InstanceLifecycleLease::bind(
+            &ticket.instance_id,
+            self.instance_lifecycle_gates.clone(),
+            self.instance_lifecycle_gates
+                .acquire(&ticket.instance_id)
+                .await,
+        );
+        if !self.known_good_tier2_ticket_is_current(&ticket) {
+            return Err(KnownGoodVerificationUnavailable::SweepAuthorityUnavailable);
+        }
+        let KnownGoodTier2Ticket {
+            sweep_authority,
+            instance_id,
+            version_id,
+            created_at,
+            library_root,
+            managed_runtime_cache,
+            inventory,
+        } = ticket;
+        let audit_authority = sweep_authority.clone();
+        let authority = KnownGoodVerificationLease {
+            owner: KnownGoodVerificationOwner::IdleSweep(sweep_authority),
+            _lifecycle: lifecycle,
+            instance_id,
+            version_id,
+            created_at,
+            library_root,
+            managed_runtime_cache,
+            inventory,
+        };
+        before_seal();
+        match self.seal_registered_artifact_findings(authority, observations) {
+            Err(_) if !self.idle_sweep_authority_is_current(&audit_authority) => {
+                Err(KnownGoodVerificationUnavailable::SweepAuthorityUnavailable)
+            }
+            result => result,
+        }
     }
 
     fn known_good_tier2_ticket_identity_is_current(&self, ticket: &KnownGoodTier2Ticket) -> bool {
@@ -260,6 +323,139 @@ mod tests {
         drop(lifecycle);
         assert!(fixture.state.known_good_tier2_ticket_is_current(&ticket));
         drop(reservation);
+        fixture.close().await;
+    }
+
+    #[tokio::test]
+    async fn sealed_sweep_findings_distinguish_admission_from_live_effect_authority() {
+        let fixture = Fixture::new("sealed-findings-authority");
+        let inventory = KnownGoodInventory::from_test_entries([TestKnownGoodEntry {
+            root: TestKnownGoodRoot::Assets,
+            path: "indexes/repairable.json".to_string(),
+            kind: KnownGoodArtifactKind::AssetIndex,
+            integrity: TestKnownGoodIntegrity::Sha1 {
+                digest: "0000000000000000000000000000000000000000".to_string(),
+                size: 1,
+            },
+        }])
+        .expect("repairable Assets inventory")
+        .with_test_standalone_leaf_repair_source(
+            0,
+            "https://example.invalid/indexes/repairable.json",
+        )
+        .expect("repairable Assets source");
+        fixture
+            .state
+            .activate_known_good_inventory_for_test(&fixture.instance.id, inventory);
+        let reservation = fixture.reserve_sweep();
+        let cancellation = reservation.cancellation();
+        let ticket = fixture
+            .state
+            .mint_known_good_tier2_ticket(&reservation.authority(), &fixture.instance.id)
+            .await
+            .expect("ticket");
+        let findings = fixture
+            .state
+            .seal_tier2_registered_artifact_findings_with_observer(
+                ticket,
+                vec![RegisteredArtifactObservation::new(
+                    0,
+                    super::super::RegisteredArtifactCondition::Missing,
+                )],
+                || {},
+            )
+            .await
+            .expect("sealed sweep findings");
+
+        assert!(
+            fixture
+                .state
+                .registered_artifact_findings_can_admit(&findings)
+        );
+        assert!(
+            fixture
+                .state
+                .registered_artifact_findings_are_live(&findings)
+        );
+        cancellation.cancel();
+        assert!(
+            !fixture
+                .state
+                .registered_artifact_findings_can_admit(&findings)
+        );
+        assert!(
+            fixture
+                .state
+                .registered_artifact_findings_are_live(&findings)
+        );
+        reservation.settle(super::super::IdleSweepTerminal::Cancelled);
+        assert!(
+            !fixture
+                .state
+                .registered_artifact_findings_are_live(&findings)
+        );
+
+        drop(findings);
+        let lifecycle = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            fixture
+                .state
+                .acquire_instance_lifecycle(&fixture.instance.id),
+        )
+        .await
+        .expect("findings release lifecycle");
+        drop(lifecycle);
+        fixture.close().await;
+    }
+
+    #[tokio::test]
+    async fn cancellation_during_sweep_finding_seal_is_classified_as_sweep_supersession() {
+        let fixture = Fixture::new("cancel-during-seal");
+        let inventory = KnownGoodInventory::from_test_entries([TestKnownGoodEntry {
+            root: TestKnownGoodRoot::Assets,
+            path: "indexes/cancelled.json".to_string(),
+            kind: KnownGoodArtifactKind::AssetIndex,
+            integrity: TestKnownGoodIntegrity::Sha1 {
+                digest: "0000000000000000000000000000000000000000".to_string(),
+                size: 1,
+            },
+        }])
+        .expect("cancelled Assets inventory")
+        .with_test_standalone_leaf_repair_source(
+            0,
+            "https://example.invalid/indexes/cancelled.json",
+        )
+        .expect("cancelled Assets source");
+        fixture
+            .state
+            .activate_known_good_inventory_for_test(&fixture.instance.id, inventory);
+        let reservation = fixture.reserve_sweep();
+        let cancellation = reservation.cancellation();
+        let cancel_during_seal = cancellation.clone();
+        let ticket = fixture
+            .state
+            .mint_known_good_tier2_ticket(&reservation.authority(), &fixture.instance.id)
+            .await
+            .expect("ticket");
+
+        let result = fixture
+            .state
+            .seal_tier2_registered_artifact_findings_with_observer(
+                ticket,
+                vec![RegisteredArtifactObservation::new(
+                    0,
+                    super::super::RegisteredArtifactCondition::Missing,
+                )],
+                move || cancel_during_seal.cancel(),
+            )
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(KnownGoodVerificationUnavailable::SweepAuthorityUnavailable)
+        ));
+        assert!(cancellation.is_cancelled());
+        reservation.settle(super::super::IdleSweepTerminal::Cancelled);
         fixture.close().await;
     }
 

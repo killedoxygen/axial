@@ -152,7 +152,7 @@ async fn execute_admitted_artifact_repair(
 
     {
         let admission = context.admission;
-        if !admission.evidence_is_current() {
+        if !admission.evidence_is_live() {
             return finish_artifact_repair(
                 &context,
                 operation_id,
@@ -168,7 +168,7 @@ async fn execute_admitted_artifact_repair(
         let state = admission.physical_state().await;
         if state
             == Some(crate::execution::registered_artifact::RegisteredArtifactPhysicalState::Exact)
-            && admission.evidence_is_current()
+            && admission.evidence_is_live()
         {
             return finish_artifact_repair(
                 &context,
@@ -192,7 +192,7 @@ async fn execute_admitted_artifact_repair(
                 crate::execution::registered_artifact::RegisteredArtifactPhysicalState::Corrupt
             }
         };
-        if state != Some(expected) || !admission.evidence_is_current() {
+        if state != Some(expected) || !admission.evidence_is_live() {
             return finish_artifact_repair(
                 &context,
                 operation_id,
@@ -307,7 +307,7 @@ async fn execute_admitted_artifact_repair(
         None
     };
 
-    let download_result = if !context.admission.evidence_is_current() {
+    let download_result = if !context.admission.evidence_is_live() {
         Err(Vec::new())
     } else {
         let (provider_url, expected_sha1, expected_size) = context.admission.download_contract();
@@ -336,7 +336,7 @@ async fn execute_admitted_artifact_repair(
                 .mutation()
                 .verify_exact(expected_sha1, expected_size)
                 .await
-                || !context.admission.evidence_is_current()
+                || !context.admission.evidence_is_live()
             {
                 return finish_artifact_repair(
                     &context,
@@ -367,7 +367,7 @@ async fn execute_admitted_artifact_repair(
         }
         Err(facts) => {
             let fact_ids = fact_ids(&facts);
-            if !context.admission.evidence_is_current() {
+            if !context.admission.evidence_is_live() {
                 return finish_artifact_repair(
                     &context,
                     operation_id,

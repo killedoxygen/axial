@@ -12,7 +12,10 @@ use super::failure_memory::{
     ReconciliationAttemptReserveError,
 };
 use super::sessions::SharedComponentMutationLease;
-use super::{AppState, InstanceLifecycleLease, OperationJournalStore, OperationJournalStoreError};
+use super::{
+    AppState, InstanceLifecycleLease, KnownGoodVerificationLease, OperationJournalStore,
+    OperationJournalStoreError,
+};
 use crate::guardian::{DiagnosisId, GuardianActionKind, GuardianDomain, GuardianMode};
 use axial_config::is_canonical_instance_id;
 use axial_minecraft::runtime::{
@@ -148,6 +151,7 @@ pub(crate) struct ReconciliationAttemptReservation {
 pub(crate) struct RegisteredReconciliationAuthority {
     state: AppState,
     lifecycle: InstanceLifecycleLease,
+    verification: Option<KnownGoodVerificationLease>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -731,16 +735,19 @@ impl RegisteredReconciliationAuthority {
         self.state.failure_memory.as_ref()
     }
 
-    pub(crate) fn registered_artifact_findings_are_current(
+    pub(crate) fn registered_artifact_findings_are_live(
         &self,
         findings: &super::RegisteredArtifactFindings,
     ) -> bool {
-        self.state
-            .registered_artifact_findings_are_current(findings)
+        self.state.registered_artifact_findings_are_live(findings)
     }
 
     pub(crate) fn attempt_is_current(&self, attempt: &ReconciliationAttempt) -> bool {
-        self.state
+        self.verification.as_ref().is_none_or(|verification| {
+            self.state
+                .known_good_verification_lease_is_live(verification)
+        }) && self
+            .state
             .current_reconciliation_incarnation(&self.lifecycle.instance_id)
             .is_ok_and(|current| {
                 matches!(
@@ -815,6 +822,9 @@ impl RegisteredReconciliationAuthority {
         outcome: ReconciliationTerminalOutcome,
         quarantined_target: Option<TargetDescriptor>,
     ) -> Result<ReconciliationTerminal, ReconciliationEvidenceRejection> {
+        if !self.attempt_is_current(&attempt) {
+            return Err(ReconciliationEvidenceRejection::IncarnationMismatch);
+        }
         let current = self
             .state
             .current_reconciliation_incarnation(&self.lifecycle.instance_id)?;
@@ -1104,6 +1114,22 @@ impl AppState {
         Ok(RegisteredReconciliationAuthority {
             state: self.clone(),
             lifecycle: lifecycle.retained(),
+            verification: None,
+        })
+    }
+
+    pub(super) fn registered_reconciliation_authority_for_verification(
+        &self,
+        verification: &KnownGoodVerificationLease,
+    ) -> Result<RegisteredReconciliationAuthority, ReconciliationEvidenceRejection> {
+        if !self.known_good_verification_lease_can_admit(verification) {
+            return Err(ReconciliationEvidenceRejection::IncarnationMismatch);
+        }
+        self.current_reconciliation_incarnation(&verification._lifecycle.instance_id)?;
+        Ok(RegisteredReconciliationAuthority {
+            state: self.clone(),
+            lifecycle: verification._lifecycle.retained(),
+            verification: Some(verification.retained()),
         })
     }
 

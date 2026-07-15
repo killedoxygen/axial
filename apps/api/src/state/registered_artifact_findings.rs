@@ -129,8 +129,9 @@ impl RegisteredArtifactSourceScope {
 }
 
 /// Exact registered-instance integrity evidence. The retained verification lease makes this
-/// move-only and keeps both foreground and instance-lifecycle authority alive.
+/// move-only and keeps its foreground-or-sweep owner plus instance lifecycle alive.
 pub(crate) struct RegisteredArtifactFindings {
+    state: AppState,
     authority: KnownGoodVerificationLease,
     findings: Vec<RegisteredArtifactFinding>,
 }
@@ -169,6 +170,7 @@ pub(crate) enum RegisteredArtifactRepairEffect {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum RegisteredArtifactRepairAuthorizationRejection {
+    LiveAuthorityUnavailable,
     NonManagedRepair,
     InvalidRepairPlan,
     AmbiguousFinding,
@@ -219,6 +221,9 @@ impl RegisteredArtifactFindings {
         decision: &GuardianDecision,
     ) -> Result<RegisteredArtifactRepairAuthorization, RegisteredArtifactRepairAuthorizationRejection>
     {
+        if !self.state.registered_artifact_findings_can_admit(&self) {
+            return Err(RegisteredArtifactRepairAuthorizationRejection::LiveAuthorityUnavailable);
+        }
         if decision.mode() != GuardianMode::Managed || decision.kind() != GuardianActionKind::Repair
         {
             return Err(RegisteredArtifactRepairAuthorizationRejection::NonManagedRepair);
@@ -328,9 +333,9 @@ impl RegisteredArtifactRepairAdmission {
         (&self.provider_url, &self.expected_sha1, self.expected_size)
     }
 
-    pub(crate) fn evidence_is_current(&self) -> bool {
+    pub(crate) fn evidence_is_live(&self) -> bool {
         self.authority
-            .registered_artifact_findings_are_current(&self.findings)
+            .registered_artifact_findings_are_live(&self.findings)
             && Arc::ptr_eq(&self.inventory, &self.findings.authority.inventory)
             && self
                 .inventory
@@ -353,7 +358,7 @@ impl RegisteredArtifactRepairAdmission {
         quarantined_target: Option<TargetDescriptor>,
     ) -> Result<super::contracts::ReconciliationTerminal, ReconciliationEvidenceRejection> {
         if outcome == super::contracts::ReconciliationTerminalOutcome::Succeeded
-            && !self.evidence_is_current()
+            && !self.evidence_is_live()
         {
             return Err(ReconciliationEvidenceRejection::IncarnationMismatch);
         }
@@ -379,7 +384,7 @@ impl AppState {
         authority: KnownGoodVerificationLease,
         observations: Vec<RegisteredArtifactObservation>,
     ) -> Result<RegisteredArtifactFindings, KnownGoodVerificationUnavailable> {
-        if !self.known_good_verification_lease_is_current(&authority) {
+        if !self.known_good_verification_lease_can_admit(&authority) {
             return Err(KnownGoodVerificationUnavailable::LiveAuthorityUnavailable);
         }
 
@@ -397,20 +402,28 @@ impl AppState {
             });
         }
 
-        if !self.known_good_verification_lease_is_current(&authority) {
+        if !self.known_good_verification_lease_can_admit(&authority) {
             return Err(KnownGoodVerificationUnavailable::LiveAuthorityUnavailable);
         }
         Ok(RegisteredArtifactFindings {
+            state: self.clone(),
             authority,
             findings,
         })
     }
 
-    pub(crate) fn registered_artifact_findings_are_current(
+    pub(crate) fn registered_artifact_findings_can_admit(
         &self,
         findings: &RegisteredArtifactFindings,
     ) -> bool {
-        self.known_good_verification_lease_is_current(&findings.authority)
+        self.known_good_verification_lease_can_admit(&findings.authority)
+    }
+
+    pub(crate) fn registered_artifact_findings_are_live(
+        &self,
+        findings: &RegisteredArtifactFindings,
+    ) -> bool {
+        self.known_good_verification_lease_is_live(&findings.authority)
     }
 
     pub(crate) async fn admit_registered_artifact_repair(
@@ -422,7 +435,7 @@ impl AppState {
         let (findings, observation, diagnosis_id, action, target) = authorization.into_parts();
         if action != GuardianActionKind::Repair
             || findings.target_for(observation) != Some(&target)
-            || !self.registered_artifact_findings_are_current(&findings)
+            || !self.registered_artifact_findings_can_admit(&findings)
         {
             return Err(ReconciliationEvidenceRejection::IncarnationMismatch);
         }
@@ -445,7 +458,7 @@ impl AppState {
             .await
             .ok_or(ReconciliationEvidenceRejection::ActiveSession)?;
 
-        if !self.registered_artifact_findings_are_current(&findings)
+        if !self.registered_artifact_findings_can_admit(&findings)
             || !Arc::ptr_eq(&inventory, &findings.authority.inventory)
         {
             return Err(ReconciliationEvidenceRejection::IncarnationMismatch);
@@ -478,13 +491,14 @@ impl AppState {
             RegisteredArtifactCondition::Missing => RegisteredArtifactRepairEffect::DownloadMissing,
             RegisteredArtifactCondition::Corrupt => source_scope.corrupt_effect(),
         };
-        if !self.registered_artifact_findings_are_current(&findings)
+        if !self.registered_artifact_findings_can_admit(&findings)
             || !Arc::ptr_eq(&inventory, &findings.authority.inventory)
             || !mutation.is_current()
         {
             return Err(ReconciliationEvidenceRejection::IncarnationMismatch);
         }
-        let authority = self.registered_reconciliation_authority(&findings.authority._lifecycle)?;
+        let authority =
+            self.registered_reconciliation_authority_for_verification(&findings.authority)?;
         let attempt = authority.repair_artifact_attempt(
             operation_id,
             diagnosis_id,

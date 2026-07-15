@@ -188,7 +188,7 @@ pub(crate) struct InstanceLifecycleLease {
 }
 
 pub(crate) struct KnownGoodVerificationLease {
-    _foreground: IntegrityForegroundLease,
+    owner: KnownGoodVerificationOwner,
     _lifecycle: InstanceLifecycleLease,
     instance_id: String,
     version_id: String,
@@ -196,6 +196,11 @@ pub(crate) struct KnownGoodVerificationLease {
     library_root: PathBuf,
     managed_runtime_cache: ManagedRuntimeCache,
     inventory: Arc<axial_minecraft::known_good::KnownGoodInventory>,
+}
+
+enum KnownGoodVerificationOwner {
+    Foreground(IntegrityForegroundLease),
+    IdleSweep(IdleSweepAuthority),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -248,6 +253,26 @@ impl InstanceLifecycleLease {
 }
 
 impl KnownGoodVerificationLease {
+    fn retained(&self) -> Self {
+        Self {
+            owner: match &self.owner {
+                KnownGoodVerificationOwner::Foreground(foreground) => {
+                    KnownGoodVerificationOwner::Foreground(foreground.retained())
+                }
+                KnownGoodVerificationOwner::IdleSweep(authority) => {
+                    KnownGoodVerificationOwner::IdleSweep(authority.clone())
+                }
+            },
+            _lifecycle: self._lifecycle.retained(),
+            instance_id: self.instance_id.clone(),
+            version_id: self.version_id.clone(),
+            created_at: self.created_at.clone(),
+            library_root: self.library_root.clone(),
+            managed_runtime_cache: self.managed_runtime_cache.clone(),
+            inventory: self.inventory.clone(),
+        }
+    }
+
     pub(crate) fn execution_parts(
         &self,
     ) -> (
@@ -1271,7 +1296,7 @@ impl AppState {
             .ok_or(KnownGoodVerificationUnavailable::LiveAuthorityUnavailable)?;
 
         Ok(KnownGoodVerificationLease {
-            _foreground: foreground.retained(),
+            owner: KnownGoodVerificationOwner::Foreground(foreground.retained()),
             _lifecycle: lifecycle.retained(),
             instance_id: instance.id,
             version_id: instance.version_id,
@@ -1295,18 +1320,49 @@ impl AppState {
         self.mint_known_good_verification_lease(foreground, lifecycle, &library_root)
     }
 
-    pub(crate) fn known_good_verification_lease_is_current(
+    pub(crate) fn known_good_verification_lease_can_admit(
         &self,
         lease: &KnownGoodVerificationLease,
     ) -> bool {
-        self.known_good_authority_is_current(
-            &lease.instance_id,
-            &lease.version_id,
-            &lease.created_at,
-            &lease.library_root,
-            &lease.managed_runtime_cache,
-            &lease.inventory,
-        )
+        self.known_good_verification_identity_is_current(lease)
+            && match &lease.owner {
+                KnownGoodVerificationOwner::Foreground(foreground) => {
+                    self.validate_integrity_foreground(foreground).is_ok()
+                }
+                KnownGoodVerificationOwner::IdleSweep(authority) => {
+                    self.idle_sweep_authority_is_current(authority)
+                }
+            }
+    }
+
+    pub(crate) fn known_good_verification_lease_is_live(
+        &self,
+        lease: &KnownGoodVerificationLease,
+    ) -> bool {
+        self.known_good_verification_identity_is_current(lease)
+            && match &lease.owner {
+                KnownGoodVerificationOwner::Foreground(foreground) => {
+                    self.validate_integrity_foreground(foreground).is_ok()
+                }
+                KnownGoodVerificationOwner::IdleSweep(authority) => {
+                    self.idle_sweep_authority_is_active(authority)
+                }
+            }
+    }
+
+    fn known_good_verification_identity_is_current(
+        &self,
+        lease: &KnownGoodVerificationLease,
+    ) -> bool {
+        self.instance_lifecycle_gates.owns(&lease._lifecycle.owner)
+            && self.known_good_authority_is_current(
+                &lease.instance_id,
+                &lease.version_id,
+                &lease.created_at,
+                &lease.library_root,
+                &lease.managed_runtime_cache,
+                &lease.inventory,
+            )
     }
 
     fn known_good_authority_is_current(

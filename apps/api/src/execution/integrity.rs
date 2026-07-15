@@ -9,18 +9,17 @@ use super::{
 use crate::observability::{EvidenceField, EvidenceSensitivity};
 use crate::state::contracts::{OwnershipClass, StabilizationSystem, TargetDescriptor, TargetKind};
 use crate::state::{
-    AppState, IdleSweepCancellation, IdleSweepReservation, InstanceLifecycleLease,
-    IntegrityForegroundLease, KnownGoodTier2Ticket, KnownGoodVerificationLease,
-    KnownGoodVerificationUnavailable, RegisteredArtifactCondition, RegisteredArtifactFindings,
-    RegisteredArtifactObservation,
+    AppState, IdleSweepCancellation, IdleSweepReservation, IdleSweepSettlement, IdleSweepTerminal,
+    InstanceLifecycleLease, IntegrityForegroundLease, KnownGoodTier2Ticket,
+    KnownGoodVerificationLease, KnownGoodVerificationUnavailable, RegisteredArtifactCondition,
+    RegisteredArtifactFindings, RegisteredArtifactObservation,
 };
 use axial_minecraft::ManagedRuntimeCache;
-#[cfg(test)]
-use axial_minecraft::known_good::KnownGoodArtifactKind;
 use axial_minecraft::known_good::{
-    KnownGoodEntry, KnownGoodIntegrity, KnownGoodPhysicalPath, KnownGoodRoot,
-    LaunchTier0RuntimeSelection, LaunchTier1AdmittedFile, MAX_LAUNCH_TIER1_AGGREGATE_BYTES,
-    Tier2Projection, known_good_entry_path, known_good_link_target_matches,
+    KnownGoodArtifactKind, KnownGoodEntry, KnownGoodIntegrity, KnownGoodInventory,
+    KnownGoodPhysicalPath, KnownGoodRoot, LaunchTier0RuntimeSelection, LaunchTier1AdmittedFile,
+    MAX_LAUNCH_TIER1_AGGREGATE_BYTES, Tier2Projection, known_good_entry_path,
+    known_good_link_target_matches,
 };
 use sha1::{Digest as _, Sha1};
 use std::collections::{BTreeMap, BTreeSet};
@@ -1657,7 +1656,7 @@ pub(crate) fn sense_integrity_tier0(
         state.mint_known_good_verification_lease(foreground, lifecycle, expected_library_root)?;
     let reader = FilesystemIntegrityReader::default();
     let report = sense_integrity_tier0_with(&lease, runtime_selection, &reader);
-    let lease_is_current = state.known_good_verification_lease_is_current(&lease);
+    let lease_is_current = state.known_good_verification_lease_can_admit(&lease);
     reader.finish_tier0();
     if !lease_is_current {
         return Err(KnownGoodVerificationUnavailable::LiveAuthorityUnavailable);
@@ -1870,7 +1869,7 @@ where
         .map_err(|_| KnownGoodVerificationUnavailable::LiveAuthorityUnavailable)?,
         Err(report) => (lease, report),
     };
-    if !state.known_good_verification_lease_is_current(&lease) {
+    if !state.known_good_verification_lease_can_admit(&lease) {
         return Err(KnownGoodVerificationUnavailable::LiveAuthorityUnavailable);
     }
     let observations = report
@@ -2223,6 +2222,13 @@ pub(crate) struct IntegrityTier2Report {
     pub(crate) metadata_lookup_count: usize,
     pub(crate) link_lookup_count: usize,
     pub(crate) suppressed_fact_count: usize,
+    repairable_observations: Vec<Tier2RepairableObservation>,
+}
+
+#[derive(Debug)]
+struct Tier2RepairableObservation {
+    fact_index: usize,
+    observation: RegisteredArtifactObservation,
 }
 
 #[must_use = "Tier 2 work must be run by its blocking owner"]
@@ -2253,9 +2259,10 @@ impl IntegrityTier2OwnedWorkAuthorityMismatch {
 
 #[must_use = "Tier 2 completion retains the ticket and unsettled sweep reservation"]
 pub(crate) struct IntegrityTier2OwnedResult {
-    pub(crate) report: IntegrityTier2Report,
-    pub(crate) ticket: KnownGoodTier2Ticket,
-    pub(crate) reservation: IdleSweepReservation,
+    state: AppState,
+    report: IntegrityTier2Report,
+    ticket: KnownGoodTier2Ticket,
+    reservation: IdleSweepReservation,
 }
 
 impl std::fmt::Debug for IntegrityTier2OwnedResult {
@@ -2265,6 +2272,112 @@ impl std::fmt::Debug for IntegrityTier2OwnedResult {
             .field("report", &self.report)
             .field("sweep_ownership", &"retained")
             .finish()
+    }
+}
+
+pub(crate) struct Tier2RegisteredArtifactSealRequest {
+    ticket: KnownGoodTier2Ticket,
+    observations: Vec<RegisteredArtifactObservation>,
+}
+
+impl Tier2RegisteredArtifactSealRequest {
+    fn new(ticket: KnownGoodTier2Ticket, observations: Vec<RegisteredArtifactObservation>) -> Self {
+        Self {
+            ticket,
+            observations,
+        }
+    }
+
+    pub(crate) fn into_parts(self) -> (KnownGoodTier2Ticket, Vec<RegisteredArtifactObservation>) {
+        (self.ticket, self.observations)
+    }
+}
+
+struct SealedIntegrityTier2Result {
+    report: IntegrityTier2Report,
+    findings: Option<RegisteredArtifactFindings>,
+    reservation: IdleSweepReservation,
+}
+
+impl IntegrityTier2OwnedResult {
+    async fn seal_and_bind(self) -> SealedIntegrityTier2Result {
+        let Self {
+            state,
+            mut report,
+            ticket,
+            reservation,
+        } = self;
+        if report.status != IntegrityTier2Status::Complete {
+            drop(ticket);
+            return SealedIntegrityTier2Result {
+                report,
+                findings: None,
+                reservation,
+            };
+        }
+
+        let request = Tier2RegisteredArtifactSealRequest::new(
+            ticket,
+            report.registered_artifact_observations(),
+        );
+        let findings = match state.seal_tier2_registered_artifact_request(request).await {
+            Ok(findings) => findings,
+            Err(_) if !reservation.is_current() => {
+                return SealedIntegrityTier2Result {
+                    report: report.cancel(),
+                    findings: None,
+                    reservation,
+                };
+            }
+            Err(_) => {
+                return SealedIntegrityTier2Result {
+                    report: report.refuse(tier2_authority_refused_fact()),
+                    findings: None,
+                    reservation,
+                };
+            }
+        };
+        if !report.bind_registered_artifact_targets(&findings) {
+            return SealedIntegrityTier2Result {
+                report: report.refuse(tier2_authority_refused_fact()),
+                findings: None,
+                reservation,
+            };
+        }
+        SealedIntegrityTier2Result {
+            report,
+            findings: Some(findings),
+            reservation,
+        }
+    }
+
+    pub(crate) async fn settle_without_recovery(
+        self,
+    ) -> (IntegrityTier2Report, IdleSweepSettlement) {
+        self.seal_and_bind().await.settle_without_recovery()
+    }
+}
+
+impl SealedIntegrityTier2Result {
+    fn settle_without_recovery(self) -> (IntegrityTier2Report, IdleSweepSettlement) {
+        let Self {
+            mut report,
+            findings,
+            reservation,
+        } = self;
+        drop(findings);
+        let terminal = match report.status {
+            IntegrityTier2Status::Complete => IdleSweepTerminal::Complete,
+            IntegrityTier2Status::Cancelled => IdleSweepTerminal::Cancelled,
+            IntegrityTier2Status::Refused => IdleSweepTerminal::Refused,
+        };
+        let settlement = reservation.settle(terminal);
+        if report.status == IntegrityTier2Status::Complete
+            && settlement == IdleSweepSettlement::Superseded
+        {
+            report = report.cancel();
+        }
+        (report, settlement)
     }
 }
 
@@ -2299,7 +2412,9 @@ impl IntegrityTier2OwnedWork {
         ticket: KnownGoodTier2Ticket,
         reservation: IdleSweepReservation,
     ) -> Result<Self, IntegrityTier2OwnedWorkAuthorityMismatch> {
-        if !ticket.matches_reservation(&reservation) {
+        if !ticket.matches_reservation(&reservation)
+            || !state.known_good_tier2_ticket_is_current(&ticket)
+        {
             return Err(IntegrityTier2OwnedWorkAuthorityMismatch {
                 ticket,
                 reservation,
@@ -2391,6 +2506,7 @@ where
         sense_integrity_tier2_owned(&state, &ticket, &cancellation)
     });
     IntegrityTier2OwnedResult {
+        state,
         report,
         ticket,
         reservation,
@@ -2399,12 +2515,13 @@ where
 
 fn refuse_integrity_tier2_thread_spawn(work: IntegrityTier2OwnedWork) -> IntegrityTier2OwnedResult {
     let IntegrityTier2OwnedWork {
+        state,
         ticket,
         reservation,
-        ..
     } = work;
     let report = IntegrityTier2Report::new(0, 0).refuse(tier2_worker_refused_fact());
     IntegrityTier2OwnedResult {
+        state,
         report,
         ticket,
         reservation,
@@ -2446,6 +2563,7 @@ impl IntegrityTier2Report {
             metadata_lookup_count: 0,
             link_lookup_count: 0,
             suppressed_fact_count: 0,
+            repairable_observations: Vec::new(),
         }
     }
 
@@ -2453,6 +2571,7 @@ impl IntegrityTier2Report {
         self.status = IntegrityTier2Status::Cancelled;
         self.facts.clear();
         self.suppressed_fact_count = 0;
+        self.repairable_observations.clear();
         self
     }
 
@@ -2460,8 +2579,34 @@ impl IntegrityTier2Report {
         self.status = IntegrityTier2Status::Refused;
         self.facts.clear();
         self.suppressed_fact_count = 0;
+        self.repairable_observations.clear();
         self.facts.push(fact);
         self
+    }
+
+    fn registered_artifact_observations(&self) -> Vec<RegisteredArtifactObservation> {
+        self.repairable_observations
+            .iter()
+            .map(|observed| observed.observation)
+            .collect()
+    }
+
+    fn bind_registered_artifact_targets(&mut self, findings: &RegisteredArtifactFindings) -> bool {
+        let mut bindings = Vec::with_capacity(self.repairable_observations.len());
+        for observed in &self.repairable_observations {
+            if self.facts.get(observed.fact_index).is_none() {
+                return false;
+            }
+            let Some(target) = findings.target_for(observed.observation) else {
+                return false;
+            };
+            bindings.push((observed.fact_index, target.clone()));
+        }
+        for (fact_index, target) in bindings {
+            self.facts[fact_index].target = Some(target);
+        }
+        self.repairable_observations.clear();
+        true
     }
 }
 
@@ -2575,6 +2720,7 @@ impl<Pacer: IntegrityTier2Pacer> ContentReadControl for IntegrityTier2ReadContro
 struct IntegrityTier2RunContext<'a, Pacer> {
     library_root: &'a Path,
     runtime_cache: &'a ManagedRuntimeCache,
+    inventory: &'a KnownGoodInventory,
     cancellation: &'a IdleSweepCancellation,
     pacer: &'a Pacer,
 }
@@ -2601,6 +2747,7 @@ fn sense_integrity_tier2_owned(
         IntegrityTier2RunContext {
             library_root,
             runtime_cache,
+            inventory,
             cancellation,
             pacer: &pacer,
         },
@@ -2658,6 +2805,7 @@ where
                 projected.entry(),
                 projected.inventory_ordinal(),
                 &path,
+                context.inventory,
                 &mut control,
                 &mut report,
             ) {
@@ -2700,6 +2848,7 @@ fn inspect_tier2_entry(
     entry: &KnownGoodEntry,
     inventory_ordinal: usize,
     path: &KnownGoodPhysicalPath,
+    inventory: &KnownGoodInventory,
     control: &mut dyn ContentReadControl,
     report: &mut IntegrityTier2Report,
 ) -> bool {
@@ -2713,19 +2862,24 @@ fn inspect_tier2_entry(
             report.content_read_byte_count = report
                 .content_read_byte_count
                 .saturating_add(result.bytes_read);
-            let fact = match result.observation {
+            let (fact, repair_condition) = match result.observation {
                 Ok(ContentHashObservation::Hashed {
                     digest: observed_digest,
                 }) => {
                     report.hashed_entry_count += 1;
-                    (observed_digest != digest.as_str()).then(|| {
-                        integrity_fact(
-                            entry,
-                            inventory_ordinal,
-                            ExecutionFactKind::ArtifactHashMismatch,
-                            "hash_mismatch",
+                    if observed_digest != digest.as_str() {
+                        (
+                            Some(integrity_fact(
+                                entry,
+                                inventory_ordinal,
+                                ExecutionFactKind::ArtifactHashMismatch,
+                                "hash_mismatch",
+                            )),
+                            Some(RegisteredArtifactCondition::Corrupt),
                         )
-                    })
+                    } else {
+                        (None, None)
+                    }
                 }
                 Ok(ContentHashObservation::SizeDrift { observed_size }) => {
                     let mut fact = integrity_fact(
@@ -2738,50 +2892,79 @@ fn inspect_tier2_entry(
                         public_field("expected_size", size.to_string()),
                         public_field("observed_size", observed_size.to_string()),
                     ]);
-                    Some(fact)
+                    (Some(fact), Some(RegisteredArtifactCondition::Corrupt))
                 }
-                Ok(ContentHashObservation::WrongType) => Some(integrity_fact(
-                    entry,
-                    inventory_ordinal,
-                    ExecutionFactKind::ArtifactMissing,
-                    "wrong_type",
-                )),
-                Ok(ContentHashObservation::ChangedDuringRead) => Some(integrity_fact(
-                    entry,
-                    inventory_ordinal,
-                    ExecutionFactKind::PrimitiveRefused,
-                    "content_changed_during_read",
-                )),
-                Ok(ContentHashObservation::BudgetRefused) => Some(integrity_fact(
-                    entry,
-                    inventory_ordinal,
-                    ExecutionFactKind::PrimitiveRefused,
-                    "content_budget_refused",
-                )),
+                Ok(ContentHashObservation::WrongType) => (
+                    Some(integrity_fact(
+                        entry,
+                        inventory_ordinal,
+                        ExecutionFactKind::ArtifactMissing,
+                        "wrong_type",
+                    )),
+                    Some(RegisteredArtifactCondition::Corrupt),
+                ),
+                Ok(ContentHashObservation::ChangedDuringRead) => (
+                    Some(integrity_fact(
+                        entry,
+                        inventory_ordinal,
+                        ExecutionFactKind::PrimitiveRefused,
+                        "content_changed_during_read",
+                    )),
+                    None,
+                ),
+                Ok(ContentHashObservation::BudgetRefused) => (
+                    Some(integrity_fact(
+                        entry,
+                        inventory_ordinal,
+                        ExecutionFactKind::PrimitiveRefused,
+                        "content_budget_refused",
+                    )),
+                    None,
+                ),
                 Ok(ContentHashObservation::Cancelled) => return false,
-                Err(error) if error.kind() == io::ErrorKind::NotFound => Some(integrity_fact(
-                    entry,
-                    inventory_ordinal,
-                    ExecutionFactKind::ArtifactMissing,
-                    "missing",
-                )),
-                Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+                Err(error) if error.kind() == io::ErrorKind::NotFound => (
+                    Some(integrity_fact(
+                        entry,
+                        inventory_ordinal,
+                        ExecutionFactKind::ArtifactMissing,
+                        "missing",
+                    )),
+                    Some(RegisteredArtifactCondition::Missing),
+                ),
+                Err(error) if error.kind() == io::ErrorKind::PermissionDenied => (
                     Some(integrity_fact(
                         entry,
                         inventory_ordinal,
                         ExecutionFactKind::FilePermissionDenied,
                         "content_permission_denied",
-                    ))
-                }
-                Err(_) => Some(integrity_fact(
-                    entry,
-                    inventory_ordinal,
-                    ExecutionFactKind::PrimitiveRefused,
-                    "content_unavailable",
-                )),
+                    )),
+                    None,
+                ),
+                Err(_) => (
+                    Some(integrity_fact(
+                        entry,
+                        inventory_ordinal,
+                        ExecutionFactKind::PrimitiveRefused,
+                        "content_unavailable",
+                    )),
+                    None,
+                ),
             };
             if let Some(fact) = fact {
-                push_bounded_tier2_fact(report, fact);
+                let fact_index = push_bounded_tier2_fact(report, fact);
+                if let (Some(fact_index), Some(condition)) = (fact_index, repair_condition)
+                    && tier2_assets_leaf_is_source_backed(inventory, entry, inventory_ordinal)
+                {
+                    report
+                        .repairable_observations
+                        .push(Tier2RepairableObservation {
+                            fact_index,
+                            observation: RegisteredArtifactObservation::new(
+                                inventory_ordinal,
+                                condition,
+                            ),
+                        });
+                }
             }
         }
         KnownGoodIntegrity::Directory | KnownGoodIntegrity::LinkTarget(_) => {
@@ -2822,7 +3005,7 @@ fn inspect_tier2_entry(
                 )),
             };
             if let Some(fact) = fact {
-                push_bounded_tier2_fact(report, fact);
+                let _ = push_bounded_tier2_fact(report, fact);
             }
         }
     }
@@ -2894,11 +3077,33 @@ fn tier2_refused_fact(
     }
 }
 
-fn push_bounded_tier2_fact(report: &mut IntegrityTier2Report, fact: ExecutionFact) {
+fn tier2_assets_leaf_is_source_backed(
+    inventory: &KnownGoodInventory,
+    entry: &KnownGoodEntry,
+    inventory_ordinal: usize,
+) -> bool {
+    matches!(
+        (entry.root(), entry.kind()),
+        (
+            KnownGoodRoot::Assets,
+            KnownGoodArtifactKind::AssetIndex | KnownGoodArtifactKind::AssetObject,
+        )
+    ) && inventory
+        .bind_standalone_leaf_repair_source(inventory_ordinal)
+        .is_ok_and(|source| source.root() == entry.root() && source.kind() == entry.kind())
+}
+
+fn push_bounded_tier2_fact(
+    report: &mut IntegrityTier2Report,
+    fact: ExecutionFact,
+) -> Option<usize> {
     if report.facts.len() < MAX_INTEGRITY_TIER2_FACTS {
+        let fact_index = report.facts.len();
         report.facts.push(fact);
+        Some(fact_index)
     } else {
         report.suppressed_fact_count += 1;
+        None
     }
 }
 
@@ -3890,27 +4095,47 @@ mod tests {
         (state, root, work)
     }
 
-    fn settle_tier2_result(
+    async fn tier2_assets_owned_work_fixture(
+        label: &str,
+    ) -> (AppState, PathBuf, IntegrityTier2OwnedWork) {
+        let (state, root) = state_fixture(label, None);
+        let instance = state
+            .instances()
+            .insert_for_test("Tier two Assets owned work", "1.21.5")
+            .expect("instance");
+        let inventory = KnownGoodInventory::from_test_entries([entry(
+            TestKnownGoodRoot::Assets,
+            "indexes/owned.json",
+            KnownGoodArtifactKind::AssetIndex,
+            TestKnownGoodIntegrity::Sha1 {
+                digest: ZERO_SHA1.to_string(),
+                size: 1,
+            },
+        )])
+        .expect("Assets inventory")
+        .with_test_standalone_leaf_repair_source(0, "https://example.invalid/indexes/owned.json")
+        .expect("Assets repair source");
+        state.activate_known_good_inventory_for_test(&instance.id, inventory);
+        let idle_epoch = state.subscribe_integrity_idle().borrow().epoch();
+        let producer = state
+            .try_claim_producer()
+            .expect("claim idle sweep producer");
+        let reservation = state
+            .try_reserve_idle_sweep(idle_epoch, producer)
+            .expect("idle sweep reservation");
+        let ticket = state
+            .mint_known_good_tier2_ticket(&reservation.authority(), &instance.id)
+            .await
+            .expect("Tier 2 ticket");
+        let work = IntegrityTier2OwnedWork::new(state.clone(), ticket, reservation)
+            .expect("matching Tier 2 ownership");
+        (state, root, work)
+    }
+
+    async fn settle_tier2_result(
         result: IntegrityTier2OwnedResult,
     ) -> (IntegrityTier2Report, IdleSweepSettlement) {
-        let IntegrityTier2OwnedResult {
-            mut report,
-            ticket,
-            reservation,
-        } = result;
-        let terminal = match report.status {
-            IntegrityTier2Status::Complete => IdleSweepTerminal::Complete,
-            IntegrityTier2Status::Cancelled => IdleSweepTerminal::Cancelled,
-            IntegrityTier2Status::Refused => IdleSweepTerminal::Refused,
-        };
-        let settlement = reservation.settle(terminal);
-        if report.status == IntegrityTier2Status::Complete
-            && settlement == IdleSweepSettlement::Superseded
-        {
-            report = report.cancel();
-        }
-        drop(ticket);
-        (report, settlement)
+        result.settle_without_recovery().await
     }
 
     async fn test_integrity_foreground(state: &AppState) -> IntegrityForegroundLease {
@@ -4116,6 +4341,7 @@ mod tests {
             IntegrityTier2RunContext {
                 library_root: Path::new("/private/library"),
                 runtime_cache: &runtime_cache,
+                inventory: &inventory,
                 cancellation: &cancellation,
                 pacer: &pacer,
             },
@@ -4146,6 +4372,227 @@ mod tests {
     }
 
     #[test]
+    fn tier_two_retains_only_source_backed_assets_leaf_observations() {
+        let empty_sha1 = "da39a3ee5e6b4b0d3255bfef95601890afd80709";
+        let inventory = KnownGoodInventory::from_test_entries([
+            entry(
+                TestKnownGoodRoot::Assets,
+                "indexes/missing.json",
+                KnownGoodArtifactKind::AssetIndex,
+                TestKnownGoodIntegrity::Sha1 {
+                    digest: ZERO_SHA1.to_string(),
+                    size: 1,
+                },
+            ),
+            entry(
+                TestKnownGoodRoot::Assets,
+                "indexes/size-drift.json",
+                KnownGoodArtifactKind::AssetIndex,
+                TestKnownGoodIntegrity::Sha1 {
+                    digest: ZERO_SHA1.to_string(),
+                    size: 1,
+                },
+            ),
+            entry(
+                TestKnownGoodRoot::Assets,
+                "objects/00/0000000000000000000000000000000000000000",
+                KnownGoodArtifactKind::AssetObject,
+                TestKnownGoodIntegrity::Sha1 {
+                    digest: ZERO_SHA1.to_string(),
+                    size: 1,
+                },
+            ),
+            entry(
+                TestKnownGoodRoot::Assets,
+                "objects/11/1111111111111111111111111111111111111111",
+                KnownGoodArtifactKind::AssetObject,
+                TestKnownGoodIntegrity::Sha1 {
+                    digest: NONZERO_SHA1.to_string(),
+                    size: 1,
+                },
+            ),
+            entry(
+                TestKnownGoodRoot::Assets,
+                "objects/da/da39a3ee5e6b4b0d3255bfef95601890afd80709",
+                KnownGoodArtifactKind::AssetObject,
+                TestKnownGoodIntegrity::Sha1 {
+                    digest: empty_sha1.to_string(),
+                    size: 0,
+                },
+            ),
+            entry(
+                TestKnownGoodRoot::Libraries,
+                "org/example/library.jar",
+                KnownGoodArtifactKind::Library,
+                TestKnownGoodIntegrity::Sha1 {
+                    digest: ZERO_SHA1.to_string(),
+                    size: 1,
+                },
+            ),
+            entry(
+                TestKnownGoodRoot::Assets,
+                "indexes/source-free.json",
+                KnownGoodArtifactKind::AssetIndex,
+                TestKnownGoodIntegrity::Sha1 {
+                    digest: ZERO_SHA1.to_string(),
+                    size: 1,
+                },
+            ),
+        ])
+        .expect("Tier 2 repairable inventory");
+        let ordinal = |root: &KnownGoodRoot, kind, path: &str| {
+            inventory
+                .entries()
+                .iter()
+                .position(|entry| {
+                    entry.root() == root && entry.kind() == kind && entry.path().as_str() == path
+                })
+                .expect("canonical repairable inventory ordinal")
+        };
+        let missing_index_ordinal = ordinal(
+            &KnownGoodRoot::Assets,
+            KnownGoodArtifactKind::AssetIndex,
+            "indexes/missing.json",
+        );
+        let drifted_index_ordinal = ordinal(
+            &KnownGoodRoot::Assets,
+            KnownGoodArtifactKind::AssetIndex,
+            "indexes/size-drift.json",
+        );
+        let mismatched_object_ordinal = ordinal(
+            &KnownGoodRoot::Assets,
+            KnownGoodArtifactKind::AssetObject,
+            "objects/00/0000000000000000000000000000000000000000",
+        );
+        let wrong_type_object_ordinal = ordinal(
+            &KnownGoodRoot::Assets,
+            KnownGoodArtifactKind::AssetObject,
+            "objects/11/1111111111111111111111111111111111111111",
+        );
+        let zero_object_ordinal = ordinal(
+            &KnownGoodRoot::Assets,
+            KnownGoodArtifactKind::AssetObject,
+            "objects/da/da39a3ee5e6b4b0d3255bfef95601890afd80709",
+        );
+        let library_ordinal = ordinal(
+            &KnownGoodRoot::Libraries,
+            KnownGoodArtifactKind::Library,
+            "org/example/library.jar",
+        );
+        let inventory = inventory
+        .with_test_standalone_leaf_repair_source(
+            missing_index_ordinal,
+            "https://example.invalid/indexes/missing.json",
+        )
+        .expect("missing index source")
+        .with_test_standalone_leaf_repair_source(
+            drifted_index_ordinal,
+            "https://example.invalid/indexes/size-drift.json",
+        )
+        .expect("drifted index source")
+        .with_test_standalone_leaf_repair_source(
+            mismatched_object_ordinal,
+            "https://resources.download.minecraft.net/00/0000000000000000000000000000000000000000",
+        )
+        .expect("mismatched object source")
+        .with_test_standalone_leaf_repair_source(
+            wrong_type_object_ordinal,
+            "https://resources.download.minecraft.net/11/1111111111111111111111111111111111111111",
+        )
+        .expect("wrong-type object source")
+        .with_test_standalone_leaf_repair_source(
+            zero_object_ordinal,
+            "https://resources.download.minecraft.net/da/da39a3ee5e6b4b0d3255bfef95601890afd80709",
+        )
+        .expect("zero-byte object source")
+        .with_test_standalone_leaf_repair_source(
+            library_ordinal,
+            "https://example.invalid/org/example/library.jar",
+        )
+        .expect("library source");
+        let projection = inventory.tier2_projection().expect("Tier 2 projection");
+        let reader = ScriptedTier2Reader {
+            metadata: Arc::new(ScriptedReader::new([], [])),
+            content: Arc::new(ScriptedContentReader::new([
+                (
+                    "indexes/missing.json",
+                    ScriptedContent::Error(io::ErrorKind::NotFound),
+                ),
+                (
+                    "indexes/size-drift.json",
+                    ScriptedContent::SizeDriftAfterRead {
+                        observed_size: 2,
+                        bytes_read: 1,
+                    },
+                ),
+                (
+                    "objects/00/0000000000000000000000000000000000000000",
+                    ScriptedContent::Hashed(NONZERO_SHA1, 1),
+                ),
+                (
+                    "objects/11/1111111111111111111111111111111111111111",
+                    ScriptedContent::WrongType,
+                ),
+                (
+                    "objects/da/da39a3ee5e6b4b0d3255bfef95601890afd80709",
+                    ScriptedContent::Error(io::ErrorKind::NotFound),
+                ),
+                (
+                    "org/example/library.jar",
+                    ScriptedContent::Error(io::ErrorKind::NotFound),
+                ),
+                (
+                    "indexes/source-free.json",
+                    ScriptedContent::Error(io::ErrorKind::NotFound),
+                ),
+            ])),
+        };
+        let cancellation = tier2_cancellation();
+        let pacer = ScriptedTier2Pacer::new();
+        let runtime_cache = ManagedRuntimeCache::isolated_for_test().expect("runtime cache");
+
+        let report = run_integrity_tier2_with(
+            projection,
+            IntegrityTier2RunContext {
+                library_root: Path::new("/private/library"),
+                runtime_cache: &runtime_cache,
+                inventory: &inventory,
+                cancellation: &cancellation,
+                pacer: &pacer,
+            },
+            || reader.clone(),
+            || true,
+        );
+
+        assert_eq!(report.status, IntegrityTier2Status::Complete);
+        assert_eq!(report.facts.len(), 7);
+        let mut expected = vec![
+            RegisteredArtifactObservation::new(
+                missing_index_ordinal,
+                RegisteredArtifactCondition::Missing,
+            ),
+            RegisteredArtifactObservation::new(
+                drifted_index_ordinal,
+                RegisteredArtifactCondition::Corrupt,
+            ),
+            RegisteredArtifactObservation::new(
+                mismatched_object_ordinal,
+                RegisteredArtifactCondition::Corrupt,
+            ),
+            RegisteredArtifactObservation::new(
+                wrong_type_object_ordinal,
+                RegisteredArtifactCondition::Corrupt,
+            ),
+            RegisteredArtifactObservation::new(
+                zero_object_ordinal,
+                RegisteredArtifactCondition::Missing,
+            ),
+        ];
+        expected.sort_by_key(|observation| observation.inventory_ordinal());
+        assert_eq!(report.registered_artifact_observations(), expected);
+    }
+
+    #[test]
     fn tier_two_pre_cancel_opens_nothing_and_publishes_no_partial_facts() {
         let inventory = KnownGoodInventory::from_test_entries([entry(
             TestKnownGoodRoot::Libraries,
@@ -4166,6 +4613,7 @@ mod tests {
             IntegrityTier2RunContext {
                 library_root: Path::new("/private/library"),
                 runtime_cache: &runtime_cache,
+                inventory: &inventory,
                 cancellation: &cancellation,
                 pacer: &pacer,
             },
@@ -4210,6 +4658,7 @@ mod tests {
             IntegrityTier2RunContext {
                 library_root: Path::new("/private/library"),
                 runtime_cache: &runtime_cache,
+                inventory: &inventory,
                 cancellation: &cancellation,
                 pacer: &pacer,
             },
@@ -4257,6 +4706,7 @@ mod tests {
             IntegrityTier2RunContext {
                 library_root: Path::new("/private/library"),
                 runtime_cache: &runtime_cache,
+                inventory: &inventory,
                 cancellation: &cancellation,
                 pacer: &pacer,
             },
@@ -4357,6 +4807,7 @@ mod tests {
             IntegrityTier2RunContext {
                 library_root: Path::new("/private/library"),
                 runtime_cache: &runtime_cache,
+                inventory: &inventory,
                 cancellation: &cancellation,
                 pacer: &pacer,
             },
@@ -4380,6 +4831,95 @@ mod tests {
                 .iter()
                 .all(|fact| fact.kind == ExecutionFactKind::ArtifactHashMismatch)
         );
+    }
+
+    #[test]
+    fn tier_two_suppression_and_noncomplete_reports_discard_repair_sidecars() {
+        let mut inventory = KnownGoodInventory::from_test_entries((0..=64).map(|index| {
+            entry(
+                TestKnownGoodRoot::Assets,
+                &format!("indexes/bounded-{index:03}.json"),
+                KnownGoodArtifactKind::AssetIndex,
+                TestKnownGoodIntegrity::Sha1 {
+                    digest: ZERO_SHA1.to_string(),
+                    size: 1,
+                },
+            )
+        }))
+        .expect("bounded Assets inventory");
+        for index in 0..=64 {
+            let path = format!("indexes/bounded-{index:03}.json");
+            let inventory_ordinal = inventory
+                .entries()
+                .iter()
+                .position(|entry| {
+                    entry.root() == &KnownGoodRoot::Assets
+                        && entry.kind() == KnownGoodArtifactKind::AssetIndex
+                        && entry.path().as_str() == path
+                })
+                .expect("canonical bounded Assets ordinal");
+            inventory = inventory
+                .with_test_standalone_leaf_repair_source(
+                    inventory_ordinal,
+                    &format!("https://example.invalid/{path}"),
+                )
+                .expect("bounded Assets source");
+        }
+        let projection = inventory.tier2_projection().expect("projection");
+        let reader = ScriptedTier2Reader {
+            metadata: Arc::new(ScriptedReader::new([], [])),
+            content: Arc::new(
+                ScriptedContentReader::new([])
+                    .with_default(ScriptedContent::Hashed(NONZERO_SHA1, 1)),
+            ),
+        };
+        let cancellation = tier2_cancellation();
+        let pacer = ScriptedTier2Pacer::new();
+        let runtime_cache = ManagedRuntimeCache::isolated_for_test().expect("runtime cache");
+
+        let report = run_integrity_tier2_with(
+            projection,
+            IntegrityTier2RunContext {
+                library_root: Path::new("/private/library"),
+                runtime_cache: &runtime_cache,
+                inventory: &inventory,
+                cancellation: &cancellation,
+                pacer: &pacer,
+            },
+            || reader.clone(),
+            || true,
+        );
+
+        assert_eq!(report.status, IntegrityTier2Status::Complete);
+        assert_eq!(report.facts.len(), MAX_INTEGRITY_TIER2_FACTS);
+        assert_eq!(report.suppressed_fact_count, 1);
+        assert_eq!(
+            report.registered_artifact_observations().len(),
+            MAX_INTEGRITY_TIER2_FACTS
+        );
+        assert!(
+            report
+                .registered_artifact_observations()
+                .iter()
+                .all(|observation| observation.inventory_ordinal() < MAX_INTEGRITY_TIER2_FACTS)
+        );
+
+        let cancelled = report.cancel();
+        assert!(cancelled.facts.is_empty());
+        assert!(cancelled.registered_artifact_observations().is_empty());
+
+        let mut refused = IntegrityTier2Report::new(1, 1);
+        refused
+            .repairable_observations
+            .push(Tier2RepairableObservation {
+                fact_index: 0,
+                observation: RegisteredArtifactObservation::new(
+                    0,
+                    RegisteredArtifactCondition::Missing,
+                ),
+            });
+        let refused = refused.refuse(tier2_worker_refused_fact());
+        assert!(refused.registered_artifact_observations().is_empty());
     }
 
     #[test]
@@ -4411,6 +4951,7 @@ mod tests {
             IntegrityTier2RunContext {
                 library_root: Path::new("/private/library"),
                 runtime_cache: &runtime_cache,
+                inventory: &inventory,
                 cancellation: &cancellation,
                 pacer: &pacer,
             },
@@ -4458,6 +4999,7 @@ mod tests {
             IntegrityTier2RunContext {
                 library_root: Path::new("/private/library"),
                 runtime_cache: &runtime_cache,
+                inventory: &inventory,
                 cancellation: &cancellation,
                 pacer: &pacer,
             },
@@ -4496,7 +5038,7 @@ mod tests {
         .await
         .expect("worker and completion ticket retain no instance lifecycle");
         drop(lifecycle);
-        let (report, settlement) = settle_tier2_result(result);
+        let (report, settlement) = settle_tier2_result(result).await;
 
         assert_eq!(settlement, IdleSweepSettlement::Authoritative);
         assert_eq!(report.status, IntegrityTier2Status::Complete);
@@ -4545,6 +5087,68 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tier_two_worker_rejects_authority_spliced_to_another_state() {
+        let (state, root, work) = tier2_owned_work_fixture("tier2-spliced-state").await;
+        let (foreign_state, foreign_root) = state_fixture("tier2-spliced-foreign-state", None);
+        let IntegrityTier2OwnedWork {
+            state: originating_state,
+            ticket,
+            reservation,
+        } = work;
+
+        let mismatch =
+            match IntegrityTier2OwnedWork::new(foreign_state.clone(), ticket, reservation) {
+                Ok(_) => panic!("ticket and reservation must retain their originating state"),
+                Err(mismatch) => mismatch,
+            };
+        let (_ticket, reservation) = mismatch.into_parts();
+        assert!(reservation.is_current());
+        assert_eq!(
+            reservation.settle(IdleSweepTerminal::Refused),
+            IdleSweepSettlement::Superseded
+        );
+
+        drop(originating_state);
+        close_fixture(state, root).await;
+        close_fixture(foreign_state, foreign_root).await;
+    }
+
+    #[tokio::test]
+    async fn tier_two_owned_result_seals_exact_opaque_assets_target_before_settlement() {
+        let (state, root, work) =
+            tier2_assets_owned_work_fixture("tier2-assets-exact-sealing").await;
+
+        let result = work.spawn().join().await.expect("dedicated worker result");
+        assert!(result.reservation.is_current());
+        let sealed = result.seal_and_bind().await;
+        assert!(sealed.reservation.is_current());
+        assert_eq!(sealed.report.status, IntegrityTier2Status::Complete);
+        assert!(sealed.report.repairable_observations.is_empty());
+        let findings = sealed.findings.as_ref().expect("sealed Assets findings");
+        assert_eq!(findings.len(), 1);
+        let target = findings.repair_target().expect("selected Assets target");
+        assert_eq!(target.system, StabilizationSystem::Execution);
+        assert_eq!(target.kind, TargetKind::Artifact);
+        assert_eq!(target.ownership, OwnershipClass::LauncherManaged);
+        assert_eq!(target.id.len(), 79);
+        assert!(target.id.starts_with("leaf-v2."));
+        assert_eq!(
+            sealed
+                .report
+                .facts
+                .iter()
+                .find(|fact| fact_field(fact, "observation") == Some("missing"))
+                .and_then(|fact| fact.target.as_ref()),
+            Some(target)
+        );
+
+        let (report, settlement) = sealed.settle_without_recovery();
+        assert_eq!(settlement, IdleSweepSettlement::Authoritative);
+        assert_eq!(report.status, IntegrityTier2Status::Complete);
+        close_fixture(state, root).await;
+    }
+
+    #[tokio::test]
     async fn tier_two_actual_confined_reader_cancels_during_a_multi_chunk_file() {
         let (state, root) = state_fixture("tier2-confined-cancellation", None);
         let library_root = root.join("private-library-root");
@@ -4588,7 +5192,7 @@ mod tests {
 
         let result = work.spawn().join().await.expect("dedicated worker result");
         canceller.join().expect("cancellation thread");
-        let (report, settlement) = settle_tier2_result(result);
+        let (report, settlement) = settle_tier2_result(result).await;
 
         assert_eq!(settlement, IdleSweepSettlement::Superseded);
         assert_eq!(report.status, IntegrityTier2Status::Cancelled);
@@ -4624,7 +5228,7 @@ mod tests {
             .join()
             .await
             .expect("priority refusal result");
-        let (report, settlement) = settle_tier2_result(result);
+        let (report, settlement) = settle_tier2_result(result).await;
 
         assert_eq!(settlement, IdleSweepSettlement::Superseded);
         assert_eq!(report.status, IntegrityTier2Status::Refused);
@@ -4651,7 +5255,7 @@ mod tests {
             .await
             .expect("bounded spawn refusal result");
         assert!(result.reservation.is_current());
-        let (report, settlement) = settle_tier2_result(result);
+        let (report, settlement) = settle_tier2_result(result).await;
 
         assert_eq!(settlement, IdleSweepSettlement::Superseded);
         assert_eq!(report.status, IntegrityTier2Status::Refused);
@@ -4693,7 +5297,7 @@ mod tests {
             .join()
             .await
             .expect("priority refusal result");
-        let (report, settlement) = settle_tier2_result(result);
+        let (report, settlement) = settle_tier2_result(result).await;
 
         assert_eq!(settlement, IdleSweepSettlement::Superseded);
         assert_eq!(report.status, IntegrityTier2Status::Refused);
@@ -4729,7 +5333,7 @@ mod tests {
             .expect("join waiter")
             .expect("dedicated worker result");
         assert!(result.reservation.is_current());
-        let (report, settlement) = settle_tier2_result(result);
+        let (report, settlement) = settle_tier2_result(result).await;
 
         assert_eq!(settlement, IdleSweepSettlement::Authoritative);
         assert_eq!(report.status, IntegrityTier2Status::Complete);
@@ -5058,7 +5662,7 @@ mod tests {
 
         assert_eq!(report.findings().len(), 2);
         assert!(!report.findings().is_empty());
-        assert!(state.registered_artifact_findings_are_current(report.findings()));
+        assert!(state.registered_artifact_findings_can_admit(report.findings()));
         let corrupt = RegisteredArtifactObservation::new(0, RegisteredArtifactCondition::Corrupt);
         let missing = RegisteredArtifactObservation::new(1, RegisteredArtifactCondition::Missing);
         let missing_target = report
@@ -5364,6 +5968,85 @@ mod tests {
             drop((admission, lifecycle));
             close_fixture(state, root).await;
         }
+    }
+
+    #[tokio::test]
+    async fn admitted_sweep_leaf_can_finish_after_cancellation_but_not_after_settlement() {
+        let (state, root) = state_fixture("sweep-leaf-live-authority", None);
+        let instance = state
+            .instances()
+            .insert_for_test("Sweep leaf live authority", "1.21.5")
+            .expect("instance");
+        let inventory = KnownGoodInventory::from_test_entries([entry(
+            TestKnownGoodRoot::Assets,
+            "indexes/live-authority.json",
+            KnownGoodArtifactKind::AssetIndex,
+            TestKnownGoodIntegrity::Sha1 {
+                digest: ZERO_SHA1.to_string(),
+                size: 1,
+            },
+        )])
+        .expect("Assets inventory")
+        .with_test_standalone_leaf_repair_source(
+            0,
+            "https://example.invalid/indexes/live-authority.json",
+        )
+        .expect("Assets source");
+        state.activate_known_good_inventory_for_test(&instance.id, inventory);
+        fs::create_dir_all(root.join("private-library-root/assets/indexes"))
+            .expect("Assets parent");
+        let epoch = state.subscribe_integrity_idle().borrow().epoch();
+        let reservation = state
+            .try_reserve_idle_sweep(
+                epoch,
+                state.try_claim_producer().expect("claim sweep producer"),
+            )
+            .expect("sweep reservation");
+        let cancellation = reservation.cancellation();
+        let ticket = state
+            .mint_known_good_tier2_ticket(&reservation.authority(), &instance.id)
+            .await
+            .expect("ticket");
+        let findings = state
+            .seal_tier2_registered_artifact_request(Tier2RegisteredArtifactSealRequest::new(
+                ticket,
+                vec![RegisteredArtifactObservation::new(
+                    0,
+                    RegisteredArtifactCondition::Missing,
+                )],
+            ))
+            .await
+            .expect("sweep findings");
+        let target = findings.repair_target().expect("repair target").clone();
+        let authorization = findings
+            .authorize_repair(&registered_artifact_decision(target, GuardianMode::Managed))
+            .expect("repair authorization");
+        let admission = state
+            .admit_registered_artifact_repair(
+                authorization,
+                OperationId::new("sweep-leaf-live-authority"),
+                chrono::Duration::minutes(30),
+            )
+            .await
+            .expect("leaf admission");
+        let attempt = admission.attempt().clone();
+
+        cancellation.cancel();
+        assert!(admission.evidence_is_live());
+        assert!(
+            admission
+                .terminal(attempt.clone(), ReconciliationTerminalOutcome::Failed, None,)
+                .is_ok()
+        );
+        reservation.settle(IdleSweepTerminal::Cancelled);
+        assert!(!admission.evidence_is_live());
+        assert!(matches!(
+            admission.terminal(attempt, ReconciliationTerminalOutcome::Failed, None),
+            Err(crate::state::ReconciliationEvidenceRejection::IncarnationMismatch)
+        ));
+
+        drop(admission);
+        close_fixture(state, root).await;
     }
 
     #[tokio::test]

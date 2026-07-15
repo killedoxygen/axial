@@ -236,23 +236,7 @@ where
     let result = worker.join().await;
     let (transition, terminal) = match result {
         Ok(result) => {
-            let crate::execution::integrity::IntegrityTier2OwnedResult {
-                mut report,
-                ticket,
-                reservation,
-            } = result;
-            let sweep_terminal = match report.status {
-                IntegrityTier2Status::Complete => IdleSweepTerminal::Complete,
-                IntegrityTier2Status::Cancelled => IdleSweepTerminal::Cancelled,
-                IntegrityTier2Status::Refused => IdleSweepTerminal::Refused,
-            };
-            let settlement = reservation.settle(sweep_terminal);
-            if report.status == IntegrityTier2Status::Complete
-                && settlement == IdleSweepSettlement::Superseded
-            {
-                report = report.cancel();
-            }
-            drop(ticket);
+            let (report, settlement) = result.settle_without_recovery().await;
             match (report.status, settlement) {
                 (IntegrityTier2Status::Complete, IdleSweepSettlement::Authoritative) => {
                     let counters = Tier2IntegrityCounters::from(&report);
