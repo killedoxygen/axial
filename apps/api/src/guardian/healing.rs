@@ -7,8 +7,7 @@ use super::{
 };
 use crate::execution::ExecutionFact;
 use crate::execution::runtime::{
-    ManagedRuntimeRepairPrimitive, ManagedRuntimeRepairRequest, ManagedRuntimeRoot,
-    repair_managed_runtime,
+    ManagedRuntimeRepairRequest, ManagedRuntimeRoot, repair_managed_runtime,
 };
 use crate::observability::{RedactionAudience, sanitize_evidence_token};
 use crate::state::contracts::{
@@ -204,12 +203,10 @@ pub(crate) async fn execute_managed_runtime_ready_marker_repair(
         ));
     }
 
-    match repair_managed_runtime(ManagedRuntimeRepairRequest {
-        operation_id: Some(operation_id.clone()),
-        target: target.clone(),
-        runtime_root,
-        primitive: ManagedRuntimeRepairPrimitive::RecreateReadyMarker,
-    }) {
+    match repair_managed_runtime(
+        ManagedRuntimeRepairRequest::new(target.clone(), runtime_root)
+            .with_operation_id(operation_id.clone()),
+    ) {
         Ok(report) => {
             let fact_ids = fact_ids(&report.facts);
             finish_runtime_repair(
@@ -804,6 +801,7 @@ mod tests {
     };
     use axial_config::{AppPaths, InstanceRegistrySnapshot};
     use axial_minecraft::ManagedRuntimeCache;
+    use axial_minecraft::known_good::{KnownGoodInventory, TestKnownGoodEntry};
     use sha1::{Digest, Sha1};
     use std::fs;
     use std::io;
@@ -1642,6 +1640,11 @@ mod tests {
         })
         .with_reconciliation_stores(journals.clone(), failure_memory.clone());
         state.set_library_dir_for_test(paths.library_dir.to_string_lossy().into_owned());
+        state.activate_known_good_inventory_for_test(
+            TEST_INSTANCE_ID,
+            KnownGoodInventory::from_test_entries(Vec::<TestKnownGoodEntry>::new())
+                .expect("empty known-good inventory"),
+        );
         fs::create_dir_all(state.managed_runtime_cache().root())
             .expect("create managed runtime root");
         Stores {

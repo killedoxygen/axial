@@ -206,6 +206,7 @@ enum WholeInstancePublicationAuthority {
 
 enum RegisteredComponentRebuildState {
     Runtime {
+        runtime_cache: ManagedRuntimeCache,
         postcondition_failure_inventory:
             std::sync::OnceLock<std::sync::Arc<axial_minecraft::known_good::KnownGoodInventory>>,
     },
@@ -1375,6 +1376,22 @@ impl RegisteredComponentRebuildAdmission {
         &self.attempt
     }
 
+    pub(crate) fn runtime_core_request(
+        &self,
+    ) -> Result<(ManagedRuntimeCache, RuntimeId), ReconciliationEvidenceRejection> {
+        let RegisteredComponentRebuildState::Runtime { runtime_cache, .. } = &self.component_state
+        else {
+            return Err(ReconciliationEvidenceRejection::ScopeMismatch);
+        };
+        if !runtime_cache.shares_identity_with(&self.authority.state.managed_runtime_cache) {
+            return Err(ReconciliationEvidenceRejection::IncarnationMismatch);
+        }
+        Ok((
+            runtime_cache.clone(),
+            RuntimeId::from(self.attempt.target().id.clone()),
+        ))
+    }
+
     pub(crate) fn failed_terminal(
         &self,
     ) -> Result<ReconciliationTerminal, ReconciliationEvidenceRejection> {
@@ -1821,6 +1838,7 @@ impl RegisteredComponentRebuildAdmission {
         match &self.component_state {
             RegisteredComponentRebuildState::Runtime {
                 postcondition_failure_inventory,
+                ..
             } => Ok(postcondition_failure_inventory),
             RegisteredComponentRebuildState::VersionBundle
             | RegisteredComponentRebuildState::Libraries => {
@@ -3116,6 +3134,7 @@ impl AppState {
         let prior = predecessor.terminal;
         let component_state = match prior.component() {
             ReconciliationComponent::Runtime => RegisteredComponentRebuildState::Runtime {
+                runtime_cache: self.managed_runtime_cache.clone(),
                 postcondition_failure_inventory: std::sync::OnceLock::new(),
             },
             ReconciliationComponent::VersionBundle

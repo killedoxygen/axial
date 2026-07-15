@@ -168,7 +168,6 @@ async fn maybe_repair_managed_runtime_before_launch_with_source(
                 Ok(admission) => {
                     let (component_outcome, repair_foreground) =
                         execute_owned_runtime_component_rebuild(
-                            state,
                             producer,
                             admission,
                             repair_foreground,
@@ -337,7 +336,6 @@ async fn maybe_repair_managed_runtime_before_launch_with_source(
                 Ok(admission) => {
                     let (component_outcome, repair_foreground) =
                         execute_owned_runtime_component_rebuild(
-                            state,
                             producer,
                             admission,
                             repair_foreground,
@@ -473,24 +471,22 @@ fn managed_runtime_ready_marker_repair_candidate(
 }
 
 async fn execute_owned_runtime_component_rebuild(
-    state: &AppState,
     producer: &crate::state::ProducerLease,
     admission: RegisteredComponentRebuildAdmission,
     foreground: IntegrityForegroundLease,
     rebuild_source: RuntimeComponentRebuildSource,
 ) -> Result<(GuardianComponentRebuildOutcome, IntegrityForegroundLease), OperationJournalStoreError>
 {
-    let state_task = state.clone();
     let (result_tx, result_rx) = tokio::sync::oneshot::channel();
     producer.spawn_child(async move {
         let result =
             execute_managed_runtime_component_rebuild(admission, move |effect| async move {
-                let component = effect.component();
+                let (runtime_cache, component) = effect.core_request();
                 let mut progress = RuntimeComponentRebuildProgress::default();
                 let rebuild = match rebuild_source {
                     RuntimeComponentRebuildSource::Production => {
                         axial_minecraft::runtime::rebuild_managed_runtime_component(
-                            state_task.managed_runtime_cache(),
+                            &runtime_cache,
                             component,
                             |event| progress.observe(&event),
                         )
@@ -499,7 +495,7 @@ async fn execute_owned_runtime_component_rebuild(
                     #[cfg(test)]
                     RuntimeComponentRebuildSource::Fixture => {
                         axial_minecraft::rebuild_managed_runtime_fixture_for_test(
-                            state_task.managed_runtime_cache(),
+                            &runtime_cache,
                             component,
                         )
                         .await

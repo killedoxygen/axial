@@ -32,7 +32,7 @@ use axial_minecraft::runtime::{
 };
 use axial_minecraft::{
     ManagedAssetsCommitReceipt, ManagedAssetsRollbackReceipt, ManagedLibrariesCommitReceipt,
-    ManagedLibrariesRollbackReceipt, ManagedVersionBundleCommitReceipt,
+    ManagedLibrariesRollbackReceipt, ManagedRuntimeCache, ManagedVersionBundleCommitReceipt,
     ManagedVersionBundleRollbackReceipt,
 };
 use std::future::Future;
@@ -179,8 +179,10 @@ impl ManagedRuntimeComponentRebuildEffect {
         Arc::ptr_eq(&self.identity, expected)
     }
 
-    pub(crate) fn component(&self) -> RuntimeId {
-        RuntimeId::from(self.admission.attempt().target().id.clone())
+    pub(crate) fn core_request(&self) -> (ManagedRuntimeCache, RuntimeId) {
+        self.admission
+            .runtime_core_request()
+            .expect("Guardian validated the State-owned Runtime effect request")
     }
 
     pub(crate) fn succeeded(
@@ -946,6 +948,7 @@ fn validate_managed_runtime_admission(
         || attempt.target().system != StabilizationSystem::Execution
         || attempt.target().kind != TargetKind::Runtime
         || !is_known_runtime_component(&attempt.target().id)
+        || admission.runtime_core_request().is_err()
     {
         return Err(invalid_component_rebuild_error(
             std::io::ErrorKind::PermissionDenied,
@@ -1649,11 +1652,11 @@ mod tests {
         settle_reconciliation_memory,
     };
     use axial_config::{AppPaths, InstanceRegistrySnapshot};
-    use axial_minecraft::RuntimeId;
     use axial_minecraft::known_good::{
         KnownGoodArtifactKind, KnownGoodInventory, TestKnownGoodEntry, TestKnownGoodIntegrity,
         TestKnownGoodRoot,
     };
+    use axial_minecraft::{ManagedRuntimeCache, RuntimeId};
     use sha1::{Digest as _, Sha1};
     use std::fs;
     use std::io;
@@ -2329,10 +2332,14 @@ mod tests {
         let operation_id = admission.attempt().operation_id().clone();
         let memory_key = reconciliation_attempt_key(admission.attempt());
         let runtime_cache = fixture.state.managed_runtime_cache().clone();
-        let effect_cache = runtime_cache.clone();
+        let expected_effect_cache = runtime_cache.clone();
         let effect_backend = backend.clone();
         let rebuild = execute_managed_runtime_component_rebuild(admission, move |effect| {
-            let component = effect.component();
+            let (effect_cache, component) = effect.core_request();
+            assert!(
+                effect_cache.shares_identity_with(&expected_effect_cache),
+                "Guardian effect must retain the exact State-owned Runtime cache"
+            );
             async move {
                 let receipt = axial_minecraft::rebuild_managed_runtime_fixture_for_test(
                     &effect_cache,
@@ -3157,12 +3164,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn managed_runtime_failure_is_planned_before_effect_and_settled_immediately() {
+    async fn managed_runtime_effect_owns_exact_state_cache_after_durable_plan() {
         let fixture = fixture("managed-failure");
         let (admission, _) = component_admission(&fixture, "managed-failure").await;
         let component_operation = admission.attempt().operation_id().clone();
         let component_key = reconciliation_attempt_key(admission.attempt());
         let journals = fixture.journals.clone();
+        let expected_runtime_cache = fixture.state.managed_runtime_cache().clone();
+        let foreign_runtime_cache =
+            ManagedRuntimeCache::isolated_for_test().expect("foreign cache");
 
         let outcome = execute_managed_runtime_component_rebuild(admission, move |effect| {
             let journal = journals
@@ -3170,7 +3180,10 @@ mod tests {
                 .expect("plan must be visible before effect capability");
             assert_eq!(journal.status, OperationStatus::Planned);
             assert!(journal.reconciliation_terminal().is_none());
-            assert_eq!(effect.component().as_str(), RUNTIME_COMPONENT);
+            let (runtime_cache, component) = effect.core_request();
+            assert!(runtime_cache.shares_identity_with(&expected_runtime_cache));
+            assert!(!runtime_cache.shares_identity_with(&foreign_runtime_cache));
+            assert_eq!(component.as_str(), RUNTIME_COMPONENT);
             async move { effect.failed_before_effect(vec!["runtime_stage_failed".to_string()]) }
         })
         .await

@@ -96,12 +96,10 @@ impl<'a> ManagedRuntimeVerificationRequest<'a> {
     }
 }
 
-#[derive(Clone)]
-pub struct ManagedRuntimeRepairRequest<'a> {
-    pub operation_id: Option<OperationId>,
-    pub target: TargetDescriptor,
-    pub runtime_root: ManagedRuntimeRoot<'a>,
-    pub primitive: ManagedRuntimeRepairPrimitive,
+pub(crate) struct ManagedRuntimeRepairRequest<'a> {
+    operation_id: Option<OperationId>,
+    target: TargetDescriptor,
+    runtime_root: ManagedRuntimeRoot<'a>,
 }
 
 impl std::fmt::Debug for ManagedRuntimeRepairRequest<'_> {
@@ -111,23 +109,22 @@ impl std::fmt::Debug for ManagedRuntimeRepairRequest<'_> {
             .field("operation_id", &self.operation_id)
             .field("target", &self.target)
             .field("runtime_root", &self.runtime_root)
-            .field("primitive", &self.primitive)
             .finish()
     }
 }
 
 impl<'a> ManagedRuntimeRepairRequest<'a> {
-    pub fn new(
-        target: TargetDescriptor,
-        runtime_root: ManagedRuntimeRoot<'a>,
-        primitive: ManagedRuntimeRepairPrimitive,
-    ) -> Self {
+    pub(crate) fn new(target: TargetDescriptor, runtime_root: ManagedRuntimeRoot<'a>) -> Self {
         Self {
             operation_id: None,
             target,
             runtime_root,
-            primitive,
         }
+    }
+
+    pub(crate) fn with_operation_id(mut self, operation_id: OperationId) -> Self {
+        self.operation_id = Some(operation_id);
+        self
     }
 }
 
@@ -198,13 +195,6 @@ fn path_has_parent_component(path: &Path) -> bool {
 pub enum ManagedRuntimeRootError {
     UnsupportedRoot,
     JavaExecutableOutsideRoot,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ManagedRuntimeRepairPrimitive {
-    QuarantineBrokenRuntime,
-    RemoveBrokenRuntime,
-    RecreateReadyMarker,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -570,9 +560,9 @@ pub fn verify_managed_runtime(
     })
 }
 
-pub fn validate_managed_runtime_repair(
-    request: ManagedRuntimeRepairRequest<'_>,
-) -> Result<RuntimeCapabilityReport, RuntimeCapabilityError> {
+fn validate_managed_runtime_repair(
+    request: &ManagedRuntimeRepairRequest<'_>,
+) -> Result<Vec<ExecutionFact>, RuntimeCapabilityError> {
     let mut facts = Vec::new();
     validate_managed_runtime_target(&request.target, request.operation_id.as_ref(), &mut facts)?;
     validate_managed_runtime_root_target(
@@ -581,90 +571,76 @@ pub fn validate_managed_runtime_repair(
         request.operation_id.as_ref(),
         &mut facts,
     )?;
-    let _primitive = request.primitive;
-    let _runtime_root = request.runtime_root.path();
-    let _java_executable = request.runtime_root.java_executable();
-
-    Ok(RuntimeCapabilityReport {
-        target: request.target,
-        facts,
-        probe: None,
-    })
+    Ok(facts)
 }
 
-pub fn repair_managed_runtime(
+pub(crate) fn repair_managed_runtime(
     request: ManagedRuntimeRepairRequest<'_>,
 ) -> Result<RuntimeCapabilityReport, RuntimeCapabilityError> {
-    let mut report = validate_managed_runtime_repair(ManagedRuntimeRepairRequest {
+    let facts = validate_managed_runtime_repair(&request)?;
+    let mut report = RuntimeCapabilityReport {
+        target: request.target.clone(),
+        facts,
+        probe: None,
+    };
+
+    if !runtime_executable_ready_without_probe(request.runtime_root.java_executable())
+        || !request
+            .runtime_root
+            .path()
+            .join(".axial-runtime-manifest.json")
+            .is_file()
+    {
+        report.facts.push(runtime_fact(
+            ExecutionFactKind::RuntimeCorrupt,
+            request.operation_id.clone(),
+            &request.target,
+            Vec::new(),
+        ));
+        return Err(RuntimeCapabilityError::new(
+            RuntimeCapabilityErrorKind::RuntimeCorrupt,
+            report.facts,
+        ));
+    }
+    recreate_ready_marker(request.runtime_root.path()).map_err(|_| {
+        let mut facts = report.facts.clone();
+        facts.push(runtime_fact(
+            ExecutionFactKind::PrimitiveRefused,
+            request.operation_id.clone(),
+            &request.target,
+            vec![EvidenceField::new(
+                "primitive",
+                "recreate_ready_marker",
+                EvidenceSensitivity::Public,
+            )],
+        ));
+        RuntimeCapabilityError::new(RuntimeCapabilityErrorKind::RepairFailed, facts)
+    })?;
+    report.facts.push(runtime_fact(
+        ExecutionFactKind::RuntimeRepairApplied,
+        request.operation_id.clone(),
+        &request.target,
+        vec![EvidenceField::new(
+            "primitive",
+            "recreate_ready_marker",
+            EvidenceSensitivity::Public,
+        )],
+    ));
+    match verify_managed_runtime(ManagedRuntimeVerificationRequest {
         operation_id: request.operation_id.clone(),
         target: request.target.clone(),
-        runtime_root: request.runtime_root.clone(),
-        primitive: request.primitive,
-    })?;
-
-    match request.primitive {
-        ManagedRuntimeRepairPrimitive::RecreateReadyMarker => {
-            if !runtime_executable_ready_without_probe(request.runtime_root.java_executable())
-                || !request
-                    .runtime_root
-                    .path()
-                    .join(".axial-runtime-manifest.json")
-                    .is_file()
-            {
-                report.facts.push(runtime_fact(
-                    ExecutionFactKind::RuntimeCorrupt,
-                    request.operation_id.clone(),
-                    &request.target,
-                    Vec::new(),
-                ));
-                return Err(RuntimeCapabilityError::new(
-                    RuntimeCapabilityErrorKind::RuntimeCorrupt,
-                    report.facts,
-                ));
-            }
-            recreate_ready_marker(request.runtime_root.path()).map_err(|_| {
-                let mut facts = report.facts.clone();
-                facts.push(runtime_fact(
-                    ExecutionFactKind::PrimitiveRefused,
-                    request.operation_id.clone(),
-                    &request.target,
-                    vec![EvidenceField::new(
-                        "primitive",
-                        "recreate_ready_marker",
-                        EvidenceSensitivity::Public,
-                    )],
-                ));
-                RuntimeCapabilityError::new(RuntimeCapabilityErrorKind::RepairFailed, facts)
-            })?;
-            report.facts.push(runtime_fact(
-                ExecutionFactKind::RuntimeRepairApplied,
-                request.operation_id.clone(),
-                &request.target,
-                vec![EvidenceField::new(
-                    "primitive",
-                    "recreate_ready_marker",
-                    EvidenceSensitivity::Public,
-                )],
-            ));
-            match verify_managed_runtime(ManagedRuntimeVerificationRequest {
-                operation_id: request.operation_id.clone(),
-                target: request.target.clone(),
-                runtime_root: request.runtime_root.path(),
-                java_executable: request.runtime_root.java_executable(),
-                require_ready_marker: true,
-            }) {
-                Ok(verification) => {
-                    report.facts.extend(verification.facts);
-                    Ok(report)
-                }
-                Err(error) => {
-                    report.facts.extend(error.facts);
-                    Err(RuntimeCapabilityError::new(error.kind, report.facts))
-                }
-            }
+        runtime_root: request.runtime_root.path(),
+        java_executable: request.runtime_root.java_executable(),
+        require_ready_marker: true,
+    }) {
+        Ok(verification) => {
+            report.facts.extend(verification.facts);
+            Ok(report)
         }
-        ManagedRuntimeRepairPrimitive::QuarantineBrokenRuntime
-        | ManagedRuntimeRepairPrimitive::RemoveBrokenRuntime => Ok(report),
+        Err(error) => {
+            report.facts.extend(error.facts);
+            Err(RuntimeCapabilityError::new(error.kind, report.facts))
+        }
     }
 }
 
@@ -777,12 +753,11 @@ fn probe_failure_label(failure: RuntimeProbeFailure) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::{
-        JavaProbeRunner, ManagedRuntimeRepairPrimitive, ManagedRuntimeRepairRequest,
-        ManagedRuntimeRoot, ManagedRuntimeRootError, ManagedRuntimeVerificationRequest,
-        RuntimeCapabilityErrorKind, RuntimeProbeFailure, RuntimeProbeInfo, RuntimeProbeRequest,
-        inspect_java_override_value, java_override_is_undefined_sentinel,
-        probe_java_runtime_with_runner, repair_managed_runtime, validate_managed_runtime_repair,
-        verify_managed_runtime,
+        JavaProbeRunner, ManagedRuntimeRepairRequest, ManagedRuntimeRoot, ManagedRuntimeRootError,
+        ManagedRuntimeVerificationRequest, RuntimeCapabilityErrorKind, RuntimeProbeFailure,
+        RuntimeProbeInfo, RuntimeProbeRequest, inspect_java_override_value,
+        java_override_is_undefined_sentinel, probe_java_runtime_with_runner,
+        repair_managed_runtime, verify_managed_runtime,
     };
     use crate::execution::ExecutionFactKind;
     use crate::state::contracts::{
@@ -1126,12 +1101,9 @@ mod tests {
             let runtime_root = managed_runtime_root(&runtime_cache, "java-runtime-delta");
             let java_path = runtime_root.join("bin").join("java");
             let runtime_root = runtime_root_binding(&runtime_cache, &runtime_root, &java_path);
-            let error = validate_managed_runtime_repair(ManagedRuntimeRepairRequest::new(
-                target,
-                runtime_root,
-                ManagedRuntimeRepairPrimitive::RemoveBrokenRuntime,
-            ))
-            .expect_err("protected runtime target should refuse repair");
+            let error =
+                repair_managed_runtime(ManagedRuntimeRepairRequest::new(target, runtime_root))
+                    .expect_err("protected runtime target should refuse repair");
 
             assert_eq!(error.kind, RuntimeCapabilityErrorKind::OwnershipRefused);
             assert!(has_fact(&error.facts, ExecutionFactKind::PrimitiveRefused));
@@ -1161,12 +1133,9 @@ mod tests {
             ),
         ] {
             let runtime_root = runtime_root_binding(&runtime_cache, &runtime_root, &java_path);
-            let error = repair_managed_runtime(ManagedRuntimeRepairRequest::new(
-                target,
-                runtime_root,
-                ManagedRuntimeRepairPrimitive::RecreateReadyMarker,
-            ))
-            .expect_err("unsupported runtime target should refuse repair");
+            let error =
+                repair_managed_runtime(ManagedRuntimeRepairRequest::new(target, runtime_root))
+                    .expect_err("unsupported runtime target should refuse repair");
 
             assert_eq!(error.kind, RuntimeCapabilityErrorKind::UnsupportedTarget);
             assert!(has_fact(&error.facts, ExecutionFactKind::PrimitiveRefused));
@@ -1188,7 +1157,6 @@ mod tests {
         let error = repair_managed_runtime(ManagedRuntimeRepairRequest::new(
             target,
             runtime_root_binding,
-            ManagedRuntimeRepairPrimitive::RecreateReadyMarker,
         ))
         .expect_err("mismatched runtime root target should refuse repair");
 
@@ -1262,14 +1230,7 @@ mod tests {
             "{:?}",
             ManagedRuntimeVerificationRequest::new(target.clone(), &runtime_root, &java_path)
         );
-        let repair_debug = format!(
-            "{:?}",
-            ManagedRuntimeRepairRequest::new(
-                target,
-                bound,
-                ManagedRuntimeRepairPrimitive::RecreateReadyMarker,
-            )
-        );
+        let repair_debug = format!("{:?}", ManagedRuntimeRepairRequest::new(target, bound));
         let runtime_root = runtime_root.to_string_lossy();
         let java_path = java_path.to_string_lossy();
 
@@ -1295,7 +1256,6 @@ mod tests {
         let report = repair_managed_runtime(ManagedRuntimeRepairRequest::new(
             managed_runtime_target(),
             runtime_root,
-            ManagedRuntimeRepairPrimitive::RecreateReadyMarker,
         ))
         .expect("repair ready marker");
 
@@ -1319,7 +1279,6 @@ mod tests {
         let error = repair_managed_runtime(ManagedRuntimeRepairRequest::new(
             managed_runtime_target(),
             runtime_root_binding,
-            ManagedRuntimeRepairPrimitive::RecreateReadyMarker,
         ))
         .expect_err("missing executable should fail post-repair verification");
 
