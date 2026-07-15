@@ -1,10 +1,9 @@
-use super::guardian_conversion::api_guardian_mode_from_config;
 use crate::execution::integrity::IntegrityTier2Report;
 #[cfg(test)]
 use crate::guardian::execute_managed_assets_component_rebuild_fixture_for_test;
 use crate::guardian::{
     DiagnosisId, GuardianArtifactRepairSettlement, GuardianArtifactRepairStatus,
-    GuardianComponentRebuildStatus, Tier2RegisteredArtifactAssessment,
+    GuardianComponentRebuildStatus, GuardianMode, Tier2RegisteredArtifactAssessment,
     assess_tier2_registered_artifact_repair, execute_managed_assets_component_rebuild,
     execute_managed_libraries_component_rebuild, execute_managed_version_bundle_component_rebuild,
     execute_registered_guardian_artifact_repair,
@@ -85,7 +84,7 @@ pub(super) fn prepare_tier2_registered_artifact_recovery(
         if matching_facts.next().is_some() {
             return Tier2RegisteredArtifactRecovery { execution: None };
         }
-        let mode = api_guardian_mode_from_config(&state.config().current().guardian_mode);
+        let mode = GuardianMode::from_config(&state.config().current().guardian_mode);
         let Some(assessment) = assess_tier2_registered_artifact_repair(
             sweep_operation_id.clone(),
             mode,

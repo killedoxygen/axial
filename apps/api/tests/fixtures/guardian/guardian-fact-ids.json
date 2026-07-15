@@ -113,6 +113,7 @@
   "recent_repair_failed",
   "recent_startup_failure",
   "registered_artifact_repair_available",
+  "registered_component_rebuild_failed",
   "repair_suppressed_until",
   "startup_window_expired",
   "temp_file_observed",

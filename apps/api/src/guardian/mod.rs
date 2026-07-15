@@ -159,8 +159,9 @@ pub(crate) use repair_authorization::{
 };
 pub use state_evidence::{GuardianStateLoadOutcome, persisted_state_load_guardian_outcome};
 pub(crate) use whole_instance_rematerialization::{
-    GuardianWholeInstanceRematerializationError, GuardianWholeInstanceRematerializationOutcome,
-    execute_whole_instance_rematerialization,
+    GuardianWholeInstanceRematerializationDisposition, GuardianWholeInstanceRematerializationError,
+    GuardianWholeInstanceRematerializationOffer, GuardianWholeInstanceRematerializationOutcome,
+    assess_whole_instance_rematerialization, execute_whole_instance_rematerialization,
 };
 #[cfg(test)]
 pub(crate) use whole_instance_rematerialization::{

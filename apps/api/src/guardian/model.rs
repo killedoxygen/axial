@@ -14,6 +14,14 @@ macro_rules! guardian_modes {
 
         impl GuardianMode {
             pub const ALL: &'static [Self] = &[$(Self::$variant),+];
+
+            pub(crate) fn from_config(value: &str) -> Self {
+                match value.trim() {
+                    "custom" => Self::Custom,
+                    "disabled" => Self::Disabled,
+                    _ => Self::Managed,
+                }
+            }
         }
     };
 }
@@ -125,6 +133,7 @@ pub enum GuardianFactId {
     RecentRepairFailed,
     RecentStartupFailure,
     RegisteredArtifactRepairAvailable,
+    RegisteredComponentRebuildFailed,
     RepairSuppressedUntil,
     StartupWindowExpired,
     TempFileObserved,
@@ -136,7 +145,7 @@ pub enum GuardianFactId {
 }
 
 impl GuardianFactId {
-    pub const ALL: [Self; 122] = [
+    pub const ALL: [Self; 123] = [
         Self::AgentHookFailed,
         Self::AgentUnavailable,
         Self::ArtifactChecksumMismatch,
@@ -251,6 +260,7 @@ impl GuardianFactId {
         Self::RecentRepairFailed,
         Self::RecentStartupFailure,
         Self::RegisteredArtifactRepairAvailable,
+        Self::RegisteredComponentRebuildFailed,
         Self::RepairSuppressedUntil,
         Self::StartupWindowExpired,
         Self::TempFileObserved,
@@ -383,6 +393,7 @@ impl GuardianFactId {
             Self::RecentRepairFailed => "recent_repair_failed",
             Self::RecentStartupFailure => "recent_startup_failure",
             Self::RegisteredArtifactRepairAvailable => "registered_artifact_repair_available",
+            Self::RegisteredComponentRebuildFailed => "registered_component_rebuild_failed",
             Self::RepairSuppressedUntil => "repair_suppressed_until",
             Self::StartupWindowExpired => "startup_window_expired",
             Self::TempFileObserved => "temp_file_observed",
@@ -830,4 +841,21 @@ pub struct SafetyOutcome {
     pub summary: String,
     pub detail: Option<String>,
     pub diagnoses: Vec<DiagnosisId>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::GuardianMode;
+
+    #[test]
+    fn config_modes_have_one_canonical_guardian_parser() {
+        assert_eq!(GuardianMode::from_config("managed"), GuardianMode::Managed);
+        assert_eq!(GuardianMode::from_config(" custom "), GuardianMode::Custom);
+        assert_eq!(
+            GuardianMode::from_config("disabled"),
+            GuardianMode::Disabled
+        );
+        assert_eq!(GuardianMode::from_config("unknown"), GuardianMode::Managed);
+        assert_eq!(GuardianMode::from_config(""), GuardianMode::Managed);
+    }
 }

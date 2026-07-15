@@ -942,6 +942,7 @@ pub(super) const DIAGNOSIS_RULES: &[DiagnosisRule] = &[
             ArtifactSizeDrift,
             ArtifactSizeMismatch,
             ArtifactMissing,
+            RegisteredComponentRebuildFailed,
         ],
         evidence: [
             ArtifactChecksumMismatch,
@@ -949,6 +950,7 @@ pub(super) const DIAGNOSIS_RULES: &[DiagnosisRule] = &[
             ArtifactSizeDrift,
             ArtifactSizeMismatch,
             ArtifactMissing,
+            RegisteredComponentRebuildFailed,
         ],
         phases: &[],
         required: &[],
@@ -964,6 +966,14 @@ pub(super) const DIAGNOSIS_RULES: &[DiagnosisRule] = &[
         },
         [Quarantine, Repair, AskUser, Block],
         clauses: &[
+            context_clause(
+                OperationPhase::Repairing,
+                &[GuardianFactId::RegisteredComponentRebuildFailed],
+                None,
+                &[GuardianActionKind::AskUser, GuardianActionKind::Block],
+                Some(&[GuardianFactId::RegisteredComponentRebuildFailed]),
+                Some(DecisionPriorityBand::RepairCorruptionConfirmed),
+            ),
             context_clause(
                 OperationPhase::Validating,
                 &[GuardianFactId::RegisteredArtifactRepairAvailable],

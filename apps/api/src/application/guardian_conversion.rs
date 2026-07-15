@@ -8,14 +8,6 @@ pub(super) fn api_guardian_mode(mode: LauncherGuardianMode) -> GuardianMode {
     }
 }
 
-pub(super) fn api_guardian_mode_from_config(value: &str) -> GuardianMode {
-    match value.trim() {
-        "custom" => GuardianMode::Custom,
-        "disabled" => GuardianMode::Disabled,
-        _ => GuardianMode::Managed,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -30,22 +22,5 @@ mod tests {
             api_guardian_mode(LauncherGuardianMode::Custom),
             GuardianMode::Custom
         );
-        assert_eq!(
-            api_guardian_mode_from_config("custom"),
-            GuardianMode::Custom
-        );
-        assert_eq!(
-            api_guardian_mode_from_config(" disabled "),
-            GuardianMode::Disabled
-        );
-        assert_eq!(
-            api_guardian_mode_from_config("managed"),
-            GuardianMode::Managed
-        );
-        assert_eq!(
-            api_guardian_mode_from_config("unknown"),
-            GuardianMode::Managed
-        );
-        assert_eq!(api_guardian_mode_from_config(""), GuardianMode::Managed);
     }
 }

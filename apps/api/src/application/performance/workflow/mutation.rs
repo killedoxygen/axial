@@ -12,7 +12,6 @@ use super::{
     PerformanceInstallResponse, PerformanceOperation, PerformanceRollbackListRequest,
     optional_value, required_value,
 };
-use crate::application::guardian_conversion::api_guardian_mode_from_config;
 use crate::guardian::{
     GuardianCopyRequest, GuardianFact, GuardianMode, GuardianPerformanceOperationKind,
     GuardianPerformanceSupervisionPlan, GuardianPerformanceSupervisionRejection,
@@ -694,7 +693,7 @@ fn supervise_performance_operation(
     fallback_chain_len: usize,
 ) -> Result<GuardianPerformanceSupervisionPlan, GuardianPerformanceSupervisionRejection> {
     plan_performance_operation_supervision(
-        api_guardian_mode_from_config(&state.config().current().guardian_mode),
+        GuardianMode::from_config(&state.config().current().guardian_mode),
         operation_id,
         operation,
         target_id,

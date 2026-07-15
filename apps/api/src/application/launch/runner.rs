@@ -1996,7 +1996,8 @@ mod tests {
     use crate::guardian::{
         GuardianActionKind, GuardianArtifactRepairSettlement, GuardianComponentRebuildStatus,
         GuardianDomain, GuardianMode, GuardianSummaryDecision,
-        GuardianWholeInstanceRematerializationStatus,
+        GuardianWholeInstanceRematerializationDisposition,
+        GuardianWholeInstanceRematerializationStatus, assess_whole_instance_rematerialization,
         execute_managed_version_bundle_component_rebuild,
         execute_registered_guardian_artifact_repair, execute_whole_instance_rematerialization_with,
         guardian_summary_for_test, guardian_user_outcome_for_test,
@@ -2010,8 +2011,7 @@ mod tests {
     use crate::state::failure_memory::{FailureMemorySnapshot, failure_memory_path};
     use crate::state::{
         AppStateInit, GuardianFailureMemoryStore, InstallStore, LaunchEvent, OperationJournalStore,
-        ReconciliationEvidenceRejection, RegisteredWholeInstanceRematerializationAvailability,
-        SessionStore, reconciliation_attempt_key,
+        ReconciliationEvidenceRejection, SessionStore, reconciliation_attempt_key,
     };
     use axial_config::{
         AppConfig, AppPaths, ConfigStore, Instance, InstanceRegistrySnapshot, InstanceStore,
@@ -2673,10 +2673,13 @@ mod tests {
             .expect("settle failed mass-tamper R2 fixture");
         assert_eq!(r2_outcome.status, GuardianComponentRebuildStatus::Failed);
 
-        let RegisteredWholeInstanceRematerializationAvailability::Offered(offer) = state
-            .whole_instance_rematerialization_availability(instance_id, GuardianMode::Managed)
+        let eligibility = state
+            .whole_instance_rematerialization_eligibility(instance_id)
             .await
-            .expect("failed mass-tamper R2 offers R3")
+            .expect("failed mass-tamper R2 is eligible for R3 assessment");
+        let GuardianWholeInstanceRematerializationDisposition::Offered(offer) =
+            assess_whole_instance_rematerialization(eligibility, GuardianMode::Managed)
+                .expect("failed mass-tamper R2 assessment")
         else {
             panic!("Managed mass tampering must produce an explicit R3 offer");
         };
@@ -2909,11 +2912,13 @@ mod tests {
                 .and_then(|memory| memory.reconciliation_terminal().cloned()),
             Some(reloaded_terminal)
         );
-        let RegisteredWholeInstanceRematerializationAvailability::Offered(second_offer) =
-            restarted_state
-                .whole_instance_rematerialization_availability(instance_id, GuardianMode::Managed)
-                .await
-                .expect("reloaded failed R2 remains a legitimate R3 predecessor")
+        let second_eligibility = restarted_state
+            .whole_instance_rematerialization_eligibility(instance_id)
+            .await
+            .expect("reloaded failed R2 remains a legitimate R3 predecessor");
+        let GuardianWholeInstanceRematerializationDisposition::Offered(second_offer) =
+            assess_whole_instance_rematerialization(second_eligibility, GuardianMode::Managed)
+                .expect("reloaded failed R2 assessment")
         else {
             panic!("reloaded Managed predecessor must remain offerable");
         };
@@ -2921,7 +2926,7 @@ mod tests {
         assert_eq!(
             restarted_state
                 .admit_whole_instance_rematerialization(
-                    second_offer,
+                    second_offer.into_authorization(),
                     second_r3_operation_id.clone(),
                     chrono::Duration::minutes(30),
                 )

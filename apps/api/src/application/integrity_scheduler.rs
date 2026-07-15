@@ -1,4 +1,3 @@
-use super::guardian_conversion::api_guardian_mode_from_config;
 use super::integrity::{
     PlannedIntegritySweep, ReservedIntegritySweep, Tier2IntegritySweepError,
     plan_tier2_integrity_sweep, reconcile_interrupted_tier2_integrity_sweeps,
@@ -590,7 +589,7 @@ where
 fn idle_integrity_enabled(state: &AppState) -> bool {
     let config = state.config().current();
     config.guardian_idle_integrity_enabled
-        && api_guardian_mode_from_config(&config.guardian_mode) == GuardianMode::Managed
+        && GuardianMode::from_config(&config.guardian_mode) == GuardianMode::Managed
 }
 
 fn next_registered_instance(state: &AppState, cursor: Option<&str>) -> Option<String> {

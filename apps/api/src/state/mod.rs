@@ -100,8 +100,6 @@ pub(crate) use performance_managed::{
     ManagedInstanceAdmissionError,
 };
 pub use performance_rules::AppPerformanceStore;
-#[cfg(test)]
-pub(crate) use reconciliation::RegisteredWholeInstanceRematerializationAvailability;
 pub(crate) use reconciliation::{
     ASSETS_COMPONENT_REBUILD_STEP, COMPONENT_QUARANTINE_STEP, COMPONENT_REBUILD_START_STEP,
     LIBRARIES_COMPONENT_REBUILD_STEP, REGISTERED_ARTIFACT_COMPONENT_REBUILD_FAILURE_POINT,
@@ -114,7 +112,8 @@ pub(crate) use reconciliation::{
     RegisteredManagedArtifactComponentSettlement, RegisteredReconciliationAuthority,
     RegisteredVersionBundleComponentRebuildEffect, RegisteredWholeInstanceDurableOutcome,
     RegisteredWholeInstancePreparation, RegisteredWholeInstanceRematerializationAdmission,
-    RegisteredWholeInstanceRematerializationOffer, VERSION_BUNDLE_COMPONENT_REBUILD_STEP,
+    RegisteredWholeInstanceRematerializationAuthorization,
+    RegisteredWholeInstanceRematerializationEligibility, VERSION_BUNDLE_COMPONENT_REBUILD_STEP,
     commit_reconciliation_memory, component_rebuild_journal, reconciliation_attempt_key,
     reconciliation_instance_target, reconciliation_journal_attempt, reconciliation_memory_entry,
     record_guardian_repair_refusal, record_reconciliation_journal_failure,

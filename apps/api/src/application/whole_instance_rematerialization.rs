@@ -1,10 +1,10 @@
 use crate::guardian::{
-    GuardianWholeInstanceRematerializationOutcome, execute_whole_instance_rematerialization,
+    GuardianWholeInstanceRematerializationOffer, GuardianWholeInstanceRematerializationOutcome,
+    execute_whole_instance_rematerialization,
 };
 use crate::state::contracts::OperationId;
 use crate::state::{
-    AppState, RegisteredWholeInstanceRematerializationAdmission,
-    RegisteredWholeInstanceRematerializationOffer, RequestProducerHandoff,
+    AppState, RegisteredWholeInstanceRematerializationAdmission, RequestProducerHandoff,
 };
 use std::future::Future;
 
@@ -19,7 +19,7 @@ pub(crate) struct ExplicitWholeInstanceRematerializationError {
 pub(crate) async fn execute_explicit_whole_instance_rematerialization(
     state: AppState,
     handoff: RequestProducerHandoff,
-    offer: RegisteredWholeInstanceRematerializationOffer,
+    offer: GuardianWholeInstanceRematerializationOffer,
 ) -> Result<
     GuardianWholeInstanceRematerializationOutcome,
     ExplicitWholeInstanceRematerializationError,
@@ -42,7 +42,7 @@ pub(crate) async fn execute_explicit_whole_instance_rematerialization(
 fn spawn_explicit_whole_instance_rematerialization(
     state: AppState,
     handoff: RequestProducerHandoff,
-    offer: RegisteredWholeInstanceRematerializationOffer,
+    offer: GuardianWholeInstanceRematerializationOffer,
     operation_id: OperationId,
     suppression_for: chrono::Duration,
 ) -> Result<
@@ -67,7 +67,7 @@ fn spawn_explicit_whole_instance_rematerialization(
 pub(crate) fn spawn_explicit_whole_instance_rematerialization_with<Executor, ExecutorFuture>(
     state: AppState,
     handoff: RequestProducerHandoff,
-    offer: RegisteredWholeInstanceRematerializationOffer,
+    offer: GuardianWholeInstanceRematerializationOffer,
     operation_id: OperationId,
     suppression_for: chrono::Duration,
     executor: Executor,
@@ -98,8 +98,13 @@ where
     let (result_tx, result_rx) = tokio::sync::oneshot::channel();
     producer.spawn(async move {
         let result = async {
+            let authorization = offer.into_authorization();
             let admission = state
-                .admit_whole_instance_rematerialization(offer, operation_id, suppression_for)
+                .admit_whole_instance_rematerialization(
+                    authorization,
+                    operation_id,
+                    suppression_for,
+                )
                 .await
                 .map_err(|error| application_error(error.class()))?;
             executor(admission)
@@ -133,7 +138,8 @@ mod tests {
         let launch = include_str!("launch.rs");
         let scheduler = include_str!("integrity_scheduler.rs");
 
-        assert!(!owner.contains("whole_instance_rematerialization_availability"));
+        assert!(!owner.contains("whole_instance_rematerialization_eligibility"));
+        assert!(!owner.contains("assess_whole_instance_rematerialization"));
         assert!(!owner.contains("prepare_launch_preflight"));
         assert!(!owner.contains("retry_launch"));
         assert!(!routes.contains("execute_explicit_whole_instance_rematerialization"));

@@ -1,10 +1,117 @@
+use crate::guardian::{
+    DiagnosisId, FactReliability, GuardianActionKind, GuardianDecision, GuardianFact,
+    GuardianFactId, GuardianMode, GuardianPolicyContext, build_safety_case, decide_guardian_policy,
+};
+use crate::state::contracts::{
+    OperationPhase, OwnershipClass, StabilizationSystem, TargetDescriptor,
+};
 use crate::state::{
     RegisteredWholeInstanceDurableOutcome, RegisteredWholeInstancePreparation,
     RegisteredWholeInstanceRematerializationAdmission,
+    RegisteredWholeInstanceRematerializationAuthorization,
+    RegisteredWholeInstanceRematerializationEligibility,
 };
 use axial_minecraft::{ManagedWholeInstanceCommitReceipt, ManagedWholeInstanceRebuildError};
 use std::future::Future;
 use std::path::PathBuf;
+
+#[must_use]
+pub(crate) enum GuardianWholeInstanceRematerializationDisposition {
+    Offered(GuardianWholeInstanceRematerializationOffer),
+    WitnessOnly { decision: GuardianDecision },
+}
+
+#[must_use]
+pub(crate) struct GuardianWholeInstanceRematerializationOffer {
+    authorization: RegisteredWholeInstanceRematerializationAuthorization,
+}
+
+impl GuardianWholeInstanceRematerializationOffer {
+    pub(crate) fn into_authorization(
+        self,
+    ) -> RegisteredWholeInstanceRematerializationAuthorization {
+        self.authorization
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+pub(crate) enum GuardianWholeInstanceRematerializationAssessmentError {
+    #[error("whole-instance rematerialization decision was malformed")]
+    InvalidDecision,
+    #[error("whole-instance rematerialization authorization was rejected")]
+    AuthorizationRejected,
+}
+
+pub(crate) fn assess_whole_instance_rematerialization(
+    eligibility: RegisteredWholeInstanceRematerializationEligibility,
+    current_mode: GuardianMode,
+) -> Result<
+    GuardianWholeInstanceRematerializationDisposition,
+    GuardianWholeInstanceRematerializationAssessmentError,
+> {
+    let operation_id = eligibility.operation_id().clone();
+    let target = eligibility.target();
+    let fact = GuardianFact {
+        operation_id: Some(operation_id.clone()),
+        id: GuardianFactId::RegisteredComponentRebuildFailed,
+        domain: eligibility.domain(),
+        phase: OperationPhase::Repairing,
+        reliability: FactReliability::DirectStructured,
+        severity: None,
+        confidence: None,
+        ownership: OwnershipClass::LauncherManaged,
+        target: Some(target.clone()),
+        fields: Vec::new(),
+    };
+    let safety_case = build_safety_case(
+        Some(operation_id.clone()),
+        current_mode,
+        OperationPhase::Repairing,
+        &[fact],
+    );
+    let decision = decide_guardian_policy(&safety_case, GuardianPolicyContext::current_operation());
+    match decision.kind() {
+        GuardianActionKind::AskUser => {
+            let authorization = eligibility.authorize_decision(&decision).map_err(|_| {
+                GuardianWholeInstanceRematerializationAssessmentError::AuthorizationRejected
+            })?;
+            Ok(GuardianWholeInstanceRematerializationDisposition::Offered(
+                GuardianWholeInstanceRematerializationOffer { authorization },
+            ))
+        }
+        GuardianActionKind::RecordOnly
+            if witness_decision_is_exact(&decision, &operation_id, &target) =>
+        {
+            Ok(GuardianWholeInstanceRematerializationDisposition::WitnessOnly { decision })
+        }
+        _ => Err(GuardianWholeInstanceRematerializationAssessmentError::InvalidDecision),
+    }
+}
+
+fn witness_decision_is_exact(
+    decision: &GuardianDecision,
+    operation_id: &crate::state::contracts::OperationId,
+    target: &TargetDescriptor,
+) -> bool {
+    decision.operation_id() == Some(operation_id)
+        && decision.mode() == GuardianMode::Disabled
+        && decision.diagnoses() == [DiagnosisId::LauncherManagedArtifactCorrupt]
+        && decision.action_plan().is_some_and(|plan| {
+            plan.owner == StabilizationSystem::Guardian
+                && plan.prerequisite.diagnosis_id == DiagnosisId::LauncherManagedArtifactCorrupt
+                && plan.prerequisite.ownership == OwnershipClass::LauncherManaged
+                && plan.prerequisite.affected_targets == [target.clone()]
+                && plan.prerequisite.candidate_actions
+                    == [GuardianActionKind::AskUser, GuardianActionKind::Block]
+                && matches!(
+                    plan.actions.as_slice(),
+                    [action]
+                        if action.kind == GuardianActionKind::RecordOnly
+                            && action.reason == DiagnosisId::LauncherManagedArtifactCorrupt
+                            && action.target.as_ref() == Some(target)
+                )
+        })
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum GuardianWholeInstanceRematerializationStatus {
@@ -120,6 +227,22 @@ fn guardian_outcome(
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    trait AmbiguousIfClone<Marker> {
+        fn assert_not_clone() {}
+    }
+
+    struct CloneMarker;
+
+    impl<T: ?Sized> AmbiguousIfClone<()> for T {}
+    impl<T: Clone> AmbiguousIfClone<CloneMarker> for T {}
+
+    const _: fn() = || {
+        let _ =
+            <GuardianWholeInstanceRematerializationOffer as AmbiguousIfClone<_>>::assert_not_clone;
+    };
+
     #[test]
     fn production_executor_has_one_core_rematerialization_call_site() {
         let source = include_str!("whole_instance_rematerialization.rs")

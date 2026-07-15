@@ -27,7 +27,9 @@ use crate::execution::registered_artifact::{
     RegisteredArtifactExactProof, RegisteredArtifactExactVerification,
     RegisteredArtifactExactVerifier,
 };
-use crate::guardian::{DiagnosisId, GuardianActionKind, GuardianDomain, GuardianMode};
+use crate::guardian::{
+    DiagnosisId, GuardianActionKind, GuardianDecision, GuardianDomain, GuardianMode,
+};
 use axial_config::is_canonical_instance_id;
 use axial_minecraft::known_good::{KnownGoodIntegrity, KnownGoodRoot, known_good_entry_path};
 use axial_minecraft::runtime::{
@@ -93,15 +95,90 @@ pub(crate) struct RegisteredComponentRebuildAdmission {
 }
 
 #[must_use]
-pub(crate) enum RegisteredWholeInstanceRematerializationAvailability {
-    Offered(RegisteredWholeInstanceRematerializationOffer),
-    WitnessOnly,
+pub(crate) struct RegisteredWholeInstanceRematerializationEligibility {
+    instance_id: String,
+    predecessor: ReconciliationTerminal,
 }
 
 #[must_use]
-pub(crate) struct RegisteredWholeInstanceRematerializationOffer {
+pub(crate) struct RegisteredWholeInstanceRematerializationAuthorization {
     instance_id: String,
     predecessor: ReconciliationTerminal,
+    authorized_policy_mode: GuardianMode,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RegisteredWholeInstanceRematerializationAuthorizationRejection {
+    InvalidDecision,
+    InvalidActionPlan,
+}
+
+impl RegisteredWholeInstanceRematerializationEligibility {
+    pub(crate) fn operation_id(&self) -> &OperationId {
+        self.predecessor.operation_id()
+    }
+
+    pub(crate) const fn domain(&self) -> GuardianDomain {
+        self.predecessor.domain()
+    }
+
+    pub(crate) fn target(&self) -> TargetDescriptor {
+        reconciliation_instance_target(&self.instance_id)
+    }
+
+    pub(crate) fn authorize_decision(
+        self,
+        decision: &GuardianDecision,
+    ) -> Result<
+        RegisteredWholeInstanceRematerializationAuthorization,
+        RegisteredWholeInstanceRematerializationAuthorizationRejection,
+    > {
+        let target = self.target();
+        if decision.operation_id() != Some(self.predecessor.operation_id())
+            || !matches!(
+                decision.mode(),
+                GuardianMode::Managed | GuardianMode::Custom
+            )
+            || decision.kind() != GuardianActionKind::AskUser
+            || decision.diagnoses() != [DiagnosisId::LauncherManagedArtifactCorrupt]
+            || self.predecessor.diagnosis_id() != DiagnosisId::LauncherManagedArtifactCorrupt
+            || self.predecessor.attempt().ownership() != OwnershipClass::LauncherManaged
+            || !matches!(
+                self.predecessor.mode(),
+                GuardianMode::Managed | GuardianMode::Custom
+            )
+        {
+            return Err(
+                RegisteredWholeInstanceRematerializationAuthorizationRejection::InvalidDecision,
+            );
+        }
+        let plan = decision.action_plan().ok_or(
+            RegisteredWholeInstanceRematerializationAuthorizationRejection::InvalidActionPlan,
+        )?;
+        if plan.owner != StabilizationSystem::Guardian
+            || plan.prerequisite.diagnosis_id != DiagnosisId::LauncherManagedArtifactCorrupt
+            || plan.prerequisite.ownership != OwnershipClass::LauncherManaged
+            || plan.prerequisite.affected_targets != [target.clone()]
+            || plan.prerequisite.candidate_actions
+                != [GuardianActionKind::AskUser, GuardianActionKind::Block]
+            || !matches!(
+                plan.actions.as_slice(),
+                [action]
+                    if action.kind == GuardianActionKind::AskUser
+                        && action.reason == DiagnosisId::LauncherManagedArtifactCorrupt
+                        && action.target.as_ref() == Some(&target)
+            )
+        {
+            return Err(
+                RegisteredWholeInstanceRematerializationAuthorizationRejection::InvalidActionPlan,
+            );
+        }
+        Ok(RegisteredWholeInstanceRematerializationAuthorization {
+            instance_id: self.instance_id,
+            predecessor: self.predecessor,
+            authorized_policy_mode: decision.mode(),
+        })
+    }
 }
 
 pub(crate) struct RegisteredWholeInstanceRematerializationAdmission {
@@ -1333,6 +1410,7 @@ pub(crate) enum ReconciliationEvidenceRejection {
     IncarnationMismatch,
     OwnershipMismatch,
     ActiveSession,
+    PolicyModeChanged,
     SuppressedPriorAttempt,
 }
 
@@ -1352,6 +1430,7 @@ impl ReconciliationEvidenceRejection {
             Self::IncarnationMismatch => "incarnation_mismatch",
             Self::OwnershipMismatch => "ownership_mismatch",
             Self::ActiveSession => "active_session",
+            Self::PolicyModeChanged => "policy_mode_changed",
             Self::SuppressedPriorAttempt => "suppressed_prior_attempt",
         }
     }
@@ -2407,58 +2486,53 @@ impl AppState {
         Ok(())
     }
 
-    pub(crate) async fn whole_instance_rematerialization_availability(
+    pub(crate) async fn whole_instance_rematerialization_eligibility(
         &self,
         instance_id: &str,
-        mode: GuardianMode,
-    ) -> Result<RegisteredWholeInstanceRematerializationAvailability, ReconciliationEvidenceRejection>
+    ) -> Result<RegisteredWholeInstanceRematerializationEligibility, ReconciliationEvidenceRejection>
     {
-        if mode == GuardianMode::Disabled {
-            return Ok(RegisteredWholeInstanceRematerializationAvailability::WitnessOnly);
-        }
         let lifecycle = self
             .try_acquire_instance_lifecycle(instance_id)
             .await
             .ok_or(ReconciliationEvidenceRejection::ActiveSession)?;
-        let predecessor = self.active_component_rebuild_failure(&lifecycle, mode)?;
-        let offer = RegisteredWholeInstanceRematerializationOffer {
+        let predecessor = self.active_component_rebuild_failure(&lifecycle)?;
+        let eligibility = RegisteredWholeInstanceRematerializationEligibility {
             instance_id: instance_id.to_string(),
             predecessor: predecessor.terminal,
         };
         drop((predecessor.lifecycle, lifecycle));
-        Ok(RegisteredWholeInstanceRematerializationAvailability::Offered(offer))
+        Ok(eligibility)
     }
 
     pub(crate) async fn admit_whole_instance_rematerialization(
         &self,
-        offer: RegisteredWholeInstanceRematerializationOffer,
+        authorization: RegisteredWholeInstanceRematerializationAuthorization,
         operation_id: OperationId,
         suppression_for: chrono::Duration,
     ) -> Result<RegisteredWholeInstanceRematerializationAdmission, ReconciliationEvidenceRejection>
     {
-        if operation_id == *offer.predecessor.operation_id() {
+        if operation_id == *authorization.predecessor.operation_id() {
             return Err(ReconciliationEvidenceRejection::JournalMismatch);
         }
         let lifecycle = self
-            .try_acquire_instance_lifecycle(&offer.instance_id)
+            .try_acquire_instance_lifecycle(&authorization.instance_id)
             .await
             .ok_or(ReconciliationEvidenceRejection::ActiveSession)?;
-        let identity = self.current_reconciliation_identity(&offer.instance_id)?;
+        let identity = self.current_reconciliation_identity(&authorization.instance_id)?;
         let ReconciliationScope::RegisteredInstance {
             instance_id,
             fingerprint,
             inventory_fingerprint,
-        } = offer.predecessor.scope();
-        if instance_id != &offer.instance_id || fingerprint != &identity.fingerprint {
+        } = authorization.predecessor.scope();
+        if instance_id != &authorization.instance_id || fingerprint != &identity.fingerprint {
             return Err(ReconciliationEvidenceRejection::IncarnationMismatch);
         }
         let current = self.reconciliation_incarnation_from_identity(identity)?;
         if inventory_fingerprint != &current.inventory_fingerprint {
             return Err(ReconciliationEvidenceRejection::IncarnationMismatch);
         }
-        let predecessor_before_wait =
-            self.active_component_rebuild_failure(&lifecycle, offer.predecessor.mode())?;
-        if predecessor_before_wait.terminal != offer.predecessor {
+        let predecessor_before_wait = self.active_component_rebuild_failure(&lifecycle)?;
+        if predecessor_before_wait.terminal != authorization.predecessor {
             return Err(ReconciliationEvidenceRejection::JournalMismatch);
         }
         let config_mutation = self
@@ -2466,13 +2540,17 @@ impl AppState {
             .acquire_mutation()
             .await
             .map_err(|_| ReconciliationEvidenceRejection::RootAuthorityUnavailable)?;
+        if GuardianMode::from_config(&self.config.current().guardian_mode)
+            != authorization.authorized_policy_mode
+        {
+            return Err(ReconciliationEvidenceRejection::PolicyModeChanged);
+        }
         let component_mutation = self
             .sessions
             .acquire_shared_component_mutation()
             .await
             .ok_or(ReconciliationEvidenceRejection::ActiveSession)?;
-        let predecessor =
-            self.active_component_rebuild_failure(&lifecycle, offer.predecessor.mode())?;
+        let predecessor = self.active_component_rebuild_failure(&lifecycle)?;
         if predecessor.terminal != predecessor_before_wait.terminal
             || predecessor.roots != predecessor_before_wait.roots
         {
@@ -2483,8 +2561,8 @@ impl AppState {
         }
         let instance = self
             .instances
-            .get(&offer.instance_id)
-            .filter(|instance| instance.id == offer.instance_id)
+            .get(&authorization.instance_id)
+            .filter(|instance| instance.id == authorization.instance_id)
             .ok_or(ReconciliationEvidenceRejection::InstanceNotRegistered)?;
         let known_good = RegisteredKnownGoodInventory {
             instance_id: instance.id,
@@ -2506,7 +2584,7 @@ impl AppState {
             prior.domain(),
             ReconciliationRung::RematerializeInstance,
             ReconciliationComponent::WholeInstance,
-            reconciliation_instance_target(&offer.instance_id),
+            reconciliation_instance_target(&authorization.instance_id),
             prior.mode(),
             observed_at,
             suppression_until,
@@ -2885,16 +2963,15 @@ impl AppState {
     fn active_component_rebuild_failure(
         &self,
         lifecycle: &InstanceLifecycleLease,
-        mode: GuardianMode,
     ) -> Result<RecordedReconciliationFailure, ReconciliationEvidenceRejection> {
-        if mode == GuardianMode::Disabled || !self.instance_lifecycle_gates.owns(&lifecycle.owner) {
+        if !self.instance_lifecycle_gates.owns(&lifecycle.owner) {
             return Err(ReconciliationEvidenceRejection::ScopeMismatch);
         }
         let current = self.current_reconciliation_incarnation(&lifecycle.instance_id)?;
         let observed_at = chrono::Utc::now().fixed_offset();
         let matches_current = |attempt: &ReconciliationAttempt| {
             attempt.rung() == ReconciliationRung::RebuildComponent
-                && attempt.mode() == mode
+                && matches!(attempt.mode(), GuardianMode::Managed | GuardianMode::Custom)
                 && attempt.ownership() == OwnershipClass::LauncherManaged
                 && attempt.component() != ReconciliationComponent::WholeInstance
                 && matches!(
@@ -4250,7 +4327,8 @@ mod tests {
     use crate::execution::persistence::{AtomicWriteBackend, PersistenceCoordinator};
     use crate::guardian::{
         ActionPlanPrerequisite, GuardianAction, GuardianActionPlan, GuardianConfidence,
-        GuardianDecision,
+        GuardianDecision, GuardianWholeInstanceRematerializationDisposition,
+        GuardianWholeInstanceRematerializationOffer, assess_whole_instance_rematerialization,
     };
     use crate::state::contracts::{JournalId, OperationPhase, OperationStepResult, RollbackState};
     use crate::state::failure_memory::FailureMemorySnapshot;
@@ -4348,7 +4426,9 @@ mod tests {
     const _: fn() = || {
         let _ = <RegisteredArtifactFailedRepair as AmbiguousIfClone<_>>::assert_not_clone;
         let _ = <RegisteredArtifactRecoveryEntry as AmbiguousIfClone<_>>::assert_not_clone;
-        let _ = <RegisteredWholeInstanceRematerializationOffer as AmbiguousIfClone<_>>::assert_not_clone;
+        let _ = <crate::state::RegisteredArtifactRepairAdmission as AmbiguousIfClone<_>>::assert_not_clone;
+        let _ = <RegisteredComponentRebuildAdmission as AmbiguousIfClone<_>>::assert_not_clone;
+        let _ = <RegisteredWholeInstanceRematerializationEligibility as AmbiguousIfClone<_>>::assert_not_clone;
         let _ = <RegisteredWholeInstanceRematerializationAdmission as AmbiguousIfClone<_>>::assert_not_clone;
         let _ = <RegisteredWholeInstanceCoreRequest as AmbiguousIfClone<_>>::assert_not_clone;
         let _ = <RegisteredWholeInstanceCompletion as AmbiguousIfClone<_>>::assert_not_clone;
@@ -5672,23 +5752,45 @@ mod tests {
         mode: GuardianMode,
     ) -> RegisteredWholeInstanceRematerializationAdmission {
         persist_runtime_component_ladder(fixture, label, "java-runtime-delta", mode).await;
-        let RegisteredWholeInstanceRematerializationAvailability::Offered(offer) = fixture
-            .state
-            .whole_instance_rematerialization_availability(INSTANCE_ID, mode)
-            .await
-            .expect("whole-instance offer")
-        else {
-            panic!("eligible mode must mint a whole-instance offer");
-        };
+        set_guardian_mode(fixture, mode);
+        let offer = whole_instance_offer(fixture, mode).await;
         fixture
             .state
             .admit_whole_instance_rematerialization(
-                offer,
+                offer.into_authorization(),
                 OperationId::new(format!("{label}-whole")),
                 chrono::Duration::minutes(30),
             )
             .await
             .expect("whole-instance admission")
+    }
+
+    async fn whole_instance_offer(
+        fixture: &Fixture,
+        mode: GuardianMode,
+    ) -> GuardianWholeInstanceRematerializationOffer {
+        let eligibility = fixture
+            .state
+            .whole_instance_rematerialization_eligibility(INSTANCE_ID)
+            .await
+            .expect("whole-instance eligibility");
+        let assessment = assess_whole_instance_rematerialization(eligibility, mode)
+            .expect("whole-instance assessment");
+        let GuardianWholeInstanceRematerializationDisposition::Offered(offer) = assessment else {
+            panic!("Managed and Custom assessments must mint a whole-instance offer");
+        };
+        offer
+    }
+
+    fn set_guardian_mode(fixture: &Fixture, mode: GuardianMode) {
+        let mut config = fixture.state.config.current();
+        config.guardian_mode = match mode {
+            GuardianMode::Managed => "managed",
+            GuardianMode::Custom => "custom",
+            GuardianMode::Disabled => "disabled",
+        }
+        .to_string();
+        fixture.state.replace_config_for_test(config);
     }
 
     async fn assert_whole_instance_ownership_is_held(fixture: &Fixture) {
@@ -6921,18 +7023,11 @@ mod tests {
             GuardianMode::Managed,
         )
         .await;
-        let availability = fixture
-            .state
-            .whole_instance_rematerialization_availability(INSTANCE_ID, GuardianMode::Managed)
-            .await;
-        let Ok(RegisteredWholeInstanceRematerializationAvailability::Offered(offer)) = availability
-        else {
-            panic!("canonical rung-two failure must offer rung three");
-        };
+        let offer = whole_instance_offer(&fixture, GuardianMode::Managed).await;
         let admission = fixture
             .state
             .admit_whole_instance_rematerialization(
-                offer,
+                offer.into_authorization(),
                 OperationId::new("whole-instance-expired-before-effect-whole"),
                 chrono::Duration::milliseconds(100),
             )
@@ -7375,14 +7470,7 @@ mod tests {
             GuardianMode::Managed,
         )
         .await;
-        let RegisteredWholeInstanceRematerializationAvailability::Offered(offer) = owner
-            .state
-            .whole_instance_rematerialization_availability(INSTANCE_ID, GuardianMode::Managed)
-            .await
-            .expect("whole-instance offer for foreign handoff refusal")
-        else {
-            panic!("Managed predecessor must mint an explicit offer");
-        };
+        let offer = whole_instance_offer(&owner, GuardianMode::Managed).await;
         let operation_id = OperationId::new("application-whole-owner-foreign-handoff-whole");
         let foreign_request = foreign.state.try_admit_request().expect("foreign request");
         let executor_calls = Arc::new(AtomicUsize::new(0));
@@ -7428,14 +7516,7 @@ mod tests {
             GuardianMode::Managed,
         )
         .await;
-        let RegisteredWholeInstanceRematerializationAvailability::Offered(offer) = fixture
-            .state
-            .whole_instance_rematerialization_availability(INSTANCE_ID, GuardianMode::Managed)
-            .await
-            .expect("whole-instance offer for Application owner")
-        else {
-            panic!("Managed predecessor must mint an explicit offer");
-        };
+        let offer = whole_instance_offer(&fixture, GuardianMode::Managed).await;
         let operation_id = OperationId::new("application-whole-owner-cancellation-whole");
         let request = fixture.state.try_admit_request().expect("admit request");
         let handoff = request.producer_handoff();
@@ -7538,14 +7619,8 @@ mod tests {
             GuardianMode::Custom,
         )
         .await;
-        let RegisteredWholeInstanceRematerializationAvailability::Offered(offer) = fixture
-            .state
-            .whole_instance_rematerialization_availability(INSTANCE_ID, GuardianMode::Custom)
-            .await
-            .expect("Custom explicit whole-instance offer")
-        else {
-            panic!("Custom predecessor must mint an explicit offer");
-        };
+        set_guardian_mode(&fixture, GuardianMode::Custom);
+        let offer = whole_instance_offer(&fixture, GuardianMode::Custom).await;
         let operation_id = OperationId::new("application-custom-whole-owner-cancellation-whole");
         let request = fixture.state.try_admit_request().expect("admit request");
         let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
@@ -7716,19 +7791,12 @@ mod tests {
         .await
         .expect("persist forged memory parity");
         drop(reservation);
-        let availability = fixture
-            .state
-            .whole_instance_rematerialization_availability(INSTANCE_ID, GuardianMode::Managed)
-            .await;
-        let Ok(RegisteredWholeInstanceRematerializationAvailability::Offered(offer)) = availability
-        else {
-            panic!("canonical rung-two failure must remain offerable");
-        };
+        let offer = whole_instance_offer(&fixture, GuardianMode::Managed).await;
         assert_eq!(
             fixture
                 .state
                 .admit_whole_instance_rematerialization(
-                    offer,
+                    offer.into_authorization(),
                     OperationId::new("whole-instance-after-forged-terminal"),
                     chrono::Duration::minutes(30),
                 )
@@ -7750,18 +7818,11 @@ mod tests {
             GuardianMode::Managed,
         )
         .await;
-        let availability = fixture
-            .state
-            .whole_instance_rematerialization_availability(INSTANCE_ID, GuardianMode::Managed)
-            .await;
-        let Ok(RegisteredWholeInstanceRematerializationAvailability::Offered(offer)) = availability
-        else {
-            panic!("canonical rung-two failure must offer rung three");
-        };
+        let offer = whole_instance_offer(&fixture, GuardianMode::Managed).await;
         let admission = fixture
             .state
             .admit_whole_instance_rematerialization(
-                offer,
+                offer.into_authorization(),
                 OperationId::new("whole-instance-terminal-shapes-whole"),
                 chrono::Duration::minutes(30),
             )
@@ -7827,37 +7888,136 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn whole_instance_offer_supports_custom_and_keeps_disabled_witness_only() {
-        let fixture = fixture("whole-instance-offer-modes");
+    async fn whole_instance_stale_policy_mode_rejects_before_r3_and_fresh_assessment_preserves_predecessor_mode()
+     {
+        let fixture = fixture("whole-instance-policy-mode-change");
         persist_runtime_component_ladder(
             &fixture,
-            "whole-instance-offer-modes",
+            "whole-instance-policy-mode-change",
             "java-runtime-delta",
-            GuardianMode::Custom,
+            GuardianMode::Managed,
         )
         .await;
-        assert!(matches!(
+        set_guardian_mode(&fixture, GuardianMode::Managed);
+        let stale_offer = whole_instance_offer(&fixture, GuardianMode::Managed).await;
+        set_guardian_mode(&fixture, GuardianMode::Custom);
+        let stale_operation_id = OperationId::new("whole-instance-stale-policy-mode");
+        assert_eq!(
             fixture
                 .state
-                .whole_instance_rematerialization_availability(INSTANCE_ID, GuardianMode::Custom,)
+                .admit_whole_instance_rematerialization(
+                    stale_offer.into_authorization(),
+                    stale_operation_id.clone(),
+                    chrono::Duration::minutes(30),
+                )
                 .await
-                .expect("Custom offer"),
-            RegisteredWholeInstanceRematerializationAvailability::Offered(_)
-        ));
-        assert!(matches!(
-            fixture
-                .state
-                .whole_instance_rematerialization_availability(INSTANCE_ID, GuardianMode::Disabled,)
-                .await
-                .expect("Disabled witness"),
-            RegisteredWholeInstanceRematerializationAvailability::WitnessOnly
-        ));
+                .err(),
+            Some(ReconciliationEvidenceRejection::PolicyModeChanged)
+        );
+        assert!(fixture.journals.get(&stale_operation_id).is_none());
         assert!(!fixture.state.instance_lifecycle_is_held(INSTANCE_ID).await);
+
+        let fresh_offer = whole_instance_offer(&fixture, GuardianMode::Custom).await;
+        let admission = fixture
+            .state
+            .admit_whole_instance_rematerialization(
+                fresh_offer.into_authorization(),
+                OperationId::new("whole-instance-fresh-policy-mode"),
+                chrono::Duration::minutes(30),
+            )
+            .await
+            .expect("fresh Custom assessment admits the Managed predecessor");
+        assert_eq!(admission.attempt().mode(), GuardianMode::Managed);
+        drop(admission);
         cleanup(fixture).await;
     }
 
     #[tokio::test]
-    async fn whole_instance_offer_rejects_root_drift_and_ambiguous_component_failures() {
+    async fn guardian_whole_instance_assessment_offers_managed_and_custom_and_witnesses_disabled() {
+        for (label, predecessor_mode) in [
+            ("whole-instance-policy-managed", GuardianMode::Managed),
+            ("whole-instance-policy-custom", GuardianMode::Custom),
+        ] {
+            let fixture = fixture(label);
+            persist_runtime_component_ladder(
+                &fixture,
+                label,
+                "java-runtime-delta",
+                predecessor_mode,
+            )
+            .await;
+            let eligibility = fixture
+                .state
+                .whole_instance_rematerialization_eligibility(INSTANCE_ID)
+                .await
+                .expect("exact failed rung two is eligible");
+            let (assessment, evaluations) =
+                crate::guardian::with_guardian_policy_evaluation_count(async move {
+                    assess_whole_instance_rematerialization(eligibility, predecessor_mode)
+                })
+                .await;
+            let GuardianWholeInstanceRematerializationDisposition::Offered(_offer) =
+                assessment.expect("Managed and Custom assessment")
+            else {
+                panic!("Managed and Custom must produce an internal offer");
+            };
+            assert_eq!(evaluations, 1);
+            assert!(!fixture.state.instance_lifecycle_is_held(INSTANCE_ID).await);
+            cleanup(fixture).await;
+        }
+
+        let disabled_fixture = fixture("whole-instance-policy-disabled");
+        persist_runtime_component_ladder(
+            &disabled_fixture,
+            "whole-instance-policy-disabled",
+            "java-runtime-delta",
+            GuardianMode::Managed,
+        )
+        .await;
+        let eligibility = disabled_fixture
+            .state
+            .whole_instance_rematerialization_eligibility(INSTANCE_ID)
+            .await
+            .expect("prior Managed failure remains factual evidence");
+        let (assessment, evaluations) =
+            crate::guardian::with_guardian_policy_evaluation_count(async move {
+                assess_whole_instance_rematerialization(eligibility, GuardianMode::Disabled)
+            })
+            .await;
+        let GuardianWholeInstanceRematerializationDisposition::WitnessOnly { decision } =
+            assessment.expect("Disabled assessment")
+        else {
+            panic!("Disabled must remain witness-only");
+        };
+        assert_eq!(decision.kind(), GuardianActionKind::RecordOnly);
+        assert_eq!(evaluations, 1);
+        assert!(
+            !disabled_fixture
+                .state
+                .instance_lifecycle_is_held(INSTANCE_ID)
+                .await
+        );
+        cleanup(disabled_fixture).await;
+
+        let missing = fixture("whole-instance-policy-missing");
+        let (missing_eligibility, evaluations) =
+            crate::guardian::with_guardian_policy_evaluation_count(async {
+                missing
+                    .state
+                    .whole_instance_rematerialization_eligibility(INSTANCE_ID)
+                    .await
+            })
+            .await;
+        assert_eq!(
+            missing_eligibility.err(),
+            Some(ReconciliationEvidenceRejection::MemoryMissing)
+        );
+        assert_eq!(evaluations, 0);
+        cleanup(missing).await;
+    }
+
+    #[tokio::test]
+    async fn whole_instance_eligibility_rejects_root_drift_and_cross_mode_ambiguity() {
         let drift = fixture("whole-instance-offer-root-drift");
         persist_runtime_component_ladder(
             &drift,
@@ -7866,14 +8026,7 @@ mod tests {
             GuardianMode::Managed,
         )
         .await;
-        let RegisteredWholeInstanceRematerializationAvailability::Offered(offer) = drift
-            .state
-            .whole_instance_rematerialization_availability(INSTANCE_ID, GuardianMode::Managed)
-            .await
-            .expect("offer before root drift")
-        else {
-            panic!("Managed failure must offer before root drift");
-        };
+        let offer = whole_instance_offer(&drift, GuardianMode::Managed).await;
         let replacement = drift.root.join("whole-instance-replacement-library");
         fs::create_dir_all(&replacement).expect("replacement root");
         drift
@@ -7883,7 +8036,7 @@ mod tests {
             drift
                 .state
                 .admit_whole_instance_rematerialization(
-                    offer,
+                    offer.into_authorization(),
                     OperationId::new("whole-instance-root-drift-rematerialize"),
                     chrono::Duration::minutes(30),
                 )
@@ -7905,17 +8058,22 @@ mod tests {
             &ambiguous,
             "whole-instance-offer-ambiguous-second",
             "jre-legacy",
-            GuardianMode::Managed,
+            GuardianMode::Custom,
         )
         .await;
+        let (ambiguous_eligibility, evaluations) =
+            crate::guardian::with_guardian_policy_evaluation_count(async {
+                ambiguous
+                    .state
+                    .whole_instance_rematerialization_eligibility(INSTANCE_ID)
+                    .await
+            })
+            .await;
         assert_eq!(
-            ambiguous
-                .state
-                .whole_instance_rematerialization_availability(INSTANCE_ID, GuardianMode::Managed,)
-                .await
-                .err(),
+            ambiguous_eligibility.err(),
             Some(ReconciliationEvidenceRejection::JournalMismatch)
         );
+        assert_eq!(evaluations, 0);
         cleanup(ambiguous).await;
     }
 }

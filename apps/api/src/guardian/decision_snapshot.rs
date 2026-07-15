@@ -15,9 +15,9 @@ const SNAPSHOT_FIXTURE: &str = include_str!(concat!(
     "/tests/fixtures/guardian/guardian-decision-snapshot-v1.json"
 ));
 const REGENERATE_ENV: &str = "AXIAL_REGENERATE_GUARDIAN_DECISION_SNAPSHOT";
-const FACT_SOURCE_COUNT: usize = 70;
+const FACT_SOURCE_COUNT: usize = 71;
 const DIAGNOSIS_COUNT: usize = 46;
-const FACT_SOURCE_PHASE_COUNT: usize = 275;
+const FACT_SOURCE_PHASE_COUNT: usize = 276;
 const UNKNOWN_SOURCE_COUNT: usize = 12;
 const CONTEXT_COUNT: usize = 16;
 const FACT_SOURCE_OWNERSHIP_COUNT: usize = 5;
@@ -281,6 +281,17 @@ fn required_source_cases() -> Vec<RequiredSourceCase> {
                 OperationPhase::Installing,
                 OperationPhase::Preparing,
             ],
+        },
+        RequiredSourceCase {
+            id: "launcher_managed_artifact_corrupt--registered_component_rebuild_failed",
+            input: SourceInput::Fact {
+                fact_id: GuardianFactId::RegisteredComponentRebuildFailed,
+                domain: GuardianDomain::Runtime,
+                reliability: FactReliability::DirectStructured,
+                severity: None,
+                confidence: None,
+            },
+            allowed_phases: vec![OperationPhase::Repairing],
         },
         RequiredSourceCase {
             id: "process_lifecycle_observed--process_killed",
@@ -564,9 +575,9 @@ fn assert_snapshot_coverage(snapshot: &GuardianDecisionSnapshot) {
         snapshot.source_cases.len(),
         FACT_SOURCE_COUNT + UNKNOWN_SOURCE_COUNT
     );
-    assert_eq!(RAW_DIAGNOSIS_CASE_COUNT, 1_387);
-    assert_eq!(RAW_POLICY_EVALUATION_COUNT, 66_576);
-    assert_eq!(COMPRESSED_POLICY_CELL_COUNT, 17_376);
+    assert_eq!(RAW_DIAGNOSIS_CASE_COUNT, 1_392);
+    assert_eq!(RAW_POLICY_EVALUATION_COUNT, 66_816);
+    assert_eq!(COMPRESSED_POLICY_CELL_COUNT, 17_616);
     assert!(
         snapshot
             .source_cases
