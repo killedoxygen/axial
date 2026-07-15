@@ -90,6 +90,7 @@ impl ManagedArtifactRebuildComponent {
             _ => return Err(ReconciliationEvidenceRejection::ScopeMismatch),
         };
         if attempt.rung() != ReconciliationRung::RepairArtifact
+            || attempt.diagnosis_id() != DiagnosisId::LauncherManagedArtifactCorrupt
             || attempt.mode() != GuardianMode::Managed
             || attempt.ownership() != OwnershipClass::LauncherManaged
             || attempt.target().system != StabilizationSystem::Execution
@@ -1601,6 +1602,23 @@ impl AppState {
                 &after.roots.library,
             )
             .ok_or(ReconciliationEvidenceRejection::RootAuthorityUnavailable)?;
+        if expected_rung == ReconciliationRung::RepairArtifact
+            && matches!(
+                terminal.component(),
+                ReconciliationComponent::Libraries | ReconciliationComponent::Assets
+            )
+            && !super::registered_artifact_findings::recorded_artifact_target_has_live_provenance(
+                &instance.id,
+                &instance.version_id,
+                &instance.created_at,
+                &after.roots.library,
+                &after.roots.runtime,
+                &inventory,
+                terminal.attempt(),
+            )
+        {
+            return Err(ReconciliationEvidenceRejection::ScopeMismatch);
+        }
         Ok(RecordedReconciliationFailure {
             terminal,
             lifecycle: lifecycle.retained(),
@@ -1965,17 +1983,20 @@ mod tests {
             },
         }])
         .expect("Libraries fixture inventory")
+        .with_test_standalone_leaf_repair_source(0, "https://example.invalid/fixture-library.jar")
+        .expect("Libraries fixture repair source")
     }
 
-    fn assets_fixture_inventory() -> KnownGoodInventory {
-        const OBJECT_BYTES: &[u8] = b"axial managed Assets fixture";
-        let object_digest = format!("{:x}", Sha1::digest(OBJECT_BYTES));
+    const ASSETS_FIXTURE_OBJECT_BYTES: &[u8] = b"axial managed Assets fixture";
+
+    fn assets_fixture_index_bytes() -> Vec<u8> {
+        let object_digest = format!("{:x}", Sha1::digest(ASSETS_FIXTURE_OBJECT_BYTES));
         let empty_digest = format!("{:x}", Sha1::digest([]));
-        let index_bytes = serde_json::to_vec(&serde_json::json!({
+        serde_json::to_vec(&serde_json::json!({
             "objects": {
                 "fixture/object": {
                     "hash": object_digest.as_str(),
-                    "size": OBJECT_BYTES.len()
+                    "size": ASSETS_FIXTURE_OBJECT_BYTES.len()
                 },
                 "fixture/empty": {
                     "hash": empty_digest.as_str(),
@@ -1983,7 +2004,13 @@ mod tests {
                 }
             }
         }))
-        .expect("Assets fixture index");
+        .expect("Assets fixture index")
+    }
+
+    fn assets_fixture_inventory() -> KnownGoodInventory {
+        let object_digest = format!("{:x}", Sha1::digest(ASSETS_FIXTURE_OBJECT_BYTES));
+        let empty_digest = format!("{:x}", Sha1::digest([]));
+        let index_bytes = assets_fixture_index_bytes();
         let entries = [
             TestKnownGoodEntry {
                 root: TestKnownGoodRoot::Assets,
@@ -1999,8 +2026,8 @@ mod tests {
                 path: format!("objects/{}/{}", &object_digest[..2], object_digest),
                 kind: KnownGoodArtifactKind::AssetObject,
                 integrity: TestKnownGoodIntegrity::Sha1 {
-                    digest: object_digest,
-                    size: OBJECT_BYTES.len() as u64,
+                    digest: object_digest.clone(),
+                    size: ASSETS_FIXTURE_OBJECT_BYTES.len() as u64,
                 },
             },
             TestKnownGoodEntry {
@@ -2008,12 +2035,52 @@ mod tests {
                 path: format!("objects/{}/{}", &empty_digest[..2], empty_digest),
                 kind: KnownGoodArtifactKind::AssetObject,
                 integrity: TestKnownGoodIntegrity::Sha1 {
-                    digest: empty_digest,
+                    digest: empty_digest.clone(),
                     size: 0,
                 },
             },
         ];
-        KnownGoodInventory::from_test_entries(entries).expect("Assets fixture inventory")
+        KnownGoodInventory::from_test_entries(entries)
+            .expect("Assets fixture inventory")
+            .with_test_standalone_leaf_repair_source(
+                0,
+                "https://example.invalid/fixture-assets.json",
+            )
+            .expect("Assets index fixture repair source")
+            .with_test_standalone_leaf_repair_source(
+                1,
+                &format!(
+                    "https://resources.download.minecraft.net/{}/{}",
+                    &object_digest[..2],
+                    object_digest
+                ),
+            )
+            .expect("Assets object fixture repair source")
+            .with_test_standalone_leaf_repair_source(
+                2,
+                &format!(
+                    "https://resources.download.minecraft.net/{}/{}",
+                    &empty_digest[..2],
+                    empty_digest
+                ),
+            )
+            .expect("empty Assets object fixture repair source")
+    }
+
+    fn assets_projection_mismatch_inventory() -> KnownGoodInventory {
+        let index_bytes = assets_fixture_index_bytes();
+        KnownGoodInventory::from_test_entries([TestKnownGoodEntry {
+            root: TestKnownGoodRoot::Assets,
+            path: "indexes/fixture-assets.json".to_string(),
+            kind: KnownGoodArtifactKind::AssetIndex,
+            integrity: TestKnownGoodIntegrity::Sha1 {
+                digest: format!("{:x}", Sha1::digest(&index_bytes)),
+                size: index_bytes.len() as u64,
+            },
+        }])
+        .expect("Assets projection-mismatch inventory")
+        .with_test_standalone_leaf_repair_source(0, "https://example.invalid/fixture-assets.json")
+        .expect("Assets projection-mismatch repair source")
     }
 
     fn activate_libraries_fixture_inventory(
@@ -2065,6 +2132,41 @@ mod tests {
                 &library_root,
             )
             .expect("active test known-good inventory")
+    }
+
+    fn source_backed_artifact_target(
+        fixture: &Fixture,
+        inventory_ordinal: usize,
+    ) -> TargetDescriptor {
+        let instance = fixture
+            .state
+            .instances
+            .get(INSTANCE_ID)
+            .expect("source-backed target instance");
+        let current = fixture
+            .state
+            .current_reconciliation_incarnation(INSTANCE_ID)
+            .expect("source-backed target incarnation");
+        let inventory = fixture
+            .state
+            .known_good
+            .active_inventory(
+                &instance.id,
+                &instance.version_id,
+                &instance.created_at,
+                &current.roots.library,
+            )
+            .expect("source-backed target inventory");
+        super::super::registered_artifact_findings::registered_artifact_target_for_test(
+            &instance.id,
+            &instance.version_id,
+            &instance.created_at,
+            &current.roots.library,
+            &current.roots.runtime,
+            &inventory,
+            inventory_ordinal,
+        )
+        .expect("source-backed artifact target")
     }
 
     async fn cleanup(fixture: Fixture) {
@@ -2239,21 +2341,14 @@ mod tests {
             .state
             .registered_reconciliation_authority(&lifecycle)
             .expect("registered component predecessor authority");
+        let target = source_backed_artifact_target(fixture, 0);
         let attempt = authority
             .repair_artifact_attempt(
                 OperationId::new(operation_id),
                 DIAGNOSIS_ID,
                 component.domain(),
                 component.reconciliation_component(),
-                TargetDescriptor::new(
-                    StabilizationSystem::Execution,
-                    TargetKind::Artifact,
-                    match component {
-                        ManagedArtifactRebuildComponent::Libraries => "fixture-library",
-                        ManagedArtifactRebuildComponent::Assets => "fixture-asset-index",
-                    },
-                    OwnershipClass::LauncherManaged,
-                ),
+                target,
                 GuardianMode::Managed,
                 chrono::Duration::minutes(30),
             )
@@ -2282,6 +2377,49 @@ mod tests {
             .expect("recorded component predecessor failure");
         drop((authority, lifecycle));
         (evidence, attempt)
+    }
+
+    async fn persist_untrusted_assets_artifact_failure(
+        fixture: &Fixture,
+        lifecycle: &InstanceLifecycleLease,
+        operation_id: &str,
+        diagnosis_id: DiagnosisId,
+        target: TargetDescriptor,
+    ) -> ReconciliationAttempt {
+        let authority = fixture
+            .state
+            .registered_reconciliation_authority(lifecycle)
+            .expect("untrusted Assets predecessor authority");
+        let attempt = authority
+            .repair_artifact_attempt(
+                OperationId::new(operation_id),
+                diagnosis_id,
+                GuardianDomain::Download,
+                ReconciliationComponent::Assets,
+                target,
+                GuardianMode::Managed,
+                chrono::Duration::minutes(30),
+            )
+            .expect("untrusted Assets predecessor attempt");
+        let terminal = authority
+            .terminal(attempt.clone(), ReconciliationTerminalOutcome::Failed)
+            .expect("generic untrusted Assets terminal");
+        let reservation = reserve_reconciliation_attempt(
+            fixture.failure_memory.as_ref(),
+            fixture.journals.as_ref(),
+            reconciliation_attempt_key(&attempt),
+        )
+        .expect("reserve untrusted Assets predecessor");
+        persist_failed_journal(fixture, &attempt, terminal.clone()).await;
+        commit_reconciliation_memory(
+            fixture.failure_memory.as_ref(),
+            reconciliation_memory_entry(terminal).expect("untrusted Assets memory"),
+            &reservation,
+        )
+        .await
+        .expect("commit untrusted Assets memory");
+        drop((reservation, authority));
+        attempt
     }
 
     #[tokio::test]
@@ -2637,6 +2775,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn assets_artifact_failure_requires_exact_source_target_and_canonical_diagnosis() {
+        let fixture = fixture("assets-artifact-provenance");
+        activate_assets_fixture_inventory(&fixture.state, INSTANCE_ID);
+        let lifecycle = fixture.state.acquire_instance_lifecycle(INSTANCE_ID).await;
+        let exact_target = source_backed_artifact_target(&fixture, 0);
+        let fabricated = persist_untrusted_assets_artifact_failure(
+            &fixture,
+            &lifecycle,
+            "assets-artifact-fabricated-target",
+            DIAGNOSIS_ID,
+            TargetDescriptor::new(
+                StabilizationSystem::Execution,
+                TargetKind::Artifact,
+                "fabricated-assets-target",
+                OwnershipClass::LauncherManaged,
+            ),
+        )
+        .await;
+        assert_eq!(
+            fixture
+                .state
+                .recorded_artifact_repair_failure(&lifecycle, fabricated.operation_id())
+                .err(),
+            Some(ReconciliationEvidenceRejection::ScopeMismatch)
+        );
+
+        let wrong_diagnosis = persist_untrusted_assets_artifact_failure(
+            &fixture,
+            &lifecycle,
+            "assets-artifact-wrong-diagnosis",
+            DiagnosisId::DownloadUnavailable,
+            exact_target,
+        )
+        .await;
+        assert_eq!(
+            fixture
+                .state
+                .recorded_artifact_repair_failure(&lifecycle, wrong_diagnosis.operation_id())
+                .err(),
+            Some(ReconciliationEvidenceRejection::ScopeMismatch)
+        );
+
+        drop(lifecycle);
+        cleanup(fixture).await;
+    }
+
+    #[tokio::test]
     async fn libraries_component_commit_keeps_exact_root_projection_and_inventory_arc() {
         let fixture = fixture("libraries-component-commit");
         let admitted_inventory = activate_libraries_fixture_inventory(&fixture.state, INSTANCE_ID);
@@ -2847,6 +3032,12 @@ mod tests {
     #[tokio::test]
     async fn assets_component_rejects_projection_and_inventory_arc_drift() {
         let projection_fixture = fixture("assets-component-projection");
+        projection_fixture
+            .state
+            .activate_known_good_inventory_for_test(
+                INSTANCE_ID,
+                assets_projection_mismatch_inventory(),
+            );
         let (projection_evidence, _) = recorded_component_predecessor_failure(
             &projection_fixture,
             "assets-component-projection-artifact",

@@ -1404,7 +1404,7 @@ mod tests {
         commit_reconciliation_memory, new_instance, reconciliation_attempt_key,
         reconciliation_instance_target, reconciliation_journal_attempt,
         reconciliation_memory_entry, record_reconciliation_journal_failure,
-        reserve_reconciliation_attempt,
+        registered_artifact_target_for_test, reserve_reconciliation_attempt,
     };
     use axial_config::{AppPaths, InstanceRegistrySnapshot};
     use axial_minecraft::RuntimeId;
@@ -1660,12 +1660,40 @@ mod tests {
             },
         ])
         .expect("Assets fixture inventory")
+        .with_test_standalone_leaf_repair_source(0, "https://example.invalid/fixture-assets.json")
+        .expect("Assets fixture index source")
     }
 
-    fn activate_assets_fixture_inventory(fixture: &Fixture) {
+    fn activate_assets_fixture_inventory(fixture: &Fixture) -> TargetDescriptor {
+        let inventory = assets_fixture_inventory();
+        let instance = fixture
+            .state
+            .instances()
+            .get(INSTANCE_ID)
+            .expect("registered Assets fixture instance");
+        let library_dir = fixture
+            .state
+            .library_dir()
+            .expect("configured Assets fixture library root");
+        let library_root = fs::canonicalize(library_dir).expect("canonical Assets library root");
+        fs::create_dir_all(fixture.state.managed_runtime_cache().root())
+            .expect("Assets fixture runtime root");
+        let runtime_root = fs::canonicalize(fixture.state.managed_runtime_cache().root())
+            .expect("canonical Assets runtime root");
+        let target = registered_artifact_target_for_test(
+            &instance.id,
+            &instance.version_id,
+            &instance.created_at,
+            &library_root,
+            &runtime_root,
+            &inventory,
+            0,
+        )
+        .expect("exact source-backed Assets target");
         fixture
             .state
-            .activate_known_good_inventory_for_test(INSTANCE_ID, assets_fixture_inventory());
+            .activate_known_good_inventory_for_test(INSTANCE_ID, inventory);
+        target
     }
 
     async fn cleanup(fixture: Fixture) {
@@ -1704,15 +1732,6 @@ mod tests {
             StabilizationSystem::Execution,
             TargetKind::Runtime,
             RUNTIME_COMPONENT,
-            OwnershipClass::LauncherManaged,
-        )
-    }
-
-    fn assets_target() -> TargetDescriptor {
-        TargetDescriptor::new(
-            StabilizationSystem::Execution,
-            TargetKind::Artifact,
-            "fixture-asset-index",
             OwnershipClass::LauncherManaged,
         )
     }
@@ -1821,7 +1840,7 @@ mod tests {
         fixture: &Fixture,
         operation_suffix: &str,
     ) -> RegisteredComponentRebuildAdmission {
-        activate_assets_fixture_inventory(fixture);
+        let target = activate_assets_fixture_inventory(fixture);
         let lifecycle = fixture.state.acquire_instance_lifecycle(INSTANCE_ID).await;
         let authority = fixture
             .state
@@ -1834,7 +1853,7 @@ mod tests {
                 DIAGNOSIS_ID,
                 GuardianDomain::Download,
                 ReconciliationComponent::Assets,
-                assets_target(),
+                target,
                 GuardianMode::Managed,
                 chrono::Duration::minutes(30),
             )

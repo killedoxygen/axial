@@ -965,6 +965,18 @@ pub(super) const DIAGNOSIS_RULES: &[DiagnosisRule] = &[
         [Quarantine, Repair, AskUser, Block],
         clauses: &[
             context_clause(
+                OperationPhase::Validating,
+                &[GuardianFactId::RegisteredArtifactRepairAvailable],
+                None,
+                &[
+                    GuardianActionKind::Repair,
+                    GuardianActionKind::AskUser,
+                    GuardianActionKind::Block,
+                ],
+                None,
+                Some(DecisionPriorityBand::RegisteredArtifactRepair),
+            ),
+            context_clause(
                 OperationPhase::Launching,
                 &[
                     GuardianFactId::LaunchFailureClassified,

@@ -1,7 +1,14 @@
-use super::{DiagnosisId, GuardianFact, diagnose, guardian_fact_from_execution};
-use crate::execution::ExecutionFact;
-use crate::state::contracts::{OperationId, OperationPhase};
-use crate::state::{MAX_OPERATION_JOURNAL_DIAGNOSES, MAX_OPERATION_JOURNAL_STEP_FACTS};
+use super::{
+    DiagnosisId, FactReliability, GuardianDecision, GuardianFact, GuardianFactId, GuardianMode,
+    GuardianPolicyContext, build_safety_case, decide_guardian_policy, diagnose,
+    guardian_fact_from_execution,
+};
+use crate::execution::{ExecutionFact, ExecutionFactKind};
+use crate::state::contracts::{OperationId, OperationPhase, OwnershipClass};
+use crate::state::{
+    MAX_OPERATION_JOURNAL_DIAGNOSES, MAX_OPERATION_JOURNAL_STEP_FACTS,
+    RegisteredArtifactRepairCandidate,
+};
 use std::collections::HashSet;
 
 pub(crate) const TIER2_INTEGRITY_COUNTER_TOKEN_COUNT: usize = 9;
@@ -11,6 +18,16 @@ const MAX_TIER2_INTEGRITY_FACT_IDS: usize =
 pub(crate) struct Tier2IntegrityGuardianEvidence {
     fact_ids: Vec<String>,
     diagnosis_ids: Vec<DiagnosisId>,
+}
+
+pub(crate) struct Tier2RegisteredArtifactAssessment {
+    decision: GuardianDecision,
+}
+
+impl Tier2RegisteredArtifactAssessment {
+    pub(crate) const fn decision(&self) -> &GuardianDecision {
+        &self.decision
+    }
 }
 
 impl Tier2IntegrityGuardianEvidence {
@@ -64,6 +81,44 @@ pub(crate) fn tier2_integrity_guardian_evidence(
     }
 }
 
+pub(crate) fn assess_tier2_registered_artifact_repair(
+    operation_id: OperationId,
+    mode: GuardianMode,
+    execution_fact: &ExecutionFact,
+    candidate: RegisteredArtifactRepairCandidate<'_>,
+) -> Option<Tier2RegisteredArtifactAssessment> {
+    if !matches!(
+        execution_fact.kind,
+        ExecutionFactKind::ArtifactHashMismatch
+            | ExecutionFactKind::ArtifactMissing
+            | ExecutionFactKind::ArtifactSizeDrift
+    ) || execution_fact.target.as_ref() != Some(candidate.target())
+        || candidate.target().ownership != OwnershipClass::LauncherManaged
+    {
+        return None;
+    }
+
+    let phase = OperationPhase::Validating;
+    let mut finding = tier2_guardian_fact(&operation_id, execution_fact);
+    finding.domain = candidate.domain();
+    let available = GuardianFact {
+        operation_id: Some(operation_id.clone()),
+        id: GuardianFactId::RegisteredArtifactRepairAvailable,
+        domain: candidate.domain(),
+        phase,
+        reliability: FactReliability::DirectStructured,
+        severity: None,
+        confidence: None,
+        ownership: OwnershipClass::LauncherManaged,
+        target: Some(candidate.target().clone()),
+        fields: Vec::new(),
+    };
+    let safety_case = build_safety_case(Some(operation_id), mode, phase, &[finding, available]);
+    Some(Tier2RegisteredArtifactAssessment {
+        decision: decide_guardian_policy(&safety_case, GuardianPolicyContext::current_operation()),
+    })
+}
+
 fn tier2_guardian_fact(operation_id: &OperationId, fact: &ExecutionFact) -> GuardianFact {
     let mut fact = fact.clone();
     fact.operation_id = Some(operation_id.clone());
@@ -74,7 +129,7 @@ fn tier2_guardian_fact(operation_id: &OperationId, fact: &ExecutionFact) -> Guar
 mod tests {
     use super::*;
     use crate::execution::{ExecutionFactKind, ExecutionFactSemantics};
-    use crate::guardian::GuardianFactId;
+    use crate::guardian::{GuardianActionKind, GuardianDomain};
     use crate::observability::{EvidenceField, EvidenceSensitivity};
     use crate::state::contracts::{
         OwnershipClass, StabilizationSystem, TargetDescriptor, TargetKind,
@@ -202,5 +257,82 @@ mod tests {
                 expected
             );
         }
+    }
+
+    #[test]
+    fn exact_tier_two_registered_artifact_assessment_respects_guardian_modes() {
+        let target = TargetDescriptor::new(
+            StabilizationSystem::Execution,
+            TargetKind::Artifact,
+            "leaf-v2.01234567.89abcdef.01234567.89abcdef.01234567.89abcdef.01234567.89abcdef",
+            OwnershipClass::LauncherManaged,
+        );
+        let fact = ExecutionFact {
+            operation_id: None,
+            kind: ExecutionFactKind::ArtifactHashMismatch,
+            target: Some(target.clone()),
+            fields: Vec::new(),
+        };
+
+        for (mode, expected) in [
+            (GuardianMode::Managed, GuardianActionKind::Repair),
+            (GuardianMode::Custom, GuardianActionKind::AskUser),
+            (GuardianMode::Disabled, GuardianActionKind::RecordOnly),
+        ] {
+            let assessment = assess_tier2_registered_artifact_repair(
+                OperationId::new("tier-two-registered-artifact"),
+                mode,
+                &fact,
+                RegisteredArtifactRepairCandidate::for_test(&target, GuardianDomain::Download),
+            )
+            .expect("exact registered artifact assessment");
+
+            assert_eq!(assessment.decision().kind(), expected);
+            assert_eq!(
+                assessment.decision().operation_id(),
+                Some(&OperationId::new("tier-two-registered-artifact"))
+            );
+            assert_eq!(
+                assessment
+                    .decision()
+                    .action_plan()
+                    .expect("registered artifact plan")
+                    .prerequisite
+                    .affected_targets,
+                vec![target.clone()]
+            );
+        }
+    }
+
+    #[test]
+    fn tier_two_registered_artifact_assessment_rejects_a_fabricated_target() {
+        let target = TargetDescriptor::new(
+            StabilizationSystem::Execution,
+            TargetKind::Artifact,
+            "leaf-v2.01234567.89abcdef.01234567.89abcdef.01234567.89abcdef.01234567.89abcdef",
+            OwnershipClass::LauncherManaged,
+        );
+        let fabricated = TargetDescriptor::new(
+            StabilizationSystem::Execution,
+            TargetKind::Artifact,
+            "leaf-v2.00000000.00000000.00000000.00000000.00000000.00000000.00000000.00000000",
+            OwnershipClass::LauncherManaged,
+        );
+        let fact = ExecutionFact {
+            operation_id: None,
+            kind: ExecutionFactKind::ArtifactMissing,
+            target: Some(fabricated),
+            fields: Vec::new(),
+        };
+
+        assert!(
+            assess_tier2_registered_artifact_repair(
+                OperationId::new("tier-two-fabricated-artifact"),
+                GuardianMode::Managed,
+                &fact,
+                RegisteredArtifactRepairCandidate::for_test(&target, GuardianDomain::Download),
+            )
+            .is_none()
+        );
     }
 }

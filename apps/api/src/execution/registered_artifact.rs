@@ -1380,8 +1380,70 @@ mod tests {
     };
     use axial_minecraft::known_good::KnownGoodPhysicalPath;
     use std::fs;
+    use std::io::{Read as _, Write as _};
+    use std::net::TcpListener;
     use std::os::unix::fs::symlink;
     use std::path::PathBuf;
+    use std::thread;
+
+    #[tokio::test]
+    async fn zero_byte_download_is_verified_and_promoted() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind zero-byte artifact server");
+        let address = listener.local_addr().expect("zero-byte server address");
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept zero-byte request");
+            let mut request = [0_u8; 1024];
+            let _ = stream.read(&mut request);
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .expect("write zero-byte response");
+        });
+        let base =
+            std::env::temp_dir().join(format!("axial-zero-byte-artifact-{}", uuid::Uuid::new_v4()));
+        let relative = PathBuf::from("assets/objects/da/da39a3ee5e6b4b0d3255bfef95601890afd80709");
+        fs::create_dir_all(base.join(relative.parent().expect("zero-byte artifact parent")))
+            .expect("create zero-byte artifact parent");
+        let capability = RegisteredArtifactMutationCapability::mint(
+            KnownGoodPhysicalPath::for_test(base.clone(), relative.clone()),
+        )
+        .await
+        .expect("mint zero-byte artifact capability");
+        let operation_id = OperationId::new("zero-byte-artifact-promotion");
+        let target = TargetDescriptor::new(
+            StabilizationSystem::Execution,
+            TargetKind::Artifact,
+            "zero-byte-artifact-promotion",
+            OwnershipClass::LauncherManaged,
+        );
+
+        let Ok(_report) = capability
+            .download_verify_promote(
+                &operation_id,
+                &target,
+                &format!("http://{address}/artifact"),
+                "da39a3ee5e6b4b0d3255bfef95601890afd80709",
+                0,
+                &reqwest::Client::new(),
+            )
+            .await
+        else {
+            panic!("download and promote zero-byte artifact");
+        };
+
+        assert_eq!(
+            fs::metadata(base.join(&relative))
+                .expect("promoted zero-byte artifact")
+                .len(),
+            0
+        );
+        assert!(
+            capability
+                .verify_exact("da39a3ee5e6b4b0d3255bfef95601890afd80709", 0)
+                .await
+        );
+        server.join().expect("join zero-byte artifact server");
+        fs::remove_dir_all(&base).expect("remove zero-byte artifact fixture");
+    }
 
     #[tokio::test]
     async fn ancestor_swap_cannot_redirect_quarantine_outside_the_held_root() {

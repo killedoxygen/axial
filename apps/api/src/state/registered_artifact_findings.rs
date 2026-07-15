@@ -1,6 +1,6 @@
 use super::contracts::{
-    OperationId, OwnershipClass, ReconciliationComponent, StabilizationSystem, TargetDescriptor,
-    TargetKind,
+    OperationId, OwnershipClass, ReconciliationAttempt, ReconciliationComponent,
+    StabilizationSystem, TargetDescriptor, TargetKind,
 };
 use super::{
     AppState, KnownGoodVerificationLease, KnownGoodVerificationUnavailable,
@@ -13,14 +13,14 @@ use crate::guardian::{
     DiagnosisId, GuardianActionKind, GuardianDecision, GuardianDomain, GuardianMode,
 };
 use axial_minecraft::known_good::{
-    KnownGoodArtifactKind, KnownGoodEntry, KnownGoodIntegrity, KnownGoodRoot, known_good_entry_path,
+    KnownGoodArtifactKind, KnownGoodIntegrity, KnownGoodRoot, known_good_entry_path,
 };
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::path::Path;
 use std::sync::Arc;
 
-const REGISTERED_ARTIFACT_TARGET_DOMAIN: &[u8] = b"axial.guardian.registered-artifact-target.v1";
+const REGISTERED_ARTIFACT_TARGET_DOMAIN: &[u8] = b"axial.guardian.registered-artifact-target.v2";
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub(crate) enum RegisteredArtifactCondition {
@@ -61,6 +61,73 @@ struct RegisteredArtifactFinding {
     target: TargetDescriptor,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct RegisteredArtifactRepairCandidate<'a> {
+    target: &'a TargetDescriptor,
+    domain: GuardianDomain,
+}
+
+impl RegisteredArtifactRepairCandidate<'_> {
+    pub(crate) const fn target(&self) -> &TargetDescriptor {
+        self.target
+    }
+
+    pub(crate) const fn domain(&self) -> GuardianDomain {
+        self.domain
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn for_test(
+        target: &TargetDescriptor,
+        domain: GuardianDomain,
+    ) -> RegisteredArtifactRepairCandidate<'_> {
+        RegisteredArtifactRepairCandidate { target, domain }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RegisteredArtifactSourceScope {
+    Libraries,
+    Assets,
+}
+
+impl RegisteredArtifactSourceScope {
+    fn from_source(root: &KnownGoodRoot, kind: KnownGoodArtifactKind) -> Option<Self> {
+        match (root, kind) {
+            (
+                KnownGoodRoot::Libraries,
+                KnownGoodArtifactKind::Library | KnownGoodArtifactKind::NativeLibrary,
+            ) => Some(Self::Libraries),
+            (
+                KnownGoodRoot::Assets,
+                KnownGoodArtifactKind::AssetIndex | KnownGoodArtifactKind::AssetObject,
+            ) => Some(Self::Assets),
+            _ => None,
+        }
+    }
+
+    const fn domain(self) -> GuardianDomain {
+        match self {
+            Self::Libraries => GuardianDomain::Library,
+            Self::Assets => GuardianDomain::Download,
+        }
+    }
+
+    const fn component(self) -> ReconciliationComponent {
+        match self {
+            Self::Libraries => ReconciliationComponent::Libraries,
+            Self::Assets => ReconciliationComponent::Assets,
+        }
+    }
+
+    const fn corrupt_effect(self) -> RegisteredArtifactRepairEffect {
+        match self {
+            Self::Libraries => RegisteredArtifactRepairEffect::QuarantineRedownload,
+            Self::Assets => RegisteredArtifactRepairEffect::ComponentRebuildRequired,
+        }
+    }
+}
+
 /// Exact registered-instance integrity evidence. The retained verification lease makes this
 /// move-only and keeps both foreground and instance-lifecycle authority alive.
 pub(crate) struct RegisteredArtifactFindings {
@@ -90,14 +157,14 @@ pub(crate) struct RegisteredArtifactRepairAdmission {
     expected_sha1: String,
     expected_size: u64,
     _component_mutation: super::sessions::SharedComponentMutationLease,
-    _library_root_mutation: tokio::sync::OwnedMutexGuard<()>,
+    _config_mutation: tokio::sync::OwnedMutexGuard<()>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum RegisteredArtifactRepairEffect {
-    AlreadyExact,
     DownloadMissing,
     QuarantineRedownload,
+    ComponentRebuildRequired,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -119,7 +186,22 @@ impl RegisteredArtifactFindings {
     }
 
     pub(crate) fn repair_target(&self) -> Option<&TargetDescriptor> {
-        self.repair_candidate().map(|finding| &finding.target)
+        self.selected_repair_finding()
+            .map(|finding| &finding.target)
+    }
+
+    pub(crate) fn repair_candidate(&self) -> Option<RegisteredArtifactRepairCandidate<'_>> {
+        let finding = self.selected_repair_finding()?;
+        let source = self
+            .authority
+            .inventory
+            .bind_standalone_leaf_repair_source(finding.observation.inventory_ordinal)
+            .ok()?;
+        let scope = RegisteredArtifactSourceScope::from_source(source.root(), source.kind())?;
+        Some(RegisteredArtifactRepairCandidate {
+            target: &finding.target,
+            domain: scope.domain(),
+        })
     }
 
     pub(crate) fn target_for(
@@ -158,7 +240,7 @@ impl RegisteredArtifactFindings {
             .ok_or(RegisteredArtifactRepairAuthorizationRejection::InvalidRepairPlan)?;
 
         let finding = self
-            .repair_candidate()
+            .selected_repair_finding()
             .ok_or(RegisteredArtifactRepairAuthorizationRejection::RepairSourceUnavailable)?;
         if !plan.actions.iter().any(|action| {
             action.kind == GuardianActionKind::Repair
@@ -183,7 +265,7 @@ impl RegisteredArtifactFindings {
         })
     }
 
-    fn repair_candidate(&self) -> Option<&RegisteredArtifactFinding> {
+    fn selected_repair_finding(&self) -> Option<&RegisteredArtifactFinding> {
         self.findings
             .iter()
             .filter(|finding| {
@@ -348,17 +430,11 @@ impl AppState {
         let source = inventory
             .bind_standalone_leaf_repair_source(observation.inventory_ordinal)
             .map_err(|_| ReconciliationEvidenceRejection::RootAuthorityUnavailable)?;
-        if source.root() != &KnownGoodRoot::Libraries
-            || !matches!(
-                source.kind(),
-                KnownGoodArtifactKind::Library | KnownGoodArtifactKind::NativeLibrary
-            )
-        {
-            return Err(ReconciliationEvidenceRejection::ScopeMismatch);
-        }
+        let source_scope = RegisteredArtifactSourceScope::from_source(source.root(), source.kind())
+            .ok_or(ReconciliationEvidenceRejection::ScopeMismatch)?;
 
         // Config precedes the shared component writer, matching component rebuild admission.
-        let library_root_mutation = self
+        let config_mutation = self
             .config
             .acquire_mutation()
             .await
@@ -377,6 +453,12 @@ impl AppState {
         let source = inventory
             .bind_standalone_leaf_repair_source(observation.inventory_ordinal)
             .map_err(|_| ReconciliationEvidenceRejection::RootAuthorityUnavailable)?;
+        let current_source_scope =
+            RegisteredArtifactSourceScope::from_source(source.root(), source.kind())
+                .ok_or(ReconciliationEvidenceRejection::ScopeMismatch)?;
+        if current_source_scope != source_scope {
+            return Err(ReconciliationEvidenceRejection::IncarnationMismatch);
+        }
         let entry = inventory
             .entries()
             .get(observation.inventory_ordinal)
@@ -392,21 +474,9 @@ impl AppState {
         let mutation = RegisteredArtifactMutationCapability::mint(physical_path)
             .await
             .map_err(|_| ReconciliationEvidenceRejection::RootAuthorityUnavailable)?;
-        let physical_state = mutation
-            .classify(&expected_sha1, expected_size)
-            .await
-            .ok_or(ReconciliationEvidenceRejection::RootAuthorityUnavailable)?;
-        let effect = match (observation.condition, physical_state) {
-            (_, RegisteredArtifactPhysicalState::Exact) => {
-                RegisteredArtifactRepairEffect::AlreadyExact
-            }
-            (RegisteredArtifactCondition::Missing, RegisteredArtifactPhysicalState::Missing) => {
-                RegisteredArtifactRepairEffect::DownloadMissing
-            }
-            (RegisteredArtifactCondition::Corrupt, RegisteredArtifactPhysicalState::Corrupt) => {
-                RegisteredArtifactRepairEffect::QuarantineRedownload
-            }
-            _ => return Err(ReconciliationEvidenceRejection::IncarnationMismatch),
+        let effect = match observation.condition {
+            RegisteredArtifactCondition::Missing => RegisteredArtifactRepairEffect::DownloadMissing,
+            RegisteredArtifactCondition::Corrupt => source_scope.corrupt_effect(),
         };
         if !self.registered_artifact_findings_are_current(&findings)
             || !Arc::ptr_eq(&inventory, &findings.authority.inventory)
@@ -418,8 +488,8 @@ impl AppState {
         let attempt = authority.repair_artifact_attempt(
             operation_id,
             diagnosis_id,
-            GuardianDomain::Library,
-            ReconciliationComponent::Libraries,
+            source_scope.domain(),
+            source_scope.component(),
             target,
             GuardianMode::Managed,
             suppression_for,
@@ -438,7 +508,7 @@ impl AppState {
             expected_sha1,
             expected_size,
             _component_mutation: component_mutation,
-            _library_root_mutation: library_root_mutation,
+            _config_mutation: config_mutation,
         })
     }
 }
@@ -449,10 +519,32 @@ fn registered_artifact_target(
 ) -> Option<TargetDescriptor> {
     let (instance_id, version_id, created_at, library_root, runtime_cache, inventory) =
         authority.execution_parts();
+    registered_artifact_target_from_inventory(
+        instance_id,
+        version_id,
+        created_at,
+        library_root,
+        runtime_cache.root(),
+        inventory,
+        inventory_ordinal,
+    )
+    .map(|(target, _)| target)
+}
+
+fn registered_artifact_target_from_inventory(
+    instance_id: &str,
+    version_id: &str,
+    created_at: &str,
+    library_root: &Path,
+    runtime_root: &Path,
+    inventory: &axial_minecraft::known_good::KnownGoodInventory,
+    inventory_ordinal: usize,
+) -> Option<(TargetDescriptor, RegisteredArtifactSourceScope)> {
     let entry = inventory.entries().get(inventory_ordinal)?;
-    if !repairable_tier1_entry(entry) {
-        return None;
-    }
+    let source = inventory
+        .bind_standalone_leaf_repair_source(inventory_ordinal)
+        .ok()?;
+    let source_scope = RegisteredArtifactSourceScope::from_source(source.root(), source.kind())?;
     let inventory_ordinal = u64::try_from(inventory_ordinal).ok()?;
 
     let mut hasher = Sha256::new();
@@ -461,7 +553,7 @@ fn registered_artifact_target(
     update_frame(&mut hasher, b"version_id", version_id.as_bytes());
     update_frame(&mut hasher, b"created_at", created_at.as_bytes());
     update_path_frame(&mut hasher, b"library_root", library_root);
-    update_path_frame(&mut hasher, b"runtime_root", runtime_cache.root());
+    update_path_frame(&mut hasher, b"runtime_root", runtime_root);
     update_frame(
         &mut hasher,
         b"inventory_ordinal",
@@ -496,32 +588,87 @@ fn registered_artifact_target(
         }
         KnownGoodIntegrity::Directory | KnownGoodIntegrity::LinkTarget(_) => return None,
     }
+    update_frame(
+        &mut hasher,
+        b"repair_provider_url",
+        source.provider_url().as_bytes(),
+    );
 
     let hex = format!("{:x}", hasher.finalize());
     let dotted = hex
         .as_bytes()
-        .chunks(8)
+        .chunks_exact(8)
         .map(|chunk| std::str::from_utf8(chunk).expect("SHA-256 hex is ASCII"))
         .collect::<Vec<_>>()
         .join(".");
-    Some(TargetDescriptor::new(
-        StabilizationSystem::Execution,
-        TargetKind::Artifact,
-        format!("sha256.{dotted}"),
-        OwnershipClass::LauncherManaged,
+    Some((
+        TargetDescriptor::new(
+            StabilizationSystem::Execution,
+            TargetKind::Artifact,
+            format!("leaf-v2.{dotted}"),
+            OwnershipClass::LauncherManaged,
+        ),
+        source_scope,
     ))
 }
 
-fn repairable_tier1_entry(entry: &KnownGoodEntry) -> bool {
-    matches!(entry.root(), KnownGoodRoot::Libraries)
-        && matches!(
-            entry.kind(),
-            KnownGoodArtifactKind::Library | KnownGoodArtifactKind::NativeLibrary
-        )
-        && matches!(
-            entry.integrity(),
-            KnownGoodIntegrity::Sha1 { .. } | KnownGoodIntegrity::ExactBytes { .. }
-        )
+#[cfg(test)]
+pub(crate) fn registered_artifact_target_for_test(
+    instance_id: &str,
+    version_id: &str,
+    created_at: &str,
+    library_root: &Path,
+    runtime_root: &Path,
+    inventory: &axial_minecraft::known_good::KnownGoodInventory,
+    inventory_ordinal: usize,
+) -> Option<TargetDescriptor> {
+    registered_artifact_target_from_inventory(
+        instance_id,
+        version_id,
+        created_at,
+        library_root,
+        runtime_root,
+        inventory,
+        inventory_ordinal,
+    )
+    .map(|(target, _)| target)
+}
+
+pub(super) fn recorded_artifact_target_has_live_provenance(
+    instance_id: &str,
+    version_id: &str,
+    created_at: &str,
+    library_root: &Path,
+    runtime_root: &Path,
+    inventory: &axial_minecraft::known_good::KnownGoodInventory,
+    attempt: &ReconciliationAttempt,
+) -> bool {
+    if attempt.diagnosis_id() != DiagnosisId::LauncherManagedArtifactCorrupt {
+        return false;
+    }
+    inventory
+        .entries()
+        .iter()
+        .enumerate()
+        .filter_map(|(inventory_ordinal, _)| {
+            registered_artifact_target_from_inventory(
+                instance_id,
+                version_id,
+                created_at,
+                library_root,
+                runtime_root,
+                inventory,
+                inventory_ordinal,
+            )
+        })
+        .filter(|(target, scope)| {
+            target == attempt.target()
+                && scope.domain() == attempt.domain()
+                && scope.component() == attempt.component()
+        })
+        .take(2)
+        .count()
+        == 1
 }
 
 fn update_frame(hasher: &mut Sha256, label: &[u8], value: &[u8]) {

@@ -3189,11 +3189,12 @@ mod tests {
     };
     use crate::state::contracts::{
         OperationId, ReconciliationComponent, ReconciliationRung, ReconciliationScope,
-        StabilizationSystem,
+        ReconciliationTerminalOutcome, StabilizationSystem,
     };
     use crate::state::{
         AppState, AppStateInit, IdleSweepSettlement, IdleSweepTerminal, InstallStore,
-        RegisteredArtifactRepairAuthorizationRejection, SessionStore,
+        RegisteredArtifactFindings, RegisteredArtifactRepairAuthorizationRejection,
+        RegisteredArtifactRepairEffect, SessionStore,
     };
     use axial_config::{AppConfig, AppPaths, ConfigStore, InstanceRegistrySnapshot, InstanceStore};
     use axial_minecraft::known_good::{
@@ -3929,6 +3930,22 @@ mod tests {
         state
             .mint_known_good_verification_lease(&foreground, lifecycle, expected_library_root)
             .expect("mint test verification lease")
+    }
+
+    async fn seal_registered_leaf_finding(
+        state: &AppState,
+        lifecycle: &InstanceLifecycleLease,
+        expected_library_root: &Path,
+        inventory_ordinal: usize,
+        condition: RegisteredArtifactCondition,
+    ) -> RegisteredArtifactFindings {
+        let lease = mint_test_verification_lease(state, lifecycle, expected_library_root).await;
+        let observation = lease
+            .registered_artifact_observation(inventory_ordinal, condition)
+            .expect("source-backed registered leaf observation");
+        state
+            .seal_registered_artifact_findings(lease, vec![observation])
+            .expect("sealed registered leaf finding")
     }
 
     const ZERO_SHA1: &str = "0000000000000000000000000000000000000000";
@@ -4836,7 +4853,10 @@ mod tests {
                 TestKnownGoodRoot::Assets,
                 "indexes/1.21.json",
                 KnownGoodArtifactKind::AssetIndex,
-                TestKnownGoodIntegrity::File { size: 14 },
+                TestKnownGoodIntegrity::Sha1 {
+                    digest: ZERO_SHA1.to_string(),
+                    size: 14,
+                },
             ),
             entry(
                 TestKnownGoodRoot::ManagedRuntime {
@@ -4848,6 +4868,21 @@ mod tests {
             ),
         ])
         .expect("inventory");
+        let asset_index_ordinal = inventory
+            .entries()
+            .iter()
+            .position(|entry| {
+                entry.root() == &KnownGoodRoot::Assets
+                    && entry.kind() == KnownGoodArtifactKind::AssetIndex
+                    && entry.path().as_str() == "indexes/1.21.json"
+            })
+            .expect("canonical asset index ordinal");
+        let inventory = inventory
+            .with_test_standalone_leaf_repair_source(
+                asset_index_ordinal,
+                "https://example.invalid/1.21.json",
+            )
+            .expect("source-backed asset index");
         state.activate_known_good_inventory_for_test(&instance.id, inventory);
         let lifecycle = state.acquire_instance_lifecycle(&instance.id).await;
         let lease =
@@ -4983,7 +5018,11 @@ mod tests {
                 TestKnownGoodIntegrity::File { size: 7 },
             ),
         ])
-        .expect("inventory");
+        .expect("inventory")
+        .with_test_standalone_leaf_repair_source(0, "https://example.invalid/private-corrupt.jar")
+        .expect("corrupt repair source")
+        .with_test_standalone_leaf_repair_source(1, "https://example.invalid/private-missing.jar")
+        .expect("missing repair source");
         state.activate_known_good_inventory_for_test(&instance.id, inventory);
         let foreground = test_integrity_foreground(&state).await;
         let lifecycle = state.acquire_instance_lifecycle(&instance.id).await;
@@ -5035,8 +5074,8 @@ mod tests {
             assert_eq!(target.system, StabilizationSystem::Execution);
             assert_eq!(target.kind, TargetKind::Artifact);
             assert_eq!(target.ownership, OwnershipClass::LauncherManaged);
-            assert_eq!(target.id.len(), 78);
-            assert!(target.id.starts_with("sha256."));
+            assert_eq!(target.id.len(), 79);
+            assert!(target.id.starts_with("leaf-v2."));
         }
         let fact_for = |observation| {
             report
@@ -5193,20 +5232,343 @@ mod tests {
         .expect("source-less Tier one report");
         let (_, findings) = report.into_parts();
         assert!(findings.repair_target().is_none());
-        let target = findings
-            .observations_for_test()
-            .next()
-            .expect("source-less finding")
-            .1
-            .clone();
-        assert!(matches!(
-            findings
-                .authorize_repair(&registered_artifact_decision(target, GuardianMode::Managed,)),
-            Err(RegisteredArtifactRepairAuthorizationRejection::RepairSourceUnavailable)
-        ));
+        assert!(findings.is_empty());
 
         drop(lifecycle);
         drop(foreground);
+        close_fixture(state, root).await;
+    }
+
+    #[tokio::test]
+    async fn assets_index_object_and_zero_byte_sources_admit_exact_missing_leaf_repairs() {
+        let object_bytes = b"source-backed-asset-object";
+        let object_digest = format!("{:x}", Sha1::digest(object_bytes));
+        let empty_digest = format!("{:x}", Sha1::digest([]));
+        let cases = [
+            (
+                "index",
+                "indexes/source-backed.json".to_string(),
+                KnownGoodArtifactKind::AssetIndex,
+                format!("{:x}", Sha1::digest(b"source-backed-index")),
+                b"source-backed-index".len() as u64,
+                "https://example.invalid/source-backed.json".to_string(),
+            ),
+            (
+                "object",
+                format!("objects/{}/{}", &object_digest[..2], object_digest),
+                KnownGoodArtifactKind::AssetObject,
+                object_digest.clone(),
+                object_bytes.len() as u64,
+                format!(
+                    "https://resources.download.minecraft.net/{}/{}",
+                    &object_digest[..2],
+                    object_digest
+                ),
+            ),
+            (
+                "zero-object",
+                format!("objects/{}/{}", &empty_digest[..2], empty_digest),
+                KnownGoodArtifactKind::AssetObject,
+                empty_digest.clone(),
+                0,
+                format!(
+                    "https://resources.download.minecraft.net/{}/{}",
+                    &empty_digest[..2],
+                    empty_digest
+                ),
+            ),
+        ];
+
+        for (label, path, kind, digest, size, provider_url) in cases {
+            let (state, root) = state_fixture(&format!("assets-leaf-{label}"), None);
+            let instance = state
+                .instances()
+                .insert_for_test("Assets registered leaf", "1.21.5")
+                .expect("instance");
+            let inventory = KnownGoodInventory::from_test_entries([entry(
+                TestKnownGoodRoot::Assets,
+                &path,
+                kind,
+                TestKnownGoodIntegrity::Sha1 { digest, size },
+            )])
+            .expect("Assets leaf inventory")
+            .with_test_standalone_leaf_repair_source(0, &provider_url)
+            .expect("Assets leaf source");
+            state.activate_known_good_inventory_for_test(&instance.id, inventory);
+            let destination = root.join("private-library-root/assets").join(&path);
+            fs::create_dir_all(
+                destination
+                    .parent()
+                    .expect("missing Assets leaf parent path"),
+            )
+            .unwrap_or_else(|error| panic!("create missing Assets {label} parent: {error}"));
+            assert!(!destination.exists(), "Assets {label} leaf must be missing");
+            let lifecycle = state.acquire_instance_lifecycle(&instance.id).await;
+            let findings = seal_registered_leaf_finding(
+                &state,
+                &lifecycle,
+                &root.join("private-library-root"),
+                0,
+                RegisteredArtifactCondition::Missing,
+            )
+            .await;
+            let candidate = findings
+                .repair_candidate()
+                .expect("Assets repair candidate");
+            assert_eq!(
+                candidate.domain(),
+                crate::guardian::GuardianDomain::Download
+            );
+            assert_eq!(candidate.target().id.len(), 79);
+            let provenance = candidate
+                .target()
+                .id
+                .strip_prefix("leaf-v2.")
+                .expect("truthful target prefix");
+            assert_eq!(provenance.len(), 71);
+            let segments = provenance.split('.').collect::<Vec<_>>();
+            assert_eq!(segments.len(), 8);
+            assert!(segments.iter().all(|segment| {
+                segment.len() == 8
+                    && segment
+                        .bytes()
+                        .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+            }));
+            let target = candidate.target().clone();
+            let authorization = findings
+                .authorize_repair(&registered_artifact_decision(target, GuardianMode::Managed))
+                .expect("Assets leaf authorization");
+            let admission = state
+                .admit_registered_artifact_repair(
+                    authorization,
+                    OperationId::new(format!("assets-leaf-{label}")),
+                    chrono::Duration::minutes(15),
+                )
+                .await
+                .expect("Assets leaf admission");
+
+            assert_eq!(
+                admission.effect(),
+                RegisteredArtifactRepairEffect::DownloadMissing
+            );
+            assert_eq!(
+                admission.attempt().domain(),
+                crate::guardian::GuardianDomain::Download
+            );
+            assert_eq!(
+                admission.attempt().component(),
+                ReconciliationComponent::Assets
+            );
+            assert_eq!(admission.download_contract().2, size);
+
+            drop((admission, lifecycle));
+            close_fixture(state, root).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn corrupt_asset_requires_component_rebuild_without_mutation_or_network() {
+        let expected = b"expected-asset-index";
+        let corrupt = vec![b'x'; expected.len()];
+        let (state, root) = state_fixture("corrupt-asset-component", None);
+        let instance = state
+            .instances()
+            .insert_for_test("Corrupt Assets registered leaf", "1.21.5")
+            .expect("instance");
+        let inventory = KnownGoodInventory::from_test_entries([entry(
+            TestKnownGoodRoot::Assets,
+            "indexes/corrupt.json",
+            KnownGoodArtifactKind::AssetIndex,
+            TestKnownGoodIntegrity::Sha1 {
+                digest: format!("{:x}", Sha1::digest(expected)),
+                size: expected.len() as u64,
+            },
+        )])
+        .expect("corrupt Assets inventory")
+        .with_test_standalone_leaf_repair_source(0, "http://127.0.0.1:0/unreachable")
+        .expect("corrupt Assets source");
+        state.activate_known_good_inventory_for_test(&instance.id, inventory);
+        let destination = root.join("private-library-root/assets/indexes/corrupt.json");
+        fs::create_dir_all(destination.parent().expect("Assets index parent"))
+            .expect("Assets index parent");
+        fs::write(&destination, &corrupt).expect("corrupt Assets index");
+        let lifecycle = state.acquire_instance_lifecycle(&instance.id).await;
+        let findings = seal_registered_leaf_finding(
+            &state,
+            &lifecycle,
+            &root.join("private-library-root"),
+            0,
+            RegisteredArtifactCondition::Corrupt,
+        )
+        .await;
+        let target = findings
+            .repair_target()
+            .expect("Assets repair target")
+            .clone();
+        let authorization = findings
+            .authorize_repair(&registered_artifact_decision(
+                target.clone(),
+                GuardianMode::Managed,
+            ))
+            .expect("corrupt Assets authorization");
+        let operation_id = OperationId::new("corrupt-asset-component");
+        let admission = state
+            .admit_registered_artifact_repair(
+                authorization,
+                operation_id.clone(),
+                chrono::Duration::minutes(15),
+            )
+            .await
+            .expect("corrupt Assets admission");
+        assert_eq!(
+            admission.effect(),
+            RegisteredArtifactRepairEffect::ComponentRebuildRequired
+        );
+        let outcome =
+            execute_registered_guardian_artifact_repair(admission, &reqwest::Client::new())
+                .await
+                .expect("corrupt Assets leaf settlement");
+
+        assert_eq!(outcome.status, GuardianArtifactRepairStatus::Failed);
+        assert_eq!(
+            fs::read(&destination).expect("unchanged Assets index"),
+            corrupt
+        );
+        assert_eq!(
+            fs::read_dir(destination.parent().expect("Assets index parent"))
+                .expect("list Assets indexes")
+                .count(),
+            1
+        );
+        let journal = state
+            .journals()
+            .get(&operation_id)
+            .expect("Assets leaf journal");
+        assert!(journal.planned_steps.iter().all(|step| {
+            !step.step_id.contains("quarantine")
+                && !step.step_id.contains("download")
+                && !step.step_id.contains("promote")
+        }));
+        assert_eq!(
+            journal
+                .completed_steps
+                .last()
+                .expect("Assets failure step")
+                .step_id,
+            "require_registered_artifact_component_rebuild"
+        );
+        let terminal = journal
+            .reconciliation_terminal()
+            .expect("Assets failed terminal");
+        assert_eq!(terminal.outcome(), ReconciliationTerminalOutcome::Failed);
+        assert_eq!(terminal.component(), ReconciliationComponent::Assets);
+        assert_eq!(terminal.domain(), crate::guardian::GuardianDomain::Download);
+        assert_eq!(terminal.target(), &target);
+        assert!(terminal.quarantined_target().is_none());
+        assert!(
+            state
+                .failure_memory()
+                .get(&crate::state::reconciliation_attempt_key(
+                    terminal.attempt()
+                ))
+                .is_some()
+        );
+        let evidence = state
+            .recorded_artifact_repair_failure(&lifecycle, &operation_id)
+            .expect("settled Assets predecessor");
+        let component = state
+            .admit_component_rebuild(
+                evidence,
+                OperationId::new("corrupt-asset-component-rebuild"),
+                chrono::Duration::minutes(15),
+            )
+            .await
+            .expect("adjacent Assets component admission");
+        assert_eq!(
+            component.attempt().component(),
+            ReconciliationComponent::Assets
+        );
+        assert_eq!(component.attempt().target(), &target);
+
+        drop((component, lifecycle));
+        close_fixture(state, root).await;
+    }
+
+    #[tokio::test]
+    async fn missing_asset_index_downloads_and_settles_exact_assets_terminal() {
+        let body = b"missing-asset-index".to_vec();
+        let digest = format!("{:x}", Sha1::digest(&body));
+        let server = RegisteredArtifactServer::start(body.clone());
+        let (state, root) = state_fixture("missing-asset-index", None);
+        let instance = state
+            .instances()
+            .insert_for_test("Missing Assets registered leaf", "1.21.5")
+            .expect("instance");
+        let inventory = KnownGoodInventory::from_test_entries([entry(
+            TestKnownGoodRoot::Assets,
+            "indexes/missing.json",
+            KnownGoodArtifactKind::AssetIndex,
+            TestKnownGoodIntegrity::Sha1 {
+                digest,
+                size: body.len() as u64,
+            },
+        )])
+        .expect("missing Assets inventory")
+        .with_test_standalone_leaf_repair_source(0, &server.url)
+        .expect("missing Assets source");
+        state.activate_known_good_inventory_for_test(&instance.id, inventory);
+        let destination = root.join("private-library-root/assets/indexes/missing.json");
+        fs::create_dir_all(destination.parent().expect("missing Assets index parent"))
+            .expect("create missing Assets index parent");
+        assert!(!destination.exists(), "Assets index leaf must be missing");
+        let lifecycle = state.acquire_instance_lifecycle(&instance.id).await;
+        let findings = seal_registered_leaf_finding(
+            &state,
+            &lifecycle,
+            &root.join("private-library-root"),
+            0,
+            RegisteredArtifactCondition::Missing,
+        )
+        .await;
+        let target = findings
+            .repair_target()
+            .expect("Assets repair target")
+            .clone();
+        let authorization = findings
+            .authorize_repair(&registered_artifact_decision(
+                target.clone(),
+                GuardianMode::Managed,
+            ))
+            .expect("missing Assets authorization");
+        let operation_id = OperationId::new("missing-asset-index");
+        let admission = state
+            .admit_registered_artifact_repair(
+                authorization,
+                operation_id.clone(),
+                chrono::Duration::minutes(15),
+            )
+            .await
+            .expect("missing Assets admission");
+        let outcome =
+            execute_registered_guardian_artifact_repair(admission, &reqwest::Client::new())
+                .await
+                .expect("missing Assets repair");
+
+        assert_eq!(outcome.status, GuardianArtifactRepairStatus::Repaired);
+        assert_eq!(fs::read(destination).expect("repaired Assets index"), body);
+        let terminal = state
+            .journals()
+            .get(&operation_id)
+            .and_then(|journal| journal.reconciliation_terminal().cloned())
+            .expect("successful Assets terminal");
+        assert_eq!(terminal.outcome(), ReconciliationTerminalOutcome::Succeeded);
+        assert_eq!(terminal.component(), ReconciliationComponent::Assets);
+        assert_eq!(terminal.domain(), crate::guardian::GuardianDomain::Download);
+        assert_eq!(terminal.target(), &target);
+        assert!(terminal.quarantined_target().is_none());
+
+        drop(lifecycle);
+        server.close();
         close_fixture(state, root).await;
     }
 

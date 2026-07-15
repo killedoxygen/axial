@@ -108,11 +108,14 @@ pub(crate) use reconciliation::{
     record_reconciliation_journal_failure, record_reconciliation_journal_success,
     reserve_reconciliation_attempt, settle_reconciliation_memory, validate_reconciliation_memory,
 };
-#[cfg(test)]
-pub(crate) use registered_artifact_findings::RegisteredArtifactRepairAuthorizationRejection;
 pub(crate) use registered_artifact_findings::{
     RegisteredArtifactCondition, RegisteredArtifactFindings, RegisteredArtifactObservation,
-    RegisteredArtifactRepairAdmission, RegisteredArtifactRepairEffect,
+    RegisteredArtifactRepairAdmission, RegisteredArtifactRepairCandidate,
+    RegisteredArtifactRepairEffect,
+};
+#[cfg(test)]
+pub(crate) use registered_artifact_findings::{
+    RegisteredArtifactRepairAuthorizationRejection, registered_artifact_target_for_test,
 };
 pub(crate) use remote_flags::{
     RemoteFlagRefreshOutcome, RemoteFlagStore, ResolvedFlagSource, resolve_flag,

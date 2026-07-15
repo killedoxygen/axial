@@ -86,7 +86,7 @@ struct ArtifactRepairContext<'a> {
     client: &'a Client,
     journals: &'a OperationJournalStore,
     failure_memory: &'a GuardianFailureMemoryStore,
-    quarantines_existing: bool,
+    effect: RegisteredArtifactRepairEffect,
     attempt: ReconciliationAttempt,
     reservation: Option<ReconciliationAttemptReservation>,
     admission: &'a RegisteredArtifactRepairAdmission,
@@ -98,13 +98,11 @@ pub(crate) async fn execute_registered_guardian_artifact_repair(
 ) -> Result<GuardianArtifactRepairOutcome, OperationJournalStoreError> {
     let attempt = admission.attempt().clone();
     let operation_id = attempt.operation_id().clone();
-    let quarantines_existing =
-        admission.effect() == RegisteredArtifactRepairEffect::QuarantineRedownload;
     let mut context = ArtifactRepairContext {
         client,
         journals: admission.authority().journals(),
         failure_memory: admission.authority().failure_memory(),
-        quarantines_existing,
+        effect: admission.effect(),
         attempt,
         reservation: None,
         admission: &admission,
@@ -170,25 +168,18 @@ async fn execute_admitted_artifact_repair(
         let state = admission.physical_state().await;
         if state
             == Some(crate::execution::registered_artifact::RegisteredArtifactPhysicalState::Exact)
+            && admission.evidence_is_current()
         {
-            let (_, expected_sha1, expected_size) = admission.download_contract();
-            if admission
-                .mutation()
-                .verify_exact(expected_sha1, expected_size)
-                .await
-                && admission.evidence_is_current()
-            {
-                return finish_artifact_repair(
-                    &context,
-                    operation_id,
-                    ArtifactTerminal::Repaired {
-                        step_id: "registered_artifact_already_exact",
-                        facts: Vec::new(),
-                        quarantined_target: None,
-                    },
-                )
-                .await;
-            }
+            return finish_artifact_repair(
+                &context,
+                operation_id,
+                ArtifactTerminal::Repaired {
+                    step_id: "registered_artifact_already_exact",
+                    facts: Vec::new(),
+                    quarantined_target: None,
+                },
+            )
+            .await;
         }
         let expected = match admission.effect() {
             RegisteredArtifactRepairEffect::DownloadMissing => {
@@ -197,21 +188,11 @@ async fn execute_admitted_artifact_repair(
             RegisteredArtifactRepairEffect::QuarantineRedownload => {
                 crate::execution::registered_artifact::RegisteredArtifactPhysicalState::Corrupt
             }
-            RegisteredArtifactRepairEffect::AlreadyExact => {
-                return finish_artifact_repair(
-                    &context,
-                    operation_id,
-                    ArtifactTerminal::Failed {
-                        step_id: "revalidate_registered_artifact_condition",
-                        rollback: RollbackState::NotApplicable,
-                        facts: Vec::new(),
-                        quarantined_target: None,
-                    },
-                )
-                .await;
+            RegisteredArtifactRepairEffect::ComponentRebuildRequired => {
+                crate::execution::registered_artifact::RegisteredArtifactPhysicalState::Corrupt
             }
         };
-        if state != Some(expected) {
+        if state != Some(expected) || !admission.evidence_is_current() {
             return finish_artifact_repair(
                 &context,
                 operation_id,
@@ -224,9 +205,22 @@ async fn execute_admitted_artifact_repair(
             )
             .await;
         }
+        if admission.effect() == RegisteredArtifactRepairEffect::ComponentRebuildRequired {
+            return finish_artifact_repair(
+                &context,
+                operation_id,
+                ArtifactTerminal::Failed {
+                    step_id: "require_registered_artifact_component_rebuild",
+                    rollback: RollbackState::NotApplicable,
+                    facts: Vec::new(),
+                    quarantined_target: None,
+                },
+            )
+            .await;
+        }
     }
 
-    let quarantined_target = if context.quarantines_existing {
+    let quarantined_target = if context.quarantines_existing() {
         let quarantine_facts = match context
             .admission
             .mutation()
@@ -349,7 +343,7 @@ async fn execute_admitted_artifact_repair(
                     operation_id,
                     ArtifactTerminal::Failed {
                         step_id: "verify_registered_artifact_postcondition",
-                        rollback: if context.quarantines_existing {
+                        rollback: if context.quarantines_existing() {
                             RollbackState::Available
                         } else {
                             RollbackState::Unavailable
@@ -379,7 +373,7 @@ async fn execute_admitted_artifact_repair(
                     operation_id,
                     ArtifactTerminal::Failed {
                         step_id: "revalidate_registered_artifact_authority",
-                        rollback: if context.quarantines_existing {
+                        rollback: if context.quarantines_existing() {
                             RollbackState::Available
                         } else {
                             RollbackState::Unavailable
@@ -395,7 +389,7 @@ async fn execute_admitted_artifact_repair(
                 operation_id,
                 ArtifactTerminal::Failed {
                     step_id: "download_artifact_to_temp",
-                    rollback: if context.quarantines_existing {
+                    rollback: if context.quarantines_existing() {
                         RollbackState::Available
                     } else {
                         RollbackState::Unavailable
@@ -962,10 +956,31 @@ fn artifact_repair_steps(
         ("promote_verified_artifact", RollbackState::Available),
         ("record_repair_outcome", RollbackState::NotApplicable),
     ];
-    if context.quarantines_existing {
-        &QUARANTINE_REDOWNLOAD
-    } else {
-        &MISSING_DOWNLOAD
+    const COMPONENT_REBUILD_REQUIRED: [(&str, RollbackState); 4] = [
+        ("journal_repair_start", RollbackState::NotApplicable),
+        (
+            "registered_artifact_already_exact",
+            RollbackState::NotApplicable,
+        ),
+        (
+            "require_registered_artifact_component_rebuild",
+            RollbackState::NotApplicable,
+        ),
+        ("record_repair_outcome", RollbackState::NotApplicable),
+    ];
+    match context.effect {
+        RegisteredArtifactRepairEffect::DownloadMissing => &MISSING_DOWNLOAD,
+        RegisteredArtifactRepairEffect::QuarantineRedownload => &QUARANTINE_REDOWNLOAD,
+        RegisteredArtifactRepairEffect::ComponentRebuildRequired => &COMPONENT_REBUILD_REQUIRED,
+    }
+}
+
+impl ArtifactRepairContext<'_> {
+    const fn quarantines_existing(&self) -> bool {
+        matches!(
+            self.effect,
+            RegisteredArtifactRepairEffect::QuarantineRedownload
+        )
     }
 }
 

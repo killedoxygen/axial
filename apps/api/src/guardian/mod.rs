@@ -99,6 +99,7 @@ pub(crate) use install_evidence::{
 };
 pub(crate) use integrity::{
     TIER2_INTEGRITY_COUNTER_TOKEN_COUNT, Tier2IntegrityGuardianEvidence,
+    Tier2RegisteredArtifactAssessment, assess_tier2_registered_artifact_repair,
     tier2_integrity_guardian_evidence,
 };
 pub use jvm_preset::{
