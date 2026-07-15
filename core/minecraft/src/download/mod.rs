@@ -30,6 +30,10 @@ pub(crate) use install::{
     RetainedVersionBundleReconstructionSources, prepare_local_managed_install,
     publish_managed_projection_sequence, publish_prepared_managed_install,
 };
+#[cfg(test)]
+pub(crate) use install::{
+    ManagedProjectionSequenceFault, publish_managed_projection_sequence_with_fault,
+};
 pub(crate) use install::{
     reconstruct_installer_library_declarations, reconstruct_installer_processor_sources,
     reconstruct_profile_library_declarations,
