@@ -15,6 +15,7 @@ use super::{
 };
 use crate::execution::{ExecutionFact, ExecutionFactKind};
 use crate::observability::{EvidenceField, EvidenceSensitivity};
+use crate::state::RegisteredArtifactRepairCandidate;
 use crate::state::contracts::{
     OperationId, OperationPhase, OwnershipClass, RollbackState, StabilizationSystem,
     TargetDescriptor, TargetKind,
@@ -242,7 +243,11 @@ async fn startup_integrity_facts_share_one_policy_evaluation() {
             },
             crash_evidence: None,
             integrity_facts: &integrity_facts,
-            registered_artifact_repair_target: integrity_facts[0].target.as_ref(),
+            registered_artifact_repair_candidate: integrity_facts[0].target.as_ref().map(
+                |target| {
+                    RegisteredArtifactRepairCandidate::for_test(target, GuardianDomain::Library)
+                },
+            ),
             target_version_id: "1.21.1",
             runtime_major: 21,
             requested_java_present: false,
@@ -1753,7 +1758,7 @@ impl NamedPolicyBoundaryCase {
                     observation: GuardianStartupFailureObservation::Stalled,
                     crash_evidence: None,
                     integrity_facts: &[],
-                    registered_artifact_repair_target: None,
+                    registered_artifact_repair_candidate: None,
                     target_version_id: "1.21.1",
                     runtime_major: 21,
                     requested_java_present: false,

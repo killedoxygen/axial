@@ -17,11 +17,11 @@ use crate::state::{
     OperationJournalReconciliation, OperationJournalStore, OperationJournalStoreError,
     ReconciliationAttemptReservation, RegisteredArtifactFailedRepair,
     RegisteredArtifactRepairAdmission, RegisteredArtifactRepairEffect,
-    RegisteredArtifactRepairMemoryReceipt, operation_journal_completed_step_is_visible,
-    operation_journal_plan_is_visible, reconciliation_attempt_key, reconciliation_instance_target,
-    reconciliation_journal_attempt, record_reconciliation_journal_failure,
-    record_reconciliation_journal_success, reserve_reconciliation_attempt,
-    settle_reconciliation_memory,
+    RegisteredArtifactRepairMemoryReceipt, RegisteredArtifactRepairPlanRef,
+    operation_journal_completed_step_is_visible, operation_journal_plan_is_visible,
+    reconciliation_attempt_key, reconciliation_instance_target, reconciliation_journal_attempt,
+    record_reconciliation_journal_failure, record_reconciliation_journal_success,
+    reserve_reconciliation_attempt, settle_reconciliation_memory,
 };
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -181,7 +181,7 @@ async fn execute_admitted_artifact_repair(
         return Err(error);
     }
 
-    {
+    let download_plan = {
         let admission = context.admission;
         if !admission.evidence_is_live() {
             return finish_artifact_repair(
@@ -212,17 +212,7 @@ async fn execute_admitted_artifact_repair(
             )
             .await;
         }
-        let expected = match admission.effect() {
-            RegisteredArtifactRepairEffect::DownloadMissing => {
-                crate::execution::registered_artifact::RegisteredArtifactPhysicalState::Missing
-            }
-            RegisteredArtifactRepairEffect::QuarantineRedownload => {
-                crate::execution::registered_artifact::RegisteredArtifactPhysicalState::Corrupt
-            }
-            RegisteredArtifactRepairEffect::ComponentRebuildRequired => {
-                crate::execution::registered_artifact::RegisteredArtifactPhysicalState::Corrupt
-            }
-        };
+        let expected = admission.expected_physical_state();
         if state != Some(expected) || !admission.evidence_is_live() {
             return finish_artifact_repair(
                 &context,
@@ -236,20 +226,23 @@ async fn execute_admitted_artifact_repair(
             )
             .await;
         }
-        if admission.effect() == RegisteredArtifactRepairEffect::ComponentRebuildRequired {
-            return finish_artifact_repair(
-                &context,
-                operation_id,
-                ArtifactTerminal::Failed {
-                    step_id: crate::state::REGISTERED_ARTIFACT_COMPONENT_REBUILD_FAILURE_POINT,
-                    rollback: RollbackState::NotApplicable,
-                    facts: Vec::new(),
-                    quarantined_target: None,
-                },
-            )
-            .await;
+        match admission.plan() {
+            RegisteredArtifactRepairPlanRef::Download(plan) => plan,
+            RegisteredArtifactRepairPlanRef::ComponentRebuildRequired => {
+                return finish_artifact_repair(
+                    &context,
+                    operation_id,
+                    ArtifactTerminal::Failed {
+                        step_id: crate::state::REGISTERED_ARTIFACT_COMPONENT_REBUILD_FAILURE_POINT,
+                        rollback: RollbackState::NotApplicable,
+                        facts: Vec::new(),
+                        quarantined_target: None,
+                    },
+                )
+                .await;
+            }
         }
-    }
+    };
 
     let quarantined_target = if context.quarantines_existing() {
         let quarantine_facts = match context
@@ -341,16 +334,15 @@ async fn execute_admitted_artifact_repair(
     let download_result = if !context.admission.evidence_is_live() {
         Err(Vec::new())
     } else {
-        let (provider_url, expected_sha1, expected_size) = context.admission.download_contract();
         context
             .admission
             .mutation()
             .download_verify_promote(
                 &operation_id,
                 &target,
-                provider_url,
-                expected_sha1,
-                expected_size,
+                download_plan.provider_url(),
+                download_plan.expected_sha1(),
+                download_plan.expected_size(),
                 context.client,
             )
             .await
@@ -361,11 +353,10 @@ async fn execute_admitted_artifact_repair(
     match download_result {
         Ok(facts) => {
             let fact_ids = fact_ids(&facts);
-            let (_, expected_sha1, expected_size) = context.admission.download_contract();
             if !context
                 .admission
                 .mutation()
-                .verify_exact(expected_sha1, expected_size)
+                .verify_exact(download_plan.expected_sha1(), download_plan.expected_size())
                 .await
                 || !context.admission.evidence_is_live()
             {
@@ -1096,7 +1087,8 @@ mod persistence_contract_tests {
             .seal_registered_artifact_findings(verification, vec![observation])
             .expect("seal corrupt Assets finding");
         let target = findings
-            .repair_target()
+            .repair_candidate()
+            .map(|candidate| candidate.target())
             .expect("corrupt Assets repair target")
             .clone();
         let authorization = findings

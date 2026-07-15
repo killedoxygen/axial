@@ -55,7 +55,7 @@ pub(crate) use artifact_repair::{
 pub(crate) use component_rebuild::{
     GuardianComponentRebuildOutcome, GuardianComponentRebuildStatus,
     execute_managed_assets_component_rebuild, execute_managed_libraries_component_rebuild,
-    execute_managed_runtime_component_rebuild,
+    execute_managed_runtime_component_rebuild, execute_managed_version_bundle_component_rebuild,
 };
 #[cfg(test)]
 pub(crate) use component_rebuild::{

@@ -43,6 +43,7 @@ pub use known_good_reconstruction::{
 pub use known_good_reconstruction::{
     rebuild_managed_assets_fixture_for_test, rebuild_managed_libraries_fixture_for_test,
     rebuild_managed_version_bundle_fixture_for_test,
+    rebuild_managed_version_bundle_rollback_fixture_for_test,
 };
 pub use launch::{
     JavaVersion, LaunchModelError, LaunchVars, ResolvedLibrary, VersionJson, build_classpath,

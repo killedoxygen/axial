@@ -68,31 +68,32 @@ struct RegisteredArtifactFinding {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct RegisteredArtifactRepairCandidate<'a> {
+pub struct RegisteredArtifactRepairCandidate<'a> {
     target: &'a TargetDescriptor,
     domain: GuardianDomain,
 }
 
-impl RegisteredArtifactRepairCandidate<'_> {
-    pub(crate) const fn target(&self) -> &TargetDescriptor {
+impl<'a> RegisteredArtifactRepairCandidate<'a> {
+    pub(crate) const fn target(self) -> &'a TargetDescriptor {
         self.target
     }
 
-    pub(crate) const fn domain(&self) -> GuardianDomain {
+    pub(crate) const fn domain(self) -> GuardianDomain {
         self.domain
     }
 
     #[cfg(test)]
     pub(crate) const fn for_test(
-        target: &TargetDescriptor,
+        target: &'a TargetDescriptor,
         domain: GuardianDomain,
-    ) -> RegisteredArtifactRepairCandidate<'_> {
+    ) -> RegisteredArtifactRepairCandidate<'a> {
         RegisteredArtifactRepairCandidate { target, domain }
     }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RegisteredArtifactSourceScope {
+    VersionBundle,
     Libraries,
     Assets,
 }
@@ -114,8 +115,15 @@ impl RegisteredArtifactProvenance {
 }
 
 impl RegisteredArtifactSourceScope {
-    fn from_source(root: &KnownGoodRoot, kind: KnownGoodArtifactKind) -> Option<Self> {
+    fn from_entry(root: &KnownGoodRoot, kind: KnownGoodArtifactKind) -> Option<Self> {
         match (root, kind) {
+            (
+                KnownGoodRoot::Versions,
+                KnownGoodArtifactKind::VersionMetadata | KnownGoodArtifactKind::ClientJar,
+            )
+            | (KnownGoodRoot::Assets, KnownGoodArtifactKind::LogConfig) => {
+                Some(Self::VersionBundle)
+            }
             (
                 KnownGoodRoot::Libraries,
                 KnownGoodArtifactKind::Library | KnownGoodArtifactKind::NativeLibrary,
@@ -130,6 +138,7 @@ impl RegisteredArtifactSourceScope {
 
     const fn domain(self) -> GuardianDomain {
         match self {
+            Self::VersionBundle => GuardianDomain::Launch,
             Self::Libraries => GuardianDomain::Library,
             Self::Assets => GuardianDomain::Download,
         }
@@ -137,15 +146,27 @@ impl RegisteredArtifactSourceScope {
 
     const fn component(self) -> ReconciliationComponent {
         match self {
+            Self::VersionBundle => ReconciliationComponent::VersionBundle,
             Self::Libraries => ReconciliationComponent::Libraries,
             Self::Assets => ReconciliationComponent::Assets,
         }
     }
 
-    const fn corrupt_effect(self) -> RegisteredArtifactRepairEffect {
-        match self {
-            Self::Libraries => RegisteredArtifactRepairEffect::QuarantineRedownload,
-            Self::Assets => RegisteredArtifactRepairEffect::ComponentRebuildRequired,
+    const fn effect(
+        self,
+        condition: RegisteredArtifactCondition,
+    ) -> RegisteredArtifactRepairEffect {
+        match (self, condition) {
+            (Self::VersionBundle, _) => RegisteredArtifactRepairEffect::ComponentRebuildRequired,
+            (_, RegisteredArtifactCondition::Missing) => {
+                RegisteredArtifactRepairEffect::DownloadMissing
+            }
+            (Self::Libraries, RegisteredArtifactCondition::Corrupt) => {
+                RegisteredArtifactRepairEffect::QuarantineRedownload
+            }
+            (Self::Assets, RegisteredArtifactCondition::Corrupt) => {
+                RegisteredArtifactRepairEffect::ComponentRebuildRequired
+            }
         }
     }
 }
@@ -175,14 +196,41 @@ pub(crate) struct RegisteredArtifactRepairAdmission {
     observation: RegisteredArtifactObservation,
     inventory: Arc<axial_minecraft::known_good::KnownGoodInventory>,
     mutation: RegisteredArtifactMutationCapability,
-    effect: RegisteredArtifactRepairEffect,
-    provider_url: String,
-    expected_sha1: String,
-    expected_size: u64,
+    plan: RegisteredArtifactRepairPlan,
     _component_mutation: super::sessions::SharedComponentMutationLease,
     _config_mutation: tokio::sync::OwnedMutexGuard<()>,
     #[cfg(test)]
     lifetime: Arc<()>,
+}
+
+enum RegisteredArtifactRepairPlan {
+    DownloadMissing {
+        provider_url: String,
+        expected_sha1: String,
+        expected_size: u64,
+    },
+    QuarantineRedownload {
+        provider_url: String,
+        expected_sha1: String,
+        expected_size: u64,
+    },
+    ComponentRebuild {
+        expected_sha1: String,
+        expected_size: u64,
+    },
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum RegisteredArtifactRepairPlanRef<'a> {
+    Download(RegisteredArtifactDownloadPlan<'a>),
+    ComponentRebuildRequired,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct RegisteredArtifactDownloadPlan<'a> {
+    provider_url: &'a str,
+    expected_sha1: &'a str,
+    expected_size: u64,
 }
 
 #[must_use]
@@ -203,7 +251,7 @@ pub(crate) enum RegisteredArtifactRepairAuthorizationRejection {
     NonManagedRepair,
     InvalidRepairPlan,
     AmbiguousFinding,
-    RepairSourceUnavailable,
+    RepairAuthorityUnavailable,
 }
 
 impl RegisteredArtifactFindings {
@@ -216,19 +264,12 @@ impl RegisteredArtifactFindings {
         self.findings.is_empty()
     }
 
-    pub(crate) fn repair_target(&self) -> Option<&TargetDescriptor> {
-        self.selected_repair_finding()
-            .map(|finding| &finding.target)
-    }
-
     pub(crate) fn repair_candidate(&self) -> Option<RegisteredArtifactRepairCandidate<'_>> {
         let finding = self.selected_repair_finding()?;
-        let source = self
-            .authority
-            .inventory
-            .bind_standalone_leaf_repair_source(finding.observation.inventory_ordinal)
-            .ok()?;
-        let scope = RegisteredArtifactSourceScope::from_source(source.root(), source.kind())?;
+        let scope = registered_artifact_scope(
+            &self.authority.inventory,
+            finding.observation.inventory_ordinal,
+        )?;
         Some(RegisteredArtifactRepairCandidate {
             target: &finding.target,
             domain: scope.domain(),
@@ -275,7 +316,7 @@ impl RegisteredArtifactFindings {
 
         let finding = self
             .selected_repair_finding()
-            .ok_or(RegisteredArtifactRepairAuthorizationRejection::RepairSourceUnavailable)?;
+            .ok_or(RegisteredArtifactRepairAuthorizationRejection::RepairAuthorityUnavailable)?;
         if !plan.actions.iter().any(|action| {
             action.kind == GuardianActionKind::Repair
                 && action.reason == DiagnosisId::LauncherManagedArtifactCorrupt
@@ -284,10 +325,11 @@ impl RegisteredArtifactFindings {
         }) {
             return Err(RegisteredArtifactRepairAuthorizationRejection::AmbiguousFinding);
         }
-        self.authority
-            .inventory
-            .bind_standalone_leaf_repair_source(finding.observation.inventory_ordinal)
-            .map_err(|_| RegisteredArtifactRepairAuthorizationRejection::RepairSourceUnavailable)?;
+        registered_artifact_scope(
+            &self.authority.inventory,
+            finding.observation.inventory_ordinal,
+        )
+        .ok_or(RegisteredArtifactRepairAuthorizationRejection::RepairAuthorityUnavailable)?;
         let observation = finding.observation;
         let target = finding.target.clone();
         Ok(RegisteredArtifactRepairAuthorization {
@@ -303,10 +345,11 @@ impl RegisteredArtifactFindings {
         self.findings
             .iter()
             .filter(|finding| {
-                self.authority
-                    .inventory
-                    .bind_standalone_leaf_repair_source(finding.observation.inventory_ordinal)
-                    .is_ok()
+                registered_artifact_scope(
+                    &self.authority.inventory,
+                    finding.observation.inventory_ordinal,
+                )
+                .is_some()
             })
             .min_by_key(|finding| finding.observation.inventory_ordinal)
     }
@@ -314,22 +357,40 @@ impl RegisteredArtifactFindings {
     #[cfg(test)]
     pub(crate) fn observations_for_test(
         &self,
-    ) -> impl Iterator<Item = (RegisteredArtifactObservation, &TargetDescriptor)> {
-        self.findings
-            .iter()
-            .map(|finding| (finding.observation, &finding.target))
+    ) -> impl Iterator<
+        Item = (
+            RegisteredArtifactObservation,
+            &TargetDescriptor,
+            GuardianDomain,
+            ReconciliationComponent,
+        ),
+    > {
+        self.findings.iter().map(|finding| {
+            let scope = registered_artifact_scope(
+                &self.authority.inventory,
+                finding.observation.inventory_ordinal,
+            )
+            .expect("sealed registered artifact finding retains its exact scope");
+            (
+                finding.observation,
+                &finding.target,
+                scope.domain(),
+                scope.component(),
+            )
+        })
     }
 }
 
 impl RegisteredArtifactRepairAuthorization {
-    pub(super) fn exact_assets_identity(
+    pub(super) fn exact_recovery_identity(
         &self,
         state: &AppState,
     ) -> Result<
         (
             &KnownGoodVerificationLease,
             usize,
-            RegisteredArtifactCondition,
+            ReconciliationComponent,
+            RegisteredArtifactRepairEffect,
         ),
         ReconciliationEvidenceRejection,
     > {
@@ -343,23 +404,19 @@ impl RegisteredArtifactRepairAuthorization {
             return Err(ReconciliationEvidenceRejection::IncarnationMismatch);
         }
         let inventory_ordinal = self.observation.inventory_ordinal;
-        let source = self
-            .findings
-            .authority
-            .inventory
-            .bind_standalone_leaf_repair_source(inventory_ordinal)
-            .map_err(|_| ReconciliationEvidenceRejection::RootAuthorityUnavailable)?;
-        if RegisteredArtifactSourceScope::from_source(source.root(), source.kind())
-            != Some(RegisteredArtifactSourceScope::Assets)
-            || registered_artifact_target(&self.findings.authority, inventory_ordinal).as_ref()
-                != Some(&self.target)
+        let scope =
+            registered_artifact_scope(&self.findings.authority.inventory, inventory_ordinal)
+                .ok_or(ReconciliationEvidenceRejection::RootAuthorityUnavailable)?;
+        if registered_artifact_target(&self.findings.authority, inventory_ordinal).as_ref()
+            != Some(&self.target)
         {
             return Err(ReconciliationEvidenceRejection::ScopeMismatch);
         }
         Ok((
             &self.findings.authority,
             inventory_ordinal,
-            self.observation.condition,
+            scope.component(),
+            scope.effect(self.observation.condition),
         ))
     }
 
@@ -392,7 +449,17 @@ impl RegisteredArtifactRepairAdmission {
     }
 
     pub(crate) const fn effect(&self) -> RegisteredArtifactRepairEffect {
-        self.effect
+        match &self.plan {
+            RegisteredArtifactRepairPlan::DownloadMissing { .. } => {
+                RegisteredArtifactRepairEffect::DownloadMissing
+            }
+            RegisteredArtifactRepairPlan::QuarantineRedownload { .. } => {
+                RegisteredArtifactRepairEffect::QuarantineRedownload
+            }
+            RegisteredArtifactRepairPlan::ComponentRebuild { .. } => {
+                RegisteredArtifactRepairEffect::ComponentRebuildRequired
+            }
+        }
     }
 
     #[cfg(test)]
@@ -404,26 +471,67 @@ impl RegisteredArtifactRepairAdmission {
         &self.mutation
     }
 
-    pub(crate) fn download_contract(&self) -> (&str, &str, u64) {
-        (&self.provider_url, &self.expected_sha1, self.expected_size)
+    pub(crate) fn plan(&self) -> RegisteredArtifactRepairPlanRef<'_> {
+        match &self.plan {
+            RegisteredArtifactRepairPlan::DownloadMissing {
+                provider_url,
+                expected_sha1,
+                expected_size,
+            }
+            | RegisteredArtifactRepairPlan::QuarantineRedownload {
+                provider_url,
+                expected_sha1,
+                expected_size,
+            } => RegisteredArtifactRepairPlanRef::Download(RegisteredArtifactDownloadPlan {
+                provider_url,
+                expected_sha1,
+                expected_size: *expected_size,
+            }),
+            RegisteredArtifactRepairPlan::ComponentRebuild { .. } => {
+                RegisteredArtifactRepairPlanRef::ComponentRebuildRequired
+            }
+        }
     }
 
     pub(crate) fn evidence_is_live(&self) -> bool {
         self.authority
             .registered_artifact_findings_are_live(&self.findings)
             && Arc::ptr_eq(&self.inventory, &self.findings.authority.inventory)
-            && self
-                .inventory
-                .bind_standalone_leaf_repair_source(self.observation.inventory_ordinal)
-                .is_ok()
+            && registered_artifact_scope(&self.inventory, self.observation.inventory_ordinal)
+                .is_some()
             && self.authority.attempt_is_current(&self.attempt)
             && self.mutation.is_current()
     }
 
     pub(crate) async fn physical_state(&self) -> Option<RegisteredArtifactPhysicalState> {
-        self.mutation
-            .classify(&self.expected_sha1, self.expected_size)
-            .await
+        let (expected_sha1, expected_size) = self.expected_integrity();
+        self.mutation.classify(expected_sha1, expected_size).await
+    }
+
+    fn expected_integrity(&self) -> (&str, u64) {
+        match &self.plan {
+            RegisteredArtifactRepairPlan::DownloadMissing {
+                expected_sha1,
+                expected_size,
+                ..
+            }
+            | RegisteredArtifactRepairPlan::QuarantineRedownload {
+                expected_sha1,
+                expected_size,
+                ..
+            }
+            | RegisteredArtifactRepairPlan::ComponentRebuild {
+                expected_sha1,
+                expected_size,
+            } => (expected_sha1, *expected_size),
+        }
+    }
+
+    pub(crate) const fn expected_physical_state(&self) -> RegisteredArtifactPhysicalState {
+        match self.observation.condition {
+            RegisteredArtifactCondition::Missing => RegisteredArtifactPhysicalState::Missing,
+            RegisteredArtifactCondition::Corrupt => RegisteredArtifactPhysicalState::Corrupt,
+        }
     }
 
     pub(crate) fn terminal(
@@ -505,6 +613,20 @@ impl RegisteredArtifactRepairAdmission {
         }
         self.authority
             .into_registered_artifact_failed_repair(&self.attempt)
+    }
+}
+
+impl<'a> RegisteredArtifactDownloadPlan<'a> {
+    pub(crate) const fn provider_url(self) -> &'a str {
+        self.provider_url
+    }
+
+    pub(crate) const fn expected_sha1(self) -> &'a str {
+        self.expected_sha1
+    }
+
+    pub(crate) const fn expected_size(self) -> u64 {
+        self.expected_size
     }
 }
 
@@ -595,11 +717,8 @@ impl AppState {
             return Err(ReconciliationEvidenceRejection::IncarnationMismatch);
         }
         let inventory = findings.authority.inventory.clone();
-        let source = inventory
-            .bind_standalone_leaf_repair_source(observation.inventory_ordinal)
-            .map_err(|_| ReconciliationEvidenceRejection::RootAuthorityUnavailable)?;
-        let source_scope = RegisteredArtifactSourceScope::from_source(source.root(), source.kind())
-            .ok_or(ReconciliationEvidenceRejection::ScopeMismatch)?;
+        let source_scope = registered_artifact_scope(&inventory, observation.inventory_ordinal)
+            .ok_or(ReconciliationEvidenceRejection::RootAuthorityUnavailable)?;
 
         // Config precedes the shared component writer, matching component rebuild admission.
         let config_mutation = self
@@ -618,12 +737,9 @@ impl AppState {
         {
             return Err(ReconciliationEvidenceRejection::IncarnationMismatch);
         }
-        let source = inventory
-            .bind_standalone_leaf_repair_source(observation.inventory_ordinal)
-            .map_err(|_| ReconciliationEvidenceRejection::RootAuthorityUnavailable)?;
         let current_source_scope =
-            RegisteredArtifactSourceScope::from_source(source.root(), source.kind())
-                .ok_or(ReconciliationEvidenceRejection::ScopeMismatch)?;
+            registered_artifact_scope(&inventory, observation.inventory_ordinal)
+                .ok_or(ReconciliationEvidenceRejection::RootAuthorityUnavailable)?;
         if current_source_scope != source_scope {
             return Err(ReconciliationEvidenceRejection::IncarnationMismatch);
         }
@@ -636,15 +752,46 @@ impl AppState {
             &findings.authority.managed_runtime_cache,
             entry,
         );
-        let provider_url = source.provider_url().to_string();
-        let expected_sha1 = source.sha1().as_str().to_string();
-        let expected_size = source.size();
+        let (expected_sha1, expected_size) = match entry.integrity() {
+            KnownGoodIntegrity::Sha1 { digest, size }
+            | KnownGoodIntegrity::ExactBytes { digest, size } => {
+                (digest.as_str().to_string(), *size)
+            }
+            KnownGoodIntegrity::Directory | KnownGoodIntegrity::LinkTarget(_) => {
+                return Err(ReconciliationEvidenceRejection::ScopeMismatch);
+            }
+        };
         let mutation = RegisteredArtifactMutationCapability::mint(physical_path)
             .await
             .map_err(|_| ReconciliationEvidenceRejection::RootAuthorityUnavailable)?;
-        let effect = match observation.condition {
-            RegisteredArtifactCondition::Missing => RegisteredArtifactRepairEffect::DownloadMissing,
-            RegisteredArtifactCondition::Corrupt => source_scope.corrupt_effect(),
+        let effect = source_scope.effect(observation.condition);
+        let plan = match effect {
+            RegisteredArtifactRepairEffect::DownloadMissing => {
+                let source = inventory
+                    .bind_standalone_leaf_repair_source(observation.inventory_ordinal)
+                    .map_err(|_| ReconciliationEvidenceRejection::RootAuthorityUnavailable)?;
+                RegisteredArtifactRepairPlan::DownloadMissing {
+                    provider_url: source.provider_url().to_string(),
+                    expected_sha1,
+                    expected_size,
+                }
+            }
+            RegisteredArtifactRepairEffect::QuarantineRedownload => {
+                let source = inventory
+                    .bind_standalone_leaf_repair_source(observation.inventory_ordinal)
+                    .map_err(|_| ReconciliationEvidenceRejection::RootAuthorityUnavailable)?;
+                RegisteredArtifactRepairPlan::QuarantineRedownload {
+                    provider_url: source.provider_url().to_string(),
+                    expected_sha1,
+                    expected_size,
+                }
+            }
+            RegisteredArtifactRepairEffect::ComponentRebuildRequired => {
+                RegisteredArtifactRepairPlan::ComponentRebuild {
+                    expected_sha1,
+                    expected_size,
+                }
+            }
         };
         if !self.registered_artifact_findings_can_admit(&findings)
             || !Arc::ptr_eq(&inventory, &findings.authority.inventory)
@@ -672,10 +819,7 @@ impl AppState {
             observation,
             inventory,
             mutation,
-            effect,
-            provider_url,
-            expected_sha1,
-            expected_size,
+            plan,
             _component_mutation: component_mutation,
             _config_mutation: config_mutation,
             #[cfg(test)]
@@ -712,10 +856,10 @@ fn registered_artifact_target_from_inventory(
     inventory_ordinal: usize,
 ) -> Option<(TargetDescriptor, RegisteredArtifactSourceScope)> {
     let entry = inventory.entries().get(inventory_ordinal)?;
+    let source_scope = registered_artifact_scope(inventory, inventory_ordinal)?;
     let source = inventory
         .bind_standalone_leaf_repair_source(inventory_ordinal)
-        .ok()?;
-    let source_scope = RegisteredArtifactSourceScope::from_source(source.root(), source.kind())?;
+        .ok();
     let inventory_ordinal = u64::try_from(inventory_ordinal).ok()?;
 
     let mut hasher = Sha256::new();
@@ -759,11 +903,15 @@ fn registered_artifact_target_from_inventory(
         }
         KnownGoodIntegrity::Directory | KnownGoodIntegrity::LinkTarget(_) => return None,
     }
-    update_frame(
-        &mut hasher,
-        b"repair_provider_url",
-        source.provider_url().as_bytes(),
-    );
+    if let Some(source) = source {
+        update_frame(
+            &mut hasher,
+            b"repair_provider_url",
+            source.provider_url().as_bytes(),
+        );
+    } else {
+        update_frame(&mut hasher, b"repair_authority", b"component_rebuild");
+    }
 
     let hex = format!("{:x}", hasher.finalize());
     let dotted = hex
@@ -781,6 +929,26 @@ fn registered_artifact_target_from_inventory(
         ),
         source_scope,
     ))
+}
+
+fn registered_artifact_scope(
+    inventory: &axial_minecraft::known_good::KnownGoodInventory,
+    inventory_ordinal: usize,
+) -> Option<RegisteredArtifactSourceScope> {
+    let entry = inventory.entries().get(inventory_ordinal)?;
+    let scope = RegisteredArtifactSourceScope::from_entry(entry.root(), entry.kind())?;
+    match scope {
+        RegisteredArtifactSourceScope::VersionBundle => inventory
+            .bind_standalone_leaf_repair_source(inventory_ordinal)
+            .is_err()
+            .then_some(scope),
+        RegisteredArtifactSourceScope::Libraries | RegisteredArtifactSourceScope::Assets => {
+            let source = inventory
+                .bind_standalone_leaf_repair_source(inventory_ordinal)
+                .ok()?;
+            (source.root() == entry.root() && source.kind() == entry.kind()).then_some(scope)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -901,4 +1069,67 @@ fn update_path_frame(hasher: &mut Sha256, label: &[u8], path: &Path) {
 #[cfg(not(any(unix, windows)))]
 fn update_path_frame(hasher: &mut Sha256, label: &[u8], path: &Path) {
     update_frame(hasher, label, path.to_string_lossy().as_bytes());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axial_minecraft::known_good::{
+        KnownGoodInventory, TestKnownGoodEntry, TestKnownGoodIntegrity, TestKnownGoodRoot,
+    };
+
+    const ZERO_SHA1: &str = "0000000000000000000000000000000000000000";
+
+    #[test]
+    fn version_bundle_kinds_and_conditions_select_provider_free_component_rebuild() {
+        let cases = [
+            (
+                TestKnownGoodRoot::Versions,
+                "1.21.1/1.21.1.json",
+                KnownGoodArtifactKind::VersionMetadata,
+            ),
+            (
+                TestKnownGoodRoot::Versions,
+                "1.21.1/1.21.1.jar",
+                KnownGoodArtifactKind::ClientJar,
+            ),
+            (
+                TestKnownGoodRoot::Assets,
+                "log_configs/guardian.xml",
+                KnownGoodArtifactKind::LogConfig,
+            ),
+        ];
+
+        for (root, path, kind) in cases {
+            let inventory = KnownGoodInventory::from_test_entries([TestKnownGoodEntry {
+                root,
+                path: path.to_string(),
+                kind,
+                integrity: TestKnownGoodIntegrity::Sha1 {
+                    digest: ZERO_SHA1.to_string(),
+                    size: 7,
+                },
+            }])
+            .expect("single VersionBundle entry inventory");
+            assert!(
+                inventory.bind_standalone_leaf_repair_source(0).is_err(),
+                "VersionBundle leaves must not carry standalone providers"
+            );
+            let scope = registered_artifact_scope(&inventory, 0)
+                .expect("provider-free VersionBundle scope");
+            assert_eq!(scope, RegisteredArtifactSourceScope::VersionBundle);
+            assert_eq!(scope.domain(), GuardianDomain::Launch);
+            assert_eq!(scope.component(), ReconciliationComponent::VersionBundle);
+            for condition in [
+                RegisteredArtifactCondition::Missing,
+                RegisteredArtifactCondition::Corrupt,
+            ] {
+                assert_eq!(
+                    scope.effect(condition),
+                    RegisteredArtifactRepairEffect::ComponentRebuildRequired,
+                    "unexpected repair effect for {kind:?} {condition:?}"
+                );
+            }
+        }
+    }
 }

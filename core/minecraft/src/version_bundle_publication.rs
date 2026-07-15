@@ -19,9 +19,9 @@ use crate::managed_publication::{
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 use std::collections::HashMap;
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 use std::sync::OnceLock;
 use std::sync::{Arc, Mutex};
 
@@ -135,7 +135,7 @@ struct TransactionContext {
     intent_guard: ManagedFileGuard,
     outcome_guard: Option<ManagedFileGuard>,
     entries: Vec<TransactionEntry>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     test_hook: Option<PublicationTestHook>,
 }
 
@@ -148,25 +148,30 @@ struct TransactionHandles {
     intent_guard: ManagedFileGuard,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 enum PublicationTestHook {
     FailAfter {
         promotions: usize,
     },
+    #[cfg(test)]
     PauseAfter {
         promotions: usize,
         reached: Option<tokio::sync::oneshot::Sender<()>>,
         release: Option<tokio::sync::oneshot::Receiver<()>>,
     },
+    #[cfg(test)]
     CrashAfterPromotion {
         kind: KnownGoodArtifactKind,
     },
+    #[cfg(test)]
     FailSettlementOnce,
+    #[cfg(test)]
     FailAfterSettlementMarkerOnce,
+    #[cfg(test)]
     FailAfterCommittedOutcomeOnce,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 static TEST_HOOKS: OnceLock<Mutex<HashMap<String, PublicationTestHook>>> = OnceLock::new();
 
 pub(crate) struct VersionBundleTransactionCommitReceipt {
@@ -339,7 +344,7 @@ pub(crate) async fn publish_version_bundle(
         return Err(VersionBundleTransactionError::ProjectionMismatch);
     }
     let version_id = source.version_id().to_string();
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     let test_hook = TEST_HOOKS
         .get_or_init(|| Mutex::new(HashMap::new()))
         .lock()
@@ -348,10 +353,10 @@ pub(crate) async fn publish_version_bundle(
     let fingerprints = own_fingerprints(&projection)?;
     validate_portable_aliases(&fingerprints)?;
     validate_bundle_topology(&version_id, &fingerprints)?;
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     let preparation =
         move || prepare_transaction(lease, source, version_id, fingerprints, test_hook);
-    #[cfg(not(test))]
+    #[cfg(not(any(test, feature = "test-support")))]
     let preparation = move || prepare_transaction(lease, source, version_id, fingerprints);
     let preparation = run_publication_blocking(preparation)
         .await
@@ -411,7 +416,7 @@ fn prepare_transaction(
     source: AuthenticatedVersionBundleSource,
     version_id: String,
     fingerprints: Vec<EntryFingerprint>,
-    #[cfg(test)] test_hook: Option<PublicationTestHook>,
+    #[cfg(any(test, feature = "test-support"))] test_hook: Option<PublicationTestHook>,
 ) -> Result<PreparationOutcome, VersionBundleTransactionError> {
     let mut planned = bind_sources(source, fingerprints)?;
     let lane = open_lane(&lease)?;
@@ -443,7 +448,7 @@ fn prepare_transaction(
                 },
                 outcome,
                 outcome_guard,
-                #[cfg(test)]
+                #[cfg(any(test, feature = "test-support"))]
                 test_hook,
             )?;
             return match terminal {
@@ -474,7 +479,7 @@ fn prepare_transaction(
                 },
                 outcome,
                 outcome_guard,
-                #[cfg(test)]
+                #[cfg(any(test, feature = "test-support"))]
                 test_hook,
             )?;
             return Ok(PreparationOutcome::Committed(committed_receipt(context)));
@@ -494,7 +499,7 @@ fn prepare_transaction(
             },
             root_identity,
             &mut planned,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             test_hook,
         )?;
         return Ok(PreparationOutcome::Ready(Box::new(context)));
@@ -552,7 +557,7 @@ fn prepare_transaction(
         },
         root_identity,
         &mut planned,
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         test_hook,
     )
     .map(Box::new)
@@ -1183,7 +1188,7 @@ fn context_from_prepared(
     handles: TransactionHandles,
     root_identity: ManagedDirectoryIdentity,
     planned: &mut [PlannedEntry],
-    #[cfg(test)] test_hook: Option<PublicationTestHook>,
+    #[cfg(any(test, feature = "test-support"))] test_hook: Option<PublicationTestHook>,
 ) -> Result<TransactionContext, VersionBundleTransactionError> {
     let TransactionHandles {
         lease,
@@ -1270,7 +1275,7 @@ fn context_from_prepared(
         intent_guard,
         outcome_guard: None,
         entries,
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         test_hook,
     })
 }
@@ -1796,7 +1801,7 @@ fn reconstruct_terminal_context(
     handles: TransactionHandles,
     outcome: PersistedOutcome,
     outcome_guard: ManagedFileGuard,
-    #[cfg(test)] test_hook: Option<PublicationTestHook>,
+    #[cfg(any(test, feature = "test-support"))] test_hook: Option<PublicationTestHook>,
 ) -> Result<TransactionContext, VersionBundleTransactionError> {
     let TransactionHandles {
         lease,
@@ -1956,7 +1961,7 @@ fn reconstruct_terminal_context(
         intent_guard,
         outcome_guard: Some(outcome_guard),
         entries,
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         test_hook,
     };
     match outcome.outcome {
@@ -2020,7 +2025,7 @@ fn mutate_in_place(
                 current_effect,
             );
         }
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         if apply_test_hook(context, index + 1) {
             return rollback_mutation_failure(
                 context,
@@ -2512,8 +2517,9 @@ fn revalidate_failure(context: &TransactionContext) -> Result<(), LoaderError> {
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 fn apply_test_hook(context: &mut TransactionContext, promotions: usize) -> bool {
+    #[cfg(test)]
     let promoted_kind = promotions
         .checked_sub(1)
         .and_then(|index| context.entries.get(index))
@@ -2522,6 +2528,7 @@ fn apply_test_hook(context: &mut TransactionContext, promotions: usize) -> bool 
         Some(PublicationTestHook::FailAfter {
             promotions: expected,
         }) if *expected == promotions => true,
+        #[cfg(test)]
         Some(PublicationTestHook::PauseAfter {
             promotions: expected,
             reached,
@@ -2535,22 +2542,23 @@ fn apply_test_hook(context: &mut TransactionContext, promotions: usize) -> bool 
             }
             false
         }
+        #[cfg(test)]
         Some(PublicationTestHook::CrashAfterPromotion { kind }) if Some(*kind) == promoted_kind => {
             panic!("injected version bundle crash after promotion");
         }
+        Some(PublicationTestHook::FailAfter { .. }) | None => false,
+        #[cfg(test)]
         Some(
-            PublicationTestHook::FailAfter { .. }
-            | PublicationTestHook::PauseAfter { .. }
+            PublicationTestHook::PauseAfter { .. }
             | PublicationTestHook::CrashAfterPromotion { .. }
             | PublicationTestHook::FailSettlementOnce
             | PublicationTestHook::FailAfterSettlementMarkerOnce
             | PublicationTestHook::FailAfterCommittedOutcomeOnce,
-        )
-        | None => false,
+        ) => false,
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn fail_after_promotions_for_test(version_id: &str, promotions: usize) {
     TEST_HOOKS
         .get_or_init(|| Mutex::new(HashMap::new()))

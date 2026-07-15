@@ -12,8 +12,8 @@ use super::failure_memory::{
     ReconciliationAttemptReserveError,
 };
 use super::registered_artifact_findings::{
-    RegisteredArtifactCondition, RegisteredArtifactProvenance,
-    RegisteredArtifactRepairAuthorization, recorded_artifact_provenance_matches,
+    RegisteredArtifactProvenance, RegisteredArtifactRepairAuthorization,
+    RegisteredArtifactRepairEffect, recorded_artifact_provenance_matches,
     registered_artifact_target, resolve_recorded_artifact_provenance,
 };
 use super::sessions::SharedComponentMutationLease;
@@ -35,7 +35,7 @@ use axial_minecraft::runtime::{
 use axial_minecraft::{
     ManagedAssetsCommitReceipt, ManagedAssetsRollbackEffect, ManagedAssetsRollbackReceipt,
     ManagedLibrariesCommitReceipt, ManagedLibrariesRollbackEffect, ManagedLibrariesRollbackReceipt,
-    ManagedRuntimeCache,
+    ManagedRuntimeCache, ManagedVersionBundleCommitReceipt, ManagedVersionBundleRollbackReceipt,
 };
 use sha2::{Digest, Sha256};
 use std::io;
@@ -56,7 +56,7 @@ pub(crate) struct RegisteredArtifactFailedRepair {
 }
 
 #[must_use]
-pub(crate) enum RegisteredAssetsRecoveryEntry {
+pub(crate) enum RegisteredArtifactRecoveryEntry {
     Fresh(RegisteredArtifactRepairAuthorization),
     Resume(RegisteredArtifactFailedRepair),
 }
@@ -78,8 +78,14 @@ enum RegisteredComponentRebuildState {
         postcondition_failure_inventory:
             std::sync::OnceLock<std::sync::Arc<axial_minecraft::known_good::KnownGoodInventory>>,
     },
+    VersionBundle,
     Libraries,
     Assets,
+}
+
+pub(crate) struct RegisteredVersionBundleComponentRebuildEffect {
+    library_root: PathBuf,
+    version_id: String,
 }
 
 pub(crate) struct RegisteredLibrariesComponentRebuildEffect {
@@ -149,10 +155,22 @@ struct ManagedArtifactDurableAuthority {
 }
 
 enum ManagedArtifactPublicationLease {
+    VersionBundleCommit {
+        _receipt: ManagedVersionBundleCommitReceipt,
+    },
+    VersionBundleRollback {
+        _receipt: ManagedVersionBundleRollbackReceipt,
+    },
     LibrariesCommit(ManagedLibrariesCommitReceipt),
     LibrariesRollback(ManagedLibrariesRollbackReceipt),
     AssetsCommit(ManagedAssetsCommitReceipt),
     AssetsRollback(ManagedAssetsRollbackReceipt),
+}
+
+impl RegisteredVersionBundleComponentRebuildEffect {
+    pub(crate) fn core_request(&self) -> (&Path, &str) {
+        (&self.library_root, &self.version_id)
+    }
 }
 
 impl RegisteredLibrariesComponentRebuildEffect {
@@ -189,6 +207,22 @@ impl RegisteredManagedArtifactComponentCompletion {
             }
             _ => unreachable!(),
         };
+        self.begin_commit_postcheck(publication, valid).await
+    }
+
+    pub(crate) async fn begin_version_bundle_commit(
+        self,
+        receipt: ManagedVersionBundleCommitReceipt,
+    ) -> RegisteredManagedArtifactCommitPostcheck {
+        let valid = self.authority.component == ManagedArtifactRebuildComponent::VersionBundle
+            && receipt.version_id() == self.authority.known_good.version_id
+            && receipt
+                .matches_root(&self.authority.known_good.library_root)
+                .await
+            && receipt.matches_known_good_inventory(&self.authority.known_good.inventory)
+            && receipt.revalidate().await;
+        let publication =
+            ManagedArtifactPublicationLease::VersionBundleCommit { _receipt: receipt };
         self.begin_commit_postcheck(publication, valid).await
     }
 
@@ -229,6 +263,21 @@ impl RegisteredManagedArtifactComponentCompletion {
             }
             _ => unreachable!(),
         };
+        (self.authority.durable.failed(Some(publication)), valid)
+    }
+
+    pub(crate) async fn settle_version_bundle_rollback(
+        self,
+        receipt: ManagedVersionBundleRollbackReceipt,
+    ) -> (RegisteredManagedArtifactComponentSettlement, bool) {
+        let valid = self.authority.component == ManagedArtifactRebuildComponent::VersionBundle
+            && receipt.version_id() == self.authority.known_good.version_id
+            && receipt
+                .matches_root(&self.authority.known_good.library_root)
+                .await
+            && receipt.matches_known_good_inventory(&self.authority.known_good.inventory);
+        let publication =
+            ManagedArtifactPublicationLease::VersionBundleRollback { _receipt: receipt };
         (self.authority.durable.failed(Some(publication)), valid)
     }
 
@@ -453,6 +502,7 @@ impl RegisteredManagedArtifactComponentSettlement {
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum ManagedArtifactRebuildComponent {
+    VersionBundle,
     Libraries,
     Assets,
 }
@@ -462,6 +512,7 @@ impl ManagedArtifactRebuildComponent {
         attempt: &ReconciliationAttempt,
     ) -> Result<Self, ReconciliationEvidenceRejection> {
         let component = match (attempt.component(), attempt.domain()) {
+            (ReconciliationComponent::VersionBundle, GuardianDomain::Launch) => Self::VersionBundle,
             (ReconciliationComponent::Libraries, GuardianDomain::Library) => Self::Libraries,
             (ReconciliationComponent::Assets, GuardianDomain::Download) => Self::Assets,
             _ => return Err(ReconciliationEvidenceRejection::ScopeMismatch),
@@ -481,6 +532,7 @@ impl ManagedArtifactRebuildComponent {
 
     fn reconciliation_component(self) -> ReconciliationComponent {
         match self {
+            Self::VersionBundle => ReconciliationComponent::VersionBundle,
             Self::Libraries => ReconciliationComponent::Libraries,
             Self::Assets => ReconciliationComponent::Assets,
         }
@@ -488,6 +540,7 @@ impl ManagedArtifactRebuildComponent {
 
     fn domain(self) -> GuardianDomain {
         match self {
+            Self::VersionBundle => GuardianDomain::Launch,
             Self::Libraries => GuardianDomain::Library,
             Self::Assets => GuardianDomain::Download,
         }
@@ -496,7 +549,10 @@ impl ManagedArtifactRebuildComponent {
     fn matches_state(self, state: &RegisteredComponentRebuildState) -> bool {
         matches!(
             (self, state),
-            (Self::Libraries, RegisteredComponentRebuildState::Libraries)
+            (
+                Self::VersionBundle,
+                RegisteredComponentRebuildState::VersionBundle
+            ) | (Self::Libraries, RegisteredComponentRebuildState::Libraries)
                 | (Self::Assets, RegisteredComponentRebuildState::Assets)
         )
     }
@@ -630,6 +686,28 @@ impl RegisteredComponentRebuildAdmission {
             Ok((request, completion)) => {
                 RegisteredManagedArtifactComponentEffectAdmission::Admitted {
                     request: RegisteredLibrariesComponentRebuildEffect {
+                        library_root: request.library_root,
+                        version_id: request.version_id,
+                    },
+                    completion,
+                }
+            }
+            Err(settlement) => {
+                RegisteredManagedArtifactComponentEffectAdmission::Refused(settlement)
+            }
+        }
+    }
+
+    pub(crate) fn into_version_bundle_effect(
+        self,
+    ) -> RegisteredManagedArtifactComponentEffectAdmission<
+        RegisteredVersionBundleComponentRebuildEffect,
+    > {
+        match self.into_managed_artifact_completion(ManagedArtifactRebuildComponent::VersionBundle)
+        {
+            Ok((request, completion)) => {
+                RegisteredManagedArtifactComponentEffectAdmission::Admitted {
+                    request: RegisteredVersionBundleComponentRebuildEffect {
                         library_root: request.library_root,
                         version_id: request.version_id,
                     },
@@ -1028,7 +1106,8 @@ impl RegisteredComponentRebuildAdmission {
             RegisteredComponentRebuildState::Runtime {
                 postcondition_failure_inventory,
             } => Ok(postcondition_failure_inventory),
-            RegisteredComponentRebuildState::Libraries => {
+            RegisteredComponentRebuildState::VersionBundle
+            | RegisteredComponentRebuildState::Libraries => {
                 Err(ReconciliationEvidenceRejection::ScopeMismatch)
             }
             RegisteredComponentRebuildState::Assets => {
@@ -1601,29 +1680,31 @@ impl AppState {
             .into_registered_artifact_failed_repair(attempt)
     }
 
-    pub(crate) fn registered_assets_recovery_entry(
+    pub(crate) fn registered_artifact_recovery_entry(
         &self,
         authorization: RegisteredArtifactRepairAuthorization,
-    ) -> Result<RegisteredAssetsRecoveryEntry, ReconciliationEvidenceRejection> {
-        let (verification, inventory_ordinal, condition) =
-            authorization.exact_assets_identity(self)?;
-        if condition == RegisteredArtifactCondition::Missing {
-            return Ok(RegisteredAssetsRecoveryEntry::Fresh(authorization));
+    ) -> Result<RegisteredArtifactRecoveryEntry, ReconciliationEvidenceRejection> {
+        let (verification, inventory_ordinal, component, effect) =
+            authorization.exact_recovery_identity(self)?;
+        if effect != RegisteredArtifactRepairEffect::ComponentRebuildRequired {
+            return Ok(RegisteredArtifactRecoveryEntry::Fresh(authorization));
         }
-        let resume = self.recorded_registered_assets_failure_for_authorization(
+        let resume = self.recorded_registered_artifact_failure_for_authorization(
             verification,
             inventory_ordinal,
+            component,
         )?;
         Ok(match resume {
-            Some(continuation) => RegisteredAssetsRecoveryEntry::Resume(continuation),
-            None => RegisteredAssetsRecoveryEntry::Fresh(authorization),
+            Some(continuation) => RegisteredArtifactRecoveryEntry::Resume(continuation),
+            None => RegisteredArtifactRecoveryEntry::Fresh(authorization),
         })
     }
 
-    fn recorded_registered_assets_failure_for_authorization(
+    fn recorded_registered_artifact_failure_for_authorization(
         &self,
         verification: &KnownGoodVerificationLease,
         inventory_ordinal: usize,
+        component: ReconciliationComponent,
     ) -> Result<Option<RegisteredArtifactFailedRepair>, ReconciliationEvidenceRejection> {
         if !self.known_good_verification_lease_can_admit(verification) {
             return Err(ReconciliationEvidenceRejection::IncarnationMismatch);
@@ -1670,11 +1751,7 @@ impl AppState {
             }
             if journal.failure_point.as_deref()
                 != Some(REGISTERED_ARTIFACT_COMPONENT_REBUILD_FAILURE_POINT)
-                || !registered_assets_component_required_terminal_matches(
-                    journal,
-                    terminal,
-                    instance_id,
-                )
+                || !registered_component_required_terminal_matches(journal, terminal, instance_id)
             {
                 return Err(ReconciliationEvidenceRejection::JournalMismatch);
             }
@@ -1718,9 +1795,10 @@ impl AppState {
         )
         .ok_or(ReconciliationEvidenceRejection::ScopeMismatch)?;
         if ManagedArtifactRebuildComponent::from_artifact_attempt(terminal.attempt())?
-            != ManagedArtifactRebuildComponent::Assets
+            .reconciliation_component()
+            != component
             || terminal.target() != &expected_target
-            || provenance.component() != ReconciliationComponent::Assets
+            || provenance.component() != component
             || provenance.inventory_ordinal() != inventory_ordinal
         {
             return Err(ReconciliationEvidenceRejection::ScopeMismatch);
@@ -2007,7 +2085,9 @@ impl AppState {
             ReconciliationComponent::Runtime => RegisteredComponentRebuildState::Runtime {
                 postcondition_failure_inventory: std::sync::OnceLock::new(),
             },
-            ReconciliationComponent::Libraries | ReconciliationComponent::Assets => {
+            ReconciliationComponent::VersionBundle
+            | ReconciliationComponent::Libraries
+            | ReconciliationComponent::Assets => {
                 let component =
                     ManagedArtifactRebuildComponent::from_artifact_attempt(prior.attempt())?;
                 if artifact_provenance.is_none_or(|provenance| {
@@ -2016,6 +2096,9 @@ impl AppState {
                     return Err(ReconciliationEvidenceRejection::ScopeMismatch);
                 }
                 match component {
+                    ManagedArtifactRebuildComponent::VersionBundle => {
+                        RegisteredComponentRebuildState::VersionBundle
+                    }
                     ManagedArtifactRebuildComponent::Libraries => {
                         RegisteredComponentRebuildState::Libraries
                     }
@@ -2024,7 +2107,7 @@ impl AppState {
                     }
                 }
             }
-            ReconciliationComponent::VersionBundle | ReconciliationComponent::WholeInstance => {
+            ReconciliationComponent::WholeInstance => {
                 return Err(ReconciliationEvidenceRejection::ScopeMismatch);
             }
         };
@@ -2281,7 +2364,9 @@ impl AppState {
         let artifact_provenance = if expected_rung == ReconciliationRung::RepairArtifact
             && matches!(
                 terminal.component(),
-                ReconciliationComponent::Libraries | ReconciliationComponent::Assets
+                ReconciliationComponent::VersionBundle
+                    | ReconciliationComponent::Libraries
+                    | ReconciliationComponent::Assets
             ) {
             Some(
                 resolve_recorded_artifact_provenance(
@@ -2343,7 +2428,7 @@ impl AppState {
     }
 }
 
-fn registered_assets_component_required_terminal_matches(
+fn registered_component_required_terminal_matches(
     journal: &OperationJournalEntry,
     terminal: &ReconciliationTerminal,
     instance_id: &str,
@@ -2606,7 +2691,7 @@ mod tests {
 
     const _: fn() = || {
         let _ = <RegisteredArtifactFailedRepair as AmbiguousIfClone<_>>::assert_not_clone;
-        let _ = <RegisteredAssetsRecoveryEntry as AmbiguousIfClone<_>>::assert_not_clone;
+        let _ = <RegisteredArtifactRecoveryEntry as AmbiguousIfClone<_>>::assert_not_clone;
     };
 
     struct Fixture {
@@ -2799,6 +2884,48 @@ mod tests {
             .expect("empty Assets object fixture repair source")
     }
 
+    fn version_bundle_fixture_inventory() -> KnownGoodInventory {
+        const CLIENT_BYTES: &[u8] = b"axial managed VersionBundle client fixture";
+        const LOG_ID: &str = "guardian-version-bundle.xml";
+        const LOG_BYTES: &[u8] = b"<Configuration/>";
+        let version_json = serde_json::to_vec(&serde_json::json!({
+            "id": "1.21.1",
+            "type": "release",
+            "mainClass": "org.axial.GuardianFixture"
+        }))
+        .expect("VersionBundle fixture metadata");
+        KnownGoodInventory::from_test_entries([
+            TestKnownGoodEntry {
+                root: TestKnownGoodRoot::Versions,
+                path: "1.21.1/1.21.1.json".to_string(),
+                kind: KnownGoodArtifactKind::VersionMetadata,
+                integrity: TestKnownGoodIntegrity::Sha1 {
+                    digest: format!("{:x}", Sha1::digest(&version_json)),
+                    size: version_json.len() as u64,
+                },
+            },
+            TestKnownGoodEntry {
+                root: TestKnownGoodRoot::Versions,
+                path: "1.21.1/1.21.1.jar".to_string(),
+                kind: KnownGoodArtifactKind::ClientJar,
+                integrity: TestKnownGoodIntegrity::Sha1 {
+                    digest: format!("{:x}", Sha1::digest(CLIENT_BYTES)),
+                    size: CLIENT_BYTES.len() as u64,
+                },
+            },
+            TestKnownGoodEntry {
+                root: TestKnownGoodRoot::Assets,
+                path: format!("log_configs/{LOG_ID}"),
+                kind: KnownGoodArtifactKind::LogConfig,
+                integrity: TestKnownGoodIntegrity::Sha1 {
+                    digest: format!("{:x}", Sha1::digest(LOG_BYTES)),
+                    size: LOG_BYTES.len() as u64,
+                },
+            },
+        ])
+        .expect("VersionBundle fixture inventory")
+    }
+
     fn activate_assets_fixture_inventory(
         state: &AppState,
         instance_id: &str,
@@ -2817,6 +2944,27 @@ mod tests {
             .expect("active Assets fixture inventory")
     }
 
+    fn activate_version_bundle_fixture_inventory(
+        state: &AppState,
+        instance_id: &str,
+    ) -> Arc<KnownGoodInventory> {
+        state.activate_known_good_inventory_for_test(
+            instance_id,
+            version_bundle_fixture_inventory(),
+        );
+        let instance = state.instances().get(instance_id).expect("test instance");
+        let library_root = PathBuf::from(state.library_dir().expect("test library root"));
+        state
+            .known_good
+            .active_inventory(
+                &instance.id,
+                &instance.version_id,
+                &instance.created_at,
+                &library_root,
+            )
+            .expect("active VersionBundle fixture inventory")
+    }
+
     fn activate_empty_inventory(state: &AppState, instance_id: &str) -> Arc<KnownGoodInventory> {
         state.activate_known_good_inventory_for_test(instance_id, empty_inventory());
         let instance = state.instances().get(instance_id).expect("test instance");
@@ -2832,7 +2980,7 @@ mod tests {
             .expect("active test known-good inventory")
     }
 
-    fn source_backed_artifact_target(
+    fn registered_artifact_target_for_ordinal(
         fixture: &Fixture,
         inventory_ordinal: usize,
     ) -> TargetDescriptor {
@@ -2840,11 +2988,11 @@ mod tests {
             .state
             .instances
             .get(INSTANCE_ID)
-            .expect("source-backed target instance");
+            .expect("registered artifact target instance");
         let current = fixture
             .state
             .current_reconciliation_incarnation(INSTANCE_ID)
-            .expect("source-backed target incarnation");
+            .expect("registered artifact target incarnation");
         let inventory = fixture
             .state
             .known_good
@@ -2854,7 +3002,7 @@ mod tests {
                 &instance.created_at,
                 &current.roots.library,
             )
-            .expect("source-backed target inventory");
+            .expect("registered artifact target inventory");
         super::super::registered_artifact_findings::registered_artifact_target_for_test(
             &instance.id,
             &instance.version_id,
@@ -2864,7 +3012,7 @@ mod tests {
             &inventory,
             inventory_ordinal,
         )
-        .expect("source-backed artifact target")
+        .expect("registered artifact target")
     }
 
     fn registered_artifact_repair_decision(target: TargetDescriptor) -> GuardianDecision {
@@ -2891,15 +3039,16 @@ mod tests {
         )
     }
 
-    async fn authorized_assets_repair(
+    async fn authorized_registered_artifact_repair(
         fixture: &Fixture,
+        inventory_ordinal: usize,
         condition: super::super::RegisteredArtifactCondition,
     ) -> RegisteredArtifactRepairAuthorization {
         let lifecycle = fixture.state.acquire_instance_lifecycle(INSTANCE_ID).await;
         let foreground = fixture
             .state
             .register_integrity_foreground()
-            .expect("register Assets recovery foreground")
+            .expect("register artifact recovery foreground")
             .wait_for_settlement()
             .await;
         let verification = fixture
@@ -2907,23 +3056,24 @@ mod tests {
             .mint_known_good_verification_lease(
                 &foreground,
                 &lifecycle,
-                &PathBuf::from(fixture.state.library_dir().expect("Assets recovery root")),
+                &PathBuf::from(fixture.state.library_dir().expect("artifact recovery root")),
             )
-            .expect("mint Assets recovery verification");
+            .expect("mint artifact recovery verification");
         let observation = verification
-            .registered_artifact_observation(0, condition)
-            .expect("source-backed Assets observation");
+            .registered_artifact_observation(inventory_ordinal, condition)
+            .expect("registered artifact observation");
         let findings = fixture
             .state
             .seal_registered_artifact_findings(verification, vec![observation])
-            .expect("seal Assets recovery finding");
+            .expect("seal artifact recovery finding");
         let target = findings
-            .repair_target()
-            .expect("Assets recovery target")
+            .repair_candidate()
+            .map(|candidate| candidate.target())
+            .expect("artifact recovery target")
             .clone();
         let authorization = findings
             .authorize_repair(&registered_artifact_repair_decision(target))
-            .expect("authorize Assets recovery");
+            .expect("authorize artifact recovery");
         drop((foreground, lifecycle));
         authorization
     }
@@ -3015,7 +3165,7 @@ mod tests {
         reconciliation_journal_attempt(entry, attempt.clone())
     }
 
-    fn assets_component_required_journal(attempt: &ReconciliationAttempt) -> OperationJournalEntry {
+    fn component_required_journal(attempt: &ReconciliationAttempt) -> OperationJournalEntry {
         let mut entry = OperationJournalEntry::new(
             JournalId::new(format!("journal-{}", attempt.operation_id().as_str())),
             attempt.operation_id().clone(),
@@ -3050,7 +3200,7 @@ mod tests {
         step
     }
 
-    fn assets_component_required_failed_step(target: &TargetDescriptor) -> OperationJournalStep {
+    fn component_required_failed_step(target: &TargetDescriptor) -> OperationJournalStep {
         let mut step = OperationJournalStep::new(
             REGISTERED_ARTIFACT_COMPONENT_REBUILD_FAILURE_POINT,
             OperationPhase::Repairing,
@@ -3090,37 +3240,39 @@ mod tests {
         .expect("persist failed reconciliation");
     }
 
-    async fn persist_assets_component_required_failure(
+    async fn persist_component_required_failure(
         fixture: &Fixture,
         attempt: &ReconciliationAttempt,
         terminal: ReconciliationTerminal,
     ) {
         fixture
             .journals
-            .create(assets_component_required_journal(attempt))
+            .create(component_required_journal(attempt))
             .await
-            .expect("persist planned Assets component-required repair");
+            .expect("persist planned component-required repair");
         record_reconciliation_journal_failure(
             fixture.journals.as_ref(),
             attempt.operation_id(),
-            assets_component_required_failed_step(attempt.target()),
+            component_required_failed_step(attempt.target()),
             REGISTERED_ARTIFACT_COMPONENT_REBUILD_FAILURE_POINT,
             terminal,
         )
         .await
-        .expect("persist failed Assets component-required repair");
+        .expect("persist failed component-required repair");
     }
 
-    async fn assets_artifact_failure_attempt_at(
+    async fn registered_artifact_failure_attempt_at(
         fixture: &Fixture,
         operation_id: &str,
         inventory_ordinal: usize,
+        domain: GuardianDomain,
+        component: ReconciliationComponent,
     ) -> (ReconciliationAttempt, ReconciliationTerminal) {
         let lifecycle = fixture.state.acquire_instance_lifecycle(INSTANCE_ID).await;
         let foreground = fixture
             .state
             .register_integrity_foreground()
-            .expect("register persisted Assets failure foreground")
+            .expect("register persisted artifact failure foreground")
             .wait_for_settlement()
             .await;
         let verification = fixture
@@ -3132,28 +3284,28 @@ mod tests {
                     fixture
                         .state
                         .library_dir()
-                        .expect("persisted Assets failure root"),
+                        .expect("persisted artifact failure root"),
                 ),
             )
-            .expect("mint persisted Assets failure verification");
+            .expect("mint persisted artifact failure verification");
         let authority = fixture
             .state
             .registered_reconciliation_authority_for_verification(&verification)
-            .expect("persisted Assets failure authority");
+            .expect("persisted artifact failure authority");
         let attempt = authority
             .repair_artifact_attempt(
                 OperationId::new(operation_id),
                 DIAGNOSIS_ID,
-                GuardianDomain::Download,
-                ReconciliationComponent::Assets,
-                source_backed_artifact_target(fixture, inventory_ordinal),
+                domain,
+                component,
+                registered_artifact_target_for_ordinal(fixture, inventory_ordinal),
                 GuardianMode::Managed,
                 chrono::Duration::minutes(30),
             )
-            .expect("persisted Assets failure attempt");
+            .expect("persisted artifact failure attempt");
         let terminal = authority
             .artifact_terminal(attempt.clone(), ReconciliationTerminalOutcome::Failed, None)
-            .expect("persisted Assets failure terminal");
+            .expect("persisted artifact failure terminal");
         drop((authority, verification, foreground, lifecycle));
         (attempt, terminal)
     }
@@ -3162,10 +3314,17 @@ mod tests {
         fixture: &Fixture,
         operation_id: &str,
     ) -> (ReconciliationAttempt, ReconciliationTerminal) {
-        assets_artifact_failure_attempt_at(fixture, operation_id, 0).await
+        registered_artifact_failure_attempt_at(
+            fixture,
+            operation_id,
+            0,
+            GuardianDomain::Download,
+            ReconciliationComponent::Assets,
+        )
+        .await
     }
 
-    async fn persist_assets_component_required_pair(
+    async fn persist_component_required_pair(
         fixture: &Fixture,
         attempt: &ReconciliationAttempt,
         terminal: ReconciliationTerminal,
@@ -3175,30 +3334,30 @@ mod tests {
             fixture.journals.as_ref(),
             reconciliation_attempt_key(attempt),
         )
-        .expect("reserve Assets component-required failure");
-        persist_assets_component_required_failure(fixture, attempt, terminal.clone()).await;
+        .expect("reserve component-required failure");
+        persist_component_required_failure(fixture, attempt, terminal.clone()).await;
         commit_reconciliation_memory(
             fixture.failure_memory.as_ref(),
-            reconciliation_memory_entry(terminal).expect("canonical Assets failure memory"),
+            reconciliation_memory_entry(terminal).expect("canonical artifact failure memory"),
             &reservation,
         )
         .await
-        .expect("commit Assets component-required failure memory");
+        .expect("commit component-required failure memory");
         drop(reservation);
     }
 
     #[tokio::test]
-    async fn registered_assets_recovery_entry_is_fresh_or_exact_resume() {
+    async fn registered_artifact_recovery_entry_is_fresh_or_exact_resume() {
         let fresh = fixture("assets-recovery-entry-fresh");
         activate_assets_fixture_inventory(&fresh.state, INSTANCE_ID);
         for condition in [
             super::super::RegisteredArtifactCondition::Missing,
             super::super::RegisteredArtifactCondition::Corrupt,
         ] {
-            let authorization = authorized_assets_repair(&fresh, condition).await;
-            let RegisteredAssetsRecoveryEntry::Fresh(authorization) = fresh
+            let authorization = authorized_registered_artifact_repair(&fresh, 0, condition).await;
+            let RegisteredArtifactRecoveryEntry::Fresh(authorization) = fresh
                 .state
-                .registered_assets_recovery_entry(authorization)
+                .registered_artifact_recovery_entry(authorization)
                 .expect("Assets finding without exact persistence stays fresh")
             else {
                 panic!("Assets finding without exact persistence must not resume");
@@ -3211,24 +3370,30 @@ mod tests {
         activate_assets_fixture_inventory(&resumed.state, INSTANCE_ID);
         let (attempt, terminal) =
             assets_artifact_failure_attempt(&resumed, "assets-recovery-entry-resume").await;
-        persist_assets_component_required_pair(&resumed, &attempt, terminal).await;
-        let missing =
-            authorized_assets_repair(&resumed, super::super::RegisteredArtifactCondition::Missing)
-                .await;
-        let RegisteredAssetsRecoveryEntry::Fresh(missing) = resumed
+        persist_component_required_pair(&resumed, &attempt, terminal).await;
+        let missing = authorized_registered_artifact_repair(
+            &resumed,
+            0,
+            super::super::RegisteredArtifactCondition::Missing,
+        )
+        .await;
+        let RegisteredArtifactRecoveryEntry::Fresh(missing) = resumed
             .state
-            .registered_assets_recovery_entry(missing)
+            .registered_artifact_recovery_entry(missing)
             .expect("missing Assets remains fresh despite persisted corrupt evidence")
         else {
             panic!("missing Assets must never resume component recovery");
         };
         drop(missing);
-        let authorization =
-            authorized_assets_repair(&resumed, super::super::RegisteredArtifactCondition::Corrupt)
-                .await;
-        let RegisteredAssetsRecoveryEntry::Resume(continuation) = resumed
+        let authorization = authorized_registered_artifact_repair(
+            &resumed,
+            0,
+            super::super::RegisteredArtifactCondition::Corrupt,
+        )
+        .await;
+        let RegisteredArtifactRecoveryEntry::Resume(continuation) = resumed
             .state
-            .registered_assets_recovery_entry(authorization)
+            .registered_artifact_recovery_entry(authorization)
             .expect("exact persisted Assets failure resumes")
         else {
             panic!("exact persisted Assets failure must resume");
@@ -3255,27 +3420,129 @@ mod tests {
 
         let unrelated = fixture("assets-recovery-entry-unrelated-leaf");
         activate_assets_fixture_inventory(&unrelated.state, INSTANCE_ID);
-        let (attempt, terminal) = assets_artifact_failure_attempt_at(
+        let (attempt, terminal) = registered_artifact_failure_attempt_at(
             &unrelated,
             "assets-recovery-entry-unrelated-leaf",
             1,
+            GuardianDomain::Download,
+            ReconciliationComponent::Assets,
         )
         .await;
-        persist_assets_component_required_pair(&unrelated, &attempt, terminal).await;
-        let authorization = authorized_assets_repair(
+        persist_component_required_pair(&unrelated, &attempt, terminal).await;
+        let authorization = authorized_registered_artifact_repair(
             &unrelated,
+            0,
             super::super::RegisteredArtifactCondition::Corrupt,
         )
         .await;
-        let RegisteredAssetsRecoveryEntry::Fresh(authorization) = unrelated
+        let RegisteredArtifactRecoveryEntry::Fresh(authorization) = unrelated
             .state
-            .registered_assets_recovery_entry(authorization)
+            .registered_artifact_recovery_entry(authorization)
             .expect("unrelated Assets predecessor does not block selected leaf")
         else {
             panic!("unrelated Assets predecessor must not resume selected leaf");
         };
         drop(authorization);
         cleanup(unrelated).await;
+    }
+
+    #[tokio::test]
+    async fn version_bundle_recovery_entry_resumes_only_the_exact_canonical_leaf_failure() {
+        let fresh = fixture("version-bundle-recovery-fresh");
+        activate_version_bundle_fixture_inventory(&fresh.state, INSTANCE_ID);
+        for inventory_ordinal in 0..3 {
+            for condition in [
+                super::super::RegisteredArtifactCondition::Missing,
+                super::super::RegisteredArtifactCondition::Corrupt,
+            ] {
+                let authorization =
+                    authorized_registered_artifact_repair(&fresh, inventory_ordinal, condition)
+                        .await;
+                let RegisteredArtifactRecoveryEntry::Fresh(authorization) = fresh
+                    .state
+                    .registered_artifact_recovery_entry(authorization)
+                    .expect("VersionBundle finding without durable evidence stays fresh")
+                else {
+                    panic!("VersionBundle finding without durable evidence must not resume");
+                };
+                drop(authorization);
+            }
+        }
+        cleanup(fresh).await;
+
+        let resumed = fixture("version-bundle-recovery-resume");
+        activate_version_bundle_fixture_inventory(&resumed.state, INSTANCE_ID);
+        let (attempt, terminal) = registered_artifact_failure_attempt_at(
+            &resumed,
+            "version-bundle-recovery-resume",
+            1,
+            GuardianDomain::Launch,
+            ReconciliationComponent::VersionBundle,
+        )
+        .await;
+        persist_component_required_pair(&resumed, &attempt, terminal).await;
+        let exact = authorized_registered_artifact_repair(
+            &resumed,
+            1,
+            super::super::RegisteredArtifactCondition::Missing,
+        )
+        .await;
+        let RegisteredArtifactRecoveryEntry::Resume(continuation) = resumed
+            .state
+            .registered_artifact_recovery_entry(exact)
+            .expect("exact durable VersionBundle failure resumes")
+        else {
+            panic!("exact durable VersionBundle failure must resume");
+        };
+        assert_eq!(
+            continuation
+                .evidence
+                .artifact_provenance
+                .map(|provenance| (provenance.inventory_ordinal(), provenance.component())),
+            Some((1, ReconciliationComponent::VersionBundle))
+        );
+        drop(continuation);
+        let unrelated = authorized_registered_artifact_repair(
+            &resumed,
+            0,
+            super::super::RegisteredArtifactCondition::Corrupt,
+        )
+        .await;
+        let RegisteredArtifactRecoveryEntry::Fresh(unrelated) = resumed
+            .state
+            .registered_artifact_recovery_entry(unrelated)
+            .expect("different VersionBundle leaf stays fresh")
+        else {
+            panic!("different VersionBundle leaf must not resume");
+        };
+        drop(unrelated);
+        cleanup(resumed).await;
+
+        let mismatched = fixture("version-bundle-recovery-component-mismatch");
+        activate_version_bundle_fixture_inventory(&mismatched.state, INSTANCE_ID);
+        let (attempt, terminal) = registered_artifact_failure_attempt_at(
+            &mismatched,
+            "version-bundle-recovery-component-mismatch",
+            1,
+            GuardianDomain::Download,
+            ReconciliationComponent::Assets,
+        )
+        .await;
+        persist_component_required_pair(&mismatched, &attempt, terminal).await;
+        let authorization = authorized_registered_artifact_repair(
+            &mismatched,
+            1,
+            super::super::RegisteredArtifactCondition::Corrupt,
+        )
+        .await;
+        assert_eq!(
+            mismatched
+                .state
+                .registered_artifact_recovery_entry(authorization)
+                .err(),
+            Some(ReconciliationEvidenceRejection::ScopeMismatch)
+        );
+        cleanup(mismatched).await;
     }
 
     #[tokio::test]
@@ -3286,18 +3553,19 @@ mod tests {
             assets_artifact_failure_attempt(&nonterminal, "assets-resume-nonterminal").await;
         nonterminal
             .journals
-            .create(assets_component_required_journal(&attempt))
+            .create(component_required_journal(&attempt))
             .await
             .expect("persist nonterminal Assets candidate");
-        let authorization = authorized_assets_repair(
+        let authorization = authorized_registered_artifact_repair(
             &nonterminal,
+            0,
             super::super::RegisteredArtifactCondition::Corrupt,
         )
         .await;
         assert_eq!(
             nonterminal
                 .state
-                .registered_assets_recovery_entry(authorization)
+                .registered_artifact_recovery_entry(authorization)
                 .err(),
             Some(ReconciliationEvidenceRejection::JournalMismatch)
         );
@@ -3307,16 +3575,17 @@ mod tests {
         activate_assets_fixture_inventory(&journal_only.state, INSTANCE_ID);
         let (attempt, terminal) =
             assets_artifact_failure_attempt(&journal_only, "assets-resume-journal-only").await;
-        persist_assets_component_required_failure(&journal_only, &attempt, terminal).await;
-        let authorization = authorized_assets_repair(
+        persist_component_required_failure(&journal_only, &attempt, terminal).await;
+        let authorization = authorized_registered_artifact_repair(
             &journal_only,
+            0,
             super::super::RegisteredArtifactCondition::Corrupt,
         )
         .await;
         assert_eq!(
             journal_only
                 .state
-                .registered_assets_recovery_entry(authorization)
+                .registered_artifact_recovery_entry(authorization)
                 .err(),
             Some(ReconciliationEvidenceRejection::MemoryMissing)
         );
@@ -3340,15 +3609,16 @@ mod tests {
         .await
         .expect("commit memory-only Assets failure");
         drop(reservation);
-        let authorization = authorized_assets_repair(
+        let authorization = authorized_registered_artifact_repair(
             &memory_only,
+            0,
             super::super::RegisteredArtifactCondition::Corrupt,
         )
         .await;
         assert_eq!(
             memory_only
                 .state
-                .registered_assets_recovery_entry(authorization)
+                .registered_artifact_recovery_entry(authorization)
                 .err(),
             Some(ReconciliationEvidenceRejection::JournalMissing)
         );
@@ -3358,7 +3628,7 @@ mod tests {
         activate_assets_fixture_inventory(&disagreed.state, INSTANCE_ID);
         let (attempt, terminal) =
             assets_artifact_failure_attempt(&disagreed, "assets-resume-memory-disagreement").await;
-        persist_assets_component_required_pair(&disagreed, &attempt, terminal).await;
+        persist_component_required_pair(&disagreed, &attempt, terminal).await;
         let mut snapshot = disagreed
             .failure_memory
             .snapshot()
@@ -3372,14 +3642,15 @@ mod tests {
             .state
             .clone()
             .with_reconciliation_stores(disagreed.journals.clone(), drifted_memory);
-        let authorization = authorized_assets_repair(
+        let authorization = authorized_registered_artifact_repair(
             &disagreed,
+            0,
             super::super::RegisteredArtifactCondition::Corrupt,
         )
         .await;
         assert_eq!(
             drifted_state
-                .registered_assets_recovery_entry(authorization)
+                .registered_artifact_recovery_entry(authorization)
                 .err(),
             Some(ReconciliationEvidenceRejection::MemoryNotFailed)
         );
@@ -3390,19 +3661,20 @@ mod tests {
         activate_assets_fixture_inventory(&duplicate.state, INSTANCE_ID);
         let (first, first_terminal) =
             assets_artifact_failure_attempt(&duplicate, "assets-resume-duplicate-first").await;
-        persist_assets_component_required_pair(&duplicate, &first, first_terminal).await;
+        persist_component_required_pair(&duplicate, &first, first_terminal).await;
         let (second, second_terminal) =
             assets_artifact_failure_attempt(&duplicate, "assets-resume-duplicate-second").await;
-        persist_assets_component_required_failure(&duplicate, &second, second_terminal).await;
-        let authorization = authorized_assets_repair(
+        persist_component_required_failure(&duplicate, &second, second_terminal).await;
+        let authorization = authorized_registered_artifact_repair(
             &duplicate,
+            0,
             super::super::RegisteredArtifactCondition::Corrupt,
         )
         .await;
         assert_eq!(
             duplicate
                 .state
-                .registered_assets_recovery_entry(authorization)
+                .registered_artifact_recovery_entry(authorization)
                 .err(),
             Some(ReconciliationEvidenceRejection::JournalMismatch)
         );
@@ -3410,14 +3682,17 @@ mod tests {
 
         let drifted = fixture("assets-resume-inventory-drift");
         activate_assets_fixture_inventory(&drifted.state, INSTANCE_ID);
-        let authorization =
-            authorized_assets_repair(&drifted, super::super::RegisteredArtifactCondition::Corrupt)
-                .await;
+        let authorization = authorized_registered_artifact_repair(
+            &drifted,
+            0,
+            super::super::RegisteredArtifactCondition::Corrupt,
+        )
+        .await;
         let replacement = activate_assets_fixture_inventory(&drifted.state, INSTANCE_ID);
         assert_eq!(
             drifted
                 .state
-                .registered_assets_recovery_entry(authorization)
+                .registered_artifact_recovery_entry(authorization)
                 .err(),
             Some(ReconciliationEvidenceRejection::IncarnationMismatch)
         );
@@ -3452,13 +3727,16 @@ mod tests {
         .await
         .expect("commit malformed Assets failure memory");
         drop(reservation);
-        let authorization =
-            authorized_assets_repair(&fixture, super::super::RegisteredArtifactCondition::Corrupt)
-                .await;
+        let authorization = authorized_registered_artifact_repair(
+            &fixture,
+            0,
+            super::super::RegisteredArtifactCondition::Corrupt,
+        )
+        .await;
         assert_eq!(
             fixture
                 .state
-                .registered_assets_recovery_entry(authorization)
+                .registered_artifact_recovery_entry(authorization)
                 .err(),
             Some(ReconciliationEvidenceRejection::JournalMismatch)
         );
@@ -3862,7 +4140,7 @@ mod tests {
                 DIAGNOSIS_ID,
                 GuardianDomain::Download,
                 ReconciliationComponent::Assets,
-                source_backed_artifact_target(&fixture, 0),
+                registered_artifact_target_for_ordinal(&fixture, 0),
                 GuardianMode::Managed,
                 chrono::Duration::minutes(30),
             )

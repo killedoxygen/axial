@@ -1097,6 +1097,73 @@ mod tests {
         state.activate_known_good_inventory_for_test(instance_id, inventory);
     }
 
+    fn activate_corrupt_version_bundle_inventory(
+        state: &AppState,
+        instance_id: &str,
+        version_id: &str,
+        paths: &AppPaths,
+    ) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+        const CLIENT_BYTES: &[u8] = b"axial managed VersionBundle client fixture";
+        const LOG_ID: &str = "guardian-version-bundle.xml";
+        const LOG_BYTES: &[u8] = b"<Configuration/>";
+
+        let version_json = serde_json::to_vec(&serde_json::json!({
+            "id": version_id,
+            "type": "release",
+            "mainClass": "org.axial.GuardianFixture"
+        }))
+        .expect("VersionBundle fixture metadata");
+        let version_dir = paths.library_dir.join("versions").join(version_id);
+        fs::create_dir_all(&version_dir).expect("create VersionBundle fixture directory");
+        fs::write(
+            version_dir.join(format!("{version_id}.json")),
+            &version_json,
+        )
+        .expect("write exact VersionBundle metadata");
+        fs::write(
+            version_dir.join(format!("{version_id}.jar")),
+            vec![7_u8; CLIENT_BYTES.len()],
+        )
+        .expect("write corrupt VersionBundle client");
+        let log_dir = paths.library_dir.join("assets/log_configs");
+        fs::create_dir_all(&log_dir).expect("create VersionBundle log directory");
+        fs::write(log_dir.join(LOG_ID), LOG_BYTES).expect("write exact VersionBundle log config");
+
+        let inventory = KnownGoodInventory::from_test_entries([
+            TestKnownGoodEntry {
+                root: TestKnownGoodRoot::Versions,
+                path: format!("{version_id}/{version_id}.json"),
+                kind: KnownGoodArtifactKind::VersionMetadata,
+                integrity: TestKnownGoodIntegrity::Sha1 {
+                    digest: format!("{:x}", Sha1::digest(&version_json)),
+                    size: version_json.len() as u64,
+                },
+            },
+            TestKnownGoodEntry {
+                root: TestKnownGoodRoot::Versions,
+                path: format!("{version_id}/{version_id}.jar"),
+                kind: KnownGoodArtifactKind::ClientJar,
+                integrity: TestKnownGoodIntegrity::Sha1 {
+                    digest: format!("{:x}", Sha1::digest(CLIENT_BYTES)),
+                    size: CLIENT_BYTES.len() as u64,
+                },
+            },
+            TestKnownGoodEntry {
+                root: TestKnownGoodRoot::Assets,
+                path: format!("log_configs/{LOG_ID}"),
+                kind: KnownGoodArtifactKind::LogConfig,
+                integrity: TestKnownGoodIntegrity::Sha1 {
+                    digest: format!("{:x}", Sha1::digest(LOG_BYTES)),
+                    size: LOG_BYTES.len() as u64,
+                },
+            },
+        ])
+        .expect("corrupt VersionBundle inventory");
+        state.activate_known_good_inventory_for_test(instance_id, inventory);
+
+        (version_json, CLIENT_BYTES.to_vec(), LOG_BYTES.to_vec())
+    }
+
     fn activate_large_corrupt_inventory(state: &AppState, instance_id: &str, paths: &AppPaths) {
         let parent = paths.library_dir.join("libraries/cancel");
         fs::create_dir_all(&parent).expect("create cancellation parent");
@@ -1446,6 +1513,145 @@ mod tests {
                 .into_iter()
                 .any(|byte| byte != 7)
         );
+        close_fixture(state, &root).await;
+    }
+
+    #[tokio::test]
+    async fn corrupt_version_bundle_sweep_rebuilds_exact_projection_without_user_owned_writes() {
+        let (state, root, paths) = state_fixture("corrupt-version-bundle");
+        let instance = state
+            .instances()
+            .insert_for_test("Corrupt VersionBundle", "1.21.5")
+            .expect("register VersionBundle instance");
+        let (version_json, client_jar, log_config) = activate_corrupt_version_bundle_inventory(
+            &state,
+            &instance.id,
+            &instance.version_id,
+            &paths,
+        );
+        let instance_root = paths.instances_dir.join(&instance.id);
+        let user_owned = [
+            (
+                instance_root.join("saves/world/level.dat"),
+                b"world".as_slice(),
+            ),
+            (instance_root.join("mods/user.jar"), b"mod".as_slice()),
+            (instance_root.join("config/user.toml"), b"config".as_slice()),
+            (
+                instance_root.join("resourcepacks/user.zip"),
+                b"resourcepack".as_slice(),
+            ),
+        ];
+        for (path, contents) in &user_owned {
+            fs::create_dir_all(path.parent().expect("user-owned sentinel parent"))
+                .expect("create user-owned sentinel parent");
+            fs::write(path, contents).expect("write user-owned sentinel");
+        }
+        let plan = fixed_plan(&state, &instance.id, FIRST_OPERATION_ID).await;
+        let reserved = reserve(plan, idle_epoch(&state));
+
+        let terminal = reserved
+            .execute_with_rebuild_source(RegisteredArtifactComponentRebuildSource::Fixture)
+            .await
+            .expect("execute VersionBundle sweep");
+
+        assert_eq!(terminal, IdleIntegrityTerminal::Succeeded);
+        let parent = state
+            .journals()
+            .get(&OperationId::new(FIRST_OPERATION_ID))
+            .expect("VersionBundle parent journal");
+        assert_eq!(parent.status, OperationStatus::Succeeded);
+        assert_eq!(
+            parent.guardian_diagnosis_ids,
+            vec![crate::guardian::DiagnosisId::LauncherManagedArtifactCorrupt]
+        );
+        let child_journals = state
+            .journals()
+            .list()
+            .into_iter()
+            .filter(|entry| entry.operation_id != parent.operation_id)
+            .filter_map(|entry| {
+                entry
+                    .reconciliation_attempt()
+                    .cloned()
+                    .map(|attempt| (entry, attempt))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(child_journals.len(), 2);
+        let leaf = child_journals
+            .iter()
+            .find(|(_, attempt)| attempt.rung() == ReconciliationRung::RepairArtifact)
+            .expect("VersionBundle leaf child journal");
+        assert_eq!(leaf.0.status, OperationStatus::Failed);
+        assert_eq!(leaf.1.component(), ReconciliationComponent::VersionBundle);
+        assert_eq!(
+            leaf.0.failure_point.as_deref(),
+            Some(crate::state::REGISTERED_ARTIFACT_COMPONENT_REBUILD_FAILURE_POINT)
+        );
+        assert!(
+            leaf.0
+                .planned_steps
+                .iter()
+                .all(|step| step.step_id != "download_artifact_to_temp"
+                    && step.step_id != "quarantine_launcher_managed_target")
+        );
+        let component = child_journals
+            .iter()
+            .find(|(_, attempt)| attempt.rung() == ReconciliationRung::RebuildComponent)
+            .expect("VersionBundle component child journal");
+        assert_eq!(component.0.status, OperationStatus::Succeeded);
+        assert_eq!(
+            component.1.component(),
+            ReconciliationComponent::VersionBundle
+        );
+        assert_ne!(leaf.0.operation_id, component.0.operation_id);
+        assert_ne!(leaf.0.operation_id, parent.operation_id);
+        assert_ne!(component.0.operation_id, parent.operation_id);
+        for (entry, attempt) in [leaf, component] {
+            let child_terminal = entry
+                .reconciliation_terminal()
+                .expect("VersionBundle child reconciliation terminal");
+            assert_eq!(
+                state
+                    .failure_memory()
+                    .get(&reconciliation_attempt_key(attempt))
+                    .and_then(|memory| memory.reconciliation_terminal().cloned()),
+                Some(child_terminal.clone()),
+                "each VersionBundle child terminal must reach memory before parent success",
+            );
+        }
+
+        let version_dir = paths
+            .library_dir
+            .join("versions")
+            .join(&instance.version_id);
+        assert_eq!(
+            fs::read(version_dir.join(format!("{}.json", instance.version_id)))
+                .expect("rebuilt VersionBundle metadata"),
+            version_json
+        );
+        assert_eq!(
+            fs::read(version_dir.join(format!("{}.jar", instance.version_id)))
+                .expect("rebuilt VersionBundle client"),
+            client_jar
+        );
+        assert_eq!(
+            fs::read(
+                paths
+                    .library_dir
+                    .join("assets/log_configs/guardian-version-bundle.xml")
+            )
+            .expect("rebuilt VersionBundle log config"),
+            log_config
+        );
+        for (path, contents) in &user_owned {
+            assert_eq!(
+                fs::read(path).expect("user-owned sentinel remains readable"),
+                *contents,
+                "VersionBundle rebuild must not mutate user-owned instance files",
+            );
+        }
+
         close_fixture(state, &root).await;
     }
 

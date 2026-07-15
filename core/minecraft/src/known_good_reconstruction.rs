@@ -500,6 +500,15 @@ pub async fn rebuild_managed_version_bundle_fixture_for_test(
         .map_err(|_| ManagedVersionBundleRebuildError::Preparation)?
 }
 
+#[cfg(feature = "test-support")]
+pub async fn rebuild_managed_version_bundle_rollback_fixture_for_test(
+    managed_root: impl Into<PathBuf>,
+    version_id: &str,
+) -> Result<ManagedVersionBundleCommitReceipt, ManagedVersionBundleRebuildError> {
+    crate::version_bundle_publication::fail_after_promotions_for_test(version_id, 1);
+    rebuild_managed_version_bundle_fixture_for_test(managed_root, version_id).await
+}
+
 async fn publish_managed_libraries_reconstruction(
     reconstruction: ManagedLibrariesReconstruction,
 ) -> Result<ManagedLibrariesCommitReceipt, ManagedLibrariesRebuildError> {

@@ -1212,8 +1212,8 @@ async fn launch_session_inner_with_control(
                 };
                 let guardian_mode = api_guardian_mode(intent.guardian.mode);
                 let startup_outcome = {
-                    let repair_target = (!registered_recovery_process_retry_used)
-                        .then(|| integrity.repair_target())
+                    let repair_candidate = (!registered_recovery_process_retry_used)
+                        .then(|| integrity.repair_candidate())
                         .flatten();
                     guardian_startup_failure_outcome(GuardianStartupFailureRequest {
                         mode: guardian_mode,
@@ -1222,7 +1222,7 @@ async fn launch_session_inner_with_control(
                             .as_ref()
                             .and_then(|record| record.crash_evidence.as_ref()),
                         integrity_facts: &integrity.facts,
-                        registered_artifact_repair_target: repair_target,
+                        registered_artifact_repair_candidate: repair_candidate,
                         target_version_id: &intent.target_version_id,
                         runtime_major: prepared.runtime.effective_info.major,
                         requested_java_present: !intent.requested_java.trim().is_empty(),
@@ -1815,8 +1815,8 @@ struct StartupFailureIntegrity {
 }
 
 impl StartupFailureIntegrity {
-    fn repair_target(&self) -> Option<&crate::state::contracts::TargetDescriptor> {
-        self.findings.as_ref()?.repair_target()
+    fn repair_candidate(&self) -> Option<crate::state::RegisteredArtifactRepairCandidate<'_>> {
+        self.findings.as_ref()?.repair_candidate()
     }
 
     fn into_findings(self) -> Option<RegisteredArtifactFindings> {
@@ -2014,7 +2014,8 @@ mod tests {
         assert_eq!(report.facts.len(), 1);
         let (_, findings) = report.into_parts();
         let target = findings
-            .repair_target()
+            .repair_candidate()
+            .map(|candidate| candidate.target())
             .expect("source-backed registered Libraries target")
             .clone();
         let authorization = findings

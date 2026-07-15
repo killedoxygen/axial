@@ -6,12 +6,15 @@ use crate::guardian::{
     DiagnosisId, GuardianArtifactRepairSettlement, GuardianArtifactRepairStatus,
     GuardianComponentRebuildStatus, Tier2RegisteredArtifactAssessment,
     assess_tier2_registered_artifact_repair, execute_managed_assets_component_rebuild,
-    execute_managed_libraries_component_rebuild, execute_registered_guardian_artifact_repair,
+    execute_managed_libraries_component_rebuild, execute_managed_version_bundle_component_rebuild,
+    execute_registered_guardian_artifact_repair,
 };
 use crate::state::contracts::{OperationId, ReconciliationComponent};
 use crate::state::{
     AppState, OperationJournalStoreError, RegisteredArtifactFailedRepair,
-    RegisteredArtifactFindings, RegisteredArtifactRepairAdmission, RegisteredAssetsRecoveryEntry,
+    RegisteredArtifactFindings,
+    RegisteredArtifactRecoveryEntry as StateRegisteredArtifactRecoveryEntry,
+    RegisteredArtifactRepairAdmission,
 };
 
 pub(super) const REGISTERED_ARTIFACT_REPAIR_SUPPRESSION_MINUTES: i64 = 15;
@@ -55,7 +58,7 @@ pub(super) struct Tier2RegisteredArtifactRecovery {
 
 struct Tier2RegisteredArtifactRecoveryExecution {
     state: AppState,
-    entry: RegisteredAssetsRecoveryEntry,
+    entry: StateRegisteredArtifactRecoveryEntry,
     client: reqwest::Client,
     rebuild_source: RegisteredArtifactComponentRebuildSource,
 }
@@ -96,7 +99,7 @@ pub(super) fn prepare_tier2_registered_artifact_recovery(
     let Ok(authorization) = findings.authorize_repair(assessment.decision()) else {
         return Tier2RegisteredArtifactRecovery { execution: None };
     };
-    let Ok(entry) = state.registered_assets_recovery_entry(authorization) else {
+    let Ok(entry) = state.registered_artifact_recovery_entry(authorization) else {
         return Tier2RegisteredArtifactRecovery { execution: None };
     };
     Tier2RegisteredArtifactRecovery {
@@ -123,7 +126,7 @@ impl Tier2RegisteredArtifactRecovery {
             rebuild_source,
         } = *execution;
         let entry = match entry {
-            RegisteredAssetsRecoveryEntry::Fresh(authorization) => {
+            StateRegisteredArtifactRecoveryEntry::Fresh(authorization) => {
                 let Ok(admission) = state
                     .admit_registered_artifact_repair(
                         authorization,
@@ -136,7 +139,7 @@ impl Tier2RegisteredArtifactRecovery {
                 };
                 RegisteredArtifactRecoveryEntry::Fresh(Box::new(admission))
             }
-            RegisteredAssetsRecoveryEntry::Resume(continuation) => {
+            StateRegisteredArtifactRecoveryEntry::Resume(continuation) => {
                 RegisteredArtifactRecoveryEntry::Resume(Box::new(continuation))
             }
         };
@@ -180,6 +183,45 @@ pub(super) async fn execute_registered_artifact_recovery_sequence(
     let diagnosis_id = component_admission.attempt().diagnosis_id();
     let component = component_admission.attempt().component();
     let rebuild = match component {
+        ReconciliationComponent::VersionBundle => {
+            execute_managed_version_bundle_component_rebuild(
+                component_admission,
+                move |effect| async move {
+                    let (root, version_id) = effect.core_request();
+                    let root = root.to_path_buf();
+                    let version_id = version_id.to_string();
+                    let rebuilt = match rebuild_source {
+                        RegisteredArtifactComponentRebuildSource::Production => {
+                            axial_minecraft::rebuild_managed_version_bundle(root, &version_id).await
+                        }
+                        #[cfg(test)]
+                        RegisteredArtifactComponentRebuildSource::Fixture => {
+                            axial_minecraft::rebuild_managed_version_bundle_fixture_for_test(
+                                root,
+                                &version_id,
+                            )
+                            .await
+                        }
+                    };
+                    match rebuilt {
+                        Ok(receipt) => effect.committed(receipt, Vec::new()),
+                        Err(
+                            axial_minecraft::ManagedVersionBundleRebuildError::Reconstruction(_)
+                            | axial_minecraft::ManagedVersionBundleRebuildError::Preparation,
+                        ) => effect.failed_before_effect([
+                            "version_bundle_component_preparation_failed".into(),
+                        ]),
+                        Err(axial_minecraft::ManagedVersionBundleRebuildError::RolledBack(
+                            receipt,
+                        )) => effect.rolled_back(
+                            receipt,
+                            ["version_bundle_component_rebuild_rolled_back".into()],
+                        ),
+                    }
+                },
+            )
+            .await?
+        }
         ReconciliationComponent::Libraries => {
             execute_managed_libraries_component_rebuild(
                 component_admission,

@@ -4,6 +4,7 @@ use super::{
     GuardianPolicyContext, GuardianStripJvmArgsReason, GuardianUserOutcome, SafetyCase,
     author_guardian_copy, build_safety_case, decide_guardian_policy,
 };
+use crate::state::RegisteredArtifactRepairCandidate;
 use crate::state::contracts::{
     OperationPhase, OwnershipClass, StabilizationSystem, TargetDescriptor, TargetKind,
 };
@@ -51,7 +52,7 @@ pub struct GuardianStartupFailureRequest<'a> {
     pub observation: GuardianStartupFailureObservation,
     pub crash_evidence: Option<&'a CrashEvidence>,
     pub integrity_facts: &'a [GuardianFact],
-    pub registered_artifact_repair_target: Option<&'a TargetDescriptor>,
+    pub registered_artifact_repair_candidate: Option<RegisteredArtifactRepairCandidate<'a>>,
     pub target_version_id: &'a str,
     pub runtime_major: u32,
     pub requested_java_present: bool,
@@ -333,10 +334,16 @@ fn startup_failure_facts(
         GuardianFactId::LaunchFailureClassified,
         OperationPhase::Launching,
     ));
-    if let Some(target) = request.registered_artifact_repair_target
-        && registered_artifact_target_matches_integrity_fact(target, request.integrity_facts)
-    {
-        facts.push(registered_artifact_repair_available_fact(target));
+    let repair_candidate = request
+        .registered_artifact_repair_candidate
+        .filter(|candidate| {
+            request
+                .integrity_facts
+                .iter()
+                .any(|fact| registered_artifact_candidate_matches_integrity_fact(*candidate, fact))
+        });
+    if let Some(candidate) = repair_candidate {
+        facts.push(registered_artifact_repair_available_fact(candidate));
     }
     if recovery_options.runtime_fallback.is_some() {
         facts.push(condition_fact(
@@ -361,43 +368,53 @@ fn startup_failure_facts(
             .integrity_facts
             .iter()
             .filter(|fact| fact.id != GuardianFactId::RegisteredArtifactRepairAvailable)
-            .cloned(),
+            .map(|fact| {
+                let mut fact = fact.clone();
+                if let Some(candidate) = repair_candidate
+                    && registered_artifact_candidate_matches_integrity_fact(candidate, &fact)
+                {
+                    fact.domain = candidate.domain();
+                }
+                fact
+            }),
     );
     facts
 }
 
-fn registered_artifact_target_matches_integrity_fact(
-    target: &TargetDescriptor,
-    integrity_facts: &[GuardianFact],
+fn registered_artifact_candidate_matches_integrity_fact(
+    candidate: RegisteredArtifactRepairCandidate<'_>,
+    integrity_fact: &GuardianFact,
 ) -> bool {
+    let target = candidate.target();
     target.system == StabilizationSystem::Execution
         && target.kind == TargetKind::Artifact
         && target.ownership == OwnershipClass::LauncherManaged
-        && integrity_facts.iter().any(|fact| {
-            matches!(
-                fact.id,
-                GuardianFactId::ArtifactChecksumMismatch
-                    | GuardianFactId::ArtifactHashMismatch
-                    | GuardianFactId::ArtifactSizeDrift
-                    | GuardianFactId::ArtifactSizeMismatch
-                    | GuardianFactId::ArtifactMissing
-            ) && fact.phase == OperationPhase::Launching
-                && fact.ownership == OwnershipClass::LauncherManaged
-                && fact.target.as_ref() == Some(target)
-        })
+        && matches!(
+            integrity_fact.id,
+            GuardianFactId::ArtifactChecksumMismatch
+                | GuardianFactId::ArtifactHashMismatch
+                | GuardianFactId::ArtifactSizeDrift
+                | GuardianFactId::ArtifactSizeMismatch
+                | GuardianFactId::ArtifactMissing
+        )
+        && integrity_fact.phase == OperationPhase::Launching
+        && integrity_fact.ownership == OwnershipClass::LauncherManaged
+        && integrity_fact.target.as_ref() == Some(target)
 }
 
-fn registered_artifact_repair_available_fact(target: &TargetDescriptor) -> GuardianFact {
+fn registered_artifact_repair_available_fact(
+    candidate: RegisteredArtifactRepairCandidate<'_>,
+) -> GuardianFact {
     GuardianFact {
         operation_id: None,
         id: GuardianFactId::RegisteredArtifactRepairAvailable,
-        domain: GuardianDomain::Library,
+        domain: candidate.domain(),
         phase: OperationPhase::Launching,
         reliability: FactReliability::DirectStructured,
         severity: None,
         confidence: None,
         ownership: OwnershipClass::LauncherManaged,
-        target: Some(target.clone()),
+        target: Some(candidate.target().clone()),
         fields: Vec::new(),
     }
 }
@@ -694,15 +711,16 @@ fn is_legacy_version_family(version_id: &str) -> bool {
 mod tests {
     use super::{
         GuardianObservedLaunchFailurePhase, GuardianPrepareFailureRequest,
-        GuardianStartupFailureObservation, GuardianStartupFailureRequest,
+        GuardianStartupFailureObservation, GuardianStartupFailureRequest, StartupRecoveryOptions,
         guardian_prelaunch_preset_adjustment_directive, guardian_prepare_failure_outcome,
-        guardian_startup_failure_outcome,
+        guardian_startup_failure_outcome, startup_failure_facts,
     };
     use crate::guardian::{
         DiagnosisId, FactReliability, GuardianActionKind, GuardianCopyRequest, GuardianDirective,
         GuardianDomain, GuardianFact, GuardianFactId, GuardianMode, GuardianPresetDowngradeReason,
         author_guardian_copy, conservative_launch_recovery_preset, guardian_directive_description,
     };
+    use crate::state::RegisteredArtifactRepairCandidate;
     use crate::state::contracts::{
         OperationPhase, OwnershipClass, StabilizationSystem, TargetDescriptor, TargetKind,
     };
@@ -744,7 +762,7 @@ mod tests {
             },
             crash_evidence: None,
             integrity_facts: &[],
-            registered_artifact_repair_target: None,
+            registered_artifact_repair_candidate: None,
             target_version_id: "1.5.2",
             runtime_major: 8,
             requested_java_present: false,
@@ -808,7 +826,14 @@ mod tests {
                     observation: GuardianStartupFailureObservation::Exited { failure_class },
                     crash_evidence: None,
                     integrity_facts: &integrity_facts,
-                    registered_artifact_repair_target: integrity_fact.target.as_ref(),
+                    registered_artifact_repair_candidate: integrity_fact.target.as_ref().map(
+                        |target| {
+                            RegisteredArtifactRepairCandidate::for_test(
+                                target,
+                                GuardianDomain::Library,
+                            )
+                        },
+                    ),
                     target_version_id: "1.21.1",
                     runtime_major: 21,
                     requested_java_present: false,
@@ -843,6 +868,74 @@ mod tests {
     }
 
     #[test]
+    fn version_bundle_repair_candidate_keeps_launch_domain() {
+        assert_registered_artifact_repair_candidate_domain(GuardianDomain::Launch);
+    }
+
+    #[test]
+    fn libraries_repair_candidate_keeps_library_domain() {
+        assert_registered_artifact_repair_candidate_domain(GuardianDomain::Library);
+    }
+
+    fn assert_registered_artifact_repair_candidate_domain(expected_domain: GuardianDomain) {
+        let integrity_fact = exact_registered_artifact_fact(GuardianFactId::ArtifactHashMismatch);
+        let target = integrity_fact
+            .target
+            .as_ref()
+            .expect("exact artifact target");
+        let request = GuardianStartupFailureRequest {
+            mode: GuardianMode::Managed,
+            observation: GuardianStartupFailureObservation::Exited {
+                failure_class: LaunchFailureClass::LauncherManagedArtifactSignature,
+            },
+            crash_evidence: None,
+            integrity_facts: std::slice::from_ref(&integrity_fact),
+            registered_artifact_repair_candidate: Some(
+                RegisteredArtifactRepairCandidate::for_test(target, expected_domain),
+            ),
+            target_version_id: "1.21.1",
+            runtime_major: 21,
+            requested_java_present: false,
+            explicit_java_override_present: false,
+            explicit_jvm_args_present: false,
+            explicit_jvm_preset_present: false,
+            startup_recovery_applied: false,
+            disable_custom_gc: false,
+            effective_preset: "performance",
+        };
+        let facts = startup_failure_facts(
+            &request,
+            LaunchFailureClass::LauncherManagedArtifactSignature,
+            &StartupRecoveryOptions::default(),
+        );
+        assert_eq!(
+            facts
+                .iter()
+                .filter(|fact| fact.target.as_ref() == Some(target))
+                .map(|fact| (fact.id, fact.domain))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    GuardianFactId::RegisteredArtifactRepairAvailable,
+                    expected_domain,
+                ),
+                (GuardianFactId::ArtifactHashMismatch, expected_domain),
+            ]
+        );
+
+        let outcome = guardian_startup_failure_outcome(request);
+        assert_eq!(outcome.guardian_decision.kind(), GuardianActionKind::Repair);
+        let diagnosis = outcome
+            .safety_case
+            .diagnoses
+            .iter()
+            .find(|diagnosis| diagnosis.id() == DiagnosisId::LauncherManagedArtifactCorrupt)
+            .expect("exact registered artifact diagnosis");
+        assert_eq!(diagnosis.domain(), expected_domain);
+        assert_eq!(diagnosis.affected_targets(), std::slice::from_ref(target));
+    }
+
+    #[test]
     fn signature_with_integrity_finding_but_no_registered_repair_stays_blocked() {
         let integrity_fact = exact_registered_artifact_fact(GuardianFactId::ArtifactHashMismatch);
         let outcome = guardian_startup_failure_outcome(GuardianStartupFailureRequest {
@@ -852,7 +945,7 @@ mod tests {
             },
             crash_evidence: None,
             integrity_facts: std::slice::from_ref(&integrity_fact),
-            registered_artifact_repair_target: None,
+            registered_artifact_repair_candidate: None,
             target_version_id: "1.21.1",
             runtime_major: 21,
             requested_java_present: false,
@@ -877,7 +970,7 @@ mod tests {
     }
 
     #[test]
-    fn registered_artifact_repair_target_must_match_a_launch_integrity_fact() {
+    fn registered_artifact_repair_candidate_must_match_a_launch_integrity_fact() {
         let integrity_fact = exact_registered_artifact_fact(GuardianFactId::ArtifactHashMismatch);
         let mismatched_target = TargetDescriptor::new(
             StabilizationSystem::Execution,
@@ -892,7 +985,12 @@ mod tests {
             },
             crash_evidence: None,
             integrity_facts: std::slice::from_ref(&integrity_fact),
-            registered_artifact_repair_target: Some(&mismatched_target),
+            registered_artifact_repair_candidate: Some(
+                RegisteredArtifactRepairCandidate::for_test(
+                    &mismatched_target,
+                    GuardianDomain::Library,
+                ),
+            ),
             target_version_id: "1.21.1",
             runtime_major: 21,
             requested_java_present: false,
@@ -945,7 +1043,7 @@ mod tests {
             },
             crash_evidence: None,
             integrity_facts: &[],
-            registered_artifact_repair_target: None,
+            registered_artifact_repair_candidate: None,
             target_version_id: "1.21.1",
             runtime_major: 21,
             requested_java_present: false,
@@ -1032,7 +1130,7 @@ mod tests {
                 observation: GuardianStartupFailureObservation::Exited { failure_class },
                 crash_evidence: None,
                 integrity_facts: &[],
-                registered_artifact_repair_target: None,
+                registered_artifact_repair_candidate: None,
                 target_version_id: "1.21.1",
                 runtime_major: 21,
                 requested_java_present: false,
@@ -1103,7 +1201,7 @@ mod tests {
             },
             crash_evidence: Some(&crash_evidence),
             integrity_facts: &[],
-            registered_artifact_repair_target: None,
+            registered_artifact_repair_candidate: None,
             target_version_id: "1.21.1",
             runtime_major: 21,
             requested_java_present: false,
@@ -1143,7 +1241,7 @@ mod tests {
             observation: GuardianStartupFailureObservation::Stalled,
             crash_evidence: None,
             integrity_facts: &[],
-            registered_artifact_repair_target: None,
+            registered_artifact_repair_candidate: None,
             target_version_id: "1.21.1",
             runtime_major: 21,
             requested_java_present: false,

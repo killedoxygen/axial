@@ -2976,7 +2976,7 @@ fn inspect_tier2_entry(
             if let Some(fact) = fact {
                 let fact_index = push_bounded_tier2_fact(report, fact);
                 if let (Some(fact_index), Some(condition)) = (fact_index, repair_condition)
-                    && tier2_assets_leaf_is_source_backed(inventory, entry, inventory_ordinal)
+                    && tier2_registered_artifact_is_recoverable(inventory, entry, inventory_ordinal)
                 {
                     report
                         .repairable_observations
@@ -3100,20 +3100,28 @@ fn tier2_refused_fact(
     }
 }
 
-fn tier2_assets_leaf_is_source_backed(
+fn tier2_registered_artifact_is_recoverable(
     inventory: &KnownGoodInventory,
     entry: &KnownGoodEntry,
     inventory_ordinal: usize,
 ) -> bool {
-    matches!(
+    let version_bundle = matches!(
         (entry.root(), entry.kind()),
         (
-            KnownGoodRoot::Assets,
-            KnownGoodArtifactKind::AssetIndex | KnownGoodArtifactKind::AssetObject,
-        )
-    ) && inventory
-        .bind_standalone_leaf_repair_source(inventory_ordinal)
-        .is_ok_and(|source| source.root() == entry.root() && source.kind() == entry.kind())
+            KnownGoodRoot::Versions,
+            KnownGoodArtifactKind::VersionMetadata | KnownGoodArtifactKind::ClientJar,
+        ) | (KnownGoodRoot::Assets, KnownGoodArtifactKind::LogConfig)
+    );
+    version_bundle
+        || matches!(
+            (entry.root(), entry.kind()),
+            (
+                KnownGoodRoot::Assets,
+                KnownGoodArtifactKind::AssetIndex | KnownGoodArtifactKind::AssetObject,
+            )
+        ) && inventory
+            .bind_standalone_leaf_repair_source(inventory_ordinal)
+            .is_ok_and(|source| source.root() == entry.root() && source.kind() == entry.kind())
 }
 
 fn push_bounded_tier2_fact(
@@ -3413,7 +3421,7 @@ mod tests {
     use crate::guardian::{
         ActionPlanPrerequisite, DiagnosisId, GuardianAction, GuardianActionKind,
         GuardianActionPlan, GuardianArtifactRepairSettlement, GuardianArtifactRepairStatus,
-        GuardianConfidence, GuardianDecision, GuardianMode,
+        GuardianConfidence, GuardianDecision, GuardianDomain, GuardianMode,
         execute_failed_managed_assets_component_rebuild_for_test,
         execute_registered_guardian_artifact_repair,
     };
@@ -4259,7 +4267,11 @@ mod tests {
             ))
             .await
             .expect("sweep findings");
-        let target = findings.repair_target().expect("repair target").clone();
+        let target = findings
+            .repair_candidate()
+            .map(|candidate| candidate.target())
+            .expect("repair target")
+            .clone();
         let authorization = findings
             .authorize_repair(&registered_artifact_decision(target, GuardianMode::Managed))
             .expect("repair authorization");
@@ -5262,7 +5274,10 @@ mod tests {
                 assert_eq!(report.status, IntegrityTier2Status::Complete);
                 assert!(report.repairable_observations.is_empty());
                 assert_eq!(findings.len(), 1);
-                let target = findings.repair_target().expect("selected Assets target");
+                let target = findings
+                    .repair_candidate()
+                    .map(|candidate| candidate.target())
+                    .expect("selected Assets target");
                 assert_eq!(target.system, StabilizationSystem::Execution);
                 assert_eq!(target.kind, TargetKind::Artifact);
                 assert_eq!(target.ownership, OwnershipClass::LauncherManaged);
@@ -5886,11 +5901,13 @@ mod tests {
         .await
         .expect("admitted Tier one report");
 
-        assert_eq!(report.findings().len(), 2);
+        assert_eq!(report.findings().len(), 3);
         assert!(!report.findings().is_empty());
         assert!(state.registered_artifact_findings_can_admit(report.findings()));
         let corrupt = RegisteredArtifactObservation::new(0, RegisteredArtifactCondition::Corrupt);
         let missing = RegisteredArtifactObservation::new(1, RegisteredArtifactCondition::Missing);
+        let version_bundle =
+            RegisteredArtifactObservation::new(3, RegisteredArtifactCondition::Corrupt);
         let missing_target = report
             .findings()
             .target_for(missing)
@@ -5899,8 +5916,14 @@ mod tests {
             .findings()
             .target_for(corrupt)
             .expect("corrupt target");
+        let version_bundle_target = report
+            .findings()
+            .target_for(version_bundle)
+            .expect("VersionBundle target");
         assert_ne!(missing_target, corrupt_target);
-        for target in [missing_target, corrupt_target] {
+        assert_ne!(missing_target, version_bundle_target);
+        assert_ne!(corrupt_target, version_bundle_target);
+        for target in [missing_target, corrupt_target, version_bundle_target] {
             assert_eq!(target.system, StabilizationSystem::Execution);
             assert_eq!(target.kind, TargetKind::Artifact);
             assert_eq!(target.ownership, OwnershipClass::LauncherManaged);
@@ -5941,21 +5964,45 @@ mod tests {
                     fact_field(fact, "inventory_root") == Some("versions")
                         && fact_field(fact, "observation") == Some("hash_mismatch")
                 })
-                .and_then(|fact| fact.target.as_ref())
-                .map(|target| target.id.as_str()),
-            Some("known_good_versions_client_jar_3")
+                .and_then(|fact| fact.target.as_ref()),
+            Some(version_bundle_target)
         );
         assert_eq!(
             report
                 .findings()
                 .observations_for_test()
-                .map(|(observation, _)| {
-                    (observation.inventory_ordinal(), observation.condition())
+                .map(|(observation, target, domain, component)| {
+                    (
+                        observation.inventory_ordinal(),
+                        observation.condition(),
+                        target,
+                        domain,
+                        component,
+                    )
                 })
                 .collect::<Vec<_>>(),
             vec![
-                (0, RegisteredArtifactCondition::Corrupt),
-                (1, RegisteredArtifactCondition::Missing),
+                (
+                    0,
+                    RegisteredArtifactCondition::Corrupt,
+                    corrupt_target,
+                    GuardianDomain::Library,
+                    ReconciliationComponent::Libraries,
+                ),
+                (
+                    1,
+                    RegisteredArtifactCondition::Missing,
+                    missing_target,
+                    GuardianDomain::Library,
+                    ReconciliationComponent::Libraries,
+                ),
+                (
+                    3,
+                    RegisteredArtifactCondition::Corrupt,
+                    version_bundle_target,
+                    GuardianDomain::Launch,
+                    ReconciliationComponent::VersionBundle,
+                ),
             ]
         );
 
@@ -6013,7 +6060,8 @@ mod tests {
             .expect("Tier one report");
             let (_, findings) = report.into_parts();
             let target = findings
-                .repair_target()
+                .repair_candidate()
+                .map(|candidate| candidate.target())
                 .expect("exact repair target")
                 .clone();
             assert!(matches!(
@@ -6031,8 +6079,12 @@ mod tests {
         .await
         .expect("managed Tier one report");
         let (_, findings) = report.into_parts();
-        assert!(findings.repair_target().is_some());
-        let selected = findings.repair_target().expect("selected target").clone();
+        assert!(findings.repair_candidate().is_some());
+        let selected = findings
+            .repair_candidate()
+            .map(|candidate| candidate.target())
+            .expect("selected target")
+            .clone();
         let authorization = findings
             .authorize_repair(&registered_artifact_decision(
                 selected,
@@ -6061,7 +6113,7 @@ mod tests {
         .await
         .expect("source-less Tier one report");
         let (_, findings) = report.into_parts();
-        assert!(findings.repair_target().is_none());
+        assert!(findings.repair_candidate().is_none());
         assert!(findings.is_empty());
 
         drop(lifecycle);
@@ -6189,7 +6241,12 @@ mod tests {
                 admission.attempt().component(),
                 ReconciliationComponent::Assets
             );
-            assert_eq!(admission.download_contract().2, size);
+            let crate::state::RegisteredArtifactRepairPlanRef::Download(download) =
+                admission.plan()
+            else {
+                panic!("source-backed repair contract");
+            };
+            assert_eq!(download.expected_size(), size);
 
             drop((admission, lifecycle));
             close_fixture(state, root).await;
@@ -6335,7 +6392,8 @@ mod tests {
         )
         .await;
         let target = findings
-            .repair_target()
+            .repair_candidate()
+            .map(|candidate| candidate.target())
             .expect("Assets repair target")
             .clone();
         let authorization = findings
@@ -6466,7 +6524,8 @@ mod tests {
         )
         .await;
         let target = findings
-            .repair_target()
+            .repair_candidate()
+            .map(|candidate| candidate.target())
             .expect("Assets repair target")
             .clone();
         let authorization = findings
@@ -6551,7 +6610,11 @@ mod tests {
             .await
             .expect("Tier one report");
             let (_, findings) = report.into_parts();
-            let target = findings.repair_target().expect("repair target").clone();
+            let target = findings
+                .repair_candidate()
+                .map(|candidate| candidate.target())
+                .expect("repair target")
+                .clone();
             let authorization = findings
                 .authorize_repair(&registered_artifact_decision(
                     target.clone(),
@@ -6599,7 +6662,11 @@ mod tests {
             .await
             .expect("repeat Tier one report");
             let (_, findings) = report.into_parts();
-            let target = findings.repair_target().expect("repeat target").clone();
+            let target = findings
+                .repair_candidate()
+                .map(|candidate| candidate.target())
+                .expect("repeat target")
+                .clone();
             let authorization = findings
                 .authorize_repair(&registered_artifact_decision(target, GuardianMode::Managed))
                 .expect("repeat authorization");
@@ -6657,7 +6724,11 @@ mod tests {
         .await
         .expect("Tier one report");
         let (_, findings) = report.into_parts();
-        let target = findings.repair_target().expect("repair target").clone();
+        let target = findings
+            .repair_candidate()
+            .map(|candidate| candidate.target())
+            .expect("repair target")
+            .clone();
         let authorization = findings
             .authorize_repair(&registered_artifact_decision(
                 target.clone(),
@@ -6735,7 +6806,11 @@ mod tests {
         .await
         .expect("Tier one report");
         let (_, findings) = report.into_parts();
-        let target = findings.repair_target().expect("repair target").clone();
+        let target = findings
+            .repair_candidate()
+            .map(|candidate| candidate.target())
+            .expect("repair target")
+            .clone();
         let authorization = findings
             .authorize_repair(&registered_artifact_decision(target, GuardianMode::Managed))
             .expect("repair authorization");
@@ -6803,7 +6878,11 @@ mod tests {
         .await
         .expect("Tier one report");
         let (_, findings) = report.into_parts();
-        let target = findings.repair_target().expect("repair target").clone();
+        let target = findings
+            .repair_candidate()
+            .map(|candidate| candidate.target())
+            .expect("repair target")
+            .clone();
         let authorization = findings
             .authorize_repair(&registered_artifact_decision(
                 target.clone(),
