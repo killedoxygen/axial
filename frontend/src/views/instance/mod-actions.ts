@@ -1,5 +1,5 @@
 import { api } from '../../api';
-import { checkContentUpdates, installContent, listInstanceContent, uninstallContent } from '../../content';
+import { checkContentUpdates, installContent, listInstanceContent, uninstallContents } from '../../content';
 import { applyInstallQueueResponse } from '../../machines/downloads';
 import { toast } from '../../toast';
 import { navigate } from '../../ui-state';
@@ -117,7 +117,18 @@ async function queueManagedModRemoval(
   entry: InstanceContentEntry,
   showNotice: boolean,
 ): Promise<void> {
-  const queue = await uninstallContent(inst.id, entry.canonical_id);
+  await queueManagedModRemovals(inst, [entry], showNotice);
+}
+
+async function queueManagedModRemovals(
+  inst: EnrichedInstance,
+  entries: InstanceContentEntry[],
+  showNotice: boolean,
+): Promise<void> {
+  const queue = await uninstallContents(
+    inst.id,
+    entries.map((entry) => entry.canonical_id),
+  );
   await applyInstallQueueResponse(queue, { showNotice, connectActive: true });
 }
 
@@ -183,13 +194,23 @@ export async function deleteMods(
         : `Remove ${mods.length} mods from this instance. Managed mods are safely removed from the install record too.`,
   });
   if (!confirmed) return;
-  await runBulkMutation({
-    items: removals,
-    action: ({ mod, entry }) => (entry ? queueManagedModRemoval(inst, entry, false) : removeMod(inst, mod.name)),
-    success: (count) => (count === 1 ? 'Mod removal started' : `${count} mod removals started`),
-    partial: (done, total, err) => partialFailureMessage('Started removal for', done, total, err),
-    onDone,
-  });
+  const managed = removals.flatMap(({ entry }) => (entry ? [entry] : []));
+  const unmanaged = removals.flatMap(({ mod, entry }) => (entry ? [] : [mod]));
+  let started = 0;
+  try {
+    if (managed.length > 0) {
+      await queueManagedModRemovals(inst, managed, false);
+      started += managed.length;
+    }
+    for (const mod of unmanaged) {
+      await removeMod(inst, mod.name);
+      started += 1;
+    }
+    toast(started === 1 ? 'Mod removal started' : `${started} mod removals started`);
+  } catch (err) {
+    toast(partialFailureMessage('Started removal for', started, mods.length, err), 'error');
+  }
+  onDone();
 }
 
 export function modMenuItems(

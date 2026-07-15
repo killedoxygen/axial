@@ -248,24 +248,50 @@ fn prepare_install_destinations(
 /// Remove a managed file (enabled or disabled variant) and drop its manifest
 /// entry. Saves the manifest when an entry was actually removed.
 pub fn uninstall(game_dir: &Path, canonical_id: &CanonicalId) -> ContentResult<bool> {
+    uninstall_many(game_dir, std::slice::from_ref(canonical_id)).map(|removed| removed > 0)
+}
+
+/// Remove a set of managed files in one transaction. Dependencies within the
+/// selected set may be removed together, while live content outside the set
+/// still protects anything it requires.
+pub fn uninstall_many(game_dir: &Path, canonical_ids: &[CanonicalId]) -> ContentResult<usize> {
     let mut manifest = ContentManifest::load(game_dir)?;
-    let Some(entry) = manifest.find(canonical_id).cloned() else {
-        return Ok(false);
-    };
+    let requested = canonical_ids.iter().collect::<HashSet<_>>();
+    let entries = manifest
+        .entries
+        .iter()
+        .filter(|entry| requested.contains(&entry.canonical_id))
+        .cloned()
+        .collect::<Vec<_>>();
+    if entries.is_empty() {
+        return Ok(0);
+    }
+    let selected = entries
+        .iter()
+        .map(|entry| &entry.canonical_id)
+        .collect::<HashSet<_>>();
     if manifest.entries.iter().any(|dependent| {
-        dependent.canonical_id != entry.canonical_id
+        !selected.contains(&dependent.canonical_id)
             && entry_file_present(game_dir, dependent)
-            && dependent
-                .dependencies
-                .iter()
-                .any(|dependency| dependency.requires_project(&entry.project_id, &entry.version_id))
+            && entries.iter().any(|entry| {
+                dependent.dependencies.iter().any(|dependency| {
+                    dependency.requires_project(&entry.project_id, &entry.version_id)
+                })
+            })
     }) {
         return Err(ContentError::Invalid(
             "content is required by another installed item".to_string(),
         ));
     }
-    let removable = verified_removable_variants(game_dir, &entry, &[])?;
-    manifest.remove(canonical_id);
+    let mut removable = Vec::new();
+    for entry in &entries {
+        removable.extend(verified_removable_variants(game_dir, entry, &[])?);
+    }
+    removable.sort();
+    removable.dedup();
+    for entry in &entries {
+        manifest.remove(&entry.canonical_id);
+    }
     let mut transaction = FileTransaction::empty(game_dir)?;
     transaction.stage_removals(&removable)?;
     if let Err(error) = manifest.save(game_dir) {
@@ -273,7 +299,7 @@ pub fn uninstall(game_dir: &Path, canonical_id: &CanonicalId) -> ContentResult<b
         return Err(error);
     }
     transaction.commit();
-    Ok(true)
+    Ok(entries.len())
 }
 
 /// Return only manifest-owned variants that are still safe to remove. A live
@@ -676,5 +702,48 @@ mod tests {
             );
             let _ = fs::remove_dir_all(root);
         }
+    }
+
+    #[test]
+    fn batch_uninstall_removes_dependents_and_dependencies_atomically() {
+        let root = test_root("batch-uninstall-dependency-closure");
+        fs::create_dir_all(root.join("mods")).expect("mods");
+        fs::write(root.join("mods/dependency.jar"), b"dependency").expect("dependency file");
+        fs::write(root.join("mods/dependent.jar"), b"dependent").expect("dependent file");
+
+        let mut dependency = recorded("dependency", "dependency.jar");
+        dependency.sha512 = Some(
+            crate::manifest::sha512_file(&root.join("mods/dependency.jar"))
+                .expect("dependency hash"),
+        );
+        let dependency_id = dependency.canonical_id.clone();
+        let mut dependent = recorded("dependent", "dependent.jar");
+        dependent.sha512 = Some(
+            crate::manifest::sha512_file(&root.join("mods/dependent.jar")).expect("dependent hash"),
+        );
+        let dependent_id = dependent.canonical_id.clone();
+        dependent.dependencies.push(ContentDependency {
+            project_id: Some(dependency.project_id.clone()),
+            version_id: Some(dependency.version_id.clone()),
+            kind: crate::model::DependencyKind::Required,
+        });
+        let mut manifest = ContentManifest::default();
+        manifest.upsert(dependency);
+        manifest.upsert(dependent);
+        manifest.save(&root).expect("save manifest");
+
+        let removed = uninstall_many(&root, &[dependency_id, dependent_id])
+            .expect("the selected dependency closure should be removable in any input order");
+
+        assert_eq!(removed, 2);
+        assert!(!root.join("mods/dependency.jar").exists());
+        assert!(!root.join("mods/dependent.jar").exists());
+        assert!(
+            ContentManifest::load(&root)
+                .expect("reload manifest")
+                .entries
+                .is_empty()
+        );
+        let _ = fs::remove_dir_all(root);
     }
 }

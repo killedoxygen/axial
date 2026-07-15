@@ -847,15 +847,23 @@ async fn install_queue_spec_from_request(
                         setup_cleanup,
                     }
                 }
-                InstallQueueContentActionRequest::Uninstall { canonical_id } => {
-                    let canonical_id = canonical_id.trim().to_string();
-                    if canonical_id.is_empty() {
+                InstallQueueContentActionRequest::Uninstall { canonical_ids } => {
+                    let canonical_ids = canonical_ids
+                        .into_iter()
+                        .map(|canonical_id| canonical_id.trim().to_string())
+                        .filter(|canonical_id| !canonical_id.is_empty())
+                        .collect::<HashSet<_>>();
+                    if canonical_ids.is_empty() || canonical_ids.len() > 500 {
                         return Err((
                             StatusCode::BAD_REQUEST,
-                            Json(serde_json::json!({ "error": "canonical_id is required" })),
+                            Json(serde_json::json!({
+                                "error": "canonical_ids must contain between 1 and 500 items"
+                            })),
                         ));
                     }
-                    ContentQueueAction::Uninstall { canonical_id }
+                    let mut canonical_ids = canonical_ids.into_iter().collect::<Vec<_>>();
+                    canonical_ids.sort();
+                    ContentQueueAction::Uninstall { canonical_ids }
                 }
                 InstallQueueContentActionRequest::Modpack {
                     canonical_id,
@@ -1065,12 +1073,18 @@ async fn start_content_operation(
                         )
                         .await
                     }
-                    ContentQueueAction::Uninstall { canonical_id } => {
-                        let _ = progress_tx.send(content_progress("removing", 0, 1, false, None));
-                        crate::application::content::execute_content_uninstall(
+                    ContentQueueAction::Uninstall { canonical_ids } => {
+                        let _ = progress_tx.send(content_progress(
+                            "removing",
+                            0,
+                            canonical_ids.len() as i32,
+                            false,
+                            None,
+                        ));
+                        crate::application::content::execute_content_uninstalls(
                             &worker_state,
                             &worker_instance_id,
-                            canonical_id,
+                            canonical_ids,
                         )
                         .await
                     }
@@ -1601,9 +1615,9 @@ fn content_action_request(action: &ContentQueueAction) -> InstallQueueContentAct
                 .collect(),
             allow_incompatible: *allow_incompatible,
         },
-        ContentQueueAction::Uninstall { canonical_id } => {
+        ContentQueueAction::Uninstall { canonical_ids } => {
             InstallQueueContentActionRequest::Uninstall {
-                canonical_id: canonical_id.clone(),
+                canonical_ids: canonical_ids.clone(),
             }
         }
         ContentQueueAction::Modpack {

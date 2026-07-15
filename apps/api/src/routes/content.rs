@@ -39,11 +39,20 @@ pub fn router() -> Router<AppState> {
             "/api/v1/instances/{id}/content/updates",
             get(handle_instance_content_updates),
         )
+        .route(
+            "/api/v1/instances/{id}/content/uninstall",
+            post(handle_instance_content_uninstalls),
+        )
 }
 
 #[derive(Debug, Deserialize)]
 struct CanonicalIdQuery {
     id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct CanonicalIdsRequest {
+    canonical_ids: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -156,6 +165,16 @@ async fn handle_instance_content_delete(
     Query(query): Query<CanonicalIdQuery>,
 ) -> Result<Json<InstallQueueStateResponse>, (StatusCode, Json<serde_json::Value>)> {
     application::queue_content_uninstall(&state, &id, &query.id)
+        .await
+        .map(Json)
+}
+
+async fn handle_instance_content_uninstalls(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(payload): Json<CanonicalIdsRequest>,
+) -> Result<Json<InstallQueueStateResponse>, (StatusCode, Json<serde_json::Value>)> {
+    application::queue_content_uninstalls(&state, &id, payload.canonical_ids)
         .await
         .map(Json)
 }

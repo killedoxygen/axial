@@ -118,7 +118,7 @@ export type InstallQueueContentAction =
       selections: InstallQueueContentSelection[];
       allow_incompatible: boolean;
     }
-  | { kind: 'uninstall'; canonical_id: string }
+  | { kind: 'uninstall'; canonical_ids: string[] }
   | {
       kind: 'modpack';
       canonical_id: string;

@@ -170,7 +170,7 @@ pub enum InstallQueueContentActionRequest {
         allow_incompatible: bool,
     },
     Uninstall {
-        canonical_id: String,
+        canonical_ids: Vec<String>,
     },
     Modpack {
         canonical_id: String,

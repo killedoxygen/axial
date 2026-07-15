@@ -738,8 +738,13 @@ function mockInstanceContentList(instanceId: string): InstanceContentResponse {
 }
 
 function mockContentUninstall(instanceId: string, canonicalId: string): InstallQueueStateResponse {
+  return mockContentUninstalls(instanceId, [canonicalId]);
+}
+
+function mockContentUninstalls(instanceId: string, canonicalIds: string[]): InstallQueueStateResponse {
+  const selected = new Set(canonicalIds);
   const current = mockInstanceContent[instanceId] ?? [];
-  mockInstanceContent[instanceId] = current.filter((entry) => entry.canonical_id !== canonicalId);
+  mockInstanceContent[instanceId] = current.filter((entry) => !selected.has(entry.canonical_id));
   return mockEmptyInstallQueue('Content queued', 'Removal');
 }
 
@@ -1010,6 +1015,15 @@ const handlers: Record<string, Handler> = {
     mockDeleteMod(instanceIdFromSubPath(path), modNameFromPath(path)),
   'DELETE /instances/{id}/content': (_body, path, request) =>
     mockContentUninstall(instanceIdFromContentPath(path), request?.searchParams.get('id') ?? ''),
+  'POST /instances/{id}/content/uninstall': (body, path) => {
+    if (!isRecord(body) || !Array.isArray(body.canonical_ids)) {
+      throw apiError(400, 'Bad Request', { error: 'invalid uninstall request' });
+    }
+    return mockContentUninstalls(
+      instanceIdFromSubPath(path),
+      body.canonical_ids.filter((id): id is string => typeof id === 'string'),
+    );
+  },
 };
 
 const MOCK_UPDATE_VERSION = '9.9.9';
@@ -1174,6 +1188,7 @@ function handlerKey(method: string, path: string): string {
   if (Object.prototype.hasOwnProperty.call(handlers, exact)) return exact;
   if (method === 'PUT' && path.startsWith('/flags/')) return 'PUT /flags/{key}';
   if (/^\/instances\/[^/]+\/content$/.test(path)) return `${method} /instances/{id}/content`;
+  if (/^\/instances\/[^/]+\/content\/uninstall$/.test(path)) return `${method} /instances/{id}/content/uninstall`;
   if (/^\/instances\/[^/]+\/content\/updates$/.test(path)) return `${method} /instances/{id}/content/updates`;
   if (/^\/instances\/[^/]+\/resources$/.test(path)) return `${method} /instances/{id}/resources`;
   if (/^\/instances\/[^/]+\/mods\/[^/]+$/.test(path)) return `${method} /instances/{id}/mods/{name}`;

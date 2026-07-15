@@ -129,3 +129,9 @@ export function uninstallContent(instanceId: string, canonicalId: string): Promi
     `/instances/${encodeURIComponent(instanceId)}/content?id=${encodeURIComponent(canonicalId)}`,
   );
 }
+
+export function uninstallContents(instanceId: string, canonicalIds: string[]): Promise<InstallQueueStateResponse> {
+  return api<InstallQueueStateResponse>('POST', `/instances/${encodeURIComponent(instanceId)}/content/uninstall`, {
+    canonical_ids: canonicalIds,
+  });
+}

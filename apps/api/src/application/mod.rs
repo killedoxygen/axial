@@ -69,7 +69,7 @@ pub use content::{
     SearchHit, content_compatibility, content_detail, content_plan, content_search,
     instance_content, instance_content_updates,
     pack::{modpack_files, modpack_target, queue_modpack_install},
-    queue_content_install, queue_content_uninstall,
+    queue_content_install, queue_content_uninstall, queue_content_uninstalls,
 };
 pub use dev::{DevCleanupResponse, DevFlushResponse, dev_cleanup_versions, dev_flush};
 pub use flags::{

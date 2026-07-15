@@ -10,7 +10,8 @@ mod transaction;
 
 pub use error::{ContentError, ContentResult};
 pub use install::{
-    PlannedFile, install_and_record, managed_file_variants, uninstall, verified_removable_variants,
+    PlannedFile, install_and_record, managed_file_variants, uninstall, uninstall_many,
+    verified_removable_variants,
 };
 pub use manifest::{
     ContentManifest, EntrySource, ManifestEntry, ReconcileReport, UnidentifiedRecord,

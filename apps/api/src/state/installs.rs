@@ -102,7 +102,7 @@ pub enum ContentQueueAction {
         setup_cleanup: Option<SetupInstanceCleanup>,
     },
     Uninstall {
-        canonical_id: String,
+        canonical_ids: Vec<String>,
     },
     Modpack {
         canonical_id: String,

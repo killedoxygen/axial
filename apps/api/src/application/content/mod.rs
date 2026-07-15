@@ -24,7 +24,7 @@ use axial_content::{
     CanonicalContent, CanonicalId, ContentDetail, ContentError, ContentKind, ContentManifest,
     ContentQuery, ContentVersion, EntrySource, ManifestEntry, Page, ProviderId, SortOrder,
     UnidentifiedRecord, UnmanagedFile, entry_file_present, install_and_record, reconcile,
-    sha512_file, uninstall,
+    sha512_file, uninstall_many,
 };
 use axial_minecraft::DownloadProgress;
 use axum::{Json, http::StatusCode};
@@ -465,25 +465,31 @@ pub async fn queue_content_uninstall(
     instance_id: &str,
     canonical_id: &str,
 ) -> Result<InstallQueueStateResponse, ContentApiError> {
+    queue_content_uninstalls(state, instance_id, vec![canonical_id.to_string()]).await
+}
+
+pub async fn queue_content_uninstalls(
+    state: &AppState,
+    instance_id: &str,
+    canonical_ids: Vec<String>,
+) -> Result<InstallQueueStateResponse, ContentApiError> {
     enqueue_install(
         state,
         InstallQueueRequest {
             kind: "content".to_string(),
             instance_id: instance_id.to_string(),
             label: "Removing content".to_string(),
-            content_action: Some(InstallQueueContentActionRequest::Uninstall {
-                canonical_id: canonical_id.to_string(),
-            }),
+            content_action: Some(InstallQueueContentActionRequest::Uninstall { canonical_ids }),
             ..InstallQueueRequest::default()
         },
     )
     .await
 }
 
-pub(crate) async fn execute_content_uninstall(
+pub(crate) async fn execute_content_uninstalls(
     state: &AppState,
     instance_id: &str,
-    canonical_id: &str,
+    canonical_ids: &[String],
 ) -> Result<(), ContentApiError> {
     let _lifecycle_guard = lock_instance_for_content_mutation(state, instance_id)?;
     let game_dir = require_instance_game_dir(state, instance_id)?;
@@ -493,7 +499,12 @@ pub(crate) async fn execute_content_uninstall(
             "cannot change content while the instance is running; stop the game first",
         ));
     }
-    uninstall(&game_dir, &CanonicalId(canonical_id.to_string())).map_err(content_error_response)?;
+    let canonical_ids = canonical_ids
+        .iter()
+        .cloned()
+        .map(CanonicalId)
+        .collect::<Vec<_>>();
+    uninstall_many(&game_dir, &canonical_ids).map_err(content_error_response)?;
     Ok(())
 }
 
