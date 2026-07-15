@@ -41,13 +41,13 @@ pub(crate) enum ComponentStartupRecoveryResult {
 }
 
 pub(crate) enum ComponentIntentPublicationRecovery {
-    Retry(ComponentIntentCandidate),
+    Retry(Box<ComponentIntentCandidate>),
     Transaction(ComponentExecutionResult),
 }
 
 pub(crate) enum ComponentRecoveryRetryResult {
     Settled(ComponentSettledOutcome),
-    RetryIntent(ComponentIntentCandidate),
+    RetryIntent(Box<ComponentIntentCandidate>),
     Transaction(ComponentExecutionResult),
     Retry(ComponentRecoveryRequired),
 }
@@ -55,7 +55,7 @@ pub(crate) enum ComponentRecoveryRetryResult {
 pub(crate) enum ComponentPriorRecoveryRetryResult {
     NoTransaction(ManagedRootPublicationLease),
     Settled(ComponentSettledOutcome),
-    RetryIntent(ComponentIntentCandidate),
+    RetryIntent(Box<ComponentIntentCandidate>),
     Transaction(ComponentExecutionResult),
 }
 
@@ -73,17 +73,17 @@ pub(crate) enum ComponentSettledOutcome {
 }
 
 pub(crate) struct ComponentTransactionReceipt {
-    context: ComponentIntentPublished,
+    context: Box<ComponentIntentPublished>,
     outcome_guard: ManagedFileGuard,
     terminal: ComponentTerminalOutcome,
 }
 
 pub(crate) struct ComponentSettlementRetry {
-    authority: ComponentSettlementAuthority,
+    authority: Box<ComponentSettlementAuthority>,
 }
 
 pub(crate) struct ComponentRecoveryRequired {
-    authority: ComponentRecoveryAuthority,
+    authority: Box<ComponentRecoveryAuthority>,
 }
 
 #[cfg(test)]
@@ -98,7 +98,7 @@ impl ComponentTransactionReceipt {
 #[cfg(test)]
 impl ComponentRecoveryRequired {
     pub(crate) fn into_restart_seed(self) -> (ManagedRootPublicationLease, ManagedComponentKind) {
-        let ComponentRecoveryAuthority::Published { context, .. } = self.authority else {
+        let ComponentRecoveryAuthority::Published { context, .. } = *self.authority else {
             panic!("test recovery authority was not a published intent")
         };
         (context.lease, context.manifest.component)
@@ -107,7 +107,7 @@ impl ComponentRecoveryRequired {
 
 enum ComponentRecoveryAuthority {
     Published {
-        context: ComponentIntentPublished,
+        context: Box<ComponentIntentPublished>,
         outcome_guard: Option<ManagedFileGuard>,
     },
     Restart {
@@ -118,7 +118,7 @@ enum ComponentRecoveryAuthority {
 }
 
 struct ComponentSettlementAuthority {
-    context: ComponentIntentPublished,
+    context: Box<ComponentIntentPublished>,
     outcome_guard: ManagedFileGuard,
     terminal: ComponentTerminalOutcome,
     outcome: Option<ComponentOutcomeRecord>,
@@ -159,7 +159,7 @@ enum SettlementDisposition {
 enum RecoveryOwnerResult {
     NoTransaction(ManagedRootPublicationLease, ManagedComponentKind),
     Settled(ComponentSettledOutcome),
-    RetryIntent(ComponentIntentCandidate),
+    RetryIntent(Box<ComponentIntentCandidate>),
     Transaction(ComponentExecutionResult),
 }
 
@@ -226,6 +226,16 @@ struct ObservedRow {
     quarantine: Option<ManagedFileGuard>,
 }
 
+struct ComponentFileMove<'a> {
+    source: &'a ManagedDir,
+    source_name: &'a str,
+    destination: &'a ManagedDir,
+    destination_name: &'a str,
+    guard: &'a ManagedFileGuard,
+    expected_size: u64,
+    expected_sha1: [u8; 20],
+}
+
 pub(crate) async fn execute_component_intent(
     published: ComponentIntentPublished,
 ) -> ComponentExecutionResult {
@@ -284,10 +294,10 @@ pub(crate) async fn recover_component_intent_publication(
 pub(crate) async fn retry_component_recovery(
     recovery: ComponentRecoveryRequired,
 ) -> ComponentRecoveryRetryResult {
-    match run_component_recovery(recovery.authority).await {
+    match run_component_recovery(*recovery.authority).await {
         RecoveryOwnerResult::NoTransaction(lease, component) => {
             ComponentRecoveryRetryResult::Retry(ComponentRecoveryRequired {
-                authority: ComponentRecoveryAuthority::Restart { lease, component },
+                authority: Box::new(ComponentRecoveryAuthority::Restart { lease, component }),
             })
         }
         RecoveryOwnerResult::Settled(outcome) => ComponentRecoveryRetryResult::Settled(outcome),
@@ -303,7 +313,7 @@ pub(crate) async fn retry_component_recovery(
 pub(crate) async fn retry_prior_component_recovery(
     recovery: ComponentRecoveryRequired,
 ) -> ComponentPriorRecoveryRetryResult {
-    match run_component_recovery(recovery.authority).await {
+    match run_component_recovery(*recovery.authority).await {
         RecoveryOwnerResult::NoTransaction(lease, _) => {
             ComponentPriorRecoveryRetryResult::NoTransaction(lease)
         }
@@ -349,20 +359,20 @@ async fn settle_component_transaction_inner(
         terminal,
     } = receipt;
     run_component_settlement(
-        ComponentSettlementAuthority {
+        Box::new(ComponentSettlementAuthority {
             context,
             outcome_guard,
             terminal,
             outcome: None,
             settlement_identity: None,
-        },
+        }),
         fault,
     )
     .await
 }
 
 async fn run_component_settlement(
-    authority: ComponentSettlementAuthority,
+    authority: Box<ComponentSettlementAuthority>,
     fault: ComponentSettlementFault,
 ) -> ComponentSettlementResult {
     let shared = Arc::new(Mutex::new(Some(authority)));
@@ -466,11 +476,10 @@ async fn run_component_recovery(authority: ComponentRecoveryAuthority) -> Recove
             else {
                 return BlockingDisposition::RecoveryRequired(None);
             };
-            let disposition = catch_unwind(AssertUnwindSafe(|| {
+            catch_unwind(AssertUnwindSafe(|| {
                 recover_component_transaction_blocking(context, outcome_guard.as_ref())
             }))
-            .unwrap_or(BlockingDisposition::RecoveryRequired(None));
-            disposition
+            .unwrap_or(BlockingDisposition::RecoveryRequired(None))
         })
         .await
         {
@@ -578,7 +587,7 @@ fn normalize_recovery_authority(
         }
     };
     *slot = Some(ComponentRecoveryAuthority::Published {
-        context,
+        context: Box::new(context),
         outcome_guard: admission.outcome_guard,
     });
     Ok(RecoveryNormalization::Published)
@@ -708,15 +717,14 @@ fn admit_restart_context(
         .inspect_regular_file(COMPONENT_INTENT_FILE)
         .map_err(tx)?
         .ok_or(ComponentTransactionError)?;
-    if let Some(retained) = retained_intent_guard {
-        if retained.identity() != intent_guard.identity()
+    if let Some(retained) = retained_intent_guard
+        && (retained.identity() != intent_guard.identity()
             || !lane
                 .lane
                 .file_guard_matches(COMPONENT_INTENT_FILE, retained)
-                .map_err(tx)?
-        {
-            return Err(ComponentTransactionError);
-        }
+                .map_err(tx)?)
+    {
+        return Err(ComponentTransactionError);
     }
     let encoded_intent = lane
         .lane
@@ -1217,16 +1225,15 @@ fn read_recovery_outcome(
         }
         return Ok(None);
     };
-    if let Some(retained) = retained {
-        if retained.identity() != guard.identity()
+    if let Some(retained) = retained
+        && (retained.identity() != guard.identity()
             || !published
                 .lane
                 .lane
                 .file_guard_matches(COMPONENT_OUTCOME_FILE, retained)
-                .map_err(tx)?
-        {
-            return Err(ComponentTransactionError);
-        }
+                .map_err(tx)?)
+    {
+        return Err(ComponentTransactionError);
     }
     if guard.size() != COMPONENT_OUTCOME_BYTES as u64 {
         return Err(ComponentTransactionError);
@@ -1471,13 +1478,15 @@ fn execute_rows_forward(
                         .map_err(tx)?;
                     sync_file_move(
                         published,
-                        &canonical.parent,
-                        &canonical.file_name,
-                        &quarantine,
-                        &slot_name,
-                        &canonical.guard,
-                        canonical.size,
-                        canonical.sha1,
+                        ComponentFileMove {
+                            source: &canonical.parent,
+                            source_name: &canonical.file_name,
+                            destination: &quarantine,
+                            destination_name: &slot_name,
+                            guard: &canonical.guard,
+                            expected_size: canonical.size,
+                            expected_sha1: canonical.sha1,
+                        },
                     )?;
                     let intermediate =
                         observe_row(published, row, &staging, &quarantine, row_in_shard)?;
@@ -1533,13 +1542,15 @@ fn move_staged_to_canonical(
         .map_err(tx)?;
     sync_file_move(
         published,
-        staging,
-        &slot_name,
-        parent,
-        plan.file_name(),
-        &guard,
-        row.final_size,
-        row.final_sha1,
+        ComponentFileMove {
+            source: staging,
+            source_name: &slot_name,
+            destination: parent,
+            destination_name: plan.file_name(),
+            guard: &guard,
+            expected_size: row.final_size,
+            expected_sha1: row.final_sha1,
+        },
     )
 }
 
@@ -1634,13 +1645,15 @@ fn move_canonical_to_staging(
         .map_err(tx)?;
     sync_file_move(
         published,
-        &canonical.parent,
-        &canonical.file_name,
-        staging,
-        &slot_name,
-        &canonical.guard,
-        canonical.size,
-        canonical.sha1,
+        ComponentFileMove {
+            source: &canonical.parent,
+            source_name: &canonical.file_name,
+            destination: staging,
+            destination_name: &slot_name,
+            guard: &canonical.guard,
+            expected_size: canonical.size,
+            expected_sha1: canonical.sha1,
+        },
     )
 }
 
@@ -1662,13 +1675,15 @@ fn move_quarantine_to_canonical(
         .map_err(tx)?;
     sync_file_move(
         published,
-        quarantine,
-        &slot_name,
-        parent,
-        plan.file_name(),
-        &guard,
-        prior.size,
-        prior.sha1,
+        ComponentFileMove {
+            source: quarantine,
+            source_name: &slot_name,
+            destination: parent,
+            destination_name: plan.file_name(),
+            guard: &guard,
+            expected_size: prior.size,
+            expected_sha1: prior.sha1,
+        },
     )
 }
 
@@ -2457,7 +2472,7 @@ fn publish_outcome(
         published.lane.lane.write_new_exact_retained_with_fault(
             COMPONENT_OUTCOME_FILE,
             &encoded,
-            crate::managed_fs::ManagedCreateOnlyWriteFault::AfterPromotion,
+            crate::managed_fs::ManagedCreateOnlyWriteFault::Promotion,
         )
     } else {
         published
@@ -2643,14 +2658,17 @@ fn read_authenticated_table_shard(
 
 fn sync_file_move(
     published: &ComponentIntentPublished,
-    source: &ManagedDir,
-    source_name: &str,
-    destination: &ManagedDir,
-    destination_name: &str,
-    guard: &ManagedFileGuard,
-    expected_size: u64,
-    expected_sha1: [u8; 20],
+    file_move: ComponentFileMove<'_>,
 ) -> Result<(), ComponentTransactionError> {
+    let ComponentFileMove {
+        source,
+        source_name,
+        destination,
+        destination_name,
+        guard,
+        expected_size,
+        expected_sha1,
+    } = file_move;
     source.sync().map_err(tx)?;
     destination.sync().map_err(tx)?;
     sync_transaction_roots(published)?;
@@ -3468,7 +3486,7 @@ fn cleanup_one_settlement_ancestor_shard(
             .ancestor_staging
             .remove_empty_child_guarded(
                 &bucket_name,
-                if shard_index % 2 == 0 {
+                if shard_index.is_multiple_of(2) {
                     COMPONENT_BUCKET_PARK_A
                 } else {
                     COMPONENT_BUCKET_PARK_B
@@ -3816,7 +3834,7 @@ fn cleanup_one_settlement_residue_bucket(
         if parent
             .remove_empty_child_guarded(
                 bucket_name,
-                if shard_index % 2 == 0 {
+                if shard_index.is_multiple_of(2) {
                     COMPONENT_BUCKET_PARK_A
                 } else {
                     COMPONENT_BUCKET_PARK_B
@@ -3954,7 +3972,7 @@ fn validate_marker_free_settlement_shape(
 }
 
 fn finish_settlement_disposition(
-    shared: &Mutex<Option<ComponentSettlementAuthority>>,
+    shared: &Mutex<Option<Box<ComponentSettlementAuthority>>>,
     disposition: SettlementDisposition,
 ) -> ComponentSettlementResult {
     let authority = shared
@@ -3969,7 +3987,7 @@ fn finish_settlement_disposition(
         context,
         outcome: Some(outcome),
         ..
-    } = authority
+    } = *authority
     else {
         panic!("settled component must retain its terminal outcome")
     };
@@ -3993,24 +4011,24 @@ fn finish_disposition(
         }
         BlockingDisposition::Committed(outcome_guard) => {
             ComponentExecutionResult::Committed(ComponentTransactionReceipt {
-                context,
+                context: Box::new(context),
                 outcome_guard,
                 terminal: ComponentTerminalOutcome::Committed,
             })
         }
         BlockingDisposition::RolledBack(outcome_guard) => {
             ComponentExecutionResult::RolledBack(ComponentTransactionReceipt {
-                context,
+                context: Box::new(context),
                 outcome_guard,
                 terminal: ComponentTerminalOutcome::RolledBack,
             })
         }
         BlockingDisposition::RecoveryRequired(outcome_guard) => {
             ComponentExecutionResult::RecoveryRequired(ComponentRecoveryRequired {
-                authority: ComponentRecoveryAuthority::Published {
-                    context,
+                authority: Box::new(ComponentRecoveryAuthority::Published {
+                    context: Box::new(context),
                     outcome_guard,
-                },
+                }),
             })
         }
     }
@@ -4039,7 +4057,7 @@ fn finish_recovery_disposition(
             ComponentRecoveryAuthority::IntentPromotionAttempted(
                 ComponentIntentPublishFailure::PromotionAttempted { candidate, .. },
             ),
-        ) => RecoveryOwnerResult::RetryIntent(*candidate),
+        ) => RecoveryOwnerResult::RetryIntent(candidate),
         (
             BlockingDisposition::Committed(outcome_guard),
             ComponentRecoveryAuthority::Published { context, .. },
@@ -4071,11 +4089,15 @@ fn finish_recovery_disposition(
                 authority => authority,
             };
             RecoveryOwnerResult::Transaction(ComponentExecutionResult::RecoveryRequired(
-                ComponentRecoveryRequired { authority },
+                ComponentRecoveryRequired {
+                    authority: Box::new(authority),
+                },
             ))
         }
         (_, authority) => RecoveryOwnerResult::Transaction(
-            ComponentExecutionResult::RecoveryRequired(ComponentRecoveryRequired { authority }),
+            ComponentExecutionResult::RecoveryRequired(ComponentRecoveryRequired {
+                authority: Box::new(authority),
+            }),
         ),
     }
 }

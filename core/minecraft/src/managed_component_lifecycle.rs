@@ -333,7 +333,7 @@ where
         execution,
         &mut backoff,
         #[cfg(test)]
-        faults.as_deref_mut(),
+        faults,
     )
     .await?
     {
@@ -408,7 +408,7 @@ async fn publish_current_component_intent(
                 loop {
                     match recover_component_intent_publication(recovery).await {
                         Ok(ComponentIntentPublicationRecovery::Retry(retry)) => {
-                            candidate = retry;
+                            candidate = *retry;
                             backoff.wait().await;
                             break;
                         }
@@ -464,7 +464,7 @@ async fn normalize_current_component_transaction(
                     ComponentRecoveryRetryResult::RetryIntent(candidate) => {
                         ComponentProgress::Execution(
                             publish_current_component_intent(
-                                candidate,
+                                *candidate,
                                 backoff,
                                 #[cfg(test)]
                                 faults.as_deref_mut(),
@@ -515,7 +515,7 @@ async fn normalize_prior_component_transaction(
                     ComponentPriorRecoveryRetryResult::RetryIntent(candidate) => {
                         ComponentProgress::Execution(
                             publish_current_component_intent(
-                                candidate,
+                                *candidate,
                                 backoff,
                                 #[cfg(test)]
                                 None,
@@ -1357,11 +1357,11 @@ mod tests {
     #[tokio::test]
     async fn sparse_sources_keep_projection_slots_across_shard_boundary() {
         let temporary = tempfile::tempdir().expect("test root");
-        let expected = (0..257)
+        let expected = (0_usize..257)
             .map(|index| {
                 test_source(
                     &format!("org/example/{index:03}.jar"),
-                    if index % 2 == 0 {
+                    if index.is_multiple_of(2) {
                         ManagedComponentArtifactKind::Library
                     } else {
                         ManagedComponentArtifactKind::NativeLibrary

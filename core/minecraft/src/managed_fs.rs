@@ -70,14 +70,14 @@ pub(crate) enum ManagedCreateOnlyWriteFailure {
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ManagedCreateOnlyWriteFault {
-    AfterTempCreated,
-    AfterBytesWritten,
-    AfterFileSynced,
-    AfterTempVerified,
-    AfterPromotion,
-    AfterDirectorySynced,
-    AfterFinalVerified,
-    AfterRevalidated,
+    TempCreated,
+    BytesWritten,
+    FileSynced,
+    TempVerified,
+    Promotion,
+    DirectorySynced,
+    FinalVerified,
+    Revalidated,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -503,6 +503,18 @@ struct PendingCreatedFile {
     directory: ManagedDir,
     name: String,
     guard: Option<ManagedFileGuard>,
+}
+
+struct ManagedAuthenticatedImport<R, G> {
+    source: R,
+    expected_size: u64,
+    expected_sha1: [u8; 20],
+    replace_existing: bool,
+    lifetime_guard: G,
+    #[cfg(test)]
+    blocking_hook: Option<Box<dyn FnOnce() + Send + 'static>>,
+    #[cfg(test)]
+    fail_after_promotion: bool,
 }
 
 struct CleanupPlan {
@@ -1471,15 +1483,17 @@ impl ManagedDir {
         parent
             .import_authenticated_inner(
                 &name,
-                source,
-                expected_size,
-                expected_sha1,
-                true,
-                (),
-                #[cfg(test)]
-                None,
-                #[cfg(test)]
-                false,
+                ManagedAuthenticatedImport {
+                    source,
+                    expected_size,
+                    expected_sha1,
+                    replace_existing: true,
+                    lifetime_guard: (),
+                    #[cfg(test)]
+                    blocking_hook: None,
+                    #[cfg(test)]
+                    fail_after_promotion: false,
+                },
             )
             .await
     }
@@ -1503,15 +1517,17 @@ impl ManagedDir {
         }
         self.import_authenticated_inner(
             name,
-            source,
-            expected_size,
-            expected_sha1,
-            false,
-            lifetime_guard,
-            #[cfg(test)]
-            None,
-            #[cfg(test)]
-            false,
+            ManagedAuthenticatedImport {
+                source,
+                expected_size,
+                expected_sha1,
+                replace_existing: false,
+                lifetime_guard,
+                #[cfg(test)]
+                blocking_hook: None,
+                #[cfg(test)]
+                fail_after_promotion: false,
+            },
         )
         .await
     }
@@ -1537,13 +1553,15 @@ impl ManagedDir {
         }
         self.import_authenticated_inner(
             name,
-            source,
-            expected_size,
-            expected_sha1,
-            false,
-            lifetime_guard,
-            Some(blocking_hook),
-            false,
+            ManagedAuthenticatedImport {
+                source,
+                expected_size,
+                expected_sha1,
+                replace_existing: false,
+                lifetime_guard,
+                blocking_hook: Some(blocking_hook),
+                fail_after_promotion: false,
+            },
         )
         .await
     }
@@ -1563,13 +1581,15 @@ impl ManagedDir {
     {
         self.import_authenticated_inner(
             name,
-            source,
-            expected_size,
-            expected_sha1,
-            false,
-            lifetime_guard,
-            None,
-            true,
+            ManagedAuthenticatedImport {
+                source,
+                expected_size,
+                expected_sha1,
+                replace_existing: false,
+                lifetime_guard,
+                blocking_hook: None,
+                fail_after_promotion: true,
+            },
         )
         .await
     }
@@ -1577,13 +1597,7 @@ impl ManagedDir {
     async fn import_authenticated_inner<R, G>(
         &self,
         name: &str,
-        source: R,
-        expected_size: u64,
-        expected_sha1: [u8; 20],
-        replace_existing: bool,
-        lifetime_guard: G,
-        #[cfg(test)] blocking_hook: Option<Box<dyn FnOnce() + Send + 'static>>,
-        #[cfg(test)] fail_after_promotion: bool,
+        request: ManagedAuthenticatedImport<R, G>,
     ) -> Result<(), LoaderError>
     where
         R: Read + Seek + Send + 'static,
@@ -1592,6 +1606,17 @@ impl ManagedDir {
         validate_segment(name)?;
         let parent = self.clone();
         let name = name.to_string();
+        let ManagedAuthenticatedImport {
+            source,
+            expected_size,
+            expected_sha1,
+            replace_existing,
+            lifetime_guard,
+            #[cfg(test)]
+            blocking_hook,
+            #[cfg(test)]
+            fail_after_promotion,
+        } = request;
         tokio::task::spawn_blocking(move || {
             let _lifetime_guard = lifetime_guard;
             #[cfg(test)]
@@ -1859,7 +1884,7 @@ impl ManagedDir {
             },
         );
         #[cfg(test)]
-        if fault == Some(ManagedCreateOnlyWriteFault::AfterTempCreated) {
+        if fault == Some(ManagedCreateOnlyWriteFault::TempCreated) {
             return Err(ManagedCreateOnlyWriteFailure::BeforePromotion(
                 injected_create_only_write_failure(),
             ));
@@ -1874,7 +1899,7 @@ impl ManagedDir {
             guard.size = size;
         }
         #[cfg(test)]
-        if fault == Some(ManagedCreateOnlyWriteFault::AfterBytesWritten) {
+        if fault == Some(ManagedCreateOnlyWriteFault::BytesWritten) {
             return Err(ManagedCreateOnlyWriteFailure::BeforePromotion(
                 injected_create_only_write_failure(),
             ));
@@ -1889,7 +1914,7 @@ impl ManagedDir {
                 .map_err(ManagedCreateOnlyWriteFailure::BeforePromotion)?;
         }
         #[cfg(test)]
-        if fault == Some(ManagedCreateOnlyWriteFault::AfterFileSynced) {
+        if fault == Some(ManagedCreateOnlyWriteFault::FileSynced) {
             return Err(ManagedCreateOnlyWriteFailure::BeforePromotion(
                 injected_create_only_write_failure(),
             ));
@@ -1913,7 +1938,7 @@ impl ManagedDir {
             }
         }
         #[cfg(test)]
-        if fault == Some(ManagedCreateOnlyWriteFault::AfterTempVerified) {
+        if fault == Some(ManagedCreateOnlyWriteFault::TempVerified) {
             return Err(ManagedCreateOnlyWriteFailure::BeforePromotion(
                 injected_create_only_write_failure(),
             ));
@@ -1946,14 +1971,14 @@ impl ManagedDir {
         }
         let guard = pending.take_guard();
         #[cfg(test)]
-        if fault == Some(ManagedCreateOnlyWriteFault::AfterPromotion) {
+        if fault == Some(ManagedCreateOnlyWriteFault::Promotion) {
             return Err(promotion_attempted_failure(self, name, guard));
         }
         if self.sync().is_err() {
             return Err(promotion_attempted_failure(self, name, guard));
         }
         #[cfg(test)]
-        if fault == Some(ManagedCreateOnlyWriteFault::AfterDirectorySynced) {
+        if fault == Some(ManagedCreateOnlyWriteFault::DirectorySynced) {
             return Err(promotion_attempted_failure(self, name, guard));
         }
         let verified = self
@@ -1969,14 +1994,14 @@ impl ManagedDir {
             }
         }
         #[cfg(test)]
-        if fault == Some(ManagedCreateOnlyWriteFault::AfterFinalVerified) {
+        if fault == Some(ManagedCreateOnlyWriteFault::FinalVerified) {
             return Err(promotion_attempted_failure(self, name, guard));
         }
         if self.revalidate().is_err() {
             return Err(promotion_attempted_failure(self, name, guard));
         }
         #[cfg(test)]
-        if fault == Some(ManagedCreateOnlyWriteFault::AfterRevalidated) {
+        if fault == Some(ManagedCreateOnlyWriteFault::Revalidated) {
             return Err(promotion_attempted_failure(self, name, guard));
         }
         Ok(guard)
@@ -3858,10 +3883,10 @@ mod tests {
         let directory = ManagedDir::open_root(&root).expect("managed root");
 
         for (index, fault) in [
-            ManagedCreateOnlyWriteFault::AfterTempCreated,
-            ManagedCreateOnlyWriteFault::AfterBytesWritten,
-            ManagedCreateOnlyWriteFault::AfterFileSynced,
-            ManagedCreateOnlyWriteFault::AfterTempVerified,
+            ManagedCreateOnlyWriteFault::TempCreated,
+            ManagedCreateOnlyWriteFault::BytesWritten,
+            ManagedCreateOnlyWriteFault::FileSynced,
+            ManagedCreateOnlyWriteFault::TempVerified,
         ]
         .into_iter()
         .enumerate()
@@ -3890,10 +3915,10 @@ mod tests {
         let directory = ManagedDir::open_root(&root).expect("managed root");
 
         for (index, fault) in [
-            ManagedCreateOnlyWriteFault::AfterPromotion,
-            ManagedCreateOnlyWriteFault::AfterDirectorySynced,
-            ManagedCreateOnlyWriteFault::AfterFinalVerified,
-            ManagedCreateOnlyWriteFault::AfterRevalidated,
+            ManagedCreateOnlyWriteFault::Promotion,
+            ManagedCreateOnlyWriteFault::DirectorySynced,
+            ManagedCreateOnlyWriteFault::FinalVerified,
+            ManagedCreateOnlyWriteFault::Revalidated,
         ]
         .into_iter()
         .enumerate()

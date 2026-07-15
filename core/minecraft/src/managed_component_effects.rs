@@ -476,14 +476,14 @@ impl ComponentIntentCandidate {
                 self.lane.lane.write_new_exact_retained_with_fault(
                     COMPONENT_INTENT_FILE,
                     &self.encoded_intent,
-                    ManagedCreateOnlyWriteFault::AfterTempVerified,
+                    ManagedCreateOnlyWriteFault::TempVerified,
                 )
             }
             Some(ComponentIntentPublishFault::AfterMarkerPromotion) => {
                 self.lane.lane.write_new_exact_retained_with_fault(
                     COMPONENT_INTENT_FILE,
                     &self.encoded_intent,
-                    ManagedCreateOnlyWriteFault::AfterPromotion,
+                    ManagedCreateOnlyWriteFault::Promotion,
                 )
             }
             _ => self
@@ -1418,9 +1418,11 @@ impl ComponentBucketCleanupPlan {
         }
         for bucket in &self.buckets {
             let directory = open_planned_child(&self.directory, &bucket.name, bucket.identity)?;
-            let temporary = include_temporary
-                .then_some(bucket.temporary.as_slice())
-                .unwrap_or_default();
+            let temporary = if include_temporary {
+                bucket.temporary.as_slice()
+            } else {
+                &[]
+            };
             validate_planned_file_entries(
                 &directory,
                 &bucket.files,
@@ -1463,7 +1465,7 @@ impl ComponentBucketCleanupPlan {
         for bucket in self.buckets.into_iter().rev() {
             let shard_index =
                 parse_component_bucket_name(&bucket.name).ok_or(ComponentEffectsError::Topology)?;
-            let park = if shard_index % 2 == 0 {
+            let park = if shard_index.is_multiple_of(2) {
                 COMPONENT_BUCKET_PARK_A
             } else {
                 COMPONENT_BUCKET_PARK_B
@@ -3569,7 +3571,7 @@ mod tests {
             panic!("exact marker absence must return the retained retry candidate")
         };
         assert!(!lane_path.join(COMPONENT_INTENT_FILE).exists());
-        assert!(candidate.publish_intent().is_ok());
+        assert!((*candidate).publish_intent().is_ok());
 
         for fault in [
             ComponentIntentPublishFault::AfterMarkerPromotion,

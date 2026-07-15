@@ -294,7 +294,6 @@ impl ComponentRowValidator {
                 .is_some_and(|prior| prior.size > MAX_TIER2_ARTIFACT_BYTES)
             || !component.accepts(row.kind)
             || row.path.as_str().len() > MAX_COMPONENT_PATH_BYTES
-            || row.path.as_str().as_bytes().len() > u16::MAX as usize
         {
             return Err(ComponentTableError);
         }
@@ -1874,7 +1873,7 @@ mod tests {
             ManagedComponentKind::Libraries,
             [0x11; 16],
             [0x22; 32],
-            &[table.clone()],
+            std::slice::from_ref(&table),
         )
         .unwrap();
         let bytes = encode_component_intent_manifest(&manifest).unwrap();
