@@ -1,7 +1,8 @@
+use super::asset_source::{AssetSourcePool, RetainedAssetComponentSource};
 use super::client::asset_download_concurrency;
-#[cfg(test)]
-use super::integrity::existing_asset_object_satisfies;
+use super::facts::selected_download_source_label;
 use super::integrity::hash_file;
+use super::libraries::decode_sha1;
 use super::model::{
     DownloadError, DownloadProgress, ExecutionDownloadFact, ExpectedIntegrity,
     SelectedDownloadArtifactKind, progress,
@@ -10,20 +11,43 @@ use super::path_safety::{
     bounded_download_file_label, bounded_provider_path_label, filesystem_path, path_is_file,
 };
 use super::plan::TransferPlan;
-use super::transfer::ensure_selected_artifact_with_client;
+use super::transfer::{
+    AuthenticatedSelectedArtifactSource, SelectedArtifactSourceRequest,
+    acquire_authenticated_selected_artifact_source,
+};
+use crate::artifact_path::ArtifactRelativePath;
 use crate::asset_index::AssetIndexFlags;
+use crate::known_good::{MAX_TIER2_AGGREGATE_BYTES, MAX_TIER2_ARTIFACT_BYTES, MAX_TIER2_ENTRIES};
+use crate::managed_component_cache::{ManagedComponentExactCache, ManagedComponentExactCacheError};
+use crate::managed_component_table::ManagedComponentKind;
 use crate::paths::assets_dir;
 use futures_util::StreamExt;
 use serde::Deserialize;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::fs as async_fs;
 use tokio::sync::mpsc;
 
+pub(super) const ASSET_OBJECT_BASE_URL: &str = "https://resources.download.minecraft.net";
+
 pub(super) struct AssetDownloadPipeline {
-    task: tokio::task::JoinHandle<Result<(), DownloadError>>,
+    task: Option<tokio::task::JoinHandle<Result<RetainedAssetsAcquisition, DownloadError>>>,
     progress_rx: mpsc::UnboundedReceiver<DownloadProgress>,
+}
+
+impl Drop for AssetDownloadPipeline {
+    fn drop(&mut self) {
+        if let Some(task) = &self.task {
+            task.abort();
+        }
+    }
+}
+
+pub(super) struct RetainedAssetsAcquisition {
+    pub(super) asset_index_source: AuthenticatedSelectedArtifactSource,
+    pub(super) sources: Vec<RetainedAssetComponentSource>,
 }
 
 #[derive(Deserialize)]
@@ -42,7 +66,9 @@ pub(crate) struct AssetObject {
 pub(super) fn spawn_asset_download_pipeline(
     mc_dir: PathBuf,
     client: reqwest::Client,
-    verified_index_bytes: Arc<[u8]>,
+    asset_object_base_url: Arc<str>,
+    asset_index_id: String,
+    asset_index_source: AuthenticatedSelectedArtifactSource,
     fact_tx: Option<mpsc::UnboundedSender<ExecutionDownloadFact>>,
     plan: Arc<TransferPlan>,
 ) -> AssetDownloadPipeline {
@@ -52,10 +78,12 @@ pub(super) fn spawn_asset_download_pipeline(
 
     let (progress_tx, progress_rx) = mpsc::unbounded_channel();
     let task = tokio::spawn(async move {
-        download_asset_objects_with_client(
+        acquire_asset_sources_with_client(
             &mc_dir,
             client,
-            verified_index_bytes,
+            asset_object_base_url,
+            asset_index_id,
+            asset_index_source,
             fact_tx,
             &plan,
             |progress| {
@@ -65,107 +93,169 @@ pub(super) fn spawn_asset_download_pipeline(
         .await
     });
 
-    AssetDownloadPipeline { task, progress_rx }
+    AssetDownloadPipeline {
+        task: Some(task),
+        progress_rx,
+    }
 }
 
 pub(super) async fn await_asset_download_pipeline<F>(
     pipeline: Option<AssetDownloadPipeline>,
     send: &mut F,
-) -> Result<(), DownloadError>
+) -> Result<Option<RetainedAssetsAcquisition>, DownloadError>
 where
     F: FnMut(DownloadProgress),
 {
-    let Some(AssetDownloadPipeline {
-        mut task,
-        mut progress_rx,
-    }) = pipeline
-    else {
-        return Ok(());
+    let Some(mut pipeline) = pipeline else {
+        return Ok(None);
     };
 
     loop {
-        tokio::select! {
-            progress = progress_rx.recv() => {
+        enum PipelineEvent {
+            Progress(Option<DownloadProgress>),
+            Complete(
+                Result<Result<RetainedAssetsAcquisition, DownloadError>, tokio::task::JoinError>,
+            ),
+        }
+        let event = {
+            let task = pipeline
+                .task
+                .as_mut()
+                .expect("live asset pipeline owns its task");
+            tokio::select! {
+                progress = pipeline.progress_rx.recv() => PipelineEvent::Progress(progress),
+                result = task => PipelineEvent::Complete(result),
+            }
+        };
+        match event {
+            PipelineEvent::Progress(progress) => {
                 if let Some(progress) = progress {
                     send(progress);
                 }
             }
-            result = &mut task => {
-                while let Ok(progress) = progress_rx.try_recv() {
+            PipelineEvent::Complete(result) => {
+                pipeline.task.take();
+                while let Ok(progress) = pipeline.progress_rx.try_recv() {
                     send(progress);
                 }
-                return result.map_err(|error| {
-                    DownloadError::ResolveManifest(format!("asset download task {error}"))
-                })?;
+                return result
+                    .map_err(|error| {
+                        DownloadError::ResolveManifest(format!("asset download task {error}"))
+                    })?
+                    .map(Some);
             }
         }
     }
 }
 
 pub(super) async fn abort_asset_download_pipeline(pipeline: Option<AssetDownloadPipeline>) {
-    if let Some(AssetDownloadPipeline { task, .. }) = pipeline {
-        task.abort();
-        let _ = task.await;
+    if let Some(mut pipeline) = pipeline {
+        if let Some(task) = pipeline.task.take() {
+            task.abort();
+            let _ = task.await;
+        }
     }
 }
 
-async fn download_asset_objects_with_client<F>(
+async fn acquire_asset_sources_with_client<F>(
     mc_dir: &Path,
     client: reqwest::Client,
-    verified_index_bytes: Arc<[u8]>,
+    asset_object_base_url: Arc<str>,
+    asset_index_id: String,
+    asset_index_source: AuthenticatedSelectedArtifactSource,
     fact_tx: Option<mpsc::UnboundedSender<ExecutionDownloadFact>>,
     plan: &TransferPlan,
     mut send: F,
-) -> Result<(), DownloadError>
+) -> Result<RetainedAssetsAcquisition, DownloadError>
 where
     F: FnMut(DownloadProgress),
 {
-    let index = parse_asset_index(&verified_index_bytes).map_err(DownloadError::ParseVersion)?;
-    let objects_dir = assets_dir(mc_dir).join("objects");
+    if asset_index_source.kind() != SelectedDownloadArtifactKind::AssetIndex
+        || asset_index_source.logical_identity() != asset_index_id
+    {
+        return Err(DownloadError::Integrity(
+            "authenticated asset index identity is invalid".to_string(),
+        ));
+    }
+    let index =
+        parse_asset_index(asset_index_source.bytes()).map_err(DownloadError::ParseVersion)?;
     let jobs = unique_asset_object_jobs(
-        &objects_dir,
+        asset_index_source.observed_size(),
         index
             .objects
             .values()
             .map(|object| (object.hash.as_str(), object.size)),
     )?;
+    let index_path = ArtifactRelativePath::new(&format!("indexes/{asset_index_id}.json"))
+        .map_err(|_| DownloadError::Integrity("asset index path is invalid".to_string()))?;
+    let source_pool = AssetSourcePool::new()?;
+    let index_source = source_pool
+        .retain_index(&asset_index_source, index_path)
+        .await?;
+    let cache = ManagedComponentExactCache::bind(mc_dir, ManagedComponentKind::Assets)
+        .await
+        .map_err(asset_cache_error)?;
 
-    plan.resolve_contribution(
-        jobs.iter()
-            .map(|job| job.expected.size.unwrap_or(0))
-            .sum::<u64>(),
-    );
+    let object_bytes = jobs.iter().try_fold(0_u64, |total, job| {
+        total.checked_add(job.expected_size).ok_or_else(|| {
+            DownloadError::Integrity("asset object byte budget overflowed".to_string())
+        })
+    })?;
+    plan.resolve_contribution(object_bytes);
     send(progress("assets", 0, jobs.len() as i32, None));
     let total_jobs = jobs.len() as i32;
     let mut completed_jobs = 0;
     let mut asset_downloads = futures_util::stream::iter(jobs.into_iter().map(|job| {
         let client = client.clone();
         let fact_tx = fact_tx.clone();
+        let source_pool = source_pool.clone();
+        let cache = cache.clone();
+        let asset_object_base_url = Arc::clone(&asset_object_base_url);
         async move {
-            let hash = job.hash;
-            let path = job.path;
-            let expected = job.expected;
-            let bytes = expected.size.unwrap_or(0);
-            let url = format!(
-                "https://resources.download.minecraft.net/{}/{}",
-                &hash[..2],
-                hash
-            );
-            ensure_selected_artifact_with_client(
+            if cache
+                .full_sha1(&job.relative_path, job.expected_size)
+                .await
+                .map_err(asset_cache_error)?
+                == Some(job.expected_sha1)
+            {
+                return Ok::<_, DownloadError>((job.expected_size, None));
+            }
+            let permit = source_pool.reserve(job.expected_size).await?;
+            let url = format!("{asset_object_base_url}/{}/{}", &job.hash[..2], job.hash);
+            let target = selected_download_source_label(
                 SelectedDownloadArtifactKind::AssetObject,
-                &client,
-                &url,
-                &path,
-                &expected,
-                fact_tx.as_ref(),
-            )
-            .await?;
-            Ok::<u64, DownloadError>(bytes)
+                &job.hash,
+            );
+            let source =
+                acquire_authenticated_selected_artifact_source(SelectedArtifactSourceRequest {
+                    client: &client,
+                    kind: SelectedDownloadArtifactKind::AssetObject,
+                    url: &url,
+                    logical_identity: &job.hash,
+                    expected: &job.expected,
+                    max_bytes: usize::try_from(job.expected_size).map_err(|_| {
+                        DownloadError::Integrity(
+                            "asset object size exceeds the platform bound".to_string(),
+                        )
+                    })?,
+                    target: &target,
+                    fact_tx: fact_tx.as_ref(),
+                })
+                .await?;
+            let retained = source_pool
+                .retain_object(&source, job.relative_path, permit)
+                .await?;
+            Ok((job.expected_size, Some(retained)))
         }
     }))
     .buffer_unordered(asset_download_concurrency());
+    let mut sources = Vec::new();
+    sources.push(index_source);
     while let Some(result) = asset_downloads.next().await {
-        let bytes = result?;
+        let (bytes, source) = result?;
+        if let Some(source) = source {
+            sources.push(source);
+        }
         plan.add_done(bytes);
         completed_jobs += 1;
         if completed_jobs == total_jobs || completed_jobs % 50 == 0 {
@@ -173,20 +263,10 @@ where
         }
     }
 
-    if index.flags.requires_virtual_repair() {
-        let virtual_dir = assets_dir(mc_dir).join("virtual").join("legacy");
-        copy_virtual_assets(
-            &objects_dir,
-            &virtual_dir,
-            index
-                .objects
-                .into_iter()
-                .map(|(name, object)| (name, object.hash)),
-        )
-        .await?;
-    }
-
-    Ok(())
+    Ok(RetainedAssetsAcquisition {
+        asset_index_source,
+        sources,
+    })
 }
 
 pub async fn repair_virtual_assets_from_index(
@@ -229,35 +309,74 @@ pub(super) async fn recv_asset_progress(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct AssetObjectDownloadJob {
     pub(super) hash: String,
-    pub(super) path: PathBuf,
+    pub(super) relative_path: ArtifactRelativePath,
+    pub(super) expected_size: u64,
+    pub(super) expected_sha1: [u8; 20],
     pub(super) expected: ExpectedIntegrity,
 }
 
 pub(super) fn unique_asset_object_jobs<'a>(
-    objects_dir: &Path,
+    asset_index_size: u64,
     objects: impl IntoIterator<Item = (&'a str, i64)>,
 ) -> Result<Vec<AssetObjectDownloadJob>, DownloadError> {
+    if asset_index_size > MAX_TIER2_ARTIFACT_BYTES {
+        return Err(DownloadError::Integrity(
+            "asset index exceeds the per-artifact bound".to_string(),
+        ));
+    }
     let mut jobs = Vec::new();
-    let mut queued_hashes = HashSet::new();
+    let mut queued_hashes = HashMap::new();
+    let mut aggregate_bytes = asset_index_size;
 
     for (hash, size) in objects {
-        let prefix = asset_object_hash_prefix(hash)?;
+        let hash = hash.to_ascii_lowercase();
+        let prefix = asset_object_hash_prefix(&hash)?;
         let size = u64::try_from(size).map_err(|_| {
             DownloadError::Integrity("asset object has an invalid declared size".to_string())
         })?;
-        if !queued_hashes.insert(hash.to_string()) {
+        if size > MAX_TIER2_ARTIFACT_BYTES {
+            return Err(DownloadError::Integrity(
+                "asset object exceeds the per-artifact bound".to_string(),
+            ));
+        }
+        if let Some(previous_size) = queued_hashes.insert(hash.clone(), size) {
+            if previous_size != size {
+                return Err(DownloadError::Integrity(
+                    "asset object digest has conflicting sizes".to_string(),
+                ));
+            }
             continue;
         }
+        if jobs.len().saturating_add(1) >= MAX_TIER2_ENTRIES {
+            return Err(DownloadError::Integrity(
+                "asset inventory exceeds the entry bound".to_string(),
+            ));
+        }
+        aggregate_bytes = aggregate_bytes.checked_add(size).ok_or_else(|| {
+            DownloadError::Integrity("asset inventory byte budget overflowed".to_string())
+        })?;
+        if aggregate_bytes > MAX_TIER2_AGGREGATE_BYTES {
+            return Err(DownloadError::Integrity(
+                "asset inventory exceeds the aggregate byte bound".to_string(),
+            ));
+        }
+        let expected_sha1 = decode_sha1(&hash).ok_or_else(|| {
+            DownloadError::Integrity("asset object digest is invalid".to_string())
+        })?;
         jobs.push(AssetObjectDownloadJob {
-            hash: hash.to_string(),
-            path: objects_dir.join(prefix).join(hash),
+            relative_path: ArtifactRelativePath::new(&format!("objects/{prefix}/{hash}")).map_err(
+                |_| DownloadError::Integrity("asset object path is invalid".to_string()),
+            )?,
+            expected_size: size,
+            expected_sha1,
             expected: ExpectedIntegrity {
                 size: Some(size),
-                sha1: Some(hash.to_ascii_lowercase()),
+                sha1: Some(hash.clone()),
             },
+            hash,
         });
     }
-
+    jobs.sort_by(|left, right| left.hash.cmp(&right.hash));
     Ok(jobs)
 }
 
@@ -277,27 +396,15 @@ pub(super) fn asset_object_hash_prefix(hash: &str) -> Result<&str, DownloadError
     Ok(&hash[..2])
 }
 
-#[cfg(test)]
-pub(super) async fn missing_asset_object_jobs(
-    candidates: Vec<AssetObjectDownloadJob>,
-) -> Result<Vec<AssetObjectDownloadJob>, DownloadError> {
-    let mut missing = Vec::new();
-    let mut checks = futures_util::stream::iter(candidates.into_iter().map(|job| async move {
-        if existing_asset_object_satisfies(&job.path, &job.expected).await? {
-            Ok::<Option<AssetObjectDownloadJob>, DownloadError>(None)
-        } else {
-            Ok::<Option<AssetObjectDownloadJob>, DownloadError>(Some(job))
+fn asset_cache_error(error: ManagedComponentExactCacheError) -> DownloadError {
+    match error {
+        ManagedComponentExactCacheError::Admission => {
+            DownloadError::Integrity("asset cache admission failed".to_string())
         }
-    }))
-    .buffer_unordered(asset_download_concurrency());
-
-    while let Some(result) = checks.next().await {
-        if let Some(job) = result? {
-            missing.push(job);
-        }
+        ManagedComponentExactCacheError::TaskStopped => DownloadError::FileOperation(
+            io::Error::other("asset cache admission task stopped unexpectedly"),
+        ),
     }
-
-    Ok(missing)
 }
 
 pub(super) async fn copy_virtual_assets(
@@ -383,47 +490,4 @@ fn unsafe_virtual_asset_path_error(asset_name: &str) -> DownloadError {
         "unsafe virtual asset path: {}",
         bounded_provider_path_label(asset_name)
     ))
-}
-
-#[cfg(test)]
-mod source_first_tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn asset_pipeline_parses_supplied_verified_bytes_without_a_disk_index() {
-        let plan = TransferPlan::shared();
-        let pipeline = spawn_asset_download_pipeline(
-            PathBuf::from("/path/that/is/not/read"),
-            reqwest::Client::new(),
-            Arc::from(br#"{"objects":{}}"#.as_slice()),
-            None,
-            plan,
-        );
-        let mut progress = Vec::new();
-
-        await_asset_download_pipeline(Some(pipeline), &mut |event| progress.push(event))
-            .await
-            .expect("empty supplied asset index should succeed");
-
-        assert_eq!(progress.len(), 1);
-        assert_eq!(progress[0].phase, "assets");
-        assert_eq!(progress[0].total, 0);
-    }
-
-    #[tokio::test]
-    async fn asset_pipeline_rejects_malformed_supplied_bytes() {
-        let pipeline = spawn_asset_download_pipeline(
-            PathBuf::from("/path/that/is/not/read"),
-            reqwest::Client::new(),
-            Arc::from(b"not json".as_slice()),
-            None,
-            TransferPlan::shared(),
-        );
-
-        let error = await_asset_download_pipeline(Some(pipeline), &mut |_| {})
-            .await
-            .expect_err("malformed supplied index must fail");
-
-        assert!(matches!(error, DownloadError::ParseVersion(_)));
-    }
 }

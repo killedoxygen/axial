@@ -22,24 +22,6 @@ pub(super) fn promotion_backup_path(destination: &Path) -> PathBuf {
     destination.with_file_name(name)
 }
 
-pub(super) fn selected_promotion_temp_path(destination: &Path) -> PathBuf {
-    let mut name = destination
-        .file_name()
-        .unwrap_or_else(|| OsStr::new("artifact"))
-        .to_os_string();
-    name.push(".axial-selected-tmp-");
-    name.push(std::process::id().to_string());
-    destination.with_file_name(name)
-}
-
-pub(super) async fn sweep_stale_selected_promotion_temps(destination: &Path) -> io::Result<()> {
-    let Some(file_name) = destination.file_name() else {
-        return Ok(());
-    };
-    let prefix = format!("{}.axial-selected-tmp-", file_name.to_string_lossy());
-    sweep_stale_owned_slots(destination, &prefix).await
-}
-
 async fn sweep_stale_owned_slots(destination: &Path, prefix: &str) -> io::Result<()> {
     let Some(parent) = destination.parent() else {
         return Ok(());

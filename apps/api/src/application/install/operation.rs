@@ -994,7 +994,6 @@ fn terminal_download_failure_fact_kind(kind: ExecutionDownloadFactKind) -> bool 
             | ExecutionDownloadFactKind::MetadataMissing
             | ExecutionDownloadFactKind::Interrupted
             | ExecutionDownloadFactKind::NetworkFailure
-            | ExecutionDownloadFactKind::OwnershipRefused
             | ExecutionDownloadFactKind::PermissionFailure
             | ExecutionDownloadFactKind::PromoteFailed
             | ExecutionDownloadFactKind::ProviderFailure

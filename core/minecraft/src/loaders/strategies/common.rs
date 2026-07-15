@@ -39,10 +39,9 @@ use crate::loaders::{validate_provider_version_id, validate_version_id};
 use crate::managed_fs::ManagedDir;
 use crate::runtime::{ManagedRuntimeCache, acquire_preferred_runtime_source};
 use sha1::{Digest as _, Sha1};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::io::{Read, Write};
 use std::path::Path;
-use std::sync::{Arc, OnceLock};
 use zip::ZipArchive;
 use zip::ZipWriter;
 use zip::write::SimpleFileOptions;
@@ -1024,9 +1023,6 @@ async fn ensure_base_version<F>(
 where
     F: FnMut(DownloadProgress),
 {
-    let install_lock = base_version_install_lock(library_dir, version_id);
-    let _guard = install_lock.lock().await;
-
     let downloader = Downloader::new(library_dir.to_path_buf(), runtime_cache.clone());
     let mut facts = Vec::new();
     let result = Box::pin(downloader.install_version_with_facts(
@@ -1046,29 +1042,6 @@ where
             facts,
         }),
     }
-}
-
-fn base_version_install_lock(library_dir: &Path, version_id: &str) -> Arc<tokio::sync::Mutex<()>> {
-    static LOCKS: OnceLock<std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> =
-        OnceLock::new();
-    let mutex = LOCKS.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
-    base_version_install_lock_from_map(mutex, library_dir, version_id)
-}
-
-fn base_version_install_lock_from_map(
-    mutex: &std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
-    library_dir: &Path,
-    version_id: &str,
-) -> Arc<tokio::sync::Mutex<()>> {
-    let key = format!("{}\n{}", library_dir.to_string_lossy(), version_id.trim());
-    let mut guard = match mutex.lock() {
-        Ok(guard) => guard,
-        Err(poisoned) => poisoned.into_inner(),
-    };
-    guard
-        .entry(key)
-        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-        .clone()
 }
 
 async fn download_profile_loader_libraries_with_evidence<F>(
@@ -1392,8 +1365,8 @@ mod tests {
         AuthenticatedProcessorSources, read_installed_base_client, spawn_bound_processor_execution,
     };
     use super::{
-        base_version_install_lock_from_map, download_installer_libraries_with_evidence,
-        ensure_base_version, fetch_sha1_verified_source, finish_supported_installer_install,
+        download_installer_libraries_with_evidence, ensure_base_version,
+        fetch_sha1_verified_source, finish_supported_installer_install,
         install_from_installer_source, install_from_legacy_archive, install_from_profile_source,
         install_legacy_archive_after_authenticated_base,
         install_profile_source_after_authenticated_base, overlay_legacy_archive_bytes,
@@ -1427,7 +1400,7 @@ mod tests {
     #[cfg(unix)]
     use crate::runtime::{RuntimeId, TestRuntimeSourceDescriptor, acquire_test_runtime_source};
     use sha1::{Digest as _, Sha1};
-    use std::collections::{BTreeMap, HashMap};
+    use std::collections::BTreeMap;
     use std::fs;
     use std::io::{ErrorKind, Read, Write};
     use std::net::{TcpListener, TcpStream};
@@ -2543,57 +2516,6 @@ printf '%s' 'processor-terminal' > "$last"
     }
 
     #[tokio::test]
-    async fn base_version_install_lock_serializes_same_library_version() {
-        let locks = std::sync::Mutex::new(HashMap::new());
-        let root = PathBuf::from("/tmp/axial-loader-base-lock");
-        let first = base_version_install_lock_from_map(&locks, &root, "1.21.5");
-        let second = base_version_install_lock_from_map(&locks, &root, "1.21.5");
-        let other_version = base_version_install_lock_from_map(&locks, &root, "1.21.4");
-        let other_library =
-            base_version_install_lock_from_map(&locks, &root.join("other"), "1.21.5");
-
-        assert!(Arc::ptr_eq(&first, &second));
-        assert!(!Arc::ptr_eq(&first, &other_version));
-        assert!(!Arc::ptr_eq(&first, &other_library));
-
-        let first_guard = first.lock().await;
-        let second_wait = tokio::spawn(async move {
-            let _guard = second.lock().await;
-        });
-        tokio::task::yield_now().await;
-        assert!(!second_wait.is_finished());
-
-        drop(first_guard);
-        tokio::time::timeout(Duration::from_secs(1), second_wait)
-            .await
-            .expect("second waiter should acquire after first guard drops")
-            .expect("second waiter should not panic");
-    }
-
-    #[test]
-    fn base_version_install_lock_recovers_from_poisoned_map_lock() {
-        let locks = Arc::new(std::sync::Mutex::new(HashMap::new()));
-        let root = PathBuf::from("/tmp/axial-loader-poisoned-base-lock");
-        let seeded_install_lock = Arc::new(tokio::sync::Mutex::new(()));
-        let poison_target = Arc::clone(&locks);
-        let poison_seed = Arc::clone(&seeded_install_lock);
-        let poison_root = root.clone();
-
-        let _ = std::thread::spawn(move || {
-            let key = format!("{}\n{}", poison_root.to_string_lossy(), "1.21.5");
-            let mut guard = poison_target.lock().unwrap();
-            guard.insert(key, poison_seed);
-            panic!("poison base install lock map");
-        })
-        .join();
-
-        assert!(locks.is_poisoned());
-        let recovered_lock = base_version_install_lock_from_map(&locks, &root, "1.21.5");
-
-        assert!(Arc::ptr_eq(&recovered_lock, &seeded_install_lock));
-    }
-
-    #[tokio::test]
     async fn fabric_install_ignores_bogus_profile_integrity_and_streams_fresh_bytes() {
         let root = temp_dir("fabric-profile-bogus-integrity");
         fs::create_dir_all(&root).expect("create root");
@@ -2871,6 +2793,123 @@ printf '%s' 'processor-terminal' > "$last"
     }
 
     #[tokio::test]
+    async fn local_loader_child_inherits_nonempty_assets_without_retained_sources() {
+        let root = temp_dir("loader-bundle-inherited-assets");
+        let mut record = legacy_archive_record();
+        record.loader_version = "3.4.9.171-inherited-assets".to_string();
+        canonicalize_record_identity(&mut record);
+
+        let asset_object = b"inherited asset object".to_vec();
+        let asset_object_sha1 = sha1_hex(&asset_object);
+        let asset_index = serde_json::to_vec(&serde_json::json!({
+            "objects": {
+                "fixture": {
+                    "hash": asset_object_sha1,
+                    "size": asset_object.len()
+                }
+            }
+        }))
+        .expect("serialize inherited asset index");
+        let asset_index_server = TestByteServer::start(asset_index.clone());
+        let asset_object_server = TestByteServer::start(asset_object.clone());
+        let base_client = b"inherited assets base client".to_vec();
+        let client_server = TestByteServer::start(base_client.clone());
+        let version_bytes = serde_json::to_vec(&serde_json::json!({
+            "id": record.minecraft_version,
+            "type": "release",
+            "mainClass": "net.minecraft.client.main.Main",
+            "assetIndex": {
+                "id": record.minecraft_version,
+                "url": asset_index_server.url,
+                "sha1": sha1_hex(&asset_index),
+                "size": asset_index.len(),
+                "totalSize": asset_object.len()
+            },
+            "downloads": {
+                "client": {
+                    "url": client_server.url,
+                    "sha1": sha1_hex(&base_client),
+                    "size": base_client.len()
+                }
+            },
+            "libraries": []
+        }))
+        .expect("serialize inherited assets base version");
+        let version_server = TestByteServer::start(version_bytes.clone());
+        let manifest = test_install_manifest(
+            &record.minecraft_version,
+            &version_server.url,
+            &version_bytes,
+        );
+        let base = Downloader::with_test_install_manifest(&root, manifest)
+            .with_test_asset_object_base_url(asset_object_server.url.clone())
+            .install_version(&record.minecraft_version, |_| {})
+            .await
+            .expect("install inherited assets base");
+
+        let asset_index_path = root
+            .join("assets/indexes")
+            .join(format!("{}.json", record.minecraft_version));
+        let asset_object_path = root
+            .join("assets/objects")
+            .join(&asset_object_sha1[..2])
+            .join(&asset_object_sha1);
+        assert_eq!(
+            fs::read(&asset_index_path).expect("base asset index"),
+            asset_index
+        );
+        assert_eq!(
+            fs::read(&asset_object_path).expect("base asset object"),
+            asset_object
+        );
+
+        let child_client = b"inherited assets child client";
+        let prepared = prepared_test_legacy_bundle_from_base(&base, &record, child_client);
+        assert_eq!(
+            prepared.retained_asset_source_count(),
+            0,
+            "loader publication must inherit Assets without new sources"
+        );
+        let receipt = super::publish_loader_managed_install(&root, prepared)
+            .await
+            .expect("publish loader child with inherited Assets");
+
+        assert_eq!(
+            fs::read(&asset_index_path).expect("child asset index"),
+            asset_index
+        );
+        assert_eq!(
+            fs::read(&asset_object_path).expect("child asset object"),
+            asset_object
+        );
+        let inventory = receipt.into_activation_source().into_parts().1;
+        assert!(inventory.entries().iter().any(|entry| {
+            entry.kind() == KnownGoodArtifactKind::AssetIndex
+                && entry.path().as_str() == format!("indexes/{}.json", record.minecraft_version)
+        }));
+        assert!(inventory.entries().iter().any(|entry| {
+            entry.kind() == KnownGoodArtifactKind::AssetObject
+                && entry.path().as_str()
+                    == format!("objects/{}/{}", &asset_object_sha1[..2], asset_object_sha1)
+        }));
+        assert_settled_loader_assets_lane(&root);
+
+        assert_eq!(asset_index_server.request_count(), 1);
+        assert_eq!(asset_object_server.request_count(), 1);
+        assert_eq!(client_server.request_count(), 1);
+        assert_eq!(version_server.request_count(), 1);
+        for server in [
+            asset_index_server,
+            asset_object_server,
+            client_server,
+            version_server,
+        ] {
+            server.stop();
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
     async fn zero_source_legacy_managed_install_survives_cancellation_and_settles() {
         let root = temp_dir("loader-bundle-cancelled-caller");
         let mut record = legacy_archive_record();
@@ -2917,6 +2956,7 @@ printf '%s' 'processor-terminal' > "$last"
             .await
             .expect("settled loader publication admits exact retry");
         assert_eq!(receipt.version_id(), record.version_id);
+        assert_settled_loader_assets_lane(&root);
         assert_settled_loader_libraries_lane(&root);
         let _ = fs::remove_dir_all(root);
     }
@@ -4907,6 +4947,14 @@ esac
         child_client: &[u8],
     ) -> super::PreparedManagedInstall {
         let base = test_authenticated_receipt(root, &record.minecraft_version);
+        prepared_test_legacy_bundle_from_base(&base, record, child_client)
+    }
+
+    fn prepared_test_legacy_bundle_from_base(
+        base: &KnownGoodInstallReceipt,
+        record: &LoaderBuildRecord,
+        child_client: &[u8],
+    ) -> super::PreparedManagedInstall {
         let mut version = base.effective_version().clone();
         version.id = record.version_id.clone();
         version.inherits_from = record.minecraft_version.clone();
@@ -4921,7 +4969,7 @@ esac
         client.url.clear();
         let version_bytes = serde_json::to_vec_pretty(&version).expect("test legacy version bytes");
         let authority = KnownGoodInstallReceipt::from_verified_legacy_archive_source(
-            &base,
+            base,
             record,
             version,
             &version_bytes,
@@ -4964,13 +5012,21 @@ esac
             .expect("write base jar");
     }
 
+    fn assert_settled_loader_assets_lane(root: &Path) {
+        assert_settled_loader_component_lane(root, "assets", "Assets");
+    }
+
     fn assert_settled_loader_libraries_lane(root: &Path) {
-        let lane = root.join(".axial-publication/libraries");
+        assert_settled_loader_component_lane(root, "libraries", "Libraries");
+    }
+
+    fn assert_settled_loader_component_lane(root: &Path, lane_name: &str, label: &str) {
+        let lane = root.join(".axial-publication").join(lane_name);
         let mut entries = fs::read_dir(&lane)
-            .expect("settled loader Libraries lane")
+            .unwrap_or_else(|_| panic!("settled loader {label} lane"))
             .map(|entry| {
                 entry
-                    .expect("loader Libraries lane entry")
+                    .unwrap_or_else(|_| panic!("loader {label} lane entry"))
                     .file_name()
                     .to_string_lossy()
                     .into_owned()
@@ -4981,19 +5037,19 @@ esac
         for child in ["quarantine", "staging", "table"] {
             assert!(
                 fs::read_dir(lane.join(child))
-                    .expect("settled loader Libraries child")
+                    .unwrap_or_else(|_| panic!("settled loader {label} child"))
                     .next()
                     .is_none(),
-                "settled loader Libraries {child} must be empty"
+                "settled loader {label} {child} must be empty"
             );
         }
         for child in ["records", "staging"] {
             assert!(
                 fs::read_dir(lane.join("ancestors").join(child))
-                    .expect("settled loader Libraries ancestor child")
+                    .unwrap_or_else(|_| panic!("settled loader {label} ancestor child"))
                     .next()
                     .is_none(),
-                "settled loader Libraries ancestors/{child} must be empty"
+                "settled loader {label} ancestors/{child} must be empty"
             );
         }
     }

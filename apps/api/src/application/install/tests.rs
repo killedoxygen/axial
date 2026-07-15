@@ -1848,18 +1848,11 @@ async fn install_status_exposes_runtime_unavailable_failure_without_retry() {
     )
     .await
     .expect("record install journal");
-    let facts = [
-        ExecutionDownloadFact {
-            kind: ExecutionDownloadFactKind::ArtifactMissing,
-            target: "minecraft_runtime_manifest".to_string(),
-            fields: Vec::new(),
-        },
-        ExecutionDownloadFact {
-            kind: ExecutionDownloadFactKind::MetadataMissing,
-            target: "minecraft_runtime_manifest".to_string(),
-            fields: Vec::new(),
-        },
-    ];
+    let facts = [ExecutionDownloadFact {
+        kind: ExecutionDownloadFactKind::MetadataMissing,
+        target: "minecraft_runtime_manifest".to_string(),
+        fields: Vec::new(),
+    }];
     record_install_failure_outcome_for_error(
         state.journals(),
         &failure_memory,
@@ -1947,18 +1940,11 @@ async fn install_status_exposes_rosetta_required_failure_with_retry() {
     )
     .await
     .expect("record install journal");
-    let facts = [
-        ExecutionDownloadFact {
-            kind: ExecutionDownloadFactKind::ArtifactMissing,
-            target: "minecraft_runtime_manifest".to_string(),
-            fields: Vec::new(),
-        },
-        ExecutionDownloadFact {
-            kind: ExecutionDownloadFactKind::MetadataMissing,
-            target: "minecraft_runtime_manifest".to_string(),
-            fields: Vec::new(),
-        },
-    ];
+    let facts = [ExecutionDownloadFact {
+        kind: ExecutionDownloadFactKind::MetadataMissing,
+        target: "minecraft_runtime_manifest".to_string(),
+        fields: Vec::new(),
+    }];
     record_install_failure_outcome_for_error(
         state.journals(),
         &failure_memory,
@@ -2050,7 +2036,7 @@ async fn network_install_error_wins_over_benign_accumulated_download_facts() {
     .expect("record install journal");
     let facts = [
         ExecutionDownloadFact {
-            kind: ExecutionDownloadFactKind::ArtifactMissing,
+            kind: ExecutionDownloadFactKind::MetadataMissing,
             target: "minecraft_client_1.21.5".to_string(),
             fields: Vec::new(),
         },
@@ -2110,7 +2096,7 @@ async fn request_install_error_keeps_terminal_artifact_target_for_failure_memory
     let terminal_target = "minecraft_client_terminal_provider_failure";
     let facts = [
         download_fact(
-            ExecutionDownloadFactKind::ArtifactMissing,
+            ExecutionDownloadFactKind::MetadataMissing,
             "minecraft_client_stale_missing",
         ),
         ExecutionDownloadFact {
@@ -2182,15 +2168,6 @@ async fn install_status_exposes_backend_authored_guardian_blocking_safety_outcom
             "verified download data could not be promoted safely",
             "atomic promotion failed",
             "permissions",
-        ),
-        (
-            "ownership-refused-status-install",
-            ExecutionDownloadFactKind::OwnershipRefused,
-            DiagnosisId::ArtifactOwnershipUnsafe,
-            "block",
-            "protect user-owned or unknown files",
-            "ownership was unsafe",
-            "launcher-managed library location",
         ),
     ];
 

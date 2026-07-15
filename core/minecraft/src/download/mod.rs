@@ -1,3 +1,4 @@
+mod asset_source;
 mod assets;
 mod client;
 mod facts;
@@ -38,8 +39,8 @@ pub use libraries::{
 pub(crate) use model::ExactLibraryDownloadProof;
 pub use model::{
     DownloadError, DownloadProgress, ExecutionDownloadError, ExecutionDownloadFact,
-    ExecutionDownloadFactKind, ExecutionDownloadOwnership, ExecutionDownloadReport,
-    ExpectedIntegrity, LibraryPlanError, SelectedDownloadArtifactKind,
+    ExecutionDownloadFactKind, ExecutionDownloadReport, ExpectedIntegrity, LibraryPlanError,
+    SelectedDownloadArtifactKind,
 };
 pub(crate) use transfer::AuthenticatedSelectedArtifactSource;
 #[cfg(test)]

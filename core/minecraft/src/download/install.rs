@@ -1,6 +1,7 @@
+use super::asset_source::RetainedAssetComponentSource;
 use super::assets::{
-    abort_asset_download_pipeline, await_asset_download_pipeline, recv_asset_progress,
-    spawn_asset_download_pipeline,
+    ASSET_OBJECT_BASE_URL, RetainedAssetsAcquisition, abort_asset_download_pipeline,
+    await_asset_download_pipeline, recv_asset_progress, spawn_asset_download_pipeline,
 };
 use super::client::{library_download_concurrency, standard_minecraft_download_client};
 use super::facts::selected_download_source_label;
@@ -24,9 +25,7 @@ use super::runtime::{
 };
 use super::transfer::{
     AuthenticatedSelectedArtifactSource, AuthenticatedSelectedArtifactVersionBundleParts,
-    MaterializedSelectedArtifactSource, SelectedArtifactSourceRequest,
-    acquire_authenticated_selected_artifact_source,
-    materialize_authenticated_selected_artifact_source, prepare_selected_artifact_install,
+    SelectedArtifactSourceRequest, acquire_authenticated_selected_artifact_source,
 };
 use crate::artifact_path::validate_artifact_path_segment;
 use crate::known_good::{
@@ -47,7 +46,6 @@ use crate::managed_component_table::ManagedComponentKind;
 use crate::managed_fs::ManagedDir;
 use crate::managed_publication::{ManagedRootPublicationLease, run_publication_blocking};
 use crate::manifest::{ManifestEntry, VersionManifest, fetch_fresh_install_version_manifest};
-use crate::paths::assets_dir;
 use crate::rules::{Environment, default_environment};
 use crate::runtime::{ManagedRuntimeCache, RuntimeSourceReceipt, acquire_preferred_runtime_source};
 #[cfg(test)]
@@ -70,6 +68,7 @@ use tokio::sync::mpsc;
 pub struct Downloader {
     root: DownloaderRoot,
     client: reqwest::Client,
+    asset_object_base_url: Arc<str>,
     #[cfg(test)]
     install_manifest: Option<VersionManifest>,
     #[cfg(test)]
@@ -389,11 +388,16 @@ pub(crate) struct ReconstructedVanillaAuthority {
 pub(crate) struct PreparedManagedInstall {
     authority: PendingKnownGoodInstallAuthority,
     version_bundle_source: AuthenticatedVersionBundleSource,
+    asset_sources: Vec<RetainedAssetComponentSource>,
     library_sources: Vec<RetainedLibraryComponentSource>,
 }
 
 #[cfg(test)]
 impl PreparedManagedInstall {
+    pub(crate) fn retained_asset_source_count(&self) -> usize {
+        self.asset_sources.len()
+    }
+
     pub(crate) fn retained_library_source_count(&self) -> usize {
         self.library_sources.len()
     }
@@ -497,6 +501,7 @@ impl Downloader {
                 runtime_cache,
             },
             client: standard_minecraft_download_client(),
+            asset_object_base_url: Arc::from(ASSET_OBJECT_BASE_URL),
             #[cfg(test)]
             install_manifest: None,
             #[cfg(test)]
@@ -508,6 +513,7 @@ impl Downloader {
         Self {
             root: DownloaderRoot::SourceOnly,
             client: standard_minecraft_download_client(),
+            asset_object_base_url: Arc::from(ASSET_OBJECT_BASE_URL),
             #[cfg(test)]
             install_manifest: None,
             #[cfg(test)]
@@ -520,6 +526,7 @@ impl Downloader {
         Self {
             root: DownloaderRoot::SourceOnly,
             client: standard_minecraft_download_client(),
+            asset_object_base_url: Arc::from(ASSET_OBJECT_BASE_URL),
             install_manifest: Some(manifest),
             runtime_source: None,
         }
@@ -537,6 +544,7 @@ impl Downloader {
                     .expect("isolated downloader runtime cache"),
             },
             client: standard_minecraft_download_client(),
+            asset_object_base_url: Arc::from(ASSET_OBJECT_BASE_URL),
             install_manifest: Some(manifest),
             runtime_source: None,
         }
@@ -548,6 +556,12 @@ impl Downloader {
         descriptor: TestRuntimeSourceDescriptor,
     ) -> Self {
         self.runtime_source = Some(descriptor);
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_test_asset_object_base_url(mut self, base_url: impl Into<Arc<str>>) -> Self {
+        self.asset_object_base_url = base_url.into();
         self
     }
 
@@ -977,12 +991,9 @@ impl Downloader {
             1,
             Some(format!("{version_id}.json")),
         ));
-        let asset_index_bytes = version
-            .asset_index
-            .size
-            .try_into()
-            .ok()
-            .filter(|size: &u64| *size > 0)
+        let asset_index_bytes = asset_index_source
+            .as_ref()
+            .map(AuthenticatedSelectedArtifactSource::observed_size)
             .unwrap_or(0);
         if asset_index_source.is_some() {
             plan.contribute_total(asset_index_bytes);
@@ -993,9 +1004,6 @@ impl Downloader {
                 Some(format!("{}.json", version.asset_index.id)),
             ));
         }
-        let asset_index_source = self
-            .materialize_asset_index_source(&version, asset_index_source, fact_tx)
-            .await?;
         if asset_index_source.is_some() {
             plan.add_done(asset_index_bytes);
             send(progress(
@@ -1111,11 +1119,13 @@ impl Downloader {
             } else {
                 None
             };
-            let mut asset_pipeline = asset_index_source.as_ref().map(|source| {
+            let mut asset_pipeline = asset_index_source.map(|source| {
                 spawn_asset_download_pipeline(
                     self.managed_root().to_path_buf(),
                     self.client.clone(),
-                    source.shared_bytes(),
+                    Arc::clone(&self.asset_object_base_url),
+                    version.asset_index.id.clone(),
+                    source,
                     fact_tx.cloned(),
                     plan.clone(),
                 )
@@ -1225,14 +1235,15 @@ impl Downloader {
                 plan.add_done(log_config_bytes);
                 send(progress("log_config", 1, 1, Some(logging.file.id.clone())));
             }
-            if client_jar_result.is_err()
+            let asset_result = if client_jar_result.is_err()
                 || log_config_result.as_ref().is_some_and(Result::is_err)
                 || library_result.is_err()
             {
                 abort_asset_download_pipeline(asset_pipeline).await;
+                None
             } else {
-                await_asset_download_pipeline(asset_pipeline, send).await?;
-            }
+                await_asset_download_pipeline(asset_pipeline, send).await?
+            };
             let client_source = client_jar_result?;
             let log_config_source = log_config_result.transpose()?;
             let (library_proofs, library_sources) = library_result?;
@@ -1242,6 +1253,7 @@ impl Downloader {
                 library_sources,
                 client_source,
                 log_config_source,
+                asset_result,
             ))
         }
         .await;
@@ -1254,6 +1266,7 @@ impl Downloader {
                 library_sources,
                 client_source,
                 log_config_source,
+                asset_result,
             ),
         ) = finish_runtime_pipeline_after_artifacts(runtime_pipeline, artifact_result, send)
             .await?;
@@ -1265,14 +1278,20 @@ impl Downloader {
                     "installed library declarations could not be completed: {error:?}"
                 ))
             })?;
+        let (asset_index_source, asset_sources) = match asset_result {
+            Some(RetainedAssetsAcquisition {
+                asset_index_source,
+                sources,
+            }) => (Some(asset_index_source), sources),
+            None => (None, Vec::new()),
+        };
         let source_authority = AuthenticatedVanillaInstallSources::new(
             VanillaAuthorityParts {
                 version,
                 environment,
                 libraries: library_declarations,
                 version_source: version_json_source,
-                asset_index_source: asset_index_source
-                    .map(MaterializedSelectedArtifactSource::into_authenticated_source),
+                asset_index_source,
                 runtime_source: runtime_receipt,
             },
             client_source,
@@ -1288,6 +1307,7 @@ impl Downloader {
         Ok(PreparedManagedInstall {
             authority,
             version_bundle_source: source,
+            asset_sources,
             library_sources,
         })
     }
@@ -1433,35 +1453,6 @@ impl Downloader {
             })
             .await?;
         Ok(Some(source))
-    }
-
-    async fn materialize_asset_index_source(
-        &self,
-        version: &VersionJson,
-        source: Option<AuthenticatedSelectedArtifactSource>,
-        fact_tx: Option<&mpsc::UnboundedSender<ExecutionDownloadFact>>,
-    ) -> Result<Option<MaterializedSelectedArtifactSource>, DownloadError> {
-        let Some(source) = source else {
-            return Ok(None);
-        };
-        let index_name = format!("{}.json", version.asset_index.id);
-        let index_path = assets_dir(self.managed_root())
-            .join("indexes")
-            .join(index_name);
-        let expected =
-            ExpectedIntegrity::from_mojang(version.asset_index.size, &version.asset_index.sha1);
-        let prepared = prepare_selected_artifact_install(
-            SelectedDownloadArtifactKind::AssetIndex,
-            &index_path,
-            &version.asset_index.url,
-            &version.asset_index.id,
-            &expected,
-            fact_tx,
-        )
-        .await?;
-        materialize_authenticated_selected_artifact_source(prepared, source, fact_tx)
-            .await
-            .map(Some)
     }
 
     async fn resolve_manifest_entry(
@@ -1958,6 +1949,7 @@ pub(crate) fn prepare_local_managed_install(
     Ok(PreparedManagedInstall {
         authority,
         version_bundle_source: source,
+        asset_sources: Vec::new(),
         library_sources,
     })
 }
@@ -1971,9 +1963,18 @@ pub(crate) async fn publish_prepared_managed_install(
         let PreparedManagedInstall {
             authority,
             version_bundle_source,
+            asset_sources,
             library_sources,
         } = prepared;
         let lease = acquire_managed_install_publication_lease(managed_root, &observer_key).await?;
+        let lease = publish_managed_component(
+            lease,
+            &authority,
+            ManagedComponentKind::Assets,
+            asset_sources,
+        )
+        .await
+        .map_err(|error| managed_component_install_error(ManagedComponentKind::Assets, error))?;
         let lease = publish_managed_component(
             lease,
             &authority,
@@ -1981,7 +1982,7 @@ pub(crate) async fn publish_prepared_managed_install(
             library_sources,
         )
         .await
-        .map_err(managed_libraries_install_error)?;
+        .map_err(|error| managed_component_install_error(ManagedComponentKind::Libraries, error))?;
         complete_prepared_version_bundle_install(lease, authority, version_bundle_source).await
     });
     owner.await.map_err(managed_install_owner_error)?
@@ -2094,8 +2095,15 @@ fn version_bundle_install_error(message: impl Into<String>) -> DownloadError {
     DownloadError::ResolveManifest(message.into())
 }
 
-fn managed_libraries_install_error(_error: ComponentLifecycleError) -> DownloadError {
-    version_bundle_install_error("managed Libraries publication failed")
+fn managed_component_install_error(
+    component: ManagedComponentKind,
+    _error: ComponentLifecycleError,
+) -> DownloadError {
+    let name = match component {
+        ManagedComponentKind::Libraries => "Libraries",
+        ManagedComponentKind::Assets => "Assets",
+    };
+    version_bundle_install_error(format!("managed {name} publication failed"))
 }
 
 async fn await_selected_source_task(

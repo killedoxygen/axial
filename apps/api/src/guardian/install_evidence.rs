@@ -39,7 +39,6 @@ macro_rules! install_artifact_failure_kinds {
 install_artifact_failure_kinds! {
     ChecksumMismatch,
     SizeMismatch,
-    ArtifactMissing,
     MetadataInvalid,
     ProviderFailure,
     NetworkFailure,
@@ -49,7 +48,6 @@ install_artifact_failure_kinds! {
     DependencyFailed,
     ExecutionFailed,
     ProcessorFailed,
-    OwnershipRefused,
     RuntimeRosettaRequired,
     RuntimeUnavailableForPlatform,
 }
@@ -130,13 +128,6 @@ pub fn install_artifact_failure_from_minecraft_download_fact(
     fact: &MinecraftDownloadFact,
 ) -> Option<GuardianInstallArtifactFailureEvidence> {
     let kind = install_failure_kind_for_minecraft_download_fact(fact.kind)?;
-    let ownership = if kind == GuardianInstallArtifactFailureKind::OwnershipRefused
-        && ownership == OwnershipClass::LauncherManaged
-    {
-        OwnershipClass::Unknown
-    } else {
-        ownership
-    };
     let evidence = GuardianInstallArtifactFailureEvidence {
         operation_id,
         target_id: fact.target.clone(),
@@ -221,9 +212,6 @@ fn install_failure_kind_for_minecraft_download_fact(
     kind: MinecraftDownloadFactKind,
 ) -> Option<GuardianInstallArtifactFailureKind> {
     match kind {
-        MinecraftDownloadFactKind::ArtifactMissing => {
-            Some(GuardianInstallArtifactFailureKind::ArtifactMissing)
-        }
         MinecraftDownloadFactKind::ChecksumMismatch => {
             Some(GuardianInstallArtifactFailureKind::ChecksumMismatch)
         }
@@ -248,11 +236,7 @@ fn install_failure_kind_for_minecraft_download_fact(
         MinecraftDownloadFactKind::PromoteFailed => {
             Some(GuardianInstallArtifactFailureKind::PromotionFailed)
         }
-        MinecraftDownloadFactKind::OwnershipRefused => {
-            Some(GuardianInstallArtifactFailureKind::OwnershipRefused)
-        }
-        MinecraftDownloadFactKind::ArtifactVerified
-        | MinecraftDownloadFactKind::TempDiscarded
+        MinecraftDownloadFactKind::TempDiscarded
         | MinecraftDownloadFactKind::WrittenToTemp
         | MinecraftDownloadFactKind::Promoted => None,
     }
@@ -266,7 +250,6 @@ fn execution_kind_for_install_failure(
             ExecutionFactKind::DownloadChecksumMismatch
         }
         GuardianInstallArtifactFailureKind::SizeMismatch => ExecutionFactKind::DownloadSizeMismatch,
-        GuardianInstallArtifactFailureKind::ArtifactMissing => ExecutionFactKind::ArtifactMissing,
         GuardianInstallArtifactFailureKind::MetadataInvalid => {
             ExecutionFactKind::ProviderDataInvalid
         }
@@ -294,7 +277,6 @@ fn execution_kind_for_install_failure(
         GuardianInstallArtifactFailureKind::ProcessorFailed => {
             ExecutionFactKind::InstallProcessorFailed
         }
-        GuardianInstallArtifactFailureKind::OwnershipRefused => ExecutionFactKind::PrimitiveRefused,
         GuardianInstallArtifactFailureKind::RuntimeRosettaRequired => {
             ExecutionFactKind::RuntimeRosettaRequired
         }
@@ -408,10 +390,6 @@ mod tests {
                 "launcher_managed_artifact_corrupt",
             ),
             (
-                GuardianInstallArtifactFailureKind::ArtifactMissing,
-                "launcher_managed_artifact_corrupt",
-            ),
-            (
                 GuardianInstallArtifactFailureKind::MetadataInvalid,
                 "install_artifact_metadata_invalid",
             ),
@@ -446,10 +424,6 @@ mod tests {
             (
                 GuardianInstallArtifactFailureKind::ProcessorFailed,
                 "install_processor_failed",
-            ),
-            (
-                GuardianInstallArtifactFailureKind::OwnershipRefused,
-                "artifact_ownership_unsafe",
             ),
             (
                 GuardianInstallArtifactFailureKind::RuntimeRosettaRequired,
@@ -690,11 +664,6 @@ mod tests {
                 "installer processor failed",
             ),
             (
-                GuardianInstallArtifactFailureKind::OwnershipRefused,
-                "artifact_ownership_unsafe",
-                "protect user-owned or unknown files",
-            ),
-            (
                 GuardianInstallArtifactFailureKind::RuntimeRosettaRequired,
                 "managed_runtime_rosetta_required",
                 "Rosetta 2",
@@ -856,33 +825,6 @@ mod tests {
     }
 
     #[test]
-    fn minecraft_download_ownership_refusal_is_protected_when_caller_lacks_ownership_context() {
-        let fact = MinecraftDownloadFact {
-            kind: MinecraftDownloadFactKind::OwnershipRefused,
-            target: "minecraft_client_1.21.5".to_string(),
-            fields: Vec::new(),
-        };
-
-        let evidence = install_artifact_failure_from_minecraft_download_fact(
-            Some(OperationId::new("install-operation-1")),
-            OwnershipClass::LauncherManaged,
-            &fact,
-        )
-        .expect("failure evidence");
-
-        assert_eq!(
-            evidence.kind,
-            GuardianInstallArtifactFailureKind::OwnershipRefused
-        );
-        assert_eq!(evidence.ownership, OwnershipClass::Unknown);
-
-        let guardian_fact =
-            install_artifact_failure_guardian_fact(&evidence, OperationPhase::Downloading);
-        assert_eq!(guardian_fact.id.as_str(), "primitive_refused");
-        assert_eq!(guardian_fact.ownership, OwnershipClass::Unknown);
-    }
-
-    #[test]
     fn minecraft_download_temp_and_promotion_failures_keep_distinct_guardian_facts() {
         let cases = [
             (
@@ -931,7 +873,6 @@ mod tests {
     #[test]
     fn minecraft_download_success_facts_are_not_failure_evidence() {
         for kind in [
-            MinecraftDownloadFactKind::ArtifactVerified,
             MinecraftDownloadFactKind::TempDiscarded,
             MinecraftDownloadFactKind::WrittenToTemp,
             MinecraftDownloadFactKind::Promoted,

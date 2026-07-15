@@ -1,35 +1,10 @@
-use super::integrity::is_sha1_hex;
 use super::model::{
     DownloadError, DownloadIntegrityError, ExecutionDownloadError, ExecutionDownloadFact,
-    ExecutionDownloadFactKind, ExecutionDownloadOwnership, ExpectedIntegrity,
-    SelectedDownloadArtifactKind,
+    ExecutionDownloadFactKind, ExpectedIntegrity, SelectedDownloadArtifactKind,
 };
 use super::path_safety::safe_download_fact_value;
 use std::io;
-use std::path::Path;
 use tokio::sync::mpsc;
-
-pub(super) struct ExecutionDownloadRequest<'a> {
-    pub(super) url: &'a str,
-    pub(super) destination: &'a Path,
-    pub(super) expected: &'a ExpectedIntegrity,
-    pub(super) ownership: ExecutionDownloadOwnership,
-}
-
-impl<'a> ExecutionDownloadRequest<'a> {
-    pub(super) fn launcher_managed(
-        url: &'a str,
-        destination: &'a Path,
-        expected: &'a ExpectedIntegrity,
-    ) -> Self {
-        Self {
-            url,
-            destination,
-            expected,
-            ownership: ExecutionDownloadOwnership::LauncherManaged,
-        }
-    }
-}
 
 pub(super) fn emit_execution_download_facts(
     fact_tx: Option<&mpsc::UnboundedSender<ExecutionDownloadFact>>,
@@ -101,40 +76,6 @@ pub(super) fn metadata_facts(
     facts
 }
 
-pub(super) fn selected_artifact_missing_fact(
-    kind: SelectedDownloadArtifactKind,
-    destination: &Path,
-    expected: &ExpectedIntegrity,
-) -> Option<ExecutionDownloadFact> {
-    let sha1 = expected.sha1.as_deref()?;
-    if !is_sha1_hex(sha1) {
-        return None;
-    }
-    Some(execution_download_fact(
-        ExecutionDownloadFactKind::ArtifactMissing,
-        &selected_download_target_label(kind, destination),
-        no_download_fact_fields(),
-    ))
-}
-
-pub(super) fn selected_download_target_label(
-    kind: SelectedDownloadArtifactKind,
-    destination: &Path,
-) -> String {
-    let prefix = selected_download_target_prefix(kind);
-    let suffix = destination
-        .file_stem()
-        .or_else(|| destination.file_name())
-        .and_then(|value| value.to_str())
-        .map(|value| safe_download_fact_value(value, prefix))
-        .filter(|value| value != prefix);
-
-    match suffix {
-        Some(suffix) => format!("{prefix}_{suffix}"),
-        None => prefix.to_string(),
-    }
-}
-
 pub(super) fn selected_download_source_label(
     kind: SelectedDownloadArtifactKind,
     identity: &str,
@@ -182,8 +123,7 @@ pub(super) fn integrity_mismatch_fact(
         DownloadIntegrityError::SizeMismatch {
             expected, actual, ..
         } => size_mismatch_fact(target, *expected, *actual),
-        DownloadIntegrityError::Sha1Mismatch { .. }
-        | DownloadIntegrityError::MissingSha1 { .. } => execution_download_fact(
+        DownloadIntegrityError::Sha1Mismatch { .. } => execution_download_fact(
             ExecutionDownloadFactKind::ChecksumMismatch,
             target,
             vec![("algorithm", "sha1")],

@@ -1,42 +1,26 @@
 use super::assets::{
-    AssetObjectDownloadJob, copy_virtual_asset_if_missing, copy_virtual_assets,
-    missing_asset_object_jobs, repair_virtual_assets_from_index, unique_asset_object_jobs,
-    virtual_asset_destination,
+    copy_virtual_asset_if_missing, copy_virtual_assets, repair_virtual_assets_from_index,
+    unique_asset_object_jobs, virtual_asset_destination,
 };
 use super::client::{adaptive_download_concurrency, build_http_client};
-use super::facts::{ExecutionDownloadRequest, execution_download_fact};
+use super::facts::execution_download_fact;
 use super::install::observe_managed_install_lease_wait_for_test;
-use super::integrity::{
-    download_size_mismatch, existing_asset_object_satisfies, existing_file_satisfies, hash_file,
-    observe_hash_file_calls, verify_download_integrity,
-};
+use super::integrity::hash_file;
 use super::libraries::{library_jobs_for, library_verification_plans_for};
-use super::model::{ActualIntegrity, DownloadIntegrityError};
-use super::path_safety::{
-    bounded_download_file_label, safe_download_target_label, windows_verbatim_path_string,
-};
-use super::promotion::{
-    selected_promotion_temp_path, sweep_stale_promotion_backups,
-    sweep_stale_selected_promotion_temps,
-};
+use super::path_safety::{safe_download_target_label, windows_verbatim_path_string};
+use super::promotion::sweep_stale_promotion_backups;
 use super::runtime::{
     RuntimeEnsurePipeline, finish_runtime_pipeline_after_artifacts, runtime_ensure_progress,
 };
 use super::transfer::{
-    AuthenticatedSelectedArtifactSource, PreparedSelectedArtifactInstall,
-    SelectedArtifactSourceRequest, SelectedPromotionTestControl, SelectedPromotionTestStage,
-    acquire_authenticated_selected_artifact_source,
     acquire_authenticated_selected_artifact_source_with_retry_delays_for_test,
-    download_file_with_client, download_file_with_client_report,
-    download_file_with_client_report_with_retry_delays, download_temp_path,
-    ensure_selected_artifact_with_client, execute_download_to_temp,
-    materialize_authenticated_selected_artifact_source,
-    materialize_authenticated_selected_artifact_source_with_control,
-    prepare_selected_artifact_install, publish_authenticated_retained_file_for_test,
-    remove_stale_download_temp,
+    promote_launcher_managed_artifact_temp_once, remove_stale_download_temp,
 };
 use super::*;
-use crate::known_good::{KnownGoodArtifactKind, KnownGoodIntegrity};
+use crate::known_good::{
+    KnownGoodArtifactKind, KnownGoodIntegrity, KnownGoodRoot, MAX_TIER2_AGGREGATE_BYTES,
+    MAX_TIER2_ARTIFACT_BYTES,
+};
 use crate::launch::{JavaVersion, Library, LibraryArtifact, LibraryDownload, maven_to_path};
 use crate::managed_fs::ManagedDir;
 use crate::managed_publication::ManagedRootPublicationLease;
@@ -339,6 +323,7 @@ async fn reconstruction_matches_install_without_touching_seeded_destinations() {
         "the corrupt exact declaration must be retained once for replacement"
     );
     assert_settled_libraries_lane(&root);
+    assert_settled_assets_lane(&root);
     assert_settled_version_bundle_lane(&root);
     let _ = fs::remove_dir_all(root);
 }
@@ -400,77 +385,6 @@ async fn reconstruction_derives_runtime_inventory_without_runtime_effects() {
 }
 
 #[tokio::test]
-async fn install_version_with_facts_emits_private_download_facts_only() {
-    let root = temp_dir("install-private-facts");
-    let (version_url, version_sha1, _requests, release_library) =
-        spawn_overlapped_install_server().await;
-    release_library
-        .send(())
-        .expect("release library response before request");
-    let downloader = test_manifest_downloader(&root, "overlap", &version_url, &version_sha1);
-    let mut events = Vec::new();
-    let mut facts = Vec::new();
-
-    let receipt = downloader
-        .install_version_with_facts(
-            "overlap",
-            |progress| events.push(progress),
-            |fact| facts.push(fact),
-        )
-        .await
-        .expect("install should succeed");
-
-    assert_eq!(receipt.version_id(), "overlap");
-    assert!(
-        !receipt
-            .into_activation_source()
-            .into_parts()
-            .1
-            .entries()
-            .is_empty()
-    );
-
-    assert!(
-        events
-            .iter()
-            .any(|event| event.phase == "done" && event.done)
-    );
-    assert!(
-        facts
-            .iter()
-            .any(|fact| fact.kind == ExecutionDownloadFactKind::ArtifactMissing)
-    );
-    assert!(
-        facts
-            .iter()
-            .any(|fact| fact.kind == ExecutionDownloadFactKind::ArtifactVerified)
-    );
-    assert!(
-        facts
-            .iter()
-            .any(|fact| fact.kind == ExecutionDownloadFactKind::Promoted)
-    );
-    let progress_json = serde_json::to_string(&events).expect("progress json");
-    assert!(!progress_json.contains("facts"));
-    assert!(!progress_json.contains("sha1"));
-    let version_root = versions_dir(&root).join("overlap");
-    let version_json = fs::read(version_root.join("overlap.json")).expect("published version json");
-    assert_eq!(
-        serde_json::from_slice::<serde_json::Value>(&version_json)
-            .expect("published version metadata")["id"]
-            .as_str(),
-        Some("overlap")
-    );
-    assert_eq!(
-        fs::read(version_root.join("overlap.jar")).expect("published client jar"),
-        b"client"
-    );
-    assert_settled_version_bundle_lane(&root);
-
-    let _ = fs::remove_dir_all(root);
-}
-
-#[tokio::test]
 async fn normal_install_publishes_and_settles_three_member_version_bundle() {
     let version_id = "normal-three-member-success";
     let root = temp_dir(version_id);
@@ -489,6 +403,7 @@ async fn normal_install_publishes_and_settles_three_member_version_bundle() {
     assert_eq!(receipt.version_id(), version_id);
     assert_normal_bundle_contents(&root, version_id, true);
     assert_settled_libraries_lane(&root);
+    assert_settled_assets_lane(&root);
     assert_settled_version_bundle_lane(&root);
     let requests = std::iter::from_fn(|| requests.try_recv().ok()).collect::<Vec<_>>();
     for path in ["/version.json", "/client.jar", "/log-config.xml"] {
@@ -501,6 +416,370 @@ async fn normal_install_publishes_and_settles_three_member_version_bundle() {
             "{path} must be fetched exactly once"
         );
     }
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn nonempty_assets_publish_once_and_match_reconstruction() {
+    let version_id = "normal-nonempty-assets";
+    let root = temp_dir(version_id);
+    let mut fixture = spawn_nonempty_asset_install_server(version_id).await;
+    let downloader = test_manifest_downloader(
+        &root,
+        version_id,
+        &fixture.version_url,
+        &fixture.version_sha1,
+    )
+    .with_test_asset_object_base_url(fixture.object_base_url.clone());
+    let before = snapshot_tree(&root);
+
+    let reconstructed = downloader
+        .reconstruct_version(version_id)
+        .await
+        .expect("reconstruct nonempty asset authority")
+        .into_activation_source()
+        .into_parts();
+    assert_eq!(snapshot_tree(&root), before);
+    let reconstruction_requests = drain_request_paths(&mut fixture.requests);
+    assert_eq!(request_count(&reconstruction_requests, "/version.json"), 1);
+    assert_eq!(
+        request_count(&reconstruction_requests, "/asset-index.json"),
+        1
+    );
+    assert_eq!(request_count(&reconstruction_requests, "/client.jar"), 0);
+    assert_eq!(
+        request_count(&reconstruction_requests, &fixture.object_path),
+        0
+    );
+    assert_eq!(
+        request_count(&reconstruction_requests, &fixture.distinct_path),
+        0
+    );
+    assert_eq!(
+        request_count(&reconstruction_requests, &fixture.empty_path),
+        0
+    );
+
+    let installed = downloader
+        .install_version(version_id, |_| {})
+        .await
+        .expect("install nonempty assets")
+        .into_activation_source()
+        .into_parts();
+    assert_eq!(installed, reconstructed);
+    let asset_entries = installed
+        .1
+        .entries()
+        .iter()
+        .filter(|entry| entry.root() == &KnownGoodRoot::Assets)
+        .collect::<Vec<_>>();
+    assert_eq!(asset_entries.len(), 4, "index plus three unique objects");
+    assert_eq!(
+        asset_entries
+            .iter()
+            .filter(|entry| entry.kind() == KnownGoodArtifactKind::AssetIndex)
+            .count(),
+        1
+    );
+    assert_eq!(
+        asset_entries
+            .iter()
+            .filter(|entry| entry.kind() == KnownGoodArtifactKind::AssetObject)
+            .count(),
+        3
+    );
+    let mut asset_identities = asset_entries
+        .iter()
+        .map(|entry| {
+            let (digest, size) = match entry.integrity() {
+                KnownGoodIntegrity::Sha1 { digest, size }
+                | KnownGoodIntegrity::ExactBytes { digest, size } => (digest.as_str(), *size),
+                other => panic!("unexpected asset integrity: {other:?}"),
+            };
+            format!(
+                "{}:{}:{digest}:{size}",
+                entry.kind().stable_id(),
+                entry.path().as_str()
+            )
+        })
+        .collect::<Vec<_>>();
+    asset_identities.sort();
+    let mut expected_asset_identities = vec![
+        format!(
+            "asset_index:indexes/{}.json:{}:{}",
+            fixture.asset_index_id,
+            sha1_hex(&fixture.asset_index),
+            fixture.asset_index.len()
+        ),
+        format!(
+            "asset_object:objects/{}/{}:{}:{}",
+            &fixture.object_hash[..2],
+            fixture.object_hash,
+            fixture.object_hash,
+            fixture.object.len()
+        ),
+        format!(
+            "asset_object:objects/{}/{}:{}:{}",
+            &fixture.distinct_hash[..2],
+            fixture.distinct_hash,
+            fixture.distinct_hash,
+            fixture.distinct.len()
+        ),
+        format!(
+            "asset_object:objects/{}/{}:{}:0",
+            &fixture.empty_hash[..2],
+            fixture.empty_hash,
+            fixture.empty_hash
+        ),
+    ];
+    expected_asset_identities.sort();
+    assert_eq!(asset_identities, expected_asset_identities);
+    assert_eq!(
+        fs::read(asset_index_path(&root, &fixture.asset_index_id)).expect("published asset index"),
+        fixture.asset_index
+    );
+    assert_eq!(
+        fs::read(asset_object_path(&root, &fixture.object_hash)).expect("published asset object"),
+        fixture.object
+    );
+    assert_eq!(
+        fs::read(asset_object_path(&root, &fixture.distinct_hash))
+            .expect("published distinct asset object"),
+        fixture.distinct
+    );
+    assert_eq!(
+        fs::read(asset_object_path(&root, &fixture.empty_hash)).expect("published zero asset"),
+        b""
+    );
+    assert!(
+        !assets_dir(&root).join("virtual").exists(),
+        "normal installation must not retain an install-time virtual-copy writer"
+    );
+    let install_requests = drain_request_paths(&mut fixture.requests);
+    assert_eq!(request_count(&install_requests, &fixture.object_path), 1);
+    assert_eq!(request_count(&install_requests, &fixture.distinct_path), 1);
+    assert_eq!(request_count(&install_requests, &fixture.empty_path), 1);
+    assert_settled_assets_lane(&root);
+    assert_settled_libraries_lane(&root);
+    assert_settled_version_bundle_lane(&root);
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn asset_cache_omits_exact_objects_and_replaces_same_size_corruption() {
+    let version_id = "normal-asset-cache";
+    let root = temp_dir(version_id);
+    let mut fixture = spawn_nonempty_asset_install_server(version_id).await;
+    let downloader = test_manifest_downloader(
+        &root,
+        version_id,
+        &fixture.version_url,
+        &fixture.version_sha1,
+    )
+    .with_test_asset_object_base_url(fixture.object_base_url.clone());
+
+    downloader
+        .install_version(version_id, |_| {})
+        .await
+        .expect("initial asset install");
+    drain_request_paths(&mut fixture.requests);
+    downloader
+        .install_version(version_id, |_| {})
+        .await
+        .expect("exact-cache asset reinstall");
+    let exact_requests = drain_request_paths(&mut fixture.requests);
+    assert_eq!(request_count(&exact_requests, &fixture.object_path), 0);
+    assert_eq!(request_count(&exact_requests, &fixture.distinct_path), 0);
+    assert_eq!(request_count(&exact_requests, &fixture.empty_path), 0);
+
+    let corrupt = vec![b'x'; fixture.object.len()];
+    assert_ne!(corrupt, fixture.object);
+    fs::write(asset_object_path(&root, &fixture.object_hash), &corrupt)
+        .expect("seed same-size corrupt asset object");
+    downloader
+        .install_version(version_id, |_| {})
+        .await
+        .expect("corrupt-cache asset reinstall");
+    let corrupt_requests = drain_request_paths(&mut fixture.requests);
+    assert_eq!(request_count(&corrupt_requests, &fixture.object_path), 1);
+    assert_eq!(request_count(&corrupt_requests, &fixture.distinct_path), 0);
+    assert_eq!(request_count(&corrupt_requests, &fixture.empty_path), 0);
+    assert_eq!(
+        fs::read(asset_object_path(&root, &fixture.object_hash)).expect("replaced asset object"),
+        fixture.object
+    );
+    assert_settled_assets_lane(&root);
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn asset_sources_do_not_prewrite_while_the_shared_lease_is_held() {
+    let version_id = "normal-assets-no-prewrite";
+    let root = temp_dir(version_id);
+    fs::create_dir_all(&root).expect("create asset no-prewrite root");
+    let held_lease = ManagedRootPublicationLease::acquire(
+        ManagedDir::open_root(&root).expect("open asset no-prewrite root"),
+    )
+    .await
+    .expect("acquire held asset no-prewrite lease");
+    let reached = observe_managed_install_lease_wait_for_test(version_id);
+    let mut fixture = spawn_nonempty_asset_install_server(version_id).await;
+    let downloader = test_manifest_downloader(
+        &root,
+        version_id,
+        &fixture.version_url,
+        &fixture.version_sha1,
+    )
+    .with_test_asset_object_base_url(fixture.object_base_url.clone());
+    let install = tokio::spawn(async move { downloader.install_version(version_id, |_| {}).await });
+
+    timeout(Duration::from_secs(10), reached)
+        .await
+        .expect("asset install should reach shared lease")
+        .expect("asset install lease wait signal");
+    assert!(!install.is_finished());
+    assert!(!asset_index_path(&root, &fixture.asset_index_id).exists());
+    assert!(!asset_object_path(&root, &fixture.object_hash).exists());
+    assert!(!asset_object_path(&root, &fixture.distinct_hash).exists());
+    assert!(!asset_object_path(&root, &fixture.empty_hash).exists());
+    assert!(!versions_dir(&root).join(version_id).exists());
+    let requests = drain_request_paths(&mut fixture.requests);
+    assert_eq!(request_count(&requests, &fixture.object_path), 1);
+    assert_eq!(request_count(&requests, &fixture.distinct_path), 1);
+    assert_eq!(request_count(&requests, &fixture.empty_path), 1);
+
+    install.abort();
+    assert!(
+        install
+            .await
+            .expect_err("outer asset no-prewrite install should be cancelled")
+            .is_cancelled()
+    );
+    drop(held_lease);
+    timeout(Duration::from_secs(10), async {
+        loop {
+            let object_matches = fs::read(asset_object_path(&root, &fixture.object_hash))
+                .is_ok_and(|bytes| bytes == fixture.object);
+            let distinct_matches = fs::read(asset_object_path(&root, &fixture.distinct_hash))
+                .is_ok_and(|bytes| bytes == fixture.distinct);
+            if object_matches
+                && distinct_matches
+                && asset_object_path(&root, &fixture.empty_hash).is_file()
+                && assets_lane_is_settled(&root)
+                && libraries_lane_is_settled(&root)
+                && version_bundle_lane_is_settled(&root)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("detached nonempty asset publication should settle");
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn asset_cache_drift_at_lease_admission_fails_before_install_effects() {
+    let version_id = "normal-asset-cache-drift";
+    let root = temp_dir(version_id);
+    let mut fixture = spawn_nonempty_asset_install_server(version_id).await;
+    let object_path = asset_object_path(&root, &fixture.object_hash);
+    let distinct_path = asset_object_path(&root, &fixture.distinct_hash);
+    let empty_path = asset_object_path(&root, &fixture.empty_hash);
+    fs::create_dir_all(object_path.parent().expect("asset object parent"))
+        .expect("create asset object parent");
+    fs::create_dir_all(empty_path.parent().expect("empty asset parent"))
+        .expect("create empty asset parent");
+    fs::write(&object_path, &fixture.object).expect("seed exact cached asset");
+    fs::create_dir_all(distinct_path.parent().expect("distinct asset parent"))
+        .expect("create distinct asset parent");
+    fs::write(&distinct_path, &fixture.distinct).expect("seed exact distinct cached asset");
+    fs::write(&empty_path, b"").expect("seed exact cached empty asset");
+    let held_lease = ManagedRootPublicationLease::acquire(
+        ManagedDir::open_root(&root).expect("open asset cache-drift root"),
+    )
+    .await
+    .expect("acquire held asset cache-drift lease");
+    let reached = observe_managed_install_lease_wait_for_test(version_id);
+    let downloader = test_manifest_downloader(
+        &root,
+        version_id,
+        &fixture.version_url,
+        &fixture.version_sha1,
+    )
+    .with_test_asset_object_base_url(fixture.object_base_url.clone());
+    let install = tokio::spawn(async move { downloader.install_version(version_id, |_| {}).await });
+
+    timeout(Duration::from_secs(10), reached)
+        .await
+        .expect("asset cache-drift install should reach lease")
+        .expect("asset cache-drift lease wait signal");
+    let corrupt = vec![b'x'; fixture.object.len()];
+    fs::write(&object_path, &corrupt).expect("drift cached asset after admission");
+    drop(held_lease);
+    let error = install
+        .await
+        .expect("asset cache-drift install task")
+        .expect_err("cache drift without a retained source must fail");
+
+    assert!(error.to_string().contains("Assets"));
+    assert_eq!(
+        fs::read(&object_path).expect("drifted asset remains"),
+        corrupt
+    );
+    assert!(!asset_index_path(&root, &fixture.asset_index_id).exists());
+    assert!(!versions_dir(&root).join(version_id).exists());
+    assert!(
+        !root.join(".axial-publication/assets").exists(),
+        "asset cache drift must fail before lane preparation"
+    );
+    assert!(!libraries_lane_is_settled(&root));
+    assert!(!version_bundle_lane_is_settled(&root));
+    let requests = drain_request_paths(&mut fixture.requests);
+    assert_eq!(request_count(&requests, &fixture.object_path), 0);
+    assert_eq!(request_count(&requests, &fixture.distinct_path), 0);
+    assert_eq!(request_count(&requests, &fixture.empty_path), 0);
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn cancelling_install_aborts_blocked_asset_object_acquisition() {
+    let version_id = "normal-assets-acquisition-cancel";
+    let root = temp_dir(version_id);
+    let fixture = spawn_blocked_asset_install_server(version_id).await;
+    let downloader = test_manifest_downloader(
+        &root,
+        version_id,
+        &fixture.version_url,
+        &fixture.version_sha1,
+    )
+    .with_test_asset_object_base_url(fixture.object_base_url);
+    let install = tokio::spawn(async move { downloader.install_version(version_id, |_| {}).await });
+
+    timeout(Duration::from_secs(10), fixture.object_started)
+        .await
+        .expect("asset object request should start")
+        .expect("asset object request signal");
+    install.abort();
+    assert!(
+        install
+            .await
+            .expect_err("outer install should be cancelled")
+            .is_cancelled()
+    );
+    timeout(Duration::from_secs(10), fixture.object_connection_closed)
+        .await
+        .expect("asset request connection should close after cancellation")
+        .expect("asset request close signal");
+    assert!(!asset_index_path(&root, &fixture.asset_index_id).exists());
+    assert!(!asset_object_path(&root, &fixture.object_hash).exists());
+    assert!(!versions_dir(&root).join(version_id).exists());
 
     let _ = fs::remove_dir_all(root);
 }
@@ -541,6 +820,7 @@ async fn normal_reinstall_omits_exact_cached_library_source() {
         );
     }
     assert_settled_libraries_lane(&root);
+    assert_settled_assets_lane(&root);
     assert_settled_version_bundle_lane(&root);
     let _ = fs::remove_dir_all(root);
 }
@@ -685,6 +965,7 @@ async fn cancelling_normal_install_does_not_cancel_started_bundle_publication() 
     timeout(Duration::from_secs(10), async {
         loop {
             if normal_bundle_contents_match(&root, version_id, true)
+                && assets_lane_is_settled(&root)
                 && libraries_lane_is_settled(&root)
                 && version_bundle_lane_is_settled(&root)
             {
@@ -743,6 +1024,7 @@ async fn cancelling_normal_install_while_waiting_for_lease_detaches_publication_
     timeout(Duration::from_secs(10), async {
         loop {
             if normal_bundle_contents_match(&root, version_id, true)
+                && assets_lane_is_settled(&root)
                 && libraries_lane_is_settled(&root)
                 && version_bundle_lane_is_settled(&root)
             {
@@ -788,167 +1070,6 @@ async fn normal_install_retries_local_version_bundle_settlement() {
         assert_settled_version_bundle_lane(&root);
         let _ = fs::remove_dir_all(root);
     }
-}
-
-#[tokio::test]
-async fn selected_missing_artifact_fact_is_emitted_before_download_failure() {
-    let root = temp_dir("selected-missing-artifact-fact");
-    let destination = root.join("artifact.jar");
-    let expected = ExpectedIntegrity::from_mojang(8, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
-    let url = spawn_download_response_server(
-        "503 Service Unavailable",
-        vec![(
-            "Content-Type".to_string(),
-            "application/octet-stream".to_string(),
-        )],
-        b"unavailable".to_vec(),
-        4,
-    )
-    .await;
-    let client = build_http_client(Duration::from_secs(5));
-    let (fact_tx, mut fact_rx) = mpsc::unbounded_channel();
-
-    let result = ensure_selected_artifact_with_client(
-        SelectedDownloadArtifactKind::Library,
-        &client,
-        &url,
-        &destination,
-        &expected,
-        Some(&fact_tx),
-    )
-    .await;
-
-    assert!(result.is_err());
-    drop(fact_tx);
-    let mut facts = Vec::new();
-    while let Some(fact) = fact_rx.recv().await {
-        facts.push(fact);
-    }
-    assert!(facts.iter().any(|fact| {
-        fact.kind == ExecutionDownloadFactKind::ArtifactMissing
-            && fact.target == "minecraft_library_artifact"
-    }));
-    assert!(
-        facts
-            .iter()
-            .any(|fact| fact.kind == ExecutionDownloadFactKind::ProviderFailure)
-    );
-    assert!(!destination.exists());
-
-    let _ = fs::remove_dir_all(root);
-}
-
-#[tokio::test]
-async fn selected_existing_corrupt_artifact_is_replaced_after_verified_download() {
-    let root = temp_dir("selected-corrupt-artifact-fact");
-    fs::create_dir_all(&root).expect("create root");
-    let destination = root.join("artifact.jar");
-    fs::write(&destination, b"wrong").expect("write corrupt artifact");
-    let body = b"fresh".to_vec();
-    let expected = ExpectedIntegrity::from_mojang(body.len() as i64, &sha1_hex(&body));
-    let url = spawn_download_response_server(
-        "200 OK",
-        vec![(
-            "Content-Type".to_string(),
-            "application/octet-stream".to_string(),
-        )],
-        body.clone(),
-        1,
-    )
-    .await;
-    let client = build_http_client(Duration::from_secs(1));
-    let (fact_tx, mut fact_rx) = mpsc::unbounded_channel();
-
-    let result = ensure_selected_artifact_with_client(
-        SelectedDownloadArtifactKind::Library,
-        &client,
-        &url,
-        &destination,
-        &expected,
-        Some(&fact_tx),
-    )
-    .await;
-
-    assert!(result.expect("corrupt artifact should self-heal").is_some());
-    assert_eq!(fs::read(&destination).expect("artifact replaced"), body);
-    drop(fact_tx);
-    let mut facts = Vec::new();
-    while let Some(fact) = fact_rx.recv().await {
-        facts.push(fact);
-    }
-    assert!(facts.iter().any(|fact| {
-        fact.kind == ExecutionDownloadFactKind::ChecksumMismatch
-            && fact.target == "minecraft_library_artifact"
-            && fact
-                .fields
-                .iter()
-                .any(|(key, value)| key == "algorithm" && value == "sha1")
-    }));
-    assert!(facts.iter().any(|fact| {
-        fact.kind == ExecutionDownloadFactKind::Promoted
-            && fact.target == "minecraft_library_artifact"
-            && fact
-                .fields
-                .iter()
-                .any(|(key, value)| key == "replaced" && value == "corrupt")
-    }));
-    assert!(
-        !facts
-            .iter()
-            .any(|fact| fact.kind == ExecutionDownloadFactKind::NetworkFailure)
-    );
-    assert!(
-        facts
-            .iter()
-            .any(|fact| fact.kind == ExecutionDownloadFactKind::Promoted)
-    );
-
-    let _ = fs::remove_dir_all(root);
-}
-
-#[tokio::test]
-async fn selected_existing_unsupported_artifact_blocks_without_network() {
-    let root = temp_dir("selected-unsupported-artifact-fact");
-    let destination = root.join("artifact.jar");
-    fs::create_dir_all(&destination).expect("create unsupported artifact directory");
-    let expected = ExpectedIntegrity::from_mojang(5, &sha1_hex(b"fresh"));
-    let client = build_http_client(Duration::from_secs(1));
-    let (fact_tx, mut fact_rx) = mpsc::unbounded_channel();
-
-    let result = ensure_selected_artifact_with_client(
-        SelectedDownloadArtifactKind::Library,
-        &client,
-        "http://127.0.0.1:9/artifact.jar",
-        &destination,
-        &expected,
-        Some(&fact_tx),
-    )
-    .await;
-
-    assert!(matches!(result, Err(DownloadError::Integrity(_))));
-    assert!(destination.is_dir());
-    drop(fact_tx);
-    let mut facts = Vec::new();
-    while let Some(fact) = fact_rx.recv().await {
-        facts.push(fact);
-    }
-    assert!(
-        facts
-            .iter()
-            .any(|fact| fact.kind == ExecutionDownloadFactKind::OwnershipRefused)
-    );
-    assert!(
-        !facts
-            .iter()
-            .any(|fact| fact.kind == ExecutionDownloadFactKind::NetworkFailure)
-    );
-    assert!(
-        !facts
-            .iter()
-            .any(|fact| fact.kind == ExecutionDownloadFactKind::WrittenToTemp)
-    );
-
-    let _ = fs::remove_dir_all(root);
 }
 
 #[tokio::test]
@@ -1304,20 +1425,62 @@ fn native_selection_uses_supplied_environment_architecture() {
 
 #[test]
 fn unique_asset_object_jobs_deduplicate_same_hash() {
-    let objects_dir = Path::new("/tmp/axial-test/assets/objects");
     let hash_a = "abcdef1234567890abcdef1234567890abcdef12";
     let hash_b = "1234567890abcdef1234567890abcdef12345678";
 
-    let jobs = unique_asset_object_jobs(objects_dir, [(hash_a, 4), (hash_a, 4), (hash_b, 8)])
+    let jobs = unique_asset_object_jobs(16, [(hash_a, 4), (hash_a, 4), (hash_b, 8)])
         .expect("valid asset jobs");
 
     assert_eq!(jobs.len(), 2);
-    assert_eq!(jobs[0].hash, hash_a);
-    assert_eq!(jobs[0].path, objects_dir.join("ab").join(hash_a));
-    assert_eq!(jobs[0].expected, ExpectedIntegrity::from_mojang(4, hash_a));
-    assert_eq!(jobs[1].hash, hash_b);
-    assert_eq!(jobs[1].path, objects_dir.join("12").join(hash_b));
-    assert_eq!(jobs[1].expected, ExpectedIntegrity::from_mojang(8, hash_b));
+    let job_a = jobs.iter().find(|job| job.hash == hash_a).expect("hash a");
+    let job_b = jobs.iter().find(|job| job.hash == hash_b).expect("hash b");
+    assert_eq!(job_a.relative_path.as_str(), format!("objects/ab/{hash_a}"));
+    assert_eq!(job_a.expected, ExpectedIntegrity::from_mojang(4, hash_a));
+    assert_eq!(job_b.relative_path.as_str(), format!("objects/12/{hash_b}"));
+    assert_eq!(job_b.expected, ExpectedIntegrity::from_mojang(8, hash_b));
+}
+
+#[test]
+fn unique_asset_object_jobs_normalize_case_and_reject_conflicting_duplicate_sizes() {
+    let lower = "abcdef1234567890abcdef1234567890abcdef12";
+    let upper = lower.to_ascii_uppercase();
+    let jobs = unique_asset_object_jobs(16, [(upper.as_str(), 4), (lower, 4)])
+        .expect("case-normalized duplicate asset jobs");
+    assert_eq!(jobs.len(), 1);
+    assert_eq!(jobs[0].hash, lower);
+
+    let conflict = unique_asset_object_jobs(16, [(upper.as_str(), 4), (lower, 5)]);
+    assert!(matches!(conflict, Err(DownloadError::Integrity(_))));
+}
+
+#[test]
+fn unique_asset_object_jobs_reject_aggregate_overflow_before_acquisition() {
+    let object_count = MAX_TIER2_AGGREGATE_BYTES / MAX_TIER2_ARTIFACT_BYTES;
+    let declarations = (0..object_count)
+        .map(|ordinal| {
+            (
+                format!("{ordinal:040x}"),
+                i64::try_from(MAX_TIER2_ARTIFACT_BYTES).expect("per-artifact bound fits i64"),
+            )
+        })
+        .collect::<Vec<_>>();
+    let result = unique_asset_object_jobs(
+        1,
+        declarations
+            .iter()
+            .map(|(hash, size)| (hash.as_str(), *size)),
+    );
+
+    assert!(matches!(result, Err(DownloadError::Integrity(_))));
+}
+
+#[test]
+fn unique_asset_object_jobs_rejects_per_artifact_overflow_before_acquisition() {
+    let hash = "abcdef1234567890abcdef1234567890abcdef12";
+    let oversized = i64::try_from(MAX_TIER2_ARTIFACT_BYTES + 1).expect("bound fits i64");
+    let result = unique_asset_object_jobs(1, [(hash, oversized)]);
+
+    assert!(matches!(result, Err(DownloadError::Integrity(_))));
 }
 
 #[test]
@@ -1333,7 +1496,7 @@ fn asset_index_requires_declared_object_size_but_accepts_explicit_zero() {
     )
     .expect("explicit zero-size asset object");
     let jobs = unique_asset_object_jobs(
-        Path::new("/tmp/axial-test/assets/objects"),
+        16,
         index
             .objects
             .values()
@@ -1348,280 +1511,23 @@ fn asset_index_requires_declared_object_size_but_accepts_explicit_zero() {
 #[test]
 fn unique_asset_object_jobs_rejects_negative_size() {
     let hash = "abcdef1234567890abcdef1234567890abcdef12";
-    let result =
-        unique_asset_object_jobs(Path::new("/tmp/axial-test/assets/objects"), [(hash, -1)]);
+    let result = unique_asset_object_jobs(16, [(hash, -1)]);
 
     assert!(matches!(result, Err(DownloadError::Integrity(_))));
 }
 
 #[test]
 fn unique_asset_object_jobs_rejects_one_character_hash() {
-    let objects_dir = Path::new("/tmp/axial-test/assets/objects");
-    let result = unique_asset_object_jobs(objects_dir, [("a", 4)]);
+    let result = unique_asset_object_jobs(16, [("a", 4)]);
 
     assert!(matches!(result, Err(DownloadError::Integrity(_))));
 }
 
 #[test]
 fn unique_asset_object_jobs_rejects_non_hex_hash() {
-    let objects_dir = Path::new("/tmp/axial-test/assets/objects");
-    let result = unique_asset_object_jobs(
-        objects_dir,
-        [("abcdef1234567890abcdef1234567890abcdef1z", 4)],
-    );
+    let result = unique_asset_object_jobs(16, [("abcdef1234567890abcdef1234567890abcdef1z", 4)]);
 
     assert!(matches!(result, Err(DownloadError::Integrity(_))));
-}
-
-#[tokio::test]
-async fn missing_asset_object_jobs_uses_content_addressed_size_fast_path() {
-    let root = temp_dir("asset-filter");
-    let objects_dir = root.join("assets").join("objects");
-    let existing_hash = sha1_hex(b"asset");
-    let missing_hash = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
-    let wrong_size_hash = "cccccccccccccccccccccccccccccccccccccccc";
-    let wrong_hash_same_size = "dddddddddddddddddddddddddddddddddddddddd";
-    let existing_path = objects_dir.join(&existing_hash[..2]).join(&existing_hash);
-    let missing_path = objects_dir.join("bb").join(missing_hash);
-    let wrong_size_path = objects_dir.join("cc").join(wrong_size_hash);
-    let wrong_hash_same_size_path = objects_dir.join("dd").join(wrong_hash_same_size);
-    fs::create_dir_all(existing_path.parent().expect("existing parent"))
-        .expect("create existing parent");
-    fs::create_dir_all(wrong_size_path.parent().expect("wrong size parent"))
-        .expect("create wrong size parent");
-    fs::create_dir_all(
-        wrong_hash_same_size_path
-            .parent()
-            .expect("wrong hash parent"),
-    )
-    .expect("create wrong hash parent");
-    fs::write(&existing_path, b"asset").expect("write existing asset");
-    fs::write(&wrong_size_path, b"short").expect("write wrong size asset");
-    fs::write(&wrong_hash_same_size_path, b"asset").expect("write wrong hash asset");
-
-    let jobs = missing_asset_object_jobs(vec![
-        AssetObjectDownloadJob {
-            hash: existing_hash.clone(),
-            path: existing_path,
-            expected: ExpectedIntegrity::from_mojang(5, &existing_hash),
-        },
-        AssetObjectDownloadJob {
-            hash: missing_hash.to_string(),
-            path: missing_path.clone(),
-            expected: ExpectedIntegrity::from_mojang(5, missing_hash),
-        },
-        AssetObjectDownloadJob {
-            hash: wrong_size_hash.to_string(),
-            path: wrong_size_path.clone(),
-            expected: ExpectedIntegrity::from_mojang(6, wrong_size_hash),
-        },
-        AssetObjectDownloadJob {
-            hash: wrong_hash_same_size.to_string(),
-            path: wrong_hash_same_size_path.clone(),
-            expected: ExpectedIntegrity::from_mojang(5, wrong_hash_same_size),
-        },
-    ])
-    .await
-    .expect("filter jobs");
-
-    let paths = jobs.into_iter().map(|job| job.path).collect::<HashSet<_>>();
-
-    assert_eq!(paths.len(), 2);
-    assert!(paths.contains(&missing_path));
-    assert!(paths.contains(&wrong_size_path));
-    assert!(!paths.contains(&wrong_hash_same_size_path));
-
-    let _ = fs::remove_dir_all(root);
-}
-
-#[tokio::test]
-async fn content_addressed_asset_object_satisfies_without_hashing() {
-    let root = temp_dir("asset-fast-path");
-    let hash = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-    let path = root.join("assets").join("objects").join("aa").join(hash);
-    fs::create_dir_all(path.parent().expect("asset parent")).expect("create asset parent");
-    fs::write(&path, b"wrong").expect("write same-size wrong asset");
-    let observer = observe_hash_file_calls(&path);
-
-    assert!(
-        existing_asset_object_satisfies(&path, &ExpectedIntegrity::from_mojang(5, hash))
-            .await
-            .expect("asset object fast path")
-    );
-    assert_eq!(
-        observer.calls(),
-        0,
-        "content-addressed asset ensure should not rehash existing objects"
-    );
-
-    let _ = fs::remove_dir_all(root);
-}
-
-#[tokio::test]
-async fn existing_file_satisfies_rejects_size_and_sha1_mismatch() {
-    let root = temp_dir("existing-integrity");
-    fs::create_dir_all(&root).expect("create root");
-    let path = root.join("artifact.jar");
-    fs::write(&path, b"artifact").expect("write artifact");
-    let good_sha1 = sha1_hex(b"artifact");
-
-    assert!(
-        existing_file_satisfies(&path, &ExpectedIntegrity::from_mojang(8, &good_sha1))
-            .await
-            .expect("matching file")
-    );
-    assert!(
-        !existing_file_satisfies(&path, &ExpectedIntegrity::from_mojang(7, &good_sha1))
-            .await
-            .expect("size mismatch")
-    );
-    assert!(
-        !existing_file_satisfies(
-            &path,
-            &ExpectedIntegrity::from_mojang(8, "0000000000000000000000000000000000000000")
-        )
-        .await
-        .expect("sha1 mismatch")
-    );
-
-    let _ = fs::remove_dir_all(root);
-}
-
-#[tokio::test]
-async fn download_file_with_client_rejects_oversized_content_length_before_temp_file() {
-    let root = temp_dir("oversized-content-length");
-    let destination = root.join("nested").join("artifact.jar");
-    let tmp_path = download_temp_path(&destination);
-    let expected = ExpectedIntegrity::from_mojang(8, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
-    let url = spawn_download_response_server(
-        "200 OK",
-        vec![
-            (
-                "Content-Type".to_string(),
-                "application/octet-stream".to_string(),
-            ),
-            ("Content-Length".to_string(), "9".to_string()),
-        ],
-        b"short".to_vec(),
-        3,
-    )
-    .await;
-    let client = build_http_client(Duration::from_secs(5));
-
-    let result = download_file_with_client(&client, &url, &destination, &expected).await;
-
-    assert!(matches!(result, Err(DownloadError::Integrity(_))));
-    assert!(!tmp_path.exists());
-    assert!(!destination.exists());
-
-    let _ = fs::remove_dir_all(root);
-}
-
-#[tokio::test]
-async fn download_file_with_client_rejects_stream_past_expected_size_and_cleans_temp() {
-    let root = temp_dir("oversized-stream");
-    let destination = root.join("nested").join("artifact.jar");
-    let tmp_path = download_temp_path(&destination);
-    let expected = ExpectedIntegrity::from_mojang(8, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
-    let url = spawn_download_response_server(
-        "200 OK",
-        vec![(
-            "Content-Type".to_string(),
-            "application/octet-stream".to_string(),
-        )],
-        b"123456789".to_vec(),
-        3,
-    )
-    .await;
-    let client = build_http_client(Duration::from_secs(5));
-
-    let result = download_file_with_client(&client, &url, &destination, &expected).await;
-
-    assert!(matches!(result, Err(DownloadError::Integrity(_))));
-    assert!(!tmp_path.exists());
-    assert!(!destination.exists());
-
-    let _ = fs::remove_dir_all(root);
-}
-
-#[tokio::test]
-async fn download_file_with_client_rejects_streamed_sha1_mismatch_and_cleans_temp() {
-    let root = temp_dir("sha1-stream-mismatch");
-    let destination = root.join("nested").join("artifact.jar");
-    let tmp_path = download_temp_path(&destination);
-    let expected = ExpectedIntegrity::from_mojang(8, "0000000000000000000000000000000000000000");
-    let url = spawn_download_response_server(
-        "200 OK",
-        vec![(
-            "Content-Type".to_string(),
-            "application/octet-stream".to_string(),
-        )],
-        b"artifact".to_vec(),
-        3,
-    )
-    .await;
-    let client = build_http_client(Duration::from_secs(5));
-
-    let result = download_file_with_client(&client, &url, &destination, &expected).await;
-
-    assert!(matches!(result, Err(DownloadError::Integrity(_))));
-    assert!(!tmp_path.exists());
-    assert!(!destination.exists());
-
-    let _ = fs::remove_dir_all(root);
-}
-
-#[tokio::test]
-async fn execute_download_to_temp_reports_successful_integrity() {
-    let root = temp_dir("execution-download-success");
-    let destination = root.join("artifact.jar");
-    let body = b"artifact".to_vec();
-    let expected = ExpectedIntegrity::from_mojang(body.len() as i64, &sha1_hex(&body));
-    let url = spawn_download_response_server(
-        "200 OK",
-        vec![(
-            "Content-Type".to_string(),
-            "application/octet-stream".to_string(),
-        )],
-        body.clone(),
-        1,
-    )
-    .await;
-    let client = build_http_client(Duration::from_secs(5));
-
-    let report = execute_download_to_temp(
-        &client,
-        ExecutionDownloadRequest::launcher_managed(&url, &destination, &expected),
-    )
-    .await
-    .expect("execute download");
-
-    assert_eq!(report.bytes_written, body.len() as u64);
-    assert!(
-        report
-            .facts
-            .iter()
-            .any(|fact| fact.kind == ExecutionDownloadFactKind::WrittenToTemp)
-    );
-    assert!(
-        report
-            .facts
-            .iter()
-            .any(|fact| fact.kind == ExecutionDownloadFactKind::ArtifactVerified)
-    );
-    assert!(
-        report
-            .facts
-            .iter()
-            .any(|fact| fact.kind == ExecutionDownloadFactKind::Promoted)
-    );
-    assert_eq!(
-        fs::read(&destination).expect("read promoted artifact"),
-        body
-    );
-    assert!(!download_temp_path(&destination).exists());
-
-    let _ = fs::remove_dir_all(root);
 }
 
 fn checksumless_test_jar() -> Vec<u8> {
@@ -1636,281 +1542,6 @@ fn test_jar(entry_name: &str, entry_bytes: &[u8]) -> Vec<u8> {
         .expect("start jar entry");
     std::io::Write::write_all(&mut archive, entry_bytes).expect("write jar entry");
     archive.finish().expect("finish jar").into_inner()
-}
-
-#[tokio::test]
-async fn execute_download_to_temp_reports_missing_metadata_without_promoting() {
-    let root = temp_dir("execution-download-missing-metadata");
-    let destination = root.join("artifact.jar");
-    let body = b"artifact".to_vec();
-    let url = spawn_download_response_server(
-        "200 OK",
-        vec![(
-            "Content-Type".to_string(),
-            "application/octet-stream".to_string(),
-        )],
-        body.clone(),
-        1,
-    )
-    .await;
-    let client = build_http_client(Duration::from_secs(5));
-
-    let error = execute_download_to_temp(
-        &client,
-        ExecutionDownloadRequest::launcher_managed(
-            &url,
-            &destination,
-            &ExpectedIntegrity::default(),
-        ),
-    )
-    .await
-    .expect_err("metadata-free download should fail closed");
-
-    assert_eq!(error.kind, ExecutionDownloadFactKind::MetadataMissing);
-    assert!(
-        error
-            .facts
-            .iter()
-            .any(|fact| fact.kind == ExecutionDownloadFactKind::MetadataMissing)
-    );
-    assert!(
-        !error
-            .facts
-            .iter()
-            .any(|fact| fact.kind == ExecutionDownloadFactKind::ArtifactVerified)
-    );
-    assert!(!destination.exists());
-    assert!(!download_temp_path(&destination).exists());
-
-    let _ = fs::remove_dir_all(root);
-}
-
-#[tokio::test]
-async fn execute_download_to_temp_reports_invalid_metadata_without_promoting() {
-    let root = temp_dir("execution-download-invalid-metadata");
-    let destination = root.join("artifact.jar");
-    let url = spawn_download_response_server(
-        "200 OK",
-        vec![(
-            "Content-Type".to_string(),
-            "application/octet-stream".to_string(),
-        )],
-        b"artifact".to_vec(),
-        0,
-    )
-    .await;
-    let client = build_http_client(Duration::from_secs(5));
-    let expected = ExpectedIntegrity::from_sha1("not-a-sha1");
-
-    let error = execute_download_to_temp(
-        &client,
-        ExecutionDownloadRequest::launcher_managed(&url, &destination, &expected),
-    )
-    .await
-    .expect_err("invalid metadata should fail before download");
-
-    assert_eq!(error.kind, ExecutionDownloadFactKind::MetadataInvalid);
-    assert!(
-        error
-            .facts
-            .iter()
-            .any(|fact| fact.kind == ExecutionDownloadFactKind::MetadataInvalid)
-    );
-    assert!(!destination.exists());
-    assert!(!download_temp_path(&destination).exists());
-
-    let _ = fs::remove_dir_all(root);
-}
-
-#[tokio::test]
-async fn download_file_with_client_report_preserves_redacted_failure_facts() {
-    let root = temp_dir("download-report-invalid-metadata");
-    let destination = root.join("nested").join("artifact.jar");
-    let expected = ExpectedIntegrity::from_sha1("not-a-sha1");
-
-    let error = download_file_with_client_report(
-        &reqwest::Client::new(),
-        "https://example.invalid/artifact.jar?token=secret",
-        &destination,
-        &expected,
-    )
-    .await
-    .expect_err("invalid metadata should fail with report");
-
-    assert_eq!(error.kind, ExecutionDownloadFactKind::MetadataInvalid);
-    assert!(
-        error
-            .facts
-            .iter()
-            .any(|fact| fact.kind == ExecutionDownloadFactKind::MetadataInvalid)
-    );
-    let facts_json = serde_json::to_string(&error.facts).expect("facts json");
-    assert!(!facts_json.contains(root.to_string_lossy().as_ref()));
-    assert!(!facts_json.contains("example.invalid"));
-    assert!(!facts_json.contains("token"));
-    assert!(!facts_json.contains("secret"));
-
-    let _ = fs::remove_dir_all(root);
-}
-
-#[tokio::test]
-async fn download_file_with_client_report_discards_stale_temp_before_promotion() {
-    let root = temp_dir("download-report-stale-temp");
-    let destination = root.join("nested").join("artifact.jar");
-    let temp_path = download_temp_path(&destination);
-    fs::create_dir_all(destination.parent().expect("destination parent"))
-        .expect("create destination parent");
-    fs::write(&temp_path, b"partial bytes from interrupted worker").expect("write stale temp");
-    let body = b"fresh launcher managed artifact".to_vec();
-    let expected = ExpectedIntegrity::from_mojang(body.len() as i64, &sha1_hex(&body));
-    let url = spawn_download_response_server(
-        "200 OK",
-        vec![(
-            "Content-Type".to_string(),
-            "application/octet-stream".to_string(),
-        )],
-        body.clone(),
-        1,
-    )
-    .await;
-
-    let report = download_file_with_client_report(
-        &build_http_client(Duration::from_secs(5)),
-        &url,
-        &destination,
-        &expected,
-    )
-    .await
-    .expect("stale temp should be discarded before promotion");
-
-    for expected_kind in [
-        ExecutionDownloadFactKind::TempDiscarded,
-        ExecutionDownloadFactKind::WrittenToTemp,
-        ExecutionDownloadFactKind::Promoted,
-    ] {
-        assert!(report.facts.iter().any(|fact| fact.kind == expected_kind));
-    }
-    assert_eq!(fs::read(&destination).expect("promoted artifact"), body);
-    assert!(!temp_path.exists());
-
-    let _ = fs::remove_dir_all(root);
-}
-
-#[tokio::test]
-async fn execute_download_to_temp_reports_provider_failure_fact() {
-    let root = temp_dir("execution-download-provider-failure");
-    let destination = root.join("artifact.jar");
-    let url = spawn_download_response_server(
-        "503 Service Unavailable",
-        vec![(
-            "Content-Type".to_string(),
-            "application/octet-stream".to_string(),
-        )],
-        b"unavailable".to_vec(),
-        1,
-    )
-    .await;
-    let client = build_http_client(Duration::from_secs(5));
-    let expected = ExpectedIntegrity::from_mojang(12, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
-
-    let error = execute_download_to_temp(
-        &client,
-        ExecutionDownloadRequest::launcher_managed(&url, &destination, &expected),
-    )
-    .await
-    .expect_err("provider failure should not promote");
-
-    assert_eq!(error.kind, ExecutionDownloadFactKind::ProviderFailure);
-    assert!(error.facts.iter().any(|fact| {
-        fact.kind == ExecutionDownloadFactKind::ProviderFailure
-            && fact
-                .fields
-                .iter()
-                .any(|(key, value)| key == "status" && value == "503")
-    }));
-    assert!(!destination.exists());
-
-    let _ = fs::remove_dir_all(root);
-}
-
-#[tokio::test]
-async fn execute_download_to_temp_reports_interrupted_short_response_without_promoting() {
-    let root = temp_dir("execution-download-interrupted");
-    let destination = root.join("artifact.jar");
-    let url = spawn_download_response_server(
-        "200 OK",
-        vec![
-            (
-                "Content-Type".to_string(),
-                "application/octet-stream".to_string(),
-            ),
-            ("Content-Length".to_string(), "12".to_string()),
-        ],
-        b"partial".to_vec(),
-        1,
-    )
-    .await;
-    let client = build_http_client(Duration::from_secs(5));
-    let expected = ExpectedIntegrity::from_mojang(12, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
-
-    let error = execute_download_to_temp(
-        &client,
-        ExecutionDownloadRequest::launcher_managed(&url, &destination, &expected),
-    )
-    .await
-    .expect_err("short response should not promote");
-
-    assert!(
-        error
-            .facts
-            .iter()
-            .any(|fact| fact.kind == ExecutionDownloadFactKind::Interrupted)
-    );
-    assert!(
-        error
-            .facts
-            .iter()
-            .any(|fact| fact.kind == ExecutionDownloadFactKind::TempDiscarded)
-    );
-    assert!(!destination.exists());
-    assert!(!download_temp_path(&destination).exists());
-
-    let _ = fs::remove_dir_all(root);
-}
-
-#[tokio::test]
-async fn execute_download_to_temp_refuses_non_launcher_owned_targets() {
-    let root = temp_dir("execution-download-ownership");
-    let destination = root.join("artifact.jar");
-    let client = build_http_client(Duration::from_secs(5));
-    let expected = ExpectedIntegrity::default();
-
-    for ownership in [
-        ExecutionDownloadOwnership::UserOwned,
-        ExecutionDownloadOwnership::Unknown,
-    ] {
-        let error = execute_download_to_temp(
-            &client,
-            ExecutionDownloadRequest {
-                url: "http://127.0.0.1:9/artifact.jar",
-                destination: &destination,
-                expected: &expected,
-                ownership,
-            },
-        )
-        .await
-        .expect_err("non-launcher ownership should be refused before network");
-
-        assert_eq!(error.kind, ExecutionDownloadFactKind::OwnershipRefused);
-        assert!(
-            error
-                .facts
-                .iter()
-                .any(|fact| fact.kind == ExecutionDownloadFactKind::OwnershipRefused)
-        );
-        assert!(!destination.exists());
-        assert!(!download_temp_path(&destination).exists());
-    }
 }
 
 #[test]
@@ -1966,17 +1597,11 @@ fn download_windows_verbatim_path_transform_handles_drive_unc_and_relative_paths
 #[test]
 fn download_integrity_futures_stay_small_enough_for_tokio_workers() {
     let path = Path::new("/tmp/axial-test/artifact.jar");
-    let expected = ExpectedIntegrity::from_mojang(8, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
 
     assert!(
         std::mem::size_of_val(&hash_file(path)) < 4096,
         "hash_file future should not embed the hash buffer on the task stack"
     );
-    assert!(
-        std::mem::size_of_val(&existing_file_satisfies(path, &expected)) < 4096,
-        "existing-file integrity future should stay small"
-    );
-
     let root = temp_dir("install-version-future-size");
     let runtime_cache =
         crate::ManagedRuntimeCache::isolated_for_test().expect("isolated downloader runtime cache");
@@ -2246,42 +1871,6 @@ fn virtual_asset_destination_rejects_unsafe_provider_paths() {
 }
 
 #[tokio::test]
-async fn execute_download_to_temp_replaces_existing_destination() {
-    let root = temp_dir("promote-replace");
-    fs::create_dir_all(&root).expect("create root");
-    let destination = root.join("artifact.jar");
-    fs::write(&destination, b"stale").expect("write stale artifact");
-    let body = b"fresh".to_vec();
-    let expected = ExpectedIntegrity::from_mojang(body.len() as i64, &sha1_hex(&body));
-    let url = spawn_download_response_server(
-        "200 OK",
-        vec![(
-            "Content-Type".to_string(),
-            "application/octet-stream".to_string(),
-        )],
-        body.clone(),
-        1,
-    )
-    .await;
-    let client = build_http_client(Duration::from_secs(5));
-
-    execute_download_to_temp(
-        &client,
-        ExecutionDownloadRequest::launcher_managed(&url, &destination, &expected),
-    )
-    .await
-    .expect("execute download");
-
-    assert_eq!(
-        fs::read(&destination).expect("read promoted artifact"),
-        b"fresh"
-    );
-    assert!(!download_temp_path(&destination).exists());
-
-    let _ = fs::remove_dir_all(root);
-}
-
-#[tokio::test]
 async fn promotion_sweep_removes_stale_other_pid_backups_only() {
     let root = temp_dir("promote-stale-backup-sweep");
     fs::create_dir_all(&root).expect("create root");
@@ -2340,45 +1929,11 @@ async fn promotion_sweep_preserves_live_other_pid_backup() {
 }
 
 #[tokio::test]
-async fn selected_temp_sweep_removes_only_strict_stale_owner_names() {
-    let root = temp_dir("selected-temp-owner-sweep");
-    let destination = root.join("asset-index.json");
-    fs::create_dir_all(&root).expect("source root");
-    let stale_pid = unused_pid_for_test(&[std::process::id()]);
-    let stale = root.join(format!("asset-index.json.axial-selected-tmp-{stale_pid}"));
-    let current = selected_promotion_temp_path(&destination);
-    let malformed = root.join(format!(
-        "asset-index.json.axial-selected-tmp-{stale_pid}-extra"
-    ));
-    let foreign = root.join(format!("other.json.axial-selected-tmp-{stale_pid}"));
-    let mut child = spawn_promotion_sweep_child_process();
-    let live = root.join(format!(
-        "asset-index.json.axial-selected-tmp-{}",
-        child.id()
-    ));
-    for path in [&stale, &current, &malformed, &foreign, &live] {
-        fs::write(path, b"reserved").expect("write selected temp fixture");
-    }
-
-    let sweep = sweep_stale_selected_promotion_temps(&destination).await;
-    let _ = child.kill();
-    let _ = child.wait();
-    sweep.expect("sweep selected temps");
-
-    assert!(!stale.exists());
-    assert!(current.exists());
-    assert!(malformed.exists());
-    assert!(foreign.exists());
-    assert!(live.exists());
-    let _ = fs::remove_dir_all(root);
-}
-
-#[tokio::test]
 async fn promote_sweeps_stale_backups_before_replace() {
     let root = temp_dir("promote-sweeps-before-replace");
     fs::create_dir_all(&root).expect("create root");
     let destination = root.join("artifact.jar");
-    let temp_path = download_temp_path(&destination);
+    let temp_path = root.join("source-temp-sentinel");
     let other_pid = unused_pid_for_test(&[std::process::id()]);
     let stale_backup = root.join(format!("artifact.jar.axial-backup-{other_pid}"));
     fs::write(&destination, b"stale").expect("write destination");
@@ -2468,45 +2023,6 @@ async fn remove_stale_download_temp_accepts_missing_path() {
 }
 
 #[tokio::test]
-async fn execute_download_to_temp_removes_temp_when_promotion_fails() {
-    let root = temp_dir("promote-cleanup");
-    fs::create_dir_all(&root).expect("create root");
-    let destination = root.join("artifact.jar");
-    fs::create_dir_all(&destination).expect("create destination directory");
-    let body = b"fresh".to_vec();
-    let expected = ExpectedIntegrity::from_mojang(body.len() as i64, &sha1_hex(&body));
-    let url = spawn_download_response_server(
-        "200 OK",
-        vec![(
-            "Content-Type".to_string(),
-            "application/octet-stream".to_string(),
-        )],
-        body,
-        1,
-    )
-    .await;
-    let client = build_http_client(Duration::from_secs(5));
-
-    let result = execute_download_to_temp(
-        &client,
-        ExecutionDownloadRequest::launcher_managed(&url, &destination, &expected),
-    )
-    .await;
-
-    let error = result.expect_err("directory destination should fail promotion");
-    assert!(
-        error
-            .facts
-            .iter()
-            .any(|fact| fact.kind == ExecutionDownloadFactKind::PromoteFailed)
-    );
-    assert!(!download_temp_path(&destination).exists());
-    assert!(destination.is_dir());
-
-    let _ = fs::remove_dir_all(root);
-}
-
-#[tokio::test]
 async fn promote_launcher_managed_artifact_temp_once_preserves_destination_when_temp_is_missing() {
     let root = temp_dir("promote-missing-temp");
     fs::create_dir_all(&root).expect("create root");
@@ -2523,55 +2039,6 @@ async fn promote_launcher_managed_artifact_temp_once_preserves_destination_when_
     );
 
     let _ = fs::remove_dir_all(root);
-}
-
-#[test]
-fn verify_download_integrity_rejects_mismatches() {
-    let path = Path::new("/tmp/axial-test/artifact.jar");
-    let expected = ExpectedIntegrity::from_mojang(8, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
-    let wrong_size = ActualIntegrity {
-        size: 7,
-        sha1: Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string()),
-    };
-    let wrong_sha1 = ActualIntegrity {
-        size: 8,
-        sha1: Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string()),
-    };
-
-    assert!(matches!(
-        verify_download_integrity(path, &expected, &wrong_size),
-        Err(DownloadIntegrityError::SizeMismatch { .. })
-    ));
-    assert!(matches!(
-        verify_download_integrity(path, &expected, &wrong_sha1),
-        Err(DownloadIntegrityError::Sha1Mismatch { .. })
-    ));
-}
-
-#[test]
-fn download_integrity_errors_report_file_name_without_local_path() {
-    let path = Path::new("/home/alice/.minecraft/libraries/org/example/lib.jar");
-    let expected = ExpectedIntegrity::from_mojang(8, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
-    let wrong_size = ActualIntegrity {
-        size: 7,
-        sha1: Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string()),
-    };
-
-    let message = verify_download_integrity(path, &expected, &wrong_size)
-        .expect_err("expected size mismatch")
-        .to_string();
-    let early_size_message = download_size_mismatch(path, 8, 9).to_string();
-
-    for message in [message, early_size_message] {
-        assert!(message.contains("lib.jar"));
-        assert!(!message.contains("/home/alice"));
-        assert!(!message.contains(".minecraft"));
-    }
-}
-
-#[test]
-fn download_integrity_file_label_falls_back_to_generic_artifact() {
-    assert_eq!(bounded_download_file_label(Path::new("/")), "artifact");
 }
 
 #[test]
@@ -2901,8 +2368,23 @@ fn assert_settled_libraries_lane(root: &Path) {
     );
 }
 
+fn assert_settled_assets_lane(root: &Path) {
+    assert!(
+        assets_lane_is_settled(root),
+        "Assets lane must be terminally settled"
+    );
+}
+
+fn assets_lane_is_settled(root: &Path) -> bool {
+    component_lane_is_settled(root, "assets")
+}
+
 fn libraries_lane_is_settled(root: &Path) -> bool {
-    let lane = root.join(".axial-publication/libraries");
+    component_lane_is_settled(root, "libraries")
+}
+
+fn component_lane_is_settled(root: &Path, name: &str) -> bool {
+    let lane = root.join(".axial-publication").join(name);
     let Ok(entries) = fs::read_dir(&lane) else {
         return false;
     };
@@ -3064,6 +2546,211 @@ async fn spawn_overlapped_install_server() -> (
         request_rx,
         release_library_tx,
     )
+}
+
+struct NonemptyAssetInstallServer {
+    version_url: String,
+    version_sha1: String,
+    object_base_url: String,
+    asset_index_id: String,
+    asset_index: Vec<u8>,
+    object: Vec<u8>,
+    object_hash: String,
+    distinct: Vec<u8>,
+    distinct_hash: String,
+    empty_hash: String,
+    object_path: String,
+    distinct_path: String,
+    empty_path: String,
+    requests: mpsc::UnboundedReceiver<String>,
+}
+
+async fn spawn_nonempty_asset_install_server(version_id: &str) -> NonemptyAssetInstallServer {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind nonempty asset install server");
+    let base_url = format!("http://{}", listener.local_addr().expect("local addr"));
+    let (request_tx, request_rx) = mpsc::unbounded_channel();
+    let client = b"nonempty-asset-client".to_vec();
+    let object = b"retained-asset-object".to_vec();
+    let distinct = b"distinct-retained-asset-object".to_vec();
+    let object_hash = sha1_hex(&object);
+    let distinct_hash = sha1_hex(&distinct);
+    let empty_hash = sha1_hex(b"");
+    let asset_index_id = format!("{version_id}-assets");
+    let asset_index = serde_json::json!({
+        "virtual": true,
+        "objects": {
+            "object.bin": { "hash": object_hash, "size": object.len() },
+            "duplicate/object.bin": { "hash": object_hash, "size": object.len() },
+            "distinct.bin": { "hash": distinct_hash, "size": distinct.len() },
+            "empty.bin": { "hash": empty_hash, "size": 0 }
+        }
+    })
+    .to_string()
+    .into_bytes();
+    let version = serde_json::json!({
+        "id": version_id,
+        "downloads": { "client": {
+            "url": format!("{base_url}/client.jar"),
+            "sha1": sha1_hex(&client),
+            "size": client.len()
+        }},
+        "assetIndex": {
+            "id": asset_index_id,
+            "url": format!("{base_url}/asset-index.json"),
+            "sha1": sha1_hex(&asset_index),
+            "size": asset_index.len()
+        },
+        "libraries": []
+    })
+    .to_string()
+    .into_bytes();
+    let version_sha1 = sha1_hex(&version);
+    let object_path = format!("/{}/{}", &object_hash[..2], object_hash);
+    let distinct_path = format!("/{}/{}", &distinct_hash[..2], distinct_hash);
+    let empty_path = format!("/{}/{}", &empty_hash[..2], empty_hash);
+    let responses = Arc::new(HashMap::from([
+        ("/version.json".to_string(), version),
+        ("/client.jar".to_string(), client),
+        ("/asset-index.json".to_string(), asset_index.clone()),
+        (object_path.clone(), object.clone()),
+        (distinct_path.clone(), distinct.clone()),
+        (empty_path.clone(), Vec::new()),
+    ]));
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            let responses = Arc::clone(&responses);
+            let request_tx = request_tx.clone();
+            tokio::spawn(async move {
+                let Some(path) = read_request_path(&mut socket).await else {
+                    return;
+                };
+                let _ = request_tx.send(path.clone());
+                match responses.get(&path) {
+                    Some(body) => write_raw_response(&mut socket, "200 OK", body).await,
+                    None => write_raw_response(&mut socket, "404 Not Found", b"not found").await,
+                }
+            });
+        }
+    });
+
+    NonemptyAssetInstallServer {
+        version_url: format!("{base_url}/version.json"),
+        version_sha1,
+        object_base_url: base_url,
+        asset_index_id,
+        asset_index,
+        object,
+        object_hash,
+        distinct,
+        distinct_hash,
+        empty_hash,
+        object_path,
+        distinct_path,
+        empty_path,
+        requests: request_rx,
+    }
+}
+
+struct BlockedAssetInstallServer {
+    version_url: String,
+    version_sha1: String,
+    object_base_url: String,
+    asset_index_id: String,
+    object_hash: String,
+    object_started: oneshot::Receiver<()>,
+    object_connection_closed: oneshot::Receiver<()>,
+}
+
+async fn spawn_blocked_asset_install_server(version_id: &str) -> BlockedAssetInstallServer {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind blocked asset install server");
+    let base_url = format!("http://{}", listener.local_addr().expect("local addr"));
+    let client = b"blocked-asset-client".to_vec();
+    let object = b"blocked-asset-object".to_vec();
+    let object_hash = sha1_hex(&object);
+    let object_path = format!("/{}/{}", &object_hash[..2], object_hash);
+    let asset_index_id = format!("{version_id}-assets");
+    let asset_index = serde_json::json!({
+        "objects": {
+            "blocked.bin": { "hash": object_hash, "size": object.len() }
+        }
+    })
+    .to_string()
+    .into_bytes();
+    let version = serde_json::json!({
+        "id": version_id,
+        "downloads": { "client": {
+            "url": format!("{base_url}/client.jar"),
+            "sha1": sha1_hex(&client),
+            "size": client.len()
+        }},
+        "assetIndex": {
+            "id": asset_index_id,
+            "url": format!("{base_url}/asset-index.json"),
+            "sha1": sha1_hex(&asset_index),
+            "size": asset_index.len()
+        },
+        "libraries": []
+    })
+    .to_string()
+    .into_bytes();
+    let version_sha1 = sha1_hex(&version);
+    let responses = Arc::new(HashMap::from([
+        ("/version.json".to_string(), version),
+        ("/client.jar".to_string(), client),
+        ("/asset-index.json".to_string(), asset_index),
+    ]));
+    let (object_started_tx, object_started_rx) = oneshot::channel();
+    let (object_closed_tx, object_closed_rx) = oneshot::channel();
+    let object_started_tx = Arc::new(Mutex::new(Some(object_started_tx)));
+    let object_closed_tx = Arc::new(Mutex::new(Some(object_closed_tx)));
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            let responses = Arc::clone(&responses);
+            let object_path = object_path.clone();
+            let object_started_tx = Arc::clone(&object_started_tx);
+            let object_closed_tx = Arc::clone(&object_closed_tx);
+            tokio::spawn(async move {
+                let Some(path) = read_request_path(&mut socket).await else {
+                    return;
+                };
+                if path == object_path {
+                    if let Some(sender) = object_started_tx.lock().await.take() {
+                        let _ = sender.send(());
+                    }
+                    let mut byte = [0_u8; 1];
+                    while socket.read(&mut byte).await.is_ok_and(|read| read != 0) {}
+                    if let Some(sender) = object_closed_tx.lock().await.take() {
+                        let _ = sender.send(());
+                    }
+                    return;
+                }
+                match responses.get(&path) {
+                    Some(body) => write_raw_response(&mut socket, "200 OK", body).await,
+                    None => write_raw_response(&mut socket, "404 Not Found", b"not found").await,
+                }
+            });
+        }
+    });
+
+    BlockedAssetInstallServer {
+        version_url: format!("{base_url}/version.json"),
+        version_sha1,
+        object_base_url: base_url,
+        asset_index_id,
+        object_hash,
+        object_started: object_started_rx,
+        object_connection_closed: object_closed_rx,
+    }
 }
 
 async fn spawn_reconstruction_parity_server(
@@ -3362,6 +3049,27 @@ fn test_manifest_downloader(
     )
 }
 
+fn asset_index_path(root: &Path, asset_index_id: &str) -> PathBuf {
+    assets_dir(root)
+        .join("indexes")
+        .join(format!("{asset_index_id}.json"))
+}
+
+fn asset_object_path(root: &Path, hash: &str) -> PathBuf {
+    assets_dir(root).join("objects").join(&hash[..2]).join(hash)
+}
+
+fn drain_request_paths(requests: &mut mpsc::UnboundedReceiver<String>) -> Vec<String> {
+    std::iter::from_fn(|| requests.try_recv().ok()).collect()
+}
+
+fn request_count(requests: &[String], path: &str) -> usize {
+    requests
+        .iter()
+        .filter(|request| request.as_str() == path)
+        .count()
+}
+
 fn empty_test_install_manifest() -> VersionManifest {
     serde_json::from_value(serde_json::json!({
         "latest": { "release": "", "snapshot": "" },
@@ -3401,105 +3109,7 @@ async fn write_raw_response(socket: &mut tokio::net::TcpStream, status: &str, bo
 }
 
 #[tokio::test]
-async fn download_file_with_client_report_retries_retryable_provider_failure() {
-    let root = temp_dir("retry-provider-then-success");
-    let destination = root.join("artifact.jar");
-    let body = b"artifact".to_vec();
-    let expected = ExpectedIntegrity::from_mojang(body.len() as i64, &sha1_hex(&body));
-    let (url, requests) = spawn_scripted_download_server(vec![
-        ScriptedDownloadResponse::full("500 Internal Server Error", b"temporary".to_vec()),
-        ScriptedDownloadResponse::full("200 OK", body.clone()),
-    ])
-    .await;
-    let client = build_http_client(Duration::from_secs(5));
-
-    let report = download_file_with_client_report_with_retry_delays(
-        &client,
-        &url,
-        &destination,
-        &expected,
-        &[Duration::ZERO],
-    )
-    .await
-    .expect("retryable provider failure should recover");
-
-    assert_eq!(report.bytes_written, body.len() as u64);
-    assert_eq!(requests.load(Ordering::SeqCst), 2);
-    assert_eq!(fs::read(&destination).expect("read artifact"), body);
-    assert!(!download_temp_path(&destination).exists());
-
-    let _ = fs::remove_dir_all(root);
-}
-
-#[tokio::test]
-async fn download_file_with_client_report_does_not_retry_checksum_mismatch() {
-    let root = temp_dir("retry-checksum-mismatch");
-    let destination = root.join("artifact.jar");
-    let body = b"artifact".to_vec();
-    let expected = ExpectedIntegrity::from_mojang(body.len() as i64, &sha1_hex(&body));
-    let (url, requests) = spawn_scripted_download_server(vec![
-        ScriptedDownloadResponse::full("200 OK", b"wrong-by".to_vec()),
-        ScriptedDownloadResponse::full("200 OK", body),
-    ])
-    .await;
-    let client = build_http_client(Duration::from_secs(5));
-
-    let error = download_file_with_client_report_with_retry_delays(
-        &client,
-        &url,
-        &destination,
-        &expected,
-        &[Duration::ZERO, Duration::ZERO, Duration::ZERO],
-    )
-    .await
-    .expect_err("checksum mismatch should fail without retry");
-
-    assert_eq!(error.kind, ExecutionDownloadFactKind::ChecksumMismatch);
-    assert_eq!(requests.load(Ordering::SeqCst), 1);
-    assert!(!destination.exists());
-    assert!(!download_temp_path(&destination).exists());
-
-    let _ = fs::remove_dir_all(root);
-}
-
-#[tokio::test]
-async fn download_file_with_client_report_retries_interrupted_body_stream() {
-    let root = temp_dir("retry-interrupted-stream");
-    let destination = root.join("artifact.jar");
-    let body = b"artifact".to_vec();
-    let expected = ExpectedIntegrity::from_mojang(body.len() as i64, &sha1_hex(&body));
-    let (url, requests) = spawn_scripted_download_server(vec![
-        ScriptedDownloadResponse::partial("200 OK", body.len(), b"art".to_vec()),
-        ScriptedDownloadResponse::full("200 OK", body.clone()),
-    ])
-    .await;
-    let client = build_http_client(Duration::from_secs(5));
-
-    download_file_with_client_report_with_retry_delays(
-        &client,
-        &url,
-        &destination,
-        &expected,
-        &[Duration::ZERO],
-    )
-    .await
-    .expect("interrupted stream should recover");
-
-    assert_eq!(requests.load(Ordering::SeqCst), 2);
-    assert_eq!(fs::read(&destination).expect("read artifact"), body);
-    assert!(!download_temp_path(&destination).exists());
-
-    let _ = fs::remove_dir_all(root);
-}
-
-#[tokio::test]
-async fn authenticated_source_retry_preserves_destination_and_binds_observed_bytes() {
-    let root = temp_dir("verified-source-retry-provider");
-    let destination = root.join("asset-index.json");
-    let temp_path = download_temp_path(&destination);
-    fs::create_dir_all(&root).expect("source sentinel root");
-    fs::write(&destination, b"installed-sentinel").expect("destination sentinel");
-    fs::write(&temp_path, b"temp-sentinel").expect("temp sentinel");
+async fn authenticated_source_retry_binds_observed_bytes() {
     let body = br#"{"id":"1.21.1"}"#.to_vec();
     let expected = ExpectedIntegrity::from_mojang(body.len() as i64, &sha1_hex(&body));
     let (url, requests) = spawn_scripted_download_server(vec![
@@ -3524,25 +3134,10 @@ async fn authenticated_source_retry_preserves_destination_and_binds_observed_byt
     let expected_sha1: [u8; 20] = Sha1::digest(&body).into();
     assert_eq!(source.observed_sha1(), expected_sha1);
     assert_eq!(requests.load(Ordering::SeqCst), 2);
-    assert_eq!(
-        fs::read(&destination).expect("destination sentinel"),
-        b"installed-sentinel"
-    );
-    assert_eq!(
-        fs::read(&temp_path).expect("temp sentinel"),
-        b"temp-sentinel"
-    );
-    let _ = fs::remove_dir_all(root);
 }
 
 #[tokio::test]
-async fn authenticated_source_interrupted_retry_never_mutates_destination() {
-    let root = temp_dir("verified-source-retry-interrupted");
-    let destination = root.join("asset-index.json");
-    let temp_path = download_temp_path(&destination);
-    fs::create_dir_all(&root).expect("source sentinel root");
-    fs::write(&destination, b"installed-sentinel").expect("destination sentinel");
-    fs::write(&temp_path, b"temp-sentinel").expect("temp sentinel");
+async fn authenticated_source_interrupted_stream_retries() {
     let body = br#"{"objects":{}}"#.to_vec();
     let expected = ExpectedIntegrity::from_mojang(body.len() as i64, &sha1_hex(&body));
     let (url, requests) = spawn_scripted_download_server(vec![
@@ -3564,25 +3159,10 @@ async fn authenticated_source_interrupted_retry_never_mutates_destination() {
 
     assert_eq!(source.bytes(), body);
     assert_eq!(requests.load(Ordering::SeqCst), 2);
-    assert_eq!(
-        fs::read(&destination).expect("destination sentinel"),
-        b"installed-sentinel"
-    );
-    assert_eq!(
-        fs::read(&temp_path).expect("temp sentinel"),
-        b"temp-sentinel"
-    );
-    let _ = fs::remove_dir_all(root);
 }
 
 #[tokio::test]
-async fn authenticated_source_checksum_failure_never_mutates_destination() {
-    let root = temp_dir("verified-source-checksum-failure");
-    let destination = root.join("asset-index.json");
-    let temp_path = download_temp_path(&destination);
-    fs::create_dir_all(&root).expect("source sentinel root");
-    fs::write(&destination, b"installed-sentinel").expect("destination sentinel");
-    fs::write(&temp_path, b"temp-sentinel").expect("temp sentinel");
+async fn authenticated_source_rejects_checksum_mismatch() {
     let body = b"wrong source".to_vec();
     let expected = ExpectedIntegrity::from_mojang(body.len() as i64, &sha1_hex(b"right source"));
     let (url, requests) =
@@ -3601,25 +3181,10 @@ async fn authenticated_source_checksum_failure_never_mutates_destination() {
     .expect("checksum mismatch must fail");
 
     assert_eq!(requests.load(Ordering::SeqCst), 1);
-    assert_eq!(
-        fs::read(&destination).expect("destination sentinel"),
-        b"installed-sentinel"
-    );
-    assert_eq!(
-        fs::read(&temp_path).expect("temp sentinel"),
-        b"temp-sentinel"
-    );
-    let _ = fs::remove_dir_all(root);
 }
 
 #[tokio::test]
-async fn authenticated_source_size_failure_never_mutates_destination() {
-    let root = temp_dir("verified-source-size-failure");
-    let destination = root.join("asset-index.json");
-    let temp_path = download_temp_path(&destination);
-    fs::create_dir_all(&root).expect("source sentinel root");
-    fs::write(&destination, b"installed-sentinel").expect("destination sentinel");
-    fs::write(&temp_path, b"temp-sentinel").expect("temp sentinel");
+async fn authenticated_source_rejects_size_mismatch() {
     let body = b"asset index".to_vec();
     let expected = ExpectedIntegrity {
         size: Some(body.len() as u64 + 1),
@@ -3641,25 +3206,10 @@ async fn authenticated_source_size_failure_never_mutates_destination() {
     .expect("size mismatch must fail");
 
     assert_eq!(requests.load(Ordering::SeqCst), 1);
-    assert_eq!(
-        fs::read(&destination).expect("destination sentinel"),
-        b"installed-sentinel"
-    );
-    assert_eq!(
-        fs::read(&temp_path).expect("temp sentinel"),
-        b"temp-sentinel"
-    );
-    let _ = fs::remove_dir_all(root);
 }
 
 #[tokio::test]
-async fn authenticated_source_oversize_failure_never_mutates_destination() {
-    let root = temp_dir("verified-source-oversize-failure");
-    let destination = root.join("asset-index.json");
-    let temp_path = download_temp_path(&destination);
-    fs::create_dir_all(&root).expect("source sentinel root");
-    fs::write(&destination, b"installed-sentinel").expect("destination sentinel");
-    fs::write(&temp_path, b"temp-sentinel").expect("temp sentinel");
+async fn authenticated_source_rejects_oversize_body() {
     let body = b"oversize source".to_vec();
     let expected = ExpectedIntegrity::from_mojang(body.len() as i64, &sha1_hex(&body));
     let (url, requests) =
@@ -3678,25 +3228,10 @@ async fn authenticated_source_oversize_failure_never_mutates_destination() {
     .expect("memory bound must fail");
 
     assert_eq!(requests.load(Ordering::SeqCst), 1);
-    assert_eq!(
-        fs::read(&destination).expect("destination sentinel"),
-        b"installed-sentinel"
-    );
-    assert_eq!(
-        fs::read(&temp_path).expect("temp sentinel"),
-        b"temp-sentinel"
-    );
-    let _ = fs::remove_dir_all(root);
 }
 
 #[tokio::test]
-async fn authenticated_source_provider_failure_never_mutates_destination() {
-    let root = temp_dir("verified-source-provider-failure");
-    let destination = root.join("asset-index.json");
-    let temp_path = download_temp_path(&destination);
-    fs::create_dir_all(&root).expect("source sentinel root");
-    fs::write(&destination, b"installed-sentinel").expect("destination sentinel");
-    fs::write(&temp_path, b"temp-sentinel").expect("temp sentinel");
+async fn authenticated_source_reports_terminal_provider_failure() {
     let expected = ExpectedIntegrity::from_mojang(7, &sha1_hex(b"missing"));
     let (url, requests) = spawn_scripted_download_server(vec![ScriptedDownloadResponse::full(
         "404 Not Found",
@@ -3717,761 +3252,6 @@ async fn authenticated_source_provider_failure_never_mutates_destination() {
     .expect("terminal provider failure must fail");
 
     assert_eq!(requests.load(Ordering::SeqCst), 1);
-    assert_eq!(
-        fs::read(&destination).expect("destination sentinel"),
-        b"installed-sentinel"
-    );
-    assert_eq!(
-        fs::read(&temp_path).expect("temp sentinel"),
-        b"temp-sentinel"
-    );
-    let _ = fs::remove_dir_all(root);
-}
-
-#[tokio::test]
-async fn authenticated_source_materialization_consumes_matching_prepared_contract() {
-    let root = temp_dir("verified-source-materialization-contract");
-    let destination = root.join("asset-index.json");
-    let body = br#"{"objects":{}}"#.to_vec();
-    let expected = ExpectedIntegrity::from_mojang(body.len() as i64, &sha1_hex(&body));
-    let (url, _) = spawn_scripted_download_server(vec![ScriptedDownloadResponse::full(
-        "200 OK",
-        body.clone(),
-    )])
-    .await;
-    let (fact_tx, mut fact_rx) = mpsc::unbounded_channel();
-    let prepared = prepare_selected_artifact_install(
-        SelectedDownloadArtifactKind::AssetIndex,
-        &destination,
-        &url,
-        "fixture-assets",
-        &expected,
-        Some(&fact_tx),
-    )
-    .await
-    .expect("prepare destination capability");
-    let source = acquire_authenticated_selected_artifact_source(SelectedArtifactSourceRequest {
-        client: &build_http_client(Duration::from_secs(5)),
-        kind: SelectedDownloadArtifactKind::AssetIndex,
-        url: &url,
-        logical_identity: "fixture-assets",
-        expected: &expected,
-        max_bytes: 1024,
-        target: prepared.target(),
-        fact_tx: Some(&fact_tx),
-    })
-    .await
-    .expect("acquire source");
-
-    let materialized =
-        materialize_authenticated_selected_artifact_source(prepared, source, Some(&fact_tx))
-            .await
-            .expect("materialize matching source");
-
-    assert_eq!(materialized.bytes(), body);
-    assert_eq!(fs::read(&destination).expect("materialized source"), body);
-    let facts = std::iter::from_fn(|| fact_rx.try_recv().ok()).collect::<Vec<_>>();
-    let promoted = facts
-        .iter()
-        .position(|fact| fact.kind == ExecutionDownloadFactKind::Promoted)
-        .expect("promoted fact");
-    let verified = facts
-        .iter()
-        .position(|fact| fact.kind == ExecutionDownloadFactKind::ArtifactVerified)
-        .expect("verified fact");
-    assert!(promoted < verified);
-    let _ = fs::remove_dir_all(root);
-}
-
-#[tokio::test]
-async fn authenticated_source_repeat_exact_materialization_reuses_with_retained_backup() {
-    let root = temp_dir("selected-repeat-exact");
-    let destination = root.join("asset-index.json");
-    fs::create_dir_all(&root).expect("source root");
-    fs::write(&destination, b"old-source").expect("old destination");
-    let (prepared, source) = selected_materialization_fixture(&destination, b"new-source").await;
-    materialize_authenticated_selected_artifact_source(prepared, source, None)
-        .await
-        .expect("first exact transition");
-    let backups = selected_reserved_backups(&destination);
-    assert_eq!(backups.len(), 1);
-    assert_eq!(
-        fs::read(&backups[0]).expect("retained backup"),
-        b"old-source"
-    );
-
-    let (prepared, source) = selected_materialization_fixture(&destination, b"new-source").await;
-    materialize_authenticated_selected_artifact_source(prepared, source, None)
-        .await
-        .expect("repeat exact materialization");
-
-    assert_eq!(
-        fs::read(&destination).expect("exact destination"),
-        b"new-source"
-    );
-    assert!(!selected_promotion_temp_path(&destination).exists());
-    assert_eq!(selected_reserved_backups(&destination), backups);
-
-    let (prepared, source) = selected_materialization_fixture(&destination, b"third-source").await;
-    materialize_authenticated_selected_artifact_source(prepared, source, None)
-        .await
-        .err()
-        .expect("different replacement must respect retained backup slot");
-    assert_eq!(
-        fs::read(&destination).expect("bounded destination"),
-        b"new-source"
-    );
-    assert_eq!(selected_reserved_backups(&destination), backups);
-    assert_eq!(
-        fs::read(selected_promotion_temp_path(&destination)).expect("one retained temp obligation"),
-        b"third-source"
-    );
-    let _ = fs::remove_dir_all(root);
-}
-
-#[tokio::test]
-async fn authenticated_source_rejects_mismatched_prepared_contract_without_mutation() {
-    let root = temp_dir("verified-source-mismatched-contract");
-    let destination = root.join("asset-index.json");
-    fs::create_dir_all(&root).expect("source sentinel root");
-    fs::write(&destination, b"installed-sentinel").expect("destination sentinel");
-    let body = br#"{"objects":{}}"#.to_vec();
-    let source_expected = ExpectedIntegrity::from_mojang(body.len() as i64, &sha1_hex(&body));
-    let prepared_expected = ExpectedIntegrity::from_mojang(
-        body.len() as i64,
-        &sha1_hex(br#"{"objects":{"other":{}}}"#),
-    );
-    let (url, _) =
-        spawn_scripted_download_server(vec![ScriptedDownloadResponse::full("200 OK", body)]).await;
-    let prepared = prepare_selected_artifact_install(
-        SelectedDownloadArtifactKind::AssetIndex,
-        &destination,
-        &url,
-        "asset-index",
-        &prepared_expected,
-        None,
-    )
-    .await
-    .expect("prepare destination capability");
-    let source = acquire_authenticated_selected_artifact_source(SelectedArtifactSourceRequest {
-        client: &build_http_client(Duration::from_secs(5)),
-        kind: SelectedDownloadArtifactKind::AssetIndex,
-        url: &url,
-        logical_identity: "asset-index",
-        expected: &source_expected,
-        max_bytes: 1024,
-        target: prepared.target(),
-        fact_tx: None,
-    })
-    .await
-    .expect("acquire source");
-
-    materialize_authenticated_selected_artifact_source(prepared, source, None)
-        .await
-        .err()
-        .expect("mismatched contract must fail");
-
-    assert_eq!(
-        fs::read(&destination).expect("destination sentinel"),
-        b"installed-sentinel"
-    );
-    let _ = fs::remove_dir_all(root);
-}
-
-#[tokio::test]
-async fn authenticated_source_rejects_each_cross_identity_recombination_axis() {
-    for case in ["kind", "provider", "logical_identity"] {
-        let root = temp_dir(&format!("verified-source-cross-{case}"));
-        let destination = root.join("artifact.json");
-        fs::create_dir_all(&root).expect("source sentinel root");
-        fs::write(&destination, b"installed-sentinel").expect("destination sentinel");
-        let body = br#"{"shared":"digest"}"#.to_vec();
-        let expected = ExpectedIntegrity::from_mojang(body.len() as i64, &sha1_hex(&body));
-        let (source_url, _) =
-            spawn_scripted_download_server(vec![ScriptedDownloadResponse::full("200 OK", body)])
-                .await;
-        let source =
-            acquire_authenticated_selected_artifact_source(SelectedArtifactSourceRequest {
-                client: &build_http_client(Duration::from_secs(5)),
-                kind: SelectedDownloadArtifactKind::AssetIndex,
-                url: &source_url,
-                logical_identity: "shared-identity",
-                expected: &expected,
-                max_bytes: 1024,
-                target: "asset_index_source",
-                fact_tx: None,
-            })
-            .await
-            .expect("acquire authenticated source");
-        let prepared_kind = if case == "kind" {
-            SelectedDownloadArtifactKind::Library
-        } else {
-            SelectedDownloadArtifactKind::AssetIndex
-        };
-        let prepared_provider = if case == "provider" {
-            format!("{source_url}?different-provider")
-        } else {
-            source_url.clone()
-        };
-        let prepared_identity = if case == "logical_identity" {
-            "different-identity"
-        } else {
-            "shared-identity"
-        };
-        let prepared = prepare_selected_artifact_install(
-            prepared_kind,
-            &destination,
-            &prepared_provider,
-            prepared_identity,
-            &expected,
-            None,
-        )
-        .await
-        .expect("prepare distinct destination contract");
-
-        assert!(
-            matches!(
-                materialize_authenticated_selected_artifact_source(prepared, source, None).await,
-                Err(DownloadError::Integrity(_))
-            ),
-            "one mismatched identity axis must reject equal-digest recombination"
-        );
-        assert_eq!(
-            fs::read(&destination).expect("destination sentinel"),
-            b"installed-sentinel",
-            "{case} mismatch must not mutate destination"
-        );
-        let _ = fs::remove_dir_all(root);
-    }
-}
-
-#[tokio::test]
-async fn authenticated_source_materialization_failure_emits_no_verified_fact() {
-    let root = temp_dir("verified-source-materialization-failure");
-    fs::create_dir_all(&root).expect("source root");
-    let blocked_parent = root.join("blocked-parent");
-    fs::write(&blocked_parent, b"not-a-directory").expect("blocked parent");
-    let destination = blocked_parent.join("asset-index.json");
-    let body = br#"{"objects":{}}"#.to_vec();
-    let expected = ExpectedIntegrity::from_mojang(body.len() as i64, &sha1_hex(&body));
-    let (url, _) =
-        spawn_scripted_download_server(vec![ScriptedDownloadResponse::full("200 OK", body)]).await;
-    let (fact_tx, mut fact_rx) = mpsc::unbounded_channel();
-    let prepared = prepare_selected_artifact_install(
-        SelectedDownloadArtifactKind::AssetIndex,
-        &destination,
-        &url,
-        "fixture-assets",
-        &expected,
-        Some(&fact_tx),
-    )
-    .await
-    .expect("prepare destination capability");
-    let source = acquire_authenticated_selected_artifact_source(SelectedArtifactSourceRequest {
-        client: &build_http_client(Duration::from_secs(5)),
-        kind: SelectedDownloadArtifactKind::AssetIndex,
-        url: &url,
-        logical_identity: "fixture-assets",
-        expected: &expected,
-        max_bytes: 1024,
-        target: prepared.target(),
-        fact_tx: Some(&fact_tx),
-    })
-    .await
-    .expect("acquire source");
-
-    materialize_authenticated_selected_artifact_source(prepared, source, Some(&fact_tx))
-        .await
-        .err()
-        .expect("materialization must fail");
-
-    assert!(
-        std::iter::from_fn(|| fact_rx.try_recv().ok())
-            .all(|fact| fact.kind != ExecutionDownloadFactKind::ArtifactVerified)
-    );
-    let _ = fs::remove_dir_all(root);
-}
-
-async fn selected_materialization_fixture(
-    destination: &Path,
-    body: &[u8],
-) -> (
-    PreparedSelectedArtifactInstall,
-    AuthenticatedSelectedArtifactSource,
-) {
-    let body = body.to_vec();
-    let expected = ExpectedIntegrity::from_mojang(body.len() as i64, &sha1_hex(&body));
-    let (url, _) =
-        spawn_scripted_download_server(vec![ScriptedDownloadResponse::full("200 OK", body)]).await;
-    let prepared = prepare_selected_artifact_install(
-        SelectedDownloadArtifactKind::AssetIndex,
-        destination,
-        &url,
-        "fixture-assets",
-        &expected,
-        None,
-    )
-    .await
-    .expect("prepare selected materialization");
-    let source = acquire_authenticated_selected_artifact_source(SelectedArtifactSourceRequest {
-        client: &build_http_client(Duration::from_secs(5)),
-        kind: SelectedDownloadArtifactKind::AssetIndex,
-        url: &url,
-        logical_identity: "fixture-assets",
-        expected: &expected,
-        max_bytes: 1024,
-        target: prepared.target(),
-        fact_tx: None,
-    })
-    .await
-    .expect("acquire selected materialization source");
-    (prepared, source)
-}
-
-fn selected_promotion_control(
-    hook: impl FnMut(SelectedPromotionTestStage, &Path, &Path) + Send + 'static,
-) -> SelectedPromotionTestControl {
-    SelectedPromotionTestControl {
-        hook: Some(Box::new(hook)),
-        pause_at: None,
-        reached: None,
-        resume: None,
-        fail_publish_rename: false,
-    }
-}
-
-fn selected_reserved_backups(destination: &Path) -> Vec<PathBuf> {
-    let prefix = format!(
-        "{}.axial-backup-",
-        destination
-            .file_name()
-            .expect("selected destination name")
-            .to_string_lossy()
-    );
-    fs::read_dir(destination.parent().expect("selected destination parent"))
-        .expect("selected destination directory")
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .filter(|path| {
-            path.file_name()
-                .is_some_and(|name| name.to_string_lossy().starts_with(&prefix))
-        })
-        .collect()
-}
-
-#[tokio::test]
-async fn authenticated_source_rejects_temp_path_substitution_before_namespace_mutation() {
-    let root = temp_dir("selected-temp-substitution");
-    let destination = root.join("asset-index.json");
-    fs::create_dir_all(&root).expect("source root");
-    fs::write(&destination, b"old-source").expect("old destination");
-    let (prepared, source) = selected_materialization_fixture(&destination, b"new-source").await;
-    let retained = root.join("retained-authenticated-temp");
-    let retained_hook = retained.clone();
-    let (fact_tx, mut fact_rx) = mpsc::unbounded_channel();
-    let control = selected_promotion_control(move |stage, temp, _destination| {
-        if stage == SelectedPromotionTestStage::TempWritten {
-            fs::rename(temp, &retained_hook).expect("retain authenticated temp");
-            fs::write(temp, b"new-source").expect("substitute same-byte temp");
-        }
-    });
-
-    materialize_authenticated_selected_artifact_source_with_control(
-        prepared,
-        source,
-        Some(&fact_tx),
-        control,
-    )
-    .await
-    .err()
-    .expect("substituted temp must fail");
-
-    assert_eq!(
-        fs::read(&destination).expect("old destination"),
-        b"old-source"
-    );
-    assert_eq!(
-        fs::read(&retained).expect("retained proof bytes"),
-        b"new-source"
-    );
-    let facts = std::iter::from_fn(|| fact_rx.try_recv().ok()).collect::<Vec<_>>();
-    assert!(
-        facts
-            .iter()
-            .any(|fact| fact.kind == ExecutionDownloadFactKind::PromoteFailed)
-    );
-    assert!(
-        facts
-            .iter()
-            .all(|fact| fact.kind != ExecutionDownloadFactKind::ChecksumMismatch)
-    );
-    let _ = fs::remove_dir_all(root);
-}
-
-#[tokio::test]
-async fn authenticated_source_post_publish_corruption_restores_exact_backup() {
-    let root = temp_dir("selected-post-publish-restore");
-    let destination = root.join("asset-index.json");
-    fs::create_dir_all(&root).expect("source root");
-    fs::write(&destination, b"old-source").expect("old destination");
-    let (prepared, source) = selected_materialization_fixture(&destination, b"new-source").await;
-    let control = selected_promotion_control(|stage, _temp, destination| {
-        if stage == SelectedPromotionTestStage::PublishedUnverified {
-            fs::write(destination, b"bad-source").expect("corrupt published handle");
-        }
-    });
-
-    materialize_authenticated_selected_artifact_source_with_control(
-        prepared, source, None, control,
-    )
-    .await
-    .err()
-    .expect("post-publish corruption must fail");
-
-    assert_eq!(
-        fs::read(&destination).expect("restored destination"),
-        b"old-source"
-    );
-    assert_eq!(
-        fs::read(selected_promotion_temp_path(&destination)).expect("retained rejected identity"),
-        b"bad-source"
-    );
-    assert!(selected_reserved_backups(&destination).is_empty());
-    let _ = fs::remove_dir_all(root);
-}
-
-#[tokio::test]
-async fn authenticated_source_post_publish_corruption_restores_absence() {
-    let root = temp_dir("selected-post-publish-absence");
-    let destination = root.join("asset-index.json");
-    fs::create_dir_all(&root).expect("source root");
-    let (prepared, source) = selected_materialization_fixture(&destination, b"new-source").await;
-    let control = selected_promotion_control(|stage, _temp, destination| {
-        if stage == SelectedPromotionTestStage::PublishedUnverified {
-            fs::write(destination, b"bad-source").expect("corrupt published handle");
-        }
-    });
-
-    materialize_authenticated_selected_artifact_source_with_control(
-        prepared, source, None, control,
-    )
-    .await
-    .err()
-    .expect("post-publish corruption must fail");
-
-    assert!(!destination.exists());
-    assert_eq!(
-        fs::read(selected_promotion_temp_path(&destination)).expect("retained rejected identity"),
-        b"bad-source"
-    );
-    assert!(selected_reserved_backups(&destination).is_empty());
-    let _ = fs::remove_dir_all(root);
-}
-
-#[tokio::test]
-async fn authenticated_source_forced_publish_failure_restores_backup_and_retains_temp() {
-    let root = temp_dir("selected-forced-publish-restore");
-    let destination = root.join("asset-index.json");
-    fs::create_dir_all(&root).expect("source root");
-    fs::write(&destination, b"old-source").expect("old destination");
-    let (prepared, source) = selected_materialization_fixture(&destination, b"new-source").await;
-    let mut control = selected_promotion_control(|_, _, _| {});
-    control.fail_publish_rename = true;
-
-    materialize_authenticated_selected_artifact_source_with_control(
-        prepared, source, None, control,
-    )
-    .await
-    .err()
-    .expect("forced publish failure must fail");
-
-    assert_eq!(
-        fs::read(&destination).expect("restored destination"),
-        b"old-source"
-    );
-    assert_eq!(
-        fs::read(selected_promotion_temp_path(&destination)).expect("retained authenticated temp"),
-        b"new-source"
-    );
-    assert!(selected_reserved_backups(&destination).is_empty());
-    let _ = fs::remove_dir_all(root);
-}
-
-#[tokio::test]
-async fn authenticated_source_forced_publish_failure_restores_absence_and_retains_temp() {
-    let root = temp_dir("selected-forced-publish-absence");
-    let destination = root.join("asset-index.json");
-    fs::create_dir_all(&root).expect("source root");
-    let (prepared, source) = selected_materialization_fixture(&destination, b"new-source").await;
-    let mut control = selected_promotion_control(|_, _, _| {});
-    control.fail_publish_rename = true;
-
-    materialize_authenticated_selected_artifact_source_with_control(
-        prepared, source, None, control,
-    )
-    .await
-    .err()
-    .expect("forced publish failure must fail");
-
-    assert!(!destination.exists());
-    assert_eq!(
-        fs::read(selected_promotion_temp_path(&destination)).expect("retained authenticated temp"),
-        b"new-source"
-    );
-    assert!(selected_reserved_backups(&destination).is_empty());
-    let _ = fs::remove_dir_all(root);
-}
-
-#[tokio::test]
-async fn authenticated_source_destination_substitution_never_deletes_foreign_replacement() {
-    let root = temp_dir("selected-destination-substitution");
-    let destination = root.join("asset-index.json");
-    let displaced = root.join("displaced-authenticated-source");
-    fs::create_dir_all(&root).expect("source root");
-    fs::write(&destination, b"old-source").expect("old destination");
-    let (prepared, source) = selected_materialization_fixture(&destination, b"new-source").await;
-    let displaced_hook = displaced.clone();
-    let (fact_tx, mut fact_rx) = mpsc::unbounded_channel();
-    let control = selected_promotion_control(move |stage, _temp, destination| {
-        if stage == SelectedPromotionTestStage::PublishedUnverified {
-            fs::rename(destination, &displaced_hook).expect("displace authenticated publication");
-            fs::write(destination, b"foreign!!").expect("foreign replacement");
-        }
-    });
-
-    materialize_authenticated_selected_artifact_source_with_control(
-        prepared,
-        source,
-        Some(&fact_tx),
-        control,
-    )
-    .await
-    .err()
-    .expect("destination substitution must fail closed");
-
-    assert_eq!(
-        fs::read(&destination).expect("foreign replacement"),
-        b"foreign!!"
-    );
-    assert_eq!(
-        fs::read(&displaced).expect("displaced source"),
-        b"new-source"
-    );
-    let backups = selected_reserved_backups(&destination);
-    assert_eq!(backups.len(), 1);
-    assert_eq!(
-        fs::read(&backups[0]).expect("reserved exact backup"),
-        b"old-source"
-    );
-    assert!(std::iter::from_fn(|| fact_rx.try_recv().ok()).all(|fact| {
-        !matches!(
-            fact.kind,
-            ExecutionDownloadFactKind::Promoted | ExecutionDownloadFactKind::ArtifactVerified
-        )
-    }));
-    let _ = fs::remove_dir_all(root);
-}
-
-#[tokio::test]
-async fn authenticated_source_cancellation_after_backup_still_settles_publication() {
-    let root = temp_dir("selected-cancel-after-backup");
-    let destination = root.join("asset-index.json");
-    fs::create_dir_all(&root).expect("source root");
-    fs::write(&destination, b"old-source").expect("old destination");
-    let (prepared, source) = selected_materialization_fixture(&destination, b"new-source").await;
-    let (reached_tx, reached_rx) = oneshot::channel();
-    let (resume_tx, resume_rx) = oneshot::channel();
-    let control = SelectedPromotionTestControl {
-        hook: None,
-        pause_at: Some(SelectedPromotionTestStage::BackupOwned),
-        reached: Some(reached_tx),
-        resume: Some(resume_rx),
-        fail_publish_rename: false,
-    };
-    let materialization = tokio::spawn(async move {
-        materialize_authenticated_selected_artifact_source_with_control(
-            prepared, source, None, control,
-        )
-        .await
-    });
-    reached_rx.await.expect("backup-owned boundary");
-    materialization.abort();
-    let _ = resume_tx.send(());
-
-    timeout(Duration::from_secs(5), async {
-        loop {
-            if fs::read(&destination).ok().as_deref() == Some(b"new-source")
-                && !selected_promotion_temp_path(&destination).exists()
-            {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("owned publication must settle after caller cancellation");
-    let backups = selected_reserved_backups(&destination);
-    assert_eq!(backups.len(), 1);
-    assert_eq!(
-        fs::read(&backups[0]).expect("retained backup"),
-        b"old-source"
-    );
-    let _ = fs::remove_dir_all(root);
-}
-
-#[tokio::test]
-async fn retained_file_publisher_owns_publication_after_caller_cancellation() {
-    use std::io::{Seek as _, SeekFrom, Write as _};
-
-    let root = temp_dir("retained-publisher-cancel-after-backup");
-    let destination = root.join("library.jar");
-    let body = b"authenticated-library-source";
-    fs::create_dir_all(&root).expect("source root");
-    fs::write(&destination, b"old-library").expect("old destination");
-    let mut source = tempfile::tempfile().expect("anonymous retained source");
-    source.write_all(body).expect("write retained source");
-    source.flush().expect("flush retained source");
-    source.sync_data().expect("sync retained source");
-    source.seek(SeekFrom::Start(0)).expect("rewind source");
-    let observed_sha1: [u8; 20] = Sha1::digest(body).into();
-    let (reached_tx, reached_rx) = oneshot::channel();
-    let (resume_tx, resume_rx) = oneshot::channel();
-    let control = SelectedPromotionTestControl {
-        hook: None,
-        pause_at: Some(SelectedPromotionTestStage::BackupOwned),
-        reached: Some(reached_tx),
-        resume: Some(resume_rx),
-        fail_publish_rename: false,
-    };
-    let destination_for_task = destination.clone();
-    let publisher = tokio::spawn(async move {
-        publish_authenticated_retained_file_for_test(
-            source,
-            destination_for_task,
-            body.len() as u64,
-            observed_sha1,
-            "minecraft_library_test".to_string(),
-            Some(control),
-        )
-        .await
-    });
-    reached_rx.await.expect("backup-owned boundary");
-    publisher.abort();
-    let _ = resume_tx.send(());
-
-    timeout(Duration::from_secs(5), async {
-        loop {
-            if fs::read(&destination).ok().as_deref() == Some(body.as_slice())
-                && !selected_promotion_temp_path(&destination).exists()
-            {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("owned publisher must settle after caller cancellation");
-    assert_eq!(selected_reserved_backups(&destination).len(), 1);
-    let _ = fs::remove_dir_all(root);
-}
-
-#[tokio::test]
-async fn authenticated_source_missing_temp_after_backup_restores_destination() {
-    let root = temp_dir("selected-missing-temp-after-backup");
-    let destination = root.join("asset-index.json");
-    fs::create_dir_all(&root).expect("source root");
-    fs::write(&destination, b"old-source").expect("old destination");
-    let (prepared, source) = selected_materialization_fixture(&destination, b"new-source").await;
-    let control = selected_promotion_control(|stage, temp, _destination| {
-        if stage == SelectedPromotionTestStage::BackupOwned {
-            fs::remove_file(temp).expect("remove authenticated temp at backup boundary");
-        }
-    });
-
-    materialize_authenticated_selected_artifact_source_with_control(
-        prepared, source, None, control,
-    )
-    .await
-    .err()
-    .expect("missing temp must fail");
-
-    assert_eq!(
-        fs::read(&destination).expect("restored destination"),
-        b"old-source"
-    );
-    assert!(selected_reserved_backups(&destination).is_empty());
-    let _ = fs::remove_dir_all(root);
-}
-
-#[tokio::test]
-async fn authenticated_source_missing_publication_restores_destination() {
-    let root = temp_dir("selected-missing-publication");
-    let destination = root.join("asset-index.json");
-    fs::create_dir_all(&root).expect("source root");
-    fs::write(&destination, b"old-source").expect("old destination");
-    let (prepared, source) = selected_materialization_fixture(&destination, b"new-source").await;
-    let control = selected_promotion_control(|stage, _temp, destination| {
-        if stage == SelectedPromotionTestStage::PublishedUnverified {
-            fs::remove_file(destination).expect("remove unverified publication");
-        }
-    });
-
-    materialize_authenticated_selected_artifact_source_with_control(
-        prepared, source, None, control,
-    )
-    .await
-    .err()
-    .expect("missing publication must fail");
-
-    assert_eq!(
-        fs::read(&destination).expect("restored destination"),
-        b"old-source"
-    );
-    assert!(selected_reserved_backups(&destination).is_empty());
-    let _ = fs::remove_dir_all(root);
-}
-
-#[tokio::test]
-async fn authenticated_source_foreign_backup_substitution_is_nonterminal_and_retained() {
-    let root = temp_dir("selected-foreign-backup-cleanup");
-    let destination = root.join("asset-index.json");
-    let displaced_backup = root.join("displaced-exact-backup");
-    fs::create_dir_all(&root).expect("source root");
-    fs::write(&destination, b"old-source").expect("old destination");
-    let (prepared, source) = selected_materialization_fixture(&destination, b"new-source").await;
-    let displaced_hook = displaced_backup.clone();
-    let control = selected_promotion_control(move |stage, _temp, destination| {
-        if stage == SelectedPromotionTestStage::PublishedVerified {
-            let backup = selected_reserved_backups(destination)
-                .into_iter()
-                .next()
-                .expect("exact backup");
-            fs::rename(&backup, &displaced_hook).expect("displace exact backup");
-            fs::write(&backup, b"foreign-backup").expect("foreign backup replacement");
-        }
-    });
-
-    materialize_authenticated_selected_artifact_source_with_control(
-        prepared, source, None, control,
-    )
-    .await
-    .expect("verified publication is already committed");
-
-    assert_eq!(
-        fs::read(&destination).expect("published destination"),
-        b"new-source"
-    );
-    assert_eq!(
-        fs::read(&displaced_backup).expect("displaced exact backup"),
-        b"old-source"
-    );
-    let backups = selected_reserved_backups(&destination);
-    assert_eq!(backups.len(), 1);
-    assert_eq!(
-        fs::read(&backups[0]).expect("foreign backup"),
-        b"foreign-backup"
-    );
-    let _ = fs::remove_dir_all(root);
 }
 
 struct ScriptedDownloadResponse {

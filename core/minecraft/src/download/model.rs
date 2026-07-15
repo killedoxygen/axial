@@ -130,7 +130,7 @@ pub struct ExpectedIntegrity {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct ActualIntegrity {
     pub(super) size: u64,
-    pub(super) sha1: Option<String>,
+    pub(super) sha1: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -144,9 +144,6 @@ pub(super) enum DownloadIntegrityError {
         file: String,
         expected: String,
         actual: String,
-    },
-    MissingSha1 {
-        file: String,
     },
 }
 
@@ -169,9 +166,6 @@ impl std::fmt::Display for DownloadIntegrityError {
                 formatter,
                 "{file} sha1 mismatch: expected {expected}, got {actual}"
             ),
-            Self::MissingSha1 { file } => {
-                write!(formatter, "{file} sha1 was not computed")
-            }
         }
     }
 }
@@ -208,28 +202,12 @@ fn non_empty_sha1(value: &str) -> Option<String> {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum ExecutionDownloadOwnership {
-    LauncherManaged,
-    UserOwned,
-    Unknown,
-}
-
-impl ExecutionDownloadOwnership {
-    pub(super) fn allows_managed_mutation(self) -> bool {
-        matches!(self, Self::LauncherManaged)
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ExecutionDownloadFactKind {
-    ArtifactMissing,
-    ArtifactVerified,
     ChecksumMismatch,
     MetadataInvalid,
     MetadataMissing,
     Interrupted,
     NetworkFailure,
-    OwnershipRefused,
     PermissionFailure,
     PromoteFailed,
     ProviderFailure,
