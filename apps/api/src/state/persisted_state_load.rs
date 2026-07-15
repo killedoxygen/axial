@@ -1,4 +1,7 @@
-use crate::execution::anchored_record::{AnchoredRecordIdentity, AnchoredRecordRestartDigest};
+use crate::execution::anchored_record::{
+    AnchoredRecordIdentity, AnchoredRecordQuarantineError, AnchoredRecordQuarantineReceipt,
+    AnchoredRecordQuarantineSuffix, AnchoredRecordRestartDigest,
+};
 use crate::state::contracts::{
     PersistedStateRecordStore, RestartStableRecordIdentity, TargetDescriptor,
 };
@@ -85,9 +88,33 @@ pub(crate) struct PersistedStateRejectedRecordEligibility {
     record: PersistedStateRejectedRecord,
 }
 
+pub(crate) struct PersistedStateRejectedRecordQuarantineReceipt {
+    evidence: PersistedStateRejectedRecordEvidence,
+    physical_identity: RestartStableRecordIdentity,
+    exact: AnchoredRecordQuarantineReceipt,
+}
+
 impl PersistedStateRejectedRecordEligibility {
     pub(super) fn still_current(&self) -> bool {
         self.record.identity.revalidate().is_ok()
+    }
+
+    pub(crate) fn quarantine(
+        self,
+        suffix: AnchoredRecordQuarantineSuffix,
+    ) -> Result<PersistedStateRejectedRecordQuarantineReceipt, AnchoredRecordQuarantineError> {
+        let PersistedStateRejectedRecord {
+            evidence,
+            identity,
+            restart_identity,
+        } = self.record;
+        identity
+            .quarantine(suffix)
+            .map(|exact| PersistedStateRejectedRecordQuarantineReceipt {
+                evidence,
+                physical_identity: restart_identity,
+                exact,
+            })
     }
 
     #[cfg(test)]
@@ -103,6 +130,23 @@ impl PersistedStateRejectedRecordEligibility {
     #[cfg(test)]
     pub(crate) fn physical_identity(&self) -> &RestartStableRecordIdentity {
         self.record.restart_identity()
+    }
+}
+
+impl PersistedStateRejectedRecordQuarantineReceipt {
+    #[cfg(test)]
+    pub(crate) fn evidence(&self) -> &PersistedStateRejectedRecordEvidence {
+        &self.evidence
+    }
+
+    #[cfg(test)]
+    pub(crate) fn physical_identity(&self) -> &RestartStableRecordIdentity {
+        &self.physical_identity
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_current(&self) -> bool {
+        self.exact.is_current()
     }
 }
 
@@ -204,6 +248,15 @@ mod tests {
             AsRef<Path>,
             AsRef<[u8]>
     );
+    assert_not_impl_any!(
+        super::PersistedStateRejectedRecordQuarantineReceipt:
+            Clone,
+            std::fmt::Debug,
+            serde::Serialize,
+            serde::de::DeserializeOwned,
+            AsRef<Path>,
+            AsRef<[u8]>
+    );
 
     #[test]
     fn five_store_issue_count_saturates() {
@@ -214,5 +267,68 @@ mod tests {
 
         assert_eq!(evidence.issue_count(), usize::MAX);
         assert!(evidence.rejected_records().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn eligibility_consumes_into_destination_bound_quarantine_receipt() {
+        use super::PersistedStateRecordRejection;
+        use crate::execution::anchored_record::{
+            AnchoredRecordDirectory, AnchoredRecordQuarantineSuffix,
+        };
+        use crate::state::contracts::{
+            OwnershipClass, PersistedStateRecordStore, StabilizationSystem, TargetDescriptor,
+            TargetKind,
+        };
+        use std::ffi::OsStr;
+        use std::fs;
+
+        let root = std::env::temp_dir().join(format!(
+            "axial-persisted-state-quarantine-delegation-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&root).expect("create rejected-record root");
+        fs::write(root.join("record.json"), b"{").expect("write rejected record");
+        let observation = AnchoredRecordDirectory::open(&root)
+            .expect("hold rejected-record directory")
+            .read_for_mutation(OsStr::new("record.json"), 64)
+            .expect("read rejected record");
+        let (identity, restart_digest) = observation
+            .into_restart_identity()
+            .expect("seal rejected record identity");
+        let eligibility = PersistedStateRejectedRecord::new(
+            PersistedStateRecordStore::PerformanceOperation,
+            PersistedStateRecordRejection::InvalidSchema,
+            TargetDescriptor::new(
+                StabilizationSystem::State,
+                TargetKind::Config,
+                "persisted-record-id",
+                OwnershipClass::LauncherManaged,
+            ),
+            identity,
+            restart_digest,
+        )
+        .into_eligibility();
+        let expected_identity = eligibility.physical_identity().clone();
+
+        let receipt =
+            match eligibility.quarantine(AnchoredRecordQuarantineSuffix::from_bytes([0x7a; 16])) {
+                Ok(receipt) => receipt,
+                Err(_) => panic!("consume exact quarantine eligibility"),
+            };
+
+        assert!(receipt.is_current());
+        assert_eq!(
+            receipt.evidence().store(),
+            PersistedStateRecordStore::PerformanceOperation
+        );
+        assert_eq!(receipt.physical_identity(), &expected_identity);
+        assert!(!root.join("record.json").exists());
+        assert_eq!(
+            fs::read(root.join(".record.json.axial-quarantine-7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a"))
+                .expect("read quarantined record"),
+            b"{"
+        );
+        fs::remove_dir_all(&root).expect("remove rejected-record root");
     }
 }
