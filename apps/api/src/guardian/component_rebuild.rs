@@ -3237,34 +3237,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn disabled_mode_cannot_mint_the_lower_attempt_needed_for_effect_admission() {
-        let fixture = fixture("disabled-refusal");
-        let lifecycle = fixture.state.acquire_instance_lifecycle(INSTANCE_ID).await;
-        let authority = fixture
-            .state
-            .registered_reconciliation_authority(&lifecycle)
-            .expect("registered reconciliation authority");
-
-        assert!(
-            authority
-                .repair_artifact_attempt(
-                    OperationId::new("artifact-disabled-refusal"),
-                    DIAGNOSIS_ID,
-                    GuardianDomain::Runtime,
-                    ReconciliationComponent::Runtime,
-                    runtime_target(),
-                    GuardianMode::Disabled,
-                    chrono::Duration::minutes(30),
-                )
-                .is_err(),
-            "Disabled mode must not reach a lower-rung attempt or component admission"
-        );
-
-        drop((authority, lifecycle));
-        cleanup(fixture).await;
-    }
-
-    #[tokio::test]
     async fn ambiguous_planned_replay_refuses_effect_ownership() {
         let fixture = fixture("ambiguous-replay");
         let (admission, _) = component_admission(&fixture, "ambiguous-replay").await;

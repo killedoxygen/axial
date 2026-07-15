@@ -2256,6 +2256,7 @@ mod tests {
         let process_count_path = root.join("deleted-library-process-count");
         let java_path =
             write_deleted_library_launch_fixture(&root, &library_path, &process_count_path);
+        let user_owned = write_user_owned_launch_sentinels(&state, instance_id);
         let mut session = test_record(session_id);
         session.instance_id = instance_id.to_string();
         state
@@ -2300,6 +2301,8 @@ mod tests {
             fs::read(&library_path).expect("leaf-repaired Libraries fixture"),
             MANAGED_LIBRARY_FIXTURE_BYTES
         );
+        assert_eq!(user_owned.len(), 4);
+        assert_user_owned_launch_sentinels(&user_owned);
         let reconciliation = state
             .journals()
             .list()
@@ -2532,12 +2535,7 @@ mod tests {
                 .await
                 .expect("wrong-content VersionBundle Tier1 postcheck");
         assert!(postcheck.facts.is_empty());
-        for (path, contents) in &user_owned {
-            assert_eq!(
-                fs::read(path).expect("user-owned launch sentinel"),
-                contents.as_slice()
-            );
-        }
+        assert_user_owned_launch_sentinels(&user_owned);
         drop((postcheck, lifecycle));
 
         let _ = state.sessions().kill(session_id).await;

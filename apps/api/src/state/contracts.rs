@@ -784,8 +784,9 @@ mod tests {
         ReconciliationComponent, ReconciliationIncarnationFingerprint,
         ReconciliationInventoryFingerprint, ReconciliationLineage,
         ReconciliationQuarantineCheckpoint, ReconciliationQuarantineRecord, ReconciliationRung,
-        ReconciliationScope, ReconciliationTerminal, ReconciliationTerminalOutcome, RollbackState,
-        StabilizationSystem, TargetDescriptor, TargetKind,
+        ReconciliationScope, ReconciliationTerminal, ReconciliationTerminalOutcome,
+        ReconciliationTerminalValidationError, RollbackState, StabilizationSystem,
+        TargetDescriptor, TargetKind,
     };
     use crate::guardian::{DiagnosisId, GuardianDomain, GuardianMode};
 
@@ -793,6 +794,24 @@ mod tests {
         rung: ReconciliationRung,
         component: ReconciliationComponent,
         lineage: ReconciliationLineage,
+    ) -> ReconciliationAttempt {
+        reconciliation_attempt_with_policy(
+            rung,
+            component,
+            lineage,
+            OwnershipClass::LauncherManaged,
+            OwnershipClass::LauncherManaged,
+            GuardianMode::Managed,
+        )
+    }
+
+    fn reconciliation_attempt_with_policy(
+        rung: ReconciliationRung,
+        component: ReconciliationComponent,
+        lineage: ReconciliationLineage,
+        ownership: OwnershipClass,
+        target_ownership: OwnershipClass,
+        mode: GuardianMode,
     ) -> ReconciliationAttempt {
         let (system, kind, id) = if component == ReconciliationComponent::WholeInstance {
             (
@@ -828,9 +847,9 @@ mod tests {
                 ),
             },
             component,
-            TargetDescriptor::new(system, kind, id, OwnershipClass::LauncherManaged),
-            GuardianMode::Managed,
-            OwnershipClass::LauncherManaged,
+            TargetDescriptor::new(system, kind, id, target_ownership),
+            mode,
+            ownership,
             "2026-07-15T00:00:00Z",
             "2026-07-15T01:00:00Z",
             lineage,
@@ -935,6 +954,96 @@ mod tests {
             },
         );
         assert!(whole.validate().is_ok());
+    }
+
+    #[test]
+    fn every_reconciliation_rung_rejects_unowned_and_disabled_attempts() {
+        let rung_shapes = [
+            (
+                ReconciliationRung::RepairArtifact,
+                ReconciliationComponent::Libraries,
+                ReconciliationLineage::Initial,
+            ),
+            (
+                ReconciliationRung::RebuildComponent,
+                ReconciliationComponent::Libraries,
+                ReconciliationLineage::Predecessor {
+                    operation_id: OperationId::new("repair-attempt"),
+                },
+            ),
+            (
+                ReconciliationRung::RematerializeInstance,
+                ReconciliationComponent::WholeInstance,
+                ReconciliationLineage::Predecessor {
+                    operation_id: OperationId::new("component-attempt"),
+                },
+            ),
+        ];
+        let unowned = [
+            OwnershipClass::CompositionManaged,
+            OwnershipClass::UserOwned,
+            OwnershipClass::ExternalProviderDerived,
+            OwnershipClass::Unknown,
+        ];
+
+        for (rung, component, lineage) in rung_shapes {
+            assert_eq!(
+                reconciliation_attempt_with_policy(
+                    rung,
+                    component,
+                    lineage.clone(),
+                    OwnershipClass::LauncherManaged,
+                    OwnershipClass::LauncherManaged,
+                    GuardianMode::Managed,
+                )
+                .validate(),
+                Ok(()),
+                "{rung:?} baseline must remain a valid durable shape"
+            );
+            for ownership in unowned {
+                let attempt = reconciliation_attempt_with_policy(
+                    rung,
+                    component,
+                    lineage.clone(),
+                    ownership,
+                    OwnershipClass::LauncherManaged,
+                    GuardianMode::Managed,
+                );
+                assert_eq!(
+                    attempt.validate(),
+                    Err(ReconciliationTerminalValidationError::UnsafeOwnership),
+                    "{rung:?} must reject {ownership:?} attempt ownership"
+                );
+
+                let attempt = reconciliation_attempt_with_policy(
+                    rung,
+                    component,
+                    lineage.clone(),
+                    OwnershipClass::LauncherManaged,
+                    ownership,
+                    GuardianMode::Managed,
+                );
+                assert_eq!(
+                    attempt.validate(),
+                    Err(ReconciliationTerminalValidationError::UnsafeTarget),
+                    "{rung:?} must reject {ownership:?} target ownership"
+                );
+            }
+
+            let disabled = reconciliation_attempt_with_policy(
+                rung,
+                component,
+                lineage,
+                OwnershipClass::LauncherManaged,
+                OwnershipClass::LauncherManaged,
+                GuardianMode::Disabled,
+            );
+            assert_eq!(
+                disabled.validate(),
+                Err(ReconciliationTerminalValidationError::DisabledMode),
+                "{rung:?} must reject Disabled mode before persistence"
+            );
+        }
     }
 
     #[test]

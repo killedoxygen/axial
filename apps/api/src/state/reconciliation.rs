@@ -6732,7 +6732,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn component_rebuild_admission_suppresses_active_terminal_after_store_reload() {
+    async fn repair_ladder_admission_suppresses_active_terminals_after_store_reload() {
         let fixture = fixture("component-admission-restart-suppression");
         let lifecycle = fixture.state.acquire_instance_lifecycle(INSTANCE_ID).await;
         let authority = fixture
@@ -6803,7 +6803,7 @@ mod tests {
         )
         .await
         .expect("commit component memory");
-        drop((component_reservation, admission));
+        drop((component_reservation, admission, authority, lifecycle));
 
         let restarted_journals = Arc::new(OperationJournalStore::new());
         restarted_journals
@@ -6817,8 +6817,39 @@ mod tests {
             .state
             .clone()
             .with_reconciliation_stores(restarted_journals, restarted_memory);
+        let restarted_lifecycle = restarted_state
+            .acquire_instance_lifecycle(INSTANCE_ID)
+            .await;
+        let restarted_authority = restarted_state
+            .registered_reconciliation_authority(&restarted_lifecycle)
+            .expect("restarted registered authority");
+        let restarted_artifact_attempt = restarted_authority
+            .repair_artifact_attempt(
+                OperationId::new("artifact-restart-repeated"),
+                DIAGNOSIS_ID,
+                GuardianDomain::Runtime,
+                ReconciliationComponent::Runtime,
+                runtime_target(),
+                GuardianMode::Managed,
+                chrono::Duration::minutes(30),
+            )
+            .expect("equivalent restarted artifact attempt");
+        assert_eq!(
+            reconciliation_attempt_key(&restarted_artifact_attempt),
+            reconciliation_attempt_key(&artifact_attempt),
+            "the restarted rung-one attempt must address the same suppression window"
+        );
+        assert_eq!(
+            restarted_state
+                .refuse_active_artifact_repair_window(&restarted_artifact_attempt)
+                .err(),
+            Some(ReconciliationEvidenceRejection::SuppressedPriorAttempt)
+        );
         let restarted_evidence = restarted_state
-            .recorded_runtime_artifact_repair_failure(&lifecycle, artifact_attempt.operation_id())
+            .recorded_runtime_artifact_repair_failure(
+                &restarted_lifecycle,
+                artifact_attempt.operation_id(),
+            )
             .expect("reloaded artifact failure");
 
         assert_eq!(
@@ -6854,7 +6885,10 @@ mod tests {
             .clone()
             .with_reconciliation_stores(disagreed_journals, disagreed_memory);
         let disagreed_evidence = disagreed_state
-            .recorded_runtime_artifact_repair_failure(&lifecycle, artifact_attempt.operation_id())
+            .recorded_runtime_artifact_repair_failure(
+                &restarted_lifecycle,
+                artifact_attempt.operation_id(),
+            )
             .expect("artifact failure remains available");
         assert_eq!(
             disagreed_state
@@ -6868,7 +6902,12 @@ mod tests {
             Some(ReconciliationEvidenceRejection::JournalMismatch)
         );
 
-        drop((disagreed_state, restarted_state, authority, lifecycle));
+        drop((
+            disagreed_state,
+            restarted_authority,
+            restarted_lifecycle,
+            restarted_state,
+        ));
         cleanup(fixture).await;
     }
 
