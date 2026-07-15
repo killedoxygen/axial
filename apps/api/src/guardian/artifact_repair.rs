@@ -3,7 +3,7 @@
 //! The executor consumes a State-minted registered-artifact admission. It does
 //! not discover providers, accept paths from callers, or decide policy.
 
-use super::{DiagnosisId, GuardianActionKind};
+use super::DiagnosisId;
 use crate::execution::ExecutionFact;
 use crate::observability::{RedactionAudience, sanitize_evidence_token};
 use crate::state::contracts::{
@@ -15,15 +15,14 @@ use crate::state::contracts::{
 use crate::state::failure_memory::GuardianFailureMemoryStore;
 use crate::state::{
     OperationJournalReconciliation, OperationJournalStore, OperationJournalStoreError,
-    ReconciliationAttemptReservation, RegisteredArtifactRepairAdmission,
-    RegisteredArtifactRepairEffect, commit_reconciliation_memory,
-    operation_journal_completed_step_is_visible, operation_journal_plan_is_visible,
-    operation_journal_terminal_is_visible, reconciliation_attempt_key,
-    reconciliation_instance_target, reconciliation_journal_attempt, reconciliation_memory_entry,
-    record_reconciliation_journal_failure, record_reconciliation_journal_success,
-    reserve_reconciliation_attempt, settle_reconciliation_memory,
+    ReconciliationAttemptReservation, RegisteredArtifactFailedRepair,
+    RegisteredArtifactRepairAdmission, RegisteredArtifactRepairEffect,
+    RegisteredArtifactRepairMemoryReceipt, operation_journal_completed_step_is_visible,
+    operation_journal_plan_is_visible, reconciliation_attempt_key, reconciliation_instance_target,
+    reconciliation_journal_attempt, record_reconciliation_journal_failure,
+    record_reconciliation_journal_success, reserve_reconciliation_attempt,
+    settle_reconciliation_memory,
 };
-use chrono::DateTime;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::time::Duration as StdDuration;
@@ -37,12 +36,53 @@ enum ArtifactJournalReconciliation {
     RetryMutation,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct GuardianArtifactRepairOutcome {
-    pub(crate) operation_id: OperationId,
-    pub(crate) diagnosis_id: DiagnosisId,
-    pub(crate) action: GuardianActionKind,
-    pub(crate) status: GuardianArtifactRepairStatus,
+#[must_use]
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct GuardianArtifactRepairReceipt {
+    diagnosis_id: DiagnosisId,
+    status: GuardianArtifactRepairStatus,
+}
+
+#[must_use]
+pub(crate) struct GuardianArtifactRepairFailure {
+    outcome: GuardianArtifactRepairReceipt,
+    continuation: RegisteredArtifactFailedRepair,
+}
+
+#[must_use]
+pub(crate) enum GuardianArtifactRepairSettlement {
+    Completed(GuardianArtifactRepairReceipt),
+    Failed(GuardianArtifactRepairFailure),
+}
+
+impl GuardianArtifactRepairReceipt {
+    pub(crate) const fn diagnosis_id(&self) -> DiagnosisId {
+        self.diagnosis_id
+    }
+
+    pub(crate) const fn status(&self) -> GuardianArtifactRepairStatus {
+        self.status
+    }
+}
+
+impl GuardianArtifactRepairFailure {
+    pub(crate) const fn outcome(&self) -> &GuardianArtifactRepairReceipt {
+        &self.outcome
+    }
+
+    pub(crate) fn into_continuation(self) -> RegisteredArtifactFailedRepair {
+        self.continuation
+    }
+}
+
+impl GuardianArtifactRepairSettlement {
+    #[cfg(test)]
+    pub(crate) const fn outcome(&self) -> &GuardianArtifactRepairReceipt {
+        match self {
+            Self::Completed(outcome) => outcome,
+            Self::Failed(failure) => failure.outcome(),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -63,7 +103,6 @@ impl GuardianArtifactRepairStatus {
 }
 
 enum ArtifactTerminal {
-    Blocked,
     Repaired {
         step_id: &'static str,
         facts: Vec<String>,
@@ -77,11 +116,6 @@ enum ArtifactTerminal {
     },
 }
 
-enum ArtifactTerminalJournal {
-    Create(OperationOutcome),
-    Record(&'static str, RollbackState, Option<&'static str>),
-}
-
 struct ArtifactRepairContext<'a> {
     client: &'a Client,
     journals: &'a OperationJournalStore,
@@ -92,10 +126,15 @@ struct ArtifactRepairContext<'a> {
     admission: &'a RegisteredArtifactRepairAdmission,
 }
 
+struct ArtifactRepairExecution {
+    outcome: GuardianArtifactRepairReceipt,
+    memory_receipt: RegisteredArtifactRepairMemoryReceipt,
+}
+
 pub(crate) async fn execute_registered_guardian_artifact_repair(
     admission: RegisteredArtifactRepairAdmission,
     client: &Client,
-) -> Result<GuardianArtifactRepairOutcome, OperationJournalStoreError> {
+) -> Result<GuardianArtifactRepairSettlement, OperationJournalStoreError> {
     let attempt = admission.attempt().clone();
     let operation_id = attempt.operation_id().clone();
     let mut context = ArtifactRepairContext {
@@ -121,18 +160,28 @@ pub(crate) async fn execute_registered_guardian_artifact_repair(
                 ))
             })?,
     );
-    execute_admitted_artifact_repair(context, operation_id).await
+    let execution = execute_admitted_artifact_repair(context, operation_id).await?;
+    if execution.outcome.status() != GuardianArtifactRepairStatus::Failed {
+        return Ok(GuardianArtifactRepairSettlement::Completed(
+            execution.outcome,
+        ));
+    }
+    let continuation = admission
+        .into_failed_continuation(execution.memory_receipt)
+        .map_err(artifact_reconciliation_error)?;
+    Ok(GuardianArtifactRepairSettlement::Failed(
+        GuardianArtifactRepairFailure {
+            outcome: execution.outcome,
+            continuation,
+        },
+    ))
 }
 
 async fn execute_admitted_artifact_repair(
     context: ArtifactRepairContext<'_>,
     operation_id: OperationId,
-) -> Result<GuardianArtifactRepairOutcome, OperationJournalStoreError> {
+) -> Result<ArtifactRepairExecution, OperationJournalStoreError> {
     let target = context.attempt.target().clone();
-    let attempt_key = reconciliation_attempt_key(&context.attempt);
-    if let Some(outcome) = recover_artifact_evidence(&context, &attempt_key).await? {
-        return Ok(outcome);
-    }
     if let Some(error) =
         create_planned_journal_reconciled(context.journals, &operation_id, &context).await?
     {
@@ -407,212 +456,81 @@ async fn finish_artifact_repair(
     context: &ArtifactRepairContext<'_>,
     operation_id: OperationId,
     terminal: ArtifactTerminal,
-) -> Result<GuardianArtifactRepairOutcome, OperationJournalStoreError> {
-    let (journal, reconciliation_outcome, status, facts, quarantined) = match terminal {
-        ArtifactTerminal::Blocked => (
-            ArtifactTerminalJournal::Create(OperationOutcome::Blocked),
-            None,
-            GuardianArtifactRepairStatus::Blocked,
-            Vec::new(),
-            None,
-        ),
-        ArtifactTerminal::Repaired {
+) -> Result<ArtifactRepairExecution, OperationJournalStoreError> {
+    let (step_id, rollback, failure_point, reconciliation_outcome, status, facts, quarantined) =
+        match terminal {
+            ArtifactTerminal::Repaired {
+                step_id,
+                facts,
+                quarantined_target,
+            } => (
+                step_id,
+                RollbackState::Available,
+                None,
+                ReconciliationTerminalOutcome::Succeeded,
+                GuardianArtifactRepairStatus::Repaired,
+                facts,
+                quarantined_target,
+            ),
+            ArtifactTerminal::Failed {
+                step_id,
+                rollback,
+                facts,
+                quarantined_target,
+            } => (
+                step_id,
+                rollback,
+                Some(step_id),
+                ReconciliationTerminalOutcome::Failed,
+                GuardianArtifactRepairStatus::Failed,
+                facts,
+                quarantined_target,
+            ),
+        };
+    let reconciliation_terminal = context
+        .admission
+        .terminal(
+            context.attempt.clone(),
+            reconciliation_outcome,
+            quarantined.clone(),
+        )
+        .map_err(artifact_reconciliation_error)?;
+    let step_result = if failure_point.is_some() {
+        OperationStepResult::Failed
+    } else {
+        OperationStepResult::Completed
+    };
+    if let Some(error) = record_artifact_terminal_reconciled(
+        context.journals,
+        &operation_id,
+        repair_step(
             step_id,
+            step_result,
+            Some(context.attempt.target().clone()),
             facts,
-            quarantined_target,
-        } => (
-            ArtifactTerminalJournal::Record(step_id, RollbackState::Available, None),
-            Some(ReconciliationTerminalOutcome::Succeeded),
-            GuardianArtifactRepairStatus::Repaired,
-            facts,
-            quarantined_target,
-        ),
-        ArtifactTerminal::Failed {
-            step_id,
             rollback,
-            facts,
-            quarantined_target,
-        } => (
-            ArtifactTerminalJournal::Record(step_id, rollback, Some(step_id)),
-            Some(ReconciliationTerminalOutcome::Failed),
-            GuardianArtifactRepairStatus::Failed,
-            facts,
-            quarantined_target,
         ),
-    };
-    let reconciliation_terminal = match reconciliation_outcome {
-        Some(outcome) => Some(
-            context
-                .admission
-                .terminal(context.attempt.clone(), outcome, quarantined.clone())
-                .map_err(artifact_reconciliation_error)?,
-        ),
-        None => None,
-    };
-    let outcome_operation_id = operation_id.clone();
-    let journal_operation_id = operation_id;
-    let journal_facts = facts;
-    let journal_terminal = reconciliation_terminal.clone();
-    let complete_journal = async move {
-        match journal {
-            ArtifactTerminalJournal::Create(outcome) => {
-                create_terminal_journal_reconciled(
-                    context.journals,
-                    &journal_operation_id,
-                    context,
-                    OperationStatus::Blocked,
-                    outcome,
-                    OperationStepResult::Skipped,
-                    journal_facts,
-                )
-                .await
-            }
-            ArtifactTerminalJournal::Record(step_id, rollback, failure_point) => {
-                let step_result = if failure_point.is_some() {
-                    OperationStepResult::Failed
-                } else {
-                    OperationStepResult::Completed
-                };
-                record_artifact_terminal_reconciled(
-                    context.journals,
-                    &journal_operation_id,
-                    repair_step(
-                        step_id,
-                        step_result,
-                        Some(context.attempt.target().clone()),
-                        journal_facts,
-                        rollback,
-                    ),
-                    failure_point,
-                    journal_terminal
-                        .as_ref()
-                        .expect("attempted repair has typed terminal"),
-                )
-                .await
-            }
-        }
-    };
-    if let Some(error) = complete_journal.await? {
+        failure_point,
+        &reconciliation_terminal,
+    )
+    .await?
+    {
         return Err(error);
     }
-    if let Some(terminal) = reconciliation_terminal {
-        let memory = reconciliation_memory_entry(terminal).map_err(|_| {
-            OperationJournalStoreError::Persistence(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "Guardian artifact repair memory terminal is invalid",
-            ))
-        })?;
-        commit_reconciliation_memory(
-            context.failure_memory,
-            memory,
+    let memory_receipt = context
+        .admission
+        .commit_terminal_memory(
+            reconciliation_terminal,
             context
                 .reservation
                 .as_ref()
                 .expect("attempted repair owns memory reservation"),
         )
-        .await
-        .map_err(|error| {
-            OperationJournalStoreError::Persistence(std::io::Error::other(format!(
-                "Guardian artifact repair memory commit failed: {}",
-                error.class()
-            )))
-        })?;
-    }
-    Ok(artifact_repair_outcome(
-        outcome_operation_id,
-        context.attempt.diagnosis_id(),
-        GuardianActionKind::Repair,
-        status,
-    ))
-}
-
-async fn recover_artifact_evidence(
-    context: &ArtifactRepairContext<'_>,
-    key: &crate::state::failure_memory::FailureMemoryKey,
-) -> Result<Option<GuardianArtifactRepairOutcome>, OperationJournalStoreError> {
-    let now = chrono::Utc::now();
-    let operation_id = context.attempt.operation_id();
-    let mut active_terminal_candidate = None;
-    for journal in context.journals.list() {
-        let Some(attempt) = journal.reconciliation_attempt() else {
-            continue;
-        };
-        if &reconciliation_attempt_key(attempt) != key
-            || attempt.diagnosis_id() != context.attempt.diagnosis_id()
-        {
-            continue;
-        }
-        if let Some(terminal) = journal.reconciliation_terminal().cloned() {
-            if &journal.operation_id == operation_id {
-                return reconcile_same_operation_artifact_terminal(context, terminal)
-                    .await
-                    .map(Some);
-            }
-            let active = DateTime::parse_from_rfc3339(terminal.suppression_until())
-                .is_ok_and(|until| until > now);
-            if active
-                && active_terminal_candidate.as_ref().is_none_or(
-                    |current: &ReconciliationTerminal| {
-                        current.observed_at() < terminal.observed_at()
-                    },
-                )
-            {
-                active_terminal_candidate = Some(terminal);
-            }
-        }
-    }
-    let Some(terminal) = active_terminal_candidate else {
-        return Ok(None);
-    };
-    reconcile_artifact_terminal_memory(context, terminal).await?;
-    finish_artifact_repair(context, operation_id.clone(), ArtifactTerminal::Blocked)
-        .await
-        .map(Some)
-}
-
-async fn reconcile_same_operation_artifact_terminal(
-    context: &ArtifactRepairContext<'_>,
-    terminal: ReconciliationTerminal,
-) -> Result<GuardianArtifactRepairOutcome, OperationJournalStoreError> {
-    reconcile_artifact_terminal_memory(context, terminal.clone()).await?;
-    let status = match terminal.outcome() {
-        ReconciliationTerminalOutcome::Succeeded => GuardianArtifactRepairStatus::Repaired,
-        ReconciliationTerminalOutcome::Failed => GuardianArtifactRepairStatus::Failed,
-    };
-    Ok(artifact_repair_outcome(
-        terminal.operation_id().clone(),
-        context.attempt.diagnosis_id(),
-        GuardianActionKind::Repair,
-        status,
-    ))
-}
-
-async fn reconcile_artifact_terminal_memory(
-    context: &ArtifactRepairContext<'_>,
-    terminal: ReconciliationTerminal,
-) -> Result<(), OperationJournalStoreError> {
-    let memory = reconciliation_memory_entry(terminal.clone()).map_err(|_| {
-        OperationJournalStoreError::Persistence(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "Guardian artifact repair journal terminal cannot reconcile memory",
-        ))
-    })?;
-    commit_reconciliation_memory(
-        context.failure_memory,
-        memory,
-        context
-            .reservation
-            .as_ref()
-            .expect("artifact replay owns memory reservation"),
-    )
-    .await
-    .map_err(|error| {
-        OperationJournalStoreError::Persistence(std::io::Error::other(format!(
-            "Guardian artifact repair memory reconciliation failed: {}",
-            error.class()
-        )))
-    })?;
-    Ok(())
+        .await?;
+    Ok(ArtifactRepairExecution {
+        outcome: artifact_repair_outcome(context.attempt.diagnosis_id(), status),
+        memory_receipt,
+    })
 }
 
 fn artifact_memory_error(error: impl std::fmt::Display) -> OperationJournalStoreError {
@@ -720,45 +638,6 @@ async fn create_planned_journal_reconciled(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn create_terminal_journal_reconciled(
-    journals: &OperationJournalStore,
-    operation_id: &OperationId,
-    context: &ArtifactRepairContext<'_>,
-    status: OperationStatus,
-    outcome: OperationOutcome,
-    step_result: OperationStepResult,
-    facts: Vec<String>,
-) -> Result<Option<OperationJournalStoreError>, OperationJournalStoreError> {
-    let expected =
-        terminal_artifact_journal(operation_id, context, status, outcome, step_result, facts);
-    loop {
-        match journals.create(expected.clone()).await {
-            Ok(()) => return Ok(None),
-            Err(OperationJournalStoreError::AlreadyExists)
-                if journals.get(operation_id).is_some_and(|entry| {
-                    operation_journal_terminal_is_visible(&entry, &expected)
-                }) =>
-            {
-                return Ok(None);
-            }
-            Err(error) => {
-                match reconcile_artifact_journal_error(journals, operation_id, error, |entry| {
-                    operation_journal_terminal_is_visible(entry, &expected)
-                })
-                .await?
-                {
-                    ArtifactJournalReconciliation::MutationCommitted => return Ok(None),
-                    ArtifactJournalReconciliation::AcceptedFailure(error) => {
-                        return Ok(Some(error));
-                    }
-                    ArtifactJournalReconciliation::RetryMutation => {}
-                }
-            }
-        }
-    }
-}
-
 async fn record_artifact_terminal_reconciled(
     journals: &OperationJournalStore,
     operation_id: &OperationId,
@@ -821,50 +700,6 @@ async fn record_artifact_terminal_reconciled(
             }
         }
     }
-}
-
-fn terminal_artifact_journal(
-    operation_id: &OperationId,
-    context: &ArtifactRepairContext<'_>,
-    status: OperationStatus,
-    outcome: OperationOutcome,
-    step_result: OperationStepResult,
-    facts: Vec<String>,
-) -> OperationJournalEntry {
-    let mut entry = OperationJournalEntry::new(
-        JournalId::new(format!("journal-{}", operation_id.as_str())),
-        operation_id.clone(),
-        CommandKind::RepairInstance,
-        StabilizationSystem::Guardian,
-        context.attempt.ownership(),
-        RollbackState::Available,
-    );
-    entry.status = status;
-    append_artifact_journal_targets(&mut entry, context);
-    entry.planned_steps = artifact_repair_steps(context)
-        .iter()
-        .map(|(step_id, rollback)| {
-            repair_step(
-                step_id,
-                OperationStepResult::Planned,
-                Some(context.attempt.target().clone()),
-                Vec::new(),
-                *rollback,
-            )
-        })
-        .collect();
-    entry.completed_steps.push(repair_step(
-        "guardian_artifact_repair_blocked",
-        step_result,
-        Some(context.attempt.target().clone()),
-        facts,
-        RollbackState::Available,
-    ));
-    entry
-        .guardian_diagnosis_ids
-        .push(context.attempt.diagnosis_id());
-    entry.outcome = Some(outcome);
-    entry
 }
 
 fn append_artifact_journal_targets(
@@ -993,15 +828,11 @@ fn fact_ids(facts: &[ExecutionFact]) -> Vec<String> {
 }
 
 fn artifact_repair_outcome(
-    operation_id: OperationId,
     diagnosis_id: DiagnosisId,
-    action: GuardianActionKind,
     status: GuardianArtifactRepairStatus,
-) -> GuardianArtifactRepairOutcome {
-    GuardianArtifactRepairOutcome {
-        operation_id,
+) -> GuardianArtifactRepairReceipt {
+    GuardianArtifactRepairReceipt {
         diagnosis_id,
-        action,
         status,
     }
 }
@@ -1009,4 +840,23 @@ fn artifact_repair_outcome(
 fn safe_id(value: &str, fallback: &str) -> String {
     sanitize_evidence_token(value, RedactionAudience::UserVisible, 96)
         .unwrap_or_else(|| fallback.to_string())
+}
+
+#[cfg(test)]
+mod move_only_contract_tests {
+    use super::{GuardianArtifactRepairFailure, GuardianArtifactRepairSettlement};
+
+    trait AmbiguousIfClone<Marker> {
+        fn assert_not_clone() {}
+    }
+
+    struct CloneMarker;
+
+    impl<T: ?Sized> AmbiguousIfClone<()> for T {}
+    impl<T: Clone> AmbiguousIfClone<CloneMarker> for T {}
+
+    const _: fn() = || {
+        let _ = <GuardianArtifactRepairFailure as AmbiguousIfClone<_>>::assert_not_clone;
+        let _ = <GuardianArtifactRepairSettlement as AmbiguousIfClone<_>>::assert_not_clone;
+    };
 }

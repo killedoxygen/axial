@@ -3400,16 +3400,19 @@ mod tests {
     use crate::application::timing::INTEGRITY_TIER0_CEILING_MS;
     use crate::guardian::{
         ActionPlanPrerequisite, DiagnosisId, GuardianAction, GuardianActionKind,
-        GuardianActionPlan, GuardianArtifactRepairStatus, GuardianConfidence, GuardianDecision,
-        GuardianMode, execute_registered_guardian_artifact_repair,
+        GuardianActionPlan, GuardianArtifactRepairSettlement, GuardianArtifactRepairStatus,
+        GuardianConfidence, GuardianDecision, GuardianMode,
+        execute_failed_managed_assets_component_rebuild_for_test,
+        execute_registered_guardian_artifact_repair,
     };
     use crate::state::contracts::{
         OperationId, ReconciliationComponent, ReconciliationRung, ReconciliationScope,
         ReconciliationTerminalOutcome, StabilizationSystem,
     };
     use crate::state::{
-        AppState, AppStateInit, IdleSweepSettlement, IdleSweepSettlementOwner, IdleSweepTerminal,
-        InstallStore, RegisteredArtifactFindings, RegisteredArtifactRepairAuthorizationRejection,
+        AppState, AppStateInit, IdleSweepReservation, IdleSweepSettlement,
+        IdleSweepSettlementOwner, IdleSweepTerminal, InstallStore, RegisteredArtifactFindings,
+        RegisteredArtifactRepairAdmission, RegisteredArtifactRepairAuthorizationRejection,
         RegisteredArtifactRepairEffect, SessionStore,
     };
     use axial_config::{AppConfig, AppPaths, ConfigStore, InstanceRegistrySnapshot, InstanceStore};
@@ -4184,6 +4187,73 @@ mod tests {
         state
             .seal_registered_artifact_findings(lease, vec![observation])
             .expect("sealed registered leaf finding")
+    }
+
+    async fn corrupt_assets_sweep_leaf_fixture(
+        label: &str,
+    ) -> (
+        AppState,
+        PathBuf,
+        IdleSweepReservation,
+        RegisteredArtifactRepairAdmission,
+    ) {
+        let (state, root) = state_fixture(label, None);
+        let instance = state
+            .instances()
+            .insert_for_test("Sweep corrupt Assets leaf", "1.21.5")
+            .expect("instance");
+        let expected = b"expected-sweep-asset";
+        let inventory = KnownGoodInventory::from_test_entries([entry(
+            TestKnownGoodRoot::Assets,
+            "indexes/sweep-corrupt.json",
+            KnownGoodArtifactKind::AssetIndex,
+            TestKnownGoodIntegrity::Sha1 {
+                digest: format!("{:x}", Sha1::digest(expected)),
+                size: expected.len() as u64,
+            },
+        )])
+        .expect("sweep Assets inventory")
+        .with_test_standalone_leaf_repair_source(0, "https://example.invalid/sweep-corrupt.json")
+        .expect("sweep Assets source");
+        state.activate_known_good_inventory_for_test(&instance.id, inventory);
+        let destination = root.join("private-library-root/assets/indexes/sweep-corrupt.json");
+        fs::create_dir_all(destination.parent().expect("sweep Assets parent"))
+            .expect("sweep Assets parent");
+        fs::write(destination, vec![b'x'; expected.len()]).expect("corrupt sweep Assets index");
+        let epoch = state.subscribe_integrity_idle().borrow().epoch();
+        let reservation = state
+            .try_reserve_idle_sweep(
+                epoch,
+                state.try_claim_producer().expect("claim sweep producer"),
+            )
+            .expect("sweep reservation");
+        let ticket = state
+            .mint_known_good_tier2_ticket(&reservation.authority(), &instance.id)
+            .await
+            .expect("Tier 2 ticket");
+        let findings = state
+            .seal_tier2_registered_artifact_request(Tier2RegisteredArtifactSealRequest::new(
+                ticket,
+                vec![RegisteredArtifactObservation::new(
+                    0,
+                    RegisteredArtifactCondition::Corrupt,
+                )],
+            ))
+            .await
+            .expect("sweep findings");
+        let target = findings.repair_target().expect("repair target").clone();
+        let authorization = findings
+            .authorize_repair(&registered_artifact_decision(target, GuardianMode::Managed))
+            .expect("repair authorization");
+        let admission = state
+            .admit_registered_artifact_repair(
+                authorization,
+                OperationId::new(format!("{label}-leaf")),
+                chrono::Duration::minutes(30),
+            )
+            .await
+            .expect("leaf admission");
+        (state, root, reservation, admission)
     }
 
     const ZERO_SHA1: &str = "0000000000000000000000000000000000000000";
@@ -6021,81 +6091,115 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn admitted_sweep_leaf_can_finish_after_cancellation_but_not_after_settlement() {
-        let (state, root) = state_fixture("sweep-leaf-live-authority", None);
-        let instance = state
-            .instances()
-            .insert_for_test("Sweep leaf live authority", "1.21.5")
-            .expect("instance");
-        let inventory = KnownGoodInventory::from_test_entries([entry(
-            TestKnownGoodRoot::Assets,
-            "indexes/live-authority.json",
-            KnownGoodArtifactKind::AssetIndex,
-            TestKnownGoodIntegrity::Sha1 {
-                digest: ZERO_SHA1.to_string(),
-                size: 1,
-            },
-        )])
-        .expect("Assets inventory")
-        .with_test_standalone_leaf_repair_source(
-            0,
-            "https://example.invalid/indexes/live-authority.json",
-        )
-        .expect("Assets source");
-        state.activate_known_good_inventory_for_test(&instance.id, inventory);
-        fs::create_dir_all(root.join("private-library-root/assets/indexes"))
-            .expect("Assets parent");
-        let epoch = state.subscribe_integrity_idle().borrow().epoch();
-        let reservation = state
-            .try_reserve_idle_sweep(
-                epoch,
-                state.try_claim_producer().expect("claim sweep producer"),
-            )
-            .expect("sweep reservation");
+    async fn cancelled_sweep_leaf_settles_failure_but_cannot_admit_component() {
+        let (state, root, reservation, admission) =
+            corrupt_assets_sweep_leaf_fixture("sweep-leaf-cancelled").await;
         let cancellation = reservation.cancellation();
-        let ticket = state
-            .mint_known_good_tier2_ticket(&reservation.authority(), &instance.id)
-            .await
-            .expect("ticket");
-        let findings = state
-            .seal_tier2_registered_artifact_request(Tier2RegisteredArtifactSealRequest::new(
-                ticket,
-                vec![RegisteredArtifactObservation::new(
-                    0,
-                    RegisteredArtifactCondition::Missing,
-                )],
-            ))
-            .await
-            .expect("sweep findings");
-        let target = findings.repair_target().expect("repair target").clone();
-        let authorization = findings
-            .authorize_repair(&registered_artifact_decision(target, GuardianMode::Managed))
-            .expect("repair authorization");
-        let admission = state
-            .admit_registered_artifact_repair(
-                authorization,
-                OperationId::new("sweep-leaf-live-authority"),
+        cancellation.cancel();
+        assert!(admission.evidence_is_live());
+        let failure =
+            match execute_registered_guardian_artifact_repair(admission, &reqwest::Client::new())
+                .await
+                .expect("cancelled admitted leaf settles")
+            {
+                GuardianArtifactRepairSettlement::Failed(failure) => failure,
+                GuardianArtifactRepairSettlement::Completed(_) => {
+                    panic!("corrupt Assets leaf must fail to the component rung")
+                }
+            };
+        assert_eq!(
+            failure.outcome().status(),
+            GuardianArtifactRepairStatus::Failed
+        );
+        assert!(matches!(
+            state
+                .admit_registered_artifact_component_rebuild(
+                    failure.into_continuation(),
+                    OperationId::new("sweep-leaf-cancelled-component"),
+                    chrono::Duration::minutes(30),
+                )
+                .await,
+            Err(crate::state::ReconciliationEvidenceRejection::IncarnationMismatch)
+        ));
+        reservation.settle(IdleSweepTerminal::Cancelled);
+
+        close_fixture(state, root).await;
+    }
+
+    #[tokio::test]
+    async fn cancelled_sweep_component_finishes_after_admission() {
+        let (state, root, reservation, admission) =
+            corrupt_assets_sweep_leaf_fixture("sweep-component-cancelled").await;
+        let failure =
+            match execute_registered_guardian_artifact_repair(admission, &reqwest::Client::new())
+                .await
+                .expect("Assets leaf settles")
+            {
+                GuardianArtifactRepairSettlement::Failed(failure) => failure,
+                GuardianArtifactRepairSettlement::Completed(_) => {
+                    panic!("corrupt Assets leaf must fail to the component rung")
+                }
+            };
+        let component = state
+            .admit_registered_artifact_component_rebuild(
+                failure.into_continuation(),
+                OperationId::new("sweep-component-cancelled-rebuild"),
                 chrono::Duration::minutes(30),
             )
             .await
-            .expect("leaf admission");
-        let attempt = admission.attempt().clone();
+            .expect("component admitted while sweep is current");
 
-        cancellation.cancel();
-        assert!(admission.evidence_is_live());
-        assert!(
-            admission
-                .terminal(attempt.clone(), ReconciliationTerminalOutcome::Failed, None,)
-                .is_ok()
+        reservation.cancellation().cancel();
+        assert!(component.assets_effect().is_ok());
+        let outcome = execute_failed_managed_assets_component_rebuild_for_test(component)
+            .await
+            .expect("admitted component settles while sweep remains active");
+        assert_eq!(
+            outcome.status,
+            crate::guardian::GuardianComponentRebuildStatus::Failed
         );
         reservation.settle(IdleSweepTerminal::Cancelled);
-        assert!(!admission.evidence_is_live());
-        assert!(matches!(
-            admission.terminal(attempt, ReconciliationTerminalOutcome::Failed, None),
-            Err(crate::state::ReconciliationEvidenceRejection::IncarnationMismatch)
-        ));
 
-        drop(admission);
+        close_fixture(state, root).await;
+    }
+
+    #[tokio::test]
+    async fn settled_sweep_revokes_an_admitted_component_before_effect() {
+        let (state, root, reservation, admission) =
+            corrupt_assets_sweep_leaf_fixture("sweep-component-settled").await;
+        let failure =
+            match execute_registered_guardian_artifact_repair(admission, &reqwest::Client::new())
+                .await
+                .expect("Assets leaf settles")
+            {
+                GuardianArtifactRepairSettlement::Failed(failure) => failure,
+                GuardianArtifactRepairSettlement::Completed(_) => {
+                    panic!("corrupt Assets leaf must fail to the component rung")
+                }
+            };
+        let component = state
+            .admit_registered_artifact_component_rebuild(
+                failure.into_continuation(),
+                OperationId::new("sweep-component-settled-rebuild"),
+                chrono::Duration::minutes(30),
+            )
+            .await
+            .expect("component admitted while sweep is current");
+
+        reservation.cancellation().cancel();
+        assert!(component.assets_effect().is_ok());
+        assert!(component.failed_terminal().is_ok());
+        reservation.settle(IdleSweepTerminal::Cancelled);
+        assert_eq!(
+            component.assets_effect().err(),
+            Some(crate::state::ReconciliationEvidenceRejection::IncarnationMismatch)
+        );
+        assert_eq!(
+            component.failed_terminal().err(),
+            Some(crate::state::ReconciliationEvidenceRejection::IncarnationMismatch)
+        );
+
+        drop(component);
         close_fixture(state, root).await;
     }
 
@@ -6157,12 +6261,21 @@ mod tests {
             admission.effect(),
             RegisteredArtifactRepairEffect::ComponentRebuildRequired
         );
-        let outcome =
+        let settlement =
             execute_registered_guardian_artifact_repair(admission, &reqwest::Client::new())
                 .await
                 .expect("corrupt Assets leaf settlement");
+        let failure = match settlement {
+            GuardianArtifactRepairSettlement::Failed(failure) => failure,
+            GuardianArtifactRepairSettlement::Completed(_) => {
+                panic!("corrupt Assets leaf must require component rebuild")
+            }
+        };
 
-        assert_eq!(outcome.status, GuardianArtifactRepairStatus::Failed);
+        assert_eq!(
+            failure.outcome().status(),
+            GuardianArtifactRepairStatus::Failed
+        );
         assert_eq!(
             fs::read(&destination).expect("unchanged Assets index"),
             corrupt
@@ -6206,12 +6319,9 @@ mod tests {
                 ))
                 .is_some()
         );
-        let evidence = state
-            .recorded_artifact_repair_failure(&lifecycle, &operation_id)
-            .expect("settled Assets predecessor");
         let component = state
-            .admit_component_rebuild(
-                evidence,
+            .admit_registered_artifact_component_rebuild(
+                failure.into_continuation(),
                 OperationId::new("corrupt-asset-component-rebuild"),
                 chrono::Duration::minutes(15),
             )
@@ -6282,12 +6392,15 @@ mod tests {
             )
             .await
             .expect("missing Assets admission");
-        let outcome =
+        let settlement =
             execute_registered_guardian_artifact_repair(admission, &reqwest::Client::new())
                 .await
                 .expect("missing Assets repair");
 
-        assert_eq!(outcome.status, GuardianArtifactRepairStatus::Repaired);
+        assert_eq!(
+            settlement.outcome().status(),
+            GuardianArtifactRepairStatus::Repaired
+        );
         assert_eq!(fs::read(destination).expect("repaired Assets index"), body);
         let terminal = state
             .journals()
@@ -6362,12 +6475,15 @@ mod tests {
                 )
                 .await
                 .expect("repair admission");
-            let outcome =
+            let settlement =
                 execute_registered_guardian_artifact_repair(admission, &reqwest::Client::new())
                     .await
                     .expect("registered artifact repair");
 
-            assert_eq!(outcome.status, GuardianArtifactRepairStatus::Repaired);
+            assert_eq!(
+                settlement.outcome().status(),
+                GuardianArtifactRepairStatus::Repaired
+            );
             assert_eq!(fs::read(&destination).expect("repaired artifact"), body);
             let journal = state.journals().get(&operation_id).expect("repair journal");
             let terminal = journal.reconciliation_terminal().expect("typed terminal");
@@ -6467,12 +6583,15 @@ mod tests {
             .expect("repair admission");
 
         fs::write(&destination, &body).expect("shared repair completed while waiting");
-        let outcome =
+        let settlement =
             execute_registered_guardian_artifact_repair(admission, &reqwest::Client::new())
                 .await
                 .expect("already repaired outcome");
 
-        assert_eq!(outcome.status, GuardianArtifactRepairStatus::Repaired);
+        assert_eq!(
+            settlement.outcome().status(),
+            GuardianArtifactRepairStatus::Repaired
+        );
         let journal = state.journals().get(&operation_id).expect("repair journal");
         assert_eq!(
             journal
@@ -6608,12 +6727,15 @@ mod tests {
             )
             .await
             .expect("repair admission");
-        let outcome =
+        let settlement =
             execute_registered_guardian_artifact_repair(admission, &reqwest::Client::new())
                 .await
                 .expect("failed repair outcome");
 
-        assert_eq!(outcome.status, GuardianArtifactRepairStatus::Failed);
+        assert_eq!(
+            settlement.outcome().status(),
+            GuardianArtifactRepairStatus::Failed
+        );
         let terminal = state
             .journals()
             .get(&operation_id)
@@ -6632,6 +6754,13 @@ mod tests {
                 ))
                 .is_some()
         );
+
+        match settlement {
+            GuardianArtifactRepairSettlement::Failed(failure) => drop(failure),
+            GuardianArtifactRepairSettlement::Completed(_) => {
+                panic!("hash failure must return a typed failed settlement")
+            }
+        }
 
         drop(lifecycle);
         drop(foreground);

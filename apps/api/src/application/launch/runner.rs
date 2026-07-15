@@ -13,17 +13,17 @@ use crate::execution::launch::{
     LaunchCommandPreparationRequest, launch_command_stage_evidence, prepare_launch_command,
 };
 use crate::guardian::{
-    DiagnosisId, GuardianActionKind, GuardianArtifactRepairStatus, GuardianComponentRebuildStatus,
-    GuardianCopyRequest, GuardianFact, GuardianLaunchRecoveryPlan,
-    GuardianObservedLaunchFailurePhase, GuardianPrepareFailureRequest,
-    GuardianPresetAdjustmentRequest, GuardianStartupFailureObservation,
-    GuardianStartupFailureRequest, GuardianSummary, author_guardian_copy,
-    execute_managed_libraries_component_rebuild, execute_registered_guardian_artifact_repair,
-    guardian_fact_from_execution, guardian_prelaunch_preset_adjustment_directive,
-    guardian_prepare_failure_outcome, guardian_startup_failure_outcome,
-    guardian_summary_with_artifact_repair_outcome, guardian_summary_with_blocked_outcome,
-    guardian_summary_with_observed_outcome, is_guardian_launch_crash_class,
-    record_launch_failure_observation,
+    DiagnosisId, GuardianActionKind, GuardianArtifactRepairSettlement,
+    GuardianArtifactRepairStatus, GuardianComponentRebuildStatus, GuardianCopyRequest,
+    GuardianFact, GuardianLaunchRecoveryPlan, GuardianObservedLaunchFailurePhase,
+    GuardianPrepareFailureRequest, GuardianPresetAdjustmentRequest,
+    GuardianStartupFailureObservation, GuardianStartupFailureRequest, GuardianSummary,
+    author_guardian_copy, execute_managed_libraries_component_rebuild,
+    execute_registered_guardian_artifact_repair, guardian_fact_from_execution,
+    guardian_prelaunch_preset_adjustment_directive, guardian_prepare_failure_outcome,
+    guardian_startup_failure_outcome, guardian_summary_with_artifact_repair_outcome,
+    guardian_summary_with_blocked_outcome, guardian_summary_with_observed_outcome,
+    is_guardian_launch_crash_class, record_launch_failure_observation,
 };
 use crate::logging::{append_trace, timestamp_utc};
 use crate::observability::telemetry::{
@@ -34,8 +34,8 @@ use crate::state::contracts::OperationId;
 use crate::state::launch_reports::LaunchProofContext;
 use crate::state::{
     AppState, LaunchEvent, LaunchFailureTermination, LaunchFailureTerminationErrorClass,
-    LaunchStatusEvent, OperationJournalStoreError, RegisteredArtifactFindings,
-    RegisteredArtifactRepairAdmission, StartupOutcome,
+    LaunchStatusEvent, OperationJournalStoreError, RegisteredArtifactFailedRepair,
+    RegisteredArtifactFindings, RegisteredArtifactRepairAdmission, StartupOutcome,
 };
 use axial_launcher::{
     LaunchFailureClass, LaunchSessionExitReason, LaunchSessionOutcome, LaunchSessionOutcomeKind,
@@ -1382,14 +1382,12 @@ async fn launch_session_inner_with_control(
                             "registered artifact recovery must retain foreground authority",
                         );
                         let recovery_state = state.clone();
-                        let recovery_operation_id = operation_id.clone();
                         let recovery_instance_id = intent.instance_id.clone();
                         let repair_task = producer.claim_child().spawn_joinable(async move {
                             let client = reqwest::Client::new();
                             let outcome = execute_registered_artifact_recovery_sequence(
                                 &recovery_state,
                                 admission,
-                                &recovery_operation_id,
                                 &client,
                                 &retained_foreground,
                                 &recovery_instance_id,
@@ -1443,33 +1441,9 @@ async fn launch_session_inner_with_control(
                                 .await);
                             }
                         };
-                        let repair_outcome = &recovery_outcome.leaf;
-                        if repair_outcome.action != GuardianActionKind::Repair
-                            || repair_outcome.diagnosis_id
-                                != DiagnosisId::LauncherManagedArtifactCorrupt
-                            || repair_outcome.operation_id != operation_id
-                        {
-                            trace_launch_event(
-                                &session_id,
-                                "registered artifact repair returned an invalid outcome",
-                            );
-                            return Err(finish_registered_artifact_repair_failure(
-                                &state,
-                                producer,
-                                &session_id,
-                                &mut launch_completion_pending,
-                                &proof_context,
-                                failure_class,
-                                healing,
-                                guardian,
-                                DiagnosisId::LauncherManagedArtifactCorrupt,
-                                GuardianArtifactRepairStatus::Failed,
-                            )
-                            .await);
-                        }
                         let repair_user_outcome =
                             author_guardian_copy(GuardianCopyRequest::artifact_repair(
-                                repair_outcome.diagnosis_id,
+                                recovery_outcome.diagnosis_id,
                                 recovery_outcome.effective_status,
                             ))
                             .expect("registered artifact repair copy request is closed");
@@ -1703,7 +1677,7 @@ enum LibrariesComponentRebuildSource {
 }
 
 struct RegisteredArtifactRecoverySequenceOutcome {
-    leaf: crate::guardian::GuardianArtifactRepairOutcome,
+    diagnosis_id: DiagnosisId,
     effective_status: GuardianArtifactRepairStatus,
 }
 
@@ -1711,65 +1685,44 @@ struct RegisteredArtifactRecoverySequenceOutcome {
 async fn execute_registered_artifact_recovery_sequence(
     state: &AppState,
     admission: RegisteredArtifactRepairAdmission,
-    expected_operation_id: &OperationId,
     client: &reqwest::Client,
     foreground: &crate::state::IntegrityForegroundLease,
     instance_id: &str,
     rebuild_source: LibrariesComponentRebuildSource,
 ) -> Result<RegisteredArtifactRecoverySequenceOutcome, OperationJournalStoreError> {
-    let outcome = execute_registered_guardian_artifact_repair(admission, client).await?;
-    if outcome.action != GuardianActionKind::Repair
-        || outcome.diagnosis_id != DiagnosisId::LauncherManagedArtifactCorrupt
-        || &outcome.operation_id != expected_operation_id
-    {
-        return Err(registered_artifact_recovery_error(
-            "registered artifact repair returned a foreign terminal outcome",
-        ));
+    match execute_registered_guardian_artifact_repair(admission, client).await? {
+        GuardianArtifactRepairSettlement::Completed(outcome) => {
+            Ok(RegisteredArtifactRecoverySequenceOutcome {
+                diagnosis_id: outcome.diagnosis_id(),
+                effective_status: outcome.status(),
+            })
+        }
+        GuardianArtifactRepairSettlement::Failed(failure) => {
+            let diagnosis_id = failure.outcome().diagnosis_id();
+            execute_failed_registered_artifact_recovery(
+                state,
+                diagnosis_id,
+                failure.into_continuation(),
+                foreground,
+                instance_id,
+                rebuild_source,
+            )
+            .await
+        }
     }
-    if outcome.status != GuardianArtifactRepairStatus::Failed {
-        let effective_status = outcome.status;
-        return Ok(RegisteredArtifactRecoverySequenceOutcome {
-            leaf: outcome,
-            effective_status,
-        });
-    }
-
-    execute_failed_registered_artifact_recovery(
-        state,
-        outcome,
-        foreground,
-        instance_id,
-        rebuild_source,
-    )
-    .await
 }
 
 async fn execute_failed_registered_artifact_recovery(
     state: &AppState,
-    outcome: crate::guardian::GuardianArtifactRepairOutcome,
+    diagnosis_id: DiagnosisId,
+    continuation: RegisteredArtifactFailedRepair,
     foreground: &crate::state::IntegrityForegroundLease,
     instance_id: &str,
     rebuild_source: LibrariesComponentRebuildSource,
 ) -> Result<RegisteredArtifactRecoverySequenceOutcome, OperationJournalStoreError> {
-    let lifecycle = state
-        .acquire_integrity_instance_lifecycle(foreground, instance_id)
-        .await
-        .map_err(|_| {
-            registered_artifact_recovery_error(
-                "Libraries rebuild could not reacquire the failed leaf lifecycle",
-            )
-        })?;
-    let evidence = state
-        .recorded_artifact_repair_failure(&lifecycle, &outcome.operation_id)
-        .map_err(|_| {
-            registered_artifact_recovery_error(
-                "Libraries rebuild could not bind the exact failed leaf terminal",
-            )
-        })?;
-    drop(lifecycle);
     let component_admission = state
-        .admit_component_rebuild(
-            evidence,
+        .admit_registered_artifact_component_rebuild(
+            continuation,
             new_libraries_component_rebuild_operation_id(),
             chrono::Duration::minutes(REGISTERED_ARTIFACT_REPAIR_SUPPRESSION_MINUTES),
         )
@@ -1809,7 +1762,7 @@ async fn execute_failed_registered_artifact_recovery(
     .await?;
     if rebuild.status != GuardianComponentRebuildStatus::Rebuilt {
         return Ok(RegisteredArtifactRecoverySequenceOutcome {
-            leaf: outcome,
+            diagnosis_id,
             effective_status: GuardianArtifactRepairStatus::Failed,
         });
     }
@@ -1828,7 +1781,7 @@ async fn execute_failed_registered_artifact_recovery(
             registered_artifact_recovery_error("Libraries rebuild Tier1 postcheck was unavailable")
         })?;
     Ok(RegisteredArtifactRecoverySequenceOutcome {
-        leaf: outcome,
+        diagnosis_id,
         effective_status: if postcheck.facts.is_empty() {
             GuardianArtifactRepairStatus::Repaired
         } else {
@@ -2222,7 +2175,6 @@ mod tests {
         let recovery = execute_registered_artifact_recovery_sequence(
             &state,
             admission,
-            &operation_id,
             &reqwest::Client::new(),
             &foreground,
             instance_id,
@@ -2231,8 +2183,10 @@ mod tests {
         .await
         .expect("settle registered Libraries component recovery");
 
-        assert_eq!(recovery.leaf.operation_id, operation_id);
-        assert_eq!(recovery.leaf.status, GuardianArtifactRepairStatus::Failed);
+        assert_eq!(
+            recovery.diagnosis_id,
+            DiagnosisId::LauncherManagedArtifactCorrupt
+        );
         assert_eq!(
             recovery.effective_status,
             GuardianArtifactRepairStatus::Repaired

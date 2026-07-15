@@ -1,10 +1,12 @@
 use super::contracts::{
     OperationId, OwnershipClass, ReconciliationAttempt, ReconciliationComponent,
-    StabilizationSystem, TargetDescriptor, TargetKind,
+    ReconciliationTerminal, ReconciliationTerminalOutcome, StabilizationSystem, TargetDescriptor,
+    TargetKind,
 };
 use super::{
     AppState, KnownGoodVerificationLease, KnownGoodVerificationUnavailable,
-    ReconciliationEvidenceRejection, RegisteredReconciliationAuthority,
+    OperationJournalStoreError, ReconciliationAttemptReservation, ReconciliationEvidenceRejection,
+    RegisteredReconciliationAuthority, commit_reconciliation_memory, reconciliation_memory_entry,
 };
 use crate::execution::registered_artifact::{
     RegisteredArtifactMutationCapability, RegisteredArtifactPhysicalState,
@@ -159,6 +161,11 @@ pub(crate) struct RegisteredArtifactRepairAdmission {
     expected_size: u64,
     _component_mutation: super::sessions::SharedComponentMutationLease,
     _config_mutation: tokio::sync::OwnedMutexGuard<()>,
+}
+
+#[must_use]
+pub(crate) struct RegisteredArtifactRepairMemoryReceipt {
+    terminal: ReconciliationTerminal,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -365,6 +372,63 @@ impl RegisteredArtifactRepairAdmission {
         self.authority
             .artifact_terminal(attempt, outcome, quarantined_target)
     }
+
+    pub(crate) async fn commit_terminal_memory(
+        &self,
+        terminal: ReconciliationTerminal,
+        reservation: &ReconciliationAttemptReservation,
+    ) -> Result<RegisteredArtifactRepairMemoryReceipt, OperationJournalStoreError> {
+        if terminal.attempt() != &self.attempt
+            || self
+                .authority
+                .journals()
+                .get(terminal.operation_id())
+                .and_then(|journal| journal.reconciliation_terminal().cloned())
+                .as_ref()
+                != Some(&terminal)
+        {
+            return Err(invalid_registered_artifact_memory_terminal());
+        }
+        let memory = reconciliation_memory_entry(terminal.clone())
+            .map_err(|_| invalid_registered_artifact_memory_terminal())?;
+        commit_reconciliation_memory(self.authority.failure_memory(), memory.clone(), reservation)
+            .await
+            .map_err(|error| {
+                OperationJournalStoreError::Persistence(std::io::Error::other(format!(
+                    "Guardian artifact repair memory commit failed: {}",
+                    error.class()
+                )))
+            })?;
+        if self.authority.failure_memory().get(&memory.key).as_ref() != Some(&memory) {
+            return Err(invalid_registered_artifact_memory_terminal());
+        }
+        Ok(RegisteredArtifactRepairMemoryReceipt { terminal })
+    }
+
+    pub(crate) fn into_failed_continuation(
+        self,
+        receipt: RegisteredArtifactRepairMemoryReceipt,
+    ) -> Result<super::RegisteredArtifactFailedRepair, ReconciliationEvidenceRejection> {
+        if !receipt.matches_failed_attempt(&self.attempt) {
+            return Err(ReconciliationEvidenceRejection::JournalMismatch);
+        }
+        self.authority
+            .into_registered_artifact_failed_repair(&self.attempt)
+    }
+}
+
+impl RegisteredArtifactRepairMemoryReceipt {
+    fn matches_failed_attempt(&self, attempt: &ReconciliationAttempt) -> bool {
+        self.terminal.attempt() == attempt
+            && self.terminal.outcome() == ReconciliationTerminalOutcome::Failed
+    }
+}
+
+fn invalid_registered_artifact_memory_terminal() -> OperationJournalStoreError {
+    OperationJournalStoreError::Persistence(std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        "Guardian registered artifact memory terminal is not the exact admitted journal terminal",
+    ))
 }
 
 impl KnownGoodVerificationLease {

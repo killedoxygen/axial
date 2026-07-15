@@ -157,7 +157,7 @@ async fn maybe_repair_managed_runtime_before_launch_with_source(
         Ok(evidence) => {
             let diagnosis_id = Some(evidence.diagnosis_id());
             let admission = state
-                .admit_component_rebuild(
+                .admit_runtime_component_rebuild(
                     evidence,
                     new_runtime_component_rebuild_operation_id(),
                     chrono::Duration::minutes(RUNTIME_COMPONENT_REBUILD_SUPPRESSION_MINUTES),
@@ -314,7 +314,10 @@ async fn maybe_repair_managed_runtime_before_launch_with_source(
     let diagnosis_id = outcome.diagnosis_id;
     let component_evidence = match outcome.status {
         GuardianRepairStatus::Failed => state
-            .recorded_artifact_repair_failure(launch.instance_lifecycle, &outcome.operation_id)
+            .recorded_runtime_artifact_repair_failure(
+                launch.instance_lifecycle,
+                &outcome.operation_id,
+            )
             .ok(),
         GuardianRepairStatus::Blocked => state
             .active_recorded_runtime_artifact_failure(launch.instance_lifecycle)
@@ -324,7 +327,7 @@ async fn maybe_repair_managed_runtime_before_launch_with_source(
     let (effective_status, repair_foreground) = match component_evidence {
         Some(evidence) => {
             let admission = state
-                .admit_component_rebuild(
+                .admit_runtime_component_rebuild(
                     evidence,
                     new_runtime_component_rebuild_operation_id(),
                     chrono::Duration::minutes(RUNTIME_COMPONENT_REBUILD_SUPPRESSION_MINUTES),

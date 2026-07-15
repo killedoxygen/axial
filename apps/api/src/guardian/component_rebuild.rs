@@ -603,6 +603,16 @@ where
     }
 }
 
+#[cfg(test)]
+pub(crate) async fn execute_failed_managed_assets_component_rebuild_for_test(
+    admission: RegisteredComponentRebuildAdmission,
+) -> Result<GuardianComponentRebuildOutcome, OperationJournalStoreError> {
+    execute_managed_assets_component_rebuild_with_driver(admission, |effect| async move {
+        effect.failed_before_effect(["assets_component_fixture_failure".to_string()])
+    })
+    .await
+}
+
 enum ComponentRebuildTerminal {
     Succeeded {
         receipt: ManagedRuntimeCommitReceipt,
@@ -1770,7 +1780,6 @@ mod tests {
 
     async fn component_admission(
         fixture: &Fixture,
-        mode: GuardianMode,
         operation_suffix: &str,
     ) -> (RegisteredComponentRebuildAdmission, OperationId) {
         let lifecycle = fixture.state.acquire_instance_lifecycle(INSTANCE_ID).await;
@@ -1786,7 +1795,7 @@ mod tests {
                 GuardianDomain::Runtime,
                 ReconciliationComponent::Runtime,
                 runtime_target(),
-                mode,
+                GuardianMode::Managed,
                 chrono::Duration::minutes(30),
             )
             .expect("runtime artifact attempt");
@@ -1824,12 +1833,16 @@ mod tests {
 
         let evidence = fixture
             .state
-            .recorded_artifact_repair_failure(&lifecycle, &artifact_operation)
+            .recorded_runtime_artifact_repair_failure(&lifecycle, &artifact_operation)
             .expect("exact artifact failure proof");
         let rebuild_operation = OperationId::new(format!("component-{operation_suffix}"));
         let admission = fixture
             .state
-            .admit_component_rebuild(evidence, rebuild_operation, chrono::Duration::minutes(30))
+            .admit_runtime_component_rebuild(
+                evidence,
+                rebuild_operation,
+                chrono::Duration::minutes(30),
+            )
             .await
             .expect("component rebuild admission");
         drop(lifecycle);
@@ -1842,6 +1855,16 @@ mod tests {
     ) -> RegisteredComponentRebuildAdmission {
         let target = activate_assets_fixture_inventory(fixture);
         let lifecycle = fixture.state.acquire_instance_lifecycle(INSTANCE_ID).await;
+        let foreground = fixture
+            .state
+            .register_integrity_foreground()
+            .expect("register Assets predecessor foreground")
+            .wait_for_settlement()
+            .await;
+        let verification = fixture
+            .state
+            .mint_current_known_good_verification_lease(&foreground, &lifecycle)
+            .expect("mint Assets predecessor verification");
         let authority = fixture
             .state
             .registered_reconciliation_authority(&lifecycle)
@@ -1890,20 +1913,20 @@ mod tests {
         .expect("Assets artifact failure memory commit");
         drop((reservation, authority));
 
-        let evidence = fixture
+        let continuation = fixture
             .state
-            .recorded_artifact_repair_failure(&lifecycle, &artifact_operation)
-            .expect("closed persisted Assets component predecessor proof");
+            .recorded_verified_registered_artifact_failure_for_test(verification, &attempt)
+            .expect("closed verified Assets component predecessor proof");
         let admission = fixture
             .state
-            .admit_component_rebuild(
-                evidence,
+            .admit_registered_artifact_component_rebuild(
+                continuation,
                 OperationId::new(format!("asset-component-{operation_suffix}")),
                 chrono::Duration::minutes(30),
             )
             .await
             .expect("Assets component rebuild admission");
-        drop(lifecycle);
+        drop((foreground, lifecycle));
         admission
     }
 
@@ -1915,11 +1938,11 @@ mod tests {
         let lifecycle = fixture.state.acquire_instance_lifecycle(INSTANCE_ID).await;
         let evidence = fixture
             .state
-            .recorded_artifact_repair_failure(&lifecycle, artifact_operation)
+            .recorded_runtime_artifact_repair_failure(&lifecycle, artifact_operation)
             .expect("artifact failure remains exact");
         let refused = fixture
             .state
-            .admit_component_rebuild(
+            .admit_runtime_component_rebuild(
                 evidence,
                 OperationId::new(format!("component-{operation_suffix}")),
                 chrono::Duration::minutes(30),
@@ -1936,8 +1959,7 @@ mod tests {
         operation_suffix: &str,
         terminal_visible_while_retrying: bool,
     ) {
-        let (admission, _) =
-            component_admission(fixture, GuardianMode::Managed, operation_suffix).await;
+        let (admission, _) = component_admission(fixture, operation_suffix).await;
         let operation_id = admission.attempt().operation_id().clone();
         let memory_key = reconciliation_attempt_key(admission.attempt());
         let runtime_cache = fixture.state.managed_runtime_cache().clone();
@@ -2307,8 +2329,7 @@ mod tests {
     #[tokio::test]
     async fn managed_runtime_failure_is_planned_before_effect_and_settled_immediately() {
         let fixture = fixture("managed-failure");
-        let (admission, _) =
-            component_admission(&fixture, GuardianMode::Managed, "managed-failure").await;
+        let (admission, _) = component_admission(&fixture, "managed-failure").await;
         let component_operation = admission.attempt().operation_id().clone();
         let component_key = reconciliation_attempt_key(admission.attempt());
         let journals = fixture.journals.clone();
@@ -2373,33 +2394,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn custom_admission_never_receives_an_effect_capability() {
-        let fixture = fixture("custom-refusal");
-        let (admission, _) =
-            component_admission(&fixture, GuardianMode::Custom, "custom-refusal").await;
-        let operation_id = admission.attempt().operation_id().clone();
-        let effect_called = Arc::new(AtomicBool::new(false));
-        let effect_called_in_closure = effect_called.clone();
-
-        let error = execute_managed_runtime_component_rebuild(admission, move |effect| {
-            effect_called_in_closure.store(true, Ordering::Release);
-            async move { effect.failed_before_effect(Vec::new()) }
-        })
-        .await
-        .expect_err("Custom mode must refuse managed component execution");
-
-        assert!(!effect_called.load(Ordering::Acquire));
-        assert!(fixture.journals.get(&operation_id).is_none());
-        assert!(matches!(
-            error,
-            crate::state::OperationJournalStoreError::Persistence(ref error)
-                if error.kind() == std::io::ErrorKind::PermissionDenied
-        ));
-
-        cleanup(fixture).await;
-    }
-
-    #[tokio::test]
     async fn disabled_mode_cannot_mint_the_lower_attempt_needed_for_effect_admission() {
         let fixture = fixture("disabled-refusal");
         let lifecycle = fixture.state.acquire_instance_lifecycle(INSTANCE_ID).await;
@@ -2430,8 +2424,7 @@ mod tests {
     #[tokio::test]
     async fn ambiguous_planned_replay_refuses_effect_ownership() {
         let fixture = fixture("ambiguous-replay");
-        let (admission, _) =
-            component_admission(&fixture, GuardianMode::Managed, "ambiguous-replay").await;
+        let (admission, _) = component_admission(&fixture, "ambiguous-replay").await;
         let operation_id = admission.attempt().operation_id().clone();
         fixture
             .journals
@@ -2469,8 +2462,7 @@ mod tests {
     #[tokio::test]
     async fn failed_component_attempt_refuses_readmission_in_the_window() {
         let fixture = fixture("window-gate");
-        let (admission, artifact_operation) =
-            component_admission(&fixture, GuardianMode::Managed, "window-first").await;
+        let (admission, artifact_operation) = component_admission(&fixture, "window-first").await;
         execute_managed_runtime_component_rebuild(admission, |effect| async move {
             effect.failed_before_effect(vec!["runtime_stage_failed".to_string()])
         })

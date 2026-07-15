@@ -50,8 +50,10 @@ mod tests;
 
 pub use artifact_repair::GuardianArtifactRepairStatus;
 pub(crate) use artifact_repair::{
-    GuardianArtifactRepairOutcome, execute_registered_guardian_artifact_repair,
+    GuardianArtifactRepairSettlement, execute_registered_guardian_artifact_repair,
 };
+#[cfg(test)]
+pub(crate) use component_rebuild::execute_failed_managed_assets_component_rebuild_for_test;
 pub(crate) use component_rebuild::{
     GuardianComponentRebuildOutcome, GuardianComponentRebuildStatus,
     execute_managed_assets_component_rebuild, execute_managed_libraries_component_rebuild,
