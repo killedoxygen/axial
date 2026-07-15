@@ -61,12 +61,12 @@ fn desktop_chrome_mode() -> &'static str {
     "mac-overlay"
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 fn desktop_chrome_mode() -> &'static str {
     "custom-frameless"
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 fn desktop_chrome_mode() -> &'static str {
     "native-decorated"
 }
