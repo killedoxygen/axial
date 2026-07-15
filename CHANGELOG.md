@@ -11,6 +11,7 @@ bullets. `## [Unreleased]` collects work that has not shipped yet.
 ### Updates
 - Update controls moved into the topbar with a streamlined download-and-restart flow
 - Clearer queued-restart state while a game or download is still running
+- Raw executables published alongside the archived in-app update packages
 
 ### Interface
 - Unified instance card banners

@@ -131,16 +131,20 @@ jobs:
           mkdir -p dist/linux
           cp target/release/axial-desktop dist/linux/axial
           chmod +x dist/linux/axial
+          cp dist/linux/axial "dist/axial-linux-amd64-${VERSION}"
           tar -C dist/linux -czf "dist/axial-linux-amd64-${VERSION}.tar.gz" axial
-          sha256sum "dist/axial-linux-amd64-${VERSION}.tar.gz" > "dist/axial-linux-amd64-${VERSION}.tar.gz.sha256"
+          (
+            cd dist
+            sha256sum "axial-linux-amd64-${VERSION}" > "axial-linux-amd64-${VERSION}.sha256"
+            sha256sum "axial-linux-amd64-${VERSION}.tar.gz" > "axial-linux-amd64-${VERSION}.tar.gz.sha256"
+          )
 
       - name: Upload linux release asset
         uses: softprops/action-gh-release@v2
         with:
           prerelease: ${{ contains(github.ref_name, '-') }}
           files: |
-            dist/axial-linux-amd64-*.tar.gz
-            dist/axial-linux-amd64-*.tar.gz.sha256
+            dist/axial-linux-amd64-*
 
   windows-desktop:
     needs: verify
@@ -169,8 +173,12 @@ jobs:
           $version = $env:GITHUB_REF_NAME.TrimStart('v')
           New-Item -ItemType Directory -Force -Path dist/windows | Out-Null
           Copy-Item target/release/axial-desktop.exe dist/windows/axial.exe
+          $executable = "dist/axial-windows-amd64-$version.exe"
+          Copy-Item dist/windows/axial.exe $executable
           $archive = "dist/axial-windows-amd64-$version.zip"
           Compress-Archive -Path dist/windows/axial.exe -DestinationPath $archive -Force
+          $executableHash = Get-FileHash -Algorithm SHA256 -Path $executable
+          "$($executableHash.Hash.ToLowerInvariant())  $(Split-Path -Leaf $executable)" | Set-Content -Path "$executable.sha256" -NoNewline -Encoding ascii
           $hash = Get-FileHash -Algorithm SHA256 -Path $archive
           "$($hash.Hash.ToLowerInvariant())  $(Split-Path -Leaf $archive)" | Set-Content -Path "$archive.sha256" -NoNewline -Encoding ascii
 
@@ -179,6 +187,8 @@ jobs:
         with:
           prerelease: ${{ contains(github.ref_name, '-') }}
           files: |
+            dist/axial-windows-amd64-*.exe
+            dist/axial-windows-amd64-*.exe.sha256
             dist/axial-windows-amd64-*.zip
             dist/axial-windows-amd64-*.zip.sha256
 
@@ -216,16 +226,20 @@ jobs:
           mkdir -p dist/macos
           cp target/release/axial-desktop dist/macos/axial
           chmod +x dist/macos/axial
+          cp dist/macos/axial "dist/axial-macos-${{ matrix.arch }}-${VERSION}"
           tar -C dist/macos -czf "dist/axial-macos-${{ matrix.arch }}-${VERSION}.tar.gz" axial
-          shasum -a 256 "dist/axial-macos-${{ matrix.arch }}-${VERSION}.tar.gz" > "dist/axial-macos-${{ matrix.arch }}-${VERSION}.tar.gz.sha256"
+          (
+            cd dist
+            shasum -a 256 "axial-macos-${{ matrix.arch }}-${VERSION}" > "axial-macos-${{ matrix.arch }}-${VERSION}.sha256"
+            shasum -a 256 "axial-macos-${{ matrix.arch }}-${VERSION}.tar.gz" > "axial-macos-${{ matrix.arch }}-${VERSION}.tar.gz.sha256"
+          )
 
       - name: Upload macOS release asset
         uses: softprops/action-gh-release@v2
         with:
           prerelease: ${{ contains(github.ref_name, '-') }}
           files: |
-            dist/axial-macos-${{ matrix.arch }}-*.tar.gz
-            dist/axial-macos-${{ matrix.arch }}-*.tar.gz.sha256
+            dist/axial-macos-${{ matrix.arch }}-*
 
   verify-release:
     needs: [linux-desktop, windows-desktop, macos-desktop]

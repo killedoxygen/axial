@@ -12,9 +12,17 @@ import { setTimeout as sleep } from 'node:timers/promises';
 const ATTEMPTS = 5;
 const DELAY_MS = 3000;
 
-// Filenames the release pipeline attaches, per platform. Kept in sync with the
-// package steps in .github/workflows/release.yml.
-const ASSET_TEMPLATES = [
+// Raw executables for manual downloads. Kept in sync with the package steps in
+// .github/workflows/release.yml.
+const EXECUTABLE_TEMPLATES = [
+  (v) => `axial-linux-amd64-${v}`,
+  (v) => `axial-windows-amd64-${v}.exe`,
+  (v) => `axial-macos-amd64-${v}`,
+  (v) => `axial-macos-arm64-${v}`,
+];
+
+// Archives consumed by the in-app updater.
+const UPDATE_PACKAGE_TEMPLATES = [
   (v) => `axial-linux-amd64-${v}.tar.gz`,
   (v) => `axial-windows-amd64-${v}.zip`,
   (v) => `axial-macos-amd64-${v}.tar.gz`,
@@ -47,8 +55,8 @@ function releasesDownloadBase() {
 }
 
 function expectedFiles(version) {
-  // Every binary ships alongside a .sha256 checksum sidecar.
-  return ASSET_TEMPLATES.flatMap((template) => {
+  // Every manual executable and updater package has a checksum sidecar.
+  return [...EXECUTABLE_TEMPLATES, ...UPDATE_PACKAGE_TEMPLATES].flatMap((template) => {
     const file = template(version);
     return [file, `${file}.sha256`];
   });
