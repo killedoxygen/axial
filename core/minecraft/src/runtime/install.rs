@@ -255,7 +255,7 @@ pub(crate) async fn finalize_managed_runtime_commit(
     finalize_managed_runtime_commit_inner(receipt, PublishFailureMode::None).await
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) async fn finalize_managed_runtime_commit_with_failure_for_test(
     receipt: ManagedRuntimeCommitReceipt,
 ) -> Result<ManagedRuntimeCommitReceipt, ManagedRuntimeFailureReceipt> {

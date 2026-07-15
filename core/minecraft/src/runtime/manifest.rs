@@ -271,7 +271,7 @@ pub(super) fn authenticated_runtime_source_fixture_for_test(
     )
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn authenticated_runtime_source_from_manifest_for_test(
     component: super::model::RuntimeId,
     manifest: ComponentManifest,

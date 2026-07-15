@@ -28,6 +28,7 @@ pub mod telemetry;
 pub(crate) mod timing;
 pub mod update;
 pub mod version;
+mod whole_instance_rematerialization;
 
 use crate::guardian::{GuardianDecision, GuardianFact, SafetyOutcome};
 use crate::observability::{EvidenceRecord, OperationEvent, PerformanceProofRecord};
@@ -123,6 +124,11 @@ pub use version::{
 };
 pub(crate) use version::{
     catalog, delete_version, installed_versions, installed_versions_event_payload, version_info,
+};
+#[cfg(test)]
+pub(crate) use whole_instance_rematerialization::spawn_explicit_whole_instance_rematerialization_with;
+pub(crate) use whole_instance_rematerialization::{
+    ExplicitWholeInstanceRematerializationError, execute_explicit_whole_instance_rematerialization,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

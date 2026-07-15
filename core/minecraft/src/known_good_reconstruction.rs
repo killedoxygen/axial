@@ -23,6 +23,12 @@ use crate::managed_fs::ManagedDir;
 use crate::managed_publication::{
     ManagedPublicationLifetimeGuard, ManagedRootPublicationLease, run_publication_blocking,
 };
+#[cfg(feature = "test-support")]
+use crate::runtime::{
+    ComponentManifest, ComponentManifestDownload, ComponentManifestDownloads,
+    ComponentManifestFile, authenticated_runtime_source_from_manifest_for_test,
+    runtime_java_relative_path,
+};
 use crate::runtime::{
     ManagedRuntimeCache, ManagedRuntimeCommitReceipt, ManagedRuntimeFailureReceipt,
     ManagedRuntimeQuarantineObligation, ManagedRuntimeRebuildError, RuntimeId,
@@ -33,7 +39,11 @@ use crate::version_bundle_publication::{
     revalidate_settled_version_bundle, settle_version_bundle_publication,
     settled_version_bundle_matches_root,
 };
+#[cfg(feature = "test-support")]
+use sha1::{Digest as _, Sha1};
 use std::path::{Path, PathBuf};
+#[cfg(feature = "test-support")]
+use std::{collections::HashMap, io};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum KnownGoodReconstructionError {
@@ -740,6 +750,8 @@ async fn publish_managed_whole_instance_reconstruction(
         runtime_cache,
         #[cfg(test)]
         None,
+        #[cfg(any(test, feature = "test-support"))]
+        false,
     )
     .await
 }
@@ -750,14 +762,20 @@ async fn publish_managed_whole_instance_reconstruction_with_fault(
     runtime_cache: ManagedRuntimeCache,
     fault: ManagedProjectionSequenceFault,
 ) -> Result<ManagedWholeInstanceCommitReceipt, ManagedWholeInstanceRebuildError> {
-    publish_managed_whole_instance_reconstruction_inner(reconstruction, runtime_cache, Some(fault))
-        .await
+    publish_managed_whole_instance_reconstruction_inner(
+        reconstruction,
+        runtime_cache,
+        Some(fault),
+        false,
+    )
+    .await
 }
 
 async fn publish_managed_whole_instance_reconstruction_inner(
     reconstruction: ManagedWholeInstanceReconstruction,
     runtime_cache: ManagedRuntimeCache,
     #[cfg(test)] fault: Option<ManagedProjectionSequenceFault>,
+    #[cfg(any(test, feature = "test-support"))] fail_runtime_finalization: bool,
 ) -> Result<ManagedWholeInstanceCommitReceipt, ManagedWholeInstanceRebuildError> {
     let (
         root_lease,
@@ -868,7 +886,13 @@ async fn publish_managed_whole_instance_reconstruction_inner(
             ManagedWholeInstanceRollbackEffect::ExactPostcheck,
         ));
     }
-    let runtime = match settle_whole_runtime_commit(runtime, projection.version_id()).await {
+    let runtime = match settle_whole_runtime_commit(
+        runtime,
+        #[cfg(any(test, feature = "test-support"))]
+        fail_runtime_finalization,
+    )
+    .await
+    {
         Ok(runtime) => runtime,
         Err(runtime) => {
             return Err(whole_rollback(
@@ -901,10 +925,10 @@ async fn publish_managed_whole_instance_reconstruction_inner(
 
 async fn settle_whole_runtime_commit(
     runtime: ManagedRuntimeCommitReceipt,
-    _version_id: &str,
+    #[cfg(any(test, feature = "test-support"))] fail_for_test: bool,
 ) -> Result<ManagedRuntimeCommitReceipt, ManagedRuntimeFailureReceipt> {
-    #[cfg(test)]
-    if take_whole_runtime_finalization_failure_for_test(_version_id) {
+    #[cfg(any(test, feature = "test-support"))]
+    if fail_for_test {
         return crate::runtime::finalize_managed_runtime_commit_with_failure_for_test(runtime)
             .await;
     }
@@ -963,6 +987,85 @@ pub async fn rebuild_managed_libraries_fixture_for_test(
     owner
         .await
         .map_err(|_| ManagedLibrariesRebuildError::Preparation)?
+}
+
+#[cfg(feature = "test-support")]
+pub struct ManagedWholeInstanceFixtureForTest {
+    reconstruction: ManagedWholeInstanceReconstruction,
+}
+
+#[cfg(feature = "test-support")]
+impl ManagedWholeInstanceFixtureForTest {
+    pub fn known_good_inventory(&self) -> KnownGoodInventory {
+        self.reconstruction.fixture_inventory_for_test()
+    }
+}
+
+#[cfg(feature = "test-support")]
+pub async fn prepare_managed_whole_instance_fixture_for_test(
+    managed_root: impl Into<PathBuf>,
+    version_id: &str,
+    runtime_component: RuntimeId,
+    runtime_url: &str,
+    runtime_bytes: &[u8],
+) -> io::Result<ManagedWholeInstanceFixtureForTest> {
+    let runtime_source = authenticated_runtime_source_from_manifest_for_test(
+        runtime_component,
+        ComponentManifest {
+            files: HashMap::from([(
+                runtime_java_relative_path().replace('\\', "/"),
+                ComponentManifestFile {
+                    kind: "file".to_string(),
+                    executable: true,
+                    downloads: Some(ComponentManifestDownloads {
+                        raw: Some(ComponentManifestDownload {
+                            url: runtime_url.to_string(),
+                            sha1: Some(format!("{:x}", Sha1::digest(runtime_bytes))),
+                            size: Some(runtime_bytes.len() as u64),
+                        }),
+                        lzma: None,
+                    }),
+                    target: None,
+                },
+            )]),
+        },
+    )
+    .map_err(|_| io::Error::other("whole-instance Runtime fixture authentication failed"))?;
+    let managed_root = managed_root.into();
+    let managed_root = ManagedDir::open_root(&managed_root)
+        .map_err(|_| io::Error::other("whole-instance fixture root admission failed"))?;
+    let reconstruction = crate::known_good::managed_whole_instance_reconstruction_fixture_for_test(
+        managed_root,
+        version_id,
+        runtime_source,
+    )
+    .await
+    .map_err(|_| io::Error::other("whole-instance fixture reconstruction failed"))?;
+    Ok(ManagedWholeInstanceFixtureForTest { reconstruction })
+}
+
+#[cfg(feature = "test-support")]
+pub async fn publish_managed_whole_instance_fixture_for_test(
+    fixture: ManagedWholeInstanceFixtureForTest,
+    runtime_cache: &ManagedRuntimeCache,
+) -> Result<ManagedWholeInstanceCommitReceipt, ManagedWholeInstanceRebuildError> {
+    publish_managed_whole_instance_reconstruction(fixture.reconstruction, runtime_cache.clone())
+        .await
+}
+
+#[cfg(feature = "test-support")]
+pub async fn publish_managed_whole_instance_rollback_fixture_for_test(
+    fixture: ManagedWholeInstanceFixtureForTest,
+    runtime_cache: &ManagedRuntimeCache,
+) -> Result<ManagedWholeInstanceCommitReceipt, ManagedWholeInstanceRebuildError> {
+    publish_managed_whole_instance_reconstruction_inner(
+        fixture.reconstruction,
+        runtime_cache.clone(),
+        #[cfg(test)]
+        None,
+        true,
+    )
+    .await
 }
 
 #[cfg(feature = "test-support")]
@@ -1285,30 +1388,6 @@ fn reconstruction_kind(version_id: &str) -> ReconstructionKind {
     } else {
         ReconstructionKind::Vanilla
     }
-}
-
-#[cfg(test)]
-static WHOLE_RUNTIME_FINALIZATION_FAILURES: std::sync::OnceLock<
-    std::sync::Mutex<std::collections::HashSet<String>>,
-> = std::sync::OnceLock::new();
-
-#[cfg(test)]
-fn fail_whole_runtime_finalization_for_test(version_id: &str) {
-    let inserted = WHOLE_RUNTIME_FINALIZATION_FAILURES
-        .get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .insert(version_id.to_string());
-    assert!(inserted, "whole Runtime finalization fault must be unique");
-}
-
-#[cfg(test)]
-fn take_whole_runtime_finalization_failure_for_test(version_id: &str) -> bool {
-    WHOLE_RUNTIME_FINALIZATION_FAILURES
-        .get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .remove(version_id)
 }
 
 #[cfg(test)]
@@ -1683,12 +1762,12 @@ mod tests {
             b"finalization java",
         )
         .await;
-        super::fail_whole_runtime_finalization_for_test(VERSION_ID);
-
         let ManagedWholeInstanceRebuildError::RolledBack(rollback) =
-            super::publish_managed_whole_instance_reconstruction(
+            super::publish_managed_whole_instance_reconstruction_inner(
                 reconstruction,
                 runtime_cache.clone(),
+                None,
+                true,
             )
             .await
             .expect_err("injected Runtime finalization failure")

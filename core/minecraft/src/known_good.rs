@@ -261,7 +261,7 @@ impl PartialEq for KnownGoodInventory {
 
 impl Eq for KnownGoodInventory {}
 
-#[derive(Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 struct KnownGoodStandaloneLeafRepairSourceContract {
     root: KnownGoodRoot,
     path: KnownGoodRelativePath,
@@ -307,6 +307,14 @@ impl KnownGoodStandaloneLeafRepairSource<'_> {
 }
 
 impl KnownGoodInventory {
+    #[cfg(feature = "test-support")]
+    pub(crate) fn duplicate_for_test(&self) -> Self {
+        Self {
+            entries: self.entries.clone(),
+            standalone_leaf_repair_sources: self.standalone_leaf_repair_sources.clone(),
+        }
+    }
+
     pub fn entries(&self) -> &[KnownGoodEntry] {
         &self.entries
     }
@@ -1543,6 +1551,11 @@ impl ManagedAssetsReconstruction {
 }
 
 impl ManagedWholeInstanceReconstruction {
+    #[cfg(feature = "test-support")]
+    pub(crate) fn fixture_inventory_for_test(&self) -> KnownGoodInventory {
+        self.projection.inventory().duplicate_for_test()
+    }
+
     pub(crate) fn into_effect_parts(
         self,
     ) -> (
@@ -1564,7 +1577,7 @@ impl ManagedWholeInstanceReconstruction {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) async fn managed_whole_instance_reconstruction_fixture_for_test(
     managed_root: ManagedDir,
     version_id: &str,

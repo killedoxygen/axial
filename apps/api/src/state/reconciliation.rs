@@ -43,6 +43,7 @@ use axial_minecraft::{
 use sha2::{Digest, Sha256};
 use std::io;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 const RECONCILIATION_FINGERPRINT_DOMAIN: &[u8] = b"axial.guardian.reconciliation.incarnation.v1";
 const RECONCILIATION_INVENTORY_FINGERPRINT_DOMAIN: &[u8] =
@@ -61,6 +62,8 @@ pub(crate) const ASSETS_COMPONENT_REBUILD_STEP: &str = "rebuild_managed_assets_c
 const WHOLE_INSTANCE_REMATERIALIZATION_START_STEP: &str =
     "journal_whole_instance_rematerialization_start";
 const WHOLE_INSTANCE_REMATERIALIZATION_STEP: &str = "rematerialize_launcher_managed_instance";
+const WHOLE_INSTANCE_PERSISTENCE_RETRY_INITIAL_DELAY: Duration = Duration::from_millis(25);
+const WHOLE_INSTANCE_PERSISTENCE_RETRY_MAX_DELAY: Duration = Duration::from_secs(1);
 
 pub(crate) struct RecordedRuntimeArtifactRepairFailure {
     evidence: RecordedReconciliationFailure,
@@ -111,17 +114,19 @@ pub(crate) struct RegisteredWholeInstanceRematerializationAdmission {
     config_mutation: tokio::sync::OwnedMutexGuard<()>,
 }
 
-pub(crate) enum RegisteredWholeInstanceEffectAdmission {
+pub(crate) enum RegisteredWholeInstancePreparation {
     Admitted {
         request: RegisteredWholeInstanceCoreRequest,
         completion: RegisteredWholeInstanceCompletion,
     },
-    Refused(RegisteredWholeInstanceSettlement),
+    Closed(RegisteredWholeInstanceDurableOutcome),
 }
 
 pub(crate) enum RegisteredWholeInstancePreparationError {
     Reservation(ReconciliationAttemptRejection),
     Journal(OperationJournalStoreError),
+    Memory(FailureMemoryStoreError),
+    Settlement(RegisteredWholeInstanceSettlementError),
 }
 
 pub(crate) struct RegisteredWholeInstanceCoreRequest {
@@ -140,15 +145,56 @@ pub(crate) struct RegisteredWholeInstanceSettlement {
     durable: WholeInstanceDurableAuthority,
     terminal: ReconciliationTerminal,
     terminal_step: &'static str,
-    receipt_valid: bool,
-    publication: Option<WholeInstancePublicationAuthority>,
+    _publication: Option<WholeInstancePublicationAuthority>,
+}
+
+pub(crate) struct RegisteredWholeInstanceDurableOutcome {
+    terminal: ReconciliationTerminal,
+}
+
+pub(crate) enum RegisteredWholeInstanceSettlementError {
+    Journal(OperationJournalStoreError),
+    Memory(FailureMemoryStoreError),
+    Evidence(ReconciliationEvidenceRejection),
+}
+
+impl RegisteredWholeInstancePreparationError {
+    pub(crate) fn class(&self) -> &'static str {
+        match self {
+            Self::Reservation(ReconciliationAttemptRejection::PersistencePending) => {
+                "persistence_pending"
+            }
+            Self::Reservation(ReconciliationAttemptRejection::AlreadyReserved) => {
+                "already_reserved"
+            }
+            Self::Reservation(ReconciliationAttemptRejection::CapacityExhausted) => {
+                "capacity_exhausted"
+            }
+            Self::Reservation(ReconciliationAttemptRejection::AmbiguousPriorAttempt) => {
+                "ambiguous_prior_attempt"
+            }
+            Self::Journal(error) => error.class(),
+            Self::Memory(error) => error.class(),
+            Self::Settlement(error) => error.class(),
+        }
+    }
+}
+
+impl RegisteredWholeInstanceSettlementError {
+    pub(crate) fn class(&self) -> &'static str {
+        match self {
+            Self::Journal(error) => error.class(),
+            Self::Memory(error) => error.class(),
+            Self::Evidence(error) => error.class(),
+        }
+    }
 }
 
 struct WholeInstanceDurableAuthority {
     state: AppState,
     attempt: ReconciliationAttempt,
     lifecycle: InstanceLifecycleLease,
-    reservation: Option<ReconciliationAttemptReservation>,
+    reservation: ReconciliationAttemptReservation,
     _component_mutation: SharedComponentMutationLease,
     _config_mutation: tokio::sync::OwnedMutexGuard<()>,
 }
@@ -253,43 +299,32 @@ enum ManagedArtifactPublicationLease {
 }
 
 impl RegisteredWholeInstanceRematerializationAdmission {
+    #[cfg(test)]
     pub(crate) fn attempt(&self) -> &ReconciliationAttempt {
         &self.attempt
     }
 
     pub(crate) async fn into_effect(
         self,
-    ) -> Result<RegisteredWholeInstanceEffectAdmission, RegisteredWholeInstancePreparationError>
-    {
-        let mut durable = WholeInstanceDurableAuthority {
+    ) -> Result<RegisteredWholeInstancePreparation, RegisteredWholeInstancePreparationError> {
+        let reservation = reserve_whole_instance_attempt(
+            &self.state.failure_memory,
+            &self.state.journals,
+            reconciliation_attempt_key(&self.attempt),
+        )
+        .await?;
+        let durable = WholeInstanceDurableAuthority {
             state: self.state,
             attempt: self.attempt,
             lifecycle: self.lifecycle,
-            reservation: None,
+            reservation,
             _component_mutation: self.component_mutation,
             _config_mutation: self.config_mutation,
         };
-        durable.reservation = Some(
-            reserve_reconciliation_attempt(
-                &durable.state.failure_memory,
-                &durable.state.journals,
-                reconciliation_attempt_key(&durable.attempt),
-            )
-            .map_err(RegisteredWholeInstancePreparationError::Reservation)?,
-        );
         let expected_plan = whole_instance_rematerialization_journal_for_attempt(&durable.attempt);
-        match durable.state.journals.create(expected_plan.clone()).await {
-            Ok(()) => {}
-            Err(OperationJournalStoreError::AlreadyExists)
-                if durable
-                    .state
-                    .journals
-                    .get(&durable.attempt.operation_id().clone())
-                    .is_some_and(|entry| {
-                        super::operation_journal_plan_is_visible(&entry, &expected_plan)
-                    }) => {}
-            Err(error) => return Err(RegisteredWholeInstancePreparationError::Journal(error)),
-        }
+        persist_whole_instance_plan(&durable.state.journals, expected_plan)
+            .await
+            .map_err(RegisteredWholeInstancePreparationError::Journal)?;
         let observed_at = chrono::Utc::now().fixed_offset();
         let current = durable
             .state
@@ -312,14 +347,16 @@ impl RegisteredWholeInstanceRematerializationAdmission {
                     )
             });
         if !live {
-            return Ok(RegisteredWholeInstanceEffectAdmission::Refused(
-                durable.failed(
+            let outcome = durable
+                .failed(
                     ReconciliationQuarantineCheckpoint::default(),
                     None,
-                    false,
                     WHOLE_INSTANCE_REMATERIALIZATION_START_STEP,
-                ),
-            ));
+                )
+                .settle()
+                .await
+                .map_err(RegisteredWholeInstancePreparationError::Settlement)?;
+            return Ok(RegisteredWholeInstancePreparation::Closed(outcome));
         }
         let request = RegisteredWholeInstanceCoreRequest {
             library_root: self.known_good.library_root.clone(),
@@ -327,7 +364,7 @@ impl RegisteredWholeInstanceRematerializationAdmission {
             version_id: self.known_good.version_id.clone(),
         };
         let runtime_cache = request.runtime_cache.clone();
-        Ok(RegisteredWholeInstanceEffectAdmission::Admitted {
+        Ok(RegisteredWholeInstancePreparation::Admitted {
             request,
             completion: RegisteredWholeInstanceCompletion {
                 durable,
@@ -349,7 +386,6 @@ impl RegisteredWholeInstanceCompletion {
         self.durable.failed(
             ReconciliationQuarantineCheckpoint::default(),
             None,
-            true,
             WHOLE_INSTANCE_REMATERIALIZATION_STEP,
         )
     }
@@ -376,7 +412,6 @@ impl RegisteredWholeInstanceCompletion {
             self.durable.failed(
                 ReconciliationQuarantineCheckpoint::default(),
                 Some(publication),
-                false,
                 WHOLE_INSTANCE_REMATERIALIZATION_STEP,
             )
         }
@@ -387,7 +422,7 @@ impl RegisteredWholeInstanceCompletion {
         receipt: ManagedWholeInstanceRollbackReceipt,
     ) -> RegisteredWholeInstanceSettlement {
         let publication = WholeInstancePublicationAuthority::Rollback(receipt);
-        let (receipt_valid, checkpoint) = match &publication {
+        let checkpoint = match &publication {
             WholeInstancePublicationAuthority::Rollback(receipt) => {
                 let valid = receipt.version_id() == self.known_good.version_id
                     && receipt.matches_root(&self.known_good.library_root).await
@@ -405,17 +440,13 @@ impl RegisteredWholeInstanceCompletion {
                     .transpose()
                     .ok()
                     .flatten();
-                (
-                    valid && checkpoint.is_some(),
-                    checkpoint.unwrap_or_default(),
-                )
+                checkpoint.unwrap_or_default()
             }
             WholeInstancePublicationAuthority::Commit(_) => unreachable!(),
         };
         self.durable.failed(
             checkpoint,
             Some(publication),
-            receipt_valid,
             WHOLE_INSTANCE_REMATERIALIZATION_STEP,
         )
     }
@@ -455,8 +486,7 @@ impl WholeInstanceDurableAuthority {
             durable: self,
             terminal,
             terminal_step: WHOLE_INSTANCE_REMATERIALIZATION_STEP,
-            receipt_valid: true,
-            publication: Some(publication),
+            _publication: Some(publication),
         }
     }
 
@@ -464,7 +494,6 @@ impl WholeInstanceDurableAuthority {
         self,
         checkpoint: ReconciliationQuarantineCheckpoint,
         publication: Option<WholeInstancePublicationAuthority>,
-        receipt_valid: bool,
         terminal_step: &'static str,
     ) -> RegisteredWholeInstanceSettlement {
         let terminal = ReconciliationTerminal::from_attempt(
@@ -476,30 +505,15 @@ impl WholeInstanceDurableAuthority {
             durable: self,
             terminal,
             terminal_step,
-            receipt_valid,
-            publication,
+            _publication: publication,
         }
     }
 }
 
 impl RegisteredWholeInstanceSettlement {
-    pub(crate) fn terminal(&self) -> &ReconciliationTerminal {
-        &self.terminal
-    }
-
-    pub(crate) fn succeeded(&self) -> bool {
-        self.terminal.outcome() == ReconciliationTerminalOutcome::Succeeded
-    }
-
-    pub(crate) fn receipt_valid(&self) -> bool {
-        self.receipt_valid
-    }
-
-    pub(crate) fn retains_publication(&self) -> bool {
-        self.publication.is_some()
-    }
-
-    pub(crate) async fn settle(self) -> Result<(), Self> {
+    pub(crate) async fn settle(
+        self,
+    ) -> Result<RegisteredWholeInstanceDurableOutcome, RegisteredWholeInstanceSettlementError> {
         let operation_id = self.durable.attempt.operation_id().clone();
         if !self.terminal.quarantine_checkpoint().is_empty() {
             let mut checkpoint =
@@ -507,24 +521,13 @@ impl RegisteredWholeInstanceSettlement {
             checkpoint.result = OperationStepResult::Completed;
             checkpoint.changed_target = Some(self.durable.attempt.target().clone());
             checkpoint.rollback = RollbackState::Available;
-            if self
-                .durable
-                .state
-                .journals
-                .record_checkpoint(&operation_id, checkpoint.clone())
-                .await
-                .is_err()
-                && !self
-                    .durable
-                    .state
-                    .journals
-                    .get(&operation_id)
-                    .is_some_and(|entry| {
-                        super::operation_journal_completed_step_is_visible(&entry, &checkpoint)
-                    })
-            {
-                return Err(self);
-            }
+            persist_whole_instance_checkpoint(
+                &self.durable.state.journals,
+                &operation_id,
+                checkpoint,
+            )
+            .await
+            .map_err(RegisteredWholeInstanceSettlementError::Journal)?;
         }
         let mut terminal_step =
             OperationJournalStep::new(self.terminal_step, OperationPhase::Repairing);
@@ -535,62 +538,284 @@ impl RegisteredWholeInstanceSettlement {
             } else {
                 RollbackState::Available
             };
-        let journal_result = match self.terminal.outcome() {
+        persist_whole_instance_terminal(
+            &self.durable.state.journals,
+            &operation_id,
+            terminal_step,
+            self.terminal_step,
+            self.terminal.clone(),
+        )
+        .await
+        .map_err(RegisteredWholeInstanceSettlementError::Journal)?;
+        let memory = reconciliation_memory_entry(self.terminal.clone())
+            .map_err(RegisteredWholeInstanceSettlementError::Evidence)?;
+        persist_whole_instance_memory(
+            &self.durable.state.failure_memory,
+            memory,
+            &self.durable.reservation,
+        )
+        .await
+        .map_err(RegisteredWholeInstanceSettlementError::Memory)?;
+        Ok(RegisteredWholeInstanceDurableOutcome {
+            terminal: self.terminal,
+        })
+    }
+}
+
+impl RegisteredWholeInstanceDurableOutcome {
+    #[cfg(test)]
+    pub(crate) fn terminal(&self) -> &ReconciliationTerminal {
+        &self.terminal
+    }
+
+    pub(crate) fn succeeded(&self) -> bool {
+        self.terminal.outcome() == ReconciliationTerminalOutcome::Succeeded
+    }
+}
+
+async fn reserve_whole_instance_attempt(
+    failure_memory: &GuardianFailureMemoryStore,
+    journals: &OperationJournalStore,
+    key: FailureMemoryKey,
+) -> Result<ReconciliationAttemptReservation, RegisteredWholeInstancePreparationError> {
+    let mut delay = WHOLE_INSTANCE_PERSISTENCE_RETRY_INITIAL_DELAY;
+    loop {
+        settle_reconciliation_pending_with_backoff(failure_memory)
+            .await
+            .map_err(RegisteredWholeInstancePreparationError::Memory)?;
+        match reserve_reconciliation_attempt(failure_memory, journals, key.clone()) {
+            Ok(reservation) => return Ok(reservation),
+            Err(ReconciliationAttemptRejection::PersistencePending) => {
+                tokio::time::sleep(delay).await;
+                delay = delay
+                    .saturating_mul(2)
+                    .min(WHOLE_INSTANCE_PERSISTENCE_RETRY_MAX_DELAY);
+            }
+            Err(error) => return Err(RegisteredWholeInstancePreparationError::Reservation(error)),
+        }
+    }
+}
+
+async fn persist_whole_instance_plan(
+    journals: &OperationJournalStore,
+    expected: OperationJournalEntry,
+) -> Result<(), OperationJournalStoreError> {
+    let operation_id = expected.operation_id.clone();
+    let mut delay = WHOLE_INSTANCE_PERSISTENCE_RETRY_INITIAL_DELAY;
+    loop {
+        match journals.create(expected.clone()).await {
+            Ok(()) => return Ok(()),
+            Err(OperationJournalStoreError::AlreadyExists)
+                if journals.get(&operation_id).is_some_and(|entry| {
+                    super::operation_journal_plan_is_visible(&entry, &expected)
+                }) =>
+            {
+                return Ok(());
+            }
+            Err(
+                error @ (OperationJournalStoreError::Persistence(_)
+                | OperationJournalStoreError::RetryRequired),
+            ) => {
+                match journals
+                    .reconcile_transition(
+                        &operation_id,
+                        error,
+                        delay,
+                        WHOLE_INSTANCE_PERSISTENCE_RETRY_MAX_DELAY,
+                        |entry| super::operation_journal_plan_is_visible(entry, &expected),
+                    )
+                    .await
+                {
+                    Ok(_)
+                        if journals.get(&operation_id).is_some_and(|entry| {
+                            super::operation_journal_plan_is_visible(&entry, &expected)
+                        }) =>
+                    {
+                        return Ok(());
+                    }
+                    Ok(_) | Err(OperationJournalStoreError::Persistence(_)) => {}
+                    Err(error) => return Err(error),
+                }
+            }
+            Err(error) => return Err(error),
+        }
+        tokio::time::sleep(delay).await;
+        delay = delay
+            .saturating_mul(2)
+            .min(WHOLE_INSTANCE_PERSISTENCE_RETRY_MAX_DELAY);
+    }
+}
+
+async fn persist_whole_instance_checkpoint(
+    journals: &OperationJournalStore,
+    operation_id: &OperationId,
+    checkpoint: OperationJournalStep,
+) -> Result<(), OperationJournalStoreError> {
+    let mut delay = WHOLE_INSTANCE_PERSISTENCE_RETRY_INITIAL_DELAY;
+    loop {
+        if journals.get(operation_id).is_some_and(|entry| {
+            super::operation_journal_completed_step_is_visible(&entry, &checkpoint)
+        }) {
+            return Ok(());
+        }
+        match journals
+            .record_checkpoint(operation_id, checkpoint.clone())
+            .await
+        {
+            Ok(()) => return Ok(()),
+            Err(
+                error @ (OperationJournalStoreError::Persistence(_)
+                | OperationJournalStoreError::RetryRequired),
+            ) => {
+                match journals
+                    .reconcile_transition(
+                        operation_id,
+                        error,
+                        delay,
+                        WHOLE_INSTANCE_PERSISTENCE_RETRY_MAX_DELAY,
+                        |entry| {
+                            super::operation_journal_completed_step_is_visible(entry, &checkpoint)
+                        },
+                    )
+                    .await
+                {
+                    Ok(_)
+                        if journals.get(operation_id).is_some_and(|entry| {
+                            super::operation_journal_completed_step_is_visible(&entry, &checkpoint)
+                        }) =>
+                    {
+                        return Ok(());
+                    }
+                    Ok(_) | Err(OperationJournalStoreError::Persistence(_)) => {}
+                    Err(error) => return Err(error),
+                }
+            }
+            Err(error) => return Err(error),
+        }
+        tokio::time::sleep(delay).await;
+        delay = delay
+            .saturating_mul(2)
+            .min(WHOLE_INSTANCE_PERSISTENCE_RETRY_MAX_DELAY);
+    }
+}
+
+async fn persist_whole_instance_terminal(
+    journals: &OperationJournalStore,
+    operation_id: &OperationId,
+    mut terminal_step: OperationJournalStep,
+    failure_point: &'static str,
+    terminal: ReconciliationTerminal,
+) -> Result<(), OperationJournalStoreError> {
+    let mut delay = WHOLE_INSTANCE_PERSISTENCE_RETRY_INITIAL_DELAY;
+    loop {
+        if journals
+            .get(operation_id)
+            .is_some_and(|entry| whole_instance_terminal_matches(&entry, &terminal))
+        {
+            return Ok(());
+        }
+        let result = match terminal.outcome() {
             ReconciliationTerminalOutcome::Succeeded => {
                 terminal_step.result = OperationStepResult::Completed;
                 record_reconciliation_journal_success(
-                    &self.durable.state.journals,
-                    &operation_id,
-                    terminal_step,
-                    self.terminal.clone(),
+                    journals,
+                    operation_id,
+                    terminal_step.clone(),
+                    terminal.clone(),
                 )
                 .await
             }
             ReconciliationTerminalOutcome::Failed => {
                 terminal_step.result = OperationStepResult::Failed;
                 record_reconciliation_journal_failure(
-                    &self.durable.state.journals,
-                    &operation_id,
-                    terminal_step,
-                    self.terminal_step,
-                    self.terminal.clone(),
+                    journals,
+                    operation_id,
+                    terminal_step.clone(),
+                    failure_point,
+                    terminal.clone(),
                 )
                 .await
             }
         };
-        if journal_result.is_err()
-            && !self
-                .durable
-                .state
-                .journals
-                .get(&operation_id)
-                .is_some_and(|entry| whole_instance_terminal_matches(&entry, &self.terminal))
-        {
-            return Err(self);
+        match result {
+            Ok(()) => return Ok(()),
+            Err(
+                error @ (OperationJournalStoreError::Persistence(_)
+                | OperationJournalStoreError::RetryRequired),
+            ) => {
+                match journals
+                    .reconcile_transition(
+                        operation_id,
+                        error,
+                        delay,
+                        WHOLE_INSTANCE_PERSISTENCE_RETRY_MAX_DELAY,
+                        |entry| whole_instance_terminal_matches(entry, &terminal),
+                    )
+                    .await
+                {
+                    Ok(_)
+                        if journals.get(operation_id).is_some_and(|entry| {
+                            whole_instance_terminal_matches(&entry, &terminal)
+                        }) =>
+                    {
+                        return Ok(());
+                    }
+                    Ok(_) | Err(OperationJournalStoreError::Persistence(_)) => {}
+                    Err(error) => return Err(error),
+                }
+            }
+            Err(error) => return Err(error),
         }
-        let Some(reservation) = self.durable.reservation.as_ref() else {
-            return Err(self);
-        };
-        let Ok(memory) = reconciliation_memory_entry(self.terminal.clone()) else {
-            return Err(self);
-        };
-        if commit_reconciliation_memory(
-            &self.durable.state.failure_memory,
-            memory.clone(),
-            reservation,
-        )
-        .await
-        .is_err()
-            && validate_reconciliation_memory(
-                &self.durable.state.failure_memory,
-                &memory,
-                reservation,
-            )
-            .is_err()
+        tokio::time::sleep(delay).await;
+        delay = delay
+            .saturating_mul(2)
+            .min(WHOLE_INSTANCE_PERSISTENCE_RETRY_MAX_DELAY);
+    }
+}
+
+async fn persist_whole_instance_memory(
+    failure_memory: &GuardianFailureMemoryStore,
+    memory: GuardianFailureMemoryEntry,
+    reservation: &ReconciliationAttemptReservation,
+) -> Result<(), FailureMemoryStoreError> {
+    let mut delay = WHOLE_INSTANCE_PERSISTENCE_RETRY_INITIAL_DELAY;
+    loop {
+        if failure_memory
+            .get(&memory.key)
+            .as_ref()
+            .is_some_and(|stored| stored == &memory)
         {
-            return Err(self);
+            return Ok(());
         }
-        Ok(())
+        match commit_reconciliation_memory(failure_memory, memory.clone(), reservation).await {
+            Ok(()) => return Ok(()),
+            Err(FailureMemoryStoreError::Persistence(_)) => {
+                tokio::time::sleep(delay).await;
+                delay = delay
+                    .saturating_mul(2)
+                    .min(WHOLE_INSTANCE_PERSISTENCE_RETRY_MAX_DELAY);
+                settle_reconciliation_pending_with_backoff(failure_memory).await?;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+async fn settle_reconciliation_pending_with_backoff(
+    failure_memory: &GuardianFailureMemoryStore,
+) -> Result<(), FailureMemoryStoreError> {
+    let mut delay = WHOLE_INSTANCE_PERSISTENCE_RETRY_INITIAL_DELAY;
+    loop {
+        match failure_memory.settle_reconciliation_pending().await {
+            Ok(()) => return Ok(()),
+            Err(FailureMemoryStoreError::Persistence(_)) => {
+                tokio::time::sleep(delay).await;
+                delay = delay
+                    .saturating_mul(2)
+                    .min(WHOLE_INSTANCE_PERSISTENCE_RETRY_MAX_DELAY);
+            }
+            Err(error) => return Err(error),
+        }
     }
 }
 
@@ -1108,6 +1333,27 @@ pub(crate) enum ReconciliationEvidenceRejection {
     OwnershipMismatch,
     ActiveSession,
     SuppressedPriorAttempt,
+}
+
+impl ReconciliationEvidenceRejection {
+    pub(crate) const fn class(self) -> &'static str {
+        match self {
+            Self::InvalidInstanceIdentity => "invalid_instance_identity",
+            Self::InstanceNotRegistered => "instance_not_registered",
+            Self::RootAuthorityUnavailable => "root_authority_unavailable",
+            Self::MemoryMissing => "memory_missing",
+            Self::MemoryNotFailed => "memory_not_failed",
+            Self::MemoryWindowInactive => "memory_window_inactive",
+            Self::JournalMissing => "journal_missing",
+            Self::JournalMismatch => "journal_mismatch",
+            Self::NonAdjacentRung => "non_adjacent_rung",
+            Self::ScopeMismatch => "scope_mismatch",
+            Self::IncarnationMismatch => "incarnation_mismatch",
+            Self::OwnershipMismatch => "ownership_mismatch",
+            Self::ActiveSession => "active_session",
+            Self::SuppressedPriorAttempt => "suppressed_prior_attempt",
+        }
+    }
 }
 
 impl RecordedRuntimeArtifactRepairFailure {
@@ -3982,6 +4228,7 @@ fn update_path_frame(hasher: &mut Sha256, label: &[u8], path: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::execution::persistence::{AtomicWriteBackend, PersistenceCoordinator};
     use crate::guardian::{
         ActionPlanPrerequisite, GuardianAction, GuardianActionPlan, GuardianConfidence,
         GuardianDecision,
@@ -3997,10 +4244,78 @@ mod tests {
     use sha1::Sha1;
     use std::fs;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
     const INSTANCE_ID: &str = "0000000000000001";
     const DIAGNOSIS_ID: DiagnosisId = DiagnosisId::LauncherManagedArtifactCorrupt;
+
+    #[derive(Default)]
+    struct ControlledWriteBackend {
+        attempts: AtomicUsize,
+        failed_attempt: AtomicUsize,
+        gated_attempt: AtomicUsize,
+        release_gate: AtomicBool,
+    }
+
+    impl ControlledWriteBackend {
+        fn fail_attempt(&self, attempt: usize) {
+            self.failed_attempt.store(attempt, Ordering::SeqCst);
+        }
+
+        fn gate_attempt(&self, attempt: usize) {
+            self.gated_attempt.store(attempt, Ordering::SeqCst);
+            self.release_gate.store(false, Ordering::SeqCst);
+        }
+
+        fn next_attempt(&self) -> usize {
+            self.attempts.load(Ordering::SeqCst) + 1
+        }
+
+        fn release(&self) {
+            self.release_gate.store(true, Ordering::SeqCst);
+        }
+
+        async fn wait_for_attempt(&self, expected: usize) {
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while self.attempts.load(Ordering::SeqCst) < expected {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("whole-instance persistence attempt");
+        }
+    }
+
+    impl AtomicWriteBackend for ControlledWriteBackend {
+        fn write(
+            &self,
+            target: &TargetDescriptor,
+            destination: &Path,
+            contents: &[u8],
+        ) -> io::Result<()> {
+            let attempt = self.attempts.fetch_add(1, Ordering::SeqCst) + 1;
+            if self.gated_attempt.load(Ordering::SeqCst) == attempt {
+                while !self.release_gate.load(Ordering::SeqCst) {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            }
+            if self.failed_attempt.load(Ordering::SeqCst) == attempt {
+                return Err(io::Error::other(
+                    "injected whole-instance persistence failure",
+                ));
+            }
+            crate::execution::file::write_file_atomically(
+                crate::execution::file::FileWriteRequest::new(
+                    target.clone(),
+                    destination,
+                    contents,
+                ),
+            )
+            .map(|_| ())
+            .map_err(io::Error::from)
+        }
+    }
 
     trait AmbiguousIfClone<Marker> {
         fn assert_not_clone() {}
@@ -4019,6 +4334,7 @@ mod tests {
         let _ = <RegisteredWholeInstanceCoreRequest as AmbiguousIfClone<_>>::assert_not_clone;
         let _ = <RegisteredWholeInstanceCompletion as AmbiguousIfClone<_>>::assert_not_clone;
         let _ = <RegisteredWholeInstanceSettlement as AmbiguousIfClone<_>>::assert_not_clone;
+        let _ = <RegisteredWholeInstanceDurableOutcome as AmbiguousIfClone<_>>::assert_not_clone;
     };
 
     struct Fixture {
@@ -4059,6 +4375,14 @@ mod tests {
     }
 
     fn fixture(label: &str) -> Fixture {
+        fixture_with_backends(label, None, None)
+    }
+
+    fn fixture_with_backends(
+        label: &str,
+        journal_backend: Option<Arc<ControlledWriteBackend>>,
+        memory_backend: Option<Arc<ControlledWriteBackend>>,
+    ) -> Fixture {
         static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(1);
 
         let root = std::env::temp_dir().join(format!(
@@ -4099,8 +4423,30 @@ mod tests {
             )
             .expect("load test instances"),
         );
-        let journals = Arc::new(OperationJournalStore::new());
-        let failure_memory = Arc::new(GuardianFailureMemoryStore::new());
+        let journals = Arc::new(match journal_backend {
+            Some(backend) => OperationJournalStore::try_load_from_paths_with_coordinator(
+                &paths,
+                PersistenceCoordinator::for_test(
+                    backend,
+                    Duration::from_millis(1),
+                    Duration::from_millis(5),
+                ),
+            )
+            .expect("persistent whole-instance journals"),
+            None => OperationJournalStore::new(),
+        });
+        let failure_memory = Arc::new(match memory_backend {
+            Some(backend) => GuardianFailureMemoryStore::try_load_from_paths_with_coordinator(
+                &paths,
+                PersistenceCoordinator::for_test(
+                    backend,
+                    Duration::from_millis(1),
+                    Duration::from_millis(5),
+                ),
+            )
+            .expect("persistent whole-instance memory"),
+            None => GuardianFailureMemoryStore::new(),
+        });
         let state = AppState::new(AppStateInit {
             app_name: "Axial".to_string(),
             version: "test".to_string(),
@@ -4432,6 +4778,16 @@ mod tests {
             .close_instance_registry()
             .await
             .expect("close instance registry");
+        fixture
+            .journals
+            .close()
+            .await
+            .expect("close reconciliation journals");
+        fixture
+            .failure_memory
+            .close()
+            .await
+            .expect("close reconciliation memory");
         let Fixture {
             state,
             journals,
@@ -5289,6 +5645,95 @@ mod tests {
         journal.completed_steps.push(terminal_step);
         journal.reconciliation_terminal = Some(terminal.clone());
         (journal, terminal)
+    }
+
+    async fn whole_instance_admission(
+        fixture: &Fixture,
+        label: &str,
+        mode: GuardianMode,
+    ) -> RegisteredWholeInstanceRematerializationAdmission {
+        persist_runtime_component_ladder(fixture, label, "java-runtime-delta", mode).await;
+        let RegisteredWholeInstanceRematerializationAvailability::Offered(offer) = fixture
+            .state
+            .whole_instance_rematerialization_availability(INSTANCE_ID, mode)
+            .await
+            .expect("whole-instance offer")
+        else {
+            panic!("eligible mode must mint a whole-instance offer");
+        };
+        fixture
+            .state
+            .admit_whole_instance_rematerialization(
+                offer,
+                OperationId::new(format!("{label}-whole")),
+                chrono::Duration::minutes(30),
+            )
+            .await
+            .expect("whole-instance admission")
+    }
+
+    async fn assert_whole_instance_ownership_is_held(fixture: &Fixture) {
+        assert!(fixture.state.instance_lifecycle_is_held(INSTANCE_ID).await);
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(25),
+                fixture.state.config.acquire_mutation()
+            )
+            .await
+            .is_err(),
+            "whole-instance owner must retain config exclusion"
+        );
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(25),
+                fixture.state.sessions.acquire_shared_component_mutation(),
+            )
+            .await
+            .is_err(),
+            "whole-instance owner must retain component exclusion"
+        );
+    }
+
+    async fn prepare_core_whole_instance_fixture(
+        fixture: &Fixture,
+        runtime_bytes: &'static [u8],
+    ) -> axial_minecraft::ManagedWholeInstanceFixtureForTest {
+        let runtime_url = serve_runtime_bytes(runtime_bytes).await;
+        axial_minecraft::prepare_managed_whole_instance_fixture_for_test(
+            PathBuf::from(fixture.state.library_dir().expect("fixture library root")),
+            "1.21.1",
+            RuntimeId::from("java-runtime-delta"),
+            &runtime_url,
+            runtime_bytes,
+        )
+        .await
+        .expect("prepare sealed Core whole-instance fixture")
+    }
+
+    async fn serve_runtime_bytes(bytes: &'static [u8]) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("whole-instance Runtime fixture server");
+        let address = listener
+            .local_addr()
+            .expect("whole-instance Runtime fixture address");
+        tokio::spawn(async move {
+            for _ in 0..2 {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut request = [0_u8; 1024];
+                let _ = socket.read(&mut request).await;
+                let headers = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    bytes.len()
+                );
+                if socket.write_all(headers.as_bytes()).await.is_ok() {
+                    let _ = socket.write_all(bytes).await;
+                }
+            }
+        });
+        format!("http://{address}/java")
     }
 
     #[tokio::test]
@@ -6439,15 +6884,11 @@ mod tests {
         };
         tokio::time::sleep(std::time::Duration::from_millis(150)).await;
         let effect = admission.into_effect().await;
-        let Ok(RegisteredWholeInstanceEffectAdmission::Refused(settlement)) = effect else {
-            panic!("expired rung-three attempt must refuse before Core");
+        let Ok(RegisteredWholeInstancePreparation::Closed(outcome)) = effect else {
+            panic!("expired rung-three attempt must close before Core");
         };
-        assert_eq!(
-            settlement.terminal_step,
-            WHOLE_INSTANCE_REMATERIALIZATION_START_STEP
-        );
-        assert!(settlement.terminal().quarantine_checkpoint().is_empty());
-        assert!(settlement.settle().await.is_ok());
+        assert!(!outcome.succeeded());
+        assert!(outcome.terminal().quarantine_checkpoint().is_empty());
         assert!(!fixture.state.instance_lifecycle_is_held(INSTANCE_ID).await);
         let config = tokio::time::timeout(
             std::time::Duration::from_secs(1),
@@ -6474,6 +6915,699 @@ mod tests {
             Some(WHOLE_INSTANCE_REMATERIALIZATION_START_STEP)
         );
         drop((component, config));
+        cleanup(fixture).await;
+    }
+
+    #[tokio::test]
+    async fn whole_instance_plan_failure_retries_exactly_before_exposing_core_request() {
+        let backend = Arc::new(ControlledWriteBackend::default());
+        let fixture = fixture_with_backends(
+            "whole-instance-plan-persistence",
+            Some(backend.clone()),
+            None,
+        );
+        let admission = whole_instance_admission(
+            &fixture,
+            "whole-instance-plan-persistence",
+            GuardianMode::Managed,
+        )
+        .await;
+        let operation_id = admission.attempt().operation_id().clone();
+        let gated_attempt = backend.next_attempt();
+        backend.gate_attempt(gated_attempt);
+        backend.fail_attempt(gated_attempt);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let driver_calls = calls.clone();
+        let execution = tokio::spawn(async move {
+            crate::guardian::execute_whole_instance_rematerialization_with(
+                admission,
+                move |_, _, _| async move {
+                    driver_calls.fetch_add(1, Ordering::SeqCst);
+                    Err(axial_minecraft::ManagedWholeInstanceRebuildError::Preparation)
+                },
+            )
+            .await
+        });
+
+        backend.wait_for_attempt(gated_attempt).await;
+        assert!(fixture.journals.get(&operation_id).is_none());
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_whole_instance_ownership_is_held(&fixture).await;
+        backend.release();
+
+        let outcome = tokio::time::timeout(Duration::from_secs(2), execution)
+            .await
+            .expect("plan reconciliation completes")
+            .expect("plan reconciliation task")
+            .expect("plan reconciliation remains structurally valid");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            outcome.status(),
+            crate::guardian::GuardianWholeInstanceRematerializationStatus::Failed
+        );
+        assert!(!fixture.state.instance_lifecycle_is_held(INSTANCE_ID).await);
+        cleanup(fixture).await;
+    }
+
+    #[tokio::test]
+    async fn whole_instance_terminal_journal_retry_precedes_memory_and_retains_authority() {
+        let backend = Arc::new(ControlledWriteBackend::default());
+        let fixture = fixture_with_backends(
+            "whole-instance-terminal-persistence",
+            Some(backend.clone()),
+            None,
+        );
+        let admission = whole_instance_admission(
+            &fixture,
+            "whole-instance-terminal-persistence",
+            GuardianMode::Managed,
+        )
+        .await;
+        let key = reconciliation_attempt_key(admission.attempt());
+        let operation_id = admission.attempt().operation_id().clone();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let driver_calls = calls.clone();
+        let (driver_entered_tx, driver_entered_rx) = tokio::sync::oneshot::channel();
+        let (driver_release_tx, driver_release_rx) = tokio::sync::oneshot::channel();
+        let execution = tokio::spawn(async move {
+            crate::guardian::execute_whole_instance_rematerialization_with(
+                admission,
+                move |_, _, _| async move {
+                    driver_calls.fetch_add(1, Ordering::SeqCst);
+                    let _ = driver_entered_tx.send(());
+                    let _ = driver_release_rx.await;
+                    Err(axial_minecraft::ManagedWholeInstanceRebuildError::Preparation)
+                },
+            )
+            .await
+        });
+        driver_entered_rx.await.expect("Core driver reached once");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let gated_attempt = backend.next_attempt();
+        backend.gate_attempt(gated_attempt);
+        backend.fail_attempt(gated_attempt);
+        let _ = driver_release_tx.send(());
+
+        backend.wait_for_attempt(gated_attempt).await;
+        assert_eq!(
+            fixture
+                .journals
+                .get(&operation_id)
+                .expect("visible whole-instance plan")
+                .status,
+            OperationStatus::Planned
+        );
+        assert!(fixture.failure_memory.get(&key).is_none());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_whole_instance_ownership_is_held(&fixture).await;
+        backend.release();
+
+        let outcome = tokio::time::timeout(Duration::from_secs(2), execution)
+            .await
+            .expect("terminal journal reconciliation completes")
+            .expect("terminal journal reconciliation task")
+            .expect("terminal settlement remains structurally valid");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            outcome.status(),
+            crate::guardian::GuardianWholeInstanceRematerializationStatus::Failed
+        );
+        let journal = fixture
+            .journals
+            .get(&operation_id)
+            .expect("durable whole-instance terminal");
+        let terminal = journal
+            .reconciliation_terminal()
+            .expect("whole-instance terminal evidence");
+        assert_eq!(
+            fixture
+                .failure_memory
+                .get(&key)
+                .and_then(|entry| entry.reconciliation_terminal().cloned()),
+            Some(terminal.clone())
+        );
+        cleanup(fixture).await;
+    }
+
+    #[tokio::test]
+    async fn whole_instance_memory_retry_retains_authority_after_terminal_journal() {
+        let backend = Arc::new(ControlledWriteBackend::default());
+        let fixture = fixture_with_backends(
+            "whole-instance-memory-persistence",
+            None,
+            Some(backend.clone()),
+        );
+        let admission = whole_instance_admission(
+            &fixture,
+            "whole-instance-memory-persistence",
+            GuardianMode::Managed,
+        )
+        .await;
+        let key = reconciliation_attempt_key(admission.attempt());
+        let operation_id = admission.attempt().operation_id().clone();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let driver_calls = calls.clone();
+        let (driver_entered_tx, driver_entered_rx) = tokio::sync::oneshot::channel();
+        let (driver_release_tx, driver_release_rx) = tokio::sync::oneshot::channel();
+        let execution = tokio::spawn(async move {
+            crate::guardian::execute_whole_instance_rematerialization_with(
+                admission,
+                move |_, _, _| async move {
+                    driver_calls.fetch_add(1, Ordering::SeqCst);
+                    let _ = driver_entered_tx.send(());
+                    let _ = driver_release_rx.await;
+                    Err(axial_minecraft::ManagedWholeInstanceRebuildError::Preparation)
+                },
+            )
+            .await
+        });
+        driver_entered_rx.await.expect("Core driver reached once");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let gated_attempt = backend.next_attempt();
+        backend.gate_attempt(gated_attempt);
+        backend.fail_attempt(gated_attempt);
+        let _ = driver_release_tx.send(());
+
+        backend.wait_for_attempt(gated_attempt).await;
+        let journal = fixture
+            .journals
+            .get(&operation_id)
+            .expect("terminal journal precedes memory");
+        assert!(journal.reconciliation_terminal().is_some());
+        assert!(fixture.failure_memory.get(&key).is_none());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_whole_instance_ownership_is_held(&fixture).await;
+        backend.release();
+
+        let outcome = tokio::time::timeout(Duration::from_secs(2), execution)
+            .await
+            .expect("memory reconciliation completes")
+            .expect("memory reconciliation task")
+            .expect("memory settlement remains structurally valid");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            outcome.status(),
+            crate::guardian::GuardianWholeInstanceRematerializationStatus::Failed
+        );
+        let terminal = fixture
+            .journals
+            .get(&operation_id)
+            .and_then(|entry| entry.reconciliation_terminal().cloned())
+            .expect("exact whole-instance journal terminal");
+        assert_eq!(
+            fixture
+                .failure_memory
+                .get(&key)
+                .and_then(|entry| entry.reconciliation_terminal().cloned()),
+            Some(terminal)
+        );
+        cleanup(fixture).await;
+    }
+
+    #[tokio::test]
+    async fn whole_instance_same_key_nonterminal_is_ambiguous_and_releases_reservation() {
+        let fixture = fixture("whole-instance-plan-conflict");
+        let admission = whole_instance_admission(
+            &fixture,
+            "whole-instance-plan-conflict",
+            GuardianMode::Managed,
+        )
+        .await;
+        let key = reconciliation_attempt_key(admission.attempt());
+        let operation_id = admission.attempt().operation_id().clone();
+        let mut conflicting =
+            whole_instance_rematerialization_journal_for_attempt(admission.attempt());
+        conflicting.journal_id = JournalId::new("journal-conflicting-whole-instance-plan");
+        let expected_conflict = conflicting.clone();
+        fixture
+            .journals
+            .create(conflicting)
+            .await
+            .expect("valid conflicting whole-instance plan");
+
+        let error = admission
+            .into_effect()
+            .await
+            .err()
+            .expect("same-key nonterminal must fail structurally");
+        assert_eq!(error.class(), "ambiguous_prior_attempt");
+        assert_eq!(fixture.journals.get(&operation_id), Some(expected_conflict));
+        let reservation = fixture
+            .failure_memory
+            .reserve_reconciliation_attempt(key)
+            .expect("structural plan conflict releases process reservation");
+        drop(reservation);
+        assert!(!fixture.state.instance_lifecycle_is_held(INSTANCE_ID).await);
+        cleanup(fixture).await;
+    }
+
+    #[tokio::test]
+    async fn guardian_whole_instance_managed_and_custom_call_driver_once_and_fail_canonically() {
+        for (label, mode) in [
+            ("guardian-whole-managed", GuardianMode::Managed),
+            ("guardian-whole-custom", GuardianMode::Custom),
+        ] {
+            let fixture = fixture(label);
+            let admission = whole_instance_admission(&fixture, label, mode).await;
+            let key = reconciliation_attempt_key(admission.attempt());
+            let operation_id = admission.attempt().operation_id().clone();
+            let calls = Arc::new(AtomicUsize::new(0));
+            let driver_calls = calls.clone();
+
+            let outcome = crate::guardian::execute_whole_instance_rematerialization_with(
+                admission,
+                move |_, _, _| async move {
+                    driver_calls.fetch_add(1, Ordering::SeqCst);
+                    Err(axial_minecraft::ManagedWholeInstanceRebuildError::Preparation)
+                },
+            )
+            .await
+            .expect("pre-effect Core error settles canonically");
+
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                outcome.status(),
+                crate::guardian::GuardianWholeInstanceRematerializationStatus::Failed
+            );
+            let terminal = fixture
+                .journals
+                .get(&operation_id)
+                .and_then(|journal| journal.reconciliation_terminal().cloned())
+                .expect("canonical Guardian whole-instance terminal");
+            assert_eq!(terminal.outcome(), ReconciliationTerminalOutcome::Failed);
+            assert_eq!(
+                fixture
+                    .failure_memory
+                    .get(&key)
+                    .and_then(|entry| entry.reconciliation_terminal().cloned()),
+                Some(terminal)
+            );
+            assert!(!fixture.state.instance_lifecycle_is_held(INSTANCE_ID).await);
+            cleanup(fixture).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn guardian_whole_instance_commit_is_rematerialized_with_user_state_untouched() {
+        const RUNTIME_BYTES: &[u8] = b"Guardian whole-instance commit Runtime";
+        let fixture = fixture("guardian-whole-commit");
+        let sentinel = PathBuf::from(fixture.state.library_dir().expect("library root"))
+            .join("mods")
+            .join("user-owned.txt");
+        fs::create_dir_all(sentinel.parent().expect("sentinel parent"))
+            .expect("create user-owned sentinel parent");
+        fs::write(&sentinel, b"untouched").expect("seed user-owned sentinel");
+        let core_fixture = prepare_core_whole_instance_fixture(&fixture, RUNTIME_BYTES).await;
+        fixture.state.activate_known_good_inventory_for_test(
+            INSTANCE_ID,
+            core_fixture.known_good_inventory(),
+        );
+        let admission =
+            whole_instance_admission(&fixture, "guardian-whole-commit", GuardianMode::Managed)
+                .await;
+        let operation_id = admission.attempt().operation_id().clone();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let driver_calls = calls.clone();
+
+        let outcome = crate::guardian::execute_whole_instance_rematerialization_with(
+            admission,
+            move |_, runtime_cache, _| async move {
+                driver_calls.fetch_add(1, Ordering::SeqCst);
+                axial_minecraft::publish_managed_whole_instance_fixture_for_test(
+                    core_fixture,
+                    &runtime_cache,
+                )
+                .await
+            },
+        )
+        .await
+        .expect("sealed commit settles through State");
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            outcome.status(),
+            crate::guardian::GuardianWholeInstanceRematerializationStatus::Rematerialized
+        );
+        let journal = fixture
+            .journals
+            .get(&operation_id)
+            .expect("committed whole-instance journal");
+        assert_eq!(journal.status, OperationStatus::Succeeded);
+        let terminal = journal
+            .reconciliation_terminal()
+            .cloned()
+            .expect("committed whole-instance terminal");
+        assert_eq!(terminal.outcome(), ReconciliationTerminalOutcome::Succeeded);
+        assert_eq!(
+            fs::read(&sentinel).expect("user sentinel remains"),
+            b"untouched"
+        );
+        cleanup(fixture).await;
+    }
+
+    #[tokio::test]
+    async fn guardian_whole_instance_rollback_has_identical_runtime_quarantine_evidence() {
+        const RUNTIME_BYTES: &[u8] = b"Guardian whole-instance rollback Runtime";
+        let fixture = fixture("guardian-whole-rollback");
+        let prior_runtime = fixture
+            .state
+            .managed_runtime_cache()
+            .component_root("java-runtime-delta")
+            .expect("fixture Runtime root");
+        fs::create_dir_all(&prior_runtime).expect("seed prior Runtime");
+        fs::write(prior_runtime.join("prior-runtime"), b"prior Runtime")
+            .expect("seed prior Runtime bytes");
+        let core_fixture = prepare_core_whole_instance_fixture(&fixture, RUNTIME_BYTES).await;
+        fixture.state.activate_known_good_inventory_for_test(
+            INSTANCE_ID,
+            core_fixture.known_good_inventory(),
+        );
+        let admission =
+            whole_instance_admission(&fixture, "guardian-whole-rollback", GuardianMode::Managed)
+                .await;
+        let operation_id = admission.attempt().operation_id().clone();
+        let key = reconciliation_attempt_key(admission.attempt());
+
+        let outcome = crate::guardian::execute_whole_instance_rematerialization_with(
+            admission,
+            move |_, runtime_cache, _| async move {
+                axial_minecraft::publish_managed_whole_instance_rollback_fixture_for_test(
+                    core_fixture,
+                    &runtime_cache,
+                )
+                .await
+            },
+        )
+        .await
+        .expect("sealed rollback settles through State");
+
+        assert_eq!(
+            outcome.status(),
+            crate::guardian::GuardianWholeInstanceRematerializationStatus::Failed
+        );
+        let terminal = fixture
+            .journals
+            .get(&operation_id)
+            .and_then(|journal| journal.reconciliation_terminal().cloned())
+            .expect("rollback whole-instance terminal");
+        assert_eq!(terminal.outcome(), ReconciliationTerminalOutcome::Failed);
+        assert_eq!(terminal.quarantine_checkpoint().records().len(), 1);
+        let memory_terminal = fixture
+            .failure_memory
+            .get(&key)
+            .and_then(|entry| entry.reconciliation_terminal().cloned())
+            .expect("rollback whole-instance memory");
+        assert_eq!(memory_terminal, terminal);
+        assert_eq!(
+            memory_terminal.quarantine_checkpoint(),
+            terminal.quarantine_checkpoint()
+        );
+        cleanup(fixture).await;
+    }
+
+    #[tokio::test]
+    async fn guardian_whole_instance_commit_receipt_fails_closed_after_current_inventory_drift() {
+        const RUNTIME_BYTES: &[u8] = b"Guardian whole-instance drift Runtime";
+        let fixture = fixture("guardian-whole-current-drift");
+        let core_fixture = prepare_core_whole_instance_fixture(&fixture, RUNTIME_BYTES).await;
+        fixture.state.activate_known_good_inventory_for_test(
+            INSTANCE_ID,
+            core_fixture.known_good_inventory(),
+        );
+        let admission = whole_instance_admission(
+            &fixture,
+            "guardian-whole-current-drift",
+            GuardianMode::Managed,
+        )
+        .await;
+        let state = fixture.state.clone();
+
+        let outcome = crate::guardian::execute_whole_instance_rematerialization_with(
+            admission,
+            move |_, runtime_cache, _| async move {
+                let receipt = axial_minecraft::publish_managed_whole_instance_fixture_for_test(
+                    core_fixture,
+                    &runtime_cache,
+                )
+                .await;
+                state.activate_known_good_inventory_for_test(INSTANCE_ID, empty_inventory());
+                receipt
+            },
+        )
+        .await
+        .expect("drifted sealed commit settles as failure");
+
+        assert_eq!(
+            outcome.status(),
+            crate::guardian::GuardianWholeInstanceRematerializationStatus::Failed
+        );
+        cleanup(fixture).await;
+    }
+
+    #[tokio::test]
+    async fn application_whole_instance_owner_rejects_a_foreign_state_handoff_before_admission() {
+        let owner = fixture("application-whole-owner-foreign-handoff");
+        let foreign = fixture("application-whole-owner-foreign-handoff-source");
+        persist_runtime_component_ladder(
+            &owner,
+            "application-whole-owner-foreign-handoff",
+            "java-runtime-delta",
+            GuardianMode::Managed,
+        )
+        .await;
+        let RegisteredWholeInstanceRematerializationAvailability::Offered(offer) = owner
+            .state
+            .whole_instance_rematerialization_availability(INSTANCE_ID, GuardianMode::Managed)
+            .await
+            .expect("whole-instance offer for foreign handoff refusal")
+        else {
+            panic!("Managed predecessor must mint an explicit offer");
+        };
+        let operation_id = OperationId::new("application-whole-owner-foreign-handoff-whole");
+        let foreign_request = foreign.state.try_admit_request().expect("foreign request");
+        let executor_calls = Arc::new(AtomicUsize::new(0));
+        let executed = executor_calls.clone();
+        let core_calls = Arc::new(AtomicUsize::new(0));
+        let driven = core_calls.clone();
+
+        let result = crate::application::spawn_explicit_whole_instance_rematerialization_with(
+            owner.state.clone(),
+            foreign_request.producer_handoff(),
+            offer,
+            operation_id.clone(),
+            chrono::Duration::minutes(30),
+            move |admission| {
+                executed.fetch_add(1, Ordering::SeqCst);
+                crate::guardian::execute_whole_instance_rematerialization_with(
+                    admission,
+                    move |_, _, _| async move {
+                        driven.fetch_add(1, Ordering::SeqCst);
+                        Err(axial_minecraft::ManagedWholeInstanceRebuildError::Preparation)
+                    },
+                )
+            },
+        );
+
+        assert!(result.is_err());
+        assert_eq!(executor_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(core_calls.load(Ordering::SeqCst), 0);
+        assert!(owner.journals.get(&operation_id).is_none());
+        assert!(!owner.state.instance_lifecycle_is_held(INSTANCE_ID).await);
+        drop(foreign_request);
+        cleanup(owner).await;
+        cleanup(foreign).await;
+    }
+
+    #[tokio::test]
+    async fn application_whole_instance_owner_survives_waiter_cancellation_and_blocks_shutdown() {
+        let fixture = fixture("application-whole-owner-cancellation");
+        persist_runtime_component_ladder(
+            &fixture,
+            "application-whole-owner-cancellation",
+            "java-runtime-delta",
+            GuardianMode::Managed,
+        )
+        .await;
+        let RegisteredWholeInstanceRematerializationAvailability::Offered(offer) = fixture
+            .state
+            .whole_instance_rematerialization_availability(INSTANCE_ID, GuardianMode::Managed)
+            .await
+            .expect("whole-instance offer for Application owner")
+        else {
+            panic!("Managed predecessor must mint an explicit offer");
+        };
+        let operation_id = OperationId::new("application-whole-owner-cancellation-whole");
+        let request = fixture.state.try_admit_request().expect("admit request");
+        let handoff = request.producer_handoff();
+        let shutdown_state = fixture.state.clone();
+        let mut quiesce = tokio::spawn(async move { shutdown_state.quiesce().await });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while fixture.state.lifecycle_phase()
+                != crate::state::AppLifecyclePhase::DrainingRequests
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("request drain begins");
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let driver_calls = calls.clone();
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let result = crate::application::spawn_explicit_whole_instance_rematerialization_with(
+            fixture.state.clone(),
+            handoff,
+            offer,
+            operation_id.clone(),
+            chrono::Duration::minutes(30),
+            move |admission| {
+                crate::guardian::execute_whole_instance_rematerialization_with(
+                    admission,
+                    move |_, _, _| async move {
+                        driver_calls.fetch_add(1, Ordering::SeqCst);
+                        let _ = entered_tx.send(());
+                        let _ = release_rx.await;
+                        Err(axial_minecraft::ManagedWholeInstanceRebuildError::Preparation)
+                    },
+                )
+            },
+        )
+        .expect("DrainingRequests handoff claims a producer");
+        drop(request);
+        entered_rx.await.expect("Core driver blocks after plan");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            fixture
+                .journals
+                .get(&operation_id)
+                .expect("plan visible before blocked Core driver")
+                .status,
+            OperationStatus::Planned
+        );
+        assert_whole_instance_ownership_is_held(&fixture).await;
+        drop(result);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while fixture.state.lifecycle_phase()
+                != crate::state::AppLifecyclePhase::QuiescingProducers
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("shutdown reaches producer drain");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut quiesce)
+                .await
+                .is_err(),
+            "shutdown must wait for detached whole-instance owner"
+        );
+
+        let _ = release_tx.send(());
+        quiesce
+            .await
+            .expect("quiesce task")
+            .expect("quiesce after whole-instance settlement");
+        let journal = fixture
+            .journals
+            .get(&operation_id)
+            .expect("cancelled waiter cannot orphan terminal");
+        let terminal = journal
+            .reconciliation_terminal()
+            .cloned()
+            .expect("whole-instance terminal after waiter cancellation");
+        let key = reconciliation_attempt_key(terminal.attempt());
+        assert_eq!(
+            fixture
+                .failure_memory
+                .get(&key)
+                .and_then(|entry| entry.reconciliation_terminal().cloned()),
+            Some(terminal)
+        );
+        assert!(!fixture.state.instance_lifecycle_is_held(INSTANCE_ID).await);
+        cleanup(fixture).await;
+    }
+
+    #[tokio::test]
+    async fn application_custom_whole_instance_owner_survives_waiter_cancellation() {
+        let fixture = fixture("application-custom-whole-owner-cancellation");
+        persist_runtime_component_ladder(
+            &fixture,
+            "application-custom-whole-owner-cancellation",
+            "java-runtime-delta",
+            GuardianMode::Custom,
+        )
+        .await;
+        let RegisteredWholeInstanceRematerializationAvailability::Offered(offer) = fixture
+            .state
+            .whole_instance_rematerialization_availability(INSTANCE_ID, GuardianMode::Custom)
+            .await
+            .expect("Custom explicit whole-instance offer")
+        else {
+            panic!("Custom predecessor must mint an explicit offer");
+        };
+        let operation_id = OperationId::new("application-custom-whole-owner-cancellation-whole");
+        let request = fixture.state.try_admit_request().expect("admit request");
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let result = crate::application::spawn_explicit_whole_instance_rematerialization_with(
+            fixture.state.clone(),
+            request.producer_handoff(),
+            offer,
+            operation_id.clone(),
+            chrono::Duration::minutes(30),
+            move |admission| {
+                crate::guardian::execute_whole_instance_rematerialization_with(
+                    admission,
+                    move |_, _, _| async move {
+                        let _ = entered_tx.send(());
+                        let _ = release_rx.await;
+                        Err(axial_minecraft::ManagedWholeInstanceRebuildError::Preparation)
+                    },
+                )
+            },
+        )
+        .expect("Custom request hands off whole-instance owner");
+        drop(request);
+        entered_rx.await.expect("Custom Core driver reached");
+        drop(result);
+        let _ = release_tx.send(());
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if fixture
+                    .journals
+                    .get(&operation_id)
+                    .is_some_and(|journal| journal.reconciliation_terminal().is_some())
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("Custom detached owner settles terminal");
+        let terminal = fixture
+            .journals
+            .get(&operation_id)
+            .and_then(|journal| journal.reconciliation_terminal().cloned())
+            .expect("Custom cancellation terminal");
+        let key = reconciliation_attempt_key(terminal.attempt());
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while fixture.failure_memory.get(&key).is_none() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("Custom cancellation memory");
+        assert_eq!(
+            fixture
+                .failure_memory
+                .get(&key)
+                .and_then(|entry| entry.reconciliation_terminal().cloned()),
+            Some(terminal)
+        );
+        assert!(!fixture.state.instance_lifecycle_is_held(INSTANCE_ID).await);
         cleanup(fixture).await;
     }
 
@@ -6742,7 +7876,7 @@ mod tests {
         ));
         let expected_root = PathBuf::from(fixture.state.library_dir().expect("library root"));
         let effect = admission.into_effect().await;
-        let Ok(RegisteredWholeInstanceEffectAdmission::Admitted {
+        let Ok(RegisteredWholeInstancePreparation::Admitted {
             request,
             completion,
         }) = effect
@@ -6757,10 +7891,11 @@ mod tests {
         );
         assert_eq!(version_id, "1.21.1");
         let settlement = completion.into_failed_settlement();
-        assert!(!settlement.succeeded());
-        assert!(settlement.receipt_valid());
-        assert!(!settlement.retains_publication());
-        assert!(settlement.settle().await.is_ok());
+        let outcome = match settlement.settle().await {
+            Ok(outcome) => outcome,
+            Err(_) => panic!("durable failed settlement"),
+        };
+        assert!(!outcome.succeeded());
         assert!(!fixture.state.instance_lifecycle_is_held(INSTANCE_ID).await);
 
         let restarted_journals = Arc::new(OperationJournalStore::new());
