@@ -31,6 +31,24 @@ pub enum ReconciliationRung {
     RematerializeInstance,
 }
 
+const RECONCILIATION_MAX_ATTEMPTS_PER_SUPPRESSION_WINDOW: usize = 1;
+
+impl ReconciliationRung {
+    pub const ALL: &'static [Self] = &[
+        Self::RepairArtifact,
+        Self::RebuildComponent,
+        Self::RematerializeInstance,
+    ];
+
+    pub(crate) const fn max_attempts_per_suppression_window(self) -> usize {
+        match self {
+            Self::RepairArtifact | Self::RebuildComponent | Self::RematerializeInstance => {
+                RECONCILIATION_MAX_ATTEMPTS_PER_SUPPRESSION_WINDOW
+            }
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
 pub enum ReconciliationComponent {
     VersionBundle,

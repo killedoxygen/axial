@@ -1,5 +1,5 @@
 {
-  "schema": "axial.guardian.invariant_coverage.v1",
+  "schema": "axial.guardian.invariant_coverage.v2",
   "invariants": [
     {
       "id": "I1",
@@ -7,7 +7,7 @@
     },
     {
       "id": "I2",
-      "status": "current_typed_hands_registered"
+      "status": "current_guardian_and_reconciliation_typed_hands_registered"
     },
     {
       "id": "I3",
@@ -15,7 +15,7 @@
     },
     {
       "id": "I4",
-      "status": "current_hand_attempt_bounds_registered"
+      "status": "current_guardian_and_reconciliation_hand_attempt_bounds_registered"
     },
     {
       "id": "I5",
@@ -4868,14 +4868,16 @@
         "artifact_hash_mismatch",
         "artifact_size_drift",
         "artifact_size_mismatch",
-        "artifact_missing"
+        "artifact_missing",
+        "registered_component_rebuild_failed"
       ],
       "evidence": [
         "artifact_checksum_mismatch",
         "artifact_hash_mismatch",
         "artifact_size_drift",
         "artifact_size_mismatch",
-        "artifact_missing"
+        "artifact_missing",
+        "registered_component_rebuild_failed"
       ],
       "phases": [],
       "actions": [
@@ -5959,6 +5961,11 @@
       "referenced_by_rule": true
     },
     {
+      "fact": "registered_component_rebuild_failed",
+      "availability": "registered_current",
+      "referenced_by_rule": true
+    },
+    {
       "fact": "repair_suppressed_until",
       "availability": "registered_current",
       "referenced_by_rule": false
@@ -6731,6 +6738,23 @@
       "kind": "ready_marker",
       "diagnosis": "managed_runtime_corrupt",
       "max_attempts": 1
+    }
+  ],
+  "reconciliation_hands": [
+    {
+      "admission_type": "RegisteredArtifactRepairAdmission",
+      "rung": "RepairArtifact",
+      "max_attempts_per_suppression_window": 1
+    },
+    {
+      "admission_type": "RegisteredComponentRebuildAdmission",
+      "rung": "RebuildComponent",
+      "max_attempts_per_suppression_window": 1
+    },
+    {
+      "admission_type": "RegisteredWholeInstanceRematerializationAdmission",
+      "rung": "RematerializeInstance",
+      "max_attempts_per_suppression_window": 1
     }
   ],
   "deferred_demonstrations": [

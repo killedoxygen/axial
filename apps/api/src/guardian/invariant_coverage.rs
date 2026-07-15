@@ -17,8 +17,10 @@ use crate::application::timing::{
 use crate::execution::{ExecutionFact, ExecutionFactKind, ExecutionFactSemantics};
 use crate::observability::evidence_text_looks_sensitive;
 use crate::state::contracts::{
-    OperationPhase, OwnershipClass, StabilizationSystem, TargetDescriptor, TargetKind,
+    OperationPhase, OwnershipClass, ReconciliationRung, StabilizationSystem, TargetDescriptor,
+    TargetKind,
 };
+use crate::state::reconciliation_hand_coverage;
 use axial_launcher::{
     LaunchFailureClass, LaunchReadiness, LaunchReadinessReason, LaunchReadinessReasonId,
     LaunchReadinessSeverity,
@@ -28,7 +30,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
 use std::fmt::Write as _;
 
-const SCHEMA: &str = "axial.guardian.invariant_coverage.v1";
+const SCHEMA: &str = "axial.guardian.invariant_coverage.v2";
 const REGENERATE_ENV: &str = "AXIAL_REGENERATE_GUARDIAN_INVARIANT_COVERAGE";
 const EXPECTED_DECISION_COUNTS: [(GuardianActionKind, usize); 5] = [
     (GuardianActionKind::Block, 160),
@@ -59,6 +61,7 @@ struct InvariantCoverage {
     preflight_senses: Vec<PreflightSenseCoverage>,
     adapters: AdapterCoverage,
     repair_hands: Vec<RepairHandCoverage>,
+    reconciliation_hands: Vec<ReconciliationHandCoverage>,
     deferred_demonstrations: Vec<DeferredDemonstration>,
 }
 
@@ -172,6 +175,14 @@ struct RepairHandCoverage {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct ReconciliationHandCoverage {
+    admission_type: String,
+    rung: String,
+    max_attempts_per_suppression_window: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct DeferredDemonstration {
     invariant: String,
     phase: String,
@@ -179,7 +190,7 @@ struct DeferredDemonstration {
 }
 
 #[test]
-fn guardian_invariant_coverage_artifacts_match_v1() {
+fn guardian_invariant_coverage_artifacts_match_v2() {
     let generated = generate_coverage();
     let expected_json =
         std::fs::read(json_fixture_path()).expect("read Guardian invariant fixture");
@@ -211,14 +222,29 @@ fn generate_coverage() -> InvariantCoverage {
     let kernel_cells = kernel_cells();
     assert_decision_counts(&kernel_cells);
     assert_reachable_public_copy(&kernel_cells);
+    let reconciliation_hands = reconciliation_hand_coverage()
+        .into_iter()
+        .map(|hand| ReconciliationHandCoverage {
+            admission_type: hand.admission_type.to_string(),
+            rung: debug_name(&hand.rung),
+            max_attempts_per_suppression_window: hand.max_attempts_per_suppression_window,
+        })
+        .collect::<Vec<_>>();
+    assert_reconciliation_hand_coverage(&reconciliation_hands);
 
     InvariantCoverage {
         schema: SCHEMA.to_string(),
         invariants: vec![
             invariant("I1", "launch_failure_matrix_and_rules_registered"),
-            invariant("I2", "current_typed_hands_registered"),
+            invariant(
+                "I2",
+                "current_guardian_and_reconciliation_typed_hands_registered",
+            ),
             invariant("I3", "public_launch_failure_guidance_complete"),
-            invariant("I4", "current_hand_attempt_bounds_registered"),
+            invariant(
+                "I4",
+                "current_guardian_and_reconciliation_hand_attempt_bounds_registered",
+            ),
             invariant("I5", "launch_failure_surfaces_bounded_and_redacted"),
             invariant("I6", "implemented_memory_trigger_rules_registered"),
             invariant(
@@ -258,12 +284,44 @@ fn generate_coverage() -> InvariantCoverage {
                 max_attempts,
             })
             .collect(),
+        reconciliation_hands,
         deferred_demonstrations: vec![DeferredDemonstration {
             invariant: "I9".to_string(),
             phase: "phase_5".to_string(),
             status: "agent_fallback_execution_pending".to_string(),
         }],
     }
+}
+
+fn assert_reconciliation_hand_coverage(hands: &[ReconciliationHandCoverage]) {
+    assert_eq!(hands.len(), ReconciliationRung::ALL.len());
+    assert_eq!(hands.len(), 3);
+    assert_eq!(
+        hands
+            .iter()
+            .map(|hand| hand.admission_type.as_str())
+            .collect::<HashSet<_>>()
+            .len(),
+        hands.len()
+    );
+    assert_eq!(
+        hands
+            .iter()
+            .map(|hand| hand.rung.as_str())
+            .collect::<HashSet<_>>()
+            .len(),
+        hands.len()
+    );
+    assert_eq!(
+        hands
+            .iter()
+            .map(|hand| hand.rung.as_str())
+            .collect::<Vec<_>>(),
+        ReconciliationRung::ALL
+            .iter()
+            .map(debug_name)
+            .collect::<Vec<_>>()
+    );
 }
 
 fn invariant(id: &str, status: &str) -> InvariantState {
@@ -729,7 +787,7 @@ fn markdown_document_bytes(snapshot: &InvariantCoverage) -> Vec<u8> {
          # Guardian Invariant Coverage\n\n\
          This document is a deterministic human-readable projection of Guardian's strict invariant coverage artifact. The JSON artifact remains the complete machine-readable inventory, including all kernel cells.\n\n\
          - Schema: `{}`\n\
-         - Machine-readable artifact: [guardian-invariant-coverage-v1.json](../apps/api/tests/fixtures/guardian/guardian-invariant-coverage-v1.json)\n\
+         - Machine-readable artifact: [guardian-invariant-coverage-v2.json](../apps/api/tests/fixtures/guardian/guardian-invariant-coverage-v2.json)\n\
          - Regenerate: `AXIAL_REGENERATE_GUARDIAN_INVARIANT_COVERAGE=1 cargo test -p axial-api regenerate_guardian_invariant_coverage_artifacts -- --ignored`\n\n\
          ## Invariant Status\n",
         snapshot.schema
@@ -768,6 +826,7 @@ fn markdown_document_bytes(snapshot: &InvariantCoverage) -> Vec<u8> {
             ("Preflight senses", snapshot.preflight_senses.len()),
             ("Adapter sources", adapter_sources),
             ("Repair hands", snapshot.repair_hands.len()),
+            ("Reconciliation hands", snapshot.reconciliation_hands.len()),
         ]
         .map(|(surface, count)| vec![surface.to_string(), count.to_string()]),
     );
@@ -834,6 +893,23 @@ fn markdown_document_bytes(snapshot: &InvariantCoverage) -> Vec<u8> {
         }),
     );
 
+    document.push_str("\n## Reconciliation Hands\n");
+    markdown_table(
+        &mut document,
+        &[
+            "Admission type",
+            "Rung",
+            "Maximum attempts per suppression window",
+        ],
+        snapshot.reconciliation_hands.iter().map(|hand| {
+            vec![
+                hand.admission_type.clone(),
+                hand.rung.clone(),
+                hand.max_attempts_per_suppression_window.to_string(),
+            ]
+        }),
+    );
+
     document.push_str("\n## Deferred Demonstrations\n");
     markdown_table(
         &mut document,
@@ -881,7 +957,7 @@ fn markdown_cell(value: &str) -> String {
 
 fn json_fixture_path() -> std::path::PathBuf {
     std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures/guardian/guardian-invariant-coverage-v1.json")
+        .join("tests/fixtures/guardian/guardian-invariant-coverage-v2.json")
 }
 
 fn markdown_document_path() -> std::path::PathBuf {

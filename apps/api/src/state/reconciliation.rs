@@ -191,6 +191,44 @@ pub(crate) struct RegisteredWholeInstanceRematerializationAdmission {
     config_mutation: tokio::sync::OwnedMutexGuard<()>,
 }
 
+#[cfg(test)]
+pub(crate) struct ReconciliationHandCoverage {
+    pub(crate) admission_type: &'static str,
+    pub(crate) rung: ReconciliationRung,
+    pub(crate) max_attempts_per_suppression_window: usize,
+}
+
+#[cfg(test)]
+pub(crate) fn reconciliation_hand_coverage() -> Vec<ReconciliationHandCoverage> {
+    ReconciliationRung::ALL
+        .iter()
+        .copied()
+        .map(|rung| match rung {
+            ReconciliationRung::RepairArtifact => reconciliation_hand::<
+                super::registered_artifact_findings::RegisteredArtifactRepairAdmission,
+            >(rung),
+            ReconciliationRung::RebuildComponent => {
+                reconciliation_hand::<RegisteredComponentRebuildAdmission>(rung)
+            }
+            ReconciliationRung::RematerializeInstance => {
+                reconciliation_hand::<RegisteredWholeInstanceRematerializationAdmission>(rung)
+            }
+        })
+        .collect()
+}
+
+#[cfg(test)]
+fn reconciliation_hand<Admission>(rung: ReconciliationRung) -> ReconciliationHandCoverage {
+    ReconciliationHandCoverage {
+        admission_type: std::any::type_name::<Admission>()
+            .rsplit("::")
+            .next()
+            .expect("admission type name"),
+        rung,
+        max_attempts_per_suppression_window: rung.max_attempts_per_suppression_window(),
+    }
+}
+
 pub(crate) enum RegisteredWholeInstancePreparation {
     Admitted {
         request: RegisteredWholeInstanceCoreRequest,
@@ -3281,15 +3319,18 @@ impl AppState {
         observed_at: chrono::DateTime<chrono::FixedOffset>,
     ) -> Result<(), ReconciliationEvidenceRejection> {
         let matches_suppression = |candidate: &ReconciliationAttempt| {
-            candidate.rung() == ReconciliationRung::RebuildComponent
-                && if attempt.component() == ReconciliationComponent::Runtime {
-                    candidate.component() == ReconciliationComponent::Runtime
-                        && candidate.target() == attempt.target()
-                } else {
-                    reconciliation_attempt_key(candidate) == reconciliation_attempt_key(attempt)
-                }
+            if attempt.component() == ReconciliationComponent::Runtime {
+                candidate.component() == ReconciliationComponent::Runtime
+                    && candidate.target() == attempt.target()
+            } else {
+                reconciliation_attempt_key(candidate) == reconciliation_attempt_key(attempt)
+            }
         };
-        self.refuse_active_reconciliation_window(observed_at, matches_suppression)
+        self.refuse_active_reconciliation_window(
+            ReconciliationRung::RebuildComponent,
+            observed_at,
+            matches_suppression,
+        )
     }
 
     fn refuse_active_whole_instance_window(
@@ -3314,16 +3355,19 @@ impl AppState {
                 return Err(ReconciliationEvidenceRejection::JournalMismatch);
             }
         }
-        self.refuse_active_reconciliation_window(observed_at, |candidate| {
-            candidate.rung() == ReconciliationRung::RematerializeInstance
-                && matches!(
+        self.refuse_active_reconciliation_window(
+            ReconciliationRung::RematerializeInstance,
+            observed_at,
+            |candidate| {
+                matches!(
                     candidate.scope(),
                     ReconciliationScope::RegisteredInstance {
                         instance_id: candidate_instance_id,
                         ..
                     } if candidate_instance_id == instance_id
                 )
-        })
+            },
+        )
     }
 
     fn whole_instance_terminal_is_semantically_canonical(
@@ -3388,22 +3432,24 @@ impl AppState {
     ) -> Result<(), ReconciliationEvidenceRejection> {
         let key = reconciliation_attempt_key(attempt);
         self.refuse_active_reconciliation_window(
+            ReconciliationRung::RepairArtifact,
             chrono::Utc::now().fixed_offset(),
-            move |candidate| {
-                candidate.rung() == ReconciliationRung::RepairArtifact
-                    && reconciliation_attempt_key(candidate) == key
-            },
+            move |candidate| reconciliation_attempt_key(candidate) == key,
         )
     }
 
     fn refuse_active_reconciliation_window<Matches>(
         &self,
+        rung: ReconciliationRung,
         observed_at: chrono::DateTime<chrono::FixedOffset>,
         matches_suppression: Matches,
     ) -> Result<(), ReconciliationEvidenceRejection>
     where
         Matches: Fn(&ReconciliationAttempt) -> bool,
     {
+        let matches_window = |attempt: &ReconciliationAttempt| {
+            attempt.rung() == rung && matches_suppression(attempt)
+        };
         let journals = self.journals.list();
         if journals.iter().any(|journal| {
             matches!(
@@ -3412,7 +3458,7 @@ impl AppState {
             ) && journal.reconciliation_terminal().is_none()
                 && journal
                     .reconciliation_attempt()
-                    .is_some_and(&matches_suppression)
+                    .is_some_and(&matches_window)
         }) {
             return Err(ReconciliationEvidenceRejection::JournalMismatch);
         }
@@ -3421,7 +3467,7 @@ impl AppState {
             let Some(terminal) = journal.reconciliation_terminal().cloned() else {
                 continue;
             };
-            if !matches_suppression(terminal.attempt())
+            if !matches_window(terminal.attempt())
                 || !active_reconciliation_terminal_at(&terminal, observed_at)?
             {
                 continue;
@@ -3434,7 +3480,7 @@ impl AppState {
             let Some(terminal) = memory.reconciliation_terminal().cloned() else {
                 continue;
             };
-            if !matches_suppression(terminal.attempt())
+            if !matches_window(terminal.attempt())
                 || !active_reconciliation_terminal_at(&terminal, observed_at)?
             {
                 continue;
@@ -3464,11 +3510,14 @@ impl AppState {
         {
             return Err(ReconciliationEvidenceRejection::JournalMismatch);
         }
-        if active_journals.is_empty() {
-            Ok(())
-        } else {
-            Err(ReconciliationEvidenceRejection::SuppressedPriorAttempt)
+        let max_attempts = rung.max_attempts_per_suppression_window();
+        if active_journals.len() > max_attempts {
+            return Err(ReconciliationEvidenceRejection::JournalMismatch);
         }
+        if active_journals.len() == max_attempts {
+            return Err(ReconciliationEvidenceRejection::SuppressedPriorAttempt);
+        }
+        Ok(())
     }
 
     fn recorded_reconciliation_failure_at(
@@ -6781,6 +6830,57 @@ mod tests {
                 .expect("queued Runtime admission task completes")
                 .err(),
             Some(ReconciliationEvidenceRejection::SuppressedPriorAttempt)
+        );
+
+        cleanup(fixture).await;
+    }
+
+    #[tokio::test]
+    async fn reconciliation_window_rejects_durable_attempts_above_state_bound() {
+        let fixture = fixture("reconciliation-window-bound");
+        let rung = ReconciliationRung::RepairArtifact;
+        let components = [
+            ReconciliationComponent::VersionBundle,
+            ReconciliationComponent::Libraries,
+        ];
+        assert_eq!(
+            components.len(),
+            rung.max_attempts_per_suppression_window() + 1
+        );
+
+        for (index, component) in components.into_iter().enumerate() {
+            let (attempt, terminal) = registered_attempt(
+                &fixture,
+                &format!("reconciliation-window-bound-{index}"),
+                component,
+            )
+            .await;
+            let reservation = reserve_reconciliation_attempt(
+                fixture.failure_memory.as_ref(),
+                fixture.journals.as_ref(),
+                reconciliation_attempt_key(&attempt),
+            )
+            .expect("reserve bounded reconciliation attempt");
+            persist_failed_journal(&fixture, &attempt, terminal.clone()).await;
+            commit_reconciliation_memory(
+                fixture.failure_memory.as_ref(),
+                reconciliation_memory_entry(terminal).expect("bounded reconciliation memory"),
+                &reservation,
+            )
+            .await
+            .expect("commit bounded reconciliation memory");
+        }
+
+        assert_eq!(
+            fixture
+                .state
+                .refuse_active_reconciliation_window(
+                    rung,
+                    chrono::Utc::now().fixed_offset(),
+                    |_| true,
+                )
+                .err(),
+            Some(ReconciliationEvidenceRejection::JournalMismatch)
         );
 
         cleanup(fixture).await;

@@ -33,8 +33,9 @@ Guardian coordinates those systems through structured facts and bounded actions.
 ## Current Implemented Surface
 The [generated Guardian invariant coverage](GUARDIAN-INVARIANT-COVERAGE.md) is the
 drift-tested inventory of current kernel cells, rules, facts, preflight senses, adapters,
-launch failure mappings, and repair hands. Its complete machine-readable matrix and the Markdown
-projection are regenerated from the same typed coverage value.
+launch failure mappings, Guardian repair hands, and State reconciliation hands. Its complete
+machine-readable matrix and the Markdown projection are regenerated from the same typed coverage
+value.
 
 Not every domain has a specialized automatic repair workflow yet. When Guardian does not have a specific workflow, it still owns the safety interpretation if the issue crosses a safety boundary: it should cushion damage by producing a bounded block, warning, degraded state, retry suppression, or user-facing notice rather than letting raw errors or frontend guesses escape.
 

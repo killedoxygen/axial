@@ -3,17 +3,17 @@
 
 This document is a deterministic human-readable projection of Guardian's strict invariant coverage artifact. The JSON artifact remains the complete machine-readable inventory, including all kernel cells.
 
-- Schema: `axial.guardian.invariant_coverage.v1`
-- Machine-readable artifact: [guardian-invariant-coverage-v1.json](../apps/api/tests/fixtures/guardian/guardian-invariant-coverage-v1.json)
+- Schema: `axial.guardian.invariant_coverage.v2`
+- Machine-readable artifact: [guardian-invariant-coverage-v2.json](../apps/api/tests/fixtures/guardian/guardian-invariant-coverage-v2.json)
 - Regenerate: `AXIAL_REGENERATE_GUARDIAN_INVARIANT_COVERAGE=1 cargo test -p axial-api regenerate_guardian_invariant_coverage_artifacts -- --ignored`
 
 ## Invariant Status
 | Invariant | Status |
 | --- | --- |
 | I1 | launch_failure_matrix_and_rules_registered |
-| I2 | current_typed_hands_registered |
+| I2 | current_guardian_and_reconciliation_typed_hands_registered |
 | I3 | public_launch_failure_guidance_complete |
-| I4 | current_hand_attempt_bounds_registered |
+| I4 | current_guardian_and_reconciliation_hand_attempt_bounds_registered |
 | I5 | launch_failure_surfaces_bounded_and_redacted |
 | I6 | implemented_memory_trigger_rules_registered |
 | I7 | typed_loader_worker_delegated_dispatch_and_named_boundary_single_assessment_complete |
@@ -29,10 +29,11 @@ This document is a deterministic human-readable projection of Guardian's strict 
 | Kernel cells | 540 |
 | Public kernel cells | 90 |
 | Diagnosis rules | 60 |
-| Registered facts | 122 |
+| Registered facts | 123 |
 | Preflight senses | 7 |
 | Adapter sources | 101 |
 | Repair hands | 2 |
+| Reconciliation hands | 3 |
 
 ### Decision Distribution
 The complete kernel matrix remains in the JSON artifact.
@@ -61,6 +62,13 @@ The complete kernel matrix remains in the JSON artifact.
 | --- | --- | --- |
 | registered_artifact | launcher_managed_artifact_corrupt | 1 |
 | ready_marker | managed_runtime_corrupt | 1 |
+
+## Reconciliation Hands
+| Admission type | Rung | Maximum attempts per suppression window |
+| --- | --- | --- |
+| RegisteredArtifactRepairAdmission | RepairArtifact | 1 |
+| RegisteredComponentRebuildAdmission | RebuildComponent | 1 |
+| RegisteredWholeInstanceRematerializationAdmission | RematerializeInstance | 1 |
 
 ## Deferred Demonstrations
 | Invariant | Phase | Status |
