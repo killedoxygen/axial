@@ -12,13 +12,14 @@ import { setTimeout as sleep } from 'node:timers/promises';
 const ATTEMPTS = 5;
 const DELAY_MS = 3000;
 
-// Raw executables for manual downloads. Kept in sync with the package steps in
-// .github/workflows/release.yml.
-const EXECUTABLE_TEMPLATES = [
+// User-facing manual downloads. Kept in sync with the package steps in
+// .github/workflows/release.yml. macOS users get native disk images rather
+// than the standalone executable consumed by self-update.
+const MANUAL_ASSET_TEMPLATES = [
   (v) => `axial-linux-amd64-${v}`,
   (v) => `axial-windows-amd64-${v}.exe`,
-  (v) => `axial-macos-amd64-${v}`,
-  (v) => `axial-macos-arm64-${v}`,
+  (v) => `axial-macos-amd64-${v}.dmg`,
+  (v) => `axial-macos-arm64-${v}.dmg`,
 ];
 
 // Archives consumed by the in-app updater.
@@ -55,8 +56,8 @@ function releasesDownloadBase() {
 }
 
 function expectedFiles(version) {
-  // Every manual executable and updater package has a checksum sidecar.
-  return [...EXECUTABLE_TEMPLATES, ...UPDATE_PACKAGE_TEMPLATES].flatMap((template) => {
+  // Every manual download and updater package has a checksum sidecar.
+  return [...MANUAL_ASSET_TEMPLATES, ...UPDATE_PACKAGE_TEMPLATES].flatMap((template) => {
     const file = template(version);
     return [file, `${file}.sha256`];
   });

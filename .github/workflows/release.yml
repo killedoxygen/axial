@@ -215,22 +215,31 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Build release desktop binary
+      - name: Install Tauri CLI
+        run: cargo install tauri-cli --version "^2.9" --locked
+
+      - name: Build macOS app and DMG
         env:
           AXIAL_POSTHOG_API_KEY: ${{ secrets.POSTHOG_API_KEY }}
-        run: cargo build --locked -p axial-desktop --release
+        working-directory: apps/desktop
+        run: cargo tauri build --bundles dmg --config '{"build":{"beforeBuildCommand":""}}' -- --locked
 
-      - name: Package macOS desktop binary
+      - name: Package macOS release assets
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
           mkdir -p dist/macos
           cp target/release/axial-desktop dist/macos/axial
           chmod +x dist/macos/axial
-          cp dist/macos/axial "dist/axial-macos-${{ matrix.arch }}-${VERSION}"
           tar -C dist/macos -czf "dist/axial-macos-${{ matrix.arch }}-${VERSION}.tar.gz" axial
+          set -- target/release/bundle/dmg/*.dmg
+          if [ "$#" -ne 1 ] || [ ! -f "$1" ]; then
+            echo "Expected exactly one macOS DMG, found $#" >&2
+            exit 1
+          fi
+          cp "$1" "dist/axial-macos-${{ matrix.arch }}-${VERSION}.dmg"
           (
             cd dist
-            shasum -a 256 "axial-macos-${{ matrix.arch }}-${VERSION}" > "axial-macos-${{ matrix.arch }}-${VERSION}.sha256"
+            shasum -a 256 "axial-macos-${{ matrix.arch }}-${VERSION}.dmg" > "axial-macos-${{ matrix.arch }}-${VERSION}.dmg.sha256"
             shasum -a 256 "axial-macos-${{ matrix.arch }}-${VERSION}.tar.gz" > "axial-macos-${{ matrix.arch }}-${VERSION}.tar.gz.sha256"
           )
 

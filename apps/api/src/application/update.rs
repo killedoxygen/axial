@@ -326,7 +326,7 @@ fn matching_release_asset(
     os: &str,
     arch: &str,
 ) -> Option<ReleaseAssetSelection> {
-    let expected_name = release_asset_name(latest_version, os, arch)?;
+    let expected_name = update_package_name(latest_version, os, arch)?;
     let url = assets
         .iter()
         .filter(|asset| asset.name == expected_name)
@@ -344,7 +344,7 @@ fn matching_release_asset(
     Some(ReleaseAssetSelection { url, checksum_url })
 }
 
-fn release_asset_name(latest_version: &str, os: &str, arch: &str) -> Option<String> {
+fn update_package_name(latest_version: &str, os: &str, arch: &str) -> Option<String> {
     let platform = match os {
         "linux" => "linux",
         "windows" => "windows",
@@ -710,8 +710,16 @@ mod tests {
     fn macos_asset_selection_matches_native_architecture() {
         let assets = [
             release_asset(
+                "axial-macos-amd64-1.2.4.dmg",
+                "https://github.com/mateoltd/axial/releases/download/v1.2.4/axial-macos-amd64-1.2.4.dmg",
+            ),
+            release_asset(
                 "axial-macos-amd64-1.2.4.tar.gz",
                 "https://github.com/mateoltd/axial/releases/download/v1.2.4/axial-macos-amd64-1.2.4.tar.gz",
+            ),
+            release_asset(
+                "axial-macos-arm64-1.2.4.dmg",
+                "https://github.com/mateoltd/axial/releases/download/v1.2.4/axial-macos-arm64-1.2.4.dmg",
             ),
             release_asset(
                 "axial-macos-arm64-1.2.4.tar.gz",
