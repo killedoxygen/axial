@@ -110,12 +110,13 @@ pub(crate) use reconciliation::{
     RegisteredManagedArtifactCommitPostcheck, RegisteredManagedArtifactComponentCompletion,
     RegisteredManagedArtifactComponentEffectAdmission,
     RegisteredManagedArtifactComponentSettlement, RegisteredReconciliationAuthority,
-    RegisteredVersionBundleComponentRebuildEffect, VERSION_BUNDLE_COMPONENT_REBUILD_STEP,
-    commit_reconciliation_memory, component_rebuild_journal, reconciliation_attempt_key,
-    reconciliation_instance_target, reconciliation_journal_attempt, reconciliation_memory_entry,
-    record_guardian_repair_refusal, record_reconciliation_journal_failure,
-    record_reconciliation_journal_success, reserve_reconciliation_attempt,
-    settle_reconciliation_memory, validate_reconciliation_memory,
+    RegisteredVersionBundleComponentRebuildEffect, RegisteredWholeInstanceEffectAdmission,
+    RegisteredWholeInstancePreparationError, RegisteredWholeInstanceRematerializationAvailability,
+    VERSION_BUNDLE_COMPONENT_REBUILD_STEP, commit_reconciliation_memory, component_rebuild_journal,
+    reconciliation_attempt_key, reconciliation_instance_target, reconciliation_journal_attempt,
+    reconciliation_memory_entry, record_guardian_repair_refusal,
+    record_reconciliation_journal_failure, record_reconciliation_journal_success,
+    reserve_reconciliation_attempt, settle_reconciliation_memory, validate_reconciliation_memory,
 };
 pub use registered_artifact_findings::RegisteredArtifactRepairCandidate;
 pub(crate) use registered_artifact_findings::{

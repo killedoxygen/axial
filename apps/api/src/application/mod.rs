@@ -249,7 +249,6 @@ pub enum ViewModelKind {
     LaunchActionState,
     PerformancePlanSummary,
     OperationProgress,
-    RepairOffer,
     SessionOutcome,
     SettingsState,
     AccountReadiness,
@@ -263,7 +262,6 @@ pub enum ApplicationViewModelPayload {
     LaunchActionState(LaunchActionStateViewModel),
     PerformancePlanSummary(PerformancePlanSummaryViewModel),
     OperationProgress(OperationProgressViewModel),
-    RepairOffer(RepairOfferViewModel),
     SessionOutcome(SessionOutcomeViewModel),
     SettingsState(SettingsStateViewModel),
     AccountReadiness(AccountReadinessViewModel),
@@ -339,19 +337,6 @@ pub struct OperationProgressViewModel {
     pub status: Option<OperationStatus>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct RepairOfferViewModel {
-    pub state_id: String,
-    pub label: String,
-    pub tone: ViewModelTone,
-    pub available: bool,
-    pub requires_confirmation: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub detail: Option<String>,
-    #[serde(default)]
-    pub actions: Vec<ViewModelAction>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
