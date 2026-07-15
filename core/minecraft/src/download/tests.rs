@@ -256,9 +256,11 @@ async fn reconstruction_matches_install_without_touching_seeded_destinations() {
     }
     let reconstructed = reconstruction.into_activation_source().into_parts();
 
-    let retained_context =
-        ReconstructionLibraryContext::new(ReconstructionLibraryRetention::Retained)
-            .expect("retained reconstruction context");
+    let guarded_root =
+        crate::managed_fs::ManagedDir::open_root(&root).expect("guard retained test root");
+    let retained_context = ManagedReconstructionContext::bind_libraries(guarded_root.clone())
+        .await
+        .expect("retained reconstruction context");
     let prepared = timeout(
         Duration::from_secs(10),
         downloader.reconstruct_version_authority("reconstruction", &retained_context),
@@ -266,10 +268,7 @@ async fn reconstruction_matches_install_without_touching_seeded_destinations() {
     .await
     .expect("retained reconstruction must not deadlock the shared source pool")
     .expect("reconstruct retained vanilla sources")
-    .bind_managed_libraries(
-        crate::managed_fs::ManagedDir::open_root(&root).expect("guard retained test root"),
-        retained_context.take_cache_proofs(),
-    )
+    .bind_managed_libraries(guarded_root, retained_context.take_library_cache_proofs())
     .expect("bind retained vanilla sources to final projection");
     assert_eq!(prepared.version_id(), "reconstruction");
     assert_eq!(prepared.library_entry_count(), 3);
@@ -786,6 +785,86 @@ async fn asset_cache_drift_at_lease_admission_fails_before_install_effects() {
     assert_eq!(request_count(&requests, &fixture.object_path), 0);
     assert_eq!(request_count(&requests, &fixture.distinct_path), 0);
     assert_eq!(request_count(&requests, &fixture.empty_path), 0);
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn managed_assets_reconstruction_rechecks_sparse_cache_under_publication_lease() {
+    let version_id = "rebuild-asset-cache-drift";
+    let root = temp_dir(version_id);
+    let mut fixture = spawn_nonempty_asset_install_server(version_id).await;
+    let object_path = asset_object_path(&root, &fixture.object_hash);
+    let distinct_path = asset_object_path(&root, &fixture.distinct_hash);
+    let empty_path = asset_object_path(&root, &fixture.empty_hash);
+    for (path, bytes) in [
+        (&object_path, fixture.object.as_slice()),
+        (&distinct_path, fixture.distinct.as_slice()),
+        (&empty_path, b"".as_slice()),
+    ] {
+        fs::create_dir_all(path.parent().expect("cached asset parent"))
+            .expect("create cached asset parent");
+        fs::write(path, bytes).expect("seed exact cached asset");
+    }
+    let guarded_root = ManagedDir::open_root(&root).expect("guard reconstruction root");
+    let context = ManagedReconstructionContext::bind_assets(guarded_root.clone())
+        .await
+        .expect("bind Assets reconstruction");
+    let downloader = test_manifest_downloader(
+        &root,
+        version_id,
+        &fixture.version_url,
+        &fixture.version_sha1,
+    )
+    .with_test_asset_object_base_url(fixture.object_base_url.clone());
+    let reconstruction = downloader
+        .reconstruct_version_authority(version_id, &context)
+        .await
+        .expect("prepare sparse Assets reconstruction");
+    let (sources, cache_proofs) = context
+        .take_assets_authority()
+        .expect("take sparse Assets authority");
+    let prepared = reconstruction
+        .bind_managed_assets(guarded_root, sources, cache_proofs)
+        .expect("bind sparse Assets projection");
+    assert_eq!(prepared.asset_entry_count(), 4);
+    assert_eq!(
+        prepared.retained_source_count(),
+        1,
+        "the authenticated index is retained while all exact objects are sparse"
+    );
+    let requests = drain_request_paths(&mut fixture.requests);
+    assert_eq!(request_count(&requests, &fixture.object_path), 0);
+    assert_eq!(request_count(&requests, &fixture.distinct_path), 0);
+    assert_eq!(request_count(&requests, &fixture.empty_path), 0);
+
+    let corrupt = vec![b'x'; fixture.object.len()];
+    fs::write(&object_path, &corrupt).expect("drift sparse cached object");
+    let (managed_root, receipt, sources) = prepared.into_effect_parts();
+    let lease = ManagedRootPublicationLease::acquire(managed_root)
+        .await
+        .expect("acquire reconstruction publication lease");
+    let projection = receipt
+        .component_projection(crate::known_good::ManagedKnownGoodComponent::Assets)
+        .expect("Assets projection");
+    let result = crate::managed_component_lifecycle::publish_managed_component_effect(
+        lease,
+        projection,
+        crate::managed_component_table::ManagedComponentKind::Assets,
+        sources,
+    )
+    .await;
+
+    assert!(result.is_err());
+    assert_eq!(
+        fs::read(&object_path).expect("drifted object remains"),
+        corrupt
+    );
+    assert!(!asset_index_path(&root, &fixture.asset_index_id).exists());
+    assert!(
+        !root.join(".axial-publication/assets").exists(),
+        "stale sparse proof must fail before lifecycle intent or effects"
+    );
 
     let _ = fs::remove_dir_all(root);
 }

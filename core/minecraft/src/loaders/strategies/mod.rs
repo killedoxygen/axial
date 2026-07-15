@@ -70,19 +70,19 @@ pub(crate) async fn reconstruct_build(
     }
 }
 
-pub(crate) async fn reconstruct_managed_libraries(
+pub(crate) async fn reconstruct_managed_component(
     plan: &LoaderInstallPlan,
-    context: &crate::download::ReconstructionLibraryContext,
+    context: &crate::download::ManagedReconstructionContext,
 ) -> Result<crate::known_good::RetainedKnownGoodReconstruction, LoaderError> {
     match plan.record.strategy {
         LoaderInstallStrategy::FabricProfile | LoaderInstallStrategy::QuiltProfile => {
-            Box::pin(common::reconstruct_libraries_from_profile_source(
+            Box::pin(common::reconstruct_component_from_profile_source(
                 plan, context,
             ))
             .await
         }
         LoaderInstallStrategy::ForgeEarliestLegacy => {
-            Box::pin(common::reconstruct_libraries_from_legacy_archive(
+            Box::pin(common::reconstruct_component_from_legacy_archive(
                 plan, context,
             ))
             .await
@@ -90,7 +90,7 @@ pub(crate) async fn reconstruct_managed_libraries(
         LoaderInstallStrategy::ForgeModern
         | LoaderInstallStrategy::ForgeLegacyInstaller
         | LoaderInstallStrategy::NeoForgeModern => {
-            Box::pin(common::reconstruct_libraries_from_installer_source(
+            Box::pin(common::reconstruct_component_from_installer_source(
                 plan, context,
             ))
             .await

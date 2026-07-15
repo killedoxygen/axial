@@ -1,7 +1,7 @@
 use crate::download::library_source::RetainedLibrarySourceSet;
 use crate::download::{
     AuthenticatedSelectedArtifactSource, DownloadProgress, Downloader, ExactLibraryDownloadProof,
-    PreparedManagedInstall, ReconstructionLibraryContext, ReconstructionLibraryRetention,
+    ManagedReconstructionContext, PreparedManagedInstall,
     download_installer_libraries_with_declarations_and_facts,
     download_profile_retained_libraries_with_declarations_and_facts, prepare_local_managed_install,
     publish_prepared_managed_install, reconstruct_installer_library_declarations,
@@ -78,28 +78,6 @@ pub(crate) struct AuthenticatedInstallerReconstructionAuthority {
 }
 
 impl AuthenticatedInstallerReconstructionAuthority {
-    fn new(
-        base: RetainedKnownGoodReconstruction,
-        base_client_source: AuthenticatedSelectedArtifactSource,
-        record: LoaderBuildRecord,
-        input: AuthenticatedInstallerReconstructionInput,
-        resolved_version: crate::launch::VersionJson,
-        version_bytes: Vec<u8>,
-        child_client: VerifiedInstallerClientBytes,
-        library_sources: RetainedLibrarySourceSet,
-    ) -> Self {
-        Self {
-            base,
-            base_client_source,
-            record,
-            input,
-            resolved_version,
-            version_bytes,
-            child_client,
-            library_sources,
-        }
-    }
-
     pub(crate) fn consume_for_sealing(
         self,
     ) -> (
@@ -184,16 +162,15 @@ async fn acquire_profile_source(
 pub(super) async fn reconstruct_from_profile_source(
     plan: &LoaderInstallPlan,
 ) -> Result<KnownGoodReconstructionReceipt, LoaderError> {
-    let context = ReconstructionLibraryContext::new(ReconstructionLibraryRetention::ProofOnly)
-        .map_err(|error| LoaderError::Verify(error.to_string()))?;
-    reconstruct_libraries_from_profile_source(plan, &context)
+    let context = ManagedReconstructionContext::proof_only();
+    reconstruct_component_from_profile_source(plan, &context)
         .await
         .map(RetainedKnownGoodReconstruction::discard_sources)
 }
 
-pub(super) async fn reconstruct_libraries_from_profile_source(
+pub(super) async fn reconstruct_component_from_profile_source(
     plan: &LoaderInstallPlan,
-    context: &ReconstructionLibraryContext,
+    context: &ManagedReconstructionContext,
 ) -> Result<RetainedKnownGoodReconstruction, LoaderError> {
     let downloader = Downloader::source_only();
     let proof = providers::fetch_profile_install_proof(&plan.record).await?;
@@ -210,7 +187,7 @@ async fn reconstruct_profile_with_downloader(
     plan: &LoaderInstallPlan,
     downloader: &Downloader,
     proof: ProfileInstallProof,
-    context: &ReconstructionLibraryContext,
+    context: &ManagedReconstructionContext,
 ) -> Result<RetainedKnownGoodReconstruction, LoaderError> {
     let LoaderInstallSource::ProfileJson { url } = &plan.record.install_source else {
         return Err(LoaderError::InvalidProfile(
@@ -233,8 +210,7 @@ async fn reconstruct_profile_with_test_sources(
 ) -> Result<KnownGoodReconstructionReceipt, LoaderError> {
     let proof =
         providers::fetch_profile_install_proof_from_url_for_test(&plan.record, proof_url).await?;
-    let context = ReconstructionLibraryContext::new(ReconstructionLibraryRetention::ProofOnly)
-        .map_err(|error| LoaderError::Verify(error.to_string()))?;
+    let context = ManagedReconstructionContext::proof_only();
     Box::pin(reconstruct_profile_with_downloader(
         plan, downloader, proof, &context,
     ))
@@ -247,7 +223,7 @@ async fn reconstruct_profile_after_sources(
     base: RetainedKnownGoodReconstruction,
     profile_source: AuthenticatedProfileSource,
     proof: ProfileInstallProof,
-    context: &ReconstructionLibraryContext,
+    context: &ManagedReconstructionContext,
 ) -> Result<RetainedKnownGoodReconstruction, LoaderError> {
     if proof.provider_url().trim().is_empty() {
         return Err(LoaderError::InvalidProfile(
@@ -299,16 +275,15 @@ async fn reconstruct_profile_after_sources(
 pub(super) async fn reconstruct_from_legacy_archive(
     plan: &LoaderInstallPlan,
 ) -> Result<KnownGoodReconstructionReceipt, LoaderError> {
-    let context = ReconstructionLibraryContext::new(ReconstructionLibraryRetention::ProofOnly)
-        .map_err(|error| LoaderError::Verify(error.to_string()))?;
-    reconstruct_libraries_from_legacy_archive(plan, &context)
+    let context = ManagedReconstructionContext::proof_only();
+    reconstruct_component_from_legacy_archive(plan, &context)
         .await
         .map(RetainedKnownGoodReconstruction::discard_sources)
 }
 
-pub(super) async fn reconstruct_libraries_from_legacy_archive(
+pub(super) async fn reconstruct_component_from_legacy_archive(
     plan: &LoaderInstallPlan,
-    context: &ReconstructionLibraryContext,
+    context: &ManagedReconstructionContext,
 ) -> Result<RetainedKnownGoodReconstruction, LoaderError> {
     let downloader = Downloader::source_only();
     reconstruct_legacy_authority_with_downloader(plan, &downloader, context).await
@@ -317,7 +292,7 @@ pub(super) async fn reconstruct_libraries_from_legacy_archive(
 async fn reconstruct_legacy_authority_with_downloader(
     plan: &LoaderInstallPlan,
     downloader: &Downloader,
-    context: &ReconstructionLibraryContext,
+    context: &ManagedReconstructionContext,
 ) -> Result<RetainedKnownGoodReconstruction, LoaderError> {
     Box::pin(reconstruct_legacy_with_downloader_inner(
         plan, downloader, context,
@@ -330,8 +305,7 @@ async fn reconstruct_legacy_with_downloader(
     plan: &LoaderInstallPlan,
     downloader: &Downloader,
 ) -> Result<KnownGoodReconstructionReceipt, LoaderError> {
-    let context = ReconstructionLibraryContext::new(ReconstructionLibraryRetention::ProofOnly)
-        .map_err(|error| LoaderError::Verify(error.to_string()))?;
+    let context = ManagedReconstructionContext::proof_only();
     reconstruct_legacy_authority_with_downloader(plan, downloader, &context)
         .await
         .map(RetainedKnownGoodReconstruction::discard_sources)
@@ -340,7 +314,7 @@ async fn reconstruct_legacy_with_downloader(
 async fn reconstruct_legacy_with_downloader_inner(
     plan: &LoaderInstallPlan,
     downloader: &Downloader,
-    context: &ReconstructionLibraryContext,
+    context: &ManagedReconstructionContext,
 ) -> Result<RetainedKnownGoodReconstruction, LoaderError> {
     let LoaderInstallSource::LegacyArchive { url } = &plan.record.install_source else {
         return Err(LoaderError::InvalidProfile(
@@ -404,16 +378,15 @@ async fn derive_legacy_archive_inputs(
 pub(super) async fn reconstruct_from_installer_source(
     plan: &LoaderInstallPlan,
 ) -> Result<KnownGoodReconstructionReceipt, LoaderError> {
-    let context = ReconstructionLibraryContext::new(ReconstructionLibraryRetention::ProofOnly)
-        .map_err(|error| LoaderError::Verify(error.to_string()))?;
-    reconstruct_libraries_from_installer_source(plan, &context)
+    let context = ManagedReconstructionContext::proof_only();
+    reconstruct_component_from_installer_source(plan, &context)
         .await
         .map(RetainedKnownGoodReconstruction::discard_sources)
 }
 
-pub(super) async fn reconstruct_libraries_from_installer_source(
+pub(super) async fn reconstruct_component_from_installer_source(
     plan: &LoaderInstallPlan,
-    context: &ReconstructionLibraryContext,
+    context: &ManagedReconstructionContext,
 ) -> Result<RetainedKnownGoodReconstruction, LoaderError> {
     let downloader = Downloader::source_only();
     reconstruct_installer_authority_with_downloader(plan, &downloader, context).await
@@ -422,7 +395,7 @@ pub(super) async fn reconstruct_libraries_from_installer_source(
 async fn reconstruct_installer_authority_with_downloader(
     plan: &LoaderInstallPlan,
     downloader: &Downloader,
-    context: &ReconstructionLibraryContext,
+    context: &ManagedReconstructionContext,
 ) -> Result<RetainedKnownGoodReconstruction, LoaderError> {
     let installer_url = validate_installer_record_authority(&plan.record)?;
     let installer_source = fetch_sha1_verified_source(
@@ -440,7 +413,7 @@ async fn reconstruct_installer_authority_with_downloader(
         .into_install_execution()
         .map_err(|error| installer_extract_error(&plan.record.component_name, error))?;
     let (execution, processor_required) = match execution {
-        BoundForgeInstallExecution::Run(execution) if !context.retains_sources() => {
+        BoundForgeInstallExecution::Run(execution) if !context.retains_library_sources() => {
             match execution.into_declared_reconstruction() {
                 Ok(continuation) => (
                     BoundForgeInstallExecution::Continue(Box::new(continuation)),
@@ -497,7 +470,10 @@ async fn reconstruct_installer_authority_with_downloader(
             .map_err(|error| LoaderError::Verify(format!("reconstruct vanilla base: {error}")))?;
         let input = result
             .continuation
-            .into_observed_reconstruction_receipt_input(result.outputs, context.retains_sources())
+            .into_observed_reconstruction_receipt_input(
+                result.outputs,
+                context.retains_library_sources(),
+            )
             .map_err(|error| installer_extract_error(&plan.record.component_name, error))?;
         (base, base_client_source, input, library_sources)
     } else {
@@ -511,7 +487,7 @@ async fn reconstruct_installer_authority_with_downloader(
             ));
         };
         let input = continuation
-            .into_reconstruction_receipt_input(context.retains_sources())
+            .into_reconstruction_receipt_input(context.retains_library_sources())
             .map_err(|error| installer_extract_error(&plan.record.component_name, error))?;
         let base = downloader
             .reconstruct_version_with_client_source(&plan.record.minecraft_version, context)
@@ -544,16 +520,16 @@ async fn reconstruct_installer_authority_with_downloader(
         .map_err(|_| LoaderError::Verify("loader client is too large".to_string()))?;
     client.url.clear();
     let version_bytes = serde_json::to_vec_pretty(&version)?;
-    seal_reconstructed_installer_source(AuthenticatedInstallerReconstructionAuthority::new(
+    seal_reconstructed_installer_source(AuthenticatedInstallerReconstructionAuthority {
         base,
         base_client_source,
-        plan.record.clone(),
+        record: plan.record.clone(),
         input,
-        version,
+        resolved_version: version,
         version_bytes,
         child_client,
         library_sources,
-    ))
+    })
     .map_err(|error| LoaderError::Verify(format!("derive loader authority: {error:?}")))
 }
 
@@ -562,8 +538,7 @@ async fn reconstruct_installer_with_downloader(
     plan: &LoaderInstallPlan,
     downloader: &Downloader,
 ) -> Result<KnownGoodReconstructionReceipt, LoaderError> {
-    let context = ReconstructionLibraryContext::new(ReconstructionLibraryRetention::ProofOnly)
-        .map_err(|error| LoaderError::Verify(error.to_string()))?;
+    let context = ManagedReconstructionContext::proof_only();
     reconstruct_installer_authority_with_downloader(plan, downloader, &context)
         .await
         .map(RetainedKnownGoodReconstruction::discard_sources)
@@ -1466,18 +1441,21 @@ mod tests {
         AuthenticatedProcessorSources, read_installed_base_client, spawn_bound_processor_execution,
     };
     use super::{
-        ReconstructionLibraryContext, ReconstructionLibraryRetention,
-        download_installer_libraries_with_evidence, ensure_base_version,
-        fetch_sha1_verified_source, finish_supported_installer_install,
+        ManagedReconstructionContext, download_installer_libraries_with_evidence,
+        ensure_base_version, fetch_sha1_verified_source, finish_supported_installer_install,
         install_from_installer_source, install_from_legacy_archive, install_from_profile_source,
         install_legacy_archive_after_authenticated_base,
         install_profile_source_after_authenticated_base, overlay_legacy_archive_bytes,
         reconstruct_installer_authority_with_downloader, reconstruct_installer_with_downloader,
-        reconstruct_legacy_with_downloader, reconstruct_profile_with_test_sources,
-        validate_installer_record_authority, validate_profile_source_structure,
+        reconstruct_legacy_with_downloader, reconstruct_profile_with_downloader,
+        reconstruct_profile_with_test_sources, validate_installer_record_authority,
+        validate_profile_source_structure,
     };
     use crate::download::{DownloadProgress, Downloader, ExpectedIntegrity};
-    use crate::known_good::{KnownGoodArtifactKind, KnownGoodInstallReceipt, KnownGoodIntegrity};
+    use crate::known_good::{
+        KnownGoodArtifactKind, KnownGoodInstallReceipt, KnownGoodIntegrity, KnownGoodRoot,
+        ManagedKnownGoodComponent,
+    };
     use crate::launch::{
         AssetIndex, Downloads, JavaVersion, Library, LoggingConf, resolve_version,
     };
@@ -1679,6 +1657,138 @@ mod tests {
             }
             let _ = fs::remove_dir_all(root);
         }
+    }
+
+    #[tokio::test]
+    async fn managed_assets_reconstruction_preserves_real_profile_loader_inheritance() {
+        let root = temp_dir("profile-managed-assets-reconstruction");
+        fs::create_dir_all(&root).expect("create managed Assets root");
+        let base_id = "1.21.5";
+        let base_client = zip_entries(&[("net/minecraft/client/Main.class", b"base")]);
+        let asset_object = b"inherited loader asset object".to_vec();
+        let asset_object_sha1 = sha1_hex(&asset_object);
+        let asset_index = serde_json::to_vec(&serde_json::json!({
+            "objects": {
+                "fixture/object": {
+                    "hash": asset_object_sha1,
+                    "size": asset_object.len()
+                }
+            }
+        }))
+        .expect("serialize loader asset index");
+        let client_server = TestByteServer::start(base_client.clone());
+        let index_server = TestByteServer::start(asset_index.clone());
+        let object_server = TestByteServer::start(asset_object.clone());
+        let version_bytes = serde_json::to_vec(&serde_json::json!({
+            "id": base_id,
+            "type": "release",
+            "mainClass": "net.minecraft.client.main.Main",
+            "assetIndex": {
+                "id": "profile-inherited-assets",
+                "url": index_server.url,
+                "sha1": sha1_hex(&asset_index),
+                "size": asset_index.len(),
+                "totalSize": asset_object.len()
+            },
+            "downloads": {
+                "client": {
+                    "url": client_server.url,
+                    "sha1": sha1_hex(&base_client),
+                    "size": base_client.len()
+                }
+            },
+            "libraries": []
+        }))
+        .expect("serialize loader base version");
+        let version_server = TestByteServer::start(version_bytes.clone());
+        let manifest = test_install_manifest(base_id, &version_server.url, &version_bytes);
+
+        let mut record = profile_record();
+        let exact = zip_entries(&[("example/Exact.class", b"exact")]);
+        let fresh = zip_entries(&[("example/Fresh.class", b"fresh")]);
+        let exact_server = TestByteServer::start(exact.clone());
+        let fresh_server = TestByteServer::start(fresh.clone());
+        let native_server = TestByteServer::start(fresh.clone());
+        let extra_server = TestByteServer::start(fresh.clone());
+        let (profile_bytes, proof_bytes, _) = profile_reconstruction_sources(
+            &record,
+            &fresh_server.url,
+            &exact_server.url,
+            &exact,
+            &native_server.url,
+            &extra_server.url,
+        );
+        let profile_server = TestByteServer::start(profile_bytes);
+        let proof_server = TestByteServer::start(proof_bytes);
+        record.install_source = LoaderInstallSource::ProfileJson {
+            url: profile_server.url.clone(),
+        };
+        let plan = LoaderInstallPlan { record };
+        let proof = crate::loaders::providers::fetch_profile_install_proof_from_url_for_test(
+            &plan.record,
+            &proof_server.url,
+        )
+        .await
+        .expect("profile proof");
+        let guarded_root =
+            crate::managed_fs::ManagedDir::open_root(&root).expect("guard managed Assets root");
+        let context = ManagedReconstructionContext::bind_assets(guarded_root.clone())
+            .await
+            .expect("bind managed Assets reconstruction");
+        let downloader = Downloader::with_test_install_manifest(&root, manifest)
+            .with_test_asset_object_base_url(object_server.url.clone());
+        let reconstruction =
+            reconstruct_profile_with_downloader(&plan, &downloader, proof, &context)
+                .await
+                .expect("reconstruct profile Assets authority");
+        let (sources, cache_proofs) = context
+            .take_assets_authority()
+            .expect("take inherited Assets authority");
+        let prepared = reconstruction
+            .bind_managed_assets(guarded_root, sources, cache_proofs)
+            .expect("bind final inherited Assets projection");
+
+        assert_eq!(prepared.version_id(), plan.record.version_id);
+        assert_eq!(prepared.asset_entry_count(), 2);
+        assert_eq!(prepared.retained_source_count(), 2);
+        assert_eq!(
+            prepared.expected_content_byte_count(),
+            (asset_index.len() + asset_object.len()) as u64
+        );
+        let (_, receipt, _) = prepared.into_effect_parts();
+        let projection = receipt
+            .component_projection(ManagedKnownGoodComponent::Assets)
+            .expect("final inherited Assets projection");
+        assert!(projection.entries().iter().any(|projected| {
+            projected.entry().root() == &KnownGoodRoot::Assets
+                && projected.entry().kind() == KnownGoodArtifactKind::AssetIndex
+                && projected.entry().path().as_str() == "indexes/profile-inherited-assets.json"
+        }));
+        assert!(projection.entries().iter().any(|projected| {
+            projected.entry().root() == &KnownGoodRoot::Assets
+                && projected.entry().kind() == KnownGoodArtifactKind::AssetObject
+                && projected.entry().path().as_str()
+                    == format!("objects/{}/{}", &asset_object_sha1[..2], asset_object_sha1)
+        }));
+        assert_eq!(index_server.request_count(), 1);
+        assert_eq!(object_server.request_count(), 1);
+        assert!(!root.join("assets").exists());
+
+        for server in [
+            client_server,
+            index_server,
+            object_server,
+            version_server,
+            exact_server,
+            fresh_server,
+            native_server,
+            extra_server,
+            profile_server,
+            proof_server,
+        ] {
+            server.stop();
+        }
+        let _ = fs::remove_dir_all(root);
     }
 
     #[tokio::test]
@@ -4751,22 +4861,21 @@ esac
         ));
 
         if matches!(shape, ProcessorFixtureShape::ForgeModern) {
+            let guarded_root = crate::managed_fs::ManagedDir::open_root(&root)
+                .expect("guard retained processor root");
             let retained_context =
-                ReconstructionLibraryContext::new(ReconstructionLibraryRetention::Retained)
+                ManagedReconstructionContext::bind_libraries(guarded_root.clone())
+                    .await
                     .expect("retained installer reconstruction context");
             let prepared = reconstruct_installer_authority_with_downloader(
                 &plan,
-                &Downloader::with_test_install_manifest(&root, manifest)
+                &Downloader::with_test_install_manifest(&root, manifest.clone())
                     .with_test_runtime_source(runtime.descriptor.clone()),
                 &retained_context,
             )
             .await
             .expect("prepare retained processor fixture")
-            .bind_managed_libraries(
-                crate::managed_fs::ManagedDir::open_root(&root)
-                    .expect("guard retained processor root"),
-                retained_context.take_cache_proofs(),
-            )
+            .bind_managed_libraries(guarded_root, retained_context.take_library_cache_proofs())
             .expect("bind retained processor sources to final projection");
             assert_eq!(prepared.version_id(), plan.record.version_id.as_str());
             assert!(prepared.library_entry_count() > 0);
@@ -4778,6 +4887,31 @@ esac
                 prepared.retained_content_byte_count(),
                 prepared.expected_content_byte_count()
             );
+            assert_eq!(snapshot_tree(&root), before);
+
+            let guarded_root = crate::managed_fs::ManagedDir::open_root(&root)
+                .expect("guard processor Assets root");
+            let assets_context = ManagedReconstructionContext::bind_assets(guarded_root.clone())
+                .await
+                .expect("retained processor Assets context");
+            let reconstruction = reconstruct_installer_authority_with_downloader(
+                &plan,
+                &Downloader::with_test_install_manifest(&root, manifest)
+                    .with_test_runtime_source(runtime.descriptor.clone()),
+                &assets_context,
+            )
+            .await
+            .expect("prepare processor Assets fixture");
+            let (sources, cache_proofs) = assets_context
+                .take_assets_authority()
+                .expect("processor task must release its Assets context clone");
+            let prepared = reconstruction
+                .bind_managed_assets(guarded_root, sources, cache_proofs)
+                .expect("bind processor Assets authority");
+            assert_eq!(prepared.version_id(), plan.record.version_id.as_str());
+            assert_eq!(prepared.asset_entry_count(), 0);
+            assert_eq!(prepared.retained_source_count(), 0);
+            assert_eq!(prepared.expected_content_byte_count(), 0);
             assert_eq!(snapshot_tree(&root), before);
         }
 

@@ -1,7 +1,10 @@
-use super::asset_source::RetainedAssetComponentSource;
+use super::asset_source::{
+    AssetSourcePool, AuthenticatedAssetCacheProofSet, RetainedAssetSourceSet,
+};
 use super::assets::{
-    ASSET_OBJECT_BASE_URL, RetainedAssetsAcquisition, abort_asset_download_pipeline,
-    await_asset_download_pipeline, recv_asset_progress, spawn_asset_download_pipeline,
+    ASSET_OBJECT_BASE_URL, AssetSourceAcquisitionRequest, RetainedAssetsAcquisition,
+    abort_asset_download_pipeline, acquire_asset_sources_with_cache, await_asset_download_pipeline,
+    recv_asset_progress, spawn_asset_download_pipeline,
 };
 use super::client::{library_download_concurrency, standard_minecraft_download_client};
 use super::facts::selected_download_source_label;
@@ -43,6 +46,7 @@ use crate::known_good_libraries::{
     seal_vanilla_exact_library_declarations,
 };
 use crate::launch::{VersionJson, effective_java_version_for};
+use crate::managed_component_cache::ManagedComponentExactCache;
 use crate::managed_component_lifecycle::{ComponentLifecycleError, publish_managed_component};
 use crate::managed_component_table::ManagedComponentKind;
 use crate::managed_fs::ManagedDir;
@@ -300,54 +304,76 @@ pub(crate) struct ReconstructedVanillaClientAuthority {
     client_source: AuthenticatedSelectedArtifactSource,
 }
 
-#[derive(Clone, Copy, Eq, PartialEq)]
-pub(crate) enum ReconstructionLibraryRetention {
-    ProofOnly,
-    Retained,
+#[derive(Clone)]
+pub(crate) struct ManagedReconstructionContext {
+    mode: ManagedReconstructionMode,
 }
 
 #[derive(Clone)]
-pub(crate) struct ReconstructionLibraryContext {
-    retention: ReconstructionLibraryRetention,
-    retained_source_pool: Option<LibrarySourcePool>,
-    cache_admission: Option<ExactLibraryCacheAdmission>,
-    cache_proofs: Arc<std::sync::Mutex<AuthenticatedLibraryCacheProofSet>>,
+enum ManagedReconstructionMode {
+    ProofOnly,
+    Libraries {
+        source_pool: LibrarySourcePool,
+        cache_admission: ExactLibraryCacheAdmission,
+        cache_proofs: Arc<std::sync::Mutex<AuthenticatedLibraryCacheProofSet>>,
+    },
+    Assets {
+        source_pool: AssetSourcePool,
+        cache: ManagedComponentExactCache,
+        authority: Arc<
+            std::sync::Mutex<Option<(RetainedAssetSourceSet, AuthenticatedAssetCacheProofSet)>>,
+        >,
+    },
 }
 
-impl ReconstructionLibraryContext {
-    pub(crate) fn new(retention: ReconstructionLibraryRetention) -> Result<Self, DownloadError> {
+impl ManagedReconstructionContext {
+    pub(crate) fn proof_only() -> Self {
+        Self {
+            mode: ManagedReconstructionMode::ProofOnly,
+        }
+    }
+
+    pub(crate) async fn bind_libraries(managed_root: ManagedDir) -> Result<Self, DownloadError> {
         Ok(Self {
-            retention,
-            retained_source_pool: match retention {
-                ReconstructionLibraryRetention::ProofOnly => None,
-                ReconstructionLibraryRetention::Retained => Some(LibrarySourcePool::new()?),
+            mode: ManagedReconstructionMode::Libraries {
+                source_pool: LibrarySourcePool::new()?,
+                cache_admission: ExactLibraryCacheAdmission::bind_guarded(managed_root).await?,
+                cache_proofs: Arc::new(std::sync::Mutex::new(
+                    AuthenticatedLibraryCacheProofSet::default(),
+                )),
             },
-            cache_admission: None,
-            cache_proofs: Arc::new(std::sync::Mutex::new(
-                AuthenticatedLibraryCacheProofSet::default(),
-            )),
         })
     }
 
-    pub(crate) async fn bind_retained(managed_root: ManagedDir) -> Result<Self, DownloadError> {
+    pub(crate) async fn bind_assets(managed_root: ManagedDir) -> Result<Self, DownloadError> {
         Ok(Self {
-            retention: ReconstructionLibraryRetention::Retained,
-            retained_source_pool: Some(LibrarySourcePool::new()?),
-            cache_admission: Some(ExactLibraryCacheAdmission::bind_guarded(managed_root).await?),
-            cache_proofs: Arc::new(std::sync::Mutex::new(
-                AuthenticatedLibraryCacheProofSet::default(),
-            )),
+            mode: ManagedReconstructionMode::Assets {
+                source_pool: AssetSourcePool::new()?,
+                cache: ManagedComponentExactCache::bind_guarded(
+                    managed_root,
+                    ManagedComponentKind::Assets,
+                )
+                .await
+                .map_err(|_| {
+                    DownloadError::Integrity(
+                        "managed Assets exact-cache admission failed".to_string(),
+                    )
+                })?,
+                authority: Arc::new(std::sync::Mutex::new(None)),
+            },
         })
     }
 
-    pub(crate) fn retains_sources(&self) -> bool {
-        self.retention == ReconstructionLibraryRetention::Retained
+    pub(crate) fn retains_library_sources(&self) -> bool {
+        matches!(&self.mode, ManagedReconstructionMode::Libraries { .. })
     }
 
-    fn phase_source_pool(&self) -> Result<LibrarySourcePool, DownloadError> {
-        match &self.retained_source_pool {
-            Some(source_pool) => Ok(source_pool.clone()),
-            None => LibrarySourcePool::new(),
+    fn phase_library_source_pool(&self) -> Result<LibrarySourcePool, DownloadError> {
+        match &self.mode {
+            ManagedReconstructionMode::Libraries { source_pool, .. } => Ok(source_pool.clone()),
+            ManagedReconstructionMode::ProofOnly | ManagedReconstructionMode::Assets { .. } => {
+                LibrarySourcePool::new()
+            }
         }
     }
 
@@ -355,10 +381,17 @@ impl ReconstructionLibraryContext {
         &self,
         job: &super::libraries::DownloadJob,
     ) -> Result<bool, DownloadError> {
-        let Some(cache) = &self.cache_admission else {
-            return Ok(true);
+        let (cache_admission, cache_proofs) = match &self.mode {
+            ManagedReconstructionMode::Libraries {
+                cache_admission,
+                cache_proofs,
+                ..
+            } => (cache_admission, cache_proofs),
+            ManagedReconstructionMode::ProofOnly | ManagedReconstructionMode::Assets { .. } => {
+                return Ok(true);
+            }
         };
-        if cache.requires_retained_source(job).await? {
+        if cache_admission.requires_retained_source(job).await? {
             return Ok(true);
         }
         let expected_size = job.expected.size.ok_or_else(|| {
@@ -372,7 +405,7 @@ impl ReconstructionLibraryContext {
             .ok_or_else(|| {
                 DownloadError::Integrity("exact library cache proof lost its SHA-1".to_string())
             })?;
-        self.cache_proofs
+        cache_proofs
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(AuthenticatedLibraryCacheProof::new(
@@ -390,19 +423,84 @@ impl ReconstructionLibraryContext {
         source_pool: &LibrarySourcePool,
         kind: LibraryComponentSourceKind,
     ) -> Result<Option<RetainedLibraryComponentSource>, DownloadError> {
-        let Some(cache) = &self.cache_admission else {
+        let ManagedReconstructionMode::Libraries {
+            cache_admission, ..
+        } = &self.mode
+        else {
             return Ok(None);
         };
-        cache.retain_installer_source(job, source_pool, kind).await
+        cache_admission
+            .retain_installer_source(job, source_pool, kind)
+            .await
     }
 
-    pub(crate) fn take_cache_proofs(&self) -> AuthenticatedLibraryCacheProofSet {
-        std::mem::take(
-            &mut *self
-                .cache_proofs
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner),
-        )
+    pub(crate) fn take_library_cache_proofs(&self) -> AuthenticatedLibraryCacheProofSet {
+        match &self.mode {
+            ManagedReconstructionMode::Libraries { cache_proofs, .. } => std::mem::take(
+                &mut *cache_proofs
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+            ),
+            ManagedReconstructionMode::ProofOnly | ManagedReconstructionMode::Assets { .. } => {
+                AuthenticatedLibraryCacheProofSet::default()
+            }
+        }
+    }
+
+    fn assets_acquisition(&self) -> Option<(AssetSourcePool, ManagedComponentExactCache)> {
+        match &self.mode {
+            ManagedReconstructionMode::Assets {
+                source_pool, cache, ..
+            } => Some((source_pool.clone(), cache.clone())),
+            ManagedReconstructionMode::ProofOnly | ManagedReconstructionMode::Libraries { .. } => {
+                None
+            }
+        }
+    }
+
+    fn retain_assets_authority(
+        &self,
+        sources: RetainedAssetSourceSet,
+        cache_proofs: AuthenticatedAssetCacheProofSet,
+    ) -> Result<(), DownloadError> {
+        let ManagedReconstructionMode::Assets { authority, .. } = &self.mode else {
+            return Err(DownloadError::Integrity(
+                "non-Assets reconstruction produced retained Assets authority".to_string(),
+            ));
+        };
+        let mut authority = authority
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if authority.is_some() {
+            return Err(DownloadError::Integrity(
+                "Assets reconstruction produced duplicate retained authority".to_string(),
+            ));
+        }
+        *authority = Some((sources, cache_proofs));
+        Ok(())
+    }
+
+    pub(crate) fn take_assets_authority(
+        self,
+    ) -> Result<(RetainedAssetSourceSet, AuthenticatedAssetCacheProofSet), DownloadError> {
+        let ManagedReconstructionMode::Assets { authority, .. } = self.mode else {
+            return Err(DownloadError::Integrity(
+                "Assets authority was requested from a different reconstruction mode".to_string(),
+            ));
+        };
+        Arc::try_unwrap(authority)
+            .map_err(|_| {
+                DownloadError::Integrity(
+                    "Assets reconstruction authority still has live borrowers".to_string(),
+                )
+            })?
+            .into_inner()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .ok_or_else(|| {
+                DownloadError::Integrity(
+                    "Assets reconstruction did not retain source authority".to_string(),
+                )
+            })
     }
 
     pub(crate) async fn retain_local_sources(
@@ -412,11 +510,11 @@ impl ReconstructionLibraryContext {
         if sources.is_empty() {
             return Ok(RetainedLibrarySourceSet::new());
         }
-        let source_pool = self.retained_source_pool.as_ref().ok_or_else(|| {
-            DownloadError::Integrity(
-                "proof-only reconstruction cannot retain local library bytes".to_string(),
-            )
-        })?;
+        let ManagedReconstructionMode::Libraries { source_pool, .. } = &self.mode else {
+            return Err(DownloadError::Integrity(
+                "non-Libraries reconstruction cannot retain local library bytes".to_string(),
+            ));
+        };
         let mut retained = RetainedLibrarySourceSet::new();
         for source in sources {
             retained.insert(
@@ -523,7 +621,7 @@ pub(crate) struct ReconstructedVanillaAuthority {
 pub(crate) struct PreparedManagedInstall {
     authority: PendingKnownGoodInstallAuthority,
     version_bundle_source: AuthenticatedVersionBundleSource,
-    asset_sources: Vec<RetainedAssetComponentSource>,
+    asset_sources: RetainedAssetSourceSet,
     library_sources: Vec<RetainedLibraryComponentSource>,
 }
 
@@ -734,7 +832,7 @@ impl Downloader {
     ) -> Result<KnownGoodReconstructionReceipt, DownloadError> {
         validate_install_version_id(version_id)?;
         let version_manifest_entry = self.resolve_manifest_entry(version_id).await?;
-        let context = ReconstructionLibraryContext::new(ReconstructionLibraryRetention::ProofOnly)?;
+        let context = ManagedReconstructionContext::proof_only();
         self.reconstruct_version_inner(version_id, version_manifest_entry, &context)
             .await
             .map(RetainedKnownGoodReconstruction::discard_sources)
@@ -743,7 +841,7 @@ impl Downloader {
     pub(crate) async fn reconstruct_version_authority(
         &self,
         version_id: &str,
-        context: &ReconstructionLibraryContext,
+        context: &ManagedReconstructionContext,
     ) -> Result<RetainedKnownGoodReconstruction, DownloadError> {
         validate_install_version_id(version_id)?;
         let version_manifest_entry = self.resolve_manifest_entry(version_id).await?;
@@ -755,7 +853,7 @@ impl Downloader {
         &self,
         version_id: &str,
         version_manifest_entry: ManifestEntry,
-        context: &ReconstructionLibraryContext,
+        context: &ManagedReconstructionContext,
     ) -> Result<RetainedKnownGoodReconstruction, DownloadError> {
         let (authority, library_sources) = self
             .reconstruct_vanilla_authority(version_id, &version_manifest_entry, context)
@@ -774,7 +872,7 @@ impl Downloader {
     pub(crate) async fn reconstruct_version_with_client_source(
         &self,
         version_id: &str,
-        context: &ReconstructionLibraryContext,
+        context: &ManagedReconstructionContext,
     ) -> Result<ReconstructedVanillaClientAuthority, DownloadError> {
         let (authority, library_sources, client_source) = self
             .reconstruct_version_with_client_authority(version_id, context)
@@ -797,7 +895,7 @@ impl Downloader {
     pub(crate) async fn reconstruct_version_for_processor(
         &self,
         version_id: &str,
-        context: &ReconstructionLibraryContext,
+        context: &ManagedReconstructionContext,
     ) -> Result<ReconstructedVanillaProcessorAuthority, DownloadError> {
         let (mut authority, library_sources, client_source) = self
             .reconstruct_version_with_client_authority(version_id, context)
@@ -847,7 +945,7 @@ impl Downloader {
     async fn reconstruct_version_with_client_authority(
         &self,
         version_id: &str,
-        context: &ReconstructionLibraryContext,
+        context: &ManagedReconstructionContext,
     ) -> Result<
         (
             VanillaAuthorityParts,
@@ -871,7 +969,7 @@ impl Downloader {
         &self,
         version_id: &str,
         version_manifest_entry: &ManifestEntry,
-        context: &ReconstructionLibraryContext,
+        context: &ManagedReconstructionContext,
     ) -> Result<(VanillaAuthorityParts, RetainedLibrarySourceSet), DownloadError> {
         let AuthenticatedVanillaPlan {
             version,
@@ -879,22 +977,53 @@ impl Downloader {
             pending_library_declarations,
             library_jobs,
             version_json_source,
-            asset_index_source,
+            mut asset_index_source,
             runtime_source,
         } = self
             .acquire_vanilla_plan(version_id, version_manifest_entry, None)
             .await?;
+        if let Some((source_pool, cache)) = context.assets_acquisition() {
+            let (sources, cache_proofs) = match asset_index_source.take() {
+                Some(source) => {
+                    let plan = TransferPlan::shared();
+                    plan.expect_contribution();
+                    let RetainedAssetsAcquisition {
+                        asset_index_source: retained_index,
+                        sources,
+                        cache_proofs,
+                    } = acquire_asset_sources_with_cache(
+                        AssetSourceAcquisitionRequest::new(
+                            self.client.clone(),
+                            Arc::clone(&self.asset_object_base_url),
+                            version.asset_index.id.clone(),
+                            source,
+                            None,
+                            &plan,
+                            |_| {},
+                        )
+                        .bind(source_pool, cache),
+                    )
+                    .await?;
+                    asset_index_source = Some(retained_index);
+                    (sources, cache_proofs)
+                }
+                None => (
+                    RetainedAssetSourceSet::new(),
+                    AuthenticatedAssetCacheProofSet::default(),
+                ),
+            };
+            context.retain_assets_authority(sources, cache_proofs)?;
+        }
         let mut library_proofs = Vec::new();
         let mut library_sources = RetainedLibrarySourceSet::new();
-        let source_pool = context.phase_source_pool()?;
+        let source_pool = context.phase_library_source_pool()?;
         for classified in library_jobs {
             let (job, acquisition) = classified.into_parts();
-            if acquisition == LibraryAcquisition::ExactDeclaration {
-                if !context.retains_sources()
-                    || !context.requires_retained_exact_source(&job).await?
-                {
-                    continue;
-                }
+            if acquisition == LibraryAcquisition::ExactDeclaration
+                && (!context.retains_library_sources()
+                    || !context.requires_retained_exact_source(&job).await?)
+            {
+                continue;
             }
             let target = selected_download_source_label(
                 SelectedDownloadArtifactKind::Library,
@@ -917,7 +1046,7 @@ impl Downloader {
             if acquisition == LibraryAcquisition::FreshStream {
                 library_proofs.push(reconstruction_download_proof(&source)?);
             }
-            if context.retains_sources() {
+            if context.retains_library_sources() {
                 library_sources.insert(source)?;
             }
         }
@@ -1352,8 +1481,9 @@ impl Downloader {
             Some(RetainedAssetsAcquisition {
                 asset_index_source,
                 sources,
+                cache_proofs: _,
             }) => (Some(asset_index_source), sources),
-            None => (None, Vec::new()),
+            None => (None, RetainedAssetSourceSet::new()),
         };
         let source_authority = AuthenticatedVanillaInstallSources::new(
             VanillaAuthorityParts {
@@ -1558,7 +1688,7 @@ impl Downloader {
 
 pub(crate) async fn reconstruct_profile_library_declarations(
     declarations: PendingExactLibraryDeclarations,
-    context: &ReconstructionLibraryContext,
+    context: &ManagedReconstructionContext,
 ) -> Result<(SealedExactLibraryDeclarations, RetainedLibrarySourceSet), DownloadError> {
     let jobs = {
         let (libraries, environment) = declarations.profile_plan_inputs().ok_or_else(|| {
@@ -1576,13 +1706,14 @@ pub(crate) async fn reconstruct_profile_library_declarations(
     let client = standard_minecraft_download_client();
     let mut proofs = Vec::new();
     let mut sources = RetainedLibrarySourceSet::new();
-    let source_pool = context.phase_source_pool()?;
+    let source_pool = context.phase_library_source_pool()?;
     for classified in classified {
         let (job, acquisition) = classified.into_parts();
-        if acquisition == LibraryAcquisition::ExactDeclaration {
-            if !context.retains_sources() || !context.requires_retained_exact_source(&job).await? {
-                continue;
-            }
+        if acquisition == LibraryAcquisition::ExactDeclaration
+            && (!context.retains_library_sources()
+                || !context.requires_retained_exact_source(&job).await?)
+        {
+            continue;
         }
         let target = selected_download_source_label(
             SelectedDownloadArtifactKind::Library,
@@ -1605,7 +1736,7 @@ pub(crate) async fn reconstruct_profile_library_declarations(
         if acquisition == LibraryAcquisition::FreshStream {
             proofs.push(reconstruction_download_proof(&source)?);
         }
-        if context.retains_sources() {
+        if context.retains_library_sources() {
             sources.insert(source)?;
         }
     }
@@ -1619,7 +1750,7 @@ pub(crate) async fn reconstruct_profile_library_declarations(
 
 pub(crate) async fn reconstruct_installer_library_declarations(
     sources: crate::loaders::PendingForgeReconstructionSources,
-    context: &ReconstructionLibraryContext,
+    context: &ManagedReconstructionContext,
 ) -> Result<
     (
         crate::loaders::BoundForgeInstallExecution,
@@ -1633,7 +1764,7 @@ pub(crate) async fn reconstruct_installer_library_declarations(
 pub(crate) async fn reconstruct_installer_processor_sources(
     sources: crate::loaders::PendingForgeReconstructionSources,
     workspace: &crate::loaders::workspace::cleanup::ProcessorWorkspace,
-    context: &ReconstructionLibraryContext,
+    context: &ManagedReconstructionContext,
 ) -> Result<
     (
         crate::loaders::BoundForgeInstallExecution,
@@ -1647,7 +1778,7 @@ pub(crate) async fn reconstruct_installer_processor_sources(
 async fn reconstruct_installer_library_declarations_inner(
     sources: crate::loaders::PendingForgeReconstructionSources,
     workspace: Option<&crate::loaders::workspace::cleanup::ProcessorWorkspace>,
-    context: &ReconstructionLibraryContext,
+    context: &ManagedReconstructionContext,
 ) -> Result<
     (
         crate::loaders::BoundForgeInstallExecution,
@@ -1664,7 +1795,7 @@ async fn reconstruct_installer_library_declarations_inner(
     let client = standard_minecraft_download_client();
     let mut proofs = Vec::new();
     let mut retained_sources = RetainedLibrarySourceSet::new();
-    let source_pool = context.phase_source_pool()?;
+    let source_pool = context.phase_library_source_pool()?;
     for classified in jobs {
         let (plan, acquisition) = classified.into_parts();
         let required_by_execution = required_execution_inputs.remove(&plan.relative_path);
@@ -1691,7 +1822,7 @@ async fn reconstruct_installer_library_declarations_inner(
                     "processor library input exceeds its admitted size bound".to_string(),
                 ));
             }
-            if !context.retains_sources() {
+            if !context.retains_library_sources() {
                 if !stage_in_workspace {
                     continue;
                 }
@@ -1763,7 +1894,7 @@ async fn reconstruct_installer_library_declarations_inner(
         } else if acquisition == LibraryAcquisition::FreshStream {
             proofs.push(reconstruction_download_proof(&source)?);
         }
-        if context.retains_sources() {
+        if context.retains_library_sources() {
             retained_sources.insert(source)?;
         }
     }
@@ -2096,7 +2227,7 @@ pub(crate) fn prepare_local_managed_install(
     Ok(PreparedManagedInstall {
         authority,
         version_bundle_source: source,
-        asset_sources: Vec::new(),
+        asset_sources: RetainedAssetSourceSet::new(),
         library_sources,
     })
 }
@@ -2118,7 +2249,7 @@ pub(crate) async fn publish_prepared_managed_install(
             lease,
             &authority,
             ManagedComponentKind::Assets,
-            asset_sources,
+            asset_sources.into_sources(),
         )
         .await
         .map_err(|error| managed_component_install_error(ManagedComponentKind::Assets, error))?;

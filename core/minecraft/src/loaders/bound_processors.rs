@@ -576,7 +576,7 @@ pub(crate) fn spawn_reconstruction_processor_execution(
     target_version_id: String,
     minecraft_version: String,
     sources: AuthenticatedProcessorSources,
-    context: crate::download::ReconstructionLibraryContext,
+    context: crate::download::ManagedReconstructionContext,
 ) -> BoundProcessorExecutionHandle {
     let (cancel_tx, mut cancel_rx) = oneshot::channel();
     let (progress_tx, progress_rx) = mpsc::unbounded_channel();

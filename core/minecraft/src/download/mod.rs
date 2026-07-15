@@ -14,14 +14,18 @@ mod runtime;
 mod transfer;
 mod transfer_failure;
 
+#[cfg(feature = "test-support")]
+pub(crate) use asset_source::AssetSourcePool;
+pub(crate) use asset_source::{
+    AuthenticatedAssetCacheProofSet, RetainedAssetComponentSource, RetainedAssetSourceSet,
+};
 pub(crate) use assets::parse_asset_index;
 pub use assets::repair_virtual_assets_from_index;
 pub use install::Downloader;
 pub(crate) use install::{
     AuthenticatedVanillaInstallSources, AuthenticatedVersionBundleMemberSource,
-    AuthenticatedVersionBundleSource, PreparedManagedInstall, ReconstructedVanillaAuthority,
-    ReconstructionLibraryContext, ReconstructionLibraryRetention, prepare_local_managed_install,
-    publish_prepared_managed_install,
+    AuthenticatedVersionBundleSource, ManagedReconstructionContext, PreparedManagedInstall,
+    ReconstructedVanillaAuthority, prepare_local_managed_install, publish_prepared_managed_install,
 };
 pub(crate) use install::{
     reconstruct_installer_library_declarations, reconstruct_installer_processor_sources,

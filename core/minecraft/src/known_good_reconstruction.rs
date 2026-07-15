@@ -1,7 +1,7 @@
-use crate::download::{Downloader, ReconstructionLibraryContext};
+use crate::download::{Downloader, ManagedReconstructionContext};
 use crate::known_good::{
-    KnownGoodInventory, KnownGoodReconstructionReceipt, ManagedKnownGoodComponent,
-    ManagedLibrariesReconstruction,
+    KnownGoodInventory, KnownGoodReconstructionReceipt, ManagedAssetsReconstruction,
+    ManagedKnownGoodComponent, ManagedLibrariesReconstruction, RetainedKnownGoodReconstruction,
 };
 use crate::managed_component_lifecycle::{
     ManagedComponentCommittedReceipt, ManagedComponentLifecycleOutcome,
@@ -30,11 +30,27 @@ enum ReconstructionKind {
 }
 
 pub struct ManagedLibrariesCommitReceipt {
+    authority: Box<CommittedComponentRebuildAuthority>,
+}
+
+pub struct ManagedLibrariesRollbackReceipt {
+    authority: Box<RolledBackComponentRebuildAuthority>,
+}
+
+pub struct ManagedAssetsCommitReceipt {
+    authority: Box<CommittedComponentRebuildAuthority>,
+}
+
+pub struct ManagedAssetsRollbackReceipt {
+    authority: Box<RolledBackComponentRebuildAuthority>,
+}
+
+struct CommittedComponentRebuildAuthority {
     projection: KnownGoodReconstructionReceipt,
     terminal: ManagedComponentCommittedReceipt,
 }
 
-pub struct ManagedLibrariesRollbackReceipt {
+struct RolledBackComponentRebuildAuthority {
     projection: KnownGoodReconstructionReceipt,
     terminal: ManagedComponentRolledBackReceipt,
 }
@@ -46,10 +62,23 @@ pub enum ManagedLibrariesRollbackEffect {
     Reconciliation,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ManagedAssetsRollbackEffect {
+    None,
+    Execution,
+    Reconciliation,
+}
+
 pub enum ManagedLibrariesRebuildError {
     Reconstruction(KnownGoodReconstructionError),
     Preparation,
     RolledBack(ManagedLibrariesRollbackReceipt),
+}
+
+pub enum ManagedAssetsRebuildError {
+    Reconstruction(KnownGoodReconstructionError),
+    Preparation,
+    RolledBack(ManagedAssetsRollbackReceipt),
 }
 
 impl std::fmt::Debug for ManagedLibrariesCommitReceipt {
@@ -64,12 +93,34 @@ impl std::fmt::Debug for ManagedLibrariesRollbackReceipt {
     }
 }
 
+impl std::fmt::Debug for ManagedAssetsCommitReceipt {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("ManagedAssetsCommitReceipt { .. }")
+    }
+}
+
+impl std::fmt::Debug for ManagedAssetsRollbackReceipt {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("ManagedAssetsRollbackReceipt { .. }")
+    }
+}
+
 impl std::fmt::Debug for ManagedLibrariesRebuildError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(match self {
             Self::Reconstruction(_) => "ManagedLibrariesRebuildError::Reconstruction(..)",
             Self::Preparation => "ManagedLibrariesRebuildError::Preparation",
             Self::RolledBack(_) => "ManagedLibrariesRebuildError::RolledBack(..)",
+        })
+    }
+}
+
+impl std::fmt::Debug for ManagedAssetsRebuildError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Reconstruction(_) => "ManagedAssetsRebuildError::Reconstruction(..)",
+            Self::Preparation => "ManagedAssetsRebuildError::Preparation",
+            Self::RolledBack(_) => "ManagedAssetsRebuildError::RolledBack(..)",
         })
     }
 }
@@ -86,48 +137,104 @@ impl std::fmt::Display for ManagedLibrariesRebuildError {
 
 impl std::error::Error for ManagedLibrariesRebuildError {}
 
+impl std::fmt::Display for ManagedAssetsRebuildError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Reconstruction(_) => "managed Assets reconstruction failed",
+            Self::Preparation => "managed Assets rebuild failed before its canonical effect",
+            Self::RolledBack(_) => "managed Assets rebuild rolled back",
+        })
+    }
+}
+
+impl std::error::Error for ManagedAssetsRebuildError {}
+
 impl ManagedLibrariesCommitReceipt {
     pub fn version_id(&self) -> &str {
-        self.projection.version_id()
+        self.authority.projection.version_id()
     }
 
     pub async fn matches_root(&self, expected: &Path) -> bool {
-        self.terminal.matches_root(expected).await
+        self.authority.terminal.matches_root(expected).await
     }
 
     pub fn matches_known_good_inventory(&self, expected: &KnownGoodInventory) -> bool {
         expected
             .managed_component_projection(ManagedKnownGoodComponent::Libraries)
-            .is_ok_and(|projection| self.terminal.matches_projection(&projection))
+            .is_ok_and(|projection| self.authority.terminal.matches_projection(&projection))
     }
 
     pub async fn revalidate(&self) -> bool {
-        self.terminal.revalidate().await
+        self.authority.terminal.revalidate().await
     }
 }
 
 impl ManagedLibrariesRollbackReceipt {
     pub fn version_id(&self) -> &str {
-        self.projection.version_id()
+        self.authority.projection.version_id()
     }
 
     pub async fn matches_root(&self, expected: &Path) -> bool {
-        self.terminal.matches_root(expected).await
+        self.authority.terminal.matches_root(expected).await
     }
 
     pub fn matches_known_good_inventory(&self, expected: &KnownGoodInventory) -> bool {
         expected
             .managed_component_projection(ManagedKnownGoodComponent::Libraries)
-            .is_ok_and(|projection| self.terminal.matches_projection(&projection))
+            .is_ok_and(|projection| self.authority.terminal.matches_projection(&projection))
     }
 
     pub fn effect(&self) -> ManagedLibrariesRollbackEffect {
-        match self.terminal.rollback_effect() {
+        match self.authority.terminal.rollback_effect() {
             ComponentRollbackEffect::None => ManagedLibrariesRollbackEffect::None,
             ComponentRollbackEffect::Execution => ManagedLibrariesRollbackEffect::Execution,
             ComponentRollbackEffect::Reconciliation => {
                 ManagedLibrariesRollbackEffect::Reconciliation
             }
+        }
+    }
+}
+
+impl ManagedAssetsCommitReceipt {
+    pub fn version_id(&self) -> &str {
+        self.authority.projection.version_id()
+    }
+
+    pub async fn matches_root(&self, expected: &Path) -> bool {
+        self.authority.terminal.matches_root(expected).await
+    }
+
+    pub fn matches_known_good_inventory(&self, expected: &KnownGoodInventory) -> bool {
+        expected
+            .managed_component_projection(ManagedKnownGoodComponent::Assets)
+            .is_ok_and(|projection| self.authority.terminal.matches_projection(&projection))
+    }
+
+    pub async fn revalidate(&self) -> bool {
+        self.authority.terminal.revalidate().await
+    }
+}
+
+impl ManagedAssetsRollbackReceipt {
+    pub fn version_id(&self) -> &str {
+        self.authority.projection.version_id()
+    }
+
+    pub async fn matches_root(&self, expected: &Path) -> bool {
+        self.authority.terminal.matches_root(expected).await
+    }
+
+    pub fn matches_known_good_inventory(&self, expected: &KnownGoodInventory) -> bool {
+        expected
+            .managed_component_projection(ManagedKnownGoodComponent::Assets)
+            .is_ok_and(|projection| self.authority.terminal.matches_projection(&projection))
+    }
+
+    pub fn effect(&self) -> ManagedAssetsRollbackEffect {
+        match self.authority.terminal.rollback_effect() {
+            ComponentRollbackEffect::None => ManagedAssetsRollbackEffect::None,
+            ComponentRollbackEffect::Execution => ManagedAssetsRollbackEffect::Execution,
+            ComponentRollbackEffect::Reconciliation => ManagedAssetsRollbackEffect::Reconciliation,
         }
     }
 }
@@ -138,14 +245,32 @@ pub async fn rebuild_managed_libraries(
 ) -> Result<ManagedLibrariesCommitReceipt, ManagedLibrariesRebuildError> {
     let managed_root = managed_root.into();
     let version_id = version_id.to_string();
-    tokio::spawn(async move {
+    let owner = tokio::spawn(async move {
         let reconstruction = prepare_managed_libraries_reconstruction(managed_root, &version_id)
             .await
             .map_err(ManagedLibrariesRebuildError::Reconstruction)?;
         publish_managed_libraries_reconstruction(reconstruction).await
-    })
-    .await
-    .map_err(|_| ManagedLibrariesRebuildError::Preparation)?
+    });
+    owner
+        .await
+        .map_err(|_| ManagedLibrariesRebuildError::Preparation)?
+}
+
+pub async fn rebuild_managed_assets(
+    managed_root: impl Into<PathBuf>,
+    version_id: &str,
+) -> Result<ManagedAssetsCommitReceipt, ManagedAssetsRebuildError> {
+    let managed_root = managed_root.into();
+    let version_id = version_id.to_string();
+    let owner = tokio::spawn(async move {
+        let reconstruction = prepare_managed_assets_reconstruction(managed_root, &version_id)
+            .await
+            .map_err(ManagedAssetsRebuildError::Reconstruction)?;
+        publish_managed_assets_reconstruction(reconstruction).await
+    });
+    owner
+        .await
+        .map_err(|_| ManagedAssetsRebuildError::Preparation)?
 }
 
 #[cfg(feature = "test-support")]
@@ -155,7 +280,7 @@ pub async fn rebuild_managed_libraries_fixture_for_test(
 ) -> Result<ManagedLibrariesCommitReceipt, ManagedLibrariesRebuildError> {
     let managed_root = managed_root.into();
     let version_id = version_id.to_string();
-    tokio::spawn(async move {
+    let owner = tokio::spawn(async move {
         let guarded_root = run_publication_blocking(move || ManagedDir::open_root(&managed_root))
             .await
             .map_err(|_| ManagedLibrariesRebuildError::Preparation)?
@@ -166,9 +291,35 @@ pub async fn rebuild_managed_libraries_fixture_for_test(
         )
         .map_err(|_| ManagedLibrariesRebuildError::Preparation)?;
         publish_managed_libraries_reconstruction(reconstruction).await
-    })
-    .await
-    .map_err(|_| ManagedLibrariesRebuildError::Preparation)?
+    });
+    owner
+        .await
+        .map_err(|_| ManagedLibrariesRebuildError::Preparation)?
+}
+
+#[cfg(feature = "test-support")]
+pub async fn rebuild_managed_assets_fixture_for_test(
+    managed_root: impl Into<PathBuf>,
+    version_id: &str,
+) -> Result<ManagedAssetsCommitReceipt, ManagedAssetsRebuildError> {
+    let managed_root = managed_root.into();
+    let version_id = version_id.to_string();
+    let owner = tokio::spawn(async move {
+        let guarded_root = run_publication_blocking(move || ManagedDir::open_root(&managed_root))
+            .await
+            .map_err(|_| ManagedAssetsRebuildError::Preparation)?
+            .map_err(|_| ManagedAssetsRebuildError::Preparation)?;
+        let reconstruction = crate::known_good::managed_assets_reconstruction_fixture_for_test(
+            guarded_root,
+            &version_id,
+        )
+        .await
+        .map_err(|_| ManagedAssetsRebuildError::Preparation)?;
+        publish_managed_assets_reconstruction(reconstruction).await
+    });
+    owner
+        .await
+        .map_err(|_| ManagedAssetsRebuildError::Preparation)?
 }
 
 async fn publish_managed_libraries_reconstruction(
@@ -192,14 +343,49 @@ async fn publish_managed_libraries_reconstruction(
     {
         ManagedComponentLifecycleOutcome::Committed(terminal) => {
             Ok(ManagedLibrariesCommitReceipt {
-                projection,
-                terminal,
+                authority: Box::new(CommittedComponentRebuildAuthority {
+                    projection,
+                    terminal,
+                }),
             })
         }
         ManagedComponentLifecycleOutcome::RolledBack(terminal) => Err(
             ManagedLibrariesRebuildError::RolledBack(ManagedLibrariesRollbackReceipt {
+                authority: Box::new(RolledBackComponentRebuildAuthority {
+                    projection,
+                    terminal,
+                }),
+            }),
+        ),
+    }
+}
+
+async fn publish_managed_assets_reconstruction(
+    reconstruction: ManagedAssetsReconstruction,
+) -> Result<ManagedAssetsCommitReceipt, ManagedAssetsRebuildError> {
+    let (managed_root, projection, sources) = reconstruction.into_effect_parts();
+    let lease = ManagedRootPublicationLease::acquire(managed_root)
+        .await
+        .map_err(|_| ManagedAssetsRebuildError::Preparation)?;
+    let assets = projection
+        .component_projection(ManagedKnownGoodComponent::Assets)
+        .map_err(|_| ManagedAssetsRebuildError::Preparation)?;
+    match publish_managed_component_effect(lease, assets, ManagedComponentKind::Assets, sources)
+        .await
+        .map_err(|_| ManagedAssetsRebuildError::Preparation)?
+    {
+        ManagedComponentLifecycleOutcome::Committed(terminal) => Ok(ManagedAssetsCommitReceipt {
+            authority: Box::new(CommittedComponentRebuildAuthority {
                 projection,
                 terminal,
+            }),
+        }),
+        ManagedComponentLifecycleOutcome::RolledBack(terminal) => Err(
+            ManagedAssetsRebuildError::RolledBack(ManagedAssetsRollbackReceipt {
+                authority: Box::new(RolledBackComponentRebuildAuthority {
+                    projection,
+                    terminal,
+                }),
             }),
         ),
     }
@@ -223,32 +409,76 @@ async fn prepare_managed_libraries_reconstruction(
     managed_root: impl Into<PathBuf>,
     version_id: &str,
 ) -> Result<ManagedLibrariesReconstruction, KnownGoodReconstructionError> {
+    let (reconstruction, guarded_root, context, kind) =
+        prepare_managed_reconstruction(managed_root, version_id, ManagedComponentKind::Libraries)
+            .await?;
+    reconstruction
+        .bind_managed_libraries(guarded_root, context.take_library_cache_proofs())
+        .map_err(|_| reconstruction_error_for(kind))
+}
+
+async fn prepare_managed_assets_reconstruction(
+    managed_root: impl Into<PathBuf>,
+    version_id: &str,
+) -> Result<ManagedAssetsReconstruction, KnownGoodReconstructionError> {
+    let (reconstruction, guarded_root, context, kind) =
+        prepare_managed_reconstruction(managed_root, version_id, ManagedComponentKind::Assets)
+            .await?;
+    let (sources, cache_proofs) = context
+        .take_assets_authority()
+        .map_err(|_| reconstruction_error_for(kind))?;
+    reconstruction
+        .bind_managed_assets(guarded_root, sources, cache_proofs)
+        .map_err(|_| reconstruction_error_for(kind))
+}
+
+async fn prepare_managed_reconstruction(
+    managed_root: impl Into<PathBuf>,
+    version_id: &str,
+    component: ManagedComponentKind,
+) -> Result<
+    (
+        RetainedKnownGoodReconstruction,
+        ManagedDir,
+        ManagedReconstructionContext,
+        ReconstructionKind,
+    ),
+    KnownGoodReconstructionError,
+> {
     let kind = reconstruction_kind(version_id);
     let managed_root = managed_root.into();
     let guarded_root = run_publication_blocking(move || ManagedDir::open_root(&managed_root))
         .await
         .map_err(|_| KnownGoodReconstructionError::ManagedRoot)?
         .map_err(|_| KnownGoodReconstructionError::ManagedRoot)?;
-    let context = ReconstructionLibraryContext::bind_retained(guarded_root.clone())
-        .await
-        .map_err(|_| KnownGoodReconstructionError::ManagedRoot)?;
+    let context = match component {
+        ManagedComponentKind::Libraries => {
+            ManagedReconstructionContext::bind_libraries(guarded_root.clone()).await
+        }
+        ManagedComponentKind::Assets => {
+            ManagedReconstructionContext::bind_assets(guarded_root.clone()).await
+        }
+    }
+    .map_err(|_| KnownGoodReconstructionError::ManagedRoot)?;
     let reconstruction = match kind {
         ReconstructionKind::Vanilla => Downloader::source_only()
             .reconstruct_version_authority(version_id, &context)
             .await
             .map_err(|_| KnownGoodReconstructionError::Vanilla)?,
         ReconstructionKind::Loader => {
-            crate::loaders::reconstruct_managed_libraries(version_id, &context)
+            crate::loaders::reconstruct_managed_component(version_id, &context)
                 .await
                 .map_err(|_| KnownGoodReconstructionError::Loader)?
         }
     };
-    reconstruction
-        .bind_managed_libraries(guarded_root, context.take_cache_proofs())
-        .map_err(|_| match kind {
-            ReconstructionKind::Vanilla => KnownGoodReconstructionError::Vanilla,
-            ReconstructionKind::Loader => KnownGoodReconstructionError::Loader,
-        })
+    Ok((reconstruction, guarded_root, context, kind))
+}
+
+fn reconstruction_error_for(kind: ReconstructionKind) -> KnownGoodReconstructionError {
+    match kind {
+        ReconstructionKind::Vanilla => KnownGoodReconstructionError::Vanilla,
+        ReconstructionKind::Loader => KnownGoodReconstructionError::Loader,
+    }
 }
 
 fn reconstruction_kind(version_id: &str) -> ReconstructionKind {
@@ -329,6 +559,52 @@ mod tests {
         assert!(!receipt.revalidate().await);
     }
 
+    #[cfg(feature = "test-support")]
+    #[tokio::test]
+    async fn test_support_fixture_executes_the_committed_assets_lifecycle() {
+        use sha1::{Digest as _, Sha1};
+
+        const VERSION_ID: &str = "fixture-assets-1.0.0";
+        const INDEX_PATH: &str = "assets/indexes/fixture-assets.json";
+        const OBJECT_BYTES: &[u8] = b"axial managed Assets fixture";
+        let root = tempfile::tempdir().expect("managed fixture root");
+
+        let receipt = super::rebuild_managed_assets_fixture_for_test(root.path(), VERSION_ID)
+            .await
+            .expect("committed fixture rebuild");
+
+        assert_eq!(receipt.version_id(), VERSION_ID);
+        assert!(receipt.matches_root(root.path()).await);
+        assert!(receipt.revalidate().await);
+        let object_digest = format!("{:x}", Sha1::digest(OBJECT_BYTES));
+        let empty_digest = format!("{:x}", Sha1::digest([]));
+        assert_eq!(
+            fs::read(
+                root.path()
+                    .join("assets/objects")
+                    .join(&object_digest[..2])
+                    .join(&object_digest),
+            )
+            .expect("fixture object"),
+            OBJECT_BYTES
+        );
+        assert_eq!(
+            fs::read(
+                root.path()
+                    .join("assets/objects")
+                    .join(&empty_digest[..2])
+                    .join(&empty_digest),
+            )
+            .expect("fixture empty object"),
+            b""
+        );
+
+        let mut corrupted = fs::read(root.path().join(INDEX_PATH)).expect("read fixture index");
+        corrupted[0] ^= 0xff;
+        fs::write(root.path().join(INDEX_PATH), corrupted).expect("corrupt fixture index");
+        assert!(!receipt.revalidate().await);
+    }
+
     #[test]
     fn public_errors_are_closed_and_source_free() {
         for (error, message) in [
@@ -348,6 +624,30 @@ mod tests {
             assert_eq!(error.to_string(), message);
             assert!(std::error::Error::source(&error).is_none());
         }
+        for error in [
+            super::ManagedLibrariesRebuildError::Preparation,
+            super::ManagedLibrariesRebuildError::Reconstruction(
+                KnownGoodReconstructionError::Vanilla,
+            ),
+        ] {
+            assert!(std::error::Error::source(&error).is_none());
+            assert!(!error.to_string().contains('/'));
+        }
+        for error in [
+            super::ManagedAssetsRebuildError::Preparation,
+            super::ManagedAssetsRebuildError::Reconstruction(KnownGoodReconstructionError::Loader),
+        ] {
+            assert!(std::error::Error::source(&error).is_none());
+            assert!(!error.to_string().contains('/'));
+        }
+        assert!(
+            std::mem::size_of::<super::ManagedLibrariesRebuildError>()
+                <= 2 * std::mem::size_of::<usize>()
+        );
+        assert!(
+            std::mem::size_of::<super::ManagedAssetsRebuildError>()
+                <= 2 * std::mem::size_of::<usize>()
+        );
     }
 
     #[test]
@@ -362,6 +662,7 @@ mod tests {
         let loader_strategies = include_str!("loaders/strategies/common.rs");
 
         assert!(crate_root.contains("rebuild_managed_libraries"));
+        assert!(crate_root.contains("rebuild_managed_assets"));
         assert!(!crate_root.contains("prepare_managed_libraries_reconstruction"));
         assert!(crate_root.contains("reconstruct_known_good"));
         assert!(!crate_root.contains("KnownGoodActivationSource"));
@@ -369,6 +670,9 @@ mod tests {
         assert!(!dispatcher.contains(concat!("PathBuf", "::new()")));
         assert!(!downloader.contains("    pub async fn reconstruct_version("));
         assert!(!loaders.contains("pub async fn reconstruct_build("));
+        assert!(!downloader.contains("ReconstructionLibraryContext"));
+        assert!(!loaders.contains("reconstruct_managed_libraries"));
+        assert!(!loader_strategies.contains("reconstruct_libraries_from_"));
         assert!(!loader_strategies.contains(concat!("Downloader::new(", "PathBuf::new())")));
     }
 

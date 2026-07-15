@@ -30,12 +30,15 @@ pub mod version_meta;
 pub use asset_index::{AssetIndexFlagsError, asset_index_requires_virtual_repair};
 pub use download::{DownloadError, DownloadProgress, Downloader};
 pub use known_good::{KnownGoodInstallReceipt, KnownGoodReconstructionReceipt};
-#[cfg(feature = "test-support")]
-pub use known_good_reconstruction::rebuild_managed_libraries_fixture_for_test;
 pub use known_good_reconstruction::{
-    KnownGoodReconstructionError, ManagedLibrariesCommitReceipt, ManagedLibrariesRebuildError,
-    ManagedLibrariesRollbackEffect, ManagedLibrariesRollbackReceipt, rebuild_managed_libraries,
-    reconstruct_known_good,
+    KnownGoodReconstructionError, ManagedAssetsCommitReceipt, ManagedAssetsRebuildError,
+    ManagedAssetsRollbackEffect, ManagedAssetsRollbackReceipt, ManagedLibrariesCommitReceipt,
+    ManagedLibrariesRebuildError, ManagedLibrariesRollbackEffect, ManagedLibrariesRollbackReceipt,
+    rebuild_managed_assets, rebuild_managed_libraries, reconstruct_known_good,
+};
+#[cfg(feature = "test-support")]
+pub use known_good_reconstruction::{
+    rebuild_managed_assets_fixture_for_test, rebuild_managed_libraries_fixture_for_test,
 };
 pub use launch::{
     JavaVersion, LaunchModelError, LaunchVars, ResolvedLibrary, VersionJson, build_classpath,

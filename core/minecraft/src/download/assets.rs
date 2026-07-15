@@ -1,4 +1,7 @@
-use super::asset_source::{AssetSourcePool, RetainedAssetComponentSource};
+use super::asset_source::{
+    AssetSourcePool, AuthenticatedAssetCacheProof, AuthenticatedAssetCacheProofSet,
+    RetainedAssetSourceSet,
+};
 use super::client::asset_download_concurrency;
 use super::facts::selected_download_source_label;
 use super::integrity::hash_file;
@@ -47,7 +50,58 @@ impl Drop for AssetDownloadPipeline {
 
 pub(super) struct RetainedAssetsAcquisition {
     pub(super) asset_index_source: AuthenticatedSelectedArtifactSource,
-    pub(super) sources: Vec<RetainedAssetComponentSource>,
+    pub(super) sources: RetainedAssetSourceSet,
+    pub(super) cache_proofs: AuthenticatedAssetCacheProofSet,
+}
+
+pub(super) struct AssetSourceAcquisitionRequest<'a, F> {
+    client: reqwest::Client,
+    asset_object_base_url: Arc<str>,
+    asset_index_id: String,
+    asset_index_source: AuthenticatedSelectedArtifactSource,
+    fact_tx: Option<mpsc::UnboundedSender<ExecutionDownloadFact>>,
+    plan: &'a TransferPlan,
+    send: F,
+}
+
+pub(super) struct GuardedAssetSourceAcquisitionRequest<'a, F> {
+    request: AssetSourceAcquisitionRequest<'a, F>,
+    source_pool: AssetSourcePool,
+    cache: ManagedComponentExactCache,
+}
+
+impl<'a, F> AssetSourceAcquisitionRequest<'a, F> {
+    pub(super) fn new(
+        client: reqwest::Client,
+        asset_object_base_url: Arc<str>,
+        asset_index_id: String,
+        asset_index_source: AuthenticatedSelectedArtifactSource,
+        fact_tx: Option<mpsc::UnboundedSender<ExecutionDownloadFact>>,
+        plan: &'a TransferPlan,
+        send: F,
+    ) -> Self {
+        Self {
+            client,
+            asset_object_base_url,
+            asset_index_id,
+            asset_index_source,
+            fact_tx,
+            plan,
+            send,
+        }
+    }
+
+    pub(super) fn bind(
+        self,
+        source_pool: AssetSourcePool,
+        cache: ManagedComponentExactCache,
+    ) -> GuardedAssetSourceAcquisitionRequest<'a, F> {
+        GuardedAssetSourceAcquisitionRequest {
+            request: self,
+            source_pool,
+            cache,
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -80,15 +134,17 @@ pub(super) fn spawn_asset_download_pipeline(
     let task = tokio::spawn(async move {
         acquire_asset_sources_with_client(
             &mc_dir,
-            client,
-            asset_object_base_url,
-            asset_index_id,
-            asset_index_source,
-            fact_tx,
-            &plan,
-            |progress| {
-                let _ = progress_tx.send(progress);
-            },
+            AssetSourceAcquisitionRequest::new(
+                client,
+                asset_object_base_url,
+                asset_index_id,
+                asset_index_source,
+                fact_tx,
+                &plan,
+                |progress| {
+                    let _ = progress_tx.send(progress);
+                },
+            ),
         )
         .await
     });
@@ -149,27 +205,47 @@ where
 }
 
 pub(super) async fn abort_asset_download_pipeline(pipeline: Option<AssetDownloadPipeline>) {
-    if let Some(mut pipeline) = pipeline {
-        if let Some(task) = pipeline.task.take() {
-            task.abort();
-            let _ = task.await;
-        }
+    if let Some(mut pipeline) = pipeline
+        && let Some(task) = pipeline.task.take()
+    {
+        task.abort();
+        let _ = task.await;
     }
 }
 
 async fn acquire_asset_sources_with_client<F>(
     mc_dir: &Path,
-    client: reqwest::Client,
-    asset_object_base_url: Arc<str>,
-    asset_index_id: String,
-    asset_index_source: AuthenticatedSelectedArtifactSource,
-    fact_tx: Option<mpsc::UnboundedSender<ExecutionDownloadFact>>,
-    plan: &TransferPlan,
-    mut send: F,
+    request: AssetSourceAcquisitionRequest<'_, F>,
 ) -> Result<RetainedAssetsAcquisition, DownloadError>
 where
     F: FnMut(DownloadProgress),
 {
+    let cache = ManagedComponentExactCache::bind(mc_dir, ManagedComponentKind::Assets)
+        .await
+        .map_err(asset_cache_error)?;
+    acquire_asset_sources_with_cache(request.bind(AssetSourcePool::new()?, cache)).await
+}
+
+pub(super) async fn acquire_asset_sources_with_cache<F>(
+    request: GuardedAssetSourceAcquisitionRequest<'_, F>,
+) -> Result<RetainedAssetsAcquisition, DownloadError>
+where
+    F: FnMut(DownloadProgress),
+{
+    let GuardedAssetSourceAcquisitionRequest {
+        request:
+            AssetSourceAcquisitionRequest {
+                client,
+                asset_object_base_url,
+                asset_index_id,
+                asset_index_source,
+                fact_tx,
+                plan,
+                mut send,
+            },
+        source_pool,
+        cache,
+    } = request;
     if asset_index_source.kind() != SelectedDownloadArtifactKind::AssetIndex
         || asset_index_source.logical_identity() != asset_index_id
     {
@@ -188,13 +264,9 @@ where
     )?;
     let index_path = ArtifactRelativePath::new(&format!("indexes/{asset_index_id}.json"))
         .map_err(|_| DownloadError::Integrity("asset index path is invalid".to_string()))?;
-    let source_pool = AssetSourcePool::new()?;
     let index_source = source_pool
         .retain_index(&asset_index_source, index_path)
         .await?;
-    let cache = ManagedComponentExactCache::bind(mc_dir, ManagedComponentKind::Assets)
-        .await
-        .map_err(asset_cache_error)?;
 
     let object_bytes = jobs.iter().try_fold(0_u64, |total, job| {
         total.checked_add(job.expected_size).ok_or_else(|| {
@@ -218,7 +290,15 @@ where
                 .map_err(asset_cache_error)?
                 == Some(job.expected_sha1)
             {
-                return Ok::<_, DownloadError>((job.expected_size, None));
+                return Ok::<_, DownloadError>((
+                    job.expected_size,
+                    None,
+                    Some(AuthenticatedAssetCacheProof::new(
+                        job.relative_path,
+                        job.expected_size,
+                        job.expected_sha1,
+                    )),
+                ));
             }
             let permit = source_pool.reserve(job.expected_size).await?;
             let url = format!("{asset_object_base_url}/{}/{}", &job.hash[..2], job.hash);
@@ -245,16 +325,20 @@ where
             let retained = source_pool
                 .retain_object(&source, job.relative_path, permit)
                 .await?;
-            Ok((job.expected_size, Some(retained)))
+            Ok((job.expected_size, Some(retained), None))
         }
     }))
     .buffer_unordered(asset_download_concurrency());
-    let mut sources = Vec::new();
-    sources.push(index_source);
+    let mut sources = RetainedAssetSourceSet::new();
+    sources.insert(index_source)?;
+    let mut cache_proofs = AuthenticatedAssetCacheProofSet::default();
     while let Some(result) = asset_downloads.next().await {
-        let (bytes, source) = result?;
+        let (bytes, source, cache_proof) = result?;
         if let Some(source) = source {
-            sources.push(source);
+            sources.insert(source)?;
+        }
+        if let Some(cache_proof) = cache_proof {
+            cache_proofs.insert(cache_proof)?;
         }
         plan.add_done(bytes);
         completed_jobs += 1;
@@ -266,6 +350,7 @@ where
     Ok(RetainedAssetsAcquisition {
         asset_index_source,
         sources,
+        cache_proofs,
     })
 }
 
