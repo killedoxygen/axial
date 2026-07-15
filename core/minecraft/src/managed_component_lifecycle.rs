@@ -267,6 +267,25 @@ where
         .await
 }
 
+#[cfg(test)]
+pub(crate) async fn publish_managed_component_effect_with_execution_fault<S>(
+    lease: ManagedRootPublicationLease,
+    projection: ManagedComponentProjection<'_>,
+    component: ManagedComponentKind,
+    sources: Vec<S>,
+    execution: ComponentExecutionFault,
+) -> Result<ManagedComponentLifecycleOutcome, ComponentLifecycleError>
+where
+    S: RetainedComponentPublicationSource + 'static,
+{
+    let mut faults = ComponentLifecycleTestFaults {
+        execution: Some(execution),
+        ..ComponentLifecycleTestFaults::default()
+    };
+    publish_managed_component_effect_inner(lease, projection, component, sources, Some(&mut faults))
+        .await
+}
+
 pub(crate) async fn publish_managed_component_effect<S>(
     lease: ManagedRootPublicationLease,
     projection: ManagedComponentProjection<'_>,

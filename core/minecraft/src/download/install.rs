@@ -48,6 +48,10 @@ use crate::known_good_libraries::{
 };
 use crate::launch::{VersionJson, effective_java_version_for};
 use crate::managed_component_cache::ManagedComponentExactCache;
+#[cfg(test)]
+use crate::managed_component_effects::ComponentExecutionFault;
+#[cfg(test)]
+use crate::managed_component_lifecycle::publish_managed_component_effect_with_execution_fault;
 use crate::managed_component_lifecycle::{
     ManagedComponentLifecycleOutcome, publish_managed_component_effect,
 };
@@ -2681,6 +2685,13 @@ pub(crate) enum ManagedProjectionSequenceError {
     VersionBundle,
 }
 
+#[cfg(test)]
+#[derive(Clone, Copy)]
+pub(crate) enum ManagedProjectionSequenceFault {
+    Assets(ComponentExecutionFault),
+    Libraries(ComponentExecutionFault),
+}
+
 impl ManagedProjectionSequenceError {
     pub(crate) fn component(&self) -> ManagedKnownGoodComponent {
         match self {
@@ -2697,19 +2708,91 @@ pub(crate) async fn publish_managed_projection_sequence(
     library_sources: Vec<RetainedLibraryComponentSource>,
     version_bundle_source: AuthenticatedVersionBundleSource,
 ) -> Result<ManagedProjectionSequenceOutcome, ManagedProjectionSequenceError> {
+    publish_managed_projection_sequence_inner(
+        lease,
+        authority,
+        asset_sources,
+        library_sources,
+        version_bundle_source,
+        #[cfg(test)]
+        None,
+    )
+    .await
+}
+
+#[cfg(test)]
+pub(crate) async fn publish_managed_projection_sequence_with_fault(
+    lease: ManagedRootPublicationLease,
+    authority: &impl ManagedProjectionAuthority,
+    asset_sources: Vec<RetainedAssetComponentSource>,
+    library_sources: Vec<RetainedLibraryComponentSource>,
+    version_bundle_source: AuthenticatedVersionBundleSource,
+    fault: ManagedProjectionSequenceFault,
+) -> Result<ManagedProjectionSequenceOutcome, ManagedProjectionSequenceError> {
+    publish_managed_projection_sequence_inner(
+        lease,
+        authority,
+        asset_sources,
+        library_sources,
+        version_bundle_source,
+        Some(fault),
+    )
+    .await
+}
+
+async fn publish_managed_projection_sequence_inner(
+    lease: ManagedRootPublicationLease,
+    authority: &impl ManagedProjectionAuthority,
+    asset_sources: Vec<RetainedAssetComponentSource>,
+    library_sources: Vec<RetainedLibraryComponentSource>,
+    version_bundle_source: AuthenticatedVersionBundleSource,
+    #[cfg(test)] mut fault: Option<ManagedProjectionSequenceFault>,
+) -> Result<ManagedProjectionSequenceOutcome, ManagedProjectionSequenceError> {
     let assets = authority
         .component_projection(ManagedKnownGoodComponent::Assets)
         .map_err(|()| {
             ManagedProjectionSequenceError::Projection(ManagedKnownGoodComponent::Assets)
         })?;
-    let lease = match publish_managed_component_effect(
+    #[cfg(test)]
+    let assets_fault = match fault {
+        Some(ManagedProjectionSequenceFault::Assets(execution)) => {
+            fault = None;
+            Some(execution)
+        }
+        Some(ManagedProjectionSequenceFault::Libraries(_)) | None => None,
+    };
+    #[cfg(test)]
+    let assets = match assets_fault {
+        Some(execution) => {
+            publish_managed_component_effect_with_execution_fault(
+                lease,
+                assets,
+                ManagedComponentKind::Assets,
+                asset_sources,
+                execution,
+            )
+            .await
+        }
+        None => {
+            publish_managed_component_effect(
+                lease,
+                assets,
+                ManagedComponentKind::Assets,
+                asset_sources,
+            )
+            .await
+        }
+    };
+    #[cfg(not(test))]
+    let assets = publish_managed_component_effect(
         lease,
         assets,
         ManagedComponentKind::Assets,
         asset_sources,
     )
-    .await
-    .map_err(|_| ManagedProjectionSequenceError::Component(ManagedKnownGoodComponent::Assets))?
+    .await;
+    let lease = match assets
+        .map_err(|_| ManagedProjectionSequenceError::Component(ManagedKnownGoodComponent::Assets))?
     {
         ManagedComponentLifecycleOutcome::Committed(receipt) => receipt.into_lease(),
         ManagedComponentLifecycleOutcome::RolledBack(receipt) => {
@@ -2725,15 +2808,44 @@ pub(crate) async fn publish_managed_projection_sequence(
         .map_err(|()| {
             ManagedProjectionSequenceError::Projection(ManagedKnownGoodComponent::Libraries)
         })?;
-    let lease = match publish_managed_component_effect(
+    #[cfg(test)]
+    let libraries_fault = match fault {
+        Some(ManagedProjectionSequenceFault::Libraries(execution)) => Some(execution),
+        Some(ManagedProjectionSequenceFault::Assets(_)) | None => None,
+    };
+    #[cfg(test)]
+    let libraries = match libraries_fault {
+        Some(execution) => {
+            publish_managed_component_effect_with_execution_fault(
+                lease,
+                libraries,
+                ManagedComponentKind::Libraries,
+                library_sources,
+                execution,
+            )
+            .await
+        }
+        None => {
+            publish_managed_component_effect(
+                lease,
+                libraries,
+                ManagedComponentKind::Libraries,
+                library_sources,
+            )
+            .await
+        }
+    };
+    #[cfg(not(test))]
+    let libraries = publish_managed_component_effect(
         lease,
         libraries,
         ManagedComponentKind::Libraries,
         library_sources,
     )
-    .await
-    .map_err(|_| ManagedProjectionSequenceError::Component(ManagedKnownGoodComponent::Libraries))?
-    {
+    .await;
+    let lease = match libraries.map_err(|_| {
+        ManagedProjectionSequenceError::Component(ManagedKnownGoodComponent::Libraries)
+    })? {
         ManagedComponentLifecycleOutcome::Committed(receipt) => receipt.into_lease(),
         ManagedComponentLifecycleOutcome::RolledBack(receipt) => {
             let effect = receipt.rollback_effect();

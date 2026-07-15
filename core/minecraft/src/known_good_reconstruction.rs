@@ -3,6 +3,10 @@ use crate::download::{
     ManagedProjectionSequenceOutcome, ManagedReconstructionContext,
     publish_managed_projection_sequence,
 };
+#[cfg(test)]
+use crate::download::{
+    ManagedProjectionSequenceFault, publish_managed_projection_sequence_with_fault,
+};
 use crate::known_good::{
     KnownGoodInventory, KnownGoodReconstructionReceipt, ManagedAssetsReconstruction,
     ManagedKnownGoodComponent, ManagedLibrariesReconstruction, ManagedVersionBundleReconstruction,
@@ -693,13 +697,35 @@ pub async fn rematerialize_managed_instance(
     let managed_root = managed_root.into();
     let runtime_cache = runtime_cache.clone();
     let version_id = version_id.to_string();
-    let owner = tokio::spawn(async move {
+    let owner = spawn_managed_whole_instance_owner(async move {
         let reconstruction =
             prepare_managed_whole_instance_reconstruction(managed_root, &version_id)
                 .await
                 .map_err(ManagedWholeInstanceRebuildError::Reconstruction)?;
         publish_managed_whole_instance_reconstruction(reconstruction, runtime_cache).await
     });
+    await_managed_whole_instance_owner(owner).await
+}
+
+fn spawn_managed_whole_instance_owner<F>(
+    owner: F,
+) -> tokio::task::JoinHandle<
+    Result<ManagedWholeInstanceCommitReceipt, ManagedWholeInstanceRebuildError>,
+>
+where
+    F: std::future::Future<
+            Output = Result<ManagedWholeInstanceCommitReceipt, ManagedWholeInstanceRebuildError>,
+        > + Send
+        + 'static,
+{
+    tokio::spawn(owner)
+}
+
+async fn await_managed_whole_instance_owner(
+    owner: tokio::task::JoinHandle<
+        Result<ManagedWholeInstanceCommitReceipt, ManagedWholeInstanceRebuildError>,
+    >,
+) -> Result<ManagedWholeInstanceCommitReceipt, ManagedWholeInstanceRebuildError> {
     owner
         .await
         .map_err(|_| ManagedWholeInstanceRebuildError::Preparation)?
@@ -708,6 +734,30 @@ pub async fn rematerialize_managed_instance(
 async fn publish_managed_whole_instance_reconstruction(
     reconstruction: ManagedWholeInstanceReconstruction,
     runtime_cache: ManagedRuntimeCache,
+) -> Result<ManagedWholeInstanceCommitReceipt, ManagedWholeInstanceRebuildError> {
+    publish_managed_whole_instance_reconstruction_inner(
+        reconstruction,
+        runtime_cache,
+        #[cfg(test)]
+        None,
+    )
+    .await
+}
+
+#[cfg(test)]
+async fn publish_managed_whole_instance_reconstruction_with_fault(
+    reconstruction: ManagedWholeInstanceReconstruction,
+    runtime_cache: ManagedRuntimeCache,
+    fault: ManagedProjectionSequenceFault,
+) -> Result<ManagedWholeInstanceCommitReceipt, ManagedWholeInstanceRebuildError> {
+    publish_managed_whole_instance_reconstruction_inner(reconstruction, runtime_cache, Some(fault))
+        .await
+}
+
+async fn publish_managed_whole_instance_reconstruction_inner(
+    reconstruction: ManagedWholeInstanceReconstruction,
+    runtime_cache: ManagedRuntimeCache,
+    #[cfg(test)] fault: Option<ManagedProjectionSequenceFault>,
 ) -> Result<ManagedWholeInstanceCommitReceipt, ManagedWholeInstanceRebuildError> {
     let (
         root_lease,
@@ -758,6 +808,31 @@ async fn publish_managed_whole_instance_reconstruction(
             ManagedWholeInstanceRollbackEffect::ExactPostcheck,
         ));
     }
+    #[cfg(test)]
+    let sequence = match fault {
+        Some(fault) => {
+            publish_managed_projection_sequence_with_fault(
+                root_lease,
+                &projection,
+                asset_sources,
+                library_sources,
+                version_bundle_source,
+                fault,
+            )
+            .await
+        }
+        None => {
+            publish_managed_projection_sequence(
+                root_lease,
+                &projection,
+                asset_sources,
+                library_sources,
+                version_bundle_source,
+            )
+            .await
+        }
+    };
+    #[cfg(not(test))]
     let sequence = publish_managed_projection_sequence(
         root_lease,
         &projection,
@@ -1243,6 +1318,8 @@ mod tests {
         ManagedWholeInstanceRollbackEffect, ReconstructionKind, reconstruct_known_good,
         reconstruction_kind,
     };
+    use crate::download::ManagedProjectionSequenceFault;
+    use crate::managed_component_effects::ComponentExecutionFault;
     use crate::runtime::{
         ComponentManifest, ComponentManifestDownload, ComponentManifestDownloads,
         ComponentManifestFile, ManagedRuntimeCache, RuntimeId,
@@ -1407,6 +1484,193 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn whole_instance_component_rollbacks_retain_runtime_and_root_authority() {
+        for (label, fault, expected_effect) in [
+            (
+                "assets",
+                ManagedProjectionSequenceFault::Assets(ComponentExecutionFault::AfterFirstRow),
+                ManagedWholeInstanceRollbackEffect::Assets(
+                    super::ManagedAssetsRollbackEffect::Execution,
+                ),
+            ),
+            (
+                "libraries",
+                ManagedProjectionSequenceFault::Libraries(ComponentExecutionFault::AfterFirstRow),
+                ManagedWholeInstanceRollbackEffect::Libraries(
+                    super::ManagedLibrariesRollbackEffect::Execution,
+                ),
+            ),
+        ] {
+            let version_id = format!("whole-instance-{label}-rollback");
+            let managed = tempfile::tempdir().expect("managed root");
+            let runtime_cache = ManagedRuntimeCache::isolated_for_test().expect("runtime cache");
+            let runtime_component = RuntimeId::from("jre-legacy");
+            let runtime_root = runtime_cache
+                .component_root(runtime_component.as_str())
+                .expect("runtime root");
+            fs::create_dir(&runtime_root).expect("prior runtime");
+            fs::write(runtime_root.join("user-prior"), b"prior runtime")
+                .expect("prior runtime bytes");
+            let user_sentinels = seed_user_owned_sentinels(managed.path());
+            let runtime_url = serve_runtime_bytes(b"component rollback java", 2).await;
+            let reconstruction = whole_instance_fixture(
+                managed.path(),
+                &version_id,
+                &runtime_component,
+                &runtime_url,
+                b"component rollback java",
+            )
+            .await;
+
+            let ManagedWholeInstanceRebuildError::RolledBack(rollback) =
+                super::publish_managed_whole_instance_reconstruction_with_fault(
+                    reconstruction,
+                    runtime_cache.clone(),
+                    fault,
+                )
+                .await
+                .expect_err("injected component rollback")
+            else {
+                panic!("component failure must retain whole rollback evidence");
+            };
+            assert_eq!(rollback.effect(), expected_effect);
+            assert!(rollback.matches_root(managed.path()).await);
+            assert!(rollback.matches_runtime_cache(&runtime_cache));
+            assert!(
+                rollback.matches_known_good_inventory(rollback.authority.projection.inventory())
+            );
+            let quarantine = rollback
+                .runtime_quarantine_obligation()
+                .expect("component rollback must retain displaced Runtime");
+            assert!(quarantine.matches_cache(&runtime_cache));
+            assert_eq!(
+                quarantine.observation(),
+                crate::runtime::ManagedRuntimeQuarantineObservation::Present
+            );
+            assert!(
+                runtime_root
+                    .with_file_name("jre-legacy.quarantine")
+                    .exists()
+            );
+            assert_user_owned_sentinels(&user_sentinels);
+
+            let waiting_root = crate::managed_fs::ManagedDir::open_root(managed.path())
+                .expect("waiting managed root");
+            let mut waiter = tokio::spawn(
+                crate::managed_publication::ManagedRootPublicationLease::acquire(waiting_root),
+            );
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(30), &mut waiter)
+                    .await
+                    .is_err(),
+                "component rollback must retain whole-root exclusion"
+            );
+            drop(rollback);
+            waiter
+                .await
+                .expect("waiting task")
+                .expect("waiting root lease");
+        }
+    }
+
+    #[tokio::test]
+    async fn whole_instance_caller_cancellation_retains_admitted_work_until_settlement() {
+        const VERSION_ID: &str = "whole-instance-cancelled-caller";
+        let managed = tempfile::tempdir().expect("managed root");
+        let runtime_cache = ManagedRuntimeCache::isolated_for_test().expect("runtime cache");
+        let runtime_component = RuntimeId::from("jre-legacy");
+        let runtime_root = runtime_cache
+            .component_root(runtime_component.as_str())
+            .expect("runtime root");
+        fs::create_dir(&runtime_root).expect("prior runtime");
+        fs::write(runtime_root.join("user-prior"), b"prior runtime").expect("prior runtime bytes");
+        let user_sentinels = seed_user_owned_sentinels(managed.path());
+        let (runtime_url, runtime_reached, release_runtime) =
+            serve_blocked_runtime_bytes(b"cancelled caller java").await;
+        let reconstruction = whole_instance_fixture(
+            managed.path(),
+            VERSION_ID,
+            &runtime_component,
+            &runtime_url,
+            b"cancelled caller java",
+        )
+        .await;
+        let cache_for_owner = runtime_cache.clone();
+        let (settled_tx, settled_rx) = tokio::sync::oneshot::channel();
+        let owner = super::spawn_managed_whole_instance_owner(async move {
+            let result = super::publish_managed_whole_instance_reconstruction(
+                reconstruction,
+                cache_for_owner,
+            )
+            .await;
+            let _ = settled_tx.send(result.is_ok());
+            result
+        });
+        let caller = tokio::spawn(super::await_managed_whole_instance_owner(owner));
+
+        runtime_reached
+            .await
+            .expect("admitted Runtime work reached its retained source");
+        let waiting_root =
+            crate::managed_fs::ManagedDir::open_root(managed.path()).expect("waiting managed root");
+        let mut waiter = tokio::spawn(
+            crate::managed_publication::ManagedRootPublicationLease::acquire(waiting_root),
+        );
+        caller.abort();
+        assert!(
+            caller
+                .await
+                .expect_err("caller task must be cancelled")
+                .is_cancelled()
+        );
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(30), &mut waiter)
+                .await
+                .is_err(),
+            "detached whole-instance work must retain root exclusion"
+        );
+
+        release_runtime
+            .send(())
+            .expect("release retained Runtime source");
+        assert!(settled_rx.await.expect("detached settlement observation"));
+        drop(
+            waiter
+                .await
+                .expect("waiting task")
+                .expect("waiting root lease"),
+        );
+        assert_eq!(
+            fs::read(runtime_root.join(runtime_java_relative_path()))
+                .expect("settled Runtime executable"),
+            b"cancelled caller java"
+        );
+        assert!(
+            managed
+                .path()
+                .join(format!("versions/{VERSION_ID}/{VERSION_ID}.jar"))
+                .is_file()
+        );
+        assert_user_owned_sentinels(&user_sentinels);
+
+        let retry_url = serve_runtime_bytes(b"cancelled caller java", 2).await;
+        let retry = whole_instance_fixture(
+            managed.path(),
+            VERSION_ID,
+            &runtime_component,
+            &retry_url,
+            b"cancelled caller java",
+        )
+        .await;
+        let receipt =
+            super::publish_managed_whole_instance_reconstruction(retry, runtime_cache.clone())
+                .await
+                .expect("settled cancelled generation must retry monotonically");
+        assert!(receipt.revalidate(&runtime_cache).await);
+        assert_user_owned_sentinels(&user_sentinels);
+    }
+
+    #[tokio::test]
     async fn whole_instance_runtime_finalization_failure_retains_both_authorities() {
         const VERSION_ID: &str = "whole-instance-runtime-finalization";
         let managed = tempfile::tempdir().expect("managed root");
@@ -1528,6 +1792,38 @@ mod tests {
             }
         });
         format!("http://{address}/java")
+    }
+
+    async fn serve_blocked_runtime_bytes(
+        bytes: &'static [u8],
+    ) -> (
+        String,
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("blocked Runtime byte server");
+        let address = listener.local_addr().expect("blocked Runtime byte address");
+        let (reached_tx, reached_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            let mut request = [0_u8; 1024];
+            let _ = socket.read(&mut request).await;
+            let _ = reached_tx.send(());
+            let _ = release_rx.await;
+            let headers = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                bytes.len()
+            );
+            if socket.write_all(headers.as_bytes()).await.is_ok() {
+                let _ = socket.write_all(bytes).await;
+            }
+        });
+        (format!("http://{address}/java"), reached_rx, release_tx)
     }
 
     fn seed_user_owned_sentinels(root: &std::path::Path) -> Vec<std::path::PathBuf> {

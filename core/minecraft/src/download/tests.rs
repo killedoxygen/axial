@@ -454,6 +454,54 @@ async fn reconstruction_derives_runtime_inventory_without_runtime_effects() {
         ])
     );
     assert!(!requests.iter().any(|path| path == "/runtime-file"));
+
+    let guarded_root = ManagedDir::open_root(&root).expect("guard vanilla whole-instance root");
+    let whole_context = ManagedReconstructionContext::bind_whole_instance(guarded_root.clone())
+        .await
+        .expect("bind vanilla whole-instance context");
+    let whole = downloader
+        .reconstruct_version_authority("runtime-reconstruction", &whole_context)
+        .await
+        .expect("reconstruct vanilla whole-instance authority");
+    let (library_cache_proofs, asset_sources, asset_cache_proofs) = whole_context
+        .take_whole_instance_authority()
+        .expect("take vanilla whole-instance authority");
+    let lease = ManagedRootPublicationLease::acquire(guarded_root)
+        .await
+        .expect("vanilla whole-instance lease");
+    let admitted = snapshot_tree(&root);
+    let whole = whole
+        .bind_managed_whole_instance(
+            lease,
+            library_cache_proofs,
+            asset_sources,
+            asset_cache_proofs,
+        )
+        .expect("bind vanilla whole-instance projection");
+    let (lease, projection, version_bundle, libraries, assets, runtime) = whole.into_effect_parts();
+    assert_eq!(projection.version_id(), "runtime-reconstruction");
+    assert!(lease.revalidate().is_ok());
+    assert!(
+        version_bundle.matches_projection(
+            &projection
+                .component_projection(crate::known_good::ManagedKnownGoodComponent::VersionBundle)
+                .expect("vanilla VersionBundle projection")
+        )
+    );
+    assert!(crate::runtime::runtime_source_matches_known_good_inventory(
+        runtime.component(),
+        &runtime,
+        projection.inventory(),
+    ));
+    drop((
+        lease,
+        version_bundle,
+        libraries,
+        assets,
+        runtime,
+        projection,
+    ));
+    assert_eq!(snapshot_tree(&root), admitted);
     let _ = fs::remove_dir_all(root);
 }
 
