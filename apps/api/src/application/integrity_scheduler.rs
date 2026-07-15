@@ -4,7 +4,9 @@ use super::integrity::{
     plan_tier2_integrity_sweep, reconcile_interrupted_tier2_integrity_sweeps,
 };
 use crate::guardian::GuardianMode;
-use crate::state::{AppState, IntegrityIdleEpoch, IntegrityIdleSnapshot, ProducerLease};
+use crate::state::{
+    AppState, IntegrityIdleEpoch, IntegrityIdleSnapshot, OperationJournalStoreError, ProducerLease,
+};
 use axial_config::is_canonical_instance_id;
 use futures_util::future::BoxFuture;
 use std::time::Duration;
@@ -68,6 +70,8 @@ trait IntegritySchedulerTransactions: Clone + Send + Sync + 'static {
 #[derive(Clone, Default)]
 struct SchedulerTestInstrumentation {
     threshold_arms: Arc<AtomicUsize>,
+    accepted_plans: Arc<AtomicUsize>,
+    execution_starts: Arc<AtomicUsize>,
 }
 
 #[cfg(test)]
@@ -88,6 +92,26 @@ impl SchedulerTestInstrumentation {
             self.threshold_arms.load(Ordering::Acquire)
         );
     }
+
+    fn threshold_arm_count(&self) -> usize {
+        self.threshold_arms.load(Ordering::Acquire)
+    }
+
+    fn plan_accepted(&self) {
+        self.accepted_plans.fetch_add(1, Ordering::AcqRel);
+    }
+
+    fn accepted_plan_count(&self) -> usize {
+        self.accepted_plans.load(Ordering::Acquire)
+    }
+
+    fn execution_started(&self) {
+        self.execution_starts.fetch_add(1, Ordering::AcqRel);
+    }
+
+    fn execution_start_count(&self) -> usize {
+        self.execution_starts.load(Ordering::Acquire)
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -96,7 +120,15 @@ struct ProductionIntegrityTransactions;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SchedulerPlanError {
     TargetRace,
+    DeferredCapacity,
     Failed(&'static str),
+}
+
+fn scheduler_journal_plan_error(error: OperationJournalStoreError) -> SchedulerPlanError {
+    match error {
+        OperationJournalStoreError::CapacityExhausted => SchedulerPlanError::DeferredCapacity,
+        error => SchedulerPlanError::Failed(error.class()),
+    }
 }
 
 impl IntegritySchedulerTransactions for ProductionIntegrityTransactions {
@@ -130,9 +162,7 @@ impl IntegritySchedulerTransactions for ProductionIntegrityTransactions {
                     | Tier2IntegritySweepError::InstanceNotRegistered => {
                         SchedulerPlanError::TargetRace
                     }
-                    error @ Tier2IntegritySweepError::Journal(_) => {
-                        SchedulerPlanError::Failed(error.class())
-                    }
+                    Tier2IntegritySweepError::Journal(error) => scheduler_journal_plan_error(error),
                 })
         })
     }
@@ -301,8 +331,19 @@ async fn run_idle_integrity_scheduler<Transactions>(
             return;
         };
         let planned = match plan {
-            Ok(planned) => planned,
+            Ok(planned) => {
+                #[cfg(test)]
+                instrumentation.plan_accepted();
+                planned
+            }
             Err(SchedulerPlanError::TargetRace) => continue,
+            Err(SchedulerPlanError::DeferredCapacity) => {
+                tracing::warn!(
+                    error_class = "capacity_exhausted",
+                    "idle integrity plan deferred because operation journal capacity is exhausted"
+                );
+                continue;
+            }
             Err(SchedulerPlanError::Failed(error_class)) => {
                 tracing::warn!(error_class, "idle integrity plan persistence failed");
                 return;
@@ -365,6 +406,8 @@ async fn run_idle_integrity_scheduler<Transactions>(
             continue;
         }
 
+        #[cfg(test)]
+        instrumentation.execution_started();
         let Some(execution) =
             await_transaction_until_shutdown(transactions.execute(reserved), &mut shutdown).await
         else {
@@ -614,16 +657,16 @@ mod tests {
     };
     use crate::state::{
         AppStateInit, IdleSweepCancellation, IdleSweepReservation, IdleSweepTerminal, InstallStore,
-        SessionStore,
+        OperationJournalStore, SessionStore,
     };
     use axial_config::{AppPaths, ConfigStore, InstanceRegistrySnapshot, InstanceStore};
     use axial_minecraft::known_good::{KnownGoodInventory, TestKnownGoodEntry};
     use axial_performance::PerformanceManager;
-    use std::fs;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::{SystemTime, UNIX_EPOCH};
+    use std::{fs, io};
     use tokio::sync::Notify;
 
     const TEST_THRESHOLD: Duration = Duration::from_secs(60);
@@ -868,7 +911,7 @@ mod tests {
                         .journals()
                         .create(journal)
                         .await
-                        .map_err(|error| SchedulerPlanError::Failed(error.class()))?;
+                        .map_err(scheduler_journal_plan_error)?;
                 }
                 transactions.record("plan_persisted");
                 transactions.inner.plan_gate.pass().await;
@@ -1217,6 +1260,103 @@ mod tests {
             OperationPhase::Validating,
         ));
         journal
+    }
+
+    #[test]
+    fn only_capacity_exhaustion_is_a_deferred_journal_plan_error() {
+        assert_eq!(
+            scheduler_journal_plan_error(OperationJournalStoreError::CapacityExhausted),
+            SchedulerPlanError::DeferredCapacity
+        );
+        for (error, expected_class) in [
+            (OperationJournalStoreError::RetryRequired, "retry_required"),
+            (
+                OperationJournalStoreError::Persistence(io::Error::other(
+                    "injected persistence ambiguity",
+                )),
+                "persistence",
+            ),
+        ] {
+            assert_eq!(
+                scheduler_journal_plan_error(error),
+                SchedulerPlanError::Failed(expected_class)
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn journal_capacity_deferral_preserves_cursor_and_requires_a_fresh_threshold() {
+        let (state, root) = state_fixture("journal-capacity-deferral");
+        let journals = Arc::new(OperationJournalStore::with_max_entries(1));
+        let blocker_id = OperationId::new("active-capacity-blocker");
+        journals
+            .create(OperationJournalEntry::new(
+                JournalId::new("journal-active-capacity-blocker"),
+                blocker_id.clone(),
+                CommandKind::InstallVersion,
+                StabilizationSystem::Application,
+                OwnershipClass::LauncherManaged,
+                RollbackState::NotApplicable,
+            ))
+            .await
+            .expect("fill journal capacity with an active operation");
+        let performance_operations = state.performance_operations().clone();
+        let state = state.with_operation_stores(journals.clone(), performance_operations);
+        let mut instance_ids = [
+            register_healthy_instance(&state, "Second after capacity"),
+            register_healthy_instance(&state, "First after capacity"),
+        ];
+        instance_ids.sort();
+        let instrumentation = SchedulerTestInstrumentation::default();
+        spawn_idle_integrity_scheduler_with_transactions(
+            &state,
+            state.try_claim_producer().expect("claim scheduler"),
+            TEST_THRESHOLD,
+            ProductionIntegrityTransactions,
+            instrumentation.clone(),
+        );
+        instrumentation.wait_for_threshold_arms(1).await;
+
+        tokio::time::advance(TEST_THRESHOLD).await;
+        instrumentation.wait_for_threshold_arms(2).await;
+        assert_eq!(instrumentation.threshold_arm_count(), 2);
+        assert!(integrity_journals(&state).is_empty());
+        assert!(state.subscribe_integrity_idle().borrow().is_stably_idle());
+        assert_eq!(instrumentation.accepted_plan_count(), 0);
+        assert_eq!(instrumentation.execution_start_count(), 0);
+        for _ in 0..256 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            instrumentation.threshold_arm_count(),
+            2,
+            "capacity rejection must not busy-retry planning"
+        );
+        assert!(integrity_journals(&state).is_empty());
+        assert_eq!(instrumentation.accepted_plan_count(), 0);
+        assert_eq!(instrumentation.execution_start_count(), 0);
+
+        let mut completed = OperationJournalStep::new("capacity_released", OperationPhase::Running);
+        completed.result = OperationStepResult::Completed;
+        journals
+            .record_success(&blocker_id, completed, OperationOutcome::Succeeded)
+            .await
+            .expect("terminalize capacity blocker");
+        tokio::time::advance(TEST_THRESHOLD - Duration::from_secs(1)).await;
+        settle_scheduler_start().await;
+        assert!(integrity_journals(&state).is_empty());
+        assert_eq!(instrumentation.threshold_arm_count(), 2);
+        assert_eq!(instrumentation.accepted_plan_count(), 0);
+        assert_eq!(instrumentation.execution_start_count(), 0);
+
+        tokio::time::advance(Duration::from_secs(1)).await;
+        wait_for_terminal_count(&state, 1).await;
+        let terminals = terminal_integrity_journals(&state);
+        assert_eq!(terminals.len(), 1);
+        assert_eq!(terminals[0].targets[0].id, instance_ids[0]);
+        assert_eq!(instrumentation.accepted_plan_count(), 1);
+        assert_eq!(instrumentation.execution_start_count(), 1);
+        close_fixture(state, &root).await;
     }
 
     #[tokio::test]
