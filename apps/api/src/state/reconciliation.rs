@@ -19,7 +19,10 @@ use axial_minecraft::runtime::{
     ManagedRuntimeCommitReceipt, ManagedRuntimeFailureReceipt, ManagedRuntimeQuarantineObligation,
     RuntimeId, is_known_runtime_component,
 };
-use axial_minecraft::{ManagedLibrariesCommitReceipt, ManagedLibrariesRollbackReceipt};
+use axial_minecraft::{
+    ManagedAssetsCommitReceipt, ManagedAssetsRollbackEffect, ManagedAssetsRollbackReceipt,
+    ManagedLibrariesCommitReceipt, ManagedLibrariesRollbackEffect, ManagedLibrariesRollbackReceipt,
+};
 use sha2::{Digest, Sha256};
 use std::io;
 use std::path::{Path, PathBuf};
@@ -37,7 +40,7 @@ pub(crate) struct RegisteredComponentRebuildAdmission {
     known_good: RegisteredKnownGoodInventory,
     component_state: RegisteredComponentRebuildState,
     _component_mutation: SharedComponentMutationLease,
-    _library_root_mutation: tokio::sync::OwnedMutexGuard<()>,
+    _config_mutation: tokio::sync::OwnedMutexGuard<()>,
 }
 
 enum RegisteredComponentRebuildState {
@@ -46,9 +49,15 @@ enum RegisteredComponentRebuildState {
             std::sync::OnceLock<std::sync::Arc<axial_minecraft::known_good::KnownGoodInventory>>,
     },
     Libraries,
+    Assets,
 }
 
 pub(crate) struct RegisteredLibrariesComponentRebuildEffect {
+    library_root: PathBuf,
+    version_id: String,
+}
+
+pub(crate) struct RegisteredAssetsComponentRebuildEffect {
     library_root: PathBuf,
     version_id: String,
 }
@@ -57,6 +66,70 @@ impl RegisteredLibrariesComponentRebuildEffect {
     pub(crate) fn core_request(&self) -> (&Path, &str) {
         (&self.library_root, &self.version_id)
     }
+}
+
+impl RegisteredAssetsComponentRebuildEffect {
+    pub(crate) fn core_request(&self) -> (&Path, &str) {
+        (&self.library_root, &self.version_id)
+    }
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum ManagedArtifactRebuildComponent {
+    Libraries,
+    Assets,
+}
+
+impl ManagedArtifactRebuildComponent {
+    fn from_artifact_attempt(
+        attempt: &ReconciliationAttempt,
+    ) -> Result<Self, ReconciliationEvidenceRejection> {
+        let component = match (attempt.component(), attempt.domain()) {
+            (ReconciliationComponent::Libraries, GuardianDomain::Library) => Self::Libraries,
+            (ReconciliationComponent::Assets, GuardianDomain::Download) => Self::Assets,
+            _ => return Err(ReconciliationEvidenceRejection::ScopeMismatch),
+        };
+        if attempt.rung() != ReconciliationRung::RepairArtifact
+            || attempt.mode() != GuardianMode::Managed
+            || attempt.ownership() != OwnershipClass::LauncherManaged
+            || attempt.target().system != StabilizationSystem::Execution
+            || attempt.target().kind != TargetKind::Artifact
+            || attempt.target().ownership != OwnershipClass::LauncherManaged
+        {
+            return Err(ReconciliationEvidenceRejection::ScopeMismatch);
+        }
+        Ok(component)
+    }
+
+    fn reconciliation_component(self) -> ReconciliationComponent {
+        match self {
+            Self::Libraries => ReconciliationComponent::Libraries,
+            Self::Assets => ReconciliationComponent::Assets,
+        }
+    }
+
+    fn domain(self) -> GuardianDomain {
+        match self {
+            Self::Libraries => GuardianDomain::Library,
+            Self::Assets => GuardianDomain::Download,
+        }
+    }
+
+    fn matches_state(self, state: &RegisteredComponentRebuildState) -> bool {
+        matches!(
+            (self, state),
+            (Self::Libraries, RegisteredComponentRebuildState::Libraries)
+                | (Self::Assets, RegisteredComponentRebuildState::Assets)
+        )
+    }
+}
+
+fn libraries_rollback_has_effect(effect: ManagedLibrariesRollbackEffect) -> bool {
+    effect != ManagedLibrariesRollbackEffect::None
+}
+
+fn assets_rollback_has_effect(effect: ManagedAssetsRollbackEffect) -> bool {
+    effect != ManagedAssetsRollbackEffect::None
 }
 
 struct RegisteredKnownGoodInventory {
@@ -155,8 +228,18 @@ impl RegisteredComponentRebuildAdmission {
     pub(crate) fn libraries_effect(
         &self,
     ) -> Result<RegisteredLibrariesComponentRebuildEffect, ReconciliationEvidenceRejection> {
-        self.current_libraries_inventory()?;
+        self.current_managed_artifact_inventory(ManagedArtifactRebuildComponent::Libraries)?;
         Ok(RegisteredLibrariesComponentRebuildEffect {
+            library_root: self.known_good.library_root.clone(),
+            version_id: self.known_good.version_id.clone(),
+        })
+    }
+
+    pub(crate) fn assets_effect(
+        &self,
+    ) -> Result<RegisteredAssetsComponentRebuildEffect, ReconciliationEvidenceRejection> {
+        self.current_managed_artifact_inventory(ManagedArtifactRebuildComponent::Assets)?;
+        Ok(RegisteredAssetsComponentRebuildEffect {
             library_root: self.known_good.library_root.clone(),
             version_id: self.known_good.version_id.clone(),
         })
@@ -166,14 +249,17 @@ impl RegisteredComponentRebuildAdmission {
         &self,
         receipt: &ManagedLibrariesCommitReceipt,
     ) -> Result<ReconciliationTerminal, ReconciliationEvidenceRejection> {
-        self.validate_libraries_receipt_version(receipt.version_id())?;
+        self.validate_managed_artifact_receipt_version(
+            ManagedArtifactRebuildComponent::Libraries,
+            receipt.version_id(),
+        )?;
         if !receipt.matches_root(&self.known_good.library_root).await
             || !receipt.matches_known_good_inventory(&self.known_good.inventory)
             || !receipt.revalidate().await
         {
             return Err(ReconciliationEvidenceRejection::JournalMismatch);
         }
-        self.current_libraries_inventory()?;
+        self.current_managed_artifact_inventory(ManagedArtifactRebuildComponent::Libraries)?;
         Ok(ReconciliationTerminal::from_attempt(
             self.attempt.clone(),
             ReconciliationTerminalOutcome::Succeeded,
@@ -185,13 +271,61 @@ impl RegisteredComponentRebuildAdmission {
         &self,
         receipt: &ManagedLibrariesRollbackReceipt,
     ) -> Result<ReconciliationTerminal, ReconciliationEvidenceRejection> {
-        self.validate_libraries_receipt_version(receipt.version_id())?;
-        if !receipt.matches_root(&self.known_good.library_root).await
+        self.validate_managed_artifact_receipt_version(
+            ManagedArtifactRebuildComponent::Libraries,
+            receipt.version_id(),
+        )?;
+        if !libraries_rollback_has_effect(receipt.effect())
+            || !receipt.matches_root(&self.known_good.library_root).await
             || !receipt.matches_known_good_inventory(&self.known_good.inventory)
         {
             return Err(ReconciliationEvidenceRejection::JournalMismatch);
         }
-        self.current_libraries_inventory()?;
+        self.current_managed_artifact_inventory(ManagedArtifactRebuildComponent::Libraries)?;
+        Ok(ReconciliationTerminal::from_attempt(
+            self.attempt.clone(),
+            ReconciliationTerminalOutcome::Failed,
+            None,
+        ))
+    }
+
+    pub(crate) async fn succeeded_assets_terminal(
+        &self,
+        receipt: &ManagedAssetsCommitReceipt,
+    ) -> Result<ReconciliationTerminal, ReconciliationEvidenceRejection> {
+        self.validate_managed_artifact_receipt_version(
+            ManagedArtifactRebuildComponent::Assets,
+            receipt.version_id(),
+        )?;
+        if !receipt.matches_root(&self.known_good.library_root).await
+            || !receipt.matches_known_good_inventory(&self.known_good.inventory)
+            || !receipt.revalidate().await
+        {
+            return Err(ReconciliationEvidenceRejection::JournalMismatch);
+        }
+        self.current_managed_artifact_inventory(ManagedArtifactRebuildComponent::Assets)?;
+        Ok(ReconciliationTerminal::from_attempt(
+            self.attempt.clone(),
+            ReconciliationTerminalOutcome::Succeeded,
+            None,
+        ))
+    }
+
+    pub(crate) async fn failed_assets_effect_terminal(
+        &self,
+        receipt: &ManagedAssetsRollbackReceipt,
+    ) -> Result<ReconciliationTerminal, ReconciliationEvidenceRejection> {
+        self.validate_managed_artifact_receipt_version(
+            ManagedArtifactRebuildComponent::Assets,
+            receipt.version_id(),
+        )?;
+        if !assets_rollback_has_effect(receipt.effect())
+            || !receipt.matches_root(&self.known_good.library_root).await
+            || !receipt.matches_known_good_inventory(&self.known_good.inventory)
+        {
+            return Err(ReconciliationEvidenceRejection::JournalMismatch);
+        }
+        self.current_managed_artifact_inventory(ManagedArtifactRebuildComponent::Assets)?;
         Ok(ReconciliationTerminal::from_attempt(
             self.attempt.clone(),
             ReconciliationTerminalOutcome::Failed,
@@ -345,24 +479,26 @@ impl RegisteredComponentRebuildAdmission {
         )
     }
 
-    fn validate_libraries_receipt_version(
+    fn validate_managed_artifact_receipt_version(
         &self,
+        component: ManagedArtifactRebuildComponent,
         version_id: &str,
     ) -> Result<(), ReconciliationEvidenceRejection> {
-        self.validate_libraries_admission()?;
+        self.validate_managed_artifact_admission(component)?;
         if version_id != self.known_good.version_id {
             return Err(ReconciliationEvidenceRejection::JournalMismatch);
         }
         Ok(())
     }
 
-    fn current_libraries_inventory(
+    fn current_managed_artifact_inventory(
         &self,
+        component: ManagedArtifactRebuildComponent,
     ) -> Result<
         std::sync::Arc<axial_minecraft::known_good::KnownGoodInventory>,
         ReconciliationEvidenceRejection,
     > {
-        self.validate_libraries_admission()?;
+        self.validate_managed_artifact_admission(component)?;
         let ReconciliationScope::RegisteredInstance {
             instance_id,
             fingerprint,
@@ -404,15 +540,19 @@ impl RegisteredComponentRebuildAdmission {
         Ok(inventory)
     }
 
-    fn validate_libraries_admission(&self) -> Result<(), ReconciliationEvidenceRejection> {
+    fn validate_managed_artifact_admission(
+        &self,
+        component: ManagedArtifactRebuildComponent,
+    ) -> Result<(), ReconciliationEvidenceRejection> {
         if self.attempt.rung() != ReconciliationRung::RebuildComponent
-            || self.attempt.component() != ReconciliationComponent::Libraries
-            || self.attempt.domain() != GuardianDomain::Library
+            || self.attempt.component() != component.reconciliation_component()
+            || self.attempt.domain() != component.domain()
             || self.attempt.mode() != GuardianMode::Managed
             || self.attempt.ownership() != OwnershipClass::LauncherManaged
             || self.attempt.target().system != StabilizationSystem::Execution
             || self.attempt.target().kind != TargetKind::Artifact
             || self.attempt.target().ownership != OwnershipClass::LauncherManaged
+            || !component.matches_state(&self.component_state)
         {
             return Err(ReconciliationEvidenceRejection::ScopeMismatch);
         }
@@ -530,6 +670,9 @@ impl RegisteredComponentRebuildAdmission {
                 postcondition_failure_inventory,
             } => Ok(postcondition_failure_inventory),
             RegisteredComponentRebuildState::Libraries => {
+                Err(ReconciliationEvidenceRejection::ScopeMismatch)
+            }
+            RegisteredComponentRebuildState::Assets => {
                 Err(ReconciliationEvidenceRejection::ScopeMismatch)
             }
         }
@@ -661,17 +804,7 @@ impl RegisteredReconciliationAuthority {
         outcome: ReconciliationTerminalOutcome,
         quarantined_target: Option<TargetDescriptor>,
     ) -> Result<ReconciliationTerminal, ReconciliationEvidenceRejection> {
-        if attempt.rung() != ReconciliationRung::RepairArtifact
-            || attempt.component() != ReconciliationComponent::Libraries
-            || attempt.domain() != GuardianDomain::Library
-            || attempt.mode() != GuardianMode::Managed
-            || attempt.ownership() != OwnershipClass::LauncherManaged
-            || attempt.target().system != StabilizationSystem::Execution
-            || attempt.target().kind != TargetKind::Artifact
-            || attempt.target().ownership != OwnershipClass::LauncherManaged
-        {
-            return Err(ReconciliationEvidenceRejection::ScopeMismatch);
-        }
+        ManagedArtifactRebuildComponent::from_artifact_attempt(&attempt)?;
         self.terminal_with_quarantine(attempt, outcome, quarantined_target)
     }
 
@@ -1167,7 +1300,7 @@ impl AppState {
         }
         // Config precedes the shared-component writer: config mutations never acquire
         // session admission, while session admission owns only the component reader.
-        let library_root_mutation = self
+        let config_mutation = self
             .config
             .acquire_mutation()
             .await
@@ -1210,10 +1343,17 @@ impl AppState {
             ReconciliationComponent::Runtime => RegisteredComponentRebuildState::Runtime {
                 postcondition_failure_inventory: std::sync::OnceLock::new(),
             },
-            ReconciliationComponent::Libraries => RegisteredComponentRebuildState::Libraries,
-            ReconciliationComponent::VersionBundle
-            | ReconciliationComponent::Assets
-            | ReconciliationComponent::WholeInstance => {
+            ReconciliationComponent::Libraries | ReconciliationComponent::Assets => {
+                match ManagedArtifactRebuildComponent::from_artifact_attempt(prior.attempt())? {
+                    ManagedArtifactRebuildComponent::Libraries => {
+                        RegisteredComponentRebuildState::Libraries
+                    }
+                    ManagedArtifactRebuildComponent::Assets => {
+                        RegisteredComponentRebuildState::Assets
+                    }
+                }
+            }
+            ReconciliationComponent::VersionBundle | ReconciliationComponent::WholeInstance => {
                 return Err(ReconciliationEvidenceRejection::ScopeMismatch);
             }
         };
@@ -1242,7 +1382,7 @@ impl AppState {
             known_good,
             component_state,
             _component_mutation: component_mutation,
-            _library_root_mutation: library_root_mutation,
+            _config_mutation: config_mutation,
         })
     }
 
@@ -1696,6 +1836,7 @@ mod tests {
         KnownGoodArtifactKind, KnownGoodInventory, TestKnownGoodEntry, TestKnownGoodIntegrity,
         TestKnownGoodRoot,
     };
+    use sha1::Sha1;
     use std::fs;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -1826,6 +1967,55 @@ mod tests {
         .expect("Libraries fixture inventory")
     }
 
+    fn assets_fixture_inventory() -> KnownGoodInventory {
+        const OBJECT_BYTES: &[u8] = b"axial managed Assets fixture";
+        let object_digest = format!("{:x}", Sha1::digest(OBJECT_BYTES));
+        let empty_digest = format!("{:x}", Sha1::digest([]));
+        let index_bytes = serde_json::to_vec(&serde_json::json!({
+            "objects": {
+                "fixture/object": {
+                    "hash": object_digest.as_str(),
+                    "size": OBJECT_BYTES.len()
+                },
+                "fixture/empty": {
+                    "hash": empty_digest.as_str(),
+                    "size": 0
+                }
+            }
+        }))
+        .expect("Assets fixture index");
+        let entries = [
+            TestKnownGoodEntry {
+                root: TestKnownGoodRoot::Assets,
+                path: "indexes/fixture-assets.json".to_string(),
+                kind: KnownGoodArtifactKind::AssetIndex,
+                integrity: TestKnownGoodIntegrity::Sha1 {
+                    digest: format!("{:x}", Sha1::digest(&index_bytes)),
+                    size: index_bytes.len() as u64,
+                },
+            },
+            TestKnownGoodEntry {
+                root: TestKnownGoodRoot::Assets,
+                path: format!("objects/{}/{}", &object_digest[..2], object_digest),
+                kind: KnownGoodArtifactKind::AssetObject,
+                integrity: TestKnownGoodIntegrity::Sha1 {
+                    digest: object_digest,
+                    size: OBJECT_BYTES.len() as u64,
+                },
+            },
+            TestKnownGoodEntry {
+                root: TestKnownGoodRoot::Assets,
+                path: format!("objects/{}/{}", &empty_digest[..2], empty_digest),
+                kind: KnownGoodArtifactKind::AssetObject,
+                integrity: TestKnownGoodIntegrity::Sha1 {
+                    digest: empty_digest,
+                    size: 0,
+                },
+            },
+        ];
+        KnownGoodInventory::from_test_entries(entries).expect("Assets fixture inventory")
+    }
+
     fn activate_libraries_fixture_inventory(
         state: &AppState,
         instance_id: &str,
@@ -1842,6 +2032,24 @@ mod tests {
                 &library_root,
             )
             .expect("active Libraries fixture inventory")
+    }
+
+    fn activate_assets_fixture_inventory(
+        state: &AppState,
+        instance_id: &str,
+    ) -> Arc<KnownGoodInventory> {
+        state.activate_known_good_inventory_for_test(instance_id, assets_fixture_inventory());
+        let instance = state.instances().get(instance_id).expect("test instance");
+        let library_root = PathBuf::from(state.library_dir().expect("test library root"));
+        state
+            .known_good
+            .active_inventory(
+                &instance.id,
+                &instance.version_id,
+                &instance.created_at,
+                &library_root,
+            )
+            .expect("active Assets fixture inventory")
     }
 
     fn activate_empty_inventory(state: &AppState, instance_id: &str) -> Arc<KnownGoodInventory> {
@@ -2021,53 +2229,57 @@ mod tests {
         (evidence, attempt)
     }
 
-    async fn recorded_libraries_artifact_failure(
+    async fn recorded_component_predecessor_failure(
         fixture: &Fixture,
         operation_id: &str,
+        component: ManagedArtifactRebuildComponent,
     ) -> (RecordedArtifactRepairFailure, ReconciliationAttempt) {
         let lifecycle = fixture.state.acquire_instance_lifecycle(INSTANCE_ID).await;
         let authority = fixture
             .state
             .registered_reconciliation_authority(&lifecycle)
-            .expect("registered Libraries authority");
+            .expect("registered component predecessor authority");
         let attempt = authority
             .repair_artifact_attempt(
                 OperationId::new(operation_id),
                 DIAGNOSIS_ID,
-                GuardianDomain::Library,
-                ReconciliationComponent::Libraries,
+                component.domain(),
+                component.reconciliation_component(),
                 TargetDescriptor::new(
                     StabilizationSystem::Execution,
                     TargetKind::Artifact,
-                    "fixture-library",
+                    match component {
+                        ManagedArtifactRebuildComponent::Libraries => "fixture-library",
+                        ManagedArtifactRebuildComponent::Assets => "fixture-asset-index",
+                    },
                     OwnershipClass::LauncherManaged,
                 ),
                 GuardianMode::Managed,
                 chrono::Duration::minutes(30),
             )
-            .expect("Libraries artifact attempt");
+            .expect("closed component predecessor attempt");
         let terminal = authority
             .artifact_terminal(attempt.clone(), ReconciliationTerminalOutcome::Failed, None)
-            .expect("Libraries artifact failure");
+            .expect("closed component predecessor failure");
         let reservation = reserve_reconciliation_attempt(
             fixture.failure_memory.as_ref(),
             fixture.journals.as_ref(),
             reconciliation_attempt_key(&attempt),
         )
-        .expect("reserve Libraries artifact attempt");
+        .expect("reserve component predecessor attempt");
         persist_failed_journal(fixture, &attempt, terminal.clone()).await;
         commit_reconciliation_memory(
             fixture.failure_memory.as_ref(),
-            reconciliation_memory_entry(terminal).expect("Libraries artifact memory"),
+            reconciliation_memory_entry(terminal).expect("component predecessor memory"),
             &reservation,
         )
         .await
-        .expect("commit Libraries artifact memory");
+        .expect("commit component predecessor memory");
         drop(reservation);
         let evidence = fixture
             .state
             .recorded_artifact_repair_failure(&lifecycle, attempt.operation_id())
-            .expect("recorded Libraries artifact failure");
+            .expect("recorded component predecessor failure");
         drop((authority, lifecycle));
         (evidence, attempt)
     }
@@ -2428,9 +2640,12 @@ mod tests {
     async fn libraries_component_commit_keeps_exact_root_projection_and_inventory_arc() {
         let fixture = fixture("libraries-component-commit");
         let admitted_inventory = activate_libraries_fixture_inventory(&fixture.state, INSTANCE_ID);
-        let (evidence, artifact_attempt) =
-            recorded_libraries_artifact_failure(&fixture, "libraries-component-commit-artifact")
-                .await;
+        let (evidence, artifact_attempt) = recorded_component_predecessor_failure(
+            &fixture,
+            "libraries-component-commit-artifact",
+            ManagedArtifactRebuildComponent::Libraries,
+        )
+        .await;
         let component_operation = OperationId::new("component-admission-rebuild");
         let admission = fixture
             .state
@@ -2529,6 +2744,214 @@ mod tests {
 
         drop((receipt, admission));
         cleanup(fixture).await;
+    }
+
+    #[tokio::test]
+    async fn assets_component_commit_keeps_exact_root_version_projection_and_inventory_arc() {
+        let fixture = fixture("assets-component-commit");
+        let admitted_inventory = activate_assets_fixture_inventory(&fixture.state, INSTANCE_ID);
+        let (evidence, artifact_attempt) = recorded_component_predecessor_failure(
+            &fixture,
+            "assets-component-commit-artifact",
+            ManagedArtifactRebuildComponent::Assets,
+        )
+        .await;
+        let admission = fixture
+            .state
+            .admit_component_rebuild(
+                evidence,
+                OperationId::new("assets-component-commit-rebuild"),
+                chrono::Duration::minutes(30),
+            )
+            .await
+            .expect("Assets component rebuild admission");
+        assert_eq!(admission.predecessor().attempt(), &artifact_attempt);
+        assert_eq!(
+            admission.attempt().component(),
+            ReconciliationComponent::Assets
+        );
+        assert_eq!(admission.attempt().domain(), GuardianDomain::Download);
+        assert_eq!(
+            admission.libraries_effect().err(),
+            Some(ReconciliationEvidenceRejection::ScopeMismatch)
+        );
+        let root = PathBuf::from(fixture.state.library_dir().expect("library root"));
+        let request = admission
+            .assets_effect()
+            .expect("State-authored Assets effect");
+        assert_eq!(request.core_request(), (root.as_path(), "1.21.1"));
+
+        let wrong_root = fixture.root.join("wrong-assets-root");
+        fs::create_dir_all(&wrong_root).expect("wrong Assets root");
+        let wrong_root_receipt =
+            axial_minecraft::rebuild_managed_assets_fixture_for_test(&wrong_root, "1.21.1")
+                .await
+                .expect("wrong-root Assets receipt");
+        assert_eq!(
+            admission
+                .succeeded_assets_terminal(&wrong_root_receipt)
+                .await
+                .err(),
+            Some(ReconciliationEvidenceRejection::JournalMismatch)
+        );
+        drop(wrong_root_receipt);
+
+        let wrong_version_receipt =
+            axial_minecraft::rebuild_managed_assets_fixture_for_test(&root, "1.21.2")
+                .await
+                .expect("wrong-version Assets receipt");
+        assert_eq!(
+            admission
+                .succeeded_assets_terminal(&wrong_version_receipt)
+                .await
+                .err(),
+            Some(ReconciliationEvidenceRejection::JournalMismatch)
+        );
+        drop(wrong_version_receipt);
+
+        let receipt = axial_minecraft::rebuild_managed_assets_fixture_for_test(&root, "1.21.1")
+            .await
+            .expect("sealed Assets rebuild receipt");
+        let terminal = admission
+            .succeeded_assets_terminal(&receipt)
+            .await
+            .expect("truthful Assets success terminal");
+        assert_eq!(terminal.outcome(), ReconciliationTerminalOutcome::Succeeded);
+        assert!(terminal.quarantined_target().is_none());
+        let instance = fixture.state.instances().get(INSTANCE_ID).unwrap();
+        let active = fixture
+            .state
+            .known_good
+            .active_inventory(
+                &instance.id,
+                &instance.version_id,
+                &instance.created_at,
+                &root,
+            )
+            .expect("same inventory remains active");
+        assert!(Arc::ptr_eq(&active, &admitted_inventory));
+
+        let canonical_index = root.join("assets/indexes/fixture-assets.json");
+        let mut corrupted = fs::read(&canonical_index).expect("read fixture asset index");
+        corrupted[0] ^= 0xff;
+        fs::write(canonical_index, corrupted).expect("corrupt fixture asset index");
+        assert_eq!(
+            admission.succeeded_assets_terminal(&receipt).await.err(),
+            Some(ReconciliationEvidenceRejection::JournalMismatch)
+        );
+
+        drop((receipt, admission));
+        cleanup(fixture).await;
+    }
+
+    #[tokio::test]
+    async fn assets_component_rejects_projection_and_inventory_arc_drift() {
+        let projection_fixture = fixture("assets-component-projection");
+        let (projection_evidence, _) = recorded_component_predecessor_failure(
+            &projection_fixture,
+            "assets-component-projection-artifact",
+            ManagedArtifactRebuildComponent::Assets,
+        )
+        .await;
+        let projection_admission = projection_fixture
+            .state
+            .admit_component_rebuild(
+                projection_evidence,
+                OperationId::new("assets-component-projection-rebuild"),
+                chrono::Duration::minutes(30),
+            )
+            .await
+            .expect("Assets projection admission");
+        let projection_root = PathBuf::from(
+            projection_fixture
+                .state
+                .library_dir()
+                .expect("library root"),
+        );
+        let receipt =
+            axial_minecraft::rebuild_managed_assets_fixture_for_test(&projection_root, "1.21.1")
+                .await
+                .expect("Assets fixture receipt");
+        assert_eq!(
+            projection_admission
+                .succeeded_assets_terminal(&receipt)
+                .await
+                .err(),
+            Some(ReconciliationEvidenceRejection::JournalMismatch)
+        );
+        drop((receipt, projection_admission));
+        cleanup(projection_fixture).await;
+
+        let arc_fixture = fixture("assets-component-inventory-arc");
+        let admitted_inventory = activate_assets_fixture_inventory(&arc_fixture.state, INSTANCE_ID);
+        let (arc_evidence, _) = recorded_component_predecessor_failure(
+            &arc_fixture,
+            "assets-component-inventory-arc-artifact",
+            ManagedArtifactRebuildComponent::Assets,
+        )
+        .await;
+        let arc_admission = arc_fixture
+            .state
+            .admit_component_rebuild(
+                arc_evidence,
+                OperationId::new("assets-component-inventory-arc-rebuild"),
+                chrono::Duration::minutes(30),
+            )
+            .await
+            .expect("Assets Arc admission");
+        let replacement = activate_assets_fixture_inventory(&arc_fixture.state, INSTANCE_ID);
+        assert!(!Arc::ptr_eq(&admitted_inventory, &replacement));
+        assert_eq!(
+            arc_admission.assets_effect().err(),
+            Some(ReconciliationEvidenceRejection::IncarnationMismatch)
+        );
+        drop(arc_admission);
+        cleanup(arc_fixture).await;
+    }
+
+    #[tokio::test]
+    async fn assets_component_requires_the_closed_persisted_predecessor_shape() {
+        let fixture = fixture("assets-component-leaf-shape");
+        let lifecycle = fixture.state.acquire_instance_lifecycle(INSTANCE_ID).await;
+        let authority = fixture
+            .state
+            .registered_reconciliation_authority(&lifecycle)
+            .expect("registered authority");
+        let wrong_domain = authority
+            .repair_artifact_attempt(
+                OperationId::new("assets-wrong-domain-artifact"),
+                DIAGNOSIS_ID,
+                GuardianDomain::Library,
+                ReconciliationComponent::Assets,
+                artifact_target(),
+                GuardianMode::Managed,
+                chrono::Duration::minutes(30),
+            )
+            .expect("structurally valid attempt carrier");
+        assert_eq!(
+            authority
+                .artifact_terminal(wrong_domain, ReconciliationTerminalOutcome::Failed, None,)
+                .err(),
+            Some(ReconciliationEvidenceRejection::ScopeMismatch)
+        );
+        drop((authority, lifecycle));
+        cleanup(fixture).await;
+    }
+
+    #[test]
+    fn component_rollback_effect_gates_reject_no_effect() {
+        assert!(!libraries_rollback_has_effect(
+            ManagedLibrariesRollbackEffect::None
+        ));
+        assert!(!assets_rollback_has_effect(
+            ManagedAssetsRollbackEffect::None
+        ));
+        assert!(libraries_rollback_has_effect(
+            ManagedLibrariesRollbackEffect::Execution
+        ));
+        assert!(assets_rollback_has_effect(
+            ManagedAssetsRollbackEffect::Reconciliation
+        ));
     }
 
     #[tokio::test]
@@ -2913,7 +3336,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn component_rebuild_admission_retains_library_root_mutation_until_drop() {
+    async fn component_rebuild_admission_retains_config_mutation_until_drop() {
         let fixture = fixture("component-admission-config-retention");
         let (evidence, _) = recorded_runtime_artifact_failure(
             &fixture,

@@ -12,17 +12,21 @@ use crate::state::contracts::{
 use crate::state::failure_memory::{FailureMemoryStoreError, GuardianFailureMemoryEntry};
 use crate::state::{
     MAX_OPERATION_JOURNAL_STEP_FACTS, OperationJournalStoreError, ReconciliationAttemptReservation,
-    RegisteredComponentRebuildAdmission, RegisteredLibrariesComponentRebuildEffect,
-    commit_reconciliation_memory, operation_journal_completed_step_is_visible,
-    operation_journal_plan_is_visible, reconciliation_attempt_key, reconciliation_instance_target,
-    reconciliation_journal_attempt, reconciliation_memory_entry, reserve_reconciliation_attempt,
-    settle_reconciliation_memory, validate_reconciliation_memory,
+    RegisteredAssetsComponentRebuildEffect, RegisteredComponentRebuildAdmission,
+    RegisteredLibrariesComponentRebuildEffect, commit_reconciliation_memory,
+    operation_journal_completed_step_is_visible, operation_journal_plan_is_visible,
+    reconciliation_attempt_key, reconciliation_instance_target, reconciliation_journal_attempt,
+    reconciliation_memory_entry, reserve_reconciliation_attempt, settle_reconciliation_memory,
+    validate_reconciliation_memory,
 };
 use axial_minecraft::runtime::{
     ManagedRuntimeCommitReceipt, ManagedRuntimeFailureReceipt, RuntimeId,
     is_known_runtime_component,
 };
-use axial_minecraft::{ManagedLibrariesCommitReceipt, ManagedLibrariesRollbackReceipt};
+use axial_minecraft::{
+    ManagedAssetsCommitReceipt, ManagedAssetsRollbackReceipt, ManagedLibrariesCommitReceipt,
+    ManagedLibrariesRollbackReceipt,
+};
 use std::future::Future;
 use std::sync::Arc;
 
@@ -30,6 +34,7 @@ const COMPONENT_REBUILD_START_STEP: &str = "journal_component_rebuild_start";
 const COMPONENT_QUARANTINE_STEP: &str = "quarantine_launcher_managed_target";
 const RUNTIME_COMPONENT_REBUILD_STEP: &str = "rebuild_managed_runtime_component";
 const LIBRARIES_COMPONENT_REBUILD_STEP: &str = "rebuild_managed_libraries_component";
+const ASSETS_COMPONENT_REBUILD_STEP: &str = "rebuild_managed_assets_component";
 const COMPONENT_MEMORY_RETRY_INITIAL_DELAY: std::time::Duration =
     std::time::Duration::from_millis(20);
 const COMPONENT_MEMORY_RETRY_MAX_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
@@ -53,6 +58,34 @@ pub(crate) struct ManagedLibrariesComponentRebuildEffect {
 
 pub(crate) struct LibrariesComponentRebuildEffectResult {
     inner: LibrariesComponentRebuildEffectResultInner,
+}
+
+struct ManagedAssetsComponentRebuildEffect {
+    admission: RegisteredComponentRebuildAdmission,
+    reservation: ReconciliationAttemptReservation,
+    request: RegisteredAssetsComponentRebuildEffect,
+    identity: Arc<()>,
+}
+
+struct AssetsComponentRebuildEffectResult {
+    inner: AssetsComponentRebuildEffectResultInner,
+}
+
+enum AssetsComponentRebuildEffectResultInner {
+    Committed {
+        effect: ManagedAssetsComponentRebuildEffect,
+        receipt: ManagedAssetsCommitReceipt,
+        facts: Vec<String>,
+    },
+    FailedBeforeEffect {
+        effect: ManagedAssetsComponentRebuildEffect,
+        facts: Vec<String>,
+    },
+    RolledBack {
+        effect: ManagedAssetsComponentRebuildEffect,
+        receipt: ManagedAssetsRollbackReceipt,
+        facts: Vec<String>,
+    },
 }
 
 enum LibrariesComponentRebuildEffectResultInner {
@@ -221,6 +254,73 @@ impl ManagedLibrariesComponentRebuildEffect {
     }
 }
 
+impl ManagedAssetsComponentRebuildEffect {
+    fn new(
+        admission: RegisteredComponentRebuildAdmission,
+        reservation: ReconciliationAttemptReservation,
+        request: RegisteredAssetsComponentRebuildEffect,
+    ) -> (Self, Arc<()>) {
+        let identity = Arc::new(());
+        (
+            Self {
+                admission,
+                reservation,
+                request,
+                identity: identity.clone(),
+            },
+            identity,
+        )
+    }
+
+    fn matches_identity(&self, expected: &Arc<()>) -> bool {
+        Arc::ptr_eq(&self.identity, expected)
+    }
+
+    fn core_request(&self) -> (&std::path::Path, &str) {
+        self.request.core_request()
+    }
+
+    fn committed(
+        self,
+        receipt: ManagedAssetsCommitReceipt,
+        facts: impl IntoIterator<Item = String>,
+    ) -> AssetsComponentRebuildEffectResult {
+        AssetsComponentRebuildEffectResult {
+            inner: AssetsComponentRebuildEffectResultInner::Committed {
+                effect: self,
+                receipt,
+                facts: bounded_fact_ids(facts),
+            },
+        }
+    }
+
+    fn failed_before_effect(
+        self,
+        facts: impl IntoIterator<Item = String>,
+    ) -> AssetsComponentRebuildEffectResult {
+        AssetsComponentRebuildEffectResult {
+            inner: AssetsComponentRebuildEffectResultInner::FailedBeforeEffect {
+                effect: self,
+                facts: bounded_fact_ids(facts),
+            },
+        }
+    }
+
+    fn rolled_back(
+        self,
+        receipt: ManagedAssetsRollbackReceipt,
+        facts: impl IntoIterator<Item = String>,
+    ) -> AssetsComponentRebuildEffectResult {
+        AssetsComponentRebuildEffectResult {
+            inner: AssetsComponentRebuildEffectResultInner::RolledBack {
+                effect: self,
+                receipt,
+                facts: bounded_fact_ids(facts),
+            },
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum GuardianComponentRebuildStatus {
     Rebuilt,
@@ -320,7 +420,7 @@ where
     Effect: FnOnce(ManagedLibrariesComponentRebuildEffect) -> EffectFuture + Send,
     EffectFuture: Future<Output = LibrariesComponentRebuildEffectResult> + Send,
 {
-    validate_managed_libraries_admission(&admission)?;
+    validate_managed_artifact_admission(&admission, ManagedArtifactGuardianComponent::Libraries)?;
     settle_reconciliation_memory(admission.failure_memory())
         .await
         .map_err(component_rebuild_memory_error)?;
@@ -337,7 +437,7 @@ where
     })?;
 
     if let Some(plan_error) = create_component_rebuild_plan(&admission).await? {
-        terminalize_libraries_before_effect(
+        terminalize_managed_artifact_before_effect(
             admission,
             reservation,
             Vec::new(),
@@ -350,7 +450,7 @@ where
     let request = match admission.libraries_effect() {
         Ok(request) => request,
         Err(_) => {
-            return terminalize_libraries_before_effect(
+            return terminalize_managed_artifact_before_effect(
                 admission,
                 reservation,
                 vec!["libraries_component_authority_changed".to_string()],
@@ -397,6 +497,112 @@ where
     }
 }
 
+pub(crate) async fn execute_managed_assets_component_rebuild(
+    admission: RegisteredComponentRebuildAdmission,
+) -> Result<GuardianComponentRebuildOutcome, OperationJournalStoreError> {
+    execute_managed_assets_component_rebuild_with_driver(admission, |effect| async move {
+        let (managed_root, version_id) = effect.core_request();
+        let managed_root = managed_root.to_path_buf();
+        let version_id = version_id.to_string();
+        match axial_minecraft::rebuild_managed_assets(managed_root, &version_id).await {
+            Ok(receipt) => effect.committed(receipt, ["assets_component_rebuilt".to_string()]),
+            Err(
+                axial_minecraft::ManagedAssetsRebuildError::Reconstruction(_)
+                | axial_minecraft::ManagedAssetsRebuildError::Preparation,
+            ) => effect.failed_before_effect(["assets_component_rebuild_failed".to_string()]),
+            Err(axial_minecraft::ManagedAssetsRebuildError::RolledBack(receipt)) => {
+                effect.rolled_back(receipt, ["assets_component_rolled_back".to_string()])
+            }
+        }
+    })
+    .await
+}
+
+async fn execute_managed_assets_component_rebuild_with_driver<Driver, DriverFuture>(
+    admission: RegisteredComponentRebuildAdmission,
+    driver: Driver,
+) -> Result<GuardianComponentRebuildOutcome, OperationJournalStoreError>
+where
+    Driver: FnOnce(ManagedAssetsComponentRebuildEffect) -> DriverFuture + Send,
+    DriverFuture: Future<Output = AssetsComponentRebuildEffectResult> + Send,
+{
+    validate_managed_artifact_admission(&admission, ManagedArtifactGuardianComponent::Assets)?;
+    settle_reconciliation_memory(admission.failure_memory())
+        .await
+        .map_err(component_rebuild_memory_error)?;
+    let reservation = reserve_reconciliation_attempt(
+        admission.failure_memory(),
+        admission.journals(),
+        reconciliation_attempt_key(admission.attempt()),
+    )
+    .map_err(|_| {
+        invalid_component_rebuild_error(
+            std::io::ErrorKind::WouldBlock,
+            "Assets component rebuild attempt is already active or ambiguous",
+        )
+    })?;
+
+    if let Some(plan_error) = create_component_rebuild_plan(&admission).await? {
+        terminalize_managed_artifact_before_effect(
+            admission,
+            reservation,
+            Vec::new(),
+            COMPONENT_REBUILD_START_STEP,
+        )
+        .await?;
+        return Err(plan_error);
+    }
+
+    let request = match admission.assets_effect() {
+        Ok(request) => request,
+        Err(_) => {
+            return terminalize_managed_artifact_before_effect(
+                admission,
+                reservation,
+                vec!["assets_component_authority_changed".to_string()],
+                ASSETS_COMPONENT_REBUILD_STEP,
+            )
+            .await;
+        }
+    };
+    let (effect_capability, effect_identity) =
+        ManagedAssetsComponentRebuildEffect::new(admission, reservation, request);
+    match driver(effect_capability).await.inner {
+        AssetsComponentRebuildEffectResultInner::Committed {
+            effect,
+            receipt,
+            facts,
+        } => {
+            validate_assets_effect_identity(&effect, &effect_identity)?;
+            terminalize_assets_component_rebuild(
+                effect,
+                AssetsComponentRebuildTerminal::Committed { receipt, facts },
+            )
+            .await
+        }
+        AssetsComponentRebuildEffectResultInner::FailedBeforeEffect { effect, facts } => {
+            validate_assets_effect_identity(&effect, &effect_identity)?;
+            terminalize_assets_component_rebuild(
+                effect,
+                AssetsComponentRebuildTerminal::FailedBeforeEffect { facts },
+            )
+            .await
+        }
+        AssetsComponentRebuildEffectResultInner::RolledBack {
+            effect,
+            receipt,
+            facts,
+        } => {
+            validate_assets_effect_identity(&effect, &effect_identity)?;
+            terminalize_assets_component_rebuild(
+                effect,
+                AssetsComponentRebuildTerminal::RolledBack { receipt, facts },
+            )
+            .await
+        }
+    }
+}
+
 enum ComponentRebuildTerminal {
     Succeeded {
         receipt: ManagedRuntimeCommitReceipt,
@@ -426,20 +632,38 @@ enum LibrariesComponentRebuildTerminal {
     },
 }
 
+enum AssetsComponentRebuildTerminal {
+    Committed {
+        receipt: ManagedAssetsCommitReceipt,
+        facts: Vec<String>,
+    },
+    FailedBeforeEffect {
+        facts: Vec<String>,
+    },
+    RolledBack {
+        receipt: ManagedAssetsRollbackReceipt,
+        facts: Vec<String>,
+    },
+}
+
 enum ComponentRebuildPublicationLease {
-    Commit(ManagedRuntimeCommitReceipt),
-    Failure(ManagedRuntimeFailureReceipt),
+    RuntimeCommit(ManagedRuntimeCommitReceipt),
+    RuntimeFailure(ManagedRuntimeFailureReceipt),
     LibrariesCommit(ManagedLibrariesCommitReceipt),
     LibrariesRollback(ManagedLibrariesRollbackReceipt),
+    AssetsCommit(ManagedAssetsCommitReceipt),
+    AssetsRollback(ManagedAssetsRollbackReceipt),
 }
 
 impl ComponentRebuildPublicationLease {
     fn release(self) {
         match self {
-            Self::Commit(receipt) => drop(receipt),
-            Self::Failure(receipt) => drop(receipt),
+            Self::RuntimeCommit(receipt) => drop(receipt),
+            Self::RuntimeFailure(receipt) => drop(receipt),
             Self::LibrariesCommit(receipt) => drop(receipt),
             Self::LibrariesRollback(receipt) => drop(receipt),
+            Self::AssetsCommit(receipt) => drop(receipt),
+            Self::AssetsRollback(receipt) => drop(receipt),
         }
     }
 }
@@ -466,14 +690,44 @@ fn validate_managed_runtime_admission(
     Ok(())
 }
 
-fn validate_managed_libraries_admission(
+#[derive(Clone, Copy)]
+enum ManagedArtifactGuardianComponent {
+    Libraries,
+    Assets,
+}
+
+impl ManagedArtifactGuardianComponent {
+    fn reconciliation_component(self) -> ReconciliationComponent {
+        match self {
+            Self::Libraries => ReconciliationComponent::Libraries,
+            Self::Assets => ReconciliationComponent::Assets,
+        }
+    }
+
+    fn domain(self) -> GuardianDomain {
+        match self {
+            Self::Libraries => GuardianDomain::Library,
+            Self::Assets => GuardianDomain::Download,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Libraries => "Libraries",
+            Self::Assets => "Assets",
+        }
+    }
+}
+
+fn validate_managed_artifact_admission(
     admission: &RegisteredComponentRebuildAdmission,
+    component: ManagedArtifactGuardianComponent,
 ) -> Result<(), OperationJournalStoreError> {
     let attempt = admission.attempt();
     if attempt.mode() != GuardianMode::Managed
-        || attempt.domain() != GuardianDomain::Library
+        || attempt.domain() != component.domain()
         || attempt.rung() != ReconciliationRung::RebuildComponent
-        || attempt.component() != ReconciliationComponent::Libraries
+        || attempt.component() != component.reconciliation_component()
         || attempt.ownership() != OwnershipClass::LauncherManaged
         || attempt.target().ownership != OwnershipClass::LauncherManaged
         || attempt.target().system != StabilizationSystem::Execution
@@ -481,7 +735,10 @@ fn validate_managed_libraries_admission(
     {
         return Err(invalid_component_rebuild_error(
             std::io::ErrorKind::PermissionDenied,
-            "Guardian refused a non-managed or non-Libraries component rebuild admission",
+            format!(
+                "Guardian refused a non-managed or non-{} component rebuild admission",
+                component.label()
+            ),
         ));
     }
     Ok(())
@@ -508,6 +765,19 @@ fn validate_libraries_effect_identity(
         return Err(invalid_component_rebuild_error(
             std::io::ErrorKind::InvalidData,
             "Libraries component rebuild returned a foreign effect capability",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_assets_effect_identity(
+    effect: &ManagedAssetsComponentRebuildEffect,
+    expected: &Arc<()>,
+) -> Result<(), OperationJournalStoreError> {
+    if !effect.matches_identity(expected) {
+        return Err(invalid_component_rebuild_error(
+            std::io::ErrorKind::InvalidData,
+            "Assets component rebuild returned a foreign effect capability",
         ));
     }
     Ok(())
@@ -586,12 +856,19 @@ fn component_rebuild_plan(
                 Vec::new(),
             ));
         }
-        ReconciliationComponent::Libraries => entry.planned_steps.push(repair_step(
-            LIBRARIES_COMPONENT_REBUILD_STEP,
-            OperationStepResult::Planned,
-            Some(target.clone()),
-            Vec::new(),
-        )),
+        ReconciliationComponent::Libraries | ReconciliationComponent::Assets => {
+            let step_id = match attempt.component() {
+                ReconciliationComponent::Libraries => LIBRARIES_COMPONENT_REBUILD_STEP,
+                ReconciliationComponent::Assets => ASSETS_COMPONENT_REBUILD_STEP,
+                _ => unreachable!(),
+            };
+            entry.planned_steps.push(repair_step(
+                step_id,
+                OperationStepResult::Planned,
+                Some(target.clone()),
+                Vec::new(),
+            ));
+        }
         _ => {}
     }
     entry.guardian_diagnosis_ids.push(attempt.diagnosis_id());
@@ -695,7 +972,7 @@ async fn terminalize_component_rebuild(
                 step_result,
                 failure_point,
                 rollback,
-                Some(ComponentRebuildPublicationLease::Commit(receipt)),
+                Some(ComponentRebuildPublicationLease::RuntimeCommit(receipt)),
             )
         }
         ComponentRebuildTerminal::FailedBeforeEffect { facts, step_id } => (
@@ -733,7 +1010,7 @@ async fn terminalize_component_rebuild(
                 OperationStepResult::Failed,
                 Some(RUNTIME_COMPONENT_REBUILD_STEP),
                 rollback,
-                Some(ComponentRebuildPublicationLease::Failure(receipt)),
+                Some(ComponentRebuildPublicationLease::RuntimeFailure(receipt)),
             )
         }
     };
@@ -757,7 +1034,7 @@ async fn terminalize_component_rebuild(
     .await
 }
 
-async fn terminalize_libraries_before_effect(
+async fn terminalize_managed_artifact_before_effect(
     admission: RegisteredComponentRebuildAdmission,
     reservation: ReconciliationAttemptReservation,
     facts: Vec<String>,
@@ -766,7 +1043,7 @@ async fn terminalize_libraries_before_effect(
     let terminal = admission.failed_terminal().map_err(|_| {
         invalid_component_rebuild_error(
             std::io::ErrorKind::InvalidData,
-            "Libraries component rebuild pre-effect terminal is invalid",
+            "managed artifact component rebuild pre-effect terminal is invalid",
         )
     })?;
     persist_component_rebuild_terminal(
@@ -872,6 +1149,103 @@ async fn terminalize_libraries_component_rebuild(
         ComponentRebuildTerminalRecord {
             terminal,
             step_id: LIBRARIES_COMPONENT_REBUILD_STEP,
+            step_result,
+            failure_point,
+            rollback,
+            status,
+            facts,
+            publication_lease,
+        },
+    )
+    .await
+}
+
+async fn terminalize_assets_component_rebuild(
+    effect: ManagedAssetsComponentRebuildEffect,
+    terminal: AssetsComponentRebuildTerminal,
+) -> Result<GuardianComponentRebuildOutcome, OperationJournalStoreError> {
+    let ManagedAssetsComponentRebuildEffect {
+        admission,
+        reservation,
+        request: _,
+        identity: _,
+    } = effect;
+    let (terminal, status, facts, step_result, failure_point, rollback, publication_lease) =
+        match terminal {
+            AssetsComponentRebuildTerminal::Committed { receipt, facts } => {
+                let (terminal, status, facts, step_result, failure_point) =
+                    match admission.succeeded_assets_terminal(&receipt).await {
+                        Ok(terminal) => (
+                            terminal,
+                            GuardianComponentRebuildStatus::Rebuilt,
+                            facts,
+                            OperationStepResult::Completed,
+                            None,
+                        ),
+                        Err(_) => (
+                            admission.failed_terminal().map_err(|_| {
+                                invalid_component_rebuild_error(
+                                    std::io::ErrorKind::InvalidData,
+                                    "Assets component rebuild postcondition terminal is invalid",
+                                )
+                            })?,
+                            GuardianComponentRebuildStatus::Failed,
+                            vec!["assets_component_postcondition_failed".to_string()],
+                            OperationStepResult::Failed,
+                            Some(ASSETS_COMPONENT_REBUILD_STEP),
+                        ),
+                    };
+                (
+                    terminal,
+                    status,
+                    facts,
+                    step_result,
+                    failure_point,
+                    RollbackState::NotApplicable,
+                    Some(ComponentRebuildPublicationLease::AssetsCommit(receipt)),
+                )
+            }
+            AssetsComponentRebuildTerminal::FailedBeforeEffect { facts } => (
+                admission.failed_terminal().map_err(|_| {
+                    invalid_component_rebuild_error(
+                        std::io::ErrorKind::InvalidData,
+                        "Assets component rebuild failure terminal is invalid",
+                    )
+                })?,
+                GuardianComponentRebuildStatus::Failed,
+                facts,
+                OperationStepResult::Failed,
+                Some(ASSETS_COMPONENT_REBUILD_STEP),
+                RollbackState::NotApplicable,
+                None,
+            ),
+            AssetsComponentRebuildTerminal::RolledBack { receipt, facts } => {
+                let terminal = admission
+                    .failed_assets_effect_terminal(&receipt)
+                    .await
+                    .map_err(|_| {
+                        invalid_component_rebuild_error(
+                            std::io::ErrorKind::InvalidData,
+                            "Assets component rollback receipt is invalid or ambiguous",
+                        )
+                    })?;
+                (
+                    terminal,
+                    GuardianComponentRebuildStatus::Failed,
+                    facts,
+                    OperationStepResult::Failed,
+                    Some(ASSETS_COMPONENT_REBUILD_STEP),
+                    RollbackState::Applied,
+                    Some(ComponentRebuildPublicationLease::AssetsRollback(receipt)),
+                )
+            }
+        };
+    persist_component_rebuild_terminal(
+        &admission,
+        &reservation,
+        ComponentRebuildTerminalRecord {
+            terminal,
+            step_id: ASSETS_COMPONENT_REBUILD_STEP,
             step_result,
             failure_point,
             rollback,
@@ -1010,7 +1384,9 @@ fn invalid_component_rebuild_error(
 #[cfg(test)]
 mod tests {
     use super::{
-        GuardianComponentRebuildStatus, bounded_fact_ids, component_rebuild_plan,
+        ASSETS_COMPONENT_REBUILD_STEP, COMPONENT_QUARANTINE_STEP, GuardianComponentRebuildStatus,
+        bounded_fact_ids, component_rebuild_plan,
+        execute_managed_assets_component_rebuild_with_driver,
         execute_managed_runtime_component_rebuild,
     };
     use crate::execution::persistence::{AtomicWriteBackend, PersistenceCoordinator};
@@ -1032,7 +1408,11 @@ mod tests {
     };
     use axial_config::{AppPaths, InstanceRegistrySnapshot};
     use axial_minecraft::RuntimeId;
-    use axial_minecraft::known_good::{KnownGoodInventory, TestKnownGoodEntry};
+    use axial_minecraft::known_good::{
+        KnownGoodArtifactKind, KnownGoodInventory, TestKnownGoodEntry, TestKnownGoodIntegrity,
+        TestKnownGoodRoot,
+    };
+    use sha1::{Digest as _, Sha1};
     use std::fs;
     use std::io;
     use std::path::{Path, PathBuf};
@@ -1233,6 +1613,61 @@ mod tests {
         }
     }
 
+    fn assets_fixture_inventory() -> KnownGoodInventory {
+        const OBJECT_BYTES: &[u8] = b"axial managed Assets fixture";
+        let object_digest = format!("{:x}", Sha1::digest(OBJECT_BYTES));
+        let empty_digest = format!("{:x}", Sha1::digest([]));
+        let index_bytes = serde_json::to_vec(&serde_json::json!({
+            "objects": {
+                "fixture/object": {
+                    "hash": object_digest.as_str(),
+                    "size": OBJECT_BYTES.len()
+                },
+                "fixture/empty": {
+                    "hash": empty_digest.as_str(),
+                    "size": 0
+                }
+            }
+        }))
+        .expect("Assets fixture index");
+        KnownGoodInventory::from_test_entries([
+            TestKnownGoodEntry {
+                root: TestKnownGoodRoot::Assets,
+                path: "indexes/fixture-assets.json".to_string(),
+                kind: KnownGoodArtifactKind::AssetIndex,
+                integrity: TestKnownGoodIntegrity::Sha1 {
+                    digest: format!("{:x}", Sha1::digest(&index_bytes)),
+                    size: index_bytes.len() as u64,
+                },
+            },
+            TestKnownGoodEntry {
+                root: TestKnownGoodRoot::Assets,
+                path: format!("objects/{}/{}", &object_digest[..2], object_digest),
+                kind: KnownGoodArtifactKind::AssetObject,
+                integrity: TestKnownGoodIntegrity::Sha1 {
+                    digest: object_digest,
+                    size: OBJECT_BYTES.len() as u64,
+                },
+            },
+            TestKnownGoodEntry {
+                root: TestKnownGoodRoot::Assets,
+                path: format!("objects/{}/{}", &empty_digest[..2], empty_digest),
+                kind: KnownGoodArtifactKind::AssetObject,
+                integrity: TestKnownGoodIntegrity::Sha1 {
+                    digest: empty_digest,
+                    size: 0,
+                },
+            },
+        ])
+        .expect("Assets fixture inventory")
+    }
+
+    fn activate_assets_fixture_inventory(fixture: &Fixture) {
+        fixture
+            .state
+            .activate_known_good_inventory_for_test(INSTANCE_ID, assets_fixture_inventory());
+    }
+
     async fn cleanup(fixture: Fixture) {
         fixture
             .state
@@ -1269,6 +1704,15 @@ mod tests {
             StabilizationSystem::Execution,
             TargetKind::Runtime,
             RUNTIME_COMPONENT,
+            OwnershipClass::LauncherManaged,
+        )
+    }
+
+    fn assets_target() -> TargetDescriptor {
+        TargetDescriptor::new(
+            StabilizationSystem::Execution,
+            TargetKind::Artifact,
+            "fixture-asset-index",
             OwnershipClass::LauncherManaged,
         )
     }
@@ -1371,6 +1815,77 @@ mod tests {
             .expect("component rebuild admission");
         drop(lifecycle);
         (admission, artifact_operation)
+    }
+
+    async fn assets_component_admission(
+        fixture: &Fixture,
+        operation_suffix: &str,
+    ) -> RegisteredComponentRebuildAdmission {
+        activate_assets_fixture_inventory(fixture);
+        let lifecycle = fixture.state.acquire_instance_lifecycle(INSTANCE_ID).await;
+        let authority = fixture
+            .state
+            .registered_reconciliation_authority(&lifecycle)
+            .expect("registered Assets reconciliation authority");
+        let artifact_operation = OperationId::new(format!("asset-artifact-{operation_suffix}"));
+        let attempt = authority
+            .repair_artifact_attempt(
+                artifact_operation.clone(),
+                DIAGNOSIS_ID,
+                GuardianDomain::Download,
+                ReconciliationComponent::Assets,
+                assets_target(),
+                GuardianMode::Managed,
+                chrono::Duration::minutes(30),
+            )
+            .expect("Assets artifact attempt");
+        let terminal = authority
+            .artifact_terminal(attempt.clone(), ReconciliationTerminalOutcome::Failed, None)
+            .expect("Assets artifact terminal");
+        let reservation = reserve_reconciliation_attempt(
+            fixture.failure_memory.as_ref(),
+            fixture.journals.as_ref(),
+            reconciliation_attempt_key(&attempt),
+        )
+        .expect("Assets artifact attempt reservation");
+        fixture
+            .journals
+            .create(artifact_repair_plan(&attempt))
+            .await
+            .expect("Assets artifact repair plan");
+        record_reconciliation_journal_failure(
+            fixture.journals.as_ref(),
+            &artifact_operation,
+            artifact_repair_failed_step(attempt.target()),
+            "repair_asset_artifact",
+            terminal.clone(),
+        )
+        .await
+        .expect("Assets artifact repair failure");
+        commit_reconciliation_memory(
+            fixture.failure_memory.as_ref(),
+            reconciliation_memory_entry(terminal).expect("Assets artifact failure memory"),
+            &reservation,
+        )
+        .await
+        .expect("Assets artifact failure memory commit");
+        drop((reservation, authority));
+
+        let evidence = fixture
+            .state
+            .recorded_artifact_repair_failure(&lifecycle, &artifact_operation)
+            .expect("closed persisted Assets component predecessor proof");
+        let admission = fixture
+            .state
+            .admit_component_rebuild(
+                evidence,
+                OperationId::new(format!("asset-component-{operation_suffix}")),
+                chrono::Duration::minutes(30),
+            )
+            .await
+            .expect("Assets component rebuild admission");
+        drop(lifecycle);
+        admission
     }
 
     async fn component_readmission_is_refused(
@@ -1488,6 +2003,273 @@ mod tests {
                 .and_then(|entry| entry.reconciliation_terminal().cloned()),
             Some(terminal)
         );
+    }
+
+    #[tokio::test]
+    async fn managed_assets_commit_has_no_quarantine_and_settles_exact_terminal_memory() {
+        let fixture = fixture("assets-commit");
+        let admission = assets_component_admission(&fixture, "commit").await;
+        let operation_id = admission.attempt().operation_id().clone();
+        let memory_key = reconciliation_attempt_key(admission.attempt());
+        let journals = fixture.journals.clone();
+        let root = PathBuf::from(fixture.state.library_dir().expect("library root"));
+        let expected_root = root.clone();
+
+        let outcome =
+            execute_managed_assets_component_rebuild_with_driver(admission, move |effect| {
+                let plan = journals
+                    .get(&operation_id)
+                    .expect("Assets plan is visible before effect");
+                assert_eq!(plan.status, OperationStatus::Planned);
+                assert!(
+                    plan.planned_steps
+                        .iter()
+                        .all(|step| step.step_id != COMPONENT_QUARANTINE_STEP)
+                );
+                assert_eq!(effect.core_request(), (expected_root.as_path(), "1.21.1"));
+                async move {
+                    let receipt = axial_minecraft::rebuild_managed_assets_fixture_for_test(
+                        expected_root,
+                        "1.21.1",
+                    )
+                    .await
+                    .expect("sealed Assets fixture receipt");
+                    effect.committed(receipt, vec!["assets_component_rebuilt".to_string()])
+                }
+            })
+            .await
+            .expect("Assets rebuild terminal settlement");
+
+        assert_eq!(outcome.status, GuardianComponentRebuildStatus::Rebuilt);
+        assert_eq!(outcome.facts, vec!["assets_component_rebuilt"]);
+        let journal = fixture
+            .journals
+            .get(&outcome.operation_id)
+            .expect("Assets component terminal journal");
+        assert_eq!(journal.status, OperationStatus::Succeeded);
+        assert!(
+            journal
+                .completed_steps
+                .iter()
+                .all(|step| step.step_id != COMPONENT_QUARANTINE_STEP)
+        );
+        let terminal = journal
+            .reconciliation_terminal()
+            .expect("typed Assets component terminal");
+        assert_eq!(terminal.outcome(), ReconciliationTerminalOutcome::Succeeded);
+        assert!(terminal.quarantined_target().is_none());
+        assert_eq!(
+            fixture
+                .failure_memory
+                .get(&memory_key)
+                .and_then(|entry| entry.reconciliation_terminal().cloned()),
+            Some(terminal.clone())
+        );
+
+        cleanup(fixture).await;
+    }
+
+    #[tokio::test]
+    async fn managed_assets_preeffect_failure_is_failed_and_not_applicable() {
+        let fixture = fixture("assets-preeffect");
+        let admission = assets_component_admission(&fixture, "preeffect").await;
+        let memory_key = reconciliation_attempt_key(admission.attempt());
+
+        let outcome =
+            execute_managed_assets_component_rebuild_with_driver(admission, |effect| async move {
+                effect.failed_before_effect(vec!["assets_source_unavailable".to_string()])
+            })
+            .await
+            .expect("Assets preeffect failure settlement");
+
+        assert_eq!(outcome.status, GuardianComponentRebuildStatus::Failed);
+        let journal = fixture
+            .journals
+            .get(&outcome.operation_id)
+            .expect("Assets failure journal");
+        assert_eq!(journal.status, OperationStatus::Failed);
+        let step = journal
+            .completed_steps
+            .iter()
+            .find(|step| step.step_id == ASSETS_COMPONENT_REBUILD_STEP)
+            .expect("Assets terminal step");
+        assert_eq!(step.result, OperationStepResult::Failed);
+        assert_eq!(step.rollback, RollbackState::NotApplicable);
+        let terminal = journal
+            .reconciliation_terminal()
+            .expect("Assets failed terminal");
+        assert_eq!(terminal.outcome(), ReconciliationTerminalOutcome::Failed);
+        assert!(terminal.quarantined_target().is_none());
+        assert_eq!(
+            fixture
+                .failure_memory
+                .get(&memory_key)
+                .and_then(|entry| entry.reconciliation_terminal().cloned()),
+            Some(terminal.clone())
+        );
+
+        cleanup(fixture).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn managed_assets_effect_rollback_is_failed_and_applied() {
+        use std::os::unix::fs::PermissionsExt;
+
+        const OBJECT_BYTES: &[u8] = b"axial managed Assets fixture";
+        let fixture = fixture("assets-rollback");
+        let admission = assets_component_admission(&fixture, "rollback").await;
+        let memory_key = reconciliation_attempt_key(admission.attempt());
+        let operation_id = admission.attempt().operation_id().clone();
+        let journals = fixture.journals.clone();
+        let root = PathBuf::from(fixture.state.library_dir().expect("library root"));
+        let outcome = execute_managed_assets_component_rebuild_with_driver(
+            admission,
+            move |effect| async move {
+                let plan = journals
+                    .get(&operation_id)
+                    .expect("Assets rollback plan is visible before Core mutation");
+                assert_eq!(plan.status, OperationStatus::Planned);
+                assert_eq!(effect.core_request(), (root.as_path(), "1.21.1"));
+                let object_digest = format!("{:x}", Sha1::digest(OBJECT_BYTES));
+                let empty_digest = format!("{:x}", Sha1::digest([]));
+                let protected = [&object_digest[..2], &empty_digest[..2]]
+                    .into_iter()
+                    .map(|prefix| root.join("assets/objects").join(prefix))
+                    .collect::<Vec<_>>();
+                for path in &protected {
+                    fs::create_dir_all(path).expect("protected Assets object parent");
+                    fs::set_permissions(path, fs::Permissions::from_mode(0o500))
+                        .expect("deny Assets object publication");
+                }
+                let rebuild =
+                    axial_minecraft::rebuild_managed_assets_fixture_for_test(&root, "1.21.1").await;
+                for path in &protected {
+                    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+                        .expect("restore Assets object parent");
+                }
+                let rollback_receipt = match rebuild {
+                    Err(axial_minecraft::ManagedAssetsRebuildError::RolledBack(receipt)) => receipt,
+                    Err(error) => panic!("Assets effect did not reach rollback: {error}"),
+                    Ok(receipt) => {
+                        drop(receipt);
+                        panic!("Assets permission fault unexpectedly committed")
+                    }
+                };
+                effect.rolled_back(
+                    rollback_receipt,
+                    vec!["assets_component_rolled_back".to_string()],
+                )
+            },
+        )
+        .await
+        .expect("Assets rollback terminal settlement");
+
+        assert_eq!(outcome.status, GuardianComponentRebuildStatus::Failed);
+        let journal = fixture
+            .journals
+            .get(&outcome.operation_id)
+            .expect("Assets rollback journal");
+        let step = journal
+            .completed_steps
+            .iter()
+            .find(|step| step.step_id == ASSETS_COMPONENT_REBUILD_STEP)
+            .expect("Assets rollback step");
+        assert_eq!(step.result, OperationStepResult::Failed);
+        assert_eq!(step.rollback, RollbackState::Applied);
+        let terminal = journal
+            .reconciliation_terminal()
+            .expect("Assets rollback terminal");
+        assert_eq!(terminal.outcome(), ReconciliationTerminalOutcome::Failed);
+        assert!(terminal.quarantined_target().is_none());
+        assert_eq!(
+            fixture
+                .failure_memory
+                .get(&memory_key)
+                .and_then(|entry| entry.reconciliation_terminal().cloned()),
+            Some(terminal.clone())
+        );
+
+        cleanup(fixture).await;
+    }
+
+    #[tokio::test]
+    async fn assets_receipt_is_retained_until_exact_memory_is_durable() {
+        let backend = Arc::new(ControlledWriteBackend::default());
+        let fixture = fixture_with_backends("assets-memory-retry", None, Some(backend.clone()));
+        let admission = assets_component_admission(&fixture, "memory-retry").await;
+        let operation_id = admission.attempt().operation_id().clone();
+        let memory_key = reconciliation_attempt_key(admission.attempt());
+        let root = PathBuf::from(fixture.state.library_dir().expect("library root"));
+        let effect_root = root.clone();
+        let effect_backend = backend.clone();
+        let rebuild = execute_managed_assets_component_rebuild_with_driver(
+            admission,
+            move |effect| async move {
+                let receipt =
+                    axial_minecraft::rebuild_managed_assets_fixture_for_test(effect_root, "1.21.1")
+                        .await
+                        .expect("sealed Assets fixture receipt");
+                let failed_attempt = effect_backend.next_attempt();
+                effect_backend.fail_attempt(failed_attempt);
+                effect_backend.gate_attempt(failed_attempt + 1);
+                effect.committed(receipt, vec!["assets_component_rebuilt".to_string()])
+            },
+        );
+        let settlement_complete = Arc::new(AtomicBool::new(false));
+        let rebuild_complete = settlement_complete.clone();
+        let rebuild = async move {
+            let outcome = rebuild.await;
+            rebuild_complete.store(true, Ordering::Release);
+            outcome
+        };
+        let control = async {
+            let gated_attempt = backend.wait_for_gate_armed().await;
+            backend.wait_for_attempt(gated_attempt).await;
+            assert!(!settlement_complete.load(Ordering::Acquire));
+            assert!(
+                fixture
+                    .journals
+                    .get(&operation_id)
+                    .and_then(|entry| entry.reconciliation_terminal().cloned())
+                    .is_some()
+            );
+            assert!(fixture.failure_memory.get(&memory_key).is_none());
+
+            let mut competing = Box::pin(axial_minecraft::rebuild_managed_assets_fixture_for_test(
+                &root, "1.21.1",
+            ));
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(100), &mut competing)
+                    .await
+                    .is_err(),
+                "Assets receipt must retain publication exclusion during memory retry"
+            );
+            backend.release();
+            let competing_receipt =
+                tokio::time::timeout(std::time::Duration::from_secs(2), competing)
+                    .await
+                    .expect("competing Assets rebuild resumes")
+                    .expect("competing Assets receipt");
+            drop(competing_receipt);
+        };
+        let (outcome, ()) = tokio::join!(rebuild, control);
+        let outcome = outcome.expect("Assets memory retry settles");
+        assert_eq!(outcome.status, GuardianComponentRebuildStatus::Rebuilt);
+        let terminal = fixture
+            .journals
+            .get(&operation_id)
+            .and_then(|entry| entry.reconciliation_terminal().cloned())
+            .expect("exact Assets terminal");
+        assert_eq!(
+            fixture
+                .failure_memory
+                .get(&memory_key)
+                .and_then(|entry| entry.reconciliation_terminal().cloned()),
+            Some(terminal)
+        );
+
+        cleanup(fixture).await;
     }
 
     #[test]

@@ -54,7 +54,8 @@ pub(crate) use artifact_repair::{
 };
 pub(crate) use component_rebuild::{
     GuardianComponentRebuildOutcome, GuardianComponentRebuildStatus,
-    execute_managed_libraries_component_rebuild, execute_managed_runtime_component_rebuild,
+    execute_managed_assets_component_rebuild, execute_managed_libraries_component_rebuild,
+    execute_managed_runtime_component_rebuild,
 };
 pub(crate) use copy::GuardianSummaryDecision;
 pub(crate) use copy::{
