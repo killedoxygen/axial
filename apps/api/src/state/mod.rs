@@ -23,6 +23,7 @@ mod performance_managed;
 pub mod performance_operations;
 mod performance_rules;
 mod persisted_state_load;
+mod persisted_state_rejection_streaks;
 pub mod presence;
 mod reconciliation;
 mod registered_artifact_findings;
@@ -167,7 +168,9 @@ pub struct AppState {
     telemetry: Arc<TelemetryHub>,
     remote_flags: Arc<RemoteFlagStore>,
     launch_reports: Arc<launch_reports::LaunchReportStore>,
-    persisted_state_load: Arc<persisted_state_load::PersistedStateStartupLoad>,
+    persisted_state_load: Arc<PersistedStateLoadEvidence>,
+    persisted_state_rejection_streaks:
+        Arc<persisted_state_rejection_streaks::PersistedStateRejectionStreaks>,
     integrity_activity: integrity_activity::IntegrityActivityCoordinator,
     instance_lifecycle_gates: instance_lifecycle::InstanceLifecycleGates,
     lifecycle: AppLifecycle,
@@ -189,6 +192,13 @@ pub struct AppStateInit {
     pub performance: Arc<PerformanceManager>,
     pub startup_warnings: Vec<String>,
     pub frontend_dir: PathBuf,
+}
+
+#[derive(Clone, Copy)]
+enum RejectionStreakStartupMode {
+    Progress,
+    #[cfg(test)]
+    Discard,
 }
 
 struct KnownGoodCandidateAdmission {
@@ -368,6 +378,7 @@ impl AppState {
             Arc::new(RemoteFlagStore::default()),
             ManagedRuntimeCache::isolated_for_test()
                 .expect("failed to create isolated managed runtime cache"),
+            RejectionStreakStartupMode::Discard,
         )
         .unwrap_or_else(|error| {
             panic!("failed to initialize known-good inventory persistence: {error}")
@@ -411,6 +422,7 @@ impl AppState {
                 Arc::new(auth_logins),
                 Arc::new(remote_flags),
                 managed_runtime_cache,
+                RejectionStreakStartupMode::Progress,
             )
         })
         .await
@@ -419,6 +431,10 @@ impl AppState {
             tracing::warn!("known-good restart cleanup remains pending");
         }
         state.reconcile_reconciliation_startup().await?;
+        state
+            .persisted_state_rejection_streaks
+            .progress_startup()
+            .await;
         Ok(state)
     }
 
@@ -437,6 +453,7 @@ impl AppState {
             Arc::new(RemoteFlagStore::default()),
             ManagedRuntimeCache::isolated_for_test()
                 .expect("failed to create isolated managed runtime cache"),
+            RejectionStreakStartupMode::Discard,
         )
         .unwrap_or_else(|error| {
             panic!("failed to initialize known-good inventory persistence: {error}")
@@ -489,6 +506,7 @@ impl AppState {
         auth_logins: Arc<AuthLoginStore>,
         remote_flags: Arc<RemoteFlagStore>,
         managed_runtime_cache: ManagedRuntimeCache,
+        rejection_streak_startup_mode: RejectionStreakStartupMode,
     ) -> std::io::Result<Self> {
         let instance_registry_authoritative = init.instances.mutation_allowed();
         let instances = Arc::new(AppInstanceStore::claim(&init.instances).unwrap_or_else(
@@ -521,19 +539,20 @@ impl AppState {
             config.paths(),
             benchmark_suites.proof_retention_handle(),
         ));
-        let (benchmark_suite_drivers, benchmark_suite_driver_rejections) = benchmark_suite_drivers
-            .bind(benchmark_suites.retention_handle())
-            .into_parts();
-        let (performance_operations, performance_operation_rejections) =
+        let (benchmark_suite_drivers, benchmark_suite_driver_rejection_scan) =
+            benchmark_suite_drivers
+                .bind(benchmark_suites.retention_handle())
+                .into_parts();
+        let (performance_operations, performance_operation_rejection_scan) =
             performance_operations::PerformanceOperationStore::load_from_paths_for_startup(
                 config.paths(),
             )
             .into_parts();
-        let rejected_records = performance_operation_rejections
-            .into_iter()
-            .chain(benchmark_suite_driver_rejections)
-            .collect();
-        let persisted_state_load = Arc::new(persisted_state_load::PersistedStateStartupLoad::new(
+        let rejected_record_scans = vec![
+            performance_operation_rejection_scan,
+            benchmark_suite_driver_rejection_scan,
+        ];
+        let persisted_state_load = Arc::new(PersistedStateLoadEvidence::from_store_parts(
             [
                 auth_logins.load_issue_count(),
                 performance_operations.load_issue_count(),
@@ -541,8 +560,24 @@ impl AppState {
                 benchmark_suite_drivers.load_issue_count(),
                 launch_reports.load_issue_count(),
             ],
-            rejected_records,
+            rejected_record_scans
+                .iter()
+                .flat_map(persisted_state_load::PersistedStateRejectedRecordStoreScan::evidence),
         ));
+        let persisted_state_rejection_streaks = Arc::new(match rejection_streak_startup_mode {
+            RejectionStreakStartupMode::Progress => {
+                persisted_state_rejection_streaks::PersistedStateRejectionStreaks::new(
+                    config.paths(),
+                    rejected_record_scans,
+                )
+            }
+            #[cfg(test)]
+            RejectionStreakStartupMode::Discard => {
+                persisted_state_rejection_streaks::PersistedStateRejectionStreaks::discarded(
+                    rejected_record_scans,
+                )
+            }
+        });
         let benchmark_suite_drivers = Arc::new(benchmark_suite_drivers);
         let performance_operations = Arc::new(performance_operations);
         let skins = Arc::new(skins::SavedSkinStore::load_from_paths(config.paths()));
@@ -590,6 +625,7 @@ impl AppState {
             remote_flags,
             launch_reports,
             persisted_state_load,
+            persisted_state_rejection_streaks,
             integrity_activity: integrity_activity::IntegrityActivityCoordinator::new(),
             instance_lifecycle_gates,
             lifecycle: AppLifecycle::new(),
@@ -655,7 +691,7 @@ impl AppState {
     }
 
     pub(crate) fn persisted_state_load_evidence(&self) -> &PersistedStateLoadEvidence {
-        self.persisted_state_load.evidence()
+        &self.persisted_state_load
     }
 
     pub fn installs(&self) -> &Arc<InstallStore> {

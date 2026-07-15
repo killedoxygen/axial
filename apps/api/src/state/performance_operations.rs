@@ -16,6 +16,7 @@ use crate::state::ownership::{CurrentArtifact, classify_current_artifact};
 use crate::state::persisted_state_load::{
     MAX_REJECTED_RESTART_RECORDS_PER_STORE, MAX_RESTART_RECORD_BYTES,
     PersistedStateRecordRejection, PersistedStateRejectedRecord,
+    PersistedStateRejectedRecordStoreScan,
 };
 use axial_config::AppPaths;
 use chrono::{DateTime, SecondsFormat, Utc};
@@ -256,11 +257,22 @@ impl Drop for PerformanceOperationIdReservation {
     }
 }
 
-#[derive(Default)]
 struct PerformanceOperationLoadState {
     inner: PerformanceOperationInner,
     issues: Vec<PerformanceOperationLoadIssue>,
     rejected_records: Vec<PersistedStateRejectedRecord>,
+    rejected_record_scan_authoritative: bool,
+}
+
+impl Default for PerformanceOperationLoadState {
+    fn default() -> Self {
+        Self {
+            inner: PerformanceOperationInner::default(),
+            issues: Vec::new(),
+            rejected_records: Vec::new(),
+            rejected_record_scan_authoritative: true,
+        }
+    }
 }
 
 struct PerformanceOperationPersistence {
@@ -376,14 +388,17 @@ pub struct PerformanceOperationStore {
 
 pub(super) struct LoadedPerformanceOperationStore {
     store: PerformanceOperationStore,
-    rejected_records: Vec<PersistedStateRejectedRecord>,
+    rejected_record_scan: PersistedStateRejectedRecordStoreScan,
 }
 
 impl LoadedPerformanceOperationStore {
     pub(super) fn into_parts(
         self,
-    ) -> (PerformanceOperationStore, Vec<PersistedStateRejectedRecord>) {
-        (self.store, self.rejected_records)
+    ) -> (
+        PerformanceOperationStore,
+        PersistedStateRejectedRecordStoreScan,
+    ) {
+        (self.store, self.rejected_record_scan)
     }
 
     #[cfg(test)]
@@ -449,6 +464,7 @@ impl PerformanceOperationStore {
             inner,
             issues,
             rejected_records,
+            rejected_record_scan_authoritative,
         } = load_state;
         let store = Self {
             inner: Arc::new(RwLock::new(inner)),
@@ -460,7 +476,11 @@ impl PerformanceOperationStore {
         };
         Ok(LoadedPerformanceOperationStore {
             store,
-            rejected_records,
+            rejected_record_scan: PersistedStateRejectedRecordStoreScan::new(
+                PersistedStateRecordStore::PerformanceOperation,
+                rejected_record_scan_authoritative,
+                rejected_records,
+            ),
         })
     }
 
@@ -1450,6 +1470,7 @@ fn load_persisted_operation_inner(storage_dir: &Path) -> PerformanceOperationLoa
                 &mut load_state.issues,
                 PerformanceOperationLoadIssueKind::DirectoryUnreadable,
             );
+            load_state.rejected_record_scan_authoritative = false;
             return load_state;
         }
     };
@@ -1465,6 +1486,7 @@ fn load_persisted_operation_inner(storage_dir: &Path) -> PerformanceOperationLoa
                 &mut load_state.issues,
                 PerformanceOperationLoadIssueKind::DirectoryUnreadable,
             );
+            load_state.rejected_record_scan_authoritative = false;
             return load_state;
         }
     };
@@ -1486,6 +1508,9 @@ fn load_persisted_operation_inner(storage_dir: &Path) -> PerformanceOperationLoa
                     &mut load_state.issues,
                     PerformanceOperationLoadIssueKind::StatusUnreadable,
                 );
+                if physical_id.is_some() {
+                    load_state.rejected_record_scan_authoritative = false;
+                }
                 continue;
             }
         };
@@ -1647,8 +1672,10 @@ fn load_persisted_operation_inner(storage_dir: &Path) -> PerformanceOperationLoa
             .insert(status.id.clone(), status);
     }
 
-    load_state.rejected_records =
+    let (rejected_records, retained_authoritatively) =
         retain_performance_rejected_records(&directory, rejected_records, &mut load_state.issues);
+    load_state.rejected_records = rejected_records;
+    load_state.rejected_record_scan_authoritative &= retained_authoritatively;
 
     load_state
 }
@@ -1662,8 +1689,9 @@ fn retain_performance_rejected_records(
     directory: &AnchoredRecordDirectory,
     rejected: BTreeMap<String, PersistedStateRecordRejection>,
     issues: &mut Vec<PerformanceOperationLoadIssue>,
-) -> Vec<PersistedStateRejectedRecord> {
+) -> (Vec<PersistedStateRejectedRecord>, bool) {
     let mut retained = Vec::new();
+    let mut authoritative = true;
     for (physical_name, rejection) in rejected {
         if retained.len() == MAX_REJECTED_RESTART_RECORDS_PER_STORE {
             break;
@@ -1682,12 +1710,14 @@ fn retain_performance_rejected_records(
                     "failed to reacquire rejected performance operation status"
                 );
                 record_load_issue(issues, PerformanceOperationLoadIssueKind::StatusUnreadable);
+                authoritative = false;
                 continue;
             }
         };
         if !performance_rejection_still_holds(&observation, physical_id, rejection) {
             warn!("performance operation rejection changed during startup load");
             record_load_issue(issues, PerformanceOperationLoadIssueKind::StatusUnreadable);
+            authoritative = false;
             continue;
         }
         let (identity, restart_digest) = match observation.into_restart_identity() {
@@ -1697,6 +1727,7 @@ fn retain_performance_rejected_records(
                     error_kind = ?error.kind(),
                     "failed to derive rejected performance operation restart identity"
                 );
+                authoritative = false;
                 continue;
             }
         };
@@ -1708,7 +1739,7 @@ fn retain_performance_rejected_records(
             restart_digest,
         ));
     }
-    retained
+    (retained, authoritative)
 }
 
 fn rejected_performance_operation_target(
@@ -1890,7 +1921,7 @@ fn safe_operation_filename(operation_id: &str) -> String {
     }
 }
 
-fn is_safe_operation_id(operation_id: &str) -> bool {
+pub(super) fn is_safe_operation_id(operation_id: &str) -> bool {
     operation_id_index(operation_id).is_some()
 }
 
@@ -3781,6 +3812,7 @@ mod tests {
                 .collect::<Vec<_>>();
 
             assert_eq!(load_state.rejected_records.len(), 8);
+            assert!(load_state.rejected_record_scan_authoritative);
             assert_eq!(
                 load_state
                     .issues
@@ -3801,6 +3833,18 @@ mod tests {
                 .map(|index| format!("{PERFORMANCE_OPERATION_ID_PREFIX}{index:032x}"))
                 .collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn missing_operation_directory_is_an_authoritative_empty_rejection_scan() {
+        let root = test_root("missing-rejection-directory");
+        let dir = operation_dir(&test_paths(&root));
+
+        let load_state = load_persisted_operation_inner(&dir);
+
+        assert!(load_state.rejected_record_scan_authoritative);
+        assert!(load_state.rejected_records.is_empty());
+        cleanup(&root);
     }
 
     #[test]
@@ -3895,9 +3939,11 @@ mod tests {
         .expect("write replacement");
         let mut issues = Vec::new();
 
-        let retained = retain_performance_rejected_records(&directory, rejected, &mut issues);
+        let (retained, authoritative) =
+            retain_performance_rejected_records(&directory, rejected, &mut issues);
 
         assert!(retained.is_empty());
+        assert!(!authoritative);
         assert_eq!(
             issues,
             vec![PerformanceOperationLoadIssue {
@@ -3943,10 +3989,38 @@ mod tests {
 
         assert!(load_state.inner.operations.is_empty());
         assert!(load_state.rejected_records.is_empty());
+        assert!(load_state.rejected_record_scan_authoritative);
         assert!(
             load_state.issues.iter().any(|issue| {
                 issue.kind == PerformanceOperationLoadIssueKind::UnsafeOperationId
             })
+        );
+        cleanup(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_noncanonical_operation_name_does_not_blind_the_store() {
+        let root = test_root("noncanonical-hostile-link");
+        let dir = operation_dir(&test_paths(&root));
+        fs::create_dir_all(&dir).expect("create operation dir");
+        let outside = root.join("outside.json");
+        fs::write(&outside, b"{").expect("write outside record");
+        std::os::unix::fs::symlink(&outside, dir.join("copied-operation.json"))
+            .expect("create noncanonical symlink");
+
+        let load_state = load_persisted_operation_inner(&dir);
+
+        assert!(load_state.inner.operations.is_empty());
+        assert!(load_state.rejected_records.is_empty());
+        assert!(load_state.rejected_record_scan_authoritative);
+        assert_eq!(
+            load_state
+                .issues
+                .iter()
+                .find(|issue| issue.kind == PerformanceOperationLoadIssueKind::StatusUnreadable)
+                .map(|issue| issue.count),
+            Some(1)
         );
         cleanup(&root);
     }
@@ -3972,6 +4046,7 @@ mod tests {
 
         assert!(load_state.inner.operations.is_empty());
         assert!(load_state.rejected_records.is_empty());
+        assert!(!load_state.rejected_record_scan_authoritative);
         assert_eq!(
             load_state
                 .issues

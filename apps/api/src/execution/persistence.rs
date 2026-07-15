@@ -709,6 +709,11 @@ impl AtomicSnapshotWriter {
         Ok(revision)
     }
 
+    /// Waits for the current worker to stop without flushing, retrying, or closing its owner.
+    pub(crate) async fn wait_until_idle(&self) {
+        await_all_lanes_idle(std::slice::from_ref(&self.lane)).await;
+    }
+
     pub(crate) fn retry(&self) -> Result<AcceptedWrite, PersistenceError> {
         let (ticket, start_worker) = {
             let owner_state = self

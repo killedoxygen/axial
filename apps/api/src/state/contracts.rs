@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 pub(crate) const RECONCILIATION_EVIDENCE_CAPACITY: usize = 128;
 pub const RECONCILIATION_QUARANTINE_CAPACITY: usize = 8;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum PersistedStateRecordStore {
     PerformanceOperation,

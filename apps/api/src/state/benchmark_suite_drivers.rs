@@ -17,6 +17,7 @@ use crate::state::ownership::{CurrentArtifact, classify_current_artifact};
 use crate::state::persisted_state_load::{
     MAX_REJECTED_RESTART_RECORDS_PER_STORE, MAX_RESTART_RECORD_BYTES,
     PersistedStateRecordRejection, PersistedStateRejectedRecord,
+    PersistedStateRejectedRecordStoreScan,
 };
 use axial_config::AppPaths;
 use chrono::{DateTime, SecondsFormat, Utc};
@@ -297,13 +298,26 @@ struct BenchmarkSuiteDriverInner {
     ready_resume_ids: Vec<String>,
 }
 
-#[derive(Default)]
 struct BenchmarkSuiteDriverLoadState {
     inner: BenchmarkSuiteDriverInner,
     issues: Vec<BenchmarkSuiteDriverLoadIssue>,
     retention_excluded_ids: HashSet<String>,
     suite_retention_claims: Vec<(String, String)>,
     rejected_records: Vec<PersistedStateRejectedRecord>,
+    rejected_record_scan_authoritative: bool,
+}
+
+impl Default for BenchmarkSuiteDriverLoadState {
+    fn default() -> Self {
+        Self {
+            inner: BenchmarkSuiteDriverInner::default(),
+            issues: Vec::new(),
+            retention_excluded_ids: HashSet::new(),
+            suite_retention_claims: Vec::new(),
+            rejected_records: Vec::new(),
+            rejected_record_scan_authoritative: true,
+        }
+    }
 }
 
 struct BenchmarkSuiteDriverPersistence {
@@ -423,14 +437,17 @@ pub(super) struct PreparedBenchmarkSuiteDriverStore {
 
 pub(super) struct LoadedBenchmarkSuiteDriverStore {
     store: BenchmarkSuiteDriverStore,
-    rejected_records: Vec<PersistedStateRejectedRecord>,
+    rejected_record_scan: PersistedStateRejectedRecordStoreScan,
 }
 
 impl LoadedBenchmarkSuiteDriverStore {
     pub(super) fn into_parts(
         self,
-    ) -> (BenchmarkSuiteDriverStore, Vec<PersistedStateRejectedRecord>) {
-        (self.store, self.rejected_records)
+    ) -> (
+        BenchmarkSuiteDriverStore,
+        PersistedStateRejectedRecordStoreScan,
+    ) {
+        (self.store, self.rejected_record_scan)
     }
 
     #[cfg(test)]
@@ -596,6 +613,7 @@ impl BenchmarkSuiteDriverStore {
             retention_excluded_ids,
             suite_retention_claims: _,
             rejected_records,
+            rejected_record_scan_authoritative,
         } = load_state;
         let store = Self {
             inner: Arc::new(RwLock::new(inner)),
@@ -618,7 +636,11 @@ impl BenchmarkSuiteDriverStore {
         };
         Ok(LoadedBenchmarkSuiteDriverStore {
             store,
-            rejected_records,
+            rejected_record_scan: PersistedStateRejectedRecordStoreScan::new(
+                PersistedStateRecordStore::BenchmarkSuiteDriver,
+                rejected_record_scan_authoritative,
+                rejected_records,
+            ),
         })
     }
 
@@ -1672,6 +1694,7 @@ fn load_persisted_driver_inner(storage_dir: &Path) -> BenchmarkSuiteDriverLoadSt
                 &mut load_state.issues,
                 BenchmarkSuiteDriverLoadIssueKind::DirectoryUnreadable,
             );
+            load_state.rejected_record_scan_authoritative = false;
             return load_state;
         }
     };
@@ -1687,6 +1710,7 @@ fn load_persisted_driver_inner(storage_dir: &Path) -> BenchmarkSuiteDriverLoadSt
                 &mut load_state.issues,
                 BenchmarkSuiteDriverLoadIssueKind::DirectoryUnreadable,
             );
+            load_state.rejected_record_scan_authoritative = false;
             return load_state;
         }
     };
@@ -1717,6 +1741,9 @@ fn load_persisted_driver_inner(storage_dir: &Path) -> BenchmarkSuiteDriverLoadSt
                     &mut load_state.issues,
                     BenchmarkSuiteDriverLoadIssueKind::StatusUnreadable,
                 );
+                if physical_id.is_some() {
+                    load_state.rejected_record_scan_authoritative = false;
+                }
                 continue;
             }
         };
@@ -1858,8 +1885,10 @@ fn load_persisted_driver_inner(storage_dir: &Path) -> BenchmarkSuiteDriverLoadSt
         admit_loaded_suite(&mut load_state, statuses);
     }
 
-    load_state.rejected_records =
+    let (rejected_records, retained_authoritatively) =
         retain_driver_rejected_records(&directory, rejected_records, &mut load_state.issues);
+    load_state.rejected_records = rejected_records;
+    load_state.rejected_record_scan_authoritative &= retained_authoritatively;
 
     load_state
 }
@@ -1873,8 +1902,9 @@ fn retain_driver_rejected_records(
     directory: &AnchoredRecordDirectory,
     rejected: BTreeMap<String, PersistedStateRecordRejection>,
     issues: &mut Vec<BenchmarkSuiteDriverLoadIssue>,
-) -> Vec<PersistedStateRejectedRecord> {
+) -> (Vec<PersistedStateRejectedRecord>, bool) {
     let mut retained = Vec::new();
+    let mut authoritative = true;
     for (physical_name, rejection) in rejected {
         if retained.len() == MAX_REJECTED_RESTART_RECORDS_PER_STORE {
             break;
@@ -1893,12 +1923,14 @@ fn retain_driver_rejected_records(
                     "failed to reacquire rejected benchmark suite driver status"
                 );
                 record_load_issue(issues, BenchmarkSuiteDriverLoadIssueKind::StatusUnreadable);
+                authoritative = false;
                 continue;
             }
         };
         if !driver_rejection_still_holds(&observation, physical_id, rejection) {
             warn!("benchmark suite driver rejection changed during startup load");
             record_load_issue(issues, BenchmarkSuiteDriverLoadIssueKind::StatusUnreadable);
+            authoritative = false;
             continue;
         }
         let (identity, restart_digest) = match observation.into_restart_identity() {
@@ -1908,6 +1940,7 @@ fn retain_driver_rejected_records(
                     error_kind = ?error.kind(),
                     "failed to derive rejected benchmark suite driver restart identity"
                 );
+                authoritative = false;
                 continue;
             }
         };
@@ -1919,7 +1952,7 @@ fn retain_driver_rejected_records(
             restart_digest,
         ));
     }
-    retained
+    (retained, authoritative)
 }
 
 fn rejected_benchmark_suite_driver_target(
@@ -2447,7 +2480,7 @@ fn safe_driver_filename(driver_id: &str) -> String {
     }
 }
 
-fn is_safe_driver_id(driver_id: &str) -> bool {
+pub(super) fn is_safe_driver_id(driver_id: &str) -> bool {
     driver_id_index(driver_id).is_some_and(|index| {
         let canonical = format!("{DRIVER_ID_PREFIX}{index:016x}");
         driver_id == canonical.as_str()
@@ -5077,6 +5110,7 @@ mod tests {
                 .collect::<Vec<_>>();
 
             assert_eq!(load_state.rejected_records.len(), 8);
+            assert!(load_state.rejected_record_scan_authoritative);
             assert_eq!(
                 load_state
                     .issues
@@ -5097,6 +5131,18 @@ mod tests {
                 .map(|index| format!("{DRIVER_ID_PREFIX}{index:016x}"))
                 .collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn missing_driver_directory_is_an_authoritative_empty_rejection_scan() {
+        let root = test_root("missing-rejection-directory");
+        let dir = driver_dir(&test_paths(&root));
+
+        let load_state = load_persisted_driver_inner(&dir);
+
+        assert!(load_state.rejected_record_scan_authoritative);
+        assert!(load_state.rejected_records.is_empty());
+        cleanup(&root);
     }
 
     #[test]
@@ -5121,8 +5167,10 @@ mod tests {
             suite_retention,
         )
         .expect("finish driver load");
-        let (store, rejected_records) = loaded.into_parts();
+        let (store, rejected_record_scan) = loaded.into_parts();
+        let (_, authoritative, rejected_records) = rejected_record_scan.into_parts();
 
+        assert!(authoritative);
         assert_eq!(rejected_records.len(), 1);
         let runtime_clone = store.clone();
         drop(store);
@@ -5219,9 +5267,11 @@ mod tests {
         .expect("write replacement");
         let mut issues = Vec::new();
 
-        let retained = retain_driver_rejected_records(&directory, rejected, &mut issues);
+        let (retained, authoritative) =
+            retain_driver_rejected_records(&directory, rejected, &mut issues);
 
         assert!(retained.is_empty());
+        assert!(!authoritative);
         assert_eq!(
             issues,
             vec![BenchmarkSuiteDriverLoadIssue {
@@ -5298,6 +5348,7 @@ mod tests {
         assert!(load_state.inner.drivers.is_empty());
         assert_eq!(load_state.inner.next_id, 2);
         assert!(load_state.rejected_records.is_empty());
+        assert!(!load_state.rejected_record_scan_authoritative);
         assert_eq!(
             load_state
                 .issues
@@ -5305,6 +5356,33 @@ mod tests {
                 .find(|issue| issue.kind == BenchmarkSuiteDriverLoadIssueKind::StatusUnreadable)
                 .map(|issue| issue.count),
             Some(2)
+        );
+        cleanup(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_noncanonical_driver_name_does_not_blind_the_store() {
+        let root = test_root("noncanonical-hostile-link");
+        let dir = driver_dir(&test_paths(&root));
+        fs::create_dir_all(&dir).expect("create driver dir");
+        let outside = root.join("outside.json");
+        fs::write(&outside, b"{").expect("write outside driver");
+        std::os::unix::fs::symlink(&outside, dir.join("copied-driver.json"))
+            .expect("create noncanonical symlink");
+
+        let load_state = load_persisted_driver_inner(&dir);
+
+        assert!(load_state.inner.drivers.is_empty());
+        assert!(load_state.rejected_records.is_empty());
+        assert!(load_state.rejected_record_scan_authoritative);
+        assert_eq!(
+            load_state
+                .issues
+                .iter()
+                .find(|issue| issue.kind == BenchmarkSuiteDriverLoadIssueKind::StatusUnreadable)
+                .map(|issue| issue.count),
+            Some(1)
         );
         cleanup(&root);
     }

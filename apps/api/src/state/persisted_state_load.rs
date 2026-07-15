@@ -37,8 +37,8 @@ impl PersistedStateRejectedRecordEvidence {
 
 pub(super) struct PersistedStateRejectedRecord {
     evidence: PersistedStateRejectedRecordEvidence,
-    _identity: AnchoredRecordIdentity,
-    _restart_identity: RestartStableRecordIdentity,
+    identity: AnchoredRecordIdentity,
+    restart_identity: RestartStableRecordIdentity,
 }
 
 impl PersistedStateRejectedRecord {
@@ -55,10 +55,8 @@ impl PersistedStateRejectedRecord {
                 rejection,
                 target,
             },
-            _identity: identity,
-            _restart_identity: RestartStableRecordIdentity::from_digest(
-                restart_digest.into_bytes(),
-            ),
+            identity,
+            restart_identity: RestartStableRecordIdentity::from_digest(restart_digest.into_bytes()),
         }
     }
 
@@ -66,9 +64,88 @@ impl PersistedStateRejectedRecord {
         self.evidence.clone()
     }
 
-    #[cfg(test)]
+    pub(super) fn store(&self) -> PersistedStateRecordStore {
+        self.evidence.store
+    }
+
+    pub(super) fn record_id(&self) -> &str {
+        &self.evidence.target.id
+    }
+
     pub(super) fn restart_identity(&self) -> &RestartStableRecordIdentity {
-        &self._restart_identity
+        &self.restart_identity
+    }
+
+    pub(super) fn into_eligibility(self) -> PersistedStateRejectedRecordEligibility {
+        PersistedStateRejectedRecordEligibility { record: self }
+    }
+}
+
+pub(crate) struct PersistedStateRejectedRecordEligibility {
+    record: PersistedStateRejectedRecord,
+}
+
+impl PersistedStateRejectedRecordEligibility {
+    pub(super) fn still_current(&self) -> bool {
+        self.record.identity.revalidate().is_ok()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn store(&self) -> PersistedStateRecordStore {
+        self.record.store()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn record_id(&self) -> &str {
+        self.record.record_id()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn physical_identity(&self) -> &RestartStableRecordIdentity {
+        self.record.restart_identity()
+    }
+}
+
+pub(super) struct PersistedStateRejectedRecordStoreScan {
+    store: PersistedStateRecordStore,
+    authoritative: bool,
+    rejected_records: Vec<PersistedStateRejectedRecord>,
+}
+
+impl PersistedStateRejectedRecordStoreScan {
+    pub(super) fn new(
+        store: PersistedStateRecordStore,
+        authoritative: bool,
+        rejected_records: Vec<PersistedStateRejectedRecord>,
+    ) -> Self {
+        debug_assert!(
+            rejected_records
+                .iter()
+                .all(|record| record.store() == store)
+        );
+        Self {
+            store,
+            authoritative,
+            rejected_records,
+        }
+    }
+
+    pub(super) fn evidence(
+        &self,
+    ) -> impl Iterator<Item = PersistedStateRejectedRecordEvidence> + '_ {
+        self.rejected_records
+            .iter()
+            .map(PersistedStateRejectedRecord::evidence)
+    }
+
+    pub(super) fn into_parts(
+        self,
+    ) -> (
+        PersistedStateRecordStore,
+        bool,
+        Vec<PersistedStateRejectedRecord>,
+    ) {
+        (self.store, self.authoritative, self.rejected_records)
     }
 }
 
@@ -79,7 +156,7 @@ pub(crate) struct PersistedStateLoadEvidence {
 }
 
 impl PersistedStateLoadEvidence {
-    fn from_store_parts(
+    pub(super) fn from_store_parts(
         issue_counts: [usize; 5],
         rejected_records: impl IntoIterator<Item = PersistedStateRejectedRecordEvidence>,
     ) -> Self {
@@ -103,38 +180,9 @@ impl PersistedStateLoadEvidence {
     }
 }
 
-pub(super) struct PersistedStateStartupLoad {
-    evidence: PersistedStateLoadEvidence,
-    _rejected_records: Vec<PersistedStateRejectedRecord>,
-}
-
-impl PersistedStateStartupLoad {
-    pub(super) fn new(
-        issue_counts: [usize; 5],
-        rejected_records: Vec<PersistedStateRejectedRecord>,
-    ) -> Self {
-        let evidence = PersistedStateLoadEvidence::from_store_parts(
-            issue_counts,
-            rejected_records
-                .iter()
-                .map(PersistedStateRejectedRecord::evidence),
-        );
-        Self {
-            evidence,
-            _rejected_records: rejected_records,
-        }
-    }
-
-    pub(super) fn evidence(&self) -> &PersistedStateLoadEvidence {
-        &self.evidence
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{
-        PersistedStateLoadEvidence, PersistedStateRejectedRecord, PersistedStateStartupLoad,
-    };
+    use super::{PersistedStateLoadEvidence, PersistedStateRejectedRecord};
     use static_assertions::assert_not_impl_any;
     use std::path::Path;
 
@@ -147,7 +195,15 @@ mod tests {
             AsRef<Path>,
             AsRef<[u8]>
     );
-    assert_not_impl_any!(PersistedStateStartupLoad: Clone, serde::Serialize);
+    assert_not_impl_any!(
+        super::PersistedStateRejectedRecordEligibility:
+            Clone,
+            std::fmt::Debug,
+            serde::Serialize,
+            serde::de::DeserializeOwned,
+            AsRef<Path>,
+            AsRef<[u8]>
+    );
 
     #[test]
     fn five_store_issue_count_saturates() {
