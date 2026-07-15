@@ -6494,10 +6494,6 @@
         "fact": "artifact_size_mismatch"
       },
       {
-        "source": "ArtifactMissing",
-        "fact": "artifact_missing"
-      },
-      {
         "source": "MetadataInvalid",
         "fact": "provider_data_invalid"
       },
@@ -6532,10 +6528,6 @@
       {
         "source": "ProcessorFailed",
         "fact": "install_processor_failed"
-      },
-      {
-        "source": "OwnershipRefused",
-        "fact": "primitive_refused"
       },
       {
         "source": "RuntimeRosettaRequired",

@@ -226,9 +226,10 @@ async fn startup_integrity_facts_share_one_policy_evaluation() {
         severity: None,
         confidence: None,
         ownership: OwnershipClass::LauncherManaged,
-        target: Some(target(
-            "sha256.01234567.89abcdef.01234567.89abcdef.01234567.89abcdef.01234567.89abcdef",
+        target: Some(TargetDescriptor::new(
+            StabilizationSystem::Execution,
             TargetKind::Artifact,
+            "sha256.01234567.89abcdef.01234567.89abcdef.01234567.89abcdef.01234567.89abcdef",
             OwnershipClass::LauncherManaged,
         )),
         fields: Vec::new(),

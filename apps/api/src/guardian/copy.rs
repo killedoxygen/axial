@@ -4345,8 +4345,8 @@ mod tests {
     }
 
     #[test]
-    fn copy_rule_table_is_unique_and_covers_the_five_migrated_families() {
-        assert_eq!(GUARDIAN_COPY_RULES.len(), 26);
+    fn copy_rule_table_is_unique_complete_and_bounded() {
+        assert_eq!(GUARDIAN_COPY_RULES.len(), 27);
         for (index, rule) in GUARDIAN_COPY_RULES.iter().enumerate() {
             assert!(
                 GUARDIAN_COPY_RULES[index + 1..]
@@ -4379,7 +4379,7 @@ mod tests {
             assert!(rule.details.len() <= MAX_COLLECTION_LINES);
             assert!(rule.guidance.len() <= MAX_COLLECTION_LINES);
         }
-        assert_eq!(counts, [3, 3, 13, 6, 1]);
+        assert_eq!(counts, [3, 3, 14, 6, 1]);
     }
 
     #[test]

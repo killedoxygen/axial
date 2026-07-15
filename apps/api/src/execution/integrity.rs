@@ -4929,8 +4929,8 @@ mod tests {
         assert_eq!(report.findings().len(), 2);
         assert!(!report.findings().is_empty());
         assert!(state.registered_artifact_findings_are_current(report.findings()));
+        let corrupt = RegisteredArtifactObservation::new(0, RegisteredArtifactCondition::Corrupt);
         let missing = RegisteredArtifactObservation::new(1, RegisteredArtifactCondition::Missing);
-        let corrupt = RegisteredArtifactObservation::new(2, RegisteredArtifactCondition::Corrupt);
         let missing_target = report
             .findings()
             .target_for(missing)
@@ -4960,7 +4960,7 @@ mod tests {
                 .facts
                 .iter()
                 .find(|fact| {
-                    fact_field(fact, "entry_ordinal") == Some("2")
+                    fact_field(fact, "entry_ordinal") == Some("0")
                         && fact_field(fact, "observation") == Some("hash_mismatch")
                 })
                 .and_then(|fact| fact.target.as_ref()),
@@ -4971,7 +4971,7 @@ mod tests {
                 .target
                 .as_ref()
                 .map(|target| target.id.as_str()),
-            Some("known_good_libraries_library_3")
+            Some("known_good_libraries_library_2")
         );
         assert_eq!(
             report
@@ -4983,7 +4983,7 @@ mod tests {
                 })
                 .and_then(|fact| fact.target.as_ref())
                 .map(|target| target.id.as_str()),
-            Some("known_good_versions_client_jar_0")
+            Some("known_good_versions_client_jar_3")
         );
         assert_eq!(
             report
@@ -4994,8 +4994,8 @@ mod tests {
                 })
                 .collect::<Vec<_>>(),
             vec![
+                (0, RegisteredArtifactCondition::Corrupt),
                 (1, RegisteredArtifactCondition::Missing),
-                (2, RegisteredArtifactCondition::Corrupt),
             ]
         );
 
