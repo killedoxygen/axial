@@ -104,11 +104,6 @@ impl AppState {
             && self.idle_sweep_authority_is_current(&ticket.sweep_authority)
     }
 
-    pub(crate) fn known_good_tier2_ticket_is_active(&self, ticket: &KnownGoodTier2Ticket) -> bool {
-        self.known_good_tier2_ticket_identity_is_current(ticket)
-            && self.idle_sweep_authority_is_active(&ticket.sweep_authority)
-    }
-
     pub(crate) async fn seal_tier2_registered_artifact_request(
         &self,
         request: Tier2RegisteredArtifactSealRequest,
@@ -529,9 +524,17 @@ mod tests {
         reservation.cancellation().cancel();
 
         assert!(!fixture.state.known_good_tier2_ticket_is_current(&ticket));
-        assert!(fixture.state.known_good_tier2_ticket_is_active(&ticket));
+        assert!(
+            fixture
+                .state
+                .idle_sweep_authority_is_active(&ticket.sweep_authority)
+        );
         reservation.settle(crate::state::IdleSweepTerminal::Cancelled);
-        assert!(!fixture.state.known_good_tier2_ticket_is_active(&ticket));
+        assert!(
+            !fixture
+                .state
+                .idle_sweep_authority_is_active(&ticket.sweep_authority)
+        );
         fixture.close().await;
     }
 

@@ -1820,15 +1820,6 @@ pub(crate) async fn sense_integrity_tier1(
     sense_integrity_tier1_with_lease(state, lease, FilesystemIntegrityReader::default).await
 }
 
-pub(crate) async fn sense_current_integrity_tier1(
-    state: &AppState,
-    foreground: &IntegrityForegroundLease,
-    lifecycle: &InstanceLifecycleLease,
-) -> Result<AdmittedIntegrityTier1Report, KnownGoodVerificationUnavailable> {
-    let lease = state.mint_current_known_good_verification_lease(foreground, lifecycle)?;
-    sense_integrity_tier1_with_lease(state, lease, FilesystemIntegrityReader::default).await
-}
-
 #[cfg(test)]
 async fn sense_integrity_tier1_with_reader_factory<Factory, Reader>(
     state: &AppState,
@@ -2307,14 +2298,15 @@ impl Tier2RegisteredArtifactSealRequest {
     }
 }
 
-struct SealedIntegrityTier2Result {
+#[must_use = "sealed Tier 2 work retains the explicit sweep settlement owner"]
+pub(crate) struct IntegrityTier2SealedResult {
     report: IntegrityTier2Report,
     findings: Option<RegisteredArtifactFindings>,
     settlement: IdleSweepSettlementOwner,
 }
 
 impl IntegrityTier2OwnedResult {
-    async fn seal_and_bind(self) -> SealedIntegrityTier2Result {
+    pub(crate) async fn seal(self) -> IntegrityTier2SealedResult {
         let Self {
             state,
             mut report,
@@ -2323,7 +2315,7 @@ impl IntegrityTier2OwnedResult {
         } = self;
         if report.status != IntegrityTier2Status::Complete {
             drop(ticket);
-            return SealedIntegrityTier2Result {
+            return IntegrityTier2SealedResult {
                 report,
                 findings: None,
                 settlement,
@@ -2337,14 +2329,14 @@ impl IntegrityTier2OwnedResult {
         let findings = match state.seal_tier2_registered_artifact_request(request).await {
             Ok(findings) => findings,
             Err(_) if !settlement.is_current() => {
-                return SealedIntegrityTier2Result {
+                return IntegrityTier2SealedResult {
                     report: report.cancel(),
                     findings: None,
                     settlement,
                 };
             }
             Err(_) => {
-                return SealedIntegrityTier2Result {
+                return IntegrityTier2SealedResult {
                     report: report.refuse(tier2_authority_refused_fact()),
                     findings: None,
                     settlement,
@@ -2352,28 +2344,32 @@ impl IntegrityTier2OwnedResult {
             }
         };
         if !report.bind_registered_artifact_targets(&findings) {
-            return SealedIntegrityTier2Result {
+            return IntegrityTier2SealedResult {
                 report: report.refuse(tier2_authority_refused_fact()),
                 findings: None,
                 settlement,
             };
         }
-        SealedIntegrityTier2Result {
+        IntegrityTier2SealedResult {
             report,
             findings: Some(findings),
             settlement,
         }
     }
-
-    pub(crate) async fn settle_without_recovery(
-        self,
-    ) -> (IntegrityTier2Report, IdleSweepSettlement) {
-        self.seal_and_bind().await.settle_without_recovery()
-    }
 }
 
-impl SealedIntegrityTier2Result {
-    fn settle_without_recovery(self) -> (IntegrityTier2Report, IdleSweepSettlement) {
+impl IntegrityTier2SealedResult {
+    pub(crate) fn report(&self) -> &IntegrityTier2Report {
+        &self.report
+    }
+
+    pub(crate) fn take_registered_artifact_findings(
+        &mut self,
+    ) -> Option<RegisteredArtifactFindings> {
+        self.findings.take()
+    }
+
+    pub(crate) fn settle(self) -> (IntegrityTier2Report, IdleSweepSettlement) {
         let Self {
             mut report,
             findings,
@@ -4151,7 +4147,7 @@ mod tests {
     async fn settle_tier2_result(
         result: IntegrityTier2OwnedResult,
     ) -> (IntegrityTier2Report, IdleSweepSettlement) {
-        result.settle_without_recovery().await
+        result.seal().await.settle()
     }
 
     async fn test_integrity_foreground(state: &AppState) -> IntegrityForegroundLease {
@@ -5239,11 +5235,13 @@ mod tests {
 
         let result = work.spawn().join().await.expect("dedicated worker result");
         assert!(result.settlement.is_current());
-        let sealed = result.seal_and_bind().await;
+        let mut sealed = result.seal().await;
         assert!(sealed.settlement.is_current());
-        assert_eq!(sealed.report.status, IntegrityTier2Status::Complete);
-        assert!(sealed.report.repairable_observations.is_empty());
-        let findings = sealed.findings.as_ref().expect("sealed Assets findings");
+        assert_eq!(sealed.report().status, IntegrityTier2Status::Complete);
+        assert!(sealed.report().repairable_observations.is_empty());
+        let findings = sealed
+            .take_registered_artifact_findings()
+            .expect("sealed Assets findings");
         assert_eq!(findings.len(), 1);
         let target = findings.repair_target().expect("selected Assets target");
         assert_eq!(target.system, StabilizationSystem::Execution);
@@ -5253,7 +5251,7 @@ mod tests {
         assert!(target.id.starts_with("leaf-v2."));
         assert_eq!(
             sealed
-                .report
+                .report()
                 .facts
                 .iter()
                 .find(|fact| fact_field(fact, "observation") == Some("missing"))
@@ -5261,7 +5259,7 @@ mod tests {
             Some(target)
         );
 
-        let (report, settlement) = sealed.settle_without_recovery();
+        let (report, settlement) = sealed.settle();
         assert_eq!(settlement, IdleSweepSettlement::Authoritative);
         assert_eq!(report.status, IntegrityTier2Status::Complete);
         close_fixture(state, root).await;
@@ -6107,10 +6105,6 @@ mod tests {
                     panic!("corrupt Assets leaf must fail to the component rung")
                 }
             };
-        assert_eq!(
-            failure.outcome().status(),
-            GuardianArtifactRepairStatus::Failed
-        );
         assert!(matches!(
             state
                 .admit_registered_artifact_component_rebuild(
@@ -6267,10 +6261,6 @@ mod tests {
         };
 
         assert_eq!(
-            failure.outcome().status(),
-            GuardianArtifactRepairStatus::Failed
-        );
-        assert_eq!(
             fs::read(&destination).expect("unchanged Assets index"),
             corrupt
         );
@@ -6391,10 +6381,10 @@ mod tests {
                 .await
                 .expect("missing Assets repair");
 
-        assert_eq!(
-            settlement.outcome().status(),
-            GuardianArtifactRepairStatus::Repaired
-        );
+        let GuardianArtifactRepairSettlement::Completed(receipt) = settlement else {
+            panic!("missing Assets repair must complete")
+        };
+        assert_eq!(receipt.status(), GuardianArtifactRepairStatus::Repaired);
         assert_eq!(fs::read(destination).expect("repaired Assets index"), body);
         let terminal = state
             .journals()
@@ -6474,10 +6464,10 @@ mod tests {
                     .await
                     .expect("registered artifact repair");
 
-            assert_eq!(
-                settlement.outcome().status(),
-                GuardianArtifactRepairStatus::Repaired
-            );
+            let GuardianArtifactRepairSettlement::Completed(receipt) = settlement else {
+                panic!("registered artifact repair must complete")
+            };
+            assert_eq!(receipt.status(), GuardianArtifactRepairStatus::Repaired);
             assert_eq!(fs::read(&destination).expect("repaired artifact"), body);
             let journal = state.journals().get(&operation_id).expect("repair journal");
             let terminal = journal.reconciliation_terminal().expect("typed terminal");
@@ -6582,10 +6572,10 @@ mod tests {
                 .await
                 .expect("already repaired outcome");
 
-        assert_eq!(
-            settlement.outcome().status(),
-            GuardianArtifactRepairStatus::Repaired
-        );
+        let GuardianArtifactRepairSettlement::Completed(receipt) = settlement else {
+            panic!("already-exact repair must complete")
+        };
+        assert_eq!(receipt.status(), GuardianArtifactRepairStatus::Repaired);
         let journal = state.journals().get(&operation_id).expect("repair journal");
         assert_eq!(
             journal
@@ -6726,10 +6716,10 @@ mod tests {
                 .await
                 .expect("failed repair outcome");
 
-        assert_eq!(
-            settlement.outcome().status(),
-            GuardianArtifactRepairStatus::Failed
-        );
+        assert!(matches!(
+            settlement,
+            GuardianArtifactRepairSettlement::Failed(_)
+        ));
         let terminal = state
             .journals()
             .get(&operation_id)

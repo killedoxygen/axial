@@ -45,7 +45,6 @@ pub(crate) struct GuardianArtifactRepairReceipt {
 
 #[must_use]
 pub(crate) struct GuardianArtifactRepairFailure {
-    outcome: GuardianArtifactRepairReceipt,
     continuation: RegisteredArtifactFailedRepair,
 }
 
@@ -66,22 +65,8 @@ impl GuardianArtifactRepairReceipt {
 }
 
 impl GuardianArtifactRepairFailure {
-    pub(crate) const fn outcome(&self) -> &GuardianArtifactRepairReceipt {
-        &self.outcome
-    }
-
     pub(crate) fn into_continuation(self) -> RegisteredArtifactFailedRepair {
         self.continuation
-    }
-}
-
-impl GuardianArtifactRepairSettlement {
-    #[cfg(test)]
-    pub(crate) const fn outcome(&self) -> &GuardianArtifactRepairReceipt {
-        match self {
-            Self::Completed(outcome) => outcome,
-            Self::Failed(failure) => failure.outcome(),
-        }
     }
 }
 
@@ -170,10 +155,7 @@ pub(crate) async fn execute_registered_guardian_artifact_repair(
         .into_failed_continuation(execution.memory_receipt)
         .map_err(artifact_reconciliation_error)?;
     Ok(GuardianArtifactRepairSettlement::Failed(
-        GuardianArtifactRepairFailure {
-            outcome: execution.outcome,
-            continuation,
-        },
+        GuardianArtifactRepairFailure { continuation },
     ))
 }
 
@@ -1067,7 +1049,16 @@ mod persistence_contract_tests {
             .await;
         let verification = fixture
             .state
-            .mint_current_known_good_verification_lease(&foreground, &lifecycle)
+            .mint_known_good_verification_lease(
+                &foreground,
+                &lifecycle,
+                &PathBuf::from(
+                    fixture
+                        .state
+                        .library_dir()
+                        .expect("artifact persistence library root"),
+                ),
+            )
             .expect("mint artifact persistence verification");
         let observation = verification
             .registered_artifact_observation(0, RegisteredArtifactCondition::Corrupt)

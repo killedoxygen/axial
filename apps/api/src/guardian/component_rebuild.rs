@@ -646,6 +646,30 @@ pub(crate) async fn execute_failed_managed_assets_component_rebuild_for_test(
     .await
 }
 
+#[cfg(test)]
+pub(crate) async fn execute_managed_assets_component_rebuild_fixture_for_test(
+    admission: RegisteredComponentRebuildAdmission,
+) -> Result<GuardianComponentRebuildOutcome, OperationJournalStoreError> {
+    execute_managed_assets_component_rebuild_with_driver(admission, |effect| async move {
+        let (managed_root, version_id) = effect.core_request();
+        let managed_root = managed_root.to_path_buf();
+        let version_id = version_id.to_string();
+        match axial_minecraft::rebuild_managed_assets_fixture_for_test(managed_root, &version_id)
+            .await
+        {
+            Ok(receipt) => effect.committed(receipt, ["assets_component_rebuilt".to_string()]),
+            Err(
+                axial_minecraft::ManagedAssetsRebuildError::Reconstruction(_)
+                | axial_minecraft::ManagedAssetsRebuildError::Preparation,
+            ) => effect.failed_before_effect(["assets_component_rebuild_failed".to_string()]),
+            Err(axial_minecraft::ManagedAssetsRebuildError::RolledBack(receipt)) => {
+                effect.rolled_back(receipt, ["assets_component_rolled_back".to_string()])
+            }
+        }
+    })
+    .await
+}
+
 enum ComponentRebuildTerminal {
     Succeeded {
         receipt: ManagedRuntimeCommitReceipt,
@@ -1848,7 +1872,16 @@ mod tests {
             .await;
         let verification = fixture
             .state
-            .mint_current_known_good_verification_lease(&foreground, &lifecycle)
+            .mint_known_good_verification_lease(
+                &foreground,
+                &lifecycle,
+                &PathBuf::from(
+                    fixture
+                        .state
+                        .library_dir()
+                        .expect("Assets predecessor library root"),
+                ),
+            )
             .expect("mint Assets predecessor verification");
         let authority = fixture
             .state

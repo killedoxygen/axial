@@ -1,3 +1,6 @@
+use crate::application::registered_artifact_recovery::{
+    RegisteredArtifactComponentRebuildSource, execute_tier2_registered_artifact_recovery,
+};
 use crate::execution::integrity::{
     IntegrityTier2OwnedWork, IntegrityTier2OwnedWorkRejection, IntegrityTier2Report,
     IntegrityTier2Status,
@@ -147,9 +150,24 @@ impl PlannedIntegritySweep {
         self,
         settlement: IdleSweepSettlementOwner,
     ) -> IntegritySweepExecution {
-        self.start_execute_reserved_with(settlement, |_| {})
+        let Self {
+            state,
+            producer,
+            instance_id,
+            journal,
+        } = self;
+        IntegritySweepExecution {
+            completion: producer.spawn_joinable(execute_reserved_owned(
+                state,
+                instance_id,
+                journal,
+                settlement,
+                |_| {},
+            )),
+        }
     }
 
+    #[cfg(test)]
     fn start_execute_reserved_with<AfterSpawn>(
         self,
         settlement: IdleSweepSettlementOwner,
@@ -175,6 +193,34 @@ impl PlannedIntegritySweep {
         }
     }
 
+    #[cfg(test)]
+    fn start_execute_reserved_with_source<AfterSpawn>(
+        self,
+        settlement: IdleSweepSettlementOwner,
+        after_spawn: AfterSpawn,
+        rebuild_source: RegisteredArtifactComponentRebuildSource,
+    ) -> IntegritySweepExecution
+    where
+        AfterSpawn: FnOnce(IdleSweepCancellation) + Send + 'static,
+    {
+        let Self {
+            state,
+            producer,
+            instance_id,
+            journal,
+        } = self;
+        IntegritySweepExecution {
+            completion: producer.spawn_joinable(execute_reserved_owned_with_source(
+                state,
+                instance_id,
+                journal,
+                settlement,
+                after_spawn,
+                rebuild_source,
+            )),
+        }
+    }
+
     async fn record_terminal(
         &self,
         transition: &Tier2TerminalTransition,
@@ -189,6 +235,28 @@ async fn execute_reserved_owned<AfterSpawn>(
     journal: OperationJournalEntry,
     settlement: IdleSweepSettlementOwner,
     after_spawn: AfterSpawn,
+) -> Result<IdleIntegrityTerminal, Tier2IntegritySweepError>
+where
+    AfterSpawn: FnOnce(IdleSweepCancellation),
+{
+    execute_reserved_owned_with_source(
+        state,
+        instance_id,
+        journal,
+        settlement,
+        after_spawn,
+        RegisteredArtifactComponentRebuildSource::Production,
+    )
+    .await
+}
+
+async fn execute_reserved_owned_with_source<AfterSpawn>(
+    state: AppState,
+    instance_id: String,
+    journal: OperationJournalEntry,
+    settlement: IdleSweepSettlementOwner,
+    after_spawn: AfterSpawn,
+    rebuild_source: RegisteredArtifactComponentRebuildSource,
 ) -> Result<IdleIntegrityTerminal, Tier2IntegritySweepError>
 where
     AfterSpawn: FnOnce(IdleSweepCancellation),
@@ -246,7 +314,29 @@ where
     let result = worker.join().await;
     let (transition, terminal) = match result {
         Ok(result) => {
-            let (report, settlement) = result.settle_without_recovery().await;
+            let mut sealed = result.seal().await;
+            if sealed.report().status == IntegrityTier2Status::Complete {
+                if let Some(findings) = sealed.take_registered_artifact_findings() {
+                    let client = reqwest::Client::new();
+                    if let Err(error) = execute_tier2_registered_artifact_recovery(
+                        &state,
+                        &journal.operation_id,
+                        sealed.report(),
+                        findings,
+                        &client,
+                        rebuild_source,
+                    )
+                    .await
+                    {
+                        tracing::warn!(
+                            operation_id = journal.operation_id.as_str(),
+                            error_kind = error.class(),
+                            "Tier 2 registered artifact recovery failed"
+                        );
+                    }
+                }
+            }
+            let (report, settlement) = sealed.settle();
             match report.status {
                 IntegrityTier2Status::Complete => {
                     debug_assert_eq!(settlement, IdleSweepSettlement::Authoritative);
@@ -298,6 +388,17 @@ impl ReservedIntegritySweep {
     #[cfg(test)]
     pub(super) async fn execute(self) -> Result<IdleIntegrityTerminal, Tier2IntegritySweepError> {
         self.start().wait().await
+    }
+
+    #[cfg(test)]
+    async fn execute_with_rebuild_source(
+        self,
+        rebuild_source: RegisteredArtifactComponentRebuildSource,
+    ) -> Result<IdleIntegrityTerminal, Tier2IntegritySweepError> {
+        self.planned
+            .start_execute_reserved_with_source(self.settlement, |_| {}, rebuild_source)
+            .wait()
+            .await
     }
 
     pub(super) async fn cancel(self) -> Result<IdleIntegrityTerminal, Tier2IntegritySweepError> {
@@ -739,6 +840,7 @@ mod tests {
     use super::*;
     use crate::execution::file::{FileWriteRequest, write_file_atomically};
     use crate::execution::persistence::{AtomicWriteBackend, PersistenceCoordinator};
+    use crate::state::contracts::{ReconciliationComponent, ReconciliationRung};
     use crate::state::{AppStateInit, InstallStore, SessionStore};
     use axial_config::{AppPaths, ConfigStore, InstanceRegistrySnapshot, InstanceStore};
     use axial_minecraft::known_good::{
@@ -746,6 +848,7 @@ mod tests {
         TestKnownGoodRoot,
     };
     use axial_performance::PerformanceManager;
+    use sha1::{Digest as _, Sha1};
     use std::fs;
     use std::io;
     use std::path::{Path, PathBuf};
@@ -927,16 +1030,70 @@ mod tests {
     }
 
     fn activate_corrupt_inventory(state: &AppState, instance_id: &str, paths: &AppPaths) {
-        let parent = paths.library_dir.join("libraries/corrupt");
-        fs::create_dir_all(&parent).expect("create corrupt parent");
-        fs::write(parent.join("library.jar"), [7_u8]).expect("write corrupt artifact");
-        let inventory = KnownGoodInventory::from_test_entries([TestKnownGoodEntry {
-            root: TestKnownGoodRoot::Libraries,
-            path: "corrupt/library.jar".to_string(),
-            kind: KnownGoodArtifactKind::Library,
-            integrity: TestKnownGoodIntegrity::File { size: 1 },
-        }])
-        .expect("corrupt inventory");
+        const OBJECT_BYTES: &[u8] = b"axial managed Assets fixture";
+        let object_digest = format!("{:x}", Sha1::digest(OBJECT_BYTES));
+        let empty_digest = format!("{:x}", Sha1::digest([]));
+        let index_bytes = serde_json::to_vec(&serde_json::json!({
+            "objects": {
+                "fixture/object": {
+                    "hash": object_digest.as_str(),
+                    "size": OBJECT_BYTES.len()
+                },
+                "fixture/empty": {
+                    "hash": empty_digest.as_str(),
+                    "size": 0
+                }
+            }
+        }))
+        .expect("Assets fixture index");
+        let parent = paths.library_dir.join("assets/indexes");
+        fs::create_dir_all(&parent).expect("create corrupt Assets parent");
+        fs::write(
+            parent.join("fixture-assets.json"),
+            vec![7_u8; index_bytes.len()],
+        )
+        .expect("write corrupt Assets index");
+        let inventory = KnownGoodInventory::from_test_entries([
+            TestKnownGoodEntry {
+                root: TestKnownGoodRoot::Assets,
+                path: "indexes/fixture-assets.json".to_string(),
+                kind: KnownGoodArtifactKind::AssetIndex,
+                integrity: TestKnownGoodIntegrity::Sha1 {
+                    digest: format!("{:x}", Sha1::digest(&index_bytes)),
+                    size: index_bytes.len() as u64,
+                },
+            },
+            TestKnownGoodEntry {
+                root: TestKnownGoodRoot::Assets,
+                path: format!("objects/{}/{}", &object_digest[..2], object_digest),
+                kind: KnownGoodArtifactKind::AssetObject,
+                integrity: TestKnownGoodIntegrity::Sha1 {
+                    digest: object_digest.clone(),
+                    size: OBJECT_BYTES.len() as u64,
+                },
+            },
+            TestKnownGoodEntry {
+                root: TestKnownGoodRoot::Assets,
+                path: format!("objects/{}/{}", &empty_digest[..2], empty_digest),
+                kind: KnownGoodArtifactKind::AssetObject,
+                integrity: TestKnownGoodIntegrity::Sha1 {
+                    digest: empty_digest,
+                    size: 0,
+                },
+            },
+        ])
+        .expect("corrupt Assets inventory")
+        .with_test_standalone_leaf_repair_source(0, "https://example.invalid/fixture-assets.json")
+        .expect("Assets index fixture source")
+        .with_test_standalone_leaf_repair_source(
+            1,
+            &format!(
+                "https://resources.download.minecraft.net/{}/{}",
+                &object_digest[..2],
+                object_digest
+            ),
+        )
+        .expect("Assets object fixture source");
         state.activate_known_good_inventory_for_test(instance_id, inventory);
     }
 
@@ -1212,7 +1369,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn corrupt_sweep_records_bounded_guardian_findings_after_completion() {
+    async fn corrupt_assets_sweep_repairs_lowest_source_backed_finding_before_completion() {
         let (state, root, paths) = state_fixture("corrupt");
         let instance = state
             .instances()
@@ -1222,7 +1379,10 @@ mod tests {
         let plan = fixed_plan(&state, &instance.id, FIRST_OPERATION_ID).await;
         let reserved = reserve(plan, idle_epoch(&state));
 
-        let terminal = reserved.execute().await.expect("execute corrupt sweep");
+        let terminal = reserved
+            .execute_with_rebuild_source(RegisteredArtifactComponentRebuildSource::Fixture)
+            .await
+            .expect("execute corrupt sweep");
 
         assert_eq!(terminal, IdleIntegrityTerminal::Succeeded);
         let journal = state
@@ -1230,10 +1390,7 @@ mod tests {
             .get(&OperationId::new(FIRST_OPERATION_ID))
             .expect("corrupt terminal journal");
         assert_eq!(journal.status, OperationStatus::Succeeded);
-        assert_eq!(
-            journal_fact_ids(&journal),
-            vec!["guardian_fact:artifact_hash_mismatch"]
-        );
+        assert!(journal_fact_ids(&journal).contains(&"guardian_fact:artifact_hash_mismatch"));
         assert_eq!(
             journal.guardian_diagnosis_ids,
             vec![crate::guardian::DiagnosisId::LauncherManagedArtifactCorrupt]
@@ -1241,6 +1398,40 @@ mod tests {
         assert!(
             journal.completed_steps[0].generated_facts.len()
                 <= crate::state::MAX_OPERATION_JOURNAL_STEP_FACTS
+        );
+        let child_journals = state
+            .journals()
+            .list()
+            .into_iter()
+            .filter(|entry| entry.operation_id != journal.operation_id)
+            .filter_map(|entry| {
+                entry
+                    .reconciliation_attempt()
+                    .cloned()
+                    .map(|attempt| (entry, attempt))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(child_journals.len(), 2);
+        let leaf = child_journals
+            .iter()
+            .find(|(_, attempt)| attempt.rung() == ReconciliationRung::RepairArtifact)
+            .expect("Assets leaf child journal");
+        assert_eq!(leaf.0.status, OperationStatus::Failed);
+        assert_eq!(leaf.1.component(), ReconciliationComponent::Assets);
+        let component = child_journals
+            .iter()
+            .find(|(_, attempt)| attempt.rung() == ReconciliationRung::RebuildComponent)
+            .expect("Assets component child journal");
+        assert_eq!(component.0.status, OperationStatus::Succeeded);
+        assert_eq!(component.1.component(), ReconciliationComponent::Assets);
+        assert_ne!(leaf.0.operation_id, component.0.operation_id);
+        assert_ne!(leaf.0.operation_id, journal.operation_id);
+        assert_ne!(component.0.operation_id, journal.operation_id);
+        assert!(
+            fs::read(paths.library_dir.join("assets/indexes/fixture-assets.json"))
+                .expect("rebuilt Assets index")
+                .into_iter()
+                .any(|byte| byte != 7)
         );
         close_fixture(state, &root).await;
     }
@@ -1493,28 +1684,5 @@ mod tests {
             OperationStatus::Planned
         );
         close_fixture(state, &root).await;
-    }
-
-    #[test]
-    fn tier_two_transaction_has_no_progress_policy_repair_or_compatibility_path() {
-        fn assert_send<T: Send>() {}
-        assert_send::<PlannedIntegritySweep>();
-
-        let source = include_str!("integrity.rs");
-        let production = source
-            .split("\n#[cfg(test)]\nmod tests {")
-            .next()
-            .expect("production transaction source");
-        assert!(!production.contains("record_progress"));
-        assert!(!production.contains("decide_guardian_policy"));
-        assert!(!production.contains("repair"));
-        assert!(!production.contains("failure_memory"));
-        assert_eq!(production.matches(".spawn()").count(), 1);
-        assert!(
-            production
-                .find("mint_known_good_tier2_ticket")
-                .expect("ticket mint")
-                < production.find(".spawn()").expect("dedicated worker spawn")
-        );
     }
 }

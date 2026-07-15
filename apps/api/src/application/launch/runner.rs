@@ -9,11 +9,10 @@ mod status;
 use crate::application::guardian_conversion::api_guardian_mode;
 use crate::application::launch_application_stage_evidence;
 use crate::application::registered_artifact_recovery::{
-    LibrariesComponentRebuildSource, REGISTERED_ARTIFACT_REPAIR_SUPPRESSION_MINUTES,
-    execute_registered_artifact_recovery_sequence, new_registered_artifact_repair_operation_id,
+    REGISTERED_ARTIFACT_REPAIR_SUPPRESSION_MINUTES, RegisteredArtifactComponentRebuildSource,
+    RegisteredArtifactRecoveryEntry, execute_registered_artifact_recovery_sequence,
+    new_registered_artifact_repair_operation_id,
 };
-#[cfg(test)]
-use crate::execution::integrity::sense_current_integrity_tier1;
 use crate::execution::integrity::sense_integrity_tier1;
 use crate::execution::launch::{
     LaunchCommandPreparationRequest, launch_command_stage_evidence, prepare_launch_command,
@@ -1387,9 +1386,9 @@ async fn launch_session_inner_with_control(
                             let client = reqwest::Client::new();
                             let outcome = execute_registered_artifact_recovery_sequence(
                                 &recovery_state,
-                                admission,
+                                RegisteredArtifactRecoveryEntry::Fresh(admission),
                                 &client,
-                                LibrariesComponentRebuildSource::Production,
+                                RegisteredArtifactComponentRebuildSource::Production,
                             )
                             .await;
                             (outcome, retained_foreground)
@@ -2009,7 +2008,7 @@ mod tests {
             .await;
         let lifecycle = state.acquire_instance_lifecycle(instance_id).await;
         let operation_id = OperationId::new("registered-library-leaf-failed");
-        let report = sense_current_integrity_tier1(&state, &foreground, &lifecycle)
+        let report = sense_integrity_tier1(&state, &foreground, &lifecycle, &library_root)
             .await
             .expect("sense missing registered Libraries fixture");
         assert_eq!(report.facts.len(), 1);
@@ -2033,9 +2032,9 @@ mod tests {
 
         let recovery = execute_registered_artifact_recovery_sequence(
             &state,
-            admission,
+            RegisteredArtifactRecoveryEntry::Fresh(admission),
             &reqwest::Client::new(),
-            LibrariesComponentRebuildSource::Fixture,
+            RegisteredArtifactComponentRebuildSource::Fixture,
         )
         .await
         .expect("settle registered Libraries component recovery");
@@ -2119,14 +2118,14 @@ mod tests {
 
         let lifecycle = state.acquire_instance_lifecycle(instance_id).await;
         let verification = state
-            .mint_current_known_good_verification_lease(&foreground, &lifecycle)
+            .mint_known_good_verification_lease(&foreground, &lifecycle, &library_root)
             .expect("current Libraries verification lease");
         assert!(std::ptr::eq(
             verification.execution_parts().5,
             Arc::as_ref(&active_inventory),
         ));
         drop(verification);
-        let postcheck = sense_current_integrity_tier1(&state, &foreground, &lifecycle)
+        let postcheck = sense_integrity_tier1(&state, &foreground, &lifecycle, &library_root)
             .await
             .expect("fresh Libraries Tier1 postcheck");
         assert!(postcheck.facts.is_empty());

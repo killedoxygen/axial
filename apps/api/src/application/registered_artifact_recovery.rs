@@ -1,12 +1,17 @@
+use super::guardian_conversion::api_guardian_mode_from_config;
+use crate::execution::integrity::IntegrityTier2Report;
+#[cfg(test)]
+use crate::guardian::execute_managed_assets_component_rebuild_fixture_for_test;
 use crate::guardian::{
     DiagnosisId, GuardianArtifactRepairSettlement, GuardianArtifactRepairStatus,
-    GuardianComponentRebuildStatus, execute_managed_libraries_component_rebuild,
-    execute_registered_guardian_artifact_repair,
+    GuardianComponentRebuildStatus, Tier2RegisteredArtifactAssessment,
+    assess_tier2_registered_artifact_repair, execute_managed_assets_component_rebuild,
+    execute_managed_libraries_component_rebuild, execute_registered_guardian_artifact_repair,
 };
-use crate::state::contracts::OperationId;
+use crate::state::contracts::{OperationId, ReconciliationComponent};
 use crate::state::{
     AppState, OperationJournalStoreError, RegisteredArtifactFailedRepair,
-    RegisteredArtifactRepairAdmission,
+    RegisteredArtifactFindings, RegisteredArtifactRepairAdmission, RegisteredAssetsRecoveryEntry,
 };
 
 pub(super) const REGISTERED_ARTIFACT_REPAIR_SUPPRESSION_MINUTES: i64 = 15;
@@ -18,18 +23,24 @@ pub(super) fn new_registered_artifact_repair_operation_id() -> OperationId {
     ))
 }
 
-fn new_libraries_component_rebuild_operation_id() -> OperationId {
+fn new_registered_component_rebuild_operation_id() -> OperationId {
     OperationId::new(format!(
-        "guardian-libraries-component-rebuild:{}",
+        "guardian-registered-component-rebuild:{}",
         uuid::Uuid::new_v4()
     ))
 }
 
 #[derive(Clone, Copy)]
-pub(super) enum LibrariesComponentRebuildSource {
+pub(super) enum RegisteredArtifactComponentRebuildSource {
     Production,
     #[cfg(test)]
     Fixture,
+}
+
+#[must_use]
+pub(super) enum RegisteredArtifactRecoveryEntry {
+    Fresh(RegisteredArtifactRepairAdmission),
+    Resume(RegisteredArtifactFailedRepair),
 }
 
 pub(super) struct RegisteredArtifactRecoverySequenceOutcome {
@@ -37,88 +48,165 @@ pub(super) struct RegisteredArtifactRecoverySequenceOutcome {
     pub(super) effective_status: GuardianArtifactRepairStatus,
 }
 
-pub(super) async fn execute_registered_artifact_recovery_sequence(
+pub(super) async fn execute_tier2_registered_artifact_recovery(
     state: &AppState,
-    admission: RegisteredArtifactRepairAdmission,
+    sweep_operation_id: &OperationId,
+    report: &IntegrityTier2Report,
+    findings: RegisteredArtifactFindings,
     client: &reqwest::Client,
-    rebuild_source: LibrariesComponentRebuildSource,
-) -> Result<RegisteredArtifactRecoverySequenceOutcome, OperationJournalStoreError> {
-    match execute_registered_guardian_artifact_repair(admission, client).await? {
-        GuardianArtifactRepairSettlement::Completed(outcome) => {
-            Ok(RegisteredArtifactRecoverySequenceOutcome {
-                diagnosis_id: outcome.diagnosis_id(),
-                effective_status: outcome.status(),
-            })
+    rebuild_source: RegisteredArtifactComponentRebuildSource,
+) -> Result<Option<RegisteredArtifactRecoverySequenceOutcome>, OperationJournalStoreError> {
+    let assessment: Tier2RegisteredArtifactAssessment = {
+        let Some(candidate) = findings.repair_candidate() else {
+            return Ok(None);
+        };
+        let mut matching_facts = report
+            .facts
+            .iter()
+            .filter(|fact| fact.target.as_ref() == Some(candidate.target()));
+        let Some(fact) = matching_facts.next() else {
+            return Ok(None);
+        };
+        if matching_facts.next().is_some() {
+            return Ok(None);
         }
-        GuardianArtifactRepairSettlement::Failed(failure) => {
-            let diagnosis_id = failure.outcome().diagnosis_id();
-            execute_failed_registered_artifact_recovery(
-                state,
-                diagnosis_id,
-                failure.into_continuation(),
-                rebuild_source,
-            )
-            .await
+        let mode = api_guardian_mode_from_config(&state.config().current().guardian_mode);
+        let Some(assessment) = assess_tier2_registered_artifact_repair(
+            sweep_operation_id.clone(),
+            mode,
+            fact,
+            candidate,
+        ) else {
+            return Ok(None);
+        };
+        assessment
+    };
+    let Ok(authorization) = findings.authorize_repair(assessment.decision()) else {
+        return Ok(None);
+    };
+    let Ok(entry) = state.registered_assets_recovery_entry(authorization) else {
+        return Ok(None);
+    };
+    let entry = match entry {
+        RegisteredAssetsRecoveryEntry::Fresh(authorization) => {
+            let Ok(admission) = state
+                .admit_registered_artifact_repair(
+                    authorization,
+                    new_registered_artifact_repair_operation_id(),
+                    chrono::Duration::minutes(REGISTERED_ARTIFACT_REPAIR_SUPPRESSION_MINUTES),
+                )
+                .await
+            else {
+                return Ok(None);
+            };
+            RegisteredArtifactRecoveryEntry::Fresh(admission)
         }
-    }
+        RegisteredAssetsRecoveryEntry::Resume(continuation) => {
+            RegisteredArtifactRecoveryEntry::Resume(continuation)
+        }
+    };
+    execute_registered_artifact_recovery_sequence(state, entry, client, rebuild_source)
+        .await
+        .map(Some)
 }
 
-async fn execute_failed_registered_artifact_recovery(
+pub(super) async fn execute_registered_artifact_recovery_sequence(
     state: &AppState,
-    diagnosis_id: DiagnosisId,
-    continuation: RegisteredArtifactFailedRepair,
-    rebuild_source: LibrariesComponentRebuildSource,
+    entry: RegisteredArtifactRecoveryEntry,
+    client: &reqwest::Client,
+    rebuild_source: RegisteredArtifactComponentRebuildSource,
 ) -> Result<RegisteredArtifactRecoverySequenceOutcome, OperationJournalStoreError> {
+    let continuation = match entry {
+        RegisteredArtifactRecoveryEntry::Fresh(admission) => {
+            match execute_registered_guardian_artifact_repair(admission, client).await? {
+                GuardianArtifactRepairSettlement::Completed(outcome) => {
+                    return Ok(RegisteredArtifactRecoverySequenceOutcome {
+                        diagnosis_id: outcome.diagnosis_id(),
+                        effective_status: outcome.status(),
+                    });
+                }
+                GuardianArtifactRepairSettlement::Failed(failure) => failure.into_continuation(),
+            }
+        }
+        RegisteredArtifactRecoveryEntry::Resume(continuation) => continuation,
+    };
+
     let component_admission = state
         .admit_registered_artifact_component_rebuild(
             continuation,
-            new_libraries_component_rebuild_operation_id(),
+            new_registered_component_rebuild_operation_id(),
             chrono::Duration::minutes(REGISTERED_ARTIFACT_REPAIR_SUPPRESSION_MINUTES),
         )
         .await
         .map_err(|_| {
-            registered_artifact_recovery_error("Libraries component rebuild admission was refused")
+            registered_artifact_recovery_error("component rebuild admission was refused")
         })?;
-
-    let rebuild = execute_managed_libraries_component_rebuild(
-        component_admission,
-        move |effect| async move {
-            let (root, version_id) = effect.core_request();
-            let root = root.to_path_buf();
-            let version_id = version_id.to_string();
-            let rebuilt = match rebuild_source {
-                LibrariesComponentRebuildSource::Production => {
-                    axial_minecraft::rebuild_managed_libraries(root, &version_id).await
-                }
-                #[cfg(test)]
-                LibrariesComponentRebuildSource::Fixture => {
-                    axial_minecraft::rebuild_managed_libraries_fixture_for_test(root, &version_id)
-                        .await
-                }
-            };
-            match rebuilt {
-                Ok(receipt) => effect.committed(receipt, Vec::new()),
-                Err(
-                    axial_minecraft::ManagedLibrariesRebuildError::Reconstruction(_)
-                    | axial_minecraft::ManagedLibrariesRebuildError::Preparation,
-                ) => effect.failed_before_effect(["libraries_component_preparation_failed".into()]),
-                Err(axial_minecraft::ManagedLibrariesRebuildError::RolledBack(receipt)) => {
-                    effect.rolled_back(receipt, ["libraries_component_rebuild_rolled_back".into()])
-                }
+    let diagnosis_id = component_admission.attempt().diagnosis_id();
+    let component = component_admission.attempt().component();
+    let rebuild = match component {
+        ReconciliationComponent::Libraries => {
+            execute_managed_libraries_component_rebuild(
+                component_admission,
+                move |effect| async move {
+                    let (root, version_id) = effect.core_request();
+                    let root = root.to_path_buf();
+                    let version_id = version_id.to_string();
+                    let rebuilt = match rebuild_source {
+                        RegisteredArtifactComponentRebuildSource::Production => {
+                            axial_minecraft::rebuild_managed_libraries(root, &version_id).await
+                        }
+                        #[cfg(test)]
+                        RegisteredArtifactComponentRebuildSource::Fixture => {
+                            axial_minecraft::rebuild_managed_libraries_fixture_for_test(
+                                root,
+                                &version_id,
+                            )
+                            .await
+                        }
+                    };
+                    match rebuilt {
+                        Ok(receipt) => effect.committed(receipt, Vec::new()),
+                        Err(
+                            axial_minecraft::ManagedLibrariesRebuildError::Reconstruction(_)
+                            | axial_minecraft::ManagedLibrariesRebuildError::Preparation,
+                        ) => effect.failed_before_effect([
+                            "libraries_component_preparation_failed".into(),
+                        ]),
+                        Err(axial_minecraft::ManagedLibrariesRebuildError::RolledBack(receipt)) => {
+                            effect.rolled_back(
+                                receipt,
+                                ["libraries_component_rebuild_rolled_back".into()],
+                            )
+                        }
+                    }
+                },
+            )
+            .await?
+        }
+        ReconciliationComponent::Assets => match rebuild_source {
+            RegisteredArtifactComponentRebuildSource::Production => {
+                execute_managed_assets_component_rebuild(component_admission).await?
+            }
+            #[cfg(test)]
+            RegisteredArtifactComponentRebuildSource::Fixture => {
+                execute_managed_assets_component_rebuild_fixture_for_test(component_admission)
+                    .await?
             }
         },
-    )
-    .await?;
-    if rebuild.status != GuardianComponentRebuildStatus::Rebuilt {
-        return Ok(RegisteredArtifactRecoverySequenceOutcome {
-            diagnosis_id,
-            effective_status: GuardianArtifactRepairStatus::Failed,
-        });
-    }
+        _ => {
+            return Err(registered_artifact_recovery_error(
+                "registered artifact recovery selected an unsupported component",
+            ));
+        }
+    };
 
     Ok(RegisteredArtifactRecoverySequenceOutcome {
         diagnosis_id,
-        effective_status: GuardianArtifactRepairStatus::Repaired,
+        effective_status: if rebuild.status == GuardianComponentRebuildStatus::Rebuilt {
+            GuardianArtifactRepairStatus::Repaired
+        } else {
+            GuardianArtifactRepairStatus::Failed
+        },
     })
 }
 

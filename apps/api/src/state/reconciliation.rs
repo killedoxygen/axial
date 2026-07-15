@@ -2904,7 +2904,11 @@ mod tests {
             .await;
         let verification = fixture
             .state
-            .mint_current_known_good_verification_lease(&foreground, &lifecycle)
+            .mint_known_good_verification_lease(
+                &foreground,
+                &lifecycle,
+                &PathBuf::from(fixture.state.library_dir().expect("Assets recovery root")),
+            )
             .expect("mint Assets recovery verification");
         let observation = verification
             .registered_artifact_observation(0, condition)
@@ -3121,7 +3125,16 @@ mod tests {
             .await;
         let verification = fixture
             .state
-            .mint_current_known_good_verification_lease(&foreground, &lifecycle)
+            .mint_known_good_verification_lease(
+                &foreground,
+                &lifecycle,
+                &PathBuf::from(
+                    fixture
+                        .state
+                        .library_dir()
+                        .expect("persisted Assets failure root"),
+                ),
+            )
             .expect("mint persisted Assets failure verification");
         let authority = fixture
             .state
@@ -3828,7 +3841,16 @@ mod tests {
             .await;
         let verification = fixture
             .state
-            .mint_current_known_good_verification_lease(&foreground, &lifecycle)
+            .mint_known_good_verification_lease(
+                &foreground,
+                &lifecycle,
+                &PathBuf::from(
+                    fixture
+                        .state
+                        .library_dir()
+                        .expect("verified predecessor root"),
+                ),
+            )
             .expect("mint verified predecessor lease");
         let authority = fixture
             .state

@@ -1325,19 +1325,6 @@ impl AppState {
         })
     }
 
-    pub(crate) fn mint_current_known_good_verification_lease(
-        &self,
-        foreground: &IntegrityForegroundLease,
-        lifecycle: &InstanceLifecycleLease,
-    ) -> Result<KnownGoodVerificationLease, KnownGoodVerificationUnavailable> {
-        let library_root = self
-            .library_dir()
-            .map(PathBuf::from)
-            .and_then(|root| known_good::normalize_library_root(&root).ok())
-            .ok_or(KnownGoodVerificationUnavailable::LibraryRootUnavailable)?;
-        self.mint_known_good_verification_lease(foreground, lifecycle, &library_root)
-    }
-
     pub(crate) fn known_good_verification_lease_can_admit(
         &self,
         lease: &KnownGoodVerificationLease,
