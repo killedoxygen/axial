@@ -1,9 +1,11 @@
 use super::contracts::{
     CommandKind, OperationId, OperationJournalEntry, OperationJournalStep, OperationOutcome,
     OperationPhase, OperationStatus, OperationStepResult, OwnershipClass, ReconciliationAttempt,
-    ReconciliationComponent, ReconciliationIncarnationFingerprint, ReconciliationRung,
-    ReconciliationScope, ReconciliationTerminal, ReconciliationTerminalOutcome, RollbackState,
-    StabilizationSystem, TargetDescriptor, TargetKind,
+    ReconciliationComponent, ReconciliationIncarnationFingerprint,
+    ReconciliationInventoryFingerprint, ReconciliationLineage, ReconciliationQuarantineCheckpoint,
+    ReconciliationQuarantineRecord, ReconciliationRung, ReconciliationScope,
+    ReconciliationTerminal, ReconciliationTerminalOutcome, RollbackState, StabilizationSystem,
+    TargetDescriptor, TargetKind,
 };
 use super::failure_memory::{
     FailureMemoryActionOutcome, FailureMemoryKey, FailureMemoryStoreError,
@@ -42,8 +44,19 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 const RECONCILIATION_FINGERPRINT_DOMAIN: &[u8] = b"axial.guardian.reconciliation.incarnation.v1";
+const RECONCILIATION_INVENTORY_FINGERPRINT_DOMAIN: &[u8] =
+    b"axial.guardian.reconciliation.inventory.v1";
+const RECONCILIATION_INVENTORY_ENTRY_DOMAIN: &[u8] =
+    b"axial.guardian.reconciliation.inventory-entry.v1";
 pub(crate) const REGISTERED_ARTIFACT_COMPONENT_REBUILD_FAILURE_POINT: &str =
     "require_registered_artifact_component_rebuild";
+pub(crate) const COMPONENT_REBUILD_START_STEP: &str = "journal_component_rebuild_start";
+pub(crate) const COMPONENT_QUARANTINE_STEP: &str = "quarantine_launcher_managed_target";
+pub(crate) const RUNTIME_COMPONENT_REBUILD_STEP: &str = "rebuild_managed_runtime_component";
+pub(crate) const VERSION_BUNDLE_COMPONENT_REBUILD_STEP: &str =
+    "rebuild_managed_version_bundle_component";
+pub(crate) const LIBRARIES_COMPONENT_REBUILD_STEP: &str = "rebuild_managed_libraries_component";
+pub(crate) const ASSETS_COMPONENT_REBUILD_STEP: &str = "rebuild_managed_assets_component";
 
 pub(crate) struct RecordedRuntimeArtifactRepairFailure {
     evidence: RecordedReconciliationFailure,
@@ -65,7 +78,6 @@ pub(crate) struct RegisteredComponentRebuildAdmission {
     authority: RegisteredReconciliationAuthority,
     attempt: ReconciliationAttempt,
     failed_terminal: ReconciliationTerminal,
-    _predecessor: ReconciliationTerminal,
     known_good: RegisteredKnownGoodInventory,
     artifact_provenance: Option<RegisteredArtifactProvenance>,
     component_state: RegisteredComponentRebuildState,
@@ -402,6 +414,7 @@ impl ManagedArtifactCompletionAuthority {
         let ReconciliationScope::RegisteredInstance {
             instance_id,
             fingerprint,
+            inventory_fingerprint,
         } = self.durable.attempt.scope();
         let Ok(current) = self
             .durable
@@ -412,6 +425,7 @@ impl ManagedArtifactCompletionAuthority {
         };
         if instance_id != &self.known_good.instance_id
             || fingerprint != &current.fingerprint
+            || inventory_fingerprint != &current.inventory_fingerprint
             || current.roots.library != self.known_good.library_root
         {
             return false;
@@ -450,7 +464,7 @@ impl ManagedArtifactCompletionAuthority {
         let terminal = ReconciliationTerminal::from_attempt(
             self.durable.attempt.clone(),
             ReconciliationTerminalOutcome::Succeeded,
-            None,
+            ReconciliationQuarantineCheckpoint::default(),
         );
         RegisteredManagedArtifactComponentSettlement {
             durable: self.durable,
@@ -631,6 +645,16 @@ struct ReconciliationRoots {
 
 struct CurrentReconciliationIncarnation {
     fingerprint: ReconciliationIncarnationFingerprint,
+    inventory_fingerprint: ReconciliationInventoryFingerprint,
+    roots: ReconciliationRoots,
+    inventory: std::sync::Arc<axial_minecraft::known_good::KnownGoodInventory>,
+}
+
+struct CurrentReconciliationIdentity {
+    instance_id: String,
+    version_id: String,
+    created_at: String,
+    fingerprint: ReconciliationIncarnationFingerprint,
     roots: ReconciliationRoots,
 }
 
@@ -779,7 +803,6 @@ impl RegisteredComponentRebuildAdmission {
             authority,
             attempt,
             failed_terminal,
-            _predecessor: _,
             known_good,
             artifact_provenance,
             component_state: _,
@@ -866,8 +889,10 @@ impl RegisteredComponentRebuildAdmission {
         if !receipt.matches_known_good_inventory(&refreshed_inventory) {
             return Err(ReconciliationEvidenceRejection::JournalMismatch);
         }
-        let quarantined_target =
-            self.validated_quarantine_target(receipt.component(), receipt.quarantine_obligation())?;
+        let quarantine_checkpoint = self.validated_runtime_quarantine_checkpoint(
+            receipt.component(),
+            receipt.quarantine_obligation(),
+        )?;
         self.authority
             .state
             .known_good
@@ -920,7 +945,7 @@ impl RegisteredComponentRebuildAdmission {
         Ok(ReconciliationTerminal::from_attempt(
             self.attempt.clone(),
             ReconciliationTerminalOutcome::Succeeded,
-            quarantined_target,
+            quarantine_checkpoint,
         ))
     }
 
@@ -940,12 +965,14 @@ impl RegisteredComponentRebuildAdmission {
         } else {
             self.validate_runtime_receipt_identity(receipt)?;
         }
-        let quarantined_target =
-            self.validated_quarantine_target(receipt.component(), receipt.quarantine_obligation())?;
+        let quarantine_checkpoint = self.validated_runtime_quarantine_checkpoint(
+            receipt.component(),
+            receipt.quarantine_obligation(),
+        )?;
         Ok(ReconciliationTerminal::from_attempt(
             self.attempt.clone(),
             ReconciliationTerminalOutcome::Failed,
-            quarantined_target,
+            quarantine_checkpoint,
         ))
     }
 
@@ -960,7 +987,10 @@ impl RegisteredComponentRebuildAdmission {
         Ok(ReconciliationTerminal::from_attempt(
             self.attempt.clone(),
             ReconciliationTerminalOutcome::Failed,
-            self.validated_quarantine_target(receipt.component(), receipt.quarantine_obligation())?,
+            self.validated_runtime_quarantine_checkpoint(
+                receipt.component(),
+                receipt.quarantine_obligation(),
+            )?,
         ))
     }
 
@@ -1004,6 +1034,15 @@ impl RegisteredComponentRebuildAdmission {
         std::sync::Arc<axial_minecraft::known_good::KnownGoodInventory>,
         ReconciliationEvidenceRejection,
     > {
+        let ReconciliationScope::RegisteredInstance {
+            inventory_fingerprint,
+            ..
+        } = self.attempt.scope();
+        if &reconciliation_inventory_fingerprint(&self.known_good.inventory)
+            != inventory_fingerprint
+        {
+            return Err(ReconciliationEvidenceRejection::IncarnationMismatch);
+        }
         self.validate_runtime_identity_against(component, matches_cache, &self.known_good.inventory)
     }
 
@@ -1016,9 +1055,8 @@ impl RegisteredComponentRebuildAdmission {
         std::sync::Arc<axial_minecraft::known_good::KnownGoodInventory>,
         ReconciliationEvidenceRejection,
     > {
-        let inventory = self
-            .current_runtime_inventory(component, matches_cache)?
-            .ok_or(ReconciliationEvidenceRejection::RootAuthorityUnavailable)?;
+        let inventory =
+            self.current_runtime_inventory(component, matches_cache, expected_inventory)?;
         if !std::sync::Arc::ptr_eq(&inventory, expected_inventory) {
             return Err(ReconciliationEvidenceRejection::IncarnationMismatch);
         }
@@ -1029,36 +1067,34 @@ impl RegisteredComponentRebuildAdmission {
         &self,
         component: &RuntimeId,
         matches_cache: bool,
+        expected_inventory: &std::sync::Arc<axial_minecraft::known_good::KnownGoodInventory>,
     ) -> Result<
-        Option<std::sync::Arc<axial_minecraft::known_good::KnownGoodInventory>>,
+        std::sync::Arc<axial_minecraft::known_good::KnownGoodInventory>,
         ReconciliationEvidenceRejection,
     > {
         self.validate_runtime_receipt_capability(component, matches_cache)?;
         let ReconciliationScope::RegisteredInstance {
             instance_id,
             fingerprint,
+            ..
         } = self.attempt.scope();
+        let identity = self
+            .authority
+            .state
+            .current_reconciliation_identity(instance_id)?;
+        if &identity.fingerprint != fingerprint {
+            return Err(ReconciliationEvidenceRejection::IncarnationMismatch);
+        }
         let current = self
             .authority
             .state
-            .current_reconciliation_incarnation(instance_id)?;
-        if &current.fingerprint != fingerprint {
+            .reconciliation_incarnation_from_identity(identity)?;
+        let expected_inventory_fingerprint =
+            reconciliation_inventory_fingerprint(expected_inventory);
+        if current.inventory_fingerprint != expected_inventory_fingerprint {
             return Err(ReconciliationEvidenceRejection::IncarnationMismatch);
         }
-        let instance = self
-            .authority
-            .state
-            .instances
-            .get(instance_id)
-            .filter(|instance| instance.id == *instance_id)
-            .ok_or(ReconciliationEvidenceRejection::InstanceNotRegistered)?;
-        let inventory = self.authority.state.known_good.active_inventory(
-            &instance.id,
-            &instance.version_id,
-            &instance.created_at,
-            &current.roots.library,
-        );
-        Ok(inventory)
+        Ok(current.inventory)
     }
 
     fn validate_runtime_receipt_capability(
@@ -1124,13 +1160,13 @@ impl RegisteredComponentRebuildAdmission {
             .expect("Runtime admission state")
     }
 
-    fn validated_quarantine_target(
+    fn validated_runtime_quarantine_checkpoint(
         &self,
         component: &RuntimeId,
         quarantine: Option<&ManagedRuntimeQuarantineObligation>,
-    ) -> Result<Option<TargetDescriptor>, ReconciliationEvidenceRejection> {
+    ) -> Result<ReconciliationQuarantineCheckpoint, ReconciliationEvidenceRejection> {
         let Some(quarantine) = quarantine else {
-            return Ok(None);
+            return Ok(ReconciliationQuarantineCheckpoint::default());
         };
         if quarantine.component() != component
             || !quarantine.matches_cache(&self.authority.state.managed_runtime_cache)
@@ -1138,14 +1174,11 @@ impl RegisteredComponentRebuildAdmission {
             return Err(ReconciliationEvidenceRejection::JournalMismatch);
         }
         if quarantine.observation() == ManagedRuntimeQuarantineObservation::Absent {
-            return Ok(None);
+            return Ok(ReconciliationQuarantineCheckpoint::default());
         }
-        Ok(Some(TargetDescriptor::new(
-            StabilizationSystem::Execution,
-            self.attempt.target().kind,
-            format!("quarantine-{}", self.attempt.target().id),
-            self.attempt.ownership(),
-        )))
+        Ok(ReconciliationQuarantineCheckpoint::new(vec![
+            ReconciliationQuarantineRecord::runtime(component.as_str()),
+        ]))
     }
 
     #[cfg(test)]
@@ -1185,8 +1218,10 @@ impl RegisteredReconciliationAuthority {
                     ReconciliationScope::RegisteredInstance {
                         instance_id,
                         fingerprint,
+                        inventory_fingerprint,
                     } if instance_id == &self.lifecycle.instance_id
                         && fingerprint == &current.fingerprint
+                        && inventory_fingerprint == &current.inventory_fingerprint
                 )
             })
     }
@@ -1266,6 +1301,7 @@ impl RegisteredReconciliationAuthority {
             mode,
             observed_at,
             suppression_until,
+            ReconciliationLineage::Initial,
         )
     }
 
@@ -1274,24 +1310,28 @@ impl RegisteredReconciliationAuthority {
         attempt: ReconciliationAttempt,
         outcome: ReconciliationTerminalOutcome,
     ) -> Result<ReconciliationTerminal, ReconciliationEvidenceRejection> {
-        self.terminal_with_quarantine(attempt, outcome, None)
+        self.terminal_with_quarantine(
+            attempt,
+            outcome,
+            ReconciliationQuarantineCheckpoint::default(),
+        )
     }
 
     pub(crate) fn artifact_terminal(
         &self,
         attempt: ReconciliationAttempt,
         outcome: ReconciliationTerminalOutcome,
-        quarantined_target: Option<TargetDescriptor>,
+        quarantine_checkpoint: ReconciliationQuarantineCheckpoint,
     ) -> Result<ReconciliationTerminal, ReconciliationEvidenceRejection> {
         ManagedArtifactRebuildComponent::from_artifact_attempt(&attempt)?;
-        self.terminal_with_quarantine(attempt, outcome, quarantined_target)
+        self.terminal_with_quarantine(attempt, outcome, quarantine_checkpoint)
     }
 
     fn terminal_with_quarantine(
         &self,
         attempt: ReconciliationAttempt,
         outcome: ReconciliationTerminalOutcome,
-        quarantined_target: Option<TargetDescriptor>,
+        quarantine_checkpoint: ReconciliationQuarantineCheckpoint,
     ) -> Result<ReconciliationTerminal, ReconciliationEvidenceRejection> {
         if !self.attempt_is_current(&attempt) {
             return Err(ReconciliationEvidenceRejection::IncarnationMismatch);
@@ -1302,28 +1342,20 @@ impl RegisteredReconciliationAuthority {
         let ReconciliationScope::RegisteredInstance {
             instance_id,
             fingerprint,
+            inventory_fingerprint,
         } = attempt.scope();
-        if instance_id != &self.lifecycle.instance_id || fingerprint != &current.fingerprint {
+        if instance_id != &self.lifecycle.instance_id
+            || fingerprint != &current.fingerprint
+            || inventory_fingerprint != &current.inventory_fingerprint
+        {
             return Err(ReconciliationEvidenceRejection::IncarnationMismatch);
         }
-        if let Some(quarantined_target) = &quarantined_target {
-            let expected = TargetDescriptor::new(
-                StabilizationSystem::Execution,
-                attempt.target().kind,
-                format!("quarantine-{}", attempt.target().id),
-                attempt.ownership(),
-            );
-            if quarantined_target != &expected
-                || quarantined_target.ownership != OwnershipClass::LauncherManaged
-            {
-                return Err(ReconciliationEvidenceRejection::OwnershipMismatch);
-            }
-        }
-        Ok(ReconciliationTerminal::from_attempt(
-            attempt,
-            outcome,
-            quarantined_target,
-        ))
+        let terminal =
+            ReconciliationTerminal::from_attempt(attempt, outcome, quarantine_checkpoint);
+        terminal
+            .validate()
+            .map_err(|_| ReconciliationEvidenceRejection::OwnershipMismatch)?;
+        Ok(terminal)
     }
 }
 
@@ -1333,6 +1365,74 @@ pub(crate) fn reconciliation_journal_attempt(
 ) -> OperationJournalEntry {
     entry.reconciliation_attempt = Some(attempt);
     entry
+}
+
+pub(crate) fn component_rebuild_journal(
+    admission: &RegisteredComponentRebuildAdmission,
+) -> OperationJournalEntry {
+    let attempt = admission.attempt();
+    let target = attempt.target();
+    let mut entry = OperationJournalEntry::new(
+        super::contracts::JournalId::new(format!("journal-{}", attempt.operation_id().as_str())),
+        attempt.operation_id().clone(),
+        CommandKind::RepairInstance,
+        StabilizationSystem::Guardian,
+        OwnershipClass::LauncherManaged,
+        RollbackState::NotApplicable,
+    );
+    entry.targets.push(target.clone());
+    let ReconciliationScope::RegisteredInstance { instance_id, .. } = attempt.scope();
+    entry
+        .targets
+        .push(reconciliation_instance_target(instance_id));
+    entry.planned_steps.push(component_rebuild_step(
+        COMPONENT_REBUILD_START_STEP,
+        target,
+        RollbackState::NotApplicable,
+    ));
+    match attempt.component() {
+        ReconciliationComponent::Runtime => {
+            entry.planned_steps.push(component_rebuild_step(
+                COMPONENT_QUARANTINE_STEP,
+                target,
+                RollbackState::Available,
+            ));
+            entry.planned_steps.push(component_rebuild_step(
+                RUNTIME_COMPONENT_REBUILD_STEP,
+                target,
+                RollbackState::NotApplicable,
+            ));
+        }
+        ReconciliationComponent::VersionBundle
+        | ReconciliationComponent::Libraries
+        | ReconciliationComponent::Assets => {
+            let step_id = match attempt.component() {
+                ReconciliationComponent::VersionBundle => VERSION_BUNDLE_COMPONENT_REBUILD_STEP,
+                ReconciliationComponent::Libraries => LIBRARIES_COMPONENT_REBUILD_STEP,
+                ReconciliationComponent::Assets => ASSETS_COMPONENT_REBUILD_STEP,
+                _ => unreachable!(),
+            };
+            entry.planned_steps.push(component_rebuild_step(
+                step_id,
+                target,
+                RollbackState::NotApplicable,
+            ));
+        }
+        ReconciliationComponent::WholeInstance => unreachable!("rung-two component plan"),
+    }
+    entry.guardian_diagnosis_ids.push(attempt.diagnosis_id());
+    reconciliation_journal_attempt(entry, attempt.clone())
+}
+
+fn component_rebuild_step(
+    step_id: &'static str,
+    target: &TargetDescriptor,
+    rollback: RollbackState,
+) -> OperationJournalStep {
+    let mut step = OperationJournalStep::new(step_id, OperationPhase::Repairing);
+    step.changed_target = Some(target.clone());
+    step.rollback = rollback;
+    step
 }
 
 pub(crate) fn reconciliation_attempt_key(attempt: &ReconciliationAttempt) -> FailureMemoryKey {
@@ -1354,8 +1454,8 @@ pub(crate) fn reconciliation_memory_entry(
         ReconciliationTerminalOutcome::Succeeded => FailureMemoryActionOutcome::Repaired,
         ReconciliationTerminalOutcome::Failed => FailureMemoryActionOutcome::Failed,
     };
-    let quarantined_target = terminal.quarantined_target().cloned();
-    let mut entry = GuardianFailureMemoryEntry::observed(
+    let quarantine_checkpoint = terminal.quarantine_checkpoint().clone();
+    let entry = GuardianFailureMemoryEntry::observed(
         terminal.diagnosis_id(),
         terminal.domain(),
         terminal.target().clone(),
@@ -1366,10 +1466,8 @@ pub(crate) fn reconciliation_memory_entry(
     .with_action(GuardianActionKind::Repair, outcome)
     .with_repair_attempt()
     .with_suppression_until(terminal.suppression_until())
-    .with_reconciliation_terminal(terminal);
-    if let Some(quarantined_target) = quarantined_target {
-        entry = entry.with_quarantined_target(quarantined_target);
-    }
+    .with_reconciliation_terminal(terminal)
+    .with_quarantine_checkpoint(quarantine_checkpoint);
     entry
         .validate()
         .map_err(|_| ReconciliationEvidenceRejection::MemoryNotFailed)?;
@@ -1617,6 +1715,7 @@ impl AppState {
         mode: GuardianMode,
         observed_at: chrono::DateTime<chrono::FixedOffset>,
         suppression_until: chrono::DateTime<chrono::FixedOffset>,
+        lineage: ReconciliationLineage,
     ) -> Result<ReconciliationAttempt, ReconciliationEvidenceRejection> {
         if !self.instance_lifecycle_gates.owns(&lifecycle.owner) {
             return Err(ReconciliationEvidenceRejection::ScopeMismatch);
@@ -1630,6 +1729,7 @@ impl AppState {
             ReconciliationScope::RegisteredInstance {
                 instance_id: lifecycle.instance_id.clone(),
                 fingerprint: incarnation.fingerprint,
+                inventory_fingerprint: incarnation.inventory_fingerprint,
             },
             component,
             target,
@@ -1637,6 +1737,7 @@ impl AppState {
             OwnershipClass::LauncherManaged,
             observed_at.to_rfc3339(),
             suppression_until.to_rfc3339(),
+            lineage,
         );
         attempt
             .validate()
@@ -1728,8 +1829,10 @@ impl AppState {
                     ReconciliationScope::RegisteredInstance {
                         instance_id: attempted_instance_id,
                         fingerprint,
+                        inventory_fingerprint,
                     } if attempted_instance_id == instance_id
                         && fingerprint == &current.fingerprint
+                        && inventory_fingerprint == &current.inventory_fingerprint
                 )
         };
 
@@ -1850,8 +1953,10 @@ impl AppState {
                     ReconciliationScope::RegisteredInstance {
                         instance_id,
                         fingerprint,
+                        inventory_fingerprint,
                     } if instance_id == &lifecycle.instance_id
                         && fingerprint == &current.fingerprint
+                        && inventory_fingerprint == &current.inventory_fingerprint
                 )
         };
 
@@ -2129,6 +2234,9 @@ impl AppState {
             prior.mode(),
             observed_at,
             suppression_until,
+            ReconciliationLineage::Predecessor {
+                operation_id: prior.operation_id().clone(),
+            },
         )?;
         self.refuse_active_component_rebuild_window(&attempt, observed_at)?;
         let failed_terminal =
@@ -2137,7 +2245,6 @@ impl AppState {
             authority,
             attempt,
             failed_terminal,
-            _predecessor: prior,
             known_good,
             artifact_provenance,
             component_state,
@@ -2273,7 +2380,7 @@ impl AppState {
         if !is_canonical_instance_id(instance_id) {
             return Err(ReconciliationEvidenceRejection::InvalidInstanceIdentity);
         }
-        let before = self.current_reconciliation_incarnation(instance_id)?;
+        let before_identity = self.current_reconciliation_identity(instance_id)?;
         let journal = self
             .journals
             .get(operation_id)
@@ -2317,8 +2424,13 @@ impl AppState {
         let ReconciliationScope::RegisteredInstance {
             instance_id: terminal_instance_id,
             fingerprint,
+            inventory_fingerprint,
         } = terminal.scope();
-        if terminal_instance_id != instance_id || fingerprint != &before.fingerprint {
+        if terminal_instance_id != instance_id || fingerprint != &before_identity.fingerprint {
+            return Err(ReconciliationEvidenceRejection::IncarnationMismatch);
+        }
+        let before = self.reconciliation_incarnation_from_identity(before_identity)?;
+        if inventory_fingerprint != &before.inventory_fingerprint {
             return Err(ReconciliationEvidenceRejection::IncarnationMismatch);
         }
         if journal.operation_id != *terminal.operation_id()
@@ -2336,8 +2448,15 @@ impl AppState {
         {
             return Err(ReconciliationEvidenceRejection::JournalMismatch);
         }
-        let after = self.current_reconciliation_incarnation(instance_id)?;
-        if before.fingerprint != after.fingerprint || before.roots != after.roots {
+        let after_identity = self.current_reconciliation_identity(instance_id)?;
+        if before.fingerprint != after_identity.fingerprint || before.roots != after_identity.roots
+        {
+            return Err(ReconciliationEvidenceRejection::IncarnationMismatch);
+        }
+        let after = self.reconciliation_incarnation_from_identity(after_identity)?;
+        if before.inventory_fingerprint != after.inventory_fingerprint
+            || !std::sync::Arc::ptr_eq(&before.inventory, &after.inventory)
+        {
             return Err(ReconciliationEvidenceRejection::IncarnationMismatch);
         }
         let instance = self
@@ -2345,15 +2464,7 @@ impl AppState {
             .get(instance_id)
             .filter(|instance| instance.id == instance_id)
             .ok_or(ReconciliationEvidenceRejection::InstanceNotRegistered)?;
-        let inventory = self
-            .known_good
-            .active_inventory(
-                &instance.id,
-                &instance.version_id,
-                &instance.created_at,
-                &after.roots.library,
-            )
-            .ok_or(ReconciliationEvidenceRejection::RootAuthorityUnavailable)?;
+        let inventory = after.inventory.clone();
         if verification.is_some_and(|verification| {
             !std::sync::Arc::ptr_eq(&inventory, &verification.inventory)
                 || verification.version_id != instance.version_id
@@ -2385,6 +2496,30 @@ impl AppState {
         } else {
             None
         };
+        if expected_rung == ReconciliationRung::RebuildComponent {
+            if !component_rebuild_terminal_matches(&journal, &terminal, instance_id) {
+                return Err(ReconciliationEvidenceRejection::JournalMismatch);
+            }
+            let ReconciliationLineage::Predecessor {
+                operation_id: predecessor_operation_id,
+            } = terminal.attempt().lineage()
+            else {
+                return Err(ReconciliationEvidenceRejection::NonAdjacentRung);
+            };
+            let predecessor = self.recorded_reconciliation_failure_at(
+                lifecycle,
+                predecessor_operation_id,
+                ReconciliationRung::RepairArtifact,
+                observed_at,
+                verification,
+            )?;
+            if !adjacent_reconciliation_attempts_match(
+                predecessor.terminal.attempt(),
+                terminal.attempt(),
+            ) {
+                return Err(ReconciliationEvidenceRejection::NonAdjacentRung);
+            }
+        }
         Ok(RecordedReconciliationFailure {
             terminal,
             lifecycle: lifecycle.retained(),
@@ -2398,6 +2533,14 @@ impl AppState {
         &self,
         instance_id: &str,
     ) -> Result<CurrentReconciliationIncarnation, ReconciliationEvidenceRejection> {
+        let identity = self.current_reconciliation_identity(instance_id)?;
+        self.reconciliation_incarnation_from_identity(identity)
+    }
+
+    fn current_reconciliation_identity(
+        &self,
+        instance_id: &str,
+    ) -> Result<CurrentReconciliationIdentity, ReconciliationEvidenceRejection> {
         let instance = self
             .instances
             .get(instance_id)
@@ -2426,7 +2569,35 @@ impl AppState {
             &instance.created_at,
             &roots,
         );
-        Ok(CurrentReconciliationIncarnation { fingerprint, roots })
+        Ok(CurrentReconciliationIdentity {
+            instance_id: instance.id,
+            version_id: instance.version_id,
+            created_at: instance.created_at,
+            fingerprint,
+            roots,
+        })
+    }
+
+    fn reconciliation_incarnation_from_identity(
+        &self,
+        identity: CurrentReconciliationIdentity,
+    ) -> Result<CurrentReconciliationIncarnation, ReconciliationEvidenceRejection> {
+        let inventory = self
+            .known_good
+            .active_inventory(
+                &identity.instance_id,
+                &identity.version_id,
+                &identity.created_at,
+                &identity.roots.library,
+            )
+            .ok_or(ReconciliationEvidenceRejection::RootAuthorityUnavailable)?;
+        let inventory_fingerprint = reconciliation_inventory_fingerprint(&inventory);
+        Ok(CurrentReconciliationIncarnation {
+            fingerprint: identity.fingerprint,
+            inventory_fingerprint,
+            roots: identity.roots,
+            inventory,
+        })
     }
 }
 
@@ -2473,10 +2644,126 @@ fn registered_component_required_terminal_matches(
     );
     exact_plan
         && exact_failure
-        && terminal.quarantined_target().is_none()
+        && terminal.quarantine_checkpoint().is_empty()
         && journal.rollback == RollbackState::Available
         && journal.targets == [target.clone(), reconciliation_instance_target(instance_id)]
         && journal.guardian_diagnosis_ids == [terminal.diagnosis_id()]
+}
+
+fn adjacent_reconciliation_attempts_match(
+    predecessor: &ReconciliationAttempt,
+    successor: &ReconciliationAttempt,
+) -> bool {
+    matches!(predecessor.lineage(), ReconciliationLineage::Initial)
+        && matches!(
+            successor.lineage(),
+            ReconciliationLineage::Predecessor { operation_id }
+                if operation_id == predecessor.operation_id()
+        )
+        && predecessor.rung() == ReconciliationRung::RepairArtifact
+        && successor.rung() == ReconciliationRung::RebuildComponent
+        && predecessor.diagnosis_id() == successor.diagnosis_id()
+        && predecessor.domain() == successor.domain()
+        && predecessor.component() == successor.component()
+        && predecessor.target() == successor.target()
+        && predecessor.mode() == successor.mode()
+        && predecessor.ownership() == successor.ownership()
+        && predecessor.scope() == successor.scope()
+}
+
+fn component_rebuild_terminal_matches(
+    journal: &OperationJournalEntry,
+    terminal: &ReconciliationTerminal,
+    instance_id: &str,
+) -> bool {
+    if terminal.rung() != ReconciliationRung::RebuildComponent
+        || terminal.outcome() != ReconciliationTerminalOutcome::Failed
+        || journal.targets
+            != [
+                terminal.target().clone(),
+                reconciliation_instance_target(instance_id),
+            ]
+        || journal.guardian_diagnosis_ids != [terminal.diagnosis_id()]
+        || journal.reconciliation_attempt() != Some(terminal.attempt())
+        || journal.reconciliation_terminal() != Some(terminal)
+    {
+        return false;
+    }
+    let expected_plan = match terminal.component() {
+        ReconciliationComponent::Runtime => vec![
+            (COMPONENT_REBUILD_START_STEP, RollbackState::NotApplicable),
+            (COMPONENT_QUARANTINE_STEP, RollbackState::Available),
+            (RUNTIME_COMPONENT_REBUILD_STEP, RollbackState::NotApplicable),
+        ],
+        ReconciliationComponent::VersionBundle => vec![
+            (COMPONENT_REBUILD_START_STEP, RollbackState::NotApplicable),
+            (
+                VERSION_BUNDLE_COMPONENT_REBUILD_STEP,
+                RollbackState::NotApplicable,
+            ),
+        ],
+        ReconciliationComponent::Libraries => vec![
+            (COMPONENT_REBUILD_START_STEP, RollbackState::NotApplicable),
+            (
+                LIBRARIES_COMPONENT_REBUILD_STEP,
+                RollbackState::NotApplicable,
+            ),
+        ],
+        ReconciliationComponent::Assets => vec![
+            (COMPONENT_REBUILD_START_STEP, RollbackState::NotApplicable),
+            (ASSETS_COMPONENT_REBUILD_STEP, RollbackState::NotApplicable),
+        ],
+        ReconciliationComponent::WholeInstance => return false,
+    };
+    if journal.planned_steps.len() != expected_plan.len()
+        || journal
+            .planned_steps
+            .iter()
+            .zip(expected_plan)
+            .any(|(step, (step_id, rollback))| {
+                step.step_id != step_id
+                    || step.phase != OperationPhase::Repairing
+                    || step.result != OperationStepResult::Planned
+                    || step.changed_target.as_ref() != Some(terminal.target())
+                    || !step.generated_facts.is_empty()
+                    || step.rollback != rollback
+            })
+    {
+        return false;
+    }
+    let effect_step_id = match terminal.component() {
+        ReconciliationComponent::Runtime => RUNTIME_COMPONENT_REBUILD_STEP,
+        ReconciliationComponent::VersionBundle => VERSION_BUNDLE_COMPONENT_REBUILD_STEP,
+        ReconciliationComponent::Libraries => LIBRARIES_COMPONENT_REBUILD_STEP,
+        ReconciliationComponent::Assets => ASSETS_COMPONENT_REBUILD_STEP,
+        ReconciliationComponent::WholeInstance => return false,
+    };
+    let terminal_steps = if terminal.quarantine_checkpoint().is_empty() {
+        journal.completed_steps.as_slice()
+    } else {
+        let Some((quarantine, terminal_steps)) = journal.completed_steps.split_first() else {
+            return false;
+        };
+        if terminal.component() != ReconciliationComponent::Runtime
+            || quarantine.step_id != COMPONENT_QUARANTINE_STEP
+            || quarantine.phase != OperationPhase::Repairing
+            || quarantine.result != OperationStepResult::Completed
+            || quarantine.changed_target.as_ref() != Some(terminal.target())
+            || quarantine.rollback != RollbackState::Available
+        {
+            return false;
+        }
+        terminal_steps
+    };
+    matches!(
+        terminal_steps,
+        [step]
+            if step.step_id == COMPONENT_REBUILD_START_STEP || step.step_id == effect_step_id
+    ) && terminal_steps[0].phase == OperationPhase::Repairing
+        && terminal_steps[0].result == OperationStepResult::Failed
+        && terminal_steps[0].changed_target.as_ref() == Some(terminal.target())
+        && journal.failure_point.as_deref() == Some(terminal_steps[0].step_id.as_str())
+        && journal.rollback == terminal_steps[0].rollback
 }
 
 fn active_reconciliation_terminal_at(
@@ -2628,6 +2915,129 @@ fn reconciliation_fingerprint(
         .collect::<Vec<_>>()
         .join(".");
     ReconciliationIncarnationFingerprint::from_digest(format!("sha256.{dotted}"))
+}
+
+fn reconciliation_inventory_fingerprint(
+    inventory: &axial_minecraft::known_good::KnownGoodInventory,
+) -> ReconciliationInventoryFingerprint {
+    let mut entry_digests = Vec::with_capacity(inventory.entries().len());
+    for (ordinal, entry) in inventory.entries().iter().enumerate() {
+        let mut entry_hasher = Sha256::new();
+        update_frame(
+            &mut entry_hasher,
+            b"domain",
+            RECONCILIATION_INVENTORY_ENTRY_DOMAIN,
+        );
+        update_frame(
+            &mut entry_hasher,
+            b"ordinal",
+            &(ordinal as u64).to_le_bytes(),
+        );
+        update_frame(
+            &mut entry_hasher,
+            b"root",
+            entry.root().stable_id().as_bytes(),
+        );
+        update_frame(
+            &mut entry_hasher,
+            b"root_scope",
+            entry.root().scope_id().as_bytes(),
+        );
+        update_frame(&mut entry_hasher, b"path", entry.path().as_str().as_bytes());
+        update_frame(
+            &mut entry_hasher,
+            b"kind",
+            entry.kind().stable_id().as_bytes(),
+        );
+        match entry.integrity() {
+            KnownGoodIntegrity::Sha1 { digest, size } => {
+                update_frame(&mut entry_hasher, b"integrity", b"sha1");
+                update_frame(&mut entry_hasher, b"digest", digest.as_str().as_bytes());
+                update_frame(&mut entry_hasher, b"size", &size.to_le_bytes());
+            }
+            KnownGoodIntegrity::ExactBytes { digest, size } => {
+                update_frame(&mut entry_hasher, b"integrity", b"exact_bytes");
+                update_frame(&mut entry_hasher, b"digest", digest.as_str().as_bytes());
+                update_frame(&mut entry_hasher, b"size", &size.to_le_bytes());
+            }
+            KnownGoodIntegrity::Directory => {
+                update_frame(&mut entry_hasher, b"integrity", b"directory");
+            }
+            KnownGoodIntegrity::LinkTarget(target) => {
+                update_frame(&mut entry_hasher, b"integrity", b"link_target");
+                update_frame(
+                    &mut entry_hasher,
+                    b"link_target",
+                    target.as_str().as_bytes(),
+                );
+            }
+        }
+        match inventory.bind_standalone_leaf_repair_source(ordinal) {
+            Ok(source) => {
+                update_frame(&mut entry_hasher, b"source", b"standalone");
+                update_frame(
+                    &mut entry_hasher,
+                    b"source_root",
+                    source.root().stable_id().as_bytes(),
+                );
+                update_frame(
+                    &mut entry_hasher,
+                    b"source_scope",
+                    source.root().scope_id().as_bytes(),
+                );
+                update_frame(
+                    &mut entry_hasher,
+                    b"source_path",
+                    source.path().as_str().as_bytes(),
+                );
+                update_frame(
+                    &mut entry_hasher,
+                    b"source_kind",
+                    source.kind().stable_id().as_bytes(),
+                );
+                update_frame(
+                    &mut entry_hasher,
+                    b"source_digest",
+                    source.sha1().as_str().as_bytes(),
+                );
+                update_frame(
+                    &mut entry_hasher,
+                    b"source_size",
+                    &source.size().to_le_bytes(),
+                );
+                update_frame(
+                    &mut entry_hasher,
+                    b"source_provider",
+                    source.provider_url().as_bytes(),
+                );
+            }
+            Err(_) => update_frame(&mut entry_hasher, b"source", b"component_rebuild"),
+        }
+        entry_digests.push(entry_hasher.finalize());
+    }
+    entry_digests.sort_unstable();
+    let mut hasher = Sha256::new();
+    update_frame(
+        &mut hasher,
+        b"domain",
+        RECONCILIATION_INVENTORY_FINGERPRINT_DOMAIN,
+    );
+    update_frame(
+        &mut hasher,
+        b"entry_count",
+        &(entry_digests.len() as u64).to_le_bytes(),
+    );
+    for digest in entry_digests {
+        update_frame(&mut hasher, b"entry", digest.as_slice());
+    }
+    let hex = format!("{:x}", hasher.finalize());
+    let dotted = hex
+        .as_bytes()
+        .chunks(8)
+        .map(|chunk| std::str::from_utf8(chunk).expect("SHA-256 hex is ASCII"))
+        .collect::<Vec<_>>()
+        .join(".");
+    ReconciliationInventoryFingerprint::from_digest(format!("sha256.{dotted}"))
 }
 
 fn update_frame(hasher: &mut Sha256, label: &[u8], value: &[u8]) {
@@ -2926,6 +3336,22 @@ mod tests {
             },
         ])
         .expect("VersionBundle fixture inventory")
+    }
+
+    #[test]
+    fn reconciliation_inventory_fingerprint_is_stable_and_full_inventory_bound() {
+        let first = assets_fixture_inventory();
+        let same = assets_fixture_inventory();
+        let different = version_bundle_fixture_inventory();
+
+        assert_eq!(
+            reconciliation_inventory_fingerprint(&first),
+            reconciliation_inventory_fingerprint(&same),
+        );
+        assert_ne!(
+            reconciliation_inventory_fingerprint(&first),
+            reconciliation_inventory_fingerprint(&different),
+        );
     }
 
     fn activate_assets_fixture_inventory(
@@ -3306,7 +3732,11 @@ mod tests {
             )
             .expect("persisted artifact failure attempt");
         let terminal = authority
-            .artifact_terminal(attempt.clone(), ReconciliationTerminalOutcome::Failed, None)
+            .artifact_terminal(
+                attempt.clone(),
+                ReconciliationTerminalOutcome::Failed,
+                ReconciliationQuarantineCheckpoint::default(),
+            )
             .expect("persisted artifact failure terminal");
         drop((authority, verification, foreground, lifecycle));
         (attempt, terminal)
@@ -4017,7 +4447,11 @@ mod tests {
             .expect("structurally valid attempt carrier");
         assert_eq!(
             authority
-                .artifact_terminal(wrong_domain, ReconciliationTerminalOutcome::Failed, None,)
+                .artifact_terminal(
+                    wrong_domain,
+                    ReconciliationTerminalOutcome::Failed,
+                    ReconciliationQuarantineCheckpoint::default(),
+                )
                 .err(),
             Some(ReconciliationEvidenceRejection::ScopeMismatch)
         );
@@ -4148,7 +4582,11 @@ mod tests {
             )
             .expect("verified predecessor attempt");
         let terminal = authority
-            .artifact_terminal(attempt.clone(), ReconciliationTerminalOutcome::Failed, None)
+            .artifact_terminal(
+                attempt.clone(),
+                ReconciliationTerminalOutcome::Failed,
+                ReconciliationQuarantineCheckpoint::default(),
+            )
             .expect("verified predecessor terminal");
         let reservation = reserve_reconciliation_attempt(
             fixture.failure_memory.as_ref(),
@@ -4739,6 +5177,7 @@ mod tests {
                 GuardianMode::Managed,
                 observed_at,
                 suppression_until,
+                ReconciliationLineage::Initial,
             )
             .expect("stale indeterminate Runtime attempt");
         fixture

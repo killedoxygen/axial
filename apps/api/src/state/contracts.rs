@@ -9,6 +9,7 @@ use crate::observability::evidence_text_looks_sensitive;
 use serde::{Deserialize, Serialize};
 
 pub(crate) const RECONCILIATION_EVIDENCE_CAPACITY: usize = 128;
+pub const RECONCILIATION_QUARANTINE_CAPACITY: usize = 8;
 
 #[derive(Clone, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
 pub struct OperationId(pub String);
@@ -43,7 +44,21 @@ pub enum ReconciliationComponent {
 #[serde(deny_unknown_fields)]
 pub struct ReconciliationIncarnationFingerprint(String);
 
+#[derive(Clone, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReconciliationInventoryFingerprint(String);
+
 impl ReconciliationIncarnationFingerprint {
+    pub(super) fn from_digest(digest: impl Into<String>) -> Self {
+        Self(digest.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl ReconciliationInventoryFingerprint {
     pub(super) fn from_digest(digest: impl Into<String>) -> Self {
         Self(digest.into())
     }
@@ -59,13 +74,34 @@ pub enum ReconciliationScope {
     RegisteredInstance {
         instance_id: String,
         fingerprint: ReconciliationIncarnationFingerprint,
+        inventory_fingerprint: ReconciliationInventoryFingerprint,
     },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub enum ReconciliationLineage {
+    Initial,
+    Predecessor { operation_id: OperationId },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
 pub enum ReconciliationTerminalOutcome {
     Succeeded,
     Failed,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub enum ReconciliationQuarantineRecord {
+    Artifact { target: TargetDescriptor },
+    RuntimeComponent { component_id: String },
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReconciliationQuarantineCheckpoint {
+    records: Vec<ReconciliationQuarantineRecord>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -82,6 +118,7 @@ pub struct ReconciliationAttempt {
     ownership: OwnershipClass,
     observed_at: String,
     suppression_until: String,
+    lineage: ReconciliationLineage,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -89,7 +126,112 @@ pub struct ReconciliationAttempt {
 pub struct ReconciliationTerminal {
     attempt: ReconciliationAttempt,
     outcome: ReconciliationTerminalOutcome,
-    quarantined_target: Option<TargetDescriptor>,
+    quarantine_checkpoint: ReconciliationQuarantineCheckpoint,
+}
+
+impl ReconciliationQuarantineRecord {
+    pub(crate) fn artifact(target: TargetDescriptor) -> Self {
+        Self::Artifact { target }
+    }
+
+    pub(crate) fn runtime(component_id: impl Into<String>) -> Self {
+        Self::RuntimeComponent {
+            component_id: component_id.into(),
+        }
+    }
+
+    pub fn artifact_target(&self) -> Option<&TargetDescriptor> {
+        match self {
+            Self::Artifact { target } => Some(target),
+            Self::RuntimeComponent { .. } => None,
+        }
+    }
+
+    pub fn runtime_component_id(&self) -> Option<&str> {
+        match self {
+            Self::RuntimeComponent { component_id } => Some(component_id),
+            Self::Artifact { .. } => None,
+        }
+    }
+}
+
+impl ReconciliationQuarantineCheckpoint {
+    pub(crate) fn new(records: Vec<ReconciliationQuarantineRecord>) -> Self {
+        Self { records }
+    }
+
+    pub fn records(&self) -> &[ReconciliationQuarantineRecord] {
+        &self.records
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.records.is_empty()
+    }
+
+    pub(super) fn validate_bounded(&self) -> Result<(), ReconciliationTerminalValidationError> {
+        if self.records.len() > RECONCILIATION_QUARANTINE_CAPACITY {
+            return Err(ReconciliationTerminalValidationError::TooManyQuarantines);
+        }
+        for (index, record) in self.records.iter().enumerate() {
+            if self.records[..index].contains(record) {
+                return Err(ReconciliationTerminalValidationError::UnsafeTarget);
+            }
+            match record {
+                ReconciliationQuarantineRecord::Artifact { target }
+                    if target.ownership == OwnershipClass::LauncherManaged
+                        && target.system == StabilizationSystem::Execution
+                        && !target.id.trim().is_empty()
+                        && !target.id.contains(['/', '\\']) => {}
+                ReconciliationQuarantineRecord::RuntimeComponent { component_id }
+                    if axial_minecraft::runtime::is_known_runtime_component(component_id) => {}
+                _ => return Err(ReconciliationTerminalValidationError::UnsafeTarget),
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_for(
+        &self,
+        attempt: &ReconciliationAttempt,
+    ) -> Result<(), ReconciliationTerminalValidationError> {
+        self.validate_bounded()?;
+        for record in &self.records {
+            match record {
+                ReconciliationQuarantineRecord::Artifact { target } => {
+                    let expected = TargetDescriptor::new(
+                        StabilizationSystem::Execution,
+                        attempt.target().kind,
+                        format!("quarantine-{}", attempt.target().id),
+                        attempt.ownership(),
+                    );
+                    if !matches!(
+                        attempt.component(),
+                        ReconciliationComponent::VersionBundle
+                            | ReconciliationComponent::Libraries
+                            | ReconciliationComponent::Assets
+                    ) || target != &expected
+                        || target.ownership != OwnershipClass::LauncherManaged
+                    {
+                        return Err(ReconciliationTerminalValidationError::UnsafeTarget);
+                    }
+                }
+                ReconciliationQuarantineRecord::RuntimeComponent { component_id } => {
+                    if !axial_minecraft::runtime::is_known_runtime_component(component_id)
+                        || !matches!(
+                            attempt.component(),
+                            ReconciliationComponent::Runtime
+                                | ReconciliationComponent::WholeInstance
+                        )
+                        || (attempt.component() == ReconciliationComponent::Runtime
+                            && attempt.target().id != *component_id)
+                    {
+                        return Err(ReconciliationTerminalValidationError::UnsafeTarget);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 impl ReconciliationAttempt {
@@ -106,6 +248,7 @@ impl ReconciliationAttempt {
         ownership: OwnershipClass,
         observed_at: impl Into<String>,
         suppression_until: impl Into<String>,
+        lineage: ReconciliationLineage,
     ) -> Self {
         Self {
             operation_id,
@@ -119,6 +262,7 @@ impl ReconciliationAttempt {
             ownership,
             observed_at: observed_at.into(),
             suppression_until: suppression_until.into(),
+            lineage,
         }
     }
 
@@ -166,6 +310,10 @@ impl ReconciliationAttempt {
         &self.suppression_until
     }
 
+    pub fn lineage(&self) -> &ReconciliationLineage {
+        &self.lineage
+    }
+
     pub(super) fn validate(&self) -> Result<(), ReconciliationTerminalValidationError> {
         if !safe_reconciliation_token(self.operation_id.as_str(), 128) {
             return Err(ReconciliationTerminalValidationError::UnsafeOperationId);
@@ -192,12 +340,25 @@ impl ReconciliationAttempt {
         let ReconciliationScope::RegisteredInstance {
             instance_id,
             fingerprint,
+            inventory_fingerprint,
         } = &self.scope;
         if !axial_config::is_canonical_instance_id(instance_id) {
             return Err(ReconciliationTerminalValidationError::UnsafeInstanceId);
         }
         if !valid_reconciliation_fingerprint(fingerprint.as_str()) {
             return Err(ReconciliationTerminalValidationError::UnsafeFingerprint);
+        }
+        if !valid_reconciliation_fingerprint(inventory_fingerprint.as_str()) {
+            return Err(ReconciliationTerminalValidationError::UnsafeInventoryFingerprint);
+        }
+        match (&self.lineage, self.rung) {
+            (ReconciliationLineage::Initial, ReconciliationRung::RepairArtifact) => {}
+            (
+                ReconciliationLineage::Predecessor { operation_id },
+                ReconciliationRung::RebuildComponent | ReconciliationRung::RematerializeInstance,
+            ) if operation_id != &self.operation_id
+                && safe_reconciliation_token(operation_id.as_str(), 128) => {}
+            _ => return Err(ReconciliationTerminalValidationError::InvalidLineage),
         }
         match (self.rung, self.component) {
             (
@@ -237,12 +398,12 @@ impl ReconciliationTerminal {
     pub(super) fn from_attempt(
         attempt: ReconciliationAttempt,
         outcome: ReconciliationTerminalOutcome,
-        quarantined_target: Option<TargetDescriptor>,
+        quarantine_checkpoint: ReconciliationQuarantineCheckpoint,
     ) -> Self {
         Self {
             attempt,
             outcome,
-            quarantined_target,
+            quarantine_checkpoint,
         }
     }
 
@@ -298,23 +459,13 @@ impl ReconciliationTerminal {
         self.outcome
     }
 
-    pub fn quarantined_target(&self) -> Option<&TargetDescriptor> {
-        self.quarantined_target.as_ref()
+    pub fn quarantine_checkpoint(&self) -> &ReconciliationQuarantineCheckpoint {
+        &self.quarantine_checkpoint
     }
 
     pub(super) fn validate(&self) -> Result<(), ReconciliationTerminalValidationError> {
         self.attempt.validate()?;
-        if let Some(target) = &self.quarantined_target {
-            let expected = TargetDescriptor::new(
-                StabilizationSystem::Execution,
-                self.target().kind,
-                format!("quarantine-{}", self.target().id),
-                self.ownership(),
-            );
-            if target != &expected {
-                return Err(ReconciliationTerminalValidationError::UnsafeTarget);
-            }
-        }
+        self.quarantine_checkpoint.validate_for(&self.attempt)?;
         Ok(())
     }
 }
@@ -324,8 +475,11 @@ pub(super) enum ReconciliationTerminalValidationError {
     UnsafeOperationId,
     UnsafeInstanceId,
     UnsafeFingerprint,
+    UnsafeInventoryFingerprint,
     UnsafeOwnership,
     UnsafeTarget,
+    TooManyQuarantines,
+    InvalidLineage,
     DisabledMode,
     InvalidWindow,
     ImpossibleComponent,
@@ -626,9 +780,62 @@ pub struct SnapshotDescriptor {
 mod tests {
     use super::{
         CommandKind, JournalId, OperationId, OperationJournalEntry, OperationJournalStep,
-        OperationOutcome, OperationPhase, OperationStatus, OwnershipClass, RollbackState,
+        OperationOutcome, OperationPhase, OperationStatus, OwnershipClass, ReconciliationAttempt,
+        ReconciliationComponent, ReconciliationIncarnationFingerprint,
+        ReconciliationInventoryFingerprint, ReconciliationLineage,
+        ReconciliationQuarantineCheckpoint, ReconciliationQuarantineRecord, ReconciliationRung,
+        ReconciliationScope, ReconciliationTerminal, ReconciliationTerminalOutcome, RollbackState,
         StabilizationSystem, TargetDescriptor, TargetKind,
     };
+    use crate::guardian::{DiagnosisId, GuardianDomain, GuardianMode};
+
+    fn reconciliation_attempt(
+        rung: ReconciliationRung,
+        component: ReconciliationComponent,
+        lineage: ReconciliationLineage,
+    ) -> ReconciliationAttempt {
+        let (system, kind, id) = if component == ReconciliationComponent::WholeInstance {
+            (
+                StabilizationSystem::State,
+                TargetKind::Instance,
+                "0123456789abcdef",
+            )
+        } else if component == ReconciliationComponent::Runtime {
+            (
+                StabilizationSystem::Execution,
+                TargetKind::Runtime,
+                "java-runtime-delta",
+            )
+        } else {
+            (
+                StabilizationSystem::Execution,
+                TargetKind::Artifact,
+                "managed-artifact",
+            )
+        };
+        ReconciliationAttempt::new(
+            OperationId::new(format!("attempt-{rung:?}")),
+            DiagnosisId::LauncherManagedArtifactCorrupt,
+            GuardianDomain::Library,
+            rung,
+            ReconciliationScope::RegisteredInstance {
+                instance_id: "0123456789abcdef".to_string(),
+                fingerprint: ReconciliationIncarnationFingerprint::from_digest(
+                    "sha256.aaaaaaaa.bbbbbbbb.cccccccc.dddddddd.eeeeeeee.ffffffff.01234567.89abcdef",
+                ),
+                inventory_fingerprint: ReconciliationInventoryFingerprint::from_digest(
+                    "sha256.11111111.22222222.33333333.44444444.55555555.66666666.77777777.88888888",
+                ),
+            },
+            component,
+            TargetDescriptor::new(system, kind, id, OwnershipClass::LauncherManaged),
+            GuardianMode::Managed,
+            OwnershipClass::LauncherManaged,
+            "2026-07-15T00:00:00Z",
+            "2026-07-15T01:00:00Z",
+            lineage,
+        )
+    }
 
     #[test]
     fn operation_journal_entry_round_trips_strict_shape() {
@@ -702,5 +909,71 @@ mod tests {
         assert!(!encoded.contains("Alice"));
         assert!(!encoded.contains("java.exe"));
         assert!(!encoded.contains(r"C:\"));
+    }
+
+    #[test]
+    fn successor_lineage_is_mandatory_and_adjacent_by_shape() {
+        let repair = reconciliation_attempt(
+            ReconciliationRung::RepairArtifact,
+            ReconciliationComponent::Libraries,
+            ReconciliationLineage::Initial,
+        );
+        assert!(repair.validate().is_ok());
+
+        let invalid = reconciliation_attempt(
+            ReconciliationRung::RebuildComponent,
+            ReconciliationComponent::Libraries,
+            ReconciliationLineage::Initial,
+        );
+        assert!(invalid.validate().is_err());
+
+        let whole = reconciliation_attempt(
+            ReconciliationRung::RematerializeInstance,
+            ReconciliationComponent::WholeInstance,
+            ReconciliationLineage::Predecessor {
+                operation_id: OperationId::new("component-attempt"),
+            },
+        );
+        assert!(whole.validate().is_ok());
+    }
+
+    #[test]
+    fn quarantine_checkpoint_is_typed_bounded_and_duplicate_free() {
+        let runtime_attempt = reconciliation_attempt(
+            ReconciliationRung::RematerializeInstance,
+            ReconciliationComponent::WholeInstance,
+            ReconciliationLineage::Predecessor {
+                operation_id: OperationId::new("component-attempt"),
+            },
+        );
+        let runtime = ReconciliationQuarantineRecord::runtime("java-runtime-delta");
+        let valid = ReconciliationTerminal::from_attempt(
+            runtime_attempt.clone(),
+            ReconciliationTerminalOutcome::Failed,
+            ReconciliationQuarantineCheckpoint::new(vec![runtime.clone()]),
+        );
+        assert!(valid.validate().is_ok());
+
+        let duplicate = ReconciliationTerminal::from_attempt(
+            runtime_attempt.clone(),
+            ReconciliationTerminalOutcome::Failed,
+            ReconciliationQuarantineCheckpoint::new(vec![runtime.clone(), runtime.clone()]),
+        );
+        assert!(duplicate.validate().is_err());
+
+        let overflow = ReconciliationTerminal::from_attempt(
+            runtime_attempt,
+            ReconciliationTerminalOutcome::Failed,
+            ReconciliationQuarantineCheckpoint::new(
+                (0..=super::RECONCILIATION_QUARANTINE_CAPACITY)
+                    .map(|index| {
+                        ReconciliationQuarantineRecord::runtime(format!(
+                            "java-runtime-test-{index}"
+                        ))
+                    })
+                    .collect(),
+            ),
+        );
+        assert!(overflow.validate().is_err());
     }
 }

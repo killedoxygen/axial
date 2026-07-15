@@ -1,7 +1,7 @@
 use super::contracts::{
     OperationId, OwnershipClass, ReconciliationAttempt, ReconciliationComponent,
-    ReconciliationTerminal, ReconciliationTerminalOutcome, StabilizationSystem, TargetDescriptor,
-    TargetKind,
+    ReconciliationQuarantineCheckpoint, ReconciliationTerminal, ReconciliationTerminalOutcome,
+    StabilizationSystem, TargetDescriptor, TargetKind,
 };
 use super::failure_memory::FailureMemoryStoreError;
 use super::{
@@ -538,7 +538,7 @@ impl RegisteredArtifactRepairAdmission {
         &self,
         attempt: super::contracts::ReconciliationAttempt,
         outcome: super::contracts::ReconciliationTerminalOutcome,
-        quarantined_target: Option<TargetDescriptor>,
+        quarantine_checkpoint: ReconciliationQuarantineCheckpoint,
     ) -> Result<super::contracts::ReconciliationTerminal, ReconciliationEvidenceRejection> {
         if outcome == super::contracts::ReconciliationTerminalOutcome::Succeeded
             && !self.evidence_is_live()
@@ -546,7 +546,7 @@ impl RegisteredArtifactRepairAdmission {
             return Err(ReconciliationEvidenceRejection::IncarnationMismatch);
         }
         self.authority
-            .artifact_terminal(attempt, outcome, quarantined_target)
+            .artifact_terminal(attempt, outcome, quarantine_checkpoint)
     }
 
     pub(crate) async fn commit_terminal_memory(

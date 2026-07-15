@@ -1335,7 +1335,7 @@ mod tests {
         assert_eq!(memory[0].last_action_kind, None);
         assert_eq!(memory[0].last_action_outcome, None);
         assert_eq!(memory[0].ownership, OwnershipClass::Unknown);
-        assert!(memory[0].quarantined_target.is_none());
+        assert!(memory[0].quarantine_checkpoint.is_empty());
 
         let encoded = serde_json::to_string(&(decision, memory)).expect("public-safe json");
         let lower = encoded.to_ascii_lowercase();

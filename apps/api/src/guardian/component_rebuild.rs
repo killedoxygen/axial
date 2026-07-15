@@ -1,27 +1,29 @@
 use super::reconciliation_journal::{
     GuardianJournalReconciliation, reconcile_guardian_journal_error,
-    record_reconciliation_terminal_reconciled, repair_step, repair_step_with_rollback,
+    record_reconciliation_terminal_reconciled, repair_step_with_rollback,
 };
 use super::{GuardianDomain, GuardianMode};
 use crate::observability::{RedactionAudience, sanitize_evidence_token};
 use crate::state::contracts::{
-    CommandKind, JournalId, OperationId, OperationJournalEntry, OperationStatus,
-    OperationStepResult, OwnershipClass, ReconciliationComponent, ReconciliationRung,
-    ReconciliationScope, ReconciliationTerminal, RollbackState, StabilizationSystem, TargetKind,
+    CommandKind, OperationId, OperationStatus, OperationStepResult, OwnershipClass,
+    ReconciliationComponent, ReconciliationRung, ReconciliationTerminal, RollbackState,
+    StabilizationSystem, TargetKind,
 };
 use crate::state::failure_memory::{
     FailureMemoryStoreError, GuardianFailureMemoryEntry, GuardianFailureMemoryStore,
 };
 use crate::state::{
-    MAX_OPERATION_JOURNAL_STEP_FACTS, OperationJournalStoreError, ReconciliationAttemptReservation,
+    ASSETS_COMPONENT_REBUILD_STEP, COMPONENT_QUARANTINE_STEP, COMPONENT_REBUILD_START_STEP,
+    LIBRARIES_COMPONENT_REBUILD_STEP, MAX_OPERATION_JOURNAL_STEP_FACTS, OperationJournalStoreError,
+    RUNTIME_COMPONENT_REBUILD_STEP, ReconciliationAttemptReservation,
     RegisteredAssetsComponentRebuildEffect, RegisteredComponentRebuildAdmission,
     RegisteredLibrariesComponentRebuildEffect, RegisteredManagedArtifactCommitPostcheck,
     RegisteredManagedArtifactComponentCompletion,
     RegisteredManagedArtifactComponentEffectAdmission,
     RegisteredManagedArtifactComponentSettlement, RegisteredVersionBundleComponentRebuildEffect,
-    commit_reconciliation_memory, operation_journal_completed_step_is_visible,
-    operation_journal_plan_is_visible, reconciliation_attempt_key, reconciliation_instance_target,
-    reconciliation_journal_attempt, reconciliation_memory_entry, reserve_reconciliation_attempt,
+    VERSION_BUNDLE_COMPONENT_REBUILD_STEP, commit_reconciliation_memory, component_rebuild_journal,
+    operation_journal_completed_step_is_visible, operation_journal_plan_is_visible,
+    reconciliation_attempt_key, reconciliation_memory_entry, reserve_reconciliation_attempt,
     settle_reconciliation_memory, validate_reconciliation_memory,
 };
 use axial_minecraft::runtime::{
@@ -36,12 +38,6 @@ use axial_minecraft::{
 use std::future::Future;
 use std::sync::Arc;
 
-const COMPONENT_REBUILD_START_STEP: &str = "journal_component_rebuild_start";
-const COMPONENT_QUARANTINE_STEP: &str = "quarantine_launcher_managed_target";
-const RUNTIME_COMPONENT_REBUILD_STEP: &str = "rebuild_managed_runtime_component";
-const VERSION_BUNDLE_COMPONENT_REBUILD_STEP: &str = "rebuild_managed_version_bundle_component";
-const LIBRARIES_COMPONENT_REBUILD_STEP: &str = "rebuild_managed_libraries_component";
-const ASSETS_COMPONENT_REBUILD_STEP: &str = "rebuild_managed_assets_component";
 const COMPONENT_MEMORY_RETRY_INITIAL_DELAY: std::time::Duration =
     std::time::Duration::from_millis(20);
 const COMPONENT_MEMORY_RETRY_MAX_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
@@ -1074,7 +1070,7 @@ async fn create_component_rebuild_plan(
 ) -> Result<Option<OperationJournalStoreError>, OperationJournalStoreError> {
     let journals = admission.journals();
     let operation_id = admission.attempt().operation_id();
-    let expected = component_rebuild_plan(admission);
+    let expected = component_rebuild_journal(admission);
     loop {
         match journals.create(expected.clone()).await {
             Ok(()) => return Ok(None),
@@ -1100,68 +1096,6 @@ async fn create_component_rebuild_plan(
             }
         }
     }
-}
-
-fn component_rebuild_plan(
-    admission: &RegisteredComponentRebuildAdmission,
-) -> OperationJournalEntry {
-    let attempt = admission.attempt();
-    let target = attempt.target();
-    let mut entry = OperationJournalEntry::new(
-        JournalId::new(format!("journal-{}", attempt.operation_id().as_str())),
-        attempt.operation_id().clone(),
-        CommandKind::RepairInstance,
-        StabilizationSystem::Guardian,
-        OwnershipClass::LauncherManaged,
-        RollbackState::NotApplicable,
-    );
-    entry.targets.push(target.clone());
-    let ReconciliationScope::RegisteredInstance { instance_id, .. } = attempt.scope();
-    entry
-        .targets
-        .push(reconciliation_instance_target(instance_id));
-    entry.planned_steps.push(repair_step(
-        COMPONENT_REBUILD_START_STEP,
-        OperationStepResult::Planned,
-        Some(target.clone()),
-        Vec::new(),
-    ));
-    match attempt.component() {
-        ReconciliationComponent::Runtime => {
-            entry.planned_steps.push(repair_step_with_rollback(
-                COMPONENT_QUARANTINE_STEP,
-                OperationStepResult::Planned,
-                Some(target.clone()),
-                Vec::new(),
-                RollbackState::Available,
-            ));
-            entry.planned_steps.push(repair_step(
-                RUNTIME_COMPONENT_REBUILD_STEP,
-                OperationStepResult::Planned,
-                Some(target.clone()),
-                Vec::new(),
-            ));
-        }
-        ReconciliationComponent::VersionBundle
-        | ReconciliationComponent::Libraries
-        | ReconciliationComponent::Assets => {
-            let step_id = match attempt.component() {
-                ReconciliationComponent::VersionBundle => VERSION_BUNDLE_COMPONENT_REBUILD_STEP,
-                ReconciliationComponent::Libraries => LIBRARIES_COMPONENT_REBUILD_STEP,
-                ReconciliationComponent::Assets => ASSETS_COMPONENT_REBUILD_STEP,
-                _ => unreachable!(),
-            };
-            entry.planned_steps.push(repair_step(
-                step_id,
-                OperationStepResult::Planned,
-                Some(target.clone()),
-                Vec::new(),
-            ));
-        }
-        _ => {}
-    }
-    entry.guardian_diagnosis_ids.push(attempt.diagnosis_id());
-    reconciliation_journal_attempt(entry, attempt.clone())
 }
 
 async fn record_component_quarantine_checkpoint(
@@ -1303,7 +1237,7 @@ async fn terminalize_component_rebuild(
             )
         }
     };
-    if typed_terminal.quarantined_target().is_some() {
+    if !typed_terminal.quarantine_checkpoint().is_empty() {
         record_component_quarantine_checkpoint(&admission).await?;
     }
     persist_component_rebuild_terminal(
@@ -1689,7 +1623,7 @@ fn invalid_component_rebuild_error(
 mod tests {
     use super::{
         ASSETS_COMPONENT_REBUILD_STEP, COMPONENT_QUARANTINE_STEP, GuardianComponentRebuildStatus,
-        VERSION_BUNDLE_COMPONENT_REBUILD_STEP, bounded_fact_ids, component_rebuild_plan,
+        VERSION_BUNDLE_COMPONENT_REBUILD_STEP, bounded_fact_ids,
         execute_managed_assets_component_rebuild_with_driver,
         execute_managed_runtime_component_rebuild,
         execute_managed_version_bundle_component_rebuild,
@@ -1708,8 +1642,8 @@ mod tests {
         OperationJournalStore, RegisteredComponentRebuildAdmission,
         RegisteredManagedArtifactCommitPostcheck,
         RegisteredManagedArtifactComponentEffectAdmission, SessionStore,
-        commit_reconciliation_memory, new_instance, reconciliation_attempt_key,
-        reconciliation_instance_target, reconciliation_journal_attempt,
+        commit_reconciliation_memory, component_rebuild_journal, new_instance,
+        reconciliation_attempt_key, reconciliation_instance_target, reconciliation_journal_attempt,
         reconciliation_memory_entry, record_reconciliation_journal_failure,
         registered_artifact_target_for_test, reserve_reconciliation_attempt,
         settle_reconciliation_memory,
@@ -2310,7 +2244,11 @@ mod tests {
             )
             .expect("managed artifact attempt");
         let terminal = authority
-            .artifact_terminal(attempt.clone(), ReconciliationTerminalOutcome::Failed, None)
+            .artifact_terminal(
+                attempt.clone(),
+                ReconciliationTerminalOutcome::Failed,
+                Default::default(),
+            )
             .expect("managed artifact terminal");
         let reservation = reserve_reconciliation_attempt(
             fixture.failure_memory.as_ref(),
@@ -2525,7 +2463,7 @@ mod tests {
             .reconciliation_terminal()
             .expect("typed VersionBundle component terminal");
         assert_eq!(terminal.outcome(), ReconciliationTerminalOutcome::Succeeded);
-        assert!(terminal.quarantined_target().is_none());
+        assert!(terminal.quarantine_checkpoint().is_empty());
         assert_eq!(
             fixture
                 .failure_memory
@@ -2596,7 +2534,7 @@ mod tests {
             .reconciliation_terminal()
             .expect("VersionBundle rollback terminal");
         assert_eq!(terminal.outcome(), ReconciliationTerminalOutcome::Failed);
-        assert!(terminal.quarantined_target().is_none());
+        assert!(terminal.quarantine_checkpoint().is_empty());
         assert_eq!(
             fixture
                 .failure_memory
@@ -2755,7 +2693,7 @@ mod tests {
             .reconciliation_terminal()
             .expect("typed Assets component terminal");
         assert_eq!(terminal.outcome(), ReconciliationTerminalOutcome::Succeeded);
-        assert!(terminal.quarantined_target().is_none());
+        assert!(terminal.quarantine_checkpoint().is_empty());
         assert_eq!(
             fixture
                 .failure_memory
@@ -2926,7 +2864,7 @@ mod tests {
             .reconciliation_terminal()
             .expect("Assets failed terminal");
         assert_eq!(terminal.outcome(), ReconciliationTerminalOutcome::Failed);
-        assert!(terminal.quarantined_target().is_none());
+        assert!(terminal.quarantine_checkpoint().is_empty());
         assert_eq!(
             fixture
                 .failure_memory
@@ -3008,7 +2946,7 @@ mod tests {
             .reconciliation_terminal()
             .expect("Assets rollback terminal");
         assert_eq!(terminal.outcome(), ReconciliationTerminalOutcome::Failed);
-        assert!(terminal.quarantined_target().is_none());
+        assert!(terminal.quarantine_checkpoint().is_empty());
         assert_eq!(
             fixture
                 .failure_memory
@@ -3320,7 +3258,7 @@ mod tests {
         let operation_id = admission.attempt().operation_id().clone();
         fixture
             .journals
-            .create(component_rebuild_plan(&admission))
+            .create(component_rebuild_journal(&admission))
             .await
             .expect("interrupted component plan");
         let effect_called = Arc::new(AtomicBool::new(false));

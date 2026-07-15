@@ -9,8 +9,9 @@ use crate::observability::{RedactionAudience, sanitize_evidence_token};
 use crate::state::contracts::{
     CommandKind, JournalId, OperationId, OperationJournalEntry, OperationJournalStep,
     OperationOutcome, OperationPhase, OperationStatus, OperationStepResult, ReconciliationAttempt,
-    ReconciliationScope, ReconciliationTerminal, ReconciliationTerminalOutcome, RollbackState,
-    StabilizationSystem, TargetDescriptor,
+    ReconciliationQuarantineCheckpoint, ReconciliationQuarantineRecord, ReconciliationScope,
+    ReconciliationTerminal, ReconciliationTerminalOutcome, RollbackState, StabilizationSystem,
+    TargetDescriptor,
 };
 use crate::state::failure_memory::GuardianFailureMemoryStore;
 use crate::state::{
@@ -91,13 +92,13 @@ enum ArtifactTerminal {
     Repaired {
         step_id: &'static str,
         facts: Vec<String>,
-        quarantined_target: Option<TargetDescriptor>,
+        quarantine_checkpoint: ReconciliationQuarantineCheckpoint,
     },
     Failed {
         step_id: &'static str,
         rollback: RollbackState,
         facts: Vec<String>,
-        quarantined_target: Option<TargetDescriptor>,
+        quarantine_checkpoint: ReconciliationQuarantineCheckpoint,
     },
 }
 
@@ -174,7 +175,7 @@ async fn execute_admitted_artifact_repair(
                 step_id: "journal_repair_start",
                 rollback: RollbackState::NotApplicable,
                 facts: Vec::new(),
-                quarantined_target: None,
+                quarantine_checkpoint: ReconciliationQuarantineCheckpoint::default(),
             },
         )
         .await?;
@@ -191,7 +192,7 @@ async fn execute_admitted_artifact_repair(
                     step_id: "revalidate_registered_artifact_authority",
                     rollback: RollbackState::NotApplicable,
                     facts: Vec::new(),
-                    quarantined_target: None,
+                    quarantine_checkpoint: ReconciliationQuarantineCheckpoint::default(),
                 },
             )
             .await;
@@ -207,7 +208,7 @@ async fn execute_admitted_artifact_repair(
                 ArtifactTerminal::Repaired {
                     step_id: "registered_artifact_already_exact",
                     facts: Vec::new(),
-                    quarantined_target: None,
+                    quarantine_checkpoint: ReconciliationQuarantineCheckpoint::default(),
                 },
             )
             .await;
@@ -221,7 +222,7 @@ async fn execute_admitted_artifact_repair(
                     step_id: "revalidate_registered_artifact_condition",
                     rollback: RollbackState::NotApplicable,
                     facts: Vec::new(),
-                    quarantined_target: None,
+                    quarantine_checkpoint: ReconciliationQuarantineCheckpoint::default(),
                 },
             )
             .await;
@@ -236,7 +237,7 @@ async fn execute_admitted_artifact_repair(
                         step_id: crate::state::REGISTERED_ARTIFACT_COMPONENT_REBUILD_FAILURE_POINT,
                         rollback: RollbackState::NotApplicable,
                         facts: Vec::new(),
-                        quarantined_target: None,
+                        quarantine_checkpoint: ReconciliationQuarantineCheckpoint::default(),
                     },
                 )
                 .await;
@@ -244,7 +245,7 @@ async fn execute_admitted_artifact_repair(
         }
     };
 
-    let quarantined_target = if context.quarantines_existing() {
+    let quarantine_checkpoint = if context.quarantines_existing() {
         let quarantine_facts = match context
             .admission
             .mutation()
@@ -259,13 +260,13 @@ async fn execute_admitted_artifact_repair(
                         step_id: "quarantine_launcher_managed_target",
                         rollback: RollbackState::Unavailable,
                         facts: fact_ids(&error.facts),
-                        quarantined_target: None,
+                        quarantine_checkpoint: ReconciliationQuarantineCheckpoint::default(),
                     },
                 )
                 .await;
             }
         };
-        let quarantined_target = TargetDescriptor::new(
+        let quarantine_target = TargetDescriptor::new(
             StabilizationSystem::Execution,
             target.kind,
             format!("quarantine-{}", target.id),
@@ -316,7 +317,11 @@ async fn execute_admitted_artifact_repair(
                                 step_id: "record_quarantine_checkpoint",
                                 rollback: RollbackState::Available,
                                 facts: Vec::new(),
-                                quarantined_target: Some(quarantined_target),
+                                quarantine_checkpoint: ReconciliationQuarantineCheckpoint::new(
+                                    vec![ReconciliationQuarantineRecord::artifact(
+                                        quarantine_target,
+                                    )],
+                                ),
                             },
                         )
                         .await?;
@@ -326,9 +331,11 @@ async fn execute_admitted_artifact_repair(
                 },
             }
         }
-        Some(quarantined_target)
+        ReconciliationQuarantineCheckpoint::new(vec![ReconciliationQuarantineRecord::artifact(
+            quarantine_target,
+        )])
     } else {
-        None
+        ReconciliationQuarantineCheckpoint::default()
     };
 
     let download_result = if !context.admission.evidence_is_live() {
@@ -371,7 +378,7 @@ async fn execute_admitted_artifact_repair(
                             RollbackState::Unavailable
                         },
                         facts: fact_ids,
-                        quarantined_target,
+                        quarantine_checkpoint,
                     },
                 )
                 .await;
@@ -382,7 +389,7 @@ async fn execute_admitted_artifact_repair(
                 ArtifactTerminal::Repaired {
                     step_id: "promote_verified_artifact",
                     facts: fact_ids,
-                    quarantined_target,
+                    quarantine_checkpoint,
                 },
             )
             .await
@@ -401,7 +408,7 @@ async fn execute_admitted_artifact_repair(
                             RollbackState::Unavailable
                         },
                         facts: fact_ids,
-                        quarantined_target,
+                        quarantine_checkpoint,
                     },
                 )
                 .await;
@@ -417,7 +424,7 @@ async fn execute_admitted_artifact_repair(
                         RollbackState::Unavailable
                     },
                     facts: fact_ids,
-                    quarantined_target,
+                    quarantine_checkpoint,
                 },
             )
             .await
@@ -430,42 +437,49 @@ async fn finish_artifact_repair(
     operation_id: OperationId,
     terminal: ArtifactTerminal,
 ) -> Result<ArtifactRepairExecution, OperationJournalStoreError> {
-    let (step_id, rollback, failure_point, reconciliation_outcome, status, facts, quarantined) =
-        match terminal {
-            ArtifactTerminal::Repaired {
-                step_id,
-                facts,
-                quarantined_target,
-            } => (
-                step_id,
-                RollbackState::Available,
-                None,
-                ReconciliationTerminalOutcome::Succeeded,
-                GuardianArtifactRepairStatus::Repaired,
-                facts,
-                quarantined_target,
-            ),
-            ArtifactTerminal::Failed {
-                step_id,
-                rollback,
-                facts,
-                quarantined_target,
-            } => (
-                step_id,
-                rollback,
-                Some(step_id),
-                ReconciliationTerminalOutcome::Failed,
-                GuardianArtifactRepairStatus::Failed,
-                facts,
-                quarantined_target,
-            ),
-        };
+    let (
+        step_id,
+        rollback,
+        failure_point,
+        reconciliation_outcome,
+        status,
+        facts,
+        quarantine_checkpoint,
+    ) = match terminal {
+        ArtifactTerminal::Repaired {
+            step_id,
+            facts,
+            quarantine_checkpoint,
+        } => (
+            step_id,
+            RollbackState::Available,
+            None,
+            ReconciliationTerminalOutcome::Succeeded,
+            GuardianArtifactRepairStatus::Repaired,
+            facts,
+            quarantine_checkpoint,
+        ),
+        ArtifactTerminal::Failed {
+            step_id,
+            rollback,
+            facts,
+            quarantine_checkpoint,
+        } => (
+            step_id,
+            rollback,
+            Some(step_id),
+            ReconciliationTerminalOutcome::Failed,
+            GuardianArtifactRepairStatus::Failed,
+            facts,
+            quarantine_checkpoint,
+        ),
+    };
     let reconciliation_terminal = context
         .admission
         .terminal(
             context.attempt.clone(),
             reconciliation_outcome,
-            quarantined.clone(),
+            quarantine_checkpoint,
         )
         .map_err(artifact_reconciliation_error)?;
     let step_result = if failure_point.is_some() {

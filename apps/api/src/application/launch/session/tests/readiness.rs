@@ -1164,14 +1164,10 @@ async fn launch_preparation_rebuilds_failed_runtime_component_once_from_exact_in
     let rebuild_terminal = rebuild_journal
         .reconciliation_terminal()
         .expect("successful component rebuild terminal");
+    assert_eq!(rebuild_terminal.quarantine_checkpoint().records().len(), 1);
     assert_eq!(
-        rebuild_terminal.quarantined_target(),
-        Some(&TargetDescriptor::new(
-            StabilizationSystem::Execution,
-            TargetKind::Runtime,
-            format!("quarantine-{component}"),
-            OwnershipClass::LauncherManaged,
-        ))
+        rebuild_terminal.quarantine_checkpoint().records()[0].runtime_component_id(),
+        Some(component),
     );
     assert!(rebuild_journal.completed_steps.iter().any(|step| {
         step.step_id == "quarantine_launcher_managed_target"

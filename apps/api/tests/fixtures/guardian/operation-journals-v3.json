@@ -1,5 +1,5 @@
 {
-  "schema": "axial.state.operation_journals.v2",
+  "schema": "axial.state.operation_journals.v3",
   "entries": [
     {
       "journal_id": "guardian-vocabulary-journal-01",
@@ -222,7 +222,8 @@
         "scope": {
           "RegisteredInstance": {
             "instance_id": "0123456789abcdef",
-            "fingerprint": "sha256.aaaaaaaa.bbbbbbbb.cccccccc.dddddddd.eeeeeeee.ffffffff.01234567.89abcdef"
+            "fingerprint": "sha256.aaaaaaaa.bbbbbbbb.cccccccc.dddddddd.eeeeeeee.ffffffff.01234567.89abcdef",
+            "inventory_fingerprint": "sha256.99999999.aaaaaaaa.bbbbbbbb.cccccccc.dddddddd.eeeeeeee.ffffffff.00000000"
           }
         },
         "component": "Libraries",
@@ -235,7 +236,8 @@
         "mode": "Managed",
         "ownership": "LauncherManaged",
         "observed_at": "2026-07-01T00:10:00Z",
-        "suppression_until": "2026-07-01T01:10:00Z"
+        "suppression_until": "2026-07-01T01:10:00Z",
+        "lineage": "Initial"
       },
       "reconciliation_terminal": {
         "attempt": {
@@ -246,7 +248,8 @@
           "scope": {
             "RegisteredInstance": {
               "instance_id": "0123456789abcdef",
-              "fingerprint": "sha256.aaaaaaaa.bbbbbbbb.cccccccc.dddddddd.eeeeeeee.ffffffff.01234567.89abcdef"
+              "fingerprint": "sha256.aaaaaaaa.bbbbbbbb.cccccccc.dddddddd.eeeeeeee.ffffffff.01234567.89abcdef",
+              "inventory_fingerprint": "sha256.99999999.aaaaaaaa.bbbbbbbb.cccccccc.dddddddd.eeeeeeee.ffffffff.00000000"
             }
           },
           "component": "Libraries",
@@ -259,10 +262,13 @@
           "mode": "Managed",
           "ownership": "LauncherManaged",
           "observed_at": "2026-07-01T00:10:00Z",
-          "suppression_until": "2026-07-01T01:10:00Z"
+          "suppression_until": "2026-07-01T01:10:00Z",
+          "lineage": "Initial"
         },
         "outcome": "Failed",
-        "quarantined_target": null
+        "quarantine_checkpoint": {
+          "records": []
+        }
       }
     },
     {
@@ -276,7 +282,7 @@
         {
           "system": "Guardian",
           "kind": "Runtime",
-          "id": "fixture_target_03",
+          "id": "java-runtime-delta",
           "ownership": "LauncherManaged"
         },
         {
@@ -304,7 +310,7 @@
           "changed_target": {
             "system": "Guardian",
             "kind": "Runtime",
-            "id": "fixture_target_03",
+            "id": "java-runtime-delta",
             "ownership": "LauncherManaged"
           },
           "generated_facts": [],
@@ -325,20 +331,26 @@
         "scope": {
           "RegisteredInstance": {
             "instance_id": "0123456789abcdef",
-            "fingerprint": "sha256.aaaaaaaa.bbbbbbbb.cccccccc.dddddddd.eeeeeeee.ffffffff.01234567.89abcdef"
+            "fingerprint": "sha256.aaaaaaaa.bbbbbbbb.cccccccc.dddddddd.eeeeeeee.ffffffff.01234567.89abcdef",
+            "inventory_fingerprint": "sha256.11111111.22222222.33333333.44444444.55555555.66666666.77777777.88888888"
           }
         },
         "component": "Runtime",
         "target": {
           "system": "Guardian",
           "kind": "Runtime",
-          "id": "fixture_target_03",
+          "id": "java-runtime-delta",
           "ownership": "LauncherManaged"
         },
         "mode": "Managed",
         "ownership": "LauncherManaged",
         "observed_at": "2026-07-01T00:03:00Z",
-        "suppression_until": "2026-07-01T01:03:00Z"
+        "suppression_until": "2026-07-01T01:03:00Z",
+        "lineage": {
+          "Predecessor": {
+            "operation_id": "guardian-reconciliation-operation-runtime-artifact"
+          }
+        }
       },
       "reconciliation_terminal": {
         "attempt": {
@@ -349,27 +361,36 @@
           "scope": {
             "RegisteredInstance": {
               "instance_id": "0123456789abcdef",
-              "fingerprint": "sha256.aaaaaaaa.bbbbbbbb.cccccccc.dddddddd.eeeeeeee.ffffffff.01234567.89abcdef"
+              "fingerprint": "sha256.aaaaaaaa.bbbbbbbb.cccccccc.dddddddd.eeeeeeee.ffffffff.01234567.89abcdef",
+              "inventory_fingerprint": "sha256.11111111.22222222.33333333.44444444.55555555.66666666.77777777.88888888"
             }
           },
           "component": "Runtime",
           "target": {
             "system": "Guardian",
             "kind": "Runtime",
-            "id": "fixture_target_03",
+            "id": "java-runtime-delta",
             "ownership": "LauncherManaged"
           },
           "mode": "Managed",
           "ownership": "LauncherManaged",
           "observed_at": "2026-07-01T00:03:00Z",
-          "suppression_until": "2026-07-01T01:03:00Z"
+          "suppression_until": "2026-07-01T01:03:00Z",
+          "lineage": {
+            "Predecessor": {
+              "operation_id": "guardian-reconciliation-operation-runtime-artifact"
+            }
+          }
         },
         "outcome": "Succeeded",
-        "quarantined_target": {
-          "system": "Execution",
-          "kind": "Runtime",
-          "id": "quarantine-fixture_target_03",
-          "ownership": "LauncherManaged"
+        "quarantine_checkpoint": {
+          "records": [
+            {
+              "RuntimeComponent": {
+                "component_id": "java-runtime-delta"
+              }
+            }
+          ]
         }
       }
     },
@@ -413,7 +434,8 @@
         "scope": {
           "RegisteredInstance": {
             "instance_id": "fedcba9876543210",
-            "fingerprint": "sha256.11111111.22222222.33333333.44444444.55555555.66666666.77777777.88888888"
+            "fingerprint": "sha256.11111111.22222222.33333333.44444444.55555555.66666666.77777777.88888888",
+            "inventory_fingerprint": "sha256.99999999.88888888.77777777.66666666.55555555.44444444.33333333.22222222"
           }
         },
         "component": "WholeInstance",
@@ -426,7 +448,12 @@
         "mode": "Managed",
         "ownership": "LauncherManaged",
         "observed_at": "2026-07-01T02:03:00Z",
-        "suppression_until": "2026-07-01T03:03:00Z"
+        "suppression_until": "2026-07-01T03:03:00Z",
+        "lineage": {
+          "Predecessor": {
+            "operation_id": "guardian-reconciliation-operation-component-prior"
+          }
+        }
       },
       "reconciliation_terminal": null
     }

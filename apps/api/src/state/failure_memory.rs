@@ -7,8 +7,8 @@ use super::contracts::{
     OwnershipClass, RECONCILIATION_EVIDENCE_CAPACITY, TargetDescriptor, sanitize_target_id,
 };
 use super::contracts::{
-    ReconciliationComponent, ReconciliationRung, ReconciliationScope, ReconciliationTerminal,
-    ReconciliationTerminalOutcome,
+    ReconciliationComponent, ReconciliationQuarantineCheckpoint, ReconciliationRung,
+    ReconciliationScope, ReconciliationTerminal, ReconciliationTerminalOutcome,
 };
 use super::ownership::{CurrentArtifact, classify_current_artifact};
 use crate::execution::persistence::{
@@ -26,7 +26,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 
-pub const FAILURE_MEMORY_SCHEMA: &str = "axial.guardian.failure_memory.v2";
+pub const FAILURE_MEMORY_SCHEMA: &str = "axial.guardian.failure_memory.v3";
 pub const DEFAULT_FAILURE_MEMORY_LIMIT: usize = RECONCILIATION_EVIDENCE_CAPACITY;
 const FAILURE_MEMORY_FILE: &str = "failure-memory.json";
 const FAILURE_MEMORY_LOCK_INVARIANT: &str =
@@ -88,8 +88,13 @@ impl FailureMemoryKey {
         let ReconciliationScope::RegisteredInstance {
             instance_id,
             fingerprint,
+            inventory_fingerprint,
         } = reconciliation_scope;
-        let scope = format!("registered.{instance_id}.{}", fingerprint.as_str());
+        let scope = format!(
+            "registered.{instance_id}.{}.{}",
+            fingerprint.as_str(),
+            inventory_fingerprint.as_str()
+        );
         let base = Self::for_observation(domain, diagnosis_id, target, mode, None);
         Self(format!(
             "{}:rung.{:?}:component.{:?}:scope.{scope}",
@@ -115,7 +120,7 @@ pub struct GuardianFailureMemoryEntry {
     pub last_action_kind: Option<GuardianActionKind>,
     pub last_action_outcome: Option<FailureMemoryActionOutcome>,
     pub repair_attempt_count: u32,
-    pub quarantined_target: Option<TargetDescriptor>,
+    pub quarantine_checkpoint: ReconciliationQuarantineCheckpoint,
     pub suppression_until: Option<String>,
     pub target_content_hash: Option<String>,
     pub user_intent_hash: Option<String>,
@@ -155,7 +160,7 @@ impl GuardianFailureMemoryEntry {
             last_action_kind: None,
             last_action_outcome: None,
             repair_attempt_count: 0,
-            quarantined_target: None,
+            quarantine_checkpoint: ReconciliationQuarantineCheckpoint::default(),
             suppression_until: None,
             target_content_hash: None,
             user_intent_hash,
@@ -178,8 +183,11 @@ impl GuardianFailureMemoryEntry {
         self
     }
 
-    pub fn with_quarantined_target(mut self, target: TargetDescriptor) -> Self {
-        self.quarantined_target = Some(target);
+    pub(super) fn with_quarantine_checkpoint(
+        mut self,
+        checkpoint: ReconciliationQuarantineCheckpoint,
+    ) -> Self {
+        self.quarantine_checkpoint = checkpoint;
         self
     }
 
@@ -259,11 +267,9 @@ impl GuardianFailureMemoryEntry {
         if last_observed_at < first_observed_at {
             return Err(FailureMemoryValidationError::InvalidObservedTimestamp);
         }
-        if let Some(target) = &self.quarantined_target
-            && !is_safe_memory_fragment(&target.id)
-        {
-            return Err(FailureMemoryValidationError::UnsafeTargetId);
-        }
+        self.quarantine_checkpoint
+            .validate_bounded()
+            .map_err(|_| FailureMemoryValidationError::UnsafeTargetId)?;
         if let Some(suppression_until) = &self.suppression_until
             && parse_timestamp(suppression_until).is_err()
         {
@@ -294,7 +300,7 @@ impl GuardianFailureMemoryEntry {
                 || self.repair_attempt_count == 0
                 || self.last_observed_at != terminal.observed_at()
                 || self.suppression_until.as_deref() != Some(terminal.suppression_until())
-                || self.quarantined_target.as_ref() != terminal.quarantined_target()
+                || &self.quarantine_checkpoint != terminal.quarantine_checkpoint()
             {
                 return Err(FailureMemoryValidationError::ReconciliationTerminalMismatch);
             }
@@ -1029,9 +1035,10 @@ mod tests {
     use crate::guardian::{DiagnosisId, GuardianActionKind, GuardianDomain, GuardianMode};
     use crate::state::contracts::{
         OperationId, OwnershipClass, ReconciliationAttempt, ReconciliationComponent,
-        ReconciliationIncarnationFingerprint, ReconciliationRung, ReconciliationScope,
-        ReconciliationTerminal, ReconciliationTerminalOutcome, StabilizationSystem,
-        TargetDescriptor, TargetKind,
+        ReconciliationIncarnationFingerprint, ReconciliationInventoryFingerprint,
+        ReconciliationLineage, ReconciliationQuarantineCheckpoint, ReconciliationRung,
+        ReconciliationScope, ReconciliationTerminal, ReconciliationTerminalOutcome,
+        StabilizationSystem, TargetDescriptor, TargetKind,
     };
     use crate::state::journals::DEFAULT_OPERATION_JOURNAL_LIMIT;
     use crate::state::ownership::{CurrentArtifact, classify_current_artifact};
@@ -1045,9 +1052,9 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
-    const FAILURE_MEMORY_V2_FIXTURE: &str = include_str!(concat!(
+    const FAILURE_MEMORY_V3_FIXTURE: &str = include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/tests/fixtures/guardian/failure-memory-v2.json"
+        "/tests/fixtures/guardian/failure-memory-v3.json"
     ));
 
     struct CountingFileBackend {
@@ -1129,6 +1136,16 @@ mod tests {
     }
 
     #[test]
+    fn retired_v2_failure_memory_schema_is_rejected() {
+        assert!(
+            FailureMemorySnapshot::from_json(
+                r#"{"schema":"axial.guardian.failure_memory.v2","entries":[]}"#,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn every_diagnosis_id_round_trips_through_strict_failure_memory_snapshot() {
         for diagnosis_id in DiagnosisId::ALL {
             let entry = GuardianFailureMemoryEntry::observed(
@@ -1156,14 +1173,14 @@ mod tests {
     }
 
     #[test]
-    fn checked_in_failure_memory_v2_fixture_is_byte_stable() {
+    fn checked_in_failure_memory_v3_fixture_is_byte_stable() {
         let snapshot =
-            FailureMemorySnapshot::from_json(FAILURE_MEMORY_V2_FIXTURE).expect("strict fixture");
+            FailureMemorySnapshot::from_json(FAILURE_MEMORY_V3_FIXTURE).expect("strict fixture");
         assert_eq!(
             super::FAILURE_MEMORY_SCHEMA,
-            "axial.guardian.failure_memory.v2"
+            "axial.guardian.failure_memory.v3"
         );
-        assert_eq!(snapshot.schema, "axial.guardian.failure_memory.v2");
+        assert_eq!(snapshot.schema, "axial.guardian.failure_memory.v3");
         let action_kinds = snapshot
             .entries
             .iter()
@@ -1236,26 +1253,28 @@ mod tests {
         let ReconciliationScope::RegisteredInstance {
             instance_id,
             fingerprint,
+            ..
         } = terminals[0].scope();
         assert_eq!(instance_id, "0123456789abcdef");
         assert_eq!(
             fingerprint.as_str(),
             "sha256.aaaaaaaa.bbbbbbbb.cccccccc.dddddddd.eeeeeeee.ffffffff.01234567.89abcdef"
         );
-        assert!(terminals[0].quarantined_target().is_some());
+        assert!(!terminals[0].quarantine_checkpoint().is_empty());
         let ReconciliationScope::RegisteredInstance {
             instance_id,
             fingerprint,
+            ..
         } = terminals[1].scope();
         assert_eq!(instance_id, "0123456789abcdef");
         assert_eq!(
             fingerprint.as_str(),
             "sha256.aaaaaaaa.bbbbbbbb.cccccccc.dddddddd.eeeeeeee.ffffffff.01234567.89abcdef"
         );
-        assert!(terminals[1].quarantined_target().is_none());
+        assert!(terminals[1].quarantine_checkpoint().is_empty());
 
         let pretty = serde_json::to_string_pretty(&snapshot).expect("pretty fixture json");
-        assert_eq!(format!("{pretty}\n"), FAILURE_MEMORY_V2_FIXTURE);
+        assert_eq!(format!("{pretty}\n"), FAILURE_MEMORY_V3_FIXTURE);
 
         let compact = snapshot.to_json().expect("compact fixture json");
         let decoded = FailureMemorySnapshot::from_json(&compact).expect("decode compact fixture");
@@ -1296,7 +1315,7 @@ mod tests {
                 "last_action_kind": "Retry",
                 "last_action_outcome": "Failed",
                 "repair_attempt_count": 0,
-                "quarantined_target": null,
+                "quarantine_checkpoint": { "records": [] },
                 "suppression_until": null,
                 "target_content_hash": null,
                 "user_intent_hash": "intent",
@@ -1328,7 +1347,7 @@ mod tests {
                 "last_action_kind": "Retry",
                 "last_action_outcome": "Failed",
                 "repair_attempt_count": 0,
-                "quarantined_target": null,
+                "quarantine_checkpoint": { "records": [] },
                 "suppression_until": null,
                 "target_content_hash": null,
                 "user_intent_hash": "intent",
@@ -1404,11 +1423,13 @@ mod tests {
             FailureMemoryActionOutcome::Failed,
         )
         .with_repair_attempt()
-        .with_quarantined_target(managed_artifact)
+        .with_quarantine_checkpoint(ReconciliationQuarantineCheckpoint::new(vec![
+            super::super::contracts::ReconciliationQuarantineRecord::runtime("java-runtime-delta"),
+        ]))
         .with_suppression_until("2026-06-15T10:20:00Z");
 
         assert_eq!(repair.repair_attempt_count, 1);
-        assert!(repair.quarantined_target.is_some());
+        assert!(!repair.quarantine_checkpoint.is_empty());
         assert_eq!(repair.ownership, OwnershipClass::LauncherManaged);
         assert!(repair.validate().is_ok());
 
@@ -1905,6 +1926,9 @@ mod tests {
                 fingerprint: ReconciliationIncarnationFingerprint::from_digest(
                     "sha256.aaaaaaaa.bbbbbbbb.cccccccc.dddddddd.eeeeeeee.ffffffff.01234567.89abcdef",
                 ),
+                inventory_fingerprint: ReconciliationInventoryFingerprint::from_digest(
+                    "sha256.11111111.22222222.33333333.44444444.55555555.66666666.77777777.88888888",
+                ),
             },
             ReconciliationComponent::Libraries,
             target,
@@ -1912,11 +1936,12 @@ mod tests {
             OwnershipClass::LauncherManaged,
             &observed_at.to_rfc3339(),
             &suppression_until.to_rfc3339(),
+            ReconciliationLineage::Initial,
         );
         reconciliation_memory_entry(ReconciliationTerminal::from_attempt(
             attempt,
             ReconciliationTerminalOutcome::Failed,
-            None,
+            ReconciliationQuarantineCheckpoint::default(),
         ))
         .expect("valid reconciliation memory")
     }

@@ -25,7 +25,7 @@ use std::time::Duration;
 use tokio::sync::Mutex as AsyncMutex;
 use tracing::warn;
 
-pub const OPERATION_JOURNAL_SCHEMA: &str = "axial.state.operation_journals.v2";
+pub const OPERATION_JOURNAL_SCHEMA: &str = "axial.state.operation_journals.v3";
 pub const DEFAULT_OPERATION_JOURNAL_LIMIT: usize = RECONCILIATION_EVIDENCE_CAPACITY;
 pub(crate) const MAX_OPERATION_JOURNAL_STEP_FACTS: usize = 64;
 pub(crate) const MAX_OPERATION_JOURNAL_DIAGNOSES: usize = 32;
@@ -991,7 +991,8 @@ fn validate_entry(entry: &OperationJournalEntry) -> Result<(), OperationJournalV
             step.step_id == "quarantine_launcher_managed_target"
                 && step.result == OperationStepResult::Completed
         });
-        if completed_quarantine != terminal.quarantined_target().is_some() {
+        let terminal_has_quarantine = !terminal.quarantine_checkpoint().is_empty();
+        if completed_quarantine != terminal_has_quarantine {
             return Err(OperationJournalValidationError::ReconciliationTerminalMismatch);
         }
         let expected = match terminal.outcome() {
@@ -1257,9 +1258,9 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
     use tokio::sync::Notify;
 
-    const OPERATION_JOURNALS_V2_FIXTURE: &str = include_str!(concat!(
+    const OPERATION_JOURNALS_V3_FIXTURE: &str = include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/tests/fixtures/guardian/operation-journals-v2.json"
+        "/tests/fixtures/guardian/operation-journals-v3.json"
     ));
 
     struct RecordingFileBackend {
@@ -1646,14 +1647,24 @@ mod tests {
     }
 
     #[test]
-    fn checked_in_operation_journals_v2_fixture_is_byte_stable() {
-        let snapshot = OperationJournalSnapshot::from_json(OPERATION_JOURNALS_V2_FIXTURE)
+    fn retired_v2_operation_journal_schema_is_rejected() {
+        assert!(
+            OperationJournalSnapshot::from_json(
+                r#"{"schema":"axial.state.operation_journals.v2","entries":[]}"#,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn checked_in_operation_journals_v3_fixture_is_byte_stable() {
+        let snapshot = OperationJournalSnapshot::from_json(OPERATION_JOURNALS_V3_FIXTURE)
             .expect("strict fixture");
         assert_eq!(
             super::OPERATION_JOURNAL_SCHEMA,
-            "axial.state.operation_journals.v2"
+            "axial.state.operation_journals.v3"
         );
-        assert_eq!(snapshot.schema, "axial.state.operation_journals.v2");
+        assert_eq!(snapshot.schema, "axial.state.operation_journals.v3");
         let diagnosis_ids = snapshot
             .entries
             .iter()
@@ -1694,6 +1705,7 @@ mod tests {
         let ReconciliationScope::RegisteredInstance {
             instance_id: artifact_instance_id,
             fingerprint: artifact_fingerprint,
+            ..
         } = attempts[0].scope();
         assert_eq!(artifact_instance_id, "0123456789abcdef");
         assert_eq!(
@@ -1703,6 +1715,7 @@ mod tests {
         let ReconciliationScope::RegisteredInstance {
             instance_id,
             fingerprint,
+            ..
         } = attempts[1].scope();
         assert_eq!(instance_id, "0123456789abcdef");
         assert_eq!(
@@ -1726,11 +1739,11 @@ mod tests {
                 ReconciliationTerminalOutcome::Succeeded,
             ]
         );
-        assert!(terminals[0].quarantined_target().is_none());
-        assert!(terminals[1].quarantined_target().is_some());
+        assert!(terminals[0].quarantine_checkpoint().is_empty());
+        assert!(!terminals[1].quarantine_checkpoint().is_empty());
 
         let mut unknown_snapshot =
-            serde_json::from_str::<serde_json::Value>(OPERATION_JOURNALS_V2_FIXTURE)
+            serde_json::from_str::<serde_json::Value>(OPERATION_JOURNALS_V3_FIXTURE)
                 .expect("fixture value");
         unknown_snapshot["entries"][0]["guardian_diagnosis_ids"][0] =
             serde_json::Value::String("future_diagnosis".to_string());
@@ -1740,7 +1753,7 @@ mod tests {
         assert!(!error.contains("future_diagnosis"));
 
         let pretty = serde_json::to_string_pretty(&snapshot).expect("pretty fixture json");
-        assert_eq!(format!("{pretty}\n"), OPERATION_JOURNALS_V2_FIXTURE);
+        assert_eq!(format!("{pretty}\n"), OPERATION_JOURNALS_V3_FIXTURE);
 
         let compact = snapshot.to_json().expect("compact fixture json");
         let decoded =

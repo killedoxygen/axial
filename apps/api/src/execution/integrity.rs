@@ -6460,7 +6460,7 @@ mod tests {
         assert_eq!(terminal.component(), ReconciliationComponent::Assets);
         assert_eq!(terminal.domain(), crate::guardian::GuardianDomain::Download);
         assert_eq!(terminal.target(), &target);
-        assert!(terminal.quarantined_target().is_none());
+        assert!(terminal.quarantine_checkpoint().is_empty());
         assert!(
             state
                 .failure_memory()
@@ -6562,7 +6562,7 @@ mod tests {
         assert_eq!(terminal.component(), ReconciliationComponent::Assets);
         assert_eq!(terminal.domain(), crate::guardian::GuardianDomain::Download);
         assert_eq!(terminal.target(), &target);
-        assert!(terminal.quarantined_target().is_none());
+        assert!(terminal.quarantine_checkpoint().is_empty());
 
         drop(lifecycle);
         server.close();
@@ -6650,7 +6650,7 @@ mod tests {
                 ReconciliationScope::RegisteredInstance { instance_id, .. }
                     if instance_id == &instance.id
             ));
-            assert_eq!(terminal.quarantined_target().is_some(), corrupt);
+            assert_eq!(!terminal.quarantine_checkpoint().is_empty(), corrupt);
 
             fs::write(&destination, vec![b'y'; body.len()]).expect("repeat corruption");
             let report = sense_integrity_tier1(
@@ -6766,7 +6766,7 @@ mod tests {
         );
         let terminal = journal.reconciliation_terminal().expect("typed terminal");
         assert_eq!(terminal.target(), &target);
-        assert!(terminal.quarantined_target().is_none());
+        assert!(terminal.quarantine_checkpoint().is_empty());
 
         drop(lifecycle);
         drop(foreground);
