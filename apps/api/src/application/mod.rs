@@ -20,6 +20,7 @@ mod known_good;
 pub mod launch;
 pub mod music;
 pub mod performance;
+mod registered_artifact_recovery;
 pub mod setup;
 pub mod skin;
 pub mod status;
