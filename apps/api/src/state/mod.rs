@@ -100,6 +100,8 @@ pub(crate) use performance_managed::{
     ManagedInstanceAdmissionError,
 };
 pub use performance_rules::AppPerformanceStore;
+#[cfg(test)]
+pub(crate) use reconciliation::RegisteredWholeInstanceRematerializationAvailability;
 pub(crate) use reconciliation::{
     ASSETS_COMPONENT_REBUILD_STEP, COMPONENT_QUARANTINE_STEP, COMPONENT_REBUILD_START_STEP,
     LIBRARIES_COMPONENT_REBUILD_STEP, REGISTERED_ARTIFACT_COMPONENT_REBUILD_FAILURE_POINT,
