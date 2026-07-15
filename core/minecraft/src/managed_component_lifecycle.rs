@@ -1,17 +1,19 @@
 use crate::artifact_path::ArtifactRelativePath;
+use crate::known_good::PendingKnownGoodInstallAuthority;
 use crate::known_good::{
-    KnownGoodArtifactKind, KnownGoodIntegrity, KnownGoodRoot, ManagedKnownGoodComponent,
-    PendingKnownGoodInstallAuthority,
+    KnownGoodArtifactKind, KnownGoodIntegrity, KnownGoodRoot, ManagedComponentProjection,
+    ManagedKnownGoodComponent,
 };
 use crate::loaders::types::LoaderError;
 use crate::managed_component_effects::{
     ComponentCanonicalObservation, ComponentEffectsError, ComponentExecutionResult,
     ComponentIntentCandidate, ComponentIntentPublicationRecovery, ComponentIntentPublishFailure,
-    ComponentLane, ComponentRecoveryRetryResult, ComponentSettledOutcome,
-    ComponentSettlementResult, ComponentStartupRecoveryResult, component_root_binding_sha256,
-    component_slot_name, execute_component_intent, plan_component_canonical_path,
-    recover_component_intent_publication, recover_component_transaction, retry_component_recovery,
-    retry_component_settlement, settle_component_transaction,
+    ComponentLane, ComponentPriorRecoveryRetryResult, ComponentRecoveryRetryResult,
+    ComponentSettledOutcome, ComponentSettlementResult, ComponentStartupRecoveryResult,
+    component_root_binding_sha256, component_slot_name, execute_component_intent,
+    plan_component_canonical_path, recover_component_intent_publication,
+    recover_component_transaction, retry_component_recovery, retry_component_settlement,
+    retry_prior_component_recovery, settle_component_transaction,
 };
 #[cfg(test)]
 use crate::managed_component_effects::{
@@ -31,6 +33,7 @@ use crate::managed_publication::{
 };
 use std::collections::{BTreeMap, VecDeque};
 use std::future::Future;
+use std::path::Path;
 use std::time::Duration;
 
 const COMPONENT_RETRY_INITIAL_DELAY: Duration = Duration::from_millis(25);
@@ -84,8 +87,6 @@ pub(crate) enum ComponentLifecycleError {
     Prepare(#[from] PrepareComponentIntentError),
     #[error("managed component intent failed before canonical effects")]
     BeforeEffects(#[source] ComponentEffectsError),
-    #[error("managed component recovery lost the admitted current transaction")]
-    CurrentTransactionLost,
     #[error("managed component transaction rolled back")]
     RolledBack,
 }
@@ -119,12 +120,79 @@ impl ComponentPublicationSourceIdentity {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct ComponentProjectionRow {
     inventory_ordinal: u32,
     path: ArtifactRelativePath,
     kind: ManagedComponentArtifactKind,
     size: u64,
     sha1: [u8; 20],
+}
+
+pub(crate) struct ManagedComponentCommittedReceipt {
+    component: ManagedComponentKind,
+    projection: Vec<ComponentProjectionRow>,
+    lease: ManagedRootPublicationLease,
+}
+
+pub(crate) struct ManagedComponentRolledBackReceipt {
+    component: ManagedComponentKind,
+    projection: Vec<ComponentProjectionRow>,
+    effect: crate::managed_component_publication::ComponentRollbackEffect,
+    lease: ManagedRootPublicationLease,
+}
+
+pub(crate) enum ManagedComponentLifecycleOutcome {
+    Committed(ManagedComponentCommittedReceipt),
+    RolledBack(ManagedComponentRolledBackReceipt),
+}
+
+impl ManagedComponentCommittedReceipt {
+    pub(crate) fn matches_projection(&self, projection: &ManagedComponentProjection<'_>) -> bool {
+        projection_rows(self.component, projection).is_ok_and(|rows| rows == self.projection)
+    }
+
+    pub(crate) async fn revalidate(&self) -> bool {
+        revalidate_component_projection(&self.lease, self.component, &self.projection).await
+    }
+
+    pub(crate) async fn matches_root(&self, expected: &Path) -> bool {
+        receipt_matches_root(&self.lease, expected).await
+    }
+
+    pub(crate) fn into_lease(self) -> ManagedRootPublicationLease {
+        self.lease
+    }
+}
+
+impl ManagedComponentRolledBackReceipt {
+    pub(crate) fn rollback_effect(
+        &self,
+    ) -> crate::managed_component_publication::ComponentRollbackEffect {
+        self.effect
+    }
+
+    pub(crate) fn matches_projection(&self, projection: &ManagedComponentProjection<'_>) -> bool {
+        projection_rows(self.component, projection).is_ok_and(|rows| rows == self.projection)
+    }
+
+    pub(crate) async fn matches_root(&self, expected: &Path) -> bool {
+        receipt_matches_root(&self.lease, expected).await
+    }
+}
+
+async fn receipt_matches_root(lease: &ManagedRootPublicationLease, expected: &Path) -> bool {
+    if lease.revalidate().is_err() {
+        return false;
+    }
+    let expected = expected.to_path_buf();
+    let root = lease.root().clone();
+    let matches = run_publication_blocking(move || {
+        root.revalidate()?;
+        Ok::<_, LoaderError>(ManagedDir::open_root(&expected)?.identity()? == root.identity()?)
+    })
+    .await;
+    matches!(matches, Ok(Ok(true))) && lease.revalidate().is_ok()
 }
 
 struct SparseSourceCounts {
@@ -134,11 +202,6 @@ struct SparseSourceCounts {
 
 struct ComponentRetryBackoff {
     delay: Duration,
-}
-
-enum NormalizedComponentState {
-    NoTransaction(ManagedRootPublicationLease),
-    Settled(ComponentSettledOutcome),
 }
 
 enum ComponentProgress {
@@ -180,15 +243,17 @@ pub(crate) async fn publish_managed_component<S>(
 where
     S: RetainedComponentPublicationSource + 'static,
 {
-    publish_managed_component_inner(
-        lease,
-        authority,
-        component,
-        sources,
-        #[cfg(test)]
-        None,
-    )
-    .await
+    let (known_good_component, _) = component_projection_contract(component);
+    let projection = authority
+        .component_projection(known_good_component)
+        .map_err(|_| PrepareComponentIntentError::Projection)?;
+    match publish_managed_component_effect(lease, projection, component, sources).await? {
+        ManagedComponentLifecycleOutcome::Committed(receipt) => Ok(receipt.into_lease()),
+        ManagedComponentLifecycleOutcome::RolledBack(receipt) => {
+            drop(receipt);
+            Err(ComponentLifecycleError::RolledBack)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -202,21 +267,60 @@ async fn publish_managed_component_with_faults<S>(
 where
     S: RetainedComponentPublicationSource + 'static,
 {
-    publish_managed_component_inner(lease, authority, component, sources, Some(faults)).await
+    let (known_good_component, _) = component_projection_contract(component);
+    let projection = authority
+        .component_projection(known_good_component)
+        .map_err(|_| PrepareComponentIntentError::Projection)?;
+    match publish_managed_component_effect_inner(
+        lease,
+        projection,
+        component,
+        sources,
+        Some(faults),
+    )
+    .await?
+    {
+        ManagedComponentLifecycleOutcome::Committed(receipt) => Ok(receipt.into_lease()),
+        ManagedComponentLifecycleOutcome::RolledBack(receipt) => {
+            drop(receipt);
+            Err(ComponentLifecycleError::RolledBack)
+        }
+    }
 }
 
-async fn publish_managed_component_inner<S>(
+pub(crate) async fn publish_managed_component_effect<S>(
     lease: ManagedRootPublicationLease,
-    authority: &PendingKnownGoodInstallAuthority,
+    projection: ManagedComponentProjection<'_>,
+    component: ManagedComponentKind,
+    sources: Vec<S>,
+) -> Result<ManagedComponentLifecycleOutcome, ComponentLifecycleError>
+where
+    S: RetainedComponentPublicationSource + 'static,
+{
+    publish_managed_component_effect_inner(
+        lease,
+        projection,
+        component,
+        sources,
+        #[cfg(test)]
+        None,
+    )
+    .await
+}
+
+async fn publish_managed_component_effect_inner<S>(
+    lease: ManagedRootPublicationLease,
+    projection: ManagedComponentProjection<'_>,
     component: ManagedComponentKind,
     sources: Vec<S>,
     #[cfg(test)] mut faults: Option<&mut ComponentLifecycleTestFaults>,
-) -> Result<ManagedRootPublicationLease, ComponentLifecycleError>
+) -> Result<ManagedComponentLifecycleOutcome, ComponentLifecycleError>
 where
     S: RetainedComponentPublicationSource + 'static,
 {
     let lease = settle_prior_component_transaction(lease, component).await?;
-    let candidate = prepare_component_intent(lease, authority, component, sources).await?;
+    let (candidate, projection) =
+        prepare_component_intent_projection(lease, projection, component, sources).await?;
     let mut backoff = ComponentRetryBackoff::new();
     let execution = publish_current_component_intent(
         candidate,
@@ -225,7 +329,7 @@ where
         faults.as_deref_mut(),
     )
     .await?;
-    match normalize_component_transaction(
+    match normalize_current_component_transaction(
         execution,
         &mut backoff,
         #[cfg(test)]
@@ -233,13 +337,21 @@ where
     )
     .await?
     {
-        NormalizedComponentState::NoTransaction(_) => {
-            Err(ComponentLifecycleError::CurrentTransactionLost)
-        }
-        NormalizedComponentState::Settled(ComponentSettledOutcome::Committed(lease)) => Ok(lease),
-        NormalizedComponentState::Settled(ComponentSettledOutcome::RolledBack { .. }) => {
-            Err(ComponentLifecycleError::RolledBack)
-        }
+        ComponentSettledOutcome::Committed(lease) => Ok(
+            ManagedComponentLifecycleOutcome::Committed(ManagedComponentCommittedReceipt {
+                component,
+                projection,
+                lease,
+            }),
+        ),
+        ComponentSettledOutcome::RolledBack { lease, effect } => Ok(
+            ManagedComponentLifecycleOutcome::RolledBack(ManagedComponentRolledBackReceipt {
+                component,
+                projection,
+                effect,
+                lease,
+            }),
+        ),
     }
 }
 
@@ -250,28 +362,15 @@ async fn settle_prior_component_transaction(
     let recovered = recover_component_transaction(lease, component).await;
     let mut backoff = ComponentRetryBackoff::new();
     let normalized = match recovered {
-        ComponentStartupRecoveryResult::NoTransaction(lease) => {
-            NormalizedComponentState::NoTransaction(lease)
-        }
-        ComponentStartupRecoveryResult::Settled(outcome) => {
-            NormalizedComponentState::Settled(outcome)
-        }
+        ComponentStartupRecoveryResult::NoTransaction(lease) => return Ok(lease),
+        ComponentStartupRecoveryResult::Settled(outcome) => outcome,
         ComponentStartupRecoveryResult::Transaction(execution) => {
-            normalize_component_transaction(
-                execution,
-                &mut backoff,
-                #[cfg(test)]
-                None,
-            )
-            .await?
+            return normalize_prior_component_transaction(execution, &mut backoff).await;
         }
     };
     Ok(match normalized {
-        NormalizedComponentState::NoTransaction(lease)
-        | NormalizedComponentState::Settled(ComponentSettledOutcome::Committed(lease))
-        | NormalizedComponentState::Settled(ComponentSettledOutcome::RolledBack {
-            lease, ..
-        }) => lease,
+        ComponentSettledOutcome::Committed(lease)
+        | ComponentSettledOutcome::RolledBack { lease, .. } => lease,
     })
 }
 
@@ -305,20 +404,28 @@ async fn publish_current_component_intent(
                 return Err(ComponentLifecycleError::BeforeEffects(cause));
             }
             Err(failure @ ComponentIntentPublishFailure::PromotionAttempted { .. }) => {
-                match recover_component_intent_publication(failure).await {
-                    Ok(ComponentIntentPublicationRecovery::Retry(retry)) => {
-                        candidate = retry;
-                        backoff.wait().await;
-                    }
-                    Ok(ComponentIntentPublicationRecovery::Transaction(execution)) => {
-                        return Ok(execution);
-                    }
-                    Err(ComponentIntentPublishFailure::BeforePromotion { candidate, cause }) => {
-                        drop(candidate);
-                        return Err(ComponentLifecycleError::BeforeEffects(cause));
-                    }
-                    Err(ComponentIntentPublishFailure::PromotionAttempted { .. }) => {
-                        return Err(ComponentLifecycleError::CurrentTransactionLost);
+                let mut recovery = failure;
+                loop {
+                    match recover_component_intent_publication(recovery).await {
+                        Ok(ComponentIntentPublicationRecovery::Retry(retry)) => {
+                            candidate = retry;
+                            backoff.wait().await;
+                            break;
+                        }
+                        Ok(ComponentIntentPublicationRecovery::Transaction(execution)) => {
+                            return Ok(execution);
+                        }
+                        Err(ComponentIntentPublishFailure::BeforePromotion {
+                            candidate,
+                            cause,
+                        }) => {
+                            drop(candidate);
+                            return Err(ComponentLifecycleError::BeforeEffects(cause));
+                        }
+                        Err(next @ ComponentIntentPublishFailure::PromotionAttempted { .. }) => {
+                            recovery = next;
+                            backoff.wait().await;
+                        }
                     }
                 }
             }
@@ -326,11 +433,11 @@ async fn publish_current_component_intent(
     }
 }
 
-async fn normalize_component_transaction(
+async fn normalize_current_component_transaction(
     execution: ComponentExecutionResult,
     backoff: &mut ComponentRetryBackoff,
     #[cfg(test)] mut faults: Option<&mut ComponentLifecycleTestFaults>,
-) -> Result<NormalizedComponentState, ComponentLifecycleError> {
+) -> Result<ComponentSettledOutcome, ComponentLifecycleError> {
     let mut progress = ComponentProgress::Execution(execution);
     loop {
         progress = match progress {
@@ -351,11 +458,8 @@ async fn normalize_component_transaction(
             ComponentProgress::Recovery(recovery) => {
                 backoff.wait().await;
                 match retry_component_recovery(recovery).await {
-                    ComponentRecoveryRetryResult::NoTransaction(lease) => {
-                        return Ok(NormalizedComponentState::NoTransaction(lease));
-                    }
                     ComponentRecoveryRetryResult::Settled(outcome) => {
-                        return Ok(NormalizedComponentState::Settled(outcome));
+                        return Ok(outcome);
                     }
                     ComponentRecoveryRetryResult::RetryIntent(candidate) => {
                         ComponentProgress::Execution(
@@ -371,16 +475,74 @@ async fn normalize_component_transaction(
                     ComponentRecoveryRetryResult::Transaction(execution) => {
                         ComponentProgress::Execution(execution)
                     }
+                    ComponentRecoveryRetryResult::Retry(recovery) => {
+                        ComponentProgress::Recovery(recovery)
+                    }
                 }
             }
             ComponentProgress::Settlement(ComponentSettlementResult::Settled(outcome)) => {
-                return Ok(NormalizedComponentState::Settled(outcome));
+                return Ok(outcome);
             }
             ComponentProgress::Settlement(ComponentSettlementResult::Retry(retry)) => {
                 backoff.wait().await;
                 ComponentProgress::Settlement(retry_component_settlement(retry).await)
             }
         };
+    }
+}
+
+async fn normalize_prior_component_transaction(
+    execution: ComponentExecutionResult,
+    backoff: &mut ComponentRetryBackoff,
+) -> Result<ManagedRootPublicationLease, ComponentLifecycleError> {
+    let mut progress = ComponentProgress::Execution(execution);
+    loop {
+        progress = match progress {
+            ComponentProgress::Execution(ComponentExecutionResult::Committed(receipt))
+            | ComponentProgress::Execution(ComponentExecutionResult::RolledBack(receipt)) => {
+                ComponentProgress::Settlement(settle_component_transaction(receipt).await)
+            }
+            ComponentProgress::Execution(ComponentExecutionResult::RecoveryRequired(recovery)) => {
+                ComponentProgress::Recovery(recovery)
+            }
+            ComponentProgress::Recovery(recovery) => {
+                backoff.wait().await;
+                match retry_prior_component_recovery(recovery).await {
+                    ComponentPriorRecoveryRetryResult::NoTransaction(lease) => return Ok(lease),
+                    ComponentPriorRecoveryRetryResult::Settled(outcome) => {
+                        return Ok(settled_component_lease(outcome));
+                    }
+                    ComponentPriorRecoveryRetryResult::RetryIntent(candidate) => {
+                        ComponentProgress::Execution(
+                            publish_current_component_intent(
+                                candidate,
+                                backoff,
+                                #[cfg(test)]
+                                None,
+                            )
+                            .await?,
+                        )
+                    }
+                    ComponentPriorRecoveryRetryResult::Transaction(execution) => {
+                        ComponentProgress::Execution(execution)
+                    }
+                }
+            }
+            ComponentProgress::Settlement(ComponentSettlementResult::Settled(outcome)) => {
+                return Ok(settled_component_lease(outcome));
+            }
+            ComponentProgress::Settlement(ComponentSettlementResult::Retry(retry)) => {
+                backoff.wait().await;
+                ComponentProgress::Settlement(retry_component_settlement(retry).await)
+            }
+        };
+    }
+}
+
+fn settled_component_lease(outcome: ComponentSettledOutcome) -> ManagedRootPublicationLease {
+    match outcome {
+        ComponentSettledOutcome::Committed(lease)
+        | ComponentSettledOutcome::RolledBack { lease, .. } => lease,
     }
 }
 
@@ -406,24 +568,18 @@ async fn settle_current_component_transaction(
     settle_component_transaction(receipt).await
 }
 
-async fn prepare_component_intent<S>(
+async fn prepare_component_intent_projection<S>(
     lease: ManagedRootPublicationLease,
-    authority: &PendingKnownGoodInstallAuthority,
+    projection: ManagedComponentProjection<'_>,
     component: ManagedComponentKind,
     sources: Vec<S>,
-) -> Result<ComponentIntentCandidate, PrepareComponentIntentError>
+) -> Result<(ComponentIntentCandidate, Vec<ComponentProjectionRow>), PrepareComponentIntentError>
 where
     S: RetainedComponentPublicationSource + 'static,
 {
-    let (projection_rows, sources) = {
-        let (known_good_component, _) = component_projection_contract(component);
-        let projection = authority
-            .component_projection(known_good_component)
-            .map_err(|_| PrepareComponentIntentError::Projection)?;
-        let projection_rows = projection_rows(component, &projection)?;
-        let sources = index_sparse_sources(&projection_rows, sources)?;
-        (projection_rows, sources)
-    };
+    let projection_rows = projection_rows(component, &projection)?;
+    let sources = index_sparse_sources(&projection_rows, sources)?;
+    let retained_projection = projection_rows.clone();
     let total_rows = projection_rows.len();
     let (mut lease, mut lane, mut builder, mut spool, planned_rows, mut sources, source_counts) =
         run_publication_blocking(move || {
@@ -522,7 +678,26 @@ where
         Ok::<_, PrepareComponentIntentError>(lane.into_intent_candidate(lease, manifest)?)
     })
     .await??;
-    Ok(candidate)
+    Ok((candidate, retained_projection))
+}
+
+#[cfg(test)]
+async fn prepare_component_intent<S>(
+    lease: ManagedRootPublicationLease,
+    authority: &PendingKnownGoodInstallAuthority,
+    component: ManagedComponentKind,
+    sources: Vec<S>,
+) -> Result<ComponentIntentCandidate, PrepareComponentIntentError>
+where
+    S: RetainedComponentPublicationSource + 'static,
+{
+    let (known_good_component, _) = component_projection_contract(component);
+    let projection = authority
+        .component_projection(known_good_component)
+        .map_err(|_| PrepareComponentIntentError::Projection)?;
+    prepare_component_intent_projection(lease, projection, component, sources)
+        .await
+        .map(|(candidate, _)| candidate)
 }
 
 fn projection_rows(
@@ -632,6 +807,34 @@ fn plan_projection(
     }
     lease.revalidate()?;
     Ok(rows)
+}
+
+async fn revalidate_component_projection(
+    lease: &ManagedRootPublicationLease,
+    component: ManagedComponentKind,
+    projection: &[ComponentProjectionRow],
+) -> bool {
+    if lease.revalidate().is_err() {
+        return false;
+    }
+    let root = lease.root().clone();
+    let projection = projection.to_vec();
+    let exact = run_publication_blocking(move || {
+        root.revalidate()?;
+        for row in projection {
+            let planned = plan_component_canonical_path(&root, component, &row.path)?;
+            let ComponentCanonicalObservation::Regular(observed) = planned.observe()? else {
+                return Ok::<_, ComponentEffectsError>(false);
+            };
+            if observed.size() != row.size || observed.sha1() != row.sha1 {
+                return Ok(false);
+            }
+        }
+        root.revalidate()?;
+        Ok(true)
+    })
+    .await;
+    matches!(exact, Ok(Ok(true))) && lease.revalidate().is_ok()
 }
 
 fn validate_sparse_source_coverage<S>(

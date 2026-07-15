@@ -17,6 +17,7 @@ use crate::known_good_libraries::{
 use crate::launch::{Library, maven_to_path};
 use crate::managed_component_cache::{ManagedComponentExactCache, ManagedComponentExactCacheError};
 use crate::managed_component_table::ManagedComponentKind;
+use crate::managed_fs::ManagedDir;
 use crate::paths::libraries_dir;
 use crate::rules::{Environment, evaluate_rules};
 use futures_util::StreamExt;
@@ -97,6 +98,17 @@ impl ExactLibraryCacheAdmission {
         })
     }
 
+    pub(crate) async fn bind_guarded(managed_root: ManagedDir) -> Result<Self, DownloadError> {
+        Ok(Self {
+            cache: ManagedComponentExactCache::bind_guarded(
+                managed_root,
+                ManagedComponentKind::Libraries,
+            )
+            .await
+            .map_err(cache_admission_error)?,
+        })
+    }
+
     pub(crate) async fn requires_retained_source(
         &self,
         job: &DownloadJob,
@@ -110,7 +122,7 @@ impl ExactLibraryCacheAdmission {
         Ok(observed != Some(expected_sha1))
     }
 
-    async fn retain_installer_source(
+    pub(crate) async fn retain_installer_source(
         &self,
         job: &DownloadJob,
         source_pool: &LibrarySourcePool,

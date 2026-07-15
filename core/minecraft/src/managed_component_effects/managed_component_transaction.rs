@@ -46,6 +46,13 @@ pub(crate) enum ComponentIntentPublicationRecovery {
 }
 
 pub(crate) enum ComponentRecoveryRetryResult {
+    Settled(ComponentSettledOutcome),
+    RetryIntent(ComponentIntentCandidate),
+    Transaction(ComponentExecutionResult),
+    Retry(ComponentRecoveryRequired),
+}
+
+pub(crate) enum ComponentPriorRecoveryRetryResult {
     NoTransaction(ManagedRootPublicationLease),
     Settled(ComponentSettledOutcome),
     RetryIntent(ComponentIntentCandidate),
@@ -150,7 +157,7 @@ enum SettlementDisposition {
 }
 
 enum RecoveryOwnerResult {
-    NoTransaction(ManagedRootPublicationLease),
+    NoTransaction(ManagedRootPublicationLease, ManagedComponentKind),
     Settled(ComponentSettledOutcome),
     RetryIntent(ComponentIntentCandidate),
     Transaction(ComponentExecutionResult),
@@ -186,11 +193,15 @@ struct SettlementRowsPlan {
 #[derive(Clone, Copy, Eq, PartialEq)]
 pub(crate) enum ComponentExecutionFault {
     None,
+    #[cfg(test)]
     AfterFirstRow,
+    #[cfg(test)]
     CrashAfterFirstRow,
     CrashAfterFirstReplacementQuarantine,
     CrashAfterFirstAncestor,
+    #[cfg(test)]
     CrashBeforeOutcome,
+    #[cfg(test)]
     OutcomePromotionAttempted,
 }
 
@@ -226,7 +237,7 @@ pub(crate) async fn recover_component_transaction(
     component: ManagedComponentKind,
 ) -> ComponentStartupRecoveryResult {
     match run_component_recovery(ComponentRecoveryAuthority::Restart { lease, component }).await {
-        RecoveryOwnerResult::NoTransaction(lease) => {
+        RecoveryOwnerResult::NoTransaction(lease, _) => {
             ComponentStartupRecoveryResult::NoTransaction(lease)
         }
         RecoveryOwnerResult::Settled(outcome) => ComponentStartupRecoveryResult::Settled(outcome),
@@ -260,7 +271,7 @@ pub(crate) async fn recover_component_intent_publication(
             RecoveryOwnerResult::Transaction(result) => {
                 ComponentIntentPublicationRecovery::Transaction(result)
             }
-            RecoveryOwnerResult::NoTransaction(_) => {
+            RecoveryOwnerResult::NoTransaction(_, _) => {
                 unreachable!("attempted publication recovery cannot lose its candidate")
             }
             RecoveryOwnerResult::Settled(_) => {
@@ -274,8 +285,10 @@ pub(crate) async fn retry_component_recovery(
     recovery: ComponentRecoveryRequired,
 ) -> ComponentRecoveryRetryResult {
     match run_component_recovery(recovery.authority).await {
-        RecoveryOwnerResult::NoTransaction(lease) => {
-            ComponentRecoveryRetryResult::NoTransaction(lease)
+        RecoveryOwnerResult::NoTransaction(lease, component) => {
+            ComponentRecoveryRetryResult::Retry(ComponentRecoveryRequired {
+                authority: ComponentRecoveryAuthority::Restart { lease, component },
+            })
         }
         RecoveryOwnerResult::Settled(outcome) => ComponentRecoveryRetryResult::Settled(outcome),
         RecoveryOwnerResult::Transaction(result) => {
@@ -283,6 +296,25 @@ pub(crate) async fn retry_component_recovery(
         }
         RecoveryOwnerResult::RetryIntent(candidate) => {
             ComponentRecoveryRetryResult::RetryIntent(candidate)
+        }
+    }
+}
+
+pub(crate) async fn retry_prior_component_recovery(
+    recovery: ComponentRecoveryRequired,
+) -> ComponentPriorRecoveryRetryResult {
+    match run_component_recovery(recovery.authority).await {
+        RecoveryOwnerResult::NoTransaction(lease, _) => {
+            ComponentPriorRecoveryRetryResult::NoTransaction(lease)
+        }
+        RecoveryOwnerResult::Settled(outcome) => {
+            ComponentPriorRecoveryRetryResult::Settled(outcome)
+        }
+        RecoveryOwnerResult::Transaction(result) => {
+            ComponentPriorRecoveryRetryResult::Transaction(result)
+        }
+        RecoveryOwnerResult::RetryIntent(candidate) => {
+            ComponentPriorRecoveryRetryResult::RetryIntent(candidate)
         }
     }
 }
@@ -978,13 +1010,19 @@ fn execute_component_intent_blocking(
                 )
             });
 
-    if matches!(
+    let crashed_without_outcome = matches!(
         fault,
-        ComponentExecutionFault::CrashAfterFirstRow
-            | ComponentExecutionFault::CrashAfterFirstReplacementQuarantine
+        ComponentExecutionFault::CrashAfterFirstReplacementQuarantine
             | ComponentExecutionFault::CrashAfterFirstAncestor
-            | ComponentExecutionFault::CrashBeforeOutcome
-    ) {
+    );
+    #[cfg(test)]
+    let crashed_without_outcome = crashed_without_outcome
+        || matches!(
+            fault,
+            ComponentExecutionFault::CrashAfterFirstRow
+                | ComponentExecutionFault::CrashBeforeOutcome
+        );
+    if crashed_without_outcome {
         return BlockingDisposition::RecoveryRequired(None);
     }
 
@@ -1462,6 +1500,7 @@ fn execute_rows_forward(
                 }
                 _ => return Err(ComponentTransactionError),
             }
+            #[cfg(test)]
             if matches!(
                 fault,
                 ComponentExecutionFault::AfterFirstRow
@@ -3987,9 +4026,10 @@ fn finish_recovery_disposition(
         .take()
         .expect("component recovery owner must retain its authority");
     match (disposition, authority) {
-        (BlockingDisposition::NoTransaction, ComponentRecoveryAuthority::Restart { lease, .. }) => {
-            RecoveryOwnerResult::NoTransaction(lease)
-        }
+        (
+            BlockingDisposition::NoTransaction,
+            ComponentRecoveryAuthority::Restart { lease, component },
+        ) => RecoveryOwnerResult::NoTransaction(lease, component),
         (
             BlockingDisposition::Settled(outcome),
             ComponentRecoveryAuthority::Restart { lease, .. },

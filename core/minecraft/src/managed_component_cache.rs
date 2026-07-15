@@ -41,24 +41,42 @@ impl ManagedComponentExactCache {
                 }
                 Err(_) => return Err(ManagedComponentExactCacheError::Admission),
             };
-            let component_name = component_lane_name(component);
-            if !root
-                .has_portably_exact_child_name(component_name)
-                .map_err(|_| ManagedComponentExactCacheError::Admission)?
-            {
-                return Ok(Self {
-                    component_root: None,
-                });
-            }
-            let component_root = root
-                .open_child(component_name)
-                .map_err(|_| ManagedComponentExactCacheError::Admission)?;
-            Ok(Self {
-                component_root: Some(component_root),
-            })
+            Self::bind_guarded_blocking(root, component)
         })
         .await
         .map_err(|_| ManagedComponentExactCacheError::TaskStopped)?
+    }
+
+    pub(crate) async fn bind_guarded(
+        managed_root: ManagedDir,
+        component: ManagedComponentKind,
+    ) -> Result<Self, ManagedComponentExactCacheError> {
+        tokio::task::spawn_blocking(move || Self::bind_guarded_blocking(managed_root, component))
+            .await
+            .map_err(|_| ManagedComponentExactCacheError::TaskStopped)?
+    }
+
+    fn bind_guarded_blocking(
+        root: ManagedDir,
+        component: ManagedComponentKind,
+    ) -> Result<Self, ManagedComponentExactCacheError> {
+        root.revalidate()
+            .map_err(|_| ManagedComponentExactCacheError::Admission)?;
+        let component_name = component_lane_name(component);
+        if !root
+            .has_portably_exact_child_name(component_name)
+            .map_err(|_| ManagedComponentExactCacheError::Admission)?
+        {
+            return Ok(Self {
+                component_root: None,
+            });
+        }
+        let component_root = root
+            .open_child(component_name)
+            .map_err(|_| ManagedComponentExactCacheError::Admission)?;
+        Ok(Self {
+            component_root: Some(component_root),
+        })
     }
 
     pub(crate) async fn full_sha1(

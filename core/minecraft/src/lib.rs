@@ -29,11 +29,13 @@ pub mod version_meta;
 
 pub use asset_index::{AssetIndexFlagsError, asset_index_requires_virtual_repair};
 pub use download::{DownloadError, DownloadProgress, Downloader};
-pub use known_good::{
-    KnownGoodInstallReceipt, KnownGoodReconstructionReceipt, ManagedLibrariesReconstruction,
-};
+pub use known_good::{KnownGoodInstallReceipt, KnownGoodReconstructionReceipt};
+#[cfg(feature = "test-support")]
+pub use known_good_reconstruction::rebuild_managed_libraries_fixture_for_test;
 pub use known_good_reconstruction::{
-    KnownGoodReconstructionError, prepare_managed_libraries_reconstruction, reconstruct_known_good,
+    KnownGoodReconstructionError, ManagedLibrariesCommitReceipt, ManagedLibrariesRebuildError,
+    ManagedLibrariesRollbackEffect, ManagedLibrariesRollbackReceipt, rebuild_managed_libraries,
+    reconstruct_known_good,
 };
 pub use launch::{
     JavaVersion, LaunchModelError, LaunchVars, ResolvedLibrary, VersionJson, build_classpath,
@@ -89,9 +91,8 @@ pub use version::{
 };
 pub use version_bundle_publication::{
     ManagedVersionBundleCommitReceipt, ManagedVersionBundleDisposition, ManagedVersionBundleEffect,
-    ManagedVersionBundleFailurePhase, ManagedVersionBundleFailureReceipt,
-    ManagedVersionBundleOrdinalDisposition, ManagedVersionBundlePublicationError,
-    ManagedVersionBundleRebuildError, ManagedVersionBundleSettlementFailure,
+    ManagedVersionBundleFailureReceipt, ManagedVersionBundleOrdinalDisposition,
+    ManagedVersionBundlePublicationError, ManagedVersionBundleSettlementFailure,
     ManagedVersionBundleSettlementOutcome,
 };
 pub use version_meta::{

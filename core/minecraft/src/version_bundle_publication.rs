@@ -161,9 +161,6 @@ enum PublicationTestHook {
     CrashAfterPromotion {
         kind: KnownGoodArtifactKind,
     },
-    CrashAfterQuarantine {
-        kind: KnownGoodArtifactKind,
-    },
     FailSettlementOnce,
     FailAfterSettlementMarkerOnce,
     FailAfterCommittedOutcomeOnce,
@@ -307,52 +304,7 @@ impl ManagedVersionBundleSettlementFailure {
     }
 }
 
-#[derive(Debug, thiserror::Error)]
-pub enum ManagedVersionBundleRebuildError {
-    #[error("version bundle source is unavailable")]
-    SourceUnavailable,
-    #[error("managed version bundle root is unavailable")]
-    RootUnavailable,
-    #[error(transparent)]
-    Publication(#[from] ManagedVersionBundlePublicationError),
-}
-
-impl ManagedVersionBundleRebuildError {
-    pub fn failure_phase(&self) -> ManagedVersionBundleFailurePhase {
-        match self {
-            Self::SourceUnavailable | Self::RootUnavailable => {
-                ManagedVersionBundleFailurePhase::PreEffect
-            }
-            Self::Publication(error) => error.failure_phase(),
-        }
-    }
-
-    pub fn into_effect_receipt(self) -> Option<ManagedVersionBundleFailureReceipt> {
-        match self {
-            Self::Publication(error) => error.into_effect_receipt(),
-            Self::SourceUnavailable | Self::RootUnavailable => None,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ManagedVersionBundleFailurePhase {
-    PreEffect,
-    Effect,
-}
-
 impl ManagedVersionBundlePublicationError {
-    pub fn failure_phase(&self) -> ManagedVersionBundleFailurePhase {
-        match self {
-            Self::ProjectionMismatch
-            | Self::PortablePathAlias
-            | Self::LaneOccupied
-            | Self::RecoveryAmbiguous
-            | Self::Preparation => ManagedVersionBundleFailurePhase::PreEffect,
-            Self::TaskStopped | Self::Effect(_) => ManagedVersionBundleFailurePhase::Effect,
-        }
-    }
-
     pub fn into_effect_receipt(self) -> Option<ManagedVersionBundleFailureReceipt> {
         match self {
             Self::Effect(receipt) => Some(*receipt),
@@ -379,10 +331,6 @@ impl ManagedVersionBundleCommitReceipt {
 
     pub fn matches_projection(&self, projection: &ManagedComponentProjection<'_>) -> bool {
         projection_matches_fingerprints(projection, fingerprints(&self.context))
-    }
-
-    pub(crate) fn matches_root_identity(&self, identity: ManagedDirectoryIdentity) -> bool {
-        identity == self.context.root_identity
     }
 
     pub async fn revalidate(&self) -> bool {
@@ -416,10 +364,6 @@ impl ManagedVersionBundleFailureReceipt {
 
     pub fn matches_projection(&self, projection: &ManagedComponentProjection<'_>) -> bool {
         projection_matches_fingerprints(projection, fingerprints(&self.context))
-    }
-
-    pub(crate) fn matches_root_identity(&self, identity: ManagedDirectoryIdentity) -> bool {
-        identity == self.context.root_identity
     }
 
     pub async fn revalidate(&self) -> bool {
@@ -2217,12 +2161,6 @@ fn rollback_mutation_failure(
 }
 
 fn promote_entry(context: &mut TransactionContext, index: usize) -> Result<(), LoaderError> {
-    #[cfg(test)]
-    let crash_after_quarantine = matches!(
-        context.test_hook.as_ref(),
-        Some(PublicationTestHook::CrashAfterQuarantine { kind })
-            if *kind == context.entries[index].fingerprint.kind
-    );
     let entry = &mut context.entries[index];
     let target = entry
         .target
@@ -2278,10 +2216,6 @@ fn promote_entry(context: &mut TransactionContext, index: usize) -> Result<(), L
         target.parent.sync()?;
         context.quarantine.sync()?;
         context.lease.revalidate().map_err(publication_as_loader)?;
-        #[cfg(test)]
-        if crash_after_quarantine {
-            panic!("injected version bundle crash after quarantine");
-        }
     }
     let stage_guard = entry.stage_guard.as_ref().ok_or_else(|| {
         LoaderError::Verify("version bundle staged source guard is absent".to_string())
@@ -2669,7 +2603,6 @@ fn apply_test_hook(context: &mut TransactionContext, promotions: usize) -> bool 
             PublicationTestHook::FailAfter { .. }
             | PublicationTestHook::PauseAfter { .. }
             | PublicationTestHook::CrashAfterPromotion { .. }
-            | PublicationTestHook::CrashAfterQuarantine { .. }
             | PublicationTestHook::FailSettlementOnce
             | PublicationTestHook::FailAfterSettlementMarkerOnce
             | PublicationTestHook::FailAfterCommittedOutcomeOnce,
@@ -2727,21 +2660,6 @@ pub(crate) fn crash_after_artifact_promotion_for_test(
         .insert(
             version_id.to_string(),
             PublicationTestHook::CrashAfterPromotion { kind },
-        );
-}
-
-#[cfg(test)]
-pub(crate) fn crash_after_artifact_quarantine_for_test(
-    version_id: &str,
-    kind: KnownGoodArtifactKind,
-) {
-    TEST_HOOKS
-        .get_or_init(|| Mutex::new(HashMap::new()))
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .insert(
-            version_id.to_string(),
-            PublicationTestHook::CrashAfterQuarantine { kind },
         );
 }
 

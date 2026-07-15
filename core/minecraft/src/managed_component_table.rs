@@ -166,6 +166,7 @@ pub(crate) fn component_table_path(shard_index: usize) -> Result<String, Compone
     Ok(format!("table/{shard_index:06}.tbl"))
 }
 
+#[cfg(test)]
 pub(crate) fn component_entry_slot(
     shard_index: usize,
     row_in_shard: usize,

@@ -94,6 +94,7 @@ impl<'a> ComponentAncestorJournalAuthority<'a> {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn component(&self) -> ManagedComponentKind {
         self.binding.component
     }

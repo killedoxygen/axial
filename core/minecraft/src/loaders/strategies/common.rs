@@ -4762,7 +4762,11 @@ esac
             )
             .await
             .expect("prepare retained processor fixture")
-            .bind_managed_libraries()
+            .bind_managed_libraries(
+                crate::managed_fs::ManagedDir::open_root(&root)
+                    .expect("guard retained processor root"),
+                retained_context.take_cache_proofs(),
+            )
             .expect("bind retained processor sources to final projection");
             assert_eq!(prepared.version_id(), plan.record.version_id.as_str());
             assert!(prepared.library_entry_count() > 0);

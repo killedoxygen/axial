@@ -91,17 +91,64 @@ pub(crate) enum ManagedEmptyChildRemoval {
 pub(crate) enum ManagedDirectoryMoveFailure {
     BeforeMove,
     MoveAttempted {
+        #[cfg(test)]
         expected_identity: ManagedDirectoryIdentity,
+        #[cfg(test)]
         cause: LoaderError,
     },
     IdentityMismatchRestored {
+        #[cfg(test)]
         expected_identity: ManagedDirectoryIdentity,
+        #[cfg(test)]
         cause: LoaderError,
     },
     IdentityMismatchParked {
+        #[cfg(test)]
         expected_identity: ManagedDirectoryIdentity,
+        #[cfg(test)]
         cause: LoaderError,
     },
+}
+
+impl ManagedDirectoryMoveFailure {
+    fn move_attempted(expected_identity: ManagedDirectoryIdentity, cause: LoaderError) -> Self {
+        #[cfg(not(test))]
+        let _ = (expected_identity, cause);
+        Self::MoveAttempted {
+            #[cfg(test)]
+            expected_identity,
+            #[cfg(test)]
+            cause,
+        }
+    }
+
+    fn identity_mismatch_restored(
+        expected_identity: ManagedDirectoryIdentity,
+        cause: LoaderError,
+    ) -> Self {
+        #[cfg(not(test))]
+        let _ = (expected_identity, cause);
+        Self::IdentityMismatchRestored {
+            #[cfg(test)]
+            expected_identity,
+            #[cfg(test)]
+            cause,
+        }
+    }
+
+    fn identity_mismatch_parked(
+        expected_identity: ManagedDirectoryIdentity,
+        cause: LoaderError,
+    ) -> Self {
+        #[cfg(not(test))]
+        let _ = (expected_identity, cause);
+        Self::IdentityMismatchParked {
+            #[cfg(test)]
+            expected_identity,
+            #[cfg(test)]
+            cause,
+        }
+    }
 }
 
 impl std::fmt::Debug for ManagedDir {
@@ -1239,33 +1286,30 @@ impl ManagedDir {
             &destination.inner.path,
             OsStr::new(destination_name),
         )
-        .map_err(|error| ManagedDirectoryMoveFailure::MoveAttempted {
-            expected_identity,
-            cause: LoaderError::Io(error),
+        .map_err(|error| {
+            ManagedDirectoryMoveFailure::move_attempted(expected_identity, LoaderError::Io(error))
         })?;
         after_move();
         if !destination
             .has_portably_exact_child_name(destination_name)
-            .map_err(|cause| ManagedDirectoryMoveFailure::MoveAttempted {
-                expected_identity,
-                cause,
+            .map_err(|cause| {
+                ManagedDirectoryMoveFailure::move_attempted(expected_identity, cause)
             })?
         {
-            return Err(ManagedDirectoryMoveFailure::MoveAttempted {
+            return Err(ManagedDirectoryMoveFailure::move_attempted(
                 expected_identity,
-                cause: LoaderError::Verify(
+                LoaderError::Verify(
                     "managed directory move destination is absent after publication".to_string(),
                 ),
-            });
+            ));
         }
         let (handle, observed_identity) = platform::open_child_directory(
             &destination.inner.handle,
             &destination.inner.path,
             OsStr::new(destination_name),
         )
-        .map_err(|error| ManagedDirectoryMoveFailure::MoveAttempted {
-            expected_identity,
-            cause: LoaderError::Io(error),
+        .map_err(|error| {
+            ManagedDirectoryMoveFailure::move_attempted(expected_identity, LoaderError::Io(error))
         })?;
         if ManagedDirectoryIdentity(observed_identity) != expected_identity {
             drop((handle, child));
@@ -1278,28 +1322,22 @@ impl ManagedDir {
             ));
         }
         if self.has_portably_exact_child_name(name).map_err(|cause| {
-            ManagedDirectoryMoveFailure::MoveAttempted {
-                expected_identity,
-                cause,
-            }
+            ManagedDirectoryMoveFailure::move_attempted(expected_identity, cause)
         })? {
-            return Err(ManagedDirectoryMoveFailure::MoveAttempted {
+            return Err(ManagedDirectoryMoveFailure::move_attempted(
                 expected_identity,
-                cause: LoaderError::Verify(
+                LoaderError::Verify(
                     "managed directory move source was replaced after publication".to_string(),
                 ),
-            });
+            ));
         }
-        self.revalidate()
-            .map_err(|cause| ManagedDirectoryMoveFailure::MoveAttempted {
-                expected_identity,
-                cause,
-            })?;
+        self.revalidate().map_err(|cause| {
+            ManagedDirectoryMoveFailure::move_attempted(expected_identity, cause)
+        })?;
         let moved = destination
             .child(destination_name, handle, observed_identity)
-            .map_err(|cause| ManagedDirectoryMoveFailure::MoveAttempted {
-                expected_identity,
-                cause,
+            .map_err(|cause| {
+                ManagedDirectoryMoveFailure::move_attempted(expected_identity, cause)
             })?;
         drop(child);
         Ok(moved)
@@ -1322,10 +1360,10 @@ impl ManagedDir {
             .has_portably_exact_child_name(source_name)
             .is_ok_and(|present| !present);
         if !source_absent {
-            return ManagedDirectoryMoveFailure::IdentityMismatchParked {
+            return ManagedDirectoryMoveFailure::identity_mismatch_parked(
                 expected_identity,
-                cause: mismatch(),
-            };
+                mismatch(),
+            );
         }
         if platform::rename_entry_no_replace(
             &destination.inner.handle,
@@ -1337,10 +1375,10 @@ impl ManagedDir {
         )
         .is_err()
         {
-            return ManagedDirectoryMoveFailure::IdentityMismatchParked {
+            return ManagedDirectoryMoveFailure::identity_mismatch_parked(
                 expected_identity,
-                cause: mismatch(),
-            };
+                mismatch(),
+            );
         }
         let restored = self
             .has_portably_exact_child_name(source_name)
@@ -1355,15 +1393,9 @@ impl ManagedDir {
             )
             .is_ok_and(|identity| ManagedDirectoryIdentity(identity) == observed_identity);
         if restored {
-            ManagedDirectoryMoveFailure::IdentityMismatchRestored {
-                expected_identity,
-                cause: mismatch(),
-            }
+            ManagedDirectoryMoveFailure::identity_mismatch_restored(expected_identity, mismatch())
         } else {
-            ManagedDirectoryMoveFailure::IdentityMismatchParked {
-                expected_identity,
-                cause: mismatch(),
-            }
+            ManagedDirectoryMoveFailure::identity_mismatch_parked(expected_identity, mismatch())
         }
     }
 

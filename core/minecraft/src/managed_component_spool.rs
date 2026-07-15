@@ -1,8 +1,7 @@
 use crate::managed_component_table::{
     COMPONENT_TABLE_HEADER_BYTES, COMPONENT_TABLE_ROW_PREFIX_BYTES, COMPONENT_TABLE_ROWS_PER_SHARD,
     ComponentIntentManifest, ComponentShardDescriptor, MAX_COMPONENT_PATH_BYTES,
-    MAX_COMPONENT_TABLE_ROWS, MAX_COMPONENT_TABLE_SHARDS, encode_component_intent_manifest,
-    expected_shard_count,
+    encode_component_intent_manifest, expected_shard_count,
 };
 use sha2::{Digest as _, Sha256};
 use std::fs::File;
@@ -10,9 +9,11 @@ use std::io::{Read, Seek, SeekFrom, Write};
 
 const MAX_COMPONENT_ENCODED_ROW_BYTES: usize =
     COMPONENT_TABLE_ROW_PREFIX_BYTES + MAX_COMPONENT_PATH_BYTES + 28;
-pub(crate) const MAX_COMPONENT_TABLE_SPOOL_BYTES: usize = MAX_COMPONENT_TABLE_SHARDS
-    * COMPONENT_TABLE_HEADER_BYTES
-    + MAX_COMPONENT_TABLE_ROWS * MAX_COMPONENT_ENCODED_ROW_BYTES;
+#[cfg(test)]
+pub(crate) const MAX_COMPONENT_TABLE_SPOOL_BYTES: usize =
+    crate::managed_component_table::MAX_COMPONENT_TABLE_SHARDS * COMPONENT_TABLE_HEADER_BYTES
+        + crate::managed_component_table::MAX_COMPONENT_TABLE_ROWS
+            * MAX_COMPONENT_ENCODED_ROW_BYTES;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
 #[error("managed component table spool is invalid")]

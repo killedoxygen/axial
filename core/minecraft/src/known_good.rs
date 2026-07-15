@@ -1,7 +1,9 @@
 use crate::artifact_path::{
     ArtifactRelativePath, MAX_ARTIFACT_PATH_SEGMENT_BYTES, MAX_ARTIFACT_RELATIVE_PATH_BYTES,
 };
-use crate::download::library_source::{RetainedLibraryComponentSource, RetainedLibrarySourceSet};
+use crate::download::library_source::{
+    AuthenticatedLibraryCacheProofSet, RetainedLibraryComponentSource, RetainedLibrarySourceSet,
+};
 use crate::download::{
     AuthenticatedSelectedArtifactSource, AuthenticatedVanillaInstallSources, DownloadError,
     ExpectedIntegrity, LibraryArtifactPlan, ReconstructedVanillaAuthority,
@@ -15,6 +17,7 @@ use crate::loaders::{
     LoaderInstallStrategy, VerifiedInstallerClientBytes, VerifiedInstallerReceiptSource,
     compose_loader_version,
 };
+use crate::managed_fs::ManagedDir;
 #[cfg(test)]
 use crate::manifest::ManifestEntry;
 use crate::rules::Environment;
@@ -1206,9 +1209,12 @@ pub(crate) struct RetainedKnownGoodReconstruction {
     library_sources: RetainedLibrarySourceSet,
 }
 
-pub struct ManagedLibrariesReconstruction {
+pub(crate) struct ManagedLibrariesReconstruction {
     reconstruction: RetainedKnownGoodReconstruction,
+    managed_root: ManagedDir,
+    #[cfg(test)]
     library_entry_count: usize,
+    #[cfg(test)]
     expected_content_byte_count: u64,
 }
 
@@ -1237,6 +1243,8 @@ impl RetainedKnownGoodReconstruction {
 
     pub(crate) fn bind_managed_libraries(
         mut self,
+        managed_root: ManagedDir,
+        cache_proofs: AuthenticatedLibraryCacheProofSet,
     ) -> Result<ManagedLibrariesReconstruction, DownloadError> {
         let projection = self
             .receipt
@@ -1248,35 +1256,137 @@ impl RetainedKnownGoodReconstruction {
                     "reconstructed Libraries projection is invalid".to_string(),
                 )
             })?;
-        self.library_sources.reconcile_projection(&projection)?;
+        self.library_sources
+            .reconcile_sparse_projection(&projection, cache_proofs)?;
         Ok(ManagedLibrariesReconstruction {
+            #[cfg(test)]
             library_entry_count: projection.entry_count(),
+            #[cfg(test)]
             expected_content_byte_count: projection.expected_content_byte_count(),
             reconstruction: self,
+            managed_root,
         })
     }
 }
 
 impl ManagedLibrariesReconstruction {
-    pub fn version_id(&self) -> &str {
+    #[cfg(test)]
+    pub(crate) fn version_id(&self) -> &str {
         self.reconstruction.receipt.version_id()
     }
 
-    pub fn library_entry_count(&self) -> usize {
+    #[cfg(test)]
+    pub(crate) fn library_entry_count(&self) -> usize {
         self.library_entry_count
     }
 
-    pub fn expected_content_byte_count(&self) -> u64 {
+    #[cfg(test)]
+    pub(crate) fn expected_content_byte_count(&self) -> u64 {
         self.expected_content_byte_count
     }
 
-    pub fn retained_source_count(&self) -> usize {
+    #[cfg(test)]
+    pub(crate) fn retained_source_count(&self) -> usize {
         self.reconstruction.library_sources.len()
     }
 
-    pub fn retained_content_byte_count(&self) -> u64 {
+    #[cfg(test)]
+    pub(crate) fn retained_content_byte_count(&self) -> u64 {
         self.reconstruction.library_sources.retained_bytes()
     }
+
+    pub(crate) fn into_effect_parts(
+        self,
+    ) -> (
+        ManagedDir,
+        KnownGoodReconstructionReceipt,
+        Vec<RetainedLibraryComponentSource>,
+    ) {
+        let (receipt, sources) = self.reconstruction.into_parts();
+        (self.managed_root, receipt, sources.into_sources())
+    }
+}
+
+#[cfg(feature = "test-support")]
+pub(crate) fn managed_libraries_reconstruction_fixture_for_test(
+    managed_root: ManagedDir,
+    version_id: &str,
+) -> Result<ManagedLibrariesReconstruction, DownloadError> {
+    const PATH: &str = "org/axial/fixture/1.0.0/fixture-1.0.0.jar";
+    const BYTES: &[u8] = b"axial managed Libraries fixture";
+    let version_id = KnownGoodId::new(version_id).map_err(|_| {
+        DownloadError::Integrity("managed Libraries fixture version id is invalid".to_string())
+    })?;
+    let path = ArtifactRelativePath::new(PATH).map_err(|_| {
+        DownloadError::Integrity("managed Libraries fixture path is invalid".to_string())
+    })?;
+    let sha1: [u8; 20] = Sha1::digest(BYTES).into();
+    let mut inventory = InventoryBuilder::default();
+    inventory
+        .insert(KnownGoodEntry {
+            root: KnownGoodRoot::Libraries,
+            path: KnownGoodRelativePath::new(PATH).map_err(|_| {
+                DownloadError::Integrity(
+                    "managed Libraries fixture inventory path is invalid".to_string(),
+                )
+            })?,
+            kind: KnownGoodArtifactKind::Library,
+            integrity: KnownGoodIntegrity::Sha1 {
+                digest: sha1_array_digest(&sha1),
+                size: BYTES.len() as u64,
+            },
+        })
+        .map_err(|_| {
+            DownloadError::Integrity("managed Libraries fixture inventory is invalid".to_string())
+        })?;
+    let authenticated = AuthenticatedKnownGoodReceipt {
+        version_id: version_id.clone(),
+        inventory: inventory.finish(),
+        effective_version: VersionJson {
+            id: version_id.0,
+            inherits_from: String::new(),
+            materialized: false,
+            kind: "release".to_string(),
+            main_class: String::new(),
+            minimum_launcher_version: 0,
+            compliance_level: 0,
+            release_time: String::new(),
+            time: String::new(),
+            arguments: None,
+            minecraft_arguments: String::new(),
+            asset_index: crate::launch::AssetIndex::default(),
+            assets: String::new(),
+            downloads: crate::launch::Downloads::default(),
+            java_version: crate::launch::JavaVersion::default(),
+            libraries: Vec::new(),
+            logging: None,
+        },
+        environment: crate::rules::default_environment(),
+    };
+    let mut sources = RetainedLibrarySourceSet::new();
+    sources.insert(
+        RetainedLibraryComponentSource::from_authenticated_local_bytes(
+            path,
+            crate::download::library_source::LibraryComponentSourceKind::Library,
+            BYTES.to_vec(),
+            BYTES.len() as u64,
+            sha1,
+        )
+        .map_err(|_| {
+            DownloadError::Integrity("managed Libraries fixture source is invalid".to_string())
+        })?,
+    )?;
+    Ok(ManagedLibrariesReconstruction {
+        reconstruction: RetainedKnownGoodReconstruction::new(
+            KnownGoodReconstructionReceipt { authenticated },
+            sources,
+        ),
+        managed_root,
+        #[cfg(test)]
+        library_entry_count: 1,
+        #[cfg(test)]
+        expected_content_byte_count: BYTES.len() as u64,
+    })
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -1988,6 +2098,15 @@ impl KnownGoodReconstructionReceipt {
             version_id: self.authenticated.version_id,
             inventory: self.authenticated.inventory,
         }
+    }
+
+    pub(crate) fn component_projection(
+        &self,
+        component: ManagedKnownGoodComponent,
+    ) -> Result<ManagedComponentProjection<'_>, ManagedComponentProjectionError> {
+        self.authenticated
+            .inventory
+            .managed_component_projection(component)
     }
 }
 

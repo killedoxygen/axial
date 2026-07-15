@@ -29,11 +29,12 @@ pub(crate) use managed_component_transaction::{
     settle_component_transaction_with_fault,
 };
 pub(crate) use managed_component_transaction::{
-    ComponentExecutionResult, ComponentIntentPublicationRecovery, ComponentRecoveryRequired,
-    ComponentRecoveryRetryResult, ComponentSettledOutcome, ComponentSettlementResult,
-    ComponentStartupRecoveryResult, ComponentTransactionReceipt, execute_component_intent,
-    recover_component_intent_publication, recover_component_transaction, retry_component_recovery,
-    retry_component_settlement, settle_component_transaction,
+    ComponentExecutionResult, ComponentIntentPublicationRecovery,
+    ComponentPriorRecoveryRetryResult, ComponentRecoveryRequired, ComponentRecoveryRetryResult,
+    ComponentSettledOutcome, ComponentSettlementResult, ComponentStartupRecoveryResult,
+    ComponentTransactionReceipt, execute_component_intent, recover_component_intent_publication,
+    recover_component_transaction, retry_component_recovery, retry_component_settlement,
+    retry_prior_component_recovery, settle_component_transaction,
 };
 
 #[cfg(test)]
@@ -76,6 +77,7 @@ pub(crate) struct ComponentLane {
 
 pub(crate) struct ComponentShardBuckets {
     staging: ManagedDir,
+    #[cfg(test)]
     quarantine: ManagedDir,
 }
 
@@ -299,18 +301,22 @@ impl ComponentLane {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn component(&self) -> ManagedComponentKind {
         self.component
     }
 
+    #[cfg(test)]
     pub(crate) fn lane(&self) -> &ManagedDir {
         &self.lane
     }
 
+    #[cfg(test)]
     pub(crate) fn staging(&self) -> &ManagedDir {
         &self.staging
     }
 
+    #[cfg(test)]
     pub(crate) fn quarantine(&self) -> &ManagedDir {
         &self.quarantine
     }
@@ -322,12 +328,13 @@ impl ComponentLane {
         let name = component_bucket_name(shard_index)?;
         let staging = self.staging.create_child_new(&name)?;
         self.staging.sync()?;
-        let quarantine = self.quarantine.create_child_new(&name)?;
+        let _quarantine_bucket = self.quarantine.create_child_new(&name)?;
         self.quarantine.sync()?;
         self.lane.sync()?;
         Ok(ComponentShardBuckets {
             staging,
-            quarantine,
+            #[cfg(test)]
+            quarantine: _quarantine_bucket,
         })
     }
 
@@ -412,6 +419,7 @@ impl ComponentShardBuckets {
         &self.staging
     }
 
+    #[cfg(test)]
     pub(crate) fn quarantine(&self) -> &ManagedDir {
         &self.quarantine
     }
@@ -545,6 +553,7 @@ impl ComponentCanonicalPathPlan {
         &self.creation_anchor
     }
 
+    #[cfg(test)]
     pub(crate) fn remaining_parent_segments(&self) -> &[String] {
         &self.remaining_parent_segments
     }
@@ -593,10 +602,12 @@ impl ComponentCanonicalPathPlan {
 }
 
 impl ComponentObservedFile {
+    #[cfg(test)]
     pub(crate) fn parent(&self) -> &ManagedDir {
         &self.parent
     }
 
+    #[cfg(test)]
     pub(crate) fn file_name(&self) -> &str {
         &self.file_name
     }
