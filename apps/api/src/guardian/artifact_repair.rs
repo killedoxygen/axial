@@ -843,6 +843,438 @@ fn safe_id(value: &str, fallback: &str) -> String {
 }
 
 #[cfg(test)]
+mod persistence_contract_tests {
+    use super::{GuardianArtifactRepairSettlement, execute_registered_guardian_artifact_repair};
+    use crate::execution::file::{FileWriteRequest, write_file_atomically};
+    use crate::execution::persistence::{AtomicWriteBackend, PersistenceCoordinator};
+    use crate::guardian::{
+        ActionPlanPrerequisite, DiagnosisId, GuardianAction, GuardianActionKind,
+        GuardianActionPlan, GuardianConfidence, GuardianDecision, GuardianMode,
+    };
+    use crate::state::contracts::{
+        OperationId, OperationStatus, OwnershipClass, ReconciliationTerminalOutcome,
+        StabilizationSystem, TargetDescriptor,
+    };
+    use crate::state::failure_memory::GuardianFailureMemoryStore;
+    use crate::state::{
+        AppState, AppStateInit, InstallStore, OperationJournalStore,
+        REGISTERED_ARTIFACT_COMPONENT_REBUILD_FAILURE_POINT, RegisteredArtifactCondition,
+        SessionStore, new_instance, reconciliation_attempt_key, reconciliation_memory_entry,
+    };
+    use axial_config::{AppPaths, InstanceRegistrySnapshot};
+    use axial_minecraft::known_good::{
+        KnownGoodArtifactKind, KnownGoodInventory, TestKnownGoodEntry, TestKnownGoodIntegrity,
+        TestKnownGoodRoot,
+    };
+    use sha1::{Digest as _, Sha1};
+    use std::fs;
+    use std::io;
+    use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    const INSTANCE_ID: &str = "0000000000000001";
+    const EXPECTED_ASSET: &[u8] = b"registered artifact persistence proof";
+
+    struct ScriptedWriteBackend {
+        attempts: AtomicUsize,
+        fail_attempt: AtomicUsize,
+        failure_message: &'static str,
+    }
+
+    impl ScriptedWriteBackend {
+        fn new(fail_attempt: Option<usize>, failure_message: &'static str) -> Self {
+            Self {
+                attempts: AtomicUsize::new(0),
+                fail_attempt: AtomicUsize::new(fail_attempt.unwrap_or_default()),
+                failure_message,
+            }
+        }
+
+        fn attempts(&self) -> usize {
+            self.attempts.load(Ordering::SeqCst)
+        }
+    }
+
+    impl AtomicWriteBackend for ScriptedWriteBackend {
+        fn write(
+            &self,
+            target: &TargetDescriptor,
+            destination: &Path,
+            contents: &[u8],
+        ) -> io::Result<()> {
+            let attempt = self.attempts.fetch_add(1, Ordering::SeqCst) + 1;
+            if self
+                .fail_attempt
+                .compare_exchange(attempt, 0, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+            {
+                return Err(io::Error::other(self.failure_message));
+            }
+            write_file_atomically(FileWriteRequest::new(target.clone(), destination, contents))
+                .map(|_| ())
+                .map_err(io::Error::from)
+        }
+    }
+
+    struct Fixture {
+        state: AppState,
+        journals: Arc<OperationJournalStore>,
+        failure_memory: Arc<GuardianFailureMemoryStore>,
+        journal_backend: Arc<ScriptedWriteBackend>,
+        memory_backend: Arc<ScriptedWriteBackend>,
+        root: PathBuf,
+    }
+
+    fn fixture(
+        label: &str,
+        journal_failure_attempt: Option<usize>,
+        memory_failure_attempt: Option<usize>,
+    ) -> Fixture {
+        static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(1);
+
+        let root = std::env::temp_dir().join(format!(
+            "axial-artifact-persistence-{label}-{}-{}",
+            std::process::id(),
+            NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let config_dir = root.join("config");
+        let paths = AppPaths {
+            config_file: config_dir.join("config.json"),
+            instances_file: config_dir.join("instances.json"),
+            instances_dir: root.join("instances"),
+            music_dir: root.join("music"),
+            library_dir: root.join("library"),
+            config_dir,
+        };
+        fs::create_dir_all(paths.instances_dir.join(INSTANCE_ID)).expect("instance root");
+        fs::create_dir_all(&paths.library_dir).expect("library root");
+        let config = Arc::new(
+            axial_config::ConfigStore::load_from(paths.clone()).expect("test config store"),
+        );
+        let instances = Arc::new(
+            axial_config::InstanceStore::from_snapshot(
+                paths.clone(),
+                InstanceRegistrySnapshot::new(
+                    vec![new_instance(
+                        INSTANCE_ID.to_string(),
+                        "Artifact Persistence Test".to_string(),
+                        "1.21.1".to_string(),
+                        String::new(),
+                        String::new(),
+                    )],
+                    INSTANCE_ID.to_string(),
+                    Vec::new(),
+                )
+                .expect("instance registry snapshot"),
+            )
+            .expect("test instance store"),
+        );
+        let journal_backend = Arc::new(ScriptedWriteBackend::new(
+            journal_failure_attempt,
+            "injected artifact journal persistence failure",
+        ));
+        let memory_backend = Arc::new(ScriptedWriteBackend::new(
+            memory_failure_attempt,
+            "injected artifact failure-memory persistence failure",
+        ));
+        let journals = Arc::new(
+            OperationJournalStore::try_load_from_paths_with_coordinator(
+                &paths,
+                PersistenceCoordinator::for_test(
+                    journal_backend.clone(),
+                    Duration::from_millis(1),
+                    Duration::from_millis(5),
+                ),
+            )
+            .expect("persistent artifact journals"),
+        );
+        let failure_memory = Arc::new(
+            GuardianFailureMemoryStore::try_load_from_paths_with_coordinator(
+                &paths,
+                PersistenceCoordinator::for_test(
+                    memory_backend.clone(),
+                    Duration::from_millis(1),
+                    Duration::from_millis(5),
+                ),
+            )
+            .expect("persistent artifact failure memory"),
+        );
+        let state = AppState::new(AppStateInit {
+            app_name: "Axial".to_string(),
+            version: "test".to_string(),
+            config,
+            instances,
+            installs: Arc::new(InstallStore::new()),
+            sessions: Arc::new(SessionStore::new()),
+            performance: Arc::new(
+                axial_performance::PerformanceManager::load_for_startup(&paths.config_dir)
+                    .expect("test performance state"),
+            ),
+            startup_warnings: Vec::new(),
+            frontend_dir: root.join("frontend"),
+        })
+        .with_reconciliation_stores(journals.clone(), failure_memory.clone());
+        state.set_library_dir_for_test(paths.library_dir.to_string_lossy().into_owned());
+        fs::create_dir_all(state.managed_runtime_cache().root()).expect("managed runtime root");
+
+        let inventory = KnownGoodInventory::from_test_entries([TestKnownGoodEntry {
+            root: TestKnownGoodRoot::Assets,
+            path: "indexes/persistence-proof.json".to_string(),
+            kind: KnownGoodArtifactKind::AssetIndex,
+            integrity: TestKnownGoodIntegrity::Sha1 {
+                digest: format!("{:x}", Sha1::digest(EXPECTED_ASSET)),
+                size: EXPECTED_ASSET.len() as u64,
+            },
+        }])
+        .expect("Assets persistence inventory")
+        .with_test_standalone_leaf_repair_source(
+            0,
+            "https://example.invalid/persistence-proof.json",
+        )
+        .expect("Assets persistence source");
+        state.activate_known_good_inventory_for_test(INSTANCE_ID, inventory);
+        let destination = paths
+            .library_dir
+            .join("assets/indexes/persistence-proof.json");
+        fs::create_dir_all(destination.parent().expect("Assets destination parent"))
+            .expect("Assets destination parent");
+        fs::write(destination, vec![b'x'; EXPECTED_ASSET.len()])
+            .expect("corrupt Assets destination");
+
+        Fixture {
+            state,
+            journals,
+            failure_memory,
+            journal_backend,
+            memory_backend,
+            root,
+        }
+    }
+
+    async fn corrupt_assets_admission(
+        fixture: &Fixture,
+        operation_id: &str,
+    ) -> crate::state::RegisteredArtifactRepairAdmission {
+        let lifecycle = fixture.state.acquire_instance_lifecycle(INSTANCE_ID).await;
+        let foreground = fixture
+            .state
+            .register_integrity_foreground()
+            .expect("register artifact persistence foreground")
+            .wait_for_settlement()
+            .await;
+        let verification = fixture
+            .state
+            .mint_current_known_good_verification_lease(&foreground, &lifecycle)
+            .expect("mint artifact persistence verification");
+        let observation = verification
+            .registered_artifact_observation(0, RegisteredArtifactCondition::Corrupt)
+            .expect("corrupt Assets observation");
+        let findings = fixture
+            .state
+            .seal_registered_artifact_findings(verification, vec![observation])
+            .expect("seal corrupt Assets finding");
+        let target = findings
+            .repair_target()
+            .expect("corrupt Assets repair target")
+            .clone();
+        let authorization = findings
+            .authorize_repair(&registered_artifact_repair_decision(target))
+            .expect("authorize corrupt Assets repair");
+        let admission = fixture
+            .state
+            .admit_registered_artifact_repair(
+                authorization,
+                OperationId::new(operation_id),
+                chrono::Duration::minutes(15),
+            )
+            .await
+            .expect("admit corrupt Assets repair");
+        drop((foreground, lifecycle));
+        admission
+    }
+
+    fn registered_artifact_repair_decision(target: TargetDescriptor) -> GuardianDecision {
+        GuardianDecision::for_test(
+            None,
+            GuardianMode::Managed,
+            GuardianActionKind::Repair,
+            vec![DiagnosisId::LauncherManagedArtifactCorrupt],
+            Some(GuardianActionPlan::new(
+                StabilizationSystem::Guardian,
+                ActionPlanPrerequisite {
+                    diagnosis_id: DiagnosisId::LauncherManagedArtifactCorrupt,
+                    ownership: OwnershipClass::LauncherManaged,
+                    confidence: GuardianConfidence::Confirmed,
+                    affected_targets: vec![target.clone()],
+                    candidate_actions: vec![GuardianActionKind::Repair],
+                },
+                vec![GuardianAction {
+                    kind: GuardianActionKind::Repair,
+                    target: Some(target),
+                    reason: DiagnosisId::LauncherManagedArtifactCorrupt,
+                }],
+            )),
+        )
+    }
+
+    async fn execute_for_error(
+        fixture: &Fixture,
+        operation_id: &str,
+    ) -> crate::state::OperationJournalStoreError {
+        let admission = corrupt_assets_admission(fixture, operation_id).await;
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            execute_registered_guardian_artifact_repair(admission, &reqwest::Client::new()),
+        )
+        .await
+        .expect("artifact executor must remain bounded");
+        match result {
+            Err(error) => error,
+            Ok(GuardianArtifactRepairSettlement::Completed(_)) => {
+                panic!("persistence failure must not return a completed settlement")
+            }
+            Ok(GuardianArtifactRepairSettlement::Failed(_)) => {
+                panic!("persistence failure must not return a typed continuation")
+            }
+        }
+    }
+
+    async fn cleanup(fixture: Fixture) {
+        fixture
+            .state
+            .close_known_good_inventories()
+            .await
+            .expect("close known-good store");
+        fixture
+            .state
+            .close_instance_registry()
+            .await
+            .expect("close instance registry");
+        let Fixture {
+            state,
+            journals,
+            failure_memory,
+            journal_backend,
+            memory_backend,
+            root,
+        } = fixture;
+        drop((
+            state,
+            journals,
+            failure_memory,
+            journal_backend,
+            memory_backend,
+        ));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn accepted_plan_persistence_failure_terminalizes_without_returning_continuation() {
+        let fixture = fixture("accepted-plan", Some(1), None);
+        let operation_id = "artifact-accepted-plan";
+
+        let error = execute_for_error(&fixture, operation_id).await;
+
+        assert!(
+            error
+                .to_string()
+                .contains("injected artifact journal persistence failure")
+        );
+        assert_eq!(fixture.journal_backend.attempts(), 3);
+        assert_eq!(fixture.memory_backend.attempts(), 1);
+        let journal = fixture
+            .journals
+            .get(&OperationId::new(operation_id))
+            .expect("accepted plan and separate terminal are visible");
+        assert_eq!(journal.status, OperationStatus::Failed);
+        assert_eq!(
+            journal.failure_point.as_deref(),
+            Some("journal_repair_start")
+        );
+        let terminal = journal
+            .reconciliation_terminal()
+            .expect("separate failed terminal")
+            .clone();
+        assert_eq!(terminal.outcome(), ReconciliationTerminalOutcome::Failed);
+        let expected_memory =
+            reconciliation_memory_entry(terminal.clone()).expect("canonical plan-failure memory");
+        assert_eq!(
+            fixture
+                .failure_memory
+                .get(&reconciliation_attempt_key(terminal.attempt())),
+            Some(expected_memory)
+        );
+
+        cleanup(fixture).await;
+    }
+
+    #[tokio::test]
+    async fn accepted_terminal_persistence_failure_returns_before_memory_or_continuation() {
+        let fixture = fixture("accepted-terminal", Some(2), None);
+        let operation_id = "artifact-accepted-terminal";
+
+        let error = execute_for_error(&fixture, operation_id).await;
+
+        assert!(
+            error
+                .to_string()
+                .contains("injected artifact journal persistence failure")
+        );
+        assert_eq!(fixture.journal_backend.attempts(), 3);
+        assert_eq!(fixture.memory_backend.attempts(), 0);
+        let journal = fixture
+            .journals
+            .get(&OperationId::new(operation_id))
+            .expect("accepted failed terminal is visible");
+        assert_eq!(journal.status, OperationStatus::Failed);
+        assert_eq!(
+            journal.failure_point.as_deref(),
+            Some(REGISTERED_ARTIFACT_COMPONENT_REBUILD_FAILURE_POINT)
+        );
+        assert_eq!(
+            journal
+                .reconciliation_terminal()
+                .expect("accepted failed terminal")
+                .outcome(),
+            ReconciliationTerminalOutcome::Failed
+        );
+        assert!(fixture.failure_memory.list().is_empty());
+
+        cleanup(fixture).await;
+    }
+
+    #[tokio::test]
+    async fn failure_memory_persistence_failure_returns_without_retry_or_continuation() {
+        let fixture = fixture("memory-failure", None, Some(1));
+        let operation_id = "artifact-memory-failure";
+
+        let error = execute_for_error(&fixture, operation_id).await;
+
+        assert!(
+            error
+                .to_string()
+                .contains("Guardian artifact repair memory commit failed: persistence")
+        );
+        assert_eq!(fixture.journal_backend.attempts(), 2);
+        assert_eq!(fixture.memory_backend.attempts(), 1);
+        let journal = fixture
+            .journals
+            .get(&OperationId::new(operation_id))
+            .expect("failed terminal remains visible");
+        assert_eq!(
+            journal.failure_point.as_deref(),
+            Some(REGISTERED_ARTIFACT_COMPONENT_REBUILD_FAILURE_POINT)
+        );
+        assert!(fixture.failure_memory.list().is_empty());
+
+        cleanup(fixture).await;
+    }
+}
+
+#[cfg(test)]
 mod move_only_contract_tests {
     use super::{GuardianArtifactRepairFailure, GuardianArtifactRepairSettlement};
 
