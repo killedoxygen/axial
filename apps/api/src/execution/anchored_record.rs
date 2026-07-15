@@ -261,13 +261,28 @@ mod platform {
     use std::path::{Component, Path, PathBuf};
     use std::sync::Arc;
 
+    #[derive(Clone, Copy, Eq, PartialEq)]
+    struct CanonicalFileIdentity {
+        device: u64,
+        inode: u64,
+    }
+
+    #[derive(Clone, Copy, Eq, PartialEq)]
+    struct CanonicalRegularFileMetadata {
+        identity: CanonicalFileIdentity,
+        size: u64,
+        modified_seconds: i64,
+        modified_nanoseconds: u64,
+        changed_seconds: i64,
+        changed_nanoseconds: u64,
+    }
+
     #[derive(Clone)]
     struct HeldDirectory {
         handle: Arc<OwnedFd>,
         parent: Option<Arc<OwnedFd>>,
         name: Option<OsString>,
-        device: u64,
-        inode: u64,
+        identity: CanonicalFileIdentity,
     }
 
     pub(super) struct Directory {
@@ -287,21 +302,14 @@ mod platform {
         parent: Arc<OwnedFd>,
         leaf: OsString,
         file: std::fs::File,
-        device: u64,
-        inode: u64,
-        size: u64,
-        modified_seconds: i64,
-        modified_nanoseconds: u64,
-        changed_seconds: i64,
-        changed_nanoseconds: u64,
+        metadata: CanonicalRegularFileMetadata,
     }
 
     pub(super) struct Temp {
         name: OsString,
         writer: Option<std::fs::File>,
         control: std::fs::File,
-        device: u64,
-        inode: u64,
+        identity: CanonicalFileIdentity,
     }
 
     impl Temp {
@@ -400,8 +408,7 @@ mod platform {
                     handle: child.clone(),
                     parent: Some(parent),
                     name: Some(name.to_os_string()),
-                    device: stat.st_dev,
-                    inode: stat.st_ino,
+                    identity: canonical_file_identity(&stat)?,
                 });
                 parent = child;
             }
@@ -429,8 +436,8 @@ mod platform {
             hasher.update(b"unix-directory-chain-v1\0");
             hasher.update((self.directories.len() as u64).to_le_bytes());
             for directory in &self.directories {
-                hasher.update(directory.device.to_le_bytes());
-                hasher.update(directory.inode.to_le_bytes());
+                hasher.update(directory.identity.device.to_le_bytes());
+                hasher.update(directory.identity.inode.to_le_bytes());
             }
         }
 
@@ -460,6 +467,7 @@ mod platform {
                     "anchored record leaf is not an exact regular file",
                 ));
             }
+            let source_identity = canonical_file_identity(&source)?;
             let quarantine = OsString::from(format!(
                 ".axial-quarantine-{}",
                 uuid::Uuid::new_v4().simple()
@@ -482,7 +490,7 @@ mod platform {
             let quarantined =
                 rustix::fs::statat(self.parent.as_ref(), &quarantine, AtFlags::SYMLINK_NOFOLLOW)
                     .map_err(io::Error::from)?;
-            if quarantined.st_dev != source.st_dev || quarantined.st_ino != source.st_ino {
+            if canonical_file_identity(&quarantined)? != source_identity {
                 return Err(identity_changed(
                     "anchored record quarantine identity changed",
                 ));
@@ -510,8 +518,7 @@ mod platform {
                 name,
                 writer: Some(writer),
                 control,
-                device: stat.st_dev,
-                inode: stat.st_ino,
+                identity: canonical_file_identity(&stat)?,
             })
         }
 
@@ -519,7 +526,7 @@ mod platform {
             let current =
                 rustix::fs::statat(self.parent.as_ref(), &temp.name, AtFlags::SYMLINK_NOFOLLOW);
             if current
-                .is_ok_and(|current| current.st_dev == temp.device && current.st_ino == temp.inode)
+                .is_ok_and(|current| canonical_file_identity(&current).ok() == Some(temp.identity))
             {
                 let _ = rustix::fs::unlinkat(self.parent.as_ref(), &temp.name, AtFlags::empty());
             }
@@ -531,10 +538,8 @@ mod platform {
             let current =
                 rustix::fs::statat(self.parent.as_ref(), &temp.name, AtFlags::SYMLINK_NOFOLLOW)
                     .map_err(io::Error::from)?;
-            if held.st_dev != temp.device
-                || held.st_ino != temp.inode
-                || current.st_dev != temp.device
-                || current.st_ino != temp.inode
+            if canonical_file_identity(&held)? != temp.identity
+                || canonical_file_identity(&current)? != temp.identity
                 || FileType::from_raw_mode(current.st_mode) != FileType::RegularFile
             {
                 return Err(identity_changed("anchored record temp changed"));
@@ -575,22 +580,12 @@ mod platform {
                     "anchored record leaf is not an exact regular file",
                 ));
             }
+            let metadata = canonical_regular_file_metadata(&stat)?;
             let file = RegularFile {
                 parent: self.parent.clone(),
                 leaf: self.leaf.clone(),
                 file: std::fs::File::from(handle),
-                device: stat.st_dev,
-                inode: stat.st_ino,
-                size: u64::try_from(stat.st_size).map_err(|_| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "anchored record size is invalid",
-                    )
-                })?,
-                modified_seconds: stat.st_mtime,
-                modified_nanoseconds: stat.st_mtime_nsec,
-                changed_seconds: stat.st_ctime,
-                changed_nanoseconds: stat.st_ctime_nsec,
+                metadata,
             };
             if !file.revalidate() {
                 return Err(identity_changed(
@@ -603,7 +598,7 @@ mod platform {
 
     impl RegularFile {
         pub(super) fn size(&self) -> u64 {
-            self.size
+            self.metadata.size
         }
 
         pub(super) fn verify_sha1(
@@ -611,7 +606,7 @@ mod platform {
             expected_sha1: &str,
             expected_size: u64,
         ) -> Option<Self> {
-            if self.size != expected_size {
+            if self.metadata.size != expected_size {
                 return None;
             }
             self.file.seek(SeekFrom::Start(0)).ok()?;
@@ -636,13 +631,13 @@ mod platform {
         }
 
         pub(super) fn read_bounded(mut self, max_bytes: u64) -> io::Result<(Vec<u8>, Self)> {
-            if self.size > max_bytes || !self.revalidate() {
+            if self.metadata.size > max_bytes || !self.revalidate() {
                 return Err(identity_changed(
                     "anchored record changed or exceeds its read bound",
                 ));
             }
             self.file.seek(SeekFrom::Start(0))?;
-            let capacity = usize::try_from(self.size).map_err(|_| {
+            let capacity = usize::try_from(self.metadata.size).map_err(|_| {
                 io::Error::new(
                     io::ErrorKind::InvalidData,
                     "anchored record size overflowed",
@@ -653,7 +648,7 @@ mod platform {
                 .by_ref()
                 .take(max_bytes.saturating_add(1))
                 .read_to_end(&mut bytes)?;
-            if bytes.len() as u64 != self.size || !self.revalidate() {
+            if bytes.len() as u64 != self.metadata.size || !self.revalidate() {
                 return Err(identity_changed("anchored record changed during reading"));
             }
             Ok((bytes, self))
@@ -665,28 +660,31 @@ mod platform {
             full_bytes: Option<&[u8]>,
         ) -> io::Result<()> {
             hasher.update(b"unix-regular-file-v1\0");
-            hasher.update(self.device.to_le_bytes());
-            hasher.update(self.inode.to_le_bytes());
-            hasher.update(self.size.to_le_bytes());
-            hasher.update(self.modified_seconds.to_le_bytes());
-            hasher.update(self.modified_nanoseconds.to_le_bytes());
-            hasher.update(self.changed_seconds.to_le_bytes());
-            hasher.update(self.changed_nanoseconds.to_le_bytes());
+            hasher.update(self.metadata.identity.device.to_le_bytes());
+            hasher.update(self.metadata.identity.inode.to_le_bytes());
+            hasher.update(self.metadata.size.to_le_bytes());
+            hasher.update(self.metadata.modified_seconds.to_le_bytes());
+            hasher.update(self.metadata.modified_nanoseconds.to_le_bytes());
+            hasher.update(self.metadata.changed_seconds.to_le_bytes());
+            hasher.update(self.metadata.changed_nanoseconds.to_le_bytes());
             match full_bytes {
                 Some(bytes) => {
-                    if u64::try_from(bytes.len()).ok() != Some(self.size) {
+                    if u64::try_from(bytes.len()).ok() != Some(self.metadata.size) {
                         return Err(identity_changed(
                             "anchored record bytes do not match held identity",
                         ));
                     }
                     hasher.update(b"full-record-v1\0");
-                    hasher.update(self.size.to_le_bytes());
+                    hasher.update(self.metadata.size.to_le_bytes());
                     hasher.update(bytes);
                 }
                 None => {
                     let sample_len = super::RESTART_IDENTITY_EDGE_SAMPLE_BYTES;
-                    let tail_offset =
-                        self.size.checked_sub(sample_len as u64).ok_or_else(|| {
+                    let tail_offset = self
+                        .metadata
+                        .size
+                        .checked_sub(sample_len as u64)
+                        .ok_or_else(|| {
                             io::Error::new(
                                 io::ErrorKind::InvalidData,
                                 "oversized anchored record is too short for fixed edge samples",
@@ -729,19 +727,91 @@ mod platform {
 
         #[cfg(test)]
         pub(super) fn same_identity(&self, other: &Self) -> bool {
-            self.device == other.device && self.inode == other.inode
+            self.metadata.identity == other.metadata.identity
         }
 
         fn matches(&self, stat: rustix::fs::Stat) -> bool {
             FileType::from_raw_mode(stat.st_mode) == FileType::RegularFile
                 && stat.st_nlink == 1
-                && stat.st_dev == self.device
-                && stat.st_ino == self.inode
-                && u64::try_from(stat.st_size).ok() == Some(self.size)
-                && stat.st_mtime == self.modified_seconds
-                && stat.st_mtime_nsec == self.modified_nanoseconds
-                && stat.st_ctime == self.changed_seconds
-                && stat.st_ctime_nsec == self.changed_nanoseconds
+                && canonical_regular_file_metadata(&stat).ok() == Some(self.metadata)
+        }
+    }
+
+    fn canonical_file_identity(stat: &rustix::fs::Stat) -> io::Result<CanonicalFileIdentity> {
+        Ok(CanonicalFileIdentity {
+            device: canonical_unsigned(stat.st_dev, "device")?,
+            inode: canonical_unsigned(stat.st_ino, "inode")?,
+        })
+    }
+
+    fn canonical_regular_file_metadata(
+        stat: &rustix::fs::Stat,
+    ) -> io::Result<CanonicalRegularFileMetadata> {
+        Ok(CanonicalRegularFileMetadata {
+            identity: canonical_file_identity(stat)?,
+            size: canonical_unsigned(stat.st_size, "size")?,
+            modified_seconds: canonical_signed(stat.st_mtime, "modified seconds")?,
+            modified_nanoseconds: canonical_nanoseconds(
+                stat.st_mtime_nsec,
+                "modified nanoseconds",
+            )?,
+            changed_seconds: canonical_signed(stat.st_ctime, "changed seconds")?,
+            changed_nanoseconds: canonical_nanoseconds(stat.st_ctime_nsec, "changed nanoseconds")?,
+        })
+    }
+
+    fn canonical_unsigned<T>(value: T, field: &'static str) -> io::Result<u64>
+    where
+        T: TryInto<u64>,
+    {
+        value.try_into().map_err(|_| invalid_stat_field(field))
+    }
+
+    fn canonical_signed<T>(value: T, field: &'static str) -> io::Result<i64>
+    where
+        T: TryInto<i64>,
+    {
+        value.try_into().map_err(|_| invalid_stat_field(field))
+    }
+
+    fn canonical_nanoseconds<T>(value: T, field: &'static str) -> io::Result<u64>
+    where
+        T: TryInto<u64>,
+    {
+        let value = canonical_unsigned(value, field)?;
+        if value < 1_000_000_000 {
+            Ok(value)
+        } else {
+            Err(invalid_stat_field(field))
+        }
+    }
+
+    fn invalid_stat_field(field: &'static str) -> io::Error {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("anchored record {field} is invalid"),
+        )
+    }
+
+    #[cfg(test)]
+    mod normalization_tests {
+        use super::{canonical_nanoseconds, canonical_signed, canonical_unsigned};
+
+        #[test]
+        fn stat_fields_are_checked_before_entering_canonical_identity() {
+            assert_eq!(canonical_unsigned(7_i32, "test").unwrap(), 7_u64);
+            assert!(canonical_unsigned(-1_i32, "test").is_err());
+            assert_eq!(
+                canonical_signed(i32::MIN, "test").unwrap(),
+                i64::from(i32::MIN)
+            );
+            assert!(canonical_signed(u64::MAX, "test").is_err());
+            assert_eq!(
+                canonical_nanoseconds(999_999_999_i64, "test").unwrap(),
+                999_999_999_u64
+            );
+            assert!(canonical_nanoseconds(-1_i64, "test").is_err());
+            assert!(canonical_nanoseconds(1_000_000_000_u64, "test").is_err());
         }
     }
 
@@ -764,8 +834,7 @@ mod platform {
             handle: root.clone(),
             parent: None,
             name: None,
-            device: stat.st_dev,
-            inode: stat.st_ino,
+            identity: canonical_file_identity(&stat)?,
         }];
         let mut parent = root;
         for component in path.components() {
@@ -798,8 +867,7 @@ mod platform {
                 handle: child.clone(),
                 parent: Some(parent),
                 name: Some(name.to_os_string()),
-                device: stat.st_dev,
-                inode: stat.st_ino,
+                identity: canonical_file_identity(&stat)?,
             });
             parent = child;
         }
@@ -818,12 +886,12 @@ mod platform {
         .map_err(io::Error::from)?;
         let root_stat = rustix::fs::fstat(&root).map_err(io::Error::from)?;
         let expected_root = &directories[0];
-        if root_stat.st_dev != expected_root.device || root_stat.st_ino != expected_root.inode {
+        if canonical_file_identity(&root_stat)? != expected_root.identity {
             return Err(identity_changed("anchored record root changed"));
         }
         let held_root =
             rustix::fs::fstat(expected_root.handle.as_ref()).map_err(io::Error::from)?;
-        if held_root.st_dev != expected_root.device || held_root.st_ino != expected_root.inode {
+        if canonical_file_identity(&held_root)? != expected_root.identity {
             return Err(identity_changed("anchored record held root changed"));
         }
         for directory in directories.iter().skip(1) {
@@ -838,13 +906,12 @@ mod platform {
             )
             .map_err(io::Error::from)?;
             if FileType::from_raw_mode(stat.st_mode) != FileType::Directory
-                || stat.st_dev != directory.device
-                || stat.st_ino != directory.inode
+                || canonical_file_identity(&stat)? != directory.identity
             {
                 return Err(identity_changed("anchored record ancestor changed"));
             }
             let held = rustix::fs::fstat(directory.handle.as_ref()).map_err(io::Error::from)?;
-            if held.st_dev != directory.device || held.st_ino != directory.inode {
+            if canonical_file_identity(&held)? != directory.identity {
                 return Err(identity_changed("anchored record held ancestor changed"));
             }
         }
