@@ -51,7 +51,7 @@ pub(crate) struct GuardianArtifactRepairFailure {
 #[must_use]
 pub(crate) enum GuardianArtifactRepairSettlement {
     Completed(GuardianArtifactRepairReceipt),
-    Failed(GuardianArtifactRepairFailure),
+    Failed(Box<GuardianArtifactRepairFailure>),
 }
 
 impl GuardianArtifactRepairReceipt {
@@ -154,9 +154,9 @@ pub(crate) async fn execute_registered_guardian_artifact_repair(
     let continuation = admission
         .into_failed_continuation(execution.memory_receipt)
         .map_err(artifact_reconciliation_error)?;
-    Ok(GuardianArtifactRepairSettlement::Failed(
+    Ok(GuardianArtifactRepairSettlement::Failed(Box::new(
         GuardianArtifactRepairFailure { continuation },
-    ))
+    )))
 }
 
 async fn execute_admitted_artifact_repair(
@@ -482,7 +482,7 @@ async fn finish_artifact_repair(
     } else {
         OperationStepResult::Completed
     };
-    if let Some(error) = record_artifact_terminal_reconciled(
+    let journal_persistence_error = record_artifact_terminal_reconciled(
         context.journals,
         &operation_id,
         repair_step(
@@ -495,10 +495,7 @@ async fn finish_artifact_repair(
         failure_point,
         &reconciliation_terminal,
     )
-    .await?
-    {
-        return Err(error);
-    }
+    .await?;
     let memory_receipt = context
         .admission
         .commit_terminal_memory(
@@ -509,6 +506,9 @@ async fn finish_artifact_repair(
                 .expect("attempted repair owns memory reservation"),
         )
         .await?;
+    if let Some(error) = journal_persistence_error {
+        return Err(error);
+    }
     Ok(ArtifactRepairExecution {
         outcome: artifact_repair_outcome(context.attempt.diagnosis_id(), status),
         memory_receipt,
@@ -853,7 +853,7 @@ mod persistence_contract_tests {
     use std::io;
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
     use std::time::Duration;
 
     const INSTANCE_ID: &str = "0000000000000001";
@@ -862,6 +862,8 @@ mod persistence_contract_tests {
     struct ScriptedWriteBackend {
         attempts: AtomicUsize,
         fail_attempt: AtomicUsize,
+        gated_attempt: AtomicUsize,
+        release_gate: AtomicBool,
         failure_message: &'static str,
     }
 
@@ -870,12 +872,33 @@ mod persistence_contract_tests {
             Self {
                 attempts: AtomicUsize::new(0),
                 fail_attempt: AtomicUsize::new(fail_attempt.unwrap_or_default()),
+                gated_attempt: AtomicUsize::new(0),
+                release_gate: AtomicBool::new(true),
                 failure_message,
             }
         }
 
         fn attempts(&self) -> usize {
             self.attempts.load(Ordering::SeqCst)
+        }
+
+        fn gate_attempt(&self, attempt: usize) {
+            self.gated_attempt.store(attempt, Ordering::SeqCst);
+            self.release_gate.store(false, Ordering::SeqCst);
+        }
+
+        fn release(&self) {
+            self.release_gate.store(true, Ordering::SeqCst);
+        }
+
+        async fn wait_for_attempt(&self, expected: usize) {
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while self.attempts() < expected {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("artifact persistence attempt");
         }
     }
 
@@ -887,6 +910,11 @@ mod persistence_contract_tests {
             contents: &[u8],
         ) -> io::Result<()> {
             let attempt = self.attempts.fetch_add(1, Ordering::SeqCst) + 1;
+            if self.gated_attempt.load(Ordering::SeqCst) == attempt {
+                while !self.release_gate.load(Ordering::SeqCst) {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            }
             if self
                 .fail_attempt
                 .compare_exchange(attempt, 0, Ordering::SeqCst, Ordering::SeqCst)
@@ -1203,7 +1231,7 @@ mod persistence_contract_tests {
     }
 
     #[tokio::test]
-    async fn accepted_terminal_persistence_failure_returns_before_memory_or_continuation() {
+    async fn accepted_terminal_persistence_failure_commits_memory_before_returning_error() {
         let fixture = fixture("accepted-terminal", Some(2), None);
         let operation_id = "artifact-accepted-terminal";
 
@@ -1215,7 +1243,7 @@ mod persistence_contract_tests {
                 .contains("injected artifact journal persistence failure")
         );
         assert_eq!(fixture.journal_backend.attempts(), 3);
-        assert_eq!(fixture.memory_backend.attempts(), 0);
+        assert_eq!(fixture.memory_backend.attempts(), 1);
         let journal = fixture
             .journals
             .get(&OperationId::new(operation_id))
@@ -1225,32 +1253,38 @@ mod persistence_contract_tests {
             journal.failure_point.as_deref(),
             Some(REGISTERED_ARTIFACT_COMPONENT_REBUILD_FAILURE_POINT)
         );
+        let terminal = journal
+            .reconciliation_terminal()
+            .expect("accepted failed terminal")
+            .clone();
+        assert_eq!(terminal.outcome(), ReconciliationTerminalOutcome::Failed);
         assert_eq!(
-            journal
-                .reconciliation_terminal()
-                .expect("accepted failed terminal")
-                .outcome(),
-            ReconciliationTerminalOutcome::Failed
+            fixture
+                .failure_memory
+                .get(&reconciliation_attempt_key(terminal.attempt())),
+            Some(reconciliation_memory_entry(terminal).expect("canonical terminal memory"))
         );
-        assert!(fixture.failure_memory.list().is_empty());
 
         cleanup(fixture).await;
     }
 
     #[tokio::test]
-    async fn failure_memory_persistence_failure_returns_without_retry_or_continuation() {
+    async fn failure_memory_persistence_retries_while_retaining_admission() {
         let fixture = fixture("memory-failure", None, Some(1));
         let operation_id = "artifact-memory-failure";
+        fixture.memory_backend.gate_attempt(2);
+        let admission = corrupt_assets_admission(&fixture, operation_id).await;
+        let admission_lifetime = admission.lifetime_for_test();
+        let execution = tokio::spawn(async move {
+            execute_registered_guardian_artifact_repair(admission, &reqwest::Client::new()).await
+        });
 
-        let error = execute_for_error(&fixture, operation_id).await;
+        fixture.memory_backend.wait_for_attempt(2).await;
 
-        assert!(
-            error
-                .to_string()
-                .contains("Guardian artifact repair memory commit failed: persistence")
-        );
+        assert!(!execution.is_finished());
+        assert!(admission_lifetime.upgrade().is_some());
         assert_eq!(fixture.journal_backend.attempts(), 2);
-        assert_eq!(fixture.memory_backend.attempts(), 1);
+        assert_eq!(fixture.memory_backend.attempts(), 2);
         let journal = fixture
             .journals
             .get(&OperationId::new(operation_id))
@@ -1260,6 +1294,26 @@ mod persistence_contract_tests {
             Some(REGISTERED_ARTIFACT_COMPONENT_REBUILD_FAILURE_POINT)
         );
         assert!(fixture.failure_memory.list().is_empty());
+
+        fixture.memory_backend.release();
+        let settlement = execution
+            .await
+            .expect("artifact memory retry task")
+            .expect("artifact memory retry settles");
+        assert!(matches!(
+            settlement,
+            GuardianArtifactRepairSettlement::Failed(_)
+        ));
+        let terminal = journal
+            .reconciliation_terminal()
+            .expect("failed terminal")
+            .clone();
+        assert_eq!(
+            fixture
+                .failure_memory
+                .get(&reconciliation_attempt_key(terminal.attempt())),
+            Some(reconciliation_memory_entry(terminal).expect("canonical terminal memory"))
+        );
 
         cleanup(fixture).await;
     }

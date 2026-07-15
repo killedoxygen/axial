@@ -39,8 +39,8 @@ pub(super) enum RegisteredArtifactComponentRebuildSource {
 
 #[must_use]
 pub(super) enum RegisteredArtifactRecoveryEntry {
-    Fresh(RegisteredArtifactRepairAdmission),
-    Resume(RegisteredArtifactFailedRepair),
+    Fresh(Box<RegisteredArtifactRepairAdmission>),
+    Resume(Box<RegisteredArtifactFailedRepair>),
 }
 
 pub(super) struct RegisteredArtifactRecoverySequenceOutcome {
@@ -48,27 +48,39 @@ pub(super) struct RegisteredArtifactRecoverySequenceOutcome {
     pub(super) effective_status: GuardianArtifactRepairStatus,
 }
 
-pub(super) async fn execute_tier2_registered_artifact_recovery(
-    state: &AppState,
+#[must_use = "a prepared Tier 2 recovery must execute before its sweep can settle"]
+pub(super) struct Tier2RegisteredArtifactRecovery {
+    execution: Option<Box<Tier2RegisteredArtifactRecoveryExecution>>,
+}
+
+struct Tier2RegisteredArtifactRecoveryExecution {
+    state: AppState,
+    entry: RegisteredAssetsRecoveryEntry,
+    client: reqwest::Client,
+    rebuild_source: RegisteredArtifactComponentRebuildSource,
+}
+
+pub(super) fn prepare_tier2_registered_artifact_recovery(
+    state: AppState,
     sweep_operation_id: &OperationId,
     report: &IntegrityTier2Report,
     findings: RegisteredArtifactFindings,
-    client: &reqwest::Client,
+    client: reqwest::Client,
     rebuild_source: RegisteredArtifactComponentRebuildSource,
-) -> Result<Option<RegisteredArtifactRecoverySequenceOutcome>, OperationJournalStoreError> {
+) -> Tier2RegisteredArtifactRecovery {
     let assessment: Tier2RegisteredArtifactAssessment = {
         let Some(candidate) = findings.repair_candidate() else {
-            return Ok(None);
+            return Tier2RegisteredArtifactRecovery { execution: None };
         };
         let mut matching_facts = report
             .facts
             .iter()
             .filter(|fact| fact.target.as_ref() == Some(candidate.target()));
         let Some(fact) = matching_facts.next() else {
-            return Ok(None);
+            return Tier2RegisteredArtifactRecovery { execution: None };
         };
         if matching_facts.next().is_some() {
-            return Ok(None);
+            return Tier2RegisteredArtifactRecovery { execution: None };
         }
         let mode = api_guardian_mode_from_config(&state.config().current().guardian_mode);
         let Some(assessment) = assess_tier2_registered_artifact_repair(
@@ -77,37 +89,61 @@ pub(super) async fn execute_tier2_registered_artifact_recovery(
             fact,
             candidate,
         ) else {
-            return Ok(None);
+            return Tier2RegisteredArtifactRecovery { execution: None };
         };
         assessment
     };
     let Ok(authorization) = findings.authorize_repair(assessment.decision()) else {
-        return Ok(None);
+        return Tier2RegisteredArtifactRecovery { execution: None };
     };
     let Ok(entry) = state.registered_assets_recovery_entry(authorization) else {
-        return Ok(None);
+        return Tier2RegisteredArtifactRecovery { execution: None };
     };
-    let entry = match entry {
-        RegisteredAssetsRecoveryEntry::Fresh(authorization) => {
-            let Ok(admission) = state
-                .admit_registered_artifact_repair(
-                    authorization,
-                    new_registered_artifact_repair_operation_id(),
-                    chrono::Duration::minutes(REGISTERED_ARTIFACT_REPAIR_SUPPRESSION_MINUTES),
-                )
-                .await
-            else {
-                return Ok(None);
-            };
-            RegisteredArtifactRecoveryEntry::Fresh(admission)
-        }
-        RegisteredAssetsRecoveryEntry::Resume(continuation) => {
-            RegisteredArtifactRecoveryEntry::Resume(continuation)
-        }
-    };
-    execute_registered_artifact_recovery_sequence(state, entry, client, rebuild_source)
-        .await
-        .map(Some)
+    Tier2RegisteredArtifactRecovery {
+        execution: Some(Box::new(Tier2RegisteredArtifactRecoveryExecution {
+            state,
+            entry,
+            client,
+            rebuild_source,
+        })),
+    }
+}
+
+impl Tier2RegisteredArtifactRecovery {
+    pub(super) async fn execute(
+        self,
+    ) -> Result<Option<RegisteredArtifactRecoverySequenceOutcome>, OperationJournalStoreError> {
+        let Some(execution) = self.execution else {
+            return Ok(None);
+        };
+        let Tier2RegisteredArtifactRecoveryExecution {
+            state,
+            entry,
+            client,
+            rebuild_source,
+        } = *execution;
+        let entry = match entry {
+            RegisteredAssetsRecoveryEntry::Fresh(authorization) => {
+                let Ok(admission) = state
+                    .admit_registered_artifact_repair(
+                        authorization,
+                        new_registered_artifact_repair_operation_id(),
+                        chrono::Duration::minutes(REGISTERED_ARTIFACT_REPAIR_SUPPRESSION_MINUTES),
+                    )
+                    .await
+                else {
+                    return Ok(None);
+                };
+                RegisteredArtifactRecoveryEntry::Fresh(Box::new(admission))
+            }
+            RegisteredAssetsRecoveryEntry::Resume(continuation) => {
+                RegisteredArtifactRecoveryEntry::Resume(Box::new(continuation))
+            }
+        };
+        execute_registered_artifact_recovery_sequence(&state, entry, &client, rebuild_source)
+            .await
+            .map(Some)
+    }
 }
 
 pub(super) async fn execute_registered_artifact_recovery_sequence(
@@ -118,17 +154,17 @@ pub(super) async fn execute_registered_artifact_recovery_sequence(
 ) -> Result<RegisteredArtifactRecoverySequenceOutcome, OperationJournalStoreError> {
     let continuation = match entry {
         RegisteredArtifactRecoveryEntry::Fresh(admission) => {
-            match execute_registered_guardian_artifact_repair(admission, client).await? {
+            match execute_registered_guardian_artifact_repair(*admission, client).await? {
                 GuardianArtifactRepairSettlement::Completed(outcome) => {
                     return Ok(RegisteredArtifactRecoverySequenceOutcome {
                         diagnosis_id: outcome.diagnosis_id(),
                         effective_status: outcome.status(),
                     });
                 }
-                GuardianArtifactRepairSettlement::Failed(failure) => failure.into_continuation(),
+                GuardianArtifactRepairSettlement::Failed(failure) => (*failure).into_continuation(),
             }
         }
-        RegisteredArtifactRecoveryEntry::Resume(continuation) => continuation,
+        RegisteredArtifactRecoveryEntry::Resume(continuation) => *continuation,
     };
 
     let component_admission = state

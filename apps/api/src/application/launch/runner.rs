@@ -1386,7 +1386,7 @@ async fn launch_session_inner_with_control(
                             let client = reqwest::Client::new();
                             let outcome = execute_registered_artifact_recovery_sequence(
                                 &recovery_state,
-                                RegisteredArtifactRecoveryEntry::Fresh(admission),
+                                RegisteredArtifactRecoveryEntry::Fresh(Box::new(admission)),
                                 &client,
                                 RegisteredArtifactComponentRebuildSource::Production,
                             )
@@ -2032,7 +2032,7 @@ mod tests {
 
         let recovery = execute_registered_artifact_recovery_sequence(
             &state,
-            RegisteredArtifactRecoveryEntry::Fresh(admission),
+            RegisteredArtifactRecoveryEntry::Fresh(Box::new(admission)),
             &reqwest::Client::new(),
             RegisteredArtifactComponentRebuildSource::Fixture,
         )

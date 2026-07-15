@@ -1,5 +1,5 @@
 use crate::application::registered_artifact_recovery::{
-    RegisteredArtifactComponentRebuildSource, execute_tier2_registered_artifact_recovery,
+    RegisteredArtifactComponentRebuildSource, prepare_tier2_registered_artifact_recovery,
 };
 use crate::execution::integrity::{
     IntegrityTier2OwnedWork, IntegrityTier2OwnedWorkRejection, IntegrityTier2Report,
@@ -314,29 +314,29 @@ where
     let result = worker.join().await;
     let (transition, terminal) = match result {
         Ok(result) => {
-            let mut sealed = result.seal().await;
-            if sealed.report().status == IntegrityTier2Status::Complete {
-                if let Some(findings) = sealed.take_registered_artifact_findings() {
-                    let client = reqwest::Client::new();
-                    if let Err(error) = execute_tier2_registered_artifact_recovery(
-                        &state,
-                        &journal.operation_id,
-                        sealed.report(),
+            let recovery_state = state.clone();
+            let recovery_operation_id = journal.operation_id.clone();
+            let client = reqwest::Client::new();
+            let (report, settlement, recovery_error) = result
+                .settle_after_registered_artifact_recovery(move |report, findings| {
+                    let recovery = prepare_tier2_registered_artifact_recovery(
+                        recovery_state,
+                        &recovery_operation_id,
+                        report,
                         findings,
-                        &client,
+                        client,
                         rebuild_source,
-                    )
-                    .await
-                    {
-                        tracing::warn!(
-                            operation_id = journal.operation_id.as_str(),
-                            error_kind = error.class(),
-                            "Tier 2 registered artifact recovery failed"
-                        );
-                    }
-                }
+                    );
+                    async move { recovery.execute().await.map(drop) }
+                })
+                .await;
+            if let Some(error) = recovery_error {
+                tracing::warn!(
+                    operation_id = journal.operation_id.as_str(),
+                    error_kind = error.class(),
+                    "Tier 2 registered artifact recovery failed"
+                );
             }
-            let (report, settlement) = sealed.settle();
             match report.status {
                 IntegrityTier2Status::Complete => {
                     debug_assert_eq!(settlement, IdleSweepSettlement::Authoritative);
@@ -841,7 +841,7 @@ mod tests {
     use crate::execution::file::{FileWriteRequest, write_file_atomically};
     use crate::execution::persistence::{AtomicWriteBackend, PersistenceCoordinator};
     use crate::state::contracts::{ReconciliationComponent, ReconciliationRung};
-    use crate::state::{AppStateInit, InstallStore, SessionStore};
+    use crate::state::{AppStateInit, InstallStore, SessionStore, reconciliation_attempt_key};
     use axial_config::{AppPaths, ConfigStore, InstanceRegistrySnapshot, InstanceStore};
     use axial_minecraft::known_good::{
         KnownGoodArtifactKind, KnownGoodInventory, TestKnownGoodEntry, TestKnownGoodIntegrity,
@@ -1427,6 +1427,19 @@ mod tests {
         assert_ne!(leaf.0.operation_id, component.0.operation_id);
         assert_ne!(leaf.0.operation_id, journal.operation_id);
         assert_ne!(component.0.operation_id, journal.operation_id);
+        for (entry, attempt) in [leaf, component] {
+            let terminal = entry
+                .reconciliation_terminal()
+                .expect("child reconciliation terminal");
+            assert_eq!(
+                state
+                    .failure_memory()
+                    .get(&reconciliation_attempt_key(attempt))
+                    .and_then(|memory| memory.reconciliation_terminal().cloned()),
+                Some(terminal.clone()),
+                "each child terminal must reach memory before parent success",
+            );
+        }
         assert!(
             fs::read(paths.library_dir.join("assets/indexes/fixture-assets.json"))
                 .expect("rebuilt Assets index")

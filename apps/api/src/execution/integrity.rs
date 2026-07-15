@@ -23,6 +23,7 @@ use axial_minecraft::known_good::{
 };
 use sha1::{Digest as _, Sha1};
 use std::collections::{BTreeMap, BTreeSet};
+use std::future::Future;
 use std::io::{self, Read};
 #[cfg(any(windows, test))]
 use std::ops::Range;
@@ -2299,14 +2300,14 @@ impl Tier2RegisteredArtifactSealRequest {
 }
 
 #[must_use = "sealed Tier 2 work retains the explicit sweep settlement owner"]
-pub(crate) struct IntegrityTier2SealedResult {
+struct IntegrityTier2SealedResult {
     report: IntegrityTier2Report,
     findings: Option<RegisteredArtifactFindings>,
     settlement: IdleSweepSettlementOwner,
 }
 
 impl IntegrityTier2OwnedResult {
-    pub(crate) async fn seal(self) -> IntegrityTier2SealedResult {
+    async fn seal(self) -> IntegrityTier2SealedResult {
         let Self {
             state,
             mut report,
@@ -2356,38 +2357,47 @@ impl IntegrityTier2OwnedResult {
             settlement,
         }
     }
-}
 
-impl IntegrityTier2SealedResult {
-    pub(crate) fn report(&self) -> &IntegrityTier2Report {
-        &self.report
-    }
-
-    pub(crate) fn take_registered_artifact_findings(
-        &mut self,
-    ) -> Option<RegisteredArtifactFindings> {
-        self.findings.take()
-    }
-
-    pub(crate) fn settle(self) -> (IntegrityTier2Report, IdleSweepSettlement) {
-        let Self {
+    pub(crate) async fn settle_after_registered_artifact_recovery<Prepare, Recovery, Error>(
+        self,
+        prepare: Prepare,
+    ) -> (IntegrityTier2Report, IdleSweepSettlement, Option<Error>)
+    where
+        Prepare: FnOnce(&IntegrityTier2Report, RegisteredArtifactFindings) -> Recovery,
+        Recovery: Future<Output = Result<(), Error>>,
+    {
+        let sealed = self.seal().await;
+        let IntegrityTier2SealedResult {
             mut report,
             findings,
             settlement,
-        } = self;
-        drop(findings);
+        } = sealed;
+        let recovery_error = if report.status == IntegrityTier2Status::Complete {
+            let findings = findings.expect("complete Tier 2 seal must retain exact findings");
+            match prepare(&report, findings).await {
+                Ok(()) => None,
+                Err(error) => {
+                    report = report.refuse_after_recovery();
+                    Some(error)
+                }
+            }
+        } else {
+            drop(findings);
+            None
+        };
         let terminal = match report.status {
             IntegrityTier2Status::Complete => IdleSweepTerminal::Complete,
             IntegrityTier2Status::Cancelled => IdleSweepTerminal::Cancelled,
             IntegrityTier2Status::Refused => IdleSweepTerminal::Refused,
         };
+        let cancellation = settlement.cancellation();
         let outcome = settlement.settle(terminal);
-        if report.status == IntegrityTier2Status::Complete
-            && outcome == IdleSweepSettlement::Superseded
+        if outcome == IdleSweepSettlement::Superseded
+            && (report.status == IntegrityTier2Status::Complete || cancellation.is_cancelled())
         {
             report = report.cancel();
         }
-        (report, outcome)
+        (report, outcome, recovery_error)
     }
 }
 
@@ -2588,6 +2598,12 @@ impl IntegrityTier2Report {
         self.suppressed_fact_count = 0;
         self.repairable_observations.clear();
         self.facts.push(fact);
+        self
+    }
+
+    fn refuse_after_recovery(mut self) -> Self {
+        self.status = IntegrityTier2Status::Refused;
+        self.repairable_observations.clear();
         self
     }
 
@@ -4147,7 +4163,13 @@ mod tests {
     async fn settle_tier2_result(
         result: IntegrityTier2OwnedResult,
     ) -> (IntegrityTier2Report, IdleSweepSettlement) {
-        result.seal().await.settle()
+        let (report, settlement, recovery_error) = result
+            .settle_after_registered_artifact_recovery(|_, _| {
+                std::future::ready(Ok::<(), std::convert::Infallible>(()))
+            })
+            .await;
+        assert!(recovery_error.is_none());
+        (report, settlement)
     }
 
     async fn test_integrity_foreground(state: &AppState) -> IntegrityForegroundLease {
@@ -5235,33 +5257,119 @@ mod tests {
 
         let result = work.spawn().join().await.expect("dedicated worker result");
         assert!(result.settlement.is_current());
-        let mut sealed = result.seal().await;
-        assert!(sealed.settlement.is_current());
-        assert_eq!(sealed.report().status, IntegrityTier2Status::Complete);
-        assert!(sealed.report().repairable_observations.is_empty());
-        let findings = sealed
-            .take_registered_artifact_findings()
-            .expect("sealed Assets findings");
-        assert_eq!(findings.len(), 1);
-        let target = findings.repair_target().expect("selected Assets target");
-        assert_eq!(target.system, StabilizationSystem::Execution);
-        assert_eq!(target.kind, TargetKind::Artifact);
-        assert_eq!(target.ownership, OwnershipClass::LauncherManaged);
-        assert_eq!(target.id.len(), 79);
-        assert!(target.id.starts_with("leaf-v2."));
-        assert_eq!(
-            sealed
-                .report()
-                .facts
-                .iter()
-                .find(|fact| fact_field(fact, "observation") == Some("missing"))
-                .and_then(|fact| fact.target.as_ref()),
-            Some(target)
-        );
-
-        let (report, settlement) = sealed.settle();
+        let (report, settlement, recovery_error) = result
+            .settle_after_registered_artifact_recovery(|report, findings| {
+                assert_eq!(report.status, IntegrityTier2Status::Complete);
+                assert!(report.repairable_observations.is_empty());
+                assert_eq!(findings.len(), 1);
+                let target = findings.repair_target().expect("selected Assets target");
+                assert_eq!(target.system, StabilizationSystem::Execution);
+                assert_eq!(target.kind, TargetKind::Artifact);
+                assert_eq!(target.ownership, OwnershipClass::LauncherManaged);
+                assert_eq!(target.id.len(), 79);
+                assert!(target.id.starts_with("leaf-v2."));
+                assert_eq!(
+                    report
+                        .facts
+                        .iter()
+                        .find(|fact| fact_field(fact, "observation") == Some("missing"))
+                        .and_then(|fact| fact.target.as_ref()),
+                    Some(target)
+                );
+                std::future::ready(Ok::<(), std::convert::Infallible>(()))
+            })
+            .await;
+        assert!(recovery_error.is_none());
         assert_eq!(settlement, IdleSweepSettlement::Authoritative);
         assert_eq!(report.status, IntegrityTier2Status::Complete);
+        close_fixture(state, root).await;
+    }
+
+    #[tokio::test]
+    async fn tier_two_recovery_error_retains_sweep_and_refuses_without_erasing_observation() {
+        let (state, root, work) =
+            tier2_assets_owned_work_fixture("tier2-assets-recovery-error").await;
+        let result = work.spawn().join().await.expect("dedicated worker result");
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+
+        let settlement = tokio::spawn(async move {
+            result
+                .settle_after_registered_artifact_recovery(move |report, findings| {
+                    assert_eq!(report.status, IntegrityTier2Status::Complete);
+                    assert_eq!(findings.len(), 1);
+                    async move {
+                        let _ = started_tx.send(());
+                        release_rx.await.expect("release recovery terminalization");
+                        Err::<(), _>("injected child terminal persistence failure")
+                    }
+                })
+                .await
+        });
+        started_rx.await.expect("recovery terminalization started");
+
+        assert!(!settlement.is_finished());
+        assert!(!state.subscribe_integrity_idle().borrow().is_stably_idle());
+
+        release_tx
+            .send(())
+            .expect("release recovery terminalization");
+        let (report, sweep_settlement, recovery_error) =
+            settlement.await.expect("recovery settlement task");
+
+        assert_eq!(sweep_settlement, IdleSweepSettlement::Superseded);
+        assert_eq!(
+            recovery_error,
+            Some("injected child terminal persistence failure")
+        );
+        assert_eq!(report.status, IntegrityTier2Status::Refused);
+        assert_eq!(report.facts.len(), 1);
+        assert_eq!(report.facts[0].kind, ExecutionFactKind::ArtifactMissing);
+        assert!(state.subscribe_integrity_idle().borrow().is_stably_idle());
+        close_fixture(state, root).await;
+    }
+
+    #[tokio::test]
+    async fn tier_two_cancellation_during_recovery_error_clears_parent_evidence() {
+        let (state, root, work) =
+            tier2_assets_owned_work_fixture("tier2-assets-recovery-cancellation").await;
+        let result = work.spawn().join().await.expect("dedicated worker result");
+        let cancellation = result.settlement.cancellation();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+
+        let settlement = tokio::spawn(async move {
+            result
+                .settle_after_registered_artifact_recovery(move |report, findings| {
+                    assert_eq!(report.status, IntegrityTier2Status::Complete);
+                    assert_eq!(findings.len(), 1);
+                    async move {
+                        let _ = started_tx.send(());
+                        release_rx.await.expect("release cancelled recovery");
+                        Err::<(), _>("injected child terminal persistence failure")
+                    }
+                })
+                .await
+        });
+        started_rx.await.expect("recovery terminalization started");
+
+        cancellation.cancel();
+        assert!(!settlement.is_finished());
+        assert!(!state.subscribe_integrity_idle().borrow().is_stably_idle());
+        release_tx.send(()).expect("release cancelled recovery");
+        let (report, sweep_settlement, recovery_error) = settlement
+            .await
+            .expect("cancelled recovery settlement task");
+
+        assert_eq!(sweep_settlement, IdleSweepSettlement::Superseded);
+        assert_eq!(
+            recovery_error,
+            Some("injected child terminal persistence failure")
+        );
+        assert_eq!(report.status, IntegrityTier2Status::Cancelled);
+        assert!(report.facts.is_empty());
+        assert_eq!(report.suppressed_fact_count, 0);
+        assert!(state.subscribe_integrity_idle().borrow().is_stably_idle());
         close_fixture(state, root).await;
     }
 
@@ -6108,7 +6216,7 @@ mod tests {
         assert!(matches!(
             state
                 .admit_registered_artifact_component_rebuild(
-                    failure.into_continuation(),
+                    (*failure).into_continuation(),
                     OperationId::new("sweep-leaf-cancelled-component"),
                     chrono::Duration::minutes(30),
                 )
@@ -6136,7 +6244,7 @@ mod tests {
             };
         let component = state
             .admit_registered_artifact_component_rebuild(
-                failure.into_continuation(),
+                (*failure).into_continuation(),
                 OperationId::new("sweep-component-cancelled-rebuild"),
                 chrono::Duration::minutes(30),
             )
@@ -6172,7 +6280,7 @@ mod tests {
             };
         let component = state
             .admit_registered_artifact_component_rebuild(
-                failure.into_continuation(),
+                (*failure).into_continuation(),
                 OperationId::new("sweep-component-settled-rebuild"),
                 chrono::Duration::minutes(30),
             )
@@ -6305,7 +6413,7 @@ mod tests {
         );
         let component = state
             .admit_registered_artifact_component_rebuild(
-                failure.into_continuation(),
+                (*failure).into_continuation(),
                 OperationId::new("corrupt-asset-component-rebuild"),
                 chrono::Duration::minutes(15),
             )

@@ -3,6 +3,7 @@ use super::contracts::{
     ReconciliationTerminal, ReconciliationTerminalOutcome, StabilizationSystem, TargetDescriptor,
     TargetKind,
 };
+use super::failure_memory::FailureMemoryStoreError;
 use super::{
     AppState, KnownGoodVerificationLease, KnownGoodVerificationUnavailable,
     OperationJournalStoreError, ReconciliationAttemptReservation, ReconciliationEvidenceRejection,
@@ -21,8 +22,11 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
 const REGISTERED_ARTIFACT_TARGET_DOMAIN: &[u8] = b"axial.guardian.registered-artifact-target.v2";
+const REGISTERED_ARTIFACT_MEMORY_RETRY_INITIAL_DELAY: Duration = Duration::from_millis(20);
+const REGISTERED_ARTIFACT_MEMORY_RETRY_MAX_DELAY: Duration = Duration::from_secs(1);
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub(crate) enum RegisteredArtifactCondition {
@@ -177,6 +181,8 @@ pub(crate) struct RegisteredArtifactRepairAdmission {
     expected_size: u64,
     _component_mutation: super::sessions::SharedComponentMutationLease,
     _config_mutation: tokio::sync::OwnedMutexGuard<()>,
+    #[cfg(test)]
+    lifetime: Arc<()>,
 }
 
 #[must_use]
@@ -389,6 +395,11 @@ impl RegisteredArtifactRepairAdmission {
         self.effect
     }
 
+    #[cfg(test)]
+    pub(crate) fn lifetime_for_test(&self) -> std::sync::Weak<()> {
+        Arc::downgrade(&self.lifetime)
+    }
+
     pub(crate) fn mutation(&self) -> &RegisteredArtifactMutationCapability {
         &self.mutation
     }
@@ -448,16 +459,39 @@ impl RegisteredArtifactRepairAdmission {
         }
         let memory = reconciliation_memory_entry(terminal.clone())
             .map_err(|_| invalid_registered_artifact_memory_terminal())?;
-        commit_reconciliation_memory(self.authority.failure_memory(), memory.clone(), reservation)
+        let mut delay = REGISTERED_ARTIFACT_MEMORY_RETRY_INITIAL_DELAY;
+        loop {
+            if self.authority.failure_memory().get(&memory.key).as_ref() == Some(&memory) {
+                break;
+            }
+            match commit_reconciliation_memory(
+                self.authority.failure_memory(),
+                memory.clone(),
+                reservation,
+            )
             .await
-            .map_err(|error| {
-                OperationJournalStoreError::Persistence(std::io::Error::other(format!(
-                    "Guardian artifact repair memory commit failed: {}",
-                    error.class()
-                )))
-            })?;
-        if self.authority.failure_memory().get(&memory.key).as_ref() != Some(&memory) {
-            return Err(invalid_registered_artifact_memory_terminal());
+            {
+                Ok(()) => {
+                    if self.authority.failure_memory().get(&memory.key).as_ref() == Some(&memory) {
+                        break;
+                    }
+                    return Err(invalid_registered_artifact_memory_terminal());
+                }
+                Err(FailureMemoryStoreError::Persistence(_)) => {
+                    tokio::time::sleep(delay).await;
+                    delay = delay
+                        .saturating_mul(2)
+                        .min(REGISTERED_ARTIFACT_MEMORY_RETRY_MAX_DELAY);
+                }
+                Err(error) => {
+                    return Err(OperationJournalStoreError::Persistence(
+                        std::io::Error::other(format!(
+                            "Guardian artifact repair memory commit failed: {}",
+                            error.class()
+                        )),
+                    ));
+                }
+            }
         }
         Ok(RegisteredArtifactRepairMemoryReceipt { terminal })
     }
@@ -644,6 +678,8 @@ impl AppState {
             expected_size,
             _component_mutation: component_mutation,
             _config_mutation: config_mutation,
+            #[cfg(test)]
+            lifetime: Arc::new(()),
         })
     }
 }
