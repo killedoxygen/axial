@@ -1927,6 +1927,9 @@ mod tests {
 
     const TEST_TELEMETRY_INSTALL_ID: &str = "123e4567-e89b-12d3-a456-426614174000";
     const TEST_TELEMETRY_KEY: &str = "phc_test";
+    const MANAGED_LIBRARY_FIXTURE_PATH: &str =
+        "libraries/org/axial/fixture/1.0.0/fixture-1.0.0.jar";
+    const MANAGED_LIBRARY_FIXTURE_BYTES: &[u8] = b"axial managed Libraries fixture";
     const CRASH_E2E_INSTANCE_ID: &str = "0123456789abcdef";
     const CRASH_E2E_FABRIC_VERSION_ID: &str =
         "loader-v2-YXhpYWwtaW5zdGFsbGVkLWxvYWRlcgABAAYxLjIxLjEABzAuMTYuMTA";
@@ -1958,44 +1961,12 @@ mod tests {
         }
     }
 
-    #[test]
-    fn registered_artifact_repair_starts_exactly_one_process_retry() {
-        let mut process_starts = 0;
-        let mut repair_executions = 0;
-        let mut process_retry_used = false;
-
-        loop {
-            process_starts += 1;
-            let decision = if process_starts == 1 {
-                GuardianActionKind::Repair
-            } else {
-                GuardianActionKind::Fallback
-            };
-            match registered_artifact_startup_disposition(
-                GuardianMode::Managed,
-                decision,
-                process_retry_used,
-            ) {
-                RegisteredArtifactStartupDisposition::ExecuteRepair => {
-                    repair_executions += 1;
-                    process_retry_used = true;
-                }
-                RegisteredArtifactStartupDisposition::TerminalizeRetryFailure => break,
-                RegisteredArtifactStartupDisposition::ContinueStartupRecovery => {
-                    panic!("post-repair startup failure must not enter unrelated recovery")
-                }
-            }
-        }
-
-        assert_eq!(process_starts, 2);
-        assert_eq!(repair_executions, 1);
-    }
-
     #[tokio::test]
-    async fn failed_registered_library_leaf_rebuilds_libraries_before_process_retry() {
+    async fn library_component_escalation_retains_exact_transaction_proofs() {
         let root = unique_test_dir("libraries-component-rebuild");
         let instance_id = "0000000000000001";
-        let (state, active_inventory) = test_libraries_recovery_app_state(&root, instance_id);
+        let (state, active_inventory) =
+            test_libraries_recovery_app_state(&root, instance_id, "http://127.0.0.1:0/unreachable");
         let library_root = PathBuf::from(
             state
                 .library_dir()
@@ -2112,11 +2083,10 @@ mod tests {
             Some(component_terminal.clone())
         );
         assert_eq!(
-            fs::read(library_root.join("libraries/org/axial/fixture/1.0.0/fixture-1.0.0.jar"))
+            fs::read(library_root.join(MANAGED_LIBRARY_FIXTURE_PATH))
                 .expect("rebuilt Libraries fixture"),
-            b"axial managed Libraries fixture"
+            MANAGED_LIBRARY_FIXTURE_BYTES
         );
-
         let lifecycle = state.acquire_instance_lifecycle(instance_id).await;
         let verification = state
             .mint_known_good_verification_lease(&foreground, &lifecycle, &library_root)
@@ -2152,6 +2122,138 @@ mod tests {
             .await
             .expect("close Libraries recovery memory");
         drop(state);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn deleted_library_uses_leaf_repair_and_second_process_reaches_boot() {
+        let root = unique_test_dir("deleted-library-launch-continuation");
+        let instance_id = "0000000000000001";
+        let session_id = "deleted-library-launch-continuation";
+        let (repair_source, source_server) =
+            serve_registered_library_once(MANAGED_LIBRARY_FIXTURE_BYTES).await;
+        let (state, _) = test_libraries_recovery_app_state(&root, instance_id, &repair_source);
+        let library_root = PathBuf::from(
+            state
+                .library_dir()
+                .expect("State-authored deleted-Libraries root"),
+        );
+        let library_path = library_root.join(MANAGED_LIBRARY_FIXTURE_PATH);
+        let process_count_path = root.join("deleted-library-process-count");
+        let java_path =
+            write_deleted_library_launch_fixture(&root, &library_path, &process_count_path);
+        let mut session = test_record(session_id);
+        session.instance_id = instance_id.to_string();
+        state
+            .sessions()
+            .insert(session)
+            .await
+            .expect("insert deleted-Libraries launch session");
+        let producer = state
+            .try_claim_producer()
+            .expect("claim deleted-Libraries launch producer");
+        let mut task = test_recovery_launch_task(&state, session_id, &root).await;
+        retarget_test_launch_task(&mut task, instance_id);
+        task.instance.java_path = java_path.clone();
+        task.intent.requested_java = java_path;
+        task.intent.game_dir = Some(state.instances().game_dir(instance_id));
+        let (integrity_foreground, task) = LaunchSessionRunTask::from_prepared(task);
+        let mut integrity_foreground = Some(integrity_foreground);
+
+        let launch_result = tokio::time::timeout(
+            Duration::from_secs(10),
+            launch_session_inner(state.clone(), task, &producer, &mut integrity_foreground),
+        )
+        .await
+        .expect("deleted-Libraries launch deadline");
+        let launched = match launch_result {
+            Ok(launched) => launched,
+            Err(error) => {
+                let terminal = state.sessions().get(session_id).await;
+                panic!(
+                    "deleted-Libraries recovery must reach process 2: {}; terminal={terminal:?}",
+                    error.message
+                );
+            }
+        };
+
+        assert_eq!(launched.session_id, session_id);
+        assert_eq!(
+            fs::read_to_string(&process_count_path).expect("launch process count"),
+            "2"
+        );
+        assert_eq!(
+            fs::read(&library_path).expect("leaf-repaired Libraries fixture"),
+            MANAGED_LIBRARY_FIXTURE_BYTES
+        );
+        let reconciliation = state
+            .journals()
+            .list()
+            .into_iter()
+            .filter_map(|journal| {
+                let attempt = journal.reconciliation_attempt()?.clone();
+                Some((journal, attempt))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(reconciliation.len(), 1);
+        let leaf = reconciliation
+            .first()
+            .expect("deleted-Libraries R1 terminal");
+        assert_eq!(leaf.1.rung(), ReconciliationRung::RepairArtifact);
+        assert_eq!(leaf.0.status, OperationStatus::Succeeded);
+        assert_eq!(leaf.1.component(), ReconciliationComponent::Libraries);
+        let leaf_terminal = leaf
+            .0
+            .reconciliation_terminal()
+            .expect("deleted-Libraries R1 result");
+        assert_eq!(
+            leaf_terminal.outcome(),
+            ReconciliationTerminalOutcome::Succeeded
+        );
+        assert!(leaf_terminal.quarantine_checkpoint().is_empty());
+        assert_eq!(
+            state
+                .failure_memory()
+                .get(&reconciliation_attempt_key(&leaf.1))
+                .and_then(|entry| entry.reconciliation_terminal().cloned()),
+            Some(leaf_terminal.clone())
+        );
+
+        let foreground = integrity_foreground
+            .as_ref()
+            .expect("successful launch retains integrity foreground");
+        let lifecycle = state.acquire_instance_lifecycle(instance_id).await;
+        let postcheck = sense_integrity_tier1(&state, foreground, &lifecycle, &library_root)
+            .await
+            .expect("deleted-Libraries Tier1 postcheck");
+        assert!(postcheck.facts.is_empty());
+        drop((postcheck, lifecycle));
+        source_server
+            .await
+            .expect("deleted-Libraries source server task");
+
+        let _ = state.sessions().kill(session_id).await;
+        drop(integrity_foreground);
+        state
+            .close_known_good_inventories()
+            .await
+            .expect("close deleted-Libraries known-good store");
+        state
+            .close_instance_registry()
+            .await
+            .expect("close deleted-Libraries instance registry");
+        state
+            .journals()
+            .close()
+            .await
+            .expect("close deleted-Libraries journal");
+        state
+            .failure_memory()
+            .close()
+            .await
+            .expect("close deleted-Libraries memory");
+        drop((producer, state));
         let _ = fs::remove_dir_all(root);
     }
 
@@ -4152,17 +4254,24 @@ mod tests {
     fn test_libraries_recovery_app_state(
         root: &Path,
         instance_id: &str,
+        repair_source: &str,
     ) -> (AppState, Arc<KnownGoodInventory>) {
         let paths = test_paths(root);
+        let library_dir = root.join("library");
         fs::create_dir_all(paths.instances_dir.join(instance_id))
             .expect("Libraries recovery instance directory");
-        fs::create_dir_all(paths.library_dir.join("libraries/org/axial/fixture/1.0.0"))
-            .expect("Libraries recovery managed library directory");
+        fs::create_dir_all(
+            library_dir
+                .join(MANAGED_LIBRARY_FIXTURE_PATH)
+                .parent()
+                .expect("Libraries recovery managed library parent"),
+        )
+        .expect("Libraries recovery managed library directory");
         let config = Arc::new(
             ConfigStore::from_config(
                 paths.clone(),
                 AppConfig {
-                    library_dir: paths.library_dir.to_string_lossy().into_owned(),
+                    library_dir: library_dir.to_string_lossy().into_owned(),
                     ..AppConfig::default()
                 },
             )
@@ -4197,15 +4306,18 @@ mod tests {
             instance_id,
             KnownGoodInventory::from_test_entries([TestKnownGoodEntry {
                 root: TestKnownGoodRoot::Libraries,
-                path: "org/axial/fixture/1.0.0/fixture-1.0.0.jar".to_string(),
+                path: MANAGED_LIBRARY_FIXTURE_PATH
+                    .strip_prefix("libraries/")
+                    .expect("Libraries fixture inventory-relative path")
+                    .to_string(),
                 kind: KnownGoodArtifactKind::Library,
                 integrity: TestKnownGoodIntegrity::Sha1 {
-                    digest: "d5eff5a05903f96145d60e61ffb9cd9159a745ac".to_string(),
-                    size: b"axial managed Libraries fixture".len() as u64,
+                    digest: format!("{:x}", Sha1::digest(MANAGED_LIBRARY_FIXTURE_BYTES)),
+                    size: MANAGED_LIBRARY_FIXTURE_BYTES.len() as u64,
                 },
             }])
             .expect("Libraries recovery known-good inventory")
-            .with_test_standalone_leaf_repair_source(0, "http://127.0.0.1:0/unreachable")
+            .with_test_standalone_leaf_repair_source(0, repair_source)
             .expect("Libraries recovery standalone leaf source"),
         );
         (state, active_inventory)
@@ -4551,6 +4663,102 @@ printf '%s\n' '[Render thread/INFO]: Created: 1024x512x4 minecraft:textures/atla
 sleep 1
 exit 0
 "#,
+        )
+    }
+
+    #[cfg(unix)]
+    async fn serve_registered_library_once(
+        body: &'static [u8],
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind deleted-Libraries source server");
+        let address = listener
+            .local_addr()
+            .expect("deleted-Libraries source address");
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener
+                .accept()
+                .await
+                .expect("accept deleted-Libraries source request");
+            let mut request = [0_u8; 2048];
+            let count = socket
+                .read(&mut request)
+                .await
+                .expect("read deleted-Libraries source request");
+            assert!(request[..count].starts_with(b"GET "));
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            socket
+                .write_all(response.as_bytes())
+                .await
+                .expect("write deleted-Libraries source headers");
+            socket
+                .write_all(body)
+                .await
+                .expect("write deleted-Libraries source body");
+            socket
+                .shutdown()
+                .await
+                .expect("close deleted-Libraries source response");
+        });
+        (format!("http://{address}/fixture-1.0.0.jar"), server)
+    }
+
+    #[cfg(unix)]
+    fn write_deleted_library_launch_fixture(
+        root: &Path,
+        library_path: &Path,
+        process_count_path: &Path,
+    ) -> String {
+        let library_path = shell_path_literal(library_path);
+        let process_count_path = shell_path_literal(process_count_path);
+        write_crashing_java_fixture(
+            root,
+            "deleted-library-java",
+            &format!(
+                r#"#!/bin/sh
+if [ "$1" = "-XshowSettings:property" ]; then
+  echo 'openjdk version "21.0.3"' >&2
+  exit 0
+fi
+count=0
+if [ -f {process_count} ]; then
+  count=$(cat {process_count})
+fi
+count=$((count + 1))
+printf '%s' "$count" > {process_count}
+if [ ! -f {library} ]; then
+  mkdir -p crash-reports
+  cat > crash-reports/crash-guardian-missing-library.txt <<'CRASH'
+---- Minecraft Crash Report ----
+Description: Loading game
+net.minecraftforge.fml.common.MissingModsException: missing launcher-managed library
+CRASH
+  printf '%s\n' 'net.minecraftforge.fml.common.MissingModsException: missing launcher-managed library' >&2
+  exit 1
+fi
+printf '%s\n' '[Render thread/INFO]: Created: 1024x512x4 minecraft:textures/atlas/blocks.png-atlas' >&2
+sleep 1
+exit 0
+"#,
+                process_count = process_count_path,
+                library = library_path,
+            ),
+        )
+    }
+
+    #[cfg(unix)]
+    fn shell_path_literal(path: &Path) -> String {
+        format!(
+            "'{}'",
+            path.to_str()
+                .expect("test shell fixture path must be UTF-8")
+                .replace('\'', "'\"'\"'")
         )
     }
 
