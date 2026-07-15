@@ -1,5 +1,6 @@
 use super::asset_source::{
-    AssetSourcePool, AuthenticatedAssetCacheProofSet, RetainedAssetSourceSet,
+    AssetSourcePool, AuthenticatedAssetCacheProofSet, RetainedAssetComponentSource,
+    RetainedAssetSourceSet,
 };
 use super::assets::{
     ASSET_OBJECT_BASE_URL, AssetSourceAcquisitionRequest, RetainedAssetsAcquisition,
@@ -47,7 +48,10 @@ use crate::known_good_libraries::{
 };
 use crate::launch::{VersionJson, effective_java_version_for};
 use crate::managed_component_cache::ManagedComponentExactCache;
-use crate::managed_component_lifecycle::{ComponentLifecycleError, publish_managed_component};
+use crate::managed_component_lifecycle::{
+    ManagedComponentLifecycleOutcome, publish_managed_component_effect,
+};
+use crate::managed_component_publication::ComponentRollbackEffect;
 use crate::managed_component_table::ManagedComponentKind;
 use crate::managed_fs::ManagedDir;
 use crate::managed_publication::{ManagedRootPublicationLease, run_publication_blocking};
@@ -59,7 +63,7 @@ use crate::runtime::{
     TestRuntimeSourceDescriptor, acquire_test_runtime_source, authenticated_test_runtime_source,
 };
 use crate::version_bundle_publication::{
-    VersionBundleTransactionSettledOutcome, publish_version_bundle,
+    VersionBundleTransactionEffect, VersionBundleTransactionSettledOutcome, publish_version_bundle,
     settle_version_bundle_publication,
 };
 use futures_util::StreamExt;
@@ -473,18 +477,27 @@ pub(crate) struct ManagedReconstructionContext {
 enum ManagedReconstructionMode {
     ProofOnly,
     VersionBundle,
-    Libraries {
-        source_pool: LibrarySourcePool,
-        cache_admission: ExactLibraryCacheAdmission,
-        cache_proofs: Arc<std::sync::Mutex<AuthenticatedLibraryCacheProofSet>>,
+    Libraries(ManagedLibrariesReconstructionContext),
+    Assets(ManagedAssetsReconstructionContext),
+    WholeInstance {
+        libraries: ManagedLibrariesReconstructionContext,
+        assets: ManagedAssetsReconstructionContext,
     },
-    Assets {
-        source_pool: AssetSourcePool,
-        cache: ManagedComponentExactCache,
-        authority: Arc<
-            std::sync::Mutex<Option<(RetainedAssetSourceSet, AuthenticatedAssetCacheProofSet)>>,
-        >,
-    },
+}
+
+#[derive(Clone)]
+struct ManagedLibrariesReconstructionContext {
+    source_pool: LibrarySourcePool,
+    cache_admission: ExactLibraryCacheAdmission,
+    cache_proofs: Arc<std::sync::Mutex<AuthenticatedLibraryCacheProofSet>>,
+}
+
+#[derive(Clone)]
+struct ManagedAssetsReconstructionContext {
+    source_pool: AssetSourcePool,
+    cache: ManagedComponentExactCache,
+    authority:
+        Arc<std::sync::Mutex<Option<(RetainedAssetSourceSet, AuthenticatedAssetCacheProofSet)>>>,
 }
 
 impl ManagedReconstructionContext {
@@ -496,19 +509,19 @@ impl ManagedReconstructionContext {
 
     pub(crate) async fn bind_libraries(managed_root: ManagedDir) -> Result<Self, DownloadError> {
         Ok(Self {
-            mode: ManagedReconstructionMode::Libraries {
+            mode: ManagedReconstructionMode::Libraries(ManagedLibrariesReconstructionContext {
                 source_pool: LibrarySourcePool::new()?,
                 cache_admission: ExactLibraryCacheAdmission::bind_guarded(managed_root).await?,
                 cache_proofs: Arc::new(std::sync::Mutex::new(
                     AuthenticatedLibraryCacheProofSet::default(),
                 )),
-            },
+            }),
         })
     }
 
     pub(crate) async fn bind_assets(managed_root: ManagedDir) -> Result<Self, DownloadError> {
         Ok(Self {
-            mode: ManagedReconstructionMode::Assets {
+            mode: ManagedReconstructionMode::Assets(ManagedAssetsReconstructionContext {
                 source_pool: AssetSourcePool::new()?,
                 cache: ManagedComponentExactCache::bind_guarded(
                     managed_root,
@@ -521,7 +534,7 @@ impl ManagedReconstructionContext {
                     )
                 })?,
                 authority: Arc::new(std::sync::Mutex::new(None)),
-            },
+            }),
         })
     }
 
@@ -531,20 +544,58 @@ impl ManagedReconstructionContext {
         }
     }
 
+    pub(crate) async fn bind_whole_instance(
+        managed_root: ManagedDir,
+    ) -> Result<Self, DownloadError> {
+        let libraries = ManagedLibrariesReconstructionContext {
+            source_pool: LibrarySourcePool::new()?,
+            cache_admission: ExactLibraryCacheAdmission::bind_guarded(managed_root.clone()).await?,
+            cache_proofs: Arc::new(std::sync::Mutex::new(
+                AuthenticatedLibraryCacheProofSet::default(),
+            )),
+        };
+        let assets = ManagedAssetsReconstructionContext {
+            source_pool: AssetSourcePool::new()?,
+            cache: ManagedComponentExactCache::bind_guarded(
+                managed_root,
+                ManagedComponentKind::Assets,
+            )
+            .await
+            .map_err(|_| {
+                DownloadError::Integrity("managed Assets exact-cache admission failed".to_string())
+            })?,
+            authority: Arc::new(std::sync::Mutex::new(None)),
+        };
+        Ok(Self {
+            mode: ManagedReconstructionMode::WholeInstance { libraries, assets },
+        })
+    }
+
     fn retains_version_bundle_sources(&self) -> bool {
-        matches!(&self.mode, ManagedReconstructionMode::VersionBundle)
+        matches!(
+            self.mode,
+            ManagedReconstructionMode::VersionBundle
+                | ManagedReconstructionMode::WholeInstance { .. }
+        )
     }
 
     pub(crate) fn retains_library_sources(&self) -> bool {
-        matches!(&self.mode, ManagedReconstructionMode::Libraries { .. })
+        matches!(
+            self.mode,
+            ManagedReconstructionMode::Libraries(_)
+                | ManagedReconstructionMode::WholeInstance { .. }
+        )
     }
 
     fn phase_library_source_pool(&self) -> Result<LibrarySourcePool, DownloadError> {
         match &self.mode {
-            ManagedReconstructionMode::Libraries { source_pool, .. } => Ok(source_pool.clone()),
+            ManagedReconstructionMode::Libraries(libraries)
+            | ManagedReconstructionMode::WholeInstance { libraries, .. } => {
+                Ok(libraries.source_pool.clone())
+            }
             ManagedReconstructionMode::ProofOnly
             | ManagedReconstructionMode::VersionBundle
-            | ManagedReconstructionMode::Assets { .. } => LibrarySourcePool::new(),
+            | ManagedReconstructionMode::Assets(_) => LibrarySourcePool::new(),
         }
     }
 
@@ -552,19 +603,18 @@ impl ManagedReconstructionContext {
         &self,
         job: &super::libraries::DownloadJob,
     ) -> Result<bool, DownloadError> {
-        let (cache_admission, cache_proofs) = match &self.mode {
-            ManagedReconstructionMode::Libraries {
-                cache_admission,
-                cache_proofs,
-                ..
-            } => (cache_admission, cache_proofs),
+        let libraries = match &self.mode {
+            ManagedReconstructionMode::Libraries(libraries)
+            | ManagedReconstructionMode::WholeInstance { libraries, .. } => libraries,
             ManagedReconstructionMode::ProofOnly
             | ManagedReconstructionMode::VersionBundle
-            | ManagedReconstructionMode::Assets { .. } => {
-                return Ok(true);
-            }
+            | ManagedReconstructionMode::Assets(_) => return Ok(true),
         };
-        if cache_admission.requires_retained_source(job).await? {
+        if libraries
+            .cache_admission
+            .requires_retained_source(job)
+            .await?
+        {
             return Ok(true);
         }
         let expected_size = job.expected.size.ok_or_else(|| {
@@ -578,7 +628,8 @@ impl ManagedReconstructionContext {
             .ok_or_else(|| {
                 DownloadError::Integrity("exact library cache proof lost its SHA-1".to_string())
             })?;
-        cache_proofs
+        libraries
+            .cache_proofs
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(AuthenticatedLibraryCacheProof::new(
@@ -596,40 +647,43 @@ impl ManagedReconstructionContext {
         source_pool: &LibrarySourcePool,
         kind: LibraryComponentSourceKind,
     ) -> Result<Option<RetainedLibraryComponentSource>, DownloadError> {
-        let ManagedReconstructionMode::Libraries {
-            cache_admission, ..
-        } = &self.mode
-        else {
-            return Ok(None);
+        let libraries = match &self.mode {
+            ManagedReconstructionMode::Libraries(libraries)
+            | ManagedReconstructionMode::WholeInstance { libraries, .. } => libraries,
+            ManagedReconstructionMode::ProofOnly
+            | ManagedReconstructionMode::VersionBundle
+            | ManagedReconstructionMode::Assets(_) => return Ok(None),
         };
-        cache_admission
+        libraries
+            .cache_admission
             .retain_installer_source(job, source_pool, kind)
             .await
     }
 
     pub(crate) fn take_library_cache_proofs(&self) -> AuthenticatedLibraryCacheProofSet {
         match &self.mode {
-            ManagedReconstructionMode::Libraries { cache_proofs, .. } => std::mem::take(
-                &mut *cache_proofs
+            ManagedReconstructionMode::Libraries(libraries)
+            | ManagedReconstructionMode::WholeInstance { libraries, .. } => std::mem::take(
+                &mut *libraries
+                    .cache_proofs
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner),
             ),
             ManagedReconstructionMode::ProofOnly
             | ManagedReconstructionMode::VersionBundle
-            | ManagedReconstructionMode::Assets { .. } => {
-                AuthenticatedLibraryCacheProofSet::default()
-            }
+            | ManagedReconstructionMode::Assets(_) => AuthenticatedLibraryCacheProofSet::default(),
         }
     }
 
     fn assets_acquisition(&self) -> Option<(AssetSourcePool, ManagedComponentExactCache)> {
         match &self.mode {
-            ManagedReconstructionMode::Assets {
-                source_pool, cache, ..
-            } => Some((source_pool.clone(), cache.clone())),
+            ManagedReconstructionMode::Assets(assets)
+            | ManagedReconstructionMode::WholeInstance { assets, .. } => {
+                Some((assets.source_pool.clone(), assets.cache.clone()))
+            }
             ManagedReconstructionMode::ProofOnly
             | ManagedReconstructionMode::VersionBundle
-            | ManagedReconstructionMode::Libraries { .. } => None,
+            | ManagedReconstructionMode::Libraries(_) => None,
         }
     }
 
@@ -638,12 +692,19 @@ impl ManagedReconstructionContext {
         sources: RetainedAssetSourceSet,
         cache_proofs: AuthenticatedAssetCacheProofSet,
     ) -> Result<(), DownloadError> {
-        let ManagedReconstructionMode::Assets { authority, .. } = &self.mode else {
-            return Err(DownloadError::Integrity(
-                "non-Assets reconstruction produced retained Assets authority".to_string(),
-            ));
+        let assets = match &self.mode {
+            ManagedReconstructionMode::Assets(assets)
+            | ManagedReconstructionMode::WholeInstance { assets, .. } => assets,
+            ManagedReconstructionMode::ProofOnly
+            | ManagedReconstructionMode::VersionBundle
+            | ManagedReconstructionMode::Libraries(_) => {
+                return Err(DownloadError::Integrity(
+                    "non-Assets reconstruction produced retained Assets authority".to_string(),
+                ));
+            }
         };
-        let mut authority = authority
+        let mut authority = assets
+            .authority
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if authority.is_some() {
@@ -658,24 +719,32 @@ impl ManagedReconstructionContext {
     pub(crate) fn take_assets_authority(
         self,
     ) -> Result<(RetainedAssetSourceSet, AuthenticatedAssetCacheProofSet), DownloadError> {
-        let ManagedReconstructionMode::Assets { authority, .. } = self.mode else {
+        let ManagedReconstructionMode::Assets(assets) = self.mode else {
             return Err(DownloadError::Integrity(
                 "Assets authority was requested from a different reconstruction mode".to_string(),
             ));
         };
-        Arc::try_unwrap(authority)
-            .map_err(|_| {
-                DownloadError::Integrity(
-                    "Assets reconstruction authority still has live borrowers".to_string(),
-                )
-            })?
-            .into_inner()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .ok_or_else(|| {
-                DownloadError::Integrity(
-                    "Assets reconstruction did not retain source authority".to_string(),
-                )
-            })
+        take_retained_assets_authority(assets.authority)
+    }
+
+    pub(crate) fn take_whole_instance_authority(
+        self,
+    ) -> Result<
+        (
+            AuthenticatedLibraryCacheProofSet,
+            RetainedAssetSourceSet,
+            AuthenticatedAssetCacheProofSet,
+        ),
+        DownloadError,
+    > {
+        let ManagedReconstructionMode::WholeInstance { libraries, assets } = self.mode else {
+            return Err(DownloadError::Integrity(
+                "whole-instance reconstruction lost its combined authority".to_string(),
+            ));
+        };
+        let library_cache_proofs = take_library_cache_proofs(libraries.cache_proofs)?;
+        let (asset_sources, asset_cache_proofs) = take_retained_assets_authority(assets.authority)?;
+        Ok((library_cache_proofs, asset_sources, asset_cache_proofs))
     }
 
     pub(crate) async fn retain_local_sources(
@@ -685,21 +754,61 @@ impl ManagedReconstructionContext {
         if sources.is_empty() {
             return Ok(RetainedLibrarySourceSet::new());
         }
-        let ManagedReconstructionMode::Libraries { source_pool, .. } = &self.mode else {
-            return Err(DownloadError::Integrity(
-                "non-Libraries reconstruction cannot retain local library bytes".to_string(),
-            ));
+        let libraries = match &self.mode {
+            ManagedReconstructionMode::Libraries(libraries)
+            | ManagedReconstructionMode::WholeInstance { libraries, .. } => libraries,
+            ManagedReconstructionMode::ProofOnly
+            | ManagedReconstructionMode::VersionBundle
+            | ManagedReconstructionMode::Assets(_) => {
+                return Err(DownloadError::Integrity(
+                    "non-Libraries reconstruction cannot retain local library bytes".to_string(),
+                ));
+            }
         };
         let mut retained = RetainedLibrarySourceSet::new();
         for source in sources {
             retained.insert(
-                source_pool
+                libraries
+                    .source_pool
                     .retain_authenticated_local_source(source)
                     .await?,
             )?;
         }
         Ok(retained)
     }
+}
+
+fn take_library_cache_proofs(
+    cache_proofs: Arc<std::sync::Mutex<AuthenticatedLibraryCacheProofSet>>,
+) -> Result<AuthenticatedLibraryCacheProofSet, DownloadError> {
+    Arc::try_unwrap(cache_proofs)
+        .map_err(|_| {
+            DownloadError::Integrity(
+                "Libraries reconstruction authority still has live borrowers".to_string(),
+            )
+        })?
+        .into_inner()
+        .map_err(|_| DownloadError::Integrity("Libraries authority was poisoned".to_string()))
+}
+
+fn take_retained_assets_authority(
+    authority: Arc<
+        std::sync::Mutex<Option<(RetainedAssetSourceSet, AuthenticatedAssetCacheProofSet)>>,
+    >,
+) -> Result<(RetainedAssetSourceSet, AuthenticatedAssetCacheProofSet), DownloadError> {
+    Arc::try_unwrap(authority)
+        .map_err(|_| {
+            DownloadError::Integrity(
+                "Assets reconstruction authority still has live borrowers".to_string(),
+            )
+        })?
+        .into_inner()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .ok_or_else(|| {
+            DownloadError::Integrity(
+                "Assets reconstruction did not retain source authority".to_string(),
+            )
+        })
 }
 
 pub(crate) struct ReconstructedVanillaProcessorAuthority {
@@ -2495,50 +2604,194 @@ pub(crate) async fn publish_prepared_managed_install(
             library_sources,
         } = prepared;
         let lease = acquire_managed_install_publication_lease(managed_root, &observer_key).await?;
-        let lease = publish_managed_component(
+        match publish_managed_projection_sequence(
             lease,
             &authority,
-            ManagedComponentKind::Assets,
             asset_sources.into_sources(),
-        )
-        .await
-        .map_err(|error| managed_component_install_error(ManagedComponentKind::Assets, error))?;
-        let lease = publish_managed_component(
-            lease,
-            &authority,
-            ManagedComponentKind::Libraries,
             library_sources,
+            version_bundle_source,
         )
         .await
-        .map_err(|error| managed_component_install_error(ManagedComponentKind::Libraries, error))?;
-        complete_prepared_version_bundle_install(lease, authority, version_bundle_source).await
+        {
+            Ok(ManagedProjectionSequenceOutcome::Committed(_lease)) => {
+                Ok(authority.seal_after_version_bundle_commit())
+            }
+            Ok(ManagedProjectionSequenceOutcome::RolledBack { effect, .. }) => Err(
+                managed_projection_sequence_rolled_back_install_error(effect.component()),
+            ),
+            Err(error) => Err(managed_projection_sequence_install_error(error.component())),
+        }
     });
     owner.await.map_err(managed_install_owner_error)?
 }
 
-async fn complete_prepared_version_bundle_install(
+pub(crate) trait ManagedProjectionAuthority {
+    fn component_projection(
+        &self,
+        component: ManagedKnownGoodComponent,
+    ) -> Result<ManagedComponentProjection<'_>, ()>;
+}
+
+impl ManagedProjectionAuthority for PendingKnownGoodInstallAuthority {
+    fn component_projection(
+        &self,
+        component: ManagedKnownGoodComponent,
+    ) -> Result<ManagedComponentProjection<'_>, ()> {
+        PendingKnownGoodInstallAuthority::component_projection(self, component).map_err(|_| ())
+    }
+}
+
+impl ManagedProjectionAuthority for KnownGoodReconstructionReceipt {
+    fn component_projection(
+        &self,
+        component: ManagedKnownGoodComponent,
+    ) -> Result<ManagedComponentProjection<'_>, ()> {
+        KnownGoodReconstructionReceipt::component_projection(self, component).map_err(|_| ())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ManagedProjectionSequenceEffect {
+    Assets(ComponentRollbackEffect),
+    Libraries(ComponentRollbackEffect),
+    VersionBundle(VersionBundleTransactionEffect),
+}
+
+impl ManagedProjectionSequenceEffect {
+    pub(crate) fn component(self) -> ManagedKnownGoodComponent {
+        match self {
+            Self::Assets(_) => ManagedKnownGoodComponent::Assets,
+            Self::Libraries(_) => ManagedKnownGoodComponent::Libraries,
+            Self::VersionBundle(_) => ManagedKnownGoodComponent::VersionBundle,
+        }
+    }
+}
+
+pub(crate) enum ManagedProjectionSequenceOutcome {
+    Committed(ManagedRootPublicationLease),
+    RolledBack {
+        lease: ManagedRootPublicationLease,
+        effect: ManagedProjectionSequenceEffect,
+    },
+}
+
+pub(crate) enum ManagedProjectionSequenceError {
+    Projection(ManagedKnownGoodComponent),
+    Component(ManagedKnownGoodComponent),
+    VersionBundle,
+}
+
+impl ManagedProjectionSequenceError {
+    pub(crate) fn component(&self) -> ManagedKnownGoodComponent {
+        match self {
+            Self::Projection(component) | Self::Component(component) => *component,
+            Self::VersionBundle => ManagedKnownGoodComponent::VersionBundle,
+        }
+    }
+}
+
+pub(crate) async fn publish_managed_projection_sequence(
     lease: ManagedRootPublicationLease,
-    authority: PendingKnownGoodInstallAuthority,
-    source: AuthenticatedVersionBundleSource,
-) -> Result<KnownGoodInstallReceipt, DownloadError> {
-    let publication = {
-        let projection = authority.version_bundle_projection().map_err(|_| {
-            version_bundle_install_error("version bundle projection could not be derived")
+    authority: &impl ManagedProjectionAuthority,
+    asset_sources: Vec<RetainedAssetComponentSource>,
+    library_sources: Vec<RetainedLibraryComponentSource>,
+    version_bundle_source: AuthenticatedVersionBundleSource,
+) -> Result<ManagedProjectionSequenceOutcome, ManagedProjectionSequenceError> {
+    let assets = authority
+        .component_projection(ManagedKnownGoodComponent::Assets)
+        .map_err(|()| {
+            ManagedProjectionSequenceError::Projection(ManagedKnownGoodComponent::Assets)
         })?;
-        publish_version_bundle(lease, source, projection).await
+    let lease = match publish_managed_component_effect(
+        lease,
+        assets,
+        ManagedComponentKind::Assets,
+        asset_sources,
+    )
+    .await
+    .map_err(|_| ManagedProjectionSequenceError::Component(ManagedKnownGoodComponent::Assets))?
+    {
+        ManagedComponentLifecycleOutcome::Committed(receipt) => receipt.into_lease(),
+        ManagedComponentLifecycleOutcome::RolledBack(receipt) => {
+            let effect = receipt.rollback_effect();
+            return Ok(ManagedProjectionSequenceOutcome::RolledBack {
+                lease: receipt.into_lease(),
+                effect: ManagedProjectionSequenceEffect::Assets(effect),
+            });
+        }
+    };
+    let libraries = authority
+        .component_projection(ManagedKnownGoodComponent::Libraries)
+        .map_err(|()| {
+            ManagedProjectionSequenceError::Projection(ManagedKnownGoodComponent::Libraries)
+        })?;
+    let lease = match publish_managed_component_effect(
+        lease,
+        libraries,
+        ManagedComponentKind::Libraries,
+        library_sources,
+    )
+    .await
+    .map_err(|_| ManagedProjectionSequenceError::Component(ManagedKnownGoodComponent::Libraries))?
+    {
+        ManagedComponentLifecycleOutcome::Committed(receipt) => receipt.into_lease(),
+        ManagedComponentLifecycleOutcome::RolledBack(receipt) => {
+            let effect = receipt.rollback_effect();
+            return Ok(ManagedProjectionSequenceOutcome::RolledBack {
+                lease: receipt.into_lease(),
+                effect: ManagedProjectionSequenceEffect::Libraries(effect),
+            });
+        }
+    };
+    let publication = {
+        let projection = authority
+            .component_projection(ManagedKnownGoodComponent::VersionBundle)
+            .map_err(|()| {
+                ManagedProjectionSequenceError::Projection(ManagedKnownGoodComponent::VersionBundle)
+            })?;
+        publish_version_bundle(lease, version_bundle_source, projection).await
     };
     let settlement = settle_version_bundle_publication(publication)
         .await
-        .map_err(|_| {
-            version_bundle_install_error("version bundle publication failed before settlement")
-        })?;
+        .map_err(|_| ManagedProjectionSequenceError::VersionBundle)?;
     match settlement {
-        VersionBundleTransactionSettledOutcome::Committed(_lease) => {
-            Ok(authority.seal_after_version_bundle_commit())
+        VersionBundleTransactionSettledOutcome::Committed(lease) => {
+            Ok(ManagedProjectionSequenceOutcome::Committed(lease))
         }
-        VersionBundleTransactionSettledOutcome::RolledBack { .. } => Err(
-            version_bundle_install_error("version bundle publication rolled back"),
-        ),
+        VersionBundleTransactionSettledOutcome::RolledBack { lease, effect } => {
+            Ok(ManagedProjectionSequenceOutcome::RolledBack {
+                lease,
+                effect: ManagedProjectionSequenceEffect::VersionBundle(effect),
+            })
+        }
+    }
+}
+
+fn managed_projection_sequence_install_error(
+    component: ManagedKnownGoodComponent,
+) -> DownloadError {
+    version_bundle_install_error(format!(
+        "managed {} publication failed",
+        managed_projection_sequence_component_name(component)
+    ))
+}
+
+fn managed_projection_sequence_rolled_back_install_error(
+    component: ManagedKnownGoodComponent,
+) -> DownloadError {
+    version_bundle_install_error(format!(
+        "managed {} publication rolled back",
+        managed_projection_sequence_component_name(component)
+    ))
+}
+
+fn managed_projection_sequence_component_name(
+    component: ManagedKnownGoodComponent,
+) -> &'static str {
+    match component {
+        ManagedKnownGoodComponent::VersionBundle => "VersionBundle",
+        ManagedKnownGoodComponent::Libraries => "Libraries",
+        ManagedKnownGoodComponent::Assets => "Assets",
     }
 }
 
@@ -2593,17 +2846,6 @@ fn notify_managed_install_lease_wait_for_test(version_id: &str) {
 
 fn version_bundle_install_error(message: impl Into<String>) -> DownloadError {
     DownloadError::ResolveManifest(message.into())
-}
-
-fn managed_component_install_error(
-    component: ManagedComponentKind,
-    _error: ComponentLifecycleError,
-) -> DownloadError {
-    let name = match component {
-        ManagedComponentKind::Libraries => "Libraries",
-        ManagedComponentKind::Assets => "Assets",
-    };
-    version_bundle_install_error(format!("managed {name} publication failed"))
 }
 
 async fn await_selected_source_task(

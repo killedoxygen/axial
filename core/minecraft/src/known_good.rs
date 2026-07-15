@@ -1,7 +1,7 @@
 use crate::artifact_path::{
     ArtifactRelativePath, MAX_ARTIFACT_PATH_SEGMENT_BYTES, MAX_ARTIFACT_RELATIVE_PATH_BYTES,
 };
-#[cfg(feature = "test-support")]
+#[cfg(any(test, feature = "test-support"))]
 use crate::download::AssetSourcePool;
 use crate::download::library_source::{
     AuthenticatedLibraryCacheProofSet, RetainedLibraryComponentSource, RetainedLibrarySourceSet,
@@ -22,15 +22,17 @@ use crate::loaders::{
     LoaderInstallStrategy, VerifiedInstallerClientBytes, VerifiedInstallerReceiptSource,
     compose_loader_version,
 };
-#[cfg(feature = "test-support")]
+#[cfg(any(test, feature = "test-support"))]
 use crate::managed_component_table::ManagedComponentArtifactKind;
 use crate::managed_fs::ManagedDir;
+use crate::managed_publication::ManagedRootPublicationLease;
 #[cfg(test)]
 use crate::manifest::ManifestEntry;
 use crate::rules::Environment;
 use crate::runtime::{
     COMPONENT_MANIFEST_PROOF_FILE, ComponentManifest, RuntimeId, RuntimeSourceReceipt,
     component_manifest_proof_bytes, plan_runtime_manifest_files, preferred_runtime_component,
+    runtime_source_matches_known_good_inventory,
 };
 use sha1::{Digest as _, Sha1};
 use std::collections::{BTreeMap, BTreeSet};
@@ -1215,6 +1217,7 @@ pub(crate) struct RetainedKnownGoodReconstruction {
     receipt: KnownGoodReconstructionReceipt,
     library_sources: RetainedLibrarySourceSet,
     version_bundle_sources: Option<RetainedVersionBundleReconstructionSources>,
+    runtime_source: Option<RuntimeSourceReceipt>,
 }
 
 pub(crate) struct ManagedVersionBundleReconstruction {
@@ -1242,16 +1245,27 @@ pub(crate) struct ManagedAssetsReconstruction {
     expected_content_byte_count: u64,
 }
 
+pub(crate) struct ManagedWholeInstanceReconstruction {
+    projection: KnownGoodReconstructionReceipt,
+    root_lease: ManagedRootPublicationLease,
+    version_bundle_source: AuthenticatedVersionBundleSource,
+    library_sources: Vec<RetainedLibraryComponentSource>,
+    asset_sources: Vec<RetainedAssetComponentSource>,
+    runtime_source: RuntimeSourceReceipt,
+}
+
 impl RetainedKnownGoodReconstruction {
     pub(crate) fn new(
         receipt: KnownGoodReconstructionReceipt,
         library_sources: RetainedLibrarySourceSet,
         version_bundle_sources: Option<RetainedVersionBundleReconstructionSources>,
+        runtime_source: Option<RuntimeSourceReceipt>,
     ) -> Self {
         Self {
             receipt,
             library_sources,
             version_bundle_sources,
+            runtime_source,
         }
     }
 
@@ -1265,11 +1279,13 @@ impl RetainedKnownGoodReconstruction {
         KnownGoodReconstructionReceipt,
         RetainedLibrarySourceSet,
         Option<RetainedVersionBundleReconstructionSources>,
+        Option<RuntimeSourceReceipt>,
     ) {
         (
             self.receipt,
             self.library_sources,
             self.version_bundle_sources,
+            self.runtime_source,
         )
     }
 
@@ -1294,7 +1310,8 @@ impl RetainedKnownGoodReconstruction {
         self,
         managed_root: ManagedDir,
     ) -> Result<ManagedVersionBundleReconstruction, DownloadError> {
-        let (receipt, _library_sources, version_bundle_sources) = self.into_parts();
+        let (receipt, _library_sources, version_bundle_sources, _runtime_source) =
+            self.into_parts();
         let projection = receipt
             .component_projection(ManagedKnownGoodComponent::VersionBundle)
             .map_err(|_| {
@@ -1371,6 +1388,71 @@ impl RetainedKnownGoodReconstruction {
             asset_sources,
         })
     }
+
+    pub(crate) fn bind_managed_whole_instance(
+        self,
+        root_lease: ManagedRootPublicationLease,
+        library_cache_proofs: AuthenticatedLibraryCacheProofSet,
+        mut asset_sources: RetainedAssetSourceSet,
+        asset_cache_proofs: AuthenticatedAssetCacheProofSet,
+    ) -> Result<ManagedWholeInstanceReconstruction, DownloadError> {
+        let (projection, mut library_sources, version_bundle_sources, runtime_source) =
+            self.into_parts();
+        let libraries = projection
+            .component_projection(ManagedKnownGoodComponent::Libraries)
+            .map_err(|_| {
+                DownloadError::Integrity(
+                    "whole-instance Libraries projection is invalid".to_string(),
+                )
+            })?;
+        library_sources.reconcile_sparse_projection(&libraries, library_cache_proofs)?;
+        let assets = projection
+            .component_projection(ManagedKnownGoodComponent::Assets)
+            .map_err(|_| {
+                DownloadError::Integrity("whole-instance Assets projection is invalid".to_string())
+            })?;
+        asset_sources.reconcile_sparse_projection(&assets, asset_cache_proofs)?;
+        let version_bundle = projection
+            .component_projection(ManagedKnownGoodComponent::VersionBundle)
+            .map_err(|_| {
+                DownloadError::Integrity(
+                    "whole-instance VersionBundle projection is invalid".to_string(),
+                )
+            })?;
+        let version_bundle_source =
+            AuthenticatedVersionBundleSource::from_reconstruction_projection(
+                projection.version_id().to_string(),
+                &version_bundle,
+                version_bundle_sources.ok_or_else(|| {
+                    DownloadError::Integrity(
+                        "whole-instance reconstruction lost exact VersionBundle sources"
+                            .to_string(),
+                    )
+                })?,
+            )?;
+        let runtime_source = runtime_source.ok_or_else(|| {
+            DownloadError::Integrity(
+                "whole-instance reconstruction lost its authenticated Runtime source".to_string(),
+            )
+        })?;
+        if !runtime_source_matches_known_good_inventory(
+            runtime_source.component(),
+            &runtime_source,
+            &projection.authenticated.inventory,
+        ) {
+            return Err(DownloadError::Integrity(
+                "whole-instance Runtime source does not match its projection".to_string(),
+            ));
+        }
+        Ok(ManagedWholeInstanceReconstruction {
+            projection,
+            root_lease,
+            version_bundle_source,
+            library_sources: library_sources.into_sources(),
+            asset_sources: asset_sources.into_sources(),
+            runtime_source,
+        })
+    }
 }
 
 impl ManagedVersionBundleReconstruction {
@@ -1418,7 +1500,8 @@ impl ManagedLibrariesReconstruction {
         KnownGoodReconstructionReceipt,
         Vec<RetainedLibraryComponentSource>,
     ) {
-        let (receipt, sources, _version_bundle_sources) = self.reconstruction.into_parts();
+        let (receipt, sources, _version_bundle_sources, _runtime_source) =
+            self.reconstruction.into_parts();
         (self.managed_root, receipt, sources.into_sources())
     }
 }
@@ -1457,6 +1540,198 @@ impl ManagedAssetsReconstruction {
             self.asset_sources.into_sources(),
         )
     }
+}
+
+impl ManagedWholeInstanceReconstruction {
+    pub(crate) fn into_effect_parts(
+        self,
+    ) -> (
+        ManagedRootPublicationLease,
+        KnownGoodReconstructionReceipt,
+        AuthenticatedVersionBundleSource,
+        Vec<RetainedLibraryComponentSource>,
+        Vec<RetainedAssetComponentSource>,
+        RuntimeSourceReceipt,
+    ) {
+        (
+            self.root_lease,
+            self.projection,
+            self.version_bundle_source,
+            self.library_sources,
+            self.asset_sources,
+            self.runtime_source,
+        )
+    }
+}
+
+#[cfg(test)]
+pub(crate) async fn managed_whole_instance_reconstruction_fixture_for_test(
+    managed_root: ManagedDir,
+    version_id: &str,
+    runtime_source: RuntimeSourceReceipt,
+) -> Result<ManagedWholeInstanceReconstruction, DownloadError> {
+    const CLIENT_BYTES: &[u8] = b"axial whole-instance client fixture";
+    const LIBRARY_PATH: &str = "org/axial/whole/1.0.0/whole-1.0.0.jar";
+    const LIBRARY_BYTES: &[u8] = b"axial whole-instance library fixture";
+    const INDEX_ID: &str = "whole-instance-assets";
+    const ASSET_BYTES: &[u8] = b"axial whole-instance asset fixture";
+    const LOG_ID: &str = "guardian-whole-instance.xml";
+    const LOG_BYTES: &[u8] = b"<Configuration/>";
+
+    let version_json = serde_json::to_vec(&serde_json::json!({
+        "id": version_id,
+        "type": "release",
+        "mainClass": "org.axial.GuardianWholeFixture"
+    }))?;
+    let version_id = KnownGoodId::new(version_id).map_err(|_| {
+        DownloadError::Integrity("whole-instance fixture id is invalid".to_string())
+    })?;
+    let version_bundle = KnownGoodInventory::version_bundle_for_test(
+        version_id.as_str(),
+        &version_json,
+        CLIENT_BYTES,
+        Some((LOG_ID, LOG_BYTES)),
+    );
+    let runtime = runtime_inventory_from_source(&runtime_source).map_err(|_| {
+        DownloadError::Integrity("whole-instance Runtime fixture is invalid".to_string())
+    })?;
+    let asset_sha1: [u8; 20] = Sha1::digest(ASSET_BYTES).into();
+    let asset_digest = sha1_array_digest(&asset_sha1);
+    let asset_path = format!(
+        "objects/{}/{}",
+        &asset_digest.as_str()[..2],
+        asset_digest.as_str()
+    );
+    let index_bytes = serde_json::to_vec(&serde_json::json!({
+        "objects": {
+            "fixture/object": {
+                "hash": asset_digest.as_str(),
+                "size": ASSET_BYTES.len()
+            }
+        }
+    }))?;
+    let index_sha1: [u8; 20] = Sha1::digest(&index_bytes).into();
+    let index_path = format!("indexes/{INDEX_ID}.json");
+    let library_sha1: [u8; 20] = Sha1::digest(LIBRARY_BYTES).into();
+    let mut inventory = InventoryBuilder::default();
+    for entry in version_bundle.entries().iter().chain(runtime.entries()) {
+        inventory.insert(entry.clone()).map_err(|_| {
+            DownloadError::Integrity("whole-instance fixture inventory conflicts".to_string())
+        })?;
+    }
+    for entry in [
+        KnownGoodEntry {
+            root: KnownGoodRoot::Libraries,
+            path: KnownGoodRelativePath::new(LIBRARY_PATH).map_err(|_| {
+                DownloadError::Integrity("whole-instance Library path is invalid".to_string())
+            })?,
+            kind: KnownGoodArtifactKind::Library,
+            integrity: KnownGoodIntegrity::Sha1 {
+                digest: sha1_array_digest(&library_sha1),
+                size: LIBRARY_BYTES.len() as u64,
+            },
+        },
+        KnownGoodEntry {
+            root: KnownGoodRoot::Assets,
+            path: KnownGoodRelativePath::new(&index_path).map_err(|_| {
+                DownloadError::Integrity("whole-instance asset index path is invalid".to_string())
+            })?,
+            kind: KnownGoodArtifactKind::AssetIndex,
+            integrity: KnownGoodIntegrity::Sha1 {
+                digest: sha1_array_digest(&index_sha1),
+                size: index_bytes.len() as u64,
+            },
+        },
+        KnownGoodEntry {
+            root: KnownGoodRoot::Assets,
+            path: KnownGoodRelativePath::new(&asset_path).map_err(|_| {
+                DownloadError::Integrity("whole-instance asset path is invalid".to_string())
+            })?,
+            kind: KnownGoodArtifactKind::AssetObject,
+            integrity: KnownGoodIntegrity::Sha1 {
+                digest: asset_digest,
+                size: ASSET_BYTES.len() as u64,
+            },
+        },
+    ] {
+        inventory.insert(entry).map_err(|_| {
+            DownloadError::Integrity("whole-instance fixture inventory conflicts".to_string())
+        })?;
+    }
+    let authenticated = AuthenticatedKnownGoodReceipt {
+        version_id,
+        inventory: inventory.finish(),
+        effective_version: serde_json::from_slice(&version_json)?,
+        environment: crate::rules::default_environment(),
+    };
+    let mut library_sources = RetainedLibrarySourceSet::new();
+    library_sources.insert(
+        RetainedLibraryComponentSource::from_authenticated_local_bytes(
+            ArtifactRelativePath::new(LIBRARY_PATH).map_err(|_| {
+                DownloadError::Integrity(
+                    "whole-instance Library source path is invalid".to_string(),
+                )
+            })?,
+            crate::download::library_source::LibraryComponentSourceKind::Library,
+            LIBRARY_BYTES.to_vec(),
+            LIBRARY_BYTES.len() as u64,
+            library_sha1,
+        )
+        .map_err(|_| {
+            DownloadError::Integrity("whole-instance Library source is invalid".to_string())
+        })?,
+    )?;
+    let asset_pool = AssetSourcePool::new()?;
+    let mut asset_sources = RetainedAssetSourceSet::new();
+    for (path, kind, bytes) in [
+        (
+            index_path.as_str(),
+            ManagedComponentArtifactKind::AssetIndex,
+            index_bytes,
+        ),
+        (
+            asset_path.as_str(),
+            ManagedComponentArtifactKind::AssetObject,
+            ASSET_BYTES.to_vec(),
+        ),
+    ] {
+        asset_sources.insert(
+            asset_pool
+                .retain_authenticated_local_bytes(
+                    ArtifactRelativePath::new(path).map_err(|_| {
+                        DownloadError::Integrity(
+                            "whole-instance Asset source path is invalid".to_string(),
+                        )
+                    })?,
+                    kind,
+                    bytes,
+                )
+                .await?,
+        )?;
+    }
+    let root_lease = ManagedRootPublicationLease::acquire(managed_root)
+        .await
+        .map_err(|_| {
+            DownloadError::Integrity("whole-instance fixture root lease is unavailable".to_string())
+        })?;
+    RetainedKnownGoodReconstruction::new(
+        KnownGoodReconstructionReceipt { authenticated },
+        library_sources,
+        Some(
+            RetainedVersionBundleReconstructionSources::from_local_final(
+                version_json,
+                CLIENT_BYTES.to_vec(),
+                Some(LOG_BYTES.to_vec()),
+            ),
+        ),
+        Some(runtime_source),
+    )
+    .bind_managed_whole_instance(
+        root_lease,
+        AuthenticatedLibraryCacheProofSet::default(),
+        asset_sources,
+        AuthenticatedAssetCacheProofSet::default(),
+    )
 }
 
 #[cfg(feature = "test-support")]
@@ -1532,6 +1807,7 @@ pub(crate) fn managed_libraries_reconstruction_fixture_for_test(
         reconstruction: RetainedKnownGoodReconstruction::new(
             KnownGoodReconstructionReceipt { authenticated },
             sources,
+            None,
             None,
         ),
         managed_root,
@@ -1682,6 +1958,7 @@ pub(crate) async fn managed_assets_reconstruction_fixture_for_test(
         KnownGoodReconstructionReceipt { authenticated },
         RetainedLibrarySourceSet::new(),
         None,
+        None,
     )
     .bind_managed_assets(
         managed_root,
@@ -1730,6 +2007,7 @@ pub(crate) fn managed_version_bundle_reconstruction_fixture_for_test(
                 Some(LOG_BYTES.to_vec()),
             ),
         ),
+        None,
     )
     .bind_managed_version_bundle(managed_root)
 }
@@ -2432,6 +2710,14 @@ impl KnownGoodReconstructionReceipt {
             .inventory
             .managed_component_projection(component)
     }
+
+    pub(crate) fn matches_inventory(&self, expected: &KnownGoodInventory) -> bool {
+        self.authenticated.inventory == *expected
+    }
+
+    pub(crate) fn inventory(&self) -> &KnownGoodInventory {
+        &self.authenticated.inventory
+    }
 }
 
 pub(crate) fn reconstructed_effective_version(
@@ -2448,7 +2734,7 @@ pub(crate) fn seal_reconstructed_profile_source(
     library_declarations: SealedExactLibraryDeclarations,
     library_sources: RetainedLibrarySourceSet,
 ) -> Result<RetainedKnownGoodReconstruction, KnownGoodInventoryError> {
-    let (base, mut retained_sources, version_bundle_sources) = base.into_parts();
+    let (base, mut retained_sources, version_bundle_sources, runtime_source) = base.into_parts();
     retained_sources
         .merge(library_sources)
         .map_err(|_| KnownGoodInventoryError::ProfileLibraryProofMismatch)?;
@@ -2463,6 +2749,7 @@ pub(crate) fn seal_reconstructed_profile_source(
         KnownGoodReconstructionReceipt { authenticated },
         retained_sources,
         version_bundle_sources.map(|sources| sources.replace_final(version_bytes, None)),
+        runtime_source,
     ))
 }
 
@@ -2479,7 +2766,7 @@ pub(crate) fn seal_reconstructed_installer_source(
         child_client,
         library_sources,
     ) = authority.consume_for_sealing();
-    let (base, mut retained_sources, version_bundle_sources) = base.into_parts();
+    let (base, mut retained_sources, version_bundle_sources, runtime_source) = base.into_parts();
     let (source, library_declarations, local_library_sources) = input.into_parts();
     if !local_library_sources.is_empty() {
         return Err(KnownGoodInventoryError::InstallerLibraryProofMismatch);
@@ -2509,6 +2796,7 @@ pub(crate) fn seal_reconstructed_installer_source(
         retained_sources,
         version_bundle_sources
             .map(|sources| sources.replace_final(version_bytes, Some(child_client))),
+        runtime_source,
     ))
 }
 
@@ -2524,7 +2812,7 @@ pub(crate) fn seal_reconstructed_legacy_archive_source(
         version_bytes,
         child_client_bytes,
     ) = authority.consume_for_sealing();
-    let (base, library_sources, version_bundle_sources) = base.into_parts();
+    let (base, library_sources, version_bundle_sources, runtime_source) = base.into_parts();
     let LoaderInstallSource::LegacyArchive { url: archive_url } = &record.install_source else {
         return Err(KnownGoodInventoryError::LoaderIdentityMismatch);
     };
@@ -2544,6 +2832,7 @@ pub(crate) fn seal_reconstructed_legacy_archive_source(
         library_sources,
         version_bundle_sources
             .map(|sources| sources.replace_final(version_bytes, Some(child_client_bytes))),
+        runtime_source,
     ))
 }
 
@@ -2598,6 +2887,7 @@ pub(crate) fn seal_reconstructed_vanilla(
         KnownGoodReconstructionReceipt { authenticated },
         library_sources,
         version_bundle_sources,
+        runtime_source,
     ))
 }
 

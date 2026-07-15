@@ -14,7 +14,7 @@ mod runtime;
 mod transfer;
 mod transfer_failure;
 
-#[cfg(feature = "test-support")]
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) use asset_source::AssetSourcePool;
 pub(crate) use asset_source::{
     AuthenticatedAssetCacheProofSet, RetainedAssetComponentSource, RetainedAssetSourceSet,
@@ -24,10 +24,11 @@ pub(crate) use assets::{ASSET_OBJECT_BASE_URL, parse_asset_index};
 pub use install::Downloader;
 pub(crate) use install::{
     AuthenticatedVanillaInstallSources, AuthenticatedVersionBundleMemberSource,
-    AuthenticatedVersionBundleSource, ManagedReconstructionContext, PreparedManagedInstall,
-    ReconstructedVanillaAuthority, ReconstructedVanillaAuthorityParts,
+    AuthenticatedVersionBundleSource, ManagedProjectionSequenceEffect,
+    ManagedProjectionSequenceError, ManagedProjectionSequenceOutcome, ManagedReconstructionContext,
+    PreparedManagedInstall, ReconstructedVanillaAuthority, ReconstructedVanillaAuthorityParts,
     RetainedVersionBundleReconstructionSources, prepare_local_managed_install,
-    publish_prepared_managed_install,
+    publish_managed_projection_sequence, publish_prepared_managed_install,
 };
 pub(crate) use install::{
     reconstruct_installer_library_declarations, reconstruct_installer_processor_sources,

@@ -17,7 +17,7 @@ use crate::managed_component_source_spool::{
 use crate::managed_component_table::ManagedComponentArtifactKind;
 use crate::managed_fs::ManagedDir;
 use crate::managed_publication::ManagedPublicationLifetimeGuard;
-#[cfg(feature = "test-support")]
+#[cfg(any(test, feature = "test-support"))]
 use sha1::{Digest as _, Sha1};
 use std::collections::BTreeMap;
 use std::io::{self, Cursor};
@@ -174,7 +174,7 @@ impl AssetSourcePool {
         })
     }
 
-    #[cfg(feature = "test-support")]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) async fn retain_authenticated_local_bytes(
         &self,
         relative_path: ArtifactRelativePath,

@@ -1,4 +1,5 @@
 use crate::artifact_path::ArtifactRelativePath;
+#[cfg(test)]
 use crate::known_good::PendingKnownGoodInstallAuthority;
 use crate::known_good::{
     KnownGoodArtifactKind, KnownGoodIntegrity, KnownGoodRoot, ManagedComponentProjection,
@@ -87,8 +88,6 @@ pub(crate) enum ComponentLifecycleError {
     Prepare(#[from] PrepareComponentIntentError),
     #[error("managed component intent failed before canonical effects")]
     BeforeEffects(#[source] ComponentEffectsError),
-    #[error("managed component transaction rolled back")]
-    RolledBack,
 }
 
 impl ComponentPublicationSourceIdentity {
@@ -179,6 +178,21 @@ impl ManagedComponentRolledBackReceipt {
     pub(crate) async fn matches_root(&self, expected: &Path) -> bool {
         receipt_matches_root(&self.lease, expected).await
     }
+
+    pub(crate) fn into_lease(self) -> ManagedRootPublicationLease {
+        self.lease
+    }
+}
+
+pub(crate) async fn revalidate_managed_component_projection(
+    lease: &ManagedRootPublicationLease,
+    projection: &ManagedComponentProjection<'_>,
+    component: ManagedComponentKind,
+) -> bool {
+    let Ok(rows) = projection_rows(component, projection) else {
+        return false;
+    };
+    revalidate_component_projection(lease, component, &rows).await
 }
 
 async fn receipt_matches_root(lease: &ManagedRootPublicationLease, expected: &Path) -> bool {
@@ -234,28 +248,6 @@ impl ComponentRetryBackoff {
     }
 }
 
-pub(crate) async fn publish_managed_component<S>(
-    lease: ManagedRootPublicationLease,
-    authority: &PendingKnownGoodInstallAuthority,
-    component: ManagedComponentKind,
-    sources: Vec<S>,
-) -> Result<ManagedRootPublicationLease, ComponentLifecycleError>
-where
-    S: RetainedComponentPublicationSource + 'static,
-{
-    let (known_good_component, _) = component_projection_contract(component);
-    let projection = authority
-        .component_projection(known_good_component)
-        .map_err(|_| PrepareComponentIntentError::Projection)?;
-    match publish_managed_component_effect(lease, projection, component, sources).await? {
-        ManagedComponentLifecycleOutcome::Committed(receipt) => Ok(receipt.into_lease()),
-        ManagedComponentLifecycleOutcome::RolledBack(receipt) => {
-            drop(receipt);
-            Err(ComponentLifecycleError::RolledBack)
-        }
-    }
-}
-
 #[cfg(test)]
 async fn publish_managed_component_with_faults<S>(
     lease: ManagedRootPublicationLease,
@@ -263,7 +255,7 @@ async fn publish_managed_component_with_faults<S>(
     component: ManagedComponentKind,
     sources: Vec<S>,
     faults: &mut ComponentLifecycleTestFaults,
-) -> Result<ManagedRootPublicationLease, ComponentLifecycleError>
+) -> Result<ManagedComponentLifecycleOutcome, ComponentLifecycleError>
 where
     S: RetainedComponentPublicationSource + 'static,
 {
@@ -271,21 +263,8 @@ where
     let projection = authority
         .component_projection(known_good_component)
         .map_err(|_| PrepareComponentIntentError::Projection)?;
-    match publish_managed_component_effect_inner(
-        lease,
-        projection,
-        component,
-        sources,
-        Some(faults),
-    )
-    .await?
-    {
-        ManagedComponentLifecycleOutcome::Committed(receipt) => Ok(receipt.into_lease()),
-        ManagedComponentLifecycleOutcome::RolledBack(receipt) => {
-            drop(receipt);
-            Err(ComponentLifecycleError::RolledBack)
-        }
-    }
+    publish_managed_component_effect_inner(lease, projection, component, sources, Some(faults))
+        .await
 }
 
 pub(crate) async fn publish_managed_component_effect<S>(
@@ -1149,7 +1128,7 @@ mod tests {
                 ..ComponentLifecycleTestFaults::default()
             };
 
-            let lease = publish_managed_component_with_faults(
+            let outcome = publish_managed_component_with_faults(
                 test_lease(&temporary).await,
                 &authority,
                 component,
@@ -1158,6 +1137,10 @@ mod tests {
             )
             .await
             .expect("recover and settle current component transaction");
+            let ManagedComponentLifecycleOutcome::Committed(receipt) = outcome else {
+                panic!("recovered transaction must commit");
+            };
+            let lease = receipt.into_lease();
 
             lease.revalidate().expect("returned publication lease");
             assert_eq!(
@@ -1182,7 +1165,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn lifecycle_settles_current_rollback_as_terminal_error() {
+    async fn lifecycle_settles_current_rollback_as_typed_outcome() {
         let temporary = tempfile::tempdir().expect("test root");
         let source = test_source(
             "org/example/rollback.jar",
@@ -1198,7 +1181,7 @@ mod tests {
             ..ComponentLifecycleTestFaults::default()
         };
 
-        let error = match publish_managed_component_with_faults(
+        let outcome = publish_managed_component_with_faults(
             test_lease(&temporary).await,
             &authority,
             ManagedComponentKind::Libraries,
@@ -1206,12 +1189,12 @@ mod tests {
             &mut faults,
         )
         .await
-        {
-            Err(error) => error,
-            Ok(_) => panic!("current rollback must terminate the Libraries lifecycle"),
-        };
+        .expect("current rollback must settle");
 
-        assert!(matches!(error, ComponentLifecycleError::RolledBack));
+        assert!(matches!(
+            outcome,
+            ManagedComponentLifecycleOutcome::RolledBack(_)
+        ));
         assert!(!temporary.path().join("libraries").exists());
         assert!(faults.execution.is_none());
         assert_component_lane_settled(&temporary, ManagedComponentKind::Libraries);
@@ -1239,7 +1222,7 @@ mod tests {
             ..ComponentLifecycleTestFaults::default()
         };
 
-        let error = match publish_managed_component_with_faults(
+        let outcome = publish_managed_component_with_faults(
             test_lease(&temporary).await,
             &authority,
             ManagedComponentKind::Libraries,
@@ -1247,12 +1230,12 @@ mod tests {
             &mut faults,
         )
         .await
-        {
-            Err(error) => error,
-            Ok(_) => panic!("reconciled current rollback must remain terminal"),
-        };
+        .expect("reconciled current rollback must settle");
 
-        assert!(matches!(error, ComponentLifecycleError::RolledBack));
+        assert!(matches!(
+            outcome,
+            ManagedComponentLifecycleOutcome::RolledBack(_)
+        ));
         assert!(!temporary.path().join("libraries").exists());
         assert!(faults.execution.is_none());
         assert!(faults.settlement.is_none());
@@ -1334,10 +1317,18 @@ mod tests {
 
             let current = test_source(path, kind, b"current-component".to_vec());
             let current_authority = test_authority(component, std::slice::from_ref(&current));
-            let lease =
-                publish_managed_component(lease, &current_authority, component, vec![current])
+            let (known_good_component, _) = component_projection_contract(component);
+            let projection = current_authority
+                .component_projection(known_good_component)
+                .expect("current component projection");
+            let outcome =
+                publish_managed_component_effect(lease, projection, component, vec![current])
                     .await
                     .expect("settle prior and publish current transaction");
+            let ManagedComponentLifecycleOutcome::Committed(receipt) = outcome else {
+                panic!("current replacement must commit");
+            };
+            let lease = receipt.into_lease();
 
             lease.revalidate().expect("returned current lease");
             assert_eq!(
@@ -1621,14 +1612,21 @@ mod tests {
         );
         let authority = test_authority(ManagedComponentKind::Assets, std::slice::from_ref(&source));
 
-        let lease = publish_managed_component(
+        let projection = authority
+            .component_projection(ManagedKnownGoodComponent::Assets)
+            .expect("Assets projection");
+        let outcome = publish_managed_component_effect(
             test_lease(&temporary).await,
-            &authority,
+            projection,
             ManagedComponentKind::Assets,
             vec![source],
         )
         .await
         .expect("zero-byte AssetObject publication");
+        let ManagedComponentLifecycleOutcome::Committed(receipt) = outcome else {
+            panic!("zero-byte AssetObject must commit");
+        };
+        let lease = receipt.into_lease();
 
         lease.revalidate().expect("returned Assets lease");
         assert_eq!(

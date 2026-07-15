@@ -24,12 +24,21 @@ pub use discovery::{
 #[cfg(feature = "test-support")]
 pub use ensure::rebuild_managed_runtime_fixture_for_test;
 pub(crate) use ensure::{
-    ProcessorRuntime, materialize_ephemeral_processor_runtime, materialize_preferred_runtime_source,
+    ProcessorRuntime, materialize_ephemeral_processor_runtime,
+    materialize_preferred_runtime_source, rebuild_managed_runtime_component_from_source,
 };
 pub use ensure::{ensure_runtime_with_events, rebuild_managed_runtime_component};
 pub use install::{
     ManagedRuntimeCommitReceipt, ManagedRuntimeFailureReceipt, ManagedRuntimeQuarantineObligation,
     ManagedRuntimeRebuildError,
+};
+pub(crate) use install::{
+    finalize_managed_runtime_commit, runtime_source_matches_known_good_inventory,
+};
+#[cfg(test)]
+pub(crate) use install::{
+    finalize_managed_runtime_commit_with_failure_for_test,
+    finalize_managed_runtime_commit_with_removed_quarantine_failure_for_test,
 };
 pub use layout::ManagedRuntimeCache;
 pub(crate) use layout::runtime_java_relative_path;
@@ -70,7 +79,7 @@ use install::{
 #[cfg(test)]
 use layout::{java_executable, java_executable_for_os, runtime_os_arch_for};
 #[cfg(test)]
-use manifest::authenticated_runtime_source_from_manifest_for_test;
+pub(crate) use manifest::authenticated_runtime_source_from_manifest_for_test;
 pub(crate) use manifest::{
     COMPONENT_MANIFEST_PROOF_FILE, ComponentManifest, RuntimeSourceReceipt,
     component_manifest_proof_bytes,

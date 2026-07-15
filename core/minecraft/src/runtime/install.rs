@@ -73,6 +73,7 @@ impl std::fmt::Debug for ManagedRuntimeFailureReceipt {
 pub struct ManagedRuntimeFailureReceipt {
     cache: ManagedRuntimeCache,
     component: RuntimeId,
+    source: Option<Box<RuntimeSourceReceipt>>,
     cause: JavaRuntimeLookupError,
     quarantine: Option<ManagedRuntimeQuarantineObligation>,
     _publication_lease: ManagedRuntimePublicationLease,
@@ -130,6 +131,34 @@ impl ManagedRuntimeFailureReceipt {
 
     pub fn quarantine_obligation(&self) -> Option<&ManagedRuntimeQuarantineObligation> {
         self.quarantine.as_ref()
+    }
+
+    pub fn matches_known_good_inventory(&self, inventory: &KnownGoodInventory) -> bool {
+        self.source.as_ref().is_some_and(|source| {
+            runtime_source_matches_known_good_inventory(&self.component, source.as_ref(), inventory)
+        })
+    }
+
+    pub async fn revalidate(
+        &self,
+        cache: &ManagedRuntimeCache,
+        expected_component: &RuntimeId,
+    ) -> bool {
+        if !self.matches_cache(cache) || &self.component != expected_component {
+            return false;
+        }
+        let (Some(source), Some(install_root)) = (
+            self.source.as_ref(),
+            cache.component_root(expected_component.as_str()),
+        ) else {
+            return false;
+        };
+        source.component() == expected_component
+            && runtime_tree_matches_source(&install_root, source.as_ref()).await
+            && self
+                .quarantine
+                .as_ref()
+                .is_none_or(ManagedRuntimeQuarantineObligation::is_present)
     }
 }
 
@@ -205,10 +234,82 @@ impl ManagedRuntimeCommitReceipt {
         ManagedRuntimeRebuildError::Effect(ManagedRuntimeFailureReceipt {
             cache: self.cache,
             component: self.component,
+            source: self.source.map(Box::new),
             cause,
             quarantine: self.quarantine,
             _publication_lease: self._publication_lease,
         })
+    }
+}
+
+pub(crate) async fn finalize_managed_runtime_commit(
+    receipt: ManagedRuntimeCommitReceipt,
+) -> Result<ManagedRuntimeCommitReceipt, ManagedRuntimeFailureReceipt> {
+    finalize_managed_runtime_commit_inner(receipt, PublishFailureMode::None).await
+}
+
+#[cfg(test)]
+pub(crate) async fn finalize_managed_runtime_commit_with_failure_for_test(
+    receipt: ManagedRuntimeCommitReceipt,
+) -> Result<ManagedRuntimeCommitReceipt, ManagedRuntimeFailureReceipt> {
+    finalize_managed_runtime_commit_inner(receipt, PublishFailureMode::Finalization).await
+}
+
+#[cfg(test)]
+pub(crate) async fn finalize_managed_runtime_commit_with_removed_quarantine_failure_for_test(
+    receipt: ManagedRuntimeCommitReceipt,
+) -> Result<ManagedRuntimeCommitReceipt, ManagedRuntimeFailureReceipt> {
+    finalize_managed_runtime_commit_inner(receipt, PublishFailureMode::FinalizationAfterRemoval)
+        .await
+}
+
+async fn finalize_managed_runtime_commit_inner(
+    mut receipt: ManagedRuntimeCommitReceipt,
+    failure_mode: PublishFailureMode,
+) -> Result<ManagedRuntimeCommitReceipt, ManagedRuntimeFailureReceipt> {
+    if !receipt.revalidate(&receipt.cache, &receipt.component).await {
+        return Err(managed_runtime_finalization_failure(
+            receipt,
+            "managed runtime changed before whole-instance settlement",
+        ));
+    }
+    let Some(quarantine) = receipt.quarantine.as_ref() else {
+        return Ok(receipt);
+    };
+    let Some(install_root) = quarantine
+        .cache
+        .component_root(quarantine.component.as_str())
+    else {
+        return Err(managed_runtime_finalization_failure(
+            receipt,
+            "managed runtime quarantine escaped the managed cache",
+        ));
+    };
+    let quarantine_root = runtime_sidecar_path(&install_root, "quarantine");
+    if let Err(error) = finalize_runtime_quarantine(&quarantine_root, failure_mode).await {
+        return Err(managed_runtime_finalization_failure(
+            receipt,
+            &format!("managed runtime quarantine finalization failed: {error}"),
+        ));
+    }
+    receipt.quarantine = None;
+    Ok(receipt)
+}
+
+fn managed_runtime_finalization_failure(
+    receipt: ManagedRuntimeCommitReceipt,
+    cause: &str,
+) -> ManagedRuntimeFailureReceipt {
+    let quarantine = receipt
+        .quarantine
+        .filter(|obligation| obligation.path_observation().retains_obligation());
+    ManagedRuntimeFailureReceipt {
+        cache: receipt.cache,
+        component: receipt.component,
+        source: receipt.source.map(Box::new),
+        cause: JavaRuntimeLookupError::Download(cause.to_string()),
+        quarantine,
+        _publication_lease: receipt._publication_lease,
     }
 }
 
@@ -222,10 +323,14 @@ impl ManagedRuntimeQuarantineObligation {
     }
 
     pub fn is_present(&self) -> bool {
+        self.path_observation().is_present()
+    }
+
+    fn path_observation(&self) -> RuntimePathObservation {
         let Some(install_root) = self.cache.component_root(self.component.as_str()) else {
-            return false;
+            return RuntimePathObservation::Indeterminate;
         };
-        runtime_path_exists(&runtime_sidecar_path(&install_root, "quarantine"))
+        observe_runtime_path(&runtime_sidecar_path(&install_root, "quarantine"))
     }
 }
 
@@ -418,6 +523,8 @@ enum PublishFailureMode {
     None,
     Promotion,
     Finalization,
+    #[cfg(test)]
+    FinalizationAfterRemoval,
     Rotation,
     Displacement,
 }
@@ -487,6 +594,7 @@ async fn publish_staged_managed_runtime_inner(
             return Err(classify_managed_runtime_publish_failure(
                 &mut staged,
                 publication_effect_started,
+                source,
                 JavaRuntimeLookupError::Download(format!(
                     "managed runtime quarantine restoration failed: {error}"
                 )),
@@ -512,6 +620,7 @@ async fn publish_staged_managed_runtime_inner(
             return Err(classify_managed_runtime_publish_failure(
                 &mut staged,
                 publication_effect_started,
+                source,
                 JavaRuntimeLookupError::Download(format!(
                     "managed runtime quarantine rotation failed: {error}"
                 )),
@@ -536,6 +645,7 @@ async fn publish_staged_managed_runtime_inner(
             return Err(classify_managed_runtime_publish_failure(
                 &mut staged,
                 publication_effect_started,
+                source,
                 JavaRuntimeLookupError::Download(format!(
                     "managed runtime canonical displacement failed: {error}"
                 )),
@@ -577,6 +687,7 @@ async fn publish_staged_managed_runtime_inner(
             return Err(classify_managed_runtime_publish_failure(
                 &mut staged,
                 publication_effect_started,
+                source,
                 JavaRuntimeLookupError::Download(
                     "runtime promotion and canonical restoration both failed".to_string(),
                 ),
@@ -585,6 +696,7 @@ async fn publish_staged_managed_runtime_inner(
         return Err(classify_managed_runtime_publish_failure(
             &mut staged,
             publication_effect_started,
+            source,
             JavaRuntimeLookupError::Download(promotion_error.to_string()),
         ));
     }
@@ -600,6 +712,7 @@ async fn publish_staged_managed_runtime_inner(
             return Err(classify_managed_runtime_publish_failure(
                 &mut staged,
                 publication_effect_started,
+                source,
                 JavaRuntimeLookupError::Download(
                     "published runtime failed verification and could not be isolated".to_string(),
                 ),
@@ -619,6 +732,7 @@ async fn publish_staged_managed_runtime_inner(
             return Err(classify_managed_runtime_publish_failure(
                 &mut staged,
                 publication_effect_started,
+                source,
                 JavaRuntimeLookupError::Download(
                     "runtime postcondition and canonical restoration both failed".to_string(),
                 ),
@@ -627,6 +741,7 @@ async fn publish_staged_managed_runtime_inner(
         return Err(classify_managed_runtime_publish_failure(
             &mut staged,
             publication_effect_started,
+            source,
             JavaRuntimeLookupError::Download(
                 "published runtime failed exact postcondition verification".to_string(),
             ),
@@ -641,6 +756,7 @@ async fn publish_staged_managed_runtime_inner(
         return Err(classify_managed_runtime_publish_failure(
             &mut staged,
             publication_effect_started,
+            source,
             JavaRuntimeLookupError::Download(format!(
                 "managed runtime quarantine finalization failed: {error}"
             )),
@@ -658,6 +774,13 @@ async fn finalize_runtime_quarantine(
     quarantine_root: &Path,
     failure_mode: PublishFailureMode,
 ) -> std::io::Result<()> {
+    #[cfg(test)]
+    if failure_mode == PublishFailureMode::FinalizationAfterRemoval {
+        remove_runtime_sidecar(quarantine_root).await?;
+        return Err(std::io::Error::other(
+            "injected failure after managed runtime quarantine removal",
+        ));
+    }
     if failure_mode == PublishFailureMode::Finalization {
         return Err(std::io::Error::other(
             "injected managed runtime quarantine finalization failure",
@@ -669,6 +792,7 @@ async fn finalize_runtime_quarantine(
 fn classify_managed_runtime_publish_failure(
     staged: &mut StagedManagedRuntime,
     publication_effect_started: bool,
+    source: RuntimeSourceReceipt,
     cause: JavaRuntimeLookupError,
 ) -> ManagedRuntimeRebuildError {
     if !publication_effect_started {
@@ -678,13 +802,14 @@ fn classify_managed_runtime_publish_failure(
     ManagedRuntimeRebuildError::Effect(ManagedRuntimeFailureReceipt {
         cache: staged.cache.clone(),
         component: staged.component.clone(),
+        source: Some(Box::new(source)),
         cause,
-        quarantine: runtime_path_exists(&quarantine_root).then(|| {
-            ManagedRuntimeQuarantineObligation {
+        quarantine: observe_runtime_path(&quarantine_root)
+            .retains_obligation()
+            .then(|| ManagedRuntimeQuarantineObligation {
                 cache: staged.cache.clone(),
                 component: staged.component.clone(),
-            }
-        }),
+            }),
         _publication_lease: staged
             .publication_lease
             .take()
@@ -886,7 +1011,7 @@ enum KnownGoodRuntimeExpectation {
     },
 }
 
-fn runtime_source_matches_known_good_inventory(
+pub(crate) fn runtime_source_matches_known_good_inventory(
     component: &RuntimeId,
     source: &RuntimeSourceReceipt,
     inventory: &KnownGoodInventory,
@@ -1051,8 +1176,36 @@ fn runtime_sidecar_path(install_root: &Path, suffix: &str) -> PathBuf {
     install_root.with_file_name(name)
 }
 
-fn runtime_path_exists(path: &Path) -> bool {
-    std::fs::symlink_metadata(runtime_filesystem_path(path).as_ref()).is_ok()
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RuntimePathObservation {
+    Present,
+    Absent,
+    Indeterminate,
+}
+
+impl RuntimePathObservation {
+    fn is_present(self) -> bool {
+        self == Self::Present
+    }
+
+    fn retains_obligation(self) -> bool {
+        self != Self::Absent
+    }
+}
+
+fn observe_runtime_path(path: &Path) -> RuntimePathObservation {
+    match std::fs::symlink_metadata(runtime_filesystem_path(path).as_ref()) {
+        Ok(_) => RuntimePathObservation::Present,
+        Err(error) => runtime_path_error_observation(&error),
+    }
+}
+
+fn runtime_path_error_observation(error: &std::io::Error) -> RuntimePathObservation {
+    if error.kind() == std::io::ErrorKind::NotFound {
+        RuntimePathObservation::Absent
+    } else {
+        RuntimePathObservation::Indeterminate
+    }
 }
 
 async fn runtime_path_exists_async(path: &Path) -> Result<bool, JavaRuntimeLookupError> {
@@ -1935,4 +2088,31 @@ async fn install_runtime_manifest_symlink(
 
 fn runtime_sha1_is_valid(value: &str) -> bool {
     value.len() == 40 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+#[cfg(test)]
+mod quarantine_observation_tests {
+    use super::{RuntimePathObservation, runtime_path_error_observation};
+
+    #[test]
+    fn quarantine_obligation_is_omitted_only_for_not_found() {
+        let absent =
+            runtime_path_error_observation(&std::io::Error::from(std::io::ErrorKind::NotFound));
+        assert_eq!(absent, RuntimePathObservation::Absent);
+        assert!(!absent.is_present());
+        assert!(!absent.retains_obligation());
+
+        assert!(RuntimePathObservation::Present.is_present());
+        assert!(RuntimePathObservation::Present.retains_obligation());
+        for kind in [
+            std::io::ErrorKind::PermissionDenied,
+            std::io::ErrorKind::InvalidData,
+            std::io::ErrorKind::Other,
+        ] {
+            let indeterminate = runtime_path_error_observation(&std::io::Error::from(kind));
+            assert_eq!(indeterminate, RuntimePathObservation::Indeterminate);
+            assert!(!indeterminate.is_present());
+            assert!(indeterminate.retains_obligation());
+        }
+    }
 }

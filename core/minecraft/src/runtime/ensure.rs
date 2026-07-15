@@ -138,7 +138,7 @@ pub async fn rebuild_managed_runtime_fixture_for_test(
     Ok(receipt)
 }
 
-async fn rebuild_managed_runtime_component_from_source(
+pub(crate) async fn rebuild_managed_runtime_component_from_source(
     cache: &ManagedRuntimeCache,
     component: &RuntimeId,
     source_receipt: RuntimeSourceReceipt,

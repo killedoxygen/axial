@@ -7,10 +7,11 @@ use super::{
     RuntimeSource, RuntimeSourceReceipt, acquire_runtime_source_for_test,
     authenticated_runtime_source_from_manifest_for_test, component_manifest_destination,
     detect_distribution, detect_runtime_state, ensure_runtime_with_events, fetch_runtime_file,
-    fetch_runtime_manifest_bytes_for_test, install_runtime_manifest_file,
-    install_runtime_manifest_files, java_executable, java_executable_for_os,
-    managed_runtime_contents_verified_without_probe, parse_mach_o_arm64_compatibility,
-    plan_runtime_manifest_files, publish_staged_managed_runtime,
+    fetch_runtime_manifest_bytes_for_test, finalize_managed_runtime_commit_with_failure_for_test,
+    finalize_managed_runtime_commit_with_removed_quarantine_failure_for_test,
+    install_runtime_manifest_file, install_runtime_manifest_files, java_executable,
+    java_executable_for_os, managed_runtime_contents_verified_without_probe,
+    parse_mach_o_arm64_compatibility, plan_runtime_manifest_files, publish_staged_managed_runtime,
     publish_staged_managed_runtime_and_finalize,
     publish_staged_managed_runtime_with_displacement_failure_for_test,
     publish_staged_managed_runtime_with_finalization_failure_for_test,
@@ -1177,6 +1178,8 @@ async fn managed_runtime_promotion_failure_restores_canonical_tree() {
     fs::create_dir(&root).expect("canonical runtime root");
     fs::write(root.join("sentinel"), b"original").expect("canonical sentinel");
     let source = runtime_source_receipt_fixture(&component, &root, b"replacement java").await;
+    let inventory = crate::known_good::runtime_inventory_from_source(&source)
+        .expect("authenticated Runtime inventory");
     let staged = stage_managed_runtime(&cache, &component, source, &mut |_| {})
         .await
         .expect("managed runtime stage");
@@ -1191,6 +1194,7 @@ async fn managed_runtime_promotion_failure_restores_canonical_tree() {
     };
     assert_eq!(effect.component(), &component);
     assert!(effect.matches_cache(&cache));
+    assert!(effect.matches_known_good_inventory(&inventory));
     assert!(effect.quarantine_obligation().is_none());
     assert_eq!(
         fs::read(root.join("sentinel")).expect("restored sentinel"),
@@ -1326,6 +1330,82 @@ async fn ordinary_quarantine_finalization_failure_retains_effect_evidence() {
         .expect("retained displaced sentinel"),
         b"original"
     );
+}
+
+#[tokio::test]
+async fn late_finalization_failure_reports_observed_quarantine_and_retains_authority() {
+    for remove_before_error in [false, true] {
+        let cache = ManagedRuntimeCache::isolated_for_test().expect("runtime cache");
+        let component = RuntimeId::from("jre-legacy");
+        let root = cache
+            .component_root(component.as_str())
+            .expect("managed runtime component root");
+        fs::create_dir(&root).expect("canonical runtime root");
+        fs::write(root.join("sentinel"), b"original").expect("canonical sentinel");
+        let source = runtime_source_receipt_fixture(&component, &root, b"replacement java").await;
+        let inventory = crate::known_good::runtime_inventory_from_source(&source)
+            .expect("authenticated Runtime inventory");
+        let staged = stage_managed_runtime(&cache, &component, source, &mut |_| {})
+            .await
+            .expect("managed runtime stage");
+        let receipt = publish_staged_managed_runtime(staged)
+            .await
+            .expect("retained managed runtime publish");
+        assert!(
+            receipt
+                .quarantine_obligation()
+                .is_some_and(|obligation| obligation.is_present())
+        );
+
+        let failure = if remove_before_error {
+            finalize_managed_runtime_commit_with_removed_quarantine_failure_for_test(receipt).await
+        } else {
+            finalize_managed_runtime_commit_with_failure_for_test(receipt).await
+        }
+        .expect_err("injected late finalization failure");
+
+        assert_eq!(
+            failure.quarantine_obligation().is_some(),
+            !remove_before_error
+        );
+        assert_eq!(
+            root.with_file_name("jre-legacy.quarantine").exists(),
+            !remove_before_error
+        );
+        assert!(failure.matches_cache(&cache));
+        assert!(failure.matches_known_good_inventory(&inventory));
+        assert!(failure.revalidate(&cache, &component).await);
+
+        let contender_source =
+            runtime_source_receipt_fixture(&component, &root, b"contender java").await;
+        let contender_cache = cache.clone();
+        let contender_component = component.clone();
+        let mut waiter = tokio::spawn(async move {
+            stage_managed_runtime(
+                &contender_cache,
+                &contender_component,
+                contender_source,
+                &mut |_| {},
+            )
+            .await
+        });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(30), &mut waiter)
+                .await
+                .is_err(),
+            "late finalization failure must retain Runtime publication exclusion"
+        );
+        drop(failure);
+        let staged = waiter
+            .await
+            .expect("waiting Runtime task")
+            .expect("waiting Runtime stage");
+        drop(
+            publish_staged_managed_runtime(staged)
+                .await
+                .expect("waiting Runtime publication"),
+        );
+    }
 }
 
 #[tokio::test]

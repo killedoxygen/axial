@@ -272,7 +272,7 @@ pub(super) fn authenticated_runtime_source_fixture_for_test(
 }
 
 #[cfg(test)]
-pub(super) fn authenticated_runtime_source_from_manifest_for_test(
+pub(crate) fn authenticated_runtime_source_from_manifest_for_test(
     component: super::model::RuntimeId,
     manifest: ComponentManifest,
 ) -> Result<RuntimeSourceReceipt, JavaRuntimeLookupError> {
