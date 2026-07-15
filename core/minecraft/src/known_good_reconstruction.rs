@@ -1556,7 +1556,7 @@ mod tests {
 
             let waiting_root = crate::managed_fs::ManagedDir::open_root(managed.path())
                 .expect("waiting managed root");
-            let mut waiter = tokio::spawn(
+            let mut waiter = Box::pin(
                 crate::managed_publication::ManagedRootPublicationLease::acquire(waiting_root),
             );
             assert!(
@@ -1566,10 +1566,7 @@ mod tests {
                 "component rollback must retain whole-root exclusion"
             );
             drop(rollback);
-            waiter
-                .await
-                .expect("waiting task")
-                .expect("waiting root lease");
+            drop(waiter.await.expect("waiting root lease"));
         }
     }
 
@@ -1613,7 +1610,7 @@ mod tests {
             .expect("admitted Runtime work reached its retained source");
         let waiting_root =
             crate::managed_fs::ManagedDir::open_root(managed.path()).expect("waiting managed root");
-        let mut waiter = tokio::spawn(
+        let mut waiter = Box::pin(
             crate::managed_publication::ManagedRootPublicationLease::acquire(waiting_root),
         );
         caller.abort();
@@ -1634,12 +1631,7 @@ mod tests {
             .send(())
             .expect("release retained Runtime source");
         assert!(settled_rx.await.expect("detached settlement observation"));
-        drop(
-            waiter
-                .await
-                .expect("waiting task")
-                .expect("waiting root lease"),
-        );
+        drop(waiter.await.expect("waiting root lease"));
         assert_eq!(
             fs::read(runtime_root.join(runtime_java_relative_path()))
                 .expect("settled Runtime executable"),
