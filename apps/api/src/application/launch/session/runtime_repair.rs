@@ -5,11 +5,11 @@ use crate::execution::runtime::{
     ManagedRuntimeRoot, ManagedRuntimeVerificationRequest, verify_managed_runtime,
 };
 use crate::guardian::{
-    DiagnosisId, GuardianPreflightOutcomeRequest, GuardianRepairStatus,
-    GuardianRuntimeComponentRebuildOutcome, GuardianRuntimeComponentRebuildStatus,
-    GuardianRuntimeRepairCopy, authorize_managed_runtime_ready_marker_repair,
-    execute_managed_runtime_component_rebuild, execute_managed_runtime_ready_marker_repair,
-    guardian_fact_from_execution, guardian_preflight_outcome,
+    DiagnosisId, GuardianComponentRebuildOutcome, GuardianComponentRebuildStatus,
+    GuardianPreflightOutcomeRequest, GuardianRepairStatus, GuardianRuntimeRepairCopy,
+    authorize_managed_runtime_ready_marker_repair, execute_managed_runtime_component_rebuild,
+    execute_managed_runtime_ready_marker_repair, guardian_fact_from_execution,
+    guardian_preflight_outcome,
 };
 use crate::observability::telemetry::{
     TelemetryErrorArea, TelemetryErrorKind, TelemetryErrorLevel, TelemetryEvent,
@@ -475,13 +475,8 @@ async fn execute_owned_runtime_component_rebuild(
     admission: RegisteredComponentRebuildAdmission,
     foreground: IntegrityForegroundLease,
     rebuild_source: RuntimeComponentRebuildSource,
-) -> Result<
-    (
-        GuardianRuntimeComponentRebuildOutcome,
-        IntegrityForegroundLease,
-    ),
-    OperationJournalStoreError,
-> {
+) -> Result<(GuardianComponentRebuildOutcome, IntegrityForegroundLease), OperationJournalStoreError>
+{
     let state_task = state.clone();
     let (result_tx, result_rx) = tokio::sync::oneshot::channel();
     producer.spawn_child(async move {
@@ -529,12 +524,10 @@ async fn execute_owned_runtime_component_rebuild(
     result.map(|outcome| (outcome, foreground))
 }
 
-fn component_rebuild_repair_status(
-    status: GuardianRuntimeComponentRebuildStatus,
-) -> GuardianRepairStatus {
+fn component_rebuild_repair_status(status: GuardianComponentRebuildStatus) -> GuardianRepairStatus {
     match status {
-        GuardianRuntimeComponentRebuildStatus::Rebuilt => GuardianRepairStatus::Repaired,
-        GuardianRuntimeComponentRebuildStatus::Failed => GuardianRepairStatus::Failed,
+        GuardianComponentRebuildStatus::Rebuilt => GuardianRepairStatus::Repaired,
+        GuardianComponentRebuildStatus::Failed => GuardianRepairStatus::Failed,
     }
 }
 

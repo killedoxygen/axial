@@ -8,16 +8,17 @@ mod status;
 
 use crate::application::guardian_conversion::api_guardian_mode;
 use crate::application::launch_application_stage_evidence;
-use crate::execution::integrity::sense_integrity_tier1;
+use crate::execution::integrity::{sense_current_integrity_tier1, sense_integrity_tier1};
 use crate::execution::launch::{
     LaunchCommandPreparationRequest, launch_command_stage_evidence, prepare_launch_command,
 };
 use crate::guardian::{
-    DiagnosisId, GuardianActionKind, GuardianArtifactRepairStatus, GuardianCopyRequest,
-    GuardianFact, GuardianLaunchRecoveryPlan, GuardianObservedLaunchFailurePhase,
-    GuardianPrepareFailureRequest, GuardianPresetAdjustmentRequest,
-    GuardianStartupFailureObservation, GuardianStartupFailureRequest, GuardianSummary,
-    author_guardian_copy, execute_registered_guardian_artifact_repair,
+    DiagnosisId, GuardianActionKind, GuardianArtifactRepairStatus, GuardianComponentRebuildStatus,
+    GuardianCopyRequest, GuardianFact, GuardianLaunchRecoveryPlan,
+    GuardianObservedLaunchFailurePhase, GuardianPrepareFailureRequest,
+    GuardianPresetAdjustmentRequest, GuardianStartupFailureObservation,
+    GuardianStartupFailureRequest, GuardianSummary, author_guardian_copy,
+    execute_managed_libraries_component_rebuild, execute_registered_guardian_artifact_repair,
     guardian_fact_from_execution, guardian_prelaunch_preset_adjustment_directive,
     guardian_prepare_failure_outcome, guardian_startup_failure_outcome,
     guardian_summary_with_artifact_repair_outcome, guardian_summary_with_blocked_outcome,
@@ -33,7 +34,8 @@ use crate::state::contracts::OperationId;
 use crate::state::launch_reports::LaunchProofContext;
 use crate::state::{
     AppState, LaunchEvent, LaunchFailureTermination, LaunchFailureTerminationErrorClass,
-    LaunchStatusEvent, OperationJournalStoreError, RegisteredArtifactFindings, StartupOutcome,
+    LaunchStatusEvent, OperationJournalStoreError, RegisteredArtifactFindings,
+    RegisteredArtifactRepairAdmission, StartupOutcome,
 };
 use axial_launcher::{
     LaunchFailureClass, LaunchSessionExitReason, LaunchSessionOutcome, LaunchSessionOutcomeKind,
@@ -655,7 +657,7 @@ async fn launch_session_inner_with_control(
     let mut attempt = axial_launcher::service::AttemptOverrides::default();
     let mut last_recovery_plan: Option<GuardianLaunchRecoveryPlan> = None;
     let mut recovery_attempts = 0_u8;
-    let mut registered_artifact_process_retry_used = false;
+    let mut registered_recovery_process_retry_used = false;
     let mut launch_completion_pending = false;
     emit_launch_started(
         &state,
@@ -1194,7 +1196,7 @@ async fn launch_session_inner_with_control(
                 } else {
                     GuardianStartupFailureObservation::Exited { failure_class }
                 };
-                let integrity = if registered_artifact_process_retry_used {
+                let integrity = if registered_recovery_process_retry_used {
                     StartupFailureIntegrity::default()
                 } else {
                     sense_startup_failure_integrity(
@@ -1210,7 +1212,7 @@ async fn launch_session_inner_with_control(
                 };
                 let guardian_mode = api_guardian_mode(intent.guardian.mode);
                 let startup_outcome = {
-                    let repair_target = (!registered_artifact_process_retry_used)
+                    let repair_target = (!registered_recovery_process_retry_used)
                         .then(|| integrity.repair_target())
                         .flatten();
                     guardian_startup_failure_outcome(GuardianStartupFailureRequest {
@@ -1270,7 +1272,7 @@ async fn launch_session_inner_with_control(
                 match registered_artifact_startup_disposition(
                     guardian_mode,
                     startup_outcome.guardian_decision.kind(),
-                    registered_artifact_process_retry_used,
+                    registered_recovery_process_retry_used,
                 ) {
                     RegisteredArtifactStartupDisposition::TerminalizeRetryFailure => {
                         let healing =
@@ -1348,7 +1350,7 @@ async fn launch_session_inner_with_control(
                         let admission = match state
                             .admit_registered_artifact_repair(
                                 authorization,
-                                operation_id,
+                                operation_id.clone(),
                                 chrono::Duration::minutes(
                                     REGISTERED_ARTIFACT_REPAIR_SUPPRESSION_MINUTES,
                                 ),
@@ -1376,16 +1378,55 @@ async fn launch_session_inner_with_control(
                                 .await);
                             }
                         };
+                        let retained_foreground = integrity_foreground.take().expect(
+                            "registered artifact recovery must retain foreground authority",
+                        );
+                        let recovery_state = state.clone();
+                        let recovery_operation_id = operation_id.clone();
+                        let recovery_instance_id = intent.instance_id.clone();
                         let repair_task = producer.claim_child().spawn_joinable(async move {
                             let client = reqwest::Client::new();
-                            execute_registered_guardian_artifact_repair(admission, &client).await
+                            let outcome = execute_registered_artifact_recovery_sequence(
+                                &recovery_state,
+                                admission,
+                                &recovery_operation_id,
+                                &client,
+                                &retained_foreground,
+                                &recovery_instance_id,
+                                LibrariesComponentRebuildSource::Production,
+                            )
+                            .await;
+                            (outcome, retained_foreground)
                         });
-                        let repair_outcome = match repair_task.await {
-                            Ok(Ok(outcome)) => outcome,
-                            Ok(Err(_)) | Err(_) => {
+                        let recovery_outcome = match repair_task.await {
+                            Ok((Ok(outcome), retained_foreground)) => {
+                                *integrity_foreground = Some(retained_foreground);
+                                outcome
+                            }
+                            Ok((Err(_), retained_foreground)) => {
+                                *integrity_foreground = Some(retained_foreground);
                                 trace_launch_event(
                                     &session_id,
-                                    "registered artifact repair execution failed",
+                                    "registered artifact recovery execution failed",
+                                );
+                                return Err(finish_registered_artifact_repair_failure(
+                                    &state,
+                                    producer,
+                                    &session_id,
+                                    &mut launch_completion_pending,
+                                    &proof_context,
+                                    failure_class,
+                                    healing,
+                                    guardian,
+                                    DiagnosisId::LauncherManagedArtifactCorrupt,
+                                    GuardianArtifactRepairStatus::Failed,
+                                )
+                                .await);
+                            }
+                            Err(_) => {
+                                trace_launch_event(
+                                    &session_id,
+                                    "registered artifact recovery owner stopped",
                                 );
                                 return Err(finish_registered_artifact_repair_failure(
                                     &state,
@@ -1402,9 +1443,11 @@ async fn launch_session_inner_with_control(
                                 .await);
                             }
                         };
+                        let repair_outcome = &recovery_outcome.leaf;
                         if repair_outcome.action != GuardianActionKind::Repair
                             || repair_outcome.diagnosis_id
                                 != DiagnosisId::LauncherManagedArtifactCorrupt
+                            || repair_outcome.operation_id != operation_id
                         {
                             trace_launch_event(
                                 &session_id,
@@ -1427,7 +1470,7 @@ async fn launch_session_inner_with_control(
                         let repair_user_outcome =
                             author_guardian_copy(GuardianCopyRequest::artifact_repair(
                                 repair_outcome.diagnosis_id,
-                                repair_outcome.status,
+                                recovery_outcome.effective_status,
                             ))
                             .expect("registered artifact repair copy request is closed");
                         guardian = guardian_summary_with_artifact_repair_outcome(
@@ -1442,9 +1485,9 @@ async fn launch_session_inner_with_control(
                                 repair_user_outcome.summary().to_string(),
                             )
                             .await;
-                        match repair_outcome.status {
+                        match recovery_outcome.effective_status {
                             GuardianArtifactRepairStatus::Repaired => {
-                                registered_artifact_process_retry_used = true;
+                                registered_recovery_process_retry_used = true;
                                 continue;
                             }
                             GuardianArtifactRepairStatus::Blocked
@@ -1643,6 +1686,159 @@ fn new_registered_artifact_repair_operation_id() -> OperationId {
         "guardian-registered-artifact-repair:{}",
         uuid::Uuid::new_v4()
     ))
+}
+
+fn new_libraries_component_rebuild_operation_id() -> OperationId {
+    OperationId::new(format!(
+        "guardian-libraries-component-rebuild:{}",
+        uuid::Uuid::new_v4()
+    ))
+}
+
+#[derive(Clone, Copy)]
+enum LibrariesComponentRebuildSource {
+    Production,
+    #[cfg(test)]
+    Fixture,
+}
+
+struct RegisteredArtifactRecoverySequenceOutcome {
+    leaf: crate::guardian::GuardianArtifactRepairOutcome,
+    effective_status: GuardianArtifactRepairStatus,
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn execute_registered_artifact_recovery_sequence(
+    state: &AppState,
+    admission: RegisteredArtifactRepairAdmission,
+    expected_operation_id: &OperationId,
+    client: &reqwest::Client,
+    foreground: &crate::state::IntegrityForegroundLease,
+    instance_id: &str,
+    rebuild_source: LibrariesComponentRebuildSource,
+) -> Result<RegisteredArtifactRecoverySequenceOutcome, OperationJournalStoreError> {
+    let outcome = execute_registered_guardian_artifact_repair(admission, client).await?;
+    if outcome.action != GuardianActionKind::Repair
+        || outcome.diagnosis_id != DiagnosisId::LauncherManagedArtifactCorrupt
+        || &outcome.operation_id != expected_operation_id
+    {
+        return Err(registered_artifact_recovery_error(
+            "registered artifact repair returned a foreign terminal outcome",
+        ));
+    }
+    if outcome.status != GuardianArtifactRepairStatus::Failed {
+        let effective_status = outcome.status;
+        return Ok(RegisteredArtifactRecoverySequenceOutcome {
+            leaf: outcome,
+            effective_status,
+        });
+    }
+
+    execute_failed_registered_artifact_recovery(
+        state,
+        outcome,
+        foreground,
+        instance_id,
+        rebuild_source,
+    )
+    .await
+}
+
+async fn execute_failed_registered_artifact_recovery(
+    state: &AppState,
+    outcome: crate::guardian::GuardianArtifactRepairOutcome,
+    foreground: &crate::state::IntegrityForegroundLease,
+    instance_id: &str,
+    rebuild_source: LibrariesComponentRebuildSource,
+) -> Result<RegisteredArtifactRecoverySequenceOutcome, OperationJournalStoreError> {
+    let lifecycle = state
+        .acquire_integrity_instance_lifecycle(foreground, instance_id)
+        .await
+        .map_err(|_| {
+            registered_artifact_recovery_error(
+                "Libraries rebuild could not reacquire the failed leaf lifecycle",
+            )
+        })?;
+    let evidence = state
+        .recorded_artifact_repair_failure(&lifecycle, &outcome.operation_id)
+        .map_err(|_| {
+            registered_artifact_recovery_error(
+                "Libraries rebuild could not bind the exact failed leaf terminal",
+            )
+        })?;
+    drop(lifecycle);
+    let component_admission = state
+        .admit_component_rebuild(
+            evidence,
+            new_libraries_component_rebuild_operation_id(),
+            chrono::Duration::minutes(REGISTERED_ARTIFACT_REPAIR_SUPPRESSION_MINUTES),
+        )
+        .await
+        .map_err(|_| {
+            registered_artifact_recovery_error("Libraries component rebuild admission was refused")
+        })?;
+
+    let rebuild = execute_managed_libraries_component_rebuild(
+        component_admission,
+        move |effect| async move {
+            let (root, version_id) = effect.core_request();
+            let root = root.to_path_buf();
+            let version_id = version_id.to_string();
+            let rebuilt = match rebuild_source {
+                LibrariesComponentRebuildSource::Production => {
+                    axial_minecraft::rebuild_managed_libraries(root, &version_id).await
+                }
+                #[cfg(test)]
+                LibrariesComponentRebuildSource::Fixture => {
+                    axial_minecraft::rebuild_managed_libraries_fixture_for_test(root, &version_id)
+                        .await
+                }
+            };
+            match rebuilt {
+                Ok(receipt) => effect.committed(receipt, Vec::new()),
+                Err(
+                    axial_minecraft::ManagedLibrariesRebuildError::Reconstruction(_)
+                    | axial_minecraft::ManagedLibrariesRebuildError::Preparation,
+                ) => effect.failed_before_effect(["libraries_component_preparation_failed".into()]),
+                Err(axial_minecraft::ManagedLibrariesRebuildError::RolledBack(receipt)) => {
+                    effect.rolled_back(receipt, ["libraries_component_rebuild_rolled_back".into()])
+                }
+            }
+        },
+    )
+    .await?;
+    if rebuild.status != GuardianComponentRebuildStatus::Rebuilt {
+        return Ok(RegisteredArtifactRecoverySequenceOutcome {
+            leaf: outcome,
+            effective_status: GuardianArtifactRepairStatus::Failed,
+        });
+    }
+
+    let lifecycle = state
+        .acquire_integrity_instance_lifecycle(foreground, instance_id)
+        .await
+        .map_err(|_| {
+            registered_artifact_recovery_error(
+                "Libraries rebuild postcheck could not reacquire the instance lifecycle",
+            )
+        })?;
+    let postcheck = sense_current_integrity_tier1(state, foreground, &lifecycle)
+        .await
+        .map_err(|_| {
+            registered_artifact_recovery_error("Libraries rebuild Tier1 postcheck was unavailable")
+        })?;
+    Ok(RegisteredArtifactRecoverySequenceOutcome {
+        leaf: outcome,
+        effective_status: if postcheck.facts.is_empty() {
+            GuardianArtifactRepairStatus::Repaired
+        } else {
+            GuardianArtifactRepairStatus::Failed
+        },
+    })
+}
+
+fn registered_artifact_recovery_error(message: &'static str) -> OperationJournalStoreError {
+    OperationJournalStoreError::Persistence(std::io::Error::other(message))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1890,10 +2086,14 @@ mod tests {
     };
     use crate::observability::telemetry::{DEFAULT_POSTHOG_HOST, TelemetryHub};
     use crate::state::contracts::{
-        OperationPhase, OwnershipClass, StabilizationSystem, TargetKind,
+        OperationPhase, OperationStatus, OwnershipClass, ReconciliationComponent,
+        ReconciliationRung, ReconciliationTerminalOutcome, StabilizationSystem, TargetDescriptor,
+        TargetKind,
     };
     use crate::state::failure_memory::{FailureMemorySnapshot, failure_memory_path};
-    use crate::state::{AppStateInit, InstallStore, LaunchEvent, SessionStore};
+    use crate::state::{
+        AppStateInit, InstallStore, LaunchEvent, SessionStore, reconciliation_attempt_key,
+    };
     use axial_config::{
         AppConfig, AppPaths, ConfigStore, Instance, InstanceRegistrySnapshot, InstanceStore,
     };
@@ -1978,6 +2178,170 @@ mod tests {
 
         assert_eq!(process_starts, 2);
         assert_eq!(repair_executions, 1);
+    }
+
+    #[tokio::test]
+    async fn failed_registered_library_leaf_rebuilds_libraries_before_process_retry() {
+        let root = unique_test_dir("libraries-component-rebuild");
+        let instance_id = "0000000000000001";
+        let (state, active_inventory) = test_libraries_recovery_app_state(&root, instance_id);
+        let library_root = PathBuf::from(
+            state
+                .library_dir()
+                .expect("State-authored Libraries recovery root"),
+        );
+        let foreground = state
+            .register_integrity_foreground()
+            .expect("register Libraries recovery foreground")
+            .wait_for_settlement()
+            .await;
+        let lifecycle = state.acquire_instance_lifecycle(instance_id).await;
+        let operation_id = OperationId::new("registered-library-leaf-failed");
+        let report = sense_current_integrity_tier1(&state, &foreground, &lifecycle)
+            .await
+            .expect("sense missing registered Libraries fixture");
+        assert_eq!(report.facts.len(), 1);
+        let (_, findings) = report.into_parts();
+        let target = findings
+            .repair_target()
+            .expect("source-backed registered Libraries target")
+            .clone();
+        let authorization = findings
+            .authorize_repair(&registered_library_repair_decision(target))
+            .expect("authorize exact registered Libraries repair");
+        let admission = state
+            .admit_registered_artifact_repair(
+                authorization,
+                operation_id.clone(),
+                chrono::Duration::minutes(30),
+            )
+            .await
+            .expect("admit registered Libraries repair");
+        drop(lifecycle);
+
+        let recovery = execute_registered_artifact_recovery_sequence(
+            &state,
+            admission,
+            &operation_id,
+            &reqwest::Client::new(),
+            &foreground,
+            instance_id,
+            LibrariesComponentRebuildSource::Fixture,
+        )
+        .await
+        .expect("settle registered Libraries component recovery");
+
+        assert_eq!(recovery.leaf.operation_id, operation_id);
+        assert_eq!(recovery.leaf.status, GuardianArtifactRepairStatus::Failed);
+        assert_eq!(
+            recovery.effective_status,
+            GuardianArtifactRepairStatus::Repaired
+        );
+        let leaf_entry = state
+            .journals()
+            .get(&operation_id)
+            .expect("registered Libraries leaf journal");
+        let leaf_attempt = leaf_entry
+            .reconciliation_attempt()
+            .expect("registered Libraries leaf attempt");
+        let leaf_terminal = leaf_entry
+            .reconciliation_terminal()
+            .expect("registered Libraries leaf terminal");
+        assert_eq!(leaf_attempt.rung(), ReconciliationRung::RepairArtifact);
+        assert_eq!(leaf_attempt.component(), ReconciliationComponent::Libraries);
+        assert_eq!(
+            leaf_terminal.outcome(),
+            ReconciliationTerminalOutcome::Failed
+        );
+        assert_eq!(
+            state
+                .failure_memory()
+                .get(&reconciliation_attempt_key(leaf_attempt))
+                .and_then(|entry| entry.reconciliation_terminal().cloned()),
+            Some(leaf_terminal.clone())
+        );
+        let component_entry = state
+            .journals()
+            .list()
+            .into_iter()
+            .find(|entry| {
+                entry
+                    .reconciliation_attempt()
+                    .is_some_and(|attempt| attempt.rung() == ReconciliationRung::RebuildComponent)
+            })
+            .expect("Libraries component rebuild journal");
+        assert_eq!(component_entry.status, OperationStatus::Succeeded);
+        assert!(
+            component_entry
+                .planned_steps
+                .iter()
+                .any(|step| { step.step_id == "rebuild_managed_libraries_component" })
+        );
+        assert!(
+            component_entry
+                .planned_steps
+                .iter()
+                .all(|step| !step.step_id.contains("quarantine"))
+        );
+        let component_attempt = component_entry
+            .reconciliation_attempt()
+            .expect("Libraries component attempt");
+        let component_terminal = component_entry
+            .reconciliation_terminal()
+            .expect("Libraries component terminal");
+        assert_eq!(
+            component_terminal.outcome(),
+            ReconciliationTerminalOutcome::Succeeded
+        );
+        assert_eq!(
+            state
+                .failure_memory()
+                .get(&reconciliation_attempt_key(component_attempt))
+                .and_then(|entry| entry.reconciliation_terminal().cloned()),
+            Some(component_terminal.clone())
+        );
+        assert_eq!(
+            fs::read(library_root.join("libraries/org/axial/fixture/1.0.0/fixture-1.0.0.jar"))
+                .expect("rebuilt Libraries fixture"),
+            b"axial managed Libraries fixture"
+        );
+
+        let lifecycle = state.acquire_instance_lifecycle(instance_id).await;
+        let verification = state
+            .mint_current_known_good_verification_lease(&foreground, &lifecycle)
+            .expect("current Libraries verification lease");
+        assert!(std::ptr::eq(
+            verification.execution_parts().5,
+            Arc::as_ref(&active_inventory),
+        ));
+        drop(verification);
+        let postcheck = sense_current_integrity_tier1(&state, &foreground, &lifecycle)
+            .await
+            .expect("fresh Libraries Tier1 postcheck");
+        assert!(postcheck.facts.is_empty());
+        drop((postcheck, lifecycle));
+
+        drop(foreground);
+        state
+            .close_known_good_inventories()
+            .await
+            .expect("close Libraries recovery known-good store");
+        state
+            .close_instance_registry()
+            .await
+            .expect("close Libraries recovery instance registry");
+        state
+            .journals()
+            .close()
+            .await
+            .expect("close Libraries recovery journal");
+        state
+            .failure_memory()
+            .close()
+            .await
+            .expect("close Libraries recovery memory");
+        drop(state);
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -3972,6 +4336,94 @@ mod tests {
             startup_warnings: Vec::new(),
             frontend_dir: root.join("frontend"),
         })
+    }
+
+    fn test_libraries_recovery_app_state(
+        root: &Path,
+        instance_id: &str,
+    ) -> (AppState, Arc<KnownGoodInventory>) {
+        let paths = test_paths(root);
+        fs::create_dir_all(paths.instances_dir.join(instance_id))
+            .expect("Libraries recovery instance directory");
+        fs::create_dir_all(paths.library_dir.join("libraries/org/axial/fixture/1.0.0"))
+            .expect("Libraries recovery managed library directory");
+        let config = Arc::new(
+            ConfigStore::from_config(
+                paths.clone(),
+                AppConfig {
+                    library_dir: paths.library_dir.to_string_lossy().into_owned(),
+                    ..AppConfig::default()
+                },
+            )
+            .expect("configure Libraries recovery root"),
+        );
+        let mut instance = test_recovery_launch_instance();
+        instance.id = instance_id.to_string();
+        instance.name = "Libraries recovery".to_string();
+        let instances = Arc::new(
+            InstanceStore::from_snapshot(
+                paths.clone(),
+                InstanceRegistrySnapshot::new(vec![instance], instance_id.to_string(), Vec::new())
+                    .expect("Libraries recovery registry snapshot"),
+            )
+            .expect("load Libraries recovery instances"),
+        );
+        let state = AppState::new(AppStateInit {
+            app_name: "Axial".to_string(),
+            version: "test".to_string(),
+            config,
+            instances,
+            installs: Arc::new(InstallStore::new()),
+            sessions: Arc::new(SessionStore::new()),
+            performance: Arc::new(
+                PerformanceManager::load_for_startup(&paths.config_dir)
+                    .expect("Libraries recovery performance manager"),
+            ),
+            startup_warnings: Vec::new(),
+            frontend_dir: root.join("frontend"),
+        });
+        let active_inventory = state.activate_known_good_inventory_for_test_with_identity(
+            instance_id,
+            KnownGoodInventory::from_test_entries([TestKnownGoodEntry {
+                root: TestKnownGoodRoot::Libraries,
+                path: "org/axial/fixture/1.0.0/fixture-1.0.0.jar".to_string(),
+                kind: KnownGoodArtifactKind::Library,
+                integrity: TestKnownGoodIntegrity::Sha1 {
+                    digest: "d5eff5a05903f96145d60e61ffb9cd9159a745ac".to_string(),
+                    size: b"axial managed Libraries fixture".len() as u64,
+                },
+            }])
+            .expect("Libraries recovery known-good inventory")
+            .with_test_standalone_leaf_repair_source(0, "http://127.0.0.1:0/unreachable")
+            .expect("Libraries recovery standalone leaf source"),
+        );
+        (state, active_inventory)
+    }
+
+    fn registered_library_repair_decision(
+        target: TargetDescriptor,
+    ) -> crate::guardian::GuardianDecision {
+        crate::guardian::GuardianDecision::for_test(
+            Some(OperationId::new("registered-library-leaf-failed")),
+            GuardianMode::Managed,
+            GuardianActionKind::Repair,
+            vec![DiagnosisId::LauncherManagedArtifactCorrupt],
+            Some(crate::guardian::GuardianActionPlan::new(
+                StabilizationSystem::Guardian,
+                crate::guardian::ActionPlanPrerequisite {
+                    diagnosis_id: DiagnosisId::LauncherManagedArtifactCorrupt,
+                    ownership: OwnershipClass::LauncherManaged,
+                    confidence: crate::guardian::GuardianConfidence::Confirmed,
+                    affected_targets: vec![target.clone()],
+                    candidate_actions: vec![GuardianActionKind::Repair],
+                },
+                vec![crate::guardian::GuardianAction {
+                    kind: GuardianActionKind::Repair,
+                    target: Some(target),
+                    reason: DiagnosisId::LauncherManagedArtifactCorrupt,
+                }],
+            )),
+        )
     }
 
     #[cfg(unix)]

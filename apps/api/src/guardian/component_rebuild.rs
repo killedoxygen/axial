@@ -12,22 +12,24 @@ use crate::state::contracts::{
 use crate::state::failure_memory::{FailureMemoryStoreError, GuardianFailureMemoryEntry};
 use crate::state::{
     MAX_OPERATION_JOURNAL_STEP_FACTS, OperationJournalStoreError, ReconciliationAttemptReservation,
-    RegisteredComponentRebuildAdmission, commit_reconciliation_memory,
-    operation_journal_completed_step_is_visible, operation_journal_plan_is_visible,
-    reconciliation_attempt_key, reconciliation_instance_target, reconciliation_journal_attempt,
-    reconciliation_memory_entry, reserve_reconciliation_attempt, settle_reconciliation_memory,
-    validate_reconciliation_memory,
+    RegisteredComponentRebuildAdmission, RegisteredLibrariesComponentRebuildEffect,
+    commit_reconciliation_memory, operation_journal_completed_step_is_visible,
+    operation_journal_plan_is_visible, reconciliation_attempt_key, reconciliation_instance_target,
+    reconciliation_journal_attempt, reconciliation_memory_entry, reserve_reconciliation_attempt,
+    settle_reconciliation_memory, validate_reconciliation_memory,
 };
 use axial_minecraft::runtime::{
     ManagedRuntimeCommitReceipt, ManagedRuntimeFailureReceipt, RuntimeId,
     is_known_runtime_component,
 };
+use axial_minecraft::{ManagedLibrariesCommitReceipt, ManagedLibrariesRollbackReceipt};
 use std::future::Future;
 use std::sync::Arc;
 
 const COMPONENT_REBUILD_START_STEP: &str = "journal_component_rebuild_start";
 const COMPONENT_QUARANTINE_STEP: &str = "quarantine_launcher_managed_target";
 const RUNTIME_COMPONENT_REBUILD_STEP: &str = "rebuild_managed_runtime_component";
+const LIBRARIES_COMPONENT_REBUILD_STEP: &str = "rebuild_managed_libraries_component";
 const COMPONENT_MEMORY_RETRY_INITIAL_DELAY: std::time::Duration =
     std::time::Duration::from_millis(20);
 const COMPONENT_MEMORY_RETRY_MAX_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
@@ -40,6 +42,34 @@ pub(crate) struct ManagedRuntimeComponentRebuildEffect {
 
 pub(crate) struct RuntimeComponentRebuildEffectResult {
     inner: RuntimeComponentRebuildEffectResultInner,
+}
+
+pub(crate) struct ManagedLibrariesComponentRebuildEffect {
+    admission: RegisteredComponentRebuildAdmission,
+    reservation: ReconciliationAttemptReservation,
+    request: RegisteredLibrariesComponentRebuildEffect,
+    identity: Arc<()>,
+}
+
+pub(crate) struct LibrariesComponentRebuildEffectResult {
+    inner: LibrariesComponentRebuildEffectResultInner,
+}
+
+enum LibrariesComponentRebuildEffectResultInner {
+    Committed {
+        effect: ManagedLibrariesComponentRebuildEffect,
+        receipt: ManagedLibrariesCommitReceipt,
+        facts: Vec<String>,
+    },
+    FailedBeforeEffect {
+        effect: ManagedLibrariesComponentRebuildEffect,
+        facts: Vec<String>,
+    },
+    RolledBack {
+        effect: ManagedLibrariesComponentRebuildEffect,
+        receipt: ManagedLibrariesRollbackReceipt,
+        facts: Vec<String>,
+    },
 }
 
 enum RuntimeComponentRebuildEffectResultInner {
@@ -124,23 +154,90 @@ impl ManagedRuntimeComponentRebuildEffect {
     }
 }
 
+impl ManagedLibrariesComponentRebuildEffect {
+    fn new(
+        admission: RegisteredComponentRebuildAdmission,
+        reservation: ReconciliationAttemptReservation,
+        request: RegisteredLibrariesComponentRebuildEffect,
+    ) -> (Self, Arc<()>) {
+        let identity = Arc::new(());
+        (
+            Self {
+                admission,
+                reservation,
+                request,
+                identity: identity.clone(),
+            },
+            identity,
+        )
+    }
+
+    fn matches_identity(&self, expected: &Arc<()>) -> bool {
+        Arc::ptr_eq(&self.identity, expected)
+    }
+
+    pub(crate) fn core_request(&self) -> (&std::path::Path, &str) {
+        self.request.core_request()
+    }
+
+    pub(crate) fn committed(
+        self,
+        receipt: ManagedLibrariesCommitReceipt,
+        facts: impl IntoIterator<Item = String>,
+    ) -> LibrariesComponentRebuildEffectResult {
+        LibrariesComponentRebuildEffectResult {
+            inner: LibrariesComponentRebuildEffectResultInner::Committed {
+                effect: self,
+                receipt,
+                facts: bounded_fact_ids(facts),
+            },
+        }
+    }
+
+    pub(crate) fn failed_before_effect(
+        self,
+        facts: impl IntoIterator<Item = String>,
+    ) -> LibrariesComponentRebuildEffectResult {
+        LibrariesComponentRebuildEffectResult {
+            inner: LibrariesComponentRebuildEffectResultInner::FailedBeforeEffect {
+                effect: self,
+                facts: bounded_fact_ids(facts),
+            },
+        }
+    }
+
+    pub(crate) fn rolled_back(
+        self,
+        receipt: ManagedLibrariesRollbackReceipt,
+        facts: impl IntoIterator<Item = String>,
+    ) -> LibrariesComponentRebuildEffectResult {
+        LibrariesComponentRebuildEffectResult {
+            inner: LibrariesComponentRebuildEffectResultInner::RolledBack {
+                effect: self,
+                receipt,
+                facts: bounded_fact_ids(facts),
+            },
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum GuardianRuntimeComponentRebuildStatus {
+pub(crate) enum GuardianComponentRebuildStatus {
     Rebuilt,
     Failed,
 }
 
 #[derive(Debug, Eq, PartialEq)]
-pub(crate) struct GuardianRuntimeComponentRebuildOutcome {
+pub(crate) struct GuardianComponentRebuildOutcome {
     pub(crate) operation_id: OperationId,
-    pub(crate) status: GuardianRuntimeComponentRebuildStatus,
+    pub(crate) status: GuardianComponentRebuildStatus,
     pub(crate) facts: Vec<String>,
 }
 
 pub(crate) async fn execute_managed_runtime_component_rebuild<Effect, EffectFuture>(
     admission: RegisteredComponentRebuildAdmission,
     effect: Effect,
-) -> Result<GuardianRuntimeComponentRebuildOutcome, OperationJournalStoreError>
+) -> Result<GuardianComponentRebuildOutcome, OperationJournalStoreError>
 where
     Effect: FnOnce(ManagedRuntimeComponentRebuildEffect) -> EffectFuture + Send,
     EffectFuture: Future<Output = RuntimeComponentRebuildEffectResult> + Send,
@@ -215,6 +312,91 @@ where
     }
 }
 
+pub(crate) async fn execute_managed_libraries_component_rebuild<Effect, EffectFuture>(
+    admission: RegisteredComponentRebuildAdmission,
+    effect: Effect,
+) -> Result<GuardianComponentRebuildOutcome, OperationJournalStoreError>
+where
+    Effect: FnOnce(ManagedLibrariesComponentRebuildEffect) -> EffectFuture + Send,
+    EffectFuture: Future<Output = LibrariesComponentRebuildEffectResult> + Send,
+{
+    validate_managed_libraries_admission(&admission)?;
+    settle_reconciliation_memory(admission.failure_memory())
+        .await
+        .map_err(component_rebuild_memory_error)?;
+    let reservation = reserve_reconciliation_attempt(
+        admission.failure_memory(),
+        admission.journals(),
+        reconciliation_attempt_key(admission.attempt()),
+    )
+    .map_err(|_| {
+        invalid_component_rebuild_error(
+            std::io::ErrorKind::WouldBlock,
+            "Libraries component rebuild attempt is already active or ambiguous",
+        )
+    })?;
+
+    if let Some(plan_error) = create_component_rebuild_plan(&admission).await? {
+        terminalize_libraries_before_effect(
+            admission,
+            reservation,
+            Vec::new(),
+            COMPONENT_REBUILD_START_STEP,
+        )
+        .await?;
+        return Err(plan_error);
+    }
+
+    let request = match admission.libraries_effect() {
+        Ok(request) => request,
+        Err(_) => {
+            return terminalize_libraries_before_effect(
+                admission,
+                reservation,
+                vec!["libraries_component_authority_changed".to_string()],
+                LIBRARIES_COMPONENT_REBUILD_STEP,
+            )
+            .await;
+        }
+    };
+    let (effect_capability, effect_identity) =
+        ManagedLibrariesComponentRebuildEffect::new(admission, reservation, request);
+    match effect(effect_capability).await.inner {
+        LibrariesComponentRebuildEffectResultInner::Committed {
+            effect,
+            receipt,
+            facts,
+        } => {
+            validate_libraries_effect_identity(&effect, &effect_identity)?;
+            terminalize_libraries_component_rebuild(
+                effect,
+                LibrariesComponentRebuildTerminal::Committed { receipt, facts },
+            )
+            .await
+        }
+        LibrariesComponentRebuildEffectResultInner::FailedBeforeEffect { effect, facts } => {
+            validate_libraries_effect_identity(&effect, &effect_identity)?;
+            terminalize_libraries_component_rebuild(
+                effect,
+                LibrariesComponentRebuildTerminal::FailedBeforeEffect { facts },
+            )
+            .await
+        }
+        LibrariesComponentRebuildEffectResultInner::RolledBack {
+            effect,
+            receipt,
+            facts,
+        } => {
+            validate_libraries_effect_identity(&effect, &effect_identity)?;
+            terminalize_libraries_component_rebuild(
+                effect,
+                LibrariesComponentRebuildTerminal::RolledBack { receipt, facts },
+            )
+            .await
+        }
+    }
+}
+
 enum ComponentRebuildTerminal {
     Succeeded {
         receipt: ManagedRuntimeCommitReceipt,
@@ -230,9 +412,25 @@ enum ComponentRebuildTerminal {
     },
 }
 
+enum LibrariesComponentRebuildTerminal {
+    Committed {
+        receipt: ManagedLibrariesCommitReceipt,
+        facts: Vec<String>,
+    },
+    FailedBeforeEffect {
+        facts: Vec<String>,
+    },
+    RolledBack {
+        receipt: ManagedLibrariesRollbackReceipt,
+        facts: Vec<String>,
+    },
+}
+
 enum ComponentRebuildPublicationLease {
     Commit(ManagedRuntimeCommitReceipt),
     Failure(ManagedRuntimeFailureReceipt),
+    LibrariesCommit(ManagedLibrariesCommitReceipt),
+    LibrariesRollback(ManagedLibrariesRollbackReceipt),
 }
 
 impl ComponentRebuildPublicationLease {
@@ -240,6 +438,8 @@ impl ComponentRebuildPublicationLease {
         match self {
             Self::Commit(receipt) => drop(receipt),
             Self::Failure(receipt) => drop(receipt),
+            Self::LibrariesCommit(receipt) => drop(receipt),
+            Self::LibrariesRollback(receipt) => drop(receipt),
         }
     }
 }
@@ -266,6 +466,27 @@ fn validate_managed_runtime_admission(
     Ok(())
 }
 
+fn validate_managed_libraries_admission(
+    admission: &RegisteredComponentRebuildAdmission,
+) -> Result<(), OperationJournalStoreError> {
+    let attempt = admission.attempt();
+    if attempt.mode() != GuardianMode::Managed
+        || attempt.domain() != GuardianDomain::Library
+        || attempt.rung() != ReconciliationRung::RebuildComponent
+        || attempt.component() != ReconciliationComponent::Libraries
+        || attempt.ownership() != OwnershipClass::LauncherManaged
+        || attempt.target().ownership != OwnershipClass::LauncherManaged
+        || attempt.target().system != StabilizationSystem::Execution
+        || attempt.target().kind != TargetKind::Artifact
+    {
+        return Err(invalid_component_rebuild_error(
+            std::io::ErrorKind::PermissionDenied,
+            "Guardian refused a non-managed or non-Libraries component rebuild admission",
+        ));
+    }
+    Ok(())
+}
+
 fn validate_effect_identity(
     effect: &ManagedRuntimeComponentRebuildEffect,
     expected: &Arc<()>,
@@ -274,6 +495,19 @@ fn validate_effect_identity(
         return Err(invalid_component_rebuild_error(
             std::io::ErrorKind::InvalidData,
             "runtime component rebuild returned a foreign effect capability",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_libraries_effect_identity(
+    effect: &ManagedLibrariesComponentRebuildEffect,
+    expected: &Arc<()>,
+) -> Result<(), OperationJournalStoreError> {
+    if !effect.matches_identity(expected) {
+        return Err(invalid_component_rebuild_error(
+            std::io::ErrorKind::InvalidData,
+            "Libraries component rebuild returned a foreign effect capability",
         ));
     }
     Ok(())
@@ -336,19 +570,30 @@ fn component_rebuild_plan(
         Some(target.clone()),
         Vec::new(),
     ));
-    entry.planned_steps.push(repair_step_with_rollback(
-        COMPONENT_QUARANTINE_STEP,
-        OperationStepResult::Planned,
-        Some(target.clone()),
-        Vec::new(),
-        RollbackState::Available,
-    ));
-    entry.planned_steps.push(repair_step(
-        RUNTIME_COMPONENT_REBUILD_STEP,
-        OperationStepResult::Planned,
-        Some(target.clone()),
-        Vec::new(),
-    ));
+    match attempt.component() {
+        ReconciliationComponent::Runtime => {
+            entry.planned_steps.push(repair_step_with_rollback(
+                COMPONENT_QUARANTINE_STEP,
+                OperationStepResult::Planned,
+                Some(target.clone()),
+                Vec::new(),
+                RollbackState::Available,
+            ));
+            entry.planned_steps.push(repair_step(
+                RUNTIME_COMPONENT_REBUILD_STEP,
+                OperationStepResult::Planned,
+                Some(target.clone()),
+                Vec::new(),
+            ));
+        }
+        ReconciliationComponent::Libraries => entry.planned_steps.push(repair_step(
+            LIBRARIES_COMPONENT_REBUILD_STEP,
+            OperationStepResult::Planned,
+            Some(target.clone()),
+            Vec::new(),
+        )),
+        _ => {}
+    }
     entry.guardian_diagnosis_ids.push(attempt.diagnosis_id());
     reconciliation_journal_attempt(entry, attempt.clone())
 }
@@ -396,7 +641,7 @@ async fn record_component_quarantine_checkpoint(
 async fn terminalize_component_rebuild(
     effect: ManagedRuntimeComponentRebuildEffect,
     terminal: ComponentRebuildTerminal,
-) -> Result<GuardianRuntimeComponentRebuildOutcome, OperationJournalStoreError> {
+) -> Result<GuardianComponentRebuildOutcome, OperationJournalStoreError> {
     let ManagedRuntimeComponentRebuildEffect {
         admission,
         reservation,
@@ -422,7 +667,7 @@ async fn terminalize_component_rebuild(
                 match admission.succeeded_terminal(&receipt).await {
                     Ok(terminal) => (
                         terminal,
-                        GuardianRuntimeComponentRebuildStatus::Rebuilt,
+                        GuardianComponentRebuildStatus::Rebuilt,
                         facts,
                         OperationStepResult::Completed,
                         None,
@@ -436,7 +681,7 @@ async fn terminalize_component_rebuild(
                                     "runtime component rebuild postcondition terminal is invalid",
                                 )
                             })?,
-                        GuardianRuntimeComponentRebuildStatus::Failed,
+                        GuardianComponentRebuildStatus::Failed,
                         vec!["runtime_component_postcondition_failed".to_string()],
                         OperationStepResult::Failed,
                         Some(RUNTIME_COMPONENT_REBUILD_STEP),
@@ -460,7 +705,7 @@ async fn terminalize_component_rebuild(
                     "runtime component rebuild failure terminal is invalid",
                 )
             })?,
-            GuardianRuntimeComponentRebuildStatus::Failed,
+            GuardianComponentRebuildStatus::Failed,
             facts,
             step_id,
             OperationStepResult::Failed,
@@ -482,7 +727,7 @@ async fn terminalize_component_rebuild(
             })?;
             (
                 terminal,
-                GuardianRuntimeComponentRebuildStatus::Failed,
+                GuardianComponentRebuildStatus::Failed,
                 facts,
                 RUNTIME_COMPONENT_REBUILD_STEP,
                 OperationStepResult::Failed,
@@ -512,13 +757,139 @@ async fn terminalize_component_rebuild(
     .await
 }
 
+async fn terminalize_libraries_before_effect(
+    admission: RegisteredComponentRebuildAdmission,
+    reservation: ReconciliationAttemptReservation,
+    facts: Vec<String>,
+    step_id: &'static str,
+) -> Result<GuardianComponentRebuildOutcome, OperationJournalStoreError> {
+    let terminal = admission.failed_terminal().map_err(|_| {
+        invalid_component_rebuild_error(
+            std::io::ErrorKind::InvalidData,
+            "Libraries component rebuild pre-effect terminal is invalid",
+        )
+    })?;
+    persist_component_rebuild_terminal(
+        &admission,
+        &reservation,
+        ComponentRebuildTerminalRecord {
+            terminal,
+            step_id,
+            step_result: OperationStepResult::Failed,
+            failure_point: Some(step_id),
+            rollback: RollbackState::NotApplicable,
+            status: GuardianComponentRebuildStatus::Failed,
+            facts,
+            publication_lease: None,
+        },
+    )
+    .await
+}
+
+async fn terminalize_libraries_component_rebuild(
+    effect: ManagedLibrariesComponentRebuildEffect,
+    terminal: LibrariesComponentRebuildTerminal,
+) -> Result<GuardianComponentRebuildOutcome, OperationJournalStoreError> {
+    let ManagedLibrariesComponentRebuildEffect {
+        admission,
+        reservation,
+        request: _,
+        identity: _,
+    } = effect;
+    let (terminal, status, facts, step_result, failure_point, rollback, publication_lease) =
+        match terminal {
+            LibrariesComponentRebuildTerminal::Committed { receipt, facts } => {
+                let (terminal, status, facts, step_result, failure_point) =
+                    match admission.succeeded_libraries_terminal(&receipt).await {
+                        Ok(terminal) => (
+                            terminal,
+                            GuardianComponentRebuildStatus::Rebuilt,
+                            facts,
+                            OperationStepResult::Completed,
+                            None,
+                        ),
+                        Err(_) => (
+                            admission.failed_terminal().map_err(|_| {
+                                invalid_component_rebuild_error(
+                                    std::io::ErrorKind::InvalidData,
+                                    "Libraries component rebuild postcondition terminal is invalid",
+                                )
+                            })?,
+                            GuardianComponentRebuildStatus::Failed,
+                            vec!["libraries_component_postcondition_failed".to_string()],
+                            OperationStepResult::Failed,
+                            Some(LIBRARIES_COMPONENT_REBUILD_STEP),
+                        ),
+                    };
+                (
+                    terminal,
+                    status,
+                    facts,
+                    step_result,
+                    failure_point,
+                    RollbackState::NotApplicable,
+                    Some(ComponentRebuildPublicationLease::LibrariesCommit(receipt)),
+                )
+            }
+            LibrariesComponentRebuildTerminal::FailedBeforeEffect { facts } => (
+                admission.failed_terminal().map_err(|_| {
+                    invalid_component_rebuild_error(
+                        std::io::ErrorKind::InvalidData,
+                        "Libraries component rebuild failure terminal is invalid",
+                    )
+                })?,
+                GuardianComponentRebuildStatus::Failed,
+                facts,
+                OperationStepResult::Failed,
+                Some(LIBRARIES_COMPONENT_REBUILD_STEP),
+                RollbackState::NotApplicable,
+                None,
+            ),
+            LibrariesComponentRebuildTerminal::RolledBack { receipt, facts } => {
+                let terminal = admission
+                    .failed_libraries_effect_terminal(&receipt)
+                    .await
+                    .map_err(|_| {
+                        invalid_component_rebuild_error(
+                            std::io::ErrorKind::InvalidData,
+                            "Libraries component rollback receipt is invalid or ambiguous",
+                        )
+                    })?;
+                (
+                    terminal,
+                    GuardianComponentRebuildStatus::Failed,
+                    facts,
+                    OperationStepResult::Failed,
+                    Some(LIBRARIES_COMPONENT_REBUILD_STEP),
+                    RollbackState::Applied,
+                    Some(ComponentRebuildPublicationLease::LibrariesRollback(receipt)),
+                )
+            }
+        };
+    persist_component_rebuild_terminal(
+        &admission,
+        &reservation,
+        ComponentRebuildTerminalRecord {
+            terminal,
+            step_id: LIBRARIES_COMPONENT_REBUILD_STEP,
+            step_result,
+            failure_point,
+            rollback,
+            status,
+            facts,
+            publication_lease,
+        },
+    )
+    .await
+}
+
 struct ComponentRebuildTerminalRecord {
     terminal: ReconciliationTerminal,
     step_id: &'static str,
     step_result: OperationStepResult,
     failure_point: Option<&'static str>,
     rollback: RollbackState,
-    status: GuardianRuntimeComponentRebuildStatus,
+    status: GuardianComponentRebuildStatus,
     facts: Vec<String>,
     publication_lease: Option<ComponentRebuildPublicationLease>,
 }
@@ -527,7 +898,7 @@ async fn persist_component_rebuild_terminal(
     admission: &RegisteredComponentRebuildAdmission,
     reservation: &ReconciliationAttemptReservation,
     record: ComponentRebuildTerminalRecord,
-) -> Result<GuardianRuntimeComponentRebuildOutcome, OperationJournalStoreError> {
+) -> Result<GuardianComponentRebuildOutcome, OperationJournalStoreError> {
     let ComponentRebuildTerminalRecord {
         terminal,
         step_id,
@@ -543,7 +914,7 @@ async fn persist_component_rebuild_terminal(
     let memory = reconciliation_memory_entry(terminal.clone()).map_err(|_| {
         invalid_component_rebuild_error(
             std::io::ErrorKind::InvalidData,
-            "runtime component rebuild memory terminal is invalid",
+            "component rebuild memory terminal is invalid",
         )
     })?;
     validate_reconciliation_memory(admission.failure_memory(), &memory, reservation)
@@ -570,7 +941,7 @@ async fn persist_component_rebuild_terminal(
         publication_lease.release();
     }
 
-    Ok(GuardianRuntimeComponentRebuildOutcome {
+    Ok(GuardianComponentRebuildOutcome {
         operation_id,
         status,
         facts,
@@ -600,7 +971,7 @@ async fn persist_exact_component_rebuild_memory(
                 }
                 return Err(invalid_component_rebuild_error(
                     std::io::ErrorKind::InvalidData,
-                    "runtime component rebuild memory commit did not publish the exact terminal",
+                    "component rebuild memory commit did not publish the exact terminal",
                 ));
             }
             Err(FailureMemoryStoreError::Persistence(_)) => {
@@ -625,7 +996,7 @@ fn bounded_fact_ids(facts: impl IntoIterator<Item = String>) -> Vec<String> {
 fn component_rebuild_memory_error(error: FailureMemoryStoreError) -> OperationJournalStoreError {
     invalid_component_rebuild_error(
         std::io::ErrorKind::Other,
-        format!("runtime component rebuild memory failed: {error}"),
+        format!("component rebuild memory failed: {error}"),
     )
 }
 
@@ -639,7 +1010,7 @@ fn invalid_component_rebuild_error(
 #[cfg(test)]
 mod tests {
     use super::{
-        GuardianRuntimeComponentRebuildStatus, bounded_fact_ids, component_rebuild_plan,
+        GuardianComponentRebuildStatus, bounded_fact_ids, component_rebuild_plan,
         execute_managed_runtime_component_rebuild,
     };
     use crate::execution::persistence::{AtomicWriteBackend, PersistenceCoordinator};
@@ -1104,10 +1475,7 @@ mod tests {
         let outcome = outcome.expect("component rebuild settles after persistence retry");
         assert!(settlement_complete.load(Ordering::Acquire));
 
-        assert_eq!(
-            outcome.status,
-            GuardianRuntimeComponentRebuildStatus::Rebuilt
-        );
+        assert_eq!(outcome.status, GuardianComponentRebuildStatus::Rebuilt);
         let terminal = fixture
             .journals
             .get(&operation_id)
@@ -1156,10 +1524,7 @@ mod tests {
         .await
         .expect("failed effect has truthful Guardian terminal");
 
-        assert_eq!(
-            outcome.status,
-            GuardianRuntimeComponentRebuildStatus::Failed
-        );
+        assert_eq!(outcome.status, GuardianComponentRebuildStatus::Failed);
         assert_eq!(outcome.facts, vec!["runtime_stage_failed"]);
         let journal = fixture
             .journals

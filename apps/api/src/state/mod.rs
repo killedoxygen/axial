@@ -101,11 +101,12 @@ pub(crate) use performance_managed::{
 pub use performance_rules::AppPerformanceStore;
 pub(crate) use reconciliation::{
     ReconciliationAttemptReservation, ReconciliationEvidenceRejection,
-    RegisteredComponentRebuildAdmission, RegisteredReconciliationAuthority,
-    commit_reconciliation_memory, reconciliation_attempt_key, reconciliation_instance_target,
-    reconciliation_journal_attempt, reconciliation_memory_entry, record_guardian_repair_refusal,
-    record_reconciliation_journal_failure, record_reconciliation_journal_success,
-    reserve_reconciliation_attempt, settle_reconciliation_memory, validate_reconciliation_memory,
+    RegisteredComponentRebuildAdmission, RegisteredLibrariesComponentRebuildEffect,
+    RegisteredReconciliationAuthority, commit_reconciliation_memory, reconciliation_attempt_key,
+    reconciliation_instance_target, reconciliation_journal_attempt, reconciliation_memory_entry,
+    record_guardian_repair_refusal, record_reconciliation_journal_failure,
+    record_reconciliation_journal_success, reserve_reconciliation_attempt,
+    settle_reconciliation_memory, validate_reconciliation_memory,
 };
 #[cfg(test)]
 pub(crate) use registered_artifact_findings::RegisteredArtifactRepairAuthorizationRejection;
@@ -1268,6 +1269,19 @@ impl AppState {
         })
     }
 
+    pub(crate) fn mint_current_known_good_verification_lease(
+        &self,
+        foreground: &IntegrityForegroundLease,
+        lifecycle: &InstanceLifecycleLease,
+    ) -> Result<KnownGoodVerificationLease, KnownGoodVerificationUnavailable> {
+        let library_root = self
+            .library_dir()
+            .map(PathBuf::from)
+            .and_then(|root| known_good::normalize_library_root(&root).ok())
+            .ok_or(KnownGoodVerificationUnavailable::LibraryRootUnavailable)?;
+        self.mint_known_good_verification_lease(foreground, lifecycle, &library_root)
+    }
+
     pub(crate) fn known_good_verification_lease_is_current(
         &self,
         lease: &KnownGoodVerificationLease,
@@ -1329,20 +1343,31 @@ impl AppState {
         instance_id: &str,
         inventory: axial_minecraft::known_good::KnownGoodInventory,
     ) {
+        drop(self.activate_known_good_inventory_for_test_with_identity(instance_id, inventory));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn activate_known_good_inventory_for_test_with_identity(
+        &self,
+        instance_id: &str,
+        inventory: axial_minecraft::known_good::KnownGoodInventory,
+    ) -> Arc<axial_minecraft::known_good::KnownGoodInventory> {
         let instance = self.instances.get(instance_id).expect("test instance");
         let library_root = self
             .library_dir()
             .map(PathBuf::from)
             .expect("test library root");
+        let inventory = Arc::new(inventory);
         self.known_good
             .activate_for_test(
                 &instance.id,
                 &instance.version_id,
                 &instance.created_at,
                 &library_root,
-                Arc::new(inventory),
+                inventory.clone(),
             )
             .expect("activate test known-good inventory");
+        inventory
     }
 
     pub(crate) async fn admit_managed_instance_with_foreground(

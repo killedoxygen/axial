@@ -49,10 +49,12 @@ mod rules;
 mod tests;
 
 pub use artifact_repair::GuardianArtifactRepairStatus;
-pub(crate) use artifact_repair::execute_registered_guardian_artifact_repair;
+pub(crate) use artifact_repair::{
+    GuardianArtifactRepairOutcome, execute_registered_guardian_artifact_repair,
+};
 pub(crate) use component_rebuild::{
-    GuardianRuntimeComponentRebuildOutcome, GuardianRuntimeComponentRebuildStatus,
-    execute_managed_runtime_component_rebuild,
+    GuardianComponentRebuildOutcome, GuardianComponentRebuildStatus,
+    execute_managed_libraries_component_rebuild, execute_managed_runtime_component_rebuild,
 };
 pub(crate) use copy::GuardianSummaryDecision;
 pub(crate) use copy::{

@@ -19,6 +19,7 @@ use axial_minecraft::runtime::{
     ManagedRuntimeCommitReceipt, ManagedRuntimeFailureReceipt, ManagedRuntimeQuarantineObligation,
     RuntimeId, is_known_runtime_component,
 };
+use axial_minecraft::{ManagedLibrariesCommitReceipt, ManagedLibrariesRollbackReceipt};
 use sha2::{Digest, Sha256};
 use std::io;
 use std::path::{Path, PathBuf};
@@ -34,10 +35,28 @@ pub(crate) struct RegisteredComponentRebuildAdmission {
     attempt: ReconciliationAttempt,
     _predecessor: ReconciliationTerminal,
     known_good: RegisteredKnownGoodInventory,
-    postcondition_failure_inventory:
-        std::sync::OnceLock<std::sync::Arc<axial_minecraft::known_good::KnownGoodInventory>>,
+    component_state: RegisteredComponentRebuildState,
     _component_mutation: SharedComponentMutationLease,
     _library_root_mutation: tokio::sync::OwnedMutexGuard<()>,
+}
+
+enum RegisteredComponentRebuildState {
+    Runtime {
+        postcondition_failure_inventory:
+            std::sync::OnceLock<std::sync::Arc<axial_minecraft::known_good::KnownGoodInventory>>,
+    },
+    Libraries,
+}
+
+pub(crate) struct RegisteredLibrariesComponentRebuildEffect {
+    library_root: PathBuf,
+    version_id: String,
+}
+
+impl RegisteredLibrariesComponentRebuildEffect {
+    pub(crate) fn core_request(&self) -> (&Path, &str) {
+        (&self.library_root, &self.version_id)
+    }
 }
 
 struct RegisteredKnownGoodInventory {
@@ -131,6 +150,53 @@ impl RegisteredComponentRebuildAdmission {
     ) -> Result<ReconciliationTerminal, ReconciliationEvidenceRejection> {
         self.authority
             .terminal(self.attempt.clone(), ReconciliationTerminalOutcome::Failed)
+    }
+
+    pub(crate) fn libraries_effect(
+        &self,
+    ) -> Result<RegisteredLibrariesComponentRebuildEffect, ReconciliationEvidenceRejection> {
+        self.current_libraries_inventory()?;
+        Ok(RegisteredLibrariesComponentRebuildEffect {
+            library_root: self.known_good.library_root.clone(),
+            version_id: self.known_good.version_id.clone(),
+        })
+    }
+
+    pub(crate) async fn succeeded_libraries_terminal(
+        &self,
+        receipt: &ManagedLibrariesCommitReceipt,
+    ) -> Result<ReconciliationTerminal, ReconciliationEvidenceRejection> {
+        self.validate_libraries_receipt_version(receipt.version_id())?;
+        if !receipt.matches_root(&self.known_good.library_root).await
+            || !receipt.matches_known_good_inventory(&self.known_good.inventory)
+            || !receipt.revalidate().await
+        {
+            return Err(ReconciliationEvidenceRejection::JournalMismatch);
+        }
+        self.current_libraries_inventory()?;
+        Ok(ReconciliationTerminal::from_attempt(
+            self.attempt.clone(),
+            ReconciliationTerminalOutcome::Succeeded,
+            None,
+        ))
+    }
+
+    pub(crate) async fn failed_libraries_effect_terminal(
+        &self,
+        receipt: &ManagedLibrariesRollbackReceipt,
+    ) -> Result<ReconciliationTerminal, ReconciliationEvidenceRejection> {
+        self.validate_libraries_receipt_version(receipt.version_id())?;
+        if !receipt.matches_root(&self.known_good.library_root).await
+            || !receipt.matches_known_good_inventory(&self.known_good.inventory)
+        {
+            return Err(ReconciliationEvidenceRejection::JournalMismatch);
+        }
+        self.current_libraries_inventory()?;
+        Ok(ReconciliationTerminal::from_attempt(
+            self.attempt.clone(),
+            ReconciliationTerminalOutcome::Failed,
+            None,
+        ))
     }
 
     pub(crate) async fn succeeded_terminal(
@@ -230,7 +296,8 @@ impl RegisteredComponentRebuildAdmission {
         &self,
         receipt: &ManagedRuntimeCommitReceipt,
     ) -> Result<ReconciliationTerminal, ReconciliationEvidenceRejection> {
-        if let Some(refreshed_inventory) = self.postcondition_failure_inventory.get() {
+        let postcondition_failure_inventory = self.runtime_postcondition_failure_inventory()?;
+        if let Some(refreshed_inventory) = postcondition_failure_inventory.get() {
             self.validate_runtime_receipt_capability(
                 receipt.component(),
                 receipt.matches_cache(&self.authority.state.managed_runtime_cache),
@@ -276,6 +343,80 @@ impl RegisteredComponentRebuildAdmission {
             receipt.component(),
             receipt.matches_cache(&self.authority.state.managed_runtime_cache),
         )
+    }
+
+    fn validate_libraries_receipt_version(
+        &self,
+        version_id: &str,
+    ) -> Result<(), ReconciliationEvidenceRejection> {
+        self.validate_libraries_admission()?;
+        if version_id != self.known_good.version_id {
+            return Err(ReconciliationEvidenceRejection::JournalMismatch);
+        }
+        Ok(())
+    }
+
+    fn current_libraries_inventory(
+        &self,
+    ) -> Result<
+        std::sync::Arc<axial_minecraft::known_good::KnownGoodInventory>,
+        ReconciliationEvidenceRejection,
+    > {
+        self.validate_libraries_admission()?;
+        let ReconciliationScope::RegisteredInstance {
+            instance_id,
+            fingerprint,
+        } = self.attempt.scope();
+        let current = self
+            .authority
+            .state
+            .current_reconciliation_incarnation(instance_id)?;
+        if &current.fingerprint != fingerprint
+            || current.roots.library != self.known_good.library_root
+        {
+            return Err(ReconciliationEvidenceRejection::IncarnationMismatch);
+        }
+        let instance = self
+            .authority
+            .state
+            .instances
+            .get(instance_id)
+            .filter(|instance| {
+                instance.id == self.known_good.instance_id
+                    && instance.version_id == self.known_good.version_id
+                    && instance.created_at == self.known_good.created_at
+            })
+            .ok_or(ReconciliationEvidenceRejection::InstanceNotRegistered)?;
+        let inventory = self
+            .authority
+            .state
+            .known_good
+            .active_inventory(
+                &instance.id,
+                &instance.version_id,
+                &instance.created_at,
+                &current.roots.library,
+            )
+            .ok_or(ReconciliationEvidenceRejection::RootAuthorityUnavailable)?;
+        if !std::sync::Arc::ptr_eq(&inventory, &self.known_good.inventory) {
+            return Err(ReconciliationEvidenceRejection::IncarnationMismatch);
+        }
+        Ok(inventory)
+    }
+
+    fn validate_libraries_admission(&self) -> Result<(), ReconciliationEvidenceRejection> {
+        if self.attempt.rung() != ReconciliationRung::RebuildComponent
+            || self.attempt.component() != ReconciliationComponent::Libraries
+            || self.attempt.domain() != GuardianDomain::Library
+            || self.attempt.mode() != GuardianMode::Managed
+            || self.attempt.ownership() != OwnershipClass::LauncherManaged
+            || self.attempt.target().system != StabilizationSystem::Execution
+            || self.attempt.target().kind != TargetKind::Artifact
+            || self.attempt.target().ownership != OwnershipClass::LauncherManaged
+        {
+            return Err(ReconciliationEvidenceRejection::ScopeMismatch);
+        }
+        Ok(())
     }
 
     fn validate_runtime_identity(
@@ -373,9 +514,33 @@ impl RegisteredComponentRebuildAdmission {
             &self.known_good.library_root,
             &refreshed_inventory,
         );
-        self.postcondition_failure_inventory
+        self.runtime_postcondition_failure_inventory()?
             .set(refreshed_inventory)
             .map_err(|_| ReconciliationEvidenceRejection::JournalMismatch)
+    }
+
+    fn runtime_postcondition_failure_inventory(
+        &self,
+    ) -> Result<
+        &std::sync::OnceLock<std::sync::Arc<axial_minecraft::known_good::KnownGoodInventory>>,
+        ReconciliationEvidenceRejection,
+    > {
+        match &self.component_state {
+            RegisteredComponentRebuildState::Runtime {
+                postcondition_failure_inventory,
+            } => Ok(postcondition_failure_inventory),
+            RegisteredComponentRebuildState::Libraries => {
+                Err(ReconciliationEvidenceRejection::ScopeMismatch)
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn runtime_postcondition_failure_inventory_for_test(
+        &self,
+    ) -> &std::sync::OnceLock<std::sync::Arc<axial_minecraft::known_good::KnownGoodInventory>> {
+        self.runtime_postcondition_failure_inventory()
+            .expect("Runtime admission state")
     }
 
     fn validated_quarantine_target(
@@ -398,16 +563,6 @@ impl RegisteredComponentRebuildAdmission {
             format!("quarantine-{}", self.attempt.target().id),
             self.attempt.ownership(),
         )))
-    }
-
-    #[cfg(test)]
-    fn succeeded_terminal_for_test(
-        &self,
-    ) -> Result<ReconciliationTerminal, ReconciliationEvidenceRejection> {
-        self.authority.terminal(
-            self.attempt.clone(),
-            ReconciliationTerminalOutcome::Succeeded,
-        )
     }
 
     #[cfg(test)]
@@ -1051,6 +1206,17 @@ impl AppState {
         };
         let authority = self.registered_reconciliation_authority(&predecessor.lifecycle)?;
         let prior = predecessor.terminal;
+        let component_state = match prior.component() {
+            ReconciliationComponent::Runtime => RegisteredComponentRebuildState::Runtime {
+                postcondition_failure_inventory: std::sync::OnceLock::new(),
+            },
+            ReconciliationComponent::Libraries => RegisteredComponentRebuildState::Libraries,
+            ReconciliationComponent::VersionBundle
+            | ReconciliationComponent::Assets
+            | ReconciliationComponent::WholeInstance => {
+                return Err(ReconciliationEvidenceRejection::ScopeMismatch);
+            }
+        };
         let observed_at = chrono::Utc::now().fixed_offset();
         let suppression_until = observed_at
             .checked_add_signed(suppression_for)
@@ -1074,7 +1240,7 @@ impl AppState {
             attempt,
             _predecessor: prior,
             known_good,
-            postcondition_failure_inventory: std::sync::OnceLock::new(),
+            component_state,
             _component_mutation: component_mutation,
             _library_root_mutation: library_root_mutation,
         })
@@ -1526,7 +1692,10 @@ mod tests {
     use crate::state::failure_memory::FailureMemorySnapshot;
     use crate::state::{AppStateInit, InstallStore, SessionStore, new_instance};
     use axial_config::{AppPaths, InstanceRegistrySnapshot};
-    use axial_minecraft::known_good::{KnownGoodInventory, TestKnownGoodEntry};
+    use axial_minecraft::known_good::{
+        KnownGoodArtifactKind, KnownGoodInventory, TestKnownGoodEntry, TestKnownGoodIntegrity,
+        TestKnownGoodRoot,
+    };
     use std::fs;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -1644,6 +1813,37 @@ mod tests {
             .expect("empty known-good inventory")
     }
 
+    fn libraries_fixture_inventory() -> KnownGoodInventory {
+        KnownGoodInventory::from_test_entries([TestKnownGoodEntry {
+            root: TestKnownGoodRoot::Libraries,
+            path: "org/axial/fixture/1.0.0/fixture-1.0.0.jar".to_string(),
+            kind: KnownGoodArtifactKind::Library,
+            integrity: TestKnownGoodIntegrity::Sha1 {
+                digest: "d5eff5a05903f96145d60e61ffb9cd9159a745ac".to_string(),
+                size: b"axial managed Libraries fixture".len() as u64,
+            },
+        }])
+        .expect("Libraries fixture inventory")
+    }
+
+    fn activate_libraries_fixture_inventory(
+        state: &AppState,
+        instance_id: &str,
+    ) -> Arc<KnownGoodInventory> {
+        state.activate_known_good_inventory_for_test(instance_id, libraries_fixture_inventory());
+        let instance = state.instances().get(instance_id).expect("test instance");
+        let library_root = PathBuf::from(state.library_dir().expect("test library root"));
+        state
+            .known_good
+            .active_inventory(
+                &instance.id,
+                &instance.version_id,
+                &instance.created_at,
+                &library_root,
+            )
+            .expect("active Libraries fixture inventory")
+    }
+
     fn activate_empty_inventory(state: &AppState, instance_id: &str) -> Arc<KnownGoodInventory> {
         state.activate_known_good_inventory_for_test(instance_id, empty_inventory());
         let instance = state.instances().get(instance_id).expect("test instance");
@@ -1753,13 +1953,6 @@ mod tests {
         step
     }
 
-    fn completed_step(target: &TargetDescriptor) -> OperationJournalStep {
-        let mut step = OperationJournalStep::new("rebuild_component", OperationPhase::Completed);
-        step.result = OperationStepResult::Completed;
-        step.changed_target = Some(target.clone());
-        step
-    }
-
     async fn persist_failed_journal(
         fixture: &Fixture,
         attempt: &ReconciliationAttempt,
@@ -1779,26 +1972,6 @@ mod tests {
         )
         .await
         .expect("persist failed reconciliation");
-    }
-
-    async fn persist_succeeded_journal(
-        fixture: &Fixture,
-        attempt: &ReconciliationAttempt,
-        terminal: ReconciliationTerminal,
-    ) {
-        fixture
-            .journals
-            .create(planned_journal(attempt))
-            .await
-            .expect("persist planned reconciliation");
-        record_reconciliation_journal_success(
-            fixture.journals.as_ref(),
-            attempt.operation_id(),
-            completed_step(attempt.target()),
-            terminal,
-        )
-        .await
-        .expect("persist successful reconciliation");
     }
 
     async fn recorded_runtime_artifact_failure(
@@ -1844,6 +2017,57 @@ mod tests {
             .state
             .recorded_artifact_repair_failure(&lifecycle, attempt.operation_id())
             .expect("recorded Runtime artifact failure");
+        drop((authority, lifecycle));
+        (evidence, attempt)
+    }
+
+    async fn recorded_libraries_artifact_failure(
+        fixture: &Fixture,
+        operation_id: &str,
+    ) -> (RecordedArtifactRepairFailure, ReconciliationAttempt) {
+        let lifecycle = fixture.state.acquire_instance_lifecycle(INSTANCE_ID).await;
+        let authority = fixture
+            .state
+            .registered_reconciliation_authority(&lifecycle)
+            .expect("registered Libraries authority");
+        let attempt = authority
+            .repair_artifact_attempt(
+                OperationId::new(operation_id),
+                DIAGNOSIS_ID,
+                GuardianDomain::Library,
+                ReconciliationComponent::Libraries,
+                TargetDescriptor::new(
+                    StabilizationSystem::Execution,
+                    TargetKind::Artifact,
+                    "fixture-library",
+                    OwnershipClass::LauncherManaged,
+                ),
+                GuardianMode::Managed,
+                chrono::Duration::minutes(30),
+            )
+            .expect("Libraries artifact attempt");
+        let terminal = authority
+            .artifact_terminal(attempt.clone(), ReconciliationTerminalOutcome::Failed, None)
+            .expect("Libraries artifact failure");
+        let reservation = reserve_reconciliation_attempt(
+            fixture.failure_memory.as_ref(),
+            fixture.journals.as_ref(),
+            reconciliation_attempt_key(&attempt),
+        )
+        .expect("reserve Libraries artifact attempt");
+        persist_failed_journal(fixture, &attempt, terminal.clone()).await;
+        commit_reconciliation_memory(
+            fixture.failure_memory.as_ref(),
+            reconciliation_memory_entry(terminal).expect("Libraries artifact memory"),
+            &reservation,
+        )
+        .await
+        .expect("commit Libraries artifact memory");
+        drop(reservation);
+        let evidence = fixture
+            .state
+            .recorded_artifact_repair_failure(&lifecycle, attempt.operation_id())
+            .expect("recorded Libraries artifact failure");
         drop((authority, lifecycle));
         (evidence, attempt)
     }
@@ -2201,36 +2425,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn component_rebuild_admission_consumes_exact_artifact_failure_without_substitution() {
-        let fixture = fixture("component-admission");
-        let (artifact_attempt, artifact_terminal) = registered_attempt(
-            &fixture,
-            "component-admission-artifact",
-            ReconciliationComponent::VersionBundle,
-        )
-        .await;
-        let key = reconciliation_attempt_key(&artifact_attempt);
-        let reservation = reserve_reconciliation_attempt(
-            fixture.failure_memory.as_ref(),
-            fixture.journals.as_ref(),
-            key,
-        )
-        .expect("reserve artifact attempt");
-        persist_failed_journal(&fixture, &artifact_attempt, artifact_terminal.clone()).await;
-        commit_reconciliation_memory(
-            fixture.failure_memory.as_ref(),
-            reconciliation_memory_entry(artifact_terminal.clone()).expect("artifact memory"),
-            &reservation,
-        )
-        .await
-        .expect("commit artifact memory");
-        drop(reservation);
-
-        let lifecycle = fixture.state.acquire_instance_lifecycle(INSTANCE_ID).await;
-        let evidence = fixture
-            .state
-            .recorded_artifact_repair_failure(&lifecycle, artifact_attempt.operation_id())
-            .expect("recorded artifact failure");
+    async fn libraries_component_commit_keeps_exact_root_projection_and_inventory_arc() {
+        let fixture = fixture("libraries-component-commit");
+        let admitted_inventory = activate_libraries_fixture_inventory(&fixture.state, INSTANCE_ID);
+        let (evidence, artifact_attempt) =
+            recorded_libraries_artifact_failure(&fixture, "libraries-component-commit-artifact")
+                .await;
         let component_operation = OperationId::new("component-admission-rebuild");
         let admission = fixture
             .state
@@ -2241,7 +2441,12 @@ mod tests {
             )
             .await
             .expect("component rebuild admission");
-        let component_attempt = admission.attempt();
+        let component_attempt = admission.attempt().clone();
+        let artifact_terminal = fixture
+            .journals
+            .get(artifact_attempt.operation_id())
+            .and_then(|journal| journal.reconciliation_terminal().cloned())
+            .expect("exact Libraries predecessor terminal");
 
         assert_eq!(admission.predecessor(), &artifact_terminal);
         assert_eq!(component_attempt.operation_id(), &component_operation);
@@ -2249,7 +2454,10 @@ mod tests {
             component_attempt.rung(),
             ReconciliationRung::RebuildComponent
         );
-        assert_eq!(component_attempt.component(), artifact_terminal.component());
+        assert_eq!(
+            component_attempt.component(),
+            ReconciliationComponent::Libraries
+        );
         assert_eq!(component_attempt.target(), artifact_terminal.target());
         assert_eq!(component_attempt.scope(), artifact_terminal.scope());
         assert_eq!(
@@ -2267,36 +2475,59 @@ mod tests {
             admission.failure_memory(),
             fixture.failure_memory.as_ref()
         ));
-        let component_terminal = admission
-            .failed_terminal()
-            .expect("current component terminal");
-        assert_eq!(component_terminal.attempt(), component_attempt);
+        let root = PathBuf::from(fixture.state.library_dir().expect("library root"));
+        let request = admission
+            .libraries_effect()
+            .expect("State-authored Libraries effect");
+        assert_eq!(request.core_request(), (root.as_path(), "1.21.1"));
+
+        let wrong_root = fixture.root.join("wrong-libraries-root");
+        fs::create_dir_all(&wrong_root).expect("wrong Libraries root");
+        let wrong_receipt =
+            axial_minecraft::rebuild_managed_libraries_fixture_for_test(&wrong_root, "1.21.1")
+                .await
+                .expect("wrong-root Libraries receipt");
         assert_eq!(
             admission
-                .succeeded_terminal_for_test()
-                .expect("test-only successful component terminal")
-                .outcome(),
-            ReconciliationTerminalOutcome::Succeeded
-        );
-
-        let same_operation_evidence = fixture
-            .state
-            .recorded_artifact_repair_failure(&lifecycle, artifact_attempt.operation_id())
-            .expect("second move-only proof");
-        assert_eq!(
-            fixture
-                .state
-                .admit_component_rebuild(
-                    same_operation_evidence,
-                    artifact_attempt.operation_id().clone(),
-                    chrono::Duration::minutes(30),
-                )
+                .succeeded_libraries_terminal(&wrong_receipt)
                 .await
                 .err(),
             Some(ReconciliationEvidenceRejection::JournalMismatch)
         );
+        drop(wrong_receipt);
 
-        drop((admission, lifecycle));
+        let receipt = axial_minecraft::rebuild_managed_libraries_fixture_for_test(&root, "1.21.1")
+            .await
+            .expect("sealed Libraries rebuild receipt");
+        let terminal = admission
+            .succeeded_libraries_terminal(&receipt)
+            .await
+            .expect("truthful Libraries success terminal");
+        assert_eq!(terminal.attempt(), &component_attempt);
+        assert_eq!(terminal.outcome(), ReconciliationTerminalOutcome::Succeeded);
+        let instance = fixture.state.instances().get(INSTANCE_ID).unwrap();
+        let active = fixture
+            .state
+            .known_good
+            .active_inventory(
+                &instance.id,
+                &instance.version_id,
+                &instance.created_at,
+                &root,
+            )
+            .expect("same inventory remains active");
+        assert!(Arc::ptr_eq(&active, &admitted_inventory));
+
+        let canonical = root.join("libraries/org/axial/fixture/1.0.0/fixture-1.0.0.jar");
+        let mut corrupted = fs::read(&canonical).expect("read fixture JAR");
+        corrupted[0] ^= 0xff;
+        fs::write(&canonical, corrupted).expect("corrupt fixture JAR");
+        assert_eq!(
+            admission.succeeded_libraries_terminal(&receipt).await.err(),
+            Some(ReconciliationEvidenceRejection::JournalMismatch)
+        );
+
+        drop((receipt, admission));
         cleanup(fixture).await;
     }
 
@@ -2496,7 +2727,12 @@ mod tests {
                 .err(),
             Some(ReconciliationEvidenceRejection::JournalMismatch)
         );
-        assert!(admission.postcondition_failure_inventory.get().is_some());
+        assert!(
+            admission
+                .runtime_postcondition_failure_inventory_for_test()
+                .get()
+                .is_some()
+        );
         let instance = fixture
             .state
             .instances()
@@ -2581,7 +2817,12 @@ mod tests {
             )
             .expect("replacement remains active");
         assert!(Arc::ptr_eq(&active, &replacement));
-        assert!(admission.postcondition_failure_inventory.get().is_some());
+        assert!(
+            admission
+                .runtime_postcondition_failure_inventory_for_test()
+                .get()
+                .is_some()
+        );
         let terminal = admission
             .failed_postcondition_terminal(&receipt)
             .expect("sealed failure proof does not adopt the replacement");
@@ -2643,7 +2884,12 @@ mod tests {
                 .err(),
             Some(ReconciliationEvidenceRejection::IncarnationMismatch)
         );
-        assert!(admission.postcondition_failure_inventory.get().is_some());
+        assert!(
+            admission
+                .runtime_postcondition_failure_inventory_for_test()
+                .get()
+                .is_some()
+        );
         assert!(
             fixture
                 .state
@@ -2716,7 +2962,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn shared_runtime_terminal_suppresses_queued_cross_instance_rebuild() {
+    async fn shared_runtime_failure_terminal_suppresses_queued_cross_instance_rebuild() {
         let fixture = fixture("component-admission-shared-runtime");
         let second = fixture
             .state
@@ -2770,15 +3016,15 @@ mod tests {
 
         let first_attempt = first_admission.attempt().clone();
         let first_terminal = first_admission
-            .succeeded_terminal_for_test()
-            .expect("first Runtime rebuild success terminal");
+            .failed_terminal()
+            .expect("first Runtime rebuild failure terminal");
         let reservation = reserve_reconciliation_attempt(
             fixture.failure_memory.as_ref(),
             fixture.journals.as_ref(),
             reconciliation_attempt_key(&first_attempt),
         )
         .expect("reserve first Runtime rebuild");
-        persist_succeeded_journal(&fixture, &first_attempt, first_terminal.clone()).await;
+        persist_failed_journal(&fixture, &first_attempt, first_terminal.clone()).await;
         commit_reconciliation_memory(
             fixture.failure_memory.as_ref(),
             reconciliation_memory_entry(first_terminal).expect("first Runtime rebuild memory"),

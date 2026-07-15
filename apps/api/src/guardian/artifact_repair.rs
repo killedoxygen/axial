@@ -39,6 +39,7 @@ enum ArtifactJournalReconciliation {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct GuardianArtifactRepairOutcome {
+    pub(crate) operation_id: OperationId,
     pub(crate) diagnosis_id: DiagnosisId,
     pub(crate) action: GuardianActionKind,
     pub(crate) status: GuardianArtifactRepairStatus,
@@ -454,6 +455,7 @@ async fn finish_artifact_repair(
         ),
         None => None,
     };
+    let outcome_operation_id = operation_id.clone();
     let journal_operation_id = operation_id;
     let journal_facts = facts;
     let journal_terminal = reconciliation_terminal.clone();
@@ -523,6 +525,7 @@ async fn finish_artifact_repair(
         })?;
     }
     Ok(artifact_repair_outcome(
+        outcome_operation_id,
         context.attempt.diagnosis_id(),
         GuardianActionKind::Repair,
         status,
@@ -583,6 +586,7 @@ async fn reconcile_same_operation_artifact_terminal(
         ReconciliationTerminalOutcome::Failed => GuardianArtifactRepairStatus::Failed,
     };
     Ok(artifact_repair_outcome(
+        terminal.operation_id().clone(),
         context.attempt.diagnosis_id(),
         GuardianActionKind::Repair,
         status,
@@ -974,11 +978,13 @@ fn fact_ids(facts: &[ExecutionFact]) -> Vec<String> {
 }
 
 fn artifact_repair_outcome(
+    operation_id: OperationId,
     diagnosis_id: DiagnosisId,
     action: GuardianActionKind,
     status: GuardianArtifactRepairStatus,
 ) -> GuardianArtifactRepairOutcome {
     GuardianArtifactRepairOutcome {
+        operation_id,
         diagnosis_id,
         action,
         status,

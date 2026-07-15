@@ -1816,16 +1816,21 @@ pub(crate) async fn sense_integrity_tier1(
     lifecycle: &InstanceLifecycleLease,
     expected_library_root: &Path,
 ) -> Result<AdmittedIntegrityTier1Report, KnownGoodVerificationUnavailable> {
-    sense_integrity_tier1_with_reader_factory(
-        state,
-        foreground,
-        lifecycle,
-        expected_library_root,
-        FilesystemIntegrityReader::default,
-    )
-    .await
+    let lease =
+        state.mint_known_good_verification_lease(foreground, lifecycle, expected_library_root)?;
+    sense_integrity_tier1_with_lease(state, lease, FilesystemIntegrityReader::default).await
 }
 
+pub(crate) async fn sense_current_integrity_tier1(
+    state: &AppState,
+    foreground: &IntegrityForegroundLease,
+    lifecycle: &InstanceLifecycleLease,
+) -> Result<AdmittedIntegrityTier1Report, KnownGoodVerificationUnavailable> {
+    let lease = state.mint_current_known_good_verification_lease(foreground, lifecycle)?;
+    sense_integrity_tier1_with_lease(state, lease, FilesystemIntegrityReader::default).await
+}
+
+#[cfg(test)]
 async fn sense_integrity_tier1_with_reader_factory<Factory, Reader>(
     state: &AppState,
     foreground: &IntegrityForegroundLease,
@@ -1839,6 +1844,18 @@ where
 {
     let lease =
         state.mint_known_good_verification_lease(foreground, lifecycle, expected_library_root)?;
+    sense_integrity_tier1_with_lease(state, lease, reader_factory).await
+}
+
+async fn sense_integrity_tier1_with_lease<Factory, Reader>(
+    state: &AppState,
+    lease: KnownGoodVerificationLease,
+    reader_factory: Factory,
+) -> Result<AdmittedIntegrityTier1Report, KnownGoodVerificationUnavailable>
+where
+    Factory: FnOnce() -> Reader + Send + 'static,
+    Reader: ContentReader,
+{
     let prepared = prepare_tier1_jobs(&lease);
     let (lease, mut report) = match prepared {
         Ok(jobs) => tokio::task::spawn_blocking(move || {
