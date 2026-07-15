@@ -101,8 +101,9 @@ pub(crate) use performance_managed::{
 };
 pub use performance_rules::AppPerformanceStore;
 pub(crate) use reconciliation::{
-    ReconciliationAttemptReservation, ReconciliationEvidenceRejection,
-    RegisteredArtifactFailedRepair, RegisteredAssetsComponentRebuildEffect,
+    REGISTERED_ARTIFACT_COMPONENT_REBUILD_FAILURE_POINT, ReconciliationAttemptReservation,
+    ReconciliationEvidenceRejection, RegisteredArtifactFailedRepair,
+    RegisteredAssetsComponentRebuildEffect, RegisteredAssetsRecoveryEntry,
     RegisteredComponentRebuildAdmission, RegisteredLibrariesComponentRebuildEffect,
     RegisteredReconciliationAuthority, commit_reconciliation_memory, reconciliation_attempt_key,
     reconciliation_instance_target, reconciliation_journal_attempt, reconciliation_memory_entry,

@@ -259,7 +259,7 @@ async fn execute_admitted_artifact_repair(
                 &context,
                 operation_id,
                 ArtifactTerminal::Failed {
-                    step_id: "require_registered_artifact_component_rebuild",
+                    step_id: crate::state::REGISTERED_ARTIFACT_COMPONENT_REBUILD_FAILURE_POINT,
                     rollback: RollbackState::NotApplicable,
                     facts: Vec::new(),
                     quarantined_target: None,
@@ -798,7 +798,7 @@ fn artifact_repair_steps(
             RollbackState::NotApplicable,
         ),
         (
-            "require_registered_artifact_component_rebuild",
+            crate::state::REGISTERED_ARTIFACT_COMPONENT_REBUILD_FAILURE_POINT,
             RollbackState::NotApplicable,
         ),
         ("record_repair_outcome", RollbackState::NotApplicable),

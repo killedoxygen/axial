@@ -300,6 +300,47 @@ impl RegisteredArtifactFindings {
 }
 
 impl RegisteredArtifactRepairAuthorization {
+    pub(super) fn exact_assets_identity(
+        &self,
+        state: &AppState,
+    ) -> Result<
+        (
+            &KnownGoodVerificationLease,
+            usize,
+            RegisteredArtifactCondition,
+        ),
+        ReconciliationEvidenceRejection,
+    > {
+        if self.diagnosis_id != DiagnosisId::LauncherManagedArtifactCorrupt
+            || self.action != GuardianActionKind::Repair
+            || self.findings.target_for(self.observation) != Some(&self.target)
+        {
+            return Err(ReconciliationEvidenceRejection::ScopeMismatch);
+        }
+        if !state.registered_artifact_findings_can_admit(&self.findings) {
+            return Err(ReconciliationEvidenceRejection::IncarnationMismatch);
+        }
+        let inventory_ordinal = self.observation.inventory_ordinal;
+        let source = self
+            .findings
+            .authority
+            .inventory
+            .bind_standalone_leaf_repair_source(inventory_ordinal)
+            .map_err(|_| ReconciliationEvidenceRejection::RootAuthorityUnavailable)?;
+        if RegisteredArtifactSourceScope::from_source(source.root(), source.kind())
+            != Some(RegisteredArtifactSourceScope::Assets)
+            || registered_artifact_target(&self.findings.authority, inventory_ordinal).as_ref()
+                != Some(&self.target)
+        {
+            return Err(ReconciliationEvidenceRejection::ScopeMismatch);
+        }
+        Ok((
+            &self.findings.authority,
+            inventory_ordinal,
+            self.observation.condition,
+        ))
+    }
+
     fn into_parts(
         self,
     ) -> (
@@ -591,7 +632,7 @@ impl AppState {
     }
 }
 
-fn registered_artifact_target(
+pub(super) fn registered_artifact_target(
     authority: &KnownGoodVerificationLease,
     inventory_ordinal: usize,
 ) -> Option<TargetDescriptor> {
@@ -712,7 +753,7 @@ pub(crate) fn registered_artifact_target_for_test(
     .map(|(target, _)| target)
 }
 
-pub(super) fn recorded_artifact_target_has_live_provenance(
+pub(super) fn resolve_unique_recorded_artifact_inventory_ordinal(
     instance_id: &str,
     version_id: &str,
     created_at: &str,
@@ -720,11 +761,11 @@ pub(super) fn recorded_artifact_target_has_live_provenance(
     runtime_root: &Path,
     inventory: &axial_minecraft::known_good::KnownGoodInventory,
     attempt: &ReconciliationAttempt,
-) -> bool {
+) -> Result<usize, ReconciliationEvidenceRejection> {
     if attempt.diagnosis_id() != DiagnosisId::LauncherManagedArtifactCorrupt {
-        return false;
+        return Err(ReconciliationEvidenceRejection::ScopeMismatch);
     }
-    inventory
+    let mut matches = inventory
         .entries()
         .iter()
         .enumerate()
@@ -738,15 +779,21 @@ pub(super) fn recorded_artifact_target_has_live_provenance(
                 inventory,
                 inventory_ordinal,
             )
+            .map(|(target, scope)| (inventory_ordinal, target, scope))
         })
-        .filter(|(target, scope)| {
+        .filter(|(_, target, scope)| {
             target == attempt.target()
                 && scope.domain() == attempt.domain()
                 && scope.component() == attempt.component()
         })
-        .take(2)
-        .count()
-        == 1
+        .map(|(inventory_ordinal, _, _)| inventory_ordinal);
+    let inventory_ordinal = matches
+        .next()
+        .ok_or(ReconciliationEvidenceRejection::ScopeMismatch)?;
+    if matches.next().is_some() {
+        return Err(ReconciliationEvidenceRejection::ScopeMismatch);
+    }
+    Ok(inventory_ordinal)
 }
 
 fn update_frame(hasher: &mut Sha256, label: &[u8], value: &[u8]) {
