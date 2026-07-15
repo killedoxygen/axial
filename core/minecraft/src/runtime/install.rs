@@ -57,6 +57,13 @@ pub struct ManagedRuntimeQuarantineObligation {
     component: RuntimeId,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ManagedRuntimeQuarantineObservation {
+    Present,
+    Absent,
+    Indeterminate,
+}
+
 impl std::fmt::Debug for ManagedRuntimeCommitReceipt {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str("ManagedRuntimeCommitReceipt { .. }")
@@ -158,7 +165,7 @@ impl ManagedRuntimeFailureReceipt {
             && self
                 .quarantine
                 .as_ref()
-                .is_none_or(ManagedRuntimeQuarantineObligation::is_present)
+                .is_none_or(|obligation| obligation.path_observation().is_present())
     }
 }
 
@@ -217,7 +224,7 @@ impl ManagedRuntimeCommitReceipt {
             && self
                 .quarantine
                 .as_ref()
-                .is_none_or(ManagedRuntimeQuarantineObligation::is_present)
+                .is_none_or(|obligation| obligation.path_observation().is_present())
     }
 
     pub(crate) fn into_source_receipt(self) -> RuntimeSourceReceipt {
@@ -322,8 +329,8 @@ impl ManagedRuntimeQuarantineObligation {
         self.cache.shares_identity_with(cache)
     }
 
-    pub fn is_present(&self) -> bool {
-        self.path_observation().is_present()
+    pub fn observation(&self) -> ManagedRuntimeQuarantineObservation {
+        self.path_observation().into()
     }
 
     fn path_observation(&self) -> RuntimePathObservation {
@@ -1190,6 +1197,16 @@ impl RuntimePathObservation {
 
     fn retains_obligation(self) -> bool {
         self != Self::Absent
+    }
+}
+
+impl From<RuntimePathObservation> for ManagedRuntimeQuarantineObservation {
+    fn from(observation: RuntimePathObservation) -> Self {
+        match observation {
+            RuntimePathObservation::Present => Self::Present,
+            RuntimePathObservation::Absent => Self::Absent,
+            RuntimePathObservation::Indeterminate => Self::Indeterminate,
+        }
     }
 }
 
@@ -2092,18 +2109,30 @@ fn runtime_sha1_is_valid(value: &str) -> bool {
 
 #[cfg(test)]
 mod quarantine_observation_tests {
-    use super::{RuntimePathObservation, runtime_path_error_observation};
+    use super::{
+        ManagedRuntimeQuarantineObligation, ManagedRuntimeQuarantineObservation,
+        RuntimePathObservation, runtime_path_error_observation,
+    };
+    use crate::runtime::{ManagedRuntimeCache, RuntimeId};
 
     #[test]
     fn quarantine_obligation_is_omitted_only_for_not_found() {
         let absent =
             runtime_path_error_observation(&std::io::Error::from(std::io::ErrorKind::NotFound));
         assert_eq!(absent, RuntimePathObservation::Absent);
+        assert_eq!(
+            ManagedRuntimeQuarantineObservation::from(absent),
+            ManagedRuntimeQuarantineObservation::Absent
+        );
         assert!(!absent.is_present());
         assert!(!absent.retains_obligation());
 
         assert!(RuntimePathObservation::Present.is_present());
         assert!(RuntimePathObservation::Present.retains_obligation());
+        assert_eq!(
+            ManagedRuntimeQuarantineObservation::from(RuntimePathObservation::Present),
+            ManagedRuntimeQuarantineObservation::Present
+        );
         for kind in [
             std::io::ErrorKind::PermissionDenied,
             std::io::ErrorKind::InvalidData,
@@ -2111,8 +2140,37 @@ mod quarantine_observation_tests {
         ] {
             let indeterminate = runtime_path_error_observation(&std::io::Error::from(kind));
             assert_eq!(indeterminate, RuntimePathObservation::Indeterminate);
+            assert_eq!(
+                ManagedRuntimeQuarantineObservation::from(indeterminate),
+                ManagedRuntimeQuarantineObservation::Indeterminate
+            );
             assert!(!indeterminate.is_present());
             assert!(indeterminate.retains_obligation());
         }
+    }
+
+    #[test]
+    fn retained_quarantine_observation_is_closed_and_path_free() {
+        let cache = ManagedRuntimeCache::isolated_for_test().expect("Runtime cache");
+        let component = RuntimeId::from("jre-legacy");
+        let quarantine = cache
+            .component_root(component.as_str())
+            .expect("Runtime root")
+            .with_file_name("jre-legacy.quarantine");
+        std::fs::create_dir(&quarantine).expect("quarantine fixture");
+        let obligation = ManagedRuntimeQuarantineObligation { cache, component };
+
+        assert_eq!(
+            obligation.observation(),
+            ManagedRuntimeQuarantineObservation::Present
+        );
+        assert_eq!(format!("{:?}", obligation.observation()), "Present");
+
+        std::fs::remove_dir(&quarantine).expect("remove quarantine fixture");
+        assert_eq!(
+            obligation.observation(),
+            ManagedRuntimeQuarantineObservation::Absent
+        );
+        assert_eq!(format!("{:?}", obligation.observation()), "Absent");
     }
 }

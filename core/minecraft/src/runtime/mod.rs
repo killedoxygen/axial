@@ -30,7 +30,7 @@ pub(crate) use ensure::{
 pub use ensure::{ensure_runtime_with_events, rebuild_managed_runtime_component};
 pub use install::{
     ManagedRuntimeCommitReceipt, ManagedRuntimeFailureReceipt, ManagedRuntimeQuarantineObligation,
-    ManagedRuntimeRebuildError,
+    ManagedRuntimeQuarantineObservation, ManagedRuntimeRebuildError,
 };
 pub(crate) use install::{
     finalize_managed_runtime_commit, runtime_source_matches_known_good_inventory,

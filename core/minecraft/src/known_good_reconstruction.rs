@@ -1373,7 +1373,10 @@ mod tests {
             .runtime_quarantine_obligation()
             .expect("late rollback must expose retained Runtime quarantine");
         assert!(runtime_quarantine.matches_cache(&runtime_cache));
-        assert!(runtime_quarantine.is_present());
+        assert_eq!(
+            runtime_quarantine.observation(),
+            crate::runtime::ManagedRuntimeQuarantineObservation::Present
+        );
         assert!(
             runtime_root
                 .with_file_name("jre-legacy.quarantine")
@@ -1448,7 +1451,10 @@ mod tests {
             .runtime_quarantine_obligation()
             .expect("Runtime finalization rollback must expose its quarantine");
         assert!(runtime_quarantine.matches_cache(&runtime_cache));
-        assert!(runtime_quarantine.is_present());
+        assert_eq!(
+            runtime_quarantine.observation(),
+            crate::runtime::ManagedRuntimeQuarantineObservation::Present
+        );
         let super::WholeInstanceRuntimeTerminal::Failed(runtime) = &rollback.authority.runtime
         else {
             panic!("Runtime finalization failure must retain Runtime failure authority");

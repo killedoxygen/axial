@@ -30,7 +30,7 @@ use axial_config::is_canonical_instance_id;
 use axial_minecraft::known_good::{KnownGoodIntegrity, known_good_entry_path};
 use axial_minecraft::runtime::{
     ManagedRuntimeCommitReceipt, ManagedRuntimeFailureReceipt, ManagedRuntimeQuarantineObligation,
-    RuntimeId, is_known_runtime_component,
+    ManagedRuntimeQuarantineObservation, RuntimeId, is_known_runtime_component,
 };
 use axial_minecraft::{
     ManagedAssetsCommitReceipt, ManagedAssetsRollbackEffect, ManagedAssetsRollbackReceipt,
@@ -1134,9 +1134,11 @@ impl RegisteredComponentRebuildAdmission {
         };
         if quarantine.component() != component
             || !quarantine.matches_cache(&self.authority.state.managed_runtime_cache)
-            || !quarantine.is_present()
         {
             return Err(ReconciliationEvidenceRejection::JournalMismatch);
+        }
+        if quarantine.observation() == ManagedRuntimeQuarantineObservation::Absent {
+            return Ok(None);
         }
         Ok(Some(TargetDescriptor::new(
             StabilizationSystem::Execution,

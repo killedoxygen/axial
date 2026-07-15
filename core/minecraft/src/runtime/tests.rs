@@ -1259,7 +1259,10 @@ async fn managed_runtime_restoration_failure_retains_sealed_quarantine_evidence(
         .expect("retained quarantine obligation");
     assert_eq!(obligation.component(), &component);
     assert!(obligation.matches_cache(&cache));
-    assert!(obligation.is_present());
+    assert_eq!(
+        obligation.observation(),
+        super::ManagedRuntimeQuarantineObservation::Present
+    );
     assert!(!root.exists());
     assert!(!staging_root.exists());
     assert_eq!(
@@ -1320,7 +1323,10 @@ async fn ordinary_quarantine_finalization_failure_retains_effect_evidence() {
         .quarantine_obligation()
         .expect("retained finalization obligation");
     assert!(obligation.matches_cache(&cache));
-    assert!(obligation.is_present());
+    assert_eq!(
+        obligation.observation(),
+        super::ManagedRuntimeQuarantineObservation::Present
+    );
     assert!(managed_runtime_contents_verified_without_probe(&root));
     assert_eq!(
         fs::read(
@@ -1351,11 +1357,9 @@ async fn late_finalization_failure_reports_observed_quarantine_and_retains_autho
         let receipt = publish_staged_managed_runtime(staged)
             .await
             .expect("retained managed runtime publish");
-        assert!(
-            receipt
-                .quarantine_obligation()
-                .is_some_and(|obligation| obligation.is_present())
-        );
+        assert!(receipt.quarantine_obligation().is_some_and(|obligation| {
+            obligation.observation() == super::ManagedRuntimeQuarantineObservation::Present
+        }));
 
         let failure = if remove_before_error {
             finalize_managed_runtime_commit_with_removed_quarantine_failure_for_test(receipt).await
@@ -1501,7 +1505,10 @@ async fn quarantine_rotation_failure_before_displacement_is_post_effect() {
         .expect("retained quarantine evidence");
     assert_eq!(obligation.component(), &component);
     assert!(obligation.matches_cache(&cache));
-    assert!(obligation.is_present());
+    assert_eq!(
+        obligation.observation(),
+        super::ManagedRuntimeQuarantineObservation::Present
+    );
     assert_eq!(
         fs::read(java_executable(&root)).expect("unchanged canonical java"),
         b"first java"
