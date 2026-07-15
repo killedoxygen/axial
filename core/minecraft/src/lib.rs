@@ -34,11 +34,15 @@ pub use known_good_reconstruction::{
     KnownGoodReconstructionError, ManagedAssetsCommitReceipt, ManagedAssetsRebuildError,
     ManagedAssetsRollbackEffect, ManagedAssetsRollbackReceipt, ManagedLibrariesCommitReceipt,
     ManagedLibrariesRebuildError, ManagedLibrariesRollbackEffect, ManagedLibrariesRollbackReceipt,
-    rebuild_managed_assets, rebuild_managed_libraries, reconstruct_known_good,
+    ManagedVersionBundleCommitReceipt, ManagedVersionBundleRebuildError,
+    ManagedVersionBundleRollbackEffect, ManagedVersionBundleRollbackReceipt,
+    rebuild_managed_assets, rebuild_managed_libraries, rebuild_managed_version_bundle,
+    reconstruct_known_good,
 };
 #[cfg(feature = "test-support")]
 pub use known_good_reconstruction::{
     rebuild_managed_assets_fixture_for_test, rebuild_managed_libraries_fixture_for_test,
+    rebuild_managed_version_bundle_fixture_for_test,
 };
 pub use launch::{
     JavaVersion, LaunchModelError, LaunchVars, ResolvedLibrary, VersionJson, build_classpath,
@@ -91,12 +95,6 @@ pub use version::{
     VersionBundleReadGuard, VersionScanDependencyStamp, VersionScanIssue, VersionScanIssueKind,
     VersionScanReport, VersionScanSnapshot, VersionScanState, scan_versions, scan_versions_report,
     scan_versions_snapshot,
-};
-pub use version_bundle_publication::{
-    ManagedVersionBundleCommitReceipt, ManagedVersionBundleDisposition, ManagedVersionBundleEffect,
-    ManagedVersionBundleFailureReceipt, ManagedVersionBundleOrdinalDisposition,
-    ManagedVersionBundlePublicationError, ManagedVersionBundleSettlementFailure,
-    ManagedVersionBundleSettlementOutcome,
 };
 pub use version_meta::{
     MinecraftVersionMeta, ReleaseReference, analyze_minecraft_version, apply_version_analysis,

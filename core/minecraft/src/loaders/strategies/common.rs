@@ -265,7 +265,7 @@ async fn reconstruct_profile_after_sources(
         base,
         &plan.record,
         version,
-        &version_bytes,
+        version_bytes,
         declarations,
         library_sources,
     )
@@ -1641,6 +1641,23 @@ mod tests {
                 install_receipt.into_activation_source().into_parts(),
                 reconstructed.into_activation_source().into_parts()
             );
+            let version_bundle_proof =
+                crate::loaders::providers::fetch_profile_install_proof_from_url_for_test(
+                    &record,
+                    &proof_server.url,
+                )
+                .await
+                .expect("VersionBundle profile proof");
+            let version_bundle = reconstruct_profile_with_downloader(
+                &plan,
+                &reconstruction_downloader,
+                version_bundle_proof,
+                &ManagedReconstructionContext::version_bundle(),
+            )
+            .await
+            .expect("retain exact profile VersionBundle sources");
+            assert!(version_bundle.retained_version_bundle_sources_match_projection());
+            assert_eq!(snapshot_tree(&root), before);
 
             for server in [
                 client_server,
@@ -1919,6 +1936,15 @@ mod tests {
             install_receipt.into_activation_source().into_parts(),
             reconstructed.into_activation_source().into_parts()
         );
+        let version_bundle = reconstruct_installer_authority_with_downloader(
+            &plan,
+            &reconstruction_downloader,
+            &ManagedReconstructionContext::version_bundle(),
+        )
+        .await
+        .expect("retain exact declarative installer VersionBundle sources");
+        assert!(version_bundle.retained_version_bundle_sources_match_projection());
+        assert_eq!(snapshot_tree(&root), before);
 
         for server in [
             client_server,
@@ -2030,6 +2056,15 @@ mod tests {
             install_receipt.into_activation_source().into_parts(),
             reconstructed.into_activation_source().into_parts()
         );
+        let version_bundle = reconstruct_installer_authority_with_downloader(
+            &plan,
+            &reconstruction_downloader,
+            &ManagedReconstructionContext::version_bundle(),
+        )
+        .await
+        .expect("retain exact legacy installer VersionBundle sources");
+        assert!(version_bundle.retained_version_bundle_sources_match_projection());
+        assert_eq!(snapshot_tree(&root), before);
 
         for server in [client_server, version_server, installer_server] {
             server.stop();
@@ -2489,6 +2524,15 @@ printf '%s' 'processor-terminal' > "$last"
                 install_receipt.into_activation_source().into_parts(),
                 reconstructed.into_activation_source().into_parts()
             );
+            let version_bundle = super::reconstruct_legacy_authority_with_downloader(
+                &plan,
+                &reconstruction_downloader,
+                &ManagedReconstructionContext::version_bundle(),
+            )
+            .await
+            .expect("retain exact earliest-archive VersionBundle sources");
+            assert!(version_bundle.retained_version_bundle_sources_match_projection());
+            assert_eq!(snapshot_tree(&root), before);
 
             for server in [client_server, version_server, archive_server] {
                 server.stop();
@@ -4859,6 +4903,18 @@ esac
                 if digest.as_str() == sha1_hex(TEST_PROCESSOR_TERMINAL_BYTES)
                     && *size == TEST_PROCESSOR_TERMINAL_BYTES.len() as u64
         ));
+
+        let version_bundle_context = ManagedReconstructionContext::version_bundle();
+        let version_bundle = reconstruct_installer_authority_with_downloader(
+            &plan,
+            &Downloader::with_test_install_manifest(&root, manifest.clone())
+                .with_test_runtime_source(runtime.descriptor.clone()),
+            &version_bundle_context,
+        )
+        .await
+        .expect("retain exact processor VersionBundle sources");
+        assert!(version_bundle.retained_version_bundle_sources_match_projection());
+        assert_eq!(snapshot_tree(&root), before);
 
         if matches!(shape, ProcessorFixtureShape::ForgeModern) {
             let guarded_root = crate::managed_fs::ManagedDir::open_root(&root)

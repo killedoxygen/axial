@@ -297,6 +297,38 @@ async fn reconstruction_matches_install_without_touching_seeded_destinations() {
     }
     drop(prepared);
 
+    let version_bundle = timeout(
+        Duration::from_secs(10),
+        downloader.reconstruct_version_authority(
+            "reconstruction",
+            &ManagedReconstructionContext::version_bundle(),
+        ),
+    )
+    .await
+    .expect("VersionBundle reconstruction must not deadlock")
+    .expect("retain exact vanilla VersionBundle sources");
+    assert!(version_bundle.retained_version_bundle_sources_match_projection());
+    assert_eq!(snapshot_tree(&root), before);
+    let version_bundle_requests =
+        std::iter::from_fn(|| requests.try_recv().ok()).collect::<Vec<_>>();
+    for path in [
+        "/version.json",
+        "/client.jar",
+        "/libraries/observed.jar",
+        "/libraries/observed-two.jar",
+        "/asset-index.json",
+        "/log-config.xml",
+    ] {
+        assert_eq!(
+            version_bundle_requests
+                .iter()
+                .filter(|request| request.as_str() == path)
+                .count(),
+            1,
+            "VersionBundle reconstruction must fetch {path} exactly once"
+        );
+    }
+
     let installed = timeout(
         Duration::from_secs(10),
         downloader.install_version("reconstruction", |_| {}),

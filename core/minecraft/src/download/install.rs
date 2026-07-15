@@ -59,9 +59,8 @@ use crate::runtime::{
     TestRuntimeSourceDescriptor, acquire_test_runtime_source, authenticated_test_runtime_source,
 };
 use crate::version_bundle_publication::{
-    ManagedVersionBundleCommitReceipt, ManagedVersionBundleFailureReceipt,
-    ManagedVersionBundleSettlementFailure, ManagedVersionBundleSettlementOutcome,
-    publish_version_bundle,
+    VersionBundleTransactionSettledOutcome, publish_version_bundle,
+    settle_version_bundle_publication,
 };
 use futures_util::StreamExt;
 use sha1::{Digest as _, Sha1};
@@ -92,6 +91,12 @@ enum DownloaderRoot {
 pub(crate) struct AuthenticatedVersionBundleSource {
     version_id: String,
     members: Vec<AuthenticatedVersionBundleMemberSource>,
+}
+
+pub(crate) struct RetainedVersionBundleReconstructionSources {
+    version_json: Arc<[u8]>,
+    client_jar: Arc<[u8]>,
+    log_config: Option<Arc<[u8]>>,
 }
 
 pub(crate) struct AuthenticatedVersionBundleMemberSource {
@@ -189,6 +194,54 @@ impl AuthenticatedVersionBundleSource {
         }
         Ok(source)
     }
+
+    pub(crate) fn from_reconstruction_projection(
+        version_id: String,
+        projection: &ManagedComponentProjection<'_>,
+        sources: RetainedVersionBundleReconstructionSources,
+    ) -> Result<Self, DownloadError> {
+        let version_json_identity = projected_member_identity(
+            &version_id,
+            projection,
+            KnownGoodArtifactKind::VersionMetadata,
+        )?;
+        let client_jar_identity =
+            projected_member_identity(&version_id, projection, KnownGoodArtifactKind::ClientJar)?;
+        let projected_log_identity = projected_optional_log_identity(projection)?;
+        if projected_log_identity.is_some() != sources.log_config.is_some() {
+            return Err(version_bundle_install_error(
+                "reconstructed version bundle logging source does not match the projection",
+            ));
+        }
+        let mut members = Vec::with_capacity(2 + usize::from(sources.log_config.is_some()));
+        members.push(AuthenticatedVersionBundleMemberSource::from_shared(
+            KnownGoodArtifactKind::VersionMetadata,
+            version_json_identity,
+            sources.version_json,
+        )?);
+        members.push(AuthenticatedVersionBundleMemberSource::from_shared(
+            KnownGoodArtifactKind::ClientJar,
+            client_jar_identity,
+            sources.client_jar,
+        )?);
+        if let (Some(identity), Some(bytes)) = (projected_log_identity, sources.log_config) {
+            members.push(AuthenticatedVersionBundleMemberSource::from_shared(
+                KnownGoodArtifactKind::LogConfig,
+                identity,
+                bytes,
+            )?);
+        }
+        let source = Self {
+            version_id,
+            members,
+        };
+        if !source.matches_projection(projection) {
+            return Err(version_bundle_install_error(
+                "reconstructed version bundle sources do not match the projection",
+            ));
+        }
+        Ok(source)
+    }
 }
 
 impl AuthenticatedVersionBundleMemberSource {
@@ -268,6 +321,40 @@ impl AuthenticatedVersionBundleMemberSource {
         })
     }
 
+    fn from_shared(
+        kind: KnownGoodArtifactKind,
+        logical_identity: String,
+        bytes: Arc<[u8]>,
+    ) -> Result<Self, DownloadError> {
+        if !matches!(
+            kind,
+            KnownGoodArtifactKind::VersionMetadata
+                | KnownGoodArtifactKind::ClientJar
+                | KnownGoodArtifactKind::LogConfig
+        ) || logical_identity.trim().is_empty()
+        {
+            return Err(version_bundle_install_error(
+                "reconstructed version bundle member identity is invalid",
+            ));
+        }
+        let observed_size = u64::try_from(bytes.len()).map_err(|_| {
+            version_bundle_install_error("reconstructed version bundle source is too large")
+        })?;
+        if observed_size == 0 || observed_size > MAX_TIER2_ARTIFACT_BYTES {
+            return Err(version_bundle_install_error(
+                "reconstructed version bundle source exceeds the admitted bounds",
+            ));
+        }
+        let observed_sha1 = format!("{:x}", Sha1::digest(&bytes));
+        Ok(Self {
+            kind,
+            logical_identity,
+            bytes,
+            observed_sha1,
+            observed_size,
+        })
+    }
+
     pub(crate) fn kind(&self) -> KnownGoodArtifactKind {
         self.kind
     }
@@ -286,6 +373,79 @@ impl AuthenticatedVersionBundleMemberSource {
 
     fn observed_size(&self) -> u64 {
         self.observed_size
+    }
+}
+
+impl RetainedVersionBundleReconstructionSources {
+    fn from_authenticated(
+        version_json: &AuthenticatedSelectedArtifactSource,
+        client_jar: &AuthenticatedSelectedArtifactSource,
+        log_config: Option<&AuthenticatedSelectedArtifactSource>,
+    ) -> Result<Self, DownloadError> {
+        if version_json.kind() != SelectedDownloadArtifactKind::VersionJson
+            || client_jar.kind() != SelectedDownloadArtifactKind::ClientJar
+            || log_config
+                .is_some_and(|source| source.kind() != SelectedDownloadArtifactKind::LogConfig)
+        {
+            return Err(version_bundle_install_error(
+                "reconstructed version bundle selected-source shape is invalid",
+            ));
+        }
+        Ok(Self {
+            version_json: version_json.shared_bytes(),
+            client_jar: client_jar.shared_bytes(),
+            log_config: log_config.map(AuthenticatedSelectedArtifactSource::shared_bytes),
+        })
+    }
+
+    pub(crate) fn replace_final(self, version_json: Vec<u8>, client_jar: Option<Vec<u8>>) -> Self {
+        Self {
+            version_json: version_json.into(),
+            client_jar: client_jar.map(Arc::<[u8]>::from).unwrap_or(self.client_jar),
+            log_config: self.log_config,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn matches_projection(&self, projection: &ManagedComponentProjection<'_>) -> bool {
+        if projection.component() != ManagedKnownGoodComponent::VersionBundle {
+            return false;
+        }
+        let expected_count = 2 + usize::from(self.log_config.is_some());
+        projection.entry_count() == expected_count
+            && projection.entries().iter().all(|projected| {
+                let bytes = match projected.entry().kind() {
+                    KnownGoodArtifactKind::VersionMetadata => self.version_json.as_ref(),
+                    KnownGoodArtifactKind::ClientJar => self.client_jar.as_ref(),
+                    KnownGoodArtifactKind::LogConfig => {
+                        let Some(bytes) = self.log_config.as_deref() else {
+                            return false;
+                        };
+                        bytes
+                    }
+                    _ => return false,
+                };
+                let (KnownGoodIntegrity::Sha1 { digest, size }
+                | KnownGoodIntegrity::ExactBytes { digest, size }) = projected.entry().integrity()
+                else {
+                    return false;
+                };
+                *size == bytes.len() as u64
+                    && digest.as_str() == format!("{:x}", Sha1::digest(bytes))
+            })
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn from_local_final(
+        version_json: Vec<u8>,
+        client_jar: Vec<u8>,
+        log_config: Option<Vec<u8>>,
+    ) -> Self {
+        Self {
+            version_json: version_json.into(),
+            client_jar: client_jar.into(),
+            log_config: log_config.map(Arc::<[u8]>::from),
+        }
     }
 }
 
@@ -312,6 +472,7 @@ pub(crate) struct ManagedReconstructionContext {
 #[derive(Clone)]
 enum ManagedReconstructionMode {
     ProofOnly,
+    VersionBundle,
     Libraries {
         source_pool: LibrarySourcePool,
         cache_admission: ExactLibraryCacheAdmission,
@@ -364,6 +525,16 @@ impl ManagedReconstructionContext {
         })
     }
 
+    pub(crate) fn version_bundle() -> Self {
+        Self {
+            mode: ManagedReconstructionMode::VersionBundle,
+        }
+    }
+
+    fn retains_version_bundle_sources(&self) -> bool {
+        matches!(&self.mode, ManagedReconstructionMode::VersionBundle)
+    }
+
     pub(crate) fn retains_library_sources(&self) -> bool {
         matches!(&self.mode, ManagedReconstructionMode::Libraries { .. })
     }
@@ -371,9 +542,9 @@ impl ManagedReconstructionContext {
     fn phase_library_source_pool(&self) -> Result<LibrarySourcePool, DownloadError> {
         match &self.mode {
             ManagedReconstructionMode::Libraries { source_pool, .. } => Ok(source_pool.clone()),
-            ManagedReconstructionMode::ProofOnly | ManagedReconstructionMode::Assets { .. } => {
-                LibrarySourcePool::new()
-            }
+            ManagedReconstructionMode::ProofOnly
+            | ManagedReconstructionMode::VersionBundle
+            | ManagedReconstructionMode::Assets { .. } => LibrarySourcePool::new(),
         }
     }
 
@@ -387,7 +558,9 @@ impl ManagedReconstructionContext {
                 cache_proofs,
                 ..
             } => (cache_admission, cache_proofs),
-            ManagedReconstructionMode::ProofOnly | ManagedReconstructionMode::Assets { .. } => {
+            ManagedReconstructionMode::ProofOnly
+            | ManagedReconstructionMode::VersionBundle
+            | ManagedReconstructionMode::Assets { .. } => {
                 return Ok(true);
             }
         };
@@ -441,7 +614,9 @@ impl ManagedReconstructionContext {
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner),
             ),
-            ManagedReconstructionMode::ProofOnly | ManagedReconstructionMode::Assets { .. } => {
+            ManagedReconstructionMode::ProofOnly
+            | ManagedReconstructionMode::VersionBundle
+            | ManagedReconstructionMode::Assets { .. } => {
                 AuthenticatedLibraryCacheProofSet::default()
             }
         }
@@ -452,9 +627,9 @@ impl ManagedReconstructionContext {
             ManagedReconstructionMode::Assets {
                 source_pool, cache, ..
             } => Some((source_pool.clone(), cache.clone())),
-            ManagedReconstructionMode::ProofOnly | ManagedReconstructionMode::Libraries { .. } => {
-                None
-            }
+            ManagedReconstructionMode::ProofOnly
+            | ManagedReconstructionMode::VersionBundle
+            | ManagedReconstructionMode::Libraries { .. } => None,
         }
     }
 
@@ -536,6 +711,7 @@ pub(crate) struct ReconstructedVanillaProcessorAuthority {
 pub(crate) struct PendingReconstructedVanillaProcessorAuthority {
     parts: VanillaAuthorityParts,
     library_sources: RetainedLibrarySourceSet,
+    version_bundle_sources: Option<RetainedVersionBundleReconstructionSources>,
 }
 
 impl ReconstructedVanillaClientAuthority {
@@ -579,6 +755,7 @@ impl PendingReconstructedVanillaProcessorAuthority {
         seal_reconstructed_vanilla(ReconstructedVanillaAuthority::new(
             self.parts,
             self.library_sources,
+            self.version_bundle_sources,
         ))
         .map_err(|error| {
             DownloadError::ResolveManifest(format!(
@@ -616,6 +793,18 @@ struct VanillaAuthorityParts {
 pub(crate) struct ReconstructedVanillaAuthority {
     parts: VanillaAuthorityParts,
     library_sources: RetainedLibrarySourceSet,
+    version_bundle_sources: Option<RetainedVersionBundleReconstructionSources>,
+}
+
+pub(crate) struct ReconstructedVanillaAuthorityParts {
+    pub(crate) version: VersionJson,
+    pub(crate) environment: Environment,
+    pub(crate) libraries: crate::known_good_libraries::SealedExactLibraryDeclarations,
+    pub(crate) version_source: AuthenticatedSelectedArtifactSource,
+    pub(crate) asset_source: Option<AuthenticatedSelectedArtifactSource>,
+    pub(crate) runtime_source: Option<RuntimeSourceReceipt>,
+    pub(crate) library_sources: RetainedLibrarySourceSet,
+    pub(crate) version_bundle_sources: Option<RetainedVersionBundleReconstructionSources>,
 }
 
 pub(crate) struct PreparedManagedInstall {
@@ -643,35 +832,31 @@ pub(crate) struct AuthenticatedVanillaInstallSources {
 }
 
 impl ReconstructedVanillaAuthority {
-    fn new(parts: VanillaAuthorityParts, library_sources: RetainedLibrarySourceSet) -> Self {
+    fn new(
+        parts: VanillaAuthorityParts,
+        library_sources: RetainedLibrarySourceSet,
+        version_bundle_sources: Option<RetainedVersionBundleReconstructionSources>,
+    ) -> Self {
         Self {
             parts,
             library_sources,
+            version_bundle_sources,
         }
     }
 
-    pub(crate) fn into_parts(
-        self,
-    ) -> (
-        VersionJson,
-        Environment,
-        crate::known_good_libraries::SealedExactLibraryDeclarations,
-        AuthenticatedSelectedArtifactSource,
-        Option<AuthenticatedSelectedArtifactSource>,
-        Option<RuntimeSourceReceipt>,
-        RetainedLibrarySourceSet,
-    ) {
+    pub(crate) fn into_parts(self) -> ReconstructedVanillaAuthorityParts {
         let (version, environment, libraries, version_source, asset_index_source, runtime_source) =
             self.parts.into_parts();
-        (
+        ReconstructedVanillaAuthorityParts {
             version,
             environment,
             libraries,
             version_source,
-            asset_index_source,
+            asset_source: asset_index_source,
             runtime_source,
-            self.library_sources,
-        )
+            library_sources: self.library_sources,
+            version_bundle_sources: self.version_bundle_sources,
+        }
     }
 }
 
@@ -858,9 +1043,27 @@ impl Downloader {
         let (authority, library_sources) = self
             .reconstruct_vanilla_authority(version_id, &version_manifest_entry, context)
             .await?;
+        let version_bundle_sources = if context.retains_version_bundle_sources() {
+            let client_source = self
+                .acquire_version_bundle_client_source(version_id, &authority.version)
+                .await?;
+            let log_config_source = self
+                .acquire_version_bundle_log_source(&authority.version)
+                .await?;
+            Some(
+                RetainedVersionBundleReconstructionSources::from_authenticated(
+                    &authority.version_source,
+                    &client_source,
+                    log_config_source.as_ref(),
+                )?,
+            )
+        } else {
+            None
+        };
         seal_reconstructed_vanilla(ReconstructedVanillaAuthority::new(
             authority,
             library_sources,
+            version_bundle_sources,
         ))
         .map_err(|error| {
             DownloadError::ResolveManifest(format!(
@@ -874,12 +1077,13 @@ impl Downloader {
         version_id: &str,
         context: &ManagedReconstructionContext,
     ) -> Result<ReconstructedVanillaClientAuthority, DownloadError> {
-        let (authority, library_sources, client_source) = self
+        let (authority, library_sources, client_source, version_bundle_sources) = self
             .reconstruct_version_with_client_authority(version_id, context)
             .await?;
         let reconstruction = seal_reconstructed_vanilla(ReconstructedVanillaAuthority::new(
             authority,
             library_sources,
+            version_bundle_sources,
         ))
         .map_err(|error| {
             DownloadError::ResolveManifest(format!(
@@ -897,7 +1101,7 @@ impl Downloader {
         version_id: &str,
         context: &ManagedReconstructionContext,
     ) -> Result<ReconstructedVanillaProcessorAuthority, DownloadError> {
-        let (mut authority, library_sources, client_source) = self
+        let (mut authority, library_sources, client_source, version_bundle_sources) = self
             .reconstruct_version_with_client_authority(version_id, context)
             .await?;
         let runtime_source = authority.runtime_source.take().ok_or_else(|| {
@@ -909,6 +1113,7 @@ impl Downloader {
             pending: PendingReconstructedVanillaProcessorAuthority {
                 parts: authority,
                 library_sources,
+                version_bundle_sources,
             },
             client_source,
             runtime_source,
@@ -942,6 +1147,37 @@ impl Downloader {
         .await
     }
 
+    async fn acquire_version_bundle_log_source(
+        &self,
+        version: &VersionJson,
+    ) -> Result<Option<AuthenticatedSelectedArtifactSource>, DownloadError> {
+        let Some(logging) = version
+            .logging
+            .as_ref()
+            .and_then(|logging| logging.client.as_ref())
+        else {
+            return Ok(None);
+        };
+        let expected = ExpectedIntegrity::from_mojang(logging.file.size, &logging.file.sha1);
+        let max_bytes = exact_version_bundle_source_limit(logging.file.size, "log config")?;
+        let target = selected_download_source_label(
+            SelectedDownloadArtifactKind::LogConfig,
+            &logging.file.id,
+        );
+        acquire_authenticated_selected_artifact_source(SelectedArtifactSourceRequest {
+            client: &self.client,
+            kind: SelectedDownloadArtifactKind::LogConfig,
+            url: &logging.file.url,
+            logical_identity: &logging.file.id,
+            expected: &expected,
+            max_bytes,
+            target: &target,
+            fact_tx: None,
+        })
+        .await
+        .map(Some)
+    }
+
     async fn reconstruct_version_with_client_authority(
         &self,
         version_id: &str,
@@ -951,6 +1187,7 @@ impl Downloader {
             VanillaAuthorityParts,
             RetainedLibrarySourceSet,
             AuthenticatedSelectedArtifactSource,
+            Option<RetainedVersionBundleReconstructionSources>,
         ),
         DownloadError,
     > {
@@ -962,7 +1199,26 @@ impl Downloader {
         let client_source = self
             .acquire_version_bundle_client_source(version_id, &authority.version)
             .await?;
-        Ok((authority, library_sources, client_source))
+        let version_bundle_sources = if context.retains_version_bundle_sources() {
+            let log_config_source = self
+                .acquire_version_bundle_log_source(&authority.version)
+                .await?;
+            Some(
+                RetainedVersionBundleReconstructionSources::from_authenticated(
+                    &authority.version_source,
+                    &client_source,
+                    log_config_source.as_ref(),
+                )?,
+            )
+        } else {
+            None
+        };
+        Ok((
+            authority,
+            library_sources,
+            client_source,
+            version_bundle_sources,
+        ))
     }
 
     async fn reconstruct_vanilla_authority(
@@ -2199,12 +2455,6 @@ fn parse_vanilla_version_source(
     Ok(version)
 }
 
-enum LocalVersionBundleSettlement {
-    Commit(ManagedVersionBundleCommitReceipt),
-    Failure(ManagedVersionBundleFailureReceipt),
-    Retry(ManagedVersionBundleSettlementFailure),
-}
-
 pub(crate) fn prepare_local_managed_install(
     authority: PendingKnownGoodInstallAuthority,
     version_json: Vec<u8>,
@@ -2277,22 +2527,16 @@ async fn complete_prepared_version_bundle_install(
         })?;
         publish_version_bundle(lease, source, projection).await
     };
-    let settlement = match publication {
-        Ok(receipt) => LocalVersionBundleSettlement::Commit(receipt),
-        Err(error) => match error.into_effect_receipt() {
-            Some(receipt) => LocalVersionBundleSettlement::Failure(receipt),
-            None => {
-                return Err(version_bundle_install_error(
-                    "version bundle publication failed before settlement",
-                ));
-            }
-        },
-    };
-    match settle_local_version_bundle(settlement).await {
-        ManagedVersionBundleSettlementOutcome::Committed => {
+    let settlement = settle_version_bundle_publication(publication)
+        .await
+        .map_err(|_| {
+            version_bundle_install_error("version bundle publication failed before settlement")
+        })?;
+    match settlement {
+        VersionBundleTransactionSettledOutcome::Committed(_lease) => {
             Ok(authority.seal_after_version_bundle_commit())
         }
-        ManagedVersionBundleSettlementOutcome::RolledBack { .. } => Err(
+        VersionBundleTransactionSettledOutcome::RolledBack { .. } => Err(
             version_bundle_install_error("version bundle publication rolled back"),
         ),
     }
@@ -2344,28 +2588,6 @@ fn notify_managed_install_lease_wait_for_test(version_id: &str) {
         .remove(version_id);
     if let Some(observer) = observer {
         let _ = observer.send(());
-    }
-}
-
-async fn settle_local_version_bundle(
-    mut settlement: LocalVersionBundleSettlement,
-) -> ManagedVersionBundleSettlementOutcome {
-    let mut retry_delay = std::time::Duration::from_millis(25);
-    let maximum_retry_delay = std::time::Duration::from_secs(1);
-    loop {
-        let attempted = match settlement {
-            LocalVersionBundleSettlement::Commit(receipt) => receipt.settle().await,
-            LocalVersionBundleSettlement::Failure(receipt) => receipt.settle().await,
-            LocalVersionBundleSettlement::Retry(retry) => retry.retry().await,
-        };
-        match attempted {
-            Ok(outcome) => return outcome,
-            Err(retry) => {
-                settlement = LocalVersionBundleSettlement::Retry(retry);
-                tokio::time::sleep(retry_delay).await;
-                retry_delay = retry_delay.saturating_mul(2).min(maximum_retry_delay);
-            }
-        }
     }
 }
 

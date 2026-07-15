@@ -25,7 +25,9 @@ pub use install::Downloader;
 pub(crate) use install::{
     AuthenticatedVanillaInstallSources, AuthenticatedVersionBundleMemberSource,
     AuthenticatedVersionBundleSource, ManagedReconstructionContext, PreparedManagedInstall,
-    ReconstructedVanillaAuthority, prepare_local_managed_install, publish_prepared_managed_install,
+    ReconstructedVanillaAuthority, ReconstructedVanillaAuthorityParts,
+    RetainedVersionBundleReconstructionSources, prepare_local_managed_install,
+    publish_prepared_managed_install,
 };
 pub(crate) use install::{
     reconstruct_installer_library_declarations, reconstruct_installer_processor_sources,
