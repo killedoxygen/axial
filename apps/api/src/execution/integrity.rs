@@ -9,10 +9,10 @@ use super::{
 use crate::observability::{EvidenceField, EvidenceSensitivity};
 use crate::state::contracts::{OwnershipClass, StabilizationSystem, TargetDescriptor, TargetKind};
 use crate::state::{
-    AppState, IdleSweepCancellation, IdleSweepReservation, IdleSweepSettlement, IdleSweepTerminal,
-    InstanceLifecycleLease, IntegrityForegroundLease, KnownGoodTier2Ticket,
-    KnownGoodVerificationLease, KnownGoodVerificationUnavailable, RegisteredArtifactCondition,
-    RegisteredArtifactFindings, RegisteredArtifactObservation,
+    AppState, IdleSweepCancellation, IdleSweepReservation, InstanceLifecycleLease,
+    IntegrityForegroundLease, KnownGoodTier2Ticket, KnownGoodVerificationLease,
+    KnownGoodVerificationUnavailable, RegisteredArtifactCondition, RegisteredArtifactFindings,
+    RegisteredArtifactObservation,
 };
 use axial_minecraft::ManagedRuntimeCache;
 #[cfg(test)]
@@ -2232,11 +2232,40 @@ pub(crate) struct IntegrityTier2OwnedWork {
     reservation: IdleSweepReservation,
 }
 
-#[derive(Debug)]
-#[must_use = "Tier 2 result records the finalized report and sweep settlement"]
+pub(crate) struct IntegrityTier2OwnedWorkAuthorityMismatch {
+    ticket: KnownGoodTier2Ticket,
+    reservation: IdleSweepReservation,
+}
+
+impl std::fmt::Debug for IntegrityTier2OwnedWorkAuthorityMismatch {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("IntegrityTier2OwnedWorkAuthorityMismatch")
+            .finish_non_exhaustive()
+    }
+}
+
+impl IntegrityTier2OwnedWorkAuthorityMismatch {
+    pub(crate) fn into_parts(self) -> (KnownGoodTier2Ticket, IdleSweepReservation) {
+        (self.ticket, self.reservation)
+    }
+}
+
+#[must_use = "Tier 2 completion retains the ticket and unsettled sweep reservation"]
 pub(crate) struct IntegrityTier2OwnedResult {
     pub(crate) report: IntegrityTier2Report,
-    pub(crate) settlement: IdleSweepSettlement,
+    pub(crate) ticket: KnownGoodTier2Ticket,
+    pub(crate) reservation: IdleSweepReservation,
+}
+
+impl std::fmt::Debug for IntegrityTier2OwnedResult {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("IntegrityTier2OwnedResult")
+            .field("report", &self.report)
+            .field("sweep_ownership", &"retained")
+            .finish()
+    }
 }
 
 #[must_use = "Tier 2 blocking ownership must be joined through physical completion"]
@@ -2245,7 +2274,7 @@ pub(crate) struct IntegrityTier2BlockingWorker {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
-#[error("Tier 2 dedicated worker stopped before terminal settlement")]
+#[error("Tier 2 dedicated worker stopped before returning sweep ownership")]
 pub(crate) struct IntegrityTier2BlockingWorkerUnavailable;
 
 trait IntegrityTier2ThreadSpawner: Send + 'static {
@@ -2269,12 +2298,18 @@ impl IntegrityTier2OwnedWork {
         state: AppState,
         ticket: KnownGoodTier2Ticket,
         reservation: IdleSweepReservation,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, IntegrityTier2OwnedWorkAuthorityMismatch> {
+        if !ticket.matches_reservation(&reservation) {
+            return Err(IntegrityTier2OwnedWorkAuthorityMismatch {
+                ticket,
+                reservation,
+            });
+        }
+        Ok(Self {
             state,
             ticket,
             reservation,
-        }
+        })
     }
 
     pub(crate) fn spawn(self) -> IntegrityTier2BlockingWorker {
@@ -2352,40 +2387,31 @@ where
         reservation,
     } = work;
     let cancellation = reservation.cancellation();
-    let mut report = settle_integrity_tier2_owned(platform, || {
-        sense_integrity_tier2_owned(&state, ticket, &cancellation)
+    let report = run_integrity_tier2_owned(platform, || {
+        sense_integrity_tier2_owned(&state, &ticket, &cancellation)
     });
-    let terminal = match report.status {
-        IntegrityTier2Status::Complete => IdleSweepTerminal::Complete,
-        IntegrityTier2Status::Cancelled => IdleSweepTerminal::Cancelled,
-        IntegrityTier2Status::Refused => IdleSweepTerminal::Refused,
-    };
-    let settlement = reservation.settle(terminal);
-    report = finalize_integrity_tier2_report(report, settlement);
-    IntegrityTier2OwnedResult { report, settlement }
-}
-
-fn finalize_integrity_tier2_report(
-    report: IntegrityTier2Report,
-    settlement: IdleSweepSettlement,
-) -> IntegrityTier2Report {
-    if report.status == IntegrityTier2Status::Complete
-        && settlement == IdleSweepSettlement::Superseded
-    {
-        report.cancel()
-    } else {
-        report
+    IntegrityTier2OwnedResult {
+        report,
+        ticket,
+        reservation,
     }
 }
 
 fn refuse_integrity_tier2_thread_spawn(work: IntegrityTier2OwnedWork) -> IntegrityTier2OwnedResult {
-    let IntegrityTier2OwnedWork { reservation, .. } = work;
+    let IntegrityTier2OwnedWork {
+        ticket,
+        reservation,
+        ..
+    } = work;
     let report = IntegrityTier2Report::new(0, 0).refuse(tier2_worker_refused_fact());
-    let settlement = reservation.settle(IdleSweepTerminal::Refused);
-    IntegrityTier2OwnedResult { report, settlement }
+    IntegrityTier2OwnedResult {
+        report,
+        ticket,
+        reservation,
+    }
 }
 
-fn settle_integrity_tier2_owned<Platform>(
+fn run_integrity_tier2_owned<Platform>(
     platform: Platform,
     run: impl FnOnce() -> IntegrityTier2Report,
 ) -> IntegrityTier2Report
@@ -2423,7 +2449,7 @@ impl IntegrityTier2Report {
         }
     }
 
-    fn cancel(mut self) -> Self {
+    pub(crate) fn cancel(mut self) -> Self {
         self.status = IntegrityTier2Status::Cancelled;
         self.facts.clear();
         self.suppressed_fact_count = 0;
@@ -2555,7 +2581,7 @@ struct IntegrityTier2RunContext<'a, Pacer> {
 
 fn sense_integrity_tier2_owned(
     state: &AppState,
-    ticket: KnownGoodTier2Ticket,
+    ticket: &KnownGoodTier2Ticket,
     cancellation: &IdleSweepCancellation,
 ) -> IntegrityTier2Report {
     let (library_root, runtime_cache, inventory) = ticket.execution_parts();
@@ -3166,8 +3192,8 @@ mod tests {
         StabilizationSystem,
     };
     use crate::state::{
-        AppState, AppStateInit, InstallStore, RegisteredArtifactRepairAuthorizationRejection,
-        SessionStore,
+        AppState, AppStateInit, IdleSweepSettlement, IdleSweepTerminal, InstallStore,
+        RegisteredArtifactRepairAuthorizationRejection, SessionStore,
     };
     use axial_config::{AppConfig, AppPaths, ConfigStore, InstanceRegistrySnapshot, InstanceStore};
     use axial_minecraft::known_good::{
@@ -3855,11 +3881,35 @@ mod tests {
             .try_reserve_idle_sweep(idle_epoch, producer)
             .expect("idle sweep reservation");
         let ticket = state
-            .mint_known_good_tier2_ticket(&reservation, &instance.id)
+            .mint_known_good_tier2_ticket(&reservation.authority(), &instance.id)
             .await
             .expect("Tier 2 ticket");
-        let work = IntegrityTier2OwnedWork::new(state.clone(), ticket, reservation);
+        let work = IntegrityTier2OwnedWork::new(state.clone(), ticket, reservation)
+            .expect("matching Tier 2 ownership");
         (state, root, work)
+    }
+
+    fn settle_tier2_result(
+        result: IntegrityTier2OwnedResult,
+    ) -> (IntegrityTier2Report, IdleSweepSettlement) {
+        let IntegrityTier2OwnedResult {
+            mut report,
+            ticket,
+            reservation,
+        } = result;
+        let terminal = match report.status {
+            IntegrityTier2Status::Complete => IdleSweepTerminal::Complete,
+            IntegrityTier2Status::Cancelled => IdleSweepTerminal::Cancelled,
+            IntegrityTier2Status::Refused => IdleSweepTerminal::Refused,
+        };
+        let settlement = reservation.settle(terminal);
+        if report.status == IntegrityTier2Status::Complete
+            && settlement == IdleSweepSettlement::Superseded
+        {
+            report = report.cancel();
+        }
+        drop(ticket);
+        (report, settlement)
     }
 
     async fn test_integrity_foreground(state: &AppState) -> IntegrityForegroundLease {
@@ -4410,13 +4460,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tier_two_move_only_work_returns_the_final_report() {
+    async fn tier_two_worker_returns_current_unsettled_ownership_without_lifecycle() {
         let (state, root, work) = tier2_owned_work_fixture("tier2-owned-work").await;
 
         let result = work.spawn().join().await.expect("dedicated worker result");
-        let report = result.report;
+        assert!(result.reservation.is_current());
+        let instance_id = state
+            .instances()
+            .list()
+            .into_iter()
+            .next()
+            .expect("fixture instance")
+            .id;
+        let lifecycle = tokio::time::timeout(
+            Duration::from_millis(100),
+            state.acquire_instance_lifecycle(&instance_id),
+        )
+        .await
+        .expect("worker and completion ticket retain no instance lifecycle");
+        drop(lifecycle);
+        let (report, settlement) = settle_tier2_result(result);
 
-        assert_eq!(result.settlement, IdleSweepSettlement::Authoritative);
+        assert_eq!(settlement, IdleSweepSettlement::Authoritative);
         assert_eq!(report.status, IntegrityTier2Status::Complete);
         assert_eq!(report.selected_entry_count, 1);
         assert_eq!(report.verified_entry_count, 1);
@@ -4426,6 +4491,38 @@ mod tests {
         assert_eq!(
             report.facts[0].kind,
             ExecutionFactKind::ArtifactHashMismatch
+        );
+        close_fixture(state, root).await;
+    }
+
+    #[tokio::test]
+    async fn tier_two_worker_rejects_a_ticket_spliced_to_another_reservation() {
+        let (state, root, work) = tier2_owned_work_fixture("tier2-spliced-authority").await;
+        let IntegrityTier2OwnedWork {
+            state: work_state,
+            ticket,
+            reservation,
+        } = work;
+        reservation.settle(IdleSweepTerminal::Cancelled);
+        let epoch = state.subscribe_integrity_idle().borrow().epoch();
+        let replacement = state
+            .try_reserve_idle_sweep(
+                epoch,
+                state
+                    .try_claim_producer()
+                    .expect("claim replacement producer"),
+            )
+            .expect("replacement reservation");
+
+        let mismatch = match IntegrityTier2OwnedWork::new(work_state, ticket, replacement) {
+            Ok(_) => panic!("ticket and reservation capabilities must not splice"),
+            Err(mismatch) => mismatch,
+        };
+        let (_ticket, replacement) = mismatch.into_parts();
+        assert!(replacement.is_current());
+        assert_eq!(
+            replacement.settle(IdleSweepTerminal::Complete),
+            IdleSweepSettlement::Authoritative
         );
         close_fixture(state, root).await;
     }
@@ -4460,7 +4557,7 @@ mod tests {
             .try_reserve_idle_sweep(idle_epoch, producer)
             .expect("idle sweep reservation");
         let ticket = state
-            .mint_known_good_tier2_ticket(&reservation, &instance.id)
+            .mint_known_good_tier2_ticket(&reservation.authority(), &instance.id)
             .await
             .expect("Tier 2 ticket");
         let cancellation = reservation.cancellation();
@@ -4469,13 +4566,14 @@ mod tests {
             std::thread::sleep(Duration::from_millis(2));
             cancel_from_thread.cancel();
         });
-        let work = IntegrityTier2OwnedWork::new(state.clone(), ticket, reservation);
+        let work = IntegrityTier2OwnedWork::new(state.clone(), ticket, reservation)
+            .expect("matching Tier 2 ownership");
 
         let result = work.spawn().join().await.expect("dedicated worker result");
         canceller.join().expect("cancellation thread");
-        let report = result.report;
+        let (report, settlement) = settle_tier2_result(result);
 
-        assert_eq!(result.settlement, IdleSweepSettlement::Superseded);
+        assert_eq!(settlement, IdleSweepSettlement::Superseded);
         assert_eq!(report.status, IntegrityTier2Status::Cancelled);
         assert!(report.content_read_byte_count <= 64 * 1024);
         assert!(report.facts.is_empty());
@@ -4483,12 +4581,11 @@ mod tests {
     }
 
     #[test]
-    fn tier_two_owned_boundary_settles_worker_panics_as_one_bounded_refusal() {
+    fn tier_two_owned_boundary_contains_worker_panics_as_one_bounded_refusal() {
         let platform = ScriptedLowPriorityPlatform::successful();
 
-        let report = settle_integrity_tier2_owned(platform.clone(), || {
-            panic!("injected Tier 2 worker panic")
-        });
+        let report =
+            run_integrity_tier2_owned(platform.clone(), || panic!("injected Tier 2 worker panic"));
 
         assert_eq!(report.status, IntegrityTier2Status::Refused);
         assert_eq!(report.facts.len(), 1);
@@ -4510,14 +4607,15 @@ mod tests {
             .join()
             .await
             .expect("priority refusal result");
+        let (report, settlement) = settle_tier2_result(result);
 
-        assert_eq!(result.settlement, IdleSweepSettlement::Superseded);
-        assert_eq!(result.report.status, IntegrityTier2Status::Refused);
-        assert_eq!(result.report.selected_entry_count, 0);
-        assert_eq!(result.report.processed_entry_count, 0);
-        assert_eq!(result.report.facts.len(), 1);
+        assert_eq!(settlement, IdleSweepSettlement::Superseded);
+        assert_eq!(report.status, IntegrityTier2Status::Refused);
+        assert_eq!(report.selected_entry_count, 0);
+        assert_eq!(report.processed_entry_count, 0);
+        assert_eq!(report.facts.len(), 1);
         assert_eq!(
-            fact_field(&result.report.facts[0], "observation"),
+            fact_field(&report.facts[0], "observation"),
             Some("tier2_low_priority_enter_failed")
         );
         assert_eq!(platform.events(), vec!["enter"]);
@@ -4535,15 +4633,17 @@ mod tests {
             .join()
             .await
             .expect("bounded spawn refusal result");
+        assert!(result.reservation.is_current());
+        let (report, settlement) = settle_tier2_result(result);
 
-        assert_eq!(result.settlement, IdleSweepSettlement::Superseded);
-        assert_eq!(result.report.status, IntegrityTier2Status::Refused);
-        assert_eq!(result.report.selected_entry_count, 0);
-        assert_eq!(result.report.processed_entry_count, 0);
-        assert_eq!(result.report.content_read_byte_count, 0);
-        assert_eq!(result.report.facts.len(), 1);
+        assert_eq!(settlement, IdleSweepSettlement::Superseded);
+        assert_eq!(report.status, IntegrityTier2Status::Refused);
+        assert_eq!(report.selected_entry_count, 0);
+        assert_eq!(report.processed_entry_count, 0);
+        assert_eq!(report.content_read_byte_count, 0);
+        assert_eq!(report.facts.len(), 1);
         assert_eq!(
-            fact_field(&result.report.facts[0], "observation"),
+            fact_field(&report.facts[0], "observation"),
             Some("tier2_worker_unavailable")
         );
         assert!(platform.events().is_empty());
@@ -4561,7 +4661,7 @@ mod tests {
                     .wait_for_settlement(),
             )
             .await
-            .expect("refused worker settles reservation before returning"),
+            .expect("caller settlement releases refused worker ownership"),
         );
         close_fixture(state, root).await;
     }
@@ -4576,16 +4676,17 @@ mod tests {
             .join()
             .await
             .expect("priority refusal result");
+        let (report, settlement) = settle_tier2_result(result);
 
-        assert_eq!(result.settlement, IdleSweepSettlement::Superseded);
-        assert_eq!(result.report.status, IntegrityTier2Status::Refused);
-        assert_eq!(result.report.selected_entry_count, 1);
-        assert_eq!(result.report.processed_entry_count, 1);
-        assert_eq!(result.report.hashed_entry_count, 1);
-        assert_eq!(result.report.content_read_byte_count, 1);
-        assert_eq!(result.report.facts.len(), 1);
+        assert_eq!(settlement, IdleSweepSettlement::Superseded);
+        assert_eq!(report.status, IntegrityTier2Status::Refused);
+        assert_eq!(report.selected_entry_count, 1);
+        assert_eq!(report.processed_entry_count, 1);
+        assert_eq!(report.hashed_entry_count, 1);
+        assert_eq!(report.content_read_byte_count, 1);
+        assert_eq!(report.facts.len(), 1);
         assert_eq!(
-            fact_field(&result.report.facts[0], "observation"),
+            fact_field(&report.facts[0], "observation"),
             Some("tier2_low_priority_restore_failed")
         );
         assert_eq!(platform.events(), vec!["enter", "restore", "restore"]);
@@ -4610,9 +4711,11 @@ mod tests {
             .expect("dedicated worker finishes")
             .expect("join waiter")
             .expect("dedicated worker result");
+        assert!(result.reservation.is_current());
+        let (report, settlement) = settle_tier2_result(result);
 
-        assert_eq!(result.settlement, IdleSweepSettlement::Authoritative);
-        assert_eq!(result.report.status, IntegrityTier2Status::Complete);
+        assert_eq!(settlement, IdleSweepSettlement::Authoritative);
+        assert_eq!(report.status, IntegrityTier2Status::Complete);
         assert_eq!(platform.events(), vec!["enter", "restore"]);
         close_fixture(state, root).await;
     }
@@ -4663,20 +4766,8 @@ mod tests {
         assert_eq!(error, IntegrityTier2BlockingWorkerUnavailable);
         assert_eq!(
             error.to_string(),
-            "Tier 2 dedicated worker stopped before terminal settlement"
+            "Tier 2 dedicated worker stopped before returning sweep ownership"
         );
-    }
-
-    #[test]
-    fn superseded_complete_report_becomes_cancelled_and_discards_findings() {
-        let report = IntegrityTier2Report::new(1, 1).refuse(tier2_authority_refused_fact());
-        let mut report = report;
-        report.status = IntegrityTier2Status::Complete;
-
-        let report = finalize_integrity_tier2_report(report, IdleSweepSettlement::Superseded);
-
-        assert_eq!(report.status, IntegrityTier2Status::Cancelled);
-        assert!(report.facts.is_empty());
     }
 
     #[test]

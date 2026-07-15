@@ -73,8 +73,8 @@ pub use instance_registry::AppInstanceStore;
 pub(crate) use instance_registry::{InstanceUpdate, new_instance};
 pub(crate) use instance_registry::{ensure_instance_layout, instance_not_found_error};
 pub(crate) use integrity_activity::{
-    IdleSweepCancellation, IdleSweepReservation, IdleSweepReserveError, IdleSweepSettlement,
-    IdleSweepTerminal, IntegrityActivityClosed, IntegrityForegroundLease,
+    IdleSweepAuthority, IdleSweepCancellation, IdleSweepReservation, IdleSweepReserveError,
+    IdleSweepSettlement, IdleSweepTerminal, IntegrityActivityClosed, IntegrityForegroundLease,
     IntegrityForegroundRegistration, IntegrityIdleEpoch, IntegrityIdleSnapshot,
 };
 pub(crate) use java_probe_failures::{
@@ -898,6 +898,16 @@ impl AppState {
     ) -> Result<IdleSweepReservation, IdleSweepReserveError> {
         self.integrity_activity
             .try_reserve_idle_sweep(expected_epoch, producer)
+    }
+
+    pub(crate) fn idle_sweep_authority_is_current(&self, authority: &IdleSweepAuthority) -> bool {
+        self.integrity_activity
+            .owns_current_sweep_authority(authority)
+    }
+
+    pub(crate) fn idle_sweep_authority_is_active(&self, authority: &IdleSweepAuthority) -> bool {
+        self.integrity_activity
+            .owns_active_sweep_authority(authority)
     }
 
     #[cfg(test)]

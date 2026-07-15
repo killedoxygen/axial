@@ -193,9 +193,10 @@ impl IntegritySchedulerTransactions for ProductionIntegrityTransactions {
     }
 
     fn execute(&self, reserved: Self::Reserved) -> BoxFuture<'static, Result<(), &'static str>> {
+        let execution = reserved.start();
         Box::pin(async move {
-            reserved
-                .execute()
+            execution
+                .wait()
                 .await
                 .map(drop)
                 .map_err(|error| error.class())
@@ -1218,6 +1219,42 @@ mod tests {
         journal
     }
 
+    #[tokio::test]
+    async fn production_execute_survives_an_unpolled_waiter_dropped_for_shutdown() {
+        let (state, root) = state_fixture("unpolled-production-execute");
+        let instance_id = register_healthy_instance(&state, "Unpolled production execute");
+        let planned = plan_tier2_integrity_sweep(
+            state.clone(),
+            state
+                .try_claim_producer()
+                .expect("claim production sweep producer"),
+            instance_id,
+        )
+        .await
+        .expect("plan production sweep");
+        let epoch = state.subscribe_integrity_idle().borrow().epoch();
+        let reserved = match planned.reserve(epoch) {
+            Ok(reserved) => reserved,
+            Err(failure) => panic!("reserve production sweep: {}", failure.class()),
+        };
+
+        let unpolled_waiter = ProductionIntegrityTransactions.execute(reserved);
+        let quiesce = spawn_quiesce(&state);
+        drop(unpolled_waiter);
+
+        tokio::time::timeout(Duration::from_secs(5), quiesce)
+            .await
+            .expect("detached production owner reaches its durable terminal")
+            .expect("quiesce waiter");
+        let terminals = terminal_integrity_journals(&state);
+        assert_eq!(terminals.len(), 1);
+        assert!(matches!(
+            terminals[0].status,
+            OperationStatus::Succeeded | OperationStatus::Cancelled
+        ));
+        close_fixture(state, &root).await;
+    }
+
     #[tokio::test(start_paused = true)]
     async fn exact_epoch_aba_requires_a_fresh_full_threshold() {
         let (state, root) = state_fixture("epoch-aba");
@@ -1575,7 +1612,7 @@ mod tests {
         transactions.inner.worker_gate.release();
         tokio::time::timeout(Duration::from_secs(1), quiesce)
             .await
-            .expect("worker settlement releases the final lifecycle owner")
+            .expect("sweep settlement releases the final lifecycle owner")
             .expect("join quiesce");
         assert_eq!(
             integrity_journals(&state)[0].status,

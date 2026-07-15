@@ -100,6 +100,15 @@ pub(crate) struct IdleSweepCancellation {
     cancelled: Arc<AtomicBool>,
 }
 
+/// Cloneable read-only authority for one exact active idle sweep.
+#[derive(Clone)]
+pub(crate) struct IdleSweepAuthority {
+    coordinator: IntegrityActivityCoordinator,
+    id: u64,
+    epoch: IntegrityIdleEpoch,
+    cancellation: IdleSweepCancellation,
+}
+
 impl IdleSweepCancellation {
     fn new() -> Self {
         Self {
@@ -118,6 +127,10 @@ impl IdleSweepCancellation {
 
     pub(crate) fn is_cancelled(&self) -> bool {
         self.cancelled.load(Ordering::Acquire)
+    }
+
+    fn is_same(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.cancelled, &other.cancelled)
     }
 }
 
@@ -171,6 +184,27 @@ impl IntegrityActivityCoordinator {
 
     pub(super) fn owns_foreground(&self, lease: &IntegrityForegroundLease) -> bool {
         Arc::ptr_eq(&self.shared, &lease.hold.coordinator.shared)
+    }
+
+    pub(super) fn owns_current_sweep_authority(&self, authority: &IdleSweepAuthority) -> bool {
+        self.owns_active_sweep_authority(authority)
+            && self.reservation_is_current(authority.id, authority.epoch, &authority.cancellation)
+    }
+
+    pub(super) fn owns_active_sweep_authority(&self, authority: &IdleSweepAuthority) -> bool {
+        if !Arc::ptr_eq(&self.shared, &authority.coordinator.shared) {
+            return false;
+        }
+        let state = self
+            .shared
+            .state
+            .lock()
+            .expect(INTEGRITY_ACTIVITY_LOCK_INVARIANT);
+        state.active_sweep.as_ref().is_some_and(|sweep| {
+            sweep.id == authority.id
+                && sweep.epoch == authority.epoch
+                && sweep.cancellation.is_same(&authority.cancellation)
+        })
     }
 
     pub(super) fn register_foreground(
@@ -296,10 +330,9 @@ impl IntegrityActivityCoordinator {
             && state.foreground_count == 0
             && state.idle_epoch == epoch
             && !cancellation.is_cancelled()
-            && state
-                .active_sweep
-                .as_ref()
-                .is_some_and(|sweep| sweep.id == id && sweep.epoch == epoch)
+            && state.active_sweep.as_ref().is_some_and(|sweep| {
+                sweep.id == id && sweep.epoch == epoch && sweep.cancellation.is_same(cancellation)
+            })
     }
 
     fn release_foreground(&self) {
@@ -460,8 +493,24 @@ impl Drop for IntegrityForegroundHold {
 }
 
 impl IdleSweepReservation {
+    pub(crate) fn authority(&self) -> IdleSweepAuthority {
+        IdleSweepAuthority {
+            coordinator: self.coordinator.clone(),
+            id: self.id,
+            epoch: self.epoch,
+            cancellation: self.cancellation.clone(),
+        }
+    }
+
     pub(crate) fn cancellation(&self) -> IdleSweepCancellation {
         self.cancellation.clone()
+    }
+
+    pub(crate) fn matches_authority(&self, authority: &IdleSweepAuthority) -> bool {
+        Arc::ptr_eq(&self.coordinator.shared, &authority.coordinator.shared)
+            && self.id == authority.id
+            && self.epoch == authority.epoch
+            && self.cancellation.is_same(&authority.cancellation)
     }
 
     pub(crate) fn is_current(&self) -> bool {
@@ -746,6 +795,28 @@ mod tests {
             reservation.settle(IdleSweepTerminal::Complete),
             IdleSweepSettlement::Superseded
         );
+    }
+
+    #[test]
+    fn cancelled_authority_remains_active_only_until_its_reservation_settles() {
+        let coordinator = IntegrityActivityCoordinator::new();
+        let epoch = coordinator.subscribe_idle().borrow().epoch();
+        let reservation = coordinator
+            .try_reserve_idle_sweep(epoch, producer())
+            .expect("reservation");
+        let authority = reservation.authority();
+
+        assert!(coordinator.owns_current_sweep_authority(&authority));
+        assert!(coordinator.owns_active_sweep_authority(&authority));
+        reservation.cancellation().cancel();
+        assert!(!coordinator.owns_current_sweep_authority(&authority));
+        assert!(coordinator.owns_active_sweep_authority(&authority));
+
+        assert_eq!(
+            reservation.settle(IdleSweepTerminal::Cancelled),
+            IdleSweepSettlement::Superseded
+        );
+        assert!(!coordinator.owns_active_sweep_authority(&authority));
     }
 
     #[tokio::test]
