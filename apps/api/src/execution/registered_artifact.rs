@@ -1,4 +1,4 @@
-//! Confined mutation of one exact registered launcher-managed artifact.
+//! Confined verification and mutation of exact registered launcher-managed artifacts.
 
 use super::file::file_fact;
 use super::{ExecutionFact, ExecutionFactKind};
@@ -8,12 +8,42 @@ use futures_util::StreamExt;
 use reqwest::Client;
 use sha1::{Digest as _, Sha1};
 use std::io;
+use std::sync::Arc;
 
 pub(crate) struct RegisteredArtifactMutationCapability {
     #[cfg(unix)]
     inner: unix::ConfinedLeaf,
     #[cfg(windows)]
     inner: windows::ConfinedLeaf,
+}
+
+/// Fresh, read-only authority to verify one exact registered artifact leaf once.
+pub(crate) struct RegisteredArtifactExactVerifier {
+    #[cfg(unix)]
+    inner: unix::ConfinedLeaf,
+    #[cfg(windows)]
+    inner: windows::ConfinedLeaf,
+    expected_sha1: String,
+    expected_size: u64,
+    identity: Arc<()>,
+}
+
+pub(crate) struct RegisteredArtifactExactVerification {
+    identity: Arc<()>,
+}
+
+pub(crate) struct RegisteredArtifactExactProof {
+    #[cfg(unix)]
+    confined: unix::ConfinedLeaf,
+    #[cfg(windows)]
+    confined: windows::ConfinedLeaf,
+    #[cfg(unix)]
+    verified: unix::Verification,
+    #[cfg(windows)]
+    verified: windows::Verification,
+    identity: Arc<()>,
+    #[cfg(test)]
+    lifetime: Arc<()>,
 }
 
 pub(crate) struct RegisteredArtifactMutationReport {
@@ -228,7 +258,7 @@ impl RegisteredArtifactMutationCapability {
                 verification.verify(&expected_sha1, expected_size)
             })
             .await
-            .unwrap_or(false);
+            .is_ok_and(|verified| verified.is_some());
             return verified && self.is_current();
         }
         #[cfg(not(any(unix, windows)))]
@@ -257,6 +287,111 @@ impl RegisteredArtifactMutationCapability {
         } else {
             Some(RegisteredArtifactPhysicalState::Corrupt)
         }
+    }
+}
+
+impl RegisteredArtifactExactVerifier {
+    pub(crate) async fn mint(
+        path: KnownGoodPhysicalPath,
+        expected_sha1: String,
+        expected_size: u64,
+    ) -> io::Result<(Self, RegisteredArtifactExactVerification)> {
+        let identity = Arc::new(());
+        #[cfg(unix)]
+        {
+            let inner = tokio::task::spawn_blocking(move || unix::ConfinedLeaf::mint(path))
+                .await
+                .map_err(|error| io::Error::other(error.to_string()))??;
+            return Ok((
+                Self {
+                    inner,
+                    expected_sha1,
+                    expected_size,
+                    identity: identity.clone(),
+                },
+                RegisteredArtifactExactVerification { identity },
+            ));
+        }
+        #[cfg(windows)]
+        {
+            let inner = tokio::task::spawn_blocking(move || windows::ConfinedLeaf::mint(path))
+                .await
+                .map_err(|error| io::Error::other(error.to_string()))??;
+            return Ok((
+                Self {
+                    inner,
+                    expected_sha1,
+                    expected_size,
+                    identity: identity.clone(),
+                },
+                RegisteredArtifactExactVerification { identity },
+            ));
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = (path, expected_sha1, expected_size, identity);
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "registered artifact exact verification is unavailable on this platform",
+            ))
+        }
+    }
+
+    pub(crate) async fn verify(self) -> Result<RegisteredArtifactExactProof, ()> {
+        #[cfg(any(unix, windows))]
+        {
+            if self.inner.revalidate().is_err() {
+                return Err(());
+            }
+            let Some(verification) = self.inner.verification() else {
+                return Err(());
+            };
+            let expected_sha1 = self.expected_sha1;
+            let expected_size = self.expected_size;
+            let verified = tokio::task::spawn_blocking(move || {
+                verification.verify(&expected_sha1, expected_size)
+            })
+            .await
+            .ok()
+            .flatten();
+            if let Some(verified) = verified
+                && self.inner.revalidate().is_ok()
+                && verified.revalidate()
+            {
+                return Ok(RegisteredArtifactExactProof {
+                    confined: self.inner,
+                    verified,
+                    identity: self.identity,
+                    #[cfg(test)]
+                    lifetime: Arc::new(()),
+                });
+            }
+            Err(())
+        }
+        #[cfg(not(any(unix, windows)))]
+        Err(())
+    }
+}
+
+impl RegisteredArtifactExactVerification {
+    pub(crate) fn matches(&self, proof: &RegisteredArtifactExactProof) -> bool {
+        Arc::ptr_eq(&self.identity, &proof.identity) && proof.is_current()
+    }
+}
+
+impl RegisteredArtifactExactProof {
+    #[cfg(test)]
+    pub(crate) fn lifetime_for_test(&self) -> std::sync::Weak<()> {
+        Arc::downgrade(&self.lifetime)
+    }
+
+    fn is_current(&self) -> bool {
+        #[cfg(any(unix, windows))]
+        {
+            return self.confined.revalidate().is_ok() && self.verified.revalidate();
+        }
+        #[cfg(not(any(unix, windows)))]
+        false
     }
 }
 
@@ -371,6 +506,7 @@ mod unix {
         file: std::fs::File,
         device: u64,
         inode: u64,
+        size: u64,
         modified_seconds: i64,
         modified_nanoseconds: u64,
         changed_seconds: i64,
@@ -638,12 +774,16 @@ mod unix {
             )
             .ok()?;
             let stat = rustix::fs::fstat(&handle).ok()?;
-            (FileType::from_raw_mode(stat.st_mode) == FileType::RegularFile).then(|| Verification {
+            if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile {
+                return None;
+            }
+            Some(Verification {
                 parent: self.parent.clone(),
                 leaf: self.leaf.clone(),
                 file: std::fs::File::from(handle),
                 device: stat.st_dev,
                 inode: stat.st_ino,
+                size: u64::try_from(stat.st_size).ok()?,
                 modified_seconds: stat.st_mtime,
                 modified_nanoseconds: stat.st_mtime_nsec,
                 changed_seconds: stat.st_ctime,
@@ -653,10 +793,13 @@ mod unix {
     }
 
     impl Verification {
-        pub(super) fn verify(mut self, expected_sha1: &str, expected_size: u64) -> bool {
+        pub(super) fn verify(mut self, expected_sha1: &str, expected_size: u64) -> Option<Self> {
+            if self.size != expected_size {
+                return None;
+            }
             let before = match self.file.metadata() {
                 Ok(metadata) if metadata.is_file() && metadata.len() == expected_size => metadata,
-                _ => return false,
+                _ => return None,
             };
             let mut hasher = Sha1::new();
             let mut observed = 0_u64;
@@ -664,20 +807,20 @@ mod unix {
             loop {
                 let count = match self.file.read(&mut buffer) {
                     Ok(count) => count,
-                    Err(_) => return false,
+                    Err(_) => return None,
                 };
                 if count == 0 {
                     break;
                 }
                 observed = match observed.checked_add(count as u64) {
                     Some(observed) if observed <= expected_size => observed,
-                    _ => return false,
+                    _ => return None,
                 };
                 hasher.update(&buffer[..count]);
             }
             let held = match rustix::fs::fstat(&self.file) {
                 Ok(held) => held,
-                Err(_) => return false,
+                Err(_) => return None,
             };
             if observed != expected_size
                 || before.len() != expected_size
@@ -688,6 +831,24 @@ mod unix {
                 || held.st_ctime != self.changed_seconds
                 || held.st_ctime_nsec != self.changed_nanoseconds
                 || format!("{:x}", hasher.finalize()) != expected_sha1
+            {
+                return None;
+            }
+            self.revalidate().then_some(self)
+        }
+
+        pub(super) fn revalidate(&self) -> bool {
+            let Ok(held) = rustix::fs::fstat(&self.file) else {
+                return false;
+            };
+            if FileType::from_raw_mode(held.st_mode) != FileType::RegularFile
+                || held.st_dev != self.device
+                || held.st_ino != self.inode
+                || u64::try_from(held.st_size).ok() != Some(self.size)
+                || held.st_mtime != self.modified_seconds
+                || held.st_mtime_nsec != self.modified_nanoseconds
+                || held.st_ctime != self.changed_seconds
+                || held.st_ctime_nsec != self.changed_nanoseconds
             {
                 return false;
             }
@@ -704,6 +865,11 @@ mod unix {
                 FileType::from_raw_mode(current.st_mode) == FileType::RegularFile
                     && current.st_dev == self.device
                     && current.st_ino == self.inode
+                    && u64::try_from(current.st_size).ok() == Some(self.size)
+                    && current.st_mtime == self.modified_seconds
+                    && current.st_mtime_nsec == self.modified_nanoseconds
+                    && current.st_ctime == self.changed_seconds
+                    && current.st_ctime_nsec == self.changed_nanoseconds
             })
         }
     }
@@ -825,6 +991,7 @@ mod windows {
         file: fs::File,
         volume: u64,
         id: [u8; 16],
+        size: i64,
         modified: i64,
         changed: i64,
     }
@@ -1086,8 +1253,11 @@ mod windows {
             )
             .ok()?;
             let basic = query::<FILE_BASIC_INFO>(&file, FileBasicInfo).ok()?;
+            let standard = query::<FILE_STANDARD_INFO>(&file, FileStandardInfo).ok()?;
             let id = query::<FILE_ID_INFO>(&file, FileIdInfo).ok()?;
             if basic.FileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT) != 0
+                || standard.Directory
+                || standard.EndOfFile < 0
             {
                 return None;
             }
@@ -1097,6 +1267,7 @@ mod windows {
                 file,
                 volume: id.VolumeSerialNumber,
                 id: id.FileId.Identifier,
+                size: standard.EndOfFile,
                 modified: basic.LastWriteTime,
                 changed: basic.ChangeTime,
             })
@@ -1167,14 +1338,16 @@ mod windows {
     }
 
     impl Verification {
-        pub(super) fn verify(mut self, expected_sha1: &str, expected_size: u64) -> bool {
+        pub(super) fn verify(mut self, expected_sha1: &str, expected_size: u64) -> Option<Self> {
+            let expected_size = i64::try_from(expected_size).ok()?;
+            if self.size != expected_size {
+                return None;
+            }
             let standard = match query::<FILE_STANDARD_INFO>(&self.file, FileStandardInfo) {
-                Ok(standard)
-                    if !standard.Directory && standard.EndOfFile == expected_size as i64 =>
-                {
+                Ok(standard) if !standard.Directory && standard.EndOfFile == expected_size => {
                     standard
                 }
-                _ => return false,
+                _ => return None,
             };
             let mut hasher = Sha1::new();
             let mut observed = 0_u64;
@@ -1182,33 +1355,50 @@ mod windows {
             loop {
                 let count = match self.file.read(&mut buffer) {
                     Ok(count) => count,
-                    Err(_) => return false,
+                    Err(_) => return None,
                 };
                 if count == 0 {
                     break;
                 }
                 observed = match observed.checked_add(count as u64) {
-                    Some(observed) if observed <= expected_size => observed,
-                    _ => return false,
+                    Some(observed) if observed <= expected_size as u64 => observed,
+                    _ => return None,
                 };
                 hasher.update(&buffer[..count]);
             }
             let basic = match query::<FILE_BASIC_INFO>(&self.file, FileBasicInfo) {
                 Ok(basic) => basic,
-                Err(_) => return false,
+                Err(_) => return None,
             };
             let held_id = match query::<FILE_ID_INFO>(&self.file, FileIdInfo) {
                 Ok(id) => id,
-                Err(_) => return false,
+                Err(_) => return None,
             };
-            if observed != expected_size
-                || standard.EndOfFile != expected_size as i64
+            if observed != expected_size as u64
+                || standard.EndOfFile != expected_size
                 || basic.LastWriteTime != self.modified
                 || basic.ChangeTime != self.changed
                 || held_id.VolumeSerialNumber != self.volume
                 || held_id.FileId.Identifier != self.id
                 || format!("{:x}", hasher.finalize()) != expected_sha1
             {
+                return None;
+            }
+            self.revalidate().then_some(self)
+        }
+
+        pub(super) fn revalidate(&self) -> bool {
+            let Ok(held_basic) = query::<FILE_BASIC_INFO>(&self.file, FileBasicInfo) else {
+                return false;
+            };
+            let Ok(held_standard) = query::<FILE_STANDARD_INFO>(&self.file, FileStandardInfo)
+            else {
+                return false;
+            };
+            let Ok(held_id) = query::<FILE_ID_INFO>(&self.file, FileIdInfo) else {
+                return false;
+            };
+            if !self.matches(&held_basic, &held_standard, &held_id) {
                 return false;
             }
             let current = match open_relative(
@@ -1222,9 +1412,32 @@ mod windows {
                 Ok(current) => current,
                 Err(_) => return false,
             };
-            query::<FILE_ID_INFO>(&current, FileIdInfo).is_ok_and(|current| {
-                current.VolumeSerialNumber == self.volume && current.FileId.Identifier == self.id
-            })
+            let Ok(current_basic) = query::<FILE_BASIC_INFO>(&current, FileBasicInfo) else {
+                return false;
+            };
+            let Ok(current_standard) = query::<FILE_STANDARD_INFO>(&current, FileStandardInfo)
+            else {
+                return false;
+            };
+            let Ok(current_id) = query::<FILE_ID_INFO>(&current, FileIdInfo) else {
+                return false;
+            };
+            self.matches(&current_basic, &current_standard, &current_id)
+        }
+
+        fn matches(
+            &self,
+            basic: &FILE_BASIC_INFO,
+            standard: &FILE_STANDARD_INFO,
+            id: &FILE_ID_INFO,
+        ) -> bool {
+            basic.FileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT) == 0
+                && !standard.Directory
+                && standard.EndOfFile == self.size
+                && basic.LastWriteTime == self.modified
+                && basic.ChangeTime == self.changed
+                && id.VolumeSerialNumber == self.volume
+                && id.FileId.Identifier == self.id
         }
     }
 

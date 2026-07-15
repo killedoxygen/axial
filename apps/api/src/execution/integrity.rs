@@ -6150,7 +6150,6 @@ mod tests {
             .expect("component admitted while sweep is current");
 
         reservation.cancellation().cancel();
-        assert!(component.assets_effect().is_ok());
         let outcome = execute_failed_managed_assets_component_rebuild_for_test(component)
             .await
             .expect("admitted component settles while sweep remains active");
@@ -6164,7 +6163,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn settled_sweep_revokes_an_admitted_component_before_effect() {
+    async fn settled_sweep_forces_an_admitted_component_to_fail_before_effect() {
         let (state, root, reservation, admission) =
             corrupt_assets_sweep_leaf_fixture("sweep-component-settled").await;
         let failure =
@@ -6187,19 +6186,14 @@ mod tests {
             .expect("component admitted while sweep is current");
 
         reservation.cancellation().cancel();
-        assert!(component.assets_effect().is_ok());
-        assert!(component.failed_terminal().is_ok());
         reservation.settle(IdleSweepTerminal::Cancelled);
+        let outcome = execute_failed_managed_assets_component_rebuild_for_test(component)
+            .await
+            .expect("settled sweep component is durably failed");
         assert_eq!(
-            component.assets_effect().err(),
-            Some(crate::state::ReconciliationEvidenceRejection::IncarnationMismatch)
+            outcome.status,
+            crate::guardian::GuardianComponentRebuildStatus::Failed
         );
-        assert_eq!(
-            component.failed_terminal().err(),
-            Some(crate::state::ReconciliationEvidenceRejection::IncarnationMismatch)
-        );
-
-        drop(component);
         close_fixture(state, root).await;
     }
 

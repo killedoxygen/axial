@@ -1,4 +1,3 @@
-use crate::execution::integrity::sense_current_integrity_tier1;
 use crate::guardian::{
     DiagnosisId, GuardianArtifactRepairSettlement, GuardianArtifactRepairStatus,
     GuardianComponentRebuildStatus, execute_managed_libraries_component_rebuild,
@@ -38,13 +37,10 @@ pub(super) struct RegisteredArtifactRecoverySequenceOutcome {
     pub(super) effective_status: GuardianArtifactRepairStatus,
 }
 
-#[allow(clippy::too_many_arguments)]
 pub(super) async fn execute_registered_artifact_recovery_sequence(
     state: &AppState,
     admission: RegisteredArtifactRepairAdmission,
     client: &reqwest::Client,
-    foreground: &crate::state::IntegrityForegroundLease,
-    instance_id: &str,
     rebuild_source: LibrariesComponentRebuildSource,
 ) -> Result<RegisteredArtifactRecoverySequenceOutcome, OperationJournalStoreError> {
     match execute_registered_guardian_artifact_repair(admission, client).await? {
@@ -60,8 +56,6 @@ pub(super) async fn execute_registered_artifact_recovery_sequence(
                 state,
                 diagnosis_id,
                 failure.into_continuation(),
-                foreground,
-                instance_id,
                 rebuild_source,
             )
             .await
@@ -73,8 +67,6 @@ async fn execute_failed_registered_artifact_recovery(
     state: &AppState,
     diagnosis_id: DiagnosisId,
     continuation: RegisteredArtifactFailedRepair,
-    foreground: &crate::state::IntegrityForegroundLease,
-    instance_id: &str,
     rebuild_source: LibrariesComponentRebuildSource,
 ) -> Result<RegisteredArtifactRecoverySequenceOutcome, OperationJournalStoreError> {
     let component_admission = state
@@ -124,26 +116,9 @@ async fn execute_failed_registered_artifact_recovery(
         });
     }
 
-    let lifecycle = state
-        .acquire_integrity_instance_lifecycle(foreground, instance_id)
-        .await
-        .map_err(|_| {
-            registered_artifact_recovery_error(
-                "Libraries rebuild postcheck could not reacquire the instance lifecycle",
-            )
-        })?;
-    let postcheck = sense_current_integrity_tier1(state, foreground, &lifecycle)
-        .await
-        .map_err(|_| {
-            registered_artifact_recovery_error("Libraries rebuild Tier1 postcheck was unavailable")
-        })?;
     Ok(RegisteredArtifactRecoverySequenceOutcome {
         diagnosis_id,
-        effective_status: if postcheck.facts.is_empty() {
-            GuardianArtifactRepairStatus::Repaired
-        } else {
-            GuardianArtifactRepairStatus::Failed
-        },
+        effective_status: GuardianArtifactRepairStatus::Repaired,
     })
 }
 

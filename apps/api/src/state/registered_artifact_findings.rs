@@ -93,6 +93,22 @@ enum RegisteredArtifactSourceScope {
     Assets,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct RegisteredArtifactProvenance {
+    inventory_ordinal: usize,
+    scope: RegisteredArtifactSourceScope,
+}
+
+impl RegisteredArtifactProvenance {
+    pub(super) const fn inventory_ordinal(self) -> usize {
+        self.inventory_ordinal
+    }
+
+    pub(super) const fn component(self) -> ReconciliationComponent {
+        self.scope.component()
+    }
+}
+
 impl RegisteredArtifactSourceScope {
     fn from_source(root: &KnownGoodRoot, kind: KnownGoodArtifactKind) -> Option<Self> {
         match (root, kind) {
@@ -753,7 +769,7 @@ pub(crate) fn registered_artifact_target_for_test(
     .map(|(target, _)| target)
 }
 
-pub(super) fn resolve_unique_recorded_artifact_inventory_ordinal(
+pub(super) fn resolve_recorded_artifact_provenance(
     instance_id: &str,
     version_id: &str,
     created_at: &str,
@@ -761,9 +777,9 @@ pub(super) fn resolve_unique_recorded_artifact_inventory_ordinal(
     runtime_root: &Path,
     inventory: &axial_minecraft::known_good::KnownGoodInventory,
     attempt: &ReconciliationAttempt,
-) -> Result<usize, ReconciliationEvidenceRejection> {
+) -> Option<RegisteredArtifactProvenance> {
     if attempt.diagnosis_id() != DiagnosisId::LauncherManagedArtifactCorrupt {
-        return Err(ReconciliationEvidenceRejection::ScopeMismatch);
+        return None;
     }
     let mut matches = inventory
         .entries()
@@ -781,19 +797,45 @@ pub(super) fn resolve_unique_recorded_artifact_inventory_ordinal(
             )
             .map(|(target, scope)| (inventory_ordinal, target, scope))
         })
-        .filter(|(_, target, scope)| {
-            target == attempt.target()
+        .filter_map(|(inventory_ordinal, target, scope)| {
+            (target == *attempt.target()
                 && scope.domain() == attempt.domain()
-                && scope.component() == attempt.component()
+                && scope.component() == attempt.component())
+            .then_some(RegisteredArtifactProvenance {
+                inventory_ordinal,
+                scope,
+            })
         })
-        .map(|(inventory_ordinal, _, _)| inventory_ordinal);
-    let inventory_ordinal = matches
-        .next()
-        .ok_or(ReconciliationEvidenceRejection::ScopeMismatch)?;
-    if matches.next().is_some() {
-        return Err(ReconciliationEvidenceRejection::ScopeMismatch);
-    }
-    Ok(inventory_ordinal)
+        .take(2);
+    let provenance = matches.next()?;
+    matches.next().is_none().then_some(provenance)
+}
+
+pub(super) fn recorded_artifact_provenance_matches(
+    instance_id: &str,
+    version_id: &str,
+    created_at: &str,
+    library_root: &Path,
+    runtime_root: &Path,
+    inventory: &axial_minecraft::known_good::KnownGoodInventory,
+    attempt: &ReconciliationAttempt,
+    provenance: RegisteredArtifactProvenance,
+) -> bool {
+    registered_artifact_target_from_inventory(
+        instance_id,
+        version_id,
+        created_at,
+        library_root,
+        runtime_root,
+        inventory,
+        provenance.inventory_ordinal,
+    )
+    .is_some_and(|(target, scope)| {
+        target == *attempt.target()
+            && scope == provenance.scope
+            && scope.domain() == attempt.domain()
+            && scope.component() == attempt.component()
+    })
 }
 
 fn update_frame(hasher: &mut Sha256, label: &[u8], value: &[u8]) {

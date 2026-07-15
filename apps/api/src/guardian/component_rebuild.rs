@@ -9,11 +9,16 @@ use crate::state::contracts::{
     OperationStepResult, OwnershipClass, ReconciliationComponent, ReconciliationRung,
     ReconciliationScope, ReconciliationTerminal, RollbackState, StabilizationSystem, TargetKind,
 };
-use crate::state::failure_memory::{FailureMemoryStoreError, GuardianFailureMemoryEntry};
+use crate::state::failure_memory::{
+    FailureMemoryStoreError, GuardianFailureMemoryEntry, GuardianFailureMemoryStore,
+};
 use crate::state::{
     MAX_OPERATION_JOURNAL_STEP_FACTS, OperationJournalStoreError, ReconciliationAttemptReservation,
     RegisteredAssetsComponentRebuildEffect, RegisteredComponentRebuildAdmission,
-    RegisteredLibrariesComponentRebuildEffect, commit_reconciliation_memory,
+    RegisteredLibrariesComponentRebuildEffect, RegisteredManagedArtifactCommitPostcheck,
+    RegisteredManagedArtifactComponentCompletion,
+    RegisteredManagedArtifactComponentEffectAdmission,
+    RegisteredManagedArtifactComponentSettlement, commit_reconciliation_memory,
     operation_journal_completed_step_is_visible, operation_journal_plan_is_visible,
     reconciliation_attempt_key, reconciliation_instance_target, reconciliation_journal_attempt,
     reconciliation_memory_entry, reserve_reconciliation_attempt, settle_reconciliation_memory,
@@ -39,6 +44,12 @@ const COMPONENT_MEMORY_RETRY_INITIAL_DELAY: std::time::Duration =
     std::time::Duration::from_millis(20);
 const COMPONENT_MEMORY_RETRY_MAX_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
 
+#[cfg(test)]
+tokio::task_local! {
+    static REGISTERED_ARTIFACT_EXACT_PROOF_LIFETIME:
+        Arc<std::sync::Mutex<Option<std::sync::Weak<()>>>>;
+}
+
 pub(crate) struct ManagedRuntimeComponentRebuildEffect {
     admission: RegisteredComponentRebuildAdmission,
     reservation: ReconciliationAttemptReservation,
@@ -50,7 +61,7 @@ pub(crate) struct RuntimeComponentRebuildEffectResult {
 }
 
 pub(crate) struct ManagedLibrariesComponentRebuildEffect {
-    admission: RegisteredComponentRebuildAdmission,
+    completion: RegisteredManagedArtifactComponentCompletion,
     reservation: ReconciliationAttemptReservation,
     request: RegisteredLibrariesComponentRebuildEffect,
     identity: Arc<()>,
@@ -61,7 +72,7 @@ pub(crate) struct LibrariesComponentRebuildEffectResult {
 }
 
 struct ManagedAssetsComponentRebuildEffect {
-    admission: RegisteredComponentRebuildAdmission,
+    completion: RegisteredManagedArtifactComponentCompletion,
     reservation: ReconciliationAttemptReservation,
     request: RegisteredAssetsComponentRebuildEffect,
     identity: Arc<()>,
@@ -189,14 +200,14 @@ impl ManagedRuntimeComponentRebuildEffect {
 
 impl ManagedLibrariesComponentRebuildEffect {
     fn new(
-        admission: RegisteredComponentRebuildAdmission,
+        completion: RegisteredManagedArtifactComponentCompletion,
         reservation: ReconciliationAttemptReservation,
         request: RegisteredLibrariesComponentRebuildEffect,
     ) -> (Self, Arc<()>) {
         let identity = Arc::new(());
         (
             Self {
-                admission,
+                completion,
                 reservation,
                 request,
                 identity: identity.clone(),
@@ -256,14 +267,14 @@ impl ManagedLibrariesComponentRebuildEffect {
 
 impl ManagedAssetsComponentRebuildEffect {
     fn new(
-        admission: RegisteredComponentRebuildAdmission,
+        completion: RegisteredManagedArtifactComponentCompletion,
         reservation: ReconciliationAttemptReservation,
         request: RegisteredAssetsComponentRebuildEffect,
     ) -> (Self, Arc<()>) {
         let identity = Arc::new(());
         (
             Self {
-                admission,
+                completion,
                 reservation,
                 request,
                 identity: identity.clone(),
@@ -437,30 +448,41 @@ where
     })?;
 
     if let Some(plan_error) = create_component_rebuild_plan(&admission).await? {
-        terminalize_managed_artifact_before_effect(
-            admission,
+        let settlement = match admission.into_libraries_effect() {
+            RegisteredManagedArtifactComponentEffectAdmission::Admitted { completion, .. } => {
+                completion.into_failed_settlement()
+            }
+            RegisteredManagedArtifactComponentEffectAdmission::Refused(settlement) => settlement,
+        };
+        persist_managed_artifact_component_terminal(
+            &settlement,
             reservation,
             Vec::new(),
             COMPONENT_REBUILD_START_STEP,
+            RollbackState::NotApplicable,
         )
         .await?;
         return Err(plan_error);
     }
 
-    let request = match admission.libraries_effect() {
-        Ok(request) => request,
-        Err(_) => {
-            return terminalize_managed_artifact_before_effect(
-                admission,
+    let (request, completion) = match admission.into_libraries_effect() {
+        RegisteredManagedArtifactComponentEffectAdmission::Admitted {
+            request,
+            completion,
+        } => (request, completion),
+        RegisteredManagedArtifactComponentEffectAdmission::Refused(settlement) => {
+            return persist_managed_artifact_component_terminal(
+                &settlement,
                 reservation,
                 vec!["libraries_component_authority_changed".to_string()],
                 LIBRARIES_COMPONENT_REBUILD_STEP,
+                RollbackState::NotApplicable,
             )
             .await;
         }
     };
     let (effect_capability, effect_identity) =
-        ManagedLibrariesComponentRebuildEffect::new(admission, reservation, request);
+        ManagedLibrariesComponentRebuildEffect::new(completion, reservation, request);
     match effect(effect_capability).await.inner {
         LibrariesComponentRebuildEffectResultInner::Committed {
             effect,
@@ -543,30 +565,41 @@ where
     })?;
 
     if let Some(plan_error) = create_component_rebuild_plan(&admission).await? {
-        terminalize_managed_artifact_before_effect(
-            admission,
+        let settlement = match admission.into_assets_effect() {
+            RegisteredManagedArtifactComponentEffectAdmission::Admitted { completion, .. } => {
+                completion.into_failed_settlement()
+            }
+            RegisteredManagedArtifactComponentEffectAdmission::Refused(settlement) => settlement,
+        };
+        persist_managed_artifact_component_terminal(
+            &settlement,
             reservation,
             Vec::new(),
             COMPONENT_REBUILD_START_STEP,
+            RollbackState::NotApplicable,
         )
         .await?;
         return Err(plan_error);
     }
 
-    let request = match admission.assets_effect() {
-        Ok(request) => request,
-        Err(_) => {
-            return terminalize_managed_artifact_before_effect(
-                admission,
+    let (request, completion) = match admission.into_assets_effect() {
+        RegisteredManagedArtifactComponentEffectAdmission::Admitted {
+            request,
+            completion,
+        } => (request, completion),
+        RegisteredManagedArtifactComponentEffectAdmission::Refused(settlement) => {
+            return persist_managed_artifact_component_terminal(
+                &settlement,
                 reservation,
                 vec!["assets_component_authority_changed".to_string()],
                 ASSETS_COMPONENT_REBUILD_STEP,
+                RollbackState::NotApplicable,
             )
             .await;
         }
     };
     let (effect_capability, effect_identity) =
-        ManagedAssetsComponentRebuildEffect::new(admission, reservation, request);
+        ManagedAssetsComponentRebuildEffect::new(completion, reservation, request);
     match driver(effect_capability).await.inner {
         AssetsComponentRebuildEffectResultInner::Committed {
             effect,
@@ -659,10 +692,6 @@ enum AssetsComponentRebuildTerminal {
 enum ComponentRebuildPublicationLease {
     RuntimeCommit(ManagedRuntimeCommitReceipt),
     RuntimeFailure(ManagedRuntimeFailureReceipt),
-    LibrariesCommit(ManagedLibrariesCommitReceipt),
-    LibrariesRollback(ManagedLibrariesRollbackReceipt),
-    AssetsCommit(ManagedAssetsCommitReceipt),
-    AssetsRollback(ManagedAssetsRollbackReceipt),
 }
 
 impl ComponentRebuildPublicationLease {
@@ -670,10 +699,6 @@ impl ComponentRebuildPublicationLease {
         match self {
             Self::RuntimeCommit(receipt) => drop(receipt),
             Self::RuntimeFailure(receipt) => drop(receipt),
-            Self::LibrariesCommit(receipt) => drop(receipt),
-            Self::LibrariesRollback(receipt) => drop(receipt),
-            Self::AssetsCommit(receipt) => drop(receipt),
-            Self::AssetsRollback(receipt) => drop(receipt),
         }
     }
 }
@@ -1044,128 +1069,61 @@ async fn terminalize_component_rebuild(
     .await
 }
 
-async fn terminalize_managed_artifact_before_effect(
-    admission: RegisteredComponentRebuildAdmission,
-    reservation: ReconciliationAttemptReservation,
-    facts: Vec<String>,
-    step_id: &'static str,
-) -> Result<GuardianComponentRebuildOutcome, OperationJournalStoreError> {
-    let terminal = admission.failed_terminal().map_err(|_| {
-        invalid_component_rebuild_error(
-            std::io::ErrorKind::InvalidData,
-            "managed artifact component rebuild pre-effect terminal is invalid",
-        )
-    })?;
-    persist_component_rebuild_terminal(
-        &admission,
-        &reservation,
-        ComponentRebuildTerminalRecord {
-            terminal,
-            step_id,
-            step_result: OperationStepResult::Failed,
-            failure_point: Some(step_id),
-            rollback: RollbackState::NotApplicable,
-            status: GuardianComponentRebuildStatus::Failed,
-            facts,
-            publication_lease: None,
-        },
-    )
-    .await
-}
-
 async fn terminalize_libraries_component_rebuild(
     effect: ManagedLibrariesComponentRebuildEffect,
     terminal: LibrariesComponentRebuildTerminal,
 ) -> Result<GuardianComponentRebuildOutcome, OperationJournalStoreError> {
     let ManagedLibrariesComponentRebuildEffect {
-        admission,
+        completion,
         reservation,
         request: _,
         identity: _,
     } = effect;
-    let (terminal, status, facts, step_result, failure_point, rollback, publication_lease) =
-        match terminal {
-            LibrariesComponentRebuildTerminal::Committed { receipt, facts } => {
-                let (terminal, status, facts, step_result, failure_point) =
-                    match admission.succeeded_libraries_terminal(&receipt).await {
-                        Ok(terminal) => (
-                            terminal,
-                            GuardianComponentRebuildStatus::Rebuilt,
-                            facts,
-                            OperationStepResult::Completed,
-                            None,
-                        ),
-                        Err(_) => (
-                            admission.failed_terminal().map_err(|_| {
-                                invalid_component_rebuild_error(
-                                    std::io::ErrorKind::InvalidData,
-                                    "Libraries component rebuild postcondition terminal is invalid",
-                                )
-                            })?,
-                            GuardianComponentRebuildStatus::Failed,
-                            vec!["libraries_component_postcondition_failed".to_string()],
-                            OperationStepResult::Failed,
-                            Some(LIBRARIES_COMPONENT_REBUILD_STEP),
-                        ),
-                    };
-                (
-                    terminal,
-                    status,
-                    facts,
-                    step_result,
-                    failure_point,
-                    RollbackState::NotApplicable,
-                    Some(ComponentRebuildPublicationLease::LibrariesCommit(receipt)),
-                )
-            }
-            LibrariesComponentRebuildTerminal::FailedBeforeEffect { facts } => (
-                admission.failed_terminal().map_err(|_| {
-                    invalid_component_rebuild_error(
-                        std::io::ErrorKind::InvalidData,
-                        "Libraries component rebuild failure terminal is invalid",
-                    )
-                })?,
-                GuardianComponentRebuildStatus::Failed,
-                facts,
-                OperationStepResult::Failed,
-                Some(LIBRARIES_COMPONENT_REBUILD_STEP),
-                RollbackState::NotApplicable,
-                None,
-            ),
-            LibrariesComponentRebuildTerminal::RolledBack { receipt, facts } => {
-                let terminal = admission
-                    .failed_libraries_effect_terminal(&receipt)
-                    .await
-                    .map_err(|_| {
-                        invalid_component_rebuild_error(
-                            std::io::ErrorKind::InvalidData,
-                            "Libraries component rollback receipt is invalid or ambiguous",
-                        )
-                    })?;
-                (
-                    terminal,
-                    GuardianComponentRebuildStatus::Failed,
-                    facts,
-                    OperationStepResult::Failed,
-                    Some(LIBRARIES_COMPONENT_REBUILD_STEP),
-                    RollbackState::Applied,
-                    Some(ComponentRebuildPublicationLease::LibrariesRollback(receipt)),
-                )
-            }
-        };
-    persist_component_rebuild_terminal(
-        &admission,
-        &reservation,
-        ComponentRebuildTerminalRecord {
-            terminal,
-            step_id: LIBRARIES_COMPONENT_REBUILD_STEP,
-            step_result,
-            failure_point,
-            rollback,
-            status,
+    let committed = matches!(
+        terminal,
+        LibrariesComponentRebuildTerminal::Committed { .. }
+    );
+    let (settlement, facts, rollback) = match terminal {
+        LibrariesComponentRebuildTerminal::Committed { receipt, facts } => {
+            let settlement = match completion.begin_libraries_commit(receipt).await {
+                RegisteredManagedArtifactCommitPostcheck::Verify { pending, verifier } => {
+                    pending.settle(verifier.verify().await.ok()).await
+                }
+                RegisteredManagedArtifactCommitPostcheck::Failed(settlement) => settlement,
+            };
+            (settlement, facts, RollbackState::NotApplicable)
+        }
+        LibrariesComponentRebuildTerminal::FailedBeforeEffect { facts } => (
+            completion.into_failed_settlement(),
             facts,
-            publication_lease,
-        },
+            RollbackState::NotApplicable,
+        ),
+        LibrariesComponentRebuildTerminal::RolledBack { receipt, facts } => {
+            let (settlement, applied) = completion.settle_libraries_rollback(receipt).await;
+            (
+                settlement,
+                facts,
+                if applied {
+                    RollbackState::Applied
+                } else {
+                    RollbackState::Unavailable
+                },
+            )
+        }
+    };
+    let facts = if settlement.succeeded() {
+        facts
+    } else if committed {
+        vec!["libraries_component_postcondition_failed".to_string()]
+    } else {
+        facts
+    };
+    persist_managed_artifact_component_terminal(
+        &settlement,
+        reservation,
+        facts,
+        LIBRARIES_COMPONENT_REBUILD_STEP,
+        rollback,
     )
     .await
 }
@@ -1175,96 +1133,116 @@ async fn terminalize_assets_component_rebuild(
     terminal: AssetsComponentRebuildTerminal,
 ) -> Result<GuardianComponentRebuildOutcome, OperationJournalStoreError> {
     let ManagedAssetsComponentRebuildEffect {
-        admission,
+        completion,
         reservation,
         request: _,
         identity: _,
     } = effect;
-    let (terminal, status, facts, step_result, failure_point, rollback, publication_lease) =
-        match terminal {
-            AssetsComponentRebuildTerminal::Committed { receipt, facts } => {
-                let (terminal, status, facts, step_result, failure_point) =
-                    match admission.succeeded_assets_terminal(&receipt).await {
-                        Ok(terminal) => (
-                            terminal,
-                            GuardianComponentRebuildStatus::Rebuilt,
-                            facts,
-                            OperationStepResult::Completed,
-                            None,
-                        ),
-                        Err(_) => (
-                            admission.failed_terminal().map_err(|_| {
-                                invalid_component_rebuild_error(
-                                    std::io::ErrorKind::InvalidData,
-                                    "Assets component rebuild postcondition terminal is invalid",
-                                )
-                            })?,
-                            GuardianComponentRebuildStatus::Failed,
-                            vec!["assets_component_postcondition_failed".to_string()],
-                            OperationStepResult::Failed,
-                            Some(ASSETS_COMPONENT_REBUILD_STEP),
-                        ),
-                    };
-                (
-                    terminal,
-                    status,
-                    facts,
-                    step_result,
-                    failure_point,
-                    RollbackState::NotApplicable,
-                    Some(ComponentRebuildPublicationLease::AssetsCommit(receipt)),
-                )
-            }
-            AssetsComponentRebuildTerminal::FailedBeforeEffect { facts } => (
-                admission.failed_terminal().map_err(|_| {
-                    invalid_component_rebuild_error(
-                        std::io::ErrorKind::InvalidData,
-                        "Assets component rebuild failure terminal is invalid",
-                    )
-                })?,
-                GuardianComponentRebuildStatus::Failed,
-                facts,
-                OperationStepResult::Failed,
-                Some(ASSETS_COMPONENT_REBUILD_STEP),
-                RollbackState::NotApplicable,
-                None,
-            ),
-            AssetsComponentRebuildTerminal::RolledBack { receipt, facts } => {
-                let terminal = admission
-                    .failed_assets_effect_terminal(&receipt)
-                    .await
-                    .map_err(|_| {
-                        invalid_component_rebuild_error(
-                            std::io::ErrorKind::InvalidData,
-                            "Assets component rollback receipt is invalid or ambiguous",
-                        )
-                    })?;
-                (
-                    terminal,
-                    GuardianComponentRebuildStatus::Failed,
-                    facts,
-                    OperationStepResult::Failed,
-                    Some(ASSETS_COMPONENT_REBUILD_STEP),
-                    RollbackState::Applied,
-                    Some(ComponentRebuildPublicationLease::AssetsRollback(receipt)),
-                )
-            }
-        };
-    persist_component_rebuild_terminal(
-        &admission,
-        &reservation,
-        ComponentRebuildTerminalRecord {
-            terminal,
-            step_id: ASSETS_COMPONENT_REBUILD_STEP,
-            step_result,
-            failure_point,
-            rollback,
-            status,
+    let committed = matches!(terminal, AssetsComponentRebuildTerminal::Committed { .. });
+    let (settlement, facts, rollback) = match terminal {
+        AssetsComponentRebuildTerminal::Committed { receipt, facts } => {
+            let settlement = match completion.begin_assets_commit(receipt).await {
+                RegisteredManagedArtifactCommitPostcheck::Verify { pending, verifier } => {
+                    let proof = verifier.verify().await.ok();
+                    #[cfg(test)]
+                    if let Some(proof) = proof.as_ref() {
+                        let lifetime = proof.lifetime_for_test();
+                        let _ = REGISTERED_ARTIFACT_EXACT_PROOF_LIFETIME.try_with(|slot| {
+                            *slot.lock().expect("exact-proof observer lock") = Some(lifetime);
+                        });
+                    }
+                    pending.settle(proof).await
+                }
+                RegisteredManagedArtifactCommitPostcheck::Failed(settlement) => settlement,
+            };
+            (settlement, facts, RollbackState::NotApplicable)
+        }
+        AssetsComponentRebuildTerminal::FailedBeforeEffect { facts } => (
+            completion.into_failed_settlement(),
             facts,
-            publication_lease,
-        },
+            RollbackState::NotApplicable,
+        ),
+        AssetsComponentRebuildTerminal::RolledBack { receipt, facts } => {
+            let (settlement, applied) = completion.settle_assets_rollback(receipt).await;
+            (
+                settlement,
+                facts,
+                if applied {
+                    RollbackState::Applied
+                } else {
+                    RollbackState::Unavailable
+                },
+            )
+        }
+    };
+    let facts = if settlement.succeeded() {
+        facts
+    } else if committed {
+        vec!["assets_component_postcondition_failed".to_string()]
+    } else {
+        facts
+    };
+    persist_managed_artifact_component_terminal(
+        &settlement,
+        reservation,
+        facts,
+        ASSETS_COMPONENT_REBUILD_STEP,
+        rollback,
     )
     .await
+}
+
+async fn persist_managed_artifact_component_terminal(
+    settlement: &RegisteredManagedArtifactComponentSettlement,
+    reservation: ReconciliationAttemptReservation,
+    facts: Vec<String>,
+    step_id: &'static str,
+    rollback: RollbackState,
+) -> Result<GuardianComponentRebuildOutcome, OperationJournalStoreError> {
+    let attempt = settlement.attempt();
+    let terminal = settlement.terminal().clone();
+    let operation_id = attempt.operation_id().clone();
+    let succeeded = settlement.succeeded();
+    let memory = reconciliation_memory_entry(terminal.clone()).map_err(|_| {
+        invalid_component_rebuild_error(
+            std::io::ErrorKind::InvalidData,
+            "managed artifact component rebuild memory terminal is invalid",
+        )
+    })?;
+    validate_reconciliation_memory(settlement.failure_memory(), &memory, &reservation)
+        .map_err(component_rebuild_memory_error)?;
+    let step_result = if succeeded {
+        OperationStepResult::Completed
+    } else {
+        OperationStepResult::Failed
+    };
+    let _journal_persistence_error = record_reconciliation_terminal_reconciled(
+        settlement.journals(),
+        &operation_id,
+        repair_step_with_rollback(
+            step_id,
+            step_result,
+            Some(attempt.target().clone()),
+            facts.clone(),
+            rollback,
+        ),
+        (!succeeded).then_some(step_id),
+        &terminal,
+        None,
+    )
+    .await?;
+    persist_exact_component_rebuild_memory(settlement.failure_memory(), &reservation, &memory)
+        .await?;
+
+    Ok(GuardianComponentRebuildOutcome {
+        operation_id,
+        status: if succeeded {
+            GuardianComponentRebuildStatus::Rebuilt
+        } else {
+            GuardianComponentRebuildStatus::Failed
+        },
+        facts,
+    })
 }
 
 struct ComponentRebuildTerminalRecord {
@@ -1319,7 +1297,8 @@ async fn persist_component_rebuild_terminal(
         None,
     )
     .await?;
-    persist_exact_component_rebuild_memory(admission, reservation, &memory).await?;
+    persist_exact_component_rebuild_memory(admission.failure_memory(), reservation, &memory)
+        .await?;
 
     if let Some(publication_lease) = publication_lease {
         publication_lease.release();
@@ -1333,24 +1312,18 @@ async fn persist_component_rebuild_terminal(
 }
 
 async fn persist_exact_component_rebuild_memory(
-    admission: &RegisteredComponentRebuildAdmission,
+    failure_memory: &GuardianFailureMemoryStore,
     reservation: &ReconciliationAttemptReservation,
     expected: &GuardianFailureMemoryEntry,
 ) -> Result<(), OperationJournalStoreError> {
     let mut delay = COMPONENT_MEMORY_RETRY_INITIAL_DELAY;
     loop {
-        if admission.failure_memory().get(&expected.key).as_ref() == Some(expected) {
+        if failure_memory.get(&expected.key).as_ref() == Some(expected) {
             return Ok(());
         }
-        match commit_reconciliation_memory(
-            admission.failure_memory(),
-            expected.clone(),
-            reservation,
-        )
-        .await
-        {
+        match commit_reconciliation_memory(failure_memory, expected.clone(), reservation).await {
             Ok(()) => {
-                if admission.failure_memory().get(&expected.key).as_ref() == Some(expected) {
+                if failure_memory.get(&expected.key).as_ref() == Some(expected) {
                     return Ok(());
                 }
                 return Err(invalid_component_rebuild_error(
@@ -1410,11 +1383,14 @@ mod tests {
     use crate::state::failure_memory::GuardianFailureMemoryStore;
     use crate::state::{
         AppState, AppStateInit, InstallStore, MAX_OPERATION_JOURNAL_STEP_FACTS,
-        OperationJournalStore, RegisteredComponentRebuildAdmission, SessionStore,
+        OperationJournalStore, RegisteredComponentRebuildAdmission,
+        RegisteredManagedArtifactCommitPostcheck,
+        RegisteredManagedArtifactComponentEffectAdmission, SessionStore,
         commit_reconciliation_memory, new_instance, reconciliation_attempt_key,
         reconciliation_instance_target, reconciliation_journal_attempt,
         reconciliation_memory_entry, record_reconciliation_journal_failure,
         registered_artifact_target_for_test, reserve_reconciliation_attempt,
+        settle_reconciliation_memory,
     };
     use axial_config::{AppPaths, InstanceRegistrySnapshot};
     use axial_minecraft::RuntimeId;
@@ -1655,7 +1631,7 @@ mod tests {
                 path: format!("objects/{}/{}", &object_digest[..2], object_digest),
                 kind: KnownGoodArtifactKind::AssetObject,
                 integrity: TestKnownGoodIntegrity::Sha1 {
-                    digest: object_digest,
+                    digest: object_digest.clone(),
                     size: OBJECT_BYTES.len() as u64,
                 },
             },
@@ -1672,6 +1648,15 @@ mod tests {
         .expect("Assets fixture inventory")
         .with_test_standalone_leaf_repair_source(0, "https://example.invalid/fixture-assets.json")
         .expect("Assets fixture index source")
+        .with_test_standalone_leaf_repair_source(
+            1,
+            &format!(
+                "https://resources.download.minecraft.net/{}/{}",
+                &object_digest[..2],
+                object_digest
+            ),
+        )
+        .expect("Assets fixture object source")
     }
 
     fn activate_assets_fixture_inventory(fixture: &Fixture) -> TargetDescriptor {
@@ -1697,7 +1682,7 @@ mod tests {
             &library_root,
             &runtime_root,
             &inventory,
-            0,
+            1,
         )
         .expect("exact source-backed Assets target");
         fixture
@@ -2047,7 +2032,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn managed_assets_commit_has_no_quarantine_and_settles_exact_terminal_memory() {
+    async fn managed_assets_commit_releases_old_lifecycle_and_settles_exact_terminal_memory() {
         let fixture = fixture("assets-commit");
         let admission = assets_component_admission(&fixture, "commit").await;
         let operation_id = admission.attempt().operation_id().clone();
@@ -2055,6 +2040,7 @@ mod tests {
         let journals = fixture.journals.clone();
         let root = PathBuf::from(fixture.state.library_dir().expect("library root"));
         let expected_root = root.clone();
+        let state = fixture.state.clone();
 
         let outcome =
             execute_managed_assets_component_rebuild_with_driver(admission, move |effect| {
@@ -2069,6 +2055,10 @@ mod tests {
                 );
                 assert_eq!(effect.core_request(), (expected_root.as_path(), "1.21.1"));
                 async move {
+                    assert!(
+                        !state.instance_lifecycle_is_held(INSTANCE_ID).await,
+                        "managed Assets Core I/O must not retain the old lifecycle"
+                    );
                     let receipt = axial_minecraft::rebuild_managed_assets_fixture_for_test(
                         expected_root,
                         "1.21.1",
@@ -2107,6 +2097,135 @@ mod tests {
             Some(terminal.clone())
         );
 
+        cleanup(fixture).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn selected_nonfirst_asset_postcheck_replacement_is_a_durable_failure() {
+        const OBJECT_BYTES: &[u8] = b"axial managed Assets fixture";
+
+        let fixture = fixture("assets-selected-postcheck-corrupt");
+        let admission = assets_component_admission(&fixture, "selected-postcheck-corrupt").await;
+        let operation_id = admission.attempt().operation_id().clone();
+        let memory_key = reconciliation_attempt_key(admission.attempt());
+        settle_reconciliation_memory(admission.failure_memory())
+            .await
+            .expect("settle prior Assets memory persistence");
+        let reservation = reserve_reconciliation_attempt(
+            admission.failure_memory(),
+            admission.journals(),
+            reconciliation_attempt_key(admission.attempt()),
+        )
+        .expect("reserve selected Assets component attempt");
+        assert!(
+            super::create_component_rebuild_plan(&admission)
+                .await
+                .expect("create selected Assets component plan")
+                .is_none()
+        );
+        let completion = match admission.into_assets_effect() {
+            RegisteredManagedArtifactComponentEffectAdmission::Admitted { completion, .. } => {
+                completion
+            }
+            RegisteredManagedArtifactComponentEffectAdmission::Refused(_) => {
+                panic!("selected Assets component effect must remain admitted")
+            }
+        };
+        let root = PathBuf::from(fixture.state.library_dir().expect("library root"));
+        let receipt = axial_minecraft::rebuild_managed_assets_fixture_for_test(&root, "1.21.1")
+            .await
+            .expect("sealed Assets fixture receipt");
+        let object_digest = format!("{:x}", Sha1::digest(OBJECT_BYTES));
+        let selected = root
+            .join("assets/objects")
+            .join(&object_digest[..2])
+            .join(&object_digest);
+        let postcheck = completion.begin_assets_commit(receipt).await;
+        let settlement = match postcheck {
+            RegisteredManagedArtifactCommitPostcheck::Verify { pending, verifier } => {
+                let proof = verifier
+                    .verify()
+                    .await
+                    .expect("fresh selected-leaf proof before replacement");
+                let replacement = selected.with_extension("replacement");
+                fs::write(&replacement, vec![b'x'; OBJECT_BYTES.len()])
+                    .expect("write selected non-first Assets replacement");
+                fs::rename(replacement, selected)
+                    .expect("replace selected non-first Assets leaf after exact verification");
+                pending.settle(Some(proof)).await
+            }
+            RegisteredManagedArtifactCommitPostcheck::Failed(_) => {
+                panic!("typed receipt must reach the selected-leaf verifier")
+            }
+        };
+        let outcome = super::persist_managed_artifact_component_terminal(
+            &settlement,
+            reservation,
+            vec!["assets_component_postcondition_failed".to_string()],
+            ASSETS_COMPONENT_REBUILD_STEP,
+            RollbackState::NotApplicable,
+        )
+        .await
+        .expect("persist selected Assets postcheck failure");
+
+        assert_eq!(outcome.status, GuardianComponentRebuildStatus::Failed);
+        let terminal = fixture
+            .journals
+            .get(&operation_id)
+            .and_then(|entry| entry.reconciliation_terminal().cloned())
+            .expect("selected Assets failed terminal");
+        assert_eq!(terminal.outcome(), ReconciliationTerminalOutcome::Failed);
+        assert_eq!(
+            fixture
+                .failure_memory
+                .get(&memory_key)
+                .and_then(|entry| entry.reconciliation_terminal().cloned()),
+            Some(terminal)
+        );
+
+        drop(settlement);
+        cleanup(fixture).await;
+    }
+
+    #[tokio::test]
+    async fn selected_asset_postcheck_lifecycle_contention_fails_without_waiting() {
+        let fixture = fixture("assets-postcheck-lifecycle-contention");
+        let admission = assets_component_admission(&fixture, "lifecycle-contention").await;
+        let state = fixture.state.clone();
+        let root = PathBuf::from(fixture.state.library_dir().expect("library root"));
+        let held_lifecycle = Arc::new(tokio::sync::Mutex::new(None));
+        let effect_hold = held_lifecycle.clone();
+
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            execute_managed_assets_component_rebuild_with_driver(
+                admission,
+                move |effect| async move {
+                    let lifecycle = state.acquire_instance_lifecycle(INSTANCE_ID).await;
+                    *effect_hold.lock().await = Some(lifecycle);
+                    let receipt =
+                        axial_minecraft::rebuild_managed_assets_fixture_for_test(&root, "1.21.1")
+                            .await
+                            .expect("sealed Assets fixture receipt");
+                    effect.committed(receipt, vec!["assets_component_rebuilt".to_string()])
+                },
+            ),
+        )
+        .await
+        .expect("postcheck contention must not wait in reverse lock order")
+        .expect("postcheck contention settles durably");
+
+        assert_eq!(outcome.status, GuardianComponentRebuildStatus::Failed);
+        assert_eq!(
+            fixture
+                .journals
+                .get(&outcome.operation_id)
+                .and_then(|entry| entry.reconciliation_terminal().cloned())
+                .map(|terminal| terminal.outcome()),
+            Some(ReconciliationTerminalOutcome::Failed)
+        );
+        drop(held_lifecycle.lock().await.take());
         cleanup(fixture).await;
     }
 
@@ -2244,18 +2363,24 @@ mod tests {
         let root = PathBuf::from(fixture.state.library_dir().expect("library root"));
         let effect_root = root.clone();
         let effect_backend = backend.clone();
-        let rebuild = execute_managed_assets_component_rebuild_with_driver(
-            admission,
-            move |effect| async move {
-                let receipt =
-                    axial_minecraft::rebuild_managed_assets_fixture_for_test(effect_root, "1.21.1")
-                        .await
-                        .expect("sealed Assets fixture receipt");
-                let failed_attempt = effect_backend.next_attempt();
-                effect_backend.fail_attempt(failed_attempt);
-                effect_backend.gate_attempt(failed_attempt + 1);
-                effect.committed(receipt, vec!["assets_component_rebuilt".to_string()])
-            },
+        let proof_lifetime = Arc::new(std::sync::Mutex::new(None));
+        let rebuild = super::REGISTERED_ARTIFACT_EXACT_PROOF_LIFETIME.scope(
+            proof_lifetime.clone(),
+            execute_managed_assets_component_rebuild_with_driver(
+                admission,
+                move |effect| async move {
+                    let receipt = axial_minecraft::rebuild_managed_assets_fixture_for_test(
+                        effect_root,
+                        "1.21.1",
+                    )
+                    .await
+                    .expect("sealed Assets fixture receipt");
+                    let failed_attempt = effect_backend.next_attempt();
+                    effect_backend.fail_attempt(failed_attempt);
+                    effect_backend.gate_attempt(failed_attempt + 1);
+                    effect.committed(receipt, vec!["assets_component_rebuilt".to_string()])
+                },
+            ),
         );
         let settlement_complete = Arc::new(AtomicBool::new(false));
         let rebuild_complete = settlement_complete.clone();
@@ -2276,6 +2401,14 @@ mod tests {
                     .is_some()
             );
             assert!(fixture.failure_memory.get(&memory_key).is_none());
+            assert!(
+                proof_lifetime
+                    .lock()
+                    .expect("exact-proof observation lock")
+                    .as_ref()
+                    .is_some_and(|proof| proof.upgrade().is_some()),
+                "exact selected-leaf proof must remain retained during exact-memory retry"
+            );
 
             let mut competing = Box::pin(axial_minecraft::rebuild_managed_assets_fixture_for_test(
                 &root, "1.21.1",

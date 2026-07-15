@@ -1383,15 +1383,12 @@ async fn launch_session_inner_with_control(
                             "registered artifact recovery must retain foreground authority",
                         );
                         let recovery_state = state.clone();
-                        let recovery_instance_id = intent.instance_id.clone();
                         let repair_task = producer.claim_child().spawn_joinable(async move {
                             let client = reqwest::Client::new();
                             let outcome = execute_registered_artifact_recovery_sequence(
                                 &recovery_state,
                                 admission,
                                 &client,
-                                &retained_foreground,
-                                &recovery_instance_id,
                                 LibrariesComponentRebuildSource::Production,
                             )
                             .await;
@@ -2038,8 +2035,6 @@ mod tests {
             &state,
             admission,
             &reqwest::Client::new(),
-            &foreground,
-            instance_id,
             LibrariesComponentRebuildSource::Fixture,
         )
         .await

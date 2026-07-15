@@ -105,11 +105,13 @@ pub(crate) use reconciliation::{
     ReconciliationEvidenceRejection, RegisteredArtifactFailedRepair,
     RegisteredAssetsComponentRebuildEffect, RegisteredAssetsRecoveryEntry,
     RegisteredComponentRebuildAdmission, RegisteredLibrariesComponentRebuildEffect,
-    RegisteredReconciliationAuthority, commit_reconciliation_memory, reconciliation_attempt_key,
-    reconciliation_instance_target, reconciliation_journal_attempt, reconciliation_memory_entry,
-    record_guardian_repair_refusal, record_reconciliation_journal_failure,
-    record_reconciliation_journal_success, reserve_reconciliation_attempt,
-    settle_reconciliation_memory, validate_reconciliation_memory,
+    RegisteredManagedArtifactCommitPostcheck, RegisteredManagedArtifactComponentCompletion,
+    RegisteredManagedArtifactComponentEffectAdmission,
+    RegisteredManagedArtifactComponentSettlement, RegisteredReconciliationAuthority,
+    commit_reconciliation_memory, reconciliation_attempt_key, reconciliation_instance_target,
+    reconciliation_journal_attempt, reconciliation_memory_entry, record_guardian_repair_refusal,
+    record_reconciliation_journal_failure, record_reconciliation_journal_success,
+    reserve_reconciliation_attempt, settle_reconciliation_memory, validate_reconciliation_memory,
 };
 pub(crate) use registered_artifact_findings::{
     RegisteredArtifactCondition, RegisteredArtifactFindings, RegisteredArtifactObservation,
@@ -1253,6 +1255,19 @@ impl AppState {
             self.instance_lifecycle_gates.clone(),
             self.instance_lifecycle_gates.acquire(instance_id).await,
         )
+    }
+
+    pub(crate) async fn try_acquire_instance_lifecycle(
+        &self,
+        instance_id: &str,
+    ) -> Option<InstanceLifecycleLease> {
+        Some(InstanceLifecycleLease::bind(
+            instance_id,
+            self.instance_lifecycle_gates.clone(),
+            self.instance_lifecycle_gates
+                .try_acquire(instance_id)
+                .await?,
+        ))
     }
 
     #[cfg(test)]
