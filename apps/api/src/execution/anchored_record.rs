@@ -1,5 +1,6 @@
 //! Identity-bound access to exact regular files below held no-follow directories.
 
+use std::ffi::{OsStr, OsString};
 use std::io;
 use std::path::Path;
 
@@ -10,6 +11,8 @@ pub(crate) struct AnchoredRecordIdentity {
     leaf: AnchoredLeaf,
     file: AnchoredRegularFile,
 }
+
+pub(crate) struct AnchoredRecordDirectory(platform::Directory);
 
 pub(crate) enum AnchoredRecordObservation {
     Bytes {
@@ -26,10 +29,19 @@ struct AnchoredRegularFile(platform::RegularFile);
 struct AnchoredTemp(platform::Temp);
 
 impl AnchoredRecordObservation {
+    #[cfg(test)]
     pub(crate) fn read(root: &Path, relative: &Path, max_bytes: u64) -> io::Result<Self> {
         let leaf = AnchoredLeaf::open(root, relative)?;
+        Self::read_leaf(leaf, max_bytes, false)
+    }
+
+    fn read_leaf(
+        leaf: AnchoredLeaf,
+        max_bytes: u64,
+        mutation_compatible: bool,
+    ) -> io::Result<Self> {
         let file = leaf
-            .open_regular()?
+            .open_regular_with_intent(mutation_compatible)?
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "anchored record is missing"))?;
         if file.size() > max_bytes {
             let identity = AnchoredRecordIdentity { leaf, file };
@@ -60,6 +72,34 @@ impl AnchoredRecordObservation {
     }
 }
 
+impl AnchoredRecordDirectory {
+    pub(crate) fn open(path: &Path) -> io::Result<Self> {
+        platform::Directory::open(path).map(Self)
+    }
+
+    pub(crate) fn names(&self) -> io::Result<Vec<OsString>> {
+        self.0.names()
+    }
+
+    pub(crate) fn read(
+        &self,
+        name: &OsStr,
+        max_bytes: u64,
+    ) -> io::Result<AnchoredRecordObservation> {
+        let leaf = self.0.open_leaf(name).map(AnchoredLeaf)?;
+        AnchoredRecordObservation::read_leaf(leaf, max_bytes, false)
+    }
+
+    pub(crate) fn read_for_mutation(
+        &self,
+        name: &OsStr,
+        max_bytes: u64,
+    ) -> io::Result<AnchoredRecordObservation> {
+        let leaf = self.0.open_leaf(name).map(AnchoredLeaf)?;
+        AnchoredRecordObservation::read_leaf(leaf, max_bytes, true)
+    }
+}
+
 impl AnchoredRecordIdentity {
     pub(crate) fn revalidate(&self) -> io::Result<()> {
         self.leaf.revalidate()?;
@@ -72,10 +112,12 @@ impl AnchoredRecordIdentity {
         self.leaf.revalidate()
     }
 
+    #[cfg(test)]
     pub(crate) fn is_current(&self) -> bool {
         self.revalidate().is_ok()
     }
 
+    #[cfg(test)]
     pub(crate) fn same_file(&self, other: &Self) -> bool {
         self.file.same_identity(&other.file)
     }
@@ -111,8 +153,15 @@ impl AnchoredLeaf {
     }
 
     fn open_regular(&self) -> io::Result<Option<AnchoredRegularFile>> {
+        self.open_regular_with_intent(false)
+    }
+
+    fn open_regular_with_intent(
+        &self,
+        mutation_compatible: bool,
+    ) -> io::Result<Option<AnchoredRegularFile>> {
         self.0
-            .open_regular()
+            .open_regular(mutation_compatible)
             .map(|file| file.map(AnchoredRegularFile))
     }
 }
@@ -136,6 +185,7 @@ impl AnchoredRegularFile {
         self.0.revalidate()
     }
 
+    #[cfg(test)]
     fn same_identity(&self, other: &Self) -> bool {
         self.0.same_identity(&other.0)
     }
@@ -152,8 +202,9 @@ mod platform {
     use rustix::fd::OwnedFd;
     use rustix::fs::{AtFlags, FileType, Mode, OFlags, RenameFlags};
     use sha1::{Digest as _, Sha1};
-    use std::ffi::OsString;
+    use std::ffi::{OsStr, OsString};
     use std::io::{self, Read as _, Seek as _, SeekFrom};
+    use std::os::unix::ffi::OsStringExt as _;
     use std::path::{Component, Path, PathBuf};
     use std::sync::Arc;
 
@@ -164,6 +215,12 @@ mod platform {
         name: Option<OsString>,
         device: u64,
         inode: u64,
+    }
+
+    pub(super) struct Directory {
+        root_path: PathBuf,
+        directories: Vec<HeldDirectory>,
+        parent: Arc<OwnedFd>,
     }
 
     pub(super) struct Leaf {
@@ -197,6 +254,55 @@ mod platform {
     impl Temp {
         pub(super) fn take_writer(&mut self) -> Option<std::fs::File> {
             self.writer.take()
+        }
+    }
+
+    impl Directory {
+        pub(super) fn open(path: &Path) -> io::Result<Self> {
+            let root_path = PathBuf::from("/");
+            let directories = open_absolute_directory_chain(path)?;
+            let parent = directories
+                .last()
+                .expect("absolute directory chain has anchor")
+                .handle
+                .clone();
+            let directory = Self {
+                root_path,
+                directories,
+                parent,
+            };
+            directory.revalidate()?;
+            Ok(directory)
+        }
+
+        pub(super) fn names(&self) -> io::Result<Vec<OsString>> {
+            self.revalidate()?;
+            let entries = rustix::fs::Dir::read_from(self.parent.as_ref())?;
+            let mut names = Vec::new();
+            for entry in entries {
+                let entry = entry?;
+                let name = entry.file_name().to_bytes();
+                if name != b"." && name != b".." {
+                    names.push(OsString::from_vec(name.to_vec()));
+                }
+            }
+            self.revalidate()?;
+            Ok(names)
+        }
+
+        pub(super) fn open_leaf(&self, name: &OsStr) -> io::Result<Leaf> {
+            require_direct_leaf(name)?;
+            self.revalidate()?;
+            Ok(Leaf {
+                root_path: self.root_path.clone(),
+                directories: self.directories.clone(),
+                parent: self.parent.clone(),
+                leaf: name.to_os_string(),
+            })
+        }
+
+        fn revalidate(&self) -> io::Result<()> {
+            revalidate_directory_chain(&self.root_path, &self.directories)
         }
     }
 
@@ -263,45 +369,7 @@ mod platform {
         }
 
         pub(super) fn revalidate(&self) -> io::Result<()> {
-            let root = rustix::fs::open(
-                &self.root_path,
-                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-                Mode::empty(),
-            )
-            .map_err(io::Error::from)?;
-            let root_stat = rustix::fs::fstat(&root).map_err(io::Error::from)?;
-            let expected_root = &self.directories[0];
-            if root_stat.st_dev != expected_root.device || root_stat.st_ino != expected_root.inode {
-                return Err(identity_changed("anchored record root changed"));
-            }
-            let held_root =
-                rustix::fs::fstat(expected_root.handle.as_ref()).map_err(io::Error::from)?;
-            if held_root.st_dev != expected_root.device || held_root.st_ino != expected_root.inode {
-                return Err(identity_changed("anchored record held root changed"));
-            }
-            for directory in self.directories.iter().skip(1) {
-                let stat = rustix::fs::statat(
-                    directory
-                        .parent
-                        .as_ref()
-                        .expect("child has held parent")
-                        .as_ref(),
-                    directory.name.as_ref().expect("child has name"),
-                    AtFlags::SYMLINK_NOFOLLOW,
-                )
-                .map_err(io::Error::from)?;
-                if FileType::from_raw_mode(stat.st_mode) != FileType::Directory
-                    || stat.st_dev != directory.device
-                    || stat.st_ino != directory.inode
-                {
-                    return Err(identity_changed("anchored record ancestor changed"));
-                }
-                let held = rustix::fs::fstat(directory.handle.as_ref()).map_err(io::Error::from)?;
-                if held.st_dev != directory.device || held.st_ino != directory.inode {
-                    return Err(identity_changed("anchored record held ancestor changed"));
-                }
-            }
-            Ok(())
+            revalidate_directory_chain(&self.root_path, &self.directories)
         }
 
         pub(super) fn target_is_missing(&self) -> io::Result<bool> {
@@ -317,7 +385,7 @@ mod platform {
             let file = rustix::fs::openat(
                 self.parent.as_ref(),
                 &self.leaf,
-                OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                OFlags::RDONLY | OFlags::NONBLOCK | OFlags::NOFOLLOW | OFlags::CLOEXEC,
                 Mode::empty(),
             )
             .map_err(io::Error::from)?;
@@ -420,12 +488,15 @@ mod platform {
             rustix::fs::fsync(self.parent.as_ref()).map_err(io::Error::from)
         }
 
-        pub(super) fn open_regular(&self) -> io::Result<Option<RegularFile>> {
+        pub(super) fn open_regular(
+            &self,
+            _mutation_compatible: bool,
+        ) -> io::Result<Option<RegularFile>> {
             self.revalidate()?;
             let handle = match rustix::fs::openat(
                 self.parent.as_ref(),
                 &self.leaf,
-                OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                OFlags::RDONLY | OFlags::NONBLOCK | OFlags::NOFOLLOW | OFlags::CLOEXEC,
                 Mode::empty(),
             ) {
                 Ok(handle) => handle,
@@ -536,7 +607,7 @@ mod platform {
             let current = match rustix::fs::openat(
                 self.parent.as_ref(),
                 &self.leaf,
-                OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                OFlags::RDONLY | OFlags::NONBLOCK | OFlags::NOFOLLOW | OFlags::CLOEXEC,
                 Mode::empty(),
             ) {
                 Ok(current) => current,
@@ -545,6 +616,7 @@ mod platform {
             rustix::fs::fstat(&current).is_ok_and(|current| self.matches(current))
         }
 
+        #[cfg(test)]
         pub(super) fn same_identity(&self, other: &Self) -> bool {
             self.device == other.device && self.inode == other.inode
         }
@@ -623,6 +695,64 @@ mod platform {
         Ok(directories)
     }
 
+    fn revalidate_directory_chain(
+        root_path: &Path,
+        directories: &[HeldDirectory],
+    ) -> io::Result<()> {
+        let root = rustix::fs::open(
+            root_path,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(io::Error::from)?;
+        let root_stat = rustix::fs::fstat(&root).map_err(io::Error::from)?;
+        let expected_root = &directories[0];
+        if root_stat.st_dev != expected_root.device || root_stat.st_ino != expected_root.inode {
+            return Err(identity_changed("anchored record root changed"));
+        }
+        let held_root =
+            rustix::fs::fstat(expected_root.handle.as_ref()).map_err(io::Error::from)?;
+        if held_root.st_dev != expected_root.device || held_root.st_ino != expected_root.inode {
+            return Err(identity_changed("anchored record held root changed"));
+        }
+        for directory in directories.iter().skip(1) {
+            let stat = rustix::fs::statat(
+                directory
+                    .parent
+                    .as_ref()
+                    .expect("child has held parent")
+                    .as_ref(),
+                directory.name.as_ref().expect("child has name"),
+                AtFlags::SYMLINK_NOFOLLOW,
+            )
+            .map_err(io::Error::from)?;
+            if FileType::from_raw_mode(stat.st_mode) != FileType::Directory
+                || stat.st_dev != directory.device
+                || stat.st_ino != directory.inode
+            {
+                return Err(identity_changed("anchored record ancestor changed"));
+            }
+            let held = rustix::fs::fstat(directory.handle.as_ref()).map_err(io::Error::from)?;
+            if held.st_dev != directory.device || held.st_ino != directory.inode {
+                return Err(identity_changed("anchored record held ancestor changed"));
+            }
+        }
+        Ok(())
+    }
+
+    fn require_direct_leaf(name: &OsStr) -> io::Result<()> {
+        let mut components = Path::new(name).components();
+        if !matches!(components.next(), Some(Component::Normal(component)) if component == name)
+            || components.next().is_some()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "anchored record name is not a direct leaf",
+            ));
+        }
+        Ok(())
+    }
+
     fn identity_changed(message: &'static str) -> io::Error {
         io::Error::new(io::ErrorKind::PermissionDenied, message)
     }
@@ -634,8 +764,8 @@ mod platform {
     use std::ffi::{OsStr, OsString};
     use std::fs;
     use std::io::{self, Read as _, Seek as _, SeekFrom};
-    use std::mem::size_of;
-    use std::os::windows::ffi::OsStrExt as _;
+    use std::mem::{offset_of, size_of};
+    use std::os::windows::ffi::{OsStrExt as _, OsStringExt as _};
     use std::os::windows::fs::OpenOptionsExt as _;
     use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _};
     use std::path::{Component, Path, PathBuf, Prefix};
@@ -648,15 +778,16 @@ mod platform {
         FileRenameInformation, NtCreateFile, NtSetInformationFile,
     };
     use windows_sys::Win32::Foundation::{
-        CloseHandle, GENERIC_READ, GENERIC_WRITE, HANDLE, OBJ_CASE_INSENSITIVE,
-        RtlNtStatusToDosError, UNICODE_STRING,
+        CloseHandle, ERROR_NO_MORE_FILES, GENERIC_READ, GENERIC_WRITE, HANDLE,
+        OBJ_CASE_INSENSITIVE, RtlNtStatusToDosError, UNICODE_STRING,
     };
     use windows_sys::Win32::Storage::FileSystem::{
         DELETE, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_BASIC_INFO,
         FILE_DISPOSITION_INFO, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
-        FILE_ID_INFO, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
-        FILE_STANDARD_INFO, FILE_TRAVERSE, FileBasicInfo, FileDispositionInfo, FileIdInfo,
-        FileStandardInfo, GetFileInformationByHandleEx, SYNCHRONIZE, SetFileInformationByHandle,
+        FILE_ID_BOTH_DIR_INFO, FILE_ID_INFO, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES,
+        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_STANDARD_INFO, FILE_TRAVERSE,
+        FileBasicInfo, FileDispositionInfo, FileIdBothDirectoryInfo, FileIdInfo, FileStandardInfo,
+        GetFileInformationByHandleEx, SYNCHRONIZE, SetFileInformationByHandle,
     };
     use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 
@@ -667,6 +798,12 @@ mod platform {
         name: Option<OsString>,
         volume: u64,
         id: [u8; 16],
+    }
+
+    pub(super) struct Directory {
+        root_path: PathBuf,
+        directories: Vec<HeldDirectory>,
+        parent: Arc<fs::File>,
     }
 
     pub(super) struct Leaf {
@@ -685,6 +822,7 @@ mod platform {
         size: i64,
         modified: i64,
         changed: i64,
+        share_mode: u32,
     }
 
     pub(super) struct Temp {
@@ -697,6 +835,105 @@ mod platform {
     impl Temp {
         pub(super) fn take_writer(&mut self) -> Option<fs::File> {
             self.writer.take()
+        }
+    }
+
+    impl Directory {
+        pub(super) fn open(path: &Path) -> io::Result<Self> {
+            let (root_path, directories) = open_absolute_directory_chain(path)?;
+            let expected = directories
+                .last()
+                .expect("absolute directory chain has anchor");
+            let parent = Arc::new(match (&expected.parent, &expected.name) {
+                (Some(parent), Some(name)) => open_relative(
+                    parent,
+                    name,
+                    Some(true),
+                    FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES | FILE_TRAVERSE,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE,
+                    FILE_OPEN,
+                )?,
+                (None, None) => open_root_exact_with_access(
+                    &root_path,
+                    FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES | FILE_TRAVERSE,
+                )?,
+                _ => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "anchored directory chain is incoherent",
+                    ));
+                }
+            });
+            require_exact_directory(&parent)?;
+            let listed_id = query::<FILE_ID_INFO>(&parent, FileIdInfo)?;
+            if listed_id.VolumeSerialNumber != expected.volume
+                || listed_id.FileId.Identifier != expected.id
+            {
+                return Err(identity_changed(
+                    "anchored directory listing handle changed identity",
+                ));
+            }
+            let directory = Self {
+                root_path,
+                directories,
+                parent,
+            };
+            directory.revalidate()?;
+            Ok(directory)
+        }
+
+        pub(super) fn names(&self) -> io::Result<Vec<OsString>> {
+            self.revalidate()?;
+            let mut names = Vec::new();
+            let mut buffer = vec![0_u64; (64 * 1024) / size_of::<u64>()];
+            loop {
+                let ok = unsafe {
+                    GetFileInformationByHandleEx(
+                        self.parent.as_raw_handle() as HANDLE,
+                        FileIdBothDirectoryInfo,
+                        buffer.as_mut_ptr().cast(),
+                        (buffer.len() * size_of::<u64>()) as u32,
+                    )
+                };
+                if ok == 0 {
+                    let error = io::Error::last_os_error();
+                    if error.raw_os_error() == Some(ERROR_NO_MORE_FILES as i32) {
+                        break;
+                    }
+                    return Err(error);
+                }
+                collect_directory_names(&buffer, &mut names)?;
+            }
+            self.revalidate()?;
+            Ok(names)
+        }
+
+        pub(super) fn open_leaf(&self, name: &OsStr) -> io::Result<Leaf> {
+            require_direct_leaf(name)?;
+            self.revalidate()?;
+            Ok(Leaf {
+                root_path: self.root_path.clone(),
+                directories: self.directories.clone(),
+                parent: self.parent.clone(),
+                leaf: name.to_os_string(),
+            })
+        }
+
+        fn revalidate(&self) -> io::Result<()> {
+            revalidate_directory_chain(&self.root_path, &self.directories)?;
+            let expected = self
+                .directories
+                .last()
+                .expect("absolute directory chain has anchor");
+            let listed_id = query::<FILE_ID_INFO>(&self.parent, FileIdInfo)?;
+            if listed_id.VolumeSerialNumber != expected.volume
+                || listed_id.FileId.Identifier != expected.id
+            {
+                return Err(identity_changed(
+                    "anchored directory listing handle changed identity",
+                ));
+            }
+            Ok(())
         }
     }
 
@@ -757,41 +994,7 @@ mod platform {
         }
 
         pub(super) fn revalidate(&self) -> io::Result<()> {
-            let root = open_root_exact(&self.root_path)?;
-            let root_id = query::<FILE_ID_INFO>(&root, FileIdInfo)?;
-            let expected = &self.directories[0];
-            if root_id.VolumeSerialNumber != expected.volume
-                || root_id.FileId.Identifier != expected.id
-            {
-                return Err(identity_changed("anchored record root changed"));
-            }
-            let held_root = query::<FILE_ID_INFO>(&expected.handle, FileIdInfo)?;
-            if held_root.VolumeSerialNumber != expected.volume
-                || held_root.FileId.Identifier != expected.id
-            {
-                return Err(identity_changed("anchored record held root changed"));
-            }
-            for directory in self.directories.iter().skip(1) {
-                let current = open_relative(
-                    directory.parent.as_ref().expect("child has parent"),
-                    directory.name.as_ref().expect("child has name"),
-                    Some(true),
-                    FILE_READ_ATTRIBUTES | FILE_TRAVERSE,
-                    FILE_SHARE_READ | FILE_SHARE_WRITE,
-                    FILE_OPEN,
-                )?;
-                require_exact_directory(&current)?;
-                let current_id = query::<FILE_ID_INFO>(&current, FileIdInfo)?;
-                let held_id = query::<FILE_ID_INFO>(&directory.handle, FileIdInfo)?;
-                if current_id.VolumeSerialNumber != directory.volume
-                    || current_id.FileId.Identifier != directory.id
-                    || held_id.VolumeSerialNumber != directory.volume
-                    || held_id.FileId.Identifier != directory.id
-                {
-                    return Err(identity_changed("anchored record ancestor changed"));
-                }
-            }
-            Ok(())
+            revalidate_directory_chain(&self.root_path, &self.directories)
         }
 
         pub(super) fn target_is_missing(&self) -> io::Result<bool> {
@@ -920,14 +1123,22 @@ mod platform {
             Ok(())
         }
 
-        pub(super) fn open_regular(&self) -> io::Result<Option<RegularFile>> {
+        pub(super) fn open_regular(
+            &self,
+            mutation_compatible: bool,
+        ) -> io::Result<Option<RegularFile>> {
             self.revalidate()?;
+            let share_mode = if mutation_compatible {
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE
+            } else {
+                FILE_SHARE_READ
+            };
             let file = match open_relative(
                 &self.parent,
                 &self.leaf,
                 Some(false),
                 GENERIC_READ | FILE_READ_ATTRIBUTES,
-                FILE_SHARE_READ,
+                share_mode,
                 FILE_OPEN,
             ) {
                 Ok(file) => file,
@@ -956,6 +1167,7 @@ mod platform {
                 size: standard.EndOfFile,
                 modified: basic.LastWriteTime,
                 changed: basic.ChangeTime,
+                share_mode,
             };
             if !file.revalidate() {
                 return Err(identity_changed(
@@ -1047,7 +1259,7 @@ mod platform {
                 &self.leaf,
                 Some(false),
                 FILE_READ_ATTRIBUTES,
-                FILE_SHARE_READ,
+                self.share_mode,
                 FILE_OPEN,
             ) {
                 Ok(current) => current,
@@ -1066,6 +1278,7 @@ mod platform {
             self.matches(&current_basic, &current_standard, &current_id)
         }
 
+        #[cfg(test)]
         pub(super) fn same_identity(&self, other: &Self) -> bool {
             self.volume == other.volume && self.id == other.id
         }
@@ -1150,6 +1363,125 @@ mod platform {
         Ok((anchor_path, directories))
     }
 
+    fn revalidate_directory_chain(
+        root_path: &Path,
+        directories: &[HeldDirectory],
+    ) -> io::Result<()> {
+        let root = open_root_exact(root_path)?;
+        let root_id = query::<FILE_ID_INFO>(&root, FileIdInfo)?;
+        let expected = &directories[0];
+        if root_id.VolumeSerialNumber != expected.volume || root_id.FileId.Identifier != expected.id
+        {
+            return Err(identity_changed("anchored record root changed"));
+        }
+        let held_root = query::<FILE_ID_INFO>(&expected.handle, FileIdInfo)?;
+        if held_root.VolumeSerialNumber != expected.volume
+            || held_root.FileId.Identifier != expected.id
+        {
+            return Err(identity_changed("anchored record held root changed"));
+        }
+        for directory in directories.iter().skip(1) {
+            let current = open_relative(
+                directory.parent.as_ref().expect("child has parent"),
+                directory.name.as_ref().expect("child has name"),
+                Some(true),
+                FILE_READ_ATTRIBUTES | FILE_TRAVERSE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                FILE_OPEN,
+            )?;
+            require_exact_directory(&current)?;
+            let current_id = query::<FILE_ID_INFO>(&current, FileIdInfo)?;
+            let held_id = query::<FILE_ID_INFO>(&directory.handle, FileIdInfo)?;
+            if current_id.VolumeSerialNumber != directory.volume
+                || current_id.FileId.Identifier != directory.id
+                || held_id.VolumeSerialNumber != directory.volume
+                || held_id.FileId.Identifier != directory.id
+            {
+                return Err(identity_changed("anchored record ancestor changed"));
+            }
+        }
+        Ok(())
+    }
+
+    fn collect_directory_names(buffer: &[u64], names: &mut Vec<OsString>) -> io::Result<()> {
+        let byte_len = buffer.len() * size_of::<u64>();
+        let name_offset = offset_of!(FILE_ID_BOTH_DIR_INFO, FileName);
+        let mut offset = 0usize;
+        loop {
+            if offset
+                .checked_add(name_offset)
+                .is_none_or(|end| end > byte_len)
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "anchored directory entry exceeded its enumeration buffer",
+                ));
+            }
+            let info = unsafe {
+                &*buffer
+                    .as_ptr()
+                    .cast::<u8>()
+                    .add(offset)
+                    .cast::<FILE_ID_BOTH_DIR_INFO>()
+            };
+            let name_bytes = usize::try_from(info.FileNameLength).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "anchored directory entry name length overflowed",
+                )
+            })?;
+            let entry_end = offset
+                .checked_add(name_offset)
+                .and_then(|start| start.checked_add(name_bytes))
+                .filter(|end| *end <= byte_len)
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "anchored directory entry name exceeded its enumeration buffer",
+                    )
+                })?;
+            if name_bytes % size_of::<u16>() != 0 || entry_end < offset {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "anchored directory entry name length is invalid",
+                ));
+            }
+            let encoded = unsafe {
+                std::slice::from_raw_parts(info.FileName.as_ptr(), name_bytes / size_of::<u16>())
+            };
+            if encoded != [b'.' as u16] && encoded != [b'.' as u16, b'.' as u16] {
+                names.push(OsString::from_wide(encoded));
+            }
+            let next = info.NextEntryOffset as usize;
+            if next == 0 {
+                break;
+            }
+            offset = offset
+                .checked_add(next)
+                .filter(|next| *next < byte_len)
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "anchored directory entry offset is invalid",
+                    )
+                })?;
+        }
+        Ok(())
+    }
+
+    fn require_direct_leaf(name: &OsStr) -> io::Result<()> {
+        let mut components = Path::new(name).components();
+        if !matches!(components.next(), Some(Component::Normal(component)) if component == name)
+            || components.next().is_some()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "anchored record name is not a direct leaf",
+            ));
+        }
+        Ok(())
+    }
+
     fn query<T: Default>(file: &fs::File, class: i32) -> io::Result<T> {
         let mut value = T::default();
         let ok = unsafe {
@@ -1168,9 +1500,13 @@ mod platform {
     }
 
     fn open_root_exact(root: &Path) -> io::Result<fs::File> {
+        open_root_exact_with_access(root, FILE_READ_ATTRIBUTES | FILE_TRAVERSE)
+    }
+
+    fn open_root_exact_with_access(root: &Path, access: u32) -> io::Result<fs::File> {
         let mut options = fs::OpenOptions::new();
         options
-            .access_mode(FILE_READ_ATTRIBUTES | FILE_TRAVERSE)
+            .access_mode(access)
             .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
             .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS);
         let file = options.open(root)?;
@@ -1300,11 +1636,12 @@ mod platform {
 
 #[cfg(all(test, unix))]
 mod tests {
-    use super::{AnchoredRecordIdentity, AnchoredRecordObservation};
+    use super::{AnchoredRecordDirectory, AnchoredRecordIdentity, AnchoredRecordObservation};
     use static_assertions::assert_not_impl_any;
     use std::fs;
     use std::os::unix::fs::symlink;
     use std::path::{Path, PathBuf};
+    use std::time::{Duration, Instant};
 
     assert_not_impl_any!(
         AnchoredRecordIdentity:
@@ -1410,6 +1747,51 @@ mod tests {
         cleanup(&root);
     }
 
+    #[test]
+    fn held_directory_rejects_path_replacement_before_leaf_open() {
+        let root = test_root("held-directory-replacement");
+        fs::create_dir_all(&root).expect("create anchored root");
+        fs::write(root.join("record.json"), b"original").expect("write original record");
+        let directory = AnchoredRecordDirectory::open(&root).expect("hold anchored directory");
+
+        let old = root.with_extension("old");
+        fs::rename(&root, &old).expect("move held directory");
+        fs::create_dir_all(&root).expect("create replacement directory");
+        fs::write(root.join("record.json"), b"replacement").expect("write replacement record");
+
+        assert!(directory.names().is_err());
+        assert!(
+            directory
+                .read(std::ffi::OsStr::new("record.json"), 64)
+                .is_err()
+        );
+        cleanup(&root);
+        cleanup(&old);
+    }
+
+    #[test]
+    fn canonical_fifo_is_rejected_without_blocking() {
+        let root = test_root("fifo");
+        fs::create_dir_all(&root).expect("create anchored root");
+        let fifo = root.join("record.json");
+        rustix::fs::mkfifoat(
+            rustix::fs::CWD,
+            &fifo,
+            rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
+        )
+        .expect("create fifo");
+        let directory = AnchoredRecordDirectory::open(&root).expect("hold anchored directory");
+
+        let started = Instant::now();
+        assert!(
+            directory
+                .read(std::ffi::OsStr::new("record.json"), 64)
+                .is_err()
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
+        cleanup(&root);
+    }
+
     fn test_root(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
             "axial-anchored-record-{name}-{}",
@@ -1422,14 +1804,87 @@ mod tests {
     }
 }
 
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::AnchoredRecordDirectory;
+    use std::ffi::OsStr;
+    use std::fs;
+    use std::path::Path;
+
+    #[test]
+    fn mutation_compatible_identity_allows_external_exact_rename() {
+        let root = std::env::temp_dir().join(format!(
+            "axial-anchored-record-windows-share-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&root).expect("create anchored root");
+        let source = root.join("record.json");
+        let destination = root.join("moved.json");
+        fs::write(&source, b"{").expect("write record");
+        let directory = AnchoredRecordDirectory::open(&root).expect("hold anchored directory");
+        let observation = directory
+            .read_for_mutation(OsStr::new("record.json"), 64)
+            .expect("retain mutation-compatible identity");
+
+        fs::rename(&source, &destination).expect("second delete-capable handle can rename");
+        assert!(!observation.into_identity().is_current());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn held_directory_enumerates_names_from_list_capable_handle() {
+        let root = std::env::temp_dir().join(format!(
+            "axial-anchored-record-windows-list-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&root).expect("create anchored root");
+        fs::write(root.join("record.json"), b"record").expect("write record");
+        let directory = AnchoredRecordDirectory::open(&root).expect("hold anchored directory");
+
+        assert!(
+            directory
+                .names()
+                .expect("enumerate held directory")
+                .iter()
+                .any(|name| Path::new(name).file_name() == Some(OsStr::new("record.json")))
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+}
+
 #[cfg(not(any(unix, windows)))]
 mod platform {
+    use std::ffi::{OsStr, OsString};
     use std::io;
     use std::path::Path;
 
+    pub(super) struct Directory;
     pub(super) struct Leaf;
     pub(super) struct RegularFile;
     pub(super) struct Temp;
+
+    impl Directory {
+        pub(super) fn open(_path: &Path) -> io::Result<Self> {
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "anchored records are unavailable on this platform",
+            ))
+        }
+
+        pub(super) fn names(&self) -> io::Result<Vec<OsString>> {
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "anchored records are unavailable on this platform",
+            ))
+        }
+
+        pub(super) fn open_leaf(&self, _name: &OsStr) -> io::Result<Leaf> {
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "anchored records are unavailable on this platform",
+            ))
+        }
+    }
 
     impl Leaf {
         pub(super) fn open(_root: &Path, _relative: &Path) -> io::Result<Self> {
@@ -1464,7 +1919,10 @@ mod platform {
             self.revalidate()
         }
 
-        pub(super) fn open_regular(&self) -> io::Result<Option<RegularFile>> {
+        pub(super) fn open_regular(
+            &self,
+            _mutation_compatible: bool,
+        ) -> io::Result<Option<RegularFile>> {
             self.revalidate().map(|()| None)
         }
     }
@@ -1489,6 +1947,7 @@ mod platform {
             false
         }
 
+        #[cfg(test)]
         pub(super) fn same_identity(&self, _other: &Self) -> bool {
             false
         }

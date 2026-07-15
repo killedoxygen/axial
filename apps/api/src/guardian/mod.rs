@@ -19,7 +19,7 @@ pub mod performance;
 pub mod policy;
 pub mod preflight;
 mod repair_authorization;
-pub mod state_evidence;
+mod state_evidence;
 mod whole_instance_rematerialization;
 
 #[cfg(test)]
@@ -157,7 +157,7 @@ pub(crate) use repair_authorization::RepairAuthorizationRejection;
 pub(crate) use repair_authorization::{
     ReadyMarkerRepairAuthorization, authorize_managed_runtime_ready_marker_repair,
 };
-pub use state_evidence::{GuardianStateLoadOutcome, persisted_state_load_guardian_outcome};
+pub(crate) use state_evidence::persisted_state_load_guardian_outcome;
 pub(crate) use whole_instance_rematerialization::{
     GuardianWholeInstanceRematerializationDisposition, GuardianWholeInstanceRematerializationError,
     GuardianWholeInstanceRematerializationOffer, GuardianWholeInstanceRematerializationOutcome,

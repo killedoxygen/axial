@@ -3178,7 +3178,7 @@ async fn persisted_identity_rejects_preflight_target_drift_on_resume() {
 }
 
 #[tokio::test]
-async fn invalid_timestamps_are_unknown_on_both_operation_endpoints() {
+async fn invalid_timestamps_are_excluded_from_operation_endpoints() {
     let root = test_root("public-operation-timestamps");
     let operation_id = test_performance_operation_id(1);
     let seed = build_test_state(&root, None, None);
@@ -3217,69 +3217,16 @@ async fn invalid_timestamps_are_unknown_on_both_operation_endpoints() {
     .expect("rewrite timestamps");
     let state = build_test_state(&root, None, None);
 
-    let direct = performance_operation_status(&state, &operation_id)
-        .await
-        .expect("direct operation status");
-    assert_eq!(direct.status.created_at, "unknown");
-    assert_eq!(direct.status.updated_at, "unknown");
+    assert!(
+        performance_operation_status(&state, &operation_id)
+            .await
+            .is_err()
+    );
     let by_instance = performance_instance_operation(&state, &instance_id)
         .await
         .expect("instance operation response");
-    let by_instance = by_instance.operation.expect("instance operation status");
-    assert_eq!(by_instance.status.created_at, "unknown");
-    assert_eq!(by_instance.status.updated_at, "unknown");
-    let encoded = serde_json::to_string(&(direct, by_instance)).expect("serialize public statuses");
-    assert_omits_raw_fragments(&encoded, &["/Users/alice", "token=", "not-rfc3339"]);
-    let _ = fs::remove_dir_all(root);
-}
-
-#[tokio::test]
-async fn startup_terminalizes_malformed_status_journal_first_with_bounded_public_fields() {
-    let root = test_root("restart-malformed-status");
-    let operation_id = test_performance_operation_id(1);
-    write_persisted_performance_status(
-        &root,
-        &operation_id,
-        "",
-        "install",
-        "applying",
-        PerformanceOperationPayload {
-            game_version: Some("/Users/alice/private-version".to_string()),
-            loader: Some("fabric?token=secret-token".to_string()),
-            mode: None,
-            rollback_id: None,
-        },
-    );
-    let state = build_test_state(&root, None, None);
-    assert_eq!(
-        state
-            .performance_operations()
-            .get(&operation_id)
-            .await
-            .expect("malformed record retained")
-            .state,
-        crate::state::performance_operations::PERFORMANCE_RESUME_INVALID_STATE
-    );
-
-    assert_eq!(
-        resume_pending_performance_operations(state.clone()).await,
-        1
-    );
-    assert_journal_first_failed_status(&state, &operation_id).await;
-    let public = performance_operation_status(&state, &operation_id)
-        .await
-        .expect("public failed status");
-    let encoded = serde_json::to_string(&public).expect("serialize public status");
-    assert_omits_raw_fragments(
-        &encoded,
-        &["/Users/alice", "private-version", "secret-token", "token="],
-    );
-    assert!(state.performance_operations().load_issue_count() >= 1);
-    let issues = format!("{:?}", state.performance_operations().load_issues());
-    assert_omits_raw_fragments(
-        &issues,
-        &["/Users/alice", "private-version", "secret-token"],
-    );
+    assert!(by_instance.operation.is_none());
+    assert!(state.performance_operations().load_issue_count() > 0);
     let _ = fs::remove_dir_all(root);
 }
 

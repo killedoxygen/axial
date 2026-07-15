@@ -1456,7 +1456,6 @@ async fn prepare_resumed_performance_operation(
     if matches!(
         status.state.as_str(),
         crate::state::performance_operations::PERFORMANCE_RESUME_BLOCKED_STATE
-            | crate::state::performance_operations::PERFORMANCE_RESUME_INVALID_STATE
     ) {
         terminalize_mismatched_performance_operation(
             state,

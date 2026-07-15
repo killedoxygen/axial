@@ -3,21 +3,22 @@ use super::{
     GuardianFact, GuardianFactId, GuardianMode, GuardianPolicyContext, GuardianUserOutcome,
     author_guardian_copy, build_safety_case, decide_guardian_policy,
 };
+use crate::state::PersistedStateLoadEvidence;
 use crate::state::contracts::{
     OperationPhase, OwnershipClass, StabilizationSystem, TargetDescriptor, TargetKind,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct GuardianStateLoadOutcome {
-    pub decision: GuardianActionKind,
-    pub diagnosis_id: DiagnosisId,
-    pub user_outcome: GuardianUserOutcome,
+pub(crate) struct GuardianStateLoadOutcome {
+    pub(crate) decision: GuardianActionKind,
+    pub(crate) diagnosis_id: DiagnosisId,
+    pub(crate) user_outcome: GuardianUserOutcome,
 }
 
-pub fn persisted_state_load_guardian_outcome(
-    load_issue_count: usize,
+pub(crate) fn persisted_state_load_guardian_outcome(
+    evidence: &PersistedStateLoadEvidence,
 ) -> Option<GuardianStateLoadOutcome> {
-    if load_issue_count == 0 {
+    if evidence.issue_count() == 0 {
         return None;
     }
 
@@ -67,16 +68,22 @@ fn persisted_state_load_fact(target: TargetDescriptor) -> GuardianFact {
 mod tests {
     use super::persisted_state_load_guardian_outcome;
     use crate::guardian::GuardianActionKind;
+    use crate::state::PersistedStateLoadEvidence;
     use crate::state::contracts::OperationPhase;
 
     #[test]
     fn no_state_load_issues_produce_no_guardian_outcome() {
-        assert_eq!(persisted_state_load_guardian_outcome(0), None);
+        assert_eq!(
+            persisted_state_load_guardian_outcome(&PersistedStateLoadEvidence::for_test(0)),
+            None
+        );
     }
 
     #[test]
     fn state_load_issues_flow_through_guardian_policy() {
-        let outcome = persisted_state_load_guardian_outcome(2).expect("guardian outcome");
+        let outcome =
+            persisted_state_load_guardian_outcome(&PersistedStateLoadEvidence::for_test(2))
+                .expect("guardian outcome");
 
         assert_eq!(outcome.decision, GuardianActionKind::Warn);
         assert_eq!(outcome.user_outcome.decision(), outcome.decision);

@@ -1,3 +1,4 @@
+use crate::execution::anchored_record::{AnchoredRecordDirectory, AnchoredRecordObservation};
 use crate::execution::file::{DeleteFileRequest, delete_launcher_managed_file, file_fact};
 use crate::execution::persistence::{
     AcceptedWrite, AtomicSnapshotWriter, PersistenceCoordinator, PersistenceOwnerLease,
@@ -12,10 +13,15 @@ use crate::state::benchmark_suites::{
     BenchmarkSuiteRetentionClaims, BenchmarkSuiteRetentionHandle,
 };
 use crate::state::ownership::{CurrentArtifact, classify_current_artifact};
+use crate::state::persisted_state_load::{
+    MAX_REJECTED_RESTART_RECORDS_PER_STORE, MAX_RESTART_RECORD_BYTES,
+    PersistedStateRecordRejection, PersistedStateRecordStore, PersistedStateRejectedRecord,
+};
 use axial_config::AppPaths;
 use chrono::{DateTime, SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
+#[cfg(test)]
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -54,6 +60,8 @@ pub enum BenchmarkSuiteDriverStoreError {
     RetentionConflict,
     #[error("benchmark suite driver shutdown has started")]
     ShuttingDown,
+    #[error("benchmark suite driver id space is exhausted")]
+    IdExhausted,
     #[error("benchmark suite driver persistence failed: {0}")]
     Persistence(#[source] io::Error),
 }
@@ -67,6 +75,7 @@ impl BenchmarkSuiteDriverStoreError {
             Self::RetryUnavailable => "retry_unavailable",
             Self::RetentionConflict => "retention_conflict",
             Self::ShuttingDown => "shutting_down",
+            Self::IdExhausted => "id_exhausted",
             Self::Persistence(_) => "persistence",
         }
     }
@@ -238,9 +247,8 @@ struct BenchmarkSuiteDriverShutdownState {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BenchmarkSuiteDriverLoadIssueKind {
+enum BenchmarkSuiteDriverLoadIssueKind {
     DirectoryUnreadable,
-    DirectoryEntryUnreadable,
     StatusUnreadable,
     StatusInvalid,
     UnsafeDriverId,
@@ -254,9 +262,9 @@ pub enum BenchmarkSuiteDriverLoadIssueKind {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct BenchmarkSuiteDriverLoadIssue {
-    pub kind: BenchmarkSuiteDriverLoadIssueKind,
-    pub count: usize,
+struct BenchmarkSuiteDriverLoadIssue {
+    kind: BenchmarkSuiteDriverLoadIssueKind,
+    count: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -294,6 +302,7 @@ struct BenchmarkSuiteDriverLoadState {
     issues: Vec<BenchmarkSuiteDriverLoadIssue>,
     retention_excluded_ids: HashSet<String>,
     suite_retention_claims: Vec<(String, String)>,
+    rejected_records: Vec<PersistedStateRejectedRecord>,
 }
 
 struct BenchmarkSuiteDriverPersistence {
@@ -405,17 +414,35 @@ pub struct BenchmarkSuiteDriverStore {
     load_issues: Vec<BenchmarkSuiteDriverLoadIssue>,
 }
 
-pub(crate) struct PreparedBenchmarkSuiteDriverStore {
+pub(super) struct PreparedBenchmarkSuiteDriverStore {
     storage_dir: PathBuf,
     load_state: BenchmarkSuiteDriverLoadState,
     suite_retention_claims: BenchmarkSuiteRetentionClaims,
 }
 
+pub(super) struct LoadedBenchmarkSuiteDriverStore {
+    store: BenchmarkSuiteDriverStore,
+    rejected_records: Vec<PersistedStateRejectedRecord>,
+}
+
+impl LoadedBenchmarkSuiteDriverStore {
+    pub(super) fn into_parts(
+        self,
+    ) -> (BenchmarkSuiteDriverStore, Vec<PersistedStateRejectedRecord>) {
+        (self.store, self.rejected_records)
+    }
+
+    #[cfg(test)]
+    fn into_store(self) -> BenchmarkSuiteDriverStore {
+        self.store
+    }
+}
+
 impl PreparedBenchmarkSuiteDriverStore {
-    pub(crate) fn bind(
+    pub(super) fn bind(
         self,
         suite_retention: BenchmarkSuiteRetentionHandle,
-    ) -> BenchmarkSuiteDriverStore {
+    ) -> LoadedBenchmarkSuiteDriverStore {
         BenchmarkSuiteDriverStore::finish_load(
             self,
             PersistenceCoordinator::global(),
@@ -476,7 +503,7 @@ impl BenchmarkSuiteDriverStore {
         Self::load_from_paths_with_retention_claims(paths, BenchmarkSuiteRetentionClaims::default())
     }
 
-    pub(crate) fn prepare_load_from_paths(
+    pub(super) fn prepare_load_from_paths(
         paths: &AppPaths,
         suite_retention_claims: BenchmarkSuiteRetentionClaims,
     ) -> PreparedBenchmarkSuiteDriverStore {
@@ -518,6 +545,7 @@ impl BenchmarkSuiteDriverStore {
             )
             .retention_handle();
         Self::finish_load(prepared, PersistenceCoordinator::global(), suite_retention)
+            .map(LoadedBenchmarkSuiteDriverStore::into_store)
             .unwrap_or_else(|error| {
                 panic!("failed to initialize benchmark suite driver persistence: {error}")
             })
@@ -548,20 +576,28 @@ impl BenchmarkSuiteDriverStore {
             )
             .retention_handle();
         Self::finish_load(prepared, coordinator, suite_retention)
+            .map(LoadedBenchmarkSuiteDriverStore::into_store)
     }
 
     fn finish_load(
         prepared: PreparedBenchmarkSuiteDriverStore,
         coordinator: PersistenceCoordinator,
         suite_retention: BenchmarkSuiteRetentionHandle,
-    ) -> Result<Self, BenchmarkSuiteDriverStoreError> {
+    ) -> Result<LoadedBenchmarkSuiteDriverStore, BenchmarkSuiteDriverStoreError> {
         let PreparedBenchmarkSuiteDriverStore {
             storage_dir,
             load_state,
             suite_retention_claims,
         } = prepared;
-        Ok(Self {
-            inner: Arc::new(RwLock::new(load_state.inner)),
+        let BenchmarkSuiteDriverLoadState {
+            inner,
+            issues,
+            retention_excluded_ids,
+            suite_retention_claims: _,
+            rejected_records,
+        } = load_state;
+        let store = Self {
+            inner: Arc::new(RwLock::new(inner)),
             mutation_gate: Arc::new(AsyncMutex::new(())),
             persistence: Some(Arc::new(BenchmarkSuiteDriverPersistence::claim(
                 &storage_dir,
@@ -574,10 +610,14 @@ impl BenchmarkSuiteDriverStore {
             shutdown_admission_closed: Arc::new(AtomicBool::new(false)),
             shutdown_requested: Self::shutdown_requested_sender(),
             shutdown_state: Arc::new(SyncMutex::new(BenchmarkSuiteDriverShutdownState::default())),
-            retention_excluded_ids: Arc::new(load_state.retention_excluded_ids),
+            retention_excluded_ids: Arc::new(retention_excluded_ids),
             suite_retention_claims,
             suite_retention,
-            load_issues: load_state.issues,
+            load_issues: issues,
+        };
+        Ok(LoadedBenchmarkSuiteDriverStore {
+            store,
+            rejected_records,
         })
     }
 
@@ -621,7 +661,12 @@ impl BenchmarkSuiteDriverStore {
                 return Err(BenchmarkSuiteDriverStartError::Conflict);
             }
 
-            inner.next_id = inner.next_id.saturating_add(1);
+            inner.next_id = inner.next_id.checked_add(1).ok_or_else(|| {
+                BenchmarkSuiteDriverStartError::Store {
+                    driver_id: format!("{DRIVER_ID_PREFIX}{:016x}", inner.next_id),
+                    source: BenchmarkSuiteDriverStoreError::IdExhausted,
+                }
+            })?;
             let id = format!("{DRIVER_ID_PREFIX}{:016x}", inner.next_id);
             let now = timestamp_utc();
             let (stop_tx, stop_rx) = watch::channel(false);
@@ -684,12 +729,11 @@ impl BenchmarkSuiteDriverStore {
             .map(|entry| entry.status.clone())
     }
 
-    pub fn load_issues(&self) -> Vec<BenchmarkSuiteDriverLoadIssue> {
-        self.load_issues.clone()
-    }
-
-    pub fn load_issue_count(&self) -> usize {
-        self.load_issues.iter().map(|issue| issue.count).sum()
+    pub(crate) fn load_issue_count(&self) -> usize {
+        self.load_issues
+            .iter()
+            .map(|issue| issue.count)
+            .fold(0usize, usize::saturating_add)
     }
 
     pub async fn take_restart_interrupted_resumable_drivers(
@@ -1615,8 +1659,8 @@ fn is_safe_public_token(value: &str) -> bool {
 
 fn load_persisted_driver_inner(storage_dir: &Path) -> BenchmarkSuiteDriverLoadState {
     let mut load_state = BenchmarkSuiteDriverLoadState::default();
-    let entries = match fs::read_dir(storage_dir) {
-        Ok(entries) => entries,
+    let directory = match AnchoredRecordDirectory::open(storage_dir) {
+        Ok(directory) => directory,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return load_state,
         Err(error) => {
             warn!(
@@ -1631,44 +1675,81 @@ fn load_persisted_driver_inner(storage_dir: &Path) -> BenchmarkSuiteDriverLoadSt
         }
     };
 
-    let mut paths = Vec::new();
-    for entry in entries {
-        let entry = match entry {
-            Ok(entry) => entry,
+    let mut names = match directory.names() {
+        Ok(names) => names,
+        Err(error) => {
+            warn!(
+                error_kind = ?error.kind(),
+                "failed to enumerate anchored benchmark suite driver status directory"
+            );
+            record_load_issue(
+                &mut load_state.issues,
+                BenchmarkSuiteDriverLoadIssueKind::DirectoryUnreadable,
+            );
+            return load_state;
+        }
+    };
+    names.retain(|name| {
+        Path::new(name).extension().and_then(|value| value.to_str()) == Some("json")
+    });
+    names.sort();
+
+    let mut candidates = BTreeMap::<String, Vec<LoadedBenchmarkSuiteDriverRecord>>::new();
+    let mut logical_occurrences = HashMap::<String, usize>::new();
+    let mut deferred_local_rejections =
+        BTreeMap::<String, (String, PersistedStateRecordRejection)>::new();
+    let mut rejected_records = BTreeMap::<String, PersistedStateRecordRejection>::new();
+    let mut max_seen_index = 0;
+    for name in names {
+        let physical_id = canonical_driver_id_from_name(&name);
+        if let Some(index) = physical_id.as_deref().and_then(driver_id_index) {
+            max_seen_index = max_seen_index.max(index);
+        }
+        let observation = match directory.read(&name, MAX_RESTART_RECORD_BYTES) {
+            Ok(observation) => observation,
             Err(error) => {
                 warn!(
                     error_kind = ?error.kind(),
-                    "failed to read benchmark suite driver status directory entry"
+                    "failed to open or read anchored benchmark suite driver status"
                 );
                 record_load_issue(
                     &mut load_state.issues,
-                    BenchmarkSuiteDriverLoadIssueKind::DirectoryEntryUnreadable,
+                    BenchmarkSuiteDriverLoadIssueKind::StatusUnreadable,
                 );
                 continue;
             }
         };
-        let path = entry.path();
-        if path.extension().and_then(|value| value.to_str()) != Some("json") {
+        if observation.is_oversized() {
+            record_load_issue(
+                &mut load_state.issues,
+                BenchmarkSuiteDriverLoadIssueKind::StatusInvalid,
+            );
+            if let Some(physical_id) = physical_id {
+                rejected_records.insert(
+                    safe_driver_filename(&physical_id),
+                    PersistedStateRecordRejection::Oversized,
+                );
+            }
             continue;
         }
-        paths.push(path);
-    }
-    paths.sort();
-
-    let mut candidates = BTreeMap::<String, Vec<(PathBuf, BenchmarkSuiteDriverStatus)>>::new();
-    let mut max_seen_index = 0;
-    for path in paths {
-        let mut status = match load_status_file(&path) {
+        let mut status = match serde_json::from_slice::<BenchmarkSuiteDriverStatus>(
+            observation
+                .bytes()
+                .expect("non-oversized anchored observation has bytes"),
+        ) {
             Ok(status) => status,
             Err(error) => {
-                warn!(
-                    error_kind = ?error.kind(),
-                    "failed to load benchmark suite driver status"
-                );
+                warn!(error = %error, "failed to decode benchmark suite driver status");
                 record_load_issue(
                     &mut load_state.issues,
-                    driver_status_load_issue_kind(&error),
+                    BenchmarkSuiteDriverLoadIssueKind::StatusInvalid,
                 );
+                if let Some(physical_id) = physical_id {
+                    rejected_records.insert(
+                        safe_driver_filename(&physical_id),
+                        PersistedStateRecordRejection::InvalidSchema,
+                    );
+                }
                 continue;
             }
         };
@@ -1678,33 +1759,57 @@ fn load_persisted_driver_inner(storage_dir: &Path) -> BenchmarkSuiteDriverLoadSt
                 &mut load_state.issues,
                 BenchmarkSuiteDriverLoadIssueKind::UnsafeDriverId,
             );
+            if let Some(physical_id) = physical_id {
+                rejected_records.insert(
+                    safe_driver_filename(&physical_id),
+                    PersistedStateRecordRejection::InvalidIdentity,
+                );
+            }
             continue;
         }
-        max_seen_index =
-            max_seen_index.max(driver_id_index(&status.id).expect("safe driver id has an index"));
+        let occurrence_count = logical_occurrences.entry(status.id.clone()).or_default();
+        *occurrence_count = occurrence_count.saturating_add(1);
         if let Err(kind) = normalize_and_validate_loaded_status(&mut status) {
             warn!(issue_kind = ?kind, "skipping invalid benchmark suite driver status");
             record_load_issue(&mut load_state.issues, kind);
+            if let Some(physical_id) = physical_id {
+                let rejection = if physical_id == status.id {
+                    PersistedStateRecordRejection::InvalidSemantics
+                } else {
+                    PersistedStateRecordRejection::InvalidIdentity
+                };
+                deferred_local_rejections
+                    .insert(safe_driver_filename(&physical_id), (status.id, rejection));
+            }
             continue;
         }
         candidates
             .entry(status.id.clone())
             .or_default()
-            .push((path, status));
+            .push(LoadedBenchmarkSuiteDriverRecord {
+                physical_id,
+                status,
+            });
     }
     load_state.inner.next_id = max_seen_index;
 
+    for (physical_name, (logical_id, rejection)) in deferred_local_rejections {
+        if logical_occurrences.get(&logical_id).copied() == Some(1) {
+            rejected_records.insert(physical_name, rejection);
+        }
+    }
+
     let mut accepted = Vec::new();
     for mut records in candidates.into_values() {
-        records.sort_by(|left, right| left.0.cmp(&right.0));
+        records.sort_by(|left, right| left.physical_id.cmp(&right.physical_id));
         if records.len() > 1 {
             warn!("skipping duplicate persisted benchmark suite driver id");
             load_state
                 .suite_retention_claims
-                .extend(records.iter().enumerate().map(|(index, (_, status))| {
+                .extend(records.iter().enumerate().map(|(index, record)| {
                     (
-                        duplicate_retention_claim_owner(&status.id, index),
-                        status.suite_id.clone(),
+                        duplicate_retention_claim_owner(&record.status.id, index),
+                        record.status.suite_id.clone(),
                     )
                 }));
             for _ in 1..records.len() {
@@ -1715,15 +1820,26 @@ fn load_persisted_driver_inner(storage_dir: &Path) -> BenchmarkSuiteDriverLoadSt
             }
             continue;
         }
-        let (path, status) = records
+        let LoadedBenchmarkSuiteDriverRecord {
+            physical_id,
+            status,
+        } = records
             .pop()
             .expect("persisted driver candidate group is non-empty");
-        if !is_canonical_driver_path(&path, &status.id) {
+        if physical_id.as_deref() != Some(status.id.as_str()) {
             warn!("skipping persisted benchmark suite driver with noncanonical filename");
             record_load_issue(
                 &mut load_state.issues,
                 BenchmarkSuiteDriverLoadIssueKind::NonCanonicalFilename,
             );
+            if let Some(physical_id) = physical_id
+                && logical_occurrences.get(&status.id).copied() == Some(1)
+            {
+                rejected_records.insert(
+                    safe_driver_filename(&physical_id),
+                    PersistedStateRecordRejection::InvalidIdentity,
+                );
+            }
             continue;
         }
         accepted.push(status);
@@ -1741,7 +1857,92 @@ fn load_persisted_driver_inner(storage_dir: &Path) -> BenchmarkSuiteDriverLoadSt
         admit_loaded_suite(&mut load_state, statuses);
     }
 
+    load_state.rejected_records =
+        retain_driver_rejected_records(&directory, rejected_records, &mut load_state.issues);
+
     load_state
+}
+
+struct LoadedBenchmarkSuiteDriverRecord {
+    physical_id: Option<String>,
+    status: BenchmarkSuiteDriverStatus,
+}
+
+fn retain_driver_rejected_records(
+    directory: &AnchoredRecordDirectory,
+    rejected: BTreeMap<String, PersistedStateRecordRejection>,
+    issues: &mut Vec<BenchmarkSuiteDriverLoadIssue>,
+) -> Vec<PersistedStateRejectedRecord> {
+    let mut retained = Vec::new();
+    for (physical_name, rejection) in rejected {
+        if retained.len() == MAX_REJECTED_RESTART_RECORDS_PER_STORE {
+            break;
+        }
+        let Some(physical_id) = physical_name.strip_suffix(".json") else {
+            continue;
+        };
+        let observation = match directory.read_for_mutation(
+            std::ffi::OsStr::new(&physical_name),
+            MAX_RESTART_RECORD_BYTES,
+        ) {
+            Ok(observation) => observation,
+            Err(error) => {
+                warn!(
+                    error_kind = ?error.kind(),
+                    "failed to reacquire rejected benchmark suite driver status"
+                );
+                record_load_issue(issues, BenchmarkSuiteDriverLoadIssueKind::StatusUnreadable);
+                continue;
+            }
+        };
+        if !driver_rejection_still_holds(&observation, physical_id, rejection) {
+            warn!("benchmark suite driver rejection changed during startup load");
+            record_load_issue(issues, BenchmarkSuiteDriverLoadIssueKind::StatusUnreadable);
+            continue;
+        }
+        retained.push(PersistedStateRejectedRecord::new(
+            PersistedStateRecordStore::BenchmarkSuiteDriver,
+            rejection,
+            rejected_benchmark_suite_driver_target(physical_id),
+            observation.into_identity(),
+        ));
+    }
+    retained
+}
+
+fn rejected_benchmark_suite_driver_target(
+    physical_id: &str,
+) -> crate::state::contracts::TargetDescriptor {
+    debug_assert!(is_safe_driver_id(physical_id));
+    let mut target = benchmark_suite_driver_target(physical_id);
+    target.id = physical_id.to_string();
+    target
+}
+
+fn driver_rejection_still_holds(
+    observation: &AnchoredRecordObservation,
+    physical_id: &str,
+    rejection: PersistedStateRecordRejection,
+) -> bool {
+    if rejection == PersistedStateRecordRejection::Oversized {
+        return observation.is_oversized();
+    }
+    let Some(bytes) = observation.bytes() else {
+        return false;
+    };
+    let decoded = serde_json::from_slice::<BenchmarkSuiteDriverStatus>(bytes);
+    match rejection {
+        PersistedStateRecordRejection::Oversized => false,
+        PersistedStateRecordRejection::InvalidSchema => decoded.is_err(),
+        PersistedStateRecordRejection::InvalidIdentity => {
+            decoded.is_ok_and(|status| !is_safe_driver_id(&status.id) || status.id != physical_id)
+        }
+        PersistedStateRecordRejection::InvalidSemantics => decoded.is_ok_and(|mut status| {
+            is_safe_driver_id(&status.id)
+                && status.id == physical_id
+                && normalize_and_validate_loaded_status(&mut status).is_err()
+        }),
+    }
 }
 
 fn admit_loaded_suite(
@@ -1862,24 +2063,10 @@ fn duplicate_retention_claim_owner(driver_id: &str, index: usize) -> String {
     format!("{driver_id}:duplicate:{index}")
 }
 
-fn driver_status_load_issue_kind(error: &io::Error) -> BenchmarkSuiteDriverLoadIssueKind {
-    if error.kind() == io::ErrorKind::InvalidData {
-        BenchmarkSuiteDriverLoadIssueKind::StatusInvalid
-    } else {
-        BenchmarkSuiteDriverLoadIssueKind::StatusUnreadable
-    }
-}
-
-fn is_canonical_driver_path(path: &Path, driver_id: &str) -> bool {
-    let expected = safe_driver_filename(driver_id);
-    path.file_name()
-        .and_then(|value| value.to_str())
-        .is_some_and(|filename| filename == expected.as_str())
-}
-
-fn load_status_file(path: &Path) -> io::Result<BenchmarkSuiteDriverStatus> {
-    let data = fs::read_to_string(path)?;
-    serde_json::from_str(&data).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+#[cfg(test)]
+fn decode_persisted_driver_fixture(path: &Path) -> io::Result<BenchmarkSuiteDriverStatus> {
+    let data = fs::read(path)?;
+    serde_json::from_slice(&data).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
 }
 
 fn encode_driver_status(status: BenchmarkSuiteDriverStatus) -> io::Result<Vec<u8>> {
@@ -2255,6 +2442,12 @@ fn is_safe_driver_id(driver_id: &str) -> bool {
     })
 }
 
+fn canonical_driver_id_from_name(name: &std::ffi::OsStr) -> Option<String> {
+    let filename = name.to_str()?;
+    let driver_id = filename.strip_suffix(".json")?;
+    is_safe_driver_id(driver_id).then(|| driver_id.to_string())
+}
+
 fn driver_id_index(driver_id: &str) -> Option<u64> {
     let suffix = driver_id.strip_prefix(DRIVER_ID_PREFIX)?;
     if suffix.len() != 16 || !suffix.chars().all(|value| value.is_ascii_hexdigit()) {
@@ -2277,10 +2470,14 @@ mod tests {
     use super::*;
     use crate::execution::persistence::{AtomicWriteBackend, PersistenceCoordinator};
     use crate::state::contracts::TargetDescriptor;
+    use static_assertions::{assert_impl_all, assert_not_impl_any};
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    assert_impl_all!(BenchmarkSuiteDriverStore: Clone);
+    assert_not_impl_any!(LoadedBenchmarkSuiteDriverStore: Clone);
 
     #[derive(Default)]
     struct ControlledBackend {
@@ -2941,7 +3138,7 @@ mod tests {
             "stopped"
         );
         assert_eq!(
-            load_status_file(&driver_path(&driver_dir(&paths), &second.status.id))
+            decode_persisted_driver_fixture(&driver_path(&driver_dir(&paths), &second.status.id))
                 .expect("second stopped status")
                 .state,
             "stopped"
@@ -3356,7 +3553,7 @@ mod tests {
             .expect("terminal status");
         assert_eq!(status.state, "complete");
         assert_eq!(
-            load_status_file(&driver_path(&driver_dir(&paths), &started.status.id))
+            decode_persisted_driver_fixture(&driver_path(&driver_dir(&paths), &started.status.id))
                 .expect("terminal file")
                 .state,
             "complete"
@@ -3477,8 +3674,9 @@ mod tests {
             "expected coalescing, observed {} physical writes",
             backend.write_count()
         );
-        let persisted = load_status_file(&driver_path(&driver_dir(&paths), &started.status.id))
-            .expect("latest progress persisted");
+        let persisted =
+            decode_persisted_driver_fixture(&driver_path(&driver_dir(&paths), &started.status.id))
+                .expect("latest progress persisted");
         assert_eq!(persisted.launched_run_count, 20);
         assert_eq!(persisted.active_session_id.as_deref(), Some("session-20"));
         store.close().await.expect("store closes");
@@ -3520,8 +3718,9 @@ mod tests {
 
         store.flush().await.expect("flush retries latest progress");
 
-        let persisted = load_status_file(&driver_path(&driver_dir(&paths), &started.status.id))
-            .expect("progress file");
+        let persisted =
+            decode_persisted_driver_fixture(&driver_path(&driver_dir(&paths), &started.status.id))
+                .expect("progress file");
         assert_eq!(persisted.state, "active");
         assert_eq!(persisted.launched_run_count, 1);
         assert_eq!(persisted.active_session_id.as_deref(), Some("session-1"));
@@ -3575,13 +3774,15 @@ mod tests {
 
         let path = driver_path(&driver_dir(&paths), &started.status.id);
         assert!(path.is_file());
-        let persisted = load_status_file(&path).expect("persisted status should load");
+        let persisted =
+            decode_persisted_driver_fixture(&path).expect("persisted status should load");
         assert_eq!(persisted.state, "active");
 
         store.close().await.expect("first store closes");
         let reloaded = BenchmarkSuiteDriverStore::load_from_paths(&paths);
         assert!(reloaded.get(&started.status.id).await.is_none());
-        let unchanged = load_status_file(&path).expect("load does not rewrite status");
+        let unchanged =
+            decode_persisted_driver_fixture(&path).expect("load does not rewrite status");
         assert_eq!(unchanged.state, "active");
 
         let pending = reloaded
@@ -3600,7 +3801,7 @@ mod tests {
             Some(AUTOMATIC_RESUME_QUEUED_ERROR)
         );
         assert_eq!(interrupted.active_session_id, None);
-        let rewritten = load_status_file(&path).expect("checkpoint persisted");
+        let rewritten = decode_persisted_driver_fixture(&path).expect("checkpoint persisted");
         assert_eq!(rewritten.state, "interrupted");
         assert_eq!(
             reloaded
@@ -3657,7 +3858,7 @@ mod tests {
             Some(AUTOMATIC_RESUME_QUEUED_ERROR)
         );
         assert_eq!(
-            load_status_file(&driver_path(&dir, &status.id))
+            decode_persisted_driver_fixture(&driver_path(&dir, &status.id))
                 .expect("checkpoint file")
                 .error
                 .as_deref(),
@@ -4817,6 +5018,264 @@ mod tests {
         let encoded = format!("{:?}", load_state.issues);
         assert!(!encoded.contains(root.to_string_lossy().as_ref()));
         assert!(!encoded.contains("unexpected_state"));
+        assert_eq!(load_state.rejected_records.len(), 1);
+        assert_eq!(
+            load_state.rejected_records[0].evidence().rejection(),
+            PersistedStateRecordRejection::InvalidSchema
+        );
+        cleanup(&root);
+    }
+
+    #[test]
+    fn rejected_driver_selection_is_creation_order_independent_and_bounded() {
+        let mut selections = Vec::new();
+        for descending in [false, true] {
+            let root = test_root(if descending {
+                "rejected-order-descending"
+            } else {
+                "rejected-order-ascending"
+            });
+            let dir = driver_dir(&test_paths(&root));
+            fs::create_dir_all(&dir).expect("create driver dir");
+            let mut indexes = (1_u64..=12).collect::<Vec<_>>();
+            if descending {
+                indexes.reverse();
+            }
+            for index in indexes {
+                let id = format!("{DRIVER_ID_PREFIX}{index:016x}");
+                fs::write(driver_path(&dir, &id), b"{").expect("write invalid driver");
+            }
+
+            let load_state = load_persisted_driver_inner(&dir);
+            let selected = load_state
+                .rejected_records
+                .iter()
+                .map(|record| record.evidence().target().id.clone())
+                .collect::<Vec<_>>();
+
+            assert_eq!(load_state.rejected_records.len(), 8);
+            assert_eq!(
+                load_state
+                    .issues
+                    .iter()
+                    .find(|issue| issue.kind == BenchmarkSuiteDriverLoadIssueKind::StatusInvalid)
+                    .map(|issue| issue.count),
+                Some(12)
+            );
+            selections.push(selected);
+            drop(load_state);
+            cleanup(&root);
+        }
+
+        assert_eq!(selections[0], selections[1]);
+        assert_eq!(
+            selections[0],
+            (1_u64..=8)
+                .map(|index| format!("{DRIVER_ID_PREFIX}{index:016x}"))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn cloned_runtime_store_cannot_share_startup_candidate_authority() {
+        let root = test_root("runtime-clone-candidate-authority");
+        let paths = test_paths(&root);
+        let dir = driver_dir(&paths);
+        fs::create_dir_all(&dir).expect("create driver dir");
+        let id = format!("{DRIVER_ID_PREFIX}{:016x}", 1);
+        fs::write(driver_path(&dir, &id), b"{").expect("write invalid driver");
+        let retention_claims = BenchmarkSuiteRetentionClaims::default();
+        let prepared = BenchmarkSuiteDriverStore::prepare_load(&paths, retention_claims.clone())
+            .expect("prepare driver load");
+        let suite_retention =
+            crate::state::benchmark_suites::BenchmarkSuiteStore::new_with_retention_claims(
+                retention_claims,
+            )
+            .retention_handle();
+        let loaded = BenchmarkSuiteDriverStore::finish_load(
+            prepared,
+            PersistenceCoordinator::global(),
+            suite_retention,
+        )
+        .expect("finish driver load");
+        let (store, rejected_records) = loaded.into_parts();
+
+        assert_eq!(rejected_records.len(), 1);
+        let runtime_clone = store.clone();
+        drop(store);
+        assert_eq!(runtime_clone.load_issue_count(), 1);
+        assert_eq!(rejected_records.len(), 1);
+
+        drop(runtime_clone);
+        drop(rejected_records);
+        cleanup(&root);
+    }
+
+    #[test]
+    fn embedded_driver_id_mismatch_targets_canonical_physical_id() {
+        let root = test_root("physical-id-mismatch");
+        let dir = driver_dir(&test_paths(&root));
+        fs::create_dir_all(&dir).expect("create driver dir");
+        let status = status_fixture(1, "complete", None);
+        let physical_id = format!("{DRIVER_ID_PREFIX}{:016x}", 2);
+        fs::write(
+            driver_path(&dir, &physical_id),
+            serde_json::to_vec_pretty(&status).expect("serialize mismatched driver"),
+        )
+        .expect("write mismatched driver");
+
+        let load_state = load_persisted_driver_inner(&dir);
+
+        assert!(load_state.inner.drivers.is_empty());
+        assert_eq!(load_state.inner.next_id, 2);
+        assert_eq!(load_state.rejected_records.len(), 1);
+        let evidence = load_state.rejected_records[0].evidence();
+        assert_eq!(
+            evidence.rejection(),
+            PersistedStateRecordRejection::InvalidIdentity
+        );
+        assert_eq!(evidence.target().id, physical_id);
+        drop(load_state);
+        cleanup(&root);
+    }
+
+    #[test]
+    fn oversized_canonical_driver_retains_exact_bounded_evidence() {
+        let root = test_root("oversized-rejected-record");
+        let dir = driver_dir(&test_paths(&root));
+        fs::create_dir_all(&dir).expect("create driver dir");
+        let id = format!("{DRIVER_ID_PREFIX}{:016x}", 1);
+        fs::write(
+            driver_path(&dir, &id),
+            vec![b'x'; MAX_RESTART_RECORD_BYTES as usize + 1],
+        )
+        .expect("write oversized driver");
+
+        let load_state = load_persisted_driver_inner(&dir);
+
+        assert!(load_state.inner.drivers.is_empty());
+        assert_eq!(load_state.inner.next_id, 1);
+        assert_eq!(load_state.rejected_records.len(), 1);
+        let evidence = load_state.rejected_records[0].evidence();
+        assert_eq!(
+            evidence.rejection(),
+            PersistedStateRecordRejection::Oversized
+        );
+        assert_eq!(evidence.target().id, id);
+        drop(load_state);
+        cleanup(&root);
+    }
+
+    #[test]
+    fn driver_replacement_before_reacquire_does_not_mint_stale_rejection_identity() {
+        let root = test_root("rejected-replacement");
+        let dir = driver_dir(&test_paths(&root));
+        fs::create_dir_all(&dir).expect("create driver dir");
+        let id = format!("{DRIVER_ID_PREFIX}{:016x}", 1);
+        let path = driver_path(&dir, &id);
+        fs::write(&path, b"{").expect("write rejected driver");
+        let directory = AnchoredRecordDirectory::open(&dir).expect("hold driver directory");
+        let mut rejected = BTreeMap::new();
+        rejected.insert(
+            safe_driver_filename(&id),
+            PersistedStateRecordRejection::InvalidSchema,
+        );
+        fs::rename(&path, dir.join("old-record")).expect("move rejected driver");
+        fs::write(
+            &path,
+            serde_json::to_vec_pretty(&status_fixture(1, "complete", None))
+                .expect("serialize replacement"),
+        )
+        .expect("write replacement");
+        let mut issues = Vec::new();
+
+        let retained = retain_driver_rejected_records(&directory, rejected, &mut issues);
+
+        assert!(retained.is_empty());
+        assert_eq!(
+            issues,
+            vec![BenchmarkSuiteDriverLoadIssue {
+                kind: BenchmarkSuiteDriverLoadIssueKind::StatusUnreadable,
+                count: 1,
+            }]
+        );
+        cleanup(&root);
+    }
+
+    #[test]
+    fn driver_load_issue_count_saturates() {
+        let mut store = BenchmarkSuiteDriverStore::new();
+        store.load_issues = vec![
+            BenchmarkSuiteDriverLoadIssue {
+                kind: BenchmarkSuiteDriverLoadIssueKind::StatusInvalid,
+                count: usize::MAX,
+            },
+            BenchmarkSuiteDriverLoadIssue {
+                kind: BenchmarkSuiteDriverLoadIssueKind::StatusUnreadable,
+                count: 1,
+            },
+        ];
+
+        assert_eq!(store.load_issue_count(), usize::MAX);
+    }
+
+    #[tokio::test]
+    async fn canonical_max_driver_filename_exhausts_id_admission_even_when_invalid() {
+        let root = test_root("max-physical-id");
+        let paths = test_paths(&root);
+        let dir = driver_dir(&paths);
+        fs::create_dir_all(&dir).expect("create driver dir");
+        let max_id = format!("{DRIVER_ID_PREFIX}{:016x}", u64::MAX);
+        fs::write(driver_path(&dir, &max_id), b"{").expect("write invalid max driver");
+        let store = BenchmarkSuiteDriverStore::load_from_paths(&paths);
+
+        assert!(matches!(
+            store
+                .start(
+                    test_suite_id("id-exhaustion", "development"),
+                    "development".to_string(),
+                    30_000,
+                    test_summary(),
+                )
+                .await,
+            Err(BenchmarkSuiteDriverStartError::Store {
+                source: BenchmarkSuiteDriverStoreError::IdExhausted,
+                ..
+            })
+        ));
+        store.close().await.expect("store closes");
+        cleanup(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn driver_links_for_canonical_names_are_warning_only() {
+        let root = test_root("hostile-links");
+        let dir = driver_dir(&test_paths(&root));
+        fs::create_dir_all(&dir).expect("create driver dir");
+        let outside = root.join("outside.json");
+        fs::write(&outside, b"{").expect("write outside driver");
+        let symlink_id = format!("{DRIVER_ID_PREFIX}{:016x}", 1);
+        std::os::unix::fs::symlink(&outside, driver_path(&dir, &symlink_id))
+            .expect("create symlink");
+        let hardlink_source = root.join("hardlink-source");
+        fs::write(&hardlink_source, b"{").expect("write hardlink source");
+        let hardlink_id = format!("{DRIVER_ID_PREFIX}{:016x}", 2);
+        fs::hard_link(&hardlink_source, driver_path(&dir, &hardlink_id)).expect("create hard link");
+
+        let load_state = load_persisted_driver_inner(&dir);
+
+        assert!(load_state.inner.drivers.is_empty());
+        assert_eq!(load_state.inner.next_id, 2);
+        assert!(load_state.rejected_records.is_empty());
+        assert_eq!(
+            load_state
+                .issues
+                .iter()
+                .find(|issue| issue.kind == BenchmarkSuiteDriverLoadIssueKind::StatusUnreadable)
+                .map(|issue| issue.count),
+            Some(2)
+        );
         cleanup(&root);
     }
 
@@ -4844,6 +5303,7 @@ mod tests {
                 count: 1,
             }]
         );
+        assert!(load_state.rejected_records.is_empty());
         cleanup(&root);
     }
 
@@ -4863,6 +5323,10 @@ mod tests {
             serde_json::to_vec_pretty(&duplicate).expect("serialize duplicate driver"),
         )
         .expect("write duplicate driver");
+
+        let load_state = load_persisted_driver_inner(&dir);
+        assert!(load_state.rejected_records.is_empty());
+        drop(load_state);
 
         let retention_claims = BenchmarkSuiteRetentionClaims::default();
         let store = BenchmarkSuiteDriverStore::load_from_paths_with_retention_claims(
@@ -4887,7 +5351,7 @@ mod tests {
             1
         );
         assert_eq!(
-            store.load_issues(),
+            store.load_issues,
             vec![BenchmarkSuiteDriverLoadIssue {
                 kind: BenchmarkSuiteDriverLoadIssueKind::DuplicateDriverId,
                 count: 1,
@@ -4930,6 +5394,11 @@ mod tests {
                 kind: BenchmarkSuiteDriverLoadIssueKind::UnknownState,
                 count: 1,
             }]
+        );
+        assert_eq!(load_state.rejected_records.len(), 1);
+        assert_eq!(
+            load_state.rejected_records[0].evidence().rejection(),
+            PersistedStateRecordRejection::InvalidSemantics
         );
         cleanup(&root);
     }
@@ -4998,6 +5467,7 @@ mod tests {
                 count: 1,
             }]
         );
+        assert_eq!(load_state.rejected_records.len(), 1);
         cleanup(&root);
     }
 
@@ -5028,6 +5498,7 @@ mod tests {
                 count: 3,
             }]
         );
+        assert_eq!(load_state.rejected_records.len(), 3);
         let encoded = format!("{:?}", load_state.issues);
         assert!(!encoded.contains("Secret"));
         assert!(!encoded.contains(root.to_string_lossy().as_ref()));
@@ -5056,6 +5527,7 @@ mod tests {
                 count: 1,
             }]
         );
+        assert_eq!(load_state.rejected_records.len(), 1);
         cleanup(&root);
     }
 
@@ -5086,6 +5558,7 @@ mod tests {
                 count: 2,
             }]
         );
+        assert!(load_state.rejected_records.is_empty());
         cleanup(&root);
     }
 

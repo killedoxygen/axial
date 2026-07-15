@@ -18,7 +18,9 @@ pub fn launcher_status(state: &AppState) -> StatusResponse {
     let config = state.config().current();
     let library_dir = state.library_dir().unwrap_or_default();
     let mut warnings = state.startup_warnings();
-    if let Some(outcome) = persisted_state_load_guardian_outcome(state_load_issue_count(state)) {
+    if let Some(outcome) =
+        persisted_state_load_guardian_outcome(state.persisted_state_load_evidence())
+    {
         warnings.push(outcome.user_outcome.summary().to_string());
     }
 
@@ -32,14 +34,6 @@ pub fn launcher_status(state: &AppState) -> StatusResponse {
         version: state.version().to_string(),
         dev_mode: cfg!(debug_assertions),
     }
-}
-
-fn state_load_issue_count(state: &AppState) -> usize {
-    state.auth_logins().load_issue_count()
-        + state.performance_operations().load_issue_count()
-        + state.benchmark_suites().load_issue_count()
-        + state.benchmark_suite_drivers().load_issue_count()
-        + state.launch_reports().load_issue_count()
 }
 
 #[cfg(test)]
@@ -86,7 +80,7 @@ mod tests {
     }
 
     #[test]
-    fn status_includes_guardian_warning_for_corrupt_persisted_operation_state() {
+    fn status_aggregates_five_stores_and_owns_two_store_rejection_evidence() {
         let root = test_root("status-operation-state-warning");
         let paths = test_paths(&root);
         let operation_dir = operation_dir(&paths);
@@ -111,6 +105,17 @@ mod tests {
             .expect("serialize status"),
         )
         .expect("write status");
+        let driver_id = "benchmark-suite-driver-0000000000000001";
+        let driver_dir = paths.config_dir.join("benchmarks").join("suite-drivers");
+        fs::create_dir_all(&driver_dir).expect("create driver dir");
+        fs::write(driver_dir.join(format!("{driver_id}.json")), b"{")
+            .expect("write malformed driver");
+        let suite_id =
+            crate::state::benchmark_suites::derive_suite_id("status-aggregate", "development");
+        let suite_path = crate::state::benchmark_suites::suite_path(&paths, &suite_id);
+        fs::create_dir_all(suite_path.parent().expect("suite directory"))
+            .expect("create suite directory");
+        fs::write(suite_path, b"{").expect("write malformed suite");
 
         let config = Arc::new(ConfigStore::load_from(paths.clone()).expect("load config"));
         let instances = Arc::new(
@@ -133,6 +138,7 @@ mod tests {
         });
 
         let response = launcher_status(&state);
+        let load_evidence = state.persisted_state_load_evidence();
 
         assert_eq!(response.status, "ok");
         assert_eq!(response.warnings.len(), 1);
@@ -143,6 +149,21 @@ mod tests {
         assert!(!response.warnings[0].contains(&root.to_string_lossy().to_string()));
         assert!(!response.warnings[0].contains("unexpected_mode"));
         assert!(!response.warnings[0].contains("line"));
+        assert_eq!(load_evidence.issue_count(), 3);
+        assert_eq!(load_evidence.rejected_records().len(), 2);
+        assert_eq!(
+            load_evidence.rejected_records()[0].target().id,
+            "performance-install-00000000000000000000000000000001"
+        );
+        assert_eq!(load_evidence.rejected_records()[1].target().id, driver_id);
+        assert_eq!(
+            format!("{:?}", load_evidence.rejected_records()[0].store()),
+            "PerformanceOperation"
+        );
+        assert_eq!(
+            format!("{:?}", load_evidence.rejected_records()[1].store()),
+            "BenchmarkSuiteDriver"
+        );
 
         let _ = fs::remove_dir_all(root);
     }

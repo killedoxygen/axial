@@ -1475,6 +1475,7 @@ fn benchmark_suite_driver_store_error_response(
         BenchmarkSuiteDriverStoreError::RetryRequired
         | BenchmarkSuiteDriverStoreError::RetryUnavailable
         | BenchmarkSuiteDriverStoreError::RetentionConflict
+        | BenchmarkSuiteDriverStoreError::IdExhausted
         | BenchmarkSuiteDriverStoreError::Persistence(_) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({

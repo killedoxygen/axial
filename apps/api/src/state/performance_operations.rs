@@ -1,3 +1,4 @@
+use crate::execution::anchored_record::{AnchoredRecordDirectory, AnchoredRecordObservation};
 use crate::execution::file::{DeleteFileRequest, delete_launcher_managed_file, file_fact};
 #[cfg(test)]
 use crate::execution::file::{
@@ -12,10 +13,15 @@ use crate::logging::timestamp_utc;
 use crate::observability::{RedactionAudience, sanitize_public_diagnostic_text};
 use crate::state::contracts::RollbackState;
 use crate::state::ownership::{CurrentArtifact, classify_current_artifact};
+use crate::state::persisted_state_load::{
+    MAX_REJECTED_RESTART_RECORDS_PER_STORE, MAX_RESTART_RECORD_BYTES,
+    PersistedStateRecordRejection, PersistedStateRecordStore, PersistedStateRejectedRecord,
+};
 use axial_config::AppPaths;
 use chrono::{DateTime, SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
+#[cfg(test)]
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -29,7 +35,6 @@ pub const PERFORMANCE_COMMITTING_COMPLETE_STATE: &str = "committing_complete";
 pub const PERFORMANCE_COMMITTING_FAILED_STATE: &str = "committing_failed";
 pub const PERFORMANCE_EFFECT_STARTED_STATE: &str = "effect_started";
 pub const PERFORMANCE_RESUME_BLOCKED_STATE: &str = "resume_blocked";
-pub const PERFORMANCE_RESUME_INVALID_STATE: &str = "resume_invalid";
 const MAX_OPERATION_ERROR_CHARS: usize = 160;
 const MAX_OPERATION_FILENAME_STEM: usize = 96;
 const MAX_RESUMABLE_OPERATIONS: usize = 16;
@@ -190,9 +195,8 @@ impl From<PersistedPerformanceOperationStatus> for PerformanceOperationStatus {
 pub struct PerformanceOperationConflict;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PerformanceOperationLoadIssueKind {
+enum PerformanceOperationLoadIssueKind {
     DirectoryUnreadable,
-    DirectoryEntryUnreadable,
     StatusUnreadable,
     StatusInvalid,
     UnsafeOperationId,
@@ -202,9 +206,9 @@ pub enum PerformanceOperationLoadIssueKind {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PerformanceOperationLoadIssue {
-    pub kind: PerformanceOperationLoadIssueKind,
-    pub count: usize,
+struct PerformanceOperationLoadIssue {
+    kind: PerformanceOperationLoadIssueKind,
+    count: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -256,6 +260,7 @@ impl Drop for PerformanceOperationIdReservation {
 struct PerformanceOperationLoadState {
     inner: PerformanceOperationInner,
     issues: Vec<PerformanceOperationLoadIssue>,
+    rejected_records: Vec<PersistedStateRejectedRecord>,
 }
 
 struct PerformanceOperationPersistence {
@@ -369,6 +374,24 @@ pub struct PerformanceOperationStore {
     load_issues: Vec<PerformanceOperationLoadIssue>,
 }
 
+pub(super) struct LoadedPerformanceOperationStore {
+    store: PerformanceOperationStore,
+    rejected_records: Vec<PersistedStateRejectedRecord>,
+}
+
+impl LoadedPerformanceOperationStore {
+    pub(super) fn into_parts(
+        self,
+    ) -> (PerformanceOperationStore, Vec<PersistedStateRejectedRecord>) {
+        (self.store, self.rejected_records)
+    }
+
+    #[cfg(test)]
+    fn into_store(self) -> PerformanceOperationStore {
+        self.store
+    }
+}
+
 impl PerformanceOperationStore {
     pub fn new() -> Self {
         Self {
@@ -381,34 +404,63 @@ impl PerformanceOperationStore {
         }
     }
 
+    #[cfg(test)]
     pub fn load_from_paths(paths: &AppPaths) -> Self {
         Self::try_load_from_paths(paths).unwrap_or_else(|error| {
             panic!("failed to initialize performance operation persistence: {error}")
         })
     }
 
+    #[cfg(test)]
     pub fn try_load_from_paths(paths: &AppPaths) -> Result<Self, PerformanceOperationStoreError> {
         Self::try_load_from_paths_with_coordinator(paths, PersistenceCoordinator::global())
     }
 
+    pub(super) fn load_from_paths_for_startup(paths: &AppPaths) -> LoadedPerformanceOperationStore {
+        Self::try_load_from_paths_with_coordinator_for_startup(
+            paths,
+            PersistenceCoordinator::global(),
+        )
+        .unwrap_or_else(|error| {
+            panic!("failed to initialize performance operation persistence: {error}")
+        })
+    }
+
+    #[cfg(test)]
     pub(crate) fn try_load_from_paths_with_coordinator(
         paths: &AppPaths,
         coordinator: PersistenceCoordinator,
     ) -> Result<Self, PerformanceOperationStoreError> {
+        Self::try_load_from_paths_with_coordinator_for_startup(paths, coordinator)
+            .map(LoadedPerformanceOperationStore::into_store)
+    }
+
+    fn try_load_from_paths_with_coordinator_for_startup(
+        paths: &AppPaths,
+        coordinator: PersistenceCoordinator,
+    ) -> Result<LoadedPerformanceOperationStore, PerformanceOperationStoreError> {
         let storage_dir = operation_dir(paths);
         let load_state = load_persisted_operation_inner(&storage_dir);
         let persistence = Arc::new(PerformanceOperationPersistence::claim(
             &storage_dir,
             coordinator,
         )?);
-
-        Ok(Self {
-            inner: Arc::new(RwLock::new(load_state.inner)),
+        let PerformanceOperationLoadState {
+            inner,
+            issues,
+            rejected_records,
+        } = load_state;
+        let store = Self {
+            inner: Arc::new(RwLock::new(inner)),
             mutation_gate: Arc::new(AsyncMutex::new(())),
             persistence: Some(persistence),
             retry_candidates: Arc::new(SyncMutex::new(HashMap::new())),
             retention_issues: Arc::new(SyncMutex::new(HashMap::new())),
-            load_issues: load_state.issues,
+            load_issues: issues,
+        };
+        Ok(LoadedPerformanceOperationStore {
+            store,
+            rejected_records,
         })
     }
 
@@ -652,12 +704,11 @@ impl PerformanceOperationStore {
             .collect()
     }
 
-    pub fn load_issues(&self) -> Vec<PerformanceOperationLoadIssue> {
-        self.load_issues.clone()
-    }
-
-    pub fn load_issue_count(&self) -> usize {
-        self.load_issues.iter().map(|issue| issue.count).sum()
+    pub(crate) fn load_issue_count(&self) -> usize {
+        self.load_issues
+            .iter()
+            .map(|issue| issue.count)
+            .fold(0usize, usize::saturating_add)
     }
 
     pub async fn current_or_latest_for_instance(
@@ -1381,10 +1432,14 @@ fn performance_operation_persistence_error(
 
 fn load_persisted_operation_inner(storage_dir: &Path) -> PerformanceOperationLoadState {
     let mut load_state = PerformanceOperationLoadState::default();
-    let mut candidates = HashMap::<String, PerformanceOperationStatus>::new();
+    let mut candidates = HashMap::<String, LoadedPerformanceOperationRecord>::new();
     let mut conflicting_ids = HashSet::<String>::new();
-    let entries = match fs::read_dir(storage_dir) {
-        Ok(entries) => entries,
+    let mut logical_occurrences = HashMap::<String, usize>::new();
+    let mut deferred_identity_rejections =
+        BTreeMap::<String, (String, PersistedStateRecordRejection)>::new();
+    let mut rejected_records = BTreeMap::<String, PersistedStateRecordRejection>::new();
+    let directory = match AnchoredRecordDirectory::open(storage_dir) {
+        Ok(directory) => directory,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return load_state,
         Err(error) => {
             warn!(
@@ -1399,36 +1454,72 @@ fn load_persisted_operation_inner(storage_dir: &Path) -> PerformanceOperationLoa
         }
     };
 
-    for entry in entries {
-        let entry = match entry {
-            Ok(entry) => entry,
+    let mut names = match directory.names() {
+        Ok(names) => names,
+        Err(error) => {
+            warn!(
+                error_kind = ?error.kind(),
+                "failed to enumerate anchored performance operation status directory"
+            );
+            record_load_issue(
+                &mut load_state.issues,
+                PerformanceOperationLoadIssueKind::DirectoryUnreadable,
+            );
+            return load_state;
+        }
+    };
+    names.retain(|name| {
+        Path::new(name).extension().and_then(|value| value.to_str()) == Some("json")
+    });
+    names.sort();
+
+    for name in names {
+        let physical_id = canonical_operation_id_from_name(&name);
+        let observation = match directory.read(&name, MAX_RESTART_RECORD_BYTES) {
+            Ok(observation) => observation,
             Err(error) => {
                 warn!(
                     error_kind = ?error.kind(),
-                    "failed to read performance operation status directory entry"
+                    "failed to open or read anchored performance operation status"
                 );
                 record_load_issue(
                     &mut load_state.issues,
-                    PerformanceOperationLoadIssueKind::DirectoryEntryUnreadable,
+                    PerformanceOperationLoadIssueKind::StatusUnreadable,
                 );
                 continue;
             }
         };
-        let path = entry.path();
-        if path.extension().and_then(|value| value.to_str()) != Some("json") {
+        if observation.is_oversized() {
+            record_load_issue(
+                &mut load_state.issues,
+                PerformanceOperationLoadIssueKind::StatusInvalid,
+            );
+            if let Some(physical_id) = physical_id {
+                rejected_records.insert(
+                    safe_operation_filename(&physical_id),
+                    PersistedStateRecordRejection::Oversized,
+                );
+            }
             continue;
         }
-        let mut status = match load_status_file(&path) {
-            Ok(status) => status,
+        let mut status = match serde_json::from_slice::<PersistedPerformanceOperationStatus>(
+            observation
+                .bytes()
+                .expect("non-oversized anchored observation has bytes"),
+        ) {
+            Ok(status) => PerformanceOperationStatus::from(status),
             Err(error) => {
-                warn!(
-                    error_kind = ?error.kind(),
-                    "failed to load performance operation status"
-                );
+                warn!(error = %error, "failed to decode performance operation status");
                 record_load_issue(
                     &mut load_state.issues,
-                    performance_status_load_issue_kind(&error),
+                    PerformanceOperationLoadIssueKind::StatusInvalid,
                 );
+                if let Some(physical_id) = physical_id {
+                    rejected_records.insert(
+                        safe_operation_filename(&physical_id),
+                        PersistedStateRecordRejection::InvalidSchema,
+                    );
+                }
                 continue;
             }
         };
@@ -1438,15 +1529,28 @@ fn load_persisted_operation_inner(storage_dir: &Path) -> PerformanceOperationLoa
                 &mut load_state.issues,
                 PerformanceOperationLoadIssueKind::UnsafeOperationId,
             );
+            if let Some(physical_id) = physical_id {
+                rejected_records.insert(
+                    safe_operation_filename(&physical_id),
+                    PersistedStateRecordRejection::InvalidIdentity,
+                );
+            }
             continue;
         }
-        let canonical_filename = safe_operation_filename(&status.id);
-        if path.file_name().and_then(|value| value.to_str()) != Some(canonical_filename.as_str()) {
+        let occurrence_count = logical_occurrences.entry(status.id.clone()).or_default();
+        *occurrence_count = occurrence_count.saturating_add(1);
+        if physical_id.as_deref() != Some(status.id.as_str()) {
             record_load_issue(
                 &mut load_state.issues,
                 PerformanceOperationLoadIssueKind::NonCanonicalFilename,
             );
-            conflicting_ids.insert(status.id);
+            conflicting_ids.insert(status.id.clone());
+            if let Some(physical_id) = physical_id {
+                deferred_identity_rejections.insert(
+                    safe_operation_filename(&physical_id),
+                    (status.id, PersistedStateRecordRejection::InvalidIdentity),
+                );
+            }
             continue;
         }
         if let Some(error) = status.error.take() {
@@ -1455,7 +1559,17 @@ fn load_persisted_operation_inner(storage_dir: &Path) -> PerformanceOperationLoa
         let created_at_valid = normalize_operation_timestamp(&mut status.created_at);
         let updated_at_valid = normalize_operation_timestamp(&mut status.updated_at);
         let operation_id = status.id.clone();
-        if candidates.insert(operation_id.clone(), status).is_some() {
+        let locally_invalid = !created_at_valid || !updated_at_valid;
+        if candidates
+            .insert(
+                operation_id.clone(),
+                LoadedPerformanceOperationRecord {
+                    status,
+                    locally_invalid,
+                },
+            )
+            .is_some()
+        {
             record_load_issue(
                 &mut load_state.issues,
                 PerformanceOperationLoadIssueKind::DuplicateOperationId,
@@ -1471,19 +1585,43 @@ fn load_persisted_operation_inner(storage_dir: &Path) -> PerformanceOperationLoa
         }
     }
 
+    for (physical_name, (logical_id, rejection)) in deferred_identity_rejections {
+        if logical_occurrences.get(&logical_id).copied() == Some(1) {
+            rejected_records.insert(physical_name, rejection);
+        }
+    }
+
     let mut candidates = candidates.into_values().collect::<Vec<_>>();
-    candidates.sort_by(|left, right| left.id.cmp(&right.id));
-    for mut status in candidates {
-        if !is_valid_loaded_status(&status) || conflicting_ids.contains(&status.id) {
+    candidates.sort_by(|left, right| left.status.id.cmp(&right.status.id));
+    for candidate in candidates {
+        let LoadedPerformanceOperationRecord {
+            mut status,
+            mut locally_invalid,
+        } = candidate;
+        locally_invalid |= !is_valid_loaded_status(&status);
+        if locally_invalid {
             warn!(
                 operation_id = %status.id,
-                "loaded performance operation requires fail-safe reconciliation"
+                "rejected locally invalid persisted performance operation"
             );
             record_load_issue(
                 &mut load_state.issues,
                 PerformanceOperationLoadIssueKind::MalformedOperationStatus,
             );
-            status.state = PERFORMANCE_RESUME_INVALID_STATE.to_string();
+            if logical_occurrences.get(&status.id).copied() == Some(1) {
+                rejected_records.insert(
+                    safe_operation_filename(&status.id),
+                    PersistedStateRecordRejection::InvalidSemantics,
+                );
+            }
+            continue;
+        }
+        if conflicting_ids.contains(&status.id) {
+            warn!(
+                operation_id = %status.id,
+                "skipping ambiguous persisted performance operation"
+            );
+            continue;
         }
         if is_non_terminal(&status.state) {
             let duplicate_instance = !status.instance_id.trim().is_empty()
@@ -1493,13 +1631,9 @@ fn load_persisted_operation_inner(storage_dir: &Path) -> PerformanceOperationLoa
                     .contains_key(&status.instance_id);
             let beyond_batch =
                 load_state.inner.pending_resume_ids.len() >= MAX_RESUMABLE_OPERATIONS;
-            if status.state != PERFORMANCE_RESUME_INVALID_STATE
-                && (duplicate_instance || beyond_batch)
-            {
+            if duplicate_instance || beyond_batch {
                 status.state = PERFORMANCE_RESUME_BLOCKED_STATE.to_string();
-            } else if status.state != PERFORMANCE_RESUME_INVALID_STATE
-                && !status.instance_id.trim().is_empty()
-            {
+            } else if !status.instance_id.trim().is_empty() {
                 load_state
                     .inner
                     .active_by_instance
@@ -1513,7 +1647,95 @@ fn load_persisted_operation_inner(storage_dir: &Path) -> PerformanceOperationLoa
             .insert(status.id.clone(), status);
     }
 
+    load_state.rejected_records =
+        retain_performance_rejected_records(&directory, rejected_records, &mut load_state.issues);
+
     load_state
+}
+
+struct LoadedPerformanceOperationRecord {
+    status: PerformanceOperationStatus,
+    locally_invalid: bool,
+}
+
+fn retain_performance_rejected_records(
+    directory: &AnchoredRecordDirectory,
+    rejected: BTreeMap<String, PersistedStateRecordRejection>,
+    issues: &mut Vec<PerformanceOperationLoadIssue>,
+) -> Vec<PersistedStateRejectedRecord> {
+    let mut retained = Vec::new();
+    for (physical_name, rejection) in rejected {
+        if retained.len() == MAX_REJECTED_RESTART_RECORDS_PER_STORE {
+            break;
+        }
+        let Some(physical_id) = physical_name.strip_suffix(".json") else {
+            continue;
+        };
+        let observation = match directory.read_for_mutation(
+            std::ffi::OsStr::new(&physical_name),
+            MAX_RESTART_RECORD_BYTES,
+        ) {
+            Ok(observation) => observation,
+            Err(error) => {
+                warn!(
+                    error_kind = ?error.kind(),
+                    "failed to reacquire rejected performance operation status"
+                );
+                record_load_issue(issues, PerformanceOperationLoadIssueKind::StatusUnreadable);
+                continue;
+            }
+        };
+        if !performance_rejection_still_holds(&observation, physical_id, rejection) {
+            warn!("performance operation rejection changed during startup load");
+            record_load_issue(issues, PerformanceOperationLoadIssueKind::StatusUnreadable);
+            continue;
+        }
+        retained.push(PersistedStateRejectedRecord::new(
+            PersistedStateRecordStore::PerformanceOperation,
+            rejection,
+            rejected_performance_operation_target(physical_id),
+            observation.into_identity(),
+        ));
+    }
+    retained
+}
+
+fn rejected_performance_operation_target(
+    physical_id: &str,
+) -> crate::state::contracts::TargetDescriptor {
+    debug_assert!(is_safe_operation_id(physical_id));
+    let mut target = performance_operation_status_target(physical_id);
+    target.id = physical_id.to_string();
+    target
+}
+
+fn performance_rejection_still_holds(
+    observation: &AnchoredRecordObservation,
+    physical_id: &str,
+    rejection: PersistedStateRecordRejection,
+) -> bool {
+    if rejection == PersistedStateRecordRejection::Oversized {
+        return observation.is_oversized();
+    }
+    let Some(bytes) = observation.bytes() else {
+        return false;
+    };
+    let decoded = serde_json::from_slice::<PersistedPerformanceOperationStatus>(bytes)
+        .map(PerformanceOperationStatus::from);
+    match rejection {
+        PersistedStateRecordRejection::Oversized => false,
+        PersistedStateRecordRejection::InvalidSchema => decoded.is_err(),
+        PersistedStateRecordRejection::InvalidIdentity => decoded
+            .is_ok_and(|status| !is_safe_operation_id(&status.id) || status.id != physical_id),
+        PersistedStateRecordRejection::InvalidSemantics => decoded.is_ok_and(|mut status| {
+            if !is_safe_operation_id(&status.id) || status.id != physical_id {
+                return false;
+            }
+            let timestamps_valid = normalize_operation_timestamp(&mut status.created_at)
+                && normalize_operation_timestamp(&mut status.updated_at);
+            !timestamps_valid || !is_valid_loaded_status(&status)
+        }),
+    }
 }
 
 fn record_load_issue(
@@ -1524,14 +1746,6 @@ fn record_load_issue(
         issue.count = issue.count.saturating_add(1);
     } else {
         issues.push(PerformanceOperationLoadIssue { kind, count: 1 });
-    }
-}
-
-fn performance_status_load_issue_kind(error: &io::Error) -> PerformanceOperationLoadIssueKind {
-    if error.kind() == io::ErrorKind::InvalidData {
-        PerformanceOperationLoadIssueKind::StatusInvalid
-    } else {
-        PerformanceOperationLoadIssueKind::StatusUnreadable
     }
 }
 
@@ -1595,9 +1809,10 @@ pub(crate) fn normalized_operation_timestamp(value: &str) -> Option<String> {
         })
 }
 
-fn load_status_file(path: &Path) -> io::Result<PerformanceOperationStatus> {
-    let data = fs::read_to_string(path)?;
-    serde_json::from_str::<PersistedPerformanceOperationStatus>(&data)
+#[cfg(test)]
+fn decode_persisted_status_fixture(path: &Path) -> io::Result<PerformanceOperationStatus> {
+    let data = fs::read(path)?;
+    serde_json::from_slice::<PersistedPerformanceOperationStatus>(&data)
         .map(Into::into)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
 }
@@ -1668,9 +1883,19 @@ fn is_safe_operation_id(operation_id: &str) -> bool {
     operation_id_index(operation_id).is_some()
 }
 
+fn canonical_operation_id_from_name(name: &std::ffi::OsStr) -> Option<String> {
+    let filename = name.to_str()?;
+    let operation_id = filename.strip_suffix(".json")?;
+    is_safe_operation_id(operation_id).then(|| operation_id.to_string())
+}
+
 fn operation_id_index(operation_id: &str) -> Option<u128> {
     let suffix = operation_id.strip_prefix(PERFORMANCE_OPERATION_ID_PREFIX)?;
-    if suffix.len() != 32 || !suffix.chars().all(|value| value.is_ascii_hexdigit()) {
+    if suffix.len() != 32
+        || !suffix
+            .bytes()
+            .all(|value| value.is_ascii_digit() || matches!(value, b'a'..=b'f'))
+    {
         return None;
     }
     u128::from_str_radix(suffix, 16).ok()
@@ -1718,9 +1943,12 @@ mod tests {
     use super::*;
     use crate::execution::persistence::{AtomicWriteBackend, PersistenceCoordinator};
     use crate::state::contracts::TargetDescriptor;
+    use static_assertions::assert_not_impl_any;
     use std::path::Path;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
+
+    assert_not_impl_any!(LoadedPerformanceOperationStore: Clone);
 
     #[derive(Default)]
     struct ControlledBackend {
@@ -1828,7 +2056,8 @@ mod tests {
 
         let path = operation_path(&operation_dir(&paths), &started.id);
         assert!(path.is_file());
-        let persisted = load_status_file(&path).expect("persisted status should load");
+        let persisted =
+            decode_persisted_status_fixture(&path).expect("persisted status should load");
         assert_eq!(persisted.state, "applying");
 
         store.close().await.expect("store closes before restart");
@@ -2295,8 +2524,9 @@ mod tests {
             Err(PerformanceOperationStoreError::Persistence(_))
         ));
 
-        let later = load_status_file(&operation_path(&operation_dir(&paths), &later_id))
-            .expect("later debounced writer settles before close returns");
+        let later =
+            decode_persisted_status_fixture(&operation_path(&operation_dir(&paths), &later_id))
+                .expect("later debounced writer settles before close returns");
         assert_eq!(later.state, "applying");
 
         backend.set_fail_destination(None);
@@ -2496,8 +2726,9 @@ mod tests {
             store.get(&started.id).await.expect("promoted status").state,
             PERFORMANCE_EFFECT_STARTED_STATE
         );
-        let persisted = load_status_file(&operation_path(&operation_dir(&paths), &started.id))
-            .expect("retried exact status bytes");
+        let persisted =
+            decode_persisted_status_fixture(&operation_path(&operation_dir(&paths), &started.id))
+                .expect("retried exact status bytes");
         assert_eq!(persisted.state, PERFORMANCE_EFFECT_STARTED_STATE);
         cleanup(&root);
     }
@@ -2583,11 +2814,15 @@ mod tests {
         assert!(backend.write_count_for(&first_path) <= 2);
         assert!(backend.write_count_for(&second_path) <= 2);
         assert_eq!(
-            load_status_file(&first_path).expect("first latest").state,
+            decode_persisted_status_fixture(&first_path)
+                .expect("first latest")
+                .state,
             "first_39"
         );
         assert_eq!(
-            load_status_file(&second_path).expect("second latest").state,
+            decode_persisted_status_fixture(&second_path)
+                .expect("second latest")
+                .state,
             "second_39"
         );
         cleanup(&root);
@@ -3193,7 +3428,7 @@ mod tests {
     }
 
     #[test]
-    fn noncanonical_duplicate_id_loads_once_and_is_blocked_for_reconciliation() {
+    fn noncanonical_duplicate_id_is_excluded_from_resume() {
         let root = test_root("noncanonical-duplicate-id");
         let paths = test_paths(&root);
         let dir = operation_dir(&paths);
@@ -3206,12 +3441,9 @@ mod tests {
 
         let load_state = load_persisted_operation_inner(&dir);
 
-        assert_eq!(load_state.inner.operations.len(), 1);
-        assert_eq!(load_state.inner.pending_resume_ids, vec![id.to_string()]);
-        assert_eq!(
-            load_state.inner.operations[id].state,
-            PERFORMANCE_RESUME_INVALID_STATE
-        );
+        assert!(load_state.inner.operations.is_empty());
+        assert!(load_state.inner.pending_resume_ids.is_empty());
+        assert!(load_state.rejected_records.is_empty());
         assert!(load_state.issues.iter().any(|issue| {
             issue.kind == PerformanceOperationLoadIssueKind::NonCanonicalFilename
                 && issue.count == 1
@@ -3220,7 +3452,7 @@ mod tests {
     }
 
     #[test]
-    fn invalid_terminal_records_are_queued_for_fail_safe_reconciliation() {
+    fn invalid_terminal_records_are_rejected_without_resume_admission() {
         let root = test_root("invalid-terminal-records");
         let paths = test_paths(&root);
         let dir = operation_dir(&paths);
@@ -3251,23 +3483,14 @@ mod tests {
 
         let load_state = load_persisted_operation_inner(&dir);
 
-        for id in [missing_identity_id, malformed_action_id, empty_instance_id] {
-            assert_eq!(
-                load_state.inner.operations[id].state,
-                PERFORMANCE_RESUME_INVALID_STATE
-            );
-            assert!(
-                load_state
-                    .inner
-                    .pending_resume_ids
-                    .contains(&id.to_string())
-            );
-        }
+        assert!(load_state.inner.operations.is_empty());
+        assert!(load_state.inner.pending_resume_ids.is_empty());
+        assert_eq!(load_state.rejected_records.len(), 3);
         cleanup(&root);
     }
 
     #[test]
-    fn noncanonical_terminal_duplicate_cannot_remain_successful() {
+    fn noncanonical_terminal_duplicate_is_excluded_from_loaded_state() {
         let root = test_root("noncanonical-terminal-duplicate");
         let paths = test_paths(&root);
         let dir = operation_dir(&paths);
@@ -3280,16 +3503,14 @@ mod tests {
 
         let load_state = load_persisted_operation_inner(&dir);
 
-        assert_eq!(
-            load_state.inner.operations[id].state,
-            PERFORMANCE_RESUME_INVALID_STATE
-        );
-        assert_eq!(load_state.inner.pending_resume_ids, vec![id.to_string()]);
+        assert!(load_state.inner.operations.is_empty());
+        assert!(load_state.inner.pending_resume_ids.is_empty());
+        assert!(load_state.rejected_records.is_empty());
         cleanup(&root);
     }
 
     #[test]
-    fn invalid_persisted_timestamps_are_replaced_and_block_resume() {
+    fn invalid_persisted_timestamps_are_rejected_without_resume_admission() {
         let root = test_root("invalid-timestamps");
         let paths = test_paths(&root);
         let dir = operation_dir(&paths);
@@ -3301,11 +3522,13 @@ mod tests {
         persist_status_to_dir(&dir, &status).expect("persist invalid timestamps");
 
         let load_state = load_persisted_operation_inner(&dir);
-        let loaded = &load_state.inner.operations[id];
-
-        assert_eq!(loaded.created_at, "unknown");
-        assert_eq!(loaded.updated_at, "unknown");
-        assert_eq!(loaded.state, PERFORMANCE_RESUME_INVALID_STATE);
+        assert!(load_state.inner.operations.is_empty());
+        assert!(load_state.inner.pending_resume_ids.is_empty());
+        assert_eq!(load_state.rejected_records.len(), 1);
+        assert_eq!(
+            load_state.rejected_records[0].evidence().rejection(),
+            PersistedStateRecordRejection::InvalidSemantics
+        );
         assert!(load_state.issues.iter().any(|issue| {
             issue.kind == PerformanceOperationLoadIssueKind::MalformedOperationStatus
         }));
@@ -3429,7 +3652,7 @@ mod tests {
     }
 
     #[test]
-    fn malformed_current_schema_pending_operation_is_retained_for_reconciliation() {
+    fn malformed_current_schema_pending_operation_is_rejected() {
         let root = test_root("malformed-pending");
         let paths = test_paths(&root);
         let dir = operation_dir(&paths);
@@ -3445,18 +3668,10 @@ mod tests {
 
         let load_state = load_persisted_operation_inner(&dir);
 
-        assert_eq!(load_state.inner.operations.len(), 1);
+        assert!(load_state.inner.operations.is_empty());
         assert!(load_state.inner.active_by_instance.is_empty());
-        assert_eq!(load_state.inner.pending_resume_ids.len(), 1);
-        assert_eq!(
-            load_state
-                .inner
-                .operations
-                .values()
-                .next()
-                .map(|status| status.state.as_str()),
-            Some(PERFORMANCE_RESUME_INVALID_STATE)
-        );
+        assert!(load_state.inner.pending_resume_ids.is_empty());
+        assert_eq!(load_state.rejected_records.len(), 1);
         assert_eq!(
             load_state.issues,
             vec![PerformanceOperationLoadIssue {
@@ -3475,23 +3690,20 @@ mod tests {
         let dir = operation_dir(&paths);
         fs::create_dir_all(&dir).expect("create operation dir");
         let path = operation_path(&dir, "performance-install-00000000000000000000000000000001");
-        fs::write(
-            path,
-            serde_json::to_vec(&serde_json::json!({
-                "id": "performance-install-00000000000000000000000000000001",
-                "instance_id": "instance-a",
-                "action": "install",
-                "payload": {
-                    "unexpected_mode": true
-                },
-                "state": "applying",
-                "error": null,
-                "created_at": timestamp_utc(),
-                "updated_at": timestamp_utc()
-            }))
-            .expect("serialize status"),
-        )
-        .expect("write status");
+        let persisted_bytes = serde_json::to_vec(&serde_json::json!({
+            "id": "performance-install-00000000000000000000000000000001",
+            "instance_id": "instance-a",
+            "action": "install",
+            "payload": {
+                "unexpected_mode": true
+            },
+            "state": "applying",
+            "error": null,
+            "created_at": timestamp_utc(),
+            "updated_at": timestamp_utc()
+        }))
+        .expect("serialize status");
+        fs::write(&path, &persisted_bytes).expect("write status");
 
         let load_state = load_persisted_operation_inner(&dir);
 
@@ -3506,7 +3718,239 @@ mod tests {
         let encoded = format!("{:?}", load_state.issues);
         assert!(!encoded.contains(root.to_string_lossy().as_ref()));
         assert!(!encoded.contains("unexpected_mode"));
+        assert_eq!(load_state.rejected_records.len(), 1);
+        assert_eq!(
+            load_state.rejected_records[0].evidence().rejection(),
+            PersistedStateRecordRejection::InvalidSchema
+        );
+        assert_eq!(
+            fs::read(&path).expect("rejected record remains"),
+            persisted_bytes
+        );
 
+        cleanup(&root);
+    }
+
+    #[test]
+    fn rejected_record_selection_is_creation_order_independent_and_bounded() {
+        let mut selections = Vec::new();
+        for descending in [false, true] {
+            let root = test_root(if descending {
+                "rejected-order-descending"
+            } else {
+                "rejected-order-ascending"
+            });
+            let dir = operation_dir(&test_paths(&root));
+            fs::create_dir_all(&dir).expect("create operation dir");
+            let mut indexes = (1_u128..=12).collect::<Vec<_>>();
+            if descending {
+                indexes.reverse();
+            }
+            for index in indexes {
+                let id = format!("{PERFORMANCE_OPERATION_ID_PREFIX}{index:032x}");
+                fs::write(operation_path(&dir, &id), b"{").expect("write invalid record");
+            }
+
+            let load_state = load_persisted_operation_inner(&dir);
+            let selected = load_state
+                .rejected_records
+                .iter()
+                .map(|record| record.evidence().target().id.clone())
+                .collect::<Vec<_>>();
+
+            assert_eq!(load_state.rejected_records.len(), 8);
+            assert_eq!(
+                load_state
+                    .issues
+                    .iter()
+                    .find(|issue| issue.kind == PerformanceOperationLoadIssueKind::StatusInvalid)
+                    .map(|issue| issue.count),
+                Some(12)
+            );
+            selections.push(selected);
+            drop(load_state);
+            cleanup(&root);
+        }
+
+        assert_eq!(selections[0], selections[1]);
+        assert_eq!(
+            selections[0],
+            (1_u128..=8)
+                .map(|index| format!("{PERFORMANCE_OPERATION_ID_PREFIX}{index:032x}"))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn oversized_canonical_record_retains_exact_bounded_evidence() {
+        let root = test_root("oversized-rejected-record");
+        let dir = operation_dir(&test_paths(&root));
+        fs::create_dir_all(&dir).expect("create operation dir");
+        let id = format!("{PERFORMANCE_OPERATION_ID_PREFIX}{:032x}", 1);
+        fs::write(
+            operation_path(&dir, &id),
+            vec![b'x'; MAX_RESTART_RECORD_BYTES as usize + 1],
+        )
+        .expect("write oversized record");
+
+        let load_state = load_persisted_operation_inner(&dir);
+
+        assert!(load_state.inner.operations.is_empty());
+        assert_eq!(load_state.rejected_records.len(), 1);
+        let evidence = load_state.rejected_records[0].evidence();
+        assert_eq!(
+            evidence.rejection(),
+            PersistedStateRecordRejection::Oversized
+        );
+        assert_eq!(evidence.target().id, id);
+        drop(load_state);
+        cleanup(&root);
+    }
+
+    #[test]
+    fn embedded_operation_id_mismatch_targets_canonical_physical_id() {
+        let root = test_root("physical-id-mismatch");
+        let dir = operation_dir(&test_paths(&root));
+        fs::create_dir_all(&dir).expect("create operation dir");
+        let embedded_id = format!("{PERFORMANCE_OPERATION_ID_PREFIX}{:032x}", 1);
+        let physical_id = format!("{PERFORMANCE_OPERATION_ID_PREFIX}{:032x}", 2);
+        let status = test_status(
+            &embedded_id,
+            "instance-a",
+            "install",
+            "applying",
+            test_payload(),
+        );
+        fs::write(
+            operation_path(&dir, &physical_id),
+            serde_json::to_vec_pretty(&PersistedPerformanceOperationStatus::from(status))
+                .expect("serialize mismatched operation"),
+        )
+        .expect("write mismatched operation");
+
+        let load_state = load_persisted_operation_inner(&dir);
+
+        assert!(load_state.inner.operations.is_empty());
+        assert_eq!(load_state.rejected_records.len(), 1);
+        let evidence = load_state.rejected_records[0].evidence();
+        assert_eq!(
+            evidence.rejection(),
+            PersistedStateRecordRejection::InvalidIdentity
+        );
+        assert_eq!(evidence.target().id, physical_id);
+        drop(load_state);
+        cleanup(&root);
+    }
+
+    #[test]
+    fn replacement_before_reacquire_does_not_mint_stale_rejection_identity() {
+        let root = test_root("rejected-replacement");
+        let dir = operation_dir(&test_paths(&root));
+        fs::create_dir_all(&dir).expect("create operation dir");
+        let id = format!("{PERFORMANCE_OPERATION_ID_PREFIX}{:032x}", 1);
+        let path = operation_path(&dir, &id);
+        fs::write(&path, b"{").expect("write rejected record");
+        let directory = AnchoredRecordDirectory::open(&dir).expect("hold operation directory");
+        let mut rejected = BTreeMap::new();
+        rejected.insert(
+            safe_operation_filename(&id),
+            PersistedStateRecordRejection::InvalidSchema,
+        );
+        fs::rename(&path, dir.join("old-record")).expect("move rejected record");
+        let valid = test_status(&id, "instance-a", "install", "complete", test_payload());
+        fs::write(
+            &path,
+            serde_json::to_vec_pretty(&PersistedPerformanceOperationStatus::from(valid))
+                .expect("serialize replacement"),
+        )
+        .expect("write replacement");
+        let mut issues = Vec::new();
+
+        let retained = retain_performance_rejected_records(&directory, rejected, &mut issues);
+
+        assert!(retained.is_empty());
+        assert_eq!(
+            issues,
+            vec![PerformanceOperationLoadIssue {
+                kind: PerformanceOperationLoadIssueKind::StatusUnreadable,
+                count: 1,
+            }]
+        );
+        cleanup(&root);
+    }
+
+    #[test]
+    fn load_issue_count_saturates() {
+        let mut store = PerformanceOperationStore::new();
+        store.load_issues = vec![
+            PerformanceOperationLoadIssue {
+                kind: PerformanceOperationLoadIssueKind::StatusInvalid,
+                count: usize::MAX,
+            },
+            PerformanceOperationLoadIssue {
+                kind: PerformanceOperationLoadIssueKind::StatusUnreadable,
+                count: 1,
+            },
+        ];
+
+        assert_eq!(store.load_issue_count(), usize::MAX);
+    }
+
+    #[test]
+    fn uppercase_operation_id_is_neither_loaded_nor_retained() {
+        let root = test_root("uppercase-id");
+        let dir = operation_dir(&test_paths(&root));
+        fs::create_dir_all(&dir).expect("create operation dir");
+        let id = format!("{PERFORMANCE_OPERATION_ID_PREFIX}0000000000000000000000000000000A");
+        let status = test_status(&id, "instance-a", "install", "applying", test_payload());
+        fs::write(
+            dir.join(format!("{id}.json")),
+            serde_json::to_vec_pretty(&PersistedPerformanceOperationStatus::from(status))
+                .expect("serialize uppercase record"),
+        )
+        .expect("write uppercase record");
+
+        let load_state = load_persisted_operation_inner(&dir);
+
+        assert!(load_state.inner.operations.is_empty());
+        assert!(load_state.rejected_records.is_empty());
+        assert!(
+            load_state.issues.iter().any(|issue| {
+                issue.kind == PerformanceOperationLoadIssueKind::UnsafeOperationId
+            })
+        );
+        cleanup(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn links_for_canonical_names_are_warning_only() {
+        let root = test_root("hostile-links");
+        let dir = operation_dir(&test_paths(&root));
+        fs::create_dir_all(&dir).expect("create operation dir");
+        let outside = root.join("outside.json");
+        fs::write(&outside, b"{").expect("write outside record");
+        let symlink_id = format!("{PERFORMANCE_OPERATION_ID_PREFIX}{:032x}", 1);
+        std::os::unix::fs::symlink(&outside, operation_path(&dir, &symlink_id))
+            .expect("create symlink");
+        let hardlink_source = root.join("hardlink-source");
+        fs::write(&hardlink_source, b"{").expect("write hardlink source");
+        let hardlink_id = format!("{PERFORMANCE_OPERATION_ID_PREFIX}{:032x}", 2);
+        fs::hard_link(&hardlink_source, operation_path(&dir, &hardlink_id))
+            .expect("create hard link");
+
+        let load_state = load_persisted_operation_inner(&dir);
+
+        assert!(load_state.inner.operations.is_empty());
+        assert!(load_state.rejected_records.is_empty());
+        assert_eq!(
+            load_state
+                .issues
+                .iter()
+                .find(|issue| issue.kind == PerformanceOperationLoadIssueKind::StatusUnreadable)
+                .map(|issue| issue.count),
+            Some(2)
+        );
         cleanup(&root);
     }
 

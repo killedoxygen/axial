@@ -1792,7 +1792,12 @@ impl NamedPolicyBoundaryCase {
                 assert!(result.is_ok());
             }
             Self::PersistedStateLoad => {
-                assert!(persisted_state_load_guardian_outcome(1).is_some());
+                assert!(
+                    persisted_state_load_guardian_outcome(
+                        &crate::state::PersistedStateLoadEvidence::for_test(1)
+                    )
+                    .is_some()
+                );
             }
             Self::UnchangedPreset => {
                 let directive = guardian_prelaunch_preset_adjustment_directive(
@@ -1826,7 +1831,12 @@ impl NamedPolicyBoundaryCase {
                 assert!(assessment.is_none());
             }
             Self::CleanPersistedState => {
-                assert!(persisted_state_load_guardian_outcome(0).is_none());
+                assert!(
+                    persisted_state_load_guardian_outcome(
+                        &crate::state::PersistedStateLoadEvidence::for_test(0)
+                    )
+                    .is_none()
+                );
             }
             Self::RejectedPerformance => {
                 let result = plan_performance_supervision(performance_supervision_request(

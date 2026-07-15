@@ -22,6 +22,7 @@ pub mod ownership;
 mod performance_managed;
 pub mod performance_operations;
 mod performance_rules;
+mod persisted_state_load;
 pub mod presence;
 mod reconciliation;
 mod registered_artifact_findings;
@@ -100,6 +101,7 @@ pub(crate) use performance_managed::{
     ManagedInstanceAdmissionError,
 };
 pub use performance_rules::AppPerformanceStore;
+pub(crate) use persisted_state_load::PersistedStateLoadEvidence;
 #[cfg(test)]
 pub(crate) use reconciliation::reconciliation_hand_coverage;
 pub(crate) use reconciliation::{
@@ -165,6 +167,7 @@ pub struct AppState {
     telemetry: Arc<TelemetryHub>,
     remote_flags: Arc<RemoteFlagStore>,
     launch_reports: Arc<launch_reports::LaunchReportStore>,
+    persisted_state_load: Arc<persisted_state_load::PersistedStateStartupLoad>,
     integrity_activity: integrity_activity::IntegrityActivityCoordinator,
     instance_lifecycle_gates: instance_lifecycle::InstanceLifecycleGates,
     lifecycle: AppLifecycle,
@@ -518,11 +521,30 @@ impl AppState {
             config.paths(),
             benchmark_suites.proof_retention_handle(),
         ));
-        let benchmark_suite_drivers =
-            Arc::new(benchmark_suite_drivers.bind(benchmark_suites.retention_handle()));
-        let performance_operations = Arc::new(
-            performance_operations::PerformanceOperationStore::load_from_paths(config.paths()),
-        );
+        let (benchmark_suite_drivers, benchmark_suite_driver_rejections) = benchmark_suite_drivers
+            .bind(benchmark_suites.retention_handle())
+            .into_parts();
+        let (performance_operations, performance_operation_rejections) =
+            performance_operations::PerformanceOperationStore::load_from_paths_for_startup(
+                config.paths(),
+            )
+            .into_parts();
+        let rejected_records = performance_operation_rejections
+            .into_iter()
+            .chain(benchmark_suite_driver_rejections)
+            .collect();
+        let persisted_state_load = Arc::new(persisted_state_load::PersistedStateStartupLoad::new(
+            [
+                auth_logins.load_issue_count(),
+                performance_operations.load_issue_count(),
+                benchmark_suites.load_issue_count(),
+                benchmark_suite_drivers.load_issue_count(),
+                launch_reports.load_issue_count(),
+            ],
+            rejected_records,
+        ));
+        let benchmark_suite_drivers = Arc::new(benchmark_suite_drivers);
+        let performance_operations = Arc::new(performance_operations);
         let skins = Arc::new(skins::SavedSkinStore::load_from_paths(config.paths()));
         let accounts = Arc::new(LauncherAccountStore::load_from_paths(config.paths()));
         let failure_memory = Arc::new(
@@ -567,6 +589,7 @@ impl AppState {
             telemetry,
             remote_flags,
             launch_reports,
+            persisted_state_load,
             integrity_activity: integrity_activity::IntegrityActivityCoordinator::new(),
             instance_lifecycle_gates,
             lifecycle: AppLifecycle::new(),
@@ -629,6 +652,10 @@ impl AppState {
         &self,
     ) -> &Arc<performance_operations::PerformanceOperationStore> {
         &self.performance_operations
+    }
+
+    pub(crate) fn persisted_state_load_evidence(&self) -> &PersistedStateLoadEvidence {
+        self.persisted_state_load.evidence()
     }
 
     pub fn installs(&self) -> &Arc<InstallStore> {
