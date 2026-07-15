@@ -1,5 +1,5 @@
-use crate::download::Downloader;
-use crate::known_good::KnownGoodReconstructionReceipt;
+use crate::download::{Downloader, ReconstructionLibraryContext, ReconstructionLibraryRetention};
+use crate::known_good::{KnownGoodReconstructionReceipt, ManagedLibrariesReconstruction};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum KnownGoodReconstructionError {
@@ -27,6 +27,34 @@ pub async fn reconstruct_known_good(
             .await
             .map_err(|_| KnownGoodReconstructionError::Loader),
     }
+}
+
+pub async fn prepare_managed_libraries_reconstruction(
+    version_id: &str,
+) -> Result<ManagedLibrariesReconstruction, KnownGoodReconstructionError> {
+    let kind = reconstruction_kind(version_id);
+    let context = ReconstructionLibraryContext::new(ReconstructionLibraryRetention::Retained)
+        .map_err(|_| match kind {
+            ReconstructionKind::Vanilla => KnownGoodReconstructionError::Vanilla,
+            ReconstructionKind::Loader => KnownGoodReconstructionError::Loader,
+        })?;
+    let reconstruction = match kind {
+        ReconstructionKind::Vanilla => Downloader::source_only()
+            .reconstruct_version_authority(version_id, &context)
+            .await
+            .map_err(|_| KnownGoodReconstructionError::Vanilla)?,
+        ReconstructionKind::Loader => {
+            crate::loaders::reconstruct_managed_libraries(version_id, &context)
+                .await
+                .map_err(|_| KnownGoodReconstructionError::Loader)?
+        }
+    };
+    reconstruction
+        .bind_managed_libraries()
+        .map_err(|_| match kind {
+            ReconstructionKind::Vanilla => KnownGoodReconstructionError::Vanilla,
+            ReconstructionKind::Loader => KnownGoodReconstructionError::Loader,
+        })
 }
 
 fn reconstruction_kind(version_id: &str) -> ReconstructionKind {
@@ -113,9 +141,8 @@ mod tests {
         let loaders = include_str!("loaders/mod.rs");
         let loader_strategies = include_str!("loaders/strategies/common.rs");
 
-        assert!(crate_root.contains(
-            "pub use known_good_reconstruction::{KnownGoodReconstructionError, reconstruct_known_good};"
-        ));
+        assert!(crate_root.contains("prepare_managed_libraries_reconstruction"));
+        assert!(crate_root.contains("reconstruct_known_good"));
         assert!(!crate_root.contains("KnownGoodActivationSource"));
         assert!(!crate_root.contains("reconstruct_build,"));
         assert!(!dispatcher.contains(concat!("PathBuf", "::new()")));

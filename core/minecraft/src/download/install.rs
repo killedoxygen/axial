@@ -10,8 +10,9 @@ use super::libraries::{
     acquire_retained_classified_library, library_jobs_for,
 };
 use super::library_source::{
-    LIBRARY_SOURCE_MAX_BYTES, LibraryComponentSourceKind, LibrarySourcePool, LibrarySourceRequest,
-    RetainedLibraryComponentSource, acquire_retained_library_component_source,
+    AuthenticatedLocalLibraryBytes, LIBRARY_SOURCE_MAX_BYTES, LibraryComponentSourceKind,
+    LibrarySourcePool, LibrarySourceRequest, RetainedLibraryComponentSource,
+    RetainedLibrarySourceSet, acquire_retained_library_component_source,
 };
 use super::model::{
     DownloadError, DownloadProgress, ExactLibraryDownloadProof, ExecutionDownloadFact,
@@ -32,7 +33,7 @@ use crate::known_good::{
     KnownGoodArtifactKind, KnownGoodInstallReceipt, KnownGoodIntegrity,
     KnownGoodReconstructionReceipt, KnownGoodRoot, MAX_KNOWN_GOOD_ASSET_INDEX_BYTES,
     MAX_KNOWN_GOOD_VERSION_JSON_BYTES, MAX_TIER2_ARTIFACT_BYTES, ManagedComponentProjection,
-    ManagedKnownGoodComponent, PendingKnownGoodInstallAuthority,
+    ManagedKnownGoodComponent, PendingKnownGoodInstallAuthority, RetainedKnownGoodReconstruction,
     authenticate_pending_known_good_install, seal_reconstructed_vanilla,
 };
 use crate::known_good_libraries::{
@@ -294,8 +295,66 @@ fn encode_sha1_digest(digest: [u8; 20]) -> String {
 }
 
 pub(crate) struct ReconstructedVanillaClientAuthority {
-    receipt: KnownGoodReconstructionReceipt,
+    reconstruction: RetainedKnownGoodReconstruction,
     client_source: AuthenticatedSelectedArtifactSource,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(crate) enum ReconstructionLibraryRetention {
+    ProofOnly,
+    Retained,
+}
+
+#[derive(Clone)]
+pub(crate) struct ReconstructionLibraryContext {
+    retention: ReconstructionLibraryRetention,
+    retained_source_pool: Option<LibrarySourcePool>,
+}
+
+impl ReconstructionLibraryContext {
+    pub(crate) fn new(retention: ReconstructionLibraryRetention) -> Result<Self, DownloadError> {
+        Ok(Self {
+            retention,
+            retained_source_pool: match retention {
+                ReconstructionLibraryRetention::ProofOnly => None,
+                ReconstructionLibraryRetention::Retained => Some(LibrarySourcePool::new()?),
+            },
+        })
+    }
+
+    pub(crate) fn retains_sources(&self) -> bool {
+        self.retention == ReconstructionLibraryRetention::Retained
+    }
+
+    fn phase_source_pool(&self) -> Result<LibrarySourcePool, DownloadError> {
+        match &self.retained_source_pool {
+            Some(source_pool) => Ok(source_pool.clone()),
+            None => LibrarySourcePool::new(),
+        }
+    }
+
+    pub(crate) async fn retain_local_sources(
+        &self,
+        sources: Vec<AuthenticatedLocalLibraryBytes>,
+    ) -> Result<RetainedLibrarySourceSet, DownloadError> {
+        if sources.is_empty() {
+            return Ok(RetainedLibrarySourceSet::new());
+        }
+        let source_pool = self.retained_source_pool.as_ref().ok_or_else(|| {
+            DownloadError::Integrity(
+                "proof-only reconstruction cannot retain local library bytes".to_string(),
+            )
+        })?;
+        let mut retained = RetainedLibrarySourceSet::new();
+        for source in sources {
+            retained.insert(
+                source_pool
+                    .retain_authenticated_local_source(source)
+                    .await?,
+            )?;
+        }
+        Ok(retained)
+    }
 }
 
 pub(crate) struct ReconstructedVanillaProcessorAuthority {
@@ -306,16 +365,17 @@ pub(crate) struct ReconstructedVanillaProcessorAuthority {
 
 pub(crate) struct PendingReconstructedVanillaProcessorAuthority {
     parts: VanillaAuthorityParts,
+    library_sources: RetainedLibrarySourceSet,
 }
 
 impl ReconstructedVanillaClientAuthority {
     pub(crate) fn consume_for_overlay(
         self,
     ) -> (
-        KnownGoodReconstructionReceipt,
+        RetainedKnownGoodReconstruction,
         AuthenticatedSelectedArtifactSource,
     ) {
-        (self.receipt, self.client_source)
+        (self.reconstruction, self.client_source)
     }
 }
 
@@ -339,20 +399,22 @@ impl PendingReconstructedVanillaProcessorAuthority {
     pub(crate) fn complete(
         mut self,
         runtime_source: RuntimeSourceReceipt,
-    ) -> Result<KnownGoodReconstructionReceipt, DownloadError> {
+    ) -> Result<RetainedKnownGoodReconstruction, DownloadError> {
         if self.parts.runtime_source.is_some() {
             return Err(DownloadError::ResolveManifest(
                 "processor runtime authority was already completed".to_string(),
             ));
         }
         self.parts.runtime_source = Some(runtime_source);
-        seal_reconstructed_vanilla(ReconstructedVanillaAuthority::new(self.parts)).map_err(
-            |error| {
-                DownloadError::ResolveManifest(format!(
-                    "reconstructed source inventory could not be derived: {error:?}"
-                ))
-            },
-        )
+        seal_reconstructed_vanilla(ReconstructedVanillaAuthority::new(
+            self.parts,
+            self.library_sources,
+        ))
+        .map_err(|error| {
+            DownloadError::ResolveManifest(format!(
+                "reconstructed source inventory could not be derived: {error:?}"
+            ))
+        })
     }
 }
 
@@ -383,6 +445,7 @@ struct VanillaAuthorityParts {
 
 pub(crate) struct ReconstructedVanillaAuthority {
     parts: VanillaAuthorityParts,
+    library_sources: RetainedLibrarySourceSet,
 }
 
 pub(crate) struct PreparedManagedInstall {
@@ -410,8 +473,11 @@ pub(crate) struct AuthenticatedVanillaInstallSources {
 }
 
 impl ReconstructedVanillaAuthority {
-    fn new(parts: VanillaAuthorityParts) -> Self {
-        Self { parts }
+    fn new(parts: VanillaAuthorityParts, library_sources: RetainedLibrarySourceSet) -> Self {
+        Self {
+            parts,
+            library_sources,
+        }
     }
 
     pub(crate) fn into_parts(
@@ -423,8 +489,19 @@ impl ReconstructedVanillaAuthority {
         AuthenticatedSelectedArtifactSource,
         Option<AuthenticatedSelectedArtifactSource>,
         Option<RuntimeSourceReceipt>,
+        RetainedLibrarySourceSet,
     ) {
-        self.parts.into_parts()
+        let (version, environment, libraries, version_source, asset_index_source, runtime_source) =
+            self.parts.into_parts();
+        (
+            version,
+            environment,
+            libraries,
+            version_source,
+            asset_index_source,
+            runtime_source,
+            self.library_sources,
+        )
     }
 }
 
@@ -653,7 +730,20 @@ impl Downloader {
     ) -> Result<KnownGoodReconstructionReceipt, DownloadError> {
         validate_install_version_id(version_id)?;
         let version_manifest_entry = self.resolve_manifest_entry(version_id).await?;
-        self.reconstruct_version_inner(version_id, version_manifest_entry)
+        let context = ReconstructionLibraryContext::new(ReconstructionLibraryRetention::ProofOnly)?;
+        self.reconstruct_version_inner(version_id, version_manifest_entry, &context)
+            .await
+            .map(RetainedKnownGoodReconstruction::discard_sources)
+    }
+
+    pub(crate) async fn reconstruct_version_authority(
+        &self,
+        version_id: &str,
+        context: &ReconstructionLibraryContext,
+    ) -> Result<RetainedKnownGoodReconstruction, DownloadError> {
+        validate_install_version_id(version_id)?;
+        let version_manifest_entry = self.resolve_manifest_entry(version_id).await?;
+        self.reconstruct_version_inner(version_id, version_manifest_entry, context)
             .await
     }
 
@@ -661,11 +751,16 @@ impl Downloader {
         &self,
         version_id: &str,
         version_manifest_entry: ManifestEntry,
-    ) -> Result<KnownGoodReconstructionReceipt, DownloadError> {
-        let authority = self
-            .reconstruct_vanilla_authority(version_id, &version_manifest_entry)
+        context: &ReconstructionLibraryContext,
+    ) -> Result<RetainedKnownGoodReconstruction, DownloadError> {
+        let (authority, library_sources) = self
+            .reconstruct_vanilla_authority(version_id, &version_manifest_entry, context)
             .await?;
-        seal_reconstructed_vanilla(ReconstructedVanillaAuthority::new(authority)).map_err(|error| {
+        seal_reconstructed_vanilla(ReconstructedVanillaAuthority::new(
+            authority,
+            library_sources,
+        ))
+        .map_err(|error| {
             DownloadError::ResolveManifest(format!(
                 "reconstructed source inventory could not be derived: {error:?}"
             ))
@@ -675,18 +770,22 @@ impl Downloader {
     pub(crate) async fn reconstruct_version_with_client_source(
         &self,
         version_id: &str,
+        context: &ReconstructionLibraryContext,
     ) -> Result<ReconstructedVanillaClientAuthority, DownloadError> {
-        let (authority, client_source) = self
-            .reconstruct_version_with_client_authority(version_id)
+        let (authority, library_sources, client_source) = self
+            .reconstruct_version_with_client_authority(version_id, context)
             .await?;
-        let receipt = seal_reconstructed_vanilla(ReconstructedVanillaAuthority::new(authority))
-            .map_err(|error| {
-                DownloadError::ResolveManifest(format!(
-                    "reconstructed source inventory could not be derived: {error:?}"
-                ))
-            })?;
+        let reconstruction = seal_reconstructed_vanilla(ReconstructedVanillaAuthority::new(
+            authority,
+            library_sources,
+        ))
+        .map_err(|error| {
+            DownloadError::ResolveManifest(format!(
+                "reconstructed source inventory could not be derived: {error:?}"
+            ))
+        })?;
         Ok(ReconstructedVanillaClientAuthority {
-            receipt,
+            reconstruction,
             client_source,
         })
     }
@@ -694,9 +793,10 @@ impl Downloader {
     pub(crate) async fn reconstruct_version_for_processor(
         &self,
         version_id: &str,
+        context: &ReconstructionLibraryContext,
     ) -> Result<ReconstructedVanillaProcessorAuthority, DownloadError> {
-        let (mut authority, client_source) = self
-            .reconstruct_version_with_client_authority(version_id)
+        let (mut authority, library_sources, client_source) = self
+            .reconstruct_version_with_client_authority(version_id, context)
             .await?;
         let runtime_source = authority.runtime_source.take().ok_or_else(|| {
             DownloadError::ResolveManifest(
@@ -704,7 +804,10 @@ impl Downloader {
             )
         })?;
         Ok(ReconstructedVanillaProcessorAuthority {
-            pending: PendingReconstructedVanillaProcessorAuthority { parts: authority },
+            pending: PendingReconstructedVanillaProcessorAuthority {
+                parts: authority,
+                library_sources,
+            },
             client_source,
             runtime_source,
         })
@@ -799,23 +902,32 @@ impl Downloader {
     async fn reconstruct_version_with_client_authority(
         &self,
         version_id: &str,
-    ) -> Result<(VanillaAuthorityParts, AuthenticatedSelectedArtifactSource), DownloadError> {
+        context: &ReconstructionLibraryContext,
+    ) -> Result<
+        (
+            VanillaAuthorityParts,
+            RetainedLibrarySourceSet,
+            AuthenticatedSelectedArtifactSource,
+        ),
+        DownloadError,
+    > {
         validate_install_version_id(version_id)?;
         let version_manifest_entry = self.resolve_manifest_entry(version_id).await?;
-        let authority = self
-            .reconstruct_vanilla_authority(version_id, &version_manifest_entry)
+        let (authority, library_sources) = self
+            .reconstruct_vanilla_authority(version_id, &version_manifest_entry, context)
             .await?;
         let client_source = self
             .acquire_version_bundle_client_source(version_id, &authority.version)
             .await?;
-        Ok((authority, client_source))
+        Ok((authority, library_sources, client_source))
     }
 
     async fn reconstruct_vanilla_authority(
         &self,
         version_id: &str,
         version_manifest_entry: &ManifestEntry,
-    ) -> Result<VanillaAuthorityParts, DownloadError> {
+        context: &ReconstructionLibraryContext,
+    ) -> Result<(VanillaAuthorityParts, RetainedLibrarySourceSet), DownloadError> {
         let AuthenticatedVanillaPlan {
             version,
             environment,
@@ -828,10 +940,11 @@ impl Downloader {
             .acquire_vanilla_plan(version_id, version_manifest_entry, None)
             .await?;
         let mut library_proofs = Vec::new();
-        let source_pool = LibrarySourcePool::new()?;
+        let mut library_sources = RetainedLibrarySourceSet::new();
+        let source_pool = context.phase_source_pool()?;
         for classified in library_jobs {
             let (job, acquisition) = classified.into_parts();
-            if acquisition == LibraryAcquisition::ExactDeclaration {
+            if acquisition == LibraryAcquisition::ExactDeclaration && !context.retains_sources() {
                 continue;
             }
             let target = selected_download_source_label(
@@ -852,7 +965,12 @@ impl Downloader {
                 component_source_kind(job.is_native),
             )
             .await?;
-            library_proofs.push(reconstruction_download_proof(&source)?);
+            if acquisition == LibraryAcquisition::FreshStream {
+                library_proofs.push(reconstruction_download_proof(&source)?);
+            }
+            if context.retains_sources() {
+                library_sources.insert(source)?;
+            }
         }
         let library_declarations = pending_library_declarations
             .seal_streamed(library_proofs)
@@ -862,14 +980,17 @@ impl Downloader {
                 ))
             })?;
 
-        Ok(VanillaAuthorityParts {
-            version,
-            environment,
-            libraries: library_declarations,
-            version_source: version_json_source,
-            asset_index_source,
-            runtime_source,
-        })
+        Ok((
+            VanillaAuthorityParts {
+                version,
+                environment,
+                libraries: library_declarations,
+                version_source: version_json_source,
+                asset_index_source,
+                runtime_source,
+            },
+            library_sources,
+        ))
     }
 
     pub async fn install_version_with_facts<F, G>(
@@ -1488,7 +1609,8 @@ impl Downloader {
 
 pub(crate) async fn reconstruct_profile_library_declarations(
     declarations: PendingExactLibraryDeclarations,
-) -> Result<SealedExactLibraryDeclarations, DownloadError> {
+    context: &ReconstructionLibraryContext,
+) -> Result<(SealedExactLibraryDeclarations, RetainedLibrarySourceSet), DownloadError> {
     let jobs = {
         let (libraries, environment) = declarations.profile_plan_inputs().ok_or_else(|| {
             DownloadError::ResolveManifest(
@@ -1503,11 +1625,12 @@ pub(crate) async fn reconstruct_profile_library_declarations(
         ))
     })?;
     let client = standard_minecraft_download_client();
-    let source_pool = LibrarySourcePool::new()?;
     let mut proofs = Vec::new();
+    let mut sources = RetainedLibrarySourceSet::new();
+    let source_pool = context.phase_source_pool()?;
     for classified in classified {
         let (job, acquisition) = classified.into_parts();
-        if acquisition == LibraryAcquisition::ExactDeclaration {
+        if acquisition == LibraryAcquisition::ExactDeclaration && !context.retains_sources() {
             continue;
         }
         let target = selected_download_source_label(
@@ -1528,32 +1651,59 @@ pub(crate) async fn reconstruct_profile_library_declarations(
             component_source_kind(job.is_native),
         )
         .await?;
-        proofs.push(reconstruction_download_proof(&source)?);
+        if acquisition == LibraryAcquisition::FreshStream {
+            proofs.push(reconstruction_download_proof(&source)?);
+        }
+        if context.retains_sources() {
+            sources.insert(source)?;
+        }
     }
-    pending.seal_streamed(proofs).map_err(|error| {
+    let declarations = pending.seal_streamed(proofs).map_err(|error| {
         DownloadError::ResolveManifest(format!(
             "profile library reconstruction could not be completed: {error:?}"
         ))
-    })
+    })?;
+    Ok((declarations, sources))
 }
 
 pub(crate) async fn reconstruct_installer_library_declarations(
     sources: crate::loaders::PendingForgeReconstructionSources,
-) -> Result<crate::loaders::BoundForgeInstallExecution, DownloadError> {
-    reconstruct_installer_library_declarations_inner(sources, None).await
+    context: &ReconstructionLibraryContext,
+) -> Result<
+    (
+        crate::loaders::BoundForgeInstallExecution,
+        RetainedLibrarySourceSet,
+    ),
+    DownloadError,
+> {
+    reconstruct_installer_library_declarations_inner(sources, None, context).await
 }
 
 pub(crate) async fn reconstruct_installer_processor_sources(
     sources: crate::loaders::PendingForgeReconstructionSources,
     workspace: &crate::loaders::workspace::cleanup::ProcessorWorkspace,
-) -> Result<crate::loaders::BoundForgeInstallExecution, DownloadError> {
-    reconstruct_installer_library_declarations_inner(sources, Some(workspace)).await
+    context: &ReconstructionLibraryContext,
+) -> Result<
+    (
+        crate::loaders::BoundForgeInstallExecution,
+        RetainedLibrarySourceSet,
+    ),
+    DownloadError,
+> {
+    reconstruct_installer_library_declarations_inner(sources, Some(workspace), context).await
 }
 
 async fn reconstruct_installer_library_declarations_inner(
     sources: crate::loaders::PendingForgeReconstructionSources,
     workspace: Option<&crate::loaders::workspace::cleanup::ProcessorWorkspace>,
-) -> Result<crate::loaders::BoundForgeInstallExecution, DownloadError> {
+    context: &ReconstructionLibraryContext,
+) -> Result<
+    (
+        crate::loaders::BoundForgeInstallExecution,
+        RetainedLibrarySourceSet,
+    ),
+    DownloadError,
+> {
     let (pending, jobs, mut required_execution_inputs) = sources.into_parts();
     if workspace.is_none() && !required_execution_inputs.is_empty() {
         return Err(DownloadError::ResolveManifest(
@@ -1561,13 +1711,17 @@ async fn reconstruct_installer_library_declarations_inner(
         ));
     }
     let client = standard_minecraft_download_client();
-    let source_pool = LibrarySourcePool::new()?;
     let mut proofs = Vec::new();
+    let mut retained_sources = RetainedLibrarySourceSet::new();
+    let source_pool = context.phase_source_pool()?;
     for classified in jobs {
         let (plan, acquisition) = classified.into_parts();
         let required_by_execution = required_execution_inputs.remove(&plan.relative_path);
         let stage_in_workspace = required_by_execution;
-        if acquisition == LibraryAcquisition::ExactDeclaration && !stage_in_workspace {
+        if acquisition == LibraryAcquisition::ExactDeclaration
+            && !stage_in_workspace
+            && !context.retains_sources()
+        {
             continue;
         }
         let target = selected_download_source_label(
@@ -1617,8 +1771,11 @@ async fn reconstruct_installer_library_declarations_inner(
             if acquisition == LibraryAcquisition::FreshStream {
                 proofs.push(reconstruction_download_proof(&source)?);
             }
-        } else {
+        } else if acquisition == LibraryAcquisition::FreshStream {
             proofs.push(reconstruction_download_proof(&source)?);
+        }
+        if context.retains_sources() {
+            retained_sources.insert(source)?;
         }
     }
     if !required_execution_inputs.is_empty() {
@@ -1626,11 +1783,12 @@ async fn reconstruct_installer_library_declarations_inner(
             "processor reconstruction input source is missing".to_string(),
         ));
     }
-    pending.complete_sources(proofs).map_err(|error| {
+    let execution = pending.complete_sources(proofs).map_err(|error| {
         DownloadError::ResolveManifest(format!(
             "installer library reconstruction could not be completed: {error}"
         ))
-    })
+    })?;
+    Ok((execution, retained_sources))
 }
 
 fn component_source_kind(is_native: bool) -> LibraryComponentSourceKind {

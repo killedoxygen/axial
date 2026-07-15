@@ -256,6 +256,45 @@ async fn reconstruction_matches_install_without_touching_seeded_destinations() {
     }
     let reconstructed = reconstruction.into_activation_source().into_parts();
 
+    let retained_context =
+        ReconstructionLibraryContext::new(ReconstructionLibraryRetention::Retained)
+            .expect("retained reconstruction context");
+    let prepared = timeout(
+        Duration::from_secs(10),
+        downloader.reconstruct_version_authority("reconstruction", &retained_context),
+    )
+    .await
+    .expect("retained reconstruction must not deadlock the shared source pool")
+    .expect("reconstruct retained vanilla sources")
+    .bind_managed_libraries()
+    .expect("bind retained vanilla sources to final projection");
+    assert_eq!(prepared.version_id(), "reconstruction");
+    assert_eq!(prepared.library_entry_count(), 3);
+    assert_eq!(prepared.retained_source_count(), 3);
+    assert_eq!(
+        prepared.expected_content_byte_count(),
+        prepared.retained_content_byte_count()
+    );
+    assert_eq!(snapshot_tree(&root), before);
+    let retained_requests = std::iter::from_fn(|| requests.try_recv().ok()).collect::<Vec<_>>();
+    for path in [
+        "/version.json",
+        "/libraries/exact.jar",
+        "/libraries/observed.jar",
+        "/libraries/observed-two.jar",
+        "/asset-index.json",
+    ] {
+        assert_eq!(
+            retained_requests
+                .iter()
+                .filter(|request| request.as_str() == path)
+                .count(),
+            1,
+            "retained reconstruction must fetch {path} exactly once"
+        );
+    }
+    drop(prepared);
+
     let installed = timeout(
         Duration::from_secs(10),
         downloader.install_version("reconstruction", |_| {}),

@@ -69,3 +69,31 @@ pub(crate) async fn reconstruct_build(
         }
     }
 }
+
+pub(crate) async fn reconstruct_managed_libraries(
+    plan: &LoaderInstallPlan,
+    context: &crate::download::ReconstructionLibraryContext,
+) -> Result<crate::known_good::RetainedKnownGoodReconstruction, LoaderError> {
+    match plan.record.strategy {
+        LoaderInstallStrategy::FabricProfile | LoaderInstallStrategy::QuiltProfile => {
+            Box::pin(common::reconstruct_libraries_from_profile_source(
+                plan, context,
+            ))
+            .await
+        }
+        LoaderInstallStrategy::ForgeEarliestLegacy => {
+            Box::pin(common::reconstruct_libraries_from_legacy_archive(
+                plan, context,
+            ))
+            .await
+        }
+        LoaderInstallStrategy::ForgeModern
+        | LoaderInstallStrategy::ForgeLegacyInstaller
+        | LoaderInstallStrategy::NeoForgeModern => {
+            Box::pin(common::reconstruct_libraries_from_installer_source(
+                plan, context,
+            ))
+            .await
+        }
+    }
+}

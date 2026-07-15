@@ -1,6 +1,7 @@
 use crate::artifact_path::ArtifactRelativePath;
 use crate::download::library_source::{
-    LibraryComponentSourceKind, RetainedLibraryComponentSource, RetainedLibrarySourceReplay,
+    AuthenticatedLocalLibraryBytes, LibraryComponentSourceKind, RetainedLibraryComponentSource,
+    RetainedLibrarySourceReplay,
 };
 use crate::download::{
     AuthenticatedSelectedArtifactSource, DownloadJob, ExactLibraryDownloadProof,
@@ -646,7 +647,22 @@ impl PendingInstallerReconstructionTerminalDeclarations {
 
     pub(crate) fn seal_declared_terminal_outputs(
         self,
-    ) -> Result<SealedExactLibraryDeclarations, SealedLibraryDeclarationError> {
+        retain_sources: bool,
+    ) -> Result<
+        (
+            SealedExactLibraryDeclarations,
+            Vec<AuthenticatedLocalLibraryBytes>,
+        ),
+        SealedLibraryDeclarationError,
+    > {
+        if retain_sources
+            && self
+                .selected
+                .values()
+                .any(|selected| matches!(selected.producer, InstallerLibraryProducer::Terminal(_)))
+        {
+            return Err(SealedLibraryDeclarationError::MissingDeclaration);
+        }
         let mut entries = self.entries;
         for selected in self.selected.values() {
             let InstallerLibraryProducer::Terminal(contract) = &selected.producer else {
@@ -661,16 +677,28 @@ impl PendingInstallerReconstructionTerminalDeclarations {
         if entries.len() != self.selected.len() {
             return Err(SealedLibraryDeclarationError::MissingDeclaration);
         }
-        Ok(SealedExactLibraryDeclarations {
+        let declarations = SealedExactLibraryDeclarations {
             entries,
             structure: LibraryStructure::Installer(Box::new(self.structure)),
-        })
+        };
+        let mut sources = Vec::new();
+        if retain_sources {
+            collect_reconstruction_embedded_sources(&self.selected, self.embedded, &mut sources)?;
+        }
+        Ok((declarations, sources))
     }
 
     pub(crate) fn seal_observed_terminal_outputs(
         self,
         outputs: VerifiedProcessorOutputs,
-    ) -> Result<SealedExactLibraryDeclarations, SealedLibraryDeclarationError> {
+        retain_sources: bool,
+    ) -> Result<
+        (
+            SealedExactLibraryDeclarations,
+            Vec<AuthenticatedLocalLibraryBytes>,
+        ),
+        SealedLibraryDeclarationError,
+    > {
         let mut outputs = outputs
             .into_entries()
             .into_iter()
@@ -680,15 +708,16 @@ impl PendingInstallerReconstructionTerminalDeclarations {
                 if size == 0 || size != bytes.len() as u64 || sha1 != observed_sha1 {
                     return Err(SealedLibraryDeclarationError::ContractDrift);
                 }
-                Ok((path, (size, sha1)))
+                Ok((path, (bytes, size, sha1)))
             })
             .collect::<Result<BTreeMap<_, _>, _>>()?;
         let mut entries = self.entries;
+        let mut sources = Vec::new();
         for (path, selected) in &self.selected {
             let InstallerLibraryProducer::Terminal(contract) = &selected.producer else {
                 continue;
             };
-            let (size, sha1) = outputs
+            let (bytes, size, sha1) = outputs
                 .remove(path)
                 .ok_or(SealedLibraryDeclarationError::MissingDeclaration)?;
             if sha1 != contract.sha1 || contract.size.is_some_and(|expected| expected != size) {
@@ -696,6 +725,13 @@ impl PendingInstallerReconstructionTerminalDeclarations {
             }
             validate_plan_contract(&selected.plan, sha1, size)?;
             insert_exact_declaration(&mut entries, &selected.plan, sha1, size, false)?;
+            if retain_sources {
+                sources.push(authenticated_local_bytes_candidate(
+                    path.clone(),
+                    &selected.plan,
+                    bytes,
+                )?);
+            }
         }
         if !outputs.is_empty() {
             return Err(SealedLibraryDeclarationError::ExtraDeclaration);
@@ -703,11 +739,51 @@ impl PendingInstallerReconstructionTerminalDeclarations {
         if entries.len() != self.selected.len() {
             return Err(SealedLibraryDeclarationError::MissingDeclaration);
         }
-        Ok(SealedExactLibraryDeclarations {
-            entries,
-            structure: LibraryStructure::Installer(Box::new(self.structure)),
-        })
+        if retain_sources {
+            collect_reconstruction_embedded_sources(&self.selected, self.embedded, &mut sources)?;
+        }
+        Ok((
+            SealedExactLibraryDeclarations {
+                entries,
+                structure: LibraryStructure::Installer(Box::new(self.structure)),
+            },
+            sources,
+        ))
     }
+}
+
+fn collect_reconstruction_embedded_sources(
+    selected: &BTreeMap<ArtifactRelativePath, InstallerSelectedLibrary>,
+    embedded: BTreeMap<ArtifactRelativePath, AuthenticatedEmbeddedMavenArtifact>,
+    sources: &mut Vec<AuthenticatedLocalLibraryBytes>,
+) -> Result<(), SealedLibraryDeclarationError> {
+    for (path, artifact) in embedded {
+        let selected = selected
+            .get(&path)
+            .ok_or(SealedLibraryDeclarationError::MissingDeclaration)?;
+        if !matches!(selected.producer, InstallerLibraryProducer::Embedded) {
+            return Err(SealedLibraryDeclarationError::ContractDrift);
+        }
+        let (artifact_path, bytes) = artifact.into_parts();
+        sources.push(authenticated_local_bytes_candidate(
+            artifact_path,
+            &selected.plan,
+            bytes,
+        )?);
+    }
+    Ok(())
+}
+
+fn authenticated_local_bytes_candidate(
+    path: ArtifactRelativePath,
+    plan: &LibraryArtifactPlan,
+    bytes: Vec<u8>,
+) -> Result<AuthenticatedLocalLibraryBytes, SealedLibraryDeclarationError> {
+    let size = bytes.len() as u64;
+    let sha1 = Sha1::digest(&bytes).into();
+    validate_plan_contract(plan, sha1, size)?;
+    AuthenticatedLocalLibraryBytes::new(path, component_kind_for_plan(plan), bytes, size, sha1)
+        .map_err(|_| SealedLibraryDeclarationError::ContractDrift)
 }
 
 impl PendingInstallerTerminalDeclarations {
@@ -2366,12 +2442,13 @@ mod tests {
             8,
             [2; 20],
         );
-        let sealed = pending
+        let (sealed, sources) = pending
             .complete_network(vec![streamed])
             .expect("fresh reconstruction source")
-            .seal_declared_terminal_outputs()
+            .seal_declared_terminal_outputs(false)
             .expect("declared terminal seal");
 
+        assert!(sources.is_empty());
         assert_eq!(sealed.len(), 3);
         assert_eq!(
             sealed.get(&terminal_path),
@@ -2401,9 +2478,75 @@ mod tests {
         let pending = pending.complete_network(Vec::new()).expect("no sources");
 
         assert!(matches!(
-            pending.seal_declared_terminal_outputs(),
+            pending.seal_declared_terminal_outputs(false),
             Err(SealedLibraryDeclarationError::MissingDeclaration)
         ));
+    }
+
+    #[test]
+    fn retained_installer_reconstruction_requires_and_retains_final_local_sources() {
+        let embedded_path = ArtifactRelativePath::new("example/embedded/1/embedded-1.jar").unwrap();
+        let embedded_bytes = b"selected embedded reconstruction source".to_vec();
+        let embedded_sha1: [u8; 20] = Sha1::digest(&embedded_bytes).into();
+        let terminal_path = ArtifactRelativePath::new("example/terminal/1/terminal-1.jar").unwrap();
+        let terminal_bytes = b"verified terminal reconstruction source".to_vec();
+        let terminal_sha1: [u8; 20] = Sha1::digest(&terminal_bytes).into();
+        let build = || {
+            let bound = bind_installer_library_declarations(
+                AuthenticatedInstallerLibraryInputs::from_test(
+                    vec![
+                        without_download_source(profile_library(
+                            "example:embedded:1",
+                            embedded_path.as_str(),
+                            &encode_sha1(embedded_sha1),
+                            embedded_bytes.len() as i64,
+                        )),
+                        without_download_source(profile_library(
+                            "example:terminal:1",
+                            terminal_path.as_str(),
+                            &encode_sha1(terminal_sha1),
+                            terminal_bytes.len() as i64,
+                        )),
+                    ],
+                    vec![(embedded_path.clone(), embedded_bytes.clone())],
+                    vec![(
+                        terminal_path.clone(),
+                        terminal_sha1,
+                        Some(terminal_bytes.len() as u64),
+                    )],
+                ),
+                crate::rules::default_environment(),
+            )
+            .expect("retained reconstruction declarations");
+            let (pending, jobs) = bound.into_reconstruction_jobs();
+            assert!(jobs.is_empty());
+            pending
+                .complete_network(Vec::new())
+                .expect("no network sources")
+        };
+
+        assert!(matches!(
+            build().seal_declared_terminal_outputs(true),
+            Err(SealedLibraryDeclarationError::MissingDeclaration)
+        ));
+        let (declarations, sources) = build()
+            .seal_observed_terminal_outputs(
+                VerifiedProcessorOutputs::from_test_terminal(vec![(
+                    terminal_path.clone(),
+                    terminal_bytes,
+                )]),
+                true,
+            )
+            .expect("observed retained reconstruction sources");
+        assert_eq!(declarations.len(), 2);
+        assert_eq!(sources.len(), 2);
+        assert_eq!(
+            sources
+                .iter()
+                .map(|source| source.relative_path().clone())
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([embedded_path, terminal_path])
+        );
     }
 
     #[test]

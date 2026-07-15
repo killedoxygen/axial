@@ -370,6 +370,7 @@ pub(crate) struct AuthenticatedInstallerReceiptInput {
 pub(crate) struct AuthenticatedInstallerReconstructionInput {
     source: VerifiedInstallerReceiptSource,
     library_declarations: SealedExactLibraryDeclarations,
+    local_library_sources: Vec<crate::download::library_source::AuthenticatedLocalLibraryBytes>,
 }
 
 pub(crate) struct VerifiedInstallerClientBytes {
@@ -748,6 +749,7 @@ impl BoundForgeInstallerContinuation {
 
     pub(crate) fn into_reconstruction_receipt_input(
         self,
+        retain_library_sources: bool,
     ) -> Result<AuthenticatedInstallerReconstructionInput, ForgeInstallerError> {
         let Self {
             source,
@@ -760,8 +762,8 @@ impl BoundForgeInstallerContinuation {
         else {
             return Err(ForgeInstallerError::InvalidForgeProcessorArtifactContract);
         };
-        let library_declarations = library_declarations
-            .seal_declared_terminal_outputs()
+        let (library_declarations, local_library_sources) = library_declarations
+            .seal_declared_terminal_outputs(retain_library_sources)
             .map_err(|_| ForgeInstallerError::InvalidForgeProcessorFinalOutput)?;
         Ok(AuthenticatedInstallerReconstructionInput {
             source: VerifiedInstallerReceiptSource {
@@ -770,12 +772,14 @@ impl BoundForgeInstallerContinuation {
                 strip_client_meta,
             },
             library_declarations,
+            local_library_sources,
         })
     }
 
     pub(crate) fn into_observed_reconstruction_receipt_input(
         self,
         outputs: crate::loaders::VerifiedProcessorOutputs,
+        retain_library_sources: bool,
     ) -> Result<AuthenticatedInstallerReconstructionInput, ForgeInstallerError> {
         let Self {
             source,
@@ -788,8 +792,8 @@ impl BoundForgeInstallerContinuation {
         else {
             return Err(ForgeInstallerError::InvalidForgeProcessorArtifactContract);
         };
-        let library_declarations = library_declarations
-            .seal_observed_terminal_outputs(outputs)
+        let (library_declarations, local_library_sources) = library_declarations
+            .seal_observed_terminal_outputs(outputs, retain_library_sources)
             .map_err(|_| ForgeInstallerError::InvalidForgeProcessorFinalOutput)?;
         Ok(AuthenticatedInstallerReconstructionInput {
             source: VerifiedInstallerReceiptSource {
@@ -798,6 +802,7 @@ impl BoundForgeInstallerContinuation {
                 strip_client_meta,
             },
             library_declarations,
+            local_library_sources,
         })
     }
 
@@ -945,13 +950,24 @@ impl AuthenticatedInstallerReconstructionInput {
             .derive_child_client_bytes(authenticated_base_bytes)
     }
 
+    pub(crate) fn take_local_library_sources(
+        &mut self,
+    ) -> Vec<crate::download::library_source::AuthenticatedLocalLibraryBytes> {
+        std::mem::take(&mut self.local_library_sources)
+    }
+
     pub(crate) fn into_parts(
         self,
     ) -> (
         VerifiedInstallerReceiptSource,
         SealedExactLibraryDeclarations,
+        Vec<crate::download::library_source::AuthenticatedLocalLibraryBytes>,
     ) {
-        (self.source, self.library_declarations)
+        (
+            self.source,
+            self.library_declarations,
+            self.local_library_sources,
+        )
     }
 }
 
@@ -3239,7 +3255,7 @@ mod tests {
             Err(_) => panic!("exact terminal reconstruction"),
         };
         let input = continuation
-            .into_reconstruction_receipt_input()
+            .into_reconstruction_receipt_input(false)
             .expect("declared terminal reconstruction input");
         assert_eq!(
             input

@@ -387,6 +387,8 @@ pub(crate) struct BoundProcessorExecutionResult {
     pub(crate) sources: AuthenticatedProcessorSources,
     pub(crate) continuation: BoundForgeInstallerContinuation,
     pub(crate) outputs: VerifiedProcessorOutputs,
+    pub(crate) reconstruction_library_sources:
+        crate::download::library_source::RetainedLibrarySourceSet,
 }
 
 pub(crate) struct AuthenticatedProcessorSources {
@@ -556,6 +558,7 @@ pub(crate) fn spawn_bound_processor_execution(
             plan,
             workspace,
             sources,
+            crate::download::library_source::RetainedLibrarySourceSet::new(),
             cancel_rx,
             progress_tx,
         )
@@ -573,6 +576,7 @@ pub(crate) fn spawn_reconstruction_processor_execution(
     target_version_id: String,
     minecraft_version: String,
     sources: AuthenticatedProcessorSources,
+    context: crate::download::ReconstructionLibraryContext,
 ) -> BoundProcessorExecutionHandle {
     let (cancel_tx, mut cancel_rx) = oneshot::channel();
     let (progress_tx, progress_rx) = mpsc::unbounded_channel();
@@ -585,16 +589,22 @@ pub(crate) fn spawn_reconstruction_processor_execution(
         let execution = if let Err(error) = check_cancel(&mut cancel_rx) {
             Err(error)
         } else {
-            crate::download::reconstruct_installer_processor_sources(pending, workspace.workspace())
-                .await
-                .map_err(|_| BoundProcessorError::Source)
-                .and_then(|execution| {
-                    check_cancel(&mut cancel_rx)?;
-                    Ok(execution)
-                })
+            crate::download::reconstruct_installer_processor_sources(
+                pending,
+                workspace.workspace(),
+                &context,
+            )
+            .await
+            .map_err(|_| BoundProcessorError::Source)
+            .and_then(|execution| {
+                check_cancel(&mut cancel_rx)?;
+                Ok(execution)
+            })
         };
-        let execution = match execution {
-            Ok(BoundForgeInstallExecution::Run(execution)) => *execution,
+        let (execution, reconstruction_library_sources) = match execution {
+            Ok((BoundForgeInstallExecution::Run(execution), library_sources)) => {
+                (*execution, library_sources)
+            }
             Ok(_) => {
                 return match workspace.cleanup() {
                     Ok(()) => Err(BoundProcessorError::Authority),
@@ -614,6 +624,7 @@ pub(crate) fn spawn_reconstruction_processor_execution(
             plan,
             workspace,
             sources,
+            reconstruction_library_sources,
             cancel_rx,
             progress_tx,
         )
@@ -631,6 +642,7 @@ async fn run_owned_execution(
     plan: BoundProcessorPlan,
     workspace_owner: ProcessorWorkspaceOwner,
     mut sources: AuthenticatedProcessorSources,
+    reconstruction_library_sources: crate::download::library_source::RetainedLibrarySourceSet,
     mut cancel: oneshot::Receiver<()>,
     progress: mpsc::UnboundedSender<BoundProcessorProgress>,
 ) -> Result<BoundProcessorExecutionResult, BoundProcessorError> {
@@ -659,6 +671,7 @@ async fn run_owned_execution(
             sources,
             continuation,
             outputs,
+            reconstruction_library_sources,
         });
     }
     workspace_owner
@@ -668,6 +681,7 @@ async fn run_owned_execution(
         sources,
         continuation,
         outputs,
+        reconstruction_library_sources,
     })
 }
 

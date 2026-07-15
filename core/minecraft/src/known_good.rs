@@ -1,11 +1,11 @@
 use crate::artifact_path::{
     ArtifactRelativePath, MAX_ARTIFACT_PATH_SEGMENT_BYTES, MAX_ARTIFACT_RELATIVE_PATH_BYTES,
 };
-use crate::download::library_source::RetainedLibraryComponentSource;
+use crate::download::library_source::{RetainedLibraryComponentSource, RetainedLibrarySourceSet};
 use crate::download::{
-    AuthenticatedSelectedArtifactSource, AuthenticatedVanillaInstallSources, ExpectedIntegrity,
-    LibraryArtifactPlan, ReconstructedVanillaAuthority, SelectedDownloadArtifactKind,
-    library_artifact_plans_for, parse_asset_index,
+    AuthenticatedSelectedArtifactSource, AuthenticatedVanillaInstallSources, DownloadError,
+    ExpectedIntegrity, LibraryArtifactPlan, ReconstructedVanillaAuthority,
+    SelectedDownloadArtifactKind, library_artifact_plans_for, parse_asset_index,
 };
 use crate::known_good_libraries::{SealedExactLibraryDeclarations, SealedLibraryKind};
 use crate::launch::{Library, VersionJson, effective_java_version_for};
@@ -1201,6 +1201,84 @@ pub struct KnownGoodReconstructionReceipt {
     authenticated: AuthenticatedKnownGoodReceipt,
 }
 
+pub(crate) struct RetainedKnownGoodReconstruction {
+    receipt: KnownGoodReconstructionReceipt,
+    library_sources: RetainedLibrarySourceSet,
+}
+
+pub struct ManagedLibrariesReconstruction {
+    reconstruction: RetainedKnownGoodReconstruction,
+    library_entry_count: usize,
+    expected_content_byte_count: u64,
+}
+
+impl RetainedKnownGoodReconstruction {
+    pub(crate) fn new(
+        receipt: KnownGoodReconstructionReceipt,
+        library_sources: RetainedLibrarySourceSet,
+    ) -> Self {
+        Self {
+            receipt,
+            library_sources,
+        }
+    }
+
+    pub(crate) fn receipt(&self) -> &KnownGoodReconstructionReceipt {
+        &self.receipt
+    }
+
+    pub(crate) fn into_parts(self) -> (KnownGoodReconstructionReceipt, RetainedLibrarySourceSet) {
+        (self.receipt, self.library_sources)
+    }
+
+    pub(crate) fn discard_sources(self) -> KnownGoodReconstructionReceipt {
+        self.receipt
+    }
+
+    pub(crate) fn bind_managed_libraries(
+        mut self,
+    ) -> Result<ManagedLibrariesReconstruction, DownloadError> {
+        let projection = self
+            .receipt
+            .authenticated
+            .inventory
+            .managed_component_projection(ManagedKnownGoodComponent::Libraries)
+            .map_err(|_| {
+                DownloadError::Integrity(
+                    "reconstructed Libraries projection is invalid".to_string(),
+                )
+            })?;
+        self.library_sources.reconcile_projection(&projection)?;
+        Ok(ManagedLibrariesReconstruction {
+            library_entry_count: projection.entry_count(),
+            expected_content_byte_count: projection.expected_content_byte_count(),
+            reconstruction: self,
+        })
+    }
+}
+
+impl ManagedLibrariesReconstruction {
+    pub fn version_id(&self) -> &str {
+        self.reconstruction.receipt.version_id()
+    }
+
+    pub fn library_entry_count(&self) -> usize {
+        self.library_entry_count
+    }
+
+    pub fn expected_content_byte_count(&self) -> u64 {
+        self.expected_content_byte_count
+    }
+
+    pub fn retained_source_count(&self) -> usize {
+        self.reconstruction.library_sources.len()
+    }
+
+    pub fn retained_content_byte_count(&self) -> u64 {
+        self.reconstruction.library_sources.retained_bytes()
+    }
+}
+
 #[derive(Debug, Eq, PartialEq)]
 pub struct KnownGoodActivationSource {
     version_id: KnownGoodId,
@@ -1920,12 +1998,17 @@ pub(crate) fn reconstructed_effective_version(
 }
 
 pub(crate) fn seal_reconstructed_profile_source(
-    base: KnownGoodReconstructionReceipt,
+    base: RetainedKnownGoodReconstruction,
     record: &LoaderBuildRecord,
     resolved_version: VersionJson,
     version_bytes: &[u8],
     library_declarations: SealedExactLibraryDeclarations,
-) -> Result<KnownGoodReconstructionReceipt, KnownGoodInventoryError> {
+    library_sources: RetainedLibrarySourceSet,
+) -> Result<RetainedKnownGoodReconstruction, KnownGoodInventoryError> {
+    let (base, mut retained_sources) = base.into_parts();
+    retained_sources
+        .merge(library_sources)
+        .map_err(|_| KnownGoodInventoryError::ProfileLibraryProofMismatch)?;
     let authenticated = derive_profile_receipt(
         &base.authenticated,
         record,
@@ -1933,15 +2016,33 @@ pub(crate) fn seal_reconstructed_profile_source(
         version_bytes,
         library_declarations,
     )?;
-    Ok(KnownGoodReconstructionReceipt { authenticated })
+    Ok(RetainedKnownGoodReconstruction::new(
+        KnownGoodReconstructionReceipt { authenticated },
+        retained_sources,
+    ))
 }
 
 pub(crate) fn seal_reconstructed_installer_source(
     authority: AuthenticatedInstallerReconstructionAuthority,
-) -> Result<KnownGoodReconstructionReceipt, KnownGoodInventoryError> {
-    let (base, base_client_source, record, input, resolved_version, version_bytes, child_client) =
-        authority.consume_for_sealing();
-    let (source, library_declarations) = input.into_parts();
+) -> Result<RetainedKnownGoodReconstruction, KnownGoodInventoryError> {
+    let (
+        base,
+        base_client_source,
+        record,
+        input,
+        resolved_version,
+        version_bytes,
+        child_client,
+        library_sources,
+    ) = authority.consume_for_sealing();
+    let (base, mut retained_sources) = base.into_parts();
+    let (source, library_declarations, local_library_sources) = input.into_parts();
+    if !local_library_sources.is_empty() {
+        return Err(KnownGoodInventoryError::InstallerLibraryProofMismatch);
+    }
+    retained_sources
+        .merge(library_sources)
+        .map_err(|_| KnownGoodInventoryError::InstallerLibraryProofMismatch)?;
     if !source.matches_record(&record) {
         return Err(KnownGoodInventoryError::LoaderIdentityMismatch);
     }
@@ -1958,12 +2059,15 @@ pub(crate) fn seal_reconstructed_installer_source(
             child_client: &child_client,
         },
     )?;
-    Ok(KnownGoodReconstructionReceipt { authenticated })
+    Ok(RetainedKnownGoodReconstruction::new(
+        KnownGoodReconstructionReceipt { authenticated },
+        retained_sources,
+    ))
 }
 
 pub(crate) fn seal_reconstructed_legacy_archive_source(
     authority: AuthenticatedLegacyOverlayAuthority,
-) -> Result<KnownGoodReconstructionReceipt, KnownGoodInventoryError> {
+) -> Result<RetainedKnownGoodReconstruction, KnownGoodInventoryError> {
     let (
         base,
         base_client_source,
@@ -1973,6 +2077,7 @@ pub(crate) fn seal_reconstructed_legacy_archive_source(
         version_bytes,
         child_client_bytes,
     ) = authority.consume_for_sealing();
+    let (base, library_sources) = base.into_parts();
     let LoaderInstallSource::LegacyArchive { url: archive_url } = &record.install_source else {
         return Err(KnownGoodInventoryError::LoaderIdentityMismatch);
     };
@@ -1987,7 +2092,10 @@ pub(crate) fn seal_reconstructed_legacy_archive_source(
         &version_bytes,
         &child_client_bytes,
     )?;
-    Ok(KnownGoodReconstructionReceipt { authenticated })
+    Ok(RetainedKnownGoodReconstruction::new(
+        KnownGoodReconstructionReceipt { authenticated },
+        library_sources,
+    ))
 }
 
 fn authenticate_reconstructed_client_source(
@@ -2018,9 +2126,16 @@ fn authenticate_reconstructed_client_source(
 
 pub(crate) fn seal_reconstructed_vanilla(
     authority: ReconstructedVanillaAuthority,
-) -> Result<KnownGoodReconstructionReceipt, KnownGoodInventoryError> {
-    let (version, environment, libraries, version_source, asset_source, runtime_source) =
-        authority.into_parts();
+) -> Result<RetainedKnownGoodReconstruction, KnownGoodInventoryError> {
+    let (
+        version,
+        environment,
+        libraries,
+        version_source,
+        asset_source,
+        runtime_source,
+        library_sources,
+    ) = authority.into_parts();
     let authenticated = authenticate_vanilla_authority(
         &version,
         &environment,
@@ -2029,7 +2144,10 @@ pub(crate) fn seal_reconstructed_vanilla(
         asset_source.as_ref(),
         runtime_source.as_ref(),
     )?;
-    Ok(KnownGoodReconstructionReceipt { authenticated })
+    Ok(RetainedKnownGoodReconstruction::new(
+        KnownGoodReconstructionReceipt { authenticated },
+        library_sources,
+    ))
 }
 
 pub(crate) fn authenticate_pending_known_good_install(

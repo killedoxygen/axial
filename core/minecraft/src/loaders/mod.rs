@@ -90,6 +90,14 @@ pub(crate) async fn reconstruct_build(
     strategies::reconstruct_build(&plan).await
 }
 
+pub(crate) async fn reconstruct_managed_libraries(
+    installed_version_id: &str,
+    context: &crate::download::ReconstructionLibraryContext,
+) -> Result<crate::known_good::RetainedKnownGoodReconstruction, LoaderError> {
+    let plan = api::loader_reconstruction_plan(installed_version_id)?;
+    strategies::reconstruct_managed_libraries(&plan, context).await
+}
+
 fn require_exact_live_build_record(
     requested: &LoaderBuildRecord,
     live: LoaderBuildRecord,
