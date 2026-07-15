@@ -3,6 +3,7 @@
 //! Execution owns bounded concrete capabilities and reports facts about low
 //! level work. These contracts do not authorize product policy decisions.
 
+pub(crate) mod anchored_record;
 pub(crate) mod crash;
 pub mod download;
 pub mod file;
@@ -12,7 +13,7 @@ pub mod launch;
 mod low_priority;
 pub(crate) mod persistence;
 pub mod process;
-pub(crate) mod registered_artifact;
+pub(crate) use anchored_record::registered_artifact;
 pub mod runtime;
 
 use crate::observability::{
@@ -38,7 +39,6 @@ pub enum ExecutionCapabilityKind {
     VerifyArtifact,
     DownloadArtifactToTemp,
     PromoteVerifiedArtifact,
-    QuarantineLauncherManagedPath,
     RepairManagedRuntime,
     VerifyManagedRuntime,
     ProbeJavaRuntime,

@@ -42,6 +42,7 @@ axial-launcher = { path = "../../core/launcher", features = ["test-support"] }
 axial-minecraft = { path = "../../core/minecraft", features = ["test-support"] }
 ed25519-dalek.workspace = true
 hex.workspace = true
+static_assertions = "1.1.0"
 tokio = { workspace = true, features = ["test-util"] }
 zip.workspace = true
 

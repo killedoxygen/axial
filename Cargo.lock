@@ -296,6 +296,7 @@ dependencies = [
  "sha1",
  "sha2",
  "shlex",
+ "static_assertions",
  "sysinfo",
  "thiserror 2.0.18",
  "tokio",

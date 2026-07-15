@@ -11,7 +11,6 @@ use std::fmt;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Clone, Debug)]
 pub struct FileWriteRequest<'a> {
@@ -52,13 +51,6 @@ impl<'a> PromoteTempFileRequest<'a> {
 }
 
 #[derive(Clone, Debug)]
-pub struct QuarantineFileRequest<'a> {
-    pub operation_id: Option<OperationId>,
-    pub target: TargetDescriptor,
-    pub source: &'a Path,
-}
-
-#[derive(Clone, Debug)]
 pub struct DeleteFileRequest<'a> {
     pub operation_id: Option<OperationId>,
     pub target: TargetDescriptor,
@@ -75,26 +67,9 @@ impl<'a> DeleteFileRequest<'a> {
     }
 }
 
-impl<'a> QuarantineFileRequest<'a> {
-    pub fn new(target: TargetDescriptor, source: &'a Path) -> Self {
-        Self {
-            operation_id: None,
-            target,
-            source,
-        }
-    }
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FileCapabilityReport {
     pub target: TargetDescriptor,
-    pub facts: Vec<ExecutionFact>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct QuarantineFileReport {
-    pub target: TargetDescriptor,
-    pub quarantine_path: PathBuf,
     pub facts: Vec<ExecutionFact>,
 }
 
@@ -143,9 +118,6 @@ impl fmt::Display for FileCapabilityError {
             FileCapabilityErrorKind::OwnershipRefused => {
                 formatter.write_str("file capability refused target ownership")
             }
-            FileCapabilityErrorKind::SourceMissing => {
-                formatter.write_str("file capability could not find source")
-            }
             FileCapabilityErrorKind::UnsupportedSource => {
                 formatter.write_str("file capability refused unsupported source type")
             }
@@ -157,9 +129,6 @@ impl fmt::Display for FileCapabilityError {
             }
             FileCapabilityErrorKind::PromoteFailed => {
                 formatter.write_str("file capability failed to promote temporary file")
-            }
-            FileCapabilityErrorKind::QuarantineFailed => {
-                formatter.write_str("file capability failed to quarantine source")
             }
             FileCapabilityErrorKind::DeleteFailed => {
                 formatter.write_str("file capability failed to delete source")
@@ -186,12 +155,10 @@ impl From<FileCapabilityError> for io::Error {
 pub enum FileCapabilityErrorKind {
     OwnershipUnknown,
     OwnershipRefused,
-    SourceMissing,
     UnsupportedSource,
     CreateParentFailed,
     TempWriteFailed,
     PromoteFailed,
-    QuarantineFailed,
     DeleteFailed,
 }
 
@@ -302,76 +269,6 @@ pub fn promote_temp_file(
             ))
         }
     }
-}
-
-pub fn quarantine_launcher_managed_file(
-    request: QuarantineFileRequest<'_>,
-) -> Result<QuarantineFileReport, FileCapabilityError> {
-    let mut facts = Vec::new();
-    validate_managed_ownership(&request.target, request.operation_id.as_ref(), &mut facts)?;
-
-    let metadata = fs::symlink_metadata(request.source).map_err(|error| {
-        let mut error_facts = facts.clone();
-        let fact_kind = if error.kind() == io::ErrorKind::NotFound {
-            ExecutionFactKind::FileMissing
-        } else {
-            io_error_fact(error.kind(), request.operation_id.clone(), &request.target).kind
-        };
-        error_facts.push(file_fact(
-            fact_kind,
-            request.operation_id.clone(),
-            &request.target,
-        ));
-        FileCapabilityError::with_source(
-            if error.kind() == io::ErrorKind::NotFound {
-                FileCapabilityErrorKind::SourceMissing
-            } else {
-                FileCapabilityErrorKind::QuarantineFailed
-            },
-            error_facts,
-            error,
-        )
-    })?;
-
-    let file_type = metadata.file_type();
-    if metadata.is_dir() && !file_type.is_symlink() {
-        let mut error_facts = facts;
-        error_facts.push(file_fact(
-            ExecutionFactKind::PrimitiveRefused,
-            request.operation_id.clone(),
-            &request.target,
-        ));
-        return Err(FileCapabilityError::new(
-            FileCapabilityErrorKind::UnsupportedSource,
-            error_facts,
-        ));
-    }
-
-    let quarantine_path = quarantine_path_for(request.source);
-    fs::rename(request.source, &quarantine_path).map_err(|error| {
-        let mut error_facts = facts.clone();
-        error_facts.push(io_error_fact(
-            error.kind(),
-            request.operation_id.clone(),
-            &request.target,
-        ));
-        FileCapabilityError::with_source(
-            FileCapabilityErrorKind::QuarantineFailed,
-            error_facts,
-            error,
-        )
-    })?;
-    facts.push(file_fact(
-        ExecutionFactKind::FileQuarantined,
-        request.operation_id,
-        &request.target,
-    ));
-
-    Ok(QuarantineFileReport {
-        target: safe_target_descriptor(&request.target),
-        quarantine_path,
-        facts,
-    })
 }
 
 pub fn delete_launcher_managed_file(
@@ -506,20 +403,6 @@ pub(crate) fn atomic_temp_path_for(destination: &Path) -> PathBuf {
     )
 }
 
-fn quarantine_path_for(source: &Path) -> PathBuf {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|value| value.as_nanos())
-        .unwrap_or_default();
-    let suffix = match source.extension().and_then(|value| value.to_str()) {
-        Some(extension) if !extension.is_empty() => {
-            format!("{extension}.quarantine-{}-{nanos:x}", std::process::id())
-        }
-        _ => format!("quarantine-{}-{nanos:x}", std::process::id()),
-    };
-    source.with_extension(suffix)
-}
-
 #[cfg(not(windows))]
 fn replace_file_atomically(source: &Path, destination: &Path) -> io::Result<()> {
     fs::rename(source, destination)
@@ -560,8 +443,7 @@ fn replace_file_atomically(source: &Path, destination: &Path) -> io::Result<()> 
 mod tests {
     use super::{
         DeleteFileRequest, FileCapabilityErrorKind, FileWriteRequest, PromoteTempFileRequest,
-        QuarantineFileRequest, delete_launcher_managed_file, file_fact, promote_temp_file,
-        quarantine_launcher_managed_file, write_file_atomically,
+        delete_launcher_managed_file, file_fact, promote_temp_file, write_file_atomically,
     };
     use crate::execution::ExecutionFactKind;
     use crate::state::contracts::{
@@ -801,133 +683,6 @@ mod tests {
     }
 
     #[test]
-    fn quarantine_moves_launcher_managed_file_to_unique_sibling() {
-        let root = test_root("quarantine-success");
-        let source = root.join("bad.jar");
-        fs::create_dir_all(&root).expect("create root");
-        fs::write(&source, b"corrupt artifact").expect("write corrupt artifact");
-
-        let report = quarantine_launcher_managed_file(QuarantineFileRequest::new(
-            artifact_target("libraries_com_example_bad-1.0.jar"),
-            &source,
-        ))
-        .expect("quarantine file");
-
-        assert!(!source.exists());
-        assert_eq!(
-            report.quarantine_path.parent(),
-            Some(root.as_path()),
-            "quarantine target should stay beside source"
-        );
-        assert!(
-            report
-                .quarantine_path
-                .file_name()
-                .and_then(|value| value.to_str())
-                .is_some_and(|value| value.contains(".quarantine-"))
-        );
-        assert_eq!(
-            fs::read(&report.quarantine_path).expect("read quarantined artifact"),
-            b"corrupt artifact"
-        );
-        assert!(
-            report
-                .facts
-                .iter()
-                .any(|fact| fact.kind == ExecutionFactKind::FileQuarantined)
-        );
-
-        cleanup(&root);
-    }
-
-    #[test]
-    fn quarantine_refuses_user_owned_and_unknown_targets_before_mutation() {
-        for ownership in [OwnershipClass::UserOwned, OwnershipClass::Unknown] {
-            let root = test_root("quarantine-ownership");
-            let source = root.join("bad.jar");
-            fs::create_dir_all(&root).expect("create root");
-            fs::write(&source, b"corrupt artifact").expect("write corrupt artifact");
-
-            let error = quarantine_launcher_managed_file(QuarantineFileRequest::new(
-                TargetDescriptor::new(
-                    StabilizationSystem::Execution,
-                    TargetKind::Artifact,
-                    "libraries_com_example_bad-1.0.jar",
-                    ownership,
-                ),
-                &source,
-            ))
-            .expect_err("ownership should block");
-
-            assert!(source.exists());
-            assert_eq!(
-                error.kind,
-                if ownership == OwnershipClass::Unknown {
-                    FileCapabilityErrorKind::OwnershipUnknown
-                } else {
-                    FileCapabilityErrorKind::OwnershipRefused
-                }
-            );
-            assert!(fs::read_dir(&root).expect("read root").all(|entry| {
-                !entry
-                    .expect("entry")
-                    .file_name()
-                    .to_string_lossy()
-                    .contains(".quarantine-")
-            }));
-
-            cleanup(&root);
-        }
-    }
-
-    #[test]
-    fn quarantine_reports_missing_source_without_creating_target() {
-        let root = test_root("quarantine-missing");
-        let source = root.join("missing.jar");
-
-        let error = quarantine_launcher_managed_file(QuarantineFileRequest::new(
-            artifact_target("libraries_com_example_missing-1.0.jar"),
-            &source,
-        ))
-        .expect_err("missing source");
-
-        assert_eq!(error.kind, FileCapabilityErrorKind::SourceMissing);
-        assert!(
-            error
-                .facts
-                .iter()
-                .any(|fact| fact.kind == ExecutionFactKind::FileMissing)
-        );
-        assert!(!source.exists());
-
-        cleanup(&root);
-    }
-
-    #[test]
-    fn quarantine_rejects_directory_source_without_removing_it() {
-        let root = test_root("quarantine-directory");
-        let source = root.join("bad.jar");
-        fs::create_dir_all(&source).expect("create directory source");
-
-        let error = quarantine_launcher_managed_file(QuarantineFileRequest::new(
-            artifact_target("libraries_com_example_bad-1.0.jar"),
-            &source,
-        ))
-        .expect_err("directory source");
-
-        assert_eq!(error.kind, FileCapabilityErrorKind::UnsupportedSource);
-        assert!(source.is_dir());
-        assert!(
-            error
-                .facts
-                .iter()
-                .any(|fact| fact.kind == ExecutionFactKind::PrimitiveRefused)
-        );
-
-        cleanup(&root);
-    }
-
-    #[test]
     fn file_facts_sanitize_unsafe_target_ids() {
         let target = TargetDescriptor {
             system: StabilizationSystem::Execution,
@@ -954,15 +709,6 @@ mod tests {
         TargetDescriptor::new(
             StabilizationSystem::Performance,
             TargetKind::Config,
-            id,
-            OwnershipClass::LauncherManaged,
-        )
-    }
-
-    fn artifact_target(id: &str) -> TargetDescriptor {
-        TargetDescriptor::new(
-            StabilizationSystem::Execution,
-            TargetKind::Artifact,
             id,
             OwnershipClass::LauncherManaged,
         )
