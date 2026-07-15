@@ -269,7 +269,7 @@ checksum = "c08606f8c3cbf4ce6ec8e28fb0014a2c086708fe954eaa885384a6165172e7e8"
 
 [[package]]
 name = "axial-api"
-version = "0.4.0-dev.3"
+version = "0.4.0-dev.4"
 dependencies = [
  "async-stream",
  "axial-config",
@@ -313,7 +313,7 @@ dependencies = [
 
 [[package]]
 name = "axial-config"
-version = "0.4.0-dev.3"
+version = "0.4.0-dev.4"
 dependencies = [
  "axial-minecraft",
  "chrono",
@@ -324,7 +324,7 @@ dependencies = [
 
 [[package]]
 name = "axial-content"
-version = "0.4.0-dev.3"
+version = "0.4.0-dev.4"
 dependencies = [
  "axial-minecraft",
  "chrono",
@@ -343,7 +343,7 @@ dependencies = [
 
 [[package]]
 name = "axial-desktop"
-version = "0.4.0-dev.3"
+version = "0.4.0-dev.4"
 dependencies = [
  "axial-api",
  "axial-config",
@@ -362,7 +362,7 @@ dependencies = [
 
 [[package]]
 name = "axial-launcher"
-version = "0.4.0-dev.3"
+version = "0.4.0-dev.4"
 dependencies = [
  "axial-minecraft",
  "md5",
@@ -377,7 +377,7 @@ dependencies = [
 
 [[package]]
 name = "axial-minecraft"
-version = "0.4.0-dev.3"
+version = "0.4.0-dev.4"
 dependencies = [
  "chrono",
  "futures-util",
@@ -396,7 +396,7 @@ dependencies = [
 
 [[package]]
 name = "axial-performance"
-version = "0.4.0-dev.3"
+version = "0.4.0-dev.4"
 dependencies = [
  "chrono",
  "ed25519-dalek",
