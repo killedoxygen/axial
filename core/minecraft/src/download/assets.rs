@@ -33,7 +33,7 @@ use std::sync::Arc;
 use tokio::fs as async_fs;
 use tokio::sync::mpsc;
 
-pub(super) const ASSET_OBJECT_BASE_URL: &str = "https://resources.download.minecraft.net";
+pub(crate) const ASSET_OBJECT_BASE_URL: &str = "https://resources.download.minecraft.net";
 
 pub(super) struct AssetDownloadPipeline {
     task: Option<tokio::task::JoinHandle<Result<RetainedAssetsAcquisition, DownloadError>>>,

@@ -19,8 +19,8 @@ pub(crate) use asset_source::AssetSourcePool;
 pub(crate) use asset_source::{
     AuthenticatedAssetCacheProofSet, RetainedAssetComponentSource, RetainedAssetSourceSet,
 };
-pub(crate) use assets::parse_asset_index;
 pub use assets::repair_virtual_assets_from_index;
+pub(crate) use assets::{ASSET_OBJECT_BASE_URL, parse_asset_index};
 pub use install::Downloader;
 pub(crate) use install::{
     AuthenticatedVanillaInstallSources, AuthenticatedVersionBundleMemberSource,
