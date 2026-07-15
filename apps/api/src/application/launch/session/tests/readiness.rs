@@ -1051,7 +1051,7 @@ async fn launch_preparation_blocks_component_rebuild_while_a_session_is_active()
 }
 
 #[tokio::test]
-async fn launch_preparation_rebuilds_failed_runtime_component_once_from_exact_inventory() {
+async fn damaged_runtime_rebuilds_minimal_component_and_launches_once() {
     let fixture = TestFixture::new("prepare-rebuilds-runtime-component");
     let component = "java-runtime-delta";
     fixture.write_version_json(
@@ -1074,64 +1074,76 @@ async fn launch_preparation_rebuilds_failed_runtime_component_once_from_exact_in
         .expect("runtime root");
     fs::create_dir_all(&runtime_root).expect("incomplete runtime root");
     let instance_id = fixture.add_instance("Survival", "1.21.1");
-    let instance = fixture
-        .state
-        .instances()
-        .get(&instance_id)
-        .expect("instance");
-    let config = fixture.state.config().current();
-    let game_dir = fixture.state.instances().game_dir(&instance.id);
-    let lifecycle = fixture.state.acquire_instance_lifecycle(&instance.id).await;
+    let version_json_path = version_dir.join("1.21.1.json");
+    let version_json_bytes = fs::read(&version_json_path).expect("runtime acceptance metadata");
+    let client_bytes = fs::read(version_dir.join("1.21.1.jar")).expect("runtime acceptance client");
+    let mut inventory_entries = vec![
+        TestKnownGoodEntry {
+            root: TestKnownGoodRoot::Versions,
+            path: "1.21.1/1.21.1.json".to_string(),
+            kind: KnownGoodArtifactKind::VersionMetadata,
+            integrity: TestKnownGoodIntegrity::Sha1 {
+                digest: sha1_hex(&version_json_bytes),
+                size: version_json_bytes.len() as u64,
+            },
+        },
+        TestKnownGoodEntry {
+            root: TestKnownGoodRoot::Versions,
+            path: "1.21.1/1.21.1.jar".to_string(),
+            kind: KnownGoodArtifactKind::ClientJar,
+            integrity: TestKnownGoodIntegrity::Sha1 {
+                digest: sha1_hex(&client_bytes),
+                size: client_bytes.len() as u64,
+            },
+        },
+    ];
+    inventory_entries.extend(fixture.expected_runtime_entries(&version_json_path));
+    fixture.state.activate_known_good_inventory_for_test(
+        &instance_id,
+        KnownGoodInventory::from_test_entries(inventory_entries)
+            .expect("runtime acceptance inventory"),
+    );
+    let user_owned = [
+        ("saves/world/level.dat", b"world".as_slice()),
+        ("mods/user.jar", b"mod".as_slice()),
+        ("config/user.toml", b"config".as_slice()),
+        ("resourcepacks/user.zip", b"resourcepack".as_slice()),
+    ]
+    .into_iter()
+    .map(|(relative, contents)| {
+        let path = fixture
+            .state
+            .instances()
+            .game_dir(&instance_id)
+            .join(relative);
+        fs::create_dir_all(path.parent().expect("runtime user-owned sentinel parent"))
+            .expect("runtime user-owned sentinel directory");
+        fs::write(&path, contents).expect("runtime user-owned sentinel");
+        (path, contents.to_vec())
+    })
+    .collect::<Vec<_>>();
+    let game_dir = fixture.state.instances().game_dir(&instance_id);
     let producer = fixture
         .state
         .try_claim_producer()
         .expect("claim runtime rebuild producer");
-    let integrity_foreground = fixture
-        .state
-        .register_integrity_foreground()
-        .expect("register runtime rebuild foreground")
-        .wait_for_settlement()
-        .await;
-    let preflight = build_launch_preflight_facts(
+    let prepared = prepare_launch_session_owned_with_runtime_fixture(
         &fixture.state,
-        &producer,
-        LaunchPreflightBuild {
-            integrity_foreground: &integrity_foreground,
-            instance_lifecycle: &lifecycle,
-            instance: &instance,
-            config: &config,
-            library_dir: &fixture.paths.library_dir,
-            game_dir: &game_dir,
-            requested_max_memory_mb: None,
-            requested_min_memory_mb: None,
+        LaunchRequest {
+            instance_id: instance_id.clone(),
+            username: None,
+            max_memory_mb: None,
+            min_memory_mb: None,
+            client_started_at_ms: None,
         },
-        None,
-    )
-    .await;
-    assert!(readiness_has_managed_runtime_missing(&preflight.readiness));
-    assert_eq!(fixture.state.installed_versions_walk_count(), 1);
-
-    let repaired = maybe_repair_managed_runtime_before_launch_with_fixture(
-        &fixture.state,
         &producer,
-        &integrity_foreground,
-        preflight,
-        ManagedRuntimeRepairLaunch {
-            instance_lifecycle: &lifecycle,
-            instance: &instance,
-            library_dir: &fixture.paths.library_dir,
-            game_dir: &game_dir,
-            requested_max_memory_mb: None,
-            requested_min_memory_mb: None,
-        },
     )
     .await
-    .expect("component rebuild settles both reconciliation rungs");
+    .unwrap_or_else(|(_, payload)| panic!("prepare rebuilt Runtime launch: {payload:?}"));
 
     assert_eq!(fixture.state.installed_versions_walk_count(), 1);
-    assert!(!readiness_has_managed_runtime_missing(&repaired.readiness));
     assert_eq!(
-        repaired.guardian_summary.decision(),
+        prepared.task.guardian.decision(),
         GuardianSummaryDecision::Intervened
     );
     assert!(runtime_root.join(".axial-ready").is_file());
@@ -1179,6 +1191,22 @@ async fn launch_preparation_rebuilds_failed_runtime_component_once_from_exact_in
             .with_file_name(format!("{component}.quarantine"))
             .is_dir()
     );
+    for journal in &journals {
+        let attempt = journal
+            .reconciliation_attempt()
+            .expect("runtime reconciliation attempt");
+        let terminal = journal
+            .reconciliation_terminal()
+            .expect("runtime reconciliation terminal");
+        assert_eq!(
+            fixture
+                .state
+                .failure_memory()
+                .get(&crate::state::reconciliation_attempt_key(attempt))
+                .and_then(|entry| entry.reconciliation_terminal().cloned()),
+            Some(terminal.clone())
+        );
+    }
     let memory = fixture.state.failure_memory().list();
     assert_eq!(memory.len(), 2);
     assert!(memory.iter().any(|entry| {
@@ -1193,6 +1221,61 @@ async fn launch_preparation_rebuilds_failed_runtime_component_once_from_exact_in
                 terminal.rung() == crate::state::contracts::ReconciliationRung::RebuildComponent
             })
     }));
+
+    let postcheck_lifecycle = fixture
+        .state
+        .acquire_integrity_instance_lifecycle(&prepared.task.integrity_foreground, &instance_id)
+        .await
+        .expect("retain rebuilt Runtime integrity authority");
+    let postcheck = crate::execution::integrity::sense_integrity_tier1(
+        &fixture.state,
+        &prepared.task.integrity_foreground,
+        &postcheck_lifecycle,
+        &fixture.paths.library_dir,
+    )
+    .await
+    .expect("rebuilt Runtime Tier1 postcheck");
+    assert!(postcheck.facts.is_empty());
+    drop((postcheck, postcheck_lifecycle));
+
+    #[cfg(unix)]
+    {
+        let rebuilt_java = managed_runtime_java_path(&runtime_root);
+        let session_id = prepared.task.intent.session_id.clone();
+        let launched = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            crate::application::launch::launch_session_with_persisted_runtime_manifest_for_test(
+                fixture.state.clone(),
+                prepared.task,
+                producer,
+            ),
+        )
+        .await
+        .expect("rebuilt Runtime launch deadline")
+        .unwrap_or_else(|error| panic!("rebuilt Runtime launch: {}", error.message));
+        assert_eq!(launched.instance_id, instance_id);
+        assert_eq!(
+            fs::read_to_string(game_dir.join("guardian-runtime-process-count"))
+                .expect("rebuilt Runtime process count"),
+            "1"
+        );
+        let running = fixture
+            .state
+            .sessions()
+            .get(&session_id)
+            .await
+            .expect("rebuilt Runtime running session");
+        assert_eq!(running.state, axial_launcher::LaunchState::Running);
+        assert!(running.boot_completed_at_ms.is_some());
+        assert_eq!(running.java_path.as_deref(), rebuilt_java.to_str());
+        let _ = fixture.state.sessions().kill(&session_id).await;
+    }
+    for (path, contents) in &user_owned {
+        assert_eq!(
+            fs::read(path).expect("runtime user-owned sentinel remains readable"),
+            contents.as_slice()
+        );
+    }
 }
 
 #[tokio::test]

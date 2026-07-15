@@ -61,6 +61,7 @@ impl Drop for RuntimeRepairRequestGuard {
     }
 }
 
+#[derive(Clone, Copy)]
 pub(super) struct ManagedRuntimeRepairLaunch<'a> {
     pub(super) instance_lifecycle: &'a InstanceLifecycleLease,
     pub(super) instance: &'a Instance,
@@ -438,7 +439,8 @@ async fn finish_managed_runtime_repair(
     result
 }
 
-enum RuntimeComponentRebuildSource {
+#[derive(Clone, Copy)]
+pub(super) enum RuntimeComponentRebuildSource {
     Production,
     #[cfg(test)]
     Fixture,

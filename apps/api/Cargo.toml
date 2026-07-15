@@ -38,6 +38,7 @@ axial-minecraft = { path = "../../core/minecraft" }
 axial-performance = { path = "../../core/performance" }
 
 [dev-dependencies]
+axial-launcher = { path = "../../core/launcher", features = ["test-support"] }
 axial-minecraft = { path = "../../core/minecraft", features = ["test-support"] }
 ed25519-dalek.workspace = true
 hex.workspace = true

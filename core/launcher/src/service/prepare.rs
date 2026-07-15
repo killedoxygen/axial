@@ -7,6 +7,8 @@ use crate::guardian::{GuardianMode, LaunchGuardianContext};
 use crate::jvm::{boot_throttle_args, gc_preset_args, recommended_preset};
 use crate::runtime::RuntimeSelection;
 use crate::types::LaunchFailureClass;
+#[cfg(feature = "test-support")]
+use axial_minecraft::ensure_runtime_with_persisted_manifest_for_test;
 use axial_minecraft::{
     JavaRuntimeInfo, JavaRuntimeProbeReceipt, JavaVersion, ManagedRuntimeCache, RuntimeEnsureEvent,
     ensure_runtime_with_events, resolve_version,
@@ -27,6 +29,57 @@ pub async fn prepare_launch_attempt_with_events<F>(
     intent: &LaunchIntent,
     attempt: &AttemptOverrides,
     probe_receipt: Option<&JavaRuntimeProbeReceipt>,
+    observer: F,
+) -> Result<PreparedLaunchAttempt, LaunchPreparationError>
+where
+    F: FnMut(LaunchPreparationEvent),
+{
+    prepare_launch_attempt_with_runtime_source(
+        runtime_cache,
+        intent,
+        attempt,
+        probe_receipt,
+        RuntimePrepareSource::Production,
+        observer,
+    )
+    .await
+}
+
+#[cfg(feature = "test-support")]
+pub async fn prepare_launch_attempt_with_persisted_runtime_manifest_for_test<F>(
+    runtime_cache: &ManagedRuntimeCache,
+    intent: &LaunchIntent,
+    attempt: &AttemptOverrides,
+    probe_receipt: Option<&JavaRuntimeProbeReceipt>,
+    observer: F,
+) -> Result<PreparedLaunchAttempt, LaunchPreparationError>
+where
+    F: FnMut(LaunchPreparationEvent),
+{
+    prepare_launch_attempt_with_runtime_source(
+        runtime_cache,
+        intent,
+        attempt,
+        probe_receipt,
+        RuntimePrepareSource::PersistedManifest,
+        observer,
+    )
+    .await
+}
+
+#[derive(Clone, Copy)]
+enum RuntimePrepareSource {
+    Production,
+    #[cfg(feature = "test-support")]
+    PersistedManifest,
+}
+
+async fn prepare_launch_attempt_with_runtime_source<F>(
+    runtime_cache: &ManagedRuntimeCache,
+    intent: &LaunchIntent,
+    attempt: &AttemptOverrides,
+    probe_receipt: Option<&JavaRuntimeProbeReceipt>,
+    source: RuntimePrepareSource,
     mut observer: F,
 ) -> Result<PreparedLaunchAttempt, LaunchPreparationError>
 where
@@ -47,15 +100,31 @@ where
 
     let runtime_started_at = Instant::now();
     observer(LaunchPreparationEvent::EnsuringRuntime);
-    let ensured_runtime = ensure_runtime_with_events(
-        runtime_cache,
-        &version.java_version,
-        &intent.requested_java,
-        attempt.force_managed_runtime,
-        probe_receipt,
-        |event| observer(launch_preparation_event_for_runtime_event(event)),
-    )
-    .await
+    let ensured_runtime = match source {
+        RuntimePrepareSource::Production => {
+            ensure_runtime_with_events(
+                runtime_cache,
+                &version.java_version,
+                &intent.requested_java,
+                attempt.force_managed_runtime,
+                probe_receipt,
+                |event| observer(launch_preparation_event_for_runtime_event(event)),
+            )
+            .await
+        }
+        #[cfg(feature = "test-support")]
+        RuntimePrepareSource::PersistedManifest => {
+            ensure_runtime_with_persisted_manifest_for_test(
+                runtime_cache,
+                &version.java_version,
+                &intent.requested_java,
+                attempt.force_managed_runtime,
+                probe_receipt,
+                |event| observer(launch_preparation_event_for_runtime_event(event)),
+            )
+            .await
+        }
+    }
     .map_err(|error| LaunchPreparationError {
         message: format!("resolve java: {error}"),
         failure_class: Some(LaunchFailureClass::JavaRuntimeMismatch),

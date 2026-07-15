@@ -5,6 +5,9 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 
+[features]
+test-support = ["axial-minecraft/test-support"]
+
 [dependencies]
 axial-minecraft = { path = "../minecraft" }
 md5.workspace = true

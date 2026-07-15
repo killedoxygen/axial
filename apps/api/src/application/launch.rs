@@ -39,6 +39,8 @@ pub(crate) use reports::{
     stop_launch_session,
 };
 pub(crate) use runner::launch_session;
+#[cfg(test)]
+pub(crate) use runner::launch_session_with_persisted_runtime_manifest_for_test;
 pub use runner::{
     LaunchRequestError, LaunchSuccess, sanitize_live_launch_failure_message, trace_launch_event,
 };

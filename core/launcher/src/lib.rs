@@ -43,6 +43,8 @@ pub use readiness::{
     LaunchReadinessSeverity, inspect_launch_readiness_structural, inspect_launch_readiness_summary,
 };
 pub use runtime::RuntimeSelection;
+#[cfg(feature = "test-support")]
+pub use service::prepare_launch_attempt_with_persisted_runtime_manifest_for_test;
 pub use service::{
     LaunchHealingSummary, LaunchIntent, LaunchPreparationError, LaunchPreparationEvent,
     PreparedLaunchAttempt, build_healing_summary, failure_class_name, format_failure_class,

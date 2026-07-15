@@ -164,6 +164,33 @@ pub(crate) async fn launch_session(
     task: super::session::LaunchSessionTask,
     producer: crate::state::ProducerLease,
 ) -> Result<LaunchSuccess, LaunchRequestError> {
+    launch_session_with_control(state, task, producer, LaunchLoopControl::default()).await
+}
+
+#[cfg(test)]
+pub(crate) async fn launch_session_with_persisted_runtime_manifest_for_test(
+    state: AppState,
+    task: super::session::LaunchSessionTask,
+    producer: crate::state::ProducerLease,
+) -> Result<LaunchSuccess, LaunchRequestError> {
+    launch_session_with_control(
+        state,
+        task,
+        producer,
+        LaunchLoopControl {
+            runtime_prepare_source: Some(LaunchRuntimePrepareSource::PersistedManifest),
+            ..LaunchLoopControl::default()
+        },
+    )
+    .await
+}
+
+async fn launch_session_with_control(
+    state: AppState,
+    task: super::session::LaunchSessionTask,
+    producer: crate::state::ProducerLease,
+    control: LaunchLoopControl,
+) -> Result<LaunchSuccess, LaunchRequestError> {
     let session_id = task.intent.session_id.clone();
     let instance_id = task.intent.instance_id.clone();
     let guardian_mode = api_guardian_mode(task.intent.guardian.mode);
@@ -196,8 +223,14 @@ pub(crate) async fn launch_session(
     };
     let (integrity_foreground, task) = LaunchSessionRunTask::from_prepared(task);
     let mut integrity_foreground = Some(integrity_foreground);
-    let result =
-        launch_session_inner(state.clone(), task, &producer, &mut integrity_foreground).await;
+    let result = launch_session_inner_with_control(
+        state.clone(),
+        task,
+        &producer,
+        &mut integrity_foreground,
+        &control,
+    )
+    .await;
     let disposition = terminalize_unhandled_launch_error(
         &state,
         &producer,
@@ -597,6 +630,7 @@ fn trace_unconfirmed_launch_failure_termination(error_class: LaunchFailureTermin
     );
 }
 
+#[cfg(test)]
 async fn launch_session_inner(
     state: AppState,
     task: LaunchSessionRunTask,
@@ -703,6 +737,31 @@ async fn launch_session_inner_with_control(
             drop(preparation_event_sender);
             Err(error)
         } else {
+            #[cfg(test)]
+            if control.runtime_prepare_source() == LaunchRuntimePrepareSource::PersistedManifest {
+                axial_launcher::prepare_launch_attempt_with_persisted_runtime_manifest_for_test(
+                    state.managed_runtime_cache(),
+                    &intent,
+                    &attempt,
+                    java_probe_receipt.as_ref(),
+                    move |event| {
+                        let _ = preparation_event_sender.send(event);
+                    },
+                )
+                .await
+            } else {
+                prepare_launch_attempt_with_events(
+                    state.managed_runtime_cache(),
+                    &intent,
+                    &attempt,
+                    java_probe_receipt.as_ref(),
+                    move |event| {
+                        let _ = preparation_event_sender.send(event);
+                    },
+                )
+                .await
+            }
+            #[cfg(not(test))]
             prepare_launch_attempt_with_events(
                 state.managed_runtime_cache(),
                 &intent,
@@ -1210,6 +1269,7 @@ async fn launch_session_inner_with_control(
                     )
                     .await
                 };
+                control.record_startup_integrity(&integrity);
                 let guardian_mode = api_guardian_mode(intent.guardian.mode);
                 let startup_outcome = {
                     let repair_candidate = (!registered_recovery_process_retry_used)
@@ -1382,13 +1442,15 @@ async fn launch_session_inner_with_control(
                             "registered artifact recovery must retain foreground authority",
                         );
                         let recovery_state = state.clone();
+                        let component_rebuild_source =
+                            control.registered_artifact_component_rebuild_source();
                         let repair_task = producer.claim_child().spawn_joinable(async move {
                             let client = reqwest::Client::new();
                             let outcome = execute_registered_artifact_recovery_sequence(
                                 &recovery_state,
                                 RegisteredArtifactRecoveryEntry::Fresh(Box::new(admission)),
                                 &client,
-                                RegisteredArtifactComponentRebuildSource::Production,
+                                component_rebuild_source,
                             )
                             .await;
                             (outcome, retained_foreground)
@@ -1581,9 +1643,49 @@ async fn launch_session_inner_with_control(
 struct LaunchLoopControl {
     #[cfg(test)]
     forced_prepare_failure: Option<std::sync::Arc<ForcedPrepareFailure>>,
+    #[cfg(test)]
+    registered_artifact_component_rebuild_source: Option<RegisteredArtifactComponentRebuildSource>,
+    #[cfg(test)]
+    observed_startup_integrity:
+        Option<std::sync::Arc<std::sync::Mutex<Vec<crate::guardian::GuardianFactId>>>>,
+    #[cfg(test)]
+    runtime_prepare_source: Option<LaunchRuntimePrepareSource>,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LaunchRuntimePrepareSource {
+    Production,
+    PersistedManifest,
 }
 
 impl LaunchLoopControl {
+    #[cfg(test)]
+    fn runtime_prepare_source(&self) -> LaunchRuntimePrepareSource {
+        self.runtime_prepare_source
+            .unwrap_or(LaunchRuntimePrepareSource::Production)
+    }
+
+    fn registered_artifact_component_rebuild_source(
+        &self,
+    ) -> RegisteredArtifactComponentRebuildSource {
+        #[cfg(test)]
+        if let Some(source) = self.registered_artifact_component_rebuild_source {
+            return source;
+        }
+        RegisteredArtifactComponentRebuildSource::Production
+    }
+
+    fn record_startup_integrity(&self, _integrity: &StartupFailureIntegrity) {
+        #[cfg(test)]
+        if let Some(observed) = self.observed_startup_integrity.as_ref() {
+            observed
+                .lock()
+                .expect("startup integrity observation lock")
+                .extend(_integrity.facts.iter().map(|fact| fact.id));
+        }
+    }
+
     fn forced_prepare_failure(&self) -> Option<axial_launcher::LaunchPreparationError> {
         #[cfg(test)]
         if let Some(failure) = self.forced_prepare_failure.as_ref() {
@@ -2257,6 +2359,200 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn wrong_content_client_rebuilds_version_bundle_and_second_process_reaches_boot() {
+        let root = unique_test_dir("wrong-content-client-launch-continuation");
+        let instance_id = "0000000000000001";
+        let session_id = "wrong-content-client-launch-continuation";
+        let (state, client_path, expected_client) =
+            test_version_bundle_recovery_app_state(&root, instance_id);
+        let wrong_client = fs::read(&client_path).expect("wrong-content VersionBundle client");
+        assert_eq!(wrong_client.len(), expected_client.len());
+        assert_ne!(wrong_client, expected_client);
+        let process_count_path = root.join("wrong-content-client-process-count");
+        let java_path = write_version_bundle_launch_fixture(
+            &root,
+            &client_path,
+            &expected_client,
+            &process_count_path,
+        );
+        let user_owned = write_user_owned_launch_sentinels(&state, instance_id);
+        let mut session = test_record(session_id);
+        session.instance_id = instance_id.to_string();
+        state
+            .sessions()
+            .insert(session)
+            .await
+            .expect("insert wrong-content client launch session");
+        let producer = state
+            .try_claim_producer()
+            .expect("claim wrong-content client launch producer");
+        let mut task = test_recovery_launch_task(&state, session_id, &root).await;
+        retarget_test_launch_task(&mut task, instance_id);
+        task.instance.java_path = java_path.clone();
+        task.intent.requested_java = java_path;
+        task.intent.game_dir = Some(state.instances().game_dir(instance_id));
+        let (integrity_foreground, task) = LaunchSessionRunTask::from_prepared(task);
+        let mut integrity_foreground = Some(integrity_foreground);
+        let observed_startup_integrity = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let control = LaunchLoopControl {
+            registered_artifact_component_rebuild_source: Some(
+                RegisteredArtifactComponentRebuildSource::Fixture,
+            ),
+            observed_startup_integrity: Some(observed_startup_integrity.clone()),
+            ..LaunchLoopControl::default()
+        };
+
+        let launched = tokio::time::timeout(
+            Duration::from_secs(10),
+            launch_session_inner_with_control(
+                state.clone(),
+                task,
+                &producer,
+                &mut integrity_foreground,
+                &control,
+            ),
+        )
+        .await
+        .expect("wrong-content client launch deadline")
+        .unwrap_or_else(|error| {
+            panic!(
+                "VersionBundle recovery must reach process 2: {}",
+                error.message
+            )
+        });
+
+        assert_eq!(launched.session_id, session_id);
+        assert_eq!(
+            fs::read_to_string(&process_count_path).expect("VersionBundle process count"),
+            "2"
+        );
+        assert_eq!(
+            fs::read(&client_path).expect("rebuilt VersionBundle client"),
+            expected_client
+        );
+        let running = state
+            .sessions()
+            .get(session_id)
+            .await
+            .expect("running VersionBundle launch");
+        assert_eq!(running.state, LaunchState::Running);
+        assert!(running.boot_completed_at_ms.is_some());
+        assert!(
+            observed_startup_integrity
+                .lock()
+                .expect("observed startup integrity")
+                .contains(&crate::guardian::GuardianFactId::ArtifactHashMismatch),
+            "process-triggered Tier1 must observe the same-size client hash mismatch"
+        );
+
+        let reconciliation = state
+            .journals()
+            .list()
+            .into_iter()
+            .filter_map(|journal| {
+                let attempt = journal.reconciliation_attempt()?.clone();
+                Some((journal, attempt))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(reconciliation.len(), 2);
+        let leaf = reconciliation
+            .iter()
+            .find(|(_, attempt)| attempt.rung() == ReconciliationRung::RepairArtifact)
+            .expect("wrong-content VersionBundle R1 terminal");
+        let component = reconciliation
+            .iter()
+            .find(|(_, attempt)| attempt.rung() == ReconciliationRung::RebuildComponent)
+            .expect("wrong-content VersionBundle R2 terminal");
+        assert_eq!(leaf.1.component(), ReconciliationComponent::VersionBundle);
+        assert_eq!(
+            component.1.component(),
+            ReconciliationComponent::VersionBundle
+        );
+        assert_eq!(leaf.0.status, OperationStatus::Failed);
+        assert_eq!(component.0.status, OperationStatus::Succeeded);
+        assert_eq!(
+            leaf.0.failure_point.as_deref(),
+            Some(crate::state::REGISTERED_ARTIFACT_COMPONENT_REBUILD_FAILURE_POINT)
+        );
+        assert!(leaf.0.planned_steps.iter().all(|step| {
+            step.step_id != "download_artifact_to_temp"
+                && step.step_id != "quarantine_launcher_managed_target"
+        }));
+        assert!(
+            component.0.planned_steps.iter().any(|step| {
+                step.step_id == crate::state::VERSION_BUNDLE_COMPONENT_REBUILD_STEP
+            })
+        );
+        let leaf_terminal = leaf
+            .0
+            .reconciliation_terminal()
+            .expect("wrong-content VersionBundle R1 result");
+        let component_terminal = component
+            .0
+            .reconciliation_terminal()
+            .expect("wrong-content VersionBundle R2 result");
+        assert_eq!(
+            leaf_terminal.outcome(),
+            ReconciliationTerminalOutcome::Failed
+        );
+        assert_eq!(
+            component_terminal.outcome(),
+            ReconciliationTerminalOutcome::Succeeded
+        );
+        assert!(leaf_terminal.quarantine_checkpoint().is_empty());
+        assert!(component_terminal.quarantine_checkpoint().is_empty());
+        for (entry, attempt) in [leaf, component] {
+            assert_eq!(
+                state
+                    .failure_memory()
+                    .get(&reconciliation_attempt_key(attempt))
+                    .and_then(|memory| memory.reconciliation_terminal().cloned()),
+                entry.reconciliation_terminal().cloned()
+            );
+        }
+        let foreground = integrity_foreground
+            .as_ref()
+            .expect("successful VersionBundle launch retains foreground");
+        let lifecycle = state.acquire_instance_lifecycle(instance_id).await;
+        let postcheck =
+            sense_integrity_tier1(&state, foreground, &lifecycle, &root.join("library"))
+                .await
+                .expect("wrong-content VersionBundle Tier1 postcheck");
+        assert!(postcheck.facts.is_empty());
+        for (path, contents) in &user_owned {
+            assert_eq!(
+                fs::read(path).expect("user-owned launch sentinel"),
+                contents.as_slice()
+            );
+        }
+        drop((postcheck, lifecycle));
+
+        let _ = state.sessions().kill(session_id).await;
+        drop(integrity_foreground);
+        state
+            .close_known_good_inventories()
+            .await
+            .expect("close VersionBundle known-good store");
+        state
+            .close_instance_registry()
+            .await
+            .expect("close VersionBundle instance registry");
+        state
+            .journals()
+            .close()
+            .await
+            .expect("close VersionBundle journal");
+        state
+            .failure_memory()
+            .close()
+            .await
+            .expect("close VersionBundle memory");
+        drop((producer, state));
+        let _ = fs::remove_dir_all(root);
+    }
+
     #[test]
     fn non_managed_modes_never_execute_registered_artifact_repair() {
         for mode in [GuardianMode::Custom, GuardianMode::Disabled] {
@@ -2340,6 +2636,7 @@ mod tests {
         let forced_failure = Arc::new(ForcedPrepareFailure::default());
         let control = LaunchLoopControl {
             forced_prepare_failure: Some(forced_failure.clone()),
+            ..LaunchLoopControl::default()
         };
         let producer = state.try_claim_producer().expect("claim launch producer");
         let task = test_recovery_launch_task(&state, session_id, &root).await;
@@ -4323,6 +4620,134 @@ mod tests {
         (state, active_inventory)
     }
 
+    #[cfg(unix)]
+    fn test_version_bundle_recovery_app_state(
+        root: &Path,
+        instance_id: &str,
+    ) -> (AppState, PathBuf, Vec<u8>) {
+        const CLIENT_BYTES: &[u8] = b"axial managed VersionBundle client fixture";
+        const LOG_ID: &str = "guardian-version-bundle.xml";
+        const LOG_BYTES: &[u8] = b"<Configuration/>";
+
+        let paths = test_paths(root);
+        let library_dir = root.join("library");
+        fs::create_dir_all(paths.instances_dir.join(instance_id))
+            .expect("VersionBundle recovery instance directory");
+        let mut instance = test_recovery_launch_instance();
+        instance.id = instance_id.to_string();
+        instance.name = "VersionBundle recovery".to_string();
+        let version_id = instance.version_id.clone();
+        let version_json = serde_json::to_vec(&serde_json::json!({
+            "id": version_id.as_str(),
+            "type": "release",
+            "mainClass": "org.axial.GuardianFixture"
+        }))
+        .expect("VersionBundle recovery metadata");
+        let version_dir = library_dir.join("versions").join(&version_id);
+        fs::create_dir_all(&version_dir).expect("VersionBundle recovery version directory");
+        fs::write(
+            version_dir.join(format!("{version_id}.json")),
+            &version_json,
+        )
+        .expect("VersionBundle recovery metadata");
+        let client_path = version_dir.join(format!("{version_id}.jar"));
+        fs::write(&client_path, vec![7_u8; CLIENT_BYTES.len()])
+            .expect("same-size wrong-content VersionBundle client");
+        let log_path = library_dir.join("assets/log_configs").join(LOG_ID);
+        fs::create_dir_all(log_path.parent().expect("VersionBundle log parent"))
+            .expect("VersionBundle log directory");
+        fs::write(&log_path, LOG_BYTES).expect("VersionBundle log config");
+
+        let config = Arc::new(
+            ConfigStore::from_config(
+                paths.clone(),
+                AppConfig {
+                    library_dir: library_dir.to_string_lossy().into_owned(),
+                    ..AppConfig::default()
+                },
+            )
+            .expect("configure VersionBundle recovery root"),
+        );
+        let instances = Arc::new(
+            InstanceStore::from_snapshot(
+                paths.clone(),
+                InstanceRegistrySnapshot::new(vec![instance], instance_id.to_string(), Vec::new())
+                    .expect("VersionBundle recovery registry snapshot"),
+            )
+            .expect("load VersionBundle recovery instances"),
+        );
+        let state = AppState::new(AppStateInit {
+            app_name: "Axial".to_string(),
+            version: "test".to_string(),
+            config,
+            instances,
+            installs: Arc::new(InstallStore::new()),
+            sessions: Arc::new(SessionStore::new()),
+            performance: Arc::new(
+                PerformanceManager::load_for_startup(&paths.config_dir)
+                    .expect("VersionBundle recovery performance manager"),
+            ),
+            startup_warnings: Vec::new(),
+            frontend_dir: root.join("frontend"),
+        });
+        state.activate_known_good_inventory_for_test(
+            instance_id,
+            KnownGoodInventory::from_test_entries([
+                TestKnownGoodEntry {
+                    root: TestKnownGoodRoot::Versions,
+                    path: format!("{version_id}/{version_id}.json"),
+                    kind: KnownGoodArtifactKind::VersionMetadata,
+                    integrity: TestKnownGoodIntegrity::Sha1 {
+                        digest: format!("{:x}", Sha1::digest(&version_json)),
+                        size: version_json.len() as u64,
+                    },
+                },
+                TestKnownGoodEntry {
+                    root: TestKnownGoodRoot::Versions,
+                    path: format!("{version_id}/{version_id}.jar"),
+                    kind: KnownGoodArtifactKind::ClientJar,
+                    integrity: TestKnownGoodIntegrity::Sha1 {
+                        digest: format!("{:x}", Sha1::digest(CLIENT_BYTES)),
+                        size: CLIENT_BYTES.len() as u64,
+                    },
+                },
+                TestKnownGoodEntry {
+                    root: TestKnownGoodRoot::Assets,
+                    path: format!("log_configs/{LOG_ID}"),
+                    kind: KnownGoodArtifactKind::LogConfig,
+                    integrity: TestKnownGoodIntegrity::Sha1 {
+                        digest: format!("{:x}", Sha1::digest(LOG_BYTES)),
+                        size: LOG_BYTES.len() as u64,
+                    },
+                },
+            ])
+            .expect("VersionBundle recovery inventory"),
+        );
+        (state, client_path, CLIENT_BYTES.to_vec())
+    }
+
+    #[cfg(unix)]
+    fn write_user_owned_launch_sentinels(
+        state: &AppState,
+        instance_id: &str,
+    ) -> Vec<(PathBuf, Vec<u8>)> {
+        [
+            ("saves/world/level.dat", b"world".as_slice()),
+            ("mods/user.jar", b"mod".as_slice()),
+            ("config/user.toml", b"config".as_slice()),
+            ("resourcepacks/user.zip", b"resourcepack".as_slice()),
+        ]
+        .into_iter()
+        .map(|(relative, contents)| {
+            let path = state.instances().game_dir(instance_id).join(relative);
+            fs::create_dir_all(path.parent().expect("user-owned launch sentinel parent"))
+                .expect("user-owned launch sentinel directory");
+            fs::write(&path, contents).expect("write user-owned launch sentinel");
+            (path, contents.to_vec())
+        })
+        .collect()
+    }
+
     fn registered_library_repair_decision(
         target: TargetDescriptor,
     ) -> crate::guardian::GuardianDecision {
@@ -4750,6 +5175,58 @@ exit 0
                 library = library_path,
             ),
         )
+    }
+
+    #[cfg(unix)]
+    fn write_version_bundle_launch_fixture(
+        root: &Path,
+        client_path: &Path,
+        expected_client: &[u8],
+        process_count_path: &Path,
+    ) -> String {
+        let expected_path = root.join("expected-version-bundle-client.jar");
+        fs::write(&expected_path, expected_client).expect("expected VersionBundle client fixture");
+        let client_path = shell_path_literal(client_path);
+        let expected_path = shell_path_literal(&expected_path);
+        let process_count_path = shell_path_literal(process_count_path);
+        let bin_dir = root.join("wrong-content-client-java").join("bin");
+        fs::create_dir_all(&bin_dir).expect("VersionBundle Java bin directory");
+        let java_path = bin_dir.join("java");
+        fs::write(
+            &java_path,
+            format!(
+                r#"#!/bin/sh
+if [ "$1" = "-XshowSettings:property" ]; then
+  echo 'openjdk version "21.0.3"' >&2
+  exit 0
+fi
+count=0
+if [ -f {process_count} ]; then
+  count=$(cat {process_count})
+fi
+count=$((count + 1))
+printf '%s' "$count" > {process_count}
+if ! cmp -s {client} {expected}; then
+  printf '%s\n' 'java.lang.SecurityException: Invalid signature file digest for Manifest main attributes' >&2
+  exit 1
+fi
+printf '%s\n' '[Render thread/INFO]: Created: 1024x512x4 minecraft:textures/atlas/blocks.png-atlas' >&2
+sleep 1
+exit 0
+"#,
+                process_count = process_count_path,
+                client = client_path,
+                expected = expected_path,
+            ),
+        )
+        .expect("write VersionBundle Java fixture");
+        let mut permissions = fs::metadata(&java_path)
+            .expect("VersionBundle Java metadata")
+            .permissions();
+        use std::os::unix::fs::PermissionsExt as _;
+        permissions.set_mode(0o755);
+        fs::set_permissions(&java_path, permissions).expect("VersionBundle Java executable");
+        java_path.to_string_lossy().into_owned()
     }
 
     #[cfg(unix)]

@@ -64,7 +64,8 @@ use resources::{LaunchCpuLoadEvidence, LaunchDiskEvidence, load_to_x100};
 #[cfg(test)]
 use runtime_repair::maybe_repair_managed_runtime_before_launch_with_fixture;
 use runtime_repair::{
-    ManagedRuntimeRepairLaunch, maybe_repair_managed_runtime_before_launch_owned,
+    ManagedRuntimeRepairLaunch, RuntimeComponentRebuildSource,
+    maybe_repair_managed_runtime_before_launch_owned,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -172,7 +173,30 @@ pub(crate) async fn prepare_launch_session_owned(
     payload: LaunchRequest,
     producer: &crate::state::ProducerLease,
 ) -> Result<PreparedLaunch, (StatusCode, Json<serde_json::Value>)> {
-    prepare_launch_session_with_auth_refresh(state, payload, None, producer).await
+    prepare_launch_session_with_auth_refresh(
+        state,
+        payload,
+        None,
+        producer,
+        RuntimeComponentRebuildSource::Production,
+    )
+    .await
+}
+
+#[cfg(test)]
+pub(super) async fn prepare_launch_session_owned_with_runtime_fixture(
+    state: &AppState,
+    payload: LaunchRequest,
+    producer: &crate::state::ProducerLease,
+) -> Result<PreparedLaunch, (StatusCode, Json<serde_json::Value>)> {
+    prepare_launch_session_with_auth_refresh(
+        state,
+        payload,
+        None,
+        producer,
+        RuntimeComponentRebuildSource::Fixture,
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -191,6 +215,7 @@ async fn prepare_launch_session_with_auth_refresh(
     payload: LaunchRequest,
     auth_refresh: Option<LaunchAuthRefreshOptions>,
     producer: &crate::state::ProducerLease,
+    runtime_rebuild_source: RuntimeComponentRebuildSource,
 ) -> Result<PreparedLaunch, (StatusCode, Json<serde_json::Value>)> {
     let started_at = Instant::now();
     let integrity_foreground = state
@@ -262,21 +287,37 @@ async fn prepare_launch_session_with_auth_refresh(
     .await;
     let preflight_elapsed = preflight_started_at.elapsed();
     let repair_started_at = Instant::now();
-    preflight = maybe_repair_managed_runtime_before_launch_owned(
-        state,
-        producer,
-        &integrity_foreground,
-        preflight,
-        ManagedRuntimeRepairLaunch {
-            instance_lifecycle: &instance_lifecycle,
-            instance: &instance,
-            library_dir: &library_dir,
-            game_dir: &game_dir,
-            requested_max_memory_mb: payload.max_memory_mb,
-            requested_min_memory_mb: payload.min_memory_mb,
-        },
-    )
-    .await
+    let repair_launch = ManagedRuntimeRepairLaunch {
+        instance_lifecycle: &instance_lifecycle,
+        instance: &instance,
+        library_dir: &library_dir,
+        game_dir: &game_dir,
+        requested_max_memory_mb: payload.max_memory_mb,
+        requested_min_memory_mb: payload.min_memory_mb,
+    };
+    preflight = match runtime_rebuild_source {
+        RuntimeComponentRebuildSource::Production => {
+            maybe_repair_managed_runtime_before_launch_owned(
+                state,
+                producer,
+                &integrity_foreground,
+                preflight,
+                repair_launch,
+            )
+            .await
+        }
+        #[cfg(test)]
+        RuntimeComponentRebuildSource::Fixture => {
+            maybe_repair_managed_runtime_before_launch_with_fixture(
+                state,
+                producer,
+                &integrity_foreground,
+                preflight,
+                repair_launch,
+            )
+            .await
+        }
+    }
     .map_err(launch_journal_error_response)?;
     let repair_elapsed = repair_started_at.elapsed();
     if preflight.guardian_admission.user_outcome().decision() == ApiGuardianActionKind::Block {

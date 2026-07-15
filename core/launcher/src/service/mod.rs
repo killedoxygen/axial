@@ -16,6 +16,8 @@ pub use mapping::{
     failure_class_name, format_failure_class, is_terminal_state, is_terminal_status,
     launch_stage_label, launch_state_name, snapshot_status,
 };
+#[cfg(feature = "test-support")]
+pub use prepare::prepare_launch_attempt_with_persisted_runtime_manifest_for_test;
 pub use prepare::{
     LaunchPreparationEvent, prepare_launch_attempt_with_events, sanitize_effective_runtime_major,
 };

@@ -80,8 +80,6 @@ pub use rules::{
     Environment, Rule, current_os_arch, current_os_name, default_environment, evaluate_rules,
     is_native_library, native_classifier_key,
 };
-#[cfg(feature = "test-support")]
-pub use runtime::rebuild_managed_runtime_fixture_for_test;
 pub use runtime::{
     JavaRuntimeInfo, JavaRuntimeLookupError, JavaRuntimeProbeReceipt, JavaRuntimeProbeResolution,
     JavaRuntimeProbeResolutionError, JavaRuntimeProbeSnapshot, JavaRuntimeResult,
@@ -95,6 +93,10 @@ pub use runtime::{
     resolve_java_runtime_probe, runtime_component_executable_present_without_probe,
     runtime_component_ready_without_probe, runtime_component_structurally_ready_without_probe,
     runtime_executable_ready_without_probe, runtime_requirement, snapshot_java_runtime,
+};
+#[cfg(feature = "test-support")]
+pub use runtime::{
+    ensure_runtime_with_persisted_manifest_for_test, rebuild_managed_runtime_fixture_for_test,
 };
 pub use types::{VersionEntry, VersionLoaderAttachment, VersionSubjectKind};
 pub use version::{

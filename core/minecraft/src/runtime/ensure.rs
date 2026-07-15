@@ -80,6 +80,23 @@ pub async fn rebuild_managed_runtime_fixture_for_test(
 ) -> Result<ManagedRuntimeCommitReceipt, ManagedRuntimeRebuildError> {
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
+    #[cfg(unix)]
+    const JAVA_BYTES: &[u8] = br#"#!/bin/sh
+if [ "$1" = "-XshowSettings:property" ]; then
+  echo 'openjdk version "21.0.3"' >&2
+  exit 0
+fi
+count=0
+if [ -f guardian-runtime-process-count ]; then
+  count=$(cat guardian-runtime-process-count)
+fi
+count=$((count + 1))
+printf '%s' "$count" > guardian-runtime-process-count
+printf '%s\n' '[Render thread/INFO]: Created: 1024x512x4 minecraft:textures/atlas/blocks.png-atlas' >&2
+sleep 1
+exit 0
+"#;
+    #[cfg(not(unix))]
     const JAVA_BYTES: &[u8] = b"axial managed runtime fixture";
     if !is_known_runtime_component(component.as_str()) {
         return Err(ManagedRuntimeRebuildError::Preparation(
@@ -260,6 +277,61 @@ pub async fn ensure_runtime_with_events<F>(
     override_path: &str,
     force_managed: bool,
     probe_receipt: Option<&JavaRuntimeProbeReceipt>,
+    observer: F,
+) -> Result<RuntimeEnsureResult, JavaRuntimeLookupError>
+where
+    F: FnMut(RuntimeEnsureEvent),
+{
+    ensure_runtime_with_events_from_source(
+        cache,
+        java_version,
+        override_path,
+        force_managed,
+        probe_receipt,
+        RuntimeEnsureSource::Production,
+        observer,
+    )
+    .await
+}
+
+#[cfg(feature = "test-support")]
+pub async fn ensure_runtime_with_persisted_manifest_for_test<F>(
+    cache: &ManagedRuntimeCache,
+    java_version: &JavaVersion,
+    override_path: &str,
+    force_managed: bool,
+    probe_receipt: Option<&JavaRuntimeProbeReceipt>,
+    observer: F,
+) -> Result<RuntimeEnsureResult, JavaRuntimeLookupError>
+where
+    F: FnMut(RuntimeEnsureEvent),
+{
+    ensure_runtime_with_events_from_source(
+        cache,
+        java_version,
+        override_path,
+        force_managed,
+        probe_receipt,
+        RuntimeEnsureSource::PersistedManifest,
+        observer,
+    )
+    .await
+}
+
+#[derive(Clone, Copy)]
+enum RuntimeEnsureSource {
+    Production,
+    #[cfg(feature = "test-support")]
+    PersistedManifest,
+}
+
+async fn ensure_runtime_with_events_from_source<F>(
+    cache: &ManagedRuntimeCache,
+    java_version: &JavaVersion,
+    override_path: &str,
+    force_managed: bool,
+    probe_receipt: Option<&JavaRuntimeProbeReceipt>,
+    source: RuntimeEnsureSource,
     mut observer: F,
 ) -> Result<RuntimeEnsureResult, JavaRuntimeLookupError>
 where
@@ -305,6 +377,7 @@ where
             cache,
             requested_runtime,
             java_version.major_version,
+            source,
             &mut observer,
         )
         .await?;
@@ -315,7 +388,8 @@ where
         });
     }
 
-    let managed = ensure_managed_runtime_with_events(cache, &requirement, &mut observer).await?;
+    let managed =
+        ensure_managed_runtime_with_events(cache, &requirement, source, &mut observer).await?;
 
     Ok(RuntimeEnsureResult {
         requested,
@@ -330,6 +404,7 @@ struct ManagedEnsure {
 async fn ensure_managed_runtime_with_events<F>(
     cache: &ManagedRuntimeCache,
     requirement: &RuntimeRequirement,
+    source: RuntimeEnsureSource,
     observer: &mut F,
 ) -> Result<ManagedEnsure, JavaRuntimeLookupError>
 where
@@ -342,6 +417,7 @@ where
                 cache,
                 runtime,
                 requirement.required_java.major_version,
+                source,
                 observer,
             )
             .await?;
@@ -362,7 +438,7 @@ where
 
     // Acquire and authenticate the source before creating or removing any
     // runtime install paths. The same parsed receipt is consumed below.
-    let source_receipt = acquire_runtime_source(preferred, &runtime_os_arch()).await?;
+    let source_receipt = acquire_runtime_source_for_ensure(cache, preferred, source).await?;
 
     match resolve_managed_runtime(cache, preferred) {
         Ok(runtime) => {
@@ -407,6 +483,7 @@ async fn refresh_ready_managed_runtime<F>(
     cache: &ManagedRuntimeCache,
     runtime: RuntimeRecord,
     required_major: i32,
+    source: RuntimeEnsureSource,
     observer: &mut F,
 ) -> Result<RefreshedRuntime, JavaRuntimeLookupError>
 where
@@ -419,7 +496,7 @@ where
         });
     }
 
-    let source_receipt = acquire_runtime_source(&runtime.id, &runtime_os_arch()).await?;
+    let source_receipt = acquire_runtime_source_for_ensure(cache, &runtime.id, source).await?;
     let component = runtime.id.clone();
     if let Ok(current) = resolve_component_runtime(cache, &component, required_major)
         && runtime_record_matches_source(&current, &source_receipt).await
@@ -451,6 +528,64 @@ where
         effective,
         install_performed: true,
     })
+}
+
+async fn acquire_runtime_source_for_ensure(
+    cache: &ManagedRuntimeCache,
+    component: &RuntimeId,
+    source: RuntimeEnsureSource,
+) -> Result<RuntimeSourceReceipt, JavaRuntimeLookupError> {
+    match source {
+        RuntimeEnsureSource::Production => {
+            acquire_runtime_source(component, &runtime_os_arch()).await
+        }
+        #[cfg(feature = "test-support")]
+        RuntimeEnsureSource::PersistedManifest => {
+            acquire_persisted_runtime_source_for_test(cache, component).await
+        }
+    }
+}
+
+#[cfg(feature = "test-support")]
+async fn acquire_persisted_runtime_source_for_test(
+    cache: &ManagedRuntimeCache,
+    component: &RuntimeId,
+) -> Result<RuntimeSourceReceipt, JavaRuntimeLookupError> {
+    use super::manifest::{COMPONENT_MANIFEST_PROOF_FILE, ComponentManifest};
+    use tokio::io::AsyncReadExt as _;
+
+    let runtime_root = cache.component_root(component.as_str()).ok_or_else(|| {
+        JavaRuntimeLookupError::Download(
+            "runtime component is outside the managed cache vocabulary".to_string(),
+        )
+    })?;
+    let proof_path = runtime_root.join(COMPONENT_MANIFEST_PROOF_FILE);
+    let file = tokio::fs::File::open(proof_path)
+        .await
+        .map_err(|error| JavaRuntimeLookupError::Download(error.to_string()))?;
+    let mut bytes = Vec::new();
+    file.take(super::manifest::MAX_RUNTIME_MANIFEST_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .await
+        .map_err(|error| JavaRuntimeLookupError::Download(error.to_string()))?;
+    if bytes.len() as u64 > super::manifest::MAX_RUNTIME_MANIFEST_BYTES {
+        return Err(JavaRuntimeLookupError::Download(
+            "persisted runtime manifest proof is too large".to_string(),
+        ));
+    }
+    let manifest = serde_json::from_slice::<ComponentManifest>(&bytes)
+        .map_err(|error| JavaRuntimeLookupError::Download(error.to_string()))?;
+    let canonical = super::manifest::component_manifest_proof_bytes(&manifest)
+        .map_err(|error| JavaRuntimeLookupError::Download(error.to_string()))?;
+    if bytes != canonical {
+        return Err(JavaRuntimeLookupError::Download(
+            "persisted runtime manifest proof is not canonical".to_string(),
+        ));
+    }
+    super::manifest::authenticated_runtime_source_from_manifest_for_test(
+        component.clone(),
+        manifest,
+    )
 }
 
 async fn runtime_record_matches_source(

@@ -21,13 +21,15 @@ pub use discovery::{
     runtime_component_ready_without_probe, runtime_component_structurally_ready_without_probe,
     runtime_executable_ready_without_probe, runtime_requirement,
 };
-#[cfg(feature = "test-support")]
-pub use ensure::rebuild_managed_runtime_fixture_for_test;
 pub(crate) use ensure::{
     ProcessorRuntime, materialize_ephemeral_processor_runtime,
     materialize_preferred_runtime_source, rebuild_managed_runtime_component_from_source,
 };
 pub use ensure::{ensure_runtime_with_events, rebuild_managed_runtime_component};
+#[cfg(feature = "test-support")]
+pub use ensure::{
+    ensure_runtime_with_persisted_manifest_for_test, rebuild_managed_runtime_fixture_for_test,
+};
 #[cfg(any(test, feature = "test-support"))]
 pub(crate) use install::finalize_managed_runtime_commit_with_failure_for_test;
 #[cfg(test)]
