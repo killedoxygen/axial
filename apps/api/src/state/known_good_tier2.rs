@@ -21,8 +21,8 @@ pub(crate) struct KnownGoodTier2Ticket {
 }
 
 impl KnownGoodTier2Ticket {
-    pub(crate) fn matches_reservation(&self, reservation: &super::IdleSweepReservation) -> bool {
-        reservation.matches_authority(&self.sweep_authority)
+    pub(crate) fn matches_settlement(&self, settlement: &super::IdleSweepSettlementOwner) -> bool {
+        settlement.matches_authority(&self.sweep_authority)
     }
 
     pub(crate) fn execution_parts(&self) -> (&Path, &ManagedRuntimeCache, &KnownGoodInventory) {

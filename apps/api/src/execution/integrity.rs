@@ -9,8 +9,8 @@ use super::{
 use crate::observability::{EvidenceField, EvidenceSensitivity};
 use crate::state::contracts::{OwnershipClass, StabilizationSystem, TargetDescriptor, TargetKind};
 use crate::state::{
-    AppState, IdleSweepCancellation, IdleSweepReservation, IdleSweepSettlement, IdleSweepTerminal,
-    InstanceLifecycleLease, IntegrityForegroundLease, KnownGoodTier2Ticket,
+    AppState, IdleSweepCancellation, IdleSweepSettlement, IdleSweepSettlementOwner,
+    IdleSweepTerminal, InstanceLifecycleLease, IntegrityForegroundLease, KnownGoodTier2Ticket,
     KnownGoodVerificationLease, KnownGoodVerificationUnavailable, RegisteredArtifactCondition,
     RegisteredArtifactFindings, RegisteredArtifactObservation,
 };
@@ -2235,12 +2235,18 @@ struct Tier2RepairableObservation {
 pub(crate) struct IntegrityTier2OwnedWork {
     state: AppState,
     ticket: KnownGoodTier2Ticket,
-    reservation: IdleSweepReservation,
+    settlement: IdleSweepSettlementOwner,
 }
 
 pub(crate) struct IntegrityTier2OwnedWorkAuthorityMismatch {
     ticket: KnownGoodTier2Ticket,
-    reservation: IdleSweepReservation,
+    settlement: IdleSweepSettlementOwner,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum IntegrityTier2OwnedWorkRejection {
+    Cancelled,
+    Refused,
 }
 
 impl std::fmt::Debug for IntegrityTier2OwnedWorkAuthorityMismatch {
@@ -2252,17 +2258,25 @@ impl std::fmt::Debug for IntegrityTier2OwnedWorkAuthorityMismatch {
 }
 
 impl IntegrityTier2OwnedWorkAuthorityMismatch {
-    pub(crate) fn into_parts(self) -> (KnownGoodTier2Ticket, IdleSweepReservation) {
-        (self.ticket, self.reservation)
+    pub(crate) fn settle(self) -> IntegrityTier2OwnedWorkRejection {
+        let Self { ticket, settlement } = self;
+        drop(ticket);
+        if settlement.is_current() {
+            settlement.settle(IdleSweepTerminal::Refused);
+            IntegrityTier2OwnedWorkRejection::Refused
+        } else {
+            settlement.settle(IdleSweepTerminal::Cancelled);
+            IntegrityTier2OwnedWorkRejection::Cancelled
+        }
     }
 }
 
-#[must_use = "Tier 2 completion retains the ticket and unsettled sweep reservation"]
+#[must_use = "Tier 2 completion retains the ticket and explicit sweep settlement owner"]
 pub(crate) struct IntegrityTier2OwnedResult {
     state: AppState,
     report: IntegrityTier2Report,
     ticket: KnownGoodTier2Ticket,
-    reservation: IdleSweepReservation,
+    settlement: IdleSweepSettlementOwner,
 }
 
 impl std::fmt::Debug for IntegrityTier2OwnedResult {
@@ -2296,7 +2310,7 @@ impl Tier2RegisteredArtifactSealRequest {
 struct SealedIntegrityTier2Result {
     report: IntegrityTier2Report,
     findings: Option<RegisteredArtifactFindings>,
-    reservation: IdleSweepReservation,
+    settlement: IdleSweepSettlementOwner,
 }
 
 impl IntegrityTier2OwnedResult {
@@ -2305,14 +2319,14 @@ impl IntegrityTier2OwnedResult {
             state,
             mut report,
             ticket,
-            reservation,
+            settlement,
         } = self;
         if report.status != IntegrityTier2Status::Complete {
             drop(ticket);
             return SealedIntegrityTier2Result {
                 report,
                 findings: None,
-                reservation,
+                settlement,
             };
         }
 
@@ -2322,18 +2336,18 @@ impl IntegrityTier2OwnedResult {
         );
         let findings = match state.seal_tier2_registered_artifact_request(request).await {
             Ok(findings) => findings,
-            Err(_) if !reservation.is_current() => {
+            Err(_) if !settlement.is_current() => {
                 return SealedIntegrityTier2Result {
                     report: report.cancel(),
                     findings: None,
-                    reservation,
+                    settlement,
                 };
             }
             Err(_) => {
                 return SealedIntegrityTier2Result {
                     report: report.refuse(tier2_authority_refused_fact()),
                     findings: None,
-                    reservation,
+                    settlement,
                 };
             }
         };
@@ -2341,13 +2355,13 @@ impl IntegrityTier2OwnedResult {
             return SealedIntegrityTier2Result {
                 report: report.refuse(tier2_authority_refused_fact()),
                 findings: None,
-                reservation,
+                settlement,
             };
         }
         SealedIntegrityTier2Result {
             report,
             findings: Some(findings),
-            reservation,
+            settlement,
         }
     }
 
@@ -2363,7 +2377,7 @@ impl SealedIntegrityTier2Result {
         let Self {
             mut report,
             findings,
-            reservation,
+            settlement,
         } = self;
         drop(findings);
         let terminal = match report.status {
@@ -2371,13 +2385,13 @@ impl SealedIntegrityTier2Result {
             IntegrityTier2Status::Cancelled => IdleSweepTerminal::Cancelled,
             IntegrityTier2Status::Refused => IdleSweepTerminal::Refused,
         };
-        let settlement = reservation.settle(terminal);
+        let outcome = settlement.settle(terminal);
         if report.status == IntegrityTier2Status::Complete
-            && settlement == IdleSweepSettlement::Superseded
+            && outcome == IdleSweepSettlement::Superseded
         {
             report = report.cancel();
         }
-        (report, settlement)
+        (report, outcome)
     }
 }
 
@@ -2410,20 +2424,17 @@ impl IntegrityTier2OwnedWork {
     pub(crate) fn new(
         state: AppState,
         ticket: KnownGoodTier2Ticket,
-        reservation: IdleSweepReservation,
+        settlement: IdleSweepSettlementOwner,
     ) -> Result<Self, IntegrityTier2OwnedWorkAuthorityMismatch> {
-        if !ticket.matches_reservation(&reservation)
+        if !ticket.matches_settlement(&settlement)
             || !state.known_good_tier2_ticket_is_current(&ticket)
         {
-            return Err(IntegrityTier2OwnedWorkAuthorityMismatch {
-                ticket,
-                reservation,
-            });
+            return Err(IntegrityTier2OwnedWorkAuthorityMismatch { ticket, settlement });
         }
         Ok(Self {
             state,
             ticket,
-            reservation,
+            settlement,
         })
     }
 
@@ -2499,9 +2510,9 @@ where
     let IntegrityTier2OwnedWork {
         state,
         ticket,
-        reservation,
+        settlement,
     } = work;
-    let cancellation = reservation.cancellation();
+    let cancellation = settlement.cancellation();
     let report = run_integrity_tier2_owned(platform, || {
         sense_integrity_tier2_owned(&state, &ticket, &cancellation)
     });
@@ -2509,7 +2520,7 @@ where
         state,
         report,
         ticket,
-        reservation,
+        settlement,
     }
 }
 
@@ -2517,14 +2528,14 @@ fn refuse_integrity_tier2_thread_spawn(work: IntegrityTier2OwnedWork) -> Integri
     let IntegrityTier2OwnedWork {
         state,
         ticket,
-        reservation,
+        settlement,
     } = work;
     let report = IntegrityTier2Report::new(0, 0).refuse(tier2_worker_refused_fact());
     IntegrityTier2OwnedResult {
         state,
         report,
         ticket,
-        reservation,
+        settlement,
     }
 }
 
@@ -3397,8 +3408,8 @@ mod tests {
         ReconciliationTerminalOutcome, StabilizationSystem,
     };
     use crate::state::{
-        AppState, AppStateInit, IdleSweepSettlement, IdleSweepTerminal, InstallStore,
-        RegisteredArtifactFindings, RegisteredArtifactRepairAuthorizationRejection,
+        AppState, AppStateInit, IdleSweepSettlement, IdleSweepSettlementOwner, IdleSweepTerminal,
+        InstallStore, RegisteredArtifactFindings, RegisteredArtifactRepairAuthorizationRejection,
         RegisteredArtifactRepairEffect, SessionStore,
     };
     use axial_config::{AppConfig, AppPaths, ConfigStore, InstanceRegistrySnapshot, InstanceStore};
@@ -4086,11 +4097,12 @@ mod tests {
         let reservation = state
             .try_reserve_idle_sweep(idle_epoch, producer)
             .expect("idle sweep reservation");
+        let settlement = IdleSweepSettlementOwner::new(reservation);
         let ticket = state
-            .mint_known_good_tier2_ticket(&reservation.authority(), &instance.id)
+            .mint_known_good_tier2_ticket(&settlement.authority(), &instance.id)
             .await
             .expect("Tier 2 ticket");
-        let work = IntegrityTier2OwnedWork::new(state.clone(), ticket, reservation)
+        let work = IntegrityTier2OwnedWork::new(state.clone(), ticket, settlement)
             .expect("matching Tier 2 ownership");
         (state, root, work)
     }
@@ -4123,11 +4135,12 @@ mod tests {
         let reservation = state
             .try_reserve_idle_sweep(idle_epoch, producer)
             .expect("idle sweep reservation");
+        let settlement = IdleSweepSettlementOwner::new(reservation);
         let ticket = state
-            .mint_known_good_tier2_ticket(&reservation.authority(), &instance.id)
+            .mint_known_good_tier2_ticket(&settlement.authority(), &instance.id)
             .await
             .expect("Tier 2 ticket");
-        let work = IntegrityTier2OwnedWork::new(state.clone(), ticket, reservation)
+        let work = IntegrityTier2OwnedWork::new(state.clone(), ticket, settlement)
             .expect("matching Tier 2 ownership");
         (state, root, work)
     }
@@ -5023,7 +5036,7 @@ mod tests {
         let (state, root, work) = tier2_owned_work_fixture("tier2-owned-work").await;
 
         let result = work.spawn().join().await.expect("dedicated worker result");
-        assert!(result.reservation.is_current());
+        assert!(result.settlement.is_current());
         let instance_id = state
             .instances()
             .list()
@@ -5055,14 +5068,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tier_two_worker_rejects_a_ticket_spliced_to_another_reservation() {
+    async fn dropping_tier_two_owned_result_abandons_and_cancels_sweep_settlement() {
+        let (state, root, work) = tier2_owned_work_fixture("tier2-dropped-result").await;
+
+        let result = work.spawn().join().await.expect("dedicated worker result");
+        assert!(result.settlement.is_current());
+        assert!(!state.subscribe_integrity_idle().borrow().is_stably_idle());
+        let cancellation = result.settlement.cancellation();
+
+        drop(result);
+
+        assert!(cancellation.is_cancelled());
+        assert!(state.subscribe_integrity_idle().borrow().is_stably_idle());
+        close_fixture(state, root).await;
+    }
+
+    #[tokio::test]
+    async fn tier_two_worker_rejects_a_ticket_spliced_to_another_settlement() {
         let (state, root, work) = tier2_owned_work_fixture("tier2-spliced-authority").await;
         let IntegrityTier2OwnedWork {
             state: work_state,
             ticket,
-            reservation,
+            settlement,
         } = work;
-        reservation.settle(IdleSweepTerminal::Cancelled);
+        settlement.settle(IdleSweepTerminal::Cancelled);
         let epoch = state.subscribe_integrity_idle().borrow().epoch();
         let replacement = state
             .try_reserve_idle_sweep(
@@ -5072,17 +5101,40 @@ mod tests {
                     .expect("claim replacement producer"),
             )
             .expect("replacement reservation");
+        let replacement = IdleSweepSettlementOwner::new(replacement);
+        let cancellation = replacement.cancellation();
 
         let mismatch = match IntegrityTier2OwnedWork::new(work_state, ticket, replacement) {
-            Ok(_) => panic!("ticket and reservation capabilities must not splice"),
+            Ok(_) => panic!("ticket and settlement capabilities must not splice"),
             Err(mismatch) => mismatch,
         };
-        let (_ticket, replacement) = mismatch.into_parts();
-        assert!(replacement.is_current());
+        assert_eq!(mismatch.settle(), IntegrityTier2OwnedWorkRejection::Refused);
+        assert!(!cancellation.is_cancelled());
+        assert!(state.subscribe_integrity_idle().borrow().is_stably_idle());
+        close_fixture(state, root).await;
+    }
+
+    #[tokio::test]
+    async fn tier_two_worker_classifies_cancellation_between_ticket_and_work_admission() {
+        let (state, root, work) = tier2_owned_work_fixture("tier2-cancel-before-admission").await;
+        let IntegrityTier2OwnedWork {
+            state: work_state,
+            ticket,
+            settlement,
+        } = work;
+        let cancellation = settlement.cancellation();
+        cancellation.cancel();
+
+        let mismatch = match IntegrityTier2OwnedWork::new(work_state, ticket, settlement) {
+            Ok(_) => panic!("cancelled Tier 2 authority must not enter worker execution"),
+            Err(mismatch) => mismatch,
+        };
         assert_eq!(
-            replacement.settle(IdleSweepTerminal::Complete),
-            IdleSweepSettlement::Authoritative
+            mismatch.settle(),
+            IntegrityTier2OwnedWorkRejection::Cancelled
         );
+        assert!(cancellation.is_cancelled());
+        assert!(state.subscribe_integrity_idle().borrow().is_stably_idle());
         close_fixture(state, root).await;
     }
 
@@ -5093,20 +5145,17 @@ mod tests {
         let IntegrityTier2OwnedWork {
             state: originating_state,
             ticket,
-            reservation,
+            settlement,
         } = work;
+        let cancellation = settlement.cancellation();
 
-        let mismatch =
-            match IntegrityTier2OwnedWork::new(foreign_state.clone(), ticket, reservation) {
-                Ok(_) => panic!("ticket and reservation must retain their originating state"),
-                Err(mismatch) => mismatch,
-            };
-        let (_ticket, reservation) = mismatch.into_parts();
-        assert!(reservation.is_current());
-        assert_eq!(
-            reservation.settle(IdleSweepTerminal::Refused),
-            IdleSweepSettlement::Superseded
-        );
+        let mismatch = match IntegrityTier2OwnedWork::new(foreign_state.clone(), ticket, settlement)
+        {
+            Ok(_) => panic!("ticket and settlement must retain their originating state"),
+            Err(mismatch) => mismatch,
+        };
+        assert_eq!(mismatch.settle(), IntegrityTier2OwnedWorkRejection::Refused);
+        assert!(!cancellation.is_cancelled());
 
         drop(originating_state);
         close_fixture(state, root).await;
@@ -5119,9 +5168,9 @@ mod tests {
             tier2_assets_owned_work_fixture("tier2-assets-exact-sealing").await;
 
         let result = work.spawn().join().await.expect("dedicated worker result");
-        assert!(result.reservation.is_current());
+        assert!(result.settlement.is_current());
         let sealed = result.seal_and_bind().await;
-        assert!(sealed.reservation.is_current());
+        assert!(sealed.settlement.is_current());
         assert_eq!(sealed.report.status, IntegrityTier2Status::Complete);
         assert!(sealed.report.repairable_observations.is_empty());
         let findings = sealed.findings.as_ref().expect("sealed Assets findings");
@@ -5177,17 +5226,18 @@ mod tests {
         let reservation = state
             .try_reserve_idle_sweep(idle_epoch, producer)
             .expect("idle sweep reservation");
+        let settlement = IdleSweepSettlementOwner::new(reservation);
         let ticket = state
-            .mint_known_good_tier2_ticket(&reservation.authority(), &instance.id)
+            .mint_known_good_tier2_ticket(&settlement.authority(), &instance.id)
             .await
             .expect("Tier 2 ticket");
-        let cancellation = reservation.cancellation();
+        let cancellation = settlement.cancellation();
         let cancel_from_thread = cancellation.clone();
         let canceller = std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(2));
             cancel_from_thread.cancel();
         });
-        let work = IntegrityTier2OwnedWork::new(state.clone(), ticket, reservation)
+        let work = IntegrityTier2OwnedWork::new(state.clone(), ticket, settlement)
             .expect("matching Tier 2 ownership");
 
         let result = work.spawn().join().await.expect("dedicated worker result");
@@ -5254,7 +5304,7 @@ mod tests {
             .join()
             .await
             .expect("bounded spawn refusal result");
-        assert!(result.reservation.is_current());
+        assert!(result.settlement.is_current());
         let (report, settlement) = settle_tier2_result(result).await;
 
         assert_eq!(settlement, IdleSweepSettlement::Superseded);
@@ -5332,7 +5382,7 @@ mod tests {
             .expect("dedicated worker finishes")
             .expect("join waiter")
             .expect("dedicated worker result");
-        assert!(result.reservation.is_current());
+        assert!(result.settlement.is_current());
         let (report, settlement) = settle_tier2_result(result).await;
 
         assert_eq!(settlement, IdleSweepSettlement::Authoritative);

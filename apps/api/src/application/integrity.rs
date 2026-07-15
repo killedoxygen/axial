@@ -1,5 +1,6 @@
 use crate::execution::integrity::{
-    IntegrityTier2OwnedWork, IntegrityTier2Report, IntegrityTier2Status,
+    IntegrityTier2OwnedWork, IntegrityTier2OwnedWorkRejection, IntegrityTier2Report,
+    IntegrityTier2Status,
 };
 use crate::guardian::{
     TIER2_INTEGRITY_COUNTER_TOKEN_COUNT, Tier2IntegrityGuardianEvidence,
@@ -11,10 +12,10 @@ use crate::state::contracts::{
     RollbackState, StabilizationSystem, TargetDescriptor, TargetKind,
 };
 use crate::state::{
-    AppState, IdleSweepCancellation, IdleSweepReservation, IdleSweepReserveError,
-    IdleSweepSettlement, IdleSweepTerminal, IntegrityIdleEpoch, KnownGoodVerificationUnavailable,
-    OperationJournalReconciliation, OperationJournalStore, OperationJournalStoreError,
-    ProducerLease,
+    AppState, IdleSweepCancellation, IdleSweepReserveError, IdleSweepSettlement,
+    IdleSweepSettlementOwner, IdleSweepTerminal, IntegrityIdleEpoch,
+    KnownGoodVerificationUnavailable, OperationJournalReconciliation, OperationJournalStore,
+    OperationJournalStoreError, ProducerLease,
 };
 use axial_config::is_canonical_instance_id;
 use std::time::Duration;
@@ -43,7 +44,7 @@ pub(super) struct PlannedIntegritySweep {
 #[must_use = "a reserved integrity sweep must execute or be cancelled"]
 pub(super) struct ReservedIntegritySweep {
     planned: PlannedIntegritySweep,
-    reservation: IdleSweepReservation,
+    settlement: IdleSweepSettlementOwner,
 }
 
 #[must_use = "a started integrity sweep must be awaited or deliberately detached"]
@@ -127,7 +128,7 @@ impl PlannedIntegritySweep {
         {
             Ok(reservation) => Ok(ReservedIntegritySweep {
                 planned: self,
-                reservation,
+                settlement: IdleSweepSettlementOwner::new(reservation),
             }),
             Err(error) => Err(IntegritySweepReservationFailure {
                 planned: Box::new(self),
@@ -142,13 +143,16 @@ impl PlannedIntegritySweep {
         Ok(IdleIntegrityTerminal::Cancelled)
     }
 
-    fn start_execute_reserved(self, reservation: IdleSweepReservation) -> IntegritySweepExecution {
-        self.start_execute_reserved_with(reservation, |_| {})
+    fn start_execute_reserved(
+        self,
+        settlement: IdleSweepSettlementOwner,
+    ) -> IntegritySweepExecution {
+        self.start_execute_reserved_with(settlement, |_| {})
     }
 
     fn start_execute_reserved_with<AfterSpawn>(
         self,
-        reservation: IdleSweepReservation,
+        settlement: IdleSweepSettlementOwner,
         after_spawn: AfterSpawn,
     ) -> IntegritySweepExecution
     where
@@ -165,7 +169,7 @@ impl PlannedIntegritySweep {
                 state,
                 instance_id,
                 journal,
-                reservation,
+                settlement,
                 after_spawn,
             )),
         }
@@ -183,20 +187,20 @@ async fn execute_reserved_owned<AfterSpawn>(
     state: AppState,
     instance_id: String,
     journal: OperationJournalEntry,
-    reservation: IdleSweepReservation,
+    settlement: IdleSweepSettlementOwner,
     after_spawn: AfterSpawn,
 ) -> Result<IdleIntegrityTerminal, Tier2IntegritySweepError>
 where
     AfterSpawn: FnOnce(IdleSweepCancellation),
 {
-    let authority = reservation.authority();
+    let authority = settlement.authority();
     let ticket = match state
         .mint_known_good_tier2_ticket(&authority, &instance_id)
         .await
     {
         Ok(ticket) => ticket,
         Err(KnownGoodVerificationUnavailable::SweepAuthorityUnavailable) => {
-            reservation.settle(IdleSweepTerminal::Cancelled);
+            settlement.settle(IdleSweepTerminal::Cancelled);
             let transition = Tier2TerminalTransition::cancelled(Tier2IntegrityCounters::default());
             record_terminal_reconciled(state.journals(), &journal, &transition).await?;
             return Ok(IdleIntegrityTerminal::Cancelled);
@@ -206,7 +210,7 @@ where
             | KnownGoodVerificationUnavailable::LibraryRootUnavailable
             | KnownGoodVerificationUnavailable::LiveAuthorityUnavailable,
         ) => {
-            reservation.settle(IdleSweepTerminal::Refused);
+            settlement.settle(IdleSweepTerminal::Refused);
             let transition = Tier2TerminalTransition::failed(
                 Tier2IntegrityCounters::default(),
                 Tier2IntegrityGuardianEvidence::empty(),
@@ -216,19 +220,25 @@ where
         }
     };
 
-    let cancellation = reservation.cancellation();
-    let work = match IntegrityTier2OwnedWork::new(state.clone(), ticket, reservation) {
+    let cancellation = settlement.cancellation();
+    let work = match IntegrityTier2OwnedWork::new(state.clone(), ticket, settlement) {
         Ok(work) => work,
         Err(mismatch) => {
-            let (ticket, reservation) = mismatch.into_parts();
-            drop(ticket);
-            reservation.settle(IdleSweepTerminal::Refused);
-            let transition = Tier2TerminalTransition::failed(
-                Tier2IntegrityCounters::default(),
-                Tier2IntegrityGuardianEvidence::empty(),
-            );
+            let (transition, terminal) = match mismatch.settle() {
+                IntegrityTier2OwnedWorkRejection::Cancelled => (
+                    Tier2TerminalTransition::cancelled(Tier2IntegrityCounters::default()),
+                    IdleIntegrityTerminal::Cancelled,
+                ),
+                IntegrityTier2OwnedWorkRejection::Refused => (
+                    Tier2TerminalTransition::failed(
+                        Tier2IntegrityCounters::default(),
+                        Tier2IntegrityGuardianEvidence::empty(),
+                    ),
+                    IdleIntegrityTerminal::Refused,
+                ),
+            };
             record_terminal_reconciled(state.journals(), &journal, &transition).await?;
-            return Ok(IdleIntegrityTerminal::Refused);
+            return Ok(terminal);
         }
     };
     let worker = work.spawn();
@@ -237,8 +247,9 @@ where
     let (transition, terminal) = match result {
         Ok(result) => {
             let (report, settlement) = result.settle_without_recovery().await;
-            match (report.status, settlement) {
-                (IntegrityTier2Status::Complete, IdleSweepSettlement::Authoritative) => {
+            match report.status {
+                IntegrityTier2Status::Complete => {
+                    debug_assert_eq!(settlement, IdleSweepSettlement::Authoritative);
                     let counters = Tier2IntegrityCounters::from(&report);
                     let evidence =
                         tier2_integrity_guardian_evidence(&journal.operation_id, &report.facts);
@@ -247,15 +258,12 @@ where
                         IdleIntegrityTerminal::Succeeded,
                     )
                 }
-                (
-                    IntegrityTier2Status::Complete | IntegrityTier2Status::Cancelled,
-                    IdleSweepSettlement::Superseded,
-                )
-                | (IntegrityTier2Status::Cancelled, IdleSweepSettlement::Authoritative) => (
+                IntegrityTier2Status::Cancelled => (
                     Tier2TerminalTransition::cancelled(Tier2IntegrityCounters::from(&report)),
                     IdleIntegrityTerminal::Cancelled,
                 ),
-                (IntegrityTier2Status::Refused, IdleSweepSettlement::Superseded) => {
+                IntegrityTier2Status::Refused => {
+                    debug_assert_eq!(settlement, IdleSweepSettlement::Superseded);
                     let counters = Tier2IntegrityCounters::from(&report);
                     let evidence =
                         tier2_integrity_guardian_evidence(&journal.operation_id, &report.facts);
@@ -264,13 +272,6 @@ where
                         IdleIntegrityTerminal::Refused,
                     )
                 }
-                (IntegrityTier2Status::Refused, IdleSweepSettlement::Authoritative) => (
-                    Tier2TerminalTransition::failed(
-                        Tier2IntegrityCounters::from(&report),
-                        Tier2IntegrityGuardianEvidence::empty(),
-                    ),
-                    IdleIntegrityTerminal::Refused,
-                ),
             }
         }
         Err(_) => (
@@ -287,11 +288,11 @@ where
 
 impl ReservedIntegritySweep {
     pub(super) fn is_current(&self) -> bool {
-        self.reservation.is_current()
+        self.settlement.is_current()
     }
 
     pub(super) fn start(self) -> IntegritySweepExecution {
-        self.planned.start_execute_reserved(self.reservation)
+        self.planned.start_execute_reserved(self.settlement)
     }
 
     #[cfg(test)]
@@ -300,7 +301,7 @@ impl ReservedIntegritySweep {
     }
 
     pub(super) async fn cancel(self) -> Result<IdleIntegrityTerminal, Tier2IntegritySweepError> {
-        self.reservation.settle(IdleSweepTerminal::Cancelled);
+        self.settlement.settle(IdleSweepTerminal::Cancelled);
         self.planned.cancel().await
     }
 
@@ -309,7 +310,7 @@ impl ReservedIntegritySweep {
         self,
     ) -> Result<IdleIntegrityTerminal, Tier2IntegritySweepError> {
         self.planned
-            .start_execute_reserved_with(self.reservation, |cancellation| cancellation.cancel())
+            .start_execute_reserved_with(self.settlement, |cancellation| cancellation.cancel())
             .wait()
             .await
     }

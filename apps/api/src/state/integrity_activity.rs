@@ -160,6 +160,12 @@ pub(crate) struct IdleSweepReservation {
     active: bool,
 }
 
+/// Move-only owner for explicit settlement; implicit loss abandons and cancels the sweep.
+#[must_use]
+pub(crate) struct IdleSweepSettlementOwner {
+    reservation: IdleSweepReservation,
+}
+
 impl IntegrityActivityCoordinator {
     pub(super) fn new() -> Self {
         let state = IntegrityActivityState {
@@ -525,6 +531,32 @@ impl IdleSweepReservation {
     }
 }
 
+impl IdleSweepSettlementOwner {
+    pub(crate) fn new(reservation: IdleSweepReservation) -> Self {
+        Self { reservation }
+    }
+
+    pub(crate) fn authority(&self) -> IdleSweepAuthority {
+        self.reservation.authority()
+    }
+
+    pub(crate) fn cancellation(&self) -> IdleSweepCancellation {
+        self.reservation.cancellation()
+    }
+
+    pub(crate) fn matches_authority(&self, authority: &IdleSweepAuthority) -> bool {
+        self.reservation.matches_authority(authority)
+    }
+
+    pub(crate) fn is_current(&self) -> bool {
+        self.reservation.is_current()
+    }
+
+    pub(crate) fn settle(self, terminal: IdleSweepTerminal) -> IdleSweepSettlement {
+        self.reservation.settle(terminal)
+    }
+}
+
 impl Drop for IdleSweepReservation {
     fn drop(&mut self) {
         if self.active {
@@ -562,6 +594,7 @@ mod tests {
 
     const _: fn() = || {
         let _ = <IdleSweepReservation as AmbiguousIfClone<_>>::assert_not_clone;
+        let _ = <IdleSweepSettlementOwner as AmbiguousIfClone<_>>::assert_not_clone;
         let _ = <IntegrityForegroundLease as AmbiguousIfClone<_>>::assert_not_clone;
     };
 
@@ -771,6 +804,69 @@ mod tests {
             reservation.settle(IdleSweepTerminal::Refused),
             IdleSweepSettlement::Superseded
         );
+        let idle = *coordinator.subscribe_idle().borrow();
+        assert!(idle.is_stably_idle());
+        assert_ne!(idle.epoch(), epoch);
+    }
+
+    #[test]
+    fn explicit_settlement_owner_refusal_releases_the_epoch() {
+        let coordinator = IntegrityActivityCoordinator::new();
+        let epoch = coordinator.subscribe_idle().borrow().epoch();
+        let owner = IdleSweepSettlementOwner::new(
+            coordinator
+                .try_reserve_idle_sweep(epoch, producer())
+                .expect("reservation"),
+        );
+        let cancellation = owner.cancellation();
+
+        assert_eq!(
+            owner.settle(IdleSweepTerminal::Refused),
+            IdleSweepSettlement::Superseded
+        );
+        assert!(!cancellation.is_cancelled());
+        let idle = *coordinator.subscribe_idle().borrow();
+        assert!(idle.is_stably_idle());
+        assert_ne!(idle.epoch(), epoch);
+    }
+
+    #[test]
+    fn dropped_settlement_owner_abandons_and_cancels_the_sweep() {
+        let coordinator = IntegrityActivityCoordinator::new();
+        let epoch = coordinator.subscribe_idle().borrow().epoch();
+        let owner = IdleSweepSettlementOwner::new(
+            coordinator
+                .try_reserve_idle_sweep(epoch, producer())
+                .expect("reservation"),
+        );
+        let cancellation = owner.cancellation();
+
+        drop(owner);
+
+        assert!(cancellation.is_cancelled());
+        let idle = *coordinator.subscribe_idle().borrow();
+        assert!(idle.is_stably_idle());
+        assert_ne!(idle.epoch(), epoch);
+    }
+
+    #[test]
+    fn panicking_settlement_owner_abandons_and_cancels_the_sweep() {
+        let coordinator = IntegrityActivityCoordinator::new();
+        let epoch = coordinator.subscribe_idle().borrow().epoch();
+        let owner = IdleSweepSettlementOwner::new(
+            coordinator
+                .try_reserve_idle_sweep(epoch, producer())
+                .expect("reservation"),
+        );
+        let cancellation = owner.cancellation();
+
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _owner = owner;
+            panic!("injected sweep owner panic");
+        }));
+
+        assert!(panic.is_err());
+        assert!(cancellation.is_cancelled());
         let idle = *coordinator.subscribe_idle().borrow();
         assert!(idle.is_stably_idle());
         assert_ne!(idle.epoch(), epoch);
