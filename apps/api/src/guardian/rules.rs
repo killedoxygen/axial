@@ -1208,13 +1208,27 @@ pub(super) const DIAGNOSIS_RULES: &[DiagnosisRule] = &[
         clauses: &[],
         "process_lifecycle_observed"
     ),
-    rule!(
+    full_rule!(
         PersistedStateSchemaInvalid,
-        [PersistedStateSchemaInvalid],
+        triggers: [PersistedStateSchemaInvalid],
+        evidence: [PersistedStateSchemaInvalid],
+        phases: &[],
+        required: &[],
+        suppressions: &[],
         RuleDomain::Fixed(GuardianDomain::State),
         RuleSeverity::Fixed(GuardianSeverity::Warning),
         RuleConfidence::Fixed(GuardianConfidence::Confirmed),
         [Warn, RecordOnly],
+        clauses: &[clause(
+            OperationPhase::Startup,
+            &[GuardianFactId::PersistedStateRepairAvailable],
+            None,
+            &[
+                GuardianActionKind::Quarantine,
+                GuardianActionKind::AskUser,
+                GuardianActionKind::RecordOnly,
+            ],
+        )],
         "persisted_state_schema_invalid"
     ),
     full_rule!(

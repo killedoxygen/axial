@@ -3,8 +3,8 @@
 
 This document is a deterministic human-readable projection of Guardian's strict invariant coverage artifact. The JSON artifact remains the complete machine-readable inventory, including all kernel cells.
 
-- Schema: `axial.guardian.invariant_coverage.v2`
-- Machine-readable artifact: [guardian-invariant-coverage-v2.json](../apps/api/tests/fixtures/guardian/guardian-invariant-coverage-v2.json)
+- Schema: `axial.guardian.invariant_coverage.v3`
+- Machine-readable artifact: [guardian-invariant-coverage-v3.json](../apps/api/tests/fixtures/guardian/guardian-invariant-coverage-v3.json)
 - Regenerate: `AXIAL_REGENERATE_GUARDIAN_INVARIANT_COVERAGE=1 cargo test -p axial-api regenerate_guardian_invariant_coverage_artifacts -- --ignored`
 
 ## Invariant Status
@@ -27,9 +27,10 @@ This document is a deterministic human-readable projection of Guardian's strict 
 | Operation phases | 12 |
 | Guardian modes | 3 |
 | Kernel cells | 540 |
+| Persisted-state Startup cells | 3 |
 | Public kernel cells | 90 |
 | Diagnosis rules | 60 |
-| Registered facts | 123 |
+| Registered facts | 124 |
 | Preflight senses | 7 |
 | Adapter sources | 101 |
 | Repair hands | 2 |
@@ -45,6 +46,13 @@ The complete kernel matrix remains in the JSON artifact.
 | Fallback | 20 | 0 |
 | RecordOnly | 300 | 0 |
 | Strip | 30 | 0 |
+
+## Persisted-State Startup Policy
+| Phase | Mode | Diagnosis | Candidates | Decision |
+| --- | --- | --- | --- | --- |
+| Startup | Managed | persisted_state_schema_invalid | Quarantine, AskUser, RecordOnly | Quarantine |
+| Startup | Custom | persisted_state_schema_invalid | Quarantine, AskUser, RecordOnly | AskUser |
+| Startup | Disabled | persisted_state_schema_invalid | Quarantine, AskUser, RecordOnly | RecordOnly |
 
 ## Preflight Senses
 | Sense | Declared cost | Timing signal | Measurement | Ceiling (ms) | Evidence |

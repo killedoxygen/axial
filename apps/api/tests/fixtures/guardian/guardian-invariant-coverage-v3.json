@@ -1,5 +1,5 @@
 {
-  "schema": "axial.guardian.invariant_coverage.v2",
+  "schema": "axial.guardian.invariant_coverage.v3",
   "invariants": [
     {
       "id": "I1",
@@ -4398,6 +4398,41 @@
       "public_surface": false
     }
   ],
+  "persisted_state_startup_cells": [
+    {
+      "phase": "Startup",
+      "mode": "Managed",
+      "diagnosis": "persisted_state_schema_invalid",
+      "candidate_actions": [
+        "Quarantine",
+        "AskUser",
+        "RecordOnly"
+      ],
+      "decision": "Quarantine"
+    },
+    {
+      "phase": "Startup",
+      "mode": "Custom",
+      "diagnosis": "persisted_state_schema_invalid",
+      "candidate_actions": [
+        "Quarantine",
+        "AskUser",
+        "RecordOnly"
+      ],
+      "decision": "AskUser"
+    },
+    {
+      "phase": "Startup",
+      "mode": "Disabled",
+      "diagnosis": "persisted_state_schema_invalid",
+      "candidate_actions": [
+        "Quarantine",
+        "AskUser",
+        "RecordOnly"
+      ],
+      "decision": "RecordOnly"
+    }
+  ],
   "rules": [
     {
       "diagnosis": "java_override_unavailable",
@@ -5902,6 +5937,11 @@
     },
     {
       "fact": "performance_user_owned_conflict",
+      "availability": "registered_current",
+      "referenced_by_rule": true
+    },
+    {
+      "fact": "persisted_state_repair_available",
       "availability": "registered_current",
       "referenced_by_rule": true
     },

@@ -3,10 +3,8 @@ use super::{
     GuardianFact, GuardianFactId, GuardianMode, GuardianPolicyContext, GuardianUserOutcome,
     author_guardian_copy, build_safety_case, decide_guardian_policy,
 };
-use crate::state::PersistedStateLoadEvidence;
-use crate::state::contracts::{
-    OperationPhase, OwnershipClass, StabilizationSystem, TargetDescriptor, TargetKind,
-};
+use crate::state::contracts::OperationPhase;
+use crate::state::{PersistedStateLoadEvidence, persisted_state_load_target};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct GuardianStateLoadOutcome {
@@ -22,13 +20,7 @@ pub(crate) fn persisted_state_load_guardian_outcome(
         return None;
     }
 
-    let target = TargetDescriptor::new(
-        StabilizationSystem::State,
-        TargetKind::Config,
-        "persisted-state-load",
-        OwnershipClass::LauncherManaged,
-    );
-    let fact = persisted_state_load_fact(target);
+    let fact = persisted_state_schema_invalid_fact();
     let safety_case = build_safety_case(
         None,
         GuardianMode::Managed,
@@ -49,10 +41,19 @@ pub(crate) fn persisted_state_load_guardian_outcome(
     })
 }
 
-fn persisted_state_load_fact(target: TargetDescriptor) -> GuardianFact {
+pub(super) fn persisted_state_schema_invalid_fact() -> GuardianFact {
+    persisted_state_fact(GuardianFactId::PersistedStateSchemaInvalid)
+}
+
+pub(super) fn persisted_state_repair_available_fact() -> GuardianFact {
+    persisted_state_fact(GuardianFactId::PersistedStateRepairAvailable)
+}
+
+fn persisted_state_fact(id: GuardianFactId) -> GuardianFact {
+    let target = persisted_state_load_target();
     GuardianFact {
         operation_id: None,
-        id: GuardianFactId::PersistedStateSchemaInvalid,
+        id,
         domain: GuardianDomain::State,
         phase: OperationPhase::Startup,
         reliability: FactReliability::DirectStructured,

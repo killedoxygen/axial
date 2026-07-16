@@ -1,5 +1,8 @@
 use super::assess_install_artifact_failure;
 use super::launch_decision::failure_class_matrix_decision;
+use super::persisted_state_repair::{
+    PERSISTED_STATE_REPAIR_CANDIDATES, persisted_state_startup_policy_cells,
+};
 use super::repair_authorization::repair_hand_coverage;
 use super::rules::DIAGNOSIS_RULES;
 use super::{
@@ -30,7 +33,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
 use std::fmt::Write as _;
 
-const SCHEMA: &str = "axial.guardian.invariant_coverage.v2";
+const SCHEMA: &str = "axial.guardian.invariant_coverage.v3";
 const REGENERATE_ENV: &str = "AXIAL_REGENERATE_GUARDIAN_INVARIANT_COVERAGE";
 const EXPECTED_DECISION_COUNTS: [(GuardianActionKind, usize); 5] = [
     (GuardianActionKind::Block, 160),
@@ -56,6 +59,7 @@ struct InvariantCoverage {
     invariants: Vec<InvariantState>,
     axes: CoverageAxes,
     kernel_cells: Vec<KernelCell>,
+    persisted_state_startup_cells: Vec<PersistedStateStartupCell>,
     rules: Vec<RuleCoverage>,
     facts: Vec<FactCoverage>,
     preflight_senses: Vec<PreflightSenseCoverage>,
@@ -89,6 +93,16 @@ struct KernelCell {
     diagnosis: String,
     decision: String,
     public_surface: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PersistedStateStartupCell {
+    phase: String,
+    mode: String,
+    diagnosis: String,
+    candidate_actions: Vec<String>,
+    decision: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -190,7 +204,7 @@ struct DeferredDemonstration {
 }
 
 #[test]
-fn guardian_invariant_coverage_artifacts_match_v2() {
+fn guardian_invariant_coverage_artifacts_match_v3() {
     let generated = generate_coverage();
     let expected_json =
         std::fs::read(json_fixture_path()).expect("read Guardian invariant fixture");
@@ -266,6 +280,7 @@ fn generate_coverage() -> InvariantCoverage {
             modes: GuardianMode::ALL.iter().map(debug_name).collect(),
         },
         kernel_cells,
+        persisted_state_startup_cells: persisted_state_startup_cells(),
         rules: rule_coverage(),
         facts: fact_coverage(),
         preflight_senses: preflight_sense_coverage(),
@@ -369,6 +384,33 @@ fn assert_decision_counts(cells: &[KernelCell]) {
         assert_eq!(counts.get(debug_name(&decision).as_str()), Some(&expected));
     }
     assert_eq!(counts.values().sum::<usize>(), 540);
+}
+
+fn persisted_state_startup_cells() -> Vec<PersistedStateStartupCell> {
+    let cells = persisted_state_startup_policy_cells()
+        .into_iter()
+        .map(|(mode, decision)| PersistedStateStartupCell {
+            phase: debug_name(&OperationPhase::Startup),
+            mode: debug_name(&mode),
+            diagnosis: DiagnosisId::PersistedStateSchemaInvalid
+                .as_str()
+                .to_string(),
+            candidate_actions: PERSISTED_STATE_REPAIR_CANDIDATES
+                .iter()
+                .map(debug_name)
+                .collect(),
+            decision: debug_name(&decision),
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(cells.len(), GuardianMode::ALL.len());
+    assert_eq!(
+        cells
+            .iter()
+            .map(|cell| cell.decision.as_str())
+            .collect::<Vec<_>>(),
+        ["Quarantine", "AskUser", "RecordOnly"]
+    );
+    cells
 }
 
 fn assert_reachable_public_copy(cells: &[KernelCell]) {
@@ -496,6 +538,26 @@ fn assert_rule_registration() {
         assert!(
             rule.evidence_fact_ids
                 .iter()
+                .all(guardian_fact_is_registered)
+        );
+        assert!(
+            rule.required_conditions
+                .iter()
+                .chain(
+                    rule.suppressions
+                        .iter()
+                        .flat_map(|suppression| suppression.required_conditions),
+                )
+                .chain(
+                    rule.clauses
+                        .iter()
+                        .flat_map(|clause| clause.required_conditions),
+                )
+                .chain(
+                    rule.clauses
+                        .iter()
+                        .flat_map(|clause| clause.evidence_fact_ids.into_iter().flatten()),
+                )
                 .all(guardian_fact_is_registered)
         );
     }
@@ -787,7 +849,7 @@ fn markdown_document_bytes(snapshot: &InvariantCoverage) -> Vec<u8> {
          # Guardian Invariant Coverage\n\n\
          This document is a deterministic human-readable projection of Guardian's strict invariant coverage artifact. The JSON artifact remains the complete machine-readable inventory, including all kernel cells.\n\n\
          - Schema: `{}`\n\
-         - Machine-readable artifact: [guardian-invariant-coverage-v2.json](../apps/api/tests/fixtures/guardian/guardian-invariant-coverage-v2.json)\n\
+         - Machine-readable artifact: [guardian-invariant-coverage-v3.json](../apps/api/tests/fixtures/guardian/guardian-invariant-coverage-v3.json)\n\
          - Regenerate: `AXIAL_REGENERATE_GUARDIAN_INVARIANT_COVERAGE=1 cargo test -p axial-api regenerate_guardian_invariant_coverage_artifacts -- --ignored`\n\n\
          ## Invariant Status\n",
         snapshot.schema
@@ -820,6 +882,10 @@ fn markdown_document_bytes(snapshot: &InvariantCoverage) -> Vec<u8> {
             ("Operation phases", snapshot.axes.phases.len()),
             ("Guardian modes", snapshot.axes.modes.len()),
             ("Kernel cells", snapshot.kernel_cells.len()),
+            (
+                "Persisted-state Startup cells",
+                snapshot.persisted_state_startup_cells.len(),
+            ),
             ("Public kernel cells", public_cells),
             ("Diagnosis rules", snapshot.rules.len()),
             ("Registered facts", snapshot.facts.len()),
@@ -850,6 +916,21 @@ fn markdown_document_bytes(snapshot: &InvariantCoverage) -> Vec<u8> {
             .map(|(decision, (all, public))| {
                 vec![decision.to_string(), all.to_string(), public.to_string()]
             }),
+    );
+
+    document.push_str("\n## Persisted-State Startup Policy\n");
+    markdown_table(
+        &mut document,
+        &["Phase", "Mode", "Diagnosis", "Candidates", "Decision"],
+        snapshot.persisted_state_startup_cells.iter().map(|cell| {
+            vec![
+                cell.phase.clone(),
+                cell.mode.clone(),
+                cell.diagnosis.clone(),
+                cell.candidate_actions.join(", "),
+                cell.decision.clone(),
+            ]
+        }),
     );
 
     document.push_str("\n## Preflight Senses\n");
@@ -957,7 +1038,7 @@ fn markdown_cell(value: &str) -> String {
 
 fn json_fixture_path() -> std::path::PathBuf {
     std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures/guardian/guardian-invariant-coverage-v2.json")
+        .join("tests/fixtures/guardian/guardian-invariant-coverage-v3.json")
 }
 
 fn markdown_document_path() -> std::path::PathBuf {

@@ -16,6 +16,7 @@ pub mod launch_decision;
 pub mod launch_failure_memory;
 pub mod launch_recovery;
 pub mod performance;
+pub(crate) mod persisted_state_repair;
 pub mod policy;
 pub mod preflight;
 mod repair_authorization;

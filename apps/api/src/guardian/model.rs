@@ -122,6 +122,7 @@ pub enum GuardianFactId {
     PerformanceHealthInvalid,
     PerformanceRulesInvalid,
     PerformanceUserOwnedConflict,
+    PersistedStateRepairAvailable,
     PersistedStateSchemaInvalid,
     PrimitiveRefused,
     ProcessExited,
@@ -145,7 +146,7 @@ pub enum GuardianFactId {
 }
 
 impl GuardianFactId {
-    pub const ALL: [Self; 123] = [
+    pub const ALL: [Self; 124] = [
         Self::AgentHookFailed,
         Self::AgentUnavailable,
         Self::ArtifactChecksumMismatch,
@@ -249,6 +250,7 @@ impl GuardianFactId {
         Self::PerformanceHealthInvalid,
         Self::PerformanceRulesInvalid,
         Self::PerformanceUserOwnedConflict,
+        Self::PersistedStateRepairAvailable,
         Self::PersistedStateSchemaInvalid,
         Self::PrimitiveRefused,
         Self::ProcessExited,
@@ -382,6 +384,7 @@ impl GuardianFactId {
             Self::PerformanceHealthInvalid => "performance_health_invalid",
             Self::PerformanceRulesInvalid => "performance_rules_invalid",
             Self::PerformanceUserOwnedConflict => "performance_user_owned_conflict",
+            Self::PersistedStateRepairAvailable => "persisted_state_repair_available",
             Self::PersistedStateSchemaInvalid => "persisted_state_schema_invalid",
             Self::PrimitiveRefused => "primitive_refused",
             Self::ProcessExited => "process_exited",

@@ -24,6 +24,7 @@ pub mod performance_operations;
 mod performance_rules;
 mod persisted_state_load;
 mod persisted_state_rejection_streaks;
+mod persisted_state_repair;
 pub mod presence;
 mod reconciliation;
 mod registered_artifact_findings;
@@ -102,7 +103,16 @@ pub(crate) use performance_managed::{
     ManagedInstanceAdmissionError,
 };
 pub use performance_rules::AppPerformanceStore;
-pub(crate) use persisted_state_load::PersistedStateLoadEvidence;
+#[cfg(test)]
+pub(crate) use persisted_state_load::persisted_state_rejected_record_eligibility_for_test;
+pub(crate) use persisted_state_load::{
+    PersistedStateLoadEvidence, PersistedStateRejectedRecordEligibility,
+    persisted_state_load_target,
+};
+pub(crate) use persisted_state_repair::{
+    PersistedStateRejectedRecordQuarantineAuthorization,
+    authorize_persisted_state_rejected_record_quarantine,
+};
 #[cfg(test)]
 pub(crate) use reconciliation::reconciliation_hand_coverage;
 pub(crate) use reconciliation::{

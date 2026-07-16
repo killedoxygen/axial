@@ -102,6 +102,7 @@
   "performance_health_invalid",
   "performance_rules_invalid",
   "performance_user_owned_conflict",
+  "persisted_state_repair_available",
   "persisted_state_schema_invalid",
   "primitive_refused",
   "process_exited",

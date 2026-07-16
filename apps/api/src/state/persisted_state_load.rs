@@ -3,11 +3,21 @@ use crate::execution::anchored_record::{
     AnchoredRecordRestartDigest,
 };
 use crate::state::contracts::{
-    PersistedStateRecordStore, RestartStableRecordIdentity, TargetDescriptor,
+    OwnershipClass, PersistedStateRecordStore, RestartStableRecordIdentity, StabilizationSystem,
+    TargetDescriptor, TargetKind,
 };
 
 pub(super) const MAX_REJECTED_RESTART_RECORDS_PER_STORE: usize = 8;
 pub(super) const MAX_RESTART_RECORD_BYTES: u64 = 256 * 1024;
+
+pub(crate) fn persisted_state_load_target() -> TargetDescriptor {
+    TargetDescriptor::new(
+        StabilizationSystem::State,
+        TargetKind::Config,
+        "persisted-state-load",
+        OwnershipClass::LauncherManaged,
+    )
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum PersistedStateRecordRejection {
@@ -131,6 +141,30 @@ impl PersistedStateRejectedRecordEligibility {
     pub(crate) fn physical_identity(&self) -> &RestartStableRecordIdentity {
         self.record.restart_identity()
     }
+}
+
+#[cfg(test)]
+pub(crate) fn persisted_state_rejected_record_eligibility_for_test(
+    root: &std::path::Path,
+    file_name: &std::ffi::OsStr,
+    record_id: &str,
+) -> std::io::Result<PersistedStateRejectedRecordEligibility> {
+    let observation = crate::execution::anchored_record::AnchoredRecordDirectory::open(root)?
+        .read_for_mutation(file_name, MAX_RESTART_RECORD_BYTES)?;
+    let (identity, restart_digest) = observation.into_restart_identity()?;
+    Ok(PersistedStateRejectedRecord::new(
+        PersistedStateRecordStore::PerformanceOperation,
+        PersistedStateRecordRejection::InvalidSchema,
+        TargetDescriptor::new(
+            StabilizationSystem::State,
+            TargetKind::Config,
+            record_id,
+            OwnershipClass::LauncherManaged,
+        ),
+        identity,
+        restart_digest,
+    )
+    .into_eligibility())
 }
 
 impl PersistedStateRejectedRecordQuarantineReceipt {
