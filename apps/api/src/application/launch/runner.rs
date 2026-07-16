@@ -1263,6 +1263,15 @@ async fn launch_session_inner_with_control(
                 } else {
                     GuardianStartupFailureObservation::Exited { failure_class }
                 };
+                let user_mod_witness_fact = sense_user_mod_witness_drift_after_failure(
+                    &state,
+                    integrity_foreground
+                        .as_ref()
+                        .expect("preboot launch must retain foreground authority"),
+                    &intent.instance_id,
+                    failure_class,
+                )
+                .await;
                 let mut integrity = if registered_recovery_process_retry_used {
                     StartupFailureIntegrity::default()
                 } else {
@@ -1277,16 +1286,7 @@ async fn launch_session_inner_with_control(
                     )
                     .await
                 };
-                if let Some(fact) = sense_user_mod_witness_drift_after_failure(
-                    &state,
-                    integrity_foreground
-                        .as_ref()
-                        .expect("preboot launch must retain foreground authority"),
-                    &intent.instance_id,
-                    failure_class,
-                )
-                .await
-                {
+                if let Some(fact) = user_mod_witness_fact {
                     integrity.facts.push(fact);
                 }
                 control.record_startup_integrity(&integrity);
