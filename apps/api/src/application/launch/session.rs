@@ -34,7 +34,6 @@ use crate::state::contracts::OperationPhase;
 use crate::state::launch_reports::{LaunchBenchmarkMetadata, LaunchProofResourceBudget};
 use crate::state::{
     AppState, InstanceLifecycleLease, IntegrityForegroundLease, LaunchSessionRecord,
-    ensure_instance_layout,
 };
 use auth::{LaunchAuthRefreshOptions, resolve_launch_auth_context};
 use axial_config::{AppConfig, Instance};
@@ -247,12 +246,11 @@ async fn prepare_launch_session_with_auth_refresh(
             Json(json!({ "error": "instance already has an active session" })),
         ));
     }
-    let layout_started_at = Instant::now();
-    ensure_instance_layout(state.instances().paths().clone(), instance.id.clone())
+    let game_dir = state
+        .instances()
+        .registered_game_dir(&instance)
         .await
-        .map_err(launch_layout_error_response)?;
-    let layout_elapsed = layout_started_at.elapsed();
-    let game_dir = state.instances().game_dir(&instance.id);
+        .map_err(launch_instance_root_error_response)?;
 
     let config = state.config().current();
     let auth_started_at = Instant::now();
@@ -324,7 +322,6 @@ async fn prepare_launch_session_with_auth_refresh(
                 instance_id: &instance.id,
                 version_id: &instance.version_id,
                 total: started_at.elapsed(),
-                layout: layout_elapsed,
                 auth: auth_elapsed,
                 preflight: preflight_elapsed,
                 runtime_repair: repair_elapsed,
@@ -421,7 +418,6 @@ async fn prepare_launch_session_with_auth_refresh(
             instance_id: &instance.id,
             version_id: &instance.version_id,
             total: started_at.elapsed(),
-            layout: layout_elapsed,
             auth: auth_elapsed,
             preflight: preflight_elapsed,
             runtime_repair: repair_elapsed,
@@ -448,13 +444,13 @@ async fn prepare_launch_session_with_auth_refresh(
     })
 }
 
-fn launch_layout_error_response(
+fn launch_instance_root_error_response(
     _error: impl std::fmt::Display,
 ) -> (StatusCode, Json<serde_json::Value>) {
     (
         StatusCode::INTERNAL_SERVER_ERROR,
         Json(json!({
-            "error": "Could not prepare the instance folder. Check app data permissions and try again."
+            "error": "Could not access the registered instance folder. Check app data permissions and try again."
         })),
     )
 }

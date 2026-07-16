@@ -169,6 +169,31 @@ impl AppInstanceStore {
         self.paths.instances_dir.join(id)
     }
 
+    pub(crate) async fn registered_game_dir(
+        &self,
+        instance: &Instance,
+    ) -> Result<PathBuf, InstanceStoreError> {
+        if !is_canonical_instance_id(&instance.id)
+            || self.get(&instance.id).as_ref() != Some(instance)
+        {
+            return Err(instance_not_found_error());
+        }
+        let game_dir = self.game_dir(&instance.id);
+        for path in [&self.paths.config_dir, &self.paths.instances_dir, &game_dir] {
+            let metadata = tokio::fs::symlink_metadata(path).await?;
+            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                return Err(InstanceStoreError::Persistence(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "registered instance root is not a regular directory",
+                )));
+            }
+        }
+        if self.get(&instance.id).as_ref() != Some(instance) {
+            return Err(instance_not_found_error());
+        }
+        Ok(game_dir)
+    }
+
     pub fn paths(&self) -> &AppPaths {
         &self.paths
     }
@@ -770,19 +795,6 @@ fn duplicate_name(
         }
     }
     unreachable!("bounded registry must leave an available duplicate name")
-}
-
-pub(crate) async fn ensure_instance_layout(
-    paths: AppPaths,
-    instance_id: String,
-) -> Result<(), InstanceStoreError> {
-    tokio::task::spawn_blocking(move || ensure_instance_layout_blocking(&paths, &instance_id))
-        .await
-        .map_err(|error| {
-            InstanceStoreError::Persistence(io::Error::other(format!(
-                "instance layout task stopped: {error}"
-            )))
-        })?
 }
 
 async fn prepare_new_instance_layout(

@@ -2506,7 +2506,7 @@ mod tests {
             fs::read(&library_path).expect("leaf-repaired Libraries fixture"),
             MANAGED_LIBRARY_FIXTURE_BYTES
         );
-        assert_eq!(user_owned.len(), 4);
+        assert_eq!(user_owned.len(), 5);
         assert_user_owned_launch_sentinels(&user_owned);
         let reconciliation = state
             .journals()
@@ -5357,6 +5357,7 @@ mod tests {
             ("mods/user.jar", b"mod".as_slice()),
             ("config/user.toml", b"config".as_slice()),
             ("resourcepacks/user.zip", b"resourcepack".as_slice()),
+            ("custom/opaque/nested.bin", b"unknown-owned".as_slice()),
         ]
         .into_iter()
         .map(|(relative, contents)| {

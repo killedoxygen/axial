@@ -75,8 +75,8 @@ pub use installs::{
     QueuedInstallEntry,
 };
 pub use instance_registry::AppInstanceStore;
+pub(crate) use instance_registry::instance_not_found_error;
 pub(crate) use instance_registry::{InstanceUpdate, new_instance};
-pub(crate) use instance_registry::{ensure_instance_layout, instance_not_found_error};
 pub(crate) use integrity_activity::{
     IdleSweepAuthority, IdleSweepCancellation, IdleSweepReservation, IdleSweepReserveError,
     IdleSweepSettlement, IdleSweepSettlementOwner, IdleSweepTerminal, IntegrityActivityClosed,

@@ -105,27 +105,31 @@ async fn prepare_launch_session_rejects_shutdown_without_returning_a_task() {
 }
 
 #[tokio::test]
-async fn prepare_launch_session_repairs_directories_without_restoring_deleted_user_files() {
-    let fixture = TestFixture::new("prepare-preserves-deleted-user-files");
+async fn prepare_launch_session_creates_no_user_owned_paths() {
+    let fixture = TestFixture::new("prepare-creates-no-user-owned-paths");
     fixture.write_ready_install("1.21.1");
-    fs::write(
-        fixture.paths.library_dir.join("options.txt"),
-        "shared options",
-    )
-    .expect("write options");
-    fs::write(
-        fixture.paths.library_dir.join("servers.dat"),
-        "shared servers",
-    )
-    .expect("write servers");
     let instance_id = fixture.add_instance("Survival", "1.21.1");
     let game_dir = fixture.state.instances().game_dir(&instance_id);
-    fs::write(game_dir.join("options.txt"), "user options").expect("write user options");
-    fs::write(game_dir.join("servers.dat"), "user servers").expect("write user servers");
-    fs::remove_file(game_dir.join("options.txt")).expect("delete user options");
-    fs::remove_file(game_dir.join("servers.dat")).expect("delete user servers");
-    let _ = fs::remove_dir_all(game_dir.join("screenshots"));
-    let _ = fs::remove_dir_all(game_dir.join("logs"));
+    let user_owned_paths = [
+        "mods",
+        "saves",
+        "resourcepacks",
+        "shaderpacks",
+        "config",
+        "screenshots",
+        "logs",
+        "options.txt",
+        "servers.dat",
+    ];
+    for relative in user_owned_paths {
+        let path = game_dir.join(relative);
+        if path.is_dir() {
+            fs::remove_dir_all(path).expect("remove prepared user-owned directory");
+        } else if path.exists() {
+            fs::remove_file(path).expect("remove prepared user-owned file");
+        }
+    }
+    assert!(game_dir.is_dir());
 
     let prepared = prepare_launch_session(
         &fixture.state,
@@ -186,10 +190,12 @@ async fn prepare_launch_session_repairs_directories_without_restoring_deleted_us
     );
     assert_eq!(prepared.task.intent.auth.access_token, "0");
     assert_eq!(prepared.task.intent.auth.user_type, "msa");
-    assert!(game_dir.join("screenshots").is_dir());
-    assert!(game_dir.join("logs").is_dir());
-    assert!(!game_dir.join("options.txt").exists());
-    assert!(!game_dir.join("servers.dat").exists());
+    for relative in user_owned_paths {
+        assert!(
+            !game_dir.join(relative).exists(),
+            "launch preparation created user-owned path {relative}"
+        );
+    }
 }
 
 #[tokio::test]
