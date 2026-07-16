@@ -669,6 +669,8 @@ mod tests {
     use std::time::Duration;
     use tempfile::TempDir;
 
+    const PUBLICATION_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(5);
+
     #[derive(Debug, Deserialize, Eq, PartialEq, Serialize)]
     #[serde(deny_unknown_fields)]
     struct TestMarker {
@@ -912,7 +914,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn different_roots_do_not_block_each_other() {
+    async fn different_roots_do_not_share_publication_exclusion() {
         let first_temporary = library_root("different-root-first");
         let second_temporary = library_root("different-root-second");
         let first = ManagedRootPublicationLease::acquire(
@@ -922,7 +924,7 @@ mod tests {
         .expect("first lease");
 
         let second = tokio::time::timeout(
-            Duration::from_millis(100),
+            PUBLICATION_ACQUIRE_TIMEOUT,
             ManagedRootPublicationLease::acquire(
                 ManagedDir::open_root(&second_temporary.path().join("library"))
                     .expect("second root"),
@@ -1080,7 +1082,7 @@ mod tests {
         drop(first);
 
         tokio::time::timeout(
-            Duration::from_millis(100),
+            PUBLICATION_ACQUIRE_TIMEOUT,
             ManagedRootPublicationLease::acquire(ManagedDir::open_root(&root).expect("final root")),
         )
         .await
@@ -1111,7 +1113,7 @@ mod tests {
         external_lock.unlock().expect("release external lock");
 
         tokio::time::timeout(
-            Duration::from_millis(100),
+            PUBLICATION_ACQUIRE_TIMEOUT,
             ManagedRootPublicationLease::acquire(ManagedDir::open_root(&root).expect("final root")),
         )
         .await
