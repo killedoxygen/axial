@@ -28,6 +28,8 @@ use std::io::{self, Read};
 #[cfg(any(windows, test))]
 use std::ops::Range;
 use std::path::{Path, PathBuf};
+#[cfg(all(test, target_os = "linux"))]
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -2228,6 +2230,43 @@ pub(crate) struct IntegrityTier2OwnedWork {
     state: AppState,
     ticket: KnownGoodTier2Ticket,
     settlement: IdleSweepSettlementOwner,
+    #[cfg(all(test, target_os = "linux"))]
+    progress_observer: Option<IntegrityTier2ProgressObserver>,
+}
+
+#[cfg(all(test, target_os = "linux"))]
+#[derive(Clone, Default)]
+pub(crate) struct IntegrityTier2ProgressObserver {
+    shared: Arc<IntegrityTier2Progress>,
+}
+
+#[cfg(all(test, target_os = "linux"))]
+#[derive(Default)]
+struct IntegrityTier2Progress {
+    content_read_count: AtomicUsize,
+    settled_at: Mutex<Option<Instant>>,
+}
+
+#[cfg(all(test, target_os = "linux"))]
+impl IntegrityTier2ProgressObserver {
+    fn content_read_started(&self) {
+        self.shared
+            .content_read_count
+            .fetch_add(1, Ordering::Release);
+    }
+
+    pub(crate) fn content_read_count(&self) -> usize {
+        self.shared.content_read_count.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn settlement_finished(&self) {
+        let mut settled_at = self.shared.settled_at.lock().expect("Tier 2 progress");
+        settled_at.get_or_insert_with(Instant::now);
+    }
+
+    pub(crate) fn settled_at(&self) -> Option<Instant> {
+        *self.shared.settled_at.lock().expect("Tier 2 progress")
+    }
 }
 
 pub(crate) struct IntegrityTier2OwnedWorkAuthorityMismatch {
@@ -2441,7 +2480,18 @@ impl IntegrityTier2OwnedWork {
             state,
             ticket,
             settlement,
+            #[cfg(all(test, target_os = "linux"))]
+            progress_observer: None,
         })
+    }
+
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn observe_progress_for_test(
+        mut self,
+        observer: IntegrityTier2ProgressObserver,
+    ) -> Self {
+        self.progress_observer = Some(observer);
+        self
     }
 
     pub(crate) fn spawn(self) -> IntegrityTier2BlockingWorker {
@@ -2517,10 +2567,18 @@ where
         state,
         ticket,
         settlement,
+        #[cfg(all(test, target_os = "linux"))]
+        progress_observer,
     } = work;
     let cancellation = settlement.cancellation();
     let report = run_integrity_tier2_owned(platform, || {
-        sense_integrity_tier2_owned(&state, &ticket, &cancellation)
+        sense_integrity_tier2_owned(
+            &state,
+            &ticket,
+            &cancellation,
+            #[cfg(all(test, target_os = "linux"))]
+            progress_observer,
+        )
     });
     IntegrityTier2OwnedResult {
         state,
@@ -2535,6 +2593,8 @@ fn refuse_integrity_tier2_thread_spawn(work: IntegrityTier2OwnedWork) -> Integri
         state,
         ticket,
         settlement,
+        #[cfg(all(test, target_os = "linux"))]
+            progress_observer: _,
     } = work;
     let report = IntegrityTier2Report::new(0, 0).refuse(tier2_worker_refused_fact());
     IntegrityTier2OwnedResult {
@@ -2636,16 +2696,27 @@ impl IntegrityTier2Report {
 trait IntegrityTier2Pacer {
     fn elapsed(&self) -> Duration;
     fn sleep(&self, duration: Duration);
+
+    #[cfg(all(test, target_os = "linux"))]
+    fn content_read_started(&self) {}
 }
 
 struct SystemIntegrityTier2Pacer {
     started_at: Instant,
+    #[cfg(all(test, target_os = "linux"))]
+    progress_observer: Option<IntegrityTier2ProgressObserver>,
 }
 
 impl SystemIntegrityTier2Pacer {
-    fn start() -> Self {
+    fn start(
+        #[cfg(all(test, target_os = "linux"))] progress_observer: Option<
+            IntegrityTier2ProgressObserver,
+        >,
+    ) -> Self {
         Self {
             started_at: Instant::now(),
+            #[cfg(all(test, target_os = "linux"))]
+            progress_observer,
         }
     }
 }
@@ -2657,6 +2728,13 @@ impl IntegrityTier2Pacer for SystemIntegrityTier2Pacer {
 
     fn sleep(&self, duration: Duration) {
         std::thread::sleep(duration);
+    }
+
+    #[cfg(all(test, target_os = "linux"))]
+    fn content_read_started(&self) {
+        if let Some(observer) = &self.progress_observer {
+            observer.content_read_started();
+        }
     }
 }
 
@@ -2731,12 +2809,17 @@ impl<Pacer: IntegrityTier2Pacer> IntegrityTier2ReadControl<'_, Pacer> {
 
 impl<Pacer: IntegrityTier2Pacer> ContentReadControl for IntegrityTier2ReadControl<'_, Pacer> {
     fn before_read(&mut self, next_read_bytes: usize) -> bool {
-        self.admit(
+        let admitted = self.admit(
             next_read_bytes as u64,
             INTEGRITY_TIER2_BYTES_PER_SECOND,
             INTEGRITY_TIER2_BYTE_BURST,
             true,
-        )
+        );
+        #[cfg(all(test, target_os = "linux"))]
+        if admitted {
+            self.pacer.content_read_started();
+        }
+        admitted
     }
 }
 
@@ -2752,6 +2835,9 @@ fn sense_integrity_tier2_owned(
     state: &AppState,
     ticket: &KnownGoodTier2Ticket,
     cancellation: &IdleSweepCancellation,
+    #[cfg(all(test, target_os = "linux"))] progress_observer: Option<
+        IntegrityTier2ProgressObserver,
+    >,
 ) -> IntegrityTier2Report {
     let (library_root, runtime_cache, inventory) = ticket.execution_parts();
     if cancellation.is_cancelled() {
@@ -2764,7 +2850,10 @@ fn sense_integrity_tier2_owned(
                 .refuse(tier2_projection_refused_fact(error.entry_count()));
         }
     };
-    let pacer = SystemIntegrityTier2Pacer::start();
+    let pacer = SystemIntegrityTier2Pacer::start(
+        #[cfg(all(test, target_os = "linux"))]
+        progress_observer,
+    );
     run_integrity_tier2_with(
         projection,
         IntegrityTier2RunContext {
@@ -5190,6 +5279,8 @@ mod tests {
             state: work_state,
             ticket,
             settlement,
+            #[cfg(target_os = "linux")]
+                progress_observer: _,
         } = work;
         settlement.settle(IdleSweepTerminal::Cancelled);
         let epoch = state.subscribe_integrity_idle().borrow().epoch();
@@ -5221,6 +5312,8 @@ mod tests {
             state: work_state,
             ticket,
             settlement,
+            #[cfg(target_os = "linux")]
+                progress_observer: _,
         } = work;
         let cancellation = settlement.cancellation();
         cancellation.cancel();
@@ -5246,6 +5339,8 @@ mod tests {
             state: originating_state,
             ticket,
             settlement,
+            #[cfg(target_os = "linux")]
+                progress_observer: _,
         } = work;
         let cancellation = settlement.cancellation();
 

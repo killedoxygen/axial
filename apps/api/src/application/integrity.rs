@@ -1,6 +1,8 @@
 use crate::application::registered_artifact_recovery::{
     RegisteredArtifactComponentRebuildSource, prepare_tier2_registered_artifact_recovery,
 };
+#[cfg(all(test, target_os = "linux"))]
+use crate::execution::integrity::IntegrityTier2ProgressObserver;
 use crate::execution::integrity::{
     IntegrityTier2OwnedWork, IntegrityTier2OwnedWorkRejection, IntegrityTier2Report,
     IntegrityTier2Status,
@@ -217,6 +219,33 @@ impl PlannedIntegritySweep {
                 settlement,
                 after_spawn,
                 rebuild_source,
+                #[cfg(target_os = "linux")]
+                None,
+            )),
+        }
+    }
+
+    #[cfg(all(test, target_os = "linux"))]
+    fn start_execute_reserved_with_progress_observer(
+        self,
+        settlement: IdleSweepSettlementOwner,
+        progress_observer: IntegrityTier2ProgressObserver,
+    ) -> IntegritySweepExecution {
+        let Self {
+            state,
+            producer,
+            instance_id,
+            journal,
+        } = self;
+        IntegritySweepExecution {
+            completion: producer.spawn_joinable(execute_reserved_owned_with_source(
+                state,
+                instance_id,
+                journal,
+                settlement,
+                |_| {},
+                RegisteredArtifactComponentRebuildSource::Production,
+                Some(progress_observer),
             )),
         }
     }
@@ -246,6 +275,8 @@ where
         settlement,
         after_spawn,
         RegisteredArtifactComponentRebuildSource::Production,
+        #[cfg(all(test, target_os = "linux"))]
+        None,
     )
     .await
 }
@@ -257,6 +288,9 @@ async fn execute_reserved_owned_with_source<AfterSpawn>(
     settlement: IdleSweepSettlementOwner,
     after_spawn: AfterSpawn,
     rebuild_source: RegisteredArtifactComponentRebuildSource,
+    #[cfg(all(test, target_os = "linux"))] progress_observer: Option<
+        IntegrityTier2ProgressObserver,
+    >,
 ) -> Result<IdleIntegrityTerminal, Tier2IntegritySweepError>
 where
     AfterSpawn: FnOnce(IdleSweepCancellation),
@@ -309,6 +343,11 @@ where
             return Ok(terminal);
         }
     };
+    #[cfg(all(test, target_os = "linux"))]
+    let work = match &progress_observer {
+        Some(observer) => work.observe_progress_for_test(observer.clone()),
+        None => work,
+    };
     let worker = work.spawn();
     after_spawn(cancellation);
     let result = worker.join().await;
@@ -330,6 +369,10 @@ where
                     async move { recovery.execute().await.map(drop) }
                 })
                 .await;
+            #[cfg(all(test, target_os = "linux"))]
+            if let Some(observer) = &progress_observer {
+                observer.settlement_finished();
+            }
             if let Some(error) = recovery_error {
                 tracing::warn!(
                     operation_id = journal.operation_id.as_str(),
@@ -388,6 +431,15 @@ impl ReservedIntegritySweep {
     #[cfg(test)]
     pub(super) async fn execute(self) -> Result<IdleIntegrityTerminal, Tier2IntegritySweepError> {
         self.start().wait().await
+    }
+
+    #[cfg(all(test, target_os = "linux"))]
+    fn start_with_progress_observer(
+        self,
+        progress_observer: IntegrityTier2ProgressObserver,
+    ) -> IntegritySweepExecution {
+        self.planned
+            .start_execute_reserved_with_progress_observer(self.settlement, progress_observer)
     }
 
     #[cfg(test)]
@@ -851,14 +903,36 @@ mod tests {
     use sha1::{Digest as _, Sha1};
     use std::fs;
     use std::io;
+    #[cfg(target_os = "linux")]
+    use std::io::Write as _;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Condvar, Mutex};
+    #[cfg(target_os = "linux")]
+    use std::time::Instant;
     use std::time::{SystemTime, UNIX_EPOCH};
     use tokio::sync::Notify;
 
     const FIRST_OPERATION_ID: &str = "integrity-sweep-00000000-0000-4000-8000-000000000001";
     const SECOND_OPERATION_ID: &str = "integrity-sweep-00000000-0000-4000-8000-000000000002";
+    #[cfg(target_os = "linux")]
+    const R5_REPRESENTATIVE_ENTRY_COUNT: usize = 442;
+    #[cfg(target_os = "linux")]
+    const R5_REPRESENTATIVE_CONTENT_BYTES: u64 = 344_363_465;
+    #[cfg(target_os = "linux")]
+    const R5_LAUNCH_SAMPLE_COUNT: usize = 21;
+    #[cfg(target_os = "linux")]
+    const R5_LAUNCH_IMPACT_CEILING: Duration = Duration::from_millis(10);
+
+    #[cfg(target_os = "linux")]
+    struct R5MeasurementRoot(PathBuf);
+
+    #[cfg(target_os = "linux")]
+    impl Drop for R5MeasurementRoot {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
 
     struct GatedJournalBackend {
         attempts: AtomicUsize,
@@ -955,6 +1029,10 @@ mod tests {
                 .expect("clock")
                 .as_nanos()
         ));
+        state_fixture_at(root)
+    }
+
+    fn state_fixture_at(root: PathBuf) -> (AppState, PathBuf, AppPaths) {
         let config_dir = root.join("config");
         let paths = AppPaths {
             config_file: config_dir.join("config.json"),
@@ -1394,6 +1472,472 @@ exit 0
         assert_eq!(running.state, axial_launcher::LaunchState::Running);
         assert!(running.boot_completed_at_ms.is_some());
         let _ = state.sessions().kill(&session_id).await;
+    }
+
+    #[cfg(target_os = "linux")]
+    fn r5_measurement_root() -> R5MeasurementRoot {
+        let supplied_parent = PathBuf::from(
+            std::env::var_os("AXIAL_R5_MEASUREMENT_ROOT")
+                .expect("AXIAL_R5_MEASUREMENT_ROOT is required"),
+        );
+        let metadata =
+            fs::symlink_metadata(&supplied_parent).expect("R5 measurement root metadata");
+        assert!(metadata.is_dir(), "R5 measurement root must be a directory");
+        assert!(
+            !metadata.file_type().is_symlink(),
+            "R5 measurement root must not be a symlink"
+        );
+        let parent = fs::canonicalize(supplied_parent).expect("canonical R5 measurement root");
+        let root = parent.join(format!(
+            "axial-r5-launch-impact-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        fs::create_dir(&root).expect("create isolated R5 measurement fixture");
+        R5MeasurementRoot(root)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn r5_entry_size(index: usize) -> u64 {
+        let base = R5_REPRESENTATIVE_CONTENT_BYTES / R5_REPRESENTATIVE_ENTRY_COUNT as u64;
+        let remainder = R5_REPRESENTATIVE_CONTENT_BYTES % R5_REPRESENTATIVE_ENTRY_COUNT as u64;
+        base + u64::from(index < remainder as usize)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn r5_write_patterned_file(path: &Path, size: u64, pattern: u8) -> String {
+        fs::create_dir_all(path.parent().expect("R5 fixture parent"))
+            .expect("create R5 fixture parent");
+        let mut file = fs::File::create(path).expect("create R5 fixture file");
+        let chunk = vec![pattern; 64 * 1024];
+        let mut remaining = size;
+        let mut hasher = Sha1::new();
+        while remaining > 0 {
+            let count = remaining.min(chunk.len() as u64) as usize;
+            file.write_all(&chunk[..count])
+                .expect("write R5 fixture file");
+            hasher.update(&chunk[..count]);
+            remaining -= count as u64;
+        }
+        format!("{:x}", hasher.finalize())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn r5_write_version_json(path: &Path, version_id: &str, size: u64) -> String {
+        let mut bytes = serde_json::to_vec(&serde_json::json!({
+            "id": version_id,
+            "type": "release",
+            "mainClass": "org.axial.GuardianR5Fixture",
+            "assetIndex": {},
+            "libraries": []
+        }))
+        .expect("encode R5 version metadata");
+        assert!(bytes.len() < size as usize);
+        bytes.resize(size as usize, b' ');
+        fs::create_dir_all(path.parent().expect("R5 version parent"))
+            .expect("create R5 version parent");
+        fs::write(path, &bytes).expect("write R5 version metadata");
+        format!("{:x}", Sha1::digest(&bytes))
+    }
+
+    #[cfg(target_os = "linux")]
+    fn r5_activate_representative_inventory(
+        state: &AppState,
+        paths: &AppPaths,
+        instance_id: &str,
+        version_id: &str,
+    ) {
+        let version_dir = paths.library_dir.join("versions").join(version_id);
+        let version_path = version_dir.join(format!("{version_id}.json"));
+        let version_digest = r5_write_version_json(&version_path, version_id, r5_entry_size(0));
+        let client_path = version_dir.join(format!("{version_id}.jar"));
+        let client_digest = r5_write_patterned_file(&client_path, r5_entry_size(1), 0x51);
+        let mut entries = vec![
+            TestKnownGoodEntry {
+                root: TestKnownGoodRoot::Versions,
+                path: format!("{version_id}/{version_id}.json"),
+                kind: KnownGoodArtifactKind::VersionMetadata,
+                integrity: TestKnownGoodIntegrity::Sha1 {
+                    digest: version_digest,
+                    size: r5_entry_size(0),
+                },
+            },
+            TestKnownGoodEntry {
+                root: TestKnownGoodRoot::Versions,
+                path: format!("{version_id}/{version_id}.jar"),
+                kind: KnownGoodArtifactKind::ClientJar,
+                integrity: TestKnownGoodIntegrity::Sha1 {
+                    digest: client_digest,
+                    size: r5_entry_size(1),
+                },
+            },
+        ];
+        for index in 2..R5_REPRESENTATIVE_ENTRY_COUNT {
+            let relative = format!("guardian-r5/{index:04}.jar");
+            let size = r5_entry_size(index);
+            let digest = r5_write_patterned_file(
+                &paths.library_dir.join("libraries").join(&relative),
+                size,
+                (index % 251) as u8,
+            );
+            entries.push(TestKnownGoodEntry {
+                root: TestKnownGoodRoot::Libraries,
+                path: relative,
+                kind: KnownGoodArtifactKind::Library,
+                integrity: TestKnownGoodIntegrity::Sha1 { digest, size },
+            });
+        }
+        let inventory = KnownGoodInventory::from_test_entries(entries)
+            .expect("synthetic representative R5 inventory");
+        assert_eq!(inventory.entries().len(), R5_REPRESENTATIVE_ENTRY_COUNT);
+        state.activate_known_good_inventory_for_test(instance_id, inventory);
+    }
+
+    #[cfg(target_os = "linux")]
+    fn r5_install_booting_java(state: &AppState, root: &Path, instance_id: &str) {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let java_dir = root.join("guardian-r5-java/bin");
+        fs::create_dir_all(&java_dir).expect("create R5 Java fixture directory");
+        let java_path = java_dir.join("java");
+        fs::write(
+            &java_path,
+            r#"#!/bin/sh
+if [ "$1" = "-XshowSettings:property" ]; then
+  echo 'openjdk version "21.0.3"' >&2
+  exit 0
+fi
+count=0
+if [ -f guardian-r5-process-count ]; then
+  count=$(cat guardian-r5-process-count)
+fi
+count=$((count + 1))
+printf '%s' "$count" > guardian-r5-process-count
+printf '%s\n' '[Render thread/INFO]: Created: 1024x512x4 minecraft:textures/atlas/blocks.png-atlas' >&2
+exec sleep 30
+"#,
+        )
+        .expect("write R5 Java fixture");
+        let mut permissions = fs::metadata(&java_path)
+            .expect("R5 Java fixture metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&java_path, permissions).expect("make R5 Java fixture executable");
+        let mut instance = state.instances().get(instance_id).expect("R5 instance");
+        instance.java_path = java_path.to_string_lossy().into_owned();
+        state
+            .instances()
+            .replace_for_test(instance)
+            .expect("set R5 Java fixture");
+    }
+
+    #[cfg(target_os = "linux")]
+    fn r5_process_count(path: &Path) -> usize {
+        fs::read_to_string(path)
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or_default()
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn r5_wait_until_stably_idle(state: &AppState) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !state.subscribe_integrity_idle().borrow().is_stably_idle() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("R5 fixture returns to stable idle");
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn r5_launch_once(state: &AppState, instance_id: &str) -> Duration {
+        let started_at = Instant::now();
+        let producer = state.try_claim_producer().expect("claim R5 launch owner");
+        let prepared = crate::application::launch::prepare_launch_session_owned(
+            state,
+            crate::application::launch::LaunchRequest {
+                instance_id: instance_id.to_string(),
+                username: None,
+                max_memory_mb: None,
+                min_memory_mb: None,
+                client_started_at_ms: None,
+            },
+            &producer,
+        )
+        .await
+        .unwrap_or_else(|(_, payload)| panic!("prepare R5 launch: {payload:?}"));
+        let session_id = prepared.task.intent.session_id.clone();
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            crate::application::launch::launch_session(state.clone(), prepared.task, producer),
+        )
+        .await
+        .expect("R5 launch deadline")
+        .unwrap_or_else(|error| panic!("R5 launch: {}", error.message));
+        let elapsed = started_at.elapsed();
+        let running = state
+            .sessions()
+            .get(&session_id)
+            .await
+            .expect("R5 running session");
+        assert!(running.boot_completed_at_ms.is_some());
+        state
+            .sessions()
+            .kill(&session_id)
+            .await
+            .expect("stop R5 launch");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while state.sessions().has_active_instance(instance_id).await {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("R5 launch session becomes terminal");
+        r5_wait_until_stably_idle(state).await;
+        elapsed
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn r5_wait_for_content_read(observer: &IntegrityTier2ProgressObserver) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while observer.content_read_count() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("R5 Tier 2 worker enters physical content sensing");
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn r5_assert_process_effect_after_settlement(
+        process_count_path: &Path,
+        expected_count: usize,
+        observer: &IntegrityTier2ProgressObserver,
+    ) {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while r5_process_count(process_count_path) < expected_count {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("R5 launch reaches its process effect");
+        assert!(
+            observer.settled_at().is_some(),
+            "Tier 2 physical ownership must settle before the launch process effect"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    fn r5_timing_summary(samples: &[Duration]) -> (Duration, Duration, Duration) {
+        assert_eq!(samples.len(), R5_LAUNCH_SAMPLE_COUNT);
+        let mut sorted = samples.to_vec();
+        sorted.sort_unstable();
+        let p50 = sorted[sorted.len() / 2];
+        let p95_index = (sorted.len() * 95).div_ceil(100) - 1;
+        (p50, sorted[p95_index], *sorted.last().expect("R5 samples"))
+    }
+
+    #[cfg(target_os = "linux")]
+    fn r5_timing_json(summary: (Duration, Duration, Duration)) -> serde_json::Value {
+        serde_json::json!({
+            "p50_micros": summary.0.as_micros(),
+            "p95_micros": summary.1.as_micros(),
+            "max_micros": summary.2.as_micros()
+        })
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "requires a release build and explicit AXIAL_R5_* physical evidence bindings"]
+    async fn representative_idle_sweep_launch_preemption_measurement() {
+        assert!(
+            !cfg!(debug_assertions),
+            "R5 physical evidence must use cargo test --release"
+        );
+        let device_evidence = std::env::var("AXIAL_R5_DEVICE_EVIDENCE")
+            .expect("AXIAL_R5_DEVICE_EVIDENCE is required");
+        let filesystem_evidence = std::env::var("AXIAL_R5_FILESYSTEM_EVIDENCE")
+            .expect("AXIAL_R5_FILESYSTEM_EVIDENCE is required");
+        let source_binding =
+            std::env::var("AXIAL_R5_SOURCE_BINDING").expect("AXIAL_R5_SOURCE_BINDING is required");
+        assert!(
+            !device_evidence.trim().is_empty(),
+            "device evidence is empty"
+        );
+        assert!(
+            !filesystem_evidence.trim().is_empty(),
+            "filesystem evidence is empty"
+        );
+        assert!(!source_binding.trim().is_empty(), "source binding is empty");
+        let kernel_release = fs::read_to_string("/proc/sys/kernel/osrelease")
+            .expect("read Linux kernel release")
+            .trim()
+            .to_string();
+        assert!(
+            kernel_release.to_ascii_lowercase().contains("microsoft"),
+            "this evidence contract is scoped to the current WSL2 host"
+        );
+
+        let measurement_root = r5_measurement_root();
+        let (state, root, paths) = state_fixture_at(measurement_root.0.clone());
+        let version_id = "guardian-r5-representative";
+        let instance = state
+            .instances()
+            .insert_for_test("R5 synthetic representative", version_id)
+            .expect("register R5 representative instance");
+        r5_activate_representative_inventory(&state, &paths, &instance.id, version_id);
+        r5_install_booting_java(&state, &root, &instance.id);
+        let process_count_path = state
+            .instances()
+            .game_dir(&instance.id)
+            .join("guardian-r5-process-count");
+
+        let full_sweep_started = Instant::now();
+        let full_sweep = reserve(
+            fixed_plan(
+                &state,
+                &instance.id,
+                "integrity-sweep-00000000-0000-4000-8000-000000000500",
+            )
+            .await,
+            idle_epoch(&state),
+        )
+        .execute()
+        .await
+        .expect("execute full representative R5 sweep");
+        let full_sweep_elapsed = full_sweep_started.elapsed();
+        assert_eq!(full_sweep, IdleIntegrityTerminal::Succeeded);
+        let full_journal = state
+            .journals()
+            .get(&OperationId::new(
+                "integrity-sweep-00000000-0000-4000-8000-000000000500",
+            ))
+            .expect("full representative R5 terminal journal");
+        assert_eq!(full_journal.status, OperationStatus::Succeeded);
+        assert_eq!(full_journal.outcome, Some(OperationOutcome::Succeeded));
+        let full_facts = &full_journal.completed_steps[0].generated_facts;
+        for expected in [
+            format!("integrity_counter:selected_entry_count:{R5_REPRESENTATIVE_ENTRY_COUNT}"),
+            format!("integrity_counter:verified_entry_count:{R5_REPRESENTATIVE_ENTRY_COUNT}"),
+            format!("integrity_counter:processed_entry_count:{R5_REPRESENTATIVE_ENTRY_COUNT}"),
+            format!("integrity_counter:hashed_entry_count:{R5_REPRESENTATIVE_ENTRY_COUNT}"),
+            format!(
+                "integrity_counter:expected_content_byte_count:{R5_REPRESENTATIVE_CONTENT_BYTES}"
+            ),
+            format!("integrity_counter:content_read_byte_count:{R5_REPRESENTATIVE_CONTENT_BYTES}"),
+        ] {
+            assert!(
+                full_facts.contains(&expected),
+                "missing R5 counter {expected}"
+            );
+        }
+
+        r5_launch_once(&state, &instance.id).await;
+        let mut baseline = Vec::with_capacity(R5_LAUNCH_SAMPLE_COUNT);
+        let mut concurrent = Vec::with_capacity(R5_LAUNCH_SAMPLE_COUNT);
+        let mut paired_impact = Vec::with_capacity(R5_LAUNCH_SAMPLE_COUNT);
+        let mut preemption = Vec::with_capacity(R5_LAUNCH_SAMPLE_COUNT);
+        for sample_index in 0..R5_LAUNCH_SAMPLE_COUNT {
+            let baseline_elapsed = r5_launch_once(&state, &instance.id).await;
+            baseline.push(baseline_elapsed);
+
+            let operation_id = format!(
+                "integrity-sweep-00000000-0000-4000-8000-{:012x}",
+                0x600 + sample_index
+            );
+            let observer = IntegrityTier2ProgressObserver::default();
+            let execution = reserve(
+                fixed_plan(&state, &instance.id, &operation_id).await,
+                idle_epoch(&state),
+            )
+            .start_with_progress_observer(observer.clone());
+            r5_wait_for_content_read(&observer).await;
+            assert!(observer.settled_at().is_none());
+
+            let expected_process_count = r5_process_count(&process_count_path) + 1;
+            let preemption_started = Instant::now();
+            let (concurrent_elapsed, ()) = tokio::join!(
+                r5_launch_once(&state, &instance.id),
+                r5_assert_process_effect_after_settlement(
+                    &process_count_path,
+                    expected_process_count,
+                    &observer,
+                )
+            );
+            let settled_at = observer
+                .settled_at()
+                .expect("R5 sweep settles before launch effect");
+            preemption.push(settled_at.saturating_duration_since(preemption_started));
+            paired_impact.push(concurrent_elapsed.saturating_sub(baseline_elapsed));
+            concurrent.push(concurrent_elapsed);
+            assert_eq!(
+                execution.wait().await.expect("R5 cancelled sweep terminal"),
+                IdleIntegrityTerminal::Cancelled
+            );
+            let journal = state
+                .journals()
+                .get(&OperationId::new(operation_id))
+                .expect("R5 cancelled sweep journal");
+            assert_eq!(journal.status, OperationStatus::Cancelled);
+            assert_eq!(journal.outcome, Some(OperationOutcome::Cancelled));
+        }
+
+        let baseline_summary = r5_timing_summary(&baseline);
+        let concurrent_summary = r5_timing_summary(&concurrent);
+        let paired_impact_summary = r5_timing_summary(&paired_impact);
+        let preemption_summary = r5_timing_summary(&preemption);
+        let launch_impact_within_ceiling = paired_impact_summary.1 <= R5_LAUNCH_IMPACT_CEILING;
+        let preemption_within_ceiling = preemption_summary.1 <= R5_LAUNCH_IMPACT_CEILING;
+
+        println!(
+            "{}",
+            serde_json::json!({
+                "schema": "axial.guardian.r5.launch-impact.v1",
+                "source_binding": source_binding,
+                "host_scope": "linux_wsl2_virtual_disk_only",
+                "kernel_release": kernel_release,
+                "device_evidence": device_evidence,
+                "filesystem_evidence": filesystem_evidence,
+                "fixture_root_supplied": true,
+                "fixture_kind": "synthetic_representative",
+                "fixture_basis": "current_local_axial_runtime_footprint",
+                "entry_count": R5_REPRESENTATIVE_ENTRY_COUNT,
+                "content_bytes": R5_REPRESENTATIVE_CONTENT_BYTES,
+                "full_sweep_elapsed_micros": full_sweep_elapsed.as_micros(),
+                "full_sweep_status": "succeeded",
+                "warmup_launch_samples": 1,
+                "paired_launch_samples": R5_LAUNCH_SAMPLE_COUNT,
+                "baseline_launch": r5_timing_json(baseline_summary),
+                "concurrent_launch": r5_timing_json(concurrent_summary),
+                "paired_launch_impact": r5_timing_json(paired_impact_summary),
+                "physical_preemption_settlement": r5_timing_json(preemption_summary),
+                "ceiling_ms": R5_LAUNCH_IMPACT_CEILING.as_millis(),
+                "launch_impact_within_ceiling": launch_impact_within_ceiling,
+                "preemption_within_ceiling": preemption_within_ceiling,
+                "cache_condition": "warm_without_cache_flush",
+                "limitations": [
+                    "synthetic fixture, not a real installed Minecraft instance",
+                    "WSL2 virtual disk, not native bare-metal or physical-HDD evidence",
+                    "warm page-cache condition; cold cache was not measured"
+                ],
+                "measurement_status": "candidate_only_pending_review"
+            })
+        );
+        assert!(
+            launch_impact_within_ceiling,
+            "R5 paired p95 launch impact exceeded the predeclared 10 ms ceiling"
+        );
+        assert!(
+            preemption_within_ceiling,
+            "R5 p95 physical sweep settlement exceeded the predeclared 10 ms ceiling"
+        );
+
+        close_fixture(state, &root).await;
+        drop(measurement_root);
     }
 
     #[test]
