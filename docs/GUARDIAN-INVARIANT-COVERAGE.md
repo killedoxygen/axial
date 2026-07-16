@@ -3,22 +3,23 @@
 
 This document is a deterministic human-readable projection of Guardian's strict invariant coverage artifact. The JSON artifact remains the complete machine-readable inventory, including all kernel cells.
 
-- Schema: `axial.guardian.invariant_coverage.v3`
-- Machine-readable artifact: [guardian-invariant-coverage-v3.json](../apps/api/tests/fixtures/guardian/guardian-invariant-coverage-v3.json)
+- Schema: `axial.guardian.invariant_coverage.v4`
+- Machine-readable artifact: [guardian-invariant-coverage-v4.json](../apps/api/tests/fixtures/guardian/guardian-invariant-coverage-v4.json)
 - Regenerate: `AXIAL_REGENERATE_GUARDIAN_INVARIANT_COVERAGE=1 cargo test -p axial-api regenerate_guardian_invariant_coverage_artifacts -- --ignored`
 
 ## Invariant Status
 | Invariant | Status |
 | --- | --- |
 | I1 | launch_failure_matrix_and_rules_registered |
-| I2 | current_guardian_and_reconciliation_typed_hands_registered |
+| I2 | current_guardian_reconciliation_and_persisted_state_repair_typed_hands_registered |
 | I3 | public_launch_failure_guidance_complete |
-| I4 | current_guardian_and_reconciliation_hand_attempt_bounds_registered |
+| I4 | current_guardian_reconciliation_and_persisted_state_repair_hand_attempt_bounds_registered |
 | I5 | launch_failure_surfaces_bounded_and_redacted |
 | I6 | implemented_memory_trigger_rules_registered |
 | I7 | typed_loader_worker_delegated_dispatch_and_named_boundary_single_assessment_complete |
 | I8 | preflight_costs_declared_reviewed_warm_cache_tier0_rotational_measurement |
 | I9 | reserved_facts_unused_agent_demo_pending_phase_5 |
+| I10 | persisted_state_repair_durability_and_fail_closed_restart_contract_registered |
 
 ## Coverage Summary
 | Surface | Covered |
@@ -28,6 +29,7 @@ This document is a deterministic human-readable projection of Guardian's strict 
 | Guardian modes | 3 |
 | Kernel cells | 540 |
 | Persisted-state Startup cells | 3 |
+| Persisted-state repair hands | 1 |
 | Public kernel cells | 90 |
 | Diagnosis rules | 60 |
 | Registered facts | 124 |
@@ -46,6 +48,28 @@ The complete kernel matrix remains in the JSON artifact.
 | Fallback | 20 | 0 |
 | RecordOnly | 300 | 0 |
 | Strip | 30 | 0 |
+
+## Persisted-State Durable Repair Hands
+| Admission | Attempt | Terminal | Phase | Mode | Diagnosis | Stable key dimensions | Maximum attempts per key/window | Window (hours) | Journal schema | Memory schema | Terminal outcomes |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| PersistedStateRepairAdmission | PersistedStateRepairAttempt | PersistedStateRepairTerminal | Startup | Managed | persisted_state_schema_invalid | store, record_id, physical_identity, mode | 1 | 24 | axial.state.operation_journals.v4 | axial.guardian.failure_memory.v4 | Quarantined, Refused, AppliedUnverified |
+
+### Durability Order
+| Admission | Contract |
+| --- | --- |
+| PersistedStateRepairAdmission | plan_before_effect |
+| PersistedStateRepairAdmission | terminal_before_memory |
+| PersistedStateRepairAdmission | exact_attempt_terminal_binding |
+| PersistedStateRepairAdmission | immediate_suppression_after_terminal |
+
+### Restart Contracts
+| Admission | Contract |
+| --- | --- |
+| PersistedStateRepairAdmission | nonterminal_without_exact_applied_proof_fail_closed |
+| PersistedStateRepairAdmission | exact_applied_nonterminal_reconstructed |
+| PersistedStateRepairAdmission | duplicate_active_key_fail_closed |
+| PersistedStateRepairAdmission | orphan_active_memory_fail_closed |
+| PersistedStateRepairAdmission | exact_missing_memory_rebuilt |
 
 ## Persisted-State Startup Policy
 | Phase | Mode | Diagnosis | Candidates | Decision |

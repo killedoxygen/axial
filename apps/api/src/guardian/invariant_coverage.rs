@@ -23,7 +23,7 @@ use crate::state::contracts::{
     OperationPhase, OwnershipClass, ReconciliationRung, StabilizationSystem, TargetDescriptor,
     TargetKind,
 };
-use crate::state::reconciliation_hand_coverage;
+use crate::state::{persisted_state_repair_hand_coverage, reconciliation_hand_coverage};
 use axial_launcher::{
     LaunchFailureClass, LaunchReadiness, LaunchReadinessReason, LaunchReadinessReasonId,
     LaunchReadinessSeverity,
@@ -33,7 +33,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
 use std::fmt::Write as _;
 
-const SCHEMA: &str = "axial.guardian.invariant_coverage.v3";
+const SCHEMA: &str = "axial.guardian.invariant_coverage.v4";
 const REGENERATE_ENV: &str = "AXIAL_REGENERATE_GUARDIAN_INVARIANT_COVERAGE";
 const EXPECTED_DECISION_COUNTS: [(GuardianActionKind, usize); 5] = [
     (GuardianActionKind::Block, 160),
@@ -60,6 +60,7 @@ struct InvariantCoverage {
     axes: CoverageAxes,
     kernel_cells: Vec<KernelCell>,
     persisted_state_startup_cells: Vec<PersistedStateStartupCell>,
+    persisted_state_repair_hands: Vec<PersistedStateRepairHandCoverage>,
     rules: Vec<RuleCoverage>,
     facts: Vec<FactCoverage>,
     preflight_senses: Vec<PreflightSenseCoverage>,
@@ -103,6 +104,25 @@ struct PersistedStateStartupCell {
     diagnosis: String,
     candidate_actions: Vec<String>,
     decision: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PersistedStateRepairHandCoverage {
+    admission_type: String,
+    attempt_type: String,
+    terminal_type: String,
+    phase: String,
+    mode: String,
+    diagnosis: String,
+    stable_key_dimensions: Vec<String>,
+    max_attempts_per_stable_key_per_suppression_window: usize,
+    suppression_window_hours: i64,
+    operation_journal_schema: String,
+    failure_memory_schema: String,
+    terminal_outcomes: Vec<String>,
+    durability_order: Vec<String>,
+    restart_contracts: Vec<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -204,7 +224,7 @@ struct DeferredDemonstration {
 }
 
 #[test]
-fn guardian_invariant_coverage_artifacts_match_v3() {
+fn guardian_invariant_coverage_artifacts_match_v4() {
     let generated = generate_coverage();
     let expected_json =
         std::fs::read(json_fixture_path()).expect("read Guardian invariant fixture");
@@ -252,12 +272,12 @@ fn generate_coverage() -> InvariantCoverage {
             invariant("I1", "launch_failure_matrix_and_rules_registered"),
             invariant(
                 "I2",
-                "current_guardian_and_reconciliation_typed_hands_registered",
+                "current_guardian_reconciliation_and_persisted_state_repair_typed_hands_registered",
             ),
             invariant("I3", "public_launch_failure_guidance_complete"),
             invariant(
                 "I4",
-                "current_guardian_and_reconciliation_hand_attempt_bounds_registered",
+                "current_guardian_reconciliation_and_persisted_state_repair_hand_attempt_bounds_registered",
             ),
             invariant("I5", "launch_failure_surfaces_bounded_and_redacted"),
             invariant("I6", "implemented_memory_trigger_rules_registered"),
@@ -270,6 +290,10 @@ fn generate_coverage() -> InvariantCoverage {
                 "preflight_costs_declared_reviewed_warm_cache_tier0_rotational_measurement",
             ),
             invariant("I9", "reserved_facts_unused_agent_demo_pending_phase_5"),
+            invariant(
+                "I10",
+                "persisted_state_repair_durability_and_fail_closed_restart_contract_registered",
+            ),
         ],
         axes: CoverageAxes {
             failure_classes: LaunchFailureClass::ALL
@@ -281,6 +305,7 @@ fn generate_coverage() -> InvariantCoverage {
         },
         kernel_cells,
         persisted_state_startup_cells: persisted_state_startup_cells(),
+        persisted_state_repair_hands: persisted_state_repair_hands(),
         rules: rule_coverage(),
         facts: fact_coverage(),
         preflight_senses: preflight_sense_coverage(),
@@ -306,6 +331,39 @@ fn generate_coverage() -> InvariantCoverage {
             status: "agent_fallback_execution_pending".to_string(),
         }],
     }
+}
+
+fn persisted_state_repair_hands() -> Vec<PersistedStateRepairHandCoverage> {
+    let hand = persisted_state_repair_hand_coverage();
+    let terminal_outcomes = hand
+        .terminal_outcomes
+        .iter()
+        .map(debug_name)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        terminal_outcomes,
+        ["Quarantined", "Refused", "AppliedUnverified"]
+    );
+
+    vec![PersistedStateRepairHandCoverage {
+        admission_type: hand.admission_type.to_string(),
+        attempt_type: hand.attempt_type.to_string(),
+        terminal_type: hand.terminal_type.to_string(),
+        phase: debug_name(&OperationPhase::Startup),
+        mode: debug_name(&GuardianMode::Managed),
+        diagnosis: DiagnosisId::PersistedStateSchemaInvalid
+            .as_str()
+            .to_string(),
+        stable_key_dimensions: hand.stable_key_dimensions.map(str::to_string).to_vec(),
+        max_attempts_per_stable_key_per_suppression_window: hand
+            .max_attempts_per_stable_key_per_suppression_window,
+        suppression_window_hours: hand.suppression_hours,
+        operation_journal_schema: hand.operation_journal_schema.to_string(),
+        failure_memory_schema: hand.failure_memory_schema.to_string(),
+        terminal_outcomes,
+        durability_order: hand.durability_contract.map(str::to_string).to_vec(),
+        restart_contracts: hand.restart_contract.map(str::to_string).to_vec(),
+    }]
 }
 
 fn assert_reconciliation_hand_coverage(hands: &[ReconciliationHandCoverage]) {
@@ -849,7 +907,7 @@ fn markdown_document_bytes(snapshot: &InvariantCoverage) -> Vec<u8> {
          # Guardian Invariant Coverage\n\n\
          This document is a deterministic human-readable projection of Guardian's strict invariant coverage artifact. The JSON artifact remains the complete machine-readable inventory, including all kernel cells.\n\n\
          - Schema: `{}`\n\
-         - Machine-readable artifact: [guardian-invariant-coverage-v3.json](../apps/api/tests/fixtures/guardian/guardian-invariant-coverage-v3.json)\n\
+         - Machine-readable artifact: [guardian-invariant-coverage-v4.json](../apps/api/tests/fixtures/guardian/guardian-invariant-coverage-v4.json)\n\
          - Regenerate: `AXIAL_REGENERATE_GUARDIAN_INVARIANT_COVERAGE=1 cargo test -p axial-api regenerate_guardian_invariant_coverage_artifacts -- --ignored`\n\n\
          ## Invariant Status\n",
         snapshot.schema
@@ -886,6 +944,10 @@ fn markdown_document_bytes(snapshot: &InvariantCoverage) -> Vec<u8> {
                 "Persisted-state Startup cells",
                 snapshot.persisted_state_startup_cells.len(),
             ),
+            (
+                "Persisted-state repair hands",
+                snapshot.persisted_state_repair_hands.len(),
+            ),
             ("Public kernel cells", public_cells),
             ("Diagnosis rules", snapshot.rules.len()),
             ("Registered facts", snapshot.facts.len()),
@@ -915,6 +977,68 @@ fn markdown_document_bytes(snapshot: &InvariantCoverage) -> Vec<u8> {
             .into_iter()
             .map(|(decision, (all, public))| {
                 vec![decision.to_string(), all.to_string(), public.to_string()]
+            }),
+    );
+
+    document.push_str("\n## Persisted-State Durable Repair Hands\n");
+    markdown_table(
+        &mut document,
+        &[
+            "Admission",
+            "Attempt",
+            "Terminal",
+            "Phase",
+            "Mode",
+            "Diagnosis",
+            "Stable key dimensions",
+            "Maximum attempts per key/window",
+            "Window (hours)",
+            "Journal schema",
+            "Memory schema",
+            "Terminal outcomes",
+        ],
+        snapshot.persisted_state_repair_hands.iter().map(|hand| {
+            vec![
+                hand.admission_type.clone(),
+                hand.attempt_type.clone(),
+                hand.terminal_type.clone(),
+                hand.phase.clone(),
+                hand.mode.clone(),
+                hand.diagnosis.clone(),
+                hand.stable_key_dimensions.join(", "),
+                hand.max_attempts_per_stable_key_per_suppression_window
+                    .to_string(),
+                hand.suppression_window_hours.to_string(),
+                hand.operation_journal_schema.clone(),
+                hand.failure_memory_schema.clone(),
+                hand.terminal_outcomes.join(", "),
+            ]
+        }),
+    );
+    document.push_str("\n### Durability Order\n");
+    markdown_table(
+        &mut document,
+        &["Admission", "Contract"],
+        snapshot
+            .persisted_state_repair_hands
+            .iter()
+            .flat_map(|hand| {
+                hand.durability_order
+                    .iter()
+                    .map(|contract| vec![hand.admission_type.clone(), contract.clone()])
+            }),
+    );
+    document.push_str("\n### Restart Contracts\n");
+    markdown_table(
+        &mut document,
+        &["Admission", "Contract"],
+        snapshot
+            .persisted_state_repair_hands
+            .iter()
+            .flat_map(|hand| {
+                hand.restart_contracts
+                    .iter()
+                    .map(|contract| vec![hand.admission_type.clone(), contract.clone()])
             }),
     );
 
@@ -1038,7 +1162,7 @@ fn markdown_cell(value: &str) -> String {
 
 fn json_fixture_path() -> std::path::PathBuf {
     std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures/guardian/guardian-invariant-coverage-v3.json")
+        .join("tests/fixtures/guardian/guardian-invariant-coverage-v4.json")
 }
 
 fn markdown_document_path() -> std::path::PathBuf {

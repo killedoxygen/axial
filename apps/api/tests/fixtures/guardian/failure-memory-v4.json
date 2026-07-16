@@ -1,5 +1,5 @@
 {
-  "schema": "axial.guardian.failure_memory.v3",
+  "schema": "axial.guardian.failure_memory.v4",
   "entries": [
     {
       "key": "Launch:launch_command_prepared:Guardian.Config.fixture_target_01:Managed:intent_01",
@@ -25,7 +25,8 @@
       "suppression_until": null,
       "target_content_hash": null,
       "user_intent_hash": "intent_01",
-      "reconciliation_terminal": null
+      "reconciliation_terminal": null,
+      "persisted_state_repair_terminal": null
     },
     {
       "key": "Jvm:custom_jvm_args_present:Guardian.Config.fixture_target_02:Custom:intent_02",
@@ -51,7 +52,8 @@
       "suppression_until": null,
       "target_content_hash": null,
       "user_intent_hash": "intent_02",
-      "reconciliation_terminal": null
+      "reconciliation_terminal": null,
+      "persisted_state_repair_terminal": null
     },
     {
       "key": "Runtime:managed_runtime_corrupt:Guardian.Runtime.java-runtime-delta:Managed:no_intent:rung.RebuildComponent:component.Runtime:scope.registered.0123456789abcdef.sha256.aaaaaaaa.bbbbbbbb.cccccccc.dddddddd.eeeeeeee.ffffffff.01234567.89abcdef.sha256.11111111.22222222.33333333.44444444.55555555.66666666.77777777.88888888",
@@ -123,7 +125,8 @@
             }
           ]
         }
-      }
+      },
+      "persisted_state_repair_terminal": null
     },
     {
       "key": "Startup:startup_stalled:Guardian.Config.fixture_target_04:Managed:intent_04",
@@ -149,7 +152,8 @@
       "suppression_until": "2026-07-01T01:04:00Z",
       "target_content_hash": null,
       "user_intent_hash": "intent_04",
-      "reconciliation_terminal": null
+      "reconciliation_terminal": null,
+      "persisted_state_repair_terminal": null
     },
     {
       "key": "Jvm:jvm_args_malformed:Guardian.Config.fixture_target_06:Custom:intent_06",
@@ -175,7 +179,8 @@
       "suppression_until": null,
       "target_content_hash": null,
       "user_intent_hash": "intent_06",
-      "reconciliation_terminal": null
+      "reconciliation_terminal": null,
+      "persisted_state_repair_terminal": null
     },
     {
       "key": "Launch:jvm_arg_unsupported:Guardian.Instance.fixture_target_07:Managed:intent_07",
@@ -201,7 +206,8 @@
       "suppression_until": "2026-07-01T01:07:00Z",
       "target_content_hash": null,
       "user_intent_hash": "intent_07",
-      "reconciliation_terminal": null
+      "reconciliation_terminal": null,
+      "persisted_state_repair_terminal": null
     },
     {
       "key": "Runtime:java_override_unavailable:Guardian.Config.fixture_target_09:Managed:intent_09",
@@ -227,7 +233,8 @@
       "suppression_until": "2026-07-01T01:09:00Z",
       "target_content_hash": null,
       "user_intent_hash": "intent_09",
-      "reconciliation_terminal": null
+      "reconciliation_terminal": null,
+      "persisted_state_repair_terminal": null
     },
     {
       "key": "Library:launcher_managed_artifact_corrupt:Execution.Artifact.fixture_target_10:Managed:no_intent:rung.RepairArtifact:component.Libraries:scope.registered.0123456789abcdef.sha256.aaaaaaaa.bbbbbbbb.cccccccc.dddddddd.eeeeeeee.ffffffff.01234567.89abcdef.sha256.11111111.22222222.33333333.44444444.55555555.66666666.77777777.88888888",
@@ -283,7 +290,8 @@
         "quarantine_checkpoint": {
           "records": []
         }
-      }
+      },
+      "persisted_state_repair_terminal": null
     },
     {
       "key": "Config:custom_java_override_present:Guardian.Config.fixture_target_12:Custom:intent_12",
@@ -309,7 +317,8 @@
       "suppression_until": null,
       "target_content_hash": null,
       "user_intent_hash": "intent_12",
-      "reconciliation_terminal": null
+      "reconciliation_terminal": null,
+      "persisted_state_repair_terminal": null
     },
     {
       "key": "State:persisted_state_schema_invalid:Guardian.Config.fixture_target_13:Disabled:intent_13",
@@ -335,7 +344,8 @@
       "suppression_until": null,
       "target_content_hash": null,
       "user_intent_hash": "intent_13",
-      "reconciliation_terminal": null
+      "reconciliation_terminal": null,
+      "persisted_state_repair_terminal": null
     },
     {
       "key": "Unknown:unknown_failure_failed:Guardian.Config.fixture_target_14:Disabled:intent_14",
@@ -361,7 +371,52 @@
       "suppression_until": null,
       "target_content_hash": null,
       "user_intent_hash": "intent_14",
-      "reconciliation_terminal": null
+      "reconciliation_terminal": null,
+      "persisted_state_repair_terminal": null
+    },
+    {
+      "key": "State:persisted_state_schema_invalid:Managed:PerformanceOperation:performance-install-00000000000000000000000000000001:sha256.01010101.01010101.01010101.01010101.01010101.01010101.01010101.01010101",
+      "diagnosis_id": "persisted_state_schema_invalid",
+      "domain": "State",
+      "mode": "Managed",
+      "target": {
+        "system": "Performance",
+        "kind": "Config",
+        "id": "performance-install-00000000000000000000000000000001",
+        "ownership": "LauncherManaged"
+      },
+      "ownership": "LauncherManaged",
+      "first_observed_at": "2026-07-01T04:00:00+00:00",
+      "last_observed_at": "2026-07-01T04:00:00+00:00",
+      "occurrence_count": 1,
+      "last_action_kind": "Quarantine",
+      "last_action_outcome": "Failed",
+      "repair_attempt_count": 1,
+      "quarantine_checkpoint": {
+        "records": []
+      },
+      "suppression_until": "2026-07-02T04:00:00+00:00",
+      "target_content_hash": null,
+      "user_intent_hash": null,
+      "reconciliation_terminal": null,
+      "persisted_state_repair_terminal": {
+        "attempt": {
+          "operation_id": "repair-persisted-state-00112233445566778899aabbccddeeff",
+          "store": "performance_operation",
+          "record_id": "performance-install-00000000000000000000000000000001",
+          "physical_identity": "sha256.01010101.01010101.01010101.01010101.01010101.01010101.01010101.01010101",
+          "target": {
+            "system": "Performance",
+            "kind": "Config",
+            "id": "performance-install-00000000000000000000000000000001",
+            "ownership": "LauncherManaged"
+          },
+          "mode": "Managed",
+          "observed_at": "2026-07-01T04:00:00+00:00",
+          "suppression_until": "2026-07-02T04:00:00+00:00"
+        },
+        "outcome": "Refused"
+      }
     }
   ]
 }

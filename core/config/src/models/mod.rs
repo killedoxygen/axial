@@ -165,6 +165,7 @@ impl AppConfig {
         }
         self.guardian_mode = match self.guardian_mode.trim() {
             "custom" => "custom".to_string(),
+            "disabled" => "disabled".to_string(),
             _ => "managed".to_string(),
         };
         if self.library_mode.is_empty() {
@@ -219,6 +220,18 @@ mod tests {
 
         assert_eq!(config.max_memory_mb, 600);
         assert_eq!(config.min_memory_mb, 600);
+    }
+
+    #[test]
+    fn normalized_preserves_disabled_guardian_mode() {
+        let config = AppConfig {
+            guardian_mode: "  disabled  ".to_string(),
+            ..AppConfig::default()
+        }
+        .normalized()
+        .expect("disabled Guardian mode should normalize");
+
+        assert_eq!(config.guardian_mode, "disabled");
     }
 
     #[test]

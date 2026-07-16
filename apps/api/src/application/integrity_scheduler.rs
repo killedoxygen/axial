@@ -1813,18 +1813,29 @@ mod tests {
     }
 
     #[test]
-    fn both_startup_surfaces_spawn_after_known_good_rebuilds() {
+    fn shared_startup_aggregator_orders_repair_before_every_supervisor() {
+        let app = include_str!("../app.rs");
+        let repair = app
+            .find("settle_startup_persisted_state_repairs(state).await")
+            .expect("awaited persisted-state repair barrier");
+        for call in [
+            "spawn_known_good_rebuilds(state);",
+            "spawn_idle_integrity_scheduler(state);",
+            "spawn_performance_operations_resume(state);",
+            "spawn_benchmark_suite_drivers_resume(state);",
+            "spawn_performance_rules_refresh(state);",
+            "spawn_telemetry_export(state);",
+            "spawn_remote_flags_refresh(state);",
+        ] {
+            assert!(repair < app.find(call).expect("aggregated startup call"));
+        }
         for source in [
             include_str!("../main.rs"),
             include_str!("../../../desktop/src/main.rs"),
         ] {
-            let rebuild = source
-                .find("spawn_known_good_rebuilds(&state);")
-                .expect("known-good startup call");
-            let scheduler = source
-                .find("spawn_idle_integrity_scheduler(&state);")
-                .expect("idle integrity startup call");
-            assert!(rebuild < scheduler);
+            assert!(source.contains("start_application_background_workflows(&state).await"));
+            assert!(!source.contains("spawn_performance_operations_resume"));
+            assert!(!source.contains("spawn_benchmark_suite_drivers_resume"));
         }
     }
 

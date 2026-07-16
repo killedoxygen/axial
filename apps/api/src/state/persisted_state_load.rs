@@ -1,11 +1,14 @@
 use crate::execution::anchored_record::{
-    AnchoredRecordIdentity, AnchoredRecordQuarantineError, AnchoredRecordQuarantineReceipt,
-    AnchoredRecordRestartDigest,
+    AnchoredRecordDirectory, AnchoredRecordIdentity, AnchoredRecordQuarantineError,
+    AnchoredRecordQuarantineReceipt, AnchoredRecordRestartDigest, anchored_record_quarantine_name,
 };
 use crate::state::contracts::{
     OwnershipClass, PersistedStateRecordStore, RestartStableRecordIdentity, StabilizationSystem,
     TargetDescriptor, TargetKind,
 };
+use crate::state::ownership::{CurrentArtifact, classify_current_artifact};
+use std::sync::Arc;
+use std::{ffi::OsString, io, path::PathBuf};
 
 pub(super) const MAX_REJECTED_RESTART_RECORDS_PER_STORE: usize = 8;
 pub(super) const MAX_RESTART_RECORD_BYTES: u64 = 256 * 1024;
@@ -16,6 +19,87 @@ pub(crate) fn persisted_state_load_target() -> TargetDescriptor {
         TargetKind::Config,
         "persisted-state-load",
         OwnershipClass::LauncherManaged,
+    )
+}
+
+pub(super) fn persisted_state_record_target(
+    store: PersistedStateRecordStore,
+    record_id: &str,
+) -> TargetDescriptor {
+    let artifact = match store {
+        PersistedStateRecordStore::PerformanceOperation => {
+            CurrentArtifact::PerformanceOperationStatus
+        }
+        PersistedStateRecordStore::BenchmarkSuiteDriver => {
+            CurrentArtifact::BenchmarkSuiteDriverStatus
+        }
+    };
+    let mut target = classify_current_artifact(artifact, record_id).target;
+    target.id = record_id.to_string();
+    target
+}
+
+pub(super) fn persisted_state_record_path(
+    paths: &axial_config::AppPaths,
+    store: PersistedStateRecordStore,
+    record_id: &str,
+) -> PathBuf {
+    match store {
+        PersistedStateRecordStore::PerformanceOperation => {
+            super::performance_operations::operation_path(
+                &super::performance_operations::operation_dir(paths),
+                record_id,
+            )
+        }
+        PersistedStateRecordStore::BenchmarkSuiteDriver => {
+            super::benchmark_suite_drivers::driver_path(
+                &super::benchmark_suite_drivers::driver_dir(paths),
+                record_id,
+            )
+        }
+    }
+}
+
+pub(super) fn exact_applied_quarantine_is_present(
+    paths: &axial_config::AppPaths,
+    attempt: &super::contracts::PersistedStateRepairAttempt,
+) -> io::Result<bool> {
+    let source = persisted_state_record_path(paths, attempt.store(), attempt.record_id());
+    let parent = source.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "persisted-state record path has no parent",
+        )
+    })?;
+    let source_name = source.file_name().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "persisted-state record path has no file name",
+        )
+    })?;
+    let directory = match AnchoredRecordDirectory::open(parent) {
+        Ok(directory) => directory,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    match directory.read_for_mutation(source_name, MAX_RESTART_RECORD_BYTES) {
+        Ok(_) => return Ok(false),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    let suffix = super::contracts::persisted_state_repair_quarantine_suffix(attempt)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid repair operation id"))?;
+    let destination_name: OsString = anchored_record_quarantine_name(source_name, suffix);
+    let destination =
+        match directory.read_for_mutation(destination_name.as_os_str(), MAX_RESTART_RECORD_BYTES) {
+            Ok(destination) => destination,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error),
+        };
+    let (_, digest) = destination.into_restart_identity()?;
+    Ok(
+        &RestartStableRecordIdentity::from_digest(digest.into_bytes())
+            == attempt.physical_identity(),
     )
 }
 
@@ -35,14 +119,17 @@ pub(crate) struct PersistedStateRejectedRecordEvidence {
 }
 
 impl PersistedStateRejectedRecordEvidence {
+    #[cfg(test)]
     pub(crate) fn store(&self) -> PersistedStateRecordStore {
         self.store
     }
 
+    #[cfg(test)]
     pub(crate) fn rejection(&self) -> PersistedStateRecordRejection {
         self.rejection
     }
 
+    #[cfg(test)]
     pub(crate) fn target(&self) -> &TargetDescriptor {
         &self.target
     }
@@ -89,22 +176,33 @@ impl PersistedStateRejectedRecord {
         &self.restart_identity
     }
 
-    pub(super) fn into_eligibility(self) -> PersistedStateRejectedRecordEligibility {
-        PersistedStateRejectedRecordEligibility { record: self }
+    pub(super) fn into_eligibility(
+        self,
+        owner: Arc<()>,
+    ) -> PersistedStateRejectedRecordEligibility {
+        PersistedStateRejectedRecordEligibility {
+            record: self,
+            owner,
+        }
     }
 }
 
 pub(crate) struct PersistedStateRejectedRecordEligibility {
     record: PersistedStateRejectedRecord,
+    owner: Arc<()>,
 }
 
 pub(crate) struct PersistedStateRejectedRecordQuarantineReceipt {
-    evidence: PersistedStateRejectedRecordEvidence,
-    physical_identity: RestartStableRecordIdentity,
     exact: AnchoredRecordQuarantineReceipt,
 }
 
 impl PersistedStateRejectedRecordEligibility {
+    #[cfg(test)]
+    pub(super) fn bind_owner_for_test(mut self, owner: Arc<()>) -> Self {
+        self.owner = owner;
+        self
+    }
+
     pub(super) fn still_current(&self) -> bool {
         self.record.identity.revalidate().is_ok()
     }
@@ -113,33 +211,30 @@ impl PersistedStateRejectedRecordEligibility {
         self,
         suffix: [u8; 16],
     ) -> Result<PersistedStateRejectedRecordQuarantineReceipt, AnchoredRecordQuarantineError> {
-        let PersistedStateRejectedRecord {
-            evidence,
-            identity,
-            restart_identity,
-        } = self.record;
+        let PersistedStateRejectedRecord { identity, .. } = self.record;
         identity
             .quarantine(suffix)
-            .map(|exact| PersistedStateRejectedRecordQuarantineReceipt {
-                evidence,
-                physical_identity: restart_identity,
-                exact,
-            })
+            .map(|exact| PersistedStateRejectedRecordQuarantineReceipt { exact })
     }
 
-    #[cfg(test)]
-    pub(crate) fn store(&self) -> PersistedStateRecordStore {
+    pub(super) fn store(&self) -> PersistedStateRecordStore {
         self.record.store()
     }
 
-    #[cfg(test)]
-    pub(crate) fn record_id(&self) -> &str {
+    pub(super) fn record_id(&self) -> &str {
         self.record.record_id()
     }
 
-    #[cfg(test)]
-    pub(crate) fn physical_identity(&self) -> &RestartStableRecordIdentity {
+    pub(super) fn physical_identity(&self) -> &RestartStableRecordIdentity {
         self.record.restart_identity()
+    }
+
+    pub(super) fn record_target(&self) -> &TargetDescriptor {
+        &self.record.evidence.target
+    }
+
+    pub(super) fn belongs_to(&self, owner: &Arc<()>) -> bool {
+        Arc::ptr_eq(&self.owner, owner)
     }
 }
 
@@ -155,31 +250,15 @@ pub(crate) fn persisted_state_rejected_record_eligibility_for_test(
     Ok(PersistedStateRejectedRecord::new(
         PersistedStateRecordStore::PerformanceOperation,
         PersistedStateRecordRejection::InvalidSchema,
-        TargetDescriptor::new(
-            StabilizationSystem::State,
-            TargetKind::Config,
-            record_id,
-            OwnershipClass::LauncherManaged,
-        ),
+        persisted_state_record_target(PersistedStateRecordStore::PerformanceOperation, record_id),
         identity,
         restart_digest,
     )
-    .into_eligibility())
+    .into_eligibility(Arc::new(())))
 }
 
 impl PersistedStateRejectedRecordQuarantineReceipt {
-    #[cfg(test)]
-    pub(crate) fn evidence(&self) -> &PersistedStateRejectedRecordEvidence {
-        &self.evidence
-    }
-
-    #[cfg(test)]
-    pub(crate) fn physical_identity(&self) -> &RestartStableRecordIdentity {
-        &self.physical_identity
-    }
-
-    #[cfg(test)]
-    pub(crate) fn is_current(&self) -> bool {
+    pub(super) fn is_current(&self) -> bool {
         self.exact.is_current()
     }
 }
@@ -248,6 +327,7 @@ impl PersistedStateLoadEvidence {
         self.issue_count
     }
 
+    #[cfg(test)]
     pub(crate) fn rejected_records(&self) -> &[PersistedStateRejectedRecordEvidence] {
         &self.rejected_records
     }
@@ -260,7 +340,9 @@ impl PersistedStateLoadEvidence {
 
 #[cfg(test)]
 mod tests {
-    use super::{PersistedStateLoadEvidence, PersistedStateRejectedRecord};
+    use super::{
+        PersistedStateLoadEvidence, PersistedStateRejectedRecord, persisted_state_record_target,
+    };
     use static_assertions::assert_not_impl_any;
     use std::path::Path;
 
@@ -316,12 +398,10 @@ mod tests {
         }
         use super::PersistedStateRecordRejection;
         use crate::execution::anchored_record::AnchoredRecordDirectory;
-        use crate::state::contracts::{
-            OwnershipClass, PersistedStateRecordStore, StabilizationSystem, TargetDescriptor,
-            TargetKind,
-        };
+        use crate::state::contracts::PersistedStateRecordStore;
         use std::ffi::OsStr;
         use std::fs;
+        use std::sync::Arc;
 
         let root = std::env::temp_dir().join(format!(
             "axial-persisted-state-quarantine-delegation-{}",
@@ -339,29 +419,20 @@ mod tests {
         let eligibility = PersistedStateRejectedRecord::new(
             PersistedStateRecordStore::PerformanceOperation,
             PersistedStateRecordRejection::InvalidSchema,
-            TargetDescriptor::new(
-                StabilizationSystem::State,
-                TargetKind::Config,
+            persisted_state_record_target(
+                PersistedStateRecordStore::PerformanceOperation,
                 "persisted-record-id",
-                OwnershipClass::LauncherManaged,
             ),
             identity,
             restart_digest,
         )
-        .into_eligibility();
-        let expected_identity = eligibility.physical_identity().clone();
-
+        .into_eligibility(Arc::new(()));
         let receipt = match eligibility.quarantine([0x7a; 16]) {
             Ok(receipt) => receipt,
             Err(_) => panic!("consume exact quarantine eligibility"),
         };
 
         assert!(receipt.is_current());
-        assert_eq!(
-            receipt.evidence().store(),
-            PersistedStateRecordStore::PerformanceOperation
-        );
-        assert_eq!(receipt.physical_identity(), &expected_identity);
         assert!(!root.join("record.json").exists());
         assert_eq!(
             fs::read(root.join(".record.json.axial-quarantine-7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a"))

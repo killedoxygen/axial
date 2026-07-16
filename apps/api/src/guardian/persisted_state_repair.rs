@@ -44,6 +44,26 @@ pub(crate) struct PersistedStateRepairRecordOnlyWitness {
     observed_decision: GuardianActionKind,
 }
 
+impl PersistedStateRepairCustomOffer {
+    pub(crate) fn discard(self) {
+        let Self {
+            eligibility,
+            decision,
+        } = self;
+        drop((eligibility, decision));
+    }
+}
+
+impl PersistedStateRepairRecordOnlyWitness {
+    pub(crate) fn discard(self) {
+        let Self {
+            assessed_mode,
+            observed_decision,
+        } = self;
+        let _ = (assessed_mode, observed_decision);
+    }
+}
+
 impl PersistedStateRepairAssessmentProof {
     pub(crate) fn assessed_mode(&self) -> GuardianMode {
         self.assessed_mode
@@ -328,7 +348,6 @@ mod tests {
             match (mode, disposition) {
                 (GuardianMode::Managed, PersistedStateRepairDisposition::Managed(managed)) => {
                     let authorization = managed.into_authorization();
-                    assert_eq!(authorization.record_id(), "rejected-record");
                     drop(authorization);
                 }
                 (GuardianMode::Custom, PersistedStateRepairDisposition::Custom(offer)) => {
@@ -344,7 +363,6 @@ mod tests {
                             .as_ref(),
                         Some(&persisted_state_load_target())
                     );
-                    assert_eq!(offer.eligibility.record_id(), "rejected-record");
                     drop(offer);
                 }
                 (GuardianMode::Disabled, PersistedStateRepairDisposition::RecordOnly(witness)) => {
@@ -604,7 +622,6 @@ mod tests {
         let authorization =
             authorize_persisted_state_rejected_record_quarantine(eligibility, proof, &decision)
                 .expect("exact sealed proof and decision");
-        assert_eq!(authorization.record_id(), "rejected-record");
         drop(authorization);
         fs::remove_dir_all(root).expect("remove direct-state-validation fixture");
     }

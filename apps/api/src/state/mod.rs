@@ -109,8 +109,10 @@ pub(crate) use persisted_state_load::{
     PersistedStateLoadEvidence, PersistedStateRejectedRecordEligibility,
     persisted_state_load_target,
 };
+#[cfg(test)]
+pub(crate) use persisted_state_repair::persisted_state_repair_hand_coverage;
 pub(crate) use persisted_state_repair::{
-    PersistedStateRejectedRecordQuarantineAuthorization,
+    PersistedStateRejectedRecordQuarantineAuthorization, PersistedStateRepairExecutionError,
     authorize_persisted_state_rejected_record_quarantine,
 };
 #[cfg(test)]
@@ -441,6 +443,7 @@ impl AppState {
             tracing::warn!("known-good restart cleanup remains pending");
         }
         state.reconcile_reconciliation_startup().await?;
+        state.reconcile_persisted_state_repair_startup().await?;
         state
             .persisted_state_rejection_streaks
             .progress_startup()
@@ -490,6 +493,15 @@ impl AppState {
         self.journals = journals;
         self.failure_memory = failure_memory;
         self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn publish_persisted_state_repair_eligibilities_for_test(
+        &self,
+        eligibilities: Vec<PersistedStateRejectedRecordEligibility>,
+    ) {
+        self.persisted_state_rejection_streaks
+            .publish_eligibilities_for_test(eligibilities);
     }
 
     #[cfg(test)]
@@ -658,6 +670,12 @@ impl AppState {
 
     pub fn config(&self) -> &Arc<AppConfigStore> {
         &self.config
+    }
+
+    pub(crate) fn take_persisted_state_repair_eligibilities(
+        &self,
+    ) -> Vec<PersistedStateRejectedRecordEligibility> {
+        self.persisted_state_rejection_streaks.take_eligibilities()
     }
 
     pub(crate) fn managed_runtime_cache(&self) -> &ManagedRuntimeCache {

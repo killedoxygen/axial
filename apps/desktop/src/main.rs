@@ -3,11 +3,7 @@ mod discord_presence;
 mod events;
 mod state;
 
-use axial_api::app::{
-    spawn_background, spawn_benchmark_suite_drivers_resume, spawn_idle_integrity_scheduler,
-    spawn_known_good_rebuilds, spawn_performance_operations_resume,
-    spawn_performance_rules_refresh, spawn_remote_flags_refresh, spawn_telemetry_export,
-};
+use axial_api::app::{spawn_background, start_application_background_workflows};
 use axial_api::observability::telemetry::{
     TelemetryErrorArea, TelemetryErrorKind, TelemetryErrorLevel, TelemetryEvent, TelemetryHub,
 };
@@ -65,15 +61,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         frontend_dir: axial_api::app::default_frontend_dir(),
     })
     .await?;
-    spawn_known_good_rebuilds(&state);
-    spawn_idle_integrity_scheduler(&state);
+    if !start_application_background_workflows(&state).await {
+        return Err(std::io::Error::other("startup background ownership was refused").into());
+    }
     let telemetry = state.telemetry().clone();
     let discord_presence = discord_presence::spawn(state.clone());
-    spawn_performance_operations_resume(&state);
-    spawn_benchmark_suite_drivers_resume(&state);
-    spawn_performance_rules_refresh(&state);
-    spawn_telemetry_export(&state);
-    spawn_remote_flags_refresh(&state);
     let close_event_state = state.clone();
     let close_event_presence = discord_presence.clone();
     let desktop_state =

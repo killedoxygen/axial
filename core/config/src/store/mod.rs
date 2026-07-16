@@ -199,6 +199,31 @@ mod tests {
     }
 
     #[test]
+    fn load_paths_preserve_disabled_guardian_mode() {
+        let paths = test_paths("load-disabled-guardian-mode");
+        fs::create_dir_all(&paths.config_dir).expect("should create temp config dir");
+        let data = serde_json::to_string_pretty(&AppConfig {
+            guardian_mode: "disabled".to_string(),
+            ..AppConfig::default()
+        })
+        .expect("should serialize config");
+        fs::write(&paths.config_file, data).expect("should write temp config");
+
+        assert_eq!(
+            ConfigStore::load_from(paths.clone())
+                .expect("regular load")
+                .current()
+                .guardian_mode,
+            "disabled"
+        );
+        let startup = ConfigStore::load_for_startup(paths.clone()).expect("startup load");
+        assert!(startup.warnings.is_empty());
+        assert_eq!(startup.store.current().guardian_mode, "disabled");
+
+        cleanup(&paths.config_dir);
+    }
+
+    #[test]
     fn load_for_startup_uses_default_config_and_warning_for_invalid_config_without_rewriting() {
         let paths = test_paths("startup-invalid-launch-auth-mode");
         fs::create_dir_all(&paths.config_dir).expect("should create temp config dir");

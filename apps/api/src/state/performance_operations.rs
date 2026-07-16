@@ -1734,21 +1734,15 @@ fn retain_performance_rejected_records(
         retained.push(PersistedStateRejectedRecord::new(
             PersistedStateRecordStore::PerformanceOperation,
             rejection,
-            rejected_performance_operation_target(physical_id),
+            super::persisted_state_load::persisted_state_record_target(
+                PersistedStateRecordStore::PerformanceOperation,
+                physical_id,
+            ),
             identity,
             restart_digest,
         ));
     }
     (retained, authoritative)
-}
-
-fn rejected_performance_operation_target(
-    physical_id: &str,
-) -> crate::state::contracts::TargetDescriptor {
-    debug_assert!(is_safe_operation_id(physical_id));
-    let mut target = performance_operation_status_target(physical_id);
-    target.id = physical_id.to_string();
-    target
 }
 
 fn performance_rejection_still_holds(

@@ -1,5 +1,5 @@
 {
-  "schema": "axial.state.operation_journals.v3",
+  "schema": "axial.state.operation_journals.v4",
   "entries": [
     {
       "journal_id": "guardian-vocabulary-journal-01",
@@ -54,7 +54,9 @@
       ],
       "outcome": null,
       "reconciliation_attempt": null,
-      "reconciliation_terminal": null
+      "reconciliation_terminal": null,
+      "persisted_state_repair_attempt": null,
+      "persisted_state_repair_terminal": null
     },
     {
       "journal_id": "guardian-vocabulary-journal-02",
@@ -107,7 +109,9 @@
       ],
       "outcome": null,
       "reconciliation_attempt": null,
-      "reconciliation_terminal": null
+      "reconciliation_terminal": null,
+      "persisted_state_repair_attempt": null,
+      "persisted_state_repair_terminal": null
     },
     {
       "journal_id": "guardian-vocabulary-journal-03",
@@ -160,7 +164,9 @@
       ],
       "outcome": null,
       "reconciliation_attempt": null,
-      "reconciliation_terminal": null
+      "reconciliation_terminal": null,
+      "persisted_state_repair_attempt": null,
+      "persisted_state_repair_terminal": null
     },
     {
       "journal_id": "guardian-reconciliation-journal-artifact",
@@ -269,7 +275,9 @@
         "quarantine_checkpoint": {
           "records": []
         }
-      }
+      },
+      "persisted_state_repair_attempt": null,
+      "persisted_state_repair_terminal": null
     },
     {
       "journal_id": "guardian-reconciliation-journal-component",
@@ -392,7 +400,9 @@
             }
           ]
         }
-      }
+      },
+      "persisted_state_repair_attempt": null,
+      "persisted_state_repair_terminal": null
     },
     {
       "journal_id": "guardian-reconciliation-journal-instance",
@@ -455,7 +465,93 @@
           }
         }
       },
-      "reconciliation_terminal": null
+      "reconciliation_terminal": null,
+      "persisted_state_repair_attempt": null,
+      "persisted_state_repair_terminal": null
+    },
+    {
+      "journal_id": "journal-repair-persisted-state-00112233445566778899aabbccddeeff",
+      "operation_id": "repair-persisted-state-00112233445566778899aabbccddeeff",
+      "command": "RepairPersistedState",
+      "status": "Failed",
+      "owner": "Guardian",
+      "ownership": "LauncherManaged",
+      "targets": [
+        {
+          "system": "Performance",
+          "kind": "Config",
+          "id": "performance-install-00000000000000000000000000000001",
+          "ownership": "LauncherManaged"
+        }
+      ],
+      "planned_steps": [
+        {
+          "step_id": "quarantine_rejected_restart_record",
+          "phase": "Repairing",
+          "result": "Planned",
+          "changed_target": null,
+          "generated_facts": [],
+          "rollback": "NotApplicable"
+        }
+      ],
+      "completed_steps": [
+        {
+          "step_id": "quarantine_rejected_restart_record",
+          "phase": "Repairing",
+          "result": "Failed",
+          "changed_target": {
+            "system": "Performance",
+            "kind": "Config",
+            "id": "performance-install-00000000000000000000000000000001",
+            "ownership": "LauncherManaged"
+          },
+          "generated_facts": [
+            "persisted_state_quarantine_refused"
+          ],
+          "rollback": "NotApplicable"
+        }
+      ],
+      "failure_point": "persisted_state_quarantine_refused",
+      "rollback": "NotApplicable",
+      "guardian_diagnosis_ids": [
+        "persisted_state_schema_invalid"
+      ],
+      "outcome": "Failed",
+      "reconciliation_attempt": null,
+      "reconciliation_terminal": null,
+      "persisted_state_repair_attempt": {
+        "operation_id": "repair-persisted-state-00112233445566778899aabbccddeeff",
+        "store": "performance_operation",
+        "record_id": "performance-install-00000000000000000000000000000001",
+        "physical_identity": "sha256.01010101.01010101.01010101.01010101.01010101.01010101.01010101.01010101",
+        "target": {
+          "system": "Performance",
+          "kind": "Config",
+          "id": "performance-install-00000000000000000000000000000001",
+          "ownership": "LauncherManaged"
+        },
+        "mode": "Managed",
+        "observed_at": "2026-07-01T04:00:00+00:00",
+        "suppression_until": "2026-07-02T04:00:00+00:00"
+      },
+      "persisted_state_repair_terminal": {
+        "attempt": {
+          "operation_id": "repair-persisted-state-00112233445566778899aabbccddeeff",
+          "store": "performance_operation",
+          "record_id": "performance-install-00000000000000000000000000000001",
+          "physical_identity": "sha256.01010101.01010101.01010101.01010101.01010101.01010101.01010101.01010101",
+          "target": {
+            "system": "Performance",
+            "kind": "Config",
+            "id": "performance-install-00000000000000000000000000000001",
+            "ownership": "LauncherManaged"
+          },
+          "mode": "Managed",
+          "observed_at": "2026-07-01T04:00:00+00:00",
+          "suppression_until": "2026-07-02T04:00:00+00:00"
+        },
+        "outcome": "Refused"
+      }
     }
   ]
 }

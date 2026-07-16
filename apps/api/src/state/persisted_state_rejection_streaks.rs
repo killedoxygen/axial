@@ -14,7 +14,7 @@ use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use tracing::warn;
 
 const REJECTION_STREAK_SCHEMA: &str = "axial.state.persisted_state_rejection_streaks.v1";
@@ -49,6 +49,7 @@ struct PersistedStateRejectionStartup {
 pub(super) struct PersistedStateRejectionStreaks {
     pending: Mutex<Option<PersistedStateRejectionStartup>>,
     eligibilities: Mutex<Option<Vec<PersistedStateRejectedRecordEligibility>>>,
+    repair_owner: Arc<()>,
 }
 
 impl PersistedStateRejectionStreaks {
@@ -59,6 +60,7 @@ impl PersistedStateRejectionStreaks {
                 scans,
             })),
             eligibilities: Mutex::new(None),
+            repair_owner: Arc::new(()),
         }
     }
 
@@ -68,6 +70,7 @@ impl PersistedStateRejectionStreaks {
         Self {
             pending: Mutex::new(None),
             eligibilities: Mutex::new(None),
+            repair_owner: Arc::new(()),
         }
     }
 
@@ -90,8 +93,9 @@ impl PersistedStateRejectionStreaks {
             return;
         };
 
+        let repair_owner = self.repair_owner.clone();
         let prepared = match tokio::task::spawn_blocking(move || {
-            prepare_progression(startup, coordinator, encoder)
+            prepare_progression(startup, repair_owner, coordinator, encoder)
         })
         .await
         {
@@ -139,13 +143,31 @@ impl PersistedStateRejectionStreaks {
             .expect(REJECTION_STREAK_LOCK_INVARIANT) = Some(eligibilities);
     }
 
-    #[cfg(test)]
     pub(super) fn take_eligibilities(&self) -> Vec<PersistedStateRejectedRecordEligibility> {
         self.eligibilities
             .lock()
             .expect(REJECTION_STREAK_LOCK_INVARIANT)
             .take()
             .unwrap_or_default()
+    }
+
+    pub(super) fn repair_owner(&self) -> &Arc<()> {
+        &self.repair_owner
+    }
+
+    #[cfg(test)]
+    pub(super) fn publish_eligibilities_for_test(
+        &self,
+        eligibilities: Vec<PersistedStateRejectedRecordEligibility>,
+    ) {
+        let eligibilities = eligibilities
+            .into_iter()
+            .map(|eligibility| eligibility.bind_owner_for_test(self.repair_owner.clone()))
+            .collect();
+        *self
+            .eligibilities
+            .lock()
+            .expect(REJECTION_STREAK_LOCK_INVARIANT) = Some(eligibilities);
     }
 
     #[cfg(test)]
@@ -169,6 +191,7 @@ enum PreparedProgression {
 
 fn prepare_progression(
     startup: PersistedStateRejectionStartup,
+    repair_owner: Arc<()>,
     coordinator: PersistenceCoordinator,
     encoder: SnapshotEncoder,
 ) -> PreparedProgression {
@@ -179,7 +202,7 @@ fn prepare_progression(
             return PreparedProgression::Skipped;
         }
     };
-    let (snapshot, eligibilities) = advance_snapshot(history, startup.scans);
+    let (snapshot, eligibilities) = advance_snapshot(history, startup.scans, &repair_owner);
 
     let owner = match coordinator.claim_owner(&startup.snapshot_path) {
         Ok(owner) => owner,
@@ -283,6 +306,7 @@ fn validate_snapshot(
 fn advance_snapshot(
     history: PersistedStateRejectionStreakSnapshot,
     scans: Vec<PersistedStateRejectedRecordStoreScan>,
+    repair_owner: &Arc<()>,
 ) -> (
     PersistedStateRejectionStreakSnapshot,
     Vec<PersistedStateRejectedRecordEligibility>,
@@ -323,7 +347,7 @@ fn advance_snapshot(
                 consecutive_startups,
             });
             if consecutive_startups == REJECTION_STREAK_THRESHOLD {
-                eligibilities.push(record.into_eligibility());
+                eligibilities.push(record.into_eligibility(repair_owner.clone()));
             }
         }
     }
@@ -878,6 +902,7 @@ mod tests {
                     vec![driver],
                 ),
             ],
+            &Arc::new(()),
         );
 
         assert_eq!(advanced.entries.len(), 1);
@@ -919,6 +944,7 @@ mod tests {
                 true,
                 vec![record],
             )],
+            &Arc::new(()),
         );
         assert_eq!(replacement.entries.len(), 1);
         assert_eq!(replacement.entries[0].consecutive_startups, 1);
@@ -931,6 +957,7 @@ mod tests {
                 true,
                 Vec::new(),
             )],
+            &Arc::new(()),
         );
         assert!(absent.entries.is_empty());
         assert!(eligibilities.is_empty());
@@ -977,6 +1004,7 @@ mod tests {
                     drivers,
                 ),
             ],
+            &Arc::new(()),
         );
 
         assert_eq!(advanced.entries.len(), 16);

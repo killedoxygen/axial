@@ -1,8 +1,10 @@
 use super::contracts::{
     CommandKind, OperationId, OperationJournalEntry, OperationJournalStep, OperationOutcome,
-    OperationPhase, OperationStatus, OperationStepResult, RECONCILIATION_EVIDENCE_CAPACITY,
-    ReconciliationAttempt, ReconciliationScope, ReconciliationTerminal,
-    ReconciliationTerminalOutcome, StabilizationSystem, TargetDescriptor, TargetKind,
+    OperationPhase, OperationStatus, OperationStepResult, OwnershipClass,
+    PersistedStateRepairAttempt, PersistedStateRepairTerminal, PersistedStateRepairTerminalOutcome,
+    RECONCILIATION_EVIDENCE_CAPACITY, ReconciliationAttempt, ReconciliationScope,
+    ReconciliationTerminal, ReconciliationTerminalOutcome, RollbackState, StabilizationSystem,
+    TargetDescriptor, TargetKind,
 };
 use super::ownership::{CurrentArtifact, classify_current_artifact};
 #[cfg(test)]
@@ -25,13 +27,14 @@ use std::time::Duration;
 use tokio::sync::Mutex as AsyncMutex;
 use tracing::warn;
 
-pub const OPERATION_JOURNAL_SCHEMA: &str = "axial.state.operation_journals.v3";
+pub const OPERATION_JOURNAL_SCHEMA: &str = "axial.state.operation_journals.v4";
 pub const DEFAULT_OPERATION_JOURNAL_LIMIT: usize = RECONCILIATION_EVIDENCE_CAPACITY;
 pub(crate) const MAX_OPERATION_JOURNAL_STEP_FACTS: usize = 64;
 pub(crate) const MAX_OPERATION_JOURNAL_DIAGNOSES: usize = 32;
 const OPERATION_JOURNAL_FILE: &str = "operation-journals.json";
 const OPERATION_JOURNAL_LOCK_INVARIANT: &str =
     "operation journal records lock poisoned; in-memory and persisted state may diverge";
+const OPERATION_JOURNAL_TRANSITION_RETRY_ATTEMPTS: usize = 4;
 
 #[derive(Debug, thiserror::Error)]
 pub enum OperationJournalStoreError {
@@ -99,6 +102,8 @@ pub(crate) fn operation_journal_plan_is_visible(
         && entry.outcome == expected.outcome
         && entry.reconciliation_attempt == expected.reconciliation_attempt
         && entry.reconciliation_terminal == expected.reconciliation_terminal
+        && entry.persisted_state_repair_attempt == expected.persisted_state_repair_attempt
+        && entry.persisted_state_repair_terminal == expected.persisted_state_repair_terminal
 }
 
 fn operation_journal_identity_and_plan_match(
@@ -146,10 +151,28 @@ pub(crate) fn operation_journal_terminal_is_visible(
         && entry.outcome == expected.outcome
         && entry.reconciliation_attempt == expected.reconciliation_attempt
         && entry.reconciliation_terminal == expected.reconciliation_terminal
+        && entry.persisted_state_repair_attempt == expected.persisted_state_repair_attempt
+        && entry.persisted_state_repair_terminal == expected.persisted_state_repair_terminal
         && expected
             .completed_steps
             .iter()
             .all(|step| operation_journal_completed_step_is_visible(entry, step))
+}
+
+pub(super) fn persisted_state_repair_plan_is_visible(
+    entry: &OperationJournalEntry,
+    attempt: &PersistedStateRepairAttempt,
+) -> bool {
+    entry.persisted_state_repair_attempt() == Some(attempt)
+        && entry.persisted_state_repair_terminal().is_none()
+        && validate_entry(entry).is_ok()
+}
+
+pub(super) fn persisted_state_repair_terminal_is_visible(
+    entry: &OperationJournalEntry,
+    terminal: &PersistedStateRepairTerminal,
+) -> bool {
+    entry.persisted_state_repair_terminal() == Some(terminal) && validate_entry(entry).is_ok()
 }
 
 struct OperationJournalPersistence {
@@ -300,6 +323,51 @@ impl OperationJournalStore {
         self.await_commit(ticket, mutation).await
     }
 
+    pub(super) async fn create_persisted_state_repair_plan(
+        &self,
+        attempt: PersistedStateRepairAttempt,
+    ) -> Result<(), OperationJournalStoreError> {
+        let mut entry = OperationJournalEntry::new(
+            attempt.journal_id(),
+            attempt.operation_id().clone(),
+            CommandKind::RepairPersistedState,
+            StabilizationSystem::Guardian,
+            OwnershipClass::LauncherManaged,
+            RollbackState::NotApplicable,
+        );
+        entry.targets.push(attempt.target().clone());
+        entry.planned_steps.push(OperationJournalStep::new(
+            "quarantine_rejected_restart_record",
+            OperationPhase::Repairing,
+        ));
+        entry
+            .guardian_diagnosis_ids
+            .push(DiagnosisId::PersistedStateSchemaInvalid);
+        entry.persisted_state_repair_attempt = Some(attempt);
+        validate_entry(&entry)?;
+        let mutation = self.mutation_gate.clone().lock_owned().await;
+        let ticket = {
+            let mut records = self
+                .records
+                .write()
+                .expect(OPERATION_JOURNAL_LOCK_INVARIANT);
+            if records.retry_candidate.is_some() {
+                return Err(OperationJournalStoreError::RetryRequired);
+            }
+            if records.visible.contains_key(entry.operation_id.as_str()) {
+                return Err(OperationJournalStoreError::AlreadyExists);
+            }
+            let operation_key = entry.operation_id.as_str().to_string();
+            let mut candidate = records.visible.clone();
+            candidate.insert(operation_key.clone(), entry);
+            if !prune_records(&mut candidate, self.max_entries, Some(&operation_key)) {
+                return Err(OperationJournalStoreError::CapacityExhausted);
+            }
+            self.accept_candidate(&mut records, candidate, WriteUrgency::Immediate)?
+        };
+        self.await_commit(ticket, mutation).await
+    }
+
     pub fn get(&self, operation_id: &OperationId) -> Option<OperationJournalEntry> {
         self.records
             .read()
@@ -433,6 +501,37 @@ impl OperationJournalStore {
             entry.failure_point = Some(failure_point.into());
             entry.outcome = Some(OperationOutcome::Failed);
             entry.reconciliation_terminal = Some(terminal);
+            Ok(())
+        })?;
+        self.await_commit(ticket, mutation).await
+    }
+
+    pub(super) async fn record_persisted_state_repair_terminal(
+        &self,
+        operation_id: &OperationId,
+        terminal: PersistedStateRepairTerminal,
+    ) -> Result<(), OperationJournalStoreError> {
+        let mutation = self.mutation_gate.clone().lock_owned().await;
+        let ticket = self.update(operation_id, WriteUrgency::Immediate, |entry| {
+            if operation_journal_status_is_terminal(entry.status) {
+                return Err(OperationJournalStoreError::AlreadyTerminal);
+            }
+            if entry.persisted_state_repair_attempt.as_ref() != Some(terminal.attempt()) {
+                return Err(OperationJournalValidationError::PersistedStateRepairMismatch.into());
+            }
+            let shape = persisted_state_repair_terminal_shape(terminal.outcome());
+            let mut completed_step = OperationJournalStep::new(
+                "quarantine_rejected_restart_record",
+                OperationPhase::Repairing,
+            );
+            completed_step.result = shape.step_result;
+            completed_step.changed_target = Some(terminal.attempt().target().clone());
+            completed_step.generated_facts = vec![shape.fact.to_string()];
+            entry.status = shape.status;
+            entry.completed_steps.push(completed_step);
+            entry.failure_point = shape.failure_point.map(str::to_string);
+            entry.outcome = Some(shape.outcome);
+            entry.persisted_state_repair_terminal = Some(terminal);
             Ok(())
         })?;
         self.await_commit(ticket, mutation).await
@@ -695,7 +794,9 @@ impl OperationJournalStore {
             _ => return Err(error),
         };
         let mut delay = retry_initial_delay;
-        while self.has_retry_candidate() {
+        let mut attempts = 0usize;
+        while self.has_retry_candidate() && attempts < OPERATION_JOURNAL_TRANSITION_RETRY_ATTEMPTS {
+            attempts += 1;
             match self.retry().await {
                 Ok(()) => break,
                 Err(next_error) => {
@@ -707,7 +808,9 @@ impl OperationJournalStore {
                         error_class = error.class(),
                         "operation journal transition reconciliation failed"
                     );
-                    tokio::time::sleep(delay).await;
+                    if attempts < OPERATION_JOURNAL_TRANSITION_RETRY_ATTEMPTS {
+                        tokio::time::sleep(delay).await;
+                    }
                     delay = delay.saturating_mul(2).min(retry_max_delay);
                 }
             }
@@ -942,6 +1045,8 @@ pub enum OperationJournalValidationError {
     TooManyDiagnoses,
     InvalidReconciliationTerminal,
     ReconciliationTerminalMismatch,
+    InvalidPersistedStateRepair,
+    PersistedStateRepairMismatch,
 }
 
 fn validate_entry(entry: &OperationJournalEntry) -> Result<(), OperationJournalValidationError> {
@@ -976,6 +1081,17 @@ fn validate_entry(entry: &OperationJournalEntry) -> Result<(), OperationJournalV
     }
     if entry.guardian_diagnosis_ids.len() > MAX_OPERATION_JOURNAL_DIAGNOSES {
         return Err(OperationJournalValidationError::TooManyDiagnoses);
+    }
+    if (entry.reconciliation_attempt().is_some() || entry.reconciliation_terminal().is_some())
+        && (entry.persisted_state_repair_attempt().is_some()
+            || entry.persisted_state_repair_terminal().is_some())
+    {
+        return Err(OperationJournalValidationError::PersistedStateRepairMismatch);
+    }
+    if (entry.command == CommandKind::RepairPersistedState)
+        != entry.persisted_state_repair_attempt().is_some()
+    {
+        return Err(OperationJournalValidationError::PersistedStateRepairMismatch);
     }
     if let Some(attempt) = entry.reconciliation_attempt() {
         validate_reconciliation_attempt(entry, attempt)?;
@@ -1036,7 +1152,105 @@ fn validate_entry(entry: &OperationJournalEntry) -> Result<(), OperationJournalV
     {
         return Err(OperationJournalValidationError::ReconciliationTerminalMismatch);
     }
+    if let Some(attempt) = entry.persisted_state_repair_attempt() {
+        attempt
+            .validate()
+            .map_err(|_| OperationJournalValidationError::InvalidPersistedStateRepair)?;
+        if attempt.operation_id() != &entry.operation_id
+            || entry.journal_id != attempt.journal_id()
+            || entry.command != CommandKind::RepairPersistedState
+            || entry.owner != StabilizationSystem::Guardian
+            || entry.ownership != OwnershipClass::LauncherManaged
+            || entry.targets != [attempt.target().clone()]
+            || entry.guardian_diagnosis_ids != [DiagnosisId::PersistedStateSchemaInvalid]
+            || entry.rollback != RollbackState::NotApplicable
+            || entry.planned_steps.len() != 1
+            || entry.planned_steps[0].step_id != "quarantine_rejected_restart_record"
+            || entry.planned_steps[0].phase != OperationPhase::Repairing
+            || entry.planned_steps[0].result != OperationStepResult::Planned
+            || entry.planned_steps[0].changed_target.is_some()
+            || !entry.planned_steps[0].generated_facts.is_empty()
+            || entry.planned_steps[0].rollback != RollbackState::NotApplicable
+        {
+            return Err(OperationJournalValidationError::PersistedStateRepairMismatch);
+        }
+        if entry.persisted_state_repair_terminal().is_none()
+            && (entry.status != OperationStatus::Planned
+                || !entry.completed_steps.is_empty()
+                || entry.failure_point.is_some()
+                || entry.outcome.is_some())
+        {
+            return Err(OperationJournalValidationError::PersistedStateRepairMismatch);
+        }
+    }
+    if let Some(terminal) = entry.persisted_state_repair_terminal() {
+        terminal
+            .validate()
+            .map_err(|_| OperationJournalValidationError::InvalidPersistedStateRepair)?;
+        if entry.persisted_state_repair_attempt() != Some(terminal.attempt())
+            || entry.completed_steps.len() != 1
+            || entry.completed_steps[0].step_id != "quarantine_rejected_restart_record"
+            || entry.completed_steps[0].phase != OperationPhase::Repairing
+            || entry.completed_steps[0].changed_target.as_ref() != Some(terminal.attempt().target())
+            || entry.completed_steps[0].rollback != RollbackState::NotApplicable
+        {
+            return Err(OperationJournalValidationError::PersistedStateRepairMismatch);
+        }
+        let shape = persisted_state_repair_terminal_shape(terminal.outcome());
+        if entry.status != shape.status
+            || entry.outcome != Some(shape.outcome)
+            || entry.completed_steps[0].result != shape.step_result
+            || entry.completed_steps[0].generated_facts != [shape.fact]
+            || entry.failure_point.as_deref() != shape.failure_point
+        {
+            return Err(OperationJournalValidationError::PersistedStateRepairMismatch);
+        }
+    } else if entry.command == CommandKind::RepairPersistedState
+        && operation_journal_status_is_terminal(entry.status)
+    {
+        return Err(OperationJournalValidationError::PersistedStateRepairMismatch);
+    }
     Ok(())
+}
+
+struct PersistedStateRepairJournalTerminalShape {
+    status: OperationStatus,
+    outcome: OperationOutcome,
+    step_result: OperationStepResult,
+    failure_point: Option<&'static str>,
+    fact: &'static str,
+}
+
+fn persisted_state_repair_terminal_shape(
+    outcome: PersistedStateRepairTerminalOutcome,
+) -> PersistedStateRepairJournalTerminalShape {
+    match outcome {
+        PersistedStateRepairTerminalOutcome::Quarantined => {
+            PersistedStateRepairJournalTerminalShape {
+                status: OperationStatus::Succeeded,
+                outcome: OperationOutcome::Succeeded,
+                step_result: OperationStepResult::Completed,
+                failure_point: None,
+                fact: "persisted_state_record_quarantined",
+            }
+        }
+        PersistedStateRepairTerminalOutcome::Refused => PersistedStateRepairJournalTerminalShape {
+            status: OperationStatus::Failed,
+            outcome: OperationOutcome::Failed,
+            step_result: OperationStepResult::Failed,
+            failure_point: Some("persisted_state_quarantine_refused"),
+            fact: "persisted_state_quarantine_refused",
+        },
+        PersistedStateRepairTerminalOutcome::AppliedUnverified => {
+            PersistedStateRepairJournalTerminalShape {
+                status: OperationStatus::Failed,
+                outcome: OperationOutcome::Failed,
+                step_result: OperationStepResult::Failed,
+                failure_point: Some("persisted_state_quarantine_applied_unverified"),
+                fact: "persisted_state_quarantine_applied_unverified",
+            }
+        }
+    }
 }
 
 fn validate_reconciliation_attempt(
@@ -1211,6 +1425,12 @@ fn active_reconciliation_terminal(entry: &OperationJournalEntry) -> bool {
             chrono::DateTime::parse_from_rfc3339(terminal.suppression_until()).ok()
         })
         .is_some_and(|until| until > chrono::Utc::now())
+        || entry
+            .persisted_state_repair_terminal()
+            .and_then(|terminal| {
+                chrono::DateTime::parse_from_rfc3339(terminal.suppression_until()).ok()
+            })
+            .is_some_and(|until| until > chrono::Utc::now())
 }
 
 pub fn operation_journal_path(paths: &AppPaths) -> PathBuf {
@@ -1244,9 +1464,10 @@ mod tests {
     use crate::guardian::DiagnosisId;
     use crate::state::contracts::{
         CommandKind, JournalId, OperationId, OperationJournalEntry, OperationJournalStep,
-        OperationOutcome, OperationPhase, OperationStatus, OwnershipClass, ReconciliationComponent,
-        ReconciliationRung, ReconciliationScope, ReconciliationTerminalOutcome, RollbackState,
-        StabilizationSystem, TargetDescriptor, TargetKind,
+        OperationOutcome, OperationPhase, OperationStatus, OwnershipClass,
+        PersistedStateRepairTerminalOutcome, ReconciliationComponent, ReconciliationRung,
+        ReconciliationScope, ReconciliationTerminalOutcome, RollbackState, StabilizationSystem,
+        TargetDescriptor, TargetKind,
     };
     use axial_config::AppPaths;
     use std::fs;
@@ -1258,9 +1479,9 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
     use tokio::sync::Notify;
 
-    const OPERATION_JOURNALS_V3_FIXTURE: &str = include_str!(concat!(
+    const OPERATION_JOURNALS_V4_FIXTURE: &str = include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/tests/fixtures/guardian/operation-journals-v3.json"
+        "/tests/fixtures/guardian/operation-journals-v4.json"
     ));
 
     struct RecordingFileBackend {
@@ -1640,6 +1861,8 @@ mod tests {
                 "outcome": "Succeeded",
                 "reconciliation_attempt": null,
                 "reconciliation_terminal": null,
+                "persisted_state_repair_attempt": null,
+                "persisted_state_repair_terminal": null,
                 "unexpected": true
             }]
         });
@@ -1647,24 +1870,25 @@ mod tests {
     }
 
     #[test]
-    fn retired_v2_operation_journal_schema_is_rejected() {
-        assert!(
-            OperationJournalSnapshot::from_json(
-                r#"{"schema":"axial.state.operation_journals.v2","entries":[]}"#,
-            )
-            .is_err()
-        );
+    fn retired_operation_journal_schemas_are_rejected() {
+        for schema in [
+            "axial.state.operation_journals.v2",
+            "axial.state.operation_journals.v3",
+        ] {
+            let value = serde_json::json!({"schema": schema, "entries": []});
+            assert!(OperationJournalSnapshot::from_json(&value.to_string()).is_err());
+        }
     }
 
     #[test]
-    fn checked_in_operation_journals_v3_fixture_is_byte_stable() {
-        let snapshot = OperationJournalSnapshot::from_json(OPERATION_JOURNALS_V3_FIXTURE)
+    fn checked_in_operation_journals_v4_fixture_is_byte_stable() {
+        let snapshot = OperationJournalSnapshot::from_json(OPERATION_JOURNALS_V4_FIXTURE)
             .expect("strict fixture");
         assert_eq!(
             super::OPERATION_JOURNAL_SCHEMA,
-            "axial.state.operation_journals.v3"
+            "axial.state.operation_journals.v4"
         );
-        assert_eq!(snapshot.schema, "axial.state.operation_journals.v3");
+        assert_eq!(snapshot.schema, "axial.state.operation_journals.v4");
         let diagnosis_ids = snapshot
             .entries
             .iter()
@@ -1742,8 +1966,19 @@ mod tests {
         assert!(terminals[0].quarantine_checkpoint().is_empty());
         assert!(!terminals[1].quarantine_checkpoint().is_empty());
 
+        let persisted_state_terminals = snapshot
+            .entries
+            .iter()
+            .filter_map(OperationJournalEntry::persisted_state_repair_terminal)
+            .collect::<Vec<_>>();
+        assert_eq!(persisted_state_terminals.len(), 1);
+        assert_eq!(
+            persisted_state_terminals[0].outcome(),
+            PersistedStateRepairTerminalOutcome::Refused
+        );
+
         let mut unknown_snapshot =
-            serde_json::from_str::<serde_json::Value>(OPERATION_JOURNALS_V3_FIXTURE)
+            serde_json::from_str::<serde_json::Value>(OPERATION_JOURNALS_V4_FIXTURE)
                 .expect("fixture value");
         unknown_snapshot["entries"][0]["guardian_diagnosis_ids"][0] =
             serde_json::Value::String("future_diagnosis".to_string());
@@ -1753,7 +1988,7 @@ mod tests {
         assert!(!error.contains("future_diagnosis"));
 
         let pretty = serde_json::to_string_pretty(&snapshot).expect("pretty fixture json");
-        assert_eq!(format!("{pretty}\n"), OPERATION_JOURNALS_V3_FIXTURE);
+        assert_eq!(format!("{pretty}\n"), OPERATION_JOURNALS_V4_FIXTURE);
 
         let compact = snapshot.to_json().expect("compact fixture json");
         let decoded =
@@ -2350,6 +2585,56 @@ mod tests {
             reconciliation,
             OperationJournalReconciliation::CommittedAfterPersistenceFailure(_)
         ));
+        cleanup(&root);
+    }
+
+    #[tokio::test]
+    async fn reconciliation_retains_a_permanent_candidate_without_retrying_forever() {
+        let (root, _paths, backend, _coordinator, store) =
+            persistence_fixture("reconcile-permanent-failure");
+        let operation_id = OperationId::new("operation-reconcile-permanent-failure");
+        store
+            .create(planned_entry(&operation_id))
+            .await
+            .expect("create journal");
+        for _ in 0..=super::OPERATION_JOURNAL_TRANSITION_RETRY_ATTEMPTS {
+            backend.fail_next();
+        }
+        let error = store
+            .record_success(
+                &operation_id,
+                completed_step("never_persisted"),
+                OperationOutcome::Succeeded,
+            )
+            .await
+            .expect_err("initial terminal persistence fails");
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            store.reconcile_transition(
+                &operation_id,
+                error,
+                Duration::from_millis(1),
+                Duration::from_millis(2),
+                |entry| entry.status == OperationStatus::Succeeded,
+            ),
+        )
+        .await
+        .expect("bounded journal reconciliation");
+        assert!(matches!(
+            result,
+            Err(OperationJournalStoreError::Persistence(_))
+        ));
+        assert!(store.has_retry_candidate());
+        assert_eq!(
+            store
+                .get(&operation_id)
+                .expect("last durable journal")
+                .status,
+            OperationStatus::Planned
+        );
+
+        drop(store);
         cleanup(&root);
     }
 

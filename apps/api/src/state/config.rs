@@ -508,6 +508,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn update_preserves_disabled_guardian_mode() {
+        let (store, backend) = test_store("disabled-guardian-mode", 0);
+
+        store
+            .mutate(
+                |config| {
+                    config.guardian_mode = "disabled".to_string();
+                    Ok(())
+                },
+                false,
+                no_op_observer(),
+            )
+            .await
+            .expect("persist disabled Guardian mode");
+
+        assert_eq!(store.current().guardian_mode, "disabled");
+        assert_eq!(backend.attempts.load(Ordering::SeqCst), 1);
+        let committed = backend.committed.lock().expect("committed config lock");
+        let persisted: AppConfig = serde_json::from_slice(&committed[0]).expect("persisted config");
+        assert_eq!(persisted.guardian_mode, "disabled");
+    }
+
+    #[tokio::test]
     async fn accepted_commit_survives_waiter_cancellation() {
         let (store, backend) = test_store("cancellation", 0);
         let gate = backend.gate_next();

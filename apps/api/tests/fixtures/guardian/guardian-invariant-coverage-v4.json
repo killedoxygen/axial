@@ -1,5 +1,5 @@
 {
-  "schema": "axial.guardian.invariant_coverage.v3",
+  "schema": "axial.guardian.invariant_coverage.v4",
   "invariants": [
     {
       "id": "I1",
@@ -7,7 +7,7 @@
     },
     {
       "id": "I2",
-      "status": "current_guardian_and_reconciliation_typed_hands_registered"
+      "status": "current_guardian_reconciliation_and_persisted_state_repair_typed_hands_registered"
     },
     {
       "id": "I3",
@@ -15,7 +15,7 @@
     },
     {
       "id": "I4",
-      "status": "current_guardian_and_reconciliation_hand_attempt_bounds_registered"
+      "status": "current_guardian_reconciliation_and_persisted_state_repair_hand_attempt_bounds_registered"
     },
     {
       "id": "I5",
@@ -36,6 +36,10 @@
     {
       "id": "I9",
       "status": "reserved_facts_unused_agent_demo_pending_phase_5"
+    },
+    {
+      "id": "I10",
+      "status": "persisted_state_repair_durability_and_fail_closed_restart_contract_registered"
     }
   ],
   "axes": {
@@ -4431,6 +4435,44 @@
         "RecordOnly"
       ],
       "decision": "RecordOnly"
+    }
+  ],
+  "persisted_state_repair_hands": [
+    {
+      "admission_type": "PersistedStateRepairAdmission",
+      "attempt_type": "PersistedStateRepairAttempt",
+      "terminal_type": "PersistedStateRepairTerminal",
+      "phase": "Startup",
+      "mode": "Managed",
+      "diagnosis": "persisted_state_schema_invalid",
+      "stable_key_dimensions": [
+        "store",
+        "record_id",
+        "physical_identity",
+        "mode"
+      ],
+      "max_attempts_per_stable_key_per_suppression_window": 1,
+      "suppression_window_hours": 24,
+      "operation_journal_schema": "axial.state.operation_journals.v4",
+      "failure_memory_schema": "axial.guardian.failure_memory.v4",
+      "terminal_outcomes": [
+        "Quarantined",
+        "Refused",
+        "AppliedUnverified"
+      ],
+      "durability_order": [
+        "plan_before_effect",
+        "terminal_before_memory",
+        "exact_attempt_terminal_binding",
+        "immediate_suppression_after_terminal"
+      ],
+      "restart_contracts": [
+        "nonterminal_without_exact_applied_proof_fail_closed",
+        "exact_applied_nonterminal_reconstructed",
+        "duplicate_active_key_fail_closed",
+        "orphan_active_memory_fail_closed",
+        "exact_missing_memory_rebuilt"
+      ]
     }
   ],
   "rules": [

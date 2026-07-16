@@ -51,7 +51,21 @@ pub fn build_router(state: AppState) -> Router {
     }
 }
 
-pub fn spawn_performance_rules_refresh(state: &AppState) -> bool {
+pub async fn start_application_background_workflows(state: &AppState) -> bool {
+    if !crate::application::settle_startup_persisted_state_repairs(state).await {
+        return false;
+    }
+    spawn_known_good_rebuilds(state);
+    spawn_idle_integrity_scheduler(state);
+    spawn_performance_operations_resume(state);
+    spawn_benchmark_suite_drivers_resume(state);
+    spawn_performance_rules_refresh(state);
+    spawn_telemetry_export(state);
+    spawn_remote_flags_refresh(state);
+    true
+}
+
+fn spawn_performance_rules_refresh(state: &AppState) -> bool {
     if !state.performance().remote_refresh_enabled() {
         return false;
     }
@@ -80,7 +94,7 @@ pub fn spawn_performance_rules_refresh(state: &AppState) -> bool {
     true
 }
 
-pub fn spawn_remote_flags_refresh(state: &AppState) -> bool {
+fn spawn_remote_flags_refresh(state: &AppState) -> bool {
     if !state.telemetry().export_configured() {
         return false;
     }
@@ -108,7 +122,7 @@ pub fn spawn_remote_flags_refresh(state: &AppState) -> bool {
     true
 }
 
-pub fn spawn_telemetry_export(state: &AppState) -> bool {
+fn spawn_telemetry_export(state: &AppState) -> bool {
     install_panic_capture(state.telemetry().clone());
     state.telemetry().emit(TelemetryEvent::app_started(
         state.version(),
@@ -221,7 +235,7 @@ fn parse_performance_rules_refresh_interval(value: Option<&str>) -> Duration {
     )
 }
 
-pub fn spawn_performance_operations_resume(state: &AppState) -> bool {
+fn spawn_performance_operations_resume(state: &AppState) -> bool {
     let Ok(producer) = state.try_claim_producer() else {
         return false;
     };
@@ -229,7 +243,7 @@ pub fn spawn_performance_operations_resume(state: &AppState) -> bool {
     true
 }
 
-pub fn spawn_known_good_rebuilds(state: &AppState) -> bool {
+fn spawn_known_good_rebuilds(state: &AppState) -> bool {
     let Ok(producer) = state.try_claim_producer() else {
         return false;
     };
@@ -237,7 +251,7 @@ pub fn spawn_known_good_rebuilds(state: &AppState) -> bool {
     true
 }
 
-pub fn spawn_idle_integrity_scheduler(state: &AppState) -> bool {
+fn spawn_idle_integrity_scheduler(state: &AppState) -> bool {
     let Ok(producer) = state.try_claim_producer() else {
         return false;
     };
@@ -245,7 +259,7 @@ pub fn spawn_idle_integrity_scheduler(state: &AppState) -> bool {
     true
 }
 
-pub fn spawn_benchmark_suite_drivers_resume(state: &AppState) -> bool {
+fn spawn_benchmark_suite_drivers_resume(state: &AppState) -> bool {
     crate::application::launch::spawn_restart_interrupted_benchmark_suite_drivers(state)
 }
 

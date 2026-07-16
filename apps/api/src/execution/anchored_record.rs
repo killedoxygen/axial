@@ -6,7 +6,7 @@ use std::path::Path;
 
 use sha2::{Digest as _, Sha256};
 
-const RESTART_IDENTITY_DOMAIN: &[u8] = b"axial.persisted-state-restart-record-identity.v1\0";
+const RESTART_IDENTITY_DOMAIN: &[u8] = b"axial.persisted-state-restart-record-identity.v2\0";
 const RESTART_IDENTITY_EDGE_SAMPLE_BYTES: usize = 4 * 1024;
 
 #[path = "registered_artifact.rs"]
@@ -16,8 +16,6 @@ pub(crate) struct AnchoredRecordIdentity {
     leaf: AnchoredLeaf,
     file: AnchoredRegularFile,
 }
-
-struct AnchoredRecordQuarantineSuffix([u8; 16]);
 
 pub(crate) struct AnchoredRecordQuarantineReceipt {
     exact: platform::ExactRenameReceipt,
@@ -201,10 +199,7 @@ impl AnchoredRecordIdentity {
         self,
         suffix: [u8; 16],
     ) -> Result<AnchoredRecordQuarantineReceipt, AnchoredRecordQuarantineError> {
-        let destination = persisted_state_quarantine_name(
-            self.leaf.name(),
-            AnchoredRecordQuarantineSuffix::from_bytes(suffix),
-        );
+        let destination = anchored_record_quarantine_name(self.leaf.name(), suffix);
         self.leaf
             .rename_exact(self.file, destination)
             .map(|exact| AnchoredRecordQuarantineReceipt { exact })
@@ -221,23 +216,7 @@ impl AnchoredRecordIdentity {
     }
 }
 
-impl AnchoredRecordQuarantineSuffix {
-    fn from_bytes(bytes: [u8; 16]) -> Self {
-        Self(bytes)
-    }
-
-    fn lowercase_hex(self) -> String {
-        let mut encoded = String::with_capacity(32);
-        for byte in self.0 {
-            use std::fmt::Write as _;
-            write!(&mut encoded, "{byte:02x}").expect("writing to a String cannot fail");
-        }
-        encoded
-    }
-}
-
 impl AnchoredRecordQuarantineReceipt {
-    #[cfg(test)]
     pub(crate) fn is_current(&self) -> bool {
         self.exact.revalidate().is_ok()
     }
@@ -251,14 +230,16 @@ impl AnchoredRecordQuarantineError {
     }
 }
 
-fn persisted_state_quarantine_name(
-    canonical: &OsStr,
-    suffix: AnchoredRecordQuarantineSuffix,
-) -> OsString {
+pub(crate) fn anchored_record_quarantine_name(canonical: &OsStr, suffix: [u8; 16]) -> OsString {
     let mut destination = OsString::from(".");
     destination.push(canonical);
     destination.push(".axial-quarantine-");
-    destination.push(suffix.lowercase_hex());
+    let mut encoded = String::with_capacity(32);
+    for byte in suffix {
+        use std::fmt::Write as _;
+        write!(&mut encoded, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    destination.push(encoded);
     destination
 }
 
@@ -892,14 +873,12 @@ mod platform {
             hasher: &mut Sha256,
             full_bytes: Option<&[u8]>,
         ) -> io::Result<()> {
-            hasher.update(b"unix-regular-file-v1\0");
+            hasher.update(b"unix-regular-file-v2\0");
             hasher.update(self.metadata.identity.device.to_le_bytes());
             hasher.update(self.metadata.identity.inode.to_le_bytes());
             hasher.update(self.metadata.size.to_le_bytes());
             hasher.update(self.metadata.modified_seconds.to_le_bytes());
             hasher.update(self.metadata.modified_nanoseconds.to_le_bytes());
-            hasher.update(self.metadata.changed_seconds.to_le_bytes());
-            hasher.update(self.metadata.changed_nanoseconds.to_le_bytes());
             match full_bytes {
                 Some(bytes) => {
                     if u64::try_from(bytes.len()).ok() != Some(self.metadata.size) {
@@ -1774,12 +1753,11 @@ mod platform {
             hasher: &mut Sha256,
             full_bytes: Option<&[u8]>,
         ) -> io::Result<()> {
-            hasher.update(b"windows-regular-file-v1\0");
+            hasher.update(b"windows-regular-file-v2\0");
             hasher.update(self.volume.to_le_bytes());
             hasher.update(self.id);
             hasher.update(self.size.to_le_bytes());
             hasher.update(self.modified.to_le_bytes());
-            hasher.update(self.changed.to_le_bytes());
             match full_bytes {
                 Some(bytes) => {
                     if usize::try_from(self.size).ok() != Some(bytes.len()) {

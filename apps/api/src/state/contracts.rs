@@ -10,6 +10,9 @@ use serde::{Deserialize, Serialize};
 
 pub(crate) const RECONCILIATION_EVIDENCE_CAPACITY: usize = 128;
 pub const RECONCILIATION_QUARANTINE_CAPACITY: usize = 8;
+pub(super) const PERSISTED_STATE_REPAIR_SUPPRESSION_HOURS: i64 = 24;
+pub(super) const PERSISTED_STATE_REPAIR_MAX_ATTEMPTS_PER_STABLE_KEY_PER_SUPPRESSION_WINDOW: usize =
+    1;
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -37,6 +40,10 @@ impl RestartStableRecordIdentity {
         }
         debug_assert!(valid_restart_stable_record_identity(&value));
         Self(value)
+    }
+
+    pub(super) fn as_str(&self) -> &str {
+        &self.0
     }
 }
 
@@ -205,6 +212,215 @@ pub struct ReconciliationTerminal {
     attempt: ReconciliationAttempt,
     outcome: ReconciliationTerminalOutcome,
     quarantine_checkpoint: ReconciliationQuarantineCheckpoint,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
+pub(crate) enum PersistedStateRepairTerminalOutcome {
+    Quarantined,
+    Refused,
+    AppliedUnverified,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PersistedStateRepairAttempt {
+    operation_id: OperationId,
+    store: PersistedStateRecordStore,
+    record_id: String,
+    physical_identity: RestartStableRecordIdentity,
+    target: TargetDescriptor,
+    mode: GuardianMode,
+    observed_at: String,
+    suppression_until: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PersistedStateRepairTerminal {
+    attempt: PersistedStateRepairAttempt,
+    outcome: PersistedStateRepairTerminalOutcome,
+}
+
+impl PersistedStateRepairAttempt {
+    pub(super) fn new(
+        quarantine_suffix: [u8; 16],
+        store: PersistedStateRecordStore,
+        record_id: impl Into<String>,
+        physical_identity: RestartStableRecordIdentity,
+        mode: GuardianMode,
+        observed_at: impl Into<String>,
+    ) -> Self {
+        let record_id = record_id.into();
+        let observed_at = observed_at.into();
+        let suppression_until = chrono::DateTime::parse_from_rfc3339(&observed_at)
+            .ok()
+            .and_then(|observed| {
+                observed.checked_add_signed(chrono::Duration::hours(
+                    PERSISTED_STATE_REPAIR_SUPPRESSION_HOURS,
+                ))
+            })
+            .map(|until| until.to_rfc3339())
+            .unwrap_or_default();
+        Self {
+            operation_id: persisted_state_repair_operation_id(quarantine_suffix),
+            store,
+            target: persisted_state_repair_record_target(store, &record_id),
+            record_id,
+            physical_identity,
+            mode,
+            observed_at,
+            suppression_until,
+        }
+    }
+
+    pub(crate) fn operation_id(&self) -> &OperationId {
+        &self.operation_id
+    }
+
+    pub(super) fn journal_id(&self) -> JournalId {
+        JournalId::new(format!("journal-{}", self.operation_id.as_str()))
+    }
+
+    pub(crate) const fn store(&self) -> PersistedStateRecordStore {
+        self.store
+    }
+
+    pub(crate) fn record_id(&self) -> &str {
+        &self.record_id
+    }
+
+    pub(crate) fn physical_identity(&self) -> &RestartStableRecordIdentity {
+        &self.physical_identity
+    }
+
+    pub(crate) fn target(&self) -> &TargetDescriptor {
+        &self.target
+    }
+
+    pub(crate) fn observed_at(&self) -> &str {
+        &self.observed_at
+    }
+
+    pub(crate) fn suppression_until(&self) -> &str {
+        &self.suppression_until
+    }
+
+    pub(super) fn validate(&self) -> Result<(), PersistedStateRepairValidationError> {
+        if persisted_state_repair_quarantine_suffix(self).is_err() {
+            return Err(PersistedStateRepairValidationError::UnsafeOperationId);
+        }
+        if !safe_reconciliation_token(&self.record_id, 128)
+            || !match self.store {
+                PersistedStateRecordStore::PerformanceOperation => {
+                    super::performance_operations::is_safe_operation_id(&self.record_id)
+                }
+                PersistedStateRecordStore::BenchmarkSuiteDriver => {
+                    super::benchmark_suite_drivers::is_safe_driver_id(&self.record_id)
+                }
+            }
+        {
+            return Err(PersistedStateRepairValidationError::UnsafeRecordId);
+        }
+        if self.mode != GuardianMode::Managed {
+            return Err(PersistedStateRepairValidationError::InvalidMode);
+        }
+        if self.target != persisted_state_repair_record_target(self.store, &self.record_id) {
+            return Err(PersistedStateRepairValidationError::UnsafeTarget);
+        }
+        let observed_at = chrono::DateTime::parse_from_rfc3339(&self.observed_at)
+            .map_err(|_| PersistedStateRepairValidationError::InvalidWindow)?;
+        let suppression_until = chrono::DateTime::parse_from_rfc3339(&self.suppression_until)
+            .map_err(|_| PersistedStateRepairValidationError::InvalidWindow)?;
+        if observed_at.checked_add_signed(chrono::Duration::hours(
+            PERSISTED_STATE_REPAIR_SUPPRESSION_HOURS,
+        )) != Some(suppression_until)
+        {
+            return Err(PersistedStateRepairValidationError::InvalidWindow);
+        }
+        Ok(())
+    }
+}
+
+pub(super) fn persisted_state_repair_quarantine_suffix(
+    attempt: &PersistedStateRepairAttempt,
+) -> Result<[u8; 16], PersistedStateRepairValidationError> {
+    let suffix = attempt
+        .operation_id
+        .as_str()
+        .strip_prefix("repair-persisted-state-")
+        .filter(|suffix| suffix.len() == 32)
+        .ok_or(PersistedStateRepairValidationError::UnsafeOperationId)?;
+    let mut bytes = [0u8; 16];
+    for (index, pair) in suffix.as_bytes().chunks_exact(2).enumerate() {
+        let high = canonical_lower_hex(pair[0])
+            .ok_or(PersistedStateRepairValidationError::UnsafeOperationId)?;
+        let low = canonical_lower_hex(pair[1])
+            .ok_or(PersistedStateRepairValidationError::UnsafeOperationId)?;
+        bytes[index] = (high << 4) | low;
+    }
+    Ok(bytes)
+}
+
+fn persisted_state_repair_operation_id(suffix_bytes: [u8; 16]) -> OperationId {
+    let mut suffix = String::with_capacity(32);
+    for byte in suffix_bytes {
+        use std::fmt::Write as _;
+        write!(&mut suffix, "{byte:02x}").expect("writing to String cannot fail");
+    }
+    OperationId::new(format!("repair-persisted-state-{suffix}"))
+}
+
+fn canonical_lower_hex(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        _ => None,
+    }
+}
+
+fn persisted_state_repair_record_target(
+    store: PersistedStateRecordStore,
+    record_id: &str,
+) -> TargetDescriptor {
+    super::persisted_state_load::persisted_state_record_target(store, record_id)
+}
+
+impl PersistedStateRepairTerminal {
+    pub(super) fn from_attempt(
+        attempt: PersistedStateRepairAttempt,
+        outcome: PersistedStateRepairTerminalOutcome,
+    ) -> Self {
+        Self { attempt, outcome }
+    }
+
+    pub(crate) fn attempt(&self) -> &PersistedStateRepairAttempt {
+        &self.attempt
+    }
+
+    pub(crate) const fn outcome(&self) -> PersistedStateRepairTerminalOutcome {
+        self.outcome
+    }
+
+    pub(crate) fn operation_id(&self) -> &OperationId {
+        self.attempt.operation_id()
+    }
+
+    pub(crate) fn suppression_until(&self) -> &str {
+        self.attempt.suppression_until()
+    }
+
+    pub(super) fn validate(&self) -> Result<(), PersistedStateRepairValidationError> {
+        self.attempt.validate()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum PersistedStateRepairValidationError {
+    UnsafeOperationId,
+    UnsafeRecordId,
+    UnsafeTarget,
+    InvalidMode,
+    InvalidWindow,
 }
 
 impl ReconciliationQuarantineRecord {
@@ -614,6 +830,7 @@ pub enum CommandKind {
     StopSession,
     InstallVersion,
     RepairInstance,
+    RepairPersistedState,
     ApplyPerformancePlan,
     RefreshPerformanceRules,
     ValidateInstance,
@@ -759,6 +976,8 @@ pub struct OperationJournalEntry {
     pub outcome: Option<OperationOutcome>,
     pub(super) reconciliation_attempt: Option<ReconciliationAttempt>,
     pub(super) reconciliation_terminal: Option<ReconciliationTerminal>,
+    pub(super) persisted_state_repair_attempt: Option<PersistedStateRepairAttempt>,
+    pub(super) persisted_state_repair_terminal: Option<PersistedStateRepairTerminal>,
 }
 
 impl OperationJournalEntry {
@@ -786,6 +1005,8 @@ impl OperationJournalEntry {
             outcome: None,
             reconciliation_attempt: None,
             reconciliation_terminal: None,
+            persisted_state_repair_attempt: None,
+            persisted_state_repair_terminal: None,
         }
     }
 
@@ -795,6 +1016,14 @@ impl OperationJournalEntry {
 
     pub(crate) fn reconciliation_attempt(&self) -> Option<&ReconciliationAttempt> {
         self.reconciliation_attempt.as_ref()
+    }
+
+    pub(crate) fn persisted_state_repair_attempt(&self) -> Option<&PersistedStateRepairAttempt> {
+        self.persisted_state_repair_attempt.as_ref()
+    }
+
+    pub(crate) fn persisted_state_repair_terminal(&self) -> Option<&PersistedStateRepairTerminal> {
+        self.persisted_state_repair_terminal.as_ref()
     }
 }
 

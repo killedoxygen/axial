@@ -4,7 +4,9 @@
 //! and later-operation guidance. It stores memory; it does not decide policy.
 
 use super::contracts::{
-    OwnershipClass, RECONCILIATION_EVIDENCE_CAPACITY, TargetDescriptor, sanitize_target_id,
+    OwnershipClass, PersistedStateRepairAttempt, PersistedStateRepairTerminal,
+    PersistedStateRepairTerminalOutcome, RECONCILIATION_EVIDENCE_CAPACITY, TargetDescriptor,
+    sanitize_target_id,
 };
 use super::contracts::{
     ReconciliationComponent, ReconciliationQuarantineCheckpoint, ReconciliationRung,
@@ -26,7 +28,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 
-pub const FAILURE_MEMORY_SCHEMA: &str = "axial.guardian.failure_memory.v3";
+pub const FAILURE_MEMORY_SCHEMA: &str = "axial.guardian.failure_memory.v4";
 pub const DEFAULT_FAILURE_MEMORY_LIMIT: usize = RECONCILIATION_EVIDENCE_CAPACITY;
 const FAILURE_MEMORY_FILE: &str = "failure-memory.json";
 const FAILURE_MEMORY_LOCK_INVARIANT: &str =
@@ -103,6 +105,16 @@ impl FailureMemoryKey {
             component,
         ))
     }
+
+    pub(super) fn for_persisted_state_repair(attempt: &PersistedStateRepairAttempt) -> Self {
+        Self(format!(
+            "State:{}:Managed:{:?}:{}:{}",
+            DiagnosisId::PersistedStateSchemaInvalid.as_str(),
+            attempt.store(),
+            attempt.record_id(),
+            attempt.physical_identity().as_str(),
+        ))
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -125,6 +137,7 @@ pub struct GuardianFailureMemoryEntry {
     pub target_content_hash: Option<String>,
     pub user_intent_hash: Option<String>,
     reconciliation_terminal: Option<ReconciliationTerminal>,
+    persisted_state_repair_terminal: Option<PersistedStateRepairTerminal>,
 }
 
 impl GuardianFailureMemoryEntry {
@@ -165,6 +178,7 @@ impl GuardianFailureMemoryEntry {
             target_content_hash: None,
             user_intent_hash,
             reconciliation_terminal: None,
+            persisted_state_repair_terminal: None,
         }
     }
 
@@ -210,6 +224,10 @@ impl GuardianFailureMemoryEntry {
         self.reconciliation_terminal.as_ref()
     }
 
+    pub(crate) fn persisted_state_repair_terminal(&self) -> Option<&PersistedStateRepairTerminal> {
+        self.persisted_state_repair_terminal.as_ref()
+    }
+
     pub(super) fn with_reconciliation_terminal(mut self, terminal: ReconciliationTerminal) -> Self {
         self.mode = terminal.mode();
         self.ownership = terminal.ownership();
@@ -225,29 +243,72 @@ impl GuardianFailureMemoryEntry {
         self
     }
 
+    pub(super) fn for_persisted_state_repair_terminal(
+        terminal: PersistedStateRepairTerminal,
+    ) -> Self {
+        let attempt = terminal.attempt();
+        let action_outcome = match terminal.outcome() {
+            PersistedStateRepairTerminalOutcome::Quarantined => {
+                FailureMemoryActionOutcome::Repaired
+            }
+            PersistedStateRepairTerminalOutcome::Refused
+            | PersistedStateRepairTerminalOutcome::AppliedUnverified => {
+                FailureMemoryActionOutcome::Failed
+            }
+        };
+        Self {
+            key: FailureMemoryKey::for_persisted_state_repair(attempt),
+            diagnosis_id: DiagnosisId::PersistedStateSchemaInvalid,
+            domain: GuardianDomain::State,
+            mode: GuardianMode::Managed,
+            target: attempt.target().clone(),
+            ownership: OwnershipClass::LauncherManaged,
+            first_observed_at: attempt.observed_at().to_string(),
+            last_observed_at: attempt.observed_at().to_string(),
+            occurrence_count: 1,
+            last_action_kind: Some(GuardianActionKind::Quarantine),
+            last_action_outcome: Some(action_outcome),
+            repair_attempt_count: 1,
+            quarantine_checkpoint: ReconciliationQuarantineCheckpoint::default(),
+            suppression_until: Some(attempt.suppression_until().to_string()),
+            target_content_hash: None,
+            user_intent_hash: None,
+            reconciliation_terminal: None,
+            persisted_state_repair_terminal: Some(terminal),
+        }
+    }
+
     pub fn validate(&self) -> Result<(), FailureMemoryValidationError> {
         if !is_safe_memory_fragment(self.key.as_str()) {
             return Err(FailureMemoryValidationError::UnsafeKey);
         }
-        let expected_key = self.reconciliation_terminal.as_ref().map_or_else(
-            || {
-                FailureMemoryKey::for_observation(
-                    self.domain,
-                    &self.diagnosis_id,
-                    &self.target,
-                    self.mode,
-                    self.user_intent_hash.as_deref(),
-                )
-            },
-            |terminal| {
-                FailureMemoryKey::for_reconciliation(
-                    self.domain,
-                    &self.diagnosis_id,
-                    &self.target,
-                    terminal,
-                )
-            },
-        );
+        if self.reconciliation_terminal.is_some() && self.persisted_state_repair_terminal.is_some()
+        {
+            return Err(FailureMemoryValidationError::PersistedStateRepairTerminalMismatch);
+        }
+        let expected_key = if let Some(terminal) = &self.persisted_state_repair_terminal {
+            FailureMemoryKey::for_persisted_state_repair(terminal.attempt())
+        } else {
+            self.reconciliation_terminal.as_ref().map_or_else(
+                || {
+                    FailureMemoryKey::for_observation(
+                        self.domain,
+                        &self.diagnosis_id,
+                        &self.target,
+                        self.mode,
+                        self.user_intent_hash.as_deref(),
+                    )
+                },
+                |terminal| {
+                    FailureMemoryKey::for_reconciliation(
+                        self.domain,
+                        &self.diagnosis_id,
+                        &self.target,
+                        terminal,
+                    )
+                },
+            )
+        };
         if self.key != expected_key {
             return Err(FailureMemoryValidationError::MemoryKeyMismatch);
         }
@@ -312,6 +373,39 @@ impl GuardianFailureMemoryEntry {
                 || self.suppression_until.is_none()
             {
                 return Err(FailureMemoryValidationError::ReconciliationTerminalMismatch);
+            }
+        }
+        if let Some(terminal) = &self.persisted_state_repair_terminal {
+            terminal
+                .validate()
+                .map_err(|_| FailureMemoryValidationError::InvalidPersistedStateRepairTerminal)?;
+            let attempt = terminal.attempt();
+            let expected_outcome = match terminal.outcome() {
+                PersistedStateRepairTerminalOutcome::Quarantined => {
+                    FailureMemoryActionOutcome::Repaired
+                }
+                PersistedStateRepairTerminalOutcome::Refused
+                | PersistedStateRepairTerminalOutcome::AppliedUnverified => {
+                    FailureMemoryActionOutcome::Failed
+                }
+            };
+            if self.diagnosis_id != DiagnosisId::PersistedStateSchemaInvalid
+                || self.domain != GuardianDomain::State
+                || self.mode != GuardianMode::Managed
+                || self.ownership != OwnershipClass::LauncherManaged
+                || self.target != *attempt.target()
+                || self.user_intent_hash.is_some()
+                || self.target_content_hash.is_some()
+                || self.last_action_kind != Some(GuardianActionKind::Quarantine)
+                || self.last_action_outcome != Some(expected_outcome)
+                || self.first_observed_at != attempt.observed_at()
+                || self.last_observed_at != attempt.observed_at()
+                || self.occurrence_count != 1
+                || self.repair_attempt_count != 1
+                || self.suppression_until.as_deref() != Some(attempt.suppression_until())
+                || !self.quarantine_checkpoint.is_empty()
+            {
+                return Err(FailureMemoryValidationError::PersistedStateRepairTerminalMismatch);
             }
         }
         Ok(())
@@ -405,6 +499,8 @@ pub enum FailureMemoryValidationError {
     InvalidSuppressionTimestamp,
     InvalidReconciliationTerminal,
     ReconciliationTerminalMismatch,
+    InvalidPersistedStateRepairTerminal,
+    PersistedStateRepairTerminalMismatch,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -474,10 +570,24 @@ pub(super) struct ReconciliationAttemptReservation {
     attempts: Arc<Mutex<BTreeSet<String>>>,
 }
 
+pub(super) struct PersistedStateRepairReservation {
+    key: FailureMemoryKey,
+    attempts: Arc<Mutex<BTreeSet<String>>>,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum ReconciliationAttemptReserveError {
     PersistencePending,
     AlreadyReserved,
+    CapacityExhausted,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum PersistedStateRepairReserveError {
+    InvalidAttempt,
+    PersistencePending,
+    AlreadyReserved,
+    Suppressed,
     CapacityExhausted,
 }
 
@@ -486,6 +596,15 @@ impl Drop for ReconciliationAttemptReservation {
         self.attempts
             .lock()
             .expect("Guardian reconciliation attempts lock poisoned")
+            .remove(self.key.as_str());
+    }
+}
+
+impl Drop for PersistedStateRepairReservation {
+    fn drop(&mut self) {
+        self.attempts
+            .lock()
+            .expect("Guardian persisted-state repair attempts lock poisoned")
             .remove(self.key.as_str());
     }
 }
@@ -579,9 +698,9 @@ impl GuardianFailureMemoryStore {
             )));
         }
         entry.validate()?;
-        let protected_key = entry
-            .reconciliation_terminal()
-            .map(|_| entry.key.as_str().to_string());
+        let protected_key = (entry.reconciliation_terminal().is_some()
+            || entry.persisted_state_repair_terminal().is_some())
+        .then(|| entry.key.as_str().to_string());
         let mut candidate = records.visible.clone();
         apply(&mut candidate, entry);
         if !prune_records(&mut candidate, self.max_entries, protected_key.as_deref()) {
@@ -653,6 +772,71 @@ impl GuardianFailureMemoryStore {
         self.await_commit(pending).await
     }
 
+    pub(super) async fn record_persisted_state_repair_terminal(
+        &self,
+        entry: GuardianFailureMemoryEntry,
+        reservation: &PersistedStateRepairReservation,
+    ) -> Result<(), FailureMemoryStoreError> {
+        self.validate_persisted_state_repair_terminal(&entry, reservation)?;
+        let key = entry.key.clone();
+        if self.get(&key).is_some_and(|stored| stored == entry) {
+            return Ok(());
+        }
+        if self
+            .records
+            .read()
+            .expect(FAILURE_MEMORY_LOCK_INVARIANT)
+            .retry_candidate
+            .is_some()
+        {
+            self.retry().await?;
+            self.validate_persisted_state_repair_terminal(&entry, reservation)?;
+            if self.get(&key).is_some_and(|stored| stored == entry) {
+                return Ok(());
+            }
+        }
+        let pending =
+            self.record_with(entry, apply_reconciliation_record, WriteUrgency::Immediate)?;
+        self.await_commit(pending).await
+    }
+
+    pub(super) fn validate_persisted_state_repair_terminal(
+        &self,
+        entry: &GuardianFailureMemoryEntry,
+        reservation: &PersistedStateRepairReservation,
+    ) -> Result<(), FailureMemoryStoreError> {
+        if entry.persisted_state_repair_terminal().is_none() {
+            return Err(FailureMemoryValidationError::InvalidPersistedStateRepairTerminal.into());
+        }
+        entry.validate()?;
+        if reservation.key != entry.key || !Arc::ptr_eq(&reservation.attempts, &self.attempts) {
+            return Err(FailureMemoryValidationError::MemoryKeyMismatch.into());
+        }
+        let records = self.records.read().expect(FAILURE_MEMORY_LOCK_INVARIANT);
+        let attempts = self
+            .attempts
+            .lock()
+            .expect("Guardian persisted-state repair attempts lock poisoned");
+        if !attempts.contains(entry.key.as_str()) {
+            return Err(FailureMemoryValidationError::MemoryKeyMismatch.into());
+        }
+        if records
+            .visible
+            .get(entry.key.as_str())
+            .is_some_and(|stored| {
+                stored != entry && !persisted_state_repair_entry_can_be_superseded(stored, entry)
+            })
+        {
+            return Err(FailureMemoryValidationError::PersistedStateRepairTerminalMismatch.into());
+        }
+        let mut candidate = records.visible.clone();
+        apply_reconciliation_record(&mut candidate, entry.clone());
+        if !prune_records(&mut candidate, self.max_entries, Some(entry.key.as_str())) {
+            return Err(FailureMemoryStoreError::CapacityExhausted);
+        }
+        Ok(())
+    }
+
     pub(super) fn validate_reconciliation_terminal(
         &self,
         entry: &GuardianFailureMemoryEntry,
@@ -709,7 +893,7 @@ impl GuardianFailureMemoryStore {
             records
                 .visible
                 .values()
-                .filter(|entry| active_reconciliation_terminal(entry))
+                .filter(|entry| active_durable_terminal(entry))
                 .map(|entry| entry.key.as_str().to_string()),
         );
         if !occupied_keys.contains(key.as_str()) && occupied_keys.len() >= self.max_entries {
@@ -718,6 +902,51 @@ impl GuardianFailureMemoryStore {
         attempts.insert(key.as_str().to_string());
         drop(records);
         Ok(ReconciliationAttemptReservation {
+            key,
+            attempts: self.attempts.clone(),
+        })
+    }
+
+    pub(super) fn reserve_persisted_state_repair(
+        &self,
+        attempt: &PersistedStateRepairAttempt,
+    ) -> Result<PersistedStateRepairReservation, PersistedStateRepairReserveError> {
+        let observed_at = DateTime::parse_from_rfc3339(attempt.observed_at())
+            .map_err(|_| PersistedStateRepairReserveError::InvalidAttempt)?;
+        let key = FailureMemoryKey::for_persisted_state_repair(attempt);
+        let records = self.records.read().expect(FAILURE_MEMORY_LOCK_INVARIANT);
+        if records.critical_pending || records.retry_candidate.is_some() {
+            return Err(PersistedStateRepairReserveError::PersistencePending);
+        }
+        let mut attempts = self
+            .attempts
+            .lock()
+            .expect("Guardian persisted-state repair attempts lock poisoned");
+        if attempts.contains(key.as_str()) {
+            return Err(PersistedStateRepairReserveError::AlreadyReserved);
+        }
+        if records
+            .visible
+            .get(key.as_str())
+            .and_then(GuardianFailureMemoryEntry::persisted_state_repair_terminal)
+            .and_then(|terminal| DateTime::parse_from_rfc3339(terminal.suppression_until()).ok())
+            .is_some_and(|until| until > observed_at)
+        {
+            return Err(PersistedStateRepairReserveError::Suppressed);
+        }
+        let mut occupied_keys = attempts.clone();
+        occupied_keys.extend(
+            records
+                .visible
+                .values()
+                .filter(|entry| active_durable_terminal(entry))
+                .map(|entry| entry.key.as_str().to_string()),
+        );
+        if !occupied_keys.contains(key.as_str()) && occupied_keys.len() >= self.max_entries {
+            return Err(PersistedStateRepairReserveError::CapacityExhausted);
+        }
+        attempts.insert(key.as_str().to_string());
+        Ok(PersistedStateRepairReservation {
             key,
             attempts: self.attempts.clone(),
         })
@@ -904,7 +1133,7 @@ fn prune_records(
     let mut ordered = records
         .values()
         .filter(|entry| {
-            protected_key != Some(entry.key.as_str()) && !active_reconciliation_terminal(entry)
+            protected_key != Some(entry.key.as_str()) && !active_durable_terminal(entry)
         })
         .map(|entry| {
             (
@@ -923,11 +1152,15 @@ fn prune_records(
     records.len() <= max_entries
 }
 
-fn active_reconciliation_terminal(entry: &GuardianFailureMemoryEntry) -> bool {
+fn active_durable_terminal(entry: &GuardianFailureMemoryEntry) -> bool {
     entry
         .reconciliation_terminal()
         .and_then(|terminal| DateTime::parse_from_rfc3339(terminal.suppression_until()).ok())
         .is_some_and(|until| until > chrono::Utc::now())
+        || entry
+            .persisted_state_repair_terminal()
+            .and_then(|terminal| DateTime::parse_from_rfc3339(terminal.suppression_until()).ok())
+            .is_some_and(|until| until > chrono::Utc::now())
 }
 
 fn apply_record(
@@ -977,6 +1210,31 @@ fn reconciliation_entry_can_be_superseded(
         return false;
     };
     let Ok(replacement_observed) = DateTime::parse_from_rfc3339(replacement_terminal.observed_at())
+    else {
+        return false;
+    };
+    existing_until <= replacement_observed
+}
+
+fn persisted_state_repair_entry_can_be_superseded(
+    existing: &GuardianFailureMemoryEntry,
+    replacement: &GuardianFailureMemoryEntry,
+) -> bool {
+    let (Some(existing_terminal), Some(replacement_terminal)) = (
+        existing.persisted_state_repair_terminal(),
+        replacement.persisted_state_repair_terminal(),
+    ) else {
+        return false;
+    };
+    if existing.key != replacement.key || existing_terminal == replacement_terminal {
+        return false;
+    }
+    let Ok(existing_until) = DateTime::parse_from_rfc3339(existing_terminal.suppression_until())
+    else {
+        return false;
+    };
+    let Ok(replacement_observed) =
+        DateTime::parse_from_rfc3339(replacement_terminal.attempt().observed_at())
     else {
         return false;
     };
@@ -1034,11 +1292,12 @@ mod tests {
     use crate::execution::persistence::{AtomicWriteBackend, PersistenceCoordinator};
     use crate::guardian::{DiagnosisId, GuardianActionKind, GuardianDomain, GuardianMode};
     use crate::state::contracts::{
-        OperationId, OwnershipClass, ReconciliationAttempt, ReconciliationComponent,
-        ReconciliationIncarnationFingerprint, ReconciliationInventoryFingerprint,
-        ReconciliationLineage, ReconciliationQuarantineCheckpoint, ReconciliationRung,
-        ReconciliationScope, ReconciliationTerminal, ReconciliationTerminalOutcome,
-        StabilizationSystem, TargetDescriptor, TargetKind,
+        OperationId, OwnershipClass, PersistedStateRepairTerminalOutcome, ReconciliationAttempt,
+        ReconciliationComponent, ReconciliationIncarnationFingerprint,
+        ReconciliationInventoryFingerprint, ReconciliationLineage,
+        ReconciliationQuarantineCheckpoint, ReconciliationRung, ReconciliationScope,
+        ReconciliationTerminal, ReconciliationTerminalOutcome, StabilizationSystem,
+        TargetDescriptor, TargetKind,
     };
     use crate::state::journals::DEFAULT_OPERATION_JOURNAL_LIMIT;
     use crate::state::ownership::{CurrentArtifact, classify_current_artifact};
@@ -1052,9 +1311,9 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
-    const FAILURE_MEMORY_V3_FIXTURE: &str = include_str!(concat!(
+    const FAILURE_MEMORY_V4_FIXTURE: &str = include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/tests/fixtures/guardian/failure-memory-v3.json"
+        "/tests/fixtures/guardian/failure-memory-v4.json"
     ));
 
     struct CountingFileBackend {
@@ -1136,13 +1395,14 @@ mod tests {
     }
 
     #[test]
-    fn retired_v2_failure_memory_schema_is_rejected() {
-        assert!(
-            FailureMemorySnapshot::from_json(
-                r#"{"schema":"axial.guardian.failure_memory.v2","entries":[]}"#,
-            )
-            .is_err()
-        );
+    fn retired_failure_memory_schemas_are_rejected() {
+        for schema in [
+            "axial.guardian.failure_memory.v2",
+            "axial.guardian.failure_memory.v3",
+        ] {
+            let value = serde_json::json!({"schema": schema, "entries": []});
+            assert!(FailureMemorySnapshot::from_json(&value.to_string()).is_err());
+        }
     }
 
     #[test]
@@ -1173,14 +1433,14 @@ mod tests {
     }
 
     #[test]
-    fn checked_in_failure_memory_v3_fixture_is_byte_stable() {
+    fn checked_in_failure_memory_v4_fixture_is_byte_stable() {
         let snapshot =
-            FailureMemorySnapshot::from_json(FAILURE_MEMORY_V3_FIXTURE).expect("strict fixture");
+            FailureMemorySnapshot::from_json(FAILURE_MEMORY_V4_FIXTURE).expect("strict fixture");
         assert_eq!(
             super::FAILURE_MEMORY_SCHEMA,
-            "axial.guardian.failure_memory.v3"
+            "axial.guardian.failure_memory.v4"
         );
-        assert_eq!(snapshot.schema, "axial.guardian.failure_memory.v3");
+        assert_eq!(snapshot.schema, "axial.guardian.failure_memory.v4");
         let action_kinds = snapshot
             .entries
             .iter()
@@ -1194,6 +1454,7 @@ mod tests {
             GuardianActionKind::Fallback,
             GuardianActionKind::Repair,
             GuardianActionKind::Block,
+            GuardianActionKind::Quarantine,
         ];
         assert_eq!(action_kinds, expected_action_kinds);
         let action_outcomes = snapshot
@@ -1273,8 +1534,19 @@ mod tests {
         );
         assert!(terminals[1].quarantine_checkpoint().is_empty());
 
+        let persisted_state_terminals = snapshot
+            .entries
+            .iter()
+            .filter_map(GuardianFailureMemoryEntry::persisted_state_repair_terminal)
+            .collect::<Vec<_>>();
+        assert_eq!(persisted_state_terminals.len(), 1);
+        assert_eq!(
+            persisted_state_terminals[0].outcome(),
+            PersistedStateRepairTerminalOutcome::Refused
+        );
+
         let pretty = serde_json::to_string_pretty(&snapshot).expect("pretty fixture json");
-        assert_eq!(format!("{pretty}\n"), FAILURE_MEMORY_V3_FIXTURE);
+        assert_eq!(format!("{pretty}\n"), FAILURE_MEMORY_V4_FIXTURE);
 
         let compact = snapshot.to_json().expect("compact fixture json");
         let decoded = FailureMemorySnapshot::from_json(&compact).expect("decode compact fixture");
@@ -1320,6 +1592,7 @@ mod tests {
                 "target_content_hash": null,
                 "user_intent_hash": "intent",
                 "reconciliation_terminal": null,
+                "persisted_state_repair_terminal": null,
                 "unexpected": true
             }]
         });
@@ -1351,7 +1624,8 @@ mod tests {
                 "suppression_until": null,
                 "target_content_hash": null,
                 "user_intent_hash": "intent",
-                "reconciliation_terminal": null
+                "reconciliation_terminal": null,
+                "persisted_state_repair_terminal": null
             }]
         });
         assert!(FailureMemorySnapshot::from_json(&nested_unknown_field.to_string()).is_err());

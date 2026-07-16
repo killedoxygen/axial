@@ -1947,21 +1947,15 @@ fn retain_driver_rejected_records(
         retained.push(PersistedStateRejectedRecord::new(
             PersistedStateRecordStore::BenchmarkSuiteDriver,
             rejection,
-            rejected_benchmark_suite_driver_target(physical_id),
+            super::persisted_state_load::persisted_state_record_target(
+                PersistedStateRecordStore::BenchmarkSuiteDriver,
+                physical_id,
+            ),
             identity,
             restart_digest,
         ));
     }
     (retained, authoritative)
-}
-
-fn rejected_benchmark_suite_driver_target(
-    physical_id: &str,
-) -> crate::state::contracts::TargetDescriptor {
-    debug_assert!(is_safe_driver_id(physical_id));
-    let mut target = benchmark_suite_driver_target(physical_id);
-    target.id = physical_id.to_string();
-    target
 }
 
 fn driver_rejection_still_holds(
@@ -2452,11 +2446,11 @@ fn benchmark_suite_driver_target(driver_id: &str) -> crate::state::contracts::Ta
     classify_current_artifact(CurrentArtifact::BenchmarkSuiteDriverStatus, driver_id).target
 }
 
-fn driver_dir(paths: &AppPaths) -> PathBuf {
+pub(super) fn driver_dir(paths: &AppPaths) -> PathBuf {
     paths.config_dir.join("benchmarks").join("suite-drivers")
 }
 
-fn driver_path(storage_dir: &Path, driver_id: &str) -> PathBuf {
+pub(super) fn driver_path(storage_dir: &Path, driver_id: &str) -> PathBuf {
     storage_dir.join(safe_driver_filename(driver_id))
 }
 

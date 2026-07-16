@@ -1,7 +1,5 @@
 use axial_api::app::{
-    DEFAULT_API_PORT, build_router, default_frontend_dir, spawn_benchmark_suite_drivers_resume,
-    spawn_idle_integrity_scheduler, spawn_known_good_rebuilds, spawn_performance_operations_resume,
-    spawn_performance_rules_refresh, spawn_remote_flags_refresh, spawn_telemetry_export,
+    DEFAULT_API_PORT, build_router, default_frontend_dir, start_application_background_workflows,
 };
 use axial_api::observability::telemetry::{
     TelemetryErrorArea, TelemetryErrorKind, TelemetryErrorLevel, TelemetryEvent, TelemetryHub,
@@ -61,13 +59,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         frontend_dir: default_frontend_dir(),
     })
     .await?;
-    spawn_known_good_rebuilds(&state);
-    spawn_idle_integrity_scheduler(&state);
-    spawn_performance_operations_resume(&state);
-    spawn_benchmark_suite_drivers_resume(&state);
-    spawn_performance_rules_refresh(&state);
-    spawn_telemetry_export(&state);
-    spawn_remote_flags_refresh(&state);
+    if !start_application_background_workflows(&state).await {
+        return Err(std::io::Error::other("startup background ownership was refused").into());
+    }
 
     let addr = std::env::var("AXIAL_API_ADDR")
         .ok()

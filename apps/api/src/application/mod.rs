@@ -20,6 +20,7 @@ mod known_good;
 pub mod launch;
 pub mod music;
 pub mod performance;
+mod persisted_state_repair;
 mod registered_artifact_recovery;
 pub mod setup;
 pub mod skin;
@@ -111,6 +112,7 @@ pub(crate) use performance::{
     performance_health, performance_install, refresh_performance_rules,
     spawn_pending_performance_operations,
 };
+pub(crate) use persisted_state_repair::settle_startup_persisted_state_repairs;
 pub(crate) use setup::setup_init_owned;
 pub use setup::{SetupLibraryResponse, SetupStatusResponse, onboarding_complete};
 pub(crate) use skin::flush_pending_saved_skin_applies_for_launch;
