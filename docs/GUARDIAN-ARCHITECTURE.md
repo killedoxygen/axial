@@ -49,6 +49,7 @@ Policy:
 - Guardian may strip fatal raw JVM args
 - Guardian may downgrade or disable unsafe GC/preset choices
 - Guardian may repair managed-runtime state, exact source-backed registered Libraries/Assets leaves, and exact registered VersionBundle members through a full component rebuild when ownership and postcondition gates pass
+- Guardian may offer one explicit whole-instance rematerialization after an exact failed component rebuild; the effect preserves a bounded user-config snapshot but never restores it automatically
 - Guardian may quarantine an exact launcher-owned persisted restart record after three consecutive authoritative startup rejections when its physical identity remains unchanged
 - Guardian may allow one bounded startup recovery when the startup window fails
 - Guardian may degrade or fall back when Performance marks that path safe
@@ -164,6 +165,8 @@ It orchestrates:
 - Managed-only repair of one exact source-backed missing Libraries/Assets leaf or corrupt library/native-library leaf
 - Managed-only no-mutation rung-one failure for an exact missing or corrupt VersionBundle member
 - Managed-only VersionBundle/Libraries/Assets component rebuild after the matching exact failed registered leaf repair
+- one explicit Managed or Custom whole-instance rematerialization offer after an exact failed component rebuild, with State-owned bounded user-config preservation and no restore writer
+- Managed-only persisted restart-record repair after three consecutive authoritative startup rejections of the same exact launcher-owned record
 - performance fallback/degraded decisions and rollback eligibility through the Performance system
 
 It does not own raw provider selection, arbitrary file deletion, user-owned file mutation, or unbounded retry loops.

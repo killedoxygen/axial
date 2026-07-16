@@ -20,45 +20,11 @@ pub(crate) mod user_owned_state;
 use crate::observability::{
     EvidenceField, RedactionAudience, sanitize_evidence_text, sanitize_evidence_token,
 };
-use crate::state::contracts::{OperationId, OwnershipClass, TargetDescriptor};
+use crate::state::contracts::{OperationId, TargetDescriptor};
 use axial_launcher::LaunchStageEvidence;
 use serde::{Deserialize, Serialize};
 
 const MAX_STAGE_EVIDENCE_DETAILS: usize = 8;
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct CapabilityContract {
-    pub kind: ExecutionCapabilityKind,
-    pub target: TargetDescriptor,
-    pub required_ownership: OwnershipClass,
-    pub rollback: RollbackBehavior,
-    pub sensitive_fields: Vec<String>,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub enum ExecutionCapabilityKind {
-    VerifyArtifact,
-    DownloadArtifactToTemp,
-    PromoteVerifiedArtifact,
-    RepairManagedRuntime,
-    VerifyManagedRuntime,
-    ProbeJavaRuntime,
-    PrepareLaunchCommand,
-    SpawnSessionProcess,
-    StopSessionProcess,
-    KillSessionProcess,
-    ObserveSessionProcess,
-    RestoreRollbackSnapshot,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub enum RollbackBehavior {
-    None,
-    JournalOnly,
-    SnapshotRequired,
-    RestoresSnapshot,
-    QuarantineOnly,
-}
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ExecutionFact {

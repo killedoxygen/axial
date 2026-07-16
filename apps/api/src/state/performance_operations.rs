@@ -193,9 +193,6 @@ impl From<PersistedPerformanceOperationStatus> for PerformanceOperationStatus {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PerformanceOperationConflict;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PerformanceOperationLoadIssueKind {
     DirectoryUnreadable,
     StatusUnreadable,
