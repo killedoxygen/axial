@@ -1751,18 +1751,18 @@ exec sleep 30
     }
 
     #[cfg(target_os = "linux")]
-    fn r5_release_build() -> bool {
-        !cfg!(debug_assertions)
-    }
-
-    #[cfg(target_os = "linux")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[ignore = "requires a release build and explicit AXIAL_R5_* physical evidence bindings"]
     async fn representative_idle_sweep_launch_preemption_measurement() {
-        assert!(
-            r5_release_build(),
-            "R5 physical evidence must use cargo test --release"
-        );
+        #[cfg(debug_assertions)]
+        panic!("R5 physical evidence must use cargo test --release");
+        #[cfg_attr(
+            debug_assertions,
+            expect(
+                unreachable_code,
+                reason = "R5 physical evidence is release-only by contract"
+            )
+        )]
         let device_evidence = std::env::var("AXIAL_R5_DEVICE_EVIDENCE")
             .expect("AXIAL_R5_DEVICE_EVIDENCE is required");
         let filesystem_evidence = std::env::var("AXIAL_R5_FILESYSTEM_EVIDENCE")

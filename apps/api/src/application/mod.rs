@@ -30,10 +30,6 @@ pub mod telemetry;
 pub(crate) mod timing;
 pub mod update;
 pub mod version;
-#[expect(
-    dead_code,
-    reason = "Phase 4 backend contract; Phase 6 transport deferred"
-)]
 mod whole_instance_rematerialization;
 
 use crate::guardian::{GuardianDecision, GuardianFact, SafetyOutcome};

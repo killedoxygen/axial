@@ -16,6 +16,10 @@ pub(crate) struct ExplicitWholeInstanceRematerializationError {
     class: &'static str,
 }
 
+#[expect(
+    dead_code,
+    reason = "Phase 4 backend contract; Phase 6 transport deferred"
+)]
 pub(crate) async fn execute_explicit_whole_instance_rematerialization(
     state: AppState,
     handoff: RequestProducerHandoff,

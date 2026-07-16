@@ -17,8 +17,26 @@ use std::path::PathBuf;
 
 #[must_use]
 pub(crate) enum GuardianWholeInstanceRematerializationDisposition {
-    Offered(GuardianWholeInstanceRematerializationOffer),
-    WitnessOnly { decision: GuardianDecision },
+    Offered(
+        #[cfg_attr(
+            not(test),
+            expect(
+                dead_code,
+                reason = "Phase 4 backend contract; Phase 6 transport deferred"
+            )
+        )]
+        GuardianWholeInstanceRematerializationOffer,
+    ),
+    WitnessOnly {
+        #[cfg_attr(
+            not(test),
+            expect(
+                dead_code,
+                reason = "Phase 4 backend contract; Phase 6 transport deferred"
+            )
+        )]
+        decision: GuardianDecision,
+    },
 }
 
 #[must_use]
@@ -42,6 +60,13 @@ pub(crate) enum GuardianWholeInstanceRematerializationAssessmentError {
     AuthorizationRejected,
 }
 
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "Phase 4 backend contract; Phase 6 transport deferred"
+    )
+)]
 pub(crate) fn assess_whole_instance_rematerialization(
     eligibility: RegisteredWholeInstanceRematerializationEligibility,
     current_mode: GuardianMode,
@@ -130,10 +155,24 @@ pub(crate) struct GuardianUserConfigRestoreOffer {
 }
 
 impl GuardianWholeInstanceRematerializationOutcome {
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "Phase 4 backend contract; Phase 6 transport deferred"
+        )
+    )]
     pub(crate) fn status(&self) -> GuardianWholeInstanceRematerializationStatus {
         self.status
     }
 
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "Phase 4 backend contract; Phase 6 transport deferred"
+        )
+    )]
     pub(crate) fn into_restore_offer(
         self,
     ) -> Option<crate::guardian::GuardianUserConfigRestoreOffer> {

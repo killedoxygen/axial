@@ -21,13 +21,6 @@ pub mod policy;
 pub mod preflight;
 mod repair_authorization;
 mod state_evidence;
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "Phase 4 backend contract; Phase 6 transport deferred"
-    )
-)]
 mod whole_instance_rematerialization;
 
 #[cfg(test)]
