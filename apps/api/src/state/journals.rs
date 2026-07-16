@@ -748,13 +748,14 @@ impl OperationJournalStore {
         urgency: WriteUrgency,
     ) -> Result<Option<PendingJournalCommit>, OperationJournalStoreError> {
         let snapshot = OperationJournalSnapshot::new(candidate.values().cloned().collect())?;
+        let encoded = encode_snapshot(snapshot).map_err(OperationJournalStoreError::Persistence)?;
         let ticket = self
             .persistence
             .as_ref()
             .map(|persistence| {
                 persistence
                     .writer
-                    .accept(snapshot, urgency, encode_snapshot)
+                    .accept_encoded(encoded, urgency)
                     .map_err(|error| OperationJournalStoreError::Persistence(error.into()))
             })
             .transpose()?;
@@ -2370,11 +2371,24 @@ mod tests {
     }
 
     #[test]
-    fn journal_snapshot_encoder_enforces_the_startup_size_bound() {
-        let snapshot = OperationJournalSnapshot {
-            schema: "x".repeat(super::MAX_OPERATION_JOURNAL_SNAPSHOT_BYTES as usize),
+    fn journal_snapshot_encoder_accepts_the_exact_size_bound_and_rejects_one_more_byte() {
+        let mut snapshot = OperationJournalSnapshot {
+            schema: String::new(),
             entries: Vec::new(),
         };
+        let overhead = serde_json::to_vec(&snapshot)
+            .expect("serialize empty snapshot")
+            .len();
+        snapshot.schema =
+            "x".repeat(super::MAX_OPERATION_JOURNAL_SNAPSHOT_BYTES as usize - overhead);
+
+        let encoded = super::encode_snapshot(snapshot.clone()).expect("accept exact size bound");
+        assert_eq!(
+            encoded.len() as u64,
+            super::MAX_OPERATION_JOURNAL_SNAPSHOT_BYTES
+        );
+
+        snapshot.schema.push('x');
 
         assert_eq!(
             super::encode_snapshot(snapshot)
@@ -2382,6 +2396,45 @@ mod tests {
                 .kind(),
             io::ErrorKind::InvalidData
         );
+    }
+
+    #[tokio::test]
+    async fn oversized_valid_candidate_is_rejected_before_acceptance_without_latching_retry() {
+        let (root, _paths, backend, _coordinator, store) =
+            persistence_fixture("oversized-candidate-preflight");
+        let mut oversized = test_entry("operation-oversized-candidate");
+        let fact = "\u{1f600}".repeat(320);
+        oversized.completed_steps = (0..110)
+            .map(|index| {
+                let mut step = completed_step(&format!("oversized-step-{index}"));
+                step.generated_facts = vec![fact.clone(); super::MAX_OPERATION_JOURNAL_STEP_FACTS];
+                step
+            })
+            .collect();
+        assert!(super::validate_entry(&oversized).is_ok());
+
+        let error = store
+            .create(oversized)
+            .await
+            .expect_err("reject oversized valid candidate before acceptance");
+        assert!(matches!(
+            error,
+            OperationJournalStoreError::Persistence(error)
+                if error.kind() == io::ErrorKind::InvalidData
+        ));
+        assert!(!store.has_retry_candidate());
+        assert_eq!(backend.attempts.load(Ordering::SeqCst), 0);
+        assert!(store.list().is_empty());
+
+        let accepted = OperationId::new("operation-after-oversized-candidate");
+        store
+            .create(planned_entry(&accepted))
+            .await
+            .expect("later bounded candidate remains writable");
+        assert_eq!(backend.attempts.load(Ordering::SeqCst), 1);
+        assert!(store.get(&accepted).is_some());
+        store.close().await.expect("close recovered journal store");
+        cleanup(&root);
     }
 
     #[tokio::test]

@@ -618,6 +618,22 @@ impl AtomicSnapshotWriter {
         Encode: FnOnce(T) -> io::Result<Vec<u8>> + Send + 'static,
     {
         let encoder: SnapshotEncoder = Box::new(move || encode(value));
+        self.accept_payload(WritePayload::Encode(encoder), urgency)
+    }
+
+    pub(crate) fn accept_encoded(
+        &self,
+        contents: Vec<u8>,
+        urgency: WriteUrgency,
+    ) -> Result<AcceptedWrite, PersistenceError> {
+        self.accept_payload(WritePayload::Encoded(contents), urgency)
+    }
+
+    fn accept_payload(
+        &self,
+        payload: WritePayload,
+        urgency: WriteUrgency,
+    ) -> Result<AcceptedWrite, PersistenceError> {
         let (ticket, start_worker) = {
             let owner_state = self
                 .lane
@@ -644,10 +660,7 @@ impl AtomicSnapshotWriter {
                 state.pending_immediate = false;
                 state.hard_deadline = Some(now + self.lane.schedule.hard_deadline);
             }
-            state.pending = Some(PendingWrite {
-                revision,
-                payload: WritePayload::Encode(encoder),
-            });
+            state.pending = Some(PendingWrite { revision, payload });
             let hard_deadline = state
                 .hard_deadline
                 .expect("pending persistence has a hard deadline");
