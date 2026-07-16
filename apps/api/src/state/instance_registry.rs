@@ -173,6 +173,10 @@ impl AppInstanceStore {
         &self.paths
     }
 
+    pub(super) fn is_authoritative(&self) -> bool {
+        self.mutation_allowed
+    }
+
     pub(crate) async fn acquire_mutation(&self) -> Result<OwnedMutexGuard<()>, InstanceStoreError> {
         let gate = self.mutation_gate.clone().lock_owned().await;
         if self.closed.load(Ordering::Acquire) {

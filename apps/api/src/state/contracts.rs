@@ -788,14 +788,17 @@ fn safe_reconciliation_token(value: &str, max_chars: usize) -> bool {
         })
 }
 
-fn valid_reconciliation_fingerprint(value: &str) -> bool {
+pub(super) fn valid_reconciliation_fingerprint(value: &str) -> bool {
     let Some(digest) = value.strip_prefix("sha256.") else {
         return false;
     };
     let segments = digest.split('.').collect::<Vec<_>>();
     segments.len() == 8
         && segments.iter().all(|segment| {
-            segment.len() == 8 && segment.bytes().all(|byte| byte.is_ascii_hexdigit())
+            segment.len() == 8
+                && segment
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
         })
 }
 
@@ -1074,13 +1077,6 @@ pub enum RollbackState {
     Unavailable,
     Available,
     Applied,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct SnapshotDescriptor {
-    pub target: TargetDescriptor,
-    pub ownership: OwnershipClass,
-    pub rollback: RollbackState,
 }
 
 #[cfg(test)]

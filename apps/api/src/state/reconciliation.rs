@@ -254,6 +254,7 @@ pub(crate) struct RegisteredWholeInstanceCompletion {
     durable: WholeInstanceDurableAuthority,
     known_good: RegisteredKnownGoodInventory,
     runtime_cache: ManagedRuntimeCache,
+    user_config_snapshot: super::user_config_snapshots::UserConfigSnapshotReceipt,
 }
 
 pub(crate) struct RegisteredWholeInstanceSettlement {
@@ -261,10 +262,17 @@ pub(crate) struct RegisteredWholeInstanceSettlement {
     terminal: ReconciliationTerminal,
     terminal_step: &'static str,
     _publication: Option<WholeInstancePublicationAuthority>,
+    user_config_snapshot: Option<super::user_config_snapshots::UserConfigSnapshotReceipt>,
 }
 
 pub(crate) struct RegisteredWholeInstanceDurableOutcome {
     terminal: ReconciliationTerminal,
+    user_config_restore: Option<RegisteredUserConfigRestoreEligibility>,
+}
+
+#[must_use]
+pub(crate) struct RegisteredUserConfigRestoreEligibility {
+    _snapshot: super::user_config_snapshots::UserConfigSnapshotReceipt,
 }
 
 pub(crate) enum RegisteredWholeInstanceSettlementError {
@@ -467,6 +475,7 @@ impl RegisteredWholeInstanceRematerializationAdmission {
                 .failed(
                     ReconciliationQuarantineCheckpoint::default(),
                     None,
+                    None,
                     WHOLE_INSTANCE_REMATERIALIZATION_START_STEP,
                 )
                 .settle()
@@ -474,6 +483,69 @@ impl RegisteredWholeInstanceRematerializationAdmission {
                 .map_err(RegisteredWholeInstancePreparationError::Settlement)?;
             return Ok(RegisteredWholeInstancePreparation::Closed(outcome));
         }
+        let (instance_id, fingerprint, inventory_fingerprint) = match durable.attempt.scope() {
+            ReconciliationScope::RegisteredInstance {
+                instance_id,
+                fingerprint,
+                inventory_fingerprint,
+                ..
+            } => (
+                instance_id.clone(),
+                fingerprint.clone(),
+                inventory_fingerprint.clone(),
+            ),
+        };
+        let capture = match crate::execution::user_owned_state::capture_user_config(
+            durable.state.instances.game_dir(&instance_id),
+        )
+        .await
+        {
+            Ok(capture) => capture,
+            Err(_) => {
+                let outcome = durable
+                    .failed(
+                        ReconciliationQuarantineCheckpoint::default(),
+                        None,
+                        None,
+                        WHOLE_INSTANCE_REMATERIALIZATION_START_STEP,
+                    )
+                    .settle()
+                    .await
+                    .map_err(RegisteredWholeInstancePreparationError::Settlement)?;
+                return Ok(RegisteredWholeInstancePreparation::Closed(outcome));
+            }
+        };
+        let user_config_snapshot = match durable
+            .state
+            .user_config_snapshots
+            .persist_before_core(
+                super::user_config_snapshots::UserConfigSnapshotIdentity {
+                    instance_id,
+                    instance_created_at: self.known_good.created_at.clone(),
+                    incarnation_fingerprint: fingerprint,
+                    inventory_fingerprint,
+                    r3_operation_id: durable.attempt.operation_id().clone(),
+                    captured_at: chrono::Utc::now().fixed_offset(),
+                },
+                capture,
+            )
+            .await
+        {
+            Ok(snapshot) => snapshot,
+            Err(_) => {
+                let outcome = durable
+                    .failed(
+                        ReconciliationQuarantineCheckpoint::default(),
+                        None,
+                        None,
+                        WHOLE_INSTANCE_REMATERIALIZATION_START_STEP,
+                    )
+                    .settle()
+                    .await
+                    .map_err(RegisteredWholeInstancePreparationError::Settlement)?;
+                return Ok(RegisteredWholeInstancePreparation::Closed(outcome));
+            }
+        };
         let request = RegisteredWholeInstanceCoreRequest {
             library_root: self.known_good.library_root.clone(),
             runtime_cache: durable.state.managed_runtime_cache.clone(),
@@ -486,6 +558,7 @@ impl RegisteredWholeInstanceRematerializationAdmission {
                 durable,
                 known_good: self.known_good,
                 runtime_cache,
+                user_config_snapshot,
             },
         })
     }
@@ -502,6 +575,7 @@ impl RegisteredWholeInstanceCompletion {
         self.durable.failed(
             ReconciliationQuarantineCheckpoint::default(),
             None,
+            Some(self.user_config_snapshot),
             WHOLE_INSTANCE_REMATERIALIZATION_STEP,
         )
     }
@@ -523,11 +597,13 @@ impl RegisteredWholeInstanceCompletion {
             WholeInstancePublicationAuthority::Rollback(_) => unreachable!(),
         };
         if receipt_valid {
-            self.durable.succeeded(publication)
+            self.durable
+                .succeeded(publication, self.user_config_snapshot)
         } else {
             self.durable.failed(
                 ReconciliationQuarantineCheckpoint::default(),
                 Some(publication),
+                Some(self.user_config_snapshot),
                 WHOLE_INSTANCE_REMATERIALIZATION_STEP,
             )
         }
@@ -563,6 +639,7 @@ impl RegisteredWholeInstanceCompletion {
         self.durable.failed(
             checkpoint,
             Some(publication),
+            Some(self.user_config_snapshot),
             WHOLE_INSTANCE_REMATERIALIZATION_STEP,
         )
     }
@@ -592,6 +669,7 @@ impl WholeInstanceDurableAuthority {
     fn succeeded(
         self,
         publication: WholeInstancePublicationAuthority,
+        user_config_snapshot: super::user_config_snapshots::UserConfigSnapshotReceipt,
     ) -> RegisteredWholeInstanceSettlement {
         let terminal = ReconciliationTerminal::from_attempt(
             self.attempt.clone(),
@@ -603,6 +681,7 @@ impl WholeInstanceDurableAuthority {
             terminal,
             terminal_step: WHOLE_INSTANCE_REMATERIALIZATION_STEP,
             _publication: Some(publication),
+            user_config_snapshot: Some(user_config_snapshot),
         }
     }
 
@@ -610,6 +689,7 @@ impl WholeInstanceDurableAuthority {
         self,
         checkpoint: ReconciliationQuarantineCheckpoint,
         publication: Option<WholeInstancePublicationAuthority>,
+        user_config_snapshot: Option<super::user_config_snapshots::UserConfigSnapshotReceipt>,
         terminal_step: &'static str,
     ) -> RegisteredWholeInstanceSettlement {
         let terminal = ReconciliationTerminal::from_attempt(
@@ -622,15 +702,27 @@ impl WholeInstanceDurableAuthority {
             terminal,
             terminal_step,
             _publication: publication,
+            user_config_snapshot,
         }
     }
 }
 
 impl RegisteredWholeInstanceSettlement {
     pub(crate) async fn settle(
-        self,
+        mut self,
     ) -> Result<RegisteredWholeInstanceDurableOutcome, RegisteredWholeInstanceSettlementError> {
         let operation_id = self.durable.attempt.operation_id().clone();
+        if self.terminal.outcome() != ReconciliationTerminalOutcome::Succeeded
+            && let Some(snapshot) = self.user_config_snapshot.take()
+        {
+            drop(snapshot);
+            let _ = self
+                .durable
+                .state
+                .user_config_snapshots
+                .reconcile_pending_removals()
+                .await;
+        }
         if !self.terminal.quarantine_checkpoint().is_empty() {
             let mut checkpoint =
                 OperationJournalStep::new(COMPONENT_QUARANTINE_STEP, OperationPhase::Repairing);
@@ -672,8 +764,14 @@ impl RegisteredWholeInstanceSettlement {
         )
         .await
         .map_err(RegisteredWholeInstanceSettlementError::Memory)?;
+        let user_config_restore =
+            self.user_config_snapshot
+                .map(|snapshot| RegisteredUserConfigRestoreEligibility {
+                    _snapshot: snapshot.confirm(),
+                });
         Ok(RegisteredWholeInstanceDurableOutcome {
             terminal: self.terminal,
+            user_config_restore,
         })
     }
 }
@@ -686,6 +784,10 @@ impl RegisteredWholeInstanceDurableOutcome {
 
     pub(crate) fn succeeded(&self) -> bool {
         self.terminal.outcome() == ReconciliationTerminalOutcome::Succeeded
+    }
+
+    pub(crate) fn into_restore_eligibility(self) -> Option<RegisteredUserConfigRestoreEligibility> {
+        self.user_config_restore
     }
 }
 
@@ -2522,6 +2624,60 @@ impl AppState {
                 })?;
         }
         Ok(())
+    }
+
+    pub(crate) async fn reconcile_user_config_snapshot_startup(&self) -> io::Result<()> {
+        if !self.instances.is_authoritative() {
+            return Ok(());
+        }
+        let mut successful = std::collections::BTreeSet::new();
+        for journal in self.journals.list() {
+            let Some(terminal) = journal.reconciliation_terminal().cloned() else {
+                continue;
+            };
+            if terminal.rung() != ReconciliationRung::RematerializeInstance
+                || terminal.outcome() != ReconciliationTerminalOutcome::Succeeded
+                || !self.whole_instance_terminal_is_semantically_canonical(&journal, &terminal)
+            {
+                continue;
+            }
+            let memory = reconciliation_memory_entry(terminal.clone()).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "successful R3 snapshot terminal cannot derive exact memory",
+                )
+            })?;
+            if self.failure_memory.get(&memory.key).as_ref() != Some(&memory) {
+                continue;
+            }
+            let ReconciliationScope::RegisteredInstance {
+                instance_id,
+                fingerprint,
+                inventory_fingerprint,
+                ..
+            } = terminal.scope();
+            let Some(instance) = self.instances.get(instance_id) else {
+                continue;
+            };
+            if self
+                .current_reconciliation_incarnation(instance_id)
+                .is_ok_and(|current| {
+                    current.fingerprint == *fingerprint
+                        && current.inventory_fingerprint == *inventory_fingerprint
+                })
+            {
+                successful.insert((
+                    instance_id.clone(),
+                    instance.created_at,
+                    fingerprint.as_str().to_string(),
+                    inventory_fingerprint.as_str().to_string(),
+                    terminal.operation_id().as_str().to_string(),
+                ));
+            }
+        }
+        self.user_config_snapshots
+            .retain_successful_incarnations(&successful)
+            .await
     }
 
     pub(crate) async fn whole_instance_rematerialization_eligibility(
@@ -4484,6 +4640,12 @@ mod tests {
         let _ = <RegisteredWholeInstanceSettlement as AmbiguousIfClone<_>>::assert_not_clone;
         let _ = <RegisteredWholeInstanceDurableOutcome as AmbiguousIfClone<_>>::assert_not_clone;
     };
+    static_assertions::assert_not_impl_any!(
+        RegisteredUserConfigRestoreEligibility: Clone, std::fmt::Debug, serde::Serialize, serde::de::DeserializeOwned
+    );
+    static_assertions::assert_not_impl_any!(
+        RegisteredWholeInstanceDurableOutcome: Clone, std::fmt::Debug, serde::Serialize, serde::de::DeserializeOwned
+    );
 
     struct Fixture {
         state: AppState,
@@ -4548,6 +4710,7 @@ mod tests {
             library_dir: root.join("library"),
             config_dir,
         };
+        fs::create_dir_all(&paths.config_dir).expect("config root");
         fs::create_dir_all(paths.instances_dir.join(INSTANCE_ID)).expect("instance root");
         fs::create_dir_all(&paths.library_dir).expect("library root");
         let config = Arc::new(
@@ -4916,6 +5079,16 @@ mod tests {
     }
 
     async fn cleanup(fixture: Fixture) {
+        fixture
+            .state
+            .close_user_config_snapshots()
+            .await
+            .expect("close user config snapshot store");
+        fixture
+            .state
+            .close_user_mod_witnesses()
+            .await
+            .expect("close user mod witness store");
         fixture
             .state
             .close_known_good_inventories()
@@ -7223,6 +7396,195 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn whole_instance_user_config_is_durable_before_core_and_failure_has_no_offer() {
+        let fixture = fixture("whole-instance-user-config-order");
+        let options_path = fixture
+            .root
+            .join("instances")
+            .join(INSTANCE_ID)
+            .join("options.txt");
+        let exact = b"guiScale:3\nresourcePacks:[\"vanilla\"]\n";
+        fs::write(&options_path, exact).expect("seed user options");
+        let admission = whole_instance_admission(
+            &fixture,
+            "whole-instance-user-config-order",
+            GuardianMode::Managed,
+        )
+        .await;
+        let snapshot_path = fixture
+            .root
+            .join("config")
+            .join("guardian-user-config-snapshots.json");
+        let observed_durable = Arc::new(AtomicBool::new(false));
+        let driver_observed = observed_durable.clone();
+        let driver_snapshot_path = snapshot_path.clone();
+
+        let outcome = crate::guardian::execute_whole_instance_rematerialization_with(
+            admission,
+            move |_, _, _| async move {
+                let snapshot = serde_json::from_slice::<serde_json::Value>(
+                    &fs::read(driver_snapshot_path).expect("snapshot visible before Core"),
+                )
+                .expect("strict snapshot JSON");
+                driver_observed.store(
+                    snapshot["snapshots"]
+                        .as_array()
+                        .is_some_and(|snapshots| snapshots.len() == 1),
+                    Ordering::SeqCst,
+                );
+                Err(axial_minecraft::ManagedWholeInstanceRebuildError::Preparation)
+            },
+        )
+        .await
+        .expect("failed Core settles canonically");
+
+        assert!(observed_durable.load(Ordering::SeqCst));
+        assert_eq!(
+            fs::read(&options_path).expect("read unchanged options"),
+            exact
+        );
+        assert_eq!(
+            outcome.status(),
+            crate::guardian::GuardianWholeInstanceRematerializationStatus::Failed
+        );
+        assert!(outcome.into_restore_offer().is_none());
+        let settled = serde_json::from_slice::<serde_json::Value>(
+            &fs::read(snapshot_path).expect("read settled snapshot store"),
+        )
+        .expect("settled snapshot JSON");
+        assert!(settled["snapshots"].as_array().is_some_and(Vec::is_empty));
+        cleanup(fixture).await;
+    }
+
+    #[tokio::test]
+    async fn whole_instance_capture_and_persist_failures_never_call_core() {
+        let capture_fixture = fixture("whole-instance-user-config-capture-failure");
+        fs::write(
+            capture_fixture
+                .root
+                .join("instances")
+                .join(INSTANCE_ID)
+                .join("options.txt"),
+            [0xff],
+        )
+        .expect("seed invalid UTF-8 options");
+        let capture_admission = whole_instance_admission(
+            &capture_fixture,
+            "whole-instance-user-config-capture-failure",
+            GuardianMode::Managed,
+        )
+        .await;
+        let capture_calls = Arc::new(AtomicUsize::new(0));
+        let called = capture_calls.clone();
+        let capture_outcome = crate::guardian::execute_whole_instance_rematerialization_with(
+            capture_admission,
+            move |_, _, _| async move {
+                called.fetch_add(1, Ordering::SeqCst);
+                Err(axial_minecraft::ManagedWholeInstanceRebuildError::Preparation)
+            },
+        )
+        .await
+        .expect("capture refusal settles before Core");
+        assert_eq!(capture_calls.load(Ordering::SeqCst), 0);
+        assert!(capture_outcome.into_restore_offer().is_none());
+        cleanup(capture_fixture).await;
+
+        let persist_fixture = fixture("whole-instance-user-config-persist-failure");
+        let snapshot_path = persist_fixture
+            .root
+            .join("config")
+            .join("guardian-user-config-snapshots.json");
+        let blocked_temp = crate::execution::file::atomic_temp_path_for(&snapshot_path);
+        fs::create_dir_all(&blocked_temp).expect("block atomic snapshot temp file");
+        let persist_admission = whole_instance_admission(
+            &persist_fixture,
+            "whole-instance-user-config-persist-failure",
+            GuardianMode::Managed,
+        )
+        .await;
+        let persist_calls = Arc::new(AtomicUsize::new(0));
+        let called = persist_calls.clone();
+        let persist_outcome = tokio::time::timeout(
+            Duration::from_secs(2),
+            crate::guardian::execute_whole_instance_rematerialization_with(
+                persist_admission,
+                move |_, _, _| async move {
+                    called.fetch_add(1, Ordering::SeqCst);
+                    Err(axial_minecraft::ManagedWholeInstanceRebuildError::Preparation)
+                },
+            ),
+        )
+        .await
+        .expect("persistence refusal returns promptly")
+        .expect("persistence refusal settles before Core");
+        assert_eq!(persist_calls.load(Ordering::SeqCst), 0);
+        assert!(persist_outcome.into_restore_offer().is_none());
+        fs::remove_dir_all(blocked_temp).expect("unblock snapshot retry");
+        cleanup(persist_fixture).await;
+    }
+
+    #[tokio::test]
+    async fn startup_prunes_capture_without_exact_success_journal_and_memory() {
+        let fixture = fixture("whole-instance-user-config-crash-residue");
+        let instance = fixture
+            .state
+            .instances
+            .get(INSTANCE_ID)
+            .expect("registered crash-residue instance");
+        let current = fixture
+            .state
+            .current_reconciliation_incarnation(INSTANCE_ID)
+            .expect("current crash-residue incarnation");
+        let game_dir = fixture.state.instances.game_dir(INSTANCE_ID);
+        fs::write(game_dir.join("options.txt"), b"exact\n").expect("seed crash-residue options");
+        let capture = crate::execution::user_owned_state::capture_user_config(game_dir)
+            .await
+            .expect("capture crash residue");
+        let receipt = fixture
+            .state
+            .user_config_snapshots
+            .persist_before_core(
+                crate::state::user_config_snapshots::UserConfigSnapshotIdentity {
+                    instance_id: instance.id.clone(),
+                    instance_created_at: instance.created_at.clone(),
+                    incarnation_fingerprint: current.fingerprint,
+                    inventory_fingerprint: current.inventory_fingerprint,
+                    r3_operation_id: OperationId::new("crash-before-core-settlement"),
+                    captured_at: chrono::Utc::now().fixed_offset(),
+                },
+                capture,
+            )
+            .await
+            .expect("persist simulated crash residue");
+        drop(receipt);
+        let snapshot_path = fixture
+            .root
+            .join("config")
+            .join("guardian-user-config-snapshots.json");
+        let before = serde_json::from_slice::<serde_json::Value>(
+            &fs::read(&snapshot_path).expect("read crash residue"),
+        )
+        .expect("crash residue JSON");
+        assert!(
+            before["snapshots"]
+                .as_array()
+                .is_some_and(|items| items.len() == 1)
+        );
+
+        fixture
+            .state
+            .reconcile_user_config_snapshot_startup()
+            .await
+            .expect("startup removes non-success residue");
+        let after = serde_json::from_slice::<serde_json::Value>(
+            &fs::read(snapshot_path).expect("read reconciled residue"),
+        )
+        .expect("reconciled residue JSON");
+        assert!(after["snapshots"].as_array().is_some_and(Vec::is_empty));
+        cleanup(fixture).await;
+    }
+
+    #[tokio::test]
     async fn whole_instance_terminal_journal_retry_precedes_memory_and_retains_authority() {
         let backend = Arc::new(ControlledWriteBackend::default());
         let fixture = fixture_with_backends(
@@ -7442,6 +7804,7 @@ mod tests {
                 outcome.status(),
                 crate::guardian::GuardianWholeInstanceRematerializationStatus::Failed
             );
+            assert!(outcome.into_restore_offer().is_none());
             let terminal = fixture
                 .journals
                 .get(&operation_id)
@@ -7500,6 +7863,7 @@ mod tests {
             outcome.status(),
             crate::guardian::GuardianWholeInstanceRematerializationStatus::Failed
         );
+        assert!(outcome.into_restore_offer().is_none());
         let terminal = fixture
             .journals
             .get(&operation_id)
@@ -7518,6 +7882,72 @@ mod tests {
             terminal.quarantine_checkpoint()
         );
         cleanup(fixture).await;
+    }
+
+    #[tokio::test]
+    async fn guardian_whole_instance_managed_and_custom_success_return_one_inert_restore_offer() {
+        const RUNTIME_BYTES: &[u8] = b"Guardian whole-instance success Runtime";
+        for (label, mode) in [
+            (
+                "guardian-whole-managed-success-restore-offer",
+                GuardianMode::Managed,
+            ),
+            (
+                "guardian-whole-custom-success-restore-offer",
+                GuardianMode::Custom,
+            ),
+        ] {
+            let fixture = fixture(label);
+            let options_path = fixture
+                .root
+                .join("instances")
+                .join(INSTANCE_ID)
+                .join("options.txt");
+            let exact = b"guiScale:2\n";
+            fs::write(&options_path, exact).expect("seed exact user options");
+            let core_fixture = prepare_core_whole_instance_fixture(&fixture, RUNTIME_BYTES).await;
+            fixture.state.activate_known_good_inventory_for_test(
+                INSTANCE_ID,
+                core_fixture.known_good_inventory(),
+            );
+            let admission = whole_instance_admission(&fixture, label, mode).await;
+
+            let outcome = crate::guardian::execute_whole_instance_rematerialization_with(
+                admission,
+                move |_, runtime_cache, _| async move {
+                    axial_minecraft::publish_managed_whole_instance_fixture_for_test(
+                        core_fixture,
+                        &runtime_cache,
+                    )
+                    .await
+                },
+            )
+            .await
+            .expect("sealed successful commit settles through State");
+
+            assert_eq!(
+                outcome.status(),
+                crate::guardian::GuardianWholeInstanceRematerializationStatus::Rematerialized
+            );
+            assert!(outcome.into_restore_offer().is_some());
+            assert_eq!(fs::read(options_path).expect("read exact options"), exact);
+            let snapshot = serde_json::from_slice::<serde_json::Value>(
+                &fs::read(
+                    fixture
+                        .root
+                        .join("config")
+                        .join("guardian-user-config-snapshots.json"),
+                )
+                .expect("read successful snapshot"),
+            )
+            .expect("successful snapshot JSON");
+            assert!(
+                snapshot["snapshots"]
+                    .as_array()
+                    .is_some_and(|items| items.len() == 1)
+            );
+            cleanup(fixture).await;
+        }
     }
 
     #[tokio::test]
@@ -7556,6 +7986,7 @@ mod tests {
             outcome.status(),
             crate::guardian::GuardianWholeInstanceRematerializationStatus::Failed
         );
+        assert!(outcome.into_restore_offer().is_none());
         cleanup(fixture).await;
     }
 

@@ -32,6 +32,7 @@ mod remote_flags;
 mod sessions;
 mod shutdown;
 pub mod skins;
+mod user_config_snapshots;
 mod user_mod_witness;
 
 use axial_config::{
@@ -128,8 +129,9 @@ pub(crate) use reconciliation::{
     RegisteredManagedArtifactCommitPostcheck, RegisteredManagedArtifactComponentCompletion,
     RegisteredManagedArtifactComponentEffectAdmission,
     RegisteredManagedArtifactComponentSettlement, RegisteredReconciliationAuthority,
-    RegisteredVersionBundleComponentRebuildEffect, RegisteredWholeInstanceDurableOutcome,
-    RegisteredWholeInstancePreparation, RegisteredWholeInstanceRematerializationAdmission,
+    RegisteredUserConfigRestoreEligibility, RegisteredVersionBundleComponentRebuildEffect,
+    RegisteredWholeInstanceDurableOutcome, RegisteredWholeInstancePreparation,
+    RegisteredWholeInstanceRematerializationAdmission,
     RegisteredWholeInstanceRematerializationAuthorization,
     RegisteredWholeInstanceRematerializationEligibility, VERSION_BUNDLE_COMPONENT_REBUILD_STEP,
     commit_reconciliation_memory, component_rebuild_journal, reconciliation_attempt_key,
@@ -170,6 +172,7 @@ pub struct AppState {
     journals: Arc<OperationJournalStore>,
     installed_versions: Arc<installed_versions::InstalledVersionsIndex>,
     known_good: Arc<known_good::KnownGoodInventoryStore>,
+    user_config_snapshots: Arc<user_config_snapshots::UserConfigSnapshotStore>,
     user_mod_witnesses: Arc<user_mod_witness::UserModWitnessStore>,
     known_good_rebuilds: Arc<known_good_rebuilds::KnownGoodRebuildFlights>,
     java_probe_failures: Arc<JavaProbeFailureCache>,
@@ -445,6 +448,7 @@ impl AppState {
             tracing::warn!("known-good restart cleanup remains pending");
         }
         state.reconcile_reconciliation_startup().await?;
+        state.reconcile_user_config_snapshot_startup().await?;
         state.reconcile_persisted_state_repair_startup().await?;
         state
             .persisted_state_rejection_streaks
@@ -622,6 +626,12 @@ impl AppState {
             &instances.list(),
             instance_registry_authoritative,
         )?);
+        let user_config_snapshots =
+            Arc::new(user_config_snapshots::UserConfigSnapshotStore::claim(
+                config.paths(),
+                &instances.list(),
+                instance_registry_authoritative,
+            )?);
         if instance_registry_authoritative {
             known_good.discover_absent_snapshot_obligations(
                 instances.list().into_iter().map(|instance| instance.id),
@@ -642,6 +652,7 @@ impl AppState {
             journals,
             installed_versions: Arc::new(installed_versions::InstalledVersionsIndex::default()),
             known_good,
+            user_config_snapshots,
             user_mod_witnesses,
             known_good_rebuilds: Arc::new(known_good_rebuilds::KnownGoodRebuildFlights::default()),
             java_probe_failures: Arc::new(JavaProbeFailureCache::default()),
@@ -1299,6 +1310,17 @@ impl AppState {
                     "user mod witness retirement cleanup was retained for retry"
                 );
             }
+            if self
+                .user_config_snapshots
+                .retire_instance(retained_instance_id.clone())
+                .await
+                .is_err()
+            {
+                tracing::warn!(
+                    instance_id = retained_instance_id,
+                    "user config snapshot retirement cleanup was retained for retry"
+                );
+            }
         } else if result.is_ok() {
             return Err(InstanceStoreError::Persistence(std::io::Error::other(
                 "instance registry reported successful deletion without removing the instance",
@@ -1753,6 +1775,10 @@ impl AppState {
 
     pub(crate) async fn close_user_mod_witnesses(&self) -> std::io::Result<()> {
         self.user_mod_witnesses.close().await
+    }
+
+    pub(crate) async fn close_user_config_snapshots(&self) -> std::io::Result<()> {
+        self.user_config_snapshots.close().await
     }
 
     fn config_commit_observer(&self) -> Arc<dyn Fn(AppConfig, AppConfig) + Send + Sync> {

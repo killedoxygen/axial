@@ -6,8 +6,8 @@ use crate::state::contracts::{
     OperationPhase, OwnershipClass, StabilizationSystem, TargetDescriptor,
 };
 use crate::state::{
-    RegisteredWholeInstanceDurableOutcome, RegisteredWholeInstancePreparation,
-    RegisteredWholeInstanceRematerializationAdmission,
+    RegisteredUserConfigRestoreEligibility, RegisteredWholeInstanceDurableOutcome,
+    RegisteredWholeInstancePreparation, RegisteredWholeInstanceRematerializationAdmission,
     RegisteredWholeInstanceRematerializationAuthorization,
     RegisteredWholeInstanceRematerializationEligibility,
 };
@@ -119,14 +119,25 @@ pub(crate) enum GuardianWholeInstanceRematerializationStatus {
     Failed,
 }
 
-#[derive(Debug, Eq, PartialEq)]
 pub(crate) struct GuardianWholeInstanceRematerializationOutcome {
     status: GuardianWholeInstanceRematerializationStatus,
+    restore_offer: Option<GuardianUserConfigRestoreOffer>,
+}
+
+#[must_use]
+pub(crate) struct GuardianUserConfigRestoreOffer {
+    _eligibility: RegisteredUserConfigRestoreEligibility,
 }
 
 impl GuardianWholeInstanceRematerializationOutcome {
     pub(crate) fn status(&self) -> GuardianWholeInstanceRematerializationStatus {
         self.status
+    }
+
+    pub(crate) fn into_restore_offer(
+        self,
+    ) -> Option<crate::guardian::GuardianUserConfigRestoreOffer> {
+        self.restore_offer
     }
 }
 
@@ -216,12 +227,18 @@ where
 fn guardian_outcome(
     outcome: RegisteredWholeInstanceDurableOutcome,
 ) -> GuardianWholeInstanceRematerializationOutcome {
+    let status = if outcome.succeeded() {
+        GuardianWholeInstanceRematerializationStatus::Rematerialized
+    } else {
+        GuardianWholeInstanceRematerializationStatus::Failed
+    };
     GuardianWholeInstanceRematerializationOutcome {
-        status: if outcome.succeeded() {
-            GuardianWholeInstanceRematerializationStatus::Rematerialized
-        } else {
-            GuardianWholeInstanceRematerializationStatus::Failed
-        },
+        status,
+        restore_offer: outcome.into_restore_eligibility().map(|eligibility| {
+            GuardianUserConfigRestoreOffer {
+                _eligibility: eligibility,
+            }
+        }),
     }
 }
 
@@ -242,6 +259,12 @@ mod tests {
         let _ =
             <GuardianWholeInstanceRematerializationOffer as AmbiguousIfClone<_>>::assert_not_clone;
     };
+    static_assertions::assert_not_impl_any!(
+        GuardianUserConfigRestoreOffer: Clone, std::fmt::Debug, serde::Serialize, serde::de::DeserializeOwned
+    );
+    static_assertions::assert_not_impl_any!(
+        GuardianWholeInstanceRematerializationOutcome: Clone, std::fmt::Debug, serde::Serialize, serde::de::DeserializeOwned
+    );
 
     #[test]
     fn production_executor_has_one_core_rematerialization_call_site() {
@@ -257,5 +280,54 @@ mod tests {
         );
         assert!(!source.contains("OperationJournal"));
         assert!(!source.contains("ReconciliationQuarantineCheckpoint"));
+    }
+
+    #[test]
+    fn user_config_restore_offer_has_no_writer_route_dto_conversion_or_scheduler() {
+        let guardian = include_str!("whole_instance_rematerialization.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .expect("Guardian production source");
+        let state = include_str!("../state/reconciliation.rs");
+        let store = include_str!("../state/user_config_snapshots.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .expect("snapshot store production source");
+        let capture = include_str!("../execution/user_owned_state.rs")
+            .split("#[cfg(test)]\nmod tests")
+            .next()
+            .expect("user config capture production source");
+        let public_surface = concat!(
+            include_str!("../routes/mod.rs"),
+            include_str!("../routes/instances.rs"),
+            include_str!("../dto/mod.rs"),
+            include_str!("../application/commands.rs"),
+        );
+
+        assert!(!guardian.contains("impl GuardianUserConfigRestoreOffer"));
+        assert!(!state.contains("impl RegisteredUserConfigRestoreEligibility"));
+        assert!(!guardian.contains("tokio::spawn"));
+        assert!(!store.contains("std::fs::write"));
+        assert!(!store.contains("File::create"));
+        assert!(!store.contains("OpenOptions"));
+        assert!(!store.contains("AnchoredRecordDirectory"));
+        for forbidden in [
+            "write_file_atomically",
+            "std::fs::write",
+            "File::create",
+            "OpenOptions",
+            "restore_user_config",
+        ] {
+            assert!(!capture.contains(forbidden));
+        }
+        for forbidden in [
+            "GuardianUserConfigRestoreOffer",
+            "RegisteredUserConfigRestoreEligibility",
+            "guardian-user-config-snapshots",
+            "restore_user_config",
+            "user_config_snapshot",
+        ] {
+            assert!(!public_surface.contains(forbidden));
+        }
     }
 }

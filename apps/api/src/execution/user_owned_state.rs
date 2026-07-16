@@ -1,11 +1,216 @@
 use super::anchored_record::AnchoredRecordDirectory;
 use axial_performance::ManagedArtifactWitnessProof;
 use sha2::{Digest, Sha256};
+use std::ffi::OsStr;
+use std::io;
 use std::path::{Path, PathBuf};
 
 const MAX_ACTIVE_MOD_ENTRIES: usize = 1024;
 const MAX_ACTIVE_MOD_FILE_BYTES: u64 = 512 << 20;
 const MAX_ACTIVE_MOD_TOTAL_BYTES: u64 = 4 << 30;
+const USER_CONFIG_ENUMERATION_LIMIT: usize = 1024;
+const USER_CONFIG_FILE_LIMIT: usize = 64;
+const USER_CONFIG_FILE_BYTE_LIMIT: u64 = 64 * 1024;
+const USER_CONFIG_TOTAL_BYTE_LIMIT: u64 = 512 * 1024;
+
+pub(crate) struct UserConfigCapture {
+    entries: Vec<UserConfigCaptureEntry>,
+}
+
+pub(crate) enum UserConfigCaptureEntry {
+    Absent {
+        slot: String,
+    },
+    File {
+        slot: String,
+        bytes: Vec<u8>,
+        sha256: [u8; 32],
+    },
+}
+
+struct PendingUserConfigFile {
+    slot: String,
+    observation: super::anchored_record::AnchoredRecordObservation,
+}
+
+impl UserConfigCapture {
+    pub(crate) fn into_entries(self) -> Vec<UserConfigCaptureEntry> {
+        self.entries
+    }
+}
+
+impl UserConfigCaptureEntry {
+    pub(crate) fn into_parts(self) -> (String, Option<(Vec<u8>, [u8; 32])>) {
+        match self {
+            Self::Absent { slot } => (slot, None),
+            Self::File {
+                slot,
+                bytes,
+                sha256,
+            } => (slot, Some((bytes, sha256))),
+        }
+    }
+}
+
+pub(crate) async fn capture_user_config(game_dir: PathBuf) -> io::Result<UserConfigCapture> {
+    tokio::task::spawn_blocking(move || capture_user_config_blocking(&game_dir))
+        .await
+        .map_err(|_| io::Error::other("user config capture worker stopped"))?
+}
+
+fn capture_user_config_blocking(game_dir: &Path) -> io::Result<UserConfigCapture> {
+    #[cfg(test)]
+    {
+        capture_user_config_blocking_with_hook(game_dir, || {})
+    }
+    #[cfg(not(test))]
+    {
+        capture_user_config_blocking_impl(game_dir)
+    }
+}
+
+#[cfg(test)]
+fn capture_user_config_blocking_with_hook(
+    game_dir: &Path,
+    after_reads: impl FnOnce(),
+) -> io::Result<UserConfigCapture> {
+    capture_user_config_blocking_impl(game_dir, after_reads)
+}
+
+fn capture_user_config_blocking_impl(
+    game_dir: &Path,
+    #[cfg(test)] after_reads: impl FnOnce(),
+) -> io::Result<UserConfigCapture> {
+    let game = AnchoredRecordDirectory::open(game_dir)?;
+    let game_epoch = game.epoch()?;
+    let mut absent_options = false;
+    let mut pending = Vec::new();
+    match game.read(OsStr::new("options.txt"), USER_CONFIG_FILE_BYTE_LIMIT) {
+        Ok(observation) => pending.push(PendingUserConfigFile {
+            slot: "options.txt".to_string(),
+            observation,
+        }),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => absent_options = true,
+        Err(error) => return Err(error),
+    }
+
+    let config_path = game_dir.join("config");
+    let config = match AnchoredRecordDirectory::open(&config_path) {
+        Ok(directory) => Some((directory.epoch()?, directory)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error),
+    };
+    if let Some((_, directory)) = &config {
+        let names = directory
+            .names_bounded(USER_CONFIG_ENUMERATION_LIMIT)?
+            .ok_or_else(|| invalid_user_config_capture("config entry bound exceeded"))?;
+        let mut selected = Vec::new();
+        for name in names {
+            let name = name
+                .into_string()
+                .map_err(|_| invalid_user_config_capture("config name is not UTF-8"))?;
+            if !classify_user_config_leaf(&name)? {
+                continue;
+            }
+            selected.push(name);
+        }
+        selected.sort_unstable();
+        for name in selected {
+            if pending.len() >= USER_CONFIG_FILE_LIMIT {
+                return Err(invalid_user_config_capture(
+                    "selected user config file bound exceeded",
+                ));
+            }
+            let observation = directory.read(OsStr::new(&name), USER_CONFIG_FILE_BYTE_LIMIT)?;
+            pending.push(PendingUserConfigFile {
+                slot: format!("config/{name}"),
+                observation,
+            });
+        }
+    }
+
+    #[cfg(test)]
+    after_reads();
+    let mut raw_bytes = 0_u64;
+    for file in &pending {
+        if file.observation.is_oversized() {
+            return Err(invalid_user_config_capture(
+                "selected user config file exceeds its byte bound",
+            ));
+        }
+        let bytes = file
+            .observation
+            .bytes()
+            .expect("non-oversized anchored capture has bytes");
+        std::str::from_utf8(bytes)
+            .map_err(|_| invalid_user_config_capture("selected user config is not UTF-8"))?;
+        raw_bytes = raw_bytes
+            .checked_add(bytes.len() as u64)
+            .filter(|total| *total <= USER_CONFIG_TOTAL_BYTE_LIMIT)
+            .ok_or_else(|| invalid_user_config_capture("user config byte bound exceeded"))?;
+        file.observation.revalidate()?;
+    }
+    if let Some((epoch, directory)) = &config
+        && directory.epoch()? != *epoch
+    {
+        return Err(invalid_user_config_capture(
+            "config directory changed during capture",
+        ));
+    }
+    if game.epoch()? != game_epoch {
+        return Err(invalid_user_config_capture(
+            "instance directory changed during capture",
+        ));
+    }
+
+    let mut entries = Vec::with_capacity(pending.len() + usize::from(absent_options));
+    if absent_options {
+        entries.push(UserConfigCaptureEntry::Absent {
+            slot: "options.txt".to_string(),
+        });
+    }
+    for file in pending {
+        let bytes = file
+            .observation
+            .into_bytes()
+            .expect("non-oversized anchored capture has bytes");
+        entries.push(UserConfigCaptureEntry::File {
+            slot: file.slot,
+            sha256: Sha256::digest(&bytes).into(),
+            bytes,
+        });
+    }
+    entries.sort_by(|left, right| user_config_entry_slot(left).cmp(user_config_entry_slot(right)));
+    Ok(UserConfigCapture { entries })
+}
+
+pub(crate) fn classify_user_config_leaf(name: &str) -> io::Result<bool> {
+    if name.is_empty()
+        || name.len() > 255
+        || name.contains(['/', '\\'])
+        || name.chars().any(char::is_control)
+    {
+        return Err(invalid_user_config_capture("config name is not canonical"));
+    }
+    let Some((_, extension)) = name.rsplit_once('.') else {
+        return Ok(false);
+    };
+    Ok(!name.starts_with('.')
+        && matches!(
+            extension.to_ascii_lowercase().as_str(),
+            "cfg" | "conf" | "json" | "json5" | "properties" | "toml" | "txt" | "yaml" | "yml"
+        ))
+}
+
+fn user_config_entry_slot(entry: &UserConfigCaptureEntry) -> &str {
+    match entry {
+        UserConfigCaptureEntry::Absent { slot } | UserConfigCaptureEntry::File { slot, .. } => slot,
+    }
+}
+
+fn invalid_user_config_capture(message: &'static str) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, message)
+}
 
 pub(crate) struct UserModSetObservation {
     entries: Vec<UserModSetEntry>,
@@ -135,6 +340,14 @@ mod tests {
 
     static NEXT_ROOT: AtomicU64 = AtomicU64::new(0);
     static_assertions::assert_not_impl_any!(
+        UserConfigCapture:
+            Clone, std::fmt::Debug, serde::Serialize, serde::de::DeserializeOwned
+    );
+    static_assertions::assert_not_impl_any!(
+        UserConfigCaptureEntry:
+            Clone, std::fmt::Debug, serde::Serialize, serde::de::DeserializeOwned
+    );
+    static_assertions::assert_not_impl_any!(
         ManagedArtifactWitnessProof: Clone, std::fmt::Debug, serde::Serialize
     );
 
@@ -166,6 +379,317 @@ mod tests {
                 .map(UserModSetEntry::into_parts)
                 .collect()
         })
+    }
+
+    fn captured_entries(root: &Path) -> io::Result<Vec<(String, Option<Vec<u8>>)>> {
+        capture_user_config_blocking(root).map(|capture| {
+            capture
+                .into_entries()
+                .into_iter()
+                .map(|entry| {
+                    let (slot, content) = entry.into_parts();
+                    let bytes = content.map(|(bytes, sha256)| {
+                        let expected: [u8; 32] = Sha256::digest(&bytes).into();
+                        assert_eq!(sha256, expected);
+                        bytes
+                    });
+                    (slot, bytes)
+                })
+                .collect()
+        })
+    }
+
+    fn capture_error_kind(root: &Path) -> io::ErrorKind {
+        match capture_user_config_blocking(root) {
+            Ok(_) => panic!("expected user config capture to fail"),
+            Err(error) => error.kind(),
+        }
+    }
+
+    #[test]
+    fn user_config_capture_is_closed_sorted_and_byte_exact() {
+        let root = TestRoot::new("config-closed");
+        let options = b"guiScale:3\nresourcePacks:[\"vanilla\"]\n";
+        fs::write(root.0.join("options.txt"), options).expect("write options");
+        let config = root.0.join("config");
+        fs::create_dir_all(config.join("nested")).expect("create nested config");
+        let allowed = [
+            ("a.CFG", b"cfg\n".as_slice()),
+            ("b.CoNf", b"conf\n".as_slice()),
+            ("c.JSON", b"json\n".as_slice()),
+            ("d.JsOn5", b"json5\n".as_slice()),
+            ("e.PROPERTIES", b"properties\n".as_slice()),
+            ("f.TomL", b"toml\n".as_slice()),
+            ("g.TXT", b"txt\n".as_slice()),
+            ("h.YaMl", b"yaml\n".as_slice()),
+            ("i.YML", b"yml\n".as_slice()),
+        ];
+        for (name, bytes) in allowed.iter().rev() {
+            fs::write(config.join(name), bytes).expect("write selected config");
+        }
+        fs::write(config.join("ignored.bin"), b"private").expect("write unsupported file");
+        fs::write(config.join("ignored.json.bak"), b"private")
+            .expect("write double-extension file");
+        fs::write(config.join("no-extension"), b"private").expect("write extensionless file");
+        fs::write(config.join(".hidden.yaml"), b"private: true\n").expect("write hidden file");
+        fs::write(config.join("nested/deep.toml"), b"private = true\n").expect("write nested file");
+        fs::write(root.0.join("servers.dat"), b"private").expect("write excluded state");
+        for directory in [
+            "mods",
+            "saves",
+            "resourcepacks",
+            "shaderpacks",
+            "logs",
+            "screenshots",
+        ] {
+            fs::create_dir(root.0.join(directory)).expect("create excluded directory");
+            fs::write(root.0.join(directory).join("excluded.toml"), b"private\n")
+                .expect("write excluded root config");
+        }
+
+        let mut expected = allowed
+            .into_iter()
+            .map(|(name, bytes)| (format!("config/{name}"), Some(bytes.to_vec())))
+            .collect::<Vec<_>>();
+        expected.push(("options.txt".to_string(), Some(options.to_vec())));
+        assert_eq!(
+            captured_entries(&root.0).expect("capture closed config"),
+            expected
+        );
+    }
+
+    #[test]
+    fn absent_options_and_exact_byte_bounds_are_enforced() {
+        let absent = TestRoot::new("config-absent");
+        assert_eq!(
+            captured_entries(&absent.0).expect("capture absent options"),
+            vec![("options.txt".to_string(), None)]
+        );
+
+        let per_file = TestRoot::new("config-file-bound");
+        fs::write(
+            per_file.0.join("options.txt"),
+            vec![b'x'; USER_CONFIG_FILE_BYTE_LIMIT as usize],
+        )
+        .expect("write exact-bound options");
+        assert_eq!(
+            captured_entries(&per_file.0)
+                .expect("accept exact per-file bound")
+                .first()
+                .and_then(|(_, bytes)| bytes.as_ref())
+                .map(Vec::len),
+            Some(USER_CONFIG_FILE_BYTE_LIMIT as usize)
+        );
+        fs::write(
+            per_file.0.join("options.txt"),
+            vec![b'x'; USER_CONFIG_FILE_BYTE_LIMIT as usize + 1],
+        )
+        .expect("write oversized options");
+        assert_eq!(capture_error_kind(&per_file.0), io::ErrorKind::InvalidData);
+
+        let aggregate = TestRoot::new("config-total-bound");
+        let config = aggregate.0.join("config");
+        fs::create_dir(&config).expect("create config");
+        for index in 0..8 {
+            fs::write(
+                config.join(format!("entry-{index}.toml")),
+                vec![b'x'; USER_CONFIG_FILE_BYTE_LIMIT as usize],
+            )
+            .expect("write aggregate config");
+        }
+        assert_eq!(
+            captured_entries(&aggregate.0)
+                .expect("accept exact aggregate byte bound")
+                .len(),
+            9
+        );
+        fs::write(
+            config.join("entry-8.toml"),
+            vec![b'x'; USER_CONFIG_FILE_BYTE_LIMIT as usize],
+        )
+        .expect("write aggregate overflow config");
+        assert_eq!(capture_error_kind(&aggregate.0), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn exact_enumeration_and_selected_file_bounds_are_enforced() {
+        let enumeration = TestRoot::new("config-enumeration-bound");
+        let config = enumeration.0.join("config");
+        fs::create_dir(&config).expect("create config");
+        for index in 0..USER_CONFIG_ENUMERATION_LIMIT {
+            fs::write(config.join(format!("ignored-{index}.bin")), b"")
+                .expect("write enumerated config");
+        }
+        assert_eq!(
+            captured_entries(&enumeration.0).expect("accept exact enumeration bound"),
+            vec![("options.txt".to_string(), None)]
+        );
+        fs::write(
+            config.join(format!("ignored-{}.bin", USER_CONFIG_ENUMERATION_LIMIT)),
+            b"",
+        )
+        .expect("write enumeration overflow");
+        assert_eq!(
+            capture_error_kind(&enumeration.0),
+            io::ErrorKind::InvalidData
+        );
+
+        let selected = TestRoot::new("config-selected-bound");
+        let config = selected.0.join("config");
+        fs::create_dir(&config).expect("create config");
+        for index in 0..USER_CONFIG_FILE_LIMIT {
+            fs::write(config.join(format!("selected-{index:02}.toml")), b"")
+                .expect("write selected config");
+        }
+        assert_eq!(
+            captured_entries(&selected.0)
+                .expect("accept exact selected-file bound")
+                .len(),
+            USER_CONFIG_FILE_LIMIT + 1
+        );
+        fs::write(
+            config.join(format!("selected-{}.toml", USER_CONFIG_FILE_LIMIT)),
+            b"",
+        )
+        .expect("write selected-file overflow");
+        assert_eq!(capture_error_kind(&selected.0), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn user_config_capture_rejects_invalid_utf8_content_and_selected_directories() {
+        let invalid_content = TestRoot::new("config-invalid-content");
+        fs::write(invalid_content.0.join("options.txt"), [0xff])
+            .expect("write invalid UTF-8 content");
+        assert_eq!(
+            capture_error_kind(&invalid_content.0),
+            io::ErrorKind::InvalidData
+        );
+
+        let directory = TestRoot::new("config-selected-directory");
+        fs::create_dir(directory.0.join("config")).expect("create config");
+        fs::create_dir(directory.0.join("config/directory.toml"))
+            .expect("create selected directory");
+        assert!(capture_user_config_blocking(&directory.0).is_err());
+
+        assert_eq!(
+            classify_user_config_leaf("control\n.toml")
+                .expect_err("reject control name")
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn user_config_capture_rejects_selected_leaf_and_directory_replacement_races() {
+        let root = TestRoot::new("config-leaf-race");
+        let options = root.0.join("options.txt");
+        fs::write(&options, b"before\n").expect("write options");
+        let displaced = root.0.join("options.displaced");
+
+        assert!(
+            capture_user_config_blocking_with_hook(&root.0, || {
+                fs::rename(&options, &displaced).expect("displace selected file");
+                fs::write(&options, b"after\n").expect("replace selected file");
+            })
+            .is_err()
+        );
+
+        let root = TestRoot::new("config-directory-race");
+        let config = root.0.join("config");
+        fs::create_dir(&config).expect("create config");
+        fs::write(config.join("selected.toml"), b"before\n").expect("write selected config");
+        let displaced = root.0.join("config.displaced");
+        assert!(
+            capture_user_config_blocking_with_hook(&root.0, || {
+                fs::rename(&config, &displaced).expect("displace config directory");
+                fs::create_dir(&config).expect("replace config directory");
+                fs::write(config.join("selected.toml"), b"after\n")
+                    .expect("replace selected config");
+            })
+            .is_err()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn user_config_capture_rejects_unsafe_selected_entries_and_non_utf8_names() {
+        use std::os::unix::ffi::OsStringExt;
+        use std::os::unix::fs::symlink;
+
+        let options_symlink = TestRoot::new("config-options-symlink");
+        fs::write(options_symlink.0.join("target.txt"), b"target\n").expect("write options target");
+        symlink("target.txt", options_symlink.0.join("options.txt"))
+            .expect("create options symlink");
+        assert!(capture_user_config_blocking(&options_symlink.0).is_err());
+
+        let leaf_symlink = TestRoot::new("config-leaf-symlink");
+        let config = leaf_symlink.0.join("config");
+        fs::create_dir(&config).expect("create config");
+        fs::write(config.join("target.bin"), b"target").expect("write target");
+        symlink("target.bin", config.join("linked.toml")).expect("create selected symlink");
+        assert!(capture_user_config_blocking(&leaf_symlink.0).is_err());
+
+        let config_symlink = TestRoot::new("config-directory-symlink");
+        fs::create_dir(config_symlink.0.join("actual-config")).expect("create config target");
+        fs::write(
+            config_symlink.0.join("actual-config/selected.toml"),
+            b"private\n",
+        )
+        .expect("write config target");
+        symlink("actual-config", config_symlink.0.join("config"))
+            .expect("create config directory symlink");
+        assert!(capture_user_config_blocking(&config_symlink.0).is_err());
+
+        let hardlink_root = TestRoot::new("config-hardlink");
+        let config = hardlink_root.0.join("config");
+        fs::create_dir(&config).expect("create config");
+        fs::write(config.join("first.toml"), b"same\n").expect("write hardlink source");
+        fs::hard_link(config.join("first.toml"), config.join("second.toml"))
+            .expect("create selected hardlink");
+        assert!(capture_user_config_blocking(&hardlink_root.0).is_err());
+
+        let fifo_root = TestRoot::new("config-fifo");
+        let config = fifo_root.0.join("config");
+        fs::create_dir(&config).expect("create config");
+        rustix::fs::mkfifoat(
+            rustix::fs::CWD,
+            config.join("special.toml"),
+            rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
+        )
+        .expect("create selected FIFO");
+        assert!(capture_user_config_blocking(&fifo_root.0).is_err());
+
+        let non_utf8_root = TestRoot::new("config-non-utf8");
+        let config = non_utf8_root.0.join("config");
+        fs::create_dir(&config).expect("create config");
+        fs::write(
+            config.join(std::ffi::OsString::from_vec(vec![
+                0xff, b'.', b't', b'o', b'm', b'l',
+            ])),
+            b"private\n",
+        )
+        .expect("write non-UTF-8 config");
+        assert!(capture_user_config_blocking(&non_utf8_root.0).is_err());
+
+        let control_root = TestRoot::new("config-control-name");
+        let config = control_root.0.join("config");
+        fs::create_dir(&config).expect("create config");
+        fs::write(config.join("unsafe\n.toml"), b"private\n").expect("write control-name config");
+        assert_eq!(
+            capture_error_kind(&control_root.0),
+            io::ErrorKind::InvalidData
+        );
+
+        let backslash_root = TestRoot::new("config-backslash-name");
+        let config = backslash_root.0.join("config");
+        fs::create_dir(&config).expect("create config");
+        fs::write(config.join("unsafe\\name.toml"), b"private\n")
+            .expect("write backslash-name config");
+        assert_eq!(
+            capture_error_kind(&backslash_root.0),
+            io::ErrorKind::InvalidData
+        );
     }
 
     #[test]

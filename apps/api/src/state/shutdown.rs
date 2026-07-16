@@ -4,7 +4,7 @@ use tokio::sync::watch;
 
 const SHUTDOWN_LOCK_INVARIANT: &str =
     "application shutdown lock poisoned; completion state may be inconsistent";
-const SHUTDOWN_STEP_COUNT: usize = 20;
+const SHUTDOWN_STEP_COUNT: usize = 21;
 type ShutdownAttemptChannel = Arc<watch::Sender<Option<Result<(), AppShutdownError>>>>;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -26,6 +26,7 @@ pub enum AppShutdownStep {
     SecureAuth,
     RemoteFlags,
     KnownGoodInventories,
+    UserConfigSnapshots,
     UserModWitnesses,
     InstanceRegistry,
     Config,
@@ -51,9 +52,10 @@ impl AppShutdownStep {
             Self::SecureAuth => 14,
             Self::RemoteFlags => 15,
             Self::KnownGoodInventories => 16,
-            Self::UserModWitnesses => 17,
-            Self::InstanceRegistry => 18,
-            Self::Config => 19,
+            Self::UserConfigSnapshots => 17,
+            Self::UserModWitnesses => 18,
+            Self::InstanceRegistry => 19,
+            Self::Config => 20,
         }
     }
 
@@ -76,6 +78,7 @@ impl AppShutdownStep {
             Self::SecureAuth => "secure_auth",
             Self::RemoteFlags => "remote_flags",
             Self::KnownGoodInventories => "known_good_inventories",
+            Self::UserConfigSnapshots => "user_config_snapshots",
             Self::UserModWitnesses => "user_mod_witnesses",
             Self::InstanceRegistry => "instance_registry",
             Self::Config => "config",
@@ -193,6 +196,7 @@ impl AppShutdownCoordinator {
             self.close_managed_compositions(state).await,
         );
         let known_good_result = self.close_known_good_inventories(state).await;
+        let user_config_snapshot_result = self.close_user_config_snapshots(state).await;
         let user_mod_witness_result = self.close_user_mod_witnesses(state).await;
 
         let skin_result = self.flush_skin(state).await;
@@ -221,6 +225,7 @@ impl AppShutdownCoordinator {
         retain_first_error(&mut first_error, remote_result);
         retain_first_error(&mut first_error, rules_result);
         retain_first_error(&mut first_error, known_good_result);
+        retain_first_error(&mut first_error, user_config_snapshot_result);
         retain_first_error(&mut first_error, user_mod_witness_result);
         retain_first_error(&mut first_error, instance_result);
         retain_first_error(&mut first_error, config_result);
@@ -507,6 +512,9 @@ impl AppShutdownCoordinator {
         if !self.completed(AppShutdownStep::UserModWitnesses) {
             return Err(AppShutdownError::at(AppShutdownStep::UserModWitnesses));
         }
+        if !self.completed(AppShutdownStep::UserConfigSnapshots) {
+            return Err(AppShutdownError::at(AppShutdownStep::UserConfigSnapshots));
+        }
         if self.completed(AppShutdownStep::InstanceRegistry) {
             return Ok(());
         }
@@ -539,6 +547,18 @@ impl AppShutdownCoordinator {
             .await
             .map_err(|_| AppShutdownError::at(AppShutdownStep::UserModWitnesses))?;
         self.mark_completed(AppShutdownStep::UserModWitnesses);
+        Ok(())
+    }
+
+    async fn close_user_config_snapshots(&self, state: &AppState) -> Result<(), AppShutdownError> {
+        if self.completed(AppShutdownStep::UserConfigSnapshots) {
+            return Ok(());
+        }
+        state
+            .close_user_config_snapshots()
+            .await
+            .map_err(|_| AppShutdownError::at(AppShutdownStep::UserConfigSnapshots))?;
+        self.mark_completed(AppShutdownStep::UserConfigSnapshots);
         Ok(())
     }
 
