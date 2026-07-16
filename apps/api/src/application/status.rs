@@ -80,7 +80,7 @@ mod tests {
     }
 
     #[test]
-    fn status_aggregates_five_stores_and_owns_two_store_rejection_evidence() {
+    fn status_aggregates_six_stores_and_owns_two_store_rejection_evidence() {
         let root = test_root("status-operation-state-warning");
         let paths = test_paths(&root);
         let operation_dir = operation_dir(&paths);
@@ -165,6 +165,53 @@ mod tests {
             "BenchmarkSuiteDriver"
         );
 
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn status_surfaces_one_bounded_issue_after_retired_journals_are_quarantined() {
+        let root = test_root("status-retired-journal-warning");
+        let paths = test_paths(&root);
+        let journal_path = paths
+            .config_dir
+            .join("state")
+            .join("operation-journals.json");
+        fs::create_dir_all(journal_path.parent().expect("journal directory"))
+            .expect("create journal directory");
+        fs::write(
+            &journal_path,
+            br#"{"schema":"axial.state.operation_journals.v1","entries":[]}"#,
+        )
+        .expect("write retired journal snapshot");
+        let config = Arc::new(ConfigStore::load_from(paths.clone()).expect("load config"));
+        let instances = Arc::new(
+            InstanceStore::from_snapshot(paths.clone(), InstanceRegistrySnapshot::default())
+                .expect("load instances"),
+        );
+        let state = AppState::new(AppStateInit {
+            app_name: "Axial".to_string(),
+            version: "test".to_string(),
+            config,
+            instances,
+            installs: Arc::new(InstallStore::new()),
+            sessions: Arc::new(SessionStore::new()),
+            performance: Arc::new(
+                PerformanceManager::load_for_startup(&paths.config_dir)
+                    .expect("performance manager"),
+            ),
+            startup_warnings: Vec::new(),
+            frontend_dir: root.join("frontend"),
+        });
+
+        let response = launcher_status(&state);
+        assert_eq!(state.persisted_state_load_evidence().issue_count(), 1);
+        assert_eq!(
+            response.warnings,
+            ["Guardian kept Axial running after persisted operation state could not be trusted."]
+        );
+        assert!(!journal_path.exists());
+
+        drop(state);
         let _ = fs::remove_dir_all(root);
     }
 

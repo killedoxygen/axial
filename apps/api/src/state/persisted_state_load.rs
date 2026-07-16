@@ -314,7 +314,7 @@ pub(crate) struct PersistedStateLoadEvidence {
 
 impl PersistedStateLoadEvidence {
     pub(super) fn from_store_parts(
-        issue_counts: [usize; 5],
+        issue_counts: [usize; 6],
         rejected_records: impl IntoIterator<Item = PersistedStateRejectedRecordEvidence>,
     ) -> Self {
         Self {
@@ -334,7 +334,7 @@ impl PersistedStateLoadEvidence {
 
     #[cfg(test)]
     pub(crate) fn for_test(issue_count: usize) -> Self {
-        Self::from_store_parts([issue_count, 0, 0, 0, 0], [])
+        Self::from_store_parts([issue_count, 0, 0, 0, 0, 0], [])
     }
 }
 
@@ -375,9 +375,9 @@ mod tests {
     );
 
     #[test]
-    fn five_store_issue_count_saturates() {
+    fn six_store_issue_count_saturates() {
         let evidence = PersistedStateLoadEvidence::from_store_parts(
-            [usize::MAX - 1, 1, 1, usize::MAX, usize::MAX],
+            [usize::MAX - 1, 1, 1, usize::MAX, usize::MAX, usize::MAX],
             [],
         );
 

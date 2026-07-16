@@ -593,6 +593,11 @@ impl AppState {
             performance_operation_rejection_scan,
             benchmark_suite_driver_rejection_scan,
         ];
+        let journals = Arc::new(
+            OperationJournalStore::try_load_from_paths(config.paths()).map_err(|error| {
+                std::io::Error::other(format!("failed to load operation journals: {error}"))
+            })?,
+        );
         let persisted_state_load = Arc::new(PersistedStateLoadEvidence::from_store_parts(
             [
                 auth_logins.load_issue_count(),
@@ -600,6 +605,7 @@ impl AppState {
                 benchmark_suites.load_issue_count(),
                 benchmark_suite_drivers.load_issue_count(),
                 launch_reports.load_issue_count(),
+                journals.load_issue_count(),
             ],
             rejected_record_scans
                 .iter()
@@ -626,11 +632,6 @@ impl AppState {
         let failure_memory = Arc::new(
             GuardianFailureMemoryStore::try_load_from_paths(config.paths()).map_err(|error| {
                 std::io::Error::other(format!("failed to load Guardian failure memory: {error}"))
-            })?,
-        );
-        let journals = Arc::new(
-            OperationJournalStore::try_load_from_paths(config.paths()).map_err(|error| {
-                std::io::Error::other(format!("failed to load operation journals: {error}"))
             })?,
         );
         let known_good = Arc::new(known_good::KnownGoodInventoryStore::claim(config.paths())?);

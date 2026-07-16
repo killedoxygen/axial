@@ -7,6 +7,10 @@ use super::contracts::{
     TargetDescriptor, TargetKind,
 };
 use super::ownership::{CurrentArtifact, classify_current_artifact};
+use crate::execution::anchored_record::{
+    AnchoredRecordDirectory, AnchoredRecordIdentity, AnchoredRecordObservation,
+    AnchoredRecordQuarantineError,
+};
 #[cfg(test)]
 use crate::execution::persistence::PersistenceCoordinator;
 use crate::execution::persistence::{
@@ -19,7 +23,6 @@ use crate::observability::{
 use axial_config::AppPaths;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
@@ -32,9 +35,19 @@ pub const DEFAULT_OPERATION_JOURNAL_LIMIT: usize = RECONCILIATION_EVIDENCE_CAPAC
 pub(crate) const MAX_OPERATION_JOURNAL_STEP_FACTS: usize = 64;
 pub(crate) const MAX_OPERATION_JOURNAL_DIAGNOSES: usize = 32;
 const OPERATION_JOURNAL_FILE: &str = "operation-journals.json";
+const MAX_OPERATION_JOURNAL_SNAPSHOT_BYTES: u64 = 8 * 1024 * 1024;
 const OPERATION_JOURNAL_LOCK_INVARIANT: &str =
     "operation journal records lock poisoned; in-memory and persisted state may diverge";
 const OPERATION_JOURNAL_TRANSITION_RETRY_ATTEMPTS: usize = 4;
+const RETIRED_OPERATION_JOURNAL_SCHEMAS: [(&str, [u8; 16]); 4] = [
+    (
+        "croopor.state.operation_journals.v1",
+        *b"cr-journal-v1\0\0\0",
+    ),
+    ("axial.state.operation_journals.v1", *b"op-journal-v1\0\0\0"),
+    ("axial.state.operation_journals.v2", *b"op-journal-v2\0\0\0"),
+    ("axial.state.operation_journals.v3", *b"op-journal-v3\0\0\0"),
+];
 
 #[derive(Debug, thiserror::Error)]
 pub enum OperationJournalStoreError {
@@ -214,6 +227,7 @@ pub struct OperationJournalStore {
     mutation_gate: Arc<AsyncMutex<()>>,
     max_entries: usize,
     persistence: Option<OperationJournalPersistence>,
+    load_issue_count: usize,
 }
 
 #[derive(Default)]
@@ -240,12 +254,13 @@ impl OperationJournalStore {
             mutation_gate: Arc::new(AsyncMutex::new(())),
             max_entries: max_entries.clamp(1, DEFAULT_OPERATION_JOURNAL_LIMIT),
             persistence: None,
+            load_issue_count: 0,
         }
     }
 
     pub fn try_load_from_paths(paths: &AppPaths) -> Result<Self, OperationJournalStoreError> {
         let storage_path = operation_journal_path(paths);
-        let store = Self::with_max_entries_and_persistence(
+        let mut store = Self::with_max_entries_and_persistence(
             DEFAULT_OPERATION_JOURNAL_LIMIT,
             Some(OperationJournalPersistence::claim(&storage_path)?),
         );
@@ -260,7 +275,7 @@ impl OperationJournalStore {
         coordinator: PersistenceCoordinator,
     ) -> Result<Self, OperationJournalStoreError> {
         let storage_path = operation_journal_path(paths);
-        let store = Self::with_max_entries_and_persistence(
+        let mut store = Self::with_max_entries_and_persistence(
             DEFAULT_OPERATION_JOURNAL_LIMIT,
             Some(OperationJournalPersistence::claim_with_coordinator(
                 &storage_path,
@@ -271,12 +286,51 @@ impl OperationJournalStore {
         Ok(store)
     }
 
-    fn load_from_path(&self, storage_path: &Path) -> Result<(), OperationJournalStoreError> {
-        match fs::read_to_string(storage_path) {
-            Ok(data) => self.load_snapshot(OperationJournalSnapshot::from_json(&data)?)?,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+    fn load_from_path(&mut self, storage_path: &Path) -> Result<(), OperationJournalStoreError> {
+        let Some(parent) = storage_path.parent() else {
+            return Err(OperationJournalStoreError::Persistence(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "operation journal path has no parent",
+            )));
+        };
+        let Some(file_name) = storage_path.file_name() else {
+            return Err(OperationJournalStoreError::Persistence(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "operation journal path has no file name",
+            )));
+        };
+        let directory = match AnchoredRecordDirectory::open(parent) {
+            Ok(directory) => directory,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
             Err(error) => return Err(OperationJournalStoreError::Persistence(error)),
+        };
+        let observation =
+            match directory.read_for_mutation(file_name, MAX_OPERATION_JOURNAL_SNAPSHOT_BYTES) {
+                Ok(observation) => observation,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+                Err(error) => return Err(OperationJournalStoreError::Persistence(error)),
+            };
+        let (data, identity) = match observation {
+            AnchoredRecordObservation::Bytes { bytes, identity } => {
+                let data = String::from_utf8(bytes).map_err(|error| {
+                    OperationJournalStoreError::Persistence(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        error,
+                    ))
+                })?;
+                (data, identity)
+            }
+            AnchoredRecordObservation::Oversized { .. } => {
+                return Err(OperationJournalLoadError::TooLarge.into());
+            }
+        };
+        if let Some(suffix) = retired_operation_journal_quarantine_suffix(&data)? {
+            quarantine_retired_operation_journal(identity, suffix)?;
+            self.load_issue_count = 1;
+            warn!("quarantined retired operation journal snapshot");
+            return Ok(());
         }
+        self.load_snapshot(OperationJournalSnapshot::from_json(&data)?)?;
         Ok(())
     }
 
@@ -289,7 +343,12 @@ impl OperationJournalStore {
             mutation_gate: Arc::new(AsyncMutex::new(())),
             max_entries: max_entries.clamp(1, DEFAULT_OPERATION_JOURNAL_LIMIT),
             persistence,
+            load_issue_count: 0,
         }
+    }
+
+    pub(crate) const fn load_issue_count(&self) -> usize {
+        self.load_issue_count
     }
 
     pub async fn create(
@@ -1012,6 +1071,7 @@ impl OperationJournalSnapshot {
 pub enum OperationJournalLoadError {
     Json(serde_json::Error),
     InvalidSchema,
+    TooLarge,
     TooManyEntries,
     InvalidEntry(OperationJournalValidationError),
     DuplicateOperationId,
@@ -1437,6 +1497,43 @@ pub fn operation_journal_path(paths: &AppPaths) -> PathBuf {
     paths.config_dir.join("state").join(OPERATION_JOURNAL_FILE)
 }
 
+#[derive(Deserialize)]
+struct OperationJournalSchemaProbe {
+    schema: String,
+}
+
+fn retired_operation_journal_quarantine_suffix(
+    data: &str,
+) -> Result<Option<[u8; 16]>, OperationJournalLoadError> {
+    let probe = serde_json::from_str::<OperationJournalSchemaProbe>(data)?;
+    Ok(RETIRED_OPERATION_JOURNAL_SCHEMAS
+        .iter()
+        .find_map(|(schema, suffix)| (probe.schema == *schema).then_some(*suffix)))
+}
+
+fn quarantine_retired_operation_journal(
+    identity: AnchoredRecordIdentity,
+    suffix: [u8; 16],
+) -> Result<(), OperationJournalStoreError> {
+    let receipt = identity.quarantine(suffix).map_err(|error| {
+        let kind = match error {
+            AnchoredRecordQuarantineError::Refused(error)
+            | AnchoredRecordQuarantineError::AppliedUnverified(error) => error.kind(),
+        };
+        OperationJournalStoreError::Persistence(io::Error::new(
+            kind,
+            "operation journal quarantine failed",
+        ))
+    })?;
+    if !receipt.is_current() {
+        return Err(OperationJournalStoreError::Persistence(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "operation journal quarantine could not be verified",
+        )));
+    }
+    Ok(())
+}
+
 fn operation_journal_target() -> TargetDescriptor {
     classify_current_artifact(
         CurrentArtifact::OperationJournalSnapshot,
@@ -1446,10 +1543,17 @@ fn operation_journal_target() -> TargetDescriptor {
 }
 
 fn encode_snapshot(snapshot: OperationJournalSnapshot) -> io::Result<Vec<u8>> {
-    snapshot
+    let encoded = snapshot
         .to_json()
         .map(String::into_bytes)
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    if encoded.len() as u64 > MAX_OPERATION_JOURNAL_SNAPSHOT_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "operation journal snapshot exceeds its persistence bound",
+        ));
+    }
+    Ok(encoded)
 }
 
 #[cfg(test)]
@@ -1871,10 +1975,7 @@ mod tests {
 
     #[test]
     fn retired_operation_journal_schemas_are_rejected() {
-        for schema in [
-            "axial.state.operation_journals.v2",
-            "axial.state.operation_journals.v3",
-        ] {
+        for (schema, _) in super::RETIRED_OPERATION_JOURNAL_SCHEMAS {
             let value = serde_json::json!({"schema": schema, "entries": []});
             assert!(OperationJournalSnapshot::from_json(&value.to_string()).is_err());
         }
@@ -2093,6 +2194,194 @@ mod tests {
         );
 
         cleanup(&root);
+    }
+
+    #[tokio::test]
+    async fn journal_store_quarantines_retired_schemas_once_before_accepting_new_work() {
+        for (index, (schema, suffix)) in super::RETIRED_OPERATION_JOURNAL_SCHEMAS.iter().enumerate()
+        {
+            let root = test_root(&format!("quarantine-retired-schema-{index}"));
+            let paths = test_paths(&root);
+            let path = operation_journal_path(&paths);
+            let parent = path.parent().expect("journal parent");
+            fs::create_dir_all(parent).expect("create journal parent");
+            let retired = format!(r#"{{"schema":"{schema}","entries":[{{"legacy":true}}]}}"#);
+            fs::write(&path, &retired).expect("write retired journal snapshot");
+
+            let store = OperationJournalStore::try_load_from_paths(&paths)
+                .expect("quarantine retired journal snapshot");
+            assert!(store.list().is_empty());
+            assert_eq!(store.load_issue_count(), 1);
+            assert!(!path.exists());
+            let quarantine = parent.join(
+                crate::execution::anchored_record::anchored_record_quarantine_name(
+                    path.file_name().expect("journal file name"),
+                    *suffix,
+                ),
+            );
+            assert_eq!(
+                fs::read_to_string(&quarantine).expect("read exact quarantine"),
+                retired
+            );
+            store.close().await.expect("close recovered journal store");
+            drop(store);
+
+            let restarted = OperationJournalStore::try_load_from_paths(&paths)
+                .expect("restart after exact quarantine");
+            assert!(restarted.list().is_empty());
+            assert_eq!(restarted.load_issue_count(), 0);
+            let operation_id = OperationId::new(format!("operation-after-retired-schema-{index}"));
+            restarted
+                .create(planned_entry(&operation_id))
+                .await
+                .expect("persist current journal snapshot");
+            restarted.close().await.expect("close restarted store");
+
+            let persisted = fs::read_to_string(&path).expect("read current journal snapshot");
+            let snapshot = OperationJournalSnapshot::from_json(&persisted)
+                .expect("new work uses the current strict schema");
+            assert_eq!(snapshot.entries.len(), 1);
+            assert_eq!(snapshot.entries[0].operation_id, operation_id);
+            assert_eq!(
+                fs::read_to_string(&quarantine).expect("quarantine remains exact"),
+                retired
+            );
+            cleanup(&root);
+        }
+    }
+
+    #[test]
+    fn journal_store_preserves_future_schema_and_fails_closed() {
+        let root = test_root("preserve-future-schema");
+        let paths = test_paths(&root);
+        let path = operation_journal_path(&paths);
+        fs::create_dir_all(path.parent().expect("journal parent")).expect("create journal parent");
+        let future = r#"{"schema":"axial.state.operation_journals.v5","entries":[]}"#;
+        fs::write(&path, future).expect("write future journal snapshot");
+
+        let result = OperationJournalStore::try_load_from_paths(&paths);
+        assert!(matches!(
+            result,
+            Err(OperationJournalStoreError::Snapshot(
+                super::OperationJournalLoadError::InvalidSchema
+            ))
+        ));
+        assert_eq!(
+            fs::read_to_string(&path).expect("future snapshot remains available"),
+            future
+        );
+        cleanup(&root);
+    }
+
+    #[test]
+    fn journal_store_preserves_malformed_and_invalid_current_snapshots() {
+        let cases = [
+            (
+                "malformed-json",
+                format!(r#"{{"schema":"{}""#, super::OPERATION_JOURNAL_SCHEMA),
+            ),
+            ("invalid-current", {
+                let mut value = serde_json::to_value(
+                    OperationJournalSnapshot::new(vec![test_entry("operation-invalid-current")])
+                        .expect("valid snapshot"),
+                )
+                .expect("snapshot value");
+                value["entries"][0]["operation_id"] =
+                    serde_json::Value::String("../unsafe".to_string());
+                value.to_string()
+            }),
+        ];
+
+        for (name, rejected) in cases {
+            let root = test_root(name);
+            let paths = test_paths(&root);
+            let path = operation_journal_path(&paths);
+            fs::create_dir_all(path.parent().expect("journal parent"))
+                .expect("create journal parent");
+            fs::write(&path, &rejected).expect("write rejected current journal snapshot");
+
+            assert!(OperationJournalStore::try_load_from_paths(&paths).is_err());
+            assert_eq!(
+                fs::read_to_string(&path).expect("rejected snapshot remains available"),
+                rejected
+            );
+            cleanup(&root);
+        }
+    }
+
+    #[test]
+    fn journal_store_preserves_retired_snapshot_when_quarantine_collides() {
+        let root = test_root("retired-schema-quarantine-collision");
+        let paths = test_paths(&root);
+        let path = operation_journal_path(&paths);
+        let parent = path.parent().expect("journal parent");
+        fs::create_dir_all(parent).expect("create journal parent");
+        let retired = r#"{"schema":"croopor.state.operation_journals.v1","entries":[]}"#;
+        fs::write(&path, retired).expect("write retired journal snapshot");
+        let quarantine = parent.join(
+            crate::execution::anchored_record::anchored_record_quarantine_name(
+                path.file_name().expect("journal file name"),
+                super::RETIRED_OPERATION_JOURNAL_SCHEMAS[0].1,
+            ),
+        );
+        fs::write(&quarantine, "existing-quarantine").expect("create quarantine collision");
+
+        let result = OperationJournalStore::try_load_from_paths(&paths);
+        assert!(matches!(
+            result,
+            Err(OperationJournalStoreError::Persistence(error))
+                if error.kind() == io::ErrorKind::AlreadyExists
+        ));
+        assert_eq!(
+            fs::read_to_string(&path).expect("retired snapshot remains canonical"),
+            retired
+        );
+        assert_eq!(
+            fs::read_to_string(&quarantine).expect("existing quarantine remains untouched"),
+            "existing-quarantine"
+        );
+        cleanup(&root);
+    }
+
+    #[test]
+    fn journal_store_rejects_oversized_snapshot_without_reading_or_replacing_it() {
+        let root = test_root("oversized-snapshot");
+        let paths = test_paths(&root);
+        let path = operation_journal_path(&paths);
+        fs::create_dir_all(path.parent().expect("journal parent")).expect("create journal parent");
+        let file = fs::File::create(&path).expect("create oversized journal snapshot");
+        file.set_len(super::MAX_OPERATION_JOURNAL_SNAPSHOT_BYTES + 1)
+            .expect("size oversized journal snapshot");
+        drop(file);
+
+        assert!(matches!(
+            OperationJournalStore::try_load_from_paths(&paths),
+            Err(OperationJournalStoreError::Snapshot(
+                super::OperationJournalLoadError::TooLarge
+            ))
+        ));
+        assert_eq!(
+            fs::metadata(&path)
+                .expect("oversized snapshot remains")
+                .len(),
+            super::MAX_OPERATION_JOURNAL_SNAPSHOT_BYTES + 1
+        );
+        cleanup(&root);
+    }
+
+    #[test]
+    fn journal_snapshot_encoder_enforces_the_startup_size_bound() {
+        let snapshot = OperationJournalSnapshot {
+            schema: "x".repeat(super::MAX_OPERATION_JOURNAL_SNAPSHOT_BYTES as usize),
+            entries: Vec::new(),
+        };
+
+        assert_eq!(
+            super::encode_snapshot(snapshot)
+                .expect_err("oversized snapshots must not be persisted")
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
     }
 
     #[tokio::test]
