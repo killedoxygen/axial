@@ -56,11 +56,11 @@ impl RegisteredArtifactMutationCapability {
         #[cfg(any(unix, windows))]
         {
             let (root, relative) = physical_path_parts(path);
-            return tokio::task::spawn_blocking(move || {
+            tokio::task::spawn_blocking(move || {
                 AnchoredLeaf::open(&root, &relative).map(|inner| Self { inner })
             })
             .await
-            .map_err(|error| io::Error::other(error.to_string()))?;
+            .map_err(|error| io::Error::other(error.to_string()))?
         }
         #[cfg(not(any(unix, windows)))]
         {
@@ -241,7 +241,7 @@ impl RegisteredArtifactExactVerifier {
             let inner = tokio::task::spawn_blocking(move || AnchoredLeaf::open(&root, &relative))
                 .await
                 .map_err(|error| io::Error::other(error.to_string()))??;
-            return Ok((
+            Ok((
                 Self {
                     inner,
                     expected_sha1,
@@ -249,7 +249,7 @@ impl RegisteredArtifactExactVerifier {
                     identity: identity.clone(),
                 },
                 RegisteredArtifactExactVerification { identity },
-            ));
+            ))
         }
         #[cfg(not(any(unix, windows)))]
         {

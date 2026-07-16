@@ -5,7 +5,7 @@ use super::{
     GuardianManagedJavaReason, GuardianMode, GuardianObservedLaunchFailurePhase,
     GuardianPerformanceSupervisionRejection, GuardianPreflightOutcome,
     GuardianPresetDowngradeReason, GuardianPresetValue, GuardianRepairStatus,
-    GuardianStartupFailureObservation, GuardianStripJvmArgsReason,
+    GuardianStartupFailureObservation, GuardianStartupFailureRequest, GuardianStripJvmArgsReason,
 };
 use crate::observability::{
     RedactionAudience, sanitize_evidence_text, sanitize_evidence_token,
@@ -1760,30 +1760,29 @@ impl<'a> GuardianCopyRequest<'a> {
 
     pub(crate) fn startup_failure(
         decision: GuardianActionKind,
-        observation: GuardianStartupFailureObservation,
-        crash_evidence: Option<&CrashEvidence>,
-        explicit_java_override_present: bool,
-        explicit_jvm_args_present: bool,
-        explicit_jvm_preset_present: bool,
-        integrity_facts: &[GuardianFact],
+        request: &GuardianStartupFailureRequest<'_>,
         directive: Option<&GuardianDirective>,
     ) -> Self {
         Self {
             diagnosis_id: None,
             context: GuardianCopyContext::StartupFailure {
                 decision,
-                failure_class: match observation {
+                failure_class: match request.observation {
                     GuardianStartupFailureObservation::Stalled => {
                         LaunchFailureClass::StartupStalled
                     }
                     GuardianStartupFailureObservation::Exited { failure_class } => failure_class,
                 },
-                stalled: matches!(observation, GuardianStartupFailureObservation::Stalled),
-                first_suspected_mod: first_suspected_mod(crash_evidence),
-                explicit_java_override_present,
-                explicit_jvm_args_present,
-                explicit_jvm_preset_present,
-                user_mod_set_drift: integrity_facts
+                stalled: matches!(
+                    request.observation,
+                    GuardianStartupFailureObservation::Stalled
+                ),
+                first_suspected_mod: first_suspected_mod(request.crash_evidence),
+                explicit_java_override_present: request.explicit_java_override_present,
+                explicit_jvm_args_present: request.explicit_jvm_args_present,
+                explicit_jvm_preset_present: request.explicit_jvm_preset_present,
+                user_mod_set_drift: request
+                    .integrity_facts
                     .iter()
                     .any(|fact| fact.id == GuardianFactId::UserModSetDrift),
                 directive: directive.cloned(),

@@ -1096,31 +1096,32 @@ mod tests {
             .await
             .expect("replace latest instance snapshot");
         drop(replacement_receipt.confirm());
-        let state = store
-            .state
-            .lock()
-            .expect(USER_CONFIG_SNAPSHOT_LOCK_INVARIANT);
-        assert_eq!(
-            state.visible.snapshots.len(),
-            USER_CONFIG_SNAPSHOT_MAX_RECORDS
-        );
-        assert!(
-            state
-                .visible
-                .snapshots
-                .iter()
-                .all(|record| record.instance_id != instances[0].id)
-        );
-        assert_eq!(
-            state
-                .visible
-                .snapshots
-                .iter()
-                .filter(|record| record.instance_id == instances[8].id)
-                .count(),
-            1
-        );
-        drop(state);
+        {
+            let state = store
+                .state
+                .lock()
+                .expect(USER_CONFIG_SNAPSHOT_LOCK_INVARIANT);
+            assert_eq!(
+                state.visible.snapshots.len(),
+                USER_CONFIG_SNAPSHOT_MAX_RECORDS
+            );
+            assert!(
+                state
+                    .visible
+                    .snapshots
+                    .iter()
+                    .all(|record| record.instance_id != instances[0].id)
+            );
+            assert_eq!(
+                state
+                    .visible
+                    .snapshots
+                    .iter()
+                    .filter(|record| record.instance_id == instances[8].id)
+                    .count(),
+                1
+            );
+        }
         store.close().await.expect("close retained store");
     }
 

@@ -39,8 +39,10 @@ impl UserConfigCapture {
     }
 }
 
+type UserConfigFilePayload = (Vec<u8>, [u8; 32]);
+
 impl UserConfigCaptureEntry {
-    pub(crate) fn into_parts(self) -> (String, Option<(Vec<u8>, [u8; 32])>) {
+    pub(crate) fn into_parts(self) -> (String, Option<UserConfigFilePayload>) {
         match self {
             Self::Absent { slot } => (slot, None),
             Self::File {

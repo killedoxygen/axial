@@ -165,12 +165,7 @@ pub fn guardian_startup_failure_outcome(
     let directive = startup_failure_directive(recovery_options, &guardian_decision);
     let user_outcome = author_guardian_copy(GuardianCopyRequest::startup_failure(
         guardian_decision.kind(),
-        request.observation,
-        request.crash_evidence,
-        request.explicit_java_override_present,
-        request.explicit_jvm_args_present,
-        request.explicit_jvm_preset_present,
-        request.integrity_facts,
+        &request,
         directive.as_ref(),
     ))
     .expect("launch startup copy request is closed");

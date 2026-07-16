@@ -927,7 +927,6 @@ async fn record_install_failure_evidence(
     .is_err()
     {
         tracing::warn!("failed to commit install Guardian outcome");
-        return;
     }
 }
 
@@ -2166,12 +2165,14 @@ where
                 worker_store.as_ref(),
                 worker_journals.as_ref(),
                 worker_state.failure_memory(),
-                &worker_operation_id,
-                &worker_install_id,
-                terminal,
-                &facts,
-                &journal_facts,
-                failure_kind,
+                ContentTerminalProgress {
+                    operation_id: &worker_operation_id,
+                    install_id: &worker_install_id,
+                    progress: terminal,
+                    execution_facts: &facts,
+                    journal_facts: &journal_facts,
+                    failure_kind,
+                },
             )
             .await
             .is_err()
@@ -2225,28 +2226,33 @@ where
     })
 }
 
+struct ContentTerminalProgress<'a> {
+    operation_id: &'a OperationId,
+    install_id: &'a str,
+    progress: DownloadProgress,
+    execution_facts: &'a [axial_minecraft::download::ExecutionDownloadFact],
+    journal_facts: &'a [String],
+    failure_kind: Option<crate::application::content::ContentExecutionFailureKind>,
+}
+
 async fn commit_and_emit_content_terminal_progress(
     store: &InstallStore,
     journals: &OperationJournalStore,
     failure_memory: &crate::state::GuardianFailureMemoryStore,
-    operation_id: &OperationId,
-    install_id: &str,
-    progress: DownloadProgress,
-    execution_facts: &[axial_minecraft::download::ExecutionDownloadFact],
-    journal_facts: &[String],
-    failure_kind: Option<crate::application::content::ContentExecutionFailureKind>,
+    terminal: ContentTerminalProgress<'_>,
 ) -> Result<(), OperationJournalStoreError> {
-    if progress.error.is_some() {
-        let (evidence, phase) = failure_kind
-            .map(|kind| content_execution_failure_evidence(operation_id, kind))
+    if terminal.progress.error.is_some() {
+        let (evidence, phase) = terminal
+            .failure_kind
+            .map(|kind| content_execution_failure_evidence(terminal.operation_id, kind))
             .map_or((None, OperationPhase::Downloading), |(evidence, phase)| {
                 (Some(evidence), phase)
             });
         record_content_failure_outcome(
             journals,
             failure_memory,
-            operation_id,
-            execution_facts,
+            terminal.operation_id,
+            terminal.execution_facts,
             evidence,
             phase,
             &chrono::Utc::now().to_rfc3339(),
@@ -2256,14 +2262,17 @@ async fn commit_and_emit_content_terminal_progress(
     let mut last_journal_phase = None;
     record_content_operation_progress(
         journals,
-        operation_id,
-        &progress,
-        journal_facts,
+        terminal.operation_id,
+        &terminal.progress,
+        terminal.journal_facts,
         &mut last_journal_phase,
     )
     .await?;
     store
-        .emit(install_id, sanitize_install_progress(progress))
+        .emit(
+            terminal.install_id,
+            sanitize_install_progress(terminal.progress),
+        )
         .await;
     Ok(())
 }

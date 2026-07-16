@@ -104,6 +104,35 @@ pub(super) struct RegisteredArtifactProvenance {
     scope: RegisteredArtifactSourceScope,
 }
 
+pub(super) struct RegisteredArtifactProvenanceContext<'a> {
+    instance_id: &'a str,
+    version_id: &'a str,
+    created_at: &'a str,
+    library_root: &'a Path,
+    runtime_root: &'a Path,
+    inventory: &'a axial_minecraft::known_good::KnownGoodInventory,
+}
+
+impl<'a> RegisteredArtifactProvenanceContext<'a> {
+    pub(super) const fn new(
+        instance_id: &'a str,
+        version_id: &'a str,
+        created_at: &'a str,
+        library_root: &'a Path,
+        runtime_root: &'a Path,
+        inventory: &'a axial_minecraft::known_good::KnownGoodInventory,
+    ) -> Self {
+        Self {
+            instance_id,
+            version_id,
+            created_at,
+            library_root,
+            runtime_root,
+            inventory,
+        }
+    }
+}
+
 impl RegisteredArtifactProvenance {
     pub(super) const fn inventory_ordinal(self) -> usize {
         self.inventory_ordinal
@@ -1016,22 +1045,17 @@ pub(super) fn resolve_recorded_artifact_provenance(
 }
 
 pub(super) fn recorded_artifact_provenance_matches(
-    instance_id: &str,
-    version_id: &str,
-    created_at: &str,
-    library_root: &Path,
-    runtime_root: &Path,
-    inventory: &axial_minecraft::known_good::KnownGoodInventory,
+    context: RegisteredArtifactProvenanceContext<'_>,
     attempt: &ReconciliationAttempt,
     provenance: RegisteredArtifactProvenance,
 ) -> bool {
     registered_artifact_target_from_inventory(
-        instance_id,
-        version_id,
-        created_at,
-        library_root,
-        runtime_root,
-        inventory,
+        context.instance_id,
+        context.version_id,
+        context.created_at,
+        context.library_root,
+        context.runtime_root,
+        context.inventory,
         provenance.inventory_ordinal,
     )
     .is_some_and(|(target, scope)| {

@@ -2208,8 +2208,8 @@ mod tests {
             target,
             GuardianMode::Managed,
             OwnershipClass::LauncherManaged,
-            &observed_at.to_rfc3339(),
-            &suppression_until.to_rfc3339(),
+            observed_at.to_rfc3339(),
+            suppression_until.to_rfc3339(),
             ReconciliationLineage::Initial,
         );
         reconciliation_memory_entry(ReconciliationTerminal::from_attempt(

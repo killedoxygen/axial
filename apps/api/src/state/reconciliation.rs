@@ -14,9 +14,10 @@ use super::failure_memory::{
     ReconciliationAttemptReserveError,
 };
 use super::registered_artifact_findings::{
-    RegisteredArtifactProvenance, RegisteredArtifactRepairAuthorization,
-    RegisteredArtifactRepairEffect, recorded_artifact_provenance_matches,
-    registered_artifact_target, resolve_recorded_artifact_provenance,
+    RegisteredArtifactProvenance, RegisteredArtifactProvenanceContext,
+    RegisteredArtifactRepairAuthorization, RegisteredArtifactRepairEffect,
+    recorded_artifact_provenance_matches, registered_artifact_target,
+    resolve_recorded_artifact_provenance,
 };
 use super::sessions::SharedComponentMutationLease;
 use super::{
@@ -232,9 +233,9 @@ fn reconciliation_hand<Admission>(rung: ReconciliationRung) -> ReconciliationHan
 pub(crate) enum RegisteredWholeInstancePreparation {
     Admitted {
         request: RegisteredWholeInstanceCoreRequest,
-        completion: RegisteredWholeInstanceCompletion,
+        completion: Box<RegisteredWholeInstanceCompletion>,
     },
-    Closed(RegisteredWholeInstanceDurableOutcome),
+    Closed(Box<RegisteredWholeInstanceDurableOutcome>),
 }
 
 pub(crate) enum RegisteredWholeInstancePreparationError {
@@ -361,9 +362,9 @@ struct ManagedArtifactCoreRequest {
 pub(crate) enum RegisteredManagedArtifactComponentEffectAdmission<Request> {
     Admitted {
         request: Request,
-        completion: RegisteredManagedArtifactComponentCompletion,
+        completion: Box<RegisteredManagedArtifactComponentCompletion>,
     },
-    Refused(RegisteredManagedArtifactComponentSettlement),
+    Refused(Box<RegisteredManagedArtifactComponentSettlement>),
 }
 
 pub(crate) struct RegisteredManagedArtifactComponentCompletion {
@@ -481,7 +482,9 @@ impl RegisteredWholeInstanceRematerializationAdmission {
                 .settle()
                 .await
                 .map_err(RegisteredWholeInstancePreparationError::Settlement)?;
-            return Ok(RegisteredWholeInstancePreparation::Closed(outcome));
+            return Ok(RegisteredWholeInstancePreparation::Closed(Box::new(
+                outcome,
+            )));
         }
         let (instance_id, fingerprint, inventory_fingerprint) = match durable.attempt.scope() {
             ReconciliationScope::RegisteredInstance {
@@ -512,7 +515,9 @@ impl RegisteredWholeInstanceRematerializationAdmission {
                     .settle()
                     .await
                     .map_err(RegisteredWholeInstancePreparationError::Settlement)?;
-                return Ok(RegisteredWholeInstancePreparation::Closed(outcome));
+                return Ok(RegisteredWholeInstancePreparation::Closed(Box::new(
+                    outcome,
+                )));
             }
         };
         let user_config_snapshot = match durable
@@ -543,7 +548,9 @@ impl RegisteredWholeInstanceRematerializationAdmission {
                     .settle()
                     .await
                     .map_err(RegisteredWholeInstancePreparationError::Settlement)?;
-                return Ok(RegisteredWholeInstancePreparation::Closed(outcome));
+                return Ok(RegisteredWholeInstancePreparation::Closed(Box::new(
+                    outcome,
+                )));
             }
         };
         let request = RegisteredWholeInstanceCoreRequest {
@@ -554,12 +561,12 @@ impl RegisteredWholeInstanceRematerializationAdmission {
         let runtime_cache = request.runtime_cache.clone();
         Ok(RegisteredWholeInstancePreparation::Admitted {
             request,
-            completion: RegisteredWholeInstanceCompletion {
+            completion: Box::new(RegisteredWholeInstanceCompletion {
                 durable,
                 known_good: self.known_good,
                 runtime_cache,
                 user_config_snapshot,
-            },
+            }),
         })
     }
 }
@@ -1289,12 +1296,14 @@ impl ManagedArtifactCompletionAuthority {
             return false;
         }
         recorded_artifact_provenance_matches(
-            &self.known_good.instance_id,
-            &self.known_good.version_id,
-            &self.known_good.created_at,
-            &self.known_good.library_root,
-            &current.roots.runtime,
-            &self.known_good.inventory,
+            RegisteredArtifactProvenanceContext::new(
+                &self.known_good.instance_id,
+                &self.known_good.version_id,
+                &self.known_good.created_at,
+                &self.known_good.library_root,
+                &current.roots.runtime,
+                &self.known_good.inventory,
+            ),
             &self.durable.attempt,
             self.provenance,
         ) && self.owner_is_live()
@@ -1629,7 +1638,7 @@ impl RegisteredComponentRebuildAdmission {
                         library_root: request.library_root,
                         version_id: request.version_id,
                     },
-                    completion,
+                    completion: Box::new(completion),
                 }
             }
             Err(settlement) => {
@@ -1651,7 +1660,7 @@ impl RegisteredComponentRebuildAdmission {
                         library_root: request.library_root,
                         version_id: request.version_id,
                     },
-                    completion,
+                    completion: Box::new(completion),
                 }
             }
             Err(settlement) => {
@@ -1671,7 +1680,7 @@ impl RegisteredComponentRebuildAdmission {
                         library_root: request.library_root,
                         version_id: request.version_id,
                     },
-                    completion,
+                    completion: Box::new(completion),
                 }
             }
             Err(settlement) => {
@@ -1688,7 +1697,7 @@ impl RegisteredComponentRebuildAdmission {
             ManagedArtifactCoreRequest,
             RegisteredManagedArtifactComponentCompletion,
         ),
-        RegisteredManagedArtifactComponentSettlement,
+        Box<RegisteredManagedArtifactComponentSettlement>,
     > {
         let structurally_valid = self.validate_managed_artifact_admission(component).is_ok()
             && self.artifact_provenance.is_some_and(|provenance| {
@@ -1739,7 +1748,7 @@ impl RegisteredComponentRebuildAdmission {
         };
         drop(lifecycle);
         let (Some(verification), Some(provenance)) = (verification, artifact_provenance) else {
-            return Err(durable.failed(None));
+            return Err(Box::new(durable.failed(None)));
         };
         let KnownGoodVerificationLease {
             owner,
@@ -1753,7 +1762,7 @@ impl RegisteredComponentRebuildAdmission {
         } = verification;
         drop(_lifecycle);
         if !structurally_valid {
-            return Err(durable.failed(None));
+            return Err(Box::new(durable.failed(None)));
         }
         Ok((
             request,
@@ -2680,6 +2689,13 @@ impl AppState {
             .await
     }
 
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "Phase 4 backend contract; Phase 6 transport deferred"
+        )
+    )]
     pub(crate) async fn whole_instance_rematerialization_eligibility(
         &self,
         instance_id: &str,
@@ -3837,10 +3853,10 @@ impl AppState {
                 return Err(ReconciliationEvidenceRejection::NonAdjacentRung);
             }
         }
-        if expected_rung == ReconciliationRung::RematerializeInstance {
-            if !self.whole_instance_terminal_is_semantically_canonical(&journal, &terminal) {
-                return Err(ReconciliationEvidenceRejection::JournalMismatch);
-            }
+        if expected_rung == ReconciliationRung::RematerializeInstance
+            && !self.whole_instance_terminal_is_semantically_canonical(&journal, &terminal)
+        {
+            return Err(ReconciliationEvidenceRejection::JournalMismatch);
         }
         Ok(RecordedReconciliationFailure {
             terminal,

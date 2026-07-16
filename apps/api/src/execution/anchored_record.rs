@@ -63,11 +63,12 @@ enum ExactRenameTestStage {
 }
 
 #[cfg(test)]
+type ExactRenameTestHook = Option<Box<dyn FnOnce()>>;
+
+#[cfg(test)]
 thread_local! {
-    static EXACT_RENAME_TEST_HOOKS: std::cell::RefCell<[
-        Option<Box<dyn FnOnce()>>;
-        3
-    ]> = std::cell::RefCell::new([None, None, None]);
+    static EXACT_RENAME_TEST_HOOKS: std::cell::RefCell<[ExactRenameTestHook; 3]> =
+        std::cell::RefCell::new([None, None, None]);
 }
 
 #[cfg(test)]
@@ -1233,28 +1234,6 @@ mod platform {
         )
     }
 
-    #[cfg(test)]
-    mod normalization_tests {
-        use super::{canonical_nanoseconds, canonical_signed, canonical_unsigned};
-
-        #[test]
-        fn stat_fields_are_checked_before_entering_canonical_identity() {
-            assert_eq!(canonical_unsigned(7_i32, "test").unwrap(), 7_u64);
-            assert!(canonical_unsigned(-1_i32, "test").is_err());
-            assert_eq!(
-                canonical_signed(i32::MIN, "test").unwrap(),
-                i64::from(i32::MIN)
-            );
-            assert!(canonical_signed(u64::MAX, "test").is_err());
-            assert_eq!(
-                canonical_nanoseconds(999_999_999_i64, "test").unwrap(),
-                999_999_999_u64
-            );
-            assert!(canonical_nanoseconds(-1_i64, "test").is_err());
-            assert!(canonical_nanoseconds(1_000_000_000_u64, "test").is_err());
-        }
-    }
-
     fn open_absolute_directory_chain(path: &Path) -> io::Result<Vec<HeldDirectory>> {
         if !path.is_absolute() {
             return Err(io::Error::new(
@@ -1379,6 +1358,28 @@ mod platform {
 
     fn identity_changed(message: &'static str) -> io::Error {
         io::Error::new(io::ErrorKind::PermissionDenied, message)
+    }
+
+    #[cfg(test)]
+    mod normalization_tests {
+        use super::{canonical_nanoseconds, canonical_signed, canonical_unsigned};
+
+        #[test]
+        fn stat_fields_are_checked_before_entering_canonical_identity() {
+            assert_eq!(canonical_unsigned(7_i32, "test").unwrap(), 7_u64);
+            assert!(canonical_unsigned(-1_i32, "test").is_err());
+            assert_eq!(
+                canonical_signed(i32::MIN, "test").unwrap(),
+                i64::from(i32::MIN)
+            );
+            assert!(canonical_signed(u64::MAX, "test").is_err());
+            assert_eq!(
+                canonical_nanoseconds(999_999_999_i64, "test").unwrap(),
+                999_999_999_u64
+            );
+            assert!(canonical_nanoseconds(-1_i64, "test").is_err());
+            assert!(canonical_nanoseconds(1_000_000_000_u64, "test").is_err());
+        }
     }
 }
 

@@ -2270,6 +2270,10 @@ impl IntegrityTier2ProgressObserver {
 }
 
 pub(crate) struct IntegrityTier2OwnedWorkAuthorityMismatch {
+    rejected: Box<IntegrityTier2RejectedAuthority>,
+}
+
+struct IntegrityTier2RejectedAuthority {
     ticket: KnownGoodTier2Ticket,
     settlement: IdleSweepSettlementOwner,
 }
@@ -2290,7 +2294,7 @@ impl std::fmt::Debug for IntegrityTier2OwnedWorkAuthorityMismatch {
 
 impl IntegrityTier2OwnedWorkAuthorityMismatch {
     pub(crate) fn settle(self) -> IntegrityTier2OwnedWorkRejection {
-        let Self { ticket, settlement } = self;
+        let IntegrityTier2RejectedAuthority { ticket, settlement } = *self.rejected;
         drop(ticket);
         if settlement.is_current() {
             settlement.settle(IdleSweepTerminal::Refused);
@@ -2474,7 +2478,9 @@ impl IntegrityTier2OwnedWork {
         if !ticket.matches_settlement(&settlement)
             || !state.known_good_tier2_ticket_is_current(&ticket)
         {
-            return Err(IntegrityTier2OwnedWorkAuthorityMismatch { ticket, settlement });
+            return Err(IntegrityTier2OwnedWorkAuthorityMismatch {
+                rejected: Box::new(IntegrityTier2RejectedAuthority { ticket, settlement }),
+            });
         }
         Ok(Self {
             state,
@@ -2864,7 +2870,7 @@ fn sense_integrity_tier2_owned(
             pacer: &pacer,
         },
         FilesystemIntegrityReader::default,
-        || state.known_good_tier2_ticket_is_current(&ticket),
+        || state.known_good_tier2_ticket_is_current(ticket),
     )
 }
 

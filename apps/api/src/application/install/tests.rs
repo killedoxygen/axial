@@ -4501,12 +4501,16 @@ async fn first_observable_content_terminal_already_contains_typed_guardian_outco
         &installs,
         &journals,
         &failure_memory,
-        &operation_id,
-        install_id,
-        progress("error", true, Some("content failed")),
-        &[],
-        &[],
-        Some(crate::application::content::ContentExecutionFailureKind::MetadataInvalid),
+        ContentTerminalProgress {
+            operation_id: &operation_id,
+            install_id,
+            progress: progress("error", true, Some("content failed")),
+            execution_facts: &[],
+            journal_facts: &[],
+            failure_kind: Some(
+                crate::application::content::ContentExecutionFailureKind::MetadataInvalid,
+            ),
+        },
     )
     .await
     .expect("commit typed content terminal");
@@ -4550,12 +4554,16 @@ async fn guardian_persistence_failure_cannot_publish_incomplete_content_terminal
             &installs,
             &journals,
             &failure_memory,
-            &operation_id,
-            install_id,
-            terminal.clone(),
-            &[],
-            &[],
-            Some(crate::application::content::ContentExecutionFailureKind::MetadataInvalid),
+            ContentTerminalProgress {
+                operation_id: &operation_id,
+                install_id,
+                progress: terminal.clone(),
+                execution_facts: &[],
+                journal_facts: &[],
+                failure_kind: Some(
+                    crate::application::content::ContentExecutionFailureKind::MetadataInvalid,
+                ),
+            },
         )
         .await
         .is_err()

@@ -190,9 +190,9 @@ where
         RegisteredWholeInstancePreparation::Admitted {
             request,
             completion,
-        } => (request, completion),
+        } => (request, *completion),
         RegisteredWholeInstancePreparation::Closed(outcome) => {
-            return Ok(guardian_outcome(outcome));
+            return Ok(guardian_outcome(*outcome));
         }
     };
     let (root, runtime_cache, version_id) = {

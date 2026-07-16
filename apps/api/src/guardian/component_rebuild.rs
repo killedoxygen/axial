@@ -545,9 +545,9 @@ where
     if let Some(plan_error) = create_component_rebuild_plan(&admission).await? {
         let settlement = match admission.into_libraries_effect() {
             RegisteredManagedArtifactComponentEffectAdmission::Admitted { completion, .. } => {
-                completion.into_failed_settlement()
+                (*completion).into_failed_settlement()
             }
-            RegisteredManagedArtifactComponentEffectAdmission::Refused(settlement) => settlement,
+            RegisteredManagedArtifactComponentEffectAdmission::Refused(settlement) => *settlement,
         };
         persist_managed_artifact_component_terminal(
             &settlement,
@@ -564,7 +564,7 @@ where
         RegisteredManagedArtifactComponentEffectAdmission::Admitted {
             request,
             completion,
-        } => (request, completion),
+        } => (request, *completion),
         RegisteredManagedArtifactComponentEffectAdmission::Refused(settlement) => {
             return persist_managed_artifact_component_terminal(
                 &settlement,
@@ -644,9 +644,9 @@ where
     if let Some(plan_error) = create_component_rebuild_plan(&admission).await? {
         let settlement = match admission.into_version_bundle_effect() {
             RegisteredManagedArtifactComponentEffectAdmission::Admitted { completion, .. } => {
-                completion.into_failed_settlement()
+                (*completion).into_failed_settlement()
             }
-            RegisteredManagedArtifactComponentEffectAdmission::Refused(settlement) => settlement,
+            RegisteredManagedArtifactComponentEffectAdmission::Refused(settlement) => *settlement,
         };
         persist_managed_artifact_component_terminal(
             &settlement,
@@ -663,7 +663,7 @@ where
         RegisteredManagedArtifactComponentEffectAdmission::Admitted {
             request,
             completion,
-        } => (request, completion),
+        } => (request, *completion),
         RegisteredManagedArtifactComponentEffectAdmission::Refused(settlement) => {
             return persist_managed_artifact_component_terminal(
                 &settlement,
@@ -761,9 +761,9 @@ where
     if let Some(plan_error) = create_component_rebuild_plan(&admission).await? {
         let settlement = match admission.into_assets_effect() {
             RegisteredManagedArtifactComponentEffectAdmission::Admitted { completion, .. } => {
-                completion.into_failed_settlement()
+                (*completion).into_failed_settlement()
             }
-            RegisteredManagedArtifactComponentEffectAdmission::Refused(settlement) => settlement,
+            RegisteredManagedArtifactComponentEffectAdmission::Refused(settlement) => *settlement,
         };
         persist_managed_artifact_component_terminal(
             &settlement,
@@ -780,7 +780,7 @@ where
         RegisteredManagedArtifactComponentEffectAdmission::Admitted {
             request,
             completion,
-        } => (request, completion),
+        } => (request, *completion),
         RegisteredManagedArtifactComponentEffectAdmission::Refused(settlement) => {
             return persist_managed_artifact_component_terminal(
                 &settlement,
@@ -2581,7 +2581,7 @@ mod tests {
         );
         let completion = match admission.into_version_bundle_effect() {
             RegisteredManagedArtifactComponentEffectAdmission::Admitted { completion, .. } => {
-                completion
+                *completion
             }
             RegisteredManagedArtifactComponentEffectAdmission::Refused(_) => {
                 panic!("selected VersionBundle component effect must remain admitted")
@@ -2738,7 +2738,7 @@ mod tests {
         );
         let completion = match admission.into_assets_effect() {
             RegisteredManagedArtifactComponentEffectAdmission::Admitted { completion, .. } => {
-                completion
+                *completion
             }
             RegisteredManagedArtifactComponentEffectAdmission::Refused(_) => {
                 panic!("selected Assets component effect must remain admitted")

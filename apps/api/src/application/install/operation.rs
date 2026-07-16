@@ -1505,11 +1505,13 @@ pub(super) async fn record_install_guardian_terminal_outcome(
         journals,
         failure_memory,
         operation_id,
-        CommandKind::InstallVersion,
-        evidence,
-        phase,
-        assessment,
-        observed_at,
+        OperationGuardianTerminal {
+            command: CommandKind::InstallVersion,
+            evidence,
+            phase,
+            assessment,
+            observed_at,
+        },
     )
     .await
 }
@@ -1527,42 +1529,48 @@ pub(crate) async fn record_content_guardian_terminal_outcome(
         journals,
         failure_memory,
         operation_id,
-        CommandKind::ModifyInstanceContent,
-        evidence,
-        phase,
-        assessment,
-        observed_at,
+        OperationGuardianTerminal {
+            command: CommandKind::ModifyInstanceContent,
+            evidence,
+            phase,
+            assessment,
+            observed_at,
+        },
     )
     .await
+}
+
+struct OperationGuardianTerminal<'a> {
+    command: CommandKind,
+    evidence: &'a [GuardianInstallArtifactFailureEvidence],
+    phase: OperationPhase,
+    assessment: &'a GuardianInstallAssessment,
+    observed_at: &'a str,
 }
 
 async fn record_operation_guardian_terminal_outcome(
     journals: &OperationJournalStore,
     failure_memory: Option<&GuardianFailureMemoryStore>,
     operation_id: &OperationId,
-    command: CommandKind,
-    evidence: &[GuardianInstallArtifactFailureEvidence],
-    phase: OperationPhase,
-    assessment: &GuardianInstallAssessment,
-    observed_at: &str,
+    terminal: OperationGuardianTerminal<'_>,
 ) -> Result<(), OperationJournalStoreError> {
-    let Some(outcome) = assessment.terminal_outcome() else {
+    let Some(outcome) = terminal.assessment.terminal_outcome() else {
         return Ok(());
     };
     record_provider_failure_memory_if_needed(
         failure_memory,
         Some(operation_id.clone()),
         GuardianMode::Managed,
-        phase,
-        evidence,
+        terminal.phase,
+        terminal.evidence,
         outcome,
-        observed_at,
+        terminal.observed_at,
     );
     let facts = guardian_install_outcome_persistence_facts(&outcome.user_outcome);
     record_guardian_evidence_with_reconciliation(
         journals,
         operation_id,
-        command,
+        terminal.command,
         facts,
         vec![outcome.diagnosis_id],
     )

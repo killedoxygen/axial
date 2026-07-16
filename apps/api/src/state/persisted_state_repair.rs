@@ -855,7 +855,7 @@ mod tests {
         );
         assert!(
             backend.attempts.load(Ordering::SeqCst)
-                >= 1 + PERSISTED_STATE_REPAIR_MEMORY_SETTLEMENT_ATTEMPTS
+                > PERSISTED_STATE_REPAIR_MEMORY_SETTLEMENT_ATTEMPTS
         );
         let config_guard = tokio::time::timeout(
             Duration::from_millis(100),
