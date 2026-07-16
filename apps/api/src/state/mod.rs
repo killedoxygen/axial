@@ -1515,6 +1515,15 @@ impl AppState {
         Ok(self.acquire_instance_lifecycle(instance_id).await)
     }
 
+    pub(crate) async fn try_acquire_integrity_instance_lifecycle(
+        &self,
+        foreground: &IntegrityForegroundLease,
+        instance_id: &str,
+    ) -> Result<Option<InstanceLifecycleLease>, IntegrityForegroundOwnershipError> {
+        self.validate_integrity_foreground(foreground)?;
+        Ok(self.try_acquire_instance_lifecycle(instance_id).await)
+    }
+
     fn validate_integrity_foreground(
         &self,
         foreground: &IntegrityForegroundLease,
@@ -2216,6 +2225,13 @@ mod known_good_identity_tests {
         assert_eq!(
             foreign
                 .acquire_integrity_instance_lifecycle(&foreground, "instance")
+                .await
+                .err(),
+            Some(IntegrityForegroundOwnershipError)
+        );
+        assert_eq!(
+            foreign
+                .try_acquire_integrity_instance_lifecycle(&foreground, "instance")
                 .await
                 .err(),
             Some(IntegrityForegroundOwnershipError)

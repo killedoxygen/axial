@@ -935,10 +935,7 @@ pub(crate) async fn handle_create_instance(
     state: &AppState,
     payload: CreateInstanceRequest,
 ) -> Result<CreateInstanceResponse, (StatusCode, Json<serde_json::Value>)> {
-    let request = state
-        .try_admit_request()
-        .map_err(instance_shutdown_error_response)?;
-    handle_create_instance_owned(state, payload, request.producer_handoff()).await
+    handle_create_instance_with_rebuild(state, payload, |_, _, _, _| async { Ok(()) }).await
 }
 
 pub(super) async fn handle_create_instance_from_continuation(

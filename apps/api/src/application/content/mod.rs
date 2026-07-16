@@ -471,10 +471,13 @@ pub(crate) async fn content_compatibility(
                     .as_deref()
                     .is_none_or(|selected| version.id == selected)
             })
-            .map(|version| compat::CompatVersion {
-                installable: version.primary_file().is_some(),
-                loaders: version.loaders,
-                game_versions: version.game_versions,
+            .map(|version| {
+                let installable = version.primary_file().is_some();
+                compat::CompatVersion::from_provider(
+                    version.loaders,
+                    version.game_versions,
+                    installable,
+                )
             })
             .collect();
         Ok(compat::CompatItem {
@@ -491,11 +494,10 @@ pub(crate) async fn content_compatibility(
 
     let candidates = compat::rank_candidates(&items);
     let create_view = if let Some(best) = candidates.first() {
-        let source = if best.loader.is_empty() {
-            "vanilla"
-        } else {
-            best.loader.as_str()
-        };
+        let source = best
+            .component_id()
+            .map(|component| component.as_str())
+            .unwrap_or("vanilla");
         Some(
             serde_json::to_value(handle_create_instance_view(state, producer, Some(source)).await)
                 .expect("create view should serialize"),

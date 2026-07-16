@@ -235,9 +235,10 @@ async fn prepare_launch_session_with_auth_refresh(
     })?;
     let library_dir = PathBuf::from(library_dir);
     let instance_lifecycle = state
-        .acquire_integrity_instance_lifecycle(&integrity_foreground, &payload.instance_id)
+        .try_acquire_integrity_instance_lifecycle(&integrity_foreground, &payload.instance_id)
         .await
-        .map_err(launch_integrity_ownership_error_response)?;
+        .map_err(launch_integrity_ownership_error_response)?
+        .ok_or_else(launch_instance_busy_error_response)?;
 
     let instance = state.instances().get(&payload.instance_id).ok_or_else(|| {
         (
@@ -515,6 +516,15 @@ fn launch_integrity_ownership_error_response(
     (
         StatusCode::INTERNAL_SERVER_ERROR,
         Json(json!({ "error": "launch integrity ownership could not be validated" })),
+    )
+}
+
+fn launch_instance_busy_error_response() -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::CONFLICT,
+        Json(json!({
+            "error": "instance is busy with another launch or content operation"
+        })),
     )
 }
 

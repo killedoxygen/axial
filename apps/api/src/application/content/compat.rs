@@ -24,9 +24,26 @@ pub struct CompatItem {
 }
 
 pub struct CompatVersion {
-    pub loaders: Vec<String>,
+    pub loaders: Vec<LoaderComponentId>,
     pub game_versions: Vec<String>,
     pub installable: bool,
+}
+
+impl CompatVersion {
+    pub(super) fn from_provider(
+        loaders: Vec<String>,
+        game_versions: Vec<String>,
+        installable: bool,
+    ) -> Self {
+        Self {
+            loaders: loaders
+                .into_iter()
+                .filter_map(|loader| loader_component_from_short_key(&loader))
+                .collect(),
+            game_versions,
+            installable,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -50,6 +67,12 @@ pub struct CompatCandidate {
     pub total_count: usize,
     pub complete: bool,
     pub drops: Vec<CompatDrop>,
+}
+
+impl CompatCandidate {
+    pub(super) fn component_id(&self) -> Option<LoaderComponentId> {
+        loader_component_from_short_key(&self.loader)
+    }
 }
 
 pub fn rank_candidates(items: &[CompatItem]) -> Vec<CompatCandidate> {
@@ -114,7 +137,7 @@ fn build_candidate(
             .map(|id| id.display_name().to_string())
             .unwrap_or_else(|| "Vanilla".to_string()),
         selection_id: match loader {
-            Some(id) => format!("loader_version|{}|{}", id.short_key(), game_version),
+            Some(id) => format!("loader_version|{}|{}", id.as_str(), game_version),
             None => format!("vanilla|{game_version}"),
         },
         game_version,
@@ -142,11 +165,7 @@ fn item_supports(item: &CompatItem, loader: Option<LoaderComponentId>, game_vers
             return true;
         }
         match loader {
-            Some(loader) => version
-                .loaders
-                .iter()
-                .filter_map(|value| LoaderComponentId::parse(value))
-                .any(|value| value == loader),
+            Some(loader) => version.loaders.contains(&loader),
             None => false,
         }
     })
@@ -169,8 +188,7 @@ fn candidate_loaders(items: &[CompatItem]) -> Vec<Option<LoaderComponentId>> {
                         .versions
                         .iter()
                         .filter(|version| version.installable)
-                        .flat_map(|version| version.loaders.iter())
-                        .filter_map(|value| LoaderComponentId::parse(value))
+                        .flat_map(|version| version.loaders.iter().copied())
                         .any(|value| value == *loader)
             })
         })
@@ -213,9 +231,16 @@ fn version_key(value: &str) -> Vec<u32> {
 }
 
 fn loader_rank(loader: &str) -> usize {
-    LoaderComponentId::parse(loader)
-        .and_then(|id| LOADER_RANK.iter().position(|entry| *entry == id))
+    loader_component_from_short_key(loader)
+        .and_then(|loader| LOADER_RANK.iter().position(|entry| *entry == loader))
         .unwrap_or(LOADER_RANK.len())
+}
+
+fn loader_component_from_short_key(value: &str) -> Option<LoaderComponentId> {
+    LOADER_RANK
+        .iter()
+        .copied()
+        .find(|component| component.short_key() == value)
 }
 
 #[cfg(test)]
@@ -229,10 +254,12 @@ mod tests {
             kind,
             versions: game_versions
                 .iter()
-                .map(|game_version| CompatVersion {
-                    loaders: loaders.iter().map(|value| value.to_string()).collect(),
-                    game_versions: vec![game_version.to_string()],
-                    installable: true,
+                .map(|game_version| {
+                    CompatVersion::from_provider(
+                        loaders.iter().map(|value| value.to_string()).collect(),
+                        vec![game_version.to_string()],
+                        true,
+                    )
                 })
                 .collect(),
         }
@@ -264,7 +291,10 @@ mod tests {
         assert!(top.complete);
         assert_eq!(top.supported_count, 3);
         assert_eq!(top.summary, "All 3 work here");
-        assert_eq!(top.selection_id, "loader_version|fabric|1.21.4");
+        assert_eq!(
+            top.selection_id,
+            "loader_version|net.fabricmc.fabric-loader|1.21.4"
+        );
         assert!(top.drops.is_empty());
     }
 
@@ -358,12 +388,12 @@ mod tests {
             kind: ContentKind::Mod,
             versions: vec![
                 CompatVersion {
-                    loaders: vec!["fabric".to_string()],
+                    loaders: vec![LoaderComponentId::Fabric],
                     game_versions: vec!["26.2".to_string()],
                     installable: true,
                 },
                 CompatVersion {
-                    loaders: vec!["forge".to_string()],
+                    loaders: vec![LoaderComponentId::Forge],
                     game_versions: vec!["1.20.1".to_string()],
                     installable: true,
                 },
@@ -397,7 +427,7 @@ mod tests {
             title: "no-file".to_string(),
             kind: ContentKind::Mod,
             versions: vec![CompatVersion {
-                loaders: vec!["forge".to_string()],
+                loaders: vec![LoaderComponentId::Forge],
                 game_versions: vec!["26.2".to_string()],
                 installable: false,
             }],
