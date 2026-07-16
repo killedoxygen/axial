@@ -2034,6 +2034,76 @@ async fn dropped_duplicate_caller_keeps_rebuild_rollback_owned_until_quiescence(
 }
 
 #[tokio::test]
+async fn state_create_instance_seeds_user_files_from_configured_library() {
+    let fixture = TestFixture::new("create-seeds-user-files");
+    let library_dir = fixture.configure_create_manifest(&["1.21.1"]);
+    let options_seed = b"configured-options-seed";
+    let servers_seed = b"configured-servers-seed";
+    fs::write(library_dir.join("options.txt"), options_seed).expect("write options seed");
+    fs::write(library_dir.join("servers.dat"), servers_seed).expect("write servers seed");
+    let instance_id = axial_config::generate_instance_id();
+    let instance = crate::state::new_instance(
+        instance_id.clone(),
+        "Seeded create".to_string(),
+        "1.21.1".to_string(),
+        String::new(),
+        String::new(),
+    );
+    let foreground = instance_foreground(&fixture.state).await;
+
+    fixture
+        .state
+        .create_instance(&foreground, instance, Some(library_dir))
+        .await
+        .expect("create seeded instance");
+
+    let game_dir = fixture.state.instances().game_dir(&instance_id);
+    assert_eq!(
+        fs::read(game_dir.join("options.txt")).expect("read seeded options"),
+        options_seed
+    );
+    assert_eq!(
+        fs::read(game_dir.join("servers.dat")).expect("read seeded servers"),
+        servers_seed
+    );
+}
+
+#[tokio::test]
+async fn state_duplicate_copies_only_present_source_user_files() {
+    let fixture = TestFixture::new("duplicate-preserves-user-file-absence");
+    let library_dir = fixture.configure_create_manifest(&["1.21.1"]);
+    fs::write(
+        library_dir.join("options.txt"),
+        b"configured-options-fallback",
+    )
+    .expect("write library options");
+    fs::write(
+        library_dir.join("servers.dat"),
+        b"configured-servers-fallback",
+    )
+    .expect("write library servers");
+    let source = add_test_instance(&fixture, "Source", "1.21.1");
+    let source_dir = fixture.state.instances().game_dir(&source.id);
+    let source_options = b"source-owned-options";
+    fs::write(source_dir.join("options.txt"), source_options).expect("write source options");
+    assert!(!source_dir.join("servers.dat").exists());
+    let foreground = instance_foreground(&fixture.state).await;
+
+    let duplicate = fixture
+        .state
+        .duplicate_instance(&foreground, source.id, None)
+        .await
+        .expect("duplicate instance");
+
+    let duplicate_dir = fixture.state.instances().game_dir(&duplicate.id);
+    assert_eq!(
+        fs::read(duplicate_dir.join("options.txt")).expect("read duplicated options"),
+        source_options
+    );
+    assert!(!duplicate_dir.join("servers.dat").exists());
+}
+
+#[tokio::test]
 async fn create_instance_duplicate_name_gets_backend_owned_suffix() {
     let fixture = TestFixture::new("create-name-conflict");
     let library_dir = fixture.configure_create_manifest(&["1.21.1", "1.21.2"]);
@@ -3366,7 +3436,7 @@ async fn state_instance_transactions_reject_foreign_foreground_before_effects() 
     let directories_before = instance_directory_names(&target.root);
     let error = target
         .state
-        .duplicate_instance(&foreground, source.id.clone(), None, None)
+        .duplicate_instance(&foreground, source.id.clone(), None)
         .await
         .expect_err("foreign duplicate foreground rejected");
     assert_foreign_foreground_error(error);
@@ -3450,7 +3520,6 @@ async fn update_and_duplicate_serialize_on_the_source_lifecycle() {
         &duplicate_foreground,
         source.id.clone(),
         Some("Lifecycle copy".to_string()),
-        None,
     ));
     {
         let waker = futures_util::task::noop_waker();

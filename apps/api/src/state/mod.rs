@@ -1194,7 +1194,6 @@ impl AppState {
         foreground: &IntegrityForegroundLease,
         source_id: String,
         requested_name: Option<String>,
-        library_dir: Option<PathBuf>,
     ) -> Result<axial_config::Instance, InstanceStoreError> {
         self.validate_integrity_foreground(foreground)
             .map_err(|_| InstanceStoreError::Persistence(foreign_integrity_foreground_error()))?;
@@ -1220,7 +1219,7 @@ impl AppState {
         let instances = self.instances.clone();
         let gate = instances.acquire_mutation().await?;
         instances
-            .duplicate_with_gate(source_id, target_id, requested_name, library_dir, gate)
+            .duplicate_with_gate(source_id, target_id, requested_name, gate)
             .await
     }
 

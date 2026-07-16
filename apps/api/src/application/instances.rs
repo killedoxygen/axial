@@ -511,12 +511,7 @@ where
         let foreground = foreground.wait_for_settlement().await;
         let payload = payload.unwrap_or_default();
         let instance = transaction_state
-            .duplicate_instance(
-                &foreground,
-                source_id,
-                payload.name,
-                transaction_state.library_dir().map(PathBuf::from),
-            )
+            .duplicate_instance(&foreground, source_id, payload.name)
             .await
             .map_err(|error| {
                 instance_write_error_response(InstanceWriteOperation::Duplicate, error)

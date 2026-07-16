@@ -105,8 +105,8 @@ async fn prepare_launch_session_rejects_shutdown_without_returning_a_task() {
 }
 
 #[tokio::test]
-async fn prepare_launch_session_ensures_instance_layout_before_building_intent() {
-    let fixture = TestFixture::new("prepare-ensures-layout");
+async fn prepare_launch_session_repairs_directories_without_restoring_deleted_user_files() {
+    let fixture = TestFixture::new("prepare-preserves-deleted-user-files");
     fixture.write_ready_install("1.21.1");
     fs::write(
         fixture.paths.library_dir.join("options.txt"),
@@ -120,6 +120,10 @@ async fn prepare_launch_session_ensures_instance_layout_before_building_intent()
     .expect("write servers");
     let instance_id = fixture.add_instance("Survival", "1.21.1");
     let game_dir = fixture.state.instances().game_dir(&instance_id);
+    fs::write(game_dir.join("options.txt"), "user options").expect("write user options");
+    fs::write(game_dir.join("servers.dat"), "user servers").expect("write user servers");
+    fs::remove_file(game_dir.join("options.txt")).expect("delete user options");
+    fs::remove_file(game_dir.join("servers.dat")).expect("delete user servers");
     let _ = fs::remove_dir_all(game_dir.join("screenshots"));
     let _ = fs::remove_dir_all(game_dir.join("logs"));
 
@@ -184,14 +188,8 @@ async fn prepare_launch_session_ensures_instance_layout_before_building_intent()
     assert_eq!(prepared.task.intent.auth.user_type, "msa");
     assert!(game_dir.join("screenshots").is_dir());
     assert!(game_dir.join("logs").is_dir());
-    assert_eq!(
-        fs::read_to_string(game_dir.join("options.txt")).expect("read options"),
-        "shared options"
-    );
-    assert_eq!(
-        fs::read_to_string(game_dir.join("servers.dat")).expect("read servers"),
-        "shared servers"
-    );
+    assert!(!game_dir.join("options.txt").exists());
+    assert!(!game_dir.join("servers.dat").exists());
 }
 
 #[tokio::test]

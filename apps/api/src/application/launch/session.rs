@@ -248,13 +248,9 @@ async fn prepare_launch_session_with_auth_refresh(
         ));
     }
     let layout_started_at = Instant::now();
-    ensure_instance_layout(
-        state.instances().paths().clone(),
-        instance.id.clone(),
-        Some(library_dir.clone()),
-    )
-    .await
-    .map_err(launch_layout_error_response)?;
+    ensure_instance_layout(state.instances().paths().clone(), instance.id.clone())
+        .await
+        .map_err(launch_layout_error_response)?;
     let layout_elapsed = layout_started_at.elapsed();
     let game_dir = state.instances().game_dir(&instance.id);
 

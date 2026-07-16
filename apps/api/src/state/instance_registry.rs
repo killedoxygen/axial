@@ -345,7 +345,6 @@ impl AppInstanceStore {
         source_id: String,
         target_id: String,
         requested_name: Option<String>,
-        library_dir: Option<PathBuf>,
         gate: OwnedMutexGuard<()>,
     ) -> Result<Instance, InstanceStoreError> {
         let gate = self.reconcile_obligations(gate).await?;
@@ -376,13 +375,7 @@ impl AppInstanceStore {
         candidate.instances.push(instance.clone());
         candidate.validate()?;
 
-        duplicate_instance_files(
-            self.paths.clone(),
-            source_id,
-            instance.id.clone(),
-            library_dir,
-        )
-        .await?;
+        duplicate_instance_files(self.paths.clone(), source_id, instance.id.clone()).await?;
         match self.commit(candidate, instance.clone(), gate).await {
             Ok(instance) => Ok(instance),
             Err(error @ InstanceStoreError::TooLarge { .. }) => {
@@ -621,7 +614,7 @@ impl AppInstanceStore {
         let name = name.into();
         let version_id = version_id.into();
         let id = generate_instance_id();
-        ensure_instance_layout_blocking(&self.paths, &id, None)?;
+        ensure_instance_layout_blocking(&self.paths, &id)?;
         let instance = new_instance(id, name, version_id, String::new(), String::new());
         let mut state = self.state.lock().expect(INSTANCE_REGISTRY_LOCK_INVARIANT);
         let mut candidate = state.visible.clone();
@@ -778,17 +771,14 @@ fn duplicate_name(
 pub(crate) async fn ensure_instance_layout(
     paths: AppPaths,
     instance_id: String,
-    library_dir: Option<PathBuf>,
 ) -> Result<(), InstanceStoreError> {
-    tokio::task::spawn_blocking(move || {
-        ensure_instance_layout_blocking(&paths, &instance_id, library_dir.as_deref())
-    })
-    .await
-    .map_err(|error| {
-        InstanceStoreError::Persistence(io::Error::other(format!(
-            "instance layout task stopped: {error}"
-        )))
-    })?
+    tokio::task::spawn_blocking(move || ensure_instance_layout_blocking(&paths, &instance_id))
+        .await
+        .map_err(|error| {
+            InstanceStoreError::Persistence(io::Error::other(format!(
+                "instance layout task stopped: {error}"
+            )))
+        })?
 }
 
 async fn prepare_new_instance_layout(
@@ -809,7 +799,14 @@ async fn prepare_new_instance_layout(
                 InstanceStoreError::Persistence(error)
             }
         })?;
-        match ensure_instance_layout_blocking(&paths, &instance_id, library_dir.as_deref()) {
+        let prepared = (|| {
+            ensure_instance_layout_blocking(&paths, &instance_id)?;
+            if let Some(library_dir) = library_dir.as_deref() {
+                seed_new_instance_files(library_dir, &game_dir)?;
+            }
+            Ok(())
+        })();
+        match prepared {
             Ok(()) => Ok(()),
             Err(error) => match std::fs::remove_dir_all(&game_dir) {
                 Ok(()) => Err(error),
@@ -830,7 +827,6 @@ async fn prepare_new_instance_layout(
 fn ensure_instance_layout_blocking(
     paths: &AppPaths,
     instance_id: &str,
-    library_dir: Option<&Path>,
 ) -> Result<(), InstanceStoreError> {
     if !is_canonical_instance_id(instance_id) {
         return Err(InstanceStoreError::Validation("instance id is invalid"));
@@ -849,11 +845,13 @@ fn ensure_instance_layout_blocking(
     ] {
         ensure_directory(&game_dir.join(subdir))?;
     }
-    if let Some(library_dir) = library_dir {
-        for file_name in ["options.txt", "servers.dat"] {
-            copy_shared_file_if_missing(library_dir, &game_dir, file_name)
-                .map_err(InstanceStoreError::Persistence)?;
-        }
+    Ok(())
+}
+
+fn seed_new_instance_files(source_dir: &Path, target_dir: &Path) -> Result<(), InstanceStoreError> {
+    for file_name in ["options.txt", "servers.dat"] {
+        seed_new_instance_file(source_dir, target_dir, file_name)
+            .map_err(InstanceStoreError::Persistence)?;
     }
     Ok(())
 }
@@ -895,10 +893,9 @@ async fn duplicate_instance_files(
     paths: AppPaths,
     source_id: String,
     target_id: String,
-    library_dir: Option<PathBuf>,
 ) -> Result<(), InstanceStoreError> {
     tokio::task::spawn_blocking(move || {
-        ensure_instance_layout_blocking(&paths, &source_id, library_dir.as_deref())?;
+        ensure_instance_layout_blocking(&paths, &source_id)?;
         ensure_instances_root(&paths)?;
         let target_dir = paths.instances_dir.join(&target_id);
         std::fs::create_dir(&target_dir).map_err(|error| {
@@ -908,9 +905,7 @@ async fn duplicate_instance_files(
                 InstanceStoreError::Persistence(error)
             }
         })?;
-        if let Err(error) =
-            ensure_instance_layout_blocking(&paths, &target_id, library_dir.as_deref())
-        {
+        if let Err(error) = ensure_instance_layout_blocking(&paths, &target_id) {
             let _ = std::fs::remove_dir_all(&target_dir);
             return Err(error);
         }
@@ -1010,18 +1005,14 @@ async fn cleanup_failed_create(
     }
 }
 
-fn copy_shared_file_if_missing(
-    source_dir: &Path,
-    target_dir: &Path,
-    file_name: &str,
-) -> io::Result<()> {
+fn seed_new_instance_file(source_dir: &Path, target_dir: &Path, file_name: &str) -> io::Result<()> {
     let source = source_dir.join(file_name);
     match std::fs::symlink_metadata(&source) {
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
         Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "shared instance source is not a regular file",
+                "new instance seed source is not a regular file",
             ));
         }
         Ok(_) => {}
@@ -1029,28 +1020,12 @@ fn copy_shared_file_if_missing(
     }
     let target = target_dir.join(file_name);
     let mut input = std::fs::File::open(source)?;
-    match std::fs::OpenOptions::new()
+    let mut output = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
-        .open(&target)
-    {
-        Ok(mut output) => {
-            io::copy(&mut input, &mut output)?;
-            Ok(())
-        }
-        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-            let metadata = std::fs::symlink_metadata(&target)?;
-            if metadata.file_type().is_symlink() || !metadata.is_file() {
-                Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "shared instance target is not a regular file",
-                ))
-            } else {
-                Ok(())
-            }
-        }
-        Err(error) => Err(error),
-    }
+        .open(target)?;
+    io::copy(&mut input, &mut output)?;
+    Ok(())
 }
 
 fn copy_regular_file_if_present(source: &Path, target: &Path) -> Result<(), InstanceStoreError> {
@@ -1553,7 +1528,7 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn create_rejects_symlinked_shared_file_and_cleans_uncommitted_directory() {
+    async fn create_rejects_symlinked_seed_file_and_cleans_uncommitted_directory() {
         use std::os::unix::fs::symlink;
 
         let (store, backend) = test_store(
@@ -1561,11 +1536,11 @@ mod tests {
             InstanceRegistrySnapshot::default(),
             0,
         );
-        let library_dir = store.paths().config_dir.join("library-source");
-        std::fs::create_dir_all(&library_dir).expect("create library source");
+        let seed_dir = store.paths().config_dir.join("library-source");
+        std::fs::create_dir_all(&seed_dir).expect("create seed source");
         let outside = store.paths().config_dir.join("outside-options.txt");
         std::fs::write(&outside, b"outside").expect("write outside source");
-        symlink(&outside, library_dir.join("options.txt")).expect("symlink shared options");
+        symlink(&outside, seed_dir.join("options.txt")).expect("symlink seed options");
         let instance = test_instance("0000000000000001", "Symlink source");
         let instance_path = store.game_dir(&instance.id);
         let gate = store
@@ -1573,9 +1548,7 @@ mod tests {
             .await
             .expect("acquire create mutation");
 
-        let result = store
-            .create_with_gate(instance, Some(library_dir), gate)
-            .await;
+        let result = store.create_with_gate(instance, Some(seed_dir), gate).await;
 
         assert!(matches!(result, Err(InstanceStoreError::Persistence(_))));
         assert!(!instance_path.exists());
