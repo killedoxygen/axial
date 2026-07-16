@@ -30,6 +30,7 @@ mod reconciliation;
 mod registered_artifact_findings;
 mod remote_flags;
 mod sessions;
+mod setup_plans;
 mod shutdown;
 pub mod skins;
 pub mod updater;
@@ -158,6 +159,7 @@ pub(crate) use remote_flags::{
 };
 pub(crate) use sessions::{LaunchFailureTermination, LaunchFailureTerminationErrorClass};
 pub use sessions::{SessionAdmissionError, SessionStopError, SessionStore, StartupOutcome};
+pub(crate) use setup_plans::{SETUP_PLAN_TTL, SetupPlanInsertError, SetupPlanTake};
 use shutdown::AppShutdownCoordinator;
 pub use shutdown::{AppShutdownError, AppShutdownStep};
 pub use updater::{UpdateFlowPhase, UpdateFlowSnapshot, UpdaterStore};
@@ -198,6 +200,7 @@ pub struct AppState {
     instance_lifecycle_gates: instance_lifecycle::InstanceLifecycleGates,
     lifecycle: AppLifecycle,
     shutdown_coordinator: AppShutdownCoordinator,
+    setup_plans: Arc<setup_plans::SetupPlanStore>,
     startup_warnings: Arc<Vec<String>>,
     config_changes: Arc<broadcast::Sender<()>>,
     #[cfg(test)]
@@ -679,6 +682,7 @@ impl AppState {
             instance_lifecycle_gates,
             lifecycle: AppLifecycle::new(),
             shutdown_coordinator: AppShutdownCoordinator::new(),
+            setup_plans: Arc::new(setup_plans::SetupPlanStore::new()),
             startup_warnings: Arc::new(bound_startup_warnings(init.startup_warnings)),
             config_changes: Arc::new(config_changes),
             #[cfg(test)]
@@ -1093,6 +1097,7 @@ impl AppState {
     #[cfg(test)]
     pub(crate) async fn quiesce(&self) -> Result<(), LifecycleQuiesceError> {
         self.lifecycle.begin_quiesce();
+        self.setup_plans.close();
         self.lifecycle.wait_for_shutdown_started().await?;
         self.integrity_activity.begin_shutdown();
         self.lifecycle.wait_for_quiesced().await
@@ -1100,7 +1105,22 @@ impl AppState {
 
     pub async fn shutdown(&self) -> Result<(), AppShutdownError> {
         self.lifecycle.begin_quiesce();
+        self.setup_plans.close();
         self.shutdown_coordinator.start(self.clone()).wait().await
+    }
+
+    pub(crate) fn store_setup_plan<T>(&self, payload: T) -> Result<String, SetupPlanInsertError>
+    where
+        T: Send + 'static,
+    {
+        self.setup_plans.insert(payload)
+    }
+
+    pub(crate) fn take_setup_plan<T>(&self, plan_id: &str) -> SetupPlanTake<T>
+    where
+        T: Send + 'static,
+    {
+        self.setup_plans.take(plan_id)
     }
 
     #[cfg(test)]

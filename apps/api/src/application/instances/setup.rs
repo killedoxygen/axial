@@ -8,22 +8,17 @@ use crate::application::content::{
 };
 use crate::application::{ContentPlanRequest, ResolutionPlan, content_plan};
 use crate::application::{ModpackInstallRequest, modpack_target};
-use crate::state::{AppState, RequestProducerHandoff};
+use crate::state::{
+    AppState, RequestProducerHandoff, SETUP_PLAN_TTL, SetupPlanInsertError, SetupPlanTake,
+};
 use axum::{Json, http::StatusCode};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::hash::{DefaultHasher, Hash, Hasher};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 type ApiError = (StatusCode, Json<serde_json::Value>);
 
-const SETUP_PLAN_TTL: Duration = Duration::from_secs(5 * 60);
-const MAX_SETUP_PLANS: usize = 64;
 const MAX_SETUP_SELECTIONS: usize = 40;
-static SETUP_PLAN_SEQUENCE: AtomicU64 = AtomicU64::new(1);
-static SETUP_PLANS: OnceLock<Mutex<HashMap<String, StoredSetupPlan>>> = OnceLock::new();
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct InstanceSetupPlanRequest {
@@ -61,11 +56,6 @@ struct StoredSetupPlan {
     selection_id: String,
     request: ContentPlanRequest,
     fingerprint: u64,
-    expires_at: Instant,
-}
-
-fn setup_plans() -> &'static Mutex<HashMap<String, StoredSetupPlan>> {
-    SETUP_PLANS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 pub async fn plan_instance_setup(
@@ -104,24 +94,20 @@ pub async fn plan_instance_setup(
     let expires_at_ms = now_ms().saturating_add(SETUP_PLAN_TTL.as_millis() as u64);
     let plan_id = if plan.conflicts.is_empty() {
         let fingerprint = plan_fingerprint(&selection_id, &content_request, &plan);
-        let plan_id = new_plan_id(fingerprint);
         let stored = StoredSetupPlan {
             selection_id: selection_id.clone(),
             request: content_request,
             fingerprint,
-            expires_at: Instant::now() + SETUP_PLAN_TTL,
         };
-        let mut plans = setup_plans()
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        plans.retain(|_, plan| plan.expires_at > Instant::now());
-        if plans.len() >= MAX_SETUP_PLANS {
-            return Err(conflict(
-                "Too many setup plans are active. Wait a moment and try again.",
-            ));
+        match state.store_setup_plan(stored) {
+            Ok(plan_id) => Some(plan_id),
+            Err(SetupPlanInsertError::Closed) => return Err(shutdown()),
+            Err(SetupPlanInsertError::Full) => {
+                return Err(conflict(
+                    "Too many setup plans are active. Wait a moment and try again.",
+                ));
+            }
         }
-        plans.insert(plan_id.clone(), stored);
-        Some(plan_id)
     } else {
         None
     };
@@ -144,16 +130,17 @@ pub async fn execute_instance_setup(
     if plan_id.is_empty() || plan_id.len() > 128 {
         return Err(bad_request("plan_id is invalid"));
     }
-    let stored = {
-        let mut plans = setup_plans()
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        plans.remove(plan_id)
-    }
-    .ok_or_else(|| conflict("Setup plan is missing or expired. Review the setup again."))?;
-    if stored.expires_at <= Instant::now() {
-        return Err(conflict("Setup plan expired. Review the setup again."));
-    }
+    let stored = match state.take_setup_plan::<StoredSetupPlan>(plan_id) {
+        SetupPlanTake::Found(stored) => stored,
+        SetupPlanTake::Missing => {
+            return Err(conflict(
+                "Setup plan is missing or expired. Review the setup again.",
+            ));
+        }
+        SetupPlanTake::Expired => {
+            return Err(conflict("Setup plan expired. Review the setup again."));
+        }
+    };
     if request.create.selection_id.trim() != stored.selection_id {
         return Err(conflict("Setup selection changed. Review the setup again."));
     }
@@ -372,11 +359,6 @@ fn target_matches_selection(target: &TargetRef, selection: &CreateSelection) -> 
     target_loader == selection_loader && game_version.trim() == selection.minecraft_version()
 }
 
-fn new_plan_id(fingerprint: u64) -> String {
-    let sequence = SETUP_PLAN_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-    format!("setup-{fingerprint:016x}-{sequence:016x}")
-}
-
 fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -468,11 +450,6 @@ mod tests {
             Some("selected-v2")
         );
         assert_eq!(request.selections.len(), 1);
-    }
-
-    #[test]
-    fn setup_plan_ids_are_unique_even_for_the_same_fingerprint() {
-        assert_ne!(new_plan_id(7), new_plan_id(7));
     }
 
     #[test]

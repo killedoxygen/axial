@@ -2,7 +2,6 @@ use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -98,15 +97,11 @@ async fn fetch_version_manifest_cached_from_url(
         return Ok(value);
     }
 
-    // Serve any stale manifest immediately and refresh in the background:
-    // callers on the interactive path (the create dialog) must not wait on
-    // the network once a manifest exists locally.
     let stale = read_persistent_manifest_cache(&cache_path)
         .ok()
         .or_else(stale_cached_manifest);
     if let Some(stale) = stale {
-        spawn_manifest_refresh(cache_path, manifest_url.to_string());
-        return Ok(stale);
+        return Ok(refresh_stale_manifest(&cache_path, manifest_url, stale).await);
     }
 
     let (manifest, live_body) = resolve_manifest_from_live_or_cache(
@@ -123,20 +118,20 @@ async fn fetch_version_manifest_cached_from_url(
     Ok(manifest)
 }
 
-fn spawn_manifest_refresh(cache_path: PathBuf, manifest_url: String) {
-    static REFRESH_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
-    if REFRESH_IN_FLIGHT.swap(true, Ordering::AcqRel) {
-        return;
-    }
-    tokio::spawn(async move {
-        if let Ok(body) = fetch_manifest_live_body_from_url(&manifest_url).await
-            && let Ok(manifest) = parse_manifest_body(&body)
-        {
-            let _ = write_persistent_manifest_cache(&cache_path, &body).await;
-            update_manifest_cache(manifest);
-        }
-        REFRESH_IN_FLIGHT.store(false, Ordering::Release);
-    });
+async fn refresh_stale_manifest(
+    cache_path: &Path,
+    manifest_url: &str,
+    stale: VersionManifest,
+) -> VersionManifest {
+    let Ok(body) = fetch_manifest_live_body_from_url(manifest_url).await else {
+        return stale;
+    };
+    let Ok(manifest) = parse_manifest_body(&body) else {
+        return stale;
+    };
+    let _ = write_persistent_manifest_cache(cache_path, &body).await;
+    update_manifest_cache(manifest.clone());
+    manifest
 }
 
 fn fresh_cached_manifest() -> Option<VersionManifest> {
@@ -444,7 +439,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn expired_persistent_cache_is_served_stale_without_waiting_on_the_network() {
+    async fn stale_persistent_cache_falls_back_when_synchronous_refresh_fails() {
         let root = temp_dir("manifest-cache-swr");
         let cache_path = version_manifest_cache_path(&root);
         write_persistent_manifest_cache(&cache_path, sample_manifest_body("1.21.8").as_bytes())
@@ -457,15 +452,40 @@ mod tests {
         cache_file
             .set_modified(SystemTime::now() - CACHE_TTL - Duration::from_secs(60))
             .expect("backdate cache");
-        let manifest = fetch_version_manifest_cached_from_url(
-            &root,
+        let stale = read_persistent_manifest_cache(&cache_path).expect("read stale cache");
+        let manifest = refresh_stale_manifest(
+            &cache_path,
             "http://127.0.0.1:9/version_manifest_v2.json",
+            stale,
         )
-        .await
-        .expect("stale manifest should be served");
+        .await;
 
         assert_eq!(manifest.latest.release, "1.21.8");
 
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn stale_persistent_cache_is_replaced_by_synchronous_refresh() {
+        let root = temp_dir("manifest-cache-synchronous-refresh");
+        let cache_path = version_manifest_cache_path(&root);
+        write_persistent_manifest_cache(&cache_path, sample_manifest_body("1.21.8").as_bytes())
+            .await
+            .expect("write cache");
+        let stale = read_persistent_manifest_cache(&cache_path).expect("read stale cache");
+        let server = TestManifestServer::start(200, sample_manifest_body("1.21.9"));
+
+        let manifest = refresh_stale_manifest(&cache_path, &server.url(), stale).await;
+
+        assert_eq!(manifest.latest.release, "1.21.9");
+        assert_eq!(
+            read_persistent_manifest_cache(&cache_path)
+                .expect("read refreshed cache")
+                .latest
+                .release,
+            "1.21.9"
+        );
+        server.join();
         let _ = fs::remove_dir_all(root);
     }
 
