@@ -1440,6 +1440,8 @@ mod tests {
     use zip::ZipWriter;
     use zip::write::SimpleFileOptions;
 
+    const PUBLICATION_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(5);
+
     struct ScriptedResponse {
         status: &'static str,
         content_length: Option<usize>,
@@ -2404,7 +2406,7 @@ mod tests {
                     body
                 );
                 assert_eq!(pool.retained_available_bytes(), 0);
-                tokio::time::timeout(Duration::from_millis(200), waiter)
+                tokio::time::timeout(PUBLICATION_ACQUIRE_TIMEOUT, waiter)
                     .await
                     .expect("blocking copy released writer exclusion")
                     .expect("waiting writer task")

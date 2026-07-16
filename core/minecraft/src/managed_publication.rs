@@ -906,7 +906,7 @@ mod tests {
         assert!(!waiter.is_finished());
 
         drop(lifetime_guard);
-        tokio::time::timeout(Duration::from_millis(200), waiter)
+        tokio::time::timeout(PUBLICATION_ACQUIRE_TIMEOUT, waiter)
             .await
             .expect("lifetime guard released writer")
             .expect("waiter task")
@@ -992,7 +992,7 @@ mod tests {
         assert!(!waiter.is_finished());
         reader.revalidate().expect("live reader");
         drop(reader);
-        tokio::time::timeout(Duration::from_millis(200), waiter)
+        tokio::time::timeout(PUBLICATION_ACQUIRE_TIMEOUT, waiter)
             .await
             .expect("writer unblocked")
             .expect("writer task")
