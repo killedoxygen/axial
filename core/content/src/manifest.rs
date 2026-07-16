@@ -130,18 +130,13 @@ pub struct ContentManifest {
     pub origin: ManifestOrigin,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 #[doc(hidden)]
 pub enum ManifestOrigin {
+    #[default]
     Untracked,
     Missing,
     Present([u8; 32]),
-}
-
-impl Default for ManifestOrigin {
-    fn default() -> Self {
-        Self::Untracked
-    }
 }
 
 impl PartialEq for ContentManifest {

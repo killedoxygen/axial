@@ -19,8 +19,8 @@ use crate::application::{
 use crate::state::{AppState, ProducerLease, RequestProducerHandoff, UpdateOperationLease};
 use axial_content::{
     CanonicalId, ContentKind, ContentManifest, FileRef, ManagedRemoval, ManifestEntry, PackIndex,
-    ProviderId, VersionIdentity, install_pack_files_with_finalize, read_pack_index,
-    verified_removable_variants,
+    PackInstallOptions, ProviderId, VersionIdentity, install_pack_files_with_finalize,
+    read_pack_index, verified_removable_variants,
 };
 use axum::http::StatusCode;
 use serde::{Deserialize, Serialize};
@@ -656,11 +656,12 @@ where
     )
     .await?;
     let install = install_pack_files_with_finalize(
-        state.content().client(),
         &game_dir,
         archive.path(),
-        &selected_paths,
-        request.include_overrides,
+        PackInstallOptions {
+            selected_paths: &selected_paths,
+            include_overrides: request.include_overrides,
+        },
         &mut on_progress,
         &mut on_download_fact,
         |report, transaction| {

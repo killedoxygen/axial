@@ -24,8 +24,8 @@ pub use model::{
 };
 pub use modrinth::ModrinthProvider;
 pub use pack::{
-    PackFile, PackFinalizeContext, PackIndex, PackInstallReport, PackLoader, install_pack,
-    install_pack_files, install_pack_files_with_finalize, read_pack_index,
+    PackFile, PackFinalizeContext, PackIndex, PackInstallOptions, PackInstallReport, PackLoader,
+    install_pack_files_with_finalize, read_pack_index,
 };
 pub use provider::{ContentProvider, ContentQuery, LoaderGameFilter, Page, SortOrder};
 pub use registry::ContentRegistry;

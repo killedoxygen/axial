@@ -100,6 +100,12 @@ pub struct PackInstallReport {
     pub overrides_applied: usize,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct PackInstallOptions<'a> {
+    pub selected_paths: &'a [String],
+    pub include_overrides: bool,
+}
+
 /// Read a pack's index without installing anything, so a caller can learn the
 /// loader and Minecraft version it needs before creating an instance for it.
 pub fn read_pack_index(archive: &Path) -> ContentResult<PackIndex> {
@@ -130,67 +136,13 @@ pub fn read_pack_index(archive: &Path) -> ContentResult<PackIndex> {
     parse_pack_index(&raw)
 }
 
-/// Materialize a pack into `game_dir`: fetch every indexed file through the
-/// verified downloader, then lay the overrides on top. Pack payloads never
-/// replace files that already exist in the target instance.
-pub async fn install_pack<F, G>(
-    client: &reqwest::Client,
-    game_dir: &Path,
-    archive: &Path,
-    on_progress: F,
-    on_download_fact: G,
-) -> ContentResult<PackInstallReport>
-where
-    F: FnMut(DownloadProgress),
-    G: FnMut(ExecutionDownloadFact),
-{
-    install_pack_files(
-        client,
-        game_dir,
-        archive,
-        &[],
-        true,
-        on_progress,
-        on_download_fact,
-    )
-    .await
-}
-
 /// Install either the full pack or an explicit set of indexed paths. Overrides
 /// are opt-in so cherry-picking files into an existing instance never silently
 /// replaces its configuration.
-pub async fn install_pack_files<F, G>(
-    client: &reqwest::Client,
-    game_dir: &Path,
-    archive: &Path,
-    selected_paths: &[String],
-    include_overrides: bool,
-    on_progress: F,
-    on_download_fact: G,
-) -> ContentResult<PackInstallReport>
-where
-    F: FnMut(DownloadProgress),
-    G: FnMut(ExecutionDownloadFact),
-{
-    install_pack_files_with_finalize(
-        client,
-        game_dir,
-        archive,
-        selected_paths,
-        include_overrides,
-        on_progress,
-        on_download_fact,
-        |_, _| Ok(()),
-    )
-    .await
-}
-
 pub async fn install_pack_files_with_finalize<F, G, P>(
-    _client: &reqwest::Client,
     game_dir: &Path,
     archive: &Path,
-    selected_paths: &[String],
-    include_overrides: bool,
+    options: PackInstallOptions<'_>,
     mut on_progress: F,
     mut on_download_fact: G,
     finalize: P,
@@ -201,8 +153,8 @@ where
     P: FnOnce(&PackInstallReport, &mut PackFinalizeContext<'_>) -> ContentResult<()>,
 {
     let index = read_pack_index(archive)?;
-    let selected: HashSet<&str> = selected_paths.iter().map(String::as_str).collect();
-    if !selected.is_empty() && include_overrides {
+    let selected: HashSet<&str> = options.selected_paths.iter().map(String::as_str).collect();
+    if !selected.is_empty() && options.include_overrides {
         return Err(ContentError::Invalid(
             "modpack overrides cannot be applied with selected files".to_string(),
         ));
@@ -269,7 +221,7 @@ where
         relative_paths.push(file.path.clone());
     }
 
-    let overrides_applied = if include_overrides {
+    let overrides_applied = if options.include_overrides {
         on_progress(progress("overrides", total, total, None));
         let overrides = apply_overrides(staging.path(), archive)?;
         let indexed: HashSet<&str> = relative_paths.iter().map(String::as_str).collect();
@@ -1395,14 +1347,16 @@ mod tests {
         }"#;
         let archive = override_archive("full-indexed-occupied", &[(INDEX_FILE, index.to_vec())]);
 
-        let error = install_pack_files(
-            &reqwest::Client::new(),
+        let error = install_pack_files_with_finalize(
             &root,
             &archive,
-            &[],
-            true,
+            PackInstallOptions {
+                selected_paths: &[],
+                include_overrides: true,
+            },
             |_| {},
             |_| {},
+            |_, _| Ok(()),
         )
         .await
         .expect_err("full pack must not replace an indexed destination");
@@ -1446,14 +1400,16 @@ mod tests {
             ],
         );
 
-        let error = install_pack_files(
-            &reqwest::Client::new(),
+        let error = install_pack_files_with_finalize(
             &root,
             &archive,
-            &[],
-            true,
+            PackInstallOptions {
+                selected_paths: &[],
+                include_overrides: true,
+            },
             |_| {},
             |_| {},
+            |_, _| Ok(()),
         )
         .await
         .expect_err("full pack must not replace an override destination");
