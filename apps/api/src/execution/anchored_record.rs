@@ -17,7 +17,7 @@ pub(crate) struct AnchoredRecordIdentity {
     file: AnchoredRegularFile,
 }
 
-pub(crate) struct AnchoredRecordQuarantineSuffix([u8; 16]);
+struct AnchoredRecordQuarantineSuffix([u8; 16]);
 
 pub(crate) struct AnchoredRecordQuarantineReceipt {
     exact: platform::ExactRenameReceipt,
@@ -199,9 +199,12 @@ impl AnchoredRecordIdentity {
 
     pub(crate) fn quarantine(
         self,
-        suffix: AnchoredRecordQuarantineSuffix,
+        suffix: [u8; 16],
     ) -> Result<AnchoredRecordQuarantineReceipt, AnchoredRecordQuarantineError> {
-        let destination = persisted_state_quarantine_name(self.leaf.name(), suffix);
+        let destination = persisted_state_quarantine_name(
+            self.leaf.name(),
+            AnchoredRecordQuarantineSuffix::from_bytes(suffix),
+        );
         self.leaf
             .rename_exact(self.file, destination)
             .map(|exact| AnchoredRecordQuarantineReceipt { exact })
@@ -219,7 +222,7 @@ impl AnchoredRecordIdentity {
 }
 
 impl AnchoredRecordQuarantineSuffix {
-    pub(crate) fn from_bytes(bytes: [u8; 16]) -> Self {
+    fn from_bytes(bytes: [u8; 16]) -> Self {
         Self(bytes)
     }
 
@@ -369,7 +372,14 @@ impl AnchoredTemp {
 #[cfg(unix)]
 mod platform {
     use rustix::fd::OwnedFd;
-    use rustix::fs::{AtFlags, FileType, Mode, OFlags, RenameFlags};
+    #[cfg(any(
+        target_vendor = "apple",
+        target_os = "linux",
+        target_os = "android",
+        target_os = "redox"
+    ))]
+    use rustix::fs::RenameFlags;
+    use rustix::fs::{AtFlags, FileType, Mode, OFlags};
     use sha1::{Digest as _, Sha1};
     use sha2::Sha256;
     use std::ffi::{OsStr, OsString};
@@ -584,6 +594,7 @@ mod platform {
         ) -> Result<ExactRenameReceipt, super::AnchoredRecordQuarantineError> {
             use super::AnchoredRecordQuarantineError::{AppliedUnverified, Refused};
 
+            require_exact_noreplace_rename().map_err(Refused)?;
             require_direct_leaf(&destination).map_err(Refused)?;
             if destination == self.leaf
                 || !Arc::ptr_eq(&self.parent, &file.parent)
@@ -634,14 +645,13 @@ mod platform {
                 Err(error) if io::Error::from(error).kind() == io::ErrorKind::NotFound => {}
                 Err(error) => return Err(Refused(io::Error::from(error))),
             }
-            rustix::fs::renameat_with(
+            renameat_noreplace(
                 self.parent.as_ref(),
                 &self.leaf,
                 self.parent.as_ref(),
                 &destination,
-                RenameFlags::NOREPLACE,
             )
-            .map_err(|error| Refused(io::Error::from(error)))?;
+            .map_err(Refused)?;
             super::run_exact_rename_test_hook(super::ExactRenameTestStage::AfterRename);
             file.reseal_after_rename().map_err(AppliedUnverified)?;
             let receipt = ExactRenameReceipt {
@@ -693,6 +703,7 @@ mod platform {
         }
 
         pub(super) fn promote_temp(&self, temp: &Temp) -> io::Result<()> {
+            require_exact_noreplace_rename()?;
             let held = rustix::fs::fstat(&temp.control).map_err(io::Error::from)?;
             let current =
                 rustix::fs::statat(self.parent.as_ref(), &temp.name, AtFlags::SYMLINK_NOFOLLOW)
@@ -703,14 +714,12 @@ mod platform {
             {
                 return Err(identity_changed("anchored record temp changed"));
             }
-            rustix::fs::renameat_with(
+            renameat_noreplace(
                 self.parent.as_ref(),
                 &temp.name,
                 self.parent.as_ref(),
                 &self.leaf,
-                RenameFlags::NOREPLACE,
-            )
-            .map_err(io::Error::from)?;
+            )?;
             rustix::fs::fsync(self.parent.as_ref()).map_err(io::Error::from)
         }
 
@@ -753,6 +762,71 @@ mod platform {
             }
             Ok(Some(file))
         }
+    }
+
+    #[cfg(any(
+        target_vendor = "apple",
+        target_os = "linux",
+        target_os = "android",
+        target_os = "redox"
+    ))]
+    fn require_exact_noreplace_rename() -> io::Result<()> {
+        Ok(())
+    }
+
+    #[cfg(any(
+        target_vendor = "apple",
+        target_os = "linux",
+        target_os = "android",
+        target_os = "redox"
+    ))]
+    fn renameat_noreplace(
+        source_parent: &OwnedFd,
+        source: &OsStr,
+        destination_parent: &OwnedFd,
+        destination: &OsStr,
+    ) -> io::Result<()> {
+        rustix::fs::renameat_with(
+            source_parent,
+            source,
+            destination_parent,
+            destination,
+            RenameFlags::NOREPLACE,
+        )
+        .map_err(io::Error::from)
+    }
+
+    #[cfg(not(any(
+        target_vendor = "apple",
+        target_os = "linux",
+        target_os = "android",
+        target_os = "redox"
+    )))]
+    fn require_exact_noreplace_rename() -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "exact no-replace rename is unavailable on this Unix target",
+        ))
+    }
+
+    #[cfg(not(any(
+        target_vendor = "apple",
+        target_os = "linux",
+        target_os = "android",
+        target_os = "redox"
+    )))]
+    fn renameat_noreplace(
+        _source_parent: &OwnedFd,
+        _source: &OsStr,
+        _destination_parent: &OwnedFd,
+        _destination: &OsStr,
+    ) -> io::Result<()> {
+        require_exact_noreplace_rename()
+    }
+
+    #[cfg(test)]
+    pub(super) fn exact_noreplace_rename_supported() -> bool {
+        require_exact_noreplace_rename().is_ok()
     }
 
     impl RegularFile {
@@ -2234,8 +2308,8 @@ mod tests {
     use super::{
         AnchoredRecordDirectory, AnchoredRecordIdentity, AnchoredRecordObservation,
         AnchoredRecordQuarantineError, AnchoredRecordQuarantineReceipt,
-        AnchoredRecordQuarantineSuffix, AnchoredRecordRestartDigest, ExactRenameTestStage,
-        RESTART_IDENTITY_EDGE_SAMPLE_BYTES, set_exact_rename_test_hook,
+        AnchoredRecordRestartDigest, ExactRenameTestStage, RESTART_IDENTITY_EDGE_SAMPLE_BYTES,
+        set_exact_rename_test_hook,
     };
     use static_assertions::assert_not_impl_any;
     use std::ffi::{OsStr, OsString};
@@ -2254,6 +2328,50 @@ mod tests {
             AsRef<Path>,
             AsRef<[u8]>
     );
+
+    #[test]
+    fn exact_noreplace_cfg_matches_the_rustix_target_surface() {
+        assert_eq!(
+            super::platform::exact_noreplace_rename_supported(),
+            cfg!(any(
+                target_vendor = "apple",
+                target_os = "linux",
+                target_os = "android",
+                target_os = "redox"
+            ))
+        );
+    }
+
+    #[cfg(not(any(
+        target_vendor = "apple",
+        target_os = "linux",
+        target_os = "android",
+        target_os = "redox"
+    )))]
+    #[test]
+    fn exact_quarantine_is_unsupported_before_any_effect() {
+        let root = test_root("unsupported-exact-quarantine");
+        fs::create_dir_all(&root).expect("create quarantine root");
+        let source = root.join("record.json");
+        let destination =
+            root.join(".record.json.axial-quarantine-88888888888888888888888888888888");
+        fs::write(&source, b"rejected restart record").expect("write rejected record");
+        let identity = mutation_identity(&root, OsStr::new("record.json"));
+
+        let result = identity.quarantine([0x88; 16]);
+
+        assert!(matches!(
+            result,
+            Err(AnchoredRecordQuarantineError::Refused(error))
+                if error.kind() == std::io::ErrorKind::Unsupported
+        ));
+        assert_eq!(
+            fs::read(&source).expect("read unchanged source"),
+            b"rejected restart record"
+        );
+        assert!(!destination.exists());
+        cleanup(&root);
+    }
     assert_not_impl_any!(
         AnchoredRecordObservation:
             Clone,
@@ -2296,8 +2414,7 @@ mod tests {
         destination.push(&canonical);
         destination.push(".axial-quarantine-00010a0f102b3c4d5e6f708192a3beff");
 
-        let receipt = match identity.quarantine(AnchoredRecordQuarantineSuffix::from_bytes(suffix))
-        {
+        let receipt = match identity.quarantine(suffix) {
             Ok(receipt) => receipt,
             Err(_) => panic!("quarantine exact retained record"),
         };
@@ -2323,7 +2440,7 @@ mod tests {
         fs::write(&destination, b"destination bytes").expect("write destination");
         let identity = mutation_identity(&root, canonical);
 
-        let result = identity.quarantine(AnchoredRecordQuarantineSuffix::from_bytes([0x11; 16]));
+        let result = identity.quarantine([0x11; 16]);
 
         assert!(matches!(
             result,
@@ -2352,7 +2469,7 @@ mod tests {
             fs::write(&hook_source, b"replacement bytes").expect("publish replacement source");
         });
 
-        let result = identity.quarantine(AnchoredRecordQuarantineSuffix::from_bytes([0x22; 16]));
+        let result = identity.quarantine([0x22; 16]);
 
         assert!(matches!(
             result,
@@ -2390,7 +2507,7 @@ mod tests {
                 .expect("write replacement source");
         });
 
-        let result = identity.quarantine(AnchoredRecordQuarantineSuffix::from_bytes([0x33; 16]));
+        let result = identity.quarantine([0x33; 16]);
 
         assert!(matches!(
             result,
@@ -2425,7 +2542,7 @@ mod tests {
             fs::write(&hook_destination, b"replacement bytes").expect("substitute destination");
         });
 
-        let result = identity.quarantine(AnchoredRecordQuarantineSuffix::from_bytes([0x44; 16]));
+        let result = identity.quarantine([0x44; 16]);
 
         assert!(matches!(
             result,
@@ -2459,7 +2576,7 @@ mod tests {
             fs::rename(&hook_destination, &hook_retained).expect("move destination after sync");
         });
 
-        let result = identity.quarantine(AnchoredRecordQuarantineSuffix::from_bytes([0x55; 16]));
+        let result = identity.quarantine([0x55; 16]);
 
         assert!(matches!(
             result,
@@ -2491,7 +2608,7 @@ mod tests {
         fs::write(&source, b"source bytes").expect("write long-name source");
         let identity = mutation_identity(&root, &canonical);
 
-        let result = identity.quarantine(AnchoredRecordQuarantineSuffix::from_bytes([0x66; 16]));
+        let result = identity.quarantine([0x66; 16]);
 
         assert!(matches!(
             result,
@@ -2787,7 +2904,7 @@ mod tests {
 mod windows_tests {
     use super::{
         AnchoredRecordDirectory, AnchoredRecordObservation, AnchoredRecordQuarantineError,
-        AnchoredRecordQuarantineSuffix, ExactRenameTestStage, set_exact_rename_test_hook,
+        ExactRenameTestStage, set_exact_rename_test_hook,
     };
     use std::ffi::OsStr;
     use std::fs;
@@ -2812,11 +2929,10 @@ mod windows_tests {
             .expect("seal restart identity")
             .0;
 
-        let receipt =
-            match identity.quarantine(AnchoredRecordQuarantineSuffix::from_bytes([0x12; 16])) {
-                Ok(receipt) => receipt,
-                Err(_) => panic!("quarantine exact retained record"),
-            };
+        let receipt = match identity.quarantine([0x12; 16]) {
+            Ok(receipt) => receipt,
+            Err(_) => panic!("quarantine exact retained record"),
+        };
 
         assert!(!source.exists());
         assert_eq!(
@@ -2833,7 +2949,7 @@ mod windows_tests {
             .into_restart_identity()
             .expect("seal second identity")
             .0;
-        let collision = second.quarantine(AnchoredRecordQuarantineSuffix::from_bytes([0x12; 16]));
+        let collision = second.quarantine([0x12; 16]);
         assert!(matches!(
             collision,
             Err(AnchoredRecordQuarantineError::Refused(_))
@@ -2872,7 +2988,7 @@ mod windows_tests {
             fs::rename(&destination, &retained).expect("move destination after sync");
         });
 
-        let result = identity.quarantine(AnchoredRecordQuarantineSuffix::from_bytes([0x34; 16]));
+        let result = identity.quarantine([0x34; 16]);
 
         assert!(matches!(
             result,

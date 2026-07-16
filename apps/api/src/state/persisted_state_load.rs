@@ -1,6 +1,6 @@
 use crate::execution::anchored_record::{
     AnchoredRecordIdentity, AnchoredRecordQuarantineError, AnchoredRecordQuarantineReceipt,
-    AnchoredRecordQuarantineSuffix, AnchoredRecordRestartDigest,
+    AnchoredRecordRestartDigest,
 };
 use crate::state::contracts::{
     PersistedStateRecordStore, RestartStableRecordIdentity, TargetDescriptor,
@@ -99,9 +99,9 @@ impl PersistedStateRejectedRecordEligibility {
         self.record.identity.revalidate().is_ok()
     }
 
-    pub(crate) fn quarantine(
+    pub(super) fn quarantine(
         self,
-        suffix: AnchoredRecordQuarantineSuffix,
+        suffix: [u8; 16],
     ) -> Result<PersistedStateRejectedRecordQuarantineReceipt, AnchoredRecordQuarantineError> {
         let PersistedStateRejectedRecord {
             evidence,
@@ -272,10 +272,16 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn eligibility_consumes_into_destination_bound_quarantine_receipt() {
+        if !cfg!(any(
+            target_vendor = "apple",
+            target_os = "linux",
+            target_os = "android",
+            target_os = "redox"
+        )) {
+            return;
+        }
         use super::PersistedStateRecordRejection;
-        use crate::execution::anchored_record::{
-            AnchoredRecordDirectory, AnchoredRecordQuarantineSuffix,
-        };
+        use crate::execution::anchored_record::AnchoredRecordDirectory;
         use crate::state::contracts::{
             OwnershipClass, PersistedStateRecordStore, StabilizationSystem, TargetDescriptor,
             TargetKind,
@@ -311,11 +317,10 @@ mod tests {
         .into_eligibility();
         let expected_identity = eligibility.physical_identity().clone();
 
-        let receipt =
-            match eligibility.quarantine(AnchoredRecordQuarantineSuffix::from_bytes([0x7a; 16])) {
-                Ok(receipt) => receipt,
-                Err(_) => panic!("consume exact quarantine eligibility"),
-            };
+        let receipt = match eligibility.quarantine([0x7a; 16]) {
+            Ok(receipt) => receipt,
+            Err(_) => panic!("consume exact quarantine eligibility"),
+        };
 
         assert!(receipt.is_current());
         assert_eq!(
