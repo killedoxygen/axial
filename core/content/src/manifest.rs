@@ -240,19 +240,51 @@ impl ContentManifest {
             .find(|entry| &entry.canonical_id == canonical_id)
     }
 
-    /// Insert or replace an entry by canonical id, returning the file that was
-    /// previously recorded when it differs from the new one (so the caller can
-    /// clean up the stale file on disk).
-    pub fn upsert(&mut self, entry: ManifestEntry) -> Option<String> {
-        let previous_filename = self
+    /// Validate provider-authored fields before they become launcher-owned
+    /// provenance. Existing manifest conflicts remain subject to normal local
+    /// ownership validation.
+    pub fn validate_provider_entry(&self, entry: &ManifestEntry) -> ContentResult<()> {
+        validate_entry(entry).map_err(|_| {
+            ContentError::ProviderMetadataInvalid(
+                "content metadata cannot be represented in the managed manifest".to_string(),
+            )
+        })?;
+        if self.find(&entry.canonical_id).is_none() && self.entries.len() >= MAX_MANIFEST_ENTRIES {
+            return Err(ContentError::ProviderMetadataInvalid(
+                "content metadata exceeds the managed manifest entry bound".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Validate the aggregate serialized bound after provider entries have been
+    /// projected into a manifest, without reclassifying local ownership rules.
+    pub fn validate_provider_projection(&self) -> ContentResult<()> {
+        let body = serde_json::to_vec_pretty(self).map_err(|_| {
+            ContentError::ProviderMetadataInvalid(
+                "content metadata cannot be represented in the managed manifest".to_string(),
+            )
+        })?;
+        if body.len() > MAX_MANIFEST_BYTES {
+            return Err(ContentError::ProviderMetadataInvalid(
+                "content metadata exceeds the managed manifest size bound".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Insert or replace an entry by canonical id, returning the prior ownership
+    /// record when its kind or filename changed so callers can clean the exact
+    /// stale path.
+    pub fn upsert(&mut self, entry: ManifestEntry) -> Option<ManifestEntry> {
+        let displaced = self
             .entries
             .iter()
             .position(|existing| existing.canonical_id == entry.canonical_id)
             .map(|index| self.entries.remove(index))
-            .filter(|previous| previous.filename != entry.filename)
-            .map(|previous| previous.filename);
+            .filter(|previous| previous.kind != entry.kind || previous.filename != entry.filename);
         self.entries.push(entry);
-        previous_filename
+        displaced
     }
 
     pub fn remove(&mut self, canonical_id: &CanonicalId) -> Option<ManifestEntry> {
@@ -339,6 +371,11 @@ fn validate_entry(entry: &ManifestEntry) -> ContentResult<()> {
         ));
     }
     for dependency in &entry.dependencies {
+        if dependency.project_id.is_none() && dependency.version_id.is_none() {
+            return Err(ContentError::Invalid(
+                "content manifest dependency has no project or version identity".to_string(),
+            ));
+        }
         if let Some(project_id) = dependency.project_id.as_deref() {
             validate_required_text("dependency project id", project_id, MAX_ID_BYTES)?;
         }
@@ -387,7 +424,7 @@ fn validate_filename(kind: ContentKind, filename: &str) -> ContentResult<()> {
         || filename == "."
         || filename == ".."
         || filename.contains(['/', '\\', '\0'])
-        || filename.ends_with(".disabled")
+        || filename.to_ascii_lowercase().ends_with(".disabled")
     {
         return Err(ContentError::Invalid(
             "content manifest filename is invalid".to_string(),
@@ -678,21 +715,49 @@ mod tests {
     }
 
     #[test]
-    fn upsert_reports_stale_filename_only_when_changed() {
+    fn upsert_reports_displaced_ownership_only_when_changed() {
         let mut manifest = ContentManifest::default();
-        assert_eq!(
-            manifest.upsert(managed_entry("AAA", "sodium-0.5.jar")),
-            None
-        );
+        let old = managed_entry("AAA", "sodium-0.5.jar");
+        assert_eq!(manifest.upsert(old.clone()), None);
         assert_eq!(
             manifest.upsert(managed_entry("AAA", "sodium-0.6.jar")),
-            Some("sodium-0.5.jar".to_string())
+            Some(old)
         );
         assert_eq!(
             manifest.upsert(managed_entry("AAA", "sodium-0.6.jar")),
             None
         );
         assert_eq!(manifest.entries.len(), 1);
+    }
+
+    #[test]
+    fn upsert_reports_displaced_ownership_when_kind_changes() {
+        let mut manifest = ContentManifest::default();
+        let previous = managed_entry("AAA", "shared.jar");
+        manifest.upsert(previous.clone());
+        let mut replacement = previous.clone();
+        replacement.kind = ContentKind::ResourcePack;
+
+        assert_eq!(manifest.upsert(replacement), Some(previous));
+    }
+
+    #[test]
+    fn provider_entry_bounds_are_typed_without_reclassifying_local_manifest_errors() {
+        let manifest = ContentManifest::default();
+        let mut provider_entry = managed_entry("AAA", "managed.jar");
+        provider_entry.title = Some("x".repeat(MAX_TITLE_BYTES + 1));
+
+        assert!(matches!(
+            manifest.validate_provider_entry(&provider_entry),
+            Err(ContentError::ProviderMetadataInvalid(_))
+        ));
+
+        let mut local_manifest = ContentManifest::default();
+        local_manifest.entries.push(provider_entry);
+        assert!(matches!(
+            local_manifest.validate(),
+            Err(ContentError::Invalid(_))
+        ));
     }
 
     #[test]
@@ -713,6 +778,29 @@ mod tests {
                 "manifest should fail closed: {body}"
             );
         }
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn load_rejects_a_dependency_without_project_or_version_identity() {
+        let dir = temp_game_dir("dependency-without-identity");
+        let path = manifest_path(&dir);
+        let mut value =
+            serde_json::to_value(ContentManifest::default()).expect("default manifest JSON");
+        let mut entry =
+            serde_json::to_value(managed_entry("AAA", "managed.jar")).expect("managed entry JSON");
+        entry["dependencies"] = serde_json::json!([{ "kind": "required" }]);
+        value["entries"] = serde_json::json!([entry]);
+        fs::write(
+            &path,
+            serde_json::to_vec(&value).expect("invalid dependency manifest"),
+        )
+        .expect("write manifest");
+
+        let error =
+            ContentManifest::load(&dir).expect_err("identity-free dependency must fail closed");
+
+        assert!(matches!(error, ContentError::Invalid(_)));
         fs::remove_dir_all(&dir).ok();
     }
 
@@ -824,6 +912,18 @@ mod tests {
             .expect("unsafe entry body"),
         )
         .expect("write unsafe entry");
+        assert!(ContentManifest::load(&dir).is_err());
+
+        let entry = managed_entry("AAA", "tracked.jar.DISABLED");
+        fs::write(
+            &path,
+            serde_json::to_vec(&ContentManifest {
+                entries: vec![entry],
+                ..ContentManifest::default()
+            })
+            .expect("disabled base filename body"),
+        )
+        .expect("write disabled base filename");
         assert!(ContentManifest::load(&dir).is_err());
 
         fs::write(&path, vec![b' '; MAX_MANIFEST_BYTES + 1]).expect("oversized manifest");

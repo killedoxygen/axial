@@ -1,7 +1,8 @@
 use super::*;
 use crate::state::{
-    AppState, AppStateInit, IdleSweepCancellation, IdleSweepReservation, IdleSweepTerminal,
-    InstallStore, ProducerLease, RequestLease, SessionStore, UpdateApplyAdmissionError,
+    AppState, AppStateInit, ContentQueueAction, IdleSweepCancellation, IdleSweepReservation,
+    IdleSweepTerminal, InstallQueuePlacement, InstallQueueSpec, InstallStore, ProducerLease,
+    RequestLease, SessionStore, UpdateApplyAdmissionError,
 };
 use axial_config::{AppPaths, ConfigStore, InstanceRegistrySnapshot, InstanceStore};
 use axial_launcher::{LaunchSessionRecord, LaunchState, SessionId};
@@ -2205,6 +2206,269 @@ async fn dropped_create_caller_keeps_rebuild_rollback_owned_until_quiescence() {
         .expect("close instance registry");
     drop(state);
     let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn cancelled_setup_after_creation_still_hands_the_instance_to_the_content_queue() {
+    let (state, root) = test_state("setup-create-cancellation");
+    let producer = state.try_claim_producer().expect("claim setup producer");
+    let (created_tx, created_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let setup_state = state.clone();
+    let caller = tokio::spawn(async move {
+        super::setup::execute_setup_mutation_owned(
+            &setup_state,
+            producer,
+            move |state, _, update_admission| async move {
+                let instance = state
+                    .instances()
+                    .insert_for_test("Cancelled setup", "1.21.1")
+                    .expect("create setup instance");
+                created_tx
+                    .send(instance.id.clone())
+                    .expect("signal durable creation");
+                release_rx.await.expect("release queue handoff");
+                enqueue_test_setup_content(&state, &instance, "setup-create-cancelled").await;
+                drop(update_admission);
+                Ok(instance.id)
+            },
+        )
+        .await
+    });
+
+    let instance_id = tokio::time::timeout(std::time::Duration::from_secs(5), created_rx)
+        .await
+        .expect("setup reaches durable creation")
+        .expect("durable creation signal");
+    assert_eq!(
+        state.try_begin_update_apply().unwrap_err(),
+        UpdateApplyAdmissionError::ActiveOperations
+    );
+    caller.abort();
+    assert!(
+        caller
+            .await
+            .expect_err("setup caller cancellation")
+            .is_cancelled()
+    );
+    release_tx.send(()).expect("release queue handoff");
+    wait_for_setup_queue(&state, "setup-create-cancelled").await;
+
+    assert!(state.instances().get(&instance_id).is_some());
+    remove_test_setup(&state, "setup-create-cancelled", &instance_id).await;
+    drop(state);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn cancelled_modpack_setup_during_post_create_resolution_still_hands_off_the_queue() {
+    let (state, root) = test_state("modpack-setup-resolution-cancellation");
+    let producer = state.try_claim_producer().expect("claim setup producer");
+    let (resolving_tx, resolving_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let setup_state = state.clone();
+    let caller = tokio::spawn(async move {
+        super::setup::execute_setup_mutation_owned(
+            &setup_state,
+            producer,
+            move |state, _, update_admission| async move {
+                let instance = state
+                    .instances()
+                    .insert_for_test("Resolving modpack", "1.21.1")
+                    .expect("create modpack setup instance");
+                resolving_tx
+                    .send(instance.id.clone())
+                    .expect("signal post-create resolution");
+                release_rx.await.expect("release modpack resolution");
+                enqueue_test_setup_content(&state, &instance, "setup-modpack-resolved").await;
+                drop(update_admission);
+                Ok(instance.id)
+            },
+        )
+        .await
+    });
+
+    let instance_id = tokio::time::timeout(std::time::Duration::from_secs(5), resolving_rx)
+        .await
+        .expect("setup reaches post-create resolution")
+        .expect("post-create resolution signal");
+    assert_eq!(
+        state.try_begin_update_apply().unwrap_err(),
+        UpdateApplyAdmissionError::ActiveOperations
+    );
+    caller.abort();
+    assert!(
+        caller
+            .await
+            .expect_err("modpack setup caller cancellation")
+            .is_cancelled()
+    );
+    release_tx
+        .send(())
+        .expect("release modpack post-create resolution");
+    wait_for_setup_queue(&state, "setup-modpack-resolved").await;
+
+    assert!(state.instances().get(&instance_id).is_some());
+    remove_test_setup(&state, "setup-modpack-resolved", &instance_id).await;
+    drop(state);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn failed_setup_queue_cleanup_finishes_under_the_transaction_admission() {
+    let (state, root) = test_state("setup-queue-failure-cleanup");
+    let producer = state.try_claim_producer().expect("claim setup producer");
+    let (cleanup_tx, cleanup_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let setup_state = state.clone();
+    let caller = tokio::spawn(async move {
+        super::setup::execute_setup_mutation_owned(
+            &setup_state,
+            producer,
+            move |state, _, update_admission| async move {
+                let instance = state
+                    .instances()
+                    .insert_for_test("Failed setup", "1.21.1")
+                    .expect("create failed setup instance");
+                let cleanup =
+                    crate::application::install::setup_instance_cleanup(&state, &instance, false);
+                cleanup_tx
+                    .send(instance.id.clone())
+                    .expect("signal compensation cleanup");
+                release_rx.await.expect("release compensation cleanup");
+                assert!(
+                    crate::application::install::remove_pristine_setup_instance_admitted(
+                        &state,
+                        &instance.id,
+                        &cleanup,
+                        &update_admission,
+                    )
+                    .await
+                );
+                Err::<String, _>((
+                    StatusCode::BAD_GATEWAY,
+                    Json(serde_json::json!({ "error": "queue admission failed" })),
+                ))
+            },
+        )
+        .await
+    });
+
+    let instance_id = tokio::time::timeout(std::time::Duration::from_secs(5), cleanup_rx)
+        .await
+        .expect("setup reaches compensation")
+        .expect("compensation signal");
+    assert!(state.instances().get(&instance_id).is_some());
+    assert_eq!(
+        state.try_begin_update_apply().unwrap_err(),
+        UpdateApplyAdmissionError::ActiveOperations
+    );
+    release_tx.send(()).expect("release compensation cleanup");
+    let error = tokio::time::timeout(std::time::Duration::from_secs(5), caller)
+        .await
+        .expect("setup compensation settles")
+        .expect("setup caller")
+        .expect_err("queue failure remains visible");
+    assert_eq!(error.0, StatusCode::BAD_GATEWAY);
+    assert!(state.instances().get(&instance_id).is_none());
+    assert!(!state.instances().game_dir(&instance_id).exists());
+    state
+        .try_begin_update_apply()
+        .expect("settled compensation releases update admission");
+    drop(state);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn normal_setup_transaction_creates_and_queues_once() {
+    let (state, root) = test_state("setup-normal-transaction");
+    let producer = state.try_claim_producer().expect("claim setup producer");
+    let instance_id = super::setup::execute_setup_mutation_owned(
+        &state,
+        producer,
+        move |state, _, _update_admission| async move {
+            let instance = state
+                .instances()
+                .insert_for_test("Normal setup", "1.21.1")
+                .expect("create setup instance");
+            enqueue_test_setup_content(&state, &instance, "setup-normal").await;
+            Ok(instance.id)
+        },
+    )
+    .await
+    .expect("complete setup transaction");
+
+    assert!(state.instances().get(&instance_id).is_some());
+    wait_for_setup_queue(&state, "setup-normal").await;
+    remove_test_setup(&state, "setup-normal", &instance_id).await;
+    drop(state);
+    let _ = fs::remove_dir_all(root);
+}
+
+async fn enqueue_test_setup_content(
+    state: &AppState,
+    instance: &axial_config::Instance,
+    queue_id: &str,
+) {
+    let cleanup = crate::application::install::setup_instance_cleanup(state, instance, false);
+    let outcome = state
+        .installs()
+        .enqueue_queued_install(
+            queue_id.to_string(),
+            InstallQueueSpec::Content {
+                instance_id: instance.id.clone(),
+                label: "Setup content".to_string(),
+                action: ContentQueueAction::Install {
+                    selections: Vec::new(),
+                    allow_incompatible: false,
+                    setup_cleanup: Some(cleanup),
+                },
+                prerequisite_queue_id: None,
+            },
+            InstallQueuePlacement::Back,
+        )
+        .await;
+    assert!(matches!(
+        outcome,
+        crate::state::InstallQueueEnqueueOutcome::Enqueued { .. }
+    ));
+}
+
+async fn wait_for_setup_queue(state: &AppState, queue_id: &str) {
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let queue = state.installs().queue_snapshot().await;
+            if queue.pending.iter().any(|entry| entry.queue_id == queue_id) {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("setup queue handoff completes");
+}
+
+async fn remove_test_setup(state: &AppState, queue_id: &str, instance_id: &str) {
+    let removed = state
+        .installs()
+        .remove_queued_install(queue_id)
+        .await
+        .expect("remove test setup queue");
+    let cleanup = match removed.spec {
+        InstallQueueSpec::Content {
+            action:
+                ContentQueueAction::Install {
+                    setup_cleanup: Some(cleanup),
+                    ..
+                },
+            ..
+        } => cleanup,
+        _ => panic!("test setup queue retains cleanup"),
+    };
+    assert!(
+        crate::application::install::remove_pristine_setup_instance(state, instance_id, &cleanup,)
+            .await
+    );
 }
 
 #[tokio::test]

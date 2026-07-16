@@ -12,6 +12,7 @@ use crate::install::{ManagedRemoval, stage_managed_removals};
 use crate::manifest::MANIFEST_FILE;
 use crate::model::{ContentKind, FileRef};
 use crate::transaction::{FileTransaction, StagingGuard};
+use axial_minecraft::LoaderComponentId;
 use axial_minecraft::download::{
     DownloadProgress, ExecutionDownloadFact, VerifiedContentIntegrity,
     download_verified_content_to_staging,
@@ -43,6 +44,7 @@ const MAX_OVERRIDE_TOTAL_BYTES: u64 = 512 << 20;
 const MAX_OVERRIDE_TOTAL_BYTES: u64 = 2048;
 const MAX_OVERRIDE_FILES: usize = 10_000;
 const MAX_PACK_REDIRECTS: usize = 10;
+const MAX_PACK_COORDINATE_BYTES: usize = 512;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct PackDownloadOrigin {
@@ -52,8 +54,7 @@ struct PackDownloadOrigin {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PackLoader {
-    /// Launcher loader short key: `fabric`, `forge`, `neoforge` or `quilt`.
-    pub key: String,
+    pub component_id: LoaderComponentId,
     pub version: String,
 }
 
@@ -663,13 +664,9 @@ pub fn parse_pack_index(raw: &str) -> ContentResult<PackIndex> {
         .get("minecraft")
         .cloned()
         .unwrap_or_default();
-    if minecraft.is_empty() {
-        return Err(ContentError::ProviderMetadataInvalid(
-            "modpack does not say which Minecraft version it needs".to_string(),
-        ));
-    }
+    validate_pack_coordinate("Minecraft version", &minecraft)?;
 
-    let loader = loader_from_dependencies(&dto.dependencies);
+    let loader = loader_from_dependencies(&dto.dependencies)?;
     let files = dto
         .files
         .into_iter()
@@ -741,23 +738,42 @@ fn validate_pack_hash(
     Ok(Some(hash.to_ascii_lowercase()))
 }
 
-fn loader_from_dependencies(dependencies: &HashMap<String, String>) -> Option<PackLoader> {
-    [
-        ("fabric-loader", "fabric"),
-        ("quilt-loader", "quilt"),
-        ("neoforge", "neoforge"),
-        ("forge", "forge"),
+fn loader_from_dependencies(
+    dependencies: &HashMap<String, String>,
+) -> ContentResult<Option<PackLoader>> {
+    let loader = [
+        ("fabric-loader", LoaderComponentId::Fabric),
+        ("quilt-loader", LoaderComponentId::Quilt),
+        ("neoforge", LoaderComponentId::NeoForge),
+        ("forge", LoaderComponentId::Forge),
     ]
     .into_iter()
-    .find_map(|(key, short)| {
+    .find_map(|(key, component_id)| {
         dependencies
             .get(key)
             .filter(|version| !version.is_empty())
             .map(|version| PackLoader {
-                key: short.to_string(),
+                component_id,
                 version: version.clone(),
             })
-    })
+    });
+    if let Some(loader) = loader.as_ref() {
+        validate_pack_coordinate("loader version", &loader.version)?;
+    }
+    Ok(loader)
+}
+
+fn validate_pack_coordinate(name: &str, value: &str) -> ContentResult<()> {
+    if value.is_empty()
+        || value.len() > MAX_PACK_COORDINATE_BYTES
+        || value != value.trim()
+        || value.chars().any(char::is_control)
+    {
+        return Err(ContentError::ProviderMetadataInvalid(format!(
+            "modpack has an invalid {name}"
+        )));
+    }
+    Ok(())
 }
 
 /// The pack's own archive, as a file to download and verify.
@@ -896,7 +912,7 @@ mod tests {
         assert_eq!(
             index.loader,
             Some(PackLoader {
-                key: "fabric".to_string(),
+                component_id: LoaderComponentId::Fabric,
                 version: "0.17.2".to_string()
             })
         );
@@ -943,6 +959,25 @@ mod tests {
     fn a_pack_without_a_minecraft_version_is_rejected() {
         let raw = r#"{ "formatVersion": 1, "dependencies": {}, "files": [] }"#;
         assert!(parse_pack_index(raw).is_err());
+    }
+
+    #[test]
+    fn pack_loader_coordinates_are_canonical_before_target_generation() {
+        for dependencies in [
+            r#"{ "minecraft": " 1.21.6", "fabric-loader": "0.17.2" }"#,
+            r#"{ "minecraft": "1.21.6", "fabric-loader": "0.17.2\n" }"#,
+            r#"{ "minecraft": "1.21.6", "fabric-loader": " " }"#,
+        ] {
+            let raw =
+                format!(r#"{{ "formatVersion": 1, "dependencies": {dependencies}, "files": [] }}"#);
+            assert!(
+                matches!(
+                    parse_pack_index(&raw),
+                    Err(ContentError::ProviderMetadataInvalid(_))
+                ),
+                "{dependencies}"
+            );
+        }
     }
 
     #[test]

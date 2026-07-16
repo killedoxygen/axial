@@ -14,9 +14,9 @@ use super::{
 };
 use crate::application::{
     InstallQueueContentActionRequest, InstallQueueRequest, InstallQueueStateResponse,
-    enqueue_install_owned, enqueue_install_with_dependency,
+    enqueue_install_owned, enqueue_install_with_dependency_admitted,
 };
-use crate::state::{AppState, ProducerLease, RequestProducerHandoff};
+use crate::state::{AppState, ProducerLease, RequestProducerHandoff, UpdateOperationLease};
 use axial_content::{
     CanonicalId, ContentKind, ContentManifest, FileRef, ManagedRemoval, ManifestEntry, PackIndex,
     ProviderId, VersionIdentity, install_pack_files_with_finalize, read_pack_index,
@@ -263,13 +263,7 @@ fn target_from_pack_index(
 ) -> Result<ModpackTarget, ContentApiError> {
     let (loader, loader_label, selection_id) = match index.loader.as_ref() {
         Some(loader) => {
-            let component =
-                axial_minecraft::LoaderComponentId::parse(&loader.key).ok_or_else(|| {
-                    json_error(
-                        StatusCode::BAD_REQUEST,
-                        "this modpack uses an unsupported loader",
-                    )
-                })?;
+            let component = loader.component_id;
             let build_id =
                 axial_minecraft::build_id_for(component, &index.minecraft, &loader.version);
             (
@@ -318,7 +312,7 @@ pub async fn modpack_files(
         .await
         .map_err(|error| error.into_parts().0)?;
     let index = read_pack_index(archive.path()).map_err(content_error_response)?;
-    validate_selection_surface(&index)?;
+    validate_selection_surface(&index).map_err(content_error_response)?;
     let identities = identify_modpack_files(state, &index)
         .await
         .map_err(content_error_response)?;
@@ -340,7 +334,9 @@ pub async fn modpack_files(
         version_id: resolved.version.id,
         name: resolved.name,
         minecraft: index.minecraft,
-        loader: index.loader.map(|loader| loader.key),
+        loader: index
+            .loader
+            .map(|loader| loader.component_id.short_key().to_string()),
         files,
     })
 }
@@ -499,19 +495,20 @@ pub(crate) async fn queue_modpack_install(
     .await
 }
 
-pub(crate) async fn queue_modpack_install_after(
+pub(crate) async fn queue_modpack_install_after_admitted(
     state: &AppState,
     request: ModpackInstallRequest,
     prerequisite_queue_id: Option<String>,
     setup_cleanup: Option<crate::state::SetupInstanceCleanup>,
     producer: ProducerLease,
+    update_admission: UpdateOperationLease,
 ) -> Result<InstallQueueStateResponse, ContentApiError> {
     validate_modpack_file_selection_ids(&request.selected_file_ids)?;
     reject_cherry_pick_overrides(&request)?;
     let resolved =
         resolve_modpack_version(state, &request.canonical_id, request.version_id.as_deref())
             .await?;
-    enqueue_install_with_dependency(
+    enqueue_install_with_dependency_admitted(
         state,
         pinned_modpack_queue_request(
             request,
@@ -522,6 +519,7 @@ pub(crate) async fn queue_modpack_install_after(
         prerequisite_queue_id,
         setup_cleanup,
         producer,
+        update_admission,
     )
     .await
 }
@@ -613,7 +611,7 @@ where
     let selected_paths = if request.selected_file_ids.is_empty() {
         Vec::new()
     } else {
-        validate_selection_surface(&preview)?;
+        validate_selection_surface(&preview).map_err(content_execution_error)?;
         let identities = identify_modpack_files(state, &preview)
             .await
             .map_err(content_execution_error)?;
@@ -687,7 +685,7 @@ where
             .index
             .loader
             .as_ref()
-            .map(|loader| loader.key.as_str()),
+            .map(|loader| loader.component_id.short_key()),
         &report.index.minecraft,
     );
 
@@ -696,7 +694,10 @@ where
         name: report.index.name,
         version: report.index.version,
         minecraft: report.index.minecraft,
-        loader: report.index.loader.map(|loader| loader.key),
+        loader: report
+            .index
+            .loader
+            .map(|loader| loader.component_id.short_key().to_string()),
         file_count: report.installed.len(),
         overrides_applied: report.overrides_applied,
         identified_count: identified,
@@ -752,7 +753,7 @@ fn validate_unique_selection_ids(
     Ok(())
 }
 
-fn validate_selection_surface(index: &PackIndex) -> Result<(), ContentApiError> {
+fn validate_selection_surface(index: &PackIndex) -> axial_content::ContentResult<()> {
     if index
         .files
         .iter()
@@ -760,9 +761,8 @@ fn validate_selection_surface(index: &PackIndex) -> Result<(), ContentApiError> 
         .count()
         > MAX_MODPACK_FILE_SELECTIONS
     {
-        return Err(json_error(
-            StatusCode::BAD_REQUEST,
-            "this modpack has too many files for selective installation",
+        return Err(axial_content::ContentError::ProviderMetadataInvalid(
+            "modpack has too many files for selective installation".to_string(),
         ));
     }
     Ok(())
@@ -974,7 +974,7 @@ async fn build_pack_manifest(
     // The pack itself: what this instance was built from, so an update knows
     // where it came from.
     if record_pack_root {
-        manifest.upsert(ManifestEntry {
+        let entry = ManifestEntry {
             canonical_id: pack_id.clone(),
             provider: ProviderId::Modrinth,
             project_id: pack_id.project_id().to_string(),
@@ -988,7 +988,13 @@ async fn build_pack_manifest(
             enabled: true,
             installed_at: chrono::Utc::now().to_rfc3339(),
             title: Some(pack_title.to_string()),
-        });
+        };
+        manifest
+            .validate_provider_entry(&entry)
+            .map_err(content_execution_error)?;
+        if let Some(previous) = manifest.upsert(entry) {
+            stale_entries.push(previous);
+        }
     }
 
     let by_hash = group_pack_files_by_sha512(installed);
@@ -1015,12 +1021,11 @@ async fn build_pack_manifest(
             };
             let Some(kind) = file.kind() else { continue };
             let canonical_id = CanonicalId::for_project(identity.provider, &identity.project_id);
-            let previous = manifest.find(&canonical_id).cloned();
             let title = titles
                 .get(&canonical_id)
                 .cloned()
                 .or(identity.title.clone());
-            let stale_filename = manifest.upsert(ManifestEntry {
+            let entry = ManifestEntry {
                 canonical_id,
                 provider: identity.provider,
                 project_id: identity.project_id,
@@ -1034,15 +1039,19 @@ async fn build_pack_manifest(
                 enabled: true,
                 installed_at: chrono::Utc::now().to_rfc3339(),
                 title,
-            });
-            if stale_filename.is_some()
-                && let Some(previous) = previous
-            {
+            };
+            manifest
+                .validate_provider_entry(&entry)
+                .map_err(content_execution_error)?;
+            if let Some(previous) = manifest.upsert(entry) {
                 stale_entries.push(previous);
             }
             identified += 1;
         }
     }
+    manifest
+        .validate_provider_projection()
+        .map_err(content_execution_error)?;
 
     Ok((manifest, identified, stale_entries))
 }
@@ -1406,7 +1415,7 @@ mod tests {
                 version: "1.0.0".to_string(),
                 minecraft: "1.20.1".to_string(),
                 loader: Some(axial_content::PackLoader {
-                    key: "fabric".to_string(),
+                    component_id: axial_minecraft::LoaderComponentId::Fabric,
                     version: "0.14.22".to_string(),
                 }),
                 files: Vec::new(),
@@ -1416,9 +1425,22 @@ mod tests {
 
         assert_eq!(target.minecraft, "1.20.1");
         assert_eq!(target.loader.as_deref(), Some("fabric"));
+        let build_id = axial_minecraft::build_id_for(
+            axial_minecraft::LoaderComponentId::Fabric,
+            "1.20.1",
+            "0.14.22",
+        );
         assert_eq!(
             target.selection_id,
-            "loader_build|net.fabricmc.fabric-loader|fabric:1.20.1:0.14.22"
+            format!("loader_build|net.fabricmc.fabric-loader|{build_id}")
+        );
+        assert_eq!(
+            axial_minecraft::parse_build_id(&build_id),
+            Some((
+                axial_minecraft::LoaderComponentId::Fabric,
+                "1.20.1".to_string(),
+                "0.14.22".to_string(),
+            ))
         );
     }
 
@@ -1560,6 +1582,35 @@ mod tests {
             .map(|index| format!("mpf1-{index:064x}"))
             .collect::<Vec<_>>();
         assert!(validate_modpack_file_selection_ids(&too_many).is_err());
+    }
+
+    #[test]
+    fn oversized_provider_selection_surface_is_typed_metadata_failure() {
+        let index = PackIndex {
+            name: "Oversized".to_string(),
+            version: "1".to_string(),
+            minecraft: "1.21.6".to_string(),
+            loader: None,
+            files: (0..=MAX_MODPACK_FILE_SELECTIONS)
+                .map(|index| axial_content::PackFile {
+                    path: format!("mods/file-{index}.jar"),
+                    url: format!("https://example.invalid/file-{index}.jar"),
+                    sha1: None,
+                    sha512: Some(format!("{index:0128x}")),
+                    size: Some(1),
+                })
+                .collect(),
+        };
+
+        let error = validate_selection_surface(&index)
+            .expect_err("provider-authored selection surface must be bounded");
+        let ((status, _), failure_kind) = content_execution_error(error).into_parts();
+
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            failure_kind,
+            Some(ContentExecutionFailureKind::MetadataInvalid)
+        );
     }
 
     #[test]

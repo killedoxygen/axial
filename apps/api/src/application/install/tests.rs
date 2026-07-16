@@ -1385,6 +1385,179 @@ async fn continuation_queue_skips_failed_older_head_and_starts_selected_residual
 }
 
 #[tokio::test]
+async fn selected_queue_skips_and_cleans_a_failed_prerequisite_dependent() {
+    let root = temp_root("install-queue-selected-prerequisite");
+    let state = build_test_state(&root);
+    let instance = state
+        .instances()
+        .insert_for_test("Dependent setup", "1.21.5")
+        .expect("create dependent setup instance");
+    let cleanup = setup_instance_cleanup(&state, &instance, false);
+    state
+        .installs()
+        .enqueue_queued_install(
+            "failed-prerequisite".to_string(),
+            InstallQueueSpec::vanilla(String::new()),
+            InstallQueuePlacement::Back,
+        )
+        .await;
+    state
+        .installs()
+        .enqueue_queued_install(
+            "dependent-content".to_string(),
+            InstallQueueSpec::Content {
+                instance_id: instance.id.clone(),
+                label: "Dependent content".to_string(),
+                action: ContentQueueAction::Install {
+                    selections: Vec::new(),
+                    allow_incompatible: false,
+                    setup_cleanup: Some(cleanup),
+                },
+                prerequisite_queue_id: Some("failed-prerequisite".to_string()),
+            },
+            InstallQueuePlacement::Back,
+        )
+        .await;
+    state
+        .installs()
+        .enqueue_queued_install(
+            "selected-queue".to_string(),
+            InstallQueueSpec::vanilla("selected-version".to_string()),
+            InstallQueuePlacement::Back,
+        )
+        .await;
+    let attempts = Arc::new(Mutex::new(Vec::<String>::new()));
+    let observed_attempts = attempts.clone();
+
+    let started = maybe_start_selected_queued_install_owned_with(
+        &state,
+        "selected-queue",
+        true,
+        move |spec| {
+            let attempts = observed_attempts.clone();
+            async move {
+                let target = spec.target_version_id().to_string();
+                attempts
+                    .lock()
+                    .expect("record prerequisite traversal")
+                    .push(target.clone());
+                if target.is_empty() {
+                    return Err((
+                        StatusCode::BAD_REQUEST,
+                        Json(json!({ "error": "failed prerequisite" })),
+                    ));
+                }
+                Ok(InstallStartResponse {
+                    operation_id: install_operation_id("selected-install"),
+                    install_id: "selected-install".to_string(),
+                    view_model: InstallProgressViewModel::starting(),
+                })
+            }
+        },
+    )
+    .await
+    .expect("failed prerequisite and dependent are settled")
+    .expect("independent selection starts");
+
+    assert_eq!(started.install_id, "selected-install");
+    assert_eq!(
+        *attempts.lock().expect("read prerequisite traversal"),
+        vec![String::new(), "selected-version".to_string()]
+    );
+    assert_eq!(
+        state
+            .installs()
+            .queued_install_succeeded("failed-prerequisite")
+            .await,
+        Some(false)
+    );
+    assert_eq!(
+        state
+            .installs()
+            .queued_install_succeeded("dependent-content")
+            .await,
+        Some(false)
+    );
+    assert!(state.instances().get(&instance.id).is_none());
+    let snapshot = state.installs().queue_snapshot().await;
+    assert!(snapshot.pending.is_empty());
+    assert_eq!(
+        snapshot
+            .active
+            .as_ref()
+            .map(|entry| entry.queue_id.as_str()),
+        Some("selected-queue")
+    );
+    assert!(
+        state
+            .installs()
+            .discard_active_queued_install("selected-queue")
+            .await
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn enqueue_settles_its_selected_item_after_an_older_head_start_failure() {
+    let root = temp_root("install-queue-enqueue-selected-settlement");
+    let state = build_test_state(&root);
+    let library_dir = root.join("library");
+    fs::create_dir_all(&library_dir).expect("create library");
+    state.set_library_dir_for_test(library_dir.to_string_lossy().to_string());
+    state
+        .installs()
+        .enqueue_queued_install(
+            "invalid-older-head".to_string(),
+            InstallQueueSpec::vanilla(String::new()),
+            InstallQueuePlacement::Back,
+        )
+        .await;
+    let producer = state
+        .try_claim_producer()
+        .expect("claim selected enqueue producer");
+    let update_admission = state
+        .try_admit_update_sensitive_operation()
+        .expect("admit selected enqueue");
+
+    let response = enqueue_install_with_placement(
+        &state,
+        InstallQueueRequest::Vanilla {
+            version_id: "1.21.5".to_string(),
+        },
+        InstallQueuePlacement::Back,
+        None,
+        None,
+        producer,
+        update_admission,
+    )
+    .await
+    .expect("older head failure does not strand the selected enqueue");
+
+    let install_id = response
+        .started_install
+        .expect("selected install starts")
+        .install_id;
+    let snapshot = state.installs().queue_snapshot().await;
+    assert!(
+        snapshot
+            .active
+            .as_ref()
+            .is_none_or(|entry| entry.queue_id != "invalid-older-head")
+    );
+    assert!(
+        snapshot
+            .pending
+            .iter()
+            .all(|entry| entry.queue_id != "invalid-older-head")
+    );
+    state.installs().emit(&install_id, failed_progress()).await;
+    wait_for_queue_empty(&state).await;
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
 async fn continuation_queue_removes_owned_selection_after_front_retry_budget() {
     let root = temp_root("install-queue-selected-front-injection");
     let state = build_test_state(&root);

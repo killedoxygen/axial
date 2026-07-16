@@ -17,9 +17,11 @@ pub mod target;
 use crate::application::instances::handle_create_instance_view;
 use crate::application::{
     InstallQueueContentActionRequest, InstallQueueContentSelection, InstallQueueRequest,
-    InstallQueueStateResponse, enqueue_install_owned, enqueue_install_with_dependency,
+    InstallQueueStateResponse, enqueue_install_owned, enqueue_install_with_dependency_admitted,
 };
-use crate::state::{AppState, InstanceLifecycleLease, ProducerLease, RequestProducerHandoff};
+use crate::state::{
+    AppState, InstanceLifecycleLease, ProducerLease, RequestProducerHandoff, UpdateOperationLease,
+};
 use axial_content::{
     CanonicalContent, CanonicalId, ContentDetail, ContentError, ContentKind, ContentManifest,
     ContentQuery, ContentVersion, ManifestEntry, Page, ProviderId, SortOrder, entry_file_present,
@@ -33,7 +35,7 @@ use std::path::Path;
 
 pub use compat::{CompatCandidate, CompatDrop};
 pub(crate) use pack::execute_modpack_install;
-pub(crate) use pack::queue_modpack_install_after;
+pub(crate) use pack::queue_modpack_install_after_admitted;
 pub(crate) use pack::validate_modpack_file_selection_ids;
 pub use pack::{
     ModpackFileOption, ModpackFilesPlan, ModpackInstallRequest, ModpackInstallResponse,
@@ -324,20 +326,22 @@ pub(crate) async fn queue_content_install(
     .await
 }
 
-pub(crate) async fn queue_content_install_with_cleanup_after(
+pub(crate) async fn queue_content_install_with_cleanup_after_admitted(
     state: &AppState,
     request: ContentInstallRequest,
     setup_cleanup: Option<crate::state::SetupInstanceCleanup>,
     prerequisite_queue_id: Option<String>,
     producer: ProducerLease,
+    update_admission: UpdateOperationLease,
 ) -> Result<InstallQueueStateResponse, ContentApiError> {
     let count = request.selections.len();
-    enqueue_install_with_dependency(
+    enqueue_install_with_dependency_admitted(
         state,
         content_install_queue_request(request, count),
         prerequisite_queue_id,
         setup_cleanup,
         producer,
+        update_admission,
     )
     .await
 }
@@ -712,7 +716,11 @@ pub(super) async fn project_titles(
 }
 
 pub fn content_error_response(error: ContentError) -> ContentApiError {
-    tracing::warn!(target: "content", error = %error, "content operation failed");
+    tracing::warn!(
+        target: "content",
+        error_kind = content_error_log_kind(&error),
+        "content operation failed"
+    );
     let (status, message) = match error {
         ContentError::Unavailable => (
             StatusCode::NOT_FOUND,
@@ -744,6 +752,20 @@ pub fn content_error_response(error: ContentError) -> ContentApiError {
         ),
     };
     json_error(status, message)
+}
+
+fn content_error_log_kind(error: &ContentError) -> &'static str {
+    match error {
+        ContentError::Request(_) => "provider_request",
+        ContentError::Parse(_) => "local_parse",
+        ContentError::ProviderMetadataInvalid(_) => "provider_metadata",
+        ContentError::Status { .. } => "provider_status",
+        ContentError::Io(_) => "file_operation",
+        ContentError::Download(_) => "content_download",
+        ContentError::DownloadPreparation(_) => "download_preparation",
+        ContentError::Unavailable => "content_unavailable",
+        ContentError::Invalid(_) => "invalid_request",
+    }
 }
 
 pub(crate) fn content_execution_error(error: ContentError) -> ContentExecutionError {
@@ -835,6 +857,16 @@ mod tests {
         assert!(present_installed_ids(&root, &manifest, &candidates).contains(&id));
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn content_error_logging_uses_only_a_closed_kind() {
+        let error = ContentError::ProviderMetadataInvalid(
+            "/private/provider/archive/modrinth.index.json".to_string(),
+        );
+
+        assert_eq!(content_error_log_kind(&error), "provider_metadata");
+        assert!(!content_error_log_kind(&error).contains('/'));
     }
 
     #[test]

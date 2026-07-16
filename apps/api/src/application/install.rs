@@ -1090,6 +1090,28 @@ pub(crate) async fn enqueue_install_with_dependency(
     setup_cleanup: Option<SetupInstanceCleanup>,
     producer: ProducerLease,
 ) -> Result<InstallQueueStateResponse, InstallApplicationError> {
+    let update_admission = state
+        .try_admit_update_sensitive_operation()
+        .map_err(install_update_admission_error_response)?;
+    enqueue_install_with_dependency_admitted(
+        state,
+        request,
+        prerequisite_queue_id,
+        setup_cleanup,
+        producer,
+        update_admission,
+    )
+    .await
+}
+
+pub(crate) async fn enqueue_install_with_dependency_admitted(
+    state: &AppState,
+    request: InstallQueueRequest,
+    prerequisite_queue_id: Option<String>,
+    setup_cleanup: Option<SetupInstanceCleanup>,
+    producer: ProducerLease,
+    update_admission: UpdateOperationLease,
+) -> Result<InstallQueueStateResponse, InstallApplicationError> {
     enqueue_install_with_placement(
         state,
         request,
@@ -1097,6 +1119,7 @@ pub(crate) async fn enqueue_install_with_dependency(
         prerequisite_queue_id,
         setup_cleanup,
         producer,
+        update_admission,
     )
     .await
 }
@@ -1106,10 +1129,14 @@ pub(crate) async fn enqueue_install_from_continuation(
     foreground: &IntegrityForegroundLease,
     request: InstallQueueRequest,
     producer: ProducerLease,
+    inherited_update_admission: Option<UpdateOperationLease>,
 ) -> Result<ContinuationInstallQueueResult, InstallApplicationError> {
-    let _update_admission = state
-        .try_admit_update_sensitive_operation()
-        .map_err(install_update_admission_error_response)?;
+    let _update_admission = match inherited_update_admission {
+        Some(update_admission) => update_admission,
+        None => state
+            .try_admit_update_sensitive_operation()
+            .map_err(install_update_admission_error_response)?,
+    };
     let selection =
         enqueue_install_request(state, request, InstallQueuePlacement::Back, None, None).await?;
     let selected_queue_id = install_queue_outcome_id(&selection.outcome).to_string();
@@ -1158,6 +1185,9 @@ pub(crate) async fn retry_install_owned(
     let producer = handoff
         .try_claim()
         .map_err(|_| install_shutdown_error_response())?;
+    let update_admission = state
+        .try_admit_update_sensitive_operation()
+        .map_err(install_update_admission_error_response)?;
     enqueue_install_with_placement(
         state,
         request,
@@ -1165,6 +1195,7 @@ pub(crate) async fn retry_install_owned(
         None,
         None,
         producer,
+        update_admission,
     )
     .await
 }
@@ -1340,9 +1371,18 @@ pub(crate) async fn remove_pristine_setup_instance(
     instance_id: &str,
     cleanup: &SetupInstanceCleanup,
 ) -> bool {
-    let Ok(_update_admission) = state.try_admit_update_sensitive_operation() else {
+    let Ok(update_admission) = state.try_admit_update_sensitive_operation() else {
         return false;
     };
+    remove_pristine_setup_instance_admitted(state, instance_id, cleanup, &update_admission).await
+}
+
+pub(crate) async fn remove_pristine_setup_instance_admitted(
+    state: &AppState,
+    instance_id: &str,
+    cleanup: &SetupInstanceCleanup,
+    _update_admission: &UpdateOperationLease,
+) -> bool {
     let Ok(foreground) = state.register_integrity_foreground() else {
         return false;
     };
@@ -1360,10 +1400,8 @@ async fn enqueue_install_with_placement(
     prerequisite_queue_id: Option<String>,
     setup_cleanup: Option<SetupInstanceCleanup>,
     producer: ProducerLease,
+    _update_admission: UpdateOperationLease,
 ) -> Result<InstallQueueStateResponse, InstallApplicationError> {
-    let _update_admission = state
-        .try_admit_update_sensitive_operation()
-        .map_err(install_update_admission_error_response)?;
     let selection = enqueue_install_request(
         state,
         request,
@@ -1372,7 +1410,27 @@ async fn enqueue_install_with_placement(
         setup_cleanup,
     )
     .await?;
-    let started = maybe_start_next_queued_install_owned(state, &producer).await?;
+    let selected_queue_id = install_queue_outcome_id(&selection.outcome).to_string();
+    let owns_selected_queue = matches!(
+        &selection.outcome,
+        InstallQueueEnqueueOutcome::Enqueued { .. }
+            | InstallQueueEnqueueOutcome::MovedToFront { .. }
+    );
+    let start_state = state.clone();
+    let started = maybe_start_selected_queued_install_owned_with(
+        state,
+        &selected_queue_id,
+        owns_selected_queue,
+        |spec| {
+            let state = start_state.clone();
+            let attempt_owner = producer.claim_child();
+            async move { start_queued_install(&state, &spec, &attempt_owner, None).await }
+        },
+    )
+    .await?;
+    if let Some(started) = started.as_ref() {
+        spawn_install_queue_monitor_owned(state.clone(), started.install_id.clone(), producer);
+    }
     Ok(install_queue_state_response(state, Some(selection.notice), started).await)
 }
 
@@ -1627,7 +1685,7 @@ where
     Start: FnOnce(AppState, InstallQueueSpec, ProducerLease) -> StartFuture,
     StartFuture: Future<Output = Result<InstallStartResponse, InstallApplicationError>>,
 {
-    let _update_admission = state
+    let update_admission = state
         .try_admit_update_sensitive_operation()
         .map_err(install_update_admission_error_response)?;
     let _queue_start = state.installs().acquire_queue_start_gate().await;
@@ -1635,29 +1693,7 @@ where
         let Some(entry) = state.installs().reserve_next_queued_install().await else {
             return Ok(None);
         };
-        let dependency = match &entry.spec {
-            InstallQueueSpec::Content {
-                prerequisite_queue_id,
-                ..
-            } => prerequisite_queue_id.as_deref(),
-            _ => None,
-        };
-        if let Some(dependency) = dependency
-            && state.installs().queued_install_succeeded(dependency).await != Some(true)
-        {
-            state
-                .installs()
-                .complete_reserved_queued_install(&entry.queue_id, false)
-                .await;
-            if let InstallQueueSpec::Content {
-                instance_id,
-                action,
-                ..
-            } = &entry.spec
-                && let Some(cleanup) = content_action_setup_cleanup(action)
-            {
-                let _ = remove_pristine_setup_instance(state, instance_id, cleanup).await;
-            }
+        if settle_unmet_queue_prerequisite(state, &entry, &update_admission).await {
             continue;
         }
         break entry;
@@ -1692,7 +1728,7 @@ where
     Start: FnMut(InstallQueueSpec) -> StartFuture,
     StartFuture: Future<Output = Result<InstallStartResponse, InstallApplicationError>>,
 {
-    let _update_admission = state
+    let update_admission = state
         .try_admit_update_sensitive_operation()
         .map_err(install_update_admission_error_response)?;
     let _queue_start = state.installs().acquire_queue_start_gate().await;
@@ -1701,6 +1737,12 @@ where
         let Some(entry) = state.installs().reserve_next_queued_install().await else {
             return selected_queue_residual(state, selected_queue_id, owns_selected_queue).await;
         };
+        if settle_unmet_queue_prerequisite(state, &entry, &update_admission).await {
+            if entry.queue_id == selected_queue_id {
+                return Err(selected_queue_missing_error_response());
+            }
+            continue;
+        }
         match start(entry.spec.clone()).await {
             Ok(started) => {
                 if !state
@@ -1715,7 +1757,7 @@ where
             Err(error) => {
                 state
                     .installs()
-                    .discard_active_queued_install(&entry.queue_id)
+                    .complete_reserved_queued_install(&entry.queue_id, false)
                     .await;
                 if entry.queue_id == selected_queue_id {
                     return Err(error);
@@ -1724,6 +1766,47 @@ where
         }
     }
     selected_queue_residual(state, selected_queue_id, owns_selected_queue).await
+}
+
+async fn settle_unmet_queue_prerequisite(
+    state: &AppState,
+    entry: &QueuedInstallEntry,
+    update_admission: &UpdateOperationLease,
+) -> bool {
+    let prerequisite = match &entry.spec {
+        InstallQueueSpec::Content {
+            prerequisite_queue_id,
+            ..
+        } => prerequisite_queue_id.as_deref(),
+        _ => None,
+    };
+    let Some(prerequisite) = prerequisite else {
+        return false;
+    };
+    if state
+        .installs()
+        .queued_install_succeeded(prerequisite)
+        .await
+        == Some(true)
+    {
+        return false;
+    }
+    state
+        .installs()
+        .complete_reserved_queued_install(&entry.queue_id, false)
+        .await;
+    if let InstallQueueSpec::Content {
+        instance_id,
+        action,
+        ..
+    } = &entry.spec
+        && let Some(cleanup) = content_action_setup_cleanup(action)
+    {
+        let _ =
+            remove_pristine_setup_instance_admitted(state, instance_id, cleanup, update_admission)
+                .await;
+    }
+    true
 }
 
 async fn selected_queue_residual(

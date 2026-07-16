@@ -33,7 +33,7 @@ use crate::observability::telemetry::TelemetryEvent;
 use crate::state::contracts::{CommandKind, OperationId, OperationStatus};
 use crate::state::{
     AppState, InstallQueueEnqueueOutcome, InstalledVersionsLookup, IntegrityForegroundLease,
-    ProducerLease, RequestProducerHandoff, new_instance,
+    ProducerLease, RequestProducerHandoff, UpdateOperationLease, new_instance,
 };
 use axial_config::{EnrichedInstance, Instance, generate_instance_id};
 use axial_launcher::{
@@ -440,6 +440,7 @@ pub(crate) async fn handle_create_instance_owned(
         payload,
         producer,
         true,
+        None,
         |state, foreground, producer, instance_id| async move {
             rebuild_registered_known_good(&state, &foreground, &producer, &instance_id).await
         },
@@ -452,6 +453,7 @@ async fn handle_create_instance_owned_with_rebuild<Rebuild, RebuildFuture>(
     payload: CreateInstanceRequest,
     producer: ProducerLease,
     seed_shared_files: bool,
+    inherited_update_admission: Option<UpdateOperationLease>,
     rebuild: Rebuild,
 ) -> Result<CreateInstanceResponse, (StatusCode, Json<serde_json::Value>)>
 where
@@ -509,6 +511,7 @@ where
                     &foreground,
                     request,
                     queue_owner.expect("queued create retains its install owner"),
+                    inherited_update_admission,
                 )
                 .await
                 {
@@ -943,12 +946,14 @@ pub(super) async fn handle_create_instance_from_continuation(
     payload: CreateInstanceRequest,
     seed_shared_files: bool,
     producer: ProducerLease,
+    update_admission: UpdateOperationLease,
 ) -> Result<CreateInstanceResponse, (StatusCode, Json<serde_json::Value>)> {
     handle_create_instance_owned_with_rebuild(
         state,
         payload,
         producer,
         seed_shared_files,
+        Some(update_admission),
         |state, foreground, producer, instance_id| async move {
             rebuild_registered_known_good(&state, &foreground, &producer, &instance_id).await
         },
@@ -976,7 +981,7 @@ where
         .producer_handoff()
         .try_claim()
         .expect("claim test create producer");
-    handle_create_instance_owned_with_rebuild(state, payload, producer, true, rebuild).await
+    handle_create_instance_owned_with_rebuild(state, payload, producer, true, None, rebuild).await
 }
 
 fn version_is_launch_ready_or_user_blocked(

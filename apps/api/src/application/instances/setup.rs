@@ -3,16 +3,18 @@ use super::create::{
 };
 use super::{CreateInstanceRequest, CreateInstanceResponse};
 use crate::application::content::{
-    ContentInstallRequest, PlanReason, TargetRef, queue_content_install_with_cleanup_after,
-    queue_modpack_install_after,
+    ContentInstallRequest, PlanReason, TargetRef,
+    queue_content_install_with_cleanup_after_admitted, queue_modpack_install_after_admitted,
 };
 use crate::application::{ContentPlanRequest, ResolutionPlan, content_plan};
 use crate::application::{ModpackInstallRequest, modpack_target};
 use crate::state::{
     AppState, RequestProducerHandoff, SETUP_PLAN_TTL, SetupPlanInsertError, SetupPlanTake,
+    UpdateOperationAdmissionError, UpdateOperationLease,
 };
 use axum::{Json, http::StatusCode};
 use serde::{Deserialize, Serialize};
+use std::future::Future;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -156,47 +158,60 @@ pub async fn execute_instance_setup(
     }
 
     request.create.selection_id = stored.selection_id;
-    let mut created = handle_create_instance_from_continuation(
+    execute_setup_mutation_owned(
         state,
-        request.create,
-        true,
-        producer.claim_child(),
-    )
-    .await?;
-    let instance_id = created.instance.id.clone();
-    let setup_cleanup =
-        crate::application::install::setup_instance_cleanup(state, &created.instance, true);
-    let prerequisite_queue_id = created
-        .queued_install
-        .as_ref()
-        .and_then(|queued| queued.queue_id.clone());
-    match queue_content_install_with_cleanup_after(
-        state,
-        ContentInstallRequest {
-            instance_id: instance_id.clone(),
-            selections: stored.request.selections,
-            allow_incompatible: false,
-        },
-        Some(setup_cleanup.clone()),
-        prerequisite_queue_id,
         producer,
+        move |state, producer, update_admission| async move {
+            let mut created = handle_create_instance_from_continuation(
+                &state,
+                request.create,
+                true,
+                producer.claim_child(),
+                update_admission.clone(),
+            )
+            .await?;
+            let instance_id = created.instance.id.clone();
+            let setup_cleanup = crate::application::install::setup_instance_cleanup(
+                &state,
+                &created.instance,
+                true,
+            );
+            let prerequisite_queue_id = created
+                .queued_install
+                .as_ref()
+                .and_then(|queued| queued.queue_id.clone());
+            match queue_content_install_with_cleanup_after_admitted(
+                &state,
+                ContentInstallRequest {
+                    instance_id: instance_id.clone(),
+                    selections: stored.request.selections,
+                    allow_incompatible: false,
+                },
+                Some(setup_cleanup.clone()),
+                prerequisite_queue_id,
+                producer,
+                update_admission.clone(),
+            )
+            .await
+            {
+                Ok(queue) => {
+                    created.install_queue = Some(queue);
+                    Ok(created)
+                }
+                Err(error) => {
+                    let _ = crate::application::install::remove_pristine_setup_instance_admitted(
+                        &state,
+                        &instance_id,
+                        &setup_cleanup,
+                        &update_admission,
+                    )
+                    .await;
+                    Err(error)
+                }
+            }
+        },
     )
     .await
-    {
-        Ok(queue) => {
-            created.install_queue = Some(queue);
-            Ok(created)
-        }
-        Err(error) => {
-            let _ = crate::application::install::remove_pristine_setup_instance(
-                state,
-                &instance_id,
-                &setup_cleanup,
-            )
-            .await;
-            Err(error)
-        }
-    }
 }
 
 pub async fn execute_modpack_instance_setup(
@@ -219,49 +234,87 @@ pub async fn execute_modpack_instance_setup(
         ));
     }
     request.create.selection_id = target.selection_id;
-    let mut created = handle_create_instance_from_continuation(
+    execute_setup_mutation_owned(
         state,
-        request.create,
-        false,
-        producer.claim_child(),
-    )
-    .await?;
-    let instance_id = created.instance.id.clone();
-    let setup_cleanup =
-        crate::application::install::setup_instance_cleanup(state, &created.instance, false);
-    let prerequisite_queue_id = created
-        .queued_install
-        .as_ref()
-        .and_then(|queued| queued.queue_id.clone());
-    let queued = queue_modpack_install_after(
-        state,
-        ModpackInstallRequest {
-            instance_id: instance_id.clone(),
-            canonical_id: target.canonical_id.as_str().to_string(),
-            version_id: Some(target.version_id),
-            selected_file_ids: Vec::new(),
-            include_overrides: true,
-        },
-        prerequisite_queue_id,
-        Some(setup_cleanup.clone()),
         producer,
-    )
-    .await;
-    match queued {
-        Ok(queue) => {
-            created.install_queue = Some(queue);
-            Ok(created)
-        }
-        Err(error) => {
-            let _ = crate::application::install::remove_pristine_setup_instance(
-                state,
-                &instance_id,
-                &setup_cleanup,
+        move |state, producer, update_admission| async move {
+            let mut created = handle_create_instance_from_continuation(
+                &state,
+                request.create,
+                false,
+                producer.claim_child(),
+                update_admission.clone(),
+            )
+            .await?;
+            let instance_id = created.instance.id.clone();
+            let setup_cleanup = crate::application::install::setup_instance_cleanup(
+                &state,
+                &created.instance,
+                false,
+            );
+            let prerequisite_queue_id = created
+                .queued_install
+                .as_ref()
+                .and_then(|queued| queued.queue_id.clone());
+            let queued = queue_modpack_install_after_admitted(
+                &state,
+                ModpackInstallRequest {
+                    instance_id: instance_id.clone(),
+                    canonical_id: target.canonical_id.as_str().to_string(),
+                    version_id: Some(target.version_id),
+                    selected_file_ids: Vec::new(),
+                    include_overrides: true,
+                },
+                prerequisite_queue_id,
+                Some(setup_cleanup.clone()),
+                producer,
+                update_admission.clone(),
             )
             .await;
-            Err(error)
-        }
-    }
+            match queued {
+                Ok(queue) => {
+                    created.install_queue = Some(queue);
+                    Ok(created)
+                }
+                Err(error) => {
+                    let _ = crate::application::install::remove_pristine_setup_instance_admitted(
+                        &state,
+                        &instance_id,
+                        &setup_cleanup,
+                        &update_admission,
+                    )
+                    .await;
+                    Err(error)
+                }
+            }
+        },
+    )
+    .await
+}
+
+pub(super) async fn execute_setup_mutation_owned<T, Mutation, MutationFuture>(
+    state: &AppState,
+    producer: crate::state::ProducerLease,
+    mutation: Mutation,
+) -> Result<T, ApiError>
+where
+    T: Send + 'static,
+    Mutation: FnOnce(AppState, crate::state::ProducerLease, UpdateOperationLease) -> MutationFuture
+        + Send
+        + 'static,
+    MutationFuture: Future<Output = Result<T, ApiError>> + Send + 'static,
+{
+    let transaction_state = state.clone();
+    let transaction_owner = producer.claim_child();
+    transaction_owner
+        .spawn_joinable(async move {
+            let update_admission = transaction_state
+                .try_admit_update_sensitive_operation()
+                .map_err(setup_update_admission_error_response)?;
+            mutation(transaction_state, producer, update_admission).await
+        })
+        .await
+        .map_err(|_| setup_internal_error_response())?
 }
 
 fn plan_fingerprint(
@@ -385,6 +438,30 @@ fn shutdown() -> ApiError {
         StatusCode::SERVICE_UNAVAILABLE,
         Json(serde_json::json!({
             "error": "application shutdown is in progress"
+        })),
+    )
+}
+
+fn setup_update_admission_error_response(error: UpdateOperationAdmissionError) -> ApiError {
+    let message = match error {
+        UpdateOperationAdmissionError::ApplyInProgress => {
+            "Setup is unavailable while an update is being applied."
+        }
+        UpdateOperationAdmissionError::RestartPending => {
+            "Restart Axial to finish the applied update before creating an instance."
+        }
+    };
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(serde_json::json!({ "error": message })),
+    )
+}
+
+fn setup_internal_error_response() -> ApiError {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(serde_json::json!({
+            "error": "Instance setup stopped before the transaction settled. Try again."
         })),
     )
 }

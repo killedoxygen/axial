@@ -76,7 +76,7 @@ pub(crate) use content::{
 pub use flags::{
     FlagOverridePatch, FlagSource, FlagViewModel, FlagsResponse, list_flags, update_flag,
 };
-pub(crate) use install::enqueue_install_with_dependency;
+pub(crate) use install::enqueue_install_with_dependency_admitted;
 pub use install::{
     InstallApplicationError, InstallProgressStepViewModel, InstallProgressViewModel,
     InstallQueueContentActionRequest, InstallQueueContentItemViewModel,
