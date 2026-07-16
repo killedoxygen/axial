@@ -2690,6 +2690,7 @@ impl AppState {
             .await
             .ok_or(ReconciliationEvidenceRejection::ActiveSession)?;
         let predecessor = self.active_component_rebuild_failure(&lifecycle)?;
+        self.refuse_active_whole_instance_window(instance_id, chrono::Utc::now().fixed_offset())?;
         let eligibility = RegisteredWholeInstanceRematerializationEligibility {
             instance_id: instance_id.to_string(),
             predecessor: predecessor.terminal,
@@ -2789,7 +2790,7 @@ impl AppState {
         if !adjacent_whole_instance_attempts_match(prior.attempt(), &attempt) {
             return Err(ReconciliationEvidenceRejection::NonAdjacentRung);
         }
-        self.refuse_active_whole_instance_window(&attempt, observed_at)?;
+        self.refuse_active_whole_instance_window(&authorization.instance_id, observed_at)?;
         Ok(RegisteredWholeInstanceRematerializationAdmission {
             state: self.clone(),
             attempt,
@@ -3491,10 +3492,9 @@ impl AppState {
 
     fn refuse_active_whole_instance_window(
         &self,
-        attempt: &ReconciliationAttempt,
+        instance_id: &str,
         observed_at: chrono::DateTime<chrono::FixedOffset>,
     ) -> Result<(), ReconciliationEvidenceRejection> {
-        let ReconciliationScope::RegisteredInstance { instance_id, .. } = attempt.scope();
         for journal in self.journals.list() {
             let Some(terminal) = journal.reconciliation_terminal() else {
                 continue;
@@ -7929,6 +7929,15 @@ mod tests {
                 outcome.status(),
                 crate::guardian::GuardianWholeInstanceRematerializationStatus::Rematerialized
             );
+            assert_eq!(
+                fixture
+                    .state
+                    .whole_instance_rematerialization_eligibility(INSTANCE_ID)
+                    .await
+                    .err(),
+                Some(ReconciliationEvidenceRejection::SuppressedPriorAttempt),
+                "the current rung-three window must close eligibility before policy assessment"
+            );
             assert!(outcome.into_restore_offer().is_some());
             assert_eq!(fs::read(options_path).expect("read exact options"), exact);
             let snapshot = serde_json::from_slice::<serde_json::Value>(
@@ -8322,15 +8331,10 @@ mod tests {
         .await
         .expect("persist forged memory parity");
         drop(reservation);
-        let offer = whole_instance_offer(&fixture, GuardianMode::Managed).await;
         assert_eq!(
             fixture
                 .state
-                .admit_whole_instance_rematerialization(
-                    offer.into_authorization(),
-                    OperationId::new("whole-instance-after-forged-terminal"),
-                    chrono::Duration::minutes(30),
-                )
+                .whole_instance_rematerialization_eligibility(INSTANCE_ID)
                 .await
                 .err(),
             Some(ReconciliationEvidenceRejection::JournalMismatch)

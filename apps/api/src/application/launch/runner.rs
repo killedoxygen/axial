@@ -2798,7 +2798,19 @@ mod tests {
         .expect("create managed-root unknown-owned sentinel parent");
         fs::write(&managed_root_unknown, b"unknown-owned").expect("write unknown-owned sentinel");
         user_owned.push((managed_root_unknown, b"unknown-owned".to_vec()));
-        tamper_every_managed_inventory_entry(&state, &active_inventory);
+        let corruption = tamper_every_managed_inventory_entry(&state, &active_inventory);
+        assert!(
+            !corruption.deleted.exists(),
+            "one managed entry must remain deleted when sensing begins"
+        );
+        assert!(
+            corruption.replaced.is_file(),
+            "one managed entry must be removed and recreated"
+        );
+        assert!(
+            corruption.tampered.is_file(),
+            "one separate managed entry must be mutated in place"
+        );
 
         let foreground = state
             .register_integrity_foreground()
@@ -3117,29 +3129,22 @@ mod tests {
                 .and_then(|memory| memory.reconciliation_terminal().cloned()),
             Some(reloaded_terminal)
         );
-        let second_eligibility = restarted_state
-            .whole_instance_rematerialization_eligibility(instance_id)
-            .await
-            .expect("reloaded failed R2 remains a legitimate R3 predecessor");
-        let GuardianWholeInstanceRematerializationDisposition::Offered(second_offer) =
-            assess_whole_instance_rematerialization(second_eligibility, GuardianMode::Managed)
-                .expect("reloaded failed R2 assessment")
-        else {
-            panic!("reloaded Managed predecessor must remain offerable");
-        };
-        let second_r3_operation_id = OperationId::new("mass-tamper-r3-second");
         assert_eq!(
             restarted_state
-                .admit_whole_instance_rematerialization(
-                    second_offer.into_authorization(),
-                    second_r3_operation_id.clone(),
-                    chrono::Duration::minutes(30),
-                )
+                .whole_instance_rematerialization_eligibility(instance_id)
                 .await
                 .err(),
             Some(ReconciliationEvidenceRejection::SuppressedPriorAttempt)
         );
-        assert!(restarted_journals.get(&second_r3_operation_id).is_none());
+        assert_eq!(
+            restarted_journals
+                .list()
+                .into_iter()
+                .filter(|journal| journal.reconciliation_attempt().is_some())
+                .count(),
+            3,
+            "reloaded suppression must not mint or admit another rung-three attempt"
+        );
 
         restarted_journals
             .close()
@@ -5441,10 +5446,22 @@ exit 0
         format!("http://{address}/java")
     }
 
-    fn tamper_every_managed_inventory_entry(state: &AppState, inventory: &KnownGoodInventory) {
+    struct MassTamperCorruption {
+        deleted: PathBuf,
+        replaced: PathBuf,
+        tampered: PathBuf,
+    }
+
+    fn tamper_every_managed_inventory_entry(
+        state: &AppState,
+        inventory: &KnownGoodInventory,
+    ) -> MassTamperCorruption {
         let library_root = PathBuf::from(state.library_dir().expect("mass-tamper managed root"));
         let mut directories = Vec::new();
         let mut paths = std::collections::BTreeSet::new();
+        let mut deleted = None;
+        let mut replaced = None;
+        let mut tampered = None;
         for entry in inventory.entries() {
             let physical =
                 known_good_entry_path(&library_root, state.managed_runtime_cache(), entry);
@@ -5459,8 +5476,38 @@ exit 0
                 | KnownGoodIntegrity::ExactBytes { size, .. } => {
                     fs::create_dir_all(path.parent().expect("managed entry parent"))
                         .expect("seed managed entry parent");
-                    fs::write(&path, vec![0xa5; (*size).max(1) as usize])
-                        .expect("tamper managed file");
+                    let wrong_size = (*size).max(1) as usize;
+                    match entry.kind() {
+                        KnownGoodArtifactKind::Library if deleted.is_none() => {
+                            fs::write(&path, vec![0x3c; wrong_size])
+                                .expect("seed managed file before deletion");
+                            fs::remove_file(&path).expect("delete managed file");
+                            deleted = Some(path);
+                        }
+                        KnownGoodArtifactKind::VersionMetadata if replaced.is_none() => {
+                            fs::write(&path, vec![0x3c; wrong_size])
+                                .expect("seed managed file before identity replacement");
+                            fs::remove_file(&path).expect("remove managed file before replacement");
+                            fs::write(&path, vec![0xa5; wrong_size])
+                                .expect("replace managed file with a new identity");
+                            replaced = Some(path);
+                        }
+                        KnownGoodArtifactKind::ClientJar if tampered.is_none() => {
+                            fs::write(&path, vec![0x3c; wrong_size])
+                                .expect("seed managed file before in-place tampering");
+                            let mut file = fs::OpenOptions::new()
+                                .write(true)
+                                .truncate(true)
+                                .open(&path)
+                                .expect("open managed file for in-place tampering");
+                            file.write_all(&vec![0x5a; wrong_size])
+                                .expect("tamper existing managed file");
+                            tampered = Some(path);
+                        }
+                        _ => {
+                            fs::write(&path, vec![0xa5; wrong_size]).expect("tamper managed file");
+                        }
+                    }
                 }
                 KnownGoodIntegrity::LinkTarget(_) => {
                     fs::create_dir_all(path.parent().expect("managed link parent"))
@@ -5476,11 +5523,35 @@ exit 0
             }
             fs::write(&path, b"not-a-managed-directory").expect("tamper managed directory");
         }
+        let corruption = MassTamperCorruption {
+            deleted: deleted.expect("mass-tamper inventory must contain a managed Library"),
+            replaced: replaced.expect("mass-tamper inventory must contain VersionMetadata"),
+            tampered: tampered.expect("mass-tamper inventory must contain a ClientJar"),
+        };
+        assert_eq!(
+            std::collections::BTreeSet::from([
+                corruption.deleted.as_path(),
+                corruption.replaced.as_path(),
+                corruption.tampered.as_path(),
+            ])
+            .len(),
+            3,
+            "delete, replace, and tamper must target distinct managed entries"
+        );
         assert_eq!(paths.len(), inventory.entries().len());
         for entry in inventory.entries() {
             let physical =
                 known_good_entry_path(&library_root, state.managed_runtime_cache(), entry);
             let path = physical.root().join(physical.relative());
+            if path == corruption.deleted {
+                assert_eq!(
+                    fs::symlink_metadata(&path)
+                        .expect_err("deleted managed entry must remain absent")
+                        .kind(),
+                    std::io::ErrorKind::NotFound
+                );
+                continue;
+            }
             let metadata = fs::symlink_metadata(&path).expect("tampered managed entry metadata");
             match entry.integrity() {
                 KnownGoodIntegrity::Sha1 { digest, .. }
@@ -5495,6 +5566,7 @@ exit 0
                 KnownGoodIntegrity::LinkTarget(_) => assert!(!metadata.file_type().is_symlink()),
             }
         }
+        corruption
     }
 
     fn registered_artifact_repair_decision(
