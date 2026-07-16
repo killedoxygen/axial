@@ -394,6 +394,14 @@ async fn recover_entry_owned(
 }
 
 impl ManagedCompositionAdmission {
+    pub(crate) async fn composition_managed_witness_proofs(
+        &self,
+    ) -> Result<Vec<axial_performance::ManagedArtifactWitnessProof>, ManagedMutationError> {
+        self.authority
+            .composition_managed_witness_proofs(&self.entry.identity)
+            .await
+    }
+
     pub(crate) async fn inspect(
         &self,
         plan: Option<&CompositionPlan>,

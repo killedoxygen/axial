@@ -112,6 +112,7 @@ pub(crate) use integrity::{
 pub use jvm_preset::{
     GuardianJvmPresetId, GuardianJvmPresetResolution, normalize_create_jvm_preset,
 };
+pub(crate) use launch_decision::user_mod_set_drift_fact;
 pub use launch_decision::{
     GuardianLaunchFailureOutcome, GuardianObservedLaunchFailurePhase,
     GuardianPrepareFailureRequest, GuardianPresetAdjustmentRequest,

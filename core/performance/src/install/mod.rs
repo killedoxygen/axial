@@ -15,7 +15,7 @@ pub use manager::{
 };
 pub use model::{InstallError, PERFORMANCE_RULES_URL_ENV, RulesRefreshError, VerifiedRemoteRules};
 pub use mutation::{
-    ManagedCompositionInspection, ManagedIndeterminate, ManagedMutationError,
-    ManagedResolvedInspection,
+    ManagedArtifactWitnessProof, ManagedCompositionInspection, ManagedIndeterminate,
+    ManagedMutationError, ManagedResolvedInspection,
 };
 pub use rules_refresh::remote_rules_refresh_warning;

@@ -1350,7 +1350,7 @@ pub(super) const DIAGNOSIS_RULES: &[DiagnosisRule] = &[
     full_rule!(
         MissingDependency,
         triggers: [MissingDependency],
-        evidence: [ProcessExitedBeforeBoot, MissingDependency],
+        evidence: [ProcessExitedBeforeBoot, MissingDependency, UserModSetDrift],
         phases: &[OperationPhase::Launching],
         required: &[
             GuardianFactId::LaunchFailureClassified,
@@ -1367,7 +1367,11 @@ pub(super) const DIAGNOSIS_RULES: &[DiagnosisRule] = &[
     full_rule!(
         ModTransformationFailure,
         triggers: [ModTransformationFailure],
-        evidence: [ProcessExitedBeforeBoot, ModTransformationFailure],
+        evidence: [
+            ProcessExitedBeforeBoot,
+            ModTransformationFailure,
+            UserModSetDrift,
+        ],
         phases: &[OperationPhase::Launching],
         required: &[
             GuardianFactId::LaunchFailureClassified,
@@ -1384,7 +1388,7 @@ pub(super) const DIAGNOSIS_RULES: &[DiagnosisRule] = &[
     full_rule!(
         ModAttributedCrash,
         triggers: [ModAttributedCrash],
-        evidence: [ProcessExitedBeforeBoot, ModAttributedCrash],
+        evidence: [ProcessExitedBeforeBoot, ModAttributedCrash, UserModSetDrift],
         phases: &[OperationPhase::Launching],
         required: &[
             GuardianFactId::LaunchFailureClassified,
@@ -1401,7 +1405,11 @@ pub(super) const DIAGNOSIS_RULES: &[DiagnosisRule] = &[
     full_rule!(
         ClasspathModuleConflict,
         triggers: [ClasspathModuleConflict],
-        evidence: [ProcessExitedBeforeBoot, ClasspathModuleConflict],
+        evidence: [
+            ProcessExitedBeforeBoot,
+            ClasspathModuleConflict,
+            UserModSetDrift,
+        ],
         phases: &[OperationPhase::Launching],
         required: &[
             GuardianFactId::LaunchFailureClassified,
@@ -1435,7 +1443,11 @@ pub(super) const DIAGNOSIS_RULES: &[DiagnosisRule] = &[
     full_rule!(
         LoaderBootstrapFailure,
         triggers: [LoaderBootstrapFailure],
-        evidence: [ProcessExitedBeforeBoot, LoaderBootstrapFailure],
+        evidence: [
+            ProcessExitedBeforeBoot,
+            LoaderBootstrapFailure,
+            UserModSetDrift,
+        ],
         phases: &[OperationPhase::Launching],
         required: &[
             GuardianFactId::LaunchFailureClassified,

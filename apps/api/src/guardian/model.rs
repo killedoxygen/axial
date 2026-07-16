@@ -140,13 +140,14 @@ pub enum GuardianFactId {
     TempFileObserved,
     TempFileWriteFailed,
     UnknownLaunchFailure,
+    UserModSetDrift,
     VersionJsonMissing,
     WatchdogActionObserved,
     WatchdogKilledProcess,
 }
 
 impl GuardianFactId {
-    pub const ALL: [Self; 124] = [
+    pub const ALL: [Self; 125] = [
         Self::AgentHookFailed,
         Self::AgentUnavailable,
         Self::ArtifactChecksumMismatch,
@@ -268,6 +269,7 @@ impl GuardianFactId {
         Self::TempFileObserved,
         Self::TempFileWriteFailed,
         Self::UnknownLaunchFailure,
+        Self::UserModSetDrift,
         Self::VersionJsonMissing,
         Self::WatchdogActionObserved,
         Self::WatchdogKilledProcess,
@@ -402,6 +404,7 @@ impl GuardianFactId {
             Self::TempFileObserved => "temp_file_observed",
             Self::TempFileWriteFailed => "temp_file_write_failed",
             Self::UnknownLaunchFailure => "unknown_launch_failure",
+            Self::UserModSetDrift => "user_mod_set_drift",
             Self::VersionJsonMissing => "version_json_missing",
             Self::WatchdogActionObserved => "watchdog_action_observed",
             Self::WatchdogKilledProcess => "watchdog_killed_process",

@@ -1207,6 +1207,33 @@ async fn authority_inspection_classifies_invalid_admitted_state_as_definite() {
 }
 
 #[tokio::test]
+async fn authority_projects_only_digest_bound_managed_witness_proofs() {
+    let instances_root = test_root("authority-managed-witness-proofs");
+    let instance_id = "0123456789abcdef";
+    let mods_dir = instances_root.join(instance_id).join("mods");
+    fs::create_dir_all(&mods_dir).expect("create instance mods directory");
+    let installed = test_mod("sodium", "managed.jar");
+    let expected_sha512 = installed.integrity.sha512.clone();
+    save_state(&mods_dir, &test_state("core", vec![installed])).expect("save managed state");
+    let manager = Arc::new(PerformanceManager::new().expect("performance manager"));
+    let authority = manager
+        .claim_managed_authority(&instances_root)
+        .expect("claim managed authority");
+    let identity = authority.identify(instance_id).expect("identify instance");
+
+    let proofs = authority
+        .composition_managed_witness_proofs(&identity)
+        .await
+        .expect("read managed witness proofs");
+
+    assert_eq!(proofs.len(), 1);
+    assert!(proofs[0].matches_observation("managed.jar", &expected_sha512));
+    assert!(!proofs[0].matches_observation("renamed.jar", &expected_sha512));
+    assert!(!proofs[0].matches_observation("managed.jar", &"0".repeat(128)));
+    let _ = fs::remove_dir_all(instances_root);
+}
+
+#[tokio::test]
 async fn authority_recovery_removes_only_exact_managed_download_duplicate() {
     let instances_root = test_root("authority-recover-download-duplicate");
     let instance_id = "0123456789abcdef";

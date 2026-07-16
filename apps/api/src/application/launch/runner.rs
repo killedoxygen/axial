@@ -26,7 +26,7 @@ use crate::guardian::{
     guardian_prelaunch_preset_adjustment_directive, guardian_prepare_failure_outcome,
     guardian_startup_failure_outcome, guardian_summary_with_artifact_repair_outcome,
     guardian_summary_with_blocked_outcome, guardian_summary_with_observed_outcome,
-    is_guardian_launch_crash_class, record_launch_failure_observation,
+    is_guardian_launch_crash_class, record_launch_failure_observation, user_mod_set_drift_fact,
 };
 use crate::logging::{append_trace, timestamp_utc};
 use crate::observability::telemetry::{
@@ -1220,6 +1220,14 @@ async fn launch_session_inner_with_control(
                 {
                     tracing::warn!(?stage, "launch metadata persistence failed");
                 }
+                drop(spawn_successful_user_mod_witness_publication(
+                    &state,
+                    producer,
+                    integrity_foreground.as_ref().expect(
+                        "successful launch must retain foreground through witness publication",
+                    ),
+                    &intent.instance_id,
+                ));
                 return Ok(LaunchSuccess {
                     session_id: session_id.clone(),
                     instance_id: intent.instance_id.clone(),
@@ -1255,7 +1263,7 @@ async fn launch_session_inner_with_control(
                 } else {
                     GuardianStartupFailureObservation::Exited { failure_class }
                 };
-                let integrity = if registered_recovery_process_retry_used {
+                let mut integrity = if registered_recovery_process_retry_used {
                     StartupFailureIntegrity::default()
                 } else {
                     sense_startup_failure_integrity(
@@ -1269,6 +1277,18 @@ async fn launch_session_inner_with_control(
                     )
                     .await
                 };
+                if let Some(fact) = sense_user_mod_witness_drift_after_failure(
+                    &state,
+                    integrity_foreground
+                        .as_ref()
+                        .expect("preboot launch must retain foreground authority"),
+                    &intent.instance_id,
+                    failure_class,
+                )
+                .await
+                {
+                    integrity.facts.push(fact);
+                }
                 control.record_startup_integrity(&integrity);
                 let guardian_mode = api_guardian_mode(intent.guardian.mode);
                 let startup_outcome = {
@@ -1910,6 +1930,58 @@ fn failure_class_needs_tier1_integrity(failure_class: LaunchFailureClass) -> boo
     )
 }
 
+fn failure_class_needs_user_mod_witness(failure_class: LaunchFailureClass) -> bool {
+    matches!(
+        failure_class,
+        LaunchFailureClass::MissingDependency
+            | LaunchFailureClass::ModTransformationFailure
+            | LaunchFailureClass::ModAttributedCrash
+            | LaunchFailureClass::ClasspathModuleConflict
+            | LaunchFailureClass::LoaderBootstrapFailure
+    )
+}
+
+fn spawn_successful_user_mod_witness_publication(
+    state: &AppState,
+    producer: &crate::state::ProducerLease,
+    foreground: &crate::state::IntegrityForegroundLease,
+    instance_id: &str,
+) -> tokio::sync::oneshot::Receiver<()> {
+    let witness_state = state.clone();
+    let witness_foreground = foreground.retained();
+    let witness_instance_id = instance_id.to_string();
+    let (completed_tx, completed_rx) = tokio::sync::oneshot::channel();
+    producer.spawn_child(async move {
+        if witness_state
+            .publish_successful_user_mod_witness(&witness_foreground, &witness_instance_id)
+            .await
+            .is_err()
+        {
+            tracing::warn!(
+                instance_id = witness_instance_id,
+                "successful launch user mod witness publication was unavailable"
+            );
+        }
+        let _ = completed_tx.send(());
+    });
+    completed_rx
+}
+
+async fn sense_user_mod_witness_drift_after_failure(
+    state: &AppState,
+    foreground: &crate::state::IntegrityForegroundLease,
+    instance_id: &str,
+    failure_class: LaunchFailureClass,
+) -> Option<GuardianFact> {
+    if !failure_class_needs_user_mod_witness(failure_class) {
+        return None;
+    }
+    state
+        .user_mod_witness_drifted_after_failure(foreground, instance_id)
+        .await
+        .then(user_mod_set_drift_fact)
+}
+
 #[derive(Default)]
 struct StartupFailureIntegrity {
     facts: Vec<GuardianFact>,
@@ -2069,6 +2141,139 @@ mod tests {
                 failure_class.as_str()
             );
         }
+    }
+
+    #[test]
+    fn user_mod_witness_has_an_exhaustive_closed_failure_class_trigger() {
+        for &failure_class in LaunchFailureClass::ALL {
+            assert_eq!(
+                failure_class_needs_user_mod_witness(failure_class),
+                matches!(
+                    failure_class,
+                    LaunchFailureClass::MissingDependency
+                        | LaunchFailureClass::ModTransformationFailure
+                        | LaunchFailureClass::ModAttributedCrash
+                        | LaunchFailureClass::ClasspathModuleConflict
+                        | LaunchFailureClass::LoaderBootstrapFailure
+                ),
+                "unexpected user mod witness admission for {}",
+                failure_class.as_str()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn production_user_mod_witness_path_is_mode_orthogonal_and_condition_only() {
+        fn outcome(
+            mode: GuardianMode,
+            integrity_facts: &[GuardianFact],
+        ) -> crate::guardian::GuardianLaunchFailureOutcome {
+            guardian_startup_failure_outcome(GuardianStartupFailureRequest {
+                mode,
+                observation: GuardianStartupFailureObservation::Exited {
+                    failure_class: LaunchFailureClass::MissingDependency,
+                },
+                crash_evidence: None,
+                integrity_facts,
+                registered_artifact_repair_candidate: None,
+                target_version_id: "1.21.1",
+                runtime_major: 21,
+                requested_java_present: false,
+                explicit_java_override_present: false,
+                explicit_jvm_args_present: false,
+                explicit_jvm_preset_present: false,
+                startup_recovery_applied: false,
+                disable_custom_gc: false,
+                effective_preset: "performance",
+            })
+        }
+
+        let root = unique_test_dir("production-user-mod-witness");
+        let state = test_app_state(&root);
+        let instance = state
+            .instances()
+            .insert_for_test("User mod witness", "1.21.1")
+            .expect("insert witness instance");
+        let instance_mode = instance.performance_mode.clone();
+        let mods_dir = state.instances().game_dir(&instance.id).join("mods");
+        fs::create_dir_all(&mods_dir).expect("create witness mods root");
+        fs::write(mods_dir.join("user.jar"), b"baseline").expect("write baseline user mod");
+        let producer = state.try_claim_producer().expect("claim witness producer");
+        let publication_foreground = state
+            .register_integrity_foreground()
+            .expect("register publication foreground")
+            .wait_for_settlement()
+            .await;
+        let publication = spawn_successful_user_mod_witness_publication(
+            &state,
+            &producer,
+            &publication_foreground,
+            &instance.id,
+        );
+        drop(publication_foreground);
+        tokio::time::timeout(Duration::from_secs(2), publication)
+            .await
+            .expect("producer-owned publication deadline")
+            .expect("producer-owned publication completed");
+
+        fs::write(mods_dir.join("added.jar"), b"added").expect("add drifted user mod");
+        let comparison_foreground = state
+            .register_integrity_foreground()
+            .expect("register comparison foreground")
+            .wait_for_settlement()
+            .await;
+        assert!(
+            sense_user_mod_witness_drift_after_failure(
+                &state,
+                &comparison_foreground,
+                &instance.id,
+                LaunchFailureClass::OutOfMemory,
+            )
+            .await
+            .is_none(),
+            "ineligible preboot failure must omit the witness"
+        );
+        let drift_fact = sense_user_mod_witness_drift_after_failure(
+            &state,
+            &comparison_foreground,
+            &instance.id,
+            LaunchFailureClass::MissingDependency,
+        )
+        .await
+        .expect("eligible preboot failure compares the successful baseline");
+
+        for &mode in GuardianMode::ALL {
+            let baseline = outcome(mode, &[]);
+            let with_drift = outcome(mode, std::slice::from_ref(&drift_fact));
+            assert_eq!(baseline.guardian_decision, with_drift.guardian_decision);
+            assert_eq!(baseline.directive, with_drift.directive);
+            assert!(with_drift.user_outcome.details().contains(
+                &"The active mods changed since the last successful launch.".to_string()
+            ));
+            assert!(
+                with_drift
+                    .user_outcome
+                    .details()
+                    .iter()
+                    .all(|line| !line.contains("added.jar"))
+            );
+        }
+        assert_eq!(
+            state
+                .instances()
+                .get(&instance.id)
+                .map(|current| current.performance_mode),
+            Some(instance_mode),
+            "the witness must not consult or rewrite instance performance mode"
+        );
+
+        drop(comparison_foreground);
+        drop(producer);
+        tokio::time::timeout(Duration::from_secs(5), state.shutdown())
+            .await
+            .expect("witness shutdown deadline")
+            .expect("witness shutdown settles");
+        let _ = fs::remove_dir_all(root);
     }
 
     #[tokio::test]

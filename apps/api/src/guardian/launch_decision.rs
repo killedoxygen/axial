@@ -4,6 +4,7 @@ use super::{
     GuardianPolicyContext, GuardianStripJvmArgsReason, GuardianUserOutcome, SafetyCase,
     author_guardian_copy, build_safety_case, decide_guardian_policy,
 };
+use crate::observability::{EvidenceField, EvidenceSensitivity};
 use crate::state::RegisteredArtifactRepairCandidate;
 use crate::state::contracts::{
     OperationPhase, OwnershipClass, StabilizationSystem, TargetDescriptor, TargetKind,
@@ -169,6 +170,7 @@ pub fn guardian_startup_failure_outcome(
         request.explicit_java_override_present,
         request.explicit_jvm_args_present,
         request.explicit_jvm_preset_present,
+        request.integrity_facts,
         directive.as_ref(),
     ))
     .expect("launch startup copy request is closed");
@@ -179,6 +181,30 @@ pub fn guardian_startup_failure_outcome(
         guardian_decision,
         user_outcome,
         directive,
+    }
+}
+
+pub(crate) fn user_mod_set_drift_fact() -> GuardianFact {
+    GuardianFact {
+        operation_id: None,
+        id: GuardianFactId::UserModSetDrift,
+        domain: GuardianDomain::Filesystem,
+        phase: OperationPhase::Launching,
+        reliability: FactReliability::ValidatedProbe,
+        severity: None,
+        confidence: None,
+        ownership: OwnershipClass::UserOwned,
+        target: Some(TargetDescriptor::new(
+            StabilizationSystem::State,
+            TargetKind::FilesystemPath,
+            "active_user_mod_set",
+            OwnershipClass::UserOwned,
+        )),
+        fields: vec![EvidenceField::new(
+            "category",
+            "active_mod_set_changed",
+            EvidenceSensitivity::Public,
+        )],
     }
 }
 
@@ -713,7 +739,7 @@ mod tests {
         GuardianObservedLaunchFailurePhase, GuardianPrepareFailureRequest,
         GuardianStartupFailureObservation, GuardianStartupFailureRequest, StartupRecoveryOptions,
         guardian_prelaunch_preset_adjustment_directive, guardian_prepare_failure_outcome,
-        guardian_startup_failure_outcome, startup_failure_facts,
+        guardian_startup_failure_outcome, startup_failure_facts, user_mod_set_drift_fact,
     };
     use crate::guardian::{
         DiagnosisId, FactReliability, GuardianActionKind, GuardianCopyRequest, GuardianDirective,
@@ -725,6 +751,93 @@ mod tests {
         OperationPhase, OwnershipClass, StabilizationSystem, TargetDescriptor, TargetKind,
     };
     use axial_launcher::{CrashEvidence, LaunchFailureClass};
+
+    #[test]
+    fn user_mod_set_drift_is_public_condition_evidence_without_policy_effect() {
+        let drift_fact = user_mod_set_drift_fact();
+        for (failure_class, diagnosis_id) in [
+            (
+                LaunchFailureClass::MissingDependency,
+                DiagnosisId::MissingDependency,
+            ),
+            (
+                LaunchFailureClass::ModTransformationFailure,
+                DiagnosisId::ModTransformationFailure,
+            ),
+            (
+                LaunchFailureClass::ModAttributedCrash,
+                DiagnosisId::ModAttributedCrash,
+            ),
+            (
+                LaunchFailureClass::ClasspathModuleConflict,
+                DiagnosisId::ClasspathModuleConflict,
+            ),
+            (
+                LaunchFailureClass::LoaderBootstrapFailure,
+                DiagnosisId::LoaderBootstrapFailure,
+            ),
+        ] {
+            let outcome = |integrity_facts| {
+                guardian_startup_failure_outcome(GuardianStartupFailureRequest {
+                    mode: GuardianMode::Managed,
+                    observation: GuardianStartupFailureObservation::Exited { failure_class },
+                    crash_evidence: None,
+                    integrity_facts,
+                    registered_artifact_repair_candidate: None,
+                    target_version_id: "1.21.1",
+                    runtime_major: 21,
+                    requested_java_present: false,
+                    explicit_java_override_present: false,
+                    explicit_jvm_args_present: false,
+                    explicit_jvm_preset_present: false,
+                    startup_recovery_applied: false,
+                    disable_custom_gc: false,
+                    effective_preset: "performance",
+                })
+            };
+            let baseline = outcome(&[]);
+            let with_drift = outcome(std::slice::from_ref(&drift_fact));
+
+            assert_eq!(baseline.guardian_decision, with_drift.guardian_decision);
+            assert_eq!(baseline.directive, with_drift.directive);
+            assert_eq!(
+                baseline
+                    .safety_case
+                    .diagnoses
+                    .iter()
+                    .map(|diagnosis| (diagnosis.id(), diagnosis.candidate_actions()))
+                    .collect::<Vec<_>>(),
+                with_drift
+                    .safety_case
+                    .diagnoses
+                    .iter()
+                    .map(|diagnosis| (diagnosis.id(), diagnosis.candidate_actions()))
+                    .collect::<Vec<_>>()
+            );
+            for (baseline_diagnosis, drift_diagnosis) in baseline
+                .safety_case
+                .diagnoses
+                .iter()
+                .zip(&with_drift.safety_case.diagnoses)
+            {
+                let mut expected_fact_ids = baseline_diagnosis.fact_ids().to_vec();
+                if baseline_diagnosis.id() == diagnosis_id {
+                    expected_fact_ids.push(GuardianFactId::UserModSetDrift);
+                }
+                assert_eq!(drift_diagnosis.fact_ids(), expected_fact_ids);
+            }
+            assert!(with_drift.user_outcome.details().contains(
+                &"The active mods changed since the last successful launch.".to_string()
+            ));
+        }
+        assert_eq!(drift_fact.fields.len(), 1);
+        assert_eq!(drift_fact.fields[0].key, "category");
+        assert_eq!(drift_fact.fields[0].value, "active_mod_set_changed");
+        assert_eq!(
+            drift_fact.target.as_ref().map(|target| target.id.as_str()),
+            Some("active_user_mod_set")
+        );
+    }
 
     #[test]
     fn managed_prelaunch_preset_adjustment_returns_downgrade_directive() {

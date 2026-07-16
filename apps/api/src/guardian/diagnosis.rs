@@ -253,6 +253,7 @@ fn is_condition_fact(id: GuardianFactId) -> bool {
             | GuardianFactId::LaunchJvmPresetDowngradeAvailable
             | GuardianFactId::RegisteredArtifactRepairAvailable
             | GuardianFactId::PersistedStateRepairAvailable
+            | GuardianFactId::UserModSetDrift
     )
 }
 

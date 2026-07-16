@@ -120,6 +120,7 @@
   "temp_file_observed",
   "temp_file_write_failed",
   "unknown_launch_failure",
+  "user_mod_set_drift",
   "version_json_missing",
   "watchdog_action_observed",
   "watchdog_killed_process"

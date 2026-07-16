@@ -5353,7 +5353,8 @@
       ],
       "evidence": [
         "process_exited_before_boot",
-        "missing_dependency"
+        "missing_dependency",
+        "user_mod_set_drift"
       ],
       "phases": [
         "Launching"
@@ -5370,7 +5371,8 @@
       ],
       "evidence": [
         "process_exited_before_boot",
-        "mod_transformation_failure"
+        "mod_transformation_failure",
+        "user_mod_set_drift"
       ],
       "phases": [
         "Launching"
@@ -5387,7 +5389,8 @@
       ],
       "evidence": [
         "process_exited_before_boot",
-        "mod_attributed_crash"
+        "mod_attributed_crash",
+        "user_mod_set_drift"
       ],
       "phases": [
         "Launching"
@@ -5404,7 +5407,8 @@
       ],
       "evidence": [
         "process_exited_before_boot",
-        "classpath_module_conflict"
+        "classpath_module_conflict",
+        "user_mod_set_drift"
       ],
       "phases": [
         "Launching"
@@ -5438,7 +5442,8 @@
       ],
       "evidence": [
         "process_exited_before_boot",
-        "loader_bootstrap_failure"
+        "loader_bootstrap_failure",
+        "user_mod_set_drift"
       ],
       "phases": [
         "Launching"
@@ -6069,6 +6074,11 @@
     },
     {
       "fact": "unknown_launch_failure",
+      "availability": "registered_current",
+      "referenced_by_rule": true
+    },
+    {
+      "fact": "user_mod_set_drift",
       "availability": "registered_current",
       "referenced_by_rule": true
     },

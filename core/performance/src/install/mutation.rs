@@ -32,6 +32,22 @@ pub struct ManagedResolvedInspection {
     pub inspection: ManagedCompositionInspection,
 }
 
+pub struct ManagedArtifactWitnessProof {
+    filename: String,
+    sha512: String,
+}
+
+impl ManagedArtifactWitnessProof {
+    pub fn matches_observation(&self, filename: &str, sha512: &str) -> bool {
+        let filename_matches = if cfg!(windows) {
+            self.filename.eq_ignore_ascii_case(filename)
+        } else {
+            self.filename == filename
+        };
+        filename_matches && self.sha512.eq_ignore_ascii_case(sha512)
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum ManagedMutationError {
     #[error("managed composition operation was definitely rejected: {0}")]
@@ -83,6 +99,35 @@ impl ManagedMutationError {
 }
 
 impl ManagedCompositionAuthority {
+    pub async fn composition_managed_witness_proofs(
+        &self,
+        identity: &ManagedInstanceIdentity,
+    ) -> Result<Vec<ManagedArtifactWitnessProof>, ManagedMutationError> {
+        self.validate_identity(identity).await?;
+        let mods_dir = identity.mods_dir().to_path_buf();
+        tokio::task::spawn_blocking(move || {
+            let state = crate::state::load_state_admitted(&mods_dir)
+                .map_err(ManagedMutationError::definite)?;
+            let mut proofs = state
+                .into_iter()
+                .flat_map(|state| state.installed_mods)
+                .map(|installed| ManagedArtifactWitnessProof {
+                    filename: installed.filename,
+                    sha512: installed.integrity.sha512,
+                })
+                .collect::<Vec<_>>();
+            proofs.sort_by(|left, right| {
+                (&left.filename, &left.sha512).cmp(&(&right.filename, &right.sha512))
+            });
+            proofs.dedup_by(|left, right| {
+                left.filename == right.filename && left.sha512 == right.sha512
+            });
+            Ok(proofs)
+        })
+        .await
+        .map_err(|_| ManagedMutationError::task_stopped("composition_managed_witness_proofs"))?
+    }
+
     pub async fn recover_and_inspect(
         &self,
         identity: &ManagedInstanceIdentity,

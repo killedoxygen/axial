@@ -32,6 +32,7 @@ mod remote_flags;
 mod sessions;
 mod shutdown;
 pub mod skins;
+mod user_mod_witness;
 
 use axial_config::{
     AppConfig, ConfigStore as StartupConfigStore, ConfigStoreError, INSTANCE_REGISTRY_MAX_ENTRIES,
@@ -169,6 +170,7 @@ pub struct AppState {
     journals: Arc<OperationJournalStore>,
     installed_versions: Arc<installed_versions::InstalledVersionsIndex>,
     known_good: Arc<known_good::KnownGoodInventoryStore>,
+    user_mod_witnesses: Arc<user_mod_witness::UserModWitnessStore>,
     known_good_rebuilds: Arc<known_good_rebuilds::KnownGoodRebuildFlights>,
     java_probe_failures: Arc<JavaProbeFailureCache>,
     sessions: Arc<SessionStore>,
@@ -615,6 +617,11 @@ impl AppState {
             })?,
         );
         let known_good = Arc::new(known_good::KnownGoodInventoryStore::claim(config.paths())?);
+        let user_mod_witnesses = Arc::new(user_mod_witness::UserModWitnessStore::claim(
+            config.paths(),
+            &instances.list(),
+            instance_registry_authoritative,
+        )?);
         if instance_registry_authoritative {
             known_good.discover_absent_snapshot_obligations(
                 instances.list().into_iter().map(|instance| instance.id),
@@ -635,6 +642,7 @@ impl AppState {
             journals,
             installed_versions: Arc::new(installed_versions::InstalledVersionsIndex::default()),
             known_good,
+            user_mod_witnesses,
             known_good_rebuilds: Arc::new(known_good_rebuilds::KnownGoodRebuildFlights::default()),
             java_probe_failures: Arc::new(JavaProbeFailureCache::default()),
             sessions: init.sessions,
@@ -1280,6 +1288,17 @@ impl AppState {
                     "known-good retirement cleanup was retained for retry"
                 );
             }
+            if self
+                .user_mod_witnesses
+                .remove(&retained_instance_id)
+                .await
+                .is_err()
+            {
+                tracing::warn!(
+                    instance_id = retained_instance_id,
+                    "user mod witness retirement cleanup was retained for retry"
+                );
+            }
         } else if result.is_ok() {
             return Err(InstanceStoreError::Persistence(std::io::Error::other(
                 "instance registry reported successful deletion without removing the instance",
@@ -1563,6 +1582,77 @@ impl AppState {
             .await
     }
 
+    pub(crate) async fn publish_successful_user_mod_witness(
+        &self,
+        foreground: &IntegrityForegroundLease,
+        instance_id: &str,
+    ) -> std::io::Result<()> {
+        let (instance, entries, _admission) = self
+            .observe_user_mod_witness(foreground, instance_id)
+            .await
+            .ok_or_else(|| std::io::Error::other("user mod witness is unavailable"))?;
+        self.user_mod_witnesses
+            .publish(instance.id, instance.created_at, entries)
+            .await
+    }
+
+    pub(crate) async fn user_mod_witness_drifted_after_failure(
+        &self,
+        foreground: &IntegrityForegroundLease,
+        instance_id: &str,
+    ) -> bool {
+        let Some((instance, entries, _admission)) =
+            self.observe_user_mod_witness(foreground, instance_id).await
+        else {
+            return false;
+        };
+        matches!(
+            self.user_mod_witnesses
+                .baseline_matches(&instance.id, &instance.created_at, &entries),
+            Some(false)
+        )
+    }
+
+    async fn observe_user_mod_witness(
+        &self,
+        foreground: &IntegrityForegroundLease,
+        instance_id: &str,
+    ) -> Option<(
+        axial_config::Instance,
+        Vec<user_mod_witness::UserModWitnessEntry>,
+        AppManagedCompositionAdmission,
+    )> {
+        let admission = self
+            .admit_managed_instance_with_foreground(foreground, instance_id, false)
+            .await
+            .ok()?;
+        let instance = self.instances.get(instance_id)?;
+        let managed = admission.composition_managed_witness_proofs().await.ok()?;
+        let observation = crate::execution::user_owned_state::observe_active_user_mod_set(
+            self.instances.game_dir(instance_id).join("mods"),
+            managed,
+        )
+        .await?;
+        let entries = observation
+            .into_entries()
+            .into_iter()
+            .map(|entry| {
+                let (digest, size, modified_at_ns) = entry.into_parts();
+                user_mod_witness::UserModWitnessEntry {
+                    digest,
+                    size,
+                    modified_at_ns,
+                }
+            })
+            .collect();
+        if self.validate_integrity_foreground(foreground).is_err()
+            || self.instances.get(instance_id).as_ref() != Some(&instance)
+        {
+            return None;
+        }
+        Some((instance, entries, admission))
+    }
+
     #[cfg(test)]
     pub(crate) async fn admit_managed_instance(
         &self,
@@ -1659,6 +1749,10 @@ impl AppState {
 
     pub(crate) async fn close_known_good_inventories(&self) -> std::io::Result<()> {
         self.known_good.close().await
+    }
+
+    pub(crate) async fn close_user_mod_witnesses(&self) -> std::io::Result<()> {
+        self.user_mod_witnesses.close().await
     }
 
     fn config_commit_observer(&self) -> Arc<dyn Fn(AppConfig, AppConfig) + Send + Sync> {
@@ -1845,6 +1939,93 @@ mod known_good_identity_tests {
             startup_warnings: Vec::new(),
             frontend_dir: root.join("frontend"),
         })
+    }
+
+    #[tokio::test]
+    async fn user_mod_witness_is_mode_independent_and_compares_success_baselines() {
+        let root = std::env::temp_dir().join(format!(
+            "axial-user-mod-state-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let state = known_good_state_fixture(&root);
+        let mut instance = state
+            .instances()
+            .insert_for_test("User mods", "1.21.1")
+            .expect("insert witness instance");
+        let mods_dir = state.instances().game_dir(&instance.id).join("mods");
+        std::fs::write(mods_dir.join("user.jar"), b"first").expect("write user jar");
+        let foreground = state
+            .register_integrity_foreground()
+            .expect("register witness foreground")
+            .wait_for_settlement()
+            .await;
+
+        for mode in ["managed", "custom", "disabled"] {
+            instance.performance_mode = mode.to_string();
+            state
+                .instances()
+                .replace_for_test(instance.clone())
+                .expect("replace instance mode");
+            let (_, entries, admission) = state
+                .observe_user_mod_witness(&foreground, &instance.id)
+                .await
+                .expect("mode-independent witness observation");
+            assert_eq!(entries.len(), 1, "unexpected observation for {mode}");
+            drop(admission);
+        }
+
+        state
+            .publish_successful_user_mod_witness(&foreground, &instance.id)
+            .await
+            .expect("publish successful baseline");
+        assert!(
+            !state
+                .user_mod_witness_drifted_after_failure(&foreground, &instance.id)
+                .await
+        );
+        std::fs::write(mods_dir.join("added.jar"), b"added").expect("add user jar");
+        assert!(
+            state
+                .user_mod_witness_drifted_after_failure(&foreground, &instance.id)
+                .await
+        );
+        std::fs::remove_file(mods_dir.join("added.jar")).expect("remove user jar");
+        std::fs::write(mods_dir.join("user.jar"), b"replacement").expect("replace user jar");
+        assert!(
+            state
+                .user_mod_witness_drifted_after_failure(&foreground, &instance.id)
+                .await
+        );
+        state
+            .delete_instance(&foreground, instance.id.clone(), true)
+            .await
+            .expect("delete witness instance");
+        assert_eq!(
+            state
+                .user_mod_witnesses
+                .baseline_matches(&instance.id, &instance.created_at, &[],),
+            None
+        );
+
+        drop(foreground);
+        state
+            .close_managed_compositions()
+            .await
+            .expect("close managed authority");
+        state
+            .close_user_mod_witnesses()
+            .await
+            .expect("close witness store");
+        state
+            .close_known_good_inventories()
+            .await
+            .expect("close known-good store");
+        drop(state);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[tokio::test]

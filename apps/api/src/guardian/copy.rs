@@ -1,7 +1,7 @@
 use super::jvm_preset::{GuardianJvmPresetId, GuardianJvmPresetResolution};
 use super::{
     DiagnosisId, GuardianActionKind, GuardianArtifactRepairStatus, GuardianDirective, GuardianFact,
-    GuardianInstallArtifactFailureEvidence, GuardianInstallArtifactFailureKind,
+    GuardianFactId, GuardianInstallArtifactFailureEvidence, GuardianInstallArtifactFailureKind,
     GuardianManagedJavaReason, GuardianMode, GuardianObservedLaunchFailurePhase,
     GuardianPerformanceSupervisionRejection, GuardianPreflightOutcome,
     GuardianPresetDowngradeReason, GuardianPresetValue, GuardianRepairStatus,
@@ -1623,6 +1623,7 @@ enum GuardianCopyContext<'a> {
         explicit_java_override_present: bool,
         explicit_jvm_args_present: bool,
         explicit_jvm_preset_present: bool,
+        user_mod_set_drift: bool,
         directive: Option<GuardianDirective>,
     },
     ObservedLaunchFailure {
@@ -1764,6 +1765,7 @@ impl<'a> GuardianCopyRequest<'a> {
         explicit_java_override_present: bool,
         explicit_jvm_args_present: bool,
         explicit_jvm_preset_present: bool,
+        integrity_facts: &[GuardianFact],
         directive: Option<&GuardianDirective>,
     ) -> Self {
         Self {
@@ -1781,6 +1783,9 @@ impl<'a> GuardianCopyRequest<'a> {
                 explicit_java_override_present,
                 explicit_jvm_args_present,
                 explicit_jvm_preset_present,
+                user_mod_set_drift: integrity_facts
+                    .iter()
+                    .any(|fact| fact.id == GuardianFactId::UserModSetDrift),
                 directive: directive.cloned(),
             },
         }
@@ -2829,6 +2834,7 @@ pub(crate) fn author_guardian_copy(
             explicit_java_override_present,
             explicit_jvm_args_present,
             explicit_jvm_preset_present,
+            user_mod_set_drift,
             directive,
         } => {
             return Some(author_startup_failure_copy(StartupFailureCopyInput {
@@ -2839,6 +2845,7 @@ pub(crate) fn author_guardian_copy(
                 explicit_java: *explicit_java_override_present,
                 explicit_jvm_args: *explicit_jvm_args_present,
                 explicit_jvm_preset: *explicit_jvm_preset_present,
+                user_mod_set_drift: *user_mod_set_drift,
                 directive: directive.as_ref(),
             }));
         }
@@ -3321,6 +3328,7 @@ struct StartupFailureCopyInput<'a> {
     explicit_java: bool,
     explicit_jvm_args: bool,
     explicit_jvm_preset: bool,
+    user_mod_set_drift: bool,
     directive: Option<&'a GuardianDirective>,
 }
 
@@ -3333,6 +3341,7 @@ fn author_startup_failure_copy(input: StartupFailureCopyInput<'_>) -> GuardianUs
         explicit_java,
         explicit_jvm_args,
         explicit_jvm_preset,
+        user_mod_set_drift,
         directive,
     } = input;
     let guidance = launch_failure_guidance(
@@ -3353,13 +3362,19 @@ fn author_startup_failure_copy(input: StartupFailureCopyInput<'_>) -> GuardianUs
         GuardianActionKind::Block => "Guardian blocked launch startup.",
         _ => "Guardian recorded launch startup failure.",
     };
+    let mut details = vec![
+        directive
+            .map(guardian_directive_description)
+            .unwrap_or_else(|| startup_failure_reason(failure_class, stalled, suspected_mod)),
+    ];
+    if user_mod_set_drift {
+        details.push("The active mods changed since the last successful launch.".to_string());
+    }
     GuardianUserOutcome::authored(
         launch_public_decision(decision),
         OperationPhase::Launching,
         trusted_line(summary, MAX_SUMMARY_BYTES),
-        finalize_launch_lines([directive
-            .map(guardian_directive_description)
-            .unwrap_or_else(|| startup_failure_reason(failure_class, stalled, suspected_mod))]),
+        finalize_launch_lines(details),
         finalize_launch_lines([guidance]),
     )
 }

@@ -30,6 +30,17 @@ pub(crate) struct AnchoredRecordRestartDigest([u8; 32]);
 
 pub(crate) struct AnchoredRecordDirectory(platform::Directory);
 
+#[derive(Eq, PartialEq)]
+pub(crate) struct AnchoredRecordDirectoryEpoch(platform::DirectoryEpoch);
+
+pub(crate) struct AnchoredRecordDigestObservation {
+    sha256: [u8; 32],
+    sha512: [u8; 64],
+    size: u64,
+    modified_at_ns: u64,
+    identity: AnchoredRecordIdentity,
+}
+
 pub(crate) enum AnchoredRecordObservation {
     Bytes {
         bytes: Vec<u8>,
@@ -164,6 +175,14 @@ impl AnchoredRecordDirectory {
         self.0.names()
     }
 
+    pub(crate) fn names_bounded(&self, max_entries: usize) -> io::Result<Option<Vec<OsString>>> {
+        self.0.names_bounded(max_entries)
+    }
+
+    pub(crate) fn epoch(&self) -> io::Result<AnchoredRecordDirectoryEpoch> {
+        self.0.epoch().map(AnchoredRecordDirectoryEpoch)
+    }
+
     pub(crate) fn read(
         &self,
         name: &OsStr,
@@ -173,6 +192,35 @@ impl AnchoredRecordDirectory {
         AnchoredRecordObservation::read_leaf(leaf, max_bytes, false)
     }
 
+    pub(crate) fn digest(
+        &self,
+        name: &OsStr,
+        max_bytes: u64,
+    ) -> io::Result<AnchoredRecordDigestObservation> {
+        let leaf = self.0.open_leaf(name).map(AnchoredLeaf)?;
+        let file = leaf
+            .open_regular()?
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "anchored record is missing"))?;
+        if file.size() > max_bytes {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "anchored record exceeds its digest bound",
+            ));
+        }
+        let size = file.size();
+        let modified_at_ns = file.modified_at_ns()?;
+        let (sha256, sha512, file) = file.digest_bounded(max_bytes)?;
+        let identity = AnchoredRecordIdentity { leaf, file };
+        identity.revalidate()?;
+        Ok(AnchoredRecordDigestObservation {
+            sha256,
+            sha512,
+            size,
+            modified_at_ns,
+            identity,
+        })
+    }
+
     pub(crate) fn read_for_mutation(
         &self,
         name: &OsStr,
@@ -180,6 +228,16 @@ impl AnchoredRecordDirectory {
     ) -> io::Result<AnchoredRecordObservation> {
         let leaf = self.0.open_leaf(name).map(AnchoredLeaf)?;
         AnchoredRecordObservation::read_leaf(leaf, max_bytes, true)
+    }
+}
+
+impl AnchoredRecordDigestObservation {
+    pub(crate) fn parts(&self) -> ([u8; 32], [u8; 64], u64, u64) {
+        (self.sha256, self.sha512, self.size, self.modified_at_ns)
+    }
+
+    pub(crate) fn revalidate(&self) -> io::Result<()> {
+        self.identity.revalidate()
     }
 }
 
@@ -316,6 +374,10 @@ impl AnchoredRegularFile {
         self.0.size()
     }
 
+    fn modified_at_ns(&self) -> io::Result<u64> {
+        self.0.modified_at_ns()
+    }
+
     fn verify_sha1(self, expected_sha1: &str, expected_size: u64) -> Option<Self> {
         self.0.verify_sha1(expected_sha1, expected_size).map(Self)
     }
@@ -324,6 +386,12 @@ impl AnchoredRegularFile {
         self.0
             .read_bounded(max_bytes)
             .map(|(bytes, file)| (bytes, Self(file)))
+    }
+
+    fn digest_bounded(self, max_bytes: u64) -> io::Result<([u8; 32], [u8; 64], Self)> {
+        self.0
+            .digest_bounded(max_bytes)
+            .map(|(sha256, sha512, file)| (sha256, sha512, Self(file)))
     }
 
     fn update_restart_identity(
@@ -362,7 +430,7 @@ mod platform {
     use rustix::fs::RenameFlags;
     use rustix::fs::{AtFlags, FileType, Mode, OFlags};
     use sha1::{Digest as _, Sha1};
-    use sha2::Sha256;
+    use sha2::{Sha256, Sha512};
     use std::ffi::{OsStr, OsString};
     use std::io::{self, Read as _, Seek as _, SeekFrom};
     use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
@@ -397,6 +465,16 @@ mod platform {
         root_path: PathBuf,
         directories: Vec<HeldDirectory>,
         parent: Arc<OwnedFd>,
+    }
+
+    #[derive(Eq, PartialEq)]
+    pub(super) struct DirectoryEpoch {
+        device: u64,
+        inode: u64,
+        modified_seconds: i64,
+        modified_nanoseconds: u64,
+        changed_seconds: i64,
+        changed_nanoseconds: u64,
     }
 
     #[derive(Clone)]
@@ -452,6 +530,18 @@ mod platform {
         }
 
         pub(super) fn names(&self) -> io::Result<Vec<OsString>> {
+            self.names_bounded(usize::MAX)?.ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "directory enumeration overflowed",
+                )
+            })
+        }
+
+        pub(super) fn names_bounded(
+            &self,
+            max_entries: usize,
+        ) -> io::Result<Option<Vec<OsString>>> {
             self.revalidate()?;
             let entries = rustix::fs::Dir::read_from(self.parent.as_ref())?;
             let mut names = Vec::new();
@@ -459,11 +549,35 @@ mod platform {
                 let entry = entry?;
                 let name = entry.file_name().to_bytes();
                 if name != b"." && name != b".." {
+                    if names.len() == max_entries {
+                        return Ok(None);
+                    }
                     names.push(OsString::from_vec(name.to_vec()));
                 }
             }
             self.revalidate()?;
-            Ok(names)
+            Ok(Some(names))
+        }
+
+        pub(super) fn epoch(&self) -> io::Result<DirectoryEpoch> {
+            self.revalidate()?;
+            let stat = rustix::fs::fstat(self.parent.as_ref()).map_err(io::Error::from)?;
+            let epoch = DirectoryEpoch {
+                device: canonical_unsigned(stat.st_dev, "directory device")?,
+                inode: canonical_unsigned(stat.st_ino, "directory inode")?,
+                modified_seconds: canonical_signed(stat.st_mtime, "directory modified seconds")?,
+                modified_nanoseconds: canonical_nanoseconds(
+                    stat.st_mtime_nsec,
+                    "directory modified nanoseconds",
+                )?,
+                changed_seconds: canonical_signed(stat.st_ctime, "directory changed seconds")?,
+                changed_nanoseconds: canonical_nanoseconds(
+                    stat.st_ctime_nsec,
+                    "directory changed nanoseconds",
+                )?,
+            };
+            self.revalidate()?;
+            Ok(epoch)
         }
 
         pub(super) fn open_leaf(&self, name: &OsStr) -> io::Result<Leaf> {
@@ -815,6 +929,27 @@ mod platform {
             self.metadata.size
         }
 
+        pub(super) fn modified_at_ns(&self) -> io::Result<u64> {
+            if self.metadata.modified_seconds < 0
+                || self.metadata.modified_nanoseconds >= 1_000_000_000
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "anchored record modified time is invalid",
+                ));
+            }
+            u64::try_from(self.metadata.modified_seconds)
+                .ok()
+                .and_then(|seconds| seconds.checked_mul(1_000_000_000))
+                .and_then(|value| value.checked_add(self.metadata.modified_nanoseconds))
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "anchored record modified time overflowed",
+                    )
+                })
+        }
+
         pub(super) fn verify_sha1(
             mut self,
             expected_sha1: &str,
@@ -866,6 +1001,43 @@ mod platform {
                 return Err(identity_changed("anchored record changed during reading"));
             }
             Ok((bytes, self))
+        }
+
+        pub(super) fn digest_bounded(
+            mut self,
+            max_bytes: u64,
+        ) -> io::Result<([u8; 32], [u8; 64], Self)> {
+            if self.metadata.size > max_bytes || !self.revalidate() {
+                return Err(identity_changed(
+                    "anchored record changed or exceeds its digest bound",
+                ));
+            }
+            self.file.seek(SeekFrom::Start(0))?;
+            let mut sha256 = Sha256::new();
+            let mut sha512 = Sha512::new();
+            let mut observed = 0_u64;
+            let mut buffer = [0_u8; 64 * 1024];
+            loop {
+                let count = self.file.read(&mut buffer)?;
+                if count == 0 {
+                    break;
+                }
+                observed = observed.checked_add(count as u64).ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "anchored digest size overflowed",
+                    )
+                })?;
+                if observed > self.metadata.size || observed > max_bytes {
+                    return Err(identity_changed("anchored record grew during digesting"));
+                }
+                sha256.update(&buffer[..count]);
+                sha512.update(&buffer[..count]);
+            }
+            if observed != self.metadata.size || !self.revalidate() {
+                return Err(identity_changed("anchored record changed during digesting"));
+            }
+            Ok((sha256.finalize().into(), sha512.finalize().into(), self))
         }
 
         pub(super) fn update_restart_identity(
@@ -1200,7 +1372,7 @@ mod platform {
 #[cfg(windows)]
 mod platform {
     use sha1::{Digest as _, Sha1};
-    use sha2::Sha256;
+    use sha2::{Sha256, Sha512};
     use std::ffi::{OsStr, OsString};
     use std::fs;
     use std::io::{self, Read as _, Seek as _, SeekFrom};
@@ -1244,6 +1416,14 @@ mod platform {
         root_path: PathBuf,
         directories: Vec<HeldDirectory>,
         parent: Arc<fs::File>,
+    }
+
+    #[derive(Eq, PartialEq)]
+    pub(super) struct DirectoryEpoch {
+        volume: u64,
+        id: [u8; 16],
+        modified: i64,
+        changed: i64,
     }
 
     #[derive(Clone)]
@@ -1331,6 +1511,18 @@ mod platform {
         }
 
         pub(super) fn names(&self) -> io::Result<Vec<OsString>> {
+            self.names_bounded(usize::MAX)?.ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "directory enumeration overflowed",
+                )
+            })
+        }
+
+        pub(super) fn names_bounded(
+            &self,
+            max_entries: usize,
+        ) -> io::Result<Option<Vec<OsString>>> {
             self.revalidate()?;
             let mut names = Vec::new();
             let mut buffer = vec![0_u64; (64 * 1024) / size_of::<u64>()];
@@ -1351,9 +1543,26 @@ mod platform {
                     return Err(error);
                 }
                 collect_directory_names(&buffer, &mut names)?;
+                if names.len() > max_entries {
+                    return Ok(None);
+                }
             }
             self.revalidate()?;
-            Ok(names)
+            Ok(Some(names))
+        }
+
+        pub(super) fn epoch(&self) -> io::Result<DirectoryEpoch> {
+            self.revalidate()?;
+            let basic = query::<FILE_BASIC_INFO>(&self.parent, FileBasicInfo)?;
+            let id = query::<FILE_ID_INFO>(&self.parent, FileIdInfo)?;
+            let epoch = DirectoryEpoch {
+                volume: id.VolumeSerialNumber,
+                id: id.FileId.Identifier,
+                modified: basic.LastWriteTime,
+                changed: basic.ChangeTime,
+            };
+            self.revalidate()?;
+            Ok(epoch)
         }
 
         pub(super) fn open_leaf(&self, name: &OsStr) -> io::Result<Leaf> {
@@ -1693,6 +1902,28 @@ mod platform {
                 .expect("validated record size is nonnegative")
         }
 
+        pub(super) fn modified_at_ns(&self) -> io::Result<u64> {
+            const WINDOWS_TO_UNIX_EPOCH_TICKS: i64 = 116_444_736_000_000_000;
+            u64::try_from(
+                self.modified
+                    .checked_sub(WINDOWS_TO_UNIX_EPOCH_TICKS)
+                    .ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "anchored record modified time predates the Unix epoch",
+                        )
+                    })?,
+            )
+            .ok()
+            .and_then(|ticks| ticks.checked_mul(100))
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "anchored record modified time overflowed",
+                )
+            })
+        }
+
         pub(super) fn verify_sha1(
             mut self,
             expected_sha1: &str,
@@ -1746,6 +1977,44 @@ mod platform {
                 return Err(identity_changed("anchored record changed during reading"));
             }
             Ok((bytes, self))
+        }
+
+        pub(super) fn digest_bounded(
+            mut self,
+            max_bytes: u64,
+        ) -> io::Result<([u8; 32], [u8; 64], Self)> {
+            let size = self.size();
+            if size > max_bytes || !self.revalidate() {
+                return Err(identity_changed(
+                    "anchored record changed or exceeds its digest bound",
+                ));
+            }
+            self.file.seek(SeekFrom::Start(0))?;
+            let mut sha256 = Sha256::new();
+            let mut sha512 = Sha512::new();
+            let mut observed = 0_u64;
+            let mut buffer = [0_u8; 64 * 1024];
+            loop {
+                let count = self.file.read(&mut buffer)?;
+                if count == 0 {
+                    break;
+                }
+                observed = observed.checked_add(count as u64).ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "anchored digest size overflowed",
+                    )
+                })?;
+                if observed > size || observed > max_bytes {
+                    return Err(identity_changed("anchored record grew during digesting"));
+                }
+                sha256.update(&buffer[..count]);
+                sha512.update(&buffer[..count]);
+            }
+            if observed != size || !self.revalidate() {
+                return Err(identity_changed("anchored record changed during digesting"));
+            }
+            Ok((sha256.finalize().into(), sha512.finalize().into(), self))
         }
 
         pub(super) fn update_restart_identity(
@@ -3093,6 +3362,8 @@ mod platform {
     use std::path::Path;
 
     pub(super) struct Directory;
+    #[derive(Eq, PartialEq)]
+    pub(super) struct DirectoryEpoch;
     pub(super) struct Leaf;
     pub(super) struct RegularFile;
     pub(super) struct ExactRenameReceipt;
@@ -3107,6 +3378,23 @@ mod platform {
         }
 
         pub(super) fn names(&self) -> io::Result<Vec<OsString>> {
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "anchored records are unavailable on this platform",
+            ))
+        }
+
+        pub(super) fn names_bounded(
+            &self,
+            _max_entries: usize,
+        ) -> io::Result<Option<Vec<OsString>>> {
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "anchored records are unavailable on this platform",
+            ))
+        }
+
+        pub(super) fn epoch(&self) -> io::Result<DirectoryEpoch> {
             Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "anchored records are unavailable on this platform",
@@ -3182,11 +3470,28 @@ mod platform {
             0
         }
 
+        pub(super) fn modified_at_ns(&self) -> io::Result<u64> {
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "anchored records are unavailable on this platform",
+            ))
+        }
+
         pub(super) fn verify_sha1(self, _expected_sha1: &str, _expected_size: u64) -> Option<Self> {
             None
         }
 
         pub(super) fn read_bounded(self, _max_bytes: u64) -> io::Result<(Vec<u8>, Self)> {
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "anchored records are unavailable on this platform",
+            ))
+        }
+
+        pub(super) fn digest_bounded(
+            self,
+            _max_bytes: u64,
+        ) -> io::Result<([u8; 32], [u8; 64], Self)> {
             Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "anchored records are unavailable on this platform",

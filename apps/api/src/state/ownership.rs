@@ -70,6 +70,7 @@ pub enum CurrentArtifact {
     PerformanceRulesCache,
     PerformanceOperationStatus,
     PersistedStateRejectionStreakSnapshot,
+    UserModWitnessSnapshot,
     UserJavaOverride,
     UserJvmArguments,
     ExternalPerformanceRules,
@@ -96,6 +97,7 @@ impl CurrentArtifact {
             | Self::BenchmarkSuiteDriverStatus
             | Self::PerformanceOperationStatus => TargetKind::Config,
             Self::PersistedStateRejectionStreakSnapshot => TargetKind::Config,
+            Self::UserModWitnessSnapshot => TargetKind::Config,
             Self::UserJavaOverride | Self::UserJvmArguments | Self::UnknownFilesystemPath => {
                 TargetKind::FilesystemPath
             }
@@ -116,6 +118,7 @@ impl CurrentArtifact {
             | Self::PerformanceRulesCache
             | Self::PerformanceOperationStatus => OwnershipClass::LauncherManaged,
             Self::PersistedStateRejectionStreakSnapshot => OwnershipClass::LauncherManaged,
+            Self::UserModWitnessSnapshot => OwnershipClass::LauncherManaged,
             Self::UserJavaOverride | Self::UserJvmArguments => OwnershipClass::UserOwned,
             Self::ExternalPerformanceRules => OwnershipClass::ExternalProviderDerived,
             Self::UnknownFilesystemPath => OwnershipClass::Unknown,
@@ -133,6 +136,7 @@ impl CurrentArtifact {
             Self::PerformanceRulesCache => "performance_rules_cache",
             Self::PerformanceOperationStatus => "performance_operation_status",
             Self::PersistedStateRejectionStreakSnapshot => "persisted_state_rejection_streaks",
+            Self::UserModWitnessSnapshot => "user_mod_witnesses",
             Self::UserJavaOverride => "custom_java_path",
             Self::UserJvmArguments => "custom_jvm_args",
             Self::ExternalPerformanceRules => "external_performance_rules",
@@ -218,6 +222,19 @@ mod tests {
         let snapshot = classify_current_artifact(
             CurrentArtifact::PersistedStateRejectionStreakSnapshot,
             "persisted_state_rejection_streaks",
+        );
+
+        assert_eq!(snapshot.target.system, StabilizationSystem::State);
+        assert_eq!(snapshot.target.kind, TargetKind::Config);
+        assert_eq!(snapshot.target.ownership, OwnershipClass::LauncherManaged);
+        assert!(snapshot.allows_automatic_managed_mutation());
+    }
+
+    #[test]
+    fn user_mod_witness_snapshot_is_launcher_managed_state_config() {
+        let snapshot = classify_current_artifact(
+            CurrentArtifact::UserModWitnessSnapshot,
+            "guardian_user_mod_witnesses",
         );
 
         assert_eq!(snapshot.target.system, StabilizationSystem::State);

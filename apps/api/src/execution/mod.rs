@@ -15,6 +15,7 @@ pub(crate) mod persistence;
 pub mod process;
 pub(crate) use anchored_record::registered_artifact;
 pub mod runtime;
+pub(crate) mod user_owned_state;
 
 use crate::observability::{
     EvidenceField, RedactionAudience, sanitize_evidence_text, sanitize_evidence_token,

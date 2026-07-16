@@ -381,4 +381,23 @@ mod launch_preflight_sense_tests {
             );
         }
     }
+
+    #[test]
+    fn user_mod_witness_does_not_expand_the_preflight_inventory() {
+        assert_eq!(
+            LaunchPreflightSenseId::ALL
+                .iter()
+                .map(|id| id.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "memory",
+                "installed_versions",
+                "overrides",
+                "resources",
+                "integrity_tier0",
+                "readiness",
+                "guardian_policy",
+            ]
+        );
+    }
 }

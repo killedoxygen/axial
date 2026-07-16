@@ -32,7 +32,7 @@ This document is a deterministic human-readable projection of Guardian's strict 
 | Persisted-state repair hands | 1 |
 | Public kernel cells | 90 |
 | Diagnosis rules | 60 |
-| Registered facts | 124 |
+| Registered facts | 125 |
 | Preflight senses | 7 |
 | Adapter sources | 101 |
 | Repair hands | 2 |
