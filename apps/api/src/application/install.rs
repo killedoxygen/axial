@@ -382,13 +382,10 @@ async fn settle_content_initialization_cleanup(
             .await
         {
             Ok(()) => return,
-            Err(error)
-                if matches!(
-                    error,
-                    OperationJournalStoreError::Persistence(_)
-                        | OperationJournalStoreError::RetryRequired
-                ) =>
-            {
+            Err(
+                OperationJournalStoreError::Persistence(_)
+                | OperationJournalStoreError::RetryRequired,
+            ) => {
                 tokio::time::sleep(INSTALL_JOURNAL_RETRY_MAX_DELAY).await;
             }
             Err(_) => return,
@@ -2180,7 +2177,6 @@ where
             .is_err()
             {
                 tracing::warn!("failed to durably settle content terminal progress");
-                return;
             }
         },
         move |_| async move {

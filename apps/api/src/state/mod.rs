@@ -2075,6 +2075,69 @@ fn foreign_integrity_foreground_error() -> std::io::Error {
     )
 }
 
+fn content_http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(15))
+        .build()
+        .expect("content HTTP client configuration must be valid")
+}
+
+fn setup_instance_paths_match(game_dir: &Path, expected: &[SetupInstancePathSnapshot]) -> bool {
+    let Ok(root_metadata) = std::fs::symlink_metadata(game_dir) else {
+        return false;
+    };
+    if !root_metadata.is_dir() || root_metadata.file_type().is_symlink() {
+        return false;
+    }
+    let mut expected_by_path = std::collections::HashMap::with_capacity(expected.len());
+    for entry in expected {
+        if entry.relative_path.as_os_str().is_empty()
+            || !entry
+                .relative_path
+                .components()
+                .all(|component| matches!(component, std::path::Component::Normal(_)))
+            || expected_by_path
+                .insert(entry.relative_path.as_path(), &entry.kind)
+                .is_some()
+        {
+            return false;
+        }
+    }
+
+    let mut seen = std::collections::HashSet::with_capacity(expected.len());
+    let mut pending = vec![game_dir.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        let Ok(entries) = std::fs::read_dir(&directory) else {
+            return false;
+        };
+        for entry in entries {
+            let Ok(entry) = entry else { return false };
+            let path = entry.path();
+            let Ok(relative) = path.strip_prefix(game_dir) else {
+                return false;
+            };
+            let Some(expected_kind) = expected_by_path.get(relative) else {
+                return false;
+            };
+            let Ok(metadata) = std::fs::symlink_metadata(&path) else {
+                return false;
+            };
+            if metadata.file_type().is_symlink() || !seen.insert(relative.to_path_buf()) {
+                return false;
+            }
+            match expected_kind {
+                SetupInstancePathKind::Directory if metadata.is_dir() => pending.push(path),
+                SetupInstancePathKind::File { size, sha512 }
+                    if metadata.is_file()
+                        && metadata.len() == *size
+                        && axial_content::sha512_file(&path).ok().as_ref() == Some(sha512) => {}
+                _ => return false,
+            }
+        }
+    }
+    seen.len() == expected_by_path.len()
+}
+
 #[cfg(test)]
 mod known_good_identity_tests {
     use super::*;
@@ -2773,67 +2836,4 @@ mod known_good_identity_tests {
 
         let _ = std::fs::remove_dir_all(root);
     }
-}
-
-fn content_http_client() -> reqwest::Client {
-    reqwest::Client::builder()
-        .connect_timeout(std::time::Duration::from_secs(15))
-        .build()
-        .expect("content HTTP client configuration must be valid")
-}
-
-fn setup_instance_paths_match(game_dir: &Path, expected: &[SetupInstancePathSnapshot]) -> bool {
-    let Ok(root_metadata) = std::fs::symlink_metadata(game_dir) else {
-        return false;
-    };
-    if !root_metadata.is_dir() || root_metadata.file_type().is_symlink() {
-        return false;
-    }
-    let mut expected_by_path = std::collections::HashMap::with_capacity(expected.len());
-    for entry in expected {
-        if entry.relative_path.as_os_str().is_empty()
-            || !entry
-                .relative_path
-                .components()
-                .all(|component| matches!(component, std::path::Component::Normal(_)))
-            || expected_by_path
-                .insert(entry.relative_path.as_path(), &entry.kind)
-                .is_some()
-        {
-            return false;
-        }
-    }
-
-    let mut seen = std::collections::HashSet::with_capacity(expected.len());
-    let mut pending = vec![game_dir.to_path_buf()];
-    while let Some(directory) = pending.pop() {
-        let Ok(entries) = std::fs::read_dir(&directory) else {
-            return false;
-        };
-        for entry in entries {
-            let Ok(entry) = entry else { return false };
-            let path = entry.path();
-            let Ok(relative) = path.strip_prefix(game_dir) else {
-                return false;
-            };
-            let Some(expected_kind) = expected_by_path.get(relative) else {
-                return false;
-            };
-            let Ok(metadata) = std::fs::symlink_metadata(&path) else {
-                return false;
-            };
-            if metadata.file_type().is_symlink() || !seen.insert(relative.to_path_buf()) {
-                return false;
-            }
-            match expected_kind {
-                SetupInstancePathKind::Directory if metadata.is_dir() => pending.push(path),
-                SetupInstancePathKind::File { size, sha512 }
-                    if metadata.is_file()
-                        && metadata.len() == *size
-                        && axial_content::sha512_file(&path).ok().as_ref() == Some(sha512) => {}
-                _ => return false,
-            }
-        }
-    }
-    seen.len() == expected_by_path.len()
 }

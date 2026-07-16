@@ -756,11 +756,11 @@ mod tests {
         release_tx.send(()).expect("settle replacement");
         tokio::time::timeout(Duration::from_secs(2), async {
             loop {
-                if state.updater().snapshot().phase == UpdateFlowPhase::Failed {
-                    if let Ok(lease) = state.try_admit_update_sensitive_operation() {
-                        drop(lease);
-                        break;
-                    }
+                if state.updater().snapshot().phase == UpdateFlowPhase::Failed
+                    && let Ok(lease) = state.try_admit_update_sensitive_operation()
+                {
+                    drop(lease);
+                    break;
                 }
                 tokio::task::yield_now().await;
             }
