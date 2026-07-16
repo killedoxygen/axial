@@ -8,11 +8,12 @@
 //! indexed downloads and the overrides go through the same containment check.
 
 use crate::error::{ContentError, ContentResult};
-use crate::manifest::{MANIFEST_FILE, MANIFEST_TEMP_FILE, sha512_file};
+use crate::manifest::MANIFEST_FILE;
 use crate::model::{ContentKind, FileRef};
 use crate::transaction::{FileTransaction, StagingGuard};
 use axial_minecraft::download::{
-    DownloadProgress, ExpectedIntegrity, download_file_with_client_report,
+    DownloadProgress, ExecutionDownloadFact, VerifiedContentIntegrity,
+    download_verified_content_to_staging,
 };
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
@@ -126,31 +127,44 @@ pub fn read_pack_index(archive: &Path) -> ContentResult<PackIndex> {
 /// Materialize a pack into `game_dir`: fetch every indexed file through the
 /// verified downloader, then lay the overrides on top. Pack payloads never
 /// replace files that already exist in the target instance.
-pub async fn install_pack<F>(
+pub async fn install_pack<F, G>(
     client: &reqwest::Client,
     game_dir: &Path,
     archive: &Path,
     on_progress: F,
+    on_download_fact: G,
 ) -> ContentResult<PackInstallReport>
 where
     F: FnMut(DownloadProgress),
+    G: FnMut(ExecutionDownloadFact),
 {
-    install_pack_files(client, game_dir, archive, &[], true, on_progress).await
+    install_pack_files(
+        client,
+        game_dir,
+        archive,
+        &[],
+        true,
+        on_progress,
+        on_download_fact,
+    )
+    .await
 }
 
 /// Install either the full pack or an explicit set of indexed paths. Overrides
 /// are opt-in so cherry-picking files into an existing instance never silently
 /// replaces its configuration.
-pub async fn install_pack_files<F>(
+pub async fn install_pack_files<F, G>(
     client: &reqwest::Client,
     game_dir: &Path,
     archive: &Path,
     selected_paths: &[String],
     include_overrides: bool,
     on_progress: F,
+    on_download_fact: G,
 ) -> ContentResult<PackInstallReport>
 where
     F: FnMut(DownloadProgress),
+    G: FnMut(ExecutionDownloadFact),
 {
     install_pack_files_with_finalize(
         client,
@@ -159,22 +173,25 @@ where
         selected_paths,
         include_overrides,
         on_progress,
+        on_download_fact,
         |_, _| Ok(()),
     )
     .await
 }
 
-pub async fn install_pack_files_with_finalize<F, P>(
+pub async fn install_pack_files_with_finalize<F, G, P>(
     _client: &reqwest::Client,
     game_dir: &Path,
     archive: &Path,
     selected_paths: &[String],
     include_overrides: bool,
     mut on_progress: F,
+    mut on_download_fact: G,
     finalize: P,
 ) -> ContentResult<PackInstallReport>
 where
     F: FnMut(DownloadProgress),
+    G: FnMut(ExecutionDownloadFact),
     P: FnOnce(&PackInstallReport, &mut PackFinalizeContext<'_>) -> ContentResult<()>,
 {
     let index = read_pack_index(archive)?;
@@ -214,9 +231,10 @@ where
             Some(file.filename().to_string()),
         ));
 
-        let expected = ExpectedIntegrity {
+        let expected = VerifiedContentIntegrity {
             size: file.size,
             sha1: file.sha1.clone(),
+            sha512: file.sha512.clone(),
         };
         let (_, origin) = validate_pack_download_url(&file.url)?;
         if !download_clients.contains_key(&origin) {
@@ -226,10 +244,21 @@ where
         let safe_client = download_clients
             .get(&origin)
             .expect("pack download client was inserted");
-        download_file_with_client_report(safe_client, &file.url, &destination, &expected)
+        match download_verified_content_to_staging(safe_client, &file.url, &destination, &expected)
             .await
-            .map_err(|error| ContentError::Download(error.into_download_error().to_string()))?;
-        verify_pack_sha512(&destination, file.sha512.as_deref())?;
+        {
+            Ok(report) => {
+                for fact in report.facts {
+                    on_download_fact(fact);
+                }
+            }
+            Err(error) => {
+                for fact in &error.facts {
+                    on_download_fact(fact.clone());
+                }
+                return Err(ContentError::Download(error));
+            }
+        }
         installed.push(file.clone());
         relative_paths.push(file.path.clone());
     }
@@ -342,7 +371,7 @@ async fn resolve_public_pack_addresses(url: &Url, port: u16) -> ContentResult<Ve
         Some(Host::Domain(domain)) => tokio::net::lookup_host((domain, port))
             .await
             .map_err(|_| {
-                ContentError::Download(
+                ContentError::DownloadPreparation(
                     "modpack download destination could not be resolved".to_string(),
                 )
             })?
@@ -406,25 +435,6 @@ fn is_public_ipv6(address: Ipv6Addr) -> bool {
         || (segments[0] & 0xffc0) == 0xfe80
         || (segments[0] & 0xffc0) == 0xfec0
         || (segments[0] == 0x2001 && segments[1] == 0x0db8))
-}
-
-fn verify_pack_sha512(path: &Path, expected: Option<&str>) -> ContentResult<()> {
-    let Some(expected) = expected else {
-        return Ok(());
-    };
-    if expected.len() != 128 || !expected.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        return Err(ContentError::Invalid(
-            "modpack file has an invalid sha512 checksum".to_string(),
-        ));
-    }
-    let actual = sha512_file(path)?;
-    if actual.eq_ignore_ascii_case(expected) {
-        Ok(())
-    } else {
-        Err(ContentError::Download(
-            "modpack file failed sha512 verification".to_string(),
-        ))
-    }
 }
 
 fn reject_occupied_pack_destinations<'a>(
@@ -596,10 +606,7 @@ fn normalize_relative_path(relative: &str) -> ContentResult<String> {
         )));
     }
     let normalized = parts.join("/");
-    if [MANIFEST_FILE, MANIFEST_TEMP_FILE]
-        .iter()
-        .any(|reserved| normalized.eq_ignore_ascii_case(reserved))
-    {
+    if normalized.eq_ignore_ascii_case(MANIFEST_FILE) {
         return Err(ContentError::Invalid(format!(
             "modpack file uses a launcher-reserved path: {relative}"
         )));
@@ -716,10 +723,11 @@ fn loader_from_dependencies(dependencies: &HashMap<String, String>) -> Option<Pa
 }
 
 /// The pack's own archive, as a file to download and verify.
-pub fn pack_archive_file(file: &FileRef) -> ExpectedIntegrity {
-    ExpectedIntegrity {
+pub fn pack_archive_file(file: &FileRef) -> VerifiedContentIntegrity {
+    VerifiedContentIntegrity {
         size: file.size,
         sha1: file.sha1.clone(),
+        sha512: file.sha512.clone(),
     }
 }
 
@@ -931,19 +939,25 @@ mod tests {
     }
 
     #[test]
-    fn sha512_only_pack_files_are_verified() {
-        let root = std::env::temp_dir().join("axial-pack-sha512-verification");
-        let _ = fs::remove_dir_all(&root);
-        fs::create_dir_all(&root).expect("root");
-        let path = root.join("payload.jar");
-        fs::write(&path, b"verified payload").expect("payload");
-        let expected = sha512_file(&path).expect("sha512");
+    fn pack_archive_integrity_preserves_sha512_only_evidence() {
+        let file = FileRef {
+            url: "https://cdn.modrinth.com/data/project/versions/version/archive.mrpack"
+                .to_string(),
+            filename: "archive.mrpack".to_string(),
+            sha1: None,
+            sha512: Some("a".repeat(128)),
+            size: Some(42),
+            primary: true,
+        };
 
-        verify_pack_sha512(&path, Some(&expected)).expect("matching checksum");
-        assert!(verify_pack_sha512(&path, Some(&"0".repeat(128))).is_err());
-        assert!(verify_pack_sha512(&path, Some("not-a-sha512")).is_err());
-
-        let _ = fs::remove_dir_all(root);
+        assert_eq!(
+            pack_archive_file(&file),
+            VerifiedContentIntegrity {
+                size: Some(42),
+                sha1: None,
+                sha512: Some("a".repeat(128)),
+            }
+        );
     }
 
     #[test]
@@ -1062,7 +1076,6 @@ mod tests {
             "axial.content.json",
             "./axial.content.json",
             "AXIAL.CONTENT.JSON",
-            "axial.content.json.tmp",
         ] {
             assert!(
                 contained_path(root, reserved).is_err(),
@@ -1122,13 +1135,12 @@ mod tests {
         fs::create_dir_all(&root).expect("root");
         let archive = override_archive(
             "manifest-path",
-            &[("overrides/./axial.content.json.tmp", b"payload".to_vec())],
+            &[("overrides/./axial.content.json", b"payload".to_vec())],
         );
 
         let error = apply_overrides(&root, &archive)
             .expect_err("override must not claim launcher manifest paths");
         assert!(error.to_string().contains("launcher-reserved path"));
-        assert!(!root.join(MANIFEST_TEMP_FILE).exists());
 
         let _ = fs::remove_file(archive);
         let _ = fs::remove_dir_all(root);
@@ -1308,9 +1320,17 @@ mod tests {
         }"#;
         let archive = override_archive("full-indexed-occupied", &[(INDEX_FILE, index.to_vec())]);
 
-        let error = install_pack_files(&reqwest::Client::new(), &root, &archive, &[], true, |_| {})
-            .await
-            .expect_err("full pack must not replace an indexed destination");
+        let error = install_pack_files(
+            &reqwest::Client::new(),
+            &root,
+            &archive,
+            &[],
+            true,
+            |_| {},
+            |_| {},
+        )
+        .await
+        .expect_err("full pack must not replace an indexed destination");
 
         assert!(error.to_string().contains("occupied"));
         assert_eq!(
@@ -1350,9 +1370,17 @@ mod tests {
             ],
         );
 
-        let error = install_pack_files(&reqwest::Client::new(), &root, &archive, &[], true, |_| {})
-            .await
-            .expect_err("full pack must not replace an override destination");
+        let error = install_pack_files(
+            &reqwest::Client::new(),
+            &root,
+            &archive,
+            &[],
+            true,
+            |_| {},
+            |_| {},
+        )
+        .await
+        .expect_err("full pack must not replace an override destination");
 
         assert!(error.to_string().contains("occupied"));
         assert_eq!(

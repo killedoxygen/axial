@@ -3,7 +3,8 @@ use crate::manifest::{ContentManifest, ManifestEntry, entry_file_present, entry_
 use crate::model::{CanonicalId, ContentDependency, ContentKind, FileRef, ProviderId};
 use crate::transaction::{FileTransaction, StagingGuard, contained_path};
 use axial_minecraft::download::{
-    DownloadProgress, ExpectedIntegrity, download_file_with_client_report,
+    DownloadProgress, ExecutionDownloadFact, VerifiedContentIntegrity,
+    download_verified_content_to_staging,
 };
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -25,16 +26,18 @@ pub struct PlannedFile {
 
 /// Download and verify each planned file into its instance subdirectory, then
 /// record it in the instance manifest. Files land through the shared verified
-/// downloader (size + sha1 checked); a replaced file is removed only after its
+/// content staging primitive; a replaced file is removed only after its
 /// replacement is in place. The manifest is saved once at the end.
-pub async fn install_and_record<F>(
+pub async fn install_and_record<F, G>(
     client: &reqwest::Client,
     game_dir: &Path,
     files: &[PlannedFile],
     mut on_progress: F,
+    mut on_download_fact: G,
 ) -> ContentResult<ContentManifest>
 where
     F: FnMut(DownloadProgress),
+    G: FnMut(ExecutionDownloadFact),
 {
     let mut manifest = ContentManifest::load(game_dir)?;
     let total = files.len() as i32;
@@ -54,13 +57,31 @@ where
             Some(planned.file.filename.clone()),
         ));
 
-        let expected = ExpectedIntegrity {
+        let expected = VerifiedContentIntegrity {
             size: planned.file.size,
             sha1: planned.file.sha1.clone(),
+            sha512: planned.file.sha512.clone(),
         };
-        download_file_with_client_report(client, &planned.file.url, &destination, &expected)
-            .await
-            .map_err(|error| ContentError::Download(error.into_download_error().to_string()))?;
+        match download_verified_content_to_staging(
+            client,
+            &planned.file.url,
+            &destination,
+            &expected,
+        )
+        .await
+        {
+            Ok(report) => {
+                for fact in report.facts {
+                    on_download_fact(fact);
+                }
+            }
+            Err(error) => {
+                for fact in &error.facts {
+                    on_download_fact(fact.clone());
+                }
+                return Err(ContentError::Download(error));
+            }
+        }
     }
 
     on_progress(progress("commit", total, total, None));

@@ -127,6 +127,13 @@ pub struct ExpectedIntegrity {
     pub sha1: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct VerifiedContentIntegrity {
+    pub size: Option<u64>,
+    pub sha1: Option<String>,
+    pub sha512: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct ActualIntegrity {
     pub(super) size: u64,
@@ -248,6 +255,22 @@ pub struct ExecutionDownloadError {
     pub facts: Vec<ExecutionDownloadFact>,
     pub(super) error: DownloadError,
 }
+
+impl std::fmt::Display for ExecutionDownloadError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "download execution failed for {} ({:?})",
+            self.facts
+                .last()
+                .map(|fact| fact.target.as_str())
+                .unwrap_or("artifact"),
+            self.kind
+        )
+    }
+}
+
+impl std::error::Error for ExecutionDownloadError {}
 
 impl ExecutionDownloadError {
     pub fn into_download_error(self) -> DownloadError {
