@@ -6,23 +6,35 @@
 //! ask the provider what they are in one batch and record real provenance for
 //! every mod, rather than leaving a pack-shaped hole in the manifest.
 
-use super::resolve::{pick_version, resolve};
+use super::resolve::{pick_version, resolve_for_execution};
 use super::target::{ResolveTarget, instance_target};
-use super::{ContentApiError, ContentSelection, content_error_response, json_error};
+use super::{
+    ContentApiError, ContentExecutionError, ContentSelection, content_error_response,
+    content_execution_error, json_error,
+};
 use crate::application::{
     InstallQueueContentActionRequest, InstallQueueRequest, InstallQueueStateResponse,
     enqueue_install_owned, enqueue_install_with_dependency,
 };
 use crate::state::{AppState, ProducerLease, RequestProducerHandoff};
 use axial_content::{
-    CanonicalId, ContentKind, ContentManifest, EntrySource, FileRef, ManifestEntry, PackIndex,
+    CanonicalId, ContentKind, ContentManifest, FileRef, ManagedRemoval, ManifestEntry, PackIndex,
     ProviderId, VersionIdentity, install_pack_files_with_finalize, read_pack_index,
     verified_removable_variants,
 };
 use axum::http::StatusCode;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+
+const MAX_MODPACK_FILE_SELECTIONS: usize = 500;
+const MODPACK_FILE_SELECTION_ID_PREFIX: &str = "mpf1-";
+const MODPACK_FILE_SELECTION_ID_LEN: usize = MODPACK_FILE_SELECTION_ID_PREFIX.len() + 64;
+const MAX_MODPACK_FILE_SELECTION_BYTES: usize =
+    MAX_MODPACK_FILE_SELECTIONS * MODPACK_FILE_SELECTION_ID_LEN;
+const MAX_MODPACK_FILENAME_CHARS: usize = 160;
+const MAX_MODPACK_TITLE_CHARS: usize = 160;
 
 struct ScratchArchive {
     path: PathBuf,
@@ -45,13 +57,14 @@ impl Drop for ScratchArchive {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ModpackInstallRequest {
     pub instance_id: String,
     pub canonical_id: String,
     #[serde(default)]
     pub version_id: Option<String>,
     #[serde(default)]
-    pub selected_paths: Vec<String>,
+    pub selected_file_ids: Vec<String>,
     #[serde(default = "default_true")]
     pub include_overrides: bool,
 }
@@ -94,7 +107,7 @@ pub struct ModpackTarget {
 
 #[derive(Debug, Serialize)]
 pub struct ModpackFileOption {
-    pub path: String,
+    pub selection_id: String,
     pub filename: String,
     pub kind: ContentKind,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -103,6 +116,12 @@ pub struct ModpackFileOption {
     pub identified: bool,
     pub compatible: bool,
     pub installed: bool,
+}
+
+#[derive(Debug)]
+struct ClassifiedModpackFile {
+    path: String,
+    option: ModpackFileOption,
 }
 
 #[derive(Debug, Serialize)]
@@ -122,6 +141,33 @@ struct ResolvedModpackVersion {
     version: axial_content::ContentVersion,
 }
 
+enum ModpackVersionResolveError {
+    Api(ContentApiError),
+    Provider(axial_content::ContentError),
+}
+
+impl From<ContentApiError> for ModpackVersionResolveError {
+    fn from(error: ContentApiError) -> Self {
+        Self::Api(error)
+    }
+}
+
+impl ModpackVersionResolveError {
+    fn into_api(self) -> ContentApiError {
+        match self {
+            Self::Api(error) => error,
+            Self::Provider(error) => content_error_response(error),
+        }
+    }
+
+    fn into_execution(self) -> ContentExecutionError {
+        match self {
+            Self::Api(error) => error.into(),
+            Self::Provider(error) => content_execution_error(error),
+        }
+    }
+}
+
 #[derive(Debug)]
 struct PackFileCompatibility {
     game: bool,
@@ -136,14 +182,34 @@ async fn resolve_modpack_version(
     canonical_id: &str,
     version_id: Option<&str>,
 ) -> Result<ResolvedModpackVersion, ContentApiError> {
+    resolve_modpack_version_inner(state, canonical_id, version_id)
+        .await
+        .map_err(ModpackVersionResolveError::into_api)
+}
+
+async fn resolve_modpack_version_for_execution(
+    state: &AppState,
+    canonical_id: &str,
+    version_id: Option<&str>,
+) -> Result<ResolvedModpackVersion, ContentExecutionError> {
+    resolve_modpack_version_inner(state, canonical_id, version_id)
+        .await
+        .map_err(ModpackVersionResolveError::into_execution)
+}
+
+async fn resolve_modpack_version_inner(
+    state: &AppState,
+    canonical_id: &str,
+    version_id: Option<&str>,
+) -> Result<ResolvedModpackVersion, ModpackVersionResolveError> {
     let canonical_id = CanonicalId(canonical_id.to_string());
     let detail = state
         .content()
         .detail(&canonical_id)
         .await
-        .map_err(content_error_response)?;
+        .map_err(ModpackVersionResolveError::Provider)?;
     if detail.content.kind != ContentKind::Modpack {
-        return Err(json_error(StatusCode::BAD_REQUEST, "this is not a modpack"));
+        return Err(json_error(StatusCode::BAD_REQUEST, "this is not a modpack").into());
     }
     let version = pick_version(&detail.versions, version_id)
         .cloned()
@@ -152,7 +218,8 @@ async fn resolve_modpack_version(
                 StatusCode::NOT_FOUND,
                 "this modpack has no installable version",
             )
-        })?;
+        })
+        .map_err(ModpackVersionResolveError::Api)?;
     Ok(ResolvedModpackVersion {
         canonical_id,
         name: detail.content.title,
@@ -175,7 +242,9 @@ pub async fn modpack_target(
             "this modpack version has no downloadable file",
         )
     })?;
-    let archive = download_archive(state, &archive_file).await?;
+    let archive = download_archive(state, &archive_file, |_| {})
+        .await
+        .map_err(|error| error.into_parts().0)?;
     let index = read_pack_index(archive.path()).map_err(content_error_response)?;
 
     target_from_pack_index(
@@ -245,10 +314,26 @@ pub async fn modpack_files(
             "this modpack version has no downloadable file",
         )
     })?;
-    let archive = download_archive(state, &archive_file).await?;
+    let archive = download_archive(state, &archive_file, |_| {})
+        .await
+        .map_err(|error| error.into_parts().0)?;
     let index = read_pack_index(archive.path()).map_err(content_error_response)?;
-    let identities = identify_modpack_files(state, &index).await?;
-    let files = classify_modpack_files(state, &target, &game_dir, &index, &identities).await;
+    validate_selection_surface(&index)?;
+    let identities = identify_modpack_files(state, &index)
+        .await
+        .map_err(content_error_response)?;
+    let classified = classify_modpack_files(
+        state,
+        &target,
+        &game_dir,
+        &resolved.canonical_id,
+        &resolved.version.id,
+        &index,
+        &identities,
+    )
+    .await;
+    validate_unique_selection_ids(&classified)?;
+    let files = classified.into_iter().map(|file| file.option).collect();
 
     Ok(ModpackFilesPlan {
         canonical_id: resolved.canonical_id,
@@ -264,9 +349,11 @@ async fn classify_modpack_files(
     state: &AppState,
     target: &ResolveTarget,
     game_dir: &Path,
+    pack_id: &CanonicalId,
+    version_id: &str,
     index: &PackIndex,
     identities: &HashMap<String, VersionIdentity>,
-) -> Vec<ModpackFileOption> {
+) -> Vec<ClassifiedModpackFile> {
     let project_ids: Vec<CanonicalId> = identities
         .values()
         .map(|identity| CanonicalId::for_project(identity.provider, &identity.project_id))
@@ -306,13 +393,20 @@ async fn classify_modpack_files(
         })
         .collect();
 
-    classify_modpack_file_options(game_dir, index, identities, &identity_versions)
+    classify_modpack_file_options(
+        game_dir,
+        pack_id,
+        version_id,
+        index,
+        identities,
+        &identity_versions,
+    )
 }
 
 async fn identify_modpack_files(
     state: &AppState,
     index: &PackIndex,
-) -> Result<HashMap<String, VersionIdentity>, ContentApiError> {
+) -> axial_content::ContentResult<HashMap<String, VersionIdentity>> {
     let hashes: Vec<String> = index
         .files
         .iter()
@@ -321,20 +415,18 @@ async fn identify_modpack_files(
     if hashes.is_empty() {
         Ok(HashMap::new())
     } else {
-        state
-            .content()
-            .identify(&hashes)
-            .await
-            .map_err(content_error_response)
+        state.content().identify(&hashes).await
     }
 }
 
 fn classify_modpack_file_options(
     game_dir: &Path,
+    pack_id: &CanonicalId,
+    version_id: &str,
     index: &PackIndex,
     identities: &HashMap<String, VersionIdentity>,
     identity_versions: &PackCompatibilityMap,
-) -> Vec<ModpackFileOption> {
+) -> Vec<ClassifiedModpackFile> {
     let mut files = Vec::new();
     for file in &index.files {
         let Some(kind) = file.kind() else { continue };
@@ -355,35 +447,41 @@ fn classify_modpack_file_options(
         ]
         .into_iter()
         .any(|path| std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_file()));
-        files.push(ModpackFileOption {
+        let filename =
+            bounded_display_text(file.filename(), MAX_MODPACK_FILENAME_CHARS, "Pack file");
+        let title = identity
+            .and_then(|identity| {
+                let project_id = CanonicalId::for_project(identity.provider, &identity.project_id);
+                identity_versions
+                    .get(&(project_id.as_str().to_string(), identity.version_id.clone()))
+                    .map(|compatibility| compatibility.title.clone())
+                    .or_else(|| identity.title.clone())
+            })
+            .unwrap_or_else(|| filename.clone());
+        files.push(ClassifiedModpackFile {
             path: file.path.clone(),
-            filename: file.filename().to_string(),
-            kind,
-            size: file.size,
-            title: identity
-                .and_then(|identity| {
-                    let project_id =
-                        CanonicalId::for_project(identity.provider, &identity.project_id);
-                    identity_versions
-                        .get(&(project_id.as_str().to_string(), identity.version_id.clone()))
-                        .map(|compatibility| compatibility.title.clone())
-                        .or_else(|| identity.title.clone())
-                })
-                .unwrap_or_else(|| file.filename().to_string()),
-            identified: identity.is_some(),
-            compatible,
-            installed,
+            option: ModpackFileOption {
+                selection_id: modpack_file_selection_id(pack_id, version_id, &file.path),
+                filename,
+                kind,
+                size: file.size,
+                title: bounded_display_text(&title, MAX_MODPACK_TITLE_CHARS, "Pack file"),
+                identified: identity.is_some(),
+                compatible,
+                installed,
+            },
         });
     }
-    files.sort_by_key(|file| file.title.to_lowercase());
+    files.sort_by_key(|file| file.option.title.to_lowercase());
     files
 }
 
-pub async fn queue_modpack_install(
+pub(crate) async fn queue_modpack_install(
     state: &AppState,
     request: ModpackInstallRequest,
     handoff: RequestProducerHandoff,
 ) -> Result<InstallQueueStateResponse, ContentApiError> {
+    validate_modpack_file_selection_ids(&request.selected_file_ids)?;
     reject_cherry_pick_overrides(&request)?;
     let resolved =
         resolve_modpack_version(state, &request.canonical_id, request.version_id.as_deref())
@@ -408,6 +506,7 @@ pub(crate) async fn queue_modpack_install_after(
     setup_cleanup: Option<crate::state::SetupInstanceCleanup>,
     producer: ProducerLease,
 ) -> Result<InstallQueueStateResponse, ContentApiError> {
+    validate_modpack_file_selection_ids(&request.selected_file_ids)?;
     reject_cherry_pick_overrides(&request)?;
     let resolved =
         resolve_modpack_version(state, &request.canonical_id, request.version_id.as_deref())
@@ -433,13 +532,13 @@ fn pinned_modpack_queue_request(
     version_id: String,
     name: String,
 ) -> InstallQueueRequest {
-    let include_overrides = request.selected_paths.is_empty() && request.include_overrides;
-    let label = if request.selected_paths.is_empty() {
+    let include_overrides = request.selected_file_ids.is_empty() && request.include_overrides;
+    let label = if request.selected_file_ids.is_empty() {
         format!("Setting up {name}")
     } else {
         format!(
             "Adding {} files from {}",
-            request.selected_paths.len(),
+            request.selected_file_ids.len(),
             name
         )
     };
@@ -449,20 +548,23 @@ fn pinned_modpack_queue_request(
         action: InstallQueueContentActionRequest::Modpack {
             canonical_id: canonical_id.as_str().to_string(),
             version_id,
-            selected_paths: request.selected_paths,
+            selected_file_ids: request.selected_file_ids,
             include_overrides,
         },
     }
 }
 
-pub(crate) async fn execute_modpack_install<F>(
+pub(crate) async fn execute_modpack_install<F, G>(
     state: &AppState,
     request: ModpackInstallRequest,
     mut on_progress: F,
-) -> Result<ModpackInstallResponse, ContentApiError>
+    mut on_download_fact: G,
+) -> Result<ModpackInstallResponse, ContentExecutionError>
 where
     F: FnMut(axial_minecraft::DownloadProgress),
+    G: FnMut(axial_minecraft::download::ExecutionDownloadFact),
 {
+    validate_modpack_file_selection_ids(&request.selected_file_ids)?;
     reject_cherry_pick_overrides(&request)?;
     on_progress(axial_minecraft::DownloadProgress {
         phase: "planning".to_string(),
@@ -484,7 +586,8 @@ where
         return Err(json_error(
             StatusCode::CONFLICT,
             "cannot install a modpack while the instance is running; stop the game first",
-        ));
+        )
+        .into());
     }
     let target = instance_target(state, &request.instance_id).await?;
     let game_dir = target
@@ -492,9 +595,12 @@ where
         .clone()
         .ok_or_else(|| json_error(StatusCode::NOT_FOUND, "instance not found"))?;
 
-    let resolved =
-        resolve_modpack_version(state, &request.canonical_id, request.version_id.as_deref())
-            .await?;
+    let resolved = resolve_modpack_version_for_execution(
+        state,
+        &request.canonical_id,
+        request.version_id.as_deref(),
+    )
+    .await?;
     let archive_file = resolved.version.primary_file().cloned().ok_or_else(|| {
         json_error(
             StatusCode::NOT_FOUND,
@@ -502,49 +608,63 @@ where
         )
     })?;
 
-    let archive = download_archive(state, &archive_file).await?;
-    let preview = read_pack_index(archive.path()).map_err(content_error_response)?;
-    if !request.selected_paths.is_empty() {
-        let identities = identify_modpack_files(state, &preview).await?;
-        let classified =
-            classify_modpack_files(state, &target, &game_dir, &preview, &identities).await;
-        validate_cherry_pick_files(&request.selected_paths, &classified)?;
+    let archive = download_archive(state, &archive_file, &mut on_download_fact).await?;
+    let preview = read_pack_index(archive.path()).map_err(content_execution_error)?;
+    let selected_paths = if request.selected_file_ids.is_empty() {
+        Vec::new()
+    } else {
+        validate_selection_surface(&preview)?;
+        let identities = identify_modpack_files(state, &preview)
+            .await
+            .map_err(content_execution_error)?;
+        let classified = classify_modpack_files(
+            state,
+            &target,
+            &game_dir,
+            &resolved.canonical_id,
+            &resolved.version.id,
+            &preview,
+            &identities,
+        )
+        .await;
+        let selected_paths = resolve_selected_paths(&request.selected_file_ids, &classified)?;
         validate_cherry_pick_dependencies(
             state,
             &target,
             &game_dir,
             &preview,
-            &request.selected_paths,
+            &selected_paths,
             &identities,
         )
         .await?;
-    }
+        selected_paths
+    };
     let preview_files: Vec<axial_content::PackFile> = preview
         .files
         .iter()
         .filter(|file| {
-            request.selected_paths.is_empty()
-                || request.selected_paths.iter().any(|path| path == &file.path)
+            selected_paths.is_empty() || selected_paths.iter().any(|path| path == &file.path)
         })
         .cloned()
         .collect();
-    let (manifest, identified, stale_entries) = build_pack_manifest(
+    let (mut manifest, identified, stale_entries) = build_pack_manifest(
         state,
         &game_dir,
         &preview_files,
         &resolved.canonical_id,
         &resolved.name,
         &resolved.version,
-        request.selected_paths.is_empty(),
+        selected_paths.is_empty(),
     )
     .await?;
     let install = install_pack_files_with_finalize(
         state.content().client(),
         &game_dir,
         archive.path(),
-        &request.selected_paths,
+        &selected_paths,
         request.include_overrides,
         &mut on_progress,
+        &mut on_download_fact,
         |report, transaction| {
             let protected_paths: Vec<String> = report
                 .installed
@@ -558,7 +678,7 @@ where
         },
     )
     .await;
-    let report = install.map_err(content_error_response)?;
+    let report = install.map_err(content_execution_error)?;
 
     let mismatch = mismatch_notice(
         &target.loader,
@@ -585,7 +705,7 @@ where
 }
 
 fn reject_cherry_pick_overrides(request: &ModpackInstallRequest) -> Result<(), ContentApiError> {
-    if !request.selected_paths.is_empty() && request.include_overrides {
+    if !request.selected_file_ids.is_empty() && request.include_overrides {
         return Err(json_error(
             StatusCode::BAD_REQUEST,
             "modpack overrides cannot be applied with selected files",
@@ -594,24 +714,134 @@ fn reject_cherry_pick_overrides(request: &ModpackInstallRequest) -> Result<(), C
     Ok(())
 }
 
-fn validate_cherry_pick_files(
-    selected_paths: &[String],
-    classified: &[ModpackFileOption],
+fn resolve_selected_paths(
+    selected_file_ids: &[String],
+    classified: &[ClassifiedModpackFile],
+) -> Result<Vec<String>, ContentApiError> {
+    validate_unique_selection_ids(classified)?;
+    let mut paths_by_id = HashMap::with_capacity(classified.len());
+    for file in classified {
+        paths_by_id.insert(file.option.selection_id.as_str(), file);
+    }
+    let mut selected_paths = Vec::with_capacity(selected_file_ids.len());
+    for selection_id in selected_file_ids {
+        let Some(file) = paths_by_id.get(selection_id.as_str()) else {
+            return Err(cherry_pick_files_changed());
+        };
+        if !file.option.identified || !file.option.compatible || file.option.installed {
+            return Err(cherry_pick_files_changed());
+        }
+        selected_paths.push(file.path.clone());
+    }
+    Ok(selected_paths)
+}
+
+fn validate_unique_selection_ids(
+    classified: &[ClassifiedModpackFile],
 ) -> Result<(), ContentApiError> {
-    let allowed: HashSet<&str> = classified
+    let unique = classified
         .iter()
-        .filter(|file| file.identified && file.compatible && !file.installed)
-        .map(|file| file.path.as_str())
-        .collect();
-    let selected: HashSet<&str> = selected_paths.iter().map(String::as_str).collect();
-    if selected.len() != selected_paths.len() || selected.iter().any(|path| !allowed.contains(path))
-    {
+        .map(|file| file.option.selection_id.as_str())
+        .collect::<HashSet<_>>();
+    if unique.len() != classified.len() {
         return Err(json_error(
             StatusCode::CONFLICT,
-            "selected modpack files are no longer compatible or available; review them and try again",
+            "modpack file identities are ambiguous; review the pack and try again",
         ));
     }
     Ok(())
+}
+
+fn validate_selection_surface(index: &PackIndex) -> Result<(), ContentApiError> {
+    if index
+        .files
+        .iter()
+        .filter(|file| file.kind().is_some())
+        .count()
+        > MAX_MODPACK_FILE_SELECTIONS
+    {
+        return Err(json_error(
+            StatusCode::BAD_REQUEST,
+            "this modpack has too many files for selective installation",
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_modpack_file_selection_ids(
+    selected_file_ids: &[String],
+) -> Result<(), ContentApiError> {
+    let aggregate_bytes = selected_file_ids
+        .iter()
+        .try_fold(0usize, |total, selection_id| {
+            total.checked_add(selection_id.len())
+        })
+        .unwrap_or(usize::MAX);
+    let unique: HashSet<&str> = selected_file_ids.iter().map(String::as_str).collect();
+    if selected_file_ids.len() > MAX_MODPACK_FILE_SELECTIONS
+        || aggregate_bytes > MAX_MODPACK_FILE_SELECTION_BYTES
+        || unique.len() != selected_file_ids.len()
+        || selected_file_ids
+            .iter()
+            .any(|selection_id| !valid_modpack_file_selection_id(selection_id))
+    {
+        return Err(json_error(
+            StatusCode::BAD_REQUEST,
+            "selected_file_ids is invalid",
+        ));
+    }
+    Ok(())
+}
+
+fn valid_modpack_file_selection_id(selection_id: &str) -> bool {
+    selection_id.len() == MODPACK_FILE_SELECTION_ID_LEN
+        && selection_id
+            .strip_prefix(MODPACK_FILE_SELECTION_ID_PREFIX)
+            .is_some_and(|digest| {
+                digest
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            })
+}
+
+fn modpack_file_selection_id(
+    pack_id: &CanonicalId,
+    version_id: &str,
+    normalized_path: &str,
+) -> String {
+    let mut digest = Sha256::new();
+    update_selection_id_frame(&mut digest, b"axial.modpack-file-selection.v1");
+    update_selection_id_frame(&mut digest, pack_id.as_str().as_bytes());
+    update_selection_id_frame(&mut digest, version_id.as_bytes());
+    update_selection_id_frame(&mut digest, normalized_path.as_bytes());
+    format!("{MODPACK_FILE_SELECTION_ID_PREFIX}{:x}", digest.finalize())
+}
+
+fn update_selection_id_frame(digest: &mut Sha256, value: &[u8]) {
+    digest.update((value.len() as u64).to_be_bytes());
+    digest.update(value);
+}
+
+fn bounded_display_text(value: &str, max_chars: usize, fallback: &str) -> String {
+    let normalized = value
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(max_chars)
+        .collect::<String>();
+    if normalized.is_empty() {
+        fallback.to_string()
+    } else {
+        normalized
+    }
+}
+
+fn cherry_pick_files_changed() -> ContentApiError {
+    json_error(
+        StatusCode::CONFLICT,
+        "selected modpack files are no longer compatible or available; review them and try again",
+    )
 }
 
 async fn validate_cherry_pick_dependencies(
@@ -621,7 +851,7 @@ async fn validate_cherry_pick_dependencies(
     index: &PackIndex,
     selected_paths: &[String],
     identities: &HashMap<String, VersionIdentity>,
-) -> Result<(), ContentApiError> {
+) -> Result<(), ContentExecutionError> {
     let files: HashMap<&str, &axial_content::PackFile> = index
         .files
         .iter()
@@ -631,17 +861,17 @@ async fn validate_cherry_pick_dependencies(
     let mut selected_versions = HashSet::with_capacity(selected_paths.len());
     for path in selected_paths {
         let Some(file) = files.get(path.as_str()) else {
-            return Err(cherry_pick_conflict());
+            return Err(cherry_pick_conflict().into());
         };
         let Some(kind) = file.kind() else {
-            return Err(cherry_pick_conflict());
+            return Err(cherry_pick_conflict().into());
         };
         let Some(identity) = file.sha512.as_ref().and_then(|hash| identities.get(hash)) else {
-            return Err(cherry_pick_conflict());
+            return Err(cherry_pick_conflict().into());
         };
         let canonical_id = CanonicalId::for_project(identity.provider, &identity.project_id);
         if !selected_versions.insert((canonical_id.clone(), identity.version_id.clone())) {
-            return Err(cherry_pick_conflict());
+            return Err(cherry_pick_conflict().into());
         }
         selections.push(ContentSelection {
             canonical_id: canonical_id.as_str().to_string(),
@@ -651,9 +881,9 @@ async fn validate_cherry_pick_dependencies(
     }
 
     let manifest = ContentManifest::load(game_dir).map_err(content_error_response)?;
-    let resolution = resolve(state, target, &selections, &manifest).await?;
+    let resolution = resolve_for_execution(state, target, &selections, &manifest).await?;
     if !cherry_pick_resolution_is_complete(&resolution, &selected_versions) {
-        return Err(cherry_pick_conflict());
+        return Err(cherry_pick_conflict().into());
     }
     Ok(())
 }
@@ -678,10 +908,14 @@ fn cherry_pick_conflict() -> ContentApiError {
 
 /// Pull the `.mrpack` into a process-unique temporary file, verified like any
 /// other download. The guard removes it on every return path.
-async fn download_archive(
+async fn download_archive<G>(
     state: &AppState,
     file: &FileRef,
-) -> Result<ScratchArchive, ContentApiError> {
+    mut on_download_fact: G,
+) -> Result<ScratchArchive, ContentExecutionError>
+where
+    G: FnMut(axial_minecraft::download::ExecutionDownloadFact),
+{
     let archive = ScratchArchive::new(std::env::temp_dir().join(format!(
         ".axial-pack-{}-{}-{}",
         std::process::id(),
@@ -690,24 +924,35 @@ async fn download_archive(
     )));
     if let Some(parent) = archive.path().parent() {
         std::fs::create_dir_all(parent)
-            .map_err(|error| content_error_response(axial_content::ContentError::Io(error)))?;
+            .map_err(|error| content_execution_error(axial_content::ContentError::Io(error)))?;
     }
-    let expected = axial_minecraft::download::ExpectedIntegrity {
+    let expected = axial_minecraft::download::VerifiedContentIntegrity {
         size: file.size,
         sha1: file.sha1.clone(),
+        sha512: file.sha512.clone(),
     };
-    axial_minecraft::download::download_file_with_client_report(
+    match axial_minecraft::download::download_verified_content_to_staging(
         state.content().client(),
         &file.url,
         archive.path(),
         &expected,
     )
     .await
-    .map_err(|error| {
-        content_error_response(axial_content::ContentError::Download(
-            error.into_download_error().to_string(),
-        ))
-    })?;
+    {
+        Ok(report) => {
+            for fact in report.facts {
+                on_download_fact(fact);
+            }
+        }
+        Err(error) => {
+            for fact in &error.facts {
+                on_download_fact(fact.clone());
+            }
+            return Err(content_execution_error(
+                axial_content::ContentError::Download(error),
+            ));
+        }
+    }
     Ok(archive)
 }
 
@@ -722,7 +967,7 @@ async fn build_pack_manifest(
     pack_title: &str,
     version: &axial_content::ContentVersion,
     record_pack_root: bool,
-) -> Result<(ContentManifest, usize, Vec<ManifestEntry>), ContentApiError> {
+) -> Result<(ContentManifest, usize, Vec<ManifestEntry>), ContentExecutionError> {
     let mut manifest = ContentManifest::load(game_dir).map_err(content_error_response)?;
     let mut stale_entries = Vec::new();
 
@@ -741,7 +986,6 @@ async fn build_pack_manifest(
             size: None,
             dependencies: Vec::new(),
             enabled: true,
-            source: EntrySource::Managed,
             installed_at: chrono::Utc::now().to_rfc3339(),
             title: Some(pack_title.to_string()),
         });
@@ -753,49 +997,50 @@ async fn build_pack_manifest(
     let mut identified = 0;
     if !by_hash.is_empty() {
         let hashes: Vec<String> = by_hash.keys().cloned().collect();
-        if let Ok(resolved) = state.content().identify(&hashes).await {
-            reject_duplicate_pack_projects(&resolved, &by_hash)?;
-            let ids: Vec<CanonicalId> = resolved
-                .values()
-                .map(|identity| CanonicalId::for_project(identity.provider, &identity.project_id))
-                .collect();
-            let titles = super::project_titles(state, &ids).await;
+        let resolved = state
+            .content()
+            .identify(&hashes)
+            .await
+            .map_err(content_execution_error)?;
+        reject_duplicate_pack_projects(&resolved, &by_hash)?;
+        let ids: Vec<CanonicalId> = resolved
+            .values()
+            .map(|identity| CanonicalId::for_project(identity.provider, &identity.project_id))
+            .collect();
+        let titles = super::project_titles(state, &ids).await;
 
-            for (hash, identity) in resolved {
-                let Some(file) = by_hash.get(&hash).and_then(|files| files.first()) else {
-                    continue;
-                };
-                let Some(kind) = file.kind() else { continue };
-                let canonical_id =
-                    CanonicalId::for_project(identity.provider, &identity.project_id);
-                let previous = manifest.find(&canonical_id).cloned();
-                let title = titles
-                    .get(&canonical_id)
-                    .cloned()
-                    .or(identity.title.clone());
-                let stale_filename = manifest.upsert(ManifestEntry {
-                    canonical_id,
-                    provider: identity.provider,
-                    project_id: identity.project_id,
-                    version_id: identity.version_id,
-                    kind,
-                    filename: file.filename().to_string(),
-                    sha1: file.sha1.clone(),
-                    sha512: file.sha512.clone(),
-                    size: file.size,
-                    dependencies: identity.dependencies,
-                    enabled: true,
-                    source: EntrySource::Managed,
-                    installed_at: chrono::Utc::now().to_rfc3339(),
-                    title,
-                });
-                if stale_filename.is_some()
-                    && let Some(previous) = previous
-                {
-                    stale_entries.push(previous);
-                }
-                identified += 1;
+        for (hash, identity) in resolved {
+            let Some(file) = by_hash.get(&hash).and_then(|files| files.first()) else {
+                continue;
+            };
+            let Some(kind) = file.kind() else { continue };
+            let canonical_id = CanonicalId::for_project(identity.provider, &identity.project_id);
+            let previous = manifest.find(&canonical_id).cloned();
+            let title = titles
+                .get(&canonical_id)
+                .cloned()
+                .or(identity.title.clone());
+            let stale_filename = manifest.upsert(ManifestEntry {
+                canonical_id,
+                provider: identity.provider,
+                project_id: identity.project_id,
+                version_id: identity.version_id,
+                kind,
+                filename: file.filename().to_string(),
+                sha1: file.sha1.clone(),
+                sha512: file.sha512.clone(),
+                size: file.size,
+                dependencies: identity.dependencies,
+                enabled: true,
+                installed_at: chrono::Utc::now().to_rfc3339(),
+                title,
+            });
+            if stale_filename.is_some()
+                && let Some(previous) = previous
+            {
+                stale_entries.push(previous);
             }
+            identified += 1;
         }
     }
 
@@ -816,11 +1061,12 @@ fn group_pack_files_by_sha512(
 
 fn reject_duplicate_pack_hashes(
     grouped: &HashMap<String, Vec<&axial_content::PackFile>>,
-) -> Result<(), ContentApiError> {
+) -> Result<(), ContentExecutionError> {
     if grouped.values().any(|files| files.len() > 1) {
-        return Err(json_error(
-            StatusCode::BAD_REQUEST,
-            "modpack repeats the same managed content at multiple paths",
+        return Err(content_execution_error(
+            axial_content::ContentError::ProviderMetadataInvalid(
+                "modpack repeats the same managed content at multiple paths".to_string(),
+            ),
         ));
     }
     Ok(())
@@ -829,7 +1075,7 @@ fn reject_duplicate_pack_hashes(
 fn reject_duplicate_pack_projects(
     resolved: &HashMap<String, VersionIdentity>,
     grouped: &HashMap<String, Vec<&axial_content::PackFile>>,
-) -> Result<(), ContentApiError> {
+) -> Result<(), ContentExecutionError> {
     let mut projects = HashSet::new();
     for (hash, identity) in resolved {
         let Some(file) = grouped.get(hash).and_then(|files| files.first()) else {
@@ -840,9 +1086,10 @@ fn reject_duplicate_pack_projects(
         }
         let canonical_id = CanonicalId::for_project(identity.provider, &identity.project_id);
         if !projects.insert(canonical_id) {
-            return Err(json_error(
-                StatusCode::BAD_REQUEST,
-                "modpack contains multiple managed files for the same project",
+            return Err(content_execution_error(
+                axial_content::ContentError::ProviderMetadataInvalid(
+                    "modpack contains multiple managed files for the same project".to_string(),
+                ),
             ));
         }
     }
@@ -853,7 +1100,7 @@ fn verified_stale_pack_files(
     game_dir: &Path,
     stale_entries: &[ManifestEntry],
     protected_paths: &[String],
-) -> axial_content::ContentResult<Vec<String>> {
+) -> axial_content::ContentResult<Vec<ManagedRemoval>> {
     let mut files = Vec::new();
     for entry in stale_entries {
         files.extend(verified_removable_variants(
@@ -862,8 +1109,8 @@ fn verified_stale_pack_files(
             protected_paths,
         )?);
     }
-    files.sort();
-    files.dedup();
+    files.sort_by(|left, right| left.relative_path().cmp(right.relative_path()));
+    files.dedup_by(|left, right| left == right);
     Ok(files)
 }
 
@@ -896,6 +1143,7 @@ fn sanitize(filename: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::super::ContentExecutionFailureKind;
     use super::*;
 
     #[test]
@@ -905,6 +1153,50 @@ mod tests {
             None
         );
         assert_eq!(mismatch_notice("", "1.21.6", None, "1.21.6"), None);
+    }
+
+    #[test]
+    fn execution_modpack_resolution_preserves_closed_provider_failure_kinds() {
+        let cases = [
+            (
+                axial_content::ContentError::DownloadPreparation(
+                    "prepare modpack download".to_string(),
+                ),
+                ContentExecutionFailureKind::NetworkFailure,
+            ),
+            (
+                axial_content::ContentError::Status {
+                    status: reqwest::StatusCode::SERVICE_UNAVAILABLE,
+                    context: "resolve modpack version".to_string(),
+                },
+                ContentExecutionFailureKind::ProviderFailure,
+            ),
+            (
+                axial_content::ContentError::ProviderMetadataInvalid(
+                    "invalid modpack metadata".to_string(),
+                ),
+                ContentExecutionFailureKind::MetadataInvalid,
+            ),
+        ];
+
+        for (error, expected) in cases {
+            let (_, failure_kind) = ModpackVersionResolveError::Provider(error)
+                .into_execution()
+                .into_parts();
+            assert_eq!(failure_kind, Some(expected));
+        }
+    }
+
+    #[test]
+    fn execution_modpack_resolution_leaves_local_conflicts_unclassified() {
+        let (_, failure_kind) = ModpackVersionResolveError::Api(json_error(
+            StatusCode::CONFLICT,
+            "modpack selection changed",
+        ))
+        .into_execution()
+        .into_parts();
+
+        assert_eq!(failure_kind, None);
     }
 
     #[test]
@@ -936,9 +1228,14 @@ mod tests {
 
         let grouped = group_pack_files_by_sha512(&installed);
         assert_eq!(grouped["shared-hash"].len(), 2);
-        let (status, _) = reject_duplicate_pack_hashes(&grouped)
-            .expect_err("one manifest entry cannot safely own two paths");
-        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let ((status, _), failure_kind) = reject_duplicate_pack_hashes(&grouped)
+            .expect_err("one manifest entry cannot safely own two paths")
+            .into_parts();
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            failure_kind,
+            Some(ContentExecutionFailureKind::MetadataInvalid)
+        );
     }
 
     #[test]
@@ -969,9 +1266,14 @@ mod tests {
         ]);
         let grouped = group_pack_files_by_sha512(&installed);
 
-        let (status, _) = reject_duplicate_pack_projects(&resolved, &grouped)
-            .expect_err("one canonical project cannot safely own two pack files");
-        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let ((status, _), failure_kind) = reject_duplicate_pack_projects(&resolved, &grouped)
+            .expect_err("one canonical project cannot safely own two pack files")
+            .into_parts();
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            failure_kind,
+            Some(ContentExecutionFailureKind::MetadataInvalid)
+        );
     }
 
     #[test]
@@ -996,6 +1298,62 @@ mod tests {
         }
 
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn malformed_pack_index_is_typed_without_classifying_generic_invalid_errors() {
+        let path = std::env::temp_dir().join(format!(
+            "axial-malformed-pack-index-test-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::write(&path, b"not a zip archive").expect("write malformed pack");
+
+        let error = read_pack_index(&path).expect_err("malformed pack must fail");
+        assert!(matches!(
+            &error,
+            axial_content::ContentError::ProviderMetadataInvalid(_)
+        ));
+        let ((status, _), failure_kind) = content_execution_error(error).into_parts();
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            failure_kind,
+            Some(ContentExecutionFailureKind::MetadataInvalid)
+        );
+
+        let ((status, _), failure_kind) =
+            content_execution_error(axial_content::ContentError::Invalid(
+                "a modpack destination is already occupied".to_string(),
+            ))
+            .into_parts();
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(failure_kind, None);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn provider_identification_failures_remain_typed_for_execution() {
+        let (_, failure_kind) = content_execution_error(axial_content::ContentError::Status {
+            status: reqwest::StatusCode::SERVICE_UNAVAILABLE,
+            context: "identify modpack files".to_string(),
+        })
+        .into_parts();
+
+        assert_eq!(
+            failure_kind,
+            Some(ContentExecutionFailureKind::ProviderFailure)
+        );
+    }
+
+    #[test]
+    fn local_parse_failures_remain_unclassified_for_execution() {
+        let parse_error =
+            serde_json::from_slice::<serde_json::Value>(b"{").expect_err("invalid local JSON");
+        let (_, failure_kind) =
+            content_execution_error(axial_content::ContentError::Parse(parse_error)).into_parts();
+
+        assert_eq!(failure_kind, None);
     }
 
     #[test]
@@ -1071,7 +1429,7 @@ mod tests {
                 instance_id: "instance-1".to_string(),
                 canonical_id: "modrinth:pack".to_string(),
                 version_id: None,
-                selected_paths: Vec::new(),
+                selected_file_ids: Vec::new(),
                 include_overrides: true,
             },
             CanonicalId("modrinth:pack".to_string()),
@@ -1079,8 +1437,10 @@ mod tests {
             "Pack".to_string(),
         );
 
-        let Some(InstallQueueContentActionRequest::Modpack { version_id, .. }) =
-            request.content_action
+        let InstallQueueRequest::Content {
+            action: InstallQueueContentActionRequest::Modpack { version_id, .. },
+            ..
+        } = request
         else {
             panic!("expected queued modpack action");
         };
@@ -1093,7 +1453,11 @@ mod tests {
             instance_id: "instance-1".to_string(),
             canonical_id: "modrinth:pack".to_string(),
             version_id: Some("version".to_string()),
-            selected_paths: vec!["mods/example.jar".to_string()],
+            selected_file_ids: vec![modpack_file_selection_id(
+                &CanonicalId("modrinth:pack".to_string()),
+                "version",
+                "mods/example.jar",
+            )],
             include_overrides: true,
         };
 
@@ -1102,17 +1466,26 @@ mod tests {
 
     #[test]
     fn cherry_pick_validation_rejects_unidentified_incompatible_and_occupied_files() {
-        let option =
-            |path: &str, identified: bool, compatible: bool, installed: bool| ModpackFileOption {
+        let pack_id = CanonicalId("modrinth:pack".to_string());
+        let option = |path: &str,
+                      identified: bool,
+                      compatible: bool,
+                      installed: bool|
+         -> ClassifiedModpackFile {
+            ClassifiedModpackFile {
                 path: path.to_string(),
-                filename: path.rsplit('/').next().unwrap_or(path).to_string(),
-                kind: ContentKind::Mod,
-                size: None,
-                title: "Example".to_string(),
-                identified,
-                compatible,
-                installed,
-            };
+                option: ModpackFileOption {
+                    selection_id: modpack_file_selection_id(&pack_id, "version", path),
+                    filename: path.rsplit('/').next().unwrap_or(path).to_string(),
+                    kind: ContentKind::Mod,
+                    size: None,
+                    title: "Example".to_string(),
+                    identified,
+                    compatible,
+                    installed,
+                },
+            }
+        };
         let classified = vec![
             option("mods/good.jar", true, true, false),
             option("mods/unknown.jar", false, false, false),
@@ -1120,18 +1493,109 @@ mod tests {
             option("mods/occupied.jar", true, true, true),
         ];
 
-        assert!(validate_cherry_pick_files(&["mods/good.jar".to_string()], &classified).is_ok());
-        for rejected in [
-            "mods/unknown.jar",
-            "mods/incompatible.jar",
-            "mods/occupied.jar",
-            "mods/missing.jar",
-        ] {
+        let good_id = classified[0].option.selection_id.clone();
+        assert_eq!(
+            resolve_selected_paths(&[good_id], &classified).expect("eligible selection"),
+            vec!["mods/good.jar".to_string()]
+        );
+        for rejected in classified
+            .iter()
+            .skip(1)
+            .map(|file| &file.option.selection_id)
+        {
             assert!(
-                validate_cherry_pick_files(&[rejected.to_string()], &classified).is_err(),
-                "{rejected} must be rejected"
+                resolve_selected_paths(std::slice::from_ref(rejected), &classified).is_err(),
+                "{rejected} must be rejected",
             );
         }
+        let missing_id = modpack_file_selection_id(&pack_id, "version", "mods/missing.jar");
+        assert!(resolve_selected_paths(&[missing_id], &classified).is_err());
+    }
+
+    #[test]
+    fn modpack_file_selection_ids_are_stable_opaque_and_domain_bound() {
+        let pack = CanonicalId("modrinth:pack".to_string());
+        let id = modpack_file_selection_id(&pack, "version-1", "mods/example.jar");
+
+        assert!(valid_modpack_file_selection_id(&id));
+        assert_eq!(
+            id,
+            modpack_file_selection_id(&pack, "version-1", "mods/example.jar")
+        );
+        assert_ne!(
+            id,
+            modpack_file_selection_id(&pack, "version-2", "mods/example.jar")
+        );
+        assert_ne!(
+            id,
+            modpack_file_selection_id(
+                &CanonicalId("modrinth:other-pack".to_string()),
+                "version-1",
+                "mods/example.jar",
+            )
+        );
+        assert_ne!(
+            id,
+            modpack_file_selection_id(&pack, "version-1", "mods/other.jar")
+        );
+        assert!(!id.contains("example"));
+    }
+
+    #[test]
+    fn selected_file_ids_have_strict_shape_count_and_uniqueness_bounds() {
+        let valid = modpack_file_selection_id(
+            &CanonicalId("modrinth:pack".to_string()),
+            "version",
+            "mods/example.jar",
+        );
+        assert!(validate_modpack_file_selection_ids(&[]).is_ok());
+        assert!(validate_modpack_file_selection_ids(std::slice::from_ref(&valid)).is_ok());
+        assert!(validate_modpack_file_selection_ids(&[valid.clone(), valid]).is_err());
+        assert!(validate_modpack_file_selection_ids(&["mods/example.jar".to_string()]).is_err());
+        assert!(
+            validate_modpack_file_selection_ids(&[format!("mpf1-{}", "A".repeat(64))]).is_err()
+        );
+
+        let too_many = (0..=MAX_MODPACK_FILE_SELECTIONS)
+            .map(|index| format!("mpf1-{index:064x}"))
+            .collect::<Vec<_>>();
+        assert!(validate_modpack_file_selection_ids(&too_many).is_err());
+    }
+
+    #[test]
+    fn public_modpack_file_option_contains_no_archive_path() {
+        let option = ModpackFileOption {
+            selection_id: modpack_file_selection_id(
+                &CanonicalId("modrinth:pack".to_string()),
+                "version",
+                "mods/private-provider-name.jar",
+            ),
+            filename: "private-provider-name.jar".to_string(),
+            kind: ContentKind::Mod,
+            size: Some(42),
+            title: "Example".to_string(),
+            identified: true,
+            compatible: true,
+            installed: false,
+        };
+        let value = serde_json::to_value(option).expect("serialize public option");
+
+        assert!(value.get("selection_id").is_some());
+        assert!(value.get("path").is_none());
+        assert!(!value.to_string().contains("mods/"));
+    }
+
+    #[test]
+    fn old_selected_paths_request_field_is_rejected() {
+        let request = serde_json::from_value::<ModpackInstallRequest>(serde_json::json!({
+            "instance_id": "instance-1",
+            "canonical_id": "modrinth:pack",
+            "version_id": "version",
+            "selected_paths": ["mods/example.jar"],
+            "include_overrides": false
+        }));
+
+        assert!(request.is_err());
     }
 
     #[test]

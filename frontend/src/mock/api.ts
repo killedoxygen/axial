@@ -517,7 +517,6 @@ const mockInstanceContent: Record<string, InstanceContentEntry[]> = {
       version_id: 'fabric-api-mock-1',
       filename: 'fabric-api.jar',
       enabled: true,
-      source: 'managed',
     },
   ],
 };
@@ -693,7 +692,12 @@ function mockModpackTarget(canonicalId: string): ModpackTarget {
 }
 
 function mockModpackInstall(body: unknown): InstallQueueStateResponse {
-  if (!isRecord(body) || typeof body.instance_id !== 'string' || typeof body.canonical_id !== 'string') {
+  if (
+    !isRecord(body) ||
+    typeof body.instance_id !== 'string' ||
+    typeof body.canonical_id !== 'string' ||
+    !Array.isArray(body.selected_file_ids)
+  ) {
     throw apiError(400, 'Bad Request', { error: 'invalid modpack install request' });
   }
   return mockEmptyInstallQueue('Content queued', 'Modpack files');
@@ -729,7 +733,6 @@ function mockContentInstall(body: unknown): InstallQueueStateResponse {
       version_id: item.version_id,
       filename: item.filename,
       enabled: true,
-      source: 'managed',
     });
   }
   return mockEmptyInstallQueue('Content queued', `${plan.items.length} items`);
@@ -784,7 +787,7 @@ function mockModpackFiles(_instanceId: string, canonicalId: string): ModpackFile
     loader: 'fabric',
     files: [
       {
-        path: 'mods/sodium.jar',
+        selection_id: `mpf1-${'1'.repeat(64)}`,
         filename: 'sodium.jar',
         kind: 'mod',
         size: 1_250_000,
@@ -794,7 +797,7 @@ function mockModpackFiles(_instanceId: string, canonicalId: string): ModpackFile
         installed: false,
       },
       {
-        path: 'mods/lithium.jar',
+        selection_id: `mpf1-${'2'.repeat(64)}`,
         filename: 'lithium.jar',
         kind: 'mod',
         size: 740_000,

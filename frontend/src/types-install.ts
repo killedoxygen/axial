@@ -120,7 +120,7 @@ export type InstallQueueContentAction =
       kind: 'modpack';
       canonical_id: string;
       version_id: string;
-      selected_paths: string[];
+      selected_file_ids: string[];
       include_overrides: boolean;
     };
 

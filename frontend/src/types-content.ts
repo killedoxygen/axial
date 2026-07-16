@@ -169,7 +169,7 @@ export interface ModpackTarget {
 }
 
 export interface ModpackFileOption {
-  path: string;
+  selection_id: string;
   filename: string;
   kind: Exclude<ContentKind, 'modpack'>;
   size?: number | null;
@@ -188,8 +188,6 @@ export interface ModpackFilesPlan {
   files: ModpackFileOption[];
 }
 
-export type EntrySource = 'managed' | 'imported';
-
 export interface InstanceContentEntry {
   canonical_id: string;
   title?: string;
@@ -199,7 +197,6 @@ export interface InstanceContentEntry {
   version_id: string;
   filename: string;
   enabled: boolean;
-  source: EntrySource;
 }
 
 export interface InstanceContentResponse {

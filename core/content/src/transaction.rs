@@ -1,7 +1,7 @@
 use crate::error::{ContentError, ContentResult};
 use std::collections::HashSet;
 use std::fs;
-use std::io;
+use std::io::{self, Read};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -143,11 +143,19 @@ pub(crate) struct FileTransaction {
     root: PathBuf,
     staging: PathBuf,
     backup: PathBuf,
-    applied: Vec<(String, bool)>,
+    applied: Vec<AppliedFile>,
     removed: Vec<String>,
     replace_existing: bool,
     must_be_absent: HashSet<String>,
+    preserve_staging: bool,
     finished: bool,
+}
+
+#[derive(Debug, Clone)]
+struct AppliedFile {
+    relative: String,
+    existed: bool,
+    expected: PathBuf,
 }
 
 impl FileTransaction {
@@ -156,19 +164,37 @@ impl FileTransaction {
         staging: PathBuf,
         relative_paths: &[String],
     ) -> ContentResult<Self> {
-        Self::apply_with_policy(root, staging, relative_paths, true, &[])
+        Self::apply_with_policy(
+            root,
+            staging,
+            relative_paths,
+            true,
+            &[],
+            &mut allow_existing_destination,
+        )
     }
 
-    /// Apply replacements while preserving paths that preflight observed as
-    /// absent. This closes the gap between ownership validation and commit: a
-    /// user file created while downloads are in flight is never overwritten.
-    pub(crate) fn apply_preserving_absence(
+    /// Apply replacements by claiming each existing destination into the unique
+    /// transaction backup, validating those claimed bytes, and promoting with
+    /// no-clobber semantics.
+    pub(crate) fn apply_preserving_absence_with_revalidation<F>(
         root: &Path,
         staging: PathBuf,
         relative_paths: &[String],
         must_be_absent: &[String],
-    ) -> ContentResult<Self> {
-        Self::apply_with_policy(root, staging, relative_paths, true, must_be_absent)
+        mut validate_existing: F,
+    ) -> ContentResult<Self>
+    where
+        F: FnMut(&str, &Path) -> ContentResult<()>,
+    {
+        Self::apply_with_policy(
+            root,
+            staging,
+            relative_paths,
+            true,
+            must_be_absent,
+            &mut validate_existing,
+        )
     }
 
     pub(crate) fn apply_new(
@@ -176,16 +202,27 @@ impl FileTransaction {
         staging: PathBuf,
         relative_paths: &[String],
     ) -> ContentResult<Self> {
-        Self::apply_with_policy(root, staging, relative_paths, false, relative_paths)
+        Self::apply_with_policy(
+            root,
+            staging,
+            relative_paths,
+            false,
+            relative_paths,
+            &mut allow_existing_destination,
+        )
     }
 
-    fn apply_with_policy(
+    fn apply_with_policy<F>(
         root: &Path,
         staging: PathBuf,
         relative_paths: &[String],
         replace_existing: bool,
         must_be_absent: &[String],
-    ) -> ContentResult<Self> {
+        validate_existing: &mut F,
+    ) -> ContentResult<Self>
+    where
+        F: FnMut(&str, &Path) -> ContentResult<()>,
+    {
         let backup = staging.join(".backup");
         let mut transaction = Self {
             root: root.to_path_buf(),
@@ -195,11 +232,15 @@ impl FileTransaction {
             removed: Vec::new(),
             replace_existing,
             must_be_absent: must_be_absent.iter().cloned().collect(),
+            preserve_staging: false,
             finished: false,
         };
         for relative in relative_paths {
-            if let Err(error) = transaction.apply_one(relative) {
-                transaction.rollback_inner();
+            if let Err(error) = transaction.apply_one(relative, validate_existing) {
+                if let Err(rollback_error) = transaction.rollback_inner() {
+                    transaction.finished = true;
+                    return Err(rollback_error);
+                }
                 transaction.finished = true;
                 return Err(error);
             }
@@ -212,18 +253,109 @@ impl FileTransaction {
         Self::apply(root, staging.transfer(), &[])
     }
 
-    /// Move existing destinations into the transaction backup. Missing files
-    /// are harmless, while every other filesystem error aborts the operation.
-    /// Paths installed by this transaction are protected automatically.
-    pub(crate) fn stage_removals(&mut self, relative_paths: &[String]) -> ContentResult<()> {
+    /// Claim existing destinations into the transaction backup and validate the
+    /// claimed bytes before removal can become part of the transaction. If a
+    /// later claim fails, earlier removals remain staged and are restored by an
+    /// explicit rollback or by dropping the transaction.
+    pub(crate) fn stage_removals_with_revalidation<F>(
+        &mut self,
+        relative_paths: &[String],
+        mut validate_claimed: F,
+    ) -> ContentResult<()>
+    where
+        F: FnMut(&str, &Path) -> ContentResult<()>,
+    {
         for relative in relative_paths {
-            self.stage_removal(relative)?;
+            self.stage_removal(relative, &mut validate_claimed)?;
         }
         Ok(())
     }
 
-    fn stage_removal(&mut self, relative: &str) -> ContentResult<()> {
-        if self.applied.iter().any(|(applied, _)| applied == relative)
+    /// Atomically claim `source`, classify the claimed bytes, and publish an
+    /// identical file at an absent `target`. Rollback compares the published
+    /// bytes with the retained claim before removing them and restores the
+    /// source without replacing a path that appeared in the meantime.
+    pub(crate) fn move_new_with_revalidation<T, F, P>(
+        &mut self,
+        source: &str,
+        target: &str,
+        validate_claimed: F,
+        before_publish: P,
+    ) -> ContentResult<T>
+    where
+        F: FnOnce(&Path) -> ContentResult<T>,
+        P: FnOnce(),
+    {
+        if source == target
+            || self
+                .applied
+                .iter()
+                .any(|applied| applied.relative == source || applied.relative == target)
+            || self
+                .removed
+                .iter()
+                .any(|removed| removed == source || removed == target)
+        {
+            return Err(ContentError::Invalid(
+                "content move overlaps another transaction path".to_string(),
+            ));
+        }
+
+        let source_path = contained_path(&self.root, source)?;
+        let target_path = contained_path(&self.root, target)?;
+        match fs::symlink_metadata(&source_path) {
+            Ok(metadata) if metadata.is_file() => {}
+            Ok(_) => {
+                return Err(ContentError::Invalid(
+                    "content move source is not a regular file".to_string(),
+                ));
+            }
+            Err(error) => return Err(ContentError::Io(error)),
+        }
+        match fs::symlink_metadata(&target_path) {
+            Ok(_) => {
+                return Err(ContentError::Invalid(
+                    "content destination became occupied before commit".to_string(),
+                ));
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(ContentError::Io(error)),
+        }
+
+        let claimed = contained_path(&self.backup, source)?;
+        if let Some(parent) = claimed.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::rename(&source_path, &claimed)?;
+        let validation = match validate_claimed(&claimed) {
+            Ok(validation) => validation,
+            Err(error) => {
+                return Err(self.restore_claimed_or_retain(&claimed, &source_path, error));
+            }
+        };
+
+        before_publish();
+        let publish_result = promote_new_file_retaining_source(&claimed, &target_path);
+        if let Err(error) = publish_result {
+            return Err(self.restore_claimed_or_retain(&claimed, &source_path, error));
+        }
+        self.removed.push(source.to_string());
+        self.applied.push(AppliedFile {
+            relative: target.to_string(),
+            existed: false,
+            expected: claimed,
+        });
+        Ok(validation)
+    }
+
+    fn stage_removal<F>(&mut self, relative: &str, validate_claimed: &mut F) -> ContentResult<()>
+    where
+        F: FnMut(&str, &Path) -> ContentResult<()>,
+    {
+        if self
+            .applied
+            .iter()
+            .any(|applied| applied.relative == relative)
             || self.removed.iter().any(|removed| removed == relative)
         {
             return Ok(());
@@ -244,11 +376,17 @@ impl FileTransaction {
             fs::create_dir_all(parent)?;
         }
         fs::rename(&destination, &backup)?;
+        if let Err(error) = validate_claimed(relative, &backup) {
+            return Err(self.restore_claimed_or_retain(&backup, &destination, error));
+        }
         self.removed.push(relative.to_string());
         Ok(())
     }
 
-    fn apply_one(&mut self, relative: &str) -> ContentResult<()> {
+    fn apply_one<F>(&mut self, relative: &str, validate_existing: &mut F) -> ContentResult<()>
+    where
+        F: FnMut(&str, &Path) -> ContentResult<()>,
+    {
         let staged = contained_path(&self.staging, relative)?;
         let destination = contained_path(&self.root, relative)?;
         let backup = contained_path(&self.backup, relative)?;
@@ -275,106 +413,240 @@ impl FileTransaction {
                 fs::create_dir_all(parent)?;
             }
             fs::rename(&destination, &backup)?;
+            if let Err(error) = validate_existing(relative, &backup) {
+                return Err(self.restore_claimed_or_retain(&backup, &destination, error));
+            }
         }
-        let must_remain_absent = !self.replace_existing || self.must_be_absent.contains(relative);
-        let promote_result = if must_remain_absent {
-            promote_new_file(&staged, &destination)
-        } else {
-            fs::rename(&staged, &destination).map_err(ContentError::Io)
-        };
+        let promote_result = promote_new_file_retaining_source(&staged, &destination);
         if let Err(error) = promote_result {
             if existed {
-                let _ = fs::rename(&backup, &destination);
+                return Err(self.restore_claimed_or_retain(&backup, &destination, error));
             }
             return Err(error);
         }
-        self.applied.push((relative.to_string(), existed));
+        self.applied.push(AppliedFile {
+            relative: relative.to_string(),
+            existed,
+            expected: staged,
+        });
         Ok(())
+    }
+
+    fn restore_claimed_or_retain(
+        &mut self,
+        backup: &Path,
+        destination: &Path,
+        original_error: ContentError,
+    ) -> ContentError {
+        match promote_new_file(backup, destination) {
+            Ok(()) => original_error,
+            Err(_) => {
+                self.preserve_staging = true;
+                ContentError::Invalid(
+                    "content changed before commit and recovery bytes were retained because the destination became occupied"
+                        .to_string(),
+                )
+            }
+        }
     }
 
     pub(crate) fn commit(mut self) {
         self.finished = true;
-        let _ = fs::remove_dir_all(&self.staging);
+        if !self.preserve_staging {
+            let _ = fs::remove_dir_all(&self.staging);
+        }
     }
 
-    pub(crate) fn rollback(mut self) {
-        self.rollback_inner();
+    pub(crate) fn rollback(mut self) -> ContentResult<()> {
+        let result = self.rollback_inner();
         self.finished = true;
+        result
     }
 
-    fn rollback_inner(&mut self) {
-        for relative in self.removed.iter().rev() {
+    fn rollback_inner(&mut self) -> ContentResult<()> {
+        let mut failed = false;
+        let applied = self.applied.clone();
+        for applied in applied.iter().rev() {
+            if self.rollback_applied(applied).is_err() {
+                self.preserve_staging = true;
+                failed = true;
+            }
+        }
+        let removed = self.removed.clone();
+        for relative in removed.iter().rev() {
             if let (Ok(destination), Ok(backup)) = (
                 contained_path(&self.root, relative),
                 contained_path(&self.backup, relative),
-            ) {
-                if let Some(parent) = destination.parent() {
-                    let _ = fs::create_dir_all(parent);
-                }
-                let _ = fs::rename(backup, destination);
+            ) && restore_without_clobber(&backup, &destination).is_err()
+            {
+                self.preserve_staging = true;
+                failed = true;
             }
         }
-        for (relative, existed) in self.applied.iter().rev() {
-            if let Ok(destination) = contained_path(&self.root, relative) {
-                let _ = fs::remove_file(&destination);
-                if *existed && let Ok(backup) = contained_path(&self.backup, relative) {
-                    if let Some(parent) = destination.parent() {
-                        let _ = fs::create_dir_all(parent);
-                    }
-                    let _ = fs::rename(backup, destination);
-                }
-            }
+        if !self.preserve_staging {
+            let _ = fs::remove_dir_all(&self.staging);
         }
-        let _ = fs::remove_dir_all(&self.staging);
+        if failed {
+            Err(ContentError::Invalid(
+                "content rollback could not restore every path without replacing newer filesystem changes; recovery bytes were retained"
+                    .to_string(),
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn rollback_applied(&mut self, applied: &AppliedFile) -> ContentResult<()> {
+        let destination = contained_path(&self.root, &applied.relative)?;
+        let backup = contained_path(&self.backup, &applied.relative)?;
+        let rollback_claim =
+            contained_path(&self.staging.join(".rollback-current"), &applied.relative)?;
+        let current_exists = match fs::symlink_metadata(&destination) {
+            Ok(_) => true,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+            Err(error) => return Err(ContentError::Io(error)),
+        };
+
+        if !current_exists {
+            if applied.existed {
+                return Err(ContentError::Invalid(
+                    "an applied content destination changed before rollback".to_string(),
+                ));
+            }
+            return Ok(());
+        }
+        if let Some(parent) = rollback_claim.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::rename(&destination, &rollback_claim)?;
+        if !regular_files_match(&rollback_claim, &applied.expected)? {
+            self.preserve_staging = true;
+            restore_without_clobber(&rollback_claim, &destination)?;
+            return Err(ContentError::Invalid(
+                "an applied content destination changed before rollback".to_string(),
+            ));
+        }
+        fs::remove_file(&rollback_claim)?;
+        if applied.existed {
+            restore_without_clobber(&backup, &destination)?;
+        }
+        Ok(())
+    }
+}
+
+fn allow_existing_destination(_: &str, _: &Path) -> ContentResult<()> {
+    Ok(())
+}
+
+fn restore_without_clobber(claimed: &Path, destination: &Path) -> ContentResult<()> {
+    if let Some(parent) = destination.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    promote_new_file(claimed, destination)
+}
+
+fn regular_files_match(left: &Path, right: &Path) -> ContentResult<bool> {
+    let left_metadata = fs::symlink_metadata(left)?;
+    let right_metadata = fs::symlink_metadata(right)?;
+    if !left_metadata.is_file()
+        || !right_metadata.is_file()
+        || left_metadata.len() != right_metadata.len()
+    {
+        return Ok(false);
+    }
+    let mut left = fs::File::open(left)?;
+    let mut right = fs::File::open(right)?;
+    let mut left_buffer = [0_u8; 64 * 1024];
+    let mut right_buffer = [0_u8; 64 * 1024];
+    loop {
+        let left_read = left.read(&mut left_buffer)?;
+        let right_read = right.read(&mut right_buffer)?;
+        if left_read != right_read || left_buffer[..left_read] != right_buffer[..right_read] {
+            return Ok(false);
+        }
+        if left_read == 0 {
+            return Ok(true);
+        }
     }
 }
 
 /// Promote a staged regular file without ever replacing an occupied path. A
-/// hard link provides an atomic same-volume fast path; filesystems without hard
-/// links fall back to an exclusive create and copy, which retains no-clobber
-/// semantics at the cost of another write.
+/// hard link provides an atomic same-volume fast path. The fallback first
+/// copies into a unique private directory beside the destination, then
+/// publishes the completed copy atomically without replacing an occupied path.
 fn promote_new_file(staged: &Path, destination: &Path) -> ContentResult<()> {
-    match fs::hard_link(staged, destination) {
-        Ok(()) => {
-            let _ = fs::remove_file(staged);
-            return Ok(());
+    promote_new_file_with_source_policy(staged, destination, true)
+}
+
+fn promote_new_file_retaining_source(staged: &Path, destination: &Path) -> ContentResult<()> {
+    promote_new_file_with_source_policy(staged, destination, false)
+}
+
+fn promote_new_file_with_source_policy(
+    staged: &Path,
+    destination: &Path,
+    remove_source: bool,
+) -> ContentResult<()> {
+    promote_new_file_with_copy(staged, destination, remove_source, |source, destination| {
+        fs::copy(source, destination)
+    })
+}
+
+fn promote_new_file_with_copy<F>(
+    staged: &Path,
+    destination: &Path,
+    remove_source: bool,
+    copy_file: F,
+) -> ContentResult<()>
+where
+    F: FnOnce(&Path, &Path) -> io::Result<u64>,
+{
+    if remove_source {
+        match fs::hard_link(staged, destination) {
+            Ok(()) => {
+                let _ = fs::remove_file(staged);
+                return Ok(());
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                return Err(ContentError::Invalid(
+                    "content destination became occupied before commit".to_string(),
+                ));
+            }
+            Err(_) => {}
         }
-        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-            return Err(ContentError::Invalid(
-                "content destination became occupied before commit".to_string(),
-            ));
-        }
-        Err(_) => {}
     }
 
-    let mut source = fs::File::open(staged)?;
-    let mut target = match fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(destination)
-    {
-        Ok(target) => target,
-        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-            return Err(ContentError::Invalid(
-                "content destination became occupied before commit".to_string(),
-            ));
-        }
-        Err(error) => return Err(ContentError::Io(error)),
-    };
-    if let Err(error) = io::copy(&mut source, &mut target) {
-        drop(target);
-        let _ = fs::remove_file(destination);
+    let parent = destination.parent().unwrap_or_else(|| Path::new("."));
+    let copy_root = staging_dir(parent, "axial-content-promotion");
+    fs::create_dir(&copy_root)?;
+    let private_copy = copy_root.join("payload");
+    if let Err(error) = copy_file(staged, &private_copy) {
+        let _ = fs::remove_dir_all(&copy_root);
         return Err(ContentError::Io(error));
     }
-    drop(target);
-    let _ = fs::remove_file(staged);
+    let publish_result = publish_private_copy(&private_copy, destination);
+    let _ = fs::remove_dir_all(&copy_root);
+    publish_result?;
+    if remove_source {
+        let _ = fs::remove_file(staged);
+    }
     Ok(())
+}
+
+fn publish_private_copy(private_copy: &Path, destination: &Path) -> ContentResult<()> {
+    match fs::hard_link(private_copy, destination) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Err(ContentError::Invalid(
+            "content destination became occupied before commit".to_string(),
+        )),
+        Err(error) => Err(ContentError::Io(error)),
+    }
 }
 
 impl Drop for FileTransaction {
     fn drop(&mut self) {
         if !self.finished {
-            self.rollback_inner();
+            let _ = self.rollback_inner();
         }
     }
 }
@@ -404,7 +676,8 @@ mod tests {
 
         FileTransaction::apply(&root, staging.transfer(), &["mods/example.jar".to_string()])
             .expect("apply")
-            .rollback();
+            .rollback()
+            .expect("rollback");
 
         assert_eq!(
             fs::read(root.join("mods/example.jar")).expect("restored"),
@@ -445,14 +718,119 @@ mod tests {
         let mut transaction = FileTransaction::empty(&root).expect("transaction");
 
         transaction
-            .stage_removals(&["mods/example.jar".to_string()])
+            .stage_removals_with_revalidation(&["mods/example.jar".to_string()], |_, _| Ok(()))
             .expect("stage removal");
         assert!(!root.join("mods/example.jar").exists());
-        transaction.rollback();
+        transaction.rollback().expect("rollback");
 
         assert_eq!(
             fs::read(root.join("mods/example.jar")).expect("restored"),
             b"content"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn partial_removal_staging_is_restored_by_caller_rollback() {
+        let root = root("partial-removal-staging");
+        fs::create_dir_all(root.join("mods")).expect("mods");
+        let first = root.join("mods/first.jar");
+        let second = root.join("mods/second.jar");
+        fs::write(&first, b"first").expect("first");
+        fs::write(&second, b"second").expect("second");
+        let mut transaction = FileTransaction::empty(&root).expect("transaction");
+
+        let result = transaction.stage_removals_with_revalidation(
+            &["mods/first.jar".to_string(), "mods/second.jar".to_string()],
+            |relative, _| {
+                if relative == "mods/second.jar" {
+                    Err(ContentError::Invalid("reject second removal".to_string()))
+                } else {
+                    Ok(())
+                }
+            },
+        );
+
+        assert!(result.is_err());
+        assert!(!first.exists());
+        assert_eq!(fs::read(&second).expect("restored second"), b"second");
+        transaction.rollback().expect("caller rollback");
+        assert_eq!(fs::read(&first).expect("restored first"), b"first");
+        assert_eq!(fs::read(&second).expect("preserved second"), b"second");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn removal_rollback_preserves_a_new_destination_and_retains_the_backup() {
+        let root = root("remove-rollback-conflict");
+        fs::create_dir_all(root.join("mods")).expect("mods");
+        let destination = root.join("mods/example.jar");
+        fs::write(&destination, b"removed bytes").expect("removal source");
+        let staging = StagingGuard::create(&root, "stage").expect("stage");
+        let staging_root = staging.path().to_path_buf();
+        let mut transaction =
+            FileTransaction::apply(&root, staging.transfer(), &[]).expect("transaction");
+        transaction
+            .stage_removals_with_revalidation(&["mods/example.jar".to_string()], |_, _| Ok(()))
+            .expect("stage removal");
+
+        fs::write(&destination, b"new destination").expect("racing destination");
+        let error = transaction
+            .rollback()
+            .expect_err("rollback must not replace a new destination");
+
+        assert!(error.to_string().contains("rollback"));
+        assert_eq!(
+            fs::read(&destination).expect("preserved new destination"),
+            b"new destination"
+        );
+        assert_eq!(
+            fs::read(staging_root.join(".backup/mods/example.jar"))
+                .expect("retained removal backup"),
+            b"removed bytes"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn partial_apply_rollback_preserves_a_replaced_earlier_destination() {
+        let root = root("partial-rollback-user-replacement");
+        fs::create_dir_all(root.join("mods")).expect("mods");
+        let first = root.join("mods/first.jar");
+        let second = root.join("mods/second.jar");
+        fs::write(&first, b"old first").expect("old first");
+        fs::write(&second, b"old second").expect("old second");
+        let staging = StagingGuard::create(&root, "stage").expect("stage");
+        let staging_root = staging.path().to_path_buf();
+        fs::create_dir_all(staging.path().join("mods")).expect("staged mods");
+        fs::write(staging.path().join("mods/first.jar"), b"new first").expect("new first");
+        fs::write(staging.path().join("mods/second.jar"), b"new second").expect("new second");
+
+        let result = FileTransaction::apply_preserving_absence_with_revalidation(
+            &root,
+            staging.transfer(),
+            &["mods/first.jar".to_string(), "mods/second.jar".to_string()],
+            &[],
+            |relative, _| {
+                if relative == "mods/second.jar" {
+                    fs::write(&first, b"user replacement").expect("replace first after apply");
+                    return Err(ContentError::Invalid(
+                        "second destination failed validation".to_string(),
+                    ));
+                }
+                Ok(())
+            },
+        );
+
+        assert!(result.is_err());
+        assert_eq!(
+            fs::read(&first).expect("preserved first replacement"),
+            b"user replacement"
+        );
+        assert_eq!(fs::read(&second).expect("restored second"), b"old second");
+        assert_eq!(
+            fs::read(staging_root.join(".backup/mods/first.jar")).expect("retained first backup"),
+            b"old first"
         );
         let _ = fs::remove_dir_all(root);
     }
@@ -468,7 +846,7 @@ mod tests {
                 .expect("apply");
 
         transaction
-            .stage_removals(&["mods/example.jar".to_string()])
+            .stage_removals_with_revalidation(&["mods/example.jar".to_string()], |_, _| Ok(()))
             .expect("protected removal");
         transaction.commit();
 
@@ -517,11 +895,12 @@ mod tests {
         // the downloaded batch is committed.
         fs::write(root.join("mods/new.jar"), b"user file").expect("racing user file");
         let paths = vec!["mods/existing.jar".to_string(), "mods/new.jar".to_string()];
-        let result = FileTransaction::apply_preserving_absence(
+        let result = FileTransaction::apply_preserving_absence_with_revalidation(
             &root,
             staging.transfer(),
             &paths,
             &["mods/new.jar".to_string()],
+            |_, _| Ok(()),
         );
 
         assert!(result.is_err());
@@ -533,6 +912,83 @@ mod tests {
             fs::read(root.join("mods/new.jar")).expect("preserved user file"),
             b"user file"
         );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn failed_claim_validation_preserves_a_new_destination_and_retains_the_claimed_file() {
+        let root = root("claim-validation-conflict");
+        fs::create_dir_all(root.join("mods")).expect("mods");
+        let destination = root.join("mods/example.jar");
+        fs::write(&destination, b"claimed bytes").expect("existing file");
+        let staging = StagingGuard::create(&root, "stage").expect("stage");
+        let staging_root = staging.path().to_path_buf();
+        fs::create_dir_all(staging.path().join("mods")).expect("staged mods");
+        fs::write(
+            staging.path().join("mods/example.jar"),
+            b"downloaded update",
+        )
+        .expect("staged update");
+
+        let result = FileTransaction::apply_preserving_absence_with_revalidation(
+            &root,
+            staging.transfer(),
+            &["mods/example.jar".to_string()],
+            &[],
+            |_, claimed| {
+                assert_eq!(fs::read(claimed).expect("claimed file"), b"claimed bytes");
+                fs::write(&destination, b"new destination").expect("racing destination");
+                Err(ContentError::Invalid(
+                    "claimed destination failed validation".to_string(),
+                ))
+            },
+        );
+
+        assert!(result.is_err());
+        assert_eq!(
+            fs::read(&destination).expect("preserved new destination"),
+            b"new destination"
+        );
+        assert_eq!(
+            fs::read(staging_root.join(".backup/mods/example.jar")).expect("retained claimed file"),
+            b"claimed bytes"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn failed_private_copy_does_not_remove_a_new_destination() {
+        let root = root("failed-private-copy");
+        let source = root.join("source.jar");
+        let destination = root.join("destination.jar");
+        fs::write(&source, b"managed bytes").expect("source");
+
+        let result = promote_new_file_with_copy(&source, &destination, false, |_, private_copy| {
+            fs::write(private_copy, b"partial private copy")?;
+            fs::write(&destination, b"user replacement")?;
+            Err(io::Error::other("simulated copy failure"))
+        });
+
+        assert!(result.is_err());
+        assert_eq!(
+            fs::read(&destination).expect("preserved replacement"),
+            b"user replacement"
+        );
+        assert_eq!(
+            fs::read(&source).expect("preserved source"),
+            b"managed bytes"
+        );
+        let promotion_directories = fs::read_dir(&root)
+            .expect("root entries")
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".axial-content-promotion-")
+            })
+            .count();
+        assert_eq!(promotion_directories, 0);
         let _ = fs::remove_dir_all(root);
     }
 

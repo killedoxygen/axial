@@ -4309,6 +4309,9 @@ async fn test_launch_session_task(
         .wait_for_settlement()
         .await;
     launch_app::LaunchSessionTask {
+        update_admission: state
+            .try_admit_update_sensitive_operation()
+            .expect("admit prepared response launch"),
         integrity_foreground,
         application: crate::application::stage_launch_instance_command(
             crate::application::LaunchInstanceCommand {

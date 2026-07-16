@@ -239,7 +239,7 @@ pub async fn execute_modpack_instance_setup(
             instance_id: instance_id.clone(),
             canonical_id: target.canonical_id.as_str().to_string(),
             version_id: Some(target.version_id),
-            selected_paths: Vec::new(),
+            selected_file_ids: Vec::new(),
             include_overrides: true,
         },
         prerequisite_queue_id,

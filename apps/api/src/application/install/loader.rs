@@ -39,6 +39,9 @@ pub(super) async fn start_loader_install_with_foreground(
     producer: &ProducerLease,
     inherited_foreground: Option<IntegrityForegroundLease>,
 ) -> Result<InstallStartResponse, InstallApplicationError> {
+    let update_admission = state
+        .try_admit_update_sensitive_operation()
+        .map_err(super::install_update_admission_error_response)?;
     let build_id = request.build_id.trim().to_string();
     if build_id.is_empty() {
         return Err((
@@ -128,7 +131,10 @@ pub(super) async fn start_loader_install_with_foreground(
     let worker_state = state.clone();
     let worker_runtime_cache = state.managed_runtime_cache().clone();
     let progress_owner = producer.claim_child();
-    let foreground = InstallForegroundActivity::new(reservation.hand_off());
+    let foreground = InstallForegroundActivity::new_with_update_admission(
+        reservation.hand_off(),
+        update_admission,
+    );
     let worker_foreground = foreground.clone();
     let interrupted_foreground = foreground.clone();
     let interrupted_state = state.clone();

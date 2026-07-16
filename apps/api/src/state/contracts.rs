@@ -832,6 +832,7 @@ pub enum CommandKind {
     LaunchInstance,
     StopSession,
     InstallVersion,
+    ModifyInstanceContent,
     RepairInstance,
     RepairPersistedState,
     ApplyPerformancePlan,

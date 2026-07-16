@@ -1,7 +1,7 @@
 mod flow;
 
-pub use flow::{UpdateDownloadRequest, UpdateFlowResponse, apply_staged_update, update_flow_state};
-pub(crate) use flow::{cleanup_update_staging, start_update_download};
+pub use flow::{UpdateDownloadRequest, UpdateFlowResponse, update_flow_state};
+pub(crate) use flow::{apply_staged_update, cleanup_update_staging, start_update_download};
 
 use crate::state::AppState;
 use axum::{Json, http::StatusCode};

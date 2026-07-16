@@ -61,14 +61,17 @@ pub use commands::{
     phase_one_command_kinds,
 };
 pub use config::{ConfigPatch, current_config, update_config};
+pub use content::pack::{modpack_files, modpack_target};
 pub use content::{
     ContentApiError, ContentCompatRequest, ContentCompatResponse, ContentInstallRequest,
     ContentPlanRequest, ContentSearchParams, ContentUpdatesResponse, InstanceContentResponse,
     ModpackFilesPlan, ModpackInstallRequest, ModpackInstallResponse, ModpackTarget, ResolutionPlan,
-    SearchHit, content_compatibility, content_detail, content_plan, content_search,
-    instance_content, instance_content_updates,
-    pack::{modpack_files, modpack_target, queue_modpack_install},
-    queue_content_install, queue_content_uninstall, queue_content_uninstalls,
+    SearchHit, content_detail, content_plan, content_search, instance_content,
+    instance_content_updates,
+};
+pub(crate) use content::{
+    content_compatibility, pack::queue_modpack_install, queue_content_install,
+    queue_content_uninstall, queue_content_uninstalls,
 };
 pub use flags::{
     FlagOverridePatch, FlagSource, FlagViewModel, FlagsResponse, list_flags, update_flag,
@@ -132,10 +135,9 @@ pub use skin::flush_pending_saved_skin_applies_for_shutdown;
 pub use status::{StatusResponse, launcher_status};
 pub use telemetry::{FrontendErrorReportRequest, report_frontend_error};
 pub use update::{
-    UpdateDownloadRequest, UpdateFlowResponse, UpdateResponse, apply_staged_update,
-    update_flow_state, update_status,
+    UpdateDownloadRequest, UpdateFlowResponse, UpdateResponse, update_flow_state, update_status,
 };
-pub(crate) use update::{cleanup_update_staging, start_update_download};
+pub(crate) use update::{apply_staged_update, cleanup_update_staging, start_update_download};
 pub use version::{
     CatalogEntry, CatalogResponse, DeleteVersionRequest, SharedDataInfo, VersionInfoResponse,
     VersionsResponse, WorldInfo, open_version_folder,

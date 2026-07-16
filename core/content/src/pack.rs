@@ -8,6 +8,7 @@
 //! indexed downloads and the overrides go through the same containment check.
 
 use crate::error::{ContentError, ContentResult};
+use crate::install::{ManagedRemoval, stage_managed_removals};
 use crate::manifest::MANIFEST_FILE;
 use crate::model::{ContentKind, FileRef};
 use crate::transaction::{FileTransaction, StagingGuard};
@@ -18,7 +19,7 @@ use axial_minecraft::download::{
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::io::{self, Read};
+use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
@@ -102,22 +103,26 @@ pub struct PackInstallReport {
 /// loader and Minecraft version it needs before creating an instance for it.
 pub fn read_pack_index(archive: &Path) -> ContentResult<PackIndex> {
     let file = fs::File::open(archive)?;
-    let mut zip = zip::ZipArchive::new(file)
-        .map_err(|error| ContentError::Invalid(format!("not a readable modpack: {error}")))?;
-    let mut entry = zip
-        .by_name(INDEX_FILE)
-        .map_err(|_| ContentError::Invalid("modpack has no modrinth.index.json".to_string()))?;
+    let mut zip = zip::ZipArchive::new(file).map_err(|error| {
+        ContentError::ProviderMetadataInvalid(format!("not a readable modpack: {error}"))
+    })?;
+    let mut entry = zip.by_name(INDEX_FILE).map_err(|_| {
+        ContentError::ProviderMetadataInvalid("modpack has no modrinth.index.json".to_string())
+    })?;
     if entry.size() > MAX_INDEX_BYTES {
-        return Err(ContentError::Invalid(
+        return Err(ContentError::ProviderMetadataInvalid(
             "modpack index exceeds the size limit".to_string(),
         ));
     }
     let mut raw = String::new();
     (&mut entry)
         .take(MAX_INDEX_BYTES + 1)
-        .read_to_string(&mut raw)?;
+        .read_to_string(&mut raw)
+        .map_err(|_| {
+            ContentError::ProviderMetadataInvalid("modpack index could not be read".to_string())
+        })?;
     if raw.len() as u64 > MAX_INDEX_BYTES {
-        return Err(ContentError::Invalid(
+        return Err(ContentError::ProviderMetadataInvalid(
             "modpack index exceeds the size limit".to_string(),
         ));
     }
@@ -207,7 +212,7 @@ where
         .filter(|file| selected.is_empty() || selected.contains(file.path.as_str()))
         .collect();
     if !selected.is_empty() && files.len() != selected.len() {
-        return Err(ContentError::Invalid(
+        return Err(ContentError::ProviderMetadataInvalid(
             "the selected modpack files changed; review the pack again".to_string(),
         ));
     }
@@ -271,7 +276,7 @@ where
             .iter()
             .any(|relative| indexed.contains(relative.as_str()))
         {
-            return Err(ContentError::Invalid(
+            return Err(ContentError::ProviderMetadataInvalid(
                 "modpack override replaces an indexed content file".to_string(),
             ));
         }
@@ -300,8 +305,10 @@ where
         finalize(&report, &mut context)
     };
     if let Err(error) = finalize_result {
-        transaction.rollback();
-        return Err(error);
+        return match transaction.rollback() {
+            Ok(()) => Err(error),
+            Err(rollback_error) => Err(rollback_error),
+        };
     }
     transaction.commit();
 
@@ -310,31 +317,32 @@ where
 }
 
 fn validate_pack_download_url(raw: &str) -> ContentResult<(Url, PackDownloadOrigin)> {
-    let url = Url::parse(raw)
-        .map_err(|_| ContentError::Invalid("modpack download URL is invalid".to_string()))?;
+    let url = Url::parse(raw).map_err(|_| {
+        ContentError::ProviderMetadataInvalid("modpack download URL is invalid".to_string())
+    })?;
     if url.scheme() != "https" || !url.username().is_empty() || url.password().is_some() {
-        return Err(ContentError::Invalid(
+        return Err(ContentError::ProviderMetadataInvalid(
             "modpack downloads require a public HTTPS URL".to_string(),
         ));
     }
-    let host = url
-        .host()
-        .ok_or_else(|| ContentError::Invalid("modpack download URL has no host".to_string()))?;
+    let host = url.host().ok_or_else(|| {
+        ContentError::ProviderMetadataInvalid("modpack download URL has no host".to_string())
+    })?;
     match host {
         Host::Ipv4(address) if !is_public_ip(IpAddr::V4(address)) => {
-            return Err(ContentError::Invalid(
+            return Err(ContentError::ProviderMetadataInvalid(
                 "modpack download destination is not public".to_string(),
             ));
         }
         Host::Ipv6(address) if !is_public_ip(IpAddr::V6(address)) => {
-            return Err(ContentError::Invalid(
+            return Err(ContentError::ProviderMetadataInvalid(
                 "modpack download destination is not public".to_string(),
             ));
         }
         Host::Domain(_) | Host::Ipv4(_) | Host::Ipv6(_) => {}
     }
     let port = url.port_or_known_default().ok_or_else(|| {
-        ContentError::Invalid("modpack download URL has no usable port".to_string())
+        ContentError::ProviderMetadataInvalid("modpack download URL has no usable port".to_string())
     })?;
     let host = host.to_string().to_ascii_lowercase();
     Ok((url, PackDownloadOrigin { host, port }))
@@ -379,7 +387,7 @@ async fn resolve_public_pack_addresses(url: &Url, port: u16) -> ContentResult<Ve
         None => Vec::new(),
     };
     if addresses.is_empty() || addresses.iter().any(|address| !is_public_ip(address.ip())) {
-        return Err(ContentError::Invalid(
+        return Err(ContentError::ProviderMetadataInvalid(
             "modpack download destination is not public".to_string(),
         ));
     }
@@ -474,15 +482,16 @@ pub struct PackFinalizeContext<'a> {
 }
 
 impl PackFinalizeContext<'_> {
-    pub fn stage_removals(&mut self, relative_paths: &[String]) -> ContentResult<()> {
-        self.transaction.stage_removals(relative_paths)
+    pub fn stage_removals(&mut self, removals: &[ManagedRemoval]) -> ContentResult<()> {
+        stage_managed_removals(self.transaction, removals)
     }
 }
 
 fn apply_overrides(game_dir: &Path, archive: &Path) -> ContentResult<Vec<String>> {
     let file = fs::File::open(archive)?;
-    let mut zip = zip::ZipArchive::new(file)
-        .map_err(|error| ContentError::Invalid(format!("not a readable modpack: {error}")))?;
+    let mut zip = zip::ZipArchive::new(file).map_err(|error| {
+        ContentError::ProviderMetadataInvalid(format!("not a readable modpack: {error}"))
+    })?;
 
     let mut applied = Vec::new();
     let mut processed = HashMap::new();
@@ -492,9 +501,9 @@ fn apply_overrides(game_dir: &Path, archive: &Path) -> ContentResult<Vec<String>
     for root in [OVERRIDES, CLIENT_OVERRIDES] {
         let prefix = format!("{root}/");
         for index in 0..zip.len() {
-            let mut entry = zip
-                .by_index(index)
-                .map_err(|error| ContentError::Invalid(format!("unreadable modpack: {error}")))?;
+            let mut entry = zip.by_index(index).map_err(|error| {
+                ContentError::ProviderMetadataInvalid(format!("unreadable modpack: {error}"))
+            })?;
             if entry.is_dir() {
                 continue;
             }
@@ -522,13 +531,13 @@ fn apply_overrides(game_dir: &Path, archive: &Path) -> ContentResult<Vec<String>
                     false
                 }
                 Some(_) => {
-                    return Err(ContentError::Invalid(
+                    return Err(ContentError::ProviderMetadataInvalid(
                         "modpack contains a duplicate override path".to_string(),
                     ));
                 }
             };
             if extracted_files >= MAX_OVERRIDE_FILES {
-                return Err(ContentError::Invalid(
+                return Err(ContentError::ProviderMetadataInvalid(
                     "modpack contains too many override files".to_string(),
                 ));
             }
@@ -536,7 +545,7 @@ fn apply_overrides(game_dir: &Path, archive: &Path) -> ContentResult<Vec<String>
             if declared_size > MAX_OVERRIDE_ENTRY_BYTES
                 || extracted_bytes.saturating_add(declared_size) > MAX_OVERRIDE_TOTAL_BYTES
             {
-                return Err(ContentError::Invalid(
+                return Err(ContentError::ProviderMetadataInvalid(
                     "modpack overrides exceed the extraction limit".to_string(),
                 ));
             }
@@ -548,12 +557,7 @@ fn apply_overrides(game_dir: &Path, archive: &Path) -> ContentResult<Vec<String>
             let mut sink = fs::File::create(&destination)?;
             let copy_limit = MAX_OVERRIDE_ENTRY_BYTES
                 .min(MAX_OVERRIDE_TOTAL_BYTES.saturating_sub(extracted_bytes));
-            let copied = io::copy(&mut (&mut entry).take(copy_limit + 1), &mut sink)?;
-            if copied > copy_limit {
-                return Err(ContentError::Invalid(
-                    "modpack overrides exceed the extraction limit".to_string(),
-                ));
-            }
+            let copied = copy_pack_archive_entry(&mut entry, &mut sink, copy_limit)?;
             extracted_files += 1;
             extracted_bytes = extracted_bytes.saturating_add(copied);
             if first_copy {
@@ -562,6 +566,35 @@ fn apply_overrides(game_dir: &Path, archive: &Path) -> ContentResult<Vec<String>
         }
     }
     Ok(applied)
+}
+
+fn copy_pack_archive_entry<R, W>(source: &mut R, sink: &mut W, limit: u64) -> ContentResult<u64>
+where
+    R: Read,
+    W: Write,
+{
+    let mut copied = 0_u64;
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let remaining = limit.saturating_sub(copied).saturating_add(1);
+        let read_limit = usize::try_from(remaining.min(buffer.len() as u64))
+            .expect("bounded override read size fits usize");
+        let read = source.read(&mut buffer[..read_limit]).map_err(|_| {
+            ContentError::ProviderMetadataInvalid(
+                "modpack override entry could not be read".to_string(),
+            )
+        })?;
+        if read == 0 {
+            return Ok(copied);
+        }
+        copied = copied.saturating_add(read as u64);
+        if copied > limit {
+            return Err(ContentError::ProviderMetadataInvalid(
+                "modpack overrides exceed the extraction limit".to_string(),
+            ));
+        }
+        sink.write_all(&buffer[..read])?;
+    }
 }
 
 /// Resolve `relative` under `root`, refusing anything that would escape it.
@@ -578,13 +611,13 @@ fn contained_path(root: &Path, relative: &str) -> ContentResult<PathBuf> {
 /// compare equal before any collision or ownership decision is made.
 fn normalize_relative_path(relative: &str) -> ContentResult<String> {
     if relative.contains('\\') {
-        return Err(ContentError::Invalid(format!(
+        return Err(ContentError::ProviderMetadataInvalid(format!(
             "modpack file uses a non-portable path: {relative}"
         )));
     }
     let candidate = Path::new(relative);
     if candidate.is_absolute() {
-        return Err(ContentError::Invalid(format!(
+        return Err(ContentError::ProviderMetadataInvalid(format!(
             "modpack file escapes the instance: {relative}"
         )));
     }
@@ -594,20 +627,20 @@ fn normalize_relative_path(relative: &str) -> ContentResult<String> {
             Component::Normal(part) => parts.push(part.to_string_lossy().into_owned()),
             Component::CurDir => {}
             Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
-                return Err(ContentError::Invalid(format!(
+                return Err(ContentError::ProviderMetadataInvalid(format!(
                     "modpack file escapes the instance: {relative}"
                 )));
             }
         }
     }
     if parts.is_empty() {
-        return Err(ContentError::Invalid(format!(
+        return Err(ContentError::ProviderMetadataInvalid(format!(
             "modpack file path is empty: {relative}"
         )));
     }
     let normalized = parts.join("/");
     if normalized.eq_ignore_ascii_case(MANIFEST_FILE) {
-        return Err(ContentError::Invalid(format!(
+        return Err(ContentError::ProviderMetadataInvalid(format!(
             "modpack file uses a launcher-reserved path: {relative}"
         )));
     }
@@ -615,9 +648,11 @@ fn normalize_relative_path(relative: &str) -> ContentResult<String> {
 }
 
 pub fn parse_pack_index(raw: &str) -> ContentResult<PackIndex> {
-    let dto: dto::Index = serde_json::from_str(raw)?;
+    let dto: dto::Index = serde_json::from_str(raw).map_err(|_| {
+        ContentError::ProviderMetadataInvalid("modpack index JSON is invalid".to_string())
+    })?;
     if dto.format_version > SUPPORTED_FORMAT_VERSION {
-        return Err(ContentError::Invalid(format!(
+        return Err(ContentError::ProviderMetadataInvalid(format!(
             "this modpack needs a newer launcher (format {})",
             dto.format_version
         )));
@@ -629,7 +664,7 @@ pub fn parse_pack_index(raw: &str) -> ContentResult<PackIndex> {
         .cloned()
         .unwrap_or_default();
     if minecraft.is_empty() {
-        return Err(ContentError::Invalid(
+        return Err(ContentError::ProviderMetadataInvalid(
             "modpack does not say which Minecraft version it needs".to_string(),
         ));
     }
@@ -643,7 +678,7 @@ pub fn parse_pack_index(raw: &str) -> ContentResult<PackIndex> {
         .collect::<ContentResult<Vec<PackFile>>>()?;
     let unique_paths: HashSet<&str> = files.iter().map(|file| file.path.as_str()).collect();
     if unique_paths.len() != files.len() {
-        return Err(ContentError::Invalid(
+        return Err(ContentError::ProviderMetadataInvalid(
             "modpack contains duplicate file destinations".to_string(),
         ));
     }
@@ -662,7 +697,7 @@ fn pack_file(file: dto::IndexFile) -> ContentResult<PackFile> {
     let sha1 = validate_pack_hash(file.hashes.sha1, 40, "sha1", &path)?;
     let sha512 = validate_pack_hash(file.hashes.sha512, 128, "sha512", &path)?;
     if sha1.is_none() && sha512.is_none() {
-        return Err(ContentError::Invalid(format!(
+        return Err(ContentError::ProviderMetadataInvalid(format!(
             "modpack file has no supported integrity hash: {path}"
         )));
     }
@@ -675,7 +710,10 @@ fn pack_file(file: dto::IndexFile) -> ContentResult<PackFile> {
                 .map(|(url, _)| url.to_string())
         })
         .ok_or_else(|| {
-            ContentError::Invalid(format!("modpack file has no download: {}", file.path))
+            ContentError::ProviderMetadataInvalid(format!(
+                "modpack file has no download: {}",
+                file.path
+            ))
         })?;
     Ok(PackFile {
         path,
@@ -696,7 +734,7 @@ fn validate_pack_hash(
         return Ok(None);
     };
     if hash.len() != expected_len || !hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        return Err(ContentError::Invalid(format!(
+        return Err(ContentError::ProviderMetadataInvalid(format!(
             "modpack file has an invalid {algorithm} hash: {path}"
         )));
     }
@@ -1037,6 +1075,7 @@ mod tests {
         );
 
         let error = read_pack_index(&archive).expect_err("oversized index must be rejected");
+        assert!(matches!(&error, ContentError::ProviderMetadataInvalid(_)));
         assert!(error.to_string().contains("size limit"));
 
         let _ = fs::remove_file(archive);
@@ -1242,6 +1281,7 @@ mod tests {
         );
 
         let error = apply_overrides(&root, &archive).expect_err("duplicate path must be rejected");
+        assert!(matches!(&error, ContentError::ProviderMetadataInvalid(_)));
         assert!(error.to_string().contains("duplicate override path"));
 
         let _ = fs::remove_file(archive);
@@ -1332,6 +1372,7 @@ mod tests {
         .await
         .expect_err("full pack must not replace an indexed destination");
 
+        assert!(matches!(&error, ContentError::Invalid(_)));
         assert!(error.to_string().contains("occupied"));
         assert_eq!(
             fs::read(&destination).expect("preserved file"),
@@ -1382,6 +1423,7 @@ mod tests {
         .await
         .expect_err("full pack must not replace an override destination");
 
+        assert!(matches!(&error, ContentError::Invalid(_)));
         assert!(error.to_string().contains("occupied"));
         assert_eq!(
             fs::read(&destination).expect("preserved file"),

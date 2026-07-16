@@ -229,11 +229,7 @@ export function ModsPane({
                     </button>
                   )}
                 </span>
-                <span
-                  class="cp-mod-source"
-                  data-provider={entry ? entry.provider : 'local'}
-                  title={entry?.source === 'imported' ? 'Identified from a file that was already here' : undefined}
-                >
+                <span class="cp-mod-source" data-provider={entry ? entry.provider : 'local'}>
                   {entry ? 'Modrinth' : 'Local'}
                 </span>
                 <span>{formatBytes(mod.size)}</span>

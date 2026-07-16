@@ -230,7 +230,18 @@ async fn parse_response<T: serde::de::DeserializeOwned>(
         });
     }
     let bytes = response.bytes().await?;
-    Ok(serde_json::from_slice(&bytes)?)
+    parse_provider_json(&bytes, context)
+}
+
+fn parse_provider_json<T: serde::de::DeserializeOwned>(
+    bytes: &[u8],
+    context: &str,
+) -> ContentResult<T> {
+    serde_json::from_slice(bytes).map_err(|error| {
+        ContentError::ProviderMetadataInvalid(format!(
+            "invalid JSON response from {context}: {error}"
+        ))
+    })
 }
 
 fn kind_from_project_type(project_type: &str) -> Option<ContentKind> {
@@ -450,6 +461,14 @@ fn release_channel(version_type: &str) -> ReleaseChannel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn invalid_provider_json_is_typed_as_metadata_invalid() {
+        let error = parse_provider_json::<serde_json::Value>(b"{", "provider endpoint")
+            .expect_err("invalid provider JSON must fail closed");
+
+        assert!(matches!(error, ContentError::ProviderMetadataInvalid(_)));
+    }
 
     #[test]
     fn hash_identity_preserves_compatibility_and_dependencies() {

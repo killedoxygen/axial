@@ -10,12 +10,12 @@ mod transaction;
 
 pub use error::{ContentError, ContentResult};
 pub use install::{
-    PlannedFile, install_and_record, managed_file_variants, uninstall, uninstall_many,
-    verified_removable_variants,
+    ManagedRemoval, ModFileDeleteOutcome, ModFileMutationError, ModFileToggleOutcome, PlannedFile,
+    delete_local_mod_file, install_and_record, managed_file_variants, toggle_mod_file, uninstall,
+    uninstall_many, verified_removable_variants,
 };
 pub use manifest::{
-    ContentManifest, EntrySource, ManifestEntry, ReconcileReport, UnidentifiedRecord,
-    UnmanagedFile, entry_file_present, entry_path_matches, reconcile, sha512_file,
+    ContentManifest, ManifestEntry, entry_file_present, entry_path_matches, sha512_file,
 };
 pub use model::{
     CanonicalContent, CanonicalId, ContentDependency, ContentDetail, ContentKind, ContentVersion,

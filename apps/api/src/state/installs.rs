@@ -119,7 +119,7 @@ pub enum ContentQueueAction {
     Modpack {
         canonical_id: String,
         version_id: String,
-        selected_paths: Vec<String>,
+        selected_file_ids: Vec<String>,
         include_overrides: bool,
         setup_cleanup: Option<SetupInstanceCleanup>,
     },

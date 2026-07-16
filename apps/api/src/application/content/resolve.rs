@@ -4,7 +4,10 @@
 //! selections, and this pass re-derives everything server-side.
 
 use super::target::ResolveTarget;
-use super::{ContentApiError, ContentSelection, content_error_response, json_error};
+use super::{
+    ContentApiError, ContentExecutionError, ContentSelection, content_error_response,
+    content_execution_error, json_error,
+};
 use axial_content::{
     CanonicalId, ContentDependency, ContentError, ContentKind, ContentManifest, ContentVersion,
     DependencyKind, FileRef, ManifestEntry, PlannedFile, ProjectMetadata, ProviderId,
@@ -206,14 +209,63 @@ struct ResolvePass {
     retry_with_exact: Option<(CanonicalId, String)>,
 }
 
+enum ResolveError {
+    Api(ContentApiError),
+    Provider(ContentError),
+}
+
+impl From<ContentApiError> for ResolveError {
+    fn from(error: ContentApiError) -> Self {
+        Self::Api(error)
+    }
+}
+
+impl ResolveError {
+    fn into_api(self) -> ContentApiError {
+        match self {
+            Self::Api(error) => error,
+            Self::Provider(error) => content_error_response(error),
+        }
+    }
+
+    fn into_execution(self) -> ContentExecutionError {
+        match self {
+            Self::Api(error) => error.into(),
+            Self::Provider(error) => content_execution_error(error),
+        }
+    }
+}
+
 pub async fn resolve(
     state: &AppState,
     target: &ResolveTarget,
     selections: &[ContentSelection],
     manifest: &ContentManifest,
 ) -> Result<Resolution, ContentApiError> {
+    resolve_inner(state, target, selections, manifest)
+        .await
+        .map_err(ResolveError::into_api)
+}
+
+pub(crate) async fn resolve_for_execution(
+    state: &AppState,
+    target: &ResolveTarget,
+    selections: &[ContentSelection],
+    manifest: &ContentManifest,
+) -> Result<Resolution, ContentExecutionError> {
+    resolve_inner(state, target, selections, manifest)
+        .await
+        .map_err(ResolveError::into_execution)
+}
+
+async fn resolve_inner(
+    state: &AppState,
+    target: &ResolveTarget,
+    selections: &[ContentSelection],
+    manifest: &ContentManifest,
+) -> Result<Resolution, ResolveError> {
     if selections.is_empty() {
-        return Err(json_error(StatusCode::BAD_REQUEST, "no content selected"));
+        return Err(json_error(StatusCode::BAD_REQUEST, "no content selected").into());
     }
     let mut exact_requirements = HashMap::new();
     let replacing: HashSet<CanonicalId> = selections
@@ -280,7 +332,7 @@ async fn installed_exact_requirements(
     target: &ResolveTarget,
     manifest: &ContentManifest,
     replacing: &HashSet<CanonicalId>,
-) -> Result<Vec<(CanonicalId, String)>, ContentApiError> {
+) -> Result<Vec<(CanonicalId, String)>, ResolveError> {
     let live_entries: Vec<&ManifestEntry> = manifest
         .entries
         .iter()
@@ -309,7 +361,7 @@ async fn installed_exact_requirements(
             .content()
             .version_identities(&unresolved_version_ids)
             .await
-            .map_err(content_error_response)?
+            .map_err(ResolveError::Provider)?
     };
 
     let mut requirements = Vec::new();
@@ -351,7 +403,7 @@ async fn resolve_pass(
     selections: &[ContentSelection],
     manifest: &ContentManifest,
     exact_requirements: &HashMap<CanonicalId, String>,
-) -> Result<ResolvePass, ContentApiError> {
+) -> Result<ResolvePass, ResolveError> {
     let selected_ids: Vec<CanonicalId> = selections
         .iter()
         .map(|selection| CanonicalId(selection.canonical_id.clone()))
@@ -360,7 +412,7 @@ async fn resolve_pass(
         .content()
         .metadata(&selected_ids)
         .await
-        .map_err(content_error_response)?;
+        .map_err(ResolveError::Provider)?;
     validate_selected_kinds(selections, &metadata, target)?;
     let mut metadata_requested: HashSet<CanonicalId> = selected_ids.into_iter().collect();
     let mut resolved_versions: HashMap<CanonicalId, String> = HashMap::new();
@@ -438,7 +490,7 @@ async fn resolve_pass(
                 .content()
                 .metadata(&missing_ids)
                 .await
-                .map_err(content_error_response)?;
+                .map_err(ResolveError::Provider)?;
             metadata.extend(fetched);
             metadata_requested.extend(missing_ids);
         }
@@ -456,7 +508,7 @@ async fn resolve_pass(
                 conflicts.push(unavailable_conflict(&canonical_id));
                 continue;
             }
-            Err(error) => return Err(content_error_response(error)),
+            Err(error) => return Err(ResolveError::Provider(error)),
         };
 
         let Some(version) = pick_version(&versions, forced_version.as_deref()) else {
@@ -482,7 +534,7 @@ async fn resolve_pass(
                     .content()
                     .version_identities(&missing_dependency_versions)
                     .await
-                    .map_err(content_error_response)?,
+                    .map_err(ResolveError::Provider)?,
             );
         }
         let dependencies =
@@ -836,6 +888,7 @@ fn incompatible_conflict(canonical_id: &CanonicalId, installed: &ManifestEntry) 
 
 #[cfg(test)]
 mod tests {
+    use super::super::ContentExecutionFailureKind;
     use super::*;
 
     fn file(name: &str, size: Option<u64>) -> FileRef {
@@ -847,6 +900,44 @@ mod tests {
             size,
             primary: true,
         }
+    }
+
+    #[test]
+    fn execution_resolution_preserves_closed_provider_failure_kinds() {
+        let cases = [
+            (
+                ContentError::DownloadPreparation("prepare download".to_string()),
+                ContentExecutionFailureKind::NetworkFailure,
+            ),
+            (
+                ContentError::Status {
+                    status: reqwest::StatusCode::SERVICE_UNAVAILABLE,
+                    context: "resolve versions".to_string(),
+                },
+                ContentExecutionFailureKind::ProviderFailure,
+            ),
+            (
+                ContentError::ProviderMetadataInvalid("invalid versions".to_string()),
+                ContentExecutionFailureKind::MetadataInvalid,
+            ),
+        ];
+
+        for (error, expected) in cases {
+            let (_, failure_kind) = ResolveError::Provider(error).into_execution().into_parts();
+            assert_eq!(failure_kind, Some(expected));
+        }
+    }
+
+    #[test]
+    fn execution_resolution_leaves_local_conflicts_unclassified() {
+        let (_, failure_kind) = ResolveError::Api(json_error(
+            StatusCode::CONFLICT,
+            "installed content changed",
+        ))
+        .into_execution()
+        .into_parts();
+
+        assert_eq!(failure_kind, None);
     }
 
     fn version(id: &str, channel: ReleaseChannel, files: Vec<FileRef>) -> ContentVersion {

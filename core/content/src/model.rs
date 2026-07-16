@@ -249,10 +249,9 @@ pub struct ContentDetail {
     pub versions: Vec<ContentVersion>,
 }
 
-/// Resolves a file hash back to the project and version that published it. Powers
-/// dedupe and retrofit of manually added files. The kind is not part of it: the
-/// hash lookup does not report one, and the directory the file was found in is a
-/// more reliable answer anyway.
+/// Resolves a file hash back to the project and version that published it.
+/// Modpack import uses the archive path to supply the content kind because the
+/// provider hash lookup does not report one.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VersionIdentity {
     pub provider: ProviderId,

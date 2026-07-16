@@ -7,6 +7,8 @@ pub enum ContentError {
     Request(#[from] reqwest::Error),
     #[error("content response was not valid: {0}")]
     Parse(#[from] serde_json::Error),
+    #[error("content provider metadata was not valid: {0}")]
+    ProviderMetadataInvalid(String),
     #[error("content provider returned {status} for {context}")]
     Status {
         status: reqwest::StatusCode,

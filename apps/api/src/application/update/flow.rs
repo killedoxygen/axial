@@ -1,4 +1,7 @@
-use crate::state::{AppState, RequestProducerHandoff, UpdateFlowPhase, UpdateFlowSnapshot};
+use crate::state::{
+    AppState, RequestProducerHandoff, UpdateApplyAdmissionError, UpdateFlowPhase,
+    UpdateFlowSnapshot,
+};
 use axum::{Json, http::StatusCode};
 use futures_util::StreamExt;
 use reqwest::header::{ACCEPT, USER_AGENT};
@@ -102,38 +105,71 @@ pub(crate) async fn start_update_download(
     Ok(Json(flow_response(state.updater().snapshot())))
 }
 
-pub async fn apply_staged_update(
+pub(crate) async fn apply_staged_update(
     state: &AppState,
+    handoff: RequestProducerHandoff,
 ) -> Result<Json<UpdateFlowResponse>, ApiErrorResponse> {
-    let active_installs = state.installs().active_install_count().await;
-    let active_sessions = state.sessions().active_session_count().await;
-    if active_installs > 0 || active_sessions > 0 {
-        return Err(flow_error(StatusCode::CONFLICT, UPDATE_BUSY_MESSAGE));
-    }
+    apply_staged_update_with(state, handoff, |staged_path| {
+        self_replace::self_replace(&staged_path)
+    })
+    .await
+}
+
+async fn apply_staged_update_with<Apply, ApplyError>(
+    state: &AppState,
+    handoff: RequestProducerHandoff,
+    apply: Apply,
+) -> Result<Json<UpdateFlowResponse>, ApiErrorResponse>
+where
+    Apply: FnOnce(PathBuf) -> Result<(), ApplyError> + Send + 'static,
+    ApplyError: std::fmt::Display + Send + 'static,
+{
+    let producer = handoff.try_claim().map_err(|_| {
+        flow_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "application shutdown is in progress",
+        )
+    })?;
+    let apply_authority = state
+        .try_begin_update_apply()
+        .map_err(update_apply_admission_error)?;
 
     let staged_path = state
         .updater()
         .begin_apply()
         .map_err(|message| flow_error(StatusCode::CONFLICT, message))?;
 
-    let replace_result =
-        tokio::task::spawn_blocking(move || self_replace::self_replace(&staged_path)).await;
-    match replace_result {
-        Ok(Ok(())) => {
-            state.updater().mark_restart_pending();
-            let _ = tokio::fs::remove_dir_all(state.updater().staging_dir()).await;
-            Ok(Json(flow_response(state.updater().snapshot())))
+    let task_state = state.clone();
+    let settlement = producer.spawn_joinable(async move {
+        let replace_result = tokio::task::spawn_blocking(move || apply(staged_path)).await;
+        match replace_result {
+            Ok(Ok(())) => {
+                task_state.updater().mark_restart_pending();
+                apply_authority.mark_restart_pending();
+                let _ = tokio::fs::remove_dir_all(task_state.updater().staging_dir()).await;
+                true
+            }
+            Ok(Err(error)) => {
+                tracing::warn!("failed to apply staged update: {error}");
+                task_state.updater().mark_apply_failed(APPLY_FAILED_MESSAGE);
+                false
+            }
+            Err(error) => {
+                tracing::warn!("staged update apply task failed: {error}");
+                task_state.updater().mark_apply_failed(APPLY_FAILED_MESSAGE);
+                false
+            }
         }
-        Ok(Err(error)) => {
-            tracing::warn!("failed to apply staged update: {error}");
-            state.updater().mark_apply_failed(APPLY_FAILED_MESSAGE);
-            Err(flow_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                APPLY_FAILED_MESSAGE,
-            ))
-        }
+    });
+
+    match settlement.await {
+        Ok(true) => Ok(Json(flow_response(state.updater().snapshot()))),
+        Ok(false) => Err(flow_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            APPLY_FAILED_MESSAGE,
+        )),
         Err(error) => {
-            tracing::warn!("staged update apply task failed: {error}");
+            tracing::warn!("producer-owned update apply task failed: {error}");
             state.updater().mark_apply_failed(APPLY_FAILED_MESSAGE);
             Err(flow_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -141,6 +177,17 @@ pub async fn apply_staged_update(
             ))
         }
     }
+}
+
+fn update_apply_admission_error(error: UpdateApplyAdmissionError) -> ApiErrorResponse {
+    let message = match error {
+        UpdateApplyAdmissionError::ActiveOperations => UPDATE_BUSY_MESSAGE,
+        UpdateApplyAdmissionError::ApplyInProgress => "an update operation is already in progress",
+        UpdateApplyAdmissionError::RestartPending => {
+            "an update is already applied; restart to finish"
+        }
+    };
+    flow_error(StatusCode::CONFLICT, message)
 }
 
 pub(crate) async fn cleanup_update_staging(state: &AppState) {
@@ -466,6 +513,11 @@ fn update_download_client() -> reqwest::Client {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::state::{AppStateInit, InstallStore, SessionStore, UpdateOperationAdmissionError};
+    use axial_config::{AppPaths, ConfigStore, InstanceRegistrySnapshot, InstanceStore};
+    use axial_performance::PerformanceManager;
+    use std::sync::Arc;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn checksum_sidecar_parsing_accepts_sha256sum_format() {
@@ -664,5 +716,104 @@ mod tests {
         });
         assert_eq!(ready.phase, "ready");
         assert_eq!(ready.percent, Some(100));
+    }
+
+    #[tokio::test]
+    async fn cancelled_apply_waiter_retains_exclusive_admission_until_replacement_settles() {
+        let root = unique_test_dir("cancelled-apply-waiter");
+        let state = test_app_state(&root);
+        let epoch = state
+            .updater()
+            .begin_download("1.2.4")
+            .expect("begin test download");
+        state
+            .updater()
+            .mark_ready(epoch, root.join("staged-update"));
+        let request = state.try_admit_request().expect("admit apply request");
+        let handoff = request.producer_handoff();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+
+        let apply_state = state.clone();
+        let waiter = tokio::spawn(async move {
+            apply_staged_update_with(&apply_state, handoff, move |_| {
+                let _ = started_tx.send(());
+                release_rx.recv().expect("release replacement");
+                Err::<(), _>("forced replacement failure")
+            })
+            .await
+        });
+        started_rx.await.expect("replacement started");
+        waiter.abort();
+        let _ = waiter.await;
+        drop(request);
+
+        assert_eq!(
+            state.try_admit_update_sensitive_operation().unwrap_err(),
+            UpdateOperationAdmissionError::ApplyInProgress
+        );
+
+        release_tx.send(()).expect("settle replacement");
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if state.updater().snapshot().phase == UpdateFlowPhase::Failed {
+                    if let Ok(lease) = state.try_admit_update_sensitive_operation() {
+                        drop(lease);
+                        break;
+                    }
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("replacement failure settles");
+        state
+            .try_admit_update_sensitive_operation()
+            .expect("failed replacement reopens admission");
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    fn test_app_state(root: &Path) -> AppState {
+        let paths = test_paths(root);
+        let config = Arc::new(ConfigStore::load_from(paths.clone()).expect("load config"));
+        let instances = Arc::new(
+            InstanceStore::from_snapshot(paths.clone(), InstanceRegistrySnapshot::default())
+                .expect("load instances"),
+        );
+        AppState::new(AppStateInit {
+            app_name: "Axial".to_string(),
+            version: "test".to_string(),
+            config,
+            instances,
+            installs: Arc::new(InstallStore::new()),
+            sessions: Arc::new(SessionStore::new()),
+            performance: Arc::new(
+                PerformanceManager::load_for_startup(&paths.config_dir)
+                    .expect("performance manager"),
+            ),
+            startup_warnings: Vec::new(),
+            frontend_dir: root.join("frontend"),
+        })
+    }
+
+    fn test_paths(root: &Path) -> AppPaths {
+        let config_dir = root.join("config");
+        AppPaths {
+            config_file: config_dir.join("config.json"),
+            instances_file: config_dir.join("instances.json"),
+            instances_dir: config_dir.join("instances"),
+            music_dir: config_dir.join("music"),
+            library_dir: config_dir.join("library"),
+            config_dir,
+        }
+    }
+
+    fn unique_test_dir(name: &str) -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("test clock")
+            .as_nanos();
+        std::env::temp_dir().join(format!("axial-update-{name}-{nonce}"))
     }
 }

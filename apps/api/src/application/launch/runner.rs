@@ -129,8 +129,13 @@ struct LaunchSessionRunTask {
 impl LaunchSessionRunTask {
     fn from_prepared(
         task: super::session::LaunchSessionTask,
-    ) -> (crate::state::IntegrityForegroundLease, Self) {
+    ) -> (
+        crate::state::IntegrityForegroundLease,
+        crate::state::UpdateOperationLease,
+        Self,
+    ) {
         let super::session::LaunchSessionTask {
+            update_admission,
             integrity_foreground,
             application,
             preflight_stage_evidence,
@@ -144,6 +149,7 @@ impl LaunchSessionRunTask {
         } = task;
         (
             integrity_foreground,
+            update_admission,
             Self {
                 application,
                 preflight_stage_evidence,
@@ -204,7 +210,9 @@ async fn launch_session_with_control(
         let (handoff_tx, handoff_rx) = tokio::sync::oneshot::channel();
         let observer_state = state.clone();
         let observer_session_id = session_id.clone();
+        let observer_update_admission = task.update_admission.clone();
         producer.spawn_child(async move {
+            let _update_admission = observer_update_admission;
             own_terminal_observation(
                 observer_state,
                 observer_session_id,
@@ -221,8 +229,9 @@ async fn launch_session_with_control(
     } else {
         None
     };
-    let (integrity_foreground, task) = LaunchSessionRunTask::from_prepared(task);
+    let (integrity_foreground, update_admission, task) = LaunchSessionRunTask::from_prepared(task);
     let mut integrity_foreground = Some(integrity_foreground);
+    let mut update_admission = Some(update_admission);
     let result = launch_session_inner_with_control(
         state.clone(),
         task,
@@ -237,9 +246,11 @@ async fn launch_session_with_control(
         &session_id,
         result,
         &mut integrity_foreground,
+        &mut update_admission,
     )
     .await;
     drop(integrity_foreground);
+    drop(update_admission);
     let (handoff, transfer_hold) = match &disposition {
         LaunchTerminalizationDisposition::Complete(Ok(success)) => (
             TerminalObservationHandoff::Observe {
@@ -491,6 +502,7 @@ async fn terminalize_unhandled_launch_error(
     session_id: &str,
     result: Result<LaunchSuccess, LaunchRequestError>,
     integrity_foreground: &mut Option<crate::state::IntegrityForegroundLease>,
+    update_admission: &mut Option<crate::state::UpdateOperationLease>,
 ) -> LaunchTerminalizationDisposition {
     let error = match result {
         Ok(success) => {
@@ -530,6 +542,9 @@ async fn terminalize_unhandled_launch_error(
             let retained_foreground = integrity_foreground
                 .take()
                 .expect("pending preboot terminalization must retain foreground authority");
+            let retained_update_admission = update_admission
+                .take()
+                .expect("pending preboot terminalization must retain update admission");
             producer.spawn_child(async move {
                 match pending.wait_for_settlement().await {
                     Ok(lease) => {
@@ -542,13 +557,15 @@ async fn terminalize_unhandled_launch_error(
                         .await;
                         lease.release().await;
                         drop(retained_foreground);
+                        drop(retained_update_admission);
                     }
                     Err(error_class) => {
                         trace_unconfirmed_launch_failure_termination(error_class);
-                        retain_integrity_foreground_until_session_terminal(
+                        retain_launch_authority_until_session_terminal(
                             deferred_state,
                             deferred_session_id,
                             retained_foreground,
+                            retained_update_admission,
                         )
                         .await;
                     }
@@ -563,11 +580,15 @@ async fn terminalize_unhandled_launch_error(
             let retained_foreground = integrity_foreground
                 .take()
                 .expect("unconfirmed preboot terminalization must retain foreground authority");
+            let retained_update_admission = update_admission
+                .take()
+                .expect("unconfirmed preboot terminalization must retain update admission");
             producer.spawn_child(async move {
-                retain_integrity_foreground_until_session_terminal(
+                retain_launch_authority_until_session_terminal(
                     retained_state,
                     retained_session_id,
                     retained_foreground,
+                    retained_update_admission,
                 )
                 .await;
             });
@@ -576,12 +597,14 @@ async fn terminalize_unhandled_launch_error(
     }
 }
 
-async fn retain_integrity_foreground_until_session_terminal(
+async fn retain_launch_authority_until_session_terminal(
     state: AppState,
     session_id: String,
     integrity_foreground: crate::state::IntegrityForegroundLease,
+    update_admission: crate::state::UpdateOperationLease,
 ) {
     let _integrity_foreground = integrity_foreground;
+    let _update_admission = update_admission;
     let mut changes = state.sessions().subscribe_changes();
     loop {
         let terminal = state
@@ -2083,7 +2106,8 @@ mod tests {
     use crate::state::failure_memory::{FailureMemorySnapshot, failure_memory_path};
     use crate::state::{
         AppStateInit, GuardianFailureMemoryStore, InstallStore, LaunchEvent, OperationJournalStore,
-        ReconciliationEvidenceRejection, SessionStore, reconciliation_attempt_key,
+        ReconciliationEvidenceRejection, SessionStore, UpdateApplyAdmissionError,
+        reconciliation_attempt_key,
     };
     use axial_config::{
         AppConfig, AppPaths, ConfigStore, Instance, InstanceRegistrySnapshot, InstanceStore,
@@ -2477,7 +2501,8 @@ mod tests {
         task.instance.java_path = java_path.clone();
         task.intent.requested_java = java_path;
         task.intent.game_dir = Some(state.instances().game_dir(instance_id));
-        let (integrity_foreground, task) = LaunchSessionRunTask::from_prepared(task);
+        let (integrity_foreground, _update_admission, task) =
+            LaunchSessionRunTask::from_prepared(task);
         let mut integrity_foreground = Some(integrity_foreground);
 
         let launch_result = tokio::time::timeout(
@@ -2612,7 +2637,8 @@ mod tests {
         task.instance.java_path = java_path.clone();
         task.intent.requested_java = java_path;
         task.intent.game_dir = Some(state.instances().game_dir(instance_id));
-        let (integrity_foreground, task) = LaunchSessionRunTask::from_prepared(task);
+        let (integrity_foreground, _update_admission, task) =
+            LaunchSessionRunTask::from_prepared(task);
         let mut integrity_foreground = Some(integrity_foreground);
         let observed_startup_integrity = Arc::new(std::sync::Mutex::new(Vec::new()));
         let control = LaunchLoopControl {
@@ -3253,7 +3279,8 @@ mod tests {
         };
         let producer = state.try_claim_producer().expect("claim launch producer");
         let task = test_recovery_launch_task(&state, session_id, &root).await;
-        let (integrity_foreground, task) = LaunchSessionRunTask::from_prepared(task);
+        let (integrity_foreground, _update_admission, task) =
+            LaunchSessionRunTask::from_prepared(task);
         let mut integrity_foreground = Some(integrity_foreground);
 
         let result = tokio::time::timeout(
@@ -3453,7 +3480,8 @@ mod tests {
         task.intent.max_memory_mb = 1024;
         task.intent.game_dir = Some(state.instances().game_dir(&task.instance.id));
         task.launched_at = "2026-01-01T00:00:00.000Z".to_string();
-        let (integrity_foreground, task) = LaunchSessionRunTask::from_prepared(task);
+        let (integrity_foreground, _update_admission, task) =
+            LaunchSessionRunTask::from_prepared(task);
         let mut integrity_foreground = Some(integrity_foreground);
         let mut session = test_record(session_id);
         session.instance_id = CRASH_E2E_INSTANCE_ID.to_string();
@@ -4500,12 +4528,18 @@ mod tests {
                 .wait_for_settlement()
                 .await,
         );
+        let mut update_admission = Some(
+            state
+                .try_admit_update_sensitive_operation()
+                .expect("admit terminal update operation"),
+        );
         let result = match terminalize_unhandled_launch_error(
             &state,
             &producer,
             session_id,
             Err(error),
             &mut integrity_foreground,
+            &mut update_admission,
         )
         .await
         {
@@ -4516,6 +4550,7 @@ mod tests {
 
         assert!(result.is_err());
         assert!(integrity_foreground.is_some());
+        assert!(update_admission.is_some());
         let record = state
             .sessions()
             .get(session_id)
@@ -4558,12 +4593,18 @@ mod tests {
                 .wait_for_settlement()
                 .await,
         );
+        let mut update_admission = Some(
+            state
+                .try_admit_update_sensitive_operation()
+                .expect("admit terminal update operation"),
+        );
         let result = match terminalize_unhandled_launch_error(
             &state,
             &producer,
             session_id,
             Err(error),
             &mut integrity_foreground,
+            &mut update_admission,
         )
         .await
         {
@@ -4574,6 +4615,7 @@ mod tests {
 
         assert!(result.is_err());
         assert!(integrity_foreground.is_some());
+        assert!(update_admission.is_some());
         let record = state
             .sessions()
             .get(session_id)
@@ -4644,12 +4686,18 @@ mod tests {
                 .wait_for_settlement()
                 .await,
         );
+        let mut update_admission = Some(
+            state
+                .try_admit_update_sensitive_operation()
+                .expect("admit terminal update operation"),
+        );
         let result = match terminalize_unhandled_launch_error(
             &state,
             &producer,
             session_id,
             Err(error),
             &mut integrity_foreground,
+            &mut update_admission,
         )
         .await
         {
@@ -4664,6 +4712,11 @@ mod tests {
         };
         assert_eq!(returned_error.message, expected_message);
         assert!(integrity_foreground.is_none());
+        assert!(update_admission.is_none());
+        assert_eq!(
+            state.try_begin_update_apply().unwrap_err(),
+            UpdateApplyAdmissionError::ActiveOperations
+        );
         assert!(
             !state.subscribe_integrity_idle().borrow().is_stably_idle(),
             "pending terminalization must retain foreground ownership"
@@ -4716,6 +4769,7 @@ mod tests {
                 if settled.state == LaunchState::Failed
                     && state.sessions().retention_hold_count(session_id).await == Some(0)
                     && state.subscribe_integrity_idle().borrow().is_stably_idle()
+                    && state.try_begin_update_apply().is_ok()
                 {
                     assert_eq!(
                         settled
@@ -4760,6 +4814,11 @@ mod tests {
                 .wait_for_settlement()
                 .await,
         );
+        let mut update_admission = Some(
+            state
+                .try_admit_update_sensitive_operation()
+                .expect("admit terminal update operation"),
+        );
 
         let disposition = terminalize_unhandled_launch_error(
             &state,
@@ -4767,6 +4826,7 @@ mod tests {
             session_id,
             Err(error),
             &mut integrity_foreground,
+            &mut update_admission,
         )
         .await;
 
@@ -4775,6 +4835,11 @@ mod tests {
             LaunchTerminalizationDisposition::Retained(Err(_))
         ));
         assert!(integrity_foreground.is_none());
+        assert!(update_admission.is_none());
+        assert_eq!(
+            state.try_begin_update_apply().unwrap_err(),
+            UpdateApplyAdmissionError::ActiveOperations
+        );
         assert!(
             !state.subscribe_integrity_idle().borrow().is_stably_idle(),
             "unconfirmed terminalization must retain foreground ownership"
@@ -4791,7 +4856,9 @@ mod tests {
         )
         .await;
         tokio::time::timeout(Duration::from_secs(1), async {
-            while !state.subscribe_integrity_idle().borrow().is_stably_idle() {
+            while !state.subscribe_integrity_idle().borrow().is_stably_idle()
+                || state.try_begin_update_apply().is_err()
+            {
                 tokio::task::yield_now().await;
             }
         })
@@ -4829,6 +4896,11 @@ mod tests {
                 .wait_for_settlement()
                 .await,
         );
+        let mut update_admission = Some(
+            state
+                .try_admit_update_sensitive_operation()
+                .expect("admit terminal update operation"),
+        );
 
         let disposition = terminalize_unhandled_launch_error(
             &state,
@@ -4838,6 +4910,7 @@ mod tests {
                 OperationJournalStoreError::MissingOperation,
             )),
             &mut integrity_foreground,
+            &mut update_admission,
         )
         .await;
 
@@ -5005,6 +5078,8 @@ mod tests {
             auto_optimize: false,
             icon: String::new(),
             accent: String::new(),
+            loader_key: String::new(),
+            minecraft_version: "1.21.1".to_string(),
         }
     }
 
@@ -5019,6 +5094,9 @@ mod tests {
             .wait_for_settlement()
             .await;
         super::super::session::LaunchSessionTask {
+            update_admission: state
+                .try_admit_update_sensitive_operation()
+                .expect("admit test launch"),
             integrity_foreground,
             application: crate::application::stage_launch_instance_command(
                 crate::application::LaunchInstanceCommand {

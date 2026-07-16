@@ -111,23 +111,10 @@ pub async fn instance_target(
     ) {
         return Ok(target);
     }
-    let versions = crate::application::version::installed_versions(state)
-        .await?
-        .versions;
-    let display = state
-        .instances()
-        .enrich(&versions)
-        .into_iter()
-        .find(|entry| entry.instance.id == instance.id)
-        .map(|entry| entry.version_display)
-        .ok_or_else(|| json_error(StatusCode::NOT_FOUND, "instance not found"))?;
-
-    Ok(ResolveTarget {
-        game_dir: Some(state.instances().game_dir(&instance.id)),
-        loader: display.loader_key,
-        game_version: display.minecraft_label,
-        supports_mods: display.supports_mods,
-    })
+    Err(json_error(
+        StatusCode::CONFLICT,
+        "instance content identity is incomplete; recreate the instance before changing content",
+    ))
 }
 
 pub fn require_instance_game_dir(

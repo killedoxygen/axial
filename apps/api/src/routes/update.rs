@@ -49,6 +49,7 @@ async fn handle_update_download(
 
 async fn handle_update_apply(
     State(state): State<AppState>,
+    Extension(handoff): Extension<RequestProducerHandoff>,
 ) -> Result<Json<UpdateFlowResponse>, (StatusCode, Json<serde_json::Value>)> {
-    application::apply_staged_update(&state).await
+    application::apply_staged_update(&state, handoff).await
 }

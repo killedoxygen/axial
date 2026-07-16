@@ -102,7 +102,7 @@ export function installModpack(
   canonicalId: string,
   versionId?: string,
   options: {
-    selectedPaths?: string[];
+    selectedFileIds?: string[];
     includeOverrides?: boolean;
   } = {},
 ): Promise<InstallQueueStateResponse> {
@@ -110,7 +110,7 @@ export function installModpack(
     instance_id: instanceId,
     canonical_id: canonicalId,
     version_id: versionId,
-    selected_paths: options.selectedPaths ?? [],
+    selected_file_ids: options.selectedFileIds ?? [],
     include_overrides: options.includeOverrides ?? true,
   });
 }

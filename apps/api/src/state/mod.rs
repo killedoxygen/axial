@@ -33,6 +33,7 @@ mod sessions;
 mod setup_plans;
 mod shutdown;
 pub mod skins;
+mod update_admission;
 pub mod updater;
 mod user_config_snapshots;
 mod user_mod_witness;
@@ -162,6 +163,10 @@ pub use sessions::{SessionAdmissionError, SessionStopError, SessionStore, Startu
 pub(crate) use setup_plans::{SETUP_PLAN_TTL, SetupPlanInsertError, SetupPlanTake};
 use shutdown::AppShutdownCoordinator;
 pub use shutdown::{AppShutdownError, AppShutdownStep};
+pub(crate) use update_admission::{
+    UpdateApplyAdmissionError, UpdateApplyAuthority, UpdateOperationAdmissionError,
+    UpdateOperationLease,
+};
 pub use updater::{UpdateFlowPhase, UpdateFlowSnapshot, UpdaterStore};
 
 #[derive(Clone)]
@@ -191,6 +196,7 @@ pub struct AppState {
     telemetry: Arc<TelemetryHub>,
     remote_flags: Arc<RemoteFlagStore>,
     updater: Arc<UpdaterStore>,
+    update_admission: update_admission::UpdateAdmissionCoordinator,
     content: Arc<ContentRegistry>,
     launch_reports: Arc<launch_reports::LaunchReportStore>,
     persisted_state_load: Arc<PersistedStateLoadEvidence>,
@@ -674,6 +680,7 @@ impl AppState {
             telemetry,
             remote_flags,
             updater,
+            update_admission: update_admission::UpdateAdmissionCoordinator::new(),
             content,
             launch_reports,
             persisted_state_load,
@@ -1036,8 +1043,16 @@ impl AppState {
         &self.updater
     }
 
-    pub fn content(&self) -> &Arc<ContentRegistry> {
-        &self.content
+    pub(crate) fn try_admit_update_sensitive_operation(
+        &self,
+    ) -> Result<UpdateOperationLease, UpdateOperationAdmissionError> {
+        self.update_admission.try_admit_operation()
+    }
+
+    pub(crate) fn try_begin_update_apply(
+        &self,
+    ) -> Result<UpdateApplyAuthority, UpdateApplyAdmissionError> {
+        self.update_admission.try_begin_apply()
     }
 
     pub(crate) fn launch_reports(&self) -> &Arc<launch_reports::LaunchReportStore> {

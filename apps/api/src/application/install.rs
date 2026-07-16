@@ -26,7 +26,7 @@ use crate::observability::{
     },
 };
 use crate::state::AppState;
-use crate::state::contracts::{OperationId, OperationJournalEntry};
+use crate::state::contracts::{OperationId, OperationJournalEntry, OperationPhase};
 use crate::state::{
     ActiveQueuedInstallEntry, ContentQueueAction, InstallInitializationStatus,
     InstallQueueEnqueueOutcome, InstallQueuePlacement, InstallQueueSnapshot, InstallQueueSpec,
@@ -34,7 +34,7 @@ use crate::state::{
     OperationJournalReconciliation, OperationJournalStore, OperationJournalStoreError,
     ProducerLease, QueuedContentSelection, QueuedInstallEntry, RequestProducerHandoff,
     SetupInstanceBaseline, SetupInstanceCleanup, SetupInstancePathKind, SetupInstancePathSnapshot,
-    operation_journal_plan_is_visible,
+    UpdateOperationAdmissionError, UpdateOperationLease, operation_journal_plan_is_visible,
 };
 use axial_config::{INSTANCE_LAYOUT_DIRS, Instance, SHARED_INSTANCE_FILES};
 use axial_minecraft::{
@@ -74,6 +74,59 @@ struct InstallInitializationReservation {
     operation_id: OperationId,
     cleanup_owner: Option<ProducerLease>,
     foreground: Option<IntegrityForegroundLease>,
+}
+
+struct ContentInitializationReservation {
+    store: Arc<InstallStore>,
+    journals: Arc<OperationJournalStore>,
+    install_id: Option<String>,
+    operation_id: OperationId,
+    expected_plan: OperationJournalEntry,
+    cleanup_owner: Option<ProducerLease>,
+}
+
+impl ContentInitializationReservation {
+    fn new(
+        store: Arc<InstallStore>,
+        journals: Arc<OperationJournalStore>,
+        install_id: String,
+        operation_id: OperationId,
+        expected_plan: OperationJournalEntry,
+        cleanup_owner: ProducerLease,
+    ) -> Self {
+        Self {
+            store,
+            journals,
+            install_id: Some(install_id),
+            operation_id,
+            expected_plan,
+            cleanup_owner: Some(cleanup_owner),
+        }
+    }
+
+    fn hand_off(mut self) {
+        self.install_id = None;
+    }
+}
+
+impl Drop for ContentInitializationReservation {
+    fn drop(&mut self) {
+        let Some(install_id) = self.install_id.take() else {
+            return;
+        };
+        let store = self.store.clone();
+        let journals = self.journals.clone();
+        let operation_id = self.operation_id.clone();
+        let expected_plan = self.expected_plan.clone();
+        let cleanup_owner = self
+            .cleanup_owner
+            .take()
+            .expect("content initialization cleanup owner remains available");
+        cleanup_owner.spawn(async move {
+            settle_content_initialization_cleanup(&journals, &operation_id, &expected_plan).await;
+            store.remove(&install_id).await;
+        });
+    }
 }
 
 impl InstallInitializationReservation {
@@ -226,17 +279,139 @@ async fn begin_install_journal_with_owned_reconciliation(
     });
     result_rx.await.unwrap_or(Err(()))
 }
+
+async fn begin_content_journal_with_owned_reconciliation(
+    store: Arc<InstallStore>,
+    journals: Arc<OperationJournalStore>,
+    install_id: String,
+    operation_id: OperationId,
+    instance_id: String,
+    producer: &ProducerLease,
+) -> Result<ContentInitializationReservation, ()> {
+    let expected = operation::planned_content_journal(&operation_id, &instance_id);
+    let reservation = ContentInitializationReservation::new(
+        store,
+        journals.clone(),
+        install_id,
+        operation_id.clone(),
+        expected.clone(),
+        producer.claim_child(),
+    );
+    let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+    producer.claim_child().spawn(async move {
+        let mut result =
+            begin_content_operation_journal(&journals, &operation_id, &instance_id).await;
+        loop {
+            match result {
+                Ok(()) => {
+                    let _ = result_tx.send(Ok(reservation));
+                    return;
+                }
+                Err(error)
+                    if matches!(
+                        &error,
+                        OperationJournalStoreError::Persistence(_)
+                            | OperationJournalStoreError::RetryRequired
+                    ) =>
+                {
+                    match reconcile_install_journal_transition(
+                        &journals,
+                        &operation_id,
+                        error,
+                        |entry| operation_journal_plan_is_visible(entry, &expected),
+                    )
+                    .await
+                    {
+                        Ok(InstallJournalReconciliation::MutationCommitted) => {
+                            let _ = result_tx.send(Ok(reservation));
+                            return;
+                        }
+                        Ok(InstallJournalReconciliation::RetryMutation) => {
+                            result = begin_content_operation_journal(
+                                &journals,
+                                &operation_id,
+                                &instance_id,
+                            )
+                            .await;
+                        }
+                        Err(_) => {
+                            let _ = result_tx.send(Err(()));
+                            return;
+                        }
+                    }
+                }
+                Err(_) => {
+                    let _ = result_tx.send(Err(()));
+                    return;
+                }
+            }
+        }
+    });
+    result_rx.await.unwrap_or(Err(()))
+}
+
+async fn settle_content_initialization_cleanup(
+    journals: &OperationJournalStore,
+    operation_id: &OperationId,
+    expected_plan: &OperationJournalEntry,
+) {
+    loop {
+        match journals.get(operation_id) {
+            Some(entry) if operation_journal_plan_is_visible(&entry, expected_plan) => break,
+            Some(_) => return,
+            None if !journals.has_retry_candidate() => return,
+            None => {}
+        }
+        match reconcile_install_journal_transition(
+            journals,
+            operation_id,
+            OperationJournalStoreError::RetryRequired,
+            |entry| operation_journal_plan_is_visible(entry, expected_plan),
+        )
+        .await
+        {
+            Ok(InstallJournalReconciliation::MutationCommitted) => break,
+            Ok(InstallJournalReconciliation::RetryMutation) | Err(_) => {
+                tokio::time::sleep(INSTALL_JOURNAL_RETRY_MAX_DELAY).await;
+            }
+        }
+    }
+
+    loop {
+        match operation::record_content_operation_initialization_cancelled(journals, operation_id)
+            .await
+        {
+            Ok(()) => return,
+            Err(error)
+                if matches!(
+                    error,
+                    OperationJournalStoreError::Persistence(_)
+                        | OperationJournalStoreError::RetryRequired
+                ) =>
+            {
+                tokio::time::sleep(INSTALL_JOURNAL_RETRY_MAX_DELAY).await;
+            }
+            Err(_) => return,
+        }
+    }
+}
+
 pub type InstallApplicationError = (StatusCode, Json<serde_json::Value>);
 
 #[derive(Clone)]
 struct InstallForegroundActivity {
     lease: Arc<Mutex<Option<IntegrityForegroundLease>>>,
+    _update_admission: UpdateOperationLease,
 }
 
 impl InstallForegroundActivity {
-    fn new(lease: IntegrityForegroundLease) -> Self {
+    fn new_with_update_admission(
+        lease: IntegrityForegroundLease,
+        update_admission: UpdateOperationLease,
+    ) -> Self {
         Self {
             lease: Arc::new(Mutex::new(Some(lease))),
+            _update_admission: update_admission,
         }
     }
 
@@ -336,13 +511,14 @@ pub use model::{
     InstallVersionStartRequest, LoaderBuildsRequest, LoaderInstallStartRequest,
 };
 use operation::{
-    InstallProgressCoalescer, assess_install_guardian_failure,
-    install_failure_evidence_from_download_error_or_facts,
+    ContentDownloadFactAccumulator, InstallProgressCoalescer, assess_install_guardian_failure,
+    begin_content_operation_journal, install_failure_evidence_from_download_error_or_facts,
     install_failure_evidence_from_download_facts, install_failure_point_from_journal,
     install_journal_is_terminal, install_progress_history_from_journal, install_progress_record,
     install_progress_with_terminal_error, interrupted_install_progress,
-    observed_install_failure_progress, public_install_id, record_install_guardian_terminal_outcome,
-    record_install_operation_guardian_evidence,
+    observed_install_failure_progress, public_install_id, record_content_failure_outcome,
+    record_content_operation_interrupted, record_content_operation_progress,
+    record_install_guardian_terminal_outcome, record_install_operation_guardian_evidence,
     record_loader_base_install_dependency_guardian_failure_outcome,
     record_loader_install_operation_guardian_failure_outcome,
 };
@@ -361,6 +537,9 @@ async fn start_install_version_with_foreground(
     producer: &ProducerLease,
     inherited_foreground: Option<IntegrityForegroundLease>,
 ) -> Result<InstallStartResponse, InstallApplicationError> {
+    let update_admission = state
+        .try_admit_update_sensitive_operation()
+        .map_err(install_update_admission_error_response)?;
     let version_id = effective_install_version_id(&request);
     if version_id.is_empty() {
         return Err((
@@ -447,7 +626,10 @@ async fn start_install_version_with_foreground(
     let worker_state = state.clone();
     let worker_runtime_cache = state.managed_runtime_cache().clone();
     let progress_owner = producer.claim_child();
-    let foreground = InstallForegroundActivity::new(reservation.hand_off());
+    let foreground = InstallForegroundActivity::new_with_update_admission(
+        reservation.hand_off(),
+        update_admission,
+    );
     let worker_foreground = foreground.clone();
     let interrupted_foreground = foreground.clone();
     let interrupted_state = state.clone();
@@ -925,6 +1107,9 @@ pub(crate) async fn enqueue_install_from_continuation(
     request: InstallQueueRequest,
     producer: ProducerLease,
 ) -> Result<ContinuationInstallQueueResult, InstallApplicationError> {
+    let _update_admission = state
+        .try_admit_update_sensitive_operation()
+        .map_err(install_update_admission_error_response)?;
     let selection =
         enqueue_install_request(state, request, InstallQueuePlacement::Back, None, None).await?;
     let selected_queue_id = install_queue_outcome_id(&selection.outcome).to_string();
@@ -1155,6 +1340,9 @@ pub(crate) async fn remove_pristine_setup_instance(
     instance_id: &str,
     cleanup: &SetupInstanceCleanup,
 ) -> bool {
+    let Ok(_update_admission) = state.try_admit_update_sensitive_operation() else {
+        return false;
+    };
     let Ok(foreground) = state.register_integrity_foreground() else {
         return false;
     };
@@ -1173,6 +1361,9 @@ async fn enqueue_install_with_placement(
     setup_cleanup: Option<SetupInstanceCleanup>,
     producer: ProducerLease,
 ) -> Result<InstallQueueStateResponse, InstallApplicationError> {
+    let _update_admission = state
+        .try_admit_update_sensitive_operation()
+        .map_err(install_update_admission_error_response)?;
     let selection = enqueue_install_request(
         state,
         request,
@@ -1182,9 +1373,6 @@ async fn enqueue_install_with_placement(
     )
     .await?;
     let started = maybe_start_next_queued_install_owned(state, &producer).await?;
-    if let Some(started) = started.as_ref() {
-        spawn_install_queue_monitor_owned(state.clone(), started.install_id.clone(), producer);
-    }
     Ok(install_queue_state_response(state, Some(selection.notice), started).await)
 }
 
@@ -1319,24 +1507,24 @@ async fn install_queue_spec_from_request(
                 InstallQueueContentActionRequest::Modpack {
                     canonical_id,
                     version_id,
-                    selected_paths,
+                    selected_file_ids,
                     include_overrides,
                 } => {
                     let canonical_id = canonical_id.trim().to_string();
                     let version_id = version_id.trim().to_string();
-                    if canonical_id.is_empty()
-                        || version_id.is_empty()
-                        || selected_paths.len() > 500
-                    {
+                    if canonical_id.is_empty() || version_id.is_empty() {
                         return Err((
                             StatusCode::BAD_REQUEST,
                             Json(serde_json::json!({ "error": "invalid modpack operation" })),
                         ));
                     }
+                    crate::application::content::validate_modpack_file_selection_ids(
+                        &selected_file_ids,
+                    )?;
                     ContentQueueAction::Modpack {
                         canonical_id,
                         version_id,
-                        selected_paths,
+                        selected_file_ids,
                         include_overrides,
                         setup_cleanup,
                     }
@@ -1365,15 +1553,48 @@ async fn maybe_start_next_queued_install(
     let producer = handoff
         .try_claim()
         .map_err(|_| install_shutdown_error_response())?;
-    let transaction_owner = producer.claim_child();
+    maybe_start_next_queued_install_owned(state, &producer).await
+}
+
+async fn maybe_start_next_queued_install_owned(
+    state: &AppState,
+    producer: &ProducerLease,
+) -> Result<Option<InstallStartResponse>, InstallApplicationError> {
+    maybe_start_next_queued_install_owned_with(
+        state,
+        producer,
+        |state, spec, producer| async move {
+            start_queued_install(&state, &spec, &producer, None).await
+        },
+    )
+    .await
+}
+
+async fn maybe_start_next_queued_install_owned_with<Start, StartFuture>(
+    state: &AppState,
+    producer: &ProducerLease,
+    start: Start,
+) -> Result<Option<InstallStartResponse>, InstallApplicationError>
+where
+    Start: FnOnce(AppState, InstallQueueSpec, ProducerLease) -> StartFuture + Send + 'static,
+    StartFuture:
+        Future<Output = Result<InstallStartResponse, InstallApplicationError>> + Send + 'static,
+{
     let transaction_state = state.clone();
+    let transaction_producer = producer.claim_child();
+    let transaction_owner = transaction_producer.claim_child();
     let transaction = transaction_owner.spawn_joinable(async move {
-        let started = maybe_start_next_queued_install_owned(&transaction_state, &producer).await?;
+        let started = start_next_queued_install_transaction_with(
+            &transaction_state,
+            &transaction_producer,
+            start,
+        )
+        .await?;
         if let Some(started) = started.as_ref() {
             spawn_install_queue_monitor_owned(
-                transaction_state.clone(),
+                transaction_state,
                 started.install_id.clone(),
-                producer,
+                transaction_producer,
             );
         }
         Ok(started)
@@ -1383,10 +1604,32 @@ async fn maybe_start_next_queued_install(
         .map_err(|_| install_queue_start_stopped_error_response())?
 }
 
-async fn maybe_start_next_queued_install_owned(
+async fn start_next_queued_install_transaction(
     state: &AppState,
     producer: &ProducerLease,
 ) -> Result<Option<InstallStartResponse>, InstallApplicationError> {
+    start_next_queued_install_transaction_with(
+        state,
+        producer,
+        |state, spec, producer| async move {
+            start_queued_install(&state, &spec, &producer, None).await
+        },
+    )
+    .await
+}
+
+async fn start_next_queued_install_transaction_with<Start, StartFuture>(
+    state: &AppState,
+    producer: &ProducerLease,
+    start: Start,
+) -> Result<Option<InstallStartResponse>, InstallApplicationError>
+where
+    Start: FnOnce(AppState, InstallQueueSpec, ProducerLease) -> StartFuture,
+    StartFuture: Future<Output = Result<InstallStartResponse, InstallApplicationError>>,
+{
+    let _update_admission = state
+        .try_admit_update_sensitive_operation()
+        .map_err(install_update_admission_error_response)?;
     let _queue_start = state.installs().acquire_queue_start_gate().await;
     let entry = loop {
         let Some(entry) = state.installs().reserve_next_queued_install().await else {
@@ -1419,7 +1662,7 @@ async fn maybe_start_next_queued_install_owned(
         }
         break entry;
     };
-    let started = match start_queued_install(state, &entry.spec, producer, None).await {
+    let started = match start(state.clone(), entry.spec.clone(), producer.claim_child()).await {
         Ok(started) => started,
         Err(error) => {
             state
@@ -1449,6 +1692,9 @@ where
     Start: FnMut(InstallQueueSpec) -> StartFuture,
     StartFuture: Future<Output = Result<InstallStartResponse, InstallApplicationError>>,
 {
+    let _update_admission = state
+        .try_admit_update_sensitive_operation()
+        .map_err(install_update_admission_error_response)?;
     let _queue_start = state.installs().acquire_queue_start_gate().await;
     let initial_pending = state.installs().queue_snapshot().await.pending.len();
     for _ in 0..initial_pending.saturating_add(1) {
@@ -1570,17 +1816,69 @@ async fn start_content_operation(
     action: &ContentQueueAction,
     producer: &ProducerLease,
 ) -> Result<InstallStartResponse, InstallApplicationError> {
+    start_content_operation_with_after_journal(
+        state,
+        instance_id,
+        label,
+        action,
+        producer,
+        |_, _| async {},
+    )
+    .await
+}
+
+async fn start_content_operation_with_after_journal<AfterJournal, AfterJournalFuture>(
+    state: &AppState,
+    instance_id: &str,
+    label: &str,
+    action: &ContentQueueAction,
+    producer: &ProducerLease,
+    after_journal: AfterJournal,
+) -> Result<InstallStartResponse, InstallApplicationError>
+where
+    AfterJournal: FnOnce(String, OperationId) -> AfterJournalFuture,
+    AfterJournalFuture: Future<Output = ()>,
+{
+    let update_admission = state
+        .try_admit_update_sensitive_operation()
+        .map_err(install_update_admission_error_response)?;
     let install_id = generate_install_id("content");
-    state.installs().insert(install_id.clone()).await;
     let operation_id = install_operation_id(&install_id);
+    let initialization = begin_content_journal_with_owned_reconciliation(
+        state.installs().clone(),
+        state.journals().clone(),
+        install_id.clone(),
+        operation_id.clone(),
+        instance_id.to_string(),
+        producer,
+    )
+    .await
+    .map_err(|_| install_journal_error_response())?;
+    after_journal(install_id.clone(), operation_id.clone()).await;
+    state.installs().insert(install_id.clone()).await;
     let worker_state = state.clone();
     let worker_store = state.installs().clone();
+    let worker_journals = state.journals().clone();
+    let progress_journals = worker_journals.clone();
     let worker_install_id = install_id.clone();
+    let worker_operation_id = operation_id.clone();
+    let progress_operation_id = operation_id.clone();
     let worker_instance_id = instance_id.to_string();
     let worker_action = action.clone();
+    let download_facts = Arc::new(Mutex::new(ContentDownloadFactAccumulator::default()));
     let worker_read_owner = producer.claim_child();
     let progress_owner = producer.claim_child();
     let interrupted_state = state.clone();
+    let interrupted_journals = state.journals().clone();
+    let interrupted_operation_id = operation_id.clone();
+    let interrupted_download_facts = download_facts.clone();
+    let attempted_terminal = Arc::new(Mutex::new(
+        None::<(
+            DownloadProgress,
+            Option<crate::application::content::ContentExecutionFailureKind>,
+        )>,
+    ));
+    let interrupted_attempted_terminal = attempted_terminal.clone();
     let interrupted_instance_id = instance_id.to_string();
     let interrupted_setup_cleanup = content_action_setup_cleanup(action).cloned();
     InstallStore::spawn_tracked_worker_with_interrupt_progress_owned(
@@ -1590,100 +1888,151 @@ async fn start_content_operation(
         content_interrupted_progress(false),
         async move {
             let (progress_tx, mut progress_rx) = mpsc::unbounded_channel::<DownloadProgress>();
+            let journal_failed = Arc::new(tokio::sync::Notify::new());
             let progress_store = worker_store.clone();
             let progress_install_id = worker_install_id.clone();
-            let progress_task = progress_owner.spawn_joinable(async move {
-                while let Some(progress) = progress_rx.recv().await {
-                    progress_store
-                        .emit(&progress_install_id, sanitize_install_progress(progress))
-                        .await;
-                }
-            });
+            let progress_task = {
+                let journal_failed = journal_failed.clone();
+                progress_owner.spawn_joinable(async move {
+                    let mut last_journal_phase = None;
+                    while let Some(progress) = progress_rx.recv().await {
+                        if progress.done {
+                            continue;
+                        }
+                        if record_content_operation_progress(
+                            &progress_journals,
+                            &progress_operation_id,
+                            &progress,
+                            &[],
+                            &mut last_journal_phase,
+                        )
+                        .await
+                        .is_err()
+                        {
+                            tracing::warn!("failed to record content operation journal progress");
+                            journal_failed.notify_one();
+                            return false;
+                        }
+                        progress_store
+                            .emit(&progress_install_id, sanitize_install_progress(progress))
+                            .await;
+                    }
+                    true
+                })
+            };
 
-            let result = if content_action_owns_instance(&worker_action)
-                && !instance_version_is_installed_and_launchable(
-                    &worker_state,
-                    &worker_read_owner,
-                    &worker_instance_id,
-                )
-                .await
-            {
-                Err((
-                    StatusCode::PRECONDITION_FAILED,
-                    Json(serde_json::json!({
-                        "error": "Minecraft or the selected mod loader did not finish installing."
-                    })),
-                ))
-            } else {
-                match &worker_action {
-                    ContentQueueAction::Install {
-                        selections,
-                        allow_incompatible,
-                        ..
-                    } => {
-                        let request = crate::application::content::ContentInstallRequest {
-                            instance_id: worker_instance_id.clone(),
-                            selections: selections
-                                .iter()
-                                .map(|selection| crate::application::content::ContentSelection {
-                                    canonical_id: selection.canonical_id.clone(),
-                                    kind: selection.kind,
-                                    version_id: selection.version_id.clone(),
-                                })
-                                .collect(),
-                            allow_incompatible: *allow_incompatible,
-                        };
-                        crate::application::content::execute_content_install(
+            let content_operation = async {
+                if content_action_owns_instance(&worker_action)
+                    && !instance_version_is_installed_and_launchable(
+                        &worker_state,
+                        &worker_read_owner,
+                        &worker_instance_id,
+                    )
+                    .await
+                {
+                    Err(crate::application::content::ContentExecutionError::from((
+                        StatusCode::PRECONDITION_FAILED,
+                        Json(serde_json::json!({
+                            "error": "Minecraft or the selected mod loader did not finish installing."
+                        })),
+                    )))
+                } else {
+                    match &worker_action {
+                        ContentQueueAction::Install {
+                            selections,
+                            allow_incompatible,
+                            ..
+                        } => {
+                            let request = crate::application::content::ContentInstallRequest {
+                                instance_id: worker_instance_id.clone(),
+                                selections: selections
+                                    .iter()
+                                    .map(|selection| {
+                                        crate::application::content::ContentSelection {
+                                            canonical_id: selection.canonical_id.clone(),
+                                            kind: selection.kind,
+                                            version_id: selection.version_id.clone(),
+                                        }
+                                    })
+                                    .collect(),
+                                allow_incompatible: *allow_incompatible,
+                            };
+                            crate::application::content::execute_content_install(
+                                &worker_state,
+                                request,
+                                |progress| {
+                                    let _ = progress_tx.send(progress);
+                                },
+                                |fact| {
+                                    download_facts
+                                        .lock()
+                                        .expect("content download fact accumulator lock poisoned")
+                                        .record(fact);
+                                },
+                            )
+                            .await
+                        }
+                        ContentQueueAction::Uninstall { canonical_ids } => {
+                            let _ = progress_tx.send(content_progress(
+                                "removing",
+                                0,
+                                canonical_ids.len() as i32,
+                                false,
+                                None,
+                            ));
+                            crate::application::content::execute_content_uninstalls(
+                                &worker_state,
+                                &worker_instance_id,
+                                canonical_ids,
+                            )
+                            .await
+                        }
+                        ContentQueueAction::Modpack {
+                            canonical_id,
+                            version_id,
+                            selected_file_ids,
+                            include_overrides,
+                            ..
+                        } => crate::application::content::execute_modpack_install(
                             &worker_state,
-                            request,
+                            crate::application::content::ModpackInstallRequest {
+                                instance_id: worker_instance_id.clone(),
+                                canonical_id: canonical_id.clone(),
+                                version_id: Some(version_id.clone()),
+                                selected_file_ids: selected_file_ids.clone(),
+                                include_overrides: *include_overrides,
+                            },
                             |progress| {
                                 let _ = progress_tx.send(progress);
                             },
+                            |fact| {
+                                download_facts
+                                    .lock()
+                                    .expect("content download fact accumulator lock poisoned")
+                                    .record(fact);
+                            },
                         )
                         .await
+                        .map(|_| ()),
                     }
-                    ContentQueueAction::Uninstall { canonical_ids } => {
-                        let _ = progress_tx.send(content_progress(
-                            "removing",
-                            0,
-                            canonical_ids.len() as i32,
-                            false,
-                            None,
-                        ));
-                        crate::application::content::execute_content_uninstalls(
-                            &worker_state,
-                            &worker_instance_id,
-                            canonical_ids,
-                        )
-                        .await
-                    }
-                    ContentQueueAction::Modpack {
-                        canonical_id,
-                        version_id,
-                        selected_paths,
-                        include_overrides,
-                        ..
-                    } => crate::application::content::execute_modpack_install(
-                        &worker_state,
-                        crate::application::content::ModpackInstallRequest {
-                            instance_id: worker_instance_id.clone(),
-                            canonical_id: canonical_id.clone(),
-                            version_id: Some(version_id.clone()),
-                            selected_paths: selected_paths.clone(),
-                            include_overrides: *include_overrides,
-                        },
-                        |progress| {
-                            let _ = progress_tx.send(progress);
-                        },
-                    )
-                    .await
-                    .map(|_| ()),
                 }
             };
+            let mut content_operation = Box::pin(content_operation);
+            let result = tokio::select! {
+                result = content_operation.as_mut() => Some(result),
+                () = journal_failed.notified() => None,
+            };
+            drop(content_operation);
+            let Some(result) = result else {
+                drop(progress_tx);
+                let _ = finish_install_progress_task(progress_task).await;
+                return;
+            };
 
-            let terminal = match result {
-                Ok(()) => content_progress("done", 1, 1, true, None),
-                Err((_, Json(body))) => {
+            let (terminal, failure_kind) = match result {
+                Ok(()) => (content_progress("done", 1, 1, true, None), None),
+                Err(error) => {
+                    let ((_, Json(body)), failure_kind) = error.into_parts();
                     let removed_instance = match content_action_setup_cleanup(&worker_action) {
                         Some(cleanup) => {
                             remove_pristine_setup_instance(
@@ -1703,34 +2052,85 @@ async fn start_content_operation(
                     if removed_instance {
                         message.push_str(" The incomplete setup instance was removed.");
                     }
-                    content_progress(
-                        if removed_instance {
-                            CONTENT_INSTANCE_REMOVED_PHASE
-                        } else {
-                            "error"
-                        },
-                        0,
-                        1,
-                        true,
-                        Some(message),
+                    (
+                        content_progress(
+                            if removed_instance {
+                                CONTENT_INSTANCE_REMOVED_PHASE
+                            } else {
+                                "error"
+                            },
+                            0,
+                            1,
+                            true,
+                            Some(message),
+                        ),
+                        failure_kind,
                     )
                 }
             };
-            let _ = progress_tx.send(terminal);
             drop(progress_tx);
-            let _ = progress_task.await;
+            if !finish_install_progress_task(progress_task).await {
+                return;
+            }
+            let (facts, journal_facts) = {
+                let download_facts = download_facts
+                    .lock()
+                    .expect("content download fact accumulator lock poisoned");
+                (download_facts.facts(), download_facts.journal_facts())
+            };
+            *attempted_terminal
+                .lock()
+                .expect("content terminal progress lock poisoned") =
+                Some((terminal.clone(), failure_kind));
+            if commit_and_emit_content_terminal_progress(
+                worker_store.as_ref(),
+                worker_journals.as_ref(),
+                worker_state.failure_memory(),
+                &worker_operation_id,
+                &worker_install_id,
+                terminal,
+                &facts,
+                &journal_facts,
+                failure_kind,
+            )
+            .await
+            .is_err()
+            {
+                tracing::warn!("failed to durably settle content terminal progress");
+                return;
+            }
         },
         move |_| async move {
-            Some(
-                interrupted_content_progress(
-                    &interrupted_state,
-                    &interrupted_instance_id,
-                    interrupted_setup_cleanup.as_ref(),
-                )
-                .await,
+            let _update_admission = update_admission;
+            let progress = interrupted_content_progress(
+                &interrupted_state,
+                &interrupted_instance_id,
+                interrupted_setup_cleanup.as_ref(),
             )
+            .await;
+            let (facts, journal_facts) = {
+                let download_facts = interrupted_download_facts
+                    .lock()
+                    .expect("content download fact accumulator lock poisoned");
+                (download_facts.facts(), download_facts.journal_facts())
+            };
+            let attempted_terminal = interrupted_attempted_terminal
+                .lock()
+                .expect("content terminal progress lock poisoned")
+                .clone();
+            settle_content_worker_interruption(
+                &interrupted_journals,
+                interrupted_state.failure_memory(),
+                &interrupted_operation_id,
+                progress,
+                &journal_facts,
+                &facts,
+                attempted_terminal,
+            )
+            .await
         },
     );
+    initialization.hand_off();
 
     Ok(InstallStartResponse {
         install_id,
@@ -1744,6 +2144,173 @@ async fn start_content_operation(
             active_step: None,
         },
     })
+}
+
+async fn commit_and_emit_content_terminal_progress(
+    store: &InstallStore,
+    journals: &OperationJournalStore,
+    failure_memory: &crate::state::GuardianFailureMemoryStore,
+    operation_id: &OperationId,
+    install_id: &str,
+    progress: DownloadProgress,
+    execution_facts: &[axial_minecraft::download::ExecutionDownloadFact],
+    journal_facts: &[String],
+    failure_kind: Option<crate::application::content::ContentExecutionFailureKind>,
+) -> Result<(), OperationJournalStoreError> {
+    if progress.error.is_some() {
+        let (evidence, phase) = failure_kind
+            .map(|kind| content_execution_failure_evidence(operation_id, kind))
+            .map_or((None, OperationPhase::Downloading), |(evidence, phase)| {
+                (Some(evidence), phase)
+            });
+        record_content_failure_outcome(
+            journals,
+            failure_memory,
+            operation_id,
+            execution_facts,
+            evidence,
+            phase,
+            &chrono::Utc::now().to_rfc3339(),
+        )
+        .await?;
+    }
+    let mut last_journal_phase = None;
+    record_content_operation_progress(
+        journals,
+        operation_id,
+        &progress,
+        journal_facts,
+        &mut last_journal_phase,
+    )
+    .await?;
+    store
+        .emit(install_id, sanitize_install_progress(progress))
+        .await;
+    Ok(())
+}
+
+async fn settle_content_worker_interruption(
+    journals: &OperationJournalStore,
+    failure_memory: &crate::state::GuardianFailureMemoryStore,
+    operation_id: &OperationId,
+    fallback: DownloadProgress,
+    journal_facts: &[String],
+    execution_facts: &[axial_minecraft::download::ExecutionDownloadFact],
+    attempted_terminal: Option<(
+        DownloadProgress,
+        Option<crate::application::content::ContentExecutionFailureKind>,
+    )>,
+) -> Option<DownloadProgress> {
+    loop {
+        if let Some((attempted_progress, failure_kind)) = attempted_terminal.as_ref()
+            && attempted_progress.error.is_some()
+        {
+            let (evidence, phase) = failure_kind
+                .map(|kind| content_execution_failure_evidence(operation_id, kind))
+                .map_or((None, OperationPhase::Downloading), |(evidence, phase)| {
+                    (Some(evidence), phase)
+                });
+            if let Err(error) = record_content_failure_outcome(
+                journals,
+                failure_memory,
+                operation_id,
+                execution_facts,
+                evidence,
+                phase,
+                &chrono::Utc::now().to_rfc3339(),
+            )
+            .await
+            {
+                if matches!(
+                    error,
+                    OperationJournalStoreError::Persistence(_)
+                        | OperationJournalStoreError::RetryRequired
+                ) {
+                    tokio::time::sleep(INSTALL_JOURNAL_RETRY_MAX_DELAY).await;
+                    continue;
+                }
+                tracing::warn!("failed to settle interrupted content Guardian outcome");
+                return None;
+            }
+        }
+        match record_content_operation_interrupted(
+            journals,
+            operation_id,
+            &fallback,
+            journal_facts,
+            execution_facts,
+        )
+        .await
+        {
+            Ok(()) => return Some(fallback.clone()),
+            Err(error) => {
+                if let Some((attempted_progress, _)) = attempted_terminal.as_ref()
+                    && journals.get(operation_id).as_ref().is_some_and(|entry| {
+                        operation::content_terminal_progress_is_visible(
+                            entry,
+                            operation_id,
+                            attempted_progress,
+                            journal_facts,
+                        )
+                    })
+                {
+                    return Some(sanitize_install_progress(attempted_progress.clone()));
+                }
+                if matches!(
+                    error,
+                    OperationJournalStoreError::Persistence(_)
+                        | OperationJournalStoreError::RetryRequired
+                ) {
+                    tokio::time::sleep(INSTALL_JOURNAL_RETRY_MAX_DELAY).await;
+                    continue;
+                }
+                tracing::warn!("failed to record interrupted content operation journal");
+                return None;
+            }
+        }
+    }
+}
+
+fn content_execution_failure_evidence(
+    operation_id: &OperationId,
+    kind: crate::application::content::ContentExecutionFailureKind,
+) -> (GuardianInstallArtifactFailureEvidence, OperationPhase) {
+    use crate::application::content::ContentExecutionFailureKind;
+    let (target, failure_kind, phase) = match kind {
+        ContentExecutionFailureKind::FileOperation => (
+            "content_filesystem",
+            crate::guardian::GuardianInstallArtifactFailureKind::TempWriteFailed,
+            OperationPhase::Installing,
+        ),
+        ContentExecutionFailureKind::MetadataInvalid => (
+            "content_metadata",
+            crate::guardian::GuardianInstallArtifactFailureKind::MetadataInvalid,
+            OperationPhase::Downloading,
+        ),
+        ContentExecutionFailureKind::NetworkFailure => (
+            "content_download",
+            crate::guardian::GuardianInstallArtifactFailureKind::NetworkFailure,
+            OperationPhase::Downloading,
+        ),
+        ContentExecutionFailureKind::PermissionDenied => (
+            "content_filesystem",
+            crate::guardian::GuardianInstallArtifactFailureKind::PermissionDenied,
+            OperationPhase::Installing,
+        ),
+        ContentExecutionFailureKind::ProviderFailure => (
+            "content_provider",
+            crate::guardian::GuardianInstallArtifactFailureKind::ProviderFailure,
+            OperationPhase::Downloading,
+        ),
+    };
+    (
+        GuardianInstallArtifactFailureEvidence::launcher_managed(
+            Some(operation_id.clone()),
+            target,
+            failure_kind,
+        ),
+        phase,
+    )
 }
 
 fn content_progress(
@@ -1814,7 +2381,7 @@ fn spawn_install_queue_monitor_owned(state: AppState, install_id: String, produc
                 return;
             };
             let Ok(Some(started_install)) =
-                maybe_start_next_queued_install_owned(&state, &successor).await
+                start_next_queued_install_transaction(&state, &successor).await
             else {
                 return;
             };
@@ -1837,6 +2404,23 @@ fn install_shutdown_error_response() -> InstallApplicationError {
         Json(serde_json::json!({
             "error": "Installs are unavailable while the application is shutting down."
         })),
+    )
+}
+
+fn install_update_admission_error_response(
+    error: UpdateOperationAdmissionError,
+) -> InstallApplicationError {
+    let message = match error {
+        UpdateOperationAdmissionError::ApplyInProgress => {
+            "Installs are unavailable while an update is being applied."
+        }
+        UpdateOperationAdmissionError::RestartPending => {
+            "Restart Axial to finish the applied update before starting installs."
+        }
+    };
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(serde_json::json!({ "error": message })),
     )
 }
 
@@ -2236,13 +2820,13 @@ fn content_action_request(action: &ContentQueueAction) -> InstallQueueContentAct
         ContentQueueAction::Modpack {
             canonical_id,
             version_id,
-            selected_paths,
+            selected_file_ids,
             include_overrides,
             ..
         } => InstallQueueContentActionRequest::Modpack {
             canonical_id: canonical_id.clone(),
             version_id: version_id.clone(),
-            selected_paths: selected_paths.clone(),
+            selected_file_ids: selected_file_ids.clone(),
             include_overrides: *include_overrides,
         },
     }

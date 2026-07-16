@@ -131,6 +131,50 @@ fn content_queue_view_model_retains_semantic_intent_without_urls() {
 }
 
 #[test]
+fn modpack_queue_view_model_exposes_only_opaque_file_ids() {
+    let selection_id = format!("mpf1-{}", "a".repeat(64));
+    let spec = InstallQueueSpec::Content {
+        instance_id: "0000000000000001".to_string(),
+        label: "Adding selected pack files".to_string(),
+        prerequisite_queue_id: None,
+        action: ContentQueueAction::Modpack {
+            canonical_id: "modrinth:pack".to_string(),
+            version_id: "pack-version".to_string(),
+            selected_file_ids: vec![selection_id.clone()],
+            include_overrides: false,
+            setup_cleanup: None,
+        },
+    };
+
+    let item = install_queue_install_item(&spec);
+    let content = item.content.expect("content queue item");
+    let encoded = serde_json::to_string(&content).expect("serialize content item");
+
+    assert!(encoded.contains(&selection_id));
+    assert!(encoded.contains("selected_file_ids"));
+    assert!(!encoded.contains("selected_paths"));
+    assert!(!encoded.contains("mods/"));
+}
+
+#[test]
+fn old_modpack_selected_paths_queue_field_is_rejected() {
+    let request = serde_json::from_value::<InstallQueueRequest>(serde_json::json!({
+        "kind": "content",
+        "instance_id": "0000000000000001",
+        "label": "Adding selected pack files",
+        "action": {
+            "kind": "modpack",
+            "canonical_id": "modrinth:pack",
+            "version_id": "pack-version",
+            "selected_paths": ["mods/provider-authored.jar"],
+            "include_overrides": false
+        }
+    }));
+
+    assert!(request.is_err());
+}
+
+#[test]
 fn retry_is_disabled_after_setup_cleanup_removes_the_instance() {
     let progress = InstallProgressViewModel {
         phase_id: CONTENT_INSTANCE_REMOVED_PHASE.to_string(),
@@ -753,7 +797,12 @@ async fn install_foreground_activity_releases_and_reacquires_without_overlap() {
         .expect("register install foreground")
         .wait_for_settlement()
         .await;
-    let activity = InstallForegroundActivity::new(foreground);
+    let activity = InstallForegroundActivity::new_with_update_admission(
+        foreground,
+        state
+            .try_admit_update_sensitive_operation()
+            .expect("admit install update-sensitive operation"),
+    );
     assert!(!state.subscribe_integrity_idle().borrow().is_stably_idle());
 
     activity.release();
@@ -776,7 +825,12 @@ async fn install_foreground_retention_waits_for_store_terminal() {
         .expect("register install foreground")
         .wait_for_settlement()
         .await;
-    let activity = InstallForegroundActivity::new(foreground);
+    let activity = InstallForegroundActivity::new_with_update_admission(
+        foreground,
+        state
+            .try_admit_update_sensitive_operation()
+            .expect("admit install update-sensitive operation"),
+    );
     let producer = state.try_claim_producer().expect("claim install producer");
 
     spawn_install_foreground_retention(
@@ -842,7 +896,12 @@ async fn failed_progress_journal_task_keeps_foreground_and_queue_active() {
         .expect("register install foreground")
         .wait_for_settlement()
         .await;
-    let foreground = InstallForegroundActivity::new(foreground);
+    let foreground = InstallForegroundActivity::new_with_update_admission(
+        foreground,
+        state
+            .try_admit_update_sensitive_operation()
+            .expect("admit install update-sensitive operation"),
+    );
     spawn_install_foreground_retention(
         state.clone(),
         install_id.to_string(),
@@ -1105,6 +1164,156 @@ async fn install_queue_state_shows_reserved_item_while_starting() {
     assert_eq!(response.view_model.state_id, "active");
     assert_eq!(response.view_model.status_label, "Installing");
 
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn cancelled_queue_start_after_content_journal_commit_completes_owned_handoff() {
+    let root = temp_root("install-queue-owned-content-start");
+    let state = build_test_state(&root);
+    let queue_id = "queue-owned-content-start";
+    state
+        .installs()
+        .enqueue_queued_install(
+            queue_id.to_string(),
+            InstallQueueSpec::Content {
+                instance_id: "missing-instance".to_string(),
+                label: "Removing content".to_string(),
+                action: ContentQueueAction::Uninstall {
+                    canonical_ids: vec!["modrinth:missing".to_string()],
+                },
+                prerequisite_queue_id: None,
+            },
+            InstallQueuePlacement::Back,
+        )
+        .await;
+    let producer = state
+        .try_claim_producer()
+        .expect("claim queue start producer");
+    let (journal_committed_tx, journal_committed_rx) = tokio::sync::oneshot::channel();
+    let (resume_after_journal_tx, resume_after_journal_rx) = tokio::sync::oneshot::channel();
+    let (worker_spawned_tx, worker_spawned_rx) = tokio::sync::oneshot::channel();
+    let (resume_queue_mark_tx, resume_queue_mark_rx) = tokio::sync::oneshot::channel();
+    let waiter_state = state.clone();
+
+    let waiter = tokio::spawn(async move {
+        maybe_start_next_queued_install_owned_with(
+            &waiter_state,
+            &producer,
+            move |start_state, spec, start_producer| async move {
+                let InstallQueueSpec::Content {
+                    instance_id,
+                    label,
+                    action,
+                    ..
+                } = spec
+                else {
+                    panic!("expected content queue spec");
+                };
+                let started = start_content_operation_with_after_journal(
+                    &start_state,
+                    &instance_id,
+                    &label,
+                    &action,
+                    &start_producer,
+                    move |install_id, operation_id| async move {
+                        let _ = journal_committed_tx.send((install_id, operation_id));
+                        let _ = resume_after_journal_rx.await;
+                    },
+                )
+                .await?;
+                let _ = worker_spawned_tx.send(started.install_id.clone());
+                let _ = resume_queue_mark_rx.await;
+                Ok(started)
+            },
+        )
+        .await
+    });
+
+    let (install_id, operation_id) = timeout(Duration::from_secs(1), journal_committed_rx)
+        .await
+        .expect("content journal commit gap is reached")
+        .expect("content journal commit is observed");
+    let reserved = state
+        .installs()
+        .queue_snapshot()
+        .await
+        .active
+        .expect("queue entry remains reserved");
+    assert_eq!(reserved.queue_id, queue_id);
+    assert!(reserved.install_id.is_none());
+    assert!(state.installs().snapshot(&install_id).await.is_none());
+    assert_eq!(
+        state
+            .journals()
+            .get(&operation_id)
+            .expect("planned content journal")
+            .status,
+        OperationStatus::Planned
+    );
+
+    waiter.abort();
+    assert!(
+        waiter
+            .await
+            .expect_err("request waiter is cancelled")
+            .is_cancelled()
+    );
+    let _ = resume_after_journal_tx.send(());
+
+    let spawned_install_id = timeout(Duration::from_secs(1), worker_spawned_rx)
+        .await
+        .expect("owned start inserts the install and spawns its worker")
+        .expect("worker spawn is observed");
+    assert_eq!(spawned_install_id, install_id);
+    assert!(state.installs().snapshot(&install_id).await.is_some());
+    let reserved = state
+        .installs()
+        .queue_snapshot()
+        .await
+        .active
+        .expect("queue remains reserved until the exact start is marked");
+    assert_eq!(reserved.queue_id, queue_id);
+    assert!(reserved.install_id.is_none());
+
+    let _ = resume_queue_mark_tx.send(());
+    timeout(Duration::from_secs(1), async {
+        loop {
+            let snapshot = state.installs().queue_snapshot().await;
+            if snapshot.active.is_none()
+                || snapshot.active.as_ref().is_some_and(|active| {
+                    active.queue_id == queue_id
+                        && active.install_id.as_deref() == Some(install_id.as_str())
+                })
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("owned start marks the exact reserved queue entry");
+    timeout(Duration::from_secs(1), async {
+        while state
+            .journals()
+            .get(&operation_id)
+            .is_some_and(|entry| entry.status == OperationStatus::Planned)
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("content worker terminalizes the durable journal");
+    wait_for_queue_empty(&state).await;
+
+    assert_ne!(
+        state
+            .journals()
+            .get(&operation_id)
+            .expect("terminal content journal")
+            .status,
+        OperationStatus::Planned
+    );
     let _ = fs::remove_dir_all(root);
 }
 
@@ -2606,7 +2815,12 @@ async fn vanilla_receipt_acceptance_blocks_terminal_success_and_foreground_relea
         .expect("register install foreground")
         .wait_for_settlement()
         .await;
-    let foreground = InstallForegroundActivity::new(foreground);
+    let foreground = InstallForegroundActivity::new_with_update_admission(
+        foreground,
+        state
+            .try_admit_update_sensitive_operation()
+            .expect("admit install update-sensitive operation"),
+    );
     spawn_install_foreground_retention(
         state.clone(),
         install_id.to_string(),
@@ -2684,7 +2898,12 @@ async fn loader_receipt_acceptance_blocks_terminal_success_and_foreground_releas
         .expect("register install foreground")
         .wait_for_settlement()
         .await;
-    let foreground = InstallForegroundActivity::new(foreground);
+    let foreground = InstallForegroundActivity::new_with_update_admission(
+        foreground,
+        state
+            .try_admit_update_sensitive_operation()
+            .expect("admit install update-sensitive operation"),
+    );
     spawn_install_foreground_retention(
         state.clone(),
         install_id.to_string(),
@@ -3108,7 +3327,12 @@ async fn loader_base_failure_reacquires_after_sweep_before_failure_mutation() {
         .expect("register base foreground")
         .wait_for_settlement()
         .await;
-    let base_foreground = InstallForegroundActivity::new(base_foreground);
+    let base_foreground = InstallForegroundActivity::new_with_update_admission(
+        base_foreground,
+        state
+            .try_admit_update_sensitive_operation()
+            .expect("admit base install update-sensitive operation"),
+    );
     spawn_install_foreground_retention(
         state.clone(),
         base_install_id.to_string(),
@@ -3122,7 +3346,12 @@ async fn loader_base_failure_reacquires_after_sweep_before_failure_mutation() {
         .expect("register loader foreground")
         .wait_for_settlement()
         .await;
-    let loader_foreground = InstallForegroundActivity::new(loader_foreground);
+    let loader_foreground = InstallForegroundActivity::new_with_update_admission(
+        loader_foreground,
+        state
+            .try_admit_update_sensitive_operation()
+            .expect("admit loader install update-sensitive operation"),
+    );
     let observed = observe_active_vanilla_base_install(state.installs(), "1.21.5")
         .await
         .expect("observe active base")
@@ -3238,7 +3467,12 @@ async fn loader_base_success_reacquires_after_sweep_before_loader_work() {
         .expect("register base foreground")
         .wait_for_settlement()
         .await;
-    let base_foreground = InstallForegroundActivity::new(base_foreground);
+    let base_foreground = InstallForegroundActivity::new_with_update_admission(
+        base_foreground,
+        state
+            .try_admit_update_sensitive_operation()
+            .expect("admit base install update-sensitive operation"),
+    );
     spawn_install_foreground_retention(
         state.clone(),
         base_install_id.to_string(),
@@ -3252,7 +3486,12 @@ async fn loader_base_success_reacquires_after_sweep_before_loader_work() {
         .expect("register loader foreground")
         .wait_for_settlement()
         .await;
-    let loader_foreground = InstallForegroundActivity::new(loader_foreground);
+    let loader_foreground = InstallForegroundActivity::new_with_update_admission(
+        loader_foreground,
+        state
+            .try_admit_update_sensitive_operation()
+            .expect("admit loader install update-sensitive operation"),
+    );
     let observed = observe_active_vanilla_base_install(state.installs(), "1.21.5")
         .await
         .expect("observe active base")
@@ -3610,6 +3849,104 @@ async fn install_reconciliation_verifies_transition_after_candidate_is_cleared()
 }
 
 #[tokio::test]
+async fn transient_content_initial_failure_reconciles_before_later_journal_mutation() {
+    let root = temp_root("transient-content-initial-journal");
+    let state = build_test_state(&root);
+    let (backend, journals) = install_journal_persistence_fixture(&root);
+    let producer = state
+        .try_claim_producer()
+        .expect("claim content journal reconciliation producer");
+    let content_operation_id = install_operation_id("transient-content-initial");
+    backend.fail_next();
+
+    let reservation = begin_content_journal_with_owned_reconciliation(
+        state.installs().clone(),
+        journals.clone(),
+        "transient-content-initial".to_string(),
+        content_operation_id.clone(),
+        "managed-instance".to_string(),
+        &producer,
+    )
+    .await
+    .expect("transient content journal failure reconciles");
+    reservation.hand_off();
+
+    assert!(!journals.has_retry_candidate());
+    assert!(operation_journal_plan_is_visible(
+        &journals
+            .get(&content_operation_id)
+            .expect("reconciled content journal"),
+        &operation::planned_content_journal(&content_operation_id, "managed-instance"),
+    ));
+
+    let later_operation_id = install_operation_id("after-content-reconciliation");
+    begin_install_operation_journal(&journals, &later_operation_id, "1.21.5")
+        .await
+        .expect("later journal mutation is not globally wedged");
+    assert_eq!(
+        journals
+            .get(&later_operation_id)
+            .expect("later journal")
+            .status,
+        OperationStatus::Planned
+    );
+
+    drop(producer);
+    journals.close().await.expect("close journals");
+    fs::remove_dir_all(root).expect("cleanup");
+}
+
+#[tokio::test]
+async fn persistent_content_initial_failure_terminalizes_late_plan_without_an_orphan() {
+    let root = temp_root("persistent-content-initial-journal");
+    let state = build_test_state(&root);
+    let (backend, journals) = install_journal_persistence_fixture(&root);
+    let installs = Arc::new(InstallStore::new());
+    let producer = state
+        .try_claim_producer()
+        .expect("claim content initialization producer");
+    let install_id = "persistent-content-initial".to_string();
+    let operation_id = install_operation_id(&install_id);
+    backend.fail_attempts(64);
+
+    assert!(
+        begin_content_journal_with_owned_reconciliation(
+            installs.clone(),
+            journals.clone(),
+            install_id.clone(),
+            operation_id.clone(),
+            "managed-instance".to_string(),
+            &producer,
+        )
+        .await
+        .is_err()
+    );
+    assert!(journals.has_retry_candidate());
+    assert!(installs.snapshot(&install_id).await.is_none());
+
+    backend.allow_writes();
+    timeout(Duration::from_secs(2), async {
+        loop {
+            if journals.get(&operation_id).is_some_and(|entry| {
+                entry.status == OperationStatus::Failed
+                    && entry.failure_point.as_deref() == Some("content_initialization_cancelled")
+            }) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("late content plan is durably terminalized");
+
+    assert!(!journals.has_retry_candidate());
+    assert!(installs.snapshot(&install_id).await.is_none());
+    drop(producer);
+    journals.close().await.expect("close journals");
+    fs::remove_dir_all(root).expect("cleanup");
+}
+
+#[tokio::test]
 async fn transient_terminal_failure_retries_and_emits_exactly_once() {
     let root = temp_root("transient-terminal-journal");
     let (backend, journals) = install_journal_persistence_fixture(&root);
@@ -3776,6 +4113,471 @@ async fn persistent_interruption_failure_keeps_tracked_owner_and_nonterminal_sta
     );
     assert!(journals.has_retry_candidate());
     drop(worker);
+}
+
+#[tokio::test]
+async fn content_journal_uses_instance_command_and_exports_bounded_redacted_success_proof() {
+    let journals = OperationJournalStore::new();
+    let operation_id = install_operation_id("content-success");
+    super::operation::begin_content_operation_journal(
+        &journals,
+        &operation_id,
+        r"C:\Users\Alice\.minecraft\instances\secret",
+    )
+    .await
+    .expect("create content journal");
+
+    let mut download_facts = super::operation::ContentDownloadFactAccumulator::default();
+    for _ in 0..500 {
+        download_facts.record(ExecutionDownloadFact {
+            kind: ExecutionDownloadFactKind::WrittenToTemp,
+            target: "/Users/alice/.axial/mods/private.jar".to_string(),
+            fields: vec![(
+                "provider_payload".to_string(),
+                "{\"token\":\"secret\"}".to_string(),
+            )],
+        });
+        download_facts.record(ExecutionDownloadFact {
+            kind: ExecutionDownloadFactKind::Promoted,
+            target: r"C:\Users\Alice\.minecraft\mods\private.jar".to_string(),
+            fields: Vec::new(),
+        });
+    }
+    let journal_facts = download_facts.journal_facts();
+    let mut last_phase = None;
+    super::operation::record_content_operation_progress(
+        &journals,
+        &operation_id,
+        &progress("planning", false, None),
+        &[],
+        &mut last_phase,
+    )
+    .await
+    .expect("record planning");
+    super::operation::record_content_operation_progress(
+        &journals,
+        &operation_id,
+        &progress("done", true, None),
+        &journal_facts,
+        &mut last_phase,
+    )
+    .await
+    .expect("record success");
+
+    let entry = journals.get(&operation_id).expect("content journal");
+    assert_eq!(entry.command, CommandKind::ModifyInstanceContent);
+    assert_eq!(entry.status, OperationStatus::Succeeded);
+    assert_eq!(entry.targets.len(), 1);
+    assert_eq!(entry.targets[0].kind, TargetKind::Instance);
+    assert_eq!(entry.targets[0].ownership, OwnershipClass::LauncherManaged);
+    assert_eq!(entry.targets[0].id, "target");
+    let terminal = entry.completed_steps.last().expect("terminal step");
+    assert!(
+        terminal
+            .generated_facts
+            .contains(&"execution_download_fact:written_to_temp:500".to_string())
+    );
+    assert!(
+        terminal
+            .generated_facts
+            .contains(&"execution_download_fact:promoted:500".to_string())
+    );
+    assert!(terminal.generated_facts.len() <= crate::state::MAX_OPERATION_JOURNAL_STEP_FACTS);
+
+    let proof = operation_journal_proof_record(&entry);
+    let encoded = serde_json::to_string(&proof).expect("proof json");
+    assert!(encoded.contains("ModifyInstanceContent"));
+    assert_no_sensitive_fragments(&encoded);
+}
+
+#[tokio::test]
+async fn content_journal_records_download_failure_guardian_outcome_and_proof() {
+    let journals = OperationJournalStore::new();
+    let failure_memory = GuardianFailureMemoryStore::new();
+    let operation_id = install_operation_id("content-failure");
+    super::operation::begin_content_operation_journal(&journals, &operation_id, "managed-instance")
+        .await
+        .expect("create content journal");
+    let mut download_facts = super::operation::ContentDownloadFactAccumulator::default();
+    download_facts.record(ExecutionDownloadFact {
+        kind: ExecutionDownloadFactKind::MetadataInvalid,
+        target: "/Users/alice/provider/private.jar".to_string(),
+        fields: vec![
+            (
+                "url".to_string(),
+                "https://example.invalid/?token=secret".to_string(),
+            ),
+            (
+                "provider_payload".to_string(),
+                "{\"token\":\"secret\"}".to_string(),
+            ),
+        ],
+    });
+    let journal_facts = download_facts.journal_facts();
+    let facts = download_facts.facts();
+    super::operation::record_content_failure_outcome(
+        &journals,
+        &failure_memory,
+        &operation_id,
+        &facts,
+        None,
+        OperationPhase::Downloading,
+        "2026-07-16T10:00:00+00:00",
+    )
+    .await
+    .expect("record content Guardian outcome");
+    let mut last_phase = None;
+    super::operation::record_content_operation_progress(
+        &journals,
+        &operation_id,
+        &progress("error", true, Some("content failed")),
+        &journal_facts,
+        &mut last_phase,
+    )
+    .await
+    .expect("record content failure");
+
+    let entry = journals.get(&operation_id).expect("content journal");
+    assert_eq!(entry.command, CommandKind::ModifyInstanceContent);
+    assert_eq!(entry.status, OperationStatus::Failed);
+    assert_eq!(entry.outcome, Some(OperationOutcome::Failed));
+    assert_eq!(
+        entry.guardian_diagnosis_ids,
+        vec![DiagnosisId::InstallArtifactMetadataInvalid]
+    );
+    assert_eq!(
+        entry.failure_point.as_deref(),
+        Some("content_progress_error")
+    );
+    assert!(
+        entry
+            .completed_steps
+            .last()
+            .expect("terminal step")
+            .generated_facts
+            .contains(&"execution_download_fact:metadata_invalid:1".to_string())
+    );
+    assert!(
+        install_guardian_outcome_summary_from_journal(&entry)
+            .is_some_and(|outcome| outcome.decision() == "block")
+    );
+    let encoded =
+        serde_json::to_string(&operation_journal_proof_record(&entry)).expect("proof json");
+    assert_no_sensitive_fragments(&encoded);
+}
+
+#[tokio::test]
+async fn content_journal_records_typed_metadata_failure_without_download_facts() {
+    let journals = OperationJournalStore::new();
+    let failure_memory = GuardianFailureMemoryStore::new();
+    let operation_id = install_operation_id("content-provider-metadata-failure");
+    super::operation::begin_content_operation_journal(&journals, &operation_id, "managed-instance")
+        .await
+        .expect("create content journal");
+    let (evidence, phase) = content_execution_failure_evidence(
+        &operation_id,
+        crate::application::content::ContentExecutionFailureKind::MetadataInvalid,
+    );
+
+    super::operation::record_content_failure_outcome(
+        &journals,
+        &failure_memory,
+        &operation_id,
+        &[],
+        Some(evidence),
+        phase,
+        "2026-07-16T10:00:00+00:00",
+    )
+    .await
+    .expect("record content Guardian outcome");
+    let mut last_phase = None;
+    super::operation::record_content_operation_progress(
+        &journals,
+        &operation_id,
+        &progress("error", true, Some("content failed")),
+        &[],
+        &mut last_phase,
+    )
+    .await
+    .expect("record content failure");
+
+    let entry = journals.get(&operation_id).expect("content journal");
+    assert_eq!(
+        entry.guardian_diagnosis_ids,
+        vec![DiagnosisId::InstallArtifactMetadataInvalid]
+    );
+    assert!(
+        install_guardian_outcome_summary_from_journal(&entry)
+            .is_some_and(|outcome| outcome.decision() == "block")
+    );
+}
+
+#[tokio::test]
+async fn first_observable_content_terminal_already_contains_typed_guardian_outcome() {
+    let journals = OperationJournalStore::new();
+    let failure_memory = GuardianFailureMemoryStore::new();
+    let installs = InstallStore::new();
+    let install_id = "content-terminal-ordering";
+    let operation_id = install_operation_id(install_id);
+    super::operation::begin_content_operation_journal(&journals, &operation_id, "managed-instance")
+        .await
+        .expect("create content journal");
+    installs.insert(install_id.to_string()).await;
+
+    commit_and_emit_content_terminal_progress(
+        &installs,
+        &journals,
+        &failure_memory,
+        &operation_id,
+        install_id,
+        progress("error", true, Some("content failed")),
+        &[],
+        &[],
+        Some(crate::application::content::ContentExecutionFailureKind::MetadataInvalid),
+    )
+    .await
+    .expect("commit typed content terminal");
+
+    assert!(
+        installs
+            .snapshot(install_id)
+            .await
+            .expect("content install")
+            .done
+    );
+    let entry = journals.get(&operation_id).expect("content journal");
+    assert_eq!(entry.status, OperationStatus::Failed);
+    assert_eq!(
+        entry.guardian_diagnosis_ids,
+        vec![DiagnosisId::InstallArtifactMetadataInvalid]
+    );
+    assert!(
+        install_guardian_outcome_summary_from_journal(&entry)
+            .is_some_and(|outcome| outcome.decision() == "block")
+    );
+}
+
+#[tokio::test]
+async fn guardian_persistence_failure_cannot_publish_incomplete_content_terminal() {
+    let root = temp_root("content-guardian-terminal-ordering");
+    let (backend, journals) = install_journal_persistence_fixture(&root);
+    let failure_memory = GuardianFailureMemoryStore::new();
+    let installs = InstallStore::new();
+    let install_id = "content-guardian-persistence";
+    let operation_id = install_operation_id(install_id);
+    super::operation::begin_content_operation_journal(&journals, &operation_id, "managed-instance")
+        .await
+        .expect("create content journal");
+    installs.insert(install_id.to_string()).await;
+    let terminal = progress("error", true, Some("content failed"));
+    backend.fail_attempts(64);
+
+    assert!(
+        commit_and_emit_content_terminal_progress(
+            &installs,
+            &journals,
+            &failure_memory,
+            &operation_id,
+            install_id,
+            terminal.clone(),
+            &[],
+            &[],
+            Some(crate::application::content::ContentExecutionFailureKind::MetadataInvalid),
+        )
+        .await
+        .is_err()
+    );
+    assert!(
+        !installs
+            .snapshot(install_id)
+            .await
+            .expect("content install remains active")
+            .done
+    );
+    assert!(
+        journals
+            .get(&operation_id)
+            .is_some_and(|entry| entry.status != OperationStatus::Failed)
+    );
+    assert!(journals.has_retry_candidate());
+
+    backend.allow_writes();
+    let settled = settle_content_worker_interruption(
+        &journals,
+        &failure_memory,
+        &operation_id,
+        content_interrupted_progress(false),
+        &[],
+        &[],
+        Some((
+            terminal,
+            Some(crate::application::content::ContentExecutionFailureKind::MetadataInvalid),
+        )),
+    )
+    .await
+    .expect("interrupt owner settles a durable terminal");
+    installs.emit(install_id, settled).await;
+
+    assert!(
+        installs
+            .snapshot(install_id)
+            .await
+            .expect("content install")
+            .done
+    );
+    let entry = journals.get(&operation_id).expect("content journal");
+    assert_eq!(entry.status, OperationStatus::Failed);
+    assert_eq!(
+        entry.guardian_diagnosis_ids,
+        vec![DiagnosisId::InstallArtifactMetadataInvalid]
+    );
+    assert!(
+        install_guardian_outcome_summary_from_journal(&entry)
+            .is_some_and(|outcome| outcome.decision() == "block")
+    );
+    assert!(!journals.has_retry_candidate());
+    journals.close().await.expect("close journals");
+    fs::remove_dir_all(root).expect("cleanup");
+}
+
+#[tokio::test]
+async fn late_terminal_persistence_recovery_returns_original_content_terminal() {
+    let root = temp_root("content-terminal-late-recovery");
+    let (backend, journals) = install_journal_persistence_fixture(&root);
+    let failure_memory = GuardianFailureMemoryStore::new();
+    let installs = InstallStore::new();
+    let install_id = "content-terminal-late-recovery";
+    let operation_id = install_operation_id(install_id);
+    super::operation::begin_content_operation_journal(&journals, &operation_id, "managed-instance")
+        .await
+        .expect("create content journal");
+    installs.insert(install_id.to_string()).await;
+    let terminal = progress("error", true, Some("content failed"));
+    let (evidence, phase) = content_execution_failure_evidence(
+        &operation_id,
+        crate::application::content::ContentExecutionFailureKind::MetadataInvalid,
+    );
+    super::operation::record_content_failure_outcome(
+        &journals,
+        &failure_memory,
+        &operation_id,
+        &[],
+        Some(evidence),
+        phase,
+        "2026-07-16T10:00:00+00:00",
+    )
+    .await
+    .expect("record Guardian outcome before terminal");
+    backend.fail_attempts(64);
+    let mut last_phase = None;
+    assert!(
+        super::operation::record_content_operation_progress(
+            &journals,
+            &operation_id,
+            &terminal,
+            &[],
+            &mut last_phase,
+        )
+        .await
+        .is_err()
+    );
+    assert!(journals.has_retry_candidate());
+    assert!(
+        !installs
+            .snapshot(install_id)
+            .await
+            .expect("content install remains active")
+            .done
+    );
+
+    backend.allow_writes();
+    let settled = settle_content_worker_interruption(
+        &journals,
+        &failure_memory,
+        &operation_id,
+        content_interrupted_progress(false),
+        &[],
+        &[],
+        Some((
+            terminal.clone(),
+            Some(crate::application::content::ContentExecutionFailureKind::MetadataInvalid),
+        )),
+    )
+    .await
+    .expect("late terminal candidate remains authoritative");
+    assert_eq!(
+        settled.error.as_deref(),
+        sanitize_install_progress(terminal).error.as_deref()
+    );
+    installs.emit(install_id, settled).await;
+
+    let entry = journals.get(&operation_id).expect("content journal");
+    assert_eq!(entry.status, OperationStatus::Failed);
+    assert_eq!(
+        entry.failure_point.as_deref(),
+        Some("content_progress_error")
+    );
+    assert_eq!(
+        entry.guardian_diagnosis_ids,
+        vec![DiagnosisId::InstallArtifactMetadataInvalid]
+    );
+    assert!(
+        install_guardian_outcome_summary_from_journal(&entry)
+            .is_some_and(|outcome| outcome.decision() == "block")
+    );
+    assert!(
+        installs
+            .snapshot(install_id)
+            .await
+            .expect("content install")
+            .done
+    );
+    assert!(!journals.has_retry_candidate());
+    journals.close().await.expect("close journals");
+    fs::remove_dir_all(root).expect("cleanup");
+}
+
+#[tokio::test]
+async fn content_journal_records_interruption_without_crossing_install_command_identity() {
+    let journals = OperationJournalStore::new();
+    let operation_id = install_operation_id("content-interrupted");
+    super::operation::begin_content_operation_journal(&journals, &operation_id, "managed-instance")
+        .await
+        .expect("create content journal");
+    let install_collision =
+        begin_install_operation_journal(&journals, &operation_id, "1.21.5").await;
+    assert!(matches!(
+        install_collision,
+        Err(OperationJournalStoreError::AlreadyExists)
+    ));
+
+    super::operation::record_content_operation_interrupted(
+        &journals,
+        &operation_id,
+        &content_interrupted_progress(false),
+        &["execution_download_fact:promoted:2".to_string()],
+        &[],
+    )
+    .await
+    .expect("record content interruption");
+
+    let entry = journals.get(&operation_id).expect("content journal");
+    assert_eq!(entry.command, CommandKind::ModifyInstanceContent);
+    assert_eq!(entry.status, OperationStatus::Failed);
+    assert!(entry.guardian_diagnosis_ids.is_empty());
+    assert!(install_guardian_outcome_summary_from_journal(&entry).is_none());
+    assert_eq!(
+        entry.failure_point.as_deref(),
+        Some("content_worker_interrupted")
+    );
+    assert!(
+        entry
+            .completed_steps
+            .last()
+            .expect("terminal step")
+            .generated_facts
+            .contains(&"execution_download_fact:promoted:2".to_string())
+    );
 }
 
 #[tokio::test]
@@ -4559,6 +5361,10 @@ impl InstallJournalBackend {
 
     fn fail_attempts(&self, attempts: usize) {
         self.failures.fetch_add(attempts, Ordering::SeqCst);
+    }
+
+    fn allow_writes(&self) {
+        self.failures.store(0, Ordering::SeqCst);
     }
 
     fn gate_attempt(&self, attempt: usize) -> InstallJournalWriteGateHandle {

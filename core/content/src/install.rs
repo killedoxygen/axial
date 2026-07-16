@@ -89,17 +89,7 @@ where
         .iter()
         .map(|destination| destination.relative.clone())
         .collect();
-    let must_be_absent: Vec<String> = destinations
-        .iter()
-        .filter(|destination| destination.must_be_absent)
-        .map(|destination| destination.relative.clone())
-        .collect();
-    let mut transaction = FileTransaction::apply_preserving_absence(
-        game_dir,
-        staging.transfer(),
-        &relative_paths,
-        &must_be_absent,
-    )?;
+    let mut transaction = apply_install_transaction(game_dir, staging.transfer(), &destinations)?;
     let mut stale_entries = Vec::new();
 
     for (planned, planned_destination) in files.iter().zip(&destinations) {
@@ -122,20 +112,20 @@ where
         }
     }
 
-    let mut stale_files = Vec::new();
+    let mut stale_removals = Vec::new();
     for entry in &stale_entries {
-        stale_files.extend(verified_removable_variants(
+        stale_removals.extend(verified_removable_variants(
             game_dir,
             entry,
             &relative_paths,
         )?);
     }
-    stale_files.sort();
-    stale_files.dedup();
-    transaction.stage_removals(&stale_files)?;
+    stage_managed_removals(&mut transaction, &stale_removals)?;
     if let Err(error) = manifest.save(game_dir) {
-        transaction.rollback();
-        return Err(error);
+        return match transaction.rollback() {
+            Ok(()) => Err(error),
+            Err(rollback_error) => Err(rollback_error),
+        };
     }
     transaction.commit();
     on_progress(done(total));
@@ -148,6 +138,7 @@ struct InstallDestination {
     relative: String,
     variants: Vec<String>,
     must_be_absent: bool,
+    existing_owner: Option<ManifestEntry>,
 }
 
 /// Resolve and validate every final path before downloading. A manifest entry
@@ -206,11 +197,13 @@ fn prepare_install_destinations(
             relative,
             variants,
             must_be_absent: true,
+            existing_owner: None,
         });
     }
 
     for (planned, destination) in files.iter().zip(&mut destinations) {
         let mut selected_destination_exists = false;
+        let mut selected_destination_owner = None;
         for variant in &destination.variants {
             let owners = manifest_variant_owners
                 .get(variant)
@@ -243,6 +236,7 @@ fn prepare_install_destinations(
                     }
                     if variant == &destination.relative {
                         selected_destination_exists = true;
+                        selected_destination_owner = owners.first().map(|owner| (*owner).clone());
                     }
                 }
                 Ok(_) if owners.is_empty() => {
@@ -261,9 +255,125 @@ fn prepare_install_destinations(
             }
         }
         destination.must_be_absent = !selected_destination_exists;
+        destination.existing_owner = selected_destination_owner;
     }
 
     Ok(destinations)
+}
+
+fn apply_install_transaction(
+    game_dir: &Path,
+    staging: std::path::PathBuf,
+    destinations: &[InstallDestination],
+) -> ContentResult<FileTransaction> {
+    let relative_paths = destinations
+        .iter()
+        .map(|destination| destination.relative.clone())
+        .collect::<Vec<_>>();
+    let must_be_absent = destinations
+        .iter()
+        .filter(|destination| destination.must_be_absent)
+        .map(|destination| destination.relative.clone())
+        .collect::<Vec<_>>();
+    let replacement_owners = destinations
+        .iter()
+        .filter_map(|destination| {
+            destination
+                .existing_owner
+                .clone()
+                .map(|owner| (destination.relative.clone(), owner))
+        })
+        .collect::<HashMap<_, _>>();
+
+    FileTransaction::apply_preserving_absence_with_revalidation(
+        game_dir,
+        staging,
+        &relative_paths,
+        &must_be_absent,
+        |relative, destination| {
+            let Some(owner) = replacement_owners.get(relative) else {
+                return Err(ContentError::Invalid(
+                    "content destination has no current ownership proof".to_string(),
+                ));
+            };
+            if entry_path_matches(destination, owner) {
+                Ok(())
+            } else {
+                Err(ContentError::Invalid(
+                    "a managed content destination changed before commit".to_string(),
+                ))
+            }
+        },
+    )
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManagedRemoval {
+    relative: String,
+    owner: ManifestEntry,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModFileToggleOutcome {
+    pub filename: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModFileDeleteOutcome {
+    Deleted,
+    Managed,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ModFileMutationError {
+    #[error("mod file was not found")]
+    NotFound,
+    #[error("mod files changed during the operation")]
+    Conflict,
+    #[error(transparent)]
+    Failed(ContentError),
+}
+
+impl ManagedRemoval {
+    pub fn relative_path(&self) -> &str {
+        &self.relative
+    }
+}
+
+pub(crate) fn stage_managed_removals(
+    transaction: &mut FileTransaction,
+    removals: &[ManagedRemoval],
+) -> ContentResult<()> {
+    let mut owners = HashMap::<String, ManifestEntry>::new();
+    for removal in removals {
+        match owners.get(&removal.relative) {
+            Some(owner) if owner == &removal.owner => {}
+            Some(_) => {
+                return Err(ContentError::Invalid(
+                    "multiple manifest owners claim the same removal path".to_string(),
+                ));
+            }
+            None => {
+                owners.insert(removal.relative.clone(), removal.owner.clone());
+            }
+        }
+    }
+    let mut relative_paths = owners.keys().cloned().collect::<Vec<_>>();
+    relative_paths.sort();
+    transaction.stage_removals_with_revalidation(&relative_paths, |relative, claimed| {
+        let Some(owner) = owners.get(relative) else {
+            return Err(ContentError::Invalid(
+                "content removal has no current ownership proof".to_string(),
+            ));
+        };
+        if entry_path_matches(claimed, owner) {
+            Ok(())
+        } else {
+            Err(ContentError::Invalid(
+                "a managed content file changed before removal commit".to_string(),
+            ))
+        }
+    })
 }
 
 /// Remove a managed file (enabled or disabled variant) and drop its manifest
@@ -308,19 +418,241 @@ pub fn uninstall_many(game_dir: &Path, canonical_ids: &[CanonicalId]) -> Content
     for entry in &entries {
         removable.extend(verified_removable_variants(game_dir, entry, &[])?);
     }
-    removable.sort();
-    removable.dedup();
     for entry in &entries {
         manifest.remove(&entry.canonical_id);
     }
     let mut transaction = FileTransaction::empty(game_dir)?;
-    transaction.stage_removals(&removable)?;
+    stage_managed_removals(&mut transaction, &removable)?;
     if let Err(error) = manifest.save(game_dir) {
-        transaction.rollback();
-        return Err(error);
+        return match transaction.rollback() {
+            Ok(()) => Err(error),
+            Err(rollback_error) => Err(rollback_error),
+        };
     }
     transaction.commit();
     Ok(entries.len())
+}
+
+/// Toggle a mod file by claiming the exact source bytes before deciding whether
+/// they are still manifest-owned. The target is published without replacement,
+/// and a manifest failure rolls the move back without clobbering a path that
+/// appeared in the meantime.
+pub fn toggle_mod_file(
+    game_dir: &Path,
+    source_filename: &str,
+    enabled: bool,
+) -> Result<ModFileToggleOutcome, ModFileMutationError> {
+    toggle_mod_file_with_hooks(game_dir, source_filename, enabled, || {}, || {}, || {})
+        .map_err(classify_mod_file_mutation_error)
+}
+
+fn toggle_mod_file_with_hooks<B, P, S>(
+    game_dir: &Path,
+    source_filename: &str,
+    enabled: bool,
+    before_claim: B,
+    before_publish: P,
+    before_manifest_save: S,
+) -> ContentResult<ModFileToggleOutcome>
+where
+    B: FnOnce(),
+    P: FnOnce(),
+    S: FnOnce(),
+{
+    validate_mod_filename(source_filename)?;
+    let target_filename = mod_enabled_filename(source_filename, enabled);
+    let source_relative = format!("mods/{source_filename}");
+    let target_relative = format!("mods/{target_filename}");
+    let base_filename = mod_base_filename(source_filename);
+    let mut manifest = ContentManifest::load(game_dir)?;
+    let mut transaction = FileTransaction::empty(game_dir)?;
+
+    before_claim();
+    if source_relative == target_relative {
+        let mut claimed = false;
+        let mut managed_index = None;
+        transaction.stage_removals_with_revalidation(
+            std::slice::from_ref(&source_relative),
+            |_, claimed_path| {
+                require_regular_claimed_mod(claimed_path)?;
+                claimed = true;
+                managed_index = matching_managed_mod(&manifest, base_filename, claimed_path);
+                Ok(())
+            },
+        )?;
+        if !claimed {
+            return Err(ContentError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "mod file disappeared before it could be claimed",
+            )));
+        }
+        before_publish();
+        transaction.rollback()?;
+        let manifest_changed = managed_index.is_some_and(|index| {
+            let entry = &mut manifest.entries[index];
+            let changed = entry.enabled != enabled;
+            entry.enabled = enabled;
+            changed
+        });
+        if manifest_changed {
+            before_manifest_save();
+            manifest.save(game_dir)?;
+        }
+        return Ok(ModFileToggleOutcome {
+            filename: target_filename,
+        });
+    }
+
+    let managed_index = transaction.move_new_with_revalidation(
+        &source_relative,
+        &target_relative,
+        |claimed_path| {
+            require_regular_claimed_mod(claimed_path)?;
+            Ok(matching_managed_mod(&manifest, base_filename, claimed_path))
+        },
+        before_publish,
+    )?;
+    let manifest_changed = managed_index.is_some_and(|index| {
+        let entry = &mut manifest.entries[index];
+        let changed = entry.enabled != enabled;
+        entry.enabled = enabled;
+        changed
+    });
+    if manifest_changed {
+        before_manifest_save();
+        if let Err(error) = manifest.save(game_dir) {
+            return match transaction.rollback() {
+                Ok(()) => Err(error),
+                Err(rollback_error) => Err(rollback_error),
+            };
+        }
+    }
+    transaction.commit();
+
+    Ok(ModFileToggleOutcome {
+        filename: target_filename,
+    })
+}
+
+/// Delete only after claiming and classifying the exact bytes at the requested
+/// path. A still-managed file is restored without replacement and reported to
+/// the caller instead of being removed.
+pub fn delete_local_mod_file(
+    game_dir: &Path,
+    source_filename: &str,
+) -> Result<ModFileDeleteOutcome, ModFileMutationError> {
+    delete_local_mod_file_with_before_claim(game_dir, source_filename, || {})
+        .map_err(classify_mod_file_mutation_error)
+}
+
+fn classify_mod_file_mutation_error(error: ContentError) -> ModFileMutationError {
+    match error {
+        ContentError::Io(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            ModFileMutationError::NotFound
+        }
+        ContentError::Invalid(_) => ModFileMutationError::Conflict,
+        error => ModFileMutationError::Failed(error),
+    }
+}
+
+fn delete_local_mod_file_with_before_claim<B>(
+    game_dir: &Path,
+    source_filename: &str,
+    before_claim: B,
+) -> ContentResult<ModFileDeleteOutcome>
+where
+    B: FnOnce(),
+{
+    validate_mod_filename(source_filename)?;
+    let source_relative = format!("mods/{source_filename}");
+    let base_filename = mod_base_filename(source_filename);
+    let manifest = ContentManifest::load(game_dir)?;
+    let mut transaction = FileTransaction::empty(game_dir)?;
+    let mut claimed = false;
+    let mut managed = false;
+
+    before_claim();
+    transaction.stage_removals_with_revalidation(
+        std::slice::from_ref(&source_relative),
+        |_, claimed_path| {
+            require_regular_claimed_mod(claimed_path)?;
+            claimed = true;
+            managed = matching_managed_mod(&manifest, base_filename, claimed_path).is_some();
+            Ok(())
+        },
+    )?;
+    if !claimed {
+        return Err(ContentError::Io(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "mod file disappeared before it could be claimed",
+        )));
+    }
+    if managed {
+        transaction.rollback()?;
+        Ok(ModFileDeleteOutcome::Managed)
+    } else {
+        transaction.commit();
+        Ok(ModFileDeleteOutcome::Deleted)
+    }
+}
+
+fn matching_managed_mod(
+    manifest: &ContentManifest,
+    base_filename: &str,
+    claimed_path: &Path,
+) -> Option<usize> {
+    manifest.entries.iter().position(|entry| {
+        entry.kind == ContentKind::Mod
+            && entry.filename == base_filename
+            && entry_path_matches(claimed_path, entry)
+    })
+}
+
+fn require_regular_claimed_mod(path: &Path) -> ContentResult<()> {
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.is_file() {
+        Ok(())
+    } else {
+        Err(ContentError::Invalid(
+            "mod mutation source is not a regular file".to_string(),
+        ))
+    }
+}
+
+fn validate_mod_filename(filename: &str) -> ContentResult<()> {
+    let lower = filename.to_ascii_lowercase();
+    if filename.is_empty()
+        || filename == "."
+        || filename == ".."
+        || filename.contains(['/', '\\', '\0'])
+        || (!lower.ends_with(".jar") && !lower.ends_with(".jar.disabled"))
+    {
+        return Err(ContentError::Invalid("mod filename is invalid".to_string()));
+    }
+    Ok(())
+}
+
+fn mod_base_filename(filename: &str) -> &str {
+    if filename.to_ascii_lowercase().ends_with(".disabled") {
+        &filename[..filename.len() - ".disabled".len()]
+    } else {
+        filename
+    }
+}
+
+fn mod_enabled_filename(filename: &str, enabled: bool) -> String {
+    let lower = filename.to_ascii_lowercase();
+    if enabled {
+        if lower.ends_with(".disabled") {
+            filename[..filename.len() - ".disabled".len()].to_string()
+        } else {
+            filename.to_string()
+        }
+    } else if lower.ends_with(".disabled") {
+        filename.to_string()
+    } else {
+        format!("{filename}.disabled")
+    }
 }
 
 /// Return only manifest-owned variants that are still safe to remove. A live
@@ -331,7 +663,7 @@ pub fn verified_removable_variants(
     game_dir: &Path,
     entry: &ManifestEntry,
     protected_paths: &[String],
-) -> ContentResult<Vec<String>> {
+) -> ContentResult<Vec<ManagedRemoval>> {
     let mut removable = Vec::new();
     for relative in managed_file_variants(entry.kind, &entry.filename) {
         if protected_paths
@@ -350,7 +682,10 @@ pub fn verified_removable_variants(
                 ));
             }
             Ok(_) if entry_has_checksum(entry) && entry_path_matches(&path, entry) => {
-                removable.push(relative);
+                removable.push(ManagedRemoval {
+                    relative,
+                    owner: entry.clone(),
+                });
             }
             Ok(_) => {
                 return Err(ContentError::Invalid(
@@ -464,6 +799,31 @@ mod tests {
         )
     }
 
+    fn save_managed_mod(
+        root: &Path,
+        project: &str,
+        filename: &str,
+        enabled: bool,
+        bytes: &[u8],
+    ) -> ContentManifest {
+        fs::create_dir_all(root.join("mods")).expect("mods");
+        let disk_name = if enabled {
+            filename.to_string()
+        } else {
+            format!("{filename}.disabled")
+        };
+        let path = root.join("mods").join(disk_name);
+        fs::write(&path, bytes).expect("managed mod");
+        let mut entry = recorded(project, filename);
+        entry.enabled = enabled;
+        entry.size = Some(bytes.len() as u64);
+        entry.sha512 = Some(crate::manifest::sha512_file(&path).expect("managed hash"));
+        let mut manifest = ContentManifest::default();
+        manifest.upsert(entry);
+        manifest.save(root).expect("save manifest");
+        manifest
+    }
+
     fn test_root(name: &str) -> std::path::PathBuf {
         let root = std::env::temp_dir().join(format!(
             "axial-content-install-{name}-{}-{}",
@@ -522,6 +882,51 @@ mod tests {
         assert_eq!(
             fs::read(&path).expect("preserved user replacement"),
             b"manually replaced user bytes"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn install_commit_preserves_a_destination_replaced_after_planning() {
+        let root = test_root("replacement-after-planning");
+        fs::create_dir_all(root.join("mods")).expect("mods");
+        let path = root.join("mods/shared.jar");
+        fs::write(&path, b"launcher-owned bytes").expect("managed file");
+
+        let mut entry = recorded("project", "shared.jar");
+        entry.sha512 = Some(crate::manifest::sha512_file(&path).expect("managed hash"));
+        entry.size = Some(b"launcher-owned bytes".len() as u64);
+        let mut manifest = ContentManifest::default();
+        manifest.upsert(entry);
+        manifest.save(&root).expect("save manifest");
+
+        let planned = planned("project", "shared.jar");
+        let destinations =
+            prepare_install_destinations(&root, &manifest, std::slice::from_ref(&planned))
+                .expect("plan managed replacement");
+        let staging = StagingGuard::create(&root, "replacement-after-planning").expect("staging");
+        let staged = contained_path(staging.path(), &destinations[0].relative)
+            .expect("contained staged destination");
+        fs::create_dir_all(staged.parent().expect("staged parent")).expect("staged parent");
+        fs::write(&staged, b"downloaded update").expect("staged update");
+
+        fs::write(&path, b"user replacement").expect("replace after planning");
+        let error = match apply_install_transaction(&root, staging.transfer(), &destinations) {
+            Ok(transaction) => {
+                transaction.rollback().expect("rollback unexpected apply");
+                panic!("commit-time ownership revalidation must reject the replacement");
+            }
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("changed before commit"));
+        assert_eq!(
+            fs::read(&path).expect("preserved user replacement"),
+            b"user replacement"
+        );
+        assert_eq!(
+            ContentManifest::load(&root).expect("reload manifest"),
+            manifest
         );
         let _ = fs::remove_dir_all(root);
     }
@@ -639,7 +1044,7 @@ mod tests {
             &FileRef {
                 url: "https://example.invalid/managed.jar".to_string(),
                 filename: "managed.jar".to_string(),
-                sha1: None,
+                sha1: Some("0".repeat(40)),
                 sha512: None,
                 size: None,
                 primary: true,
@@ -686,6 +1091,195 @@ mod tests {
     }
 
     #[test]
+    fn removal_commit_preserves_a_destination_replaced_after_preflight() {
+        let root = test_root("removal-replacement-after-preflight");
+        fs::create_dir_all(root.join("mods")).expect("mods");
+        let path = root.join("mods/managed.jar");
+        fs::write(&path, b"managed bytes").expect("managed file");
+        let mut entry = recorded("project", "managed.jar");
+        entry.sha512 = Some(crate::manifest::sha512_file(&path).expect("managed hash"));
+        entry.size = Some(b"managed bytes".len() as u64);
+        let mut manifest = ContentManifest::default();
+        manifest.upsert(entry.clone());
+        manifest.save(&root).expect("save manifest");
+        let removals = verified_removable_variants(&root, &entry, &[]).expect("removal preflight");
+
+        fs::write(&path, b"user replacement").expect("replace after preflight");
+        let mut transaction = FileTransaction::empty(&root).expect("transaction");
+        let error = stage_managed_removals(&mut transaction, &removals)
+            .expect_err("claim-time ownership validation must reject replacement");
+
+        assert!(error.to_string().contains("changed before removal commit"));
+        assert_eq!(
+            fs::read(&path).expect("preserved replacement"),
+            b"user replacement"
+        );
+        assert_eq!(
+            ContentManifest::load(&root).expect("reload manifest"),
+            manifest
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn mod_toggle_classifies_the_claimed_replacement_instead_of_preflight_bytes() {
+        let root = test_root("mod-toggle-source-replacement");
+        let manifest = save_managed_mod(&root, "project", "managed.jar", true, b"managed bytes");
+        let manifest_path = crate::manifest::manifest_path(&root);
+        let manifest_before = fs::read(&manifest_path).expect("manifest before");
+        let source = root.join("mods/managed.jar");
+        let target = root.join("mods/managed.jar.disabled");
+
+        let outcome = toggle_mod_file_with_hooks(
+            &root,
+            "managed.jar",
+            false,
+            || fs::write(&source, b"user replacement").expect("replace before claim"),
+            || {},
+            || {},
+        )
+        .expect("toggle claimed replacement");
+
+        assert_eq!(outcome.filename, "managed.jar.disabled");
+        assert!(!source.exists());
+        assert_eq!(
+            fs::read(&target).expect("moved replacement"),
+            b"user replacement"
+        );
+        assert_eq!(
+            fs::read(&manifest_path).expect("manifest after"),
+            manifest_before
+        );
+        assert_eq!(
+            ContentManifest::load(&root).expect("load manifest"),
+            manifest
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn mod_toggle_preserves_a_target_that_appears_before_publish() {
+        let root = test_root("mod-toggle-target-race");
+        let manifest = save_managed_mod(&root, "project", "managed.jar", true, b"managed bytes");
+        let source = root.join("mods/managed.jar");
+        let target = root.join("mods/managed.jar.disabled");
+
+        let error = toggle_mod_file_with_hooks(
+            &root,
+            "managed.jar",
+            false,
+            || {},
+            || fs::write(&target, b"user target").expect("racing target"),
+            || {},
+        )
+        .expect_err("occupied target must abort");
+
+        assert!(matches!(error, ContentError::Invalid(_)));
+        assert_eq!(
+            fs::read(&source).expect("restored source"),
+            b"managed bytes"
+        );
+        assert_eq!(fs::read(&target).expect("preserved target"), b"user target");
+        assert_eq!(
+            ContentManifest::load(&root).expect("load manifest"),
+            manifest
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn mod_toggle_rollback_preserves_a_new_source_and_retains_recovery_bytes() {
+        let root = test_root("mod-toggle-rollback-source-race");
+        save_managed_mod(&root, "project", "managed.jar", true, b"managed bytes");
+        let source = root.join("mods/managed.jar");
+        let target = root.join("mods/managed.jar.disabled");
+        let manifest_path = crate::manifest::manifest_path(&root);
+        let external_manifest =
+            serde_json::to_vec_pretty(&ContentManifest::default()).expect("external manifest");
+
+        let error = toggle_mod_file_with_hooks(
+            &root,
+            "managed.jar",
+            false,
+            || {},
+            || {},
+            || {
+                fs::write(&source, b"user source").expect("racing source");
+                fs::write(&manifest_path, &external_manifest).expect("external manifest");
+            },
+        )
+        .expect_err("stale manifest must roll back without clobber");
+
+        assert!(matches!(error, ContentError::Invalid(_)));
+        assert_eq!(fs::read(&source).expect("preserved source"), b"user source");
+        assert!(!target.exists());
+        let recovery = fs::read_dir(&root)
+            .expect("root entries")
+            .filter_map(Result::ok)
+            .map(|entry| entry.path().join(".backup/mods/managed.jar"))
+            .find(|path| path.is_file())
+            .expect("retained recovery bytes");
+        assert_eq!(
+            fs::read(recovery).expect("recovery source"),
+            b"managed bytes"
+        );
+        assert!(
+            ContentManifest::load(&root)
+                .expect("load external manifest")
+                .entries
+                .is_empty()
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn mod_delete_classifies_the_claimed_replacement_as_local() {
+        let root = test_root("mod-delete-source-replacement");
+        let manifest = save_managed_mod(&root, "project", "managed.jar", true, b"managed bytes");
+        let manifest_path = crate::manifest::manifest_path(&root);
+        let manifest_before = fs::read(&manifest_path).expect("manifest before");
+        let source = root.join("mods/managed.jar");
+
+        let outcome = delete_local_mod_file_with_before_claim(&root, "managed.jar", || {
+            fs::write(&source, b"user replacement").expect("replace before claim");
+        })
+        .expect("delete claimed local replacement");
+
+        assert_eq!(outcome, ModFileDeleteOutcome::Deleted);
+        assert!(!source.exists());
+        assert_eq!(
+            fs::read(&manifest_path).expect("manifest after"),
+            manifest_before
+        );
+        assert_eq!(
+            ContentManifest::load(&root).expect("load manifest"),
+            manifest
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn mod_delete_restores_a_still_managed_claim() {
+        let root = test_root("mod-delete-managed");
+        let manifest = save_managed_mod(&root, "project", "managed.jar", true, b"managed bytes");
+        let source = root.join("mods/managed.jar");
+
+        let outcome =
+            delete_local_mod_file(&root, "managed.jar").expect("classify managed deletion");
+
+        assert_eq!(outcome, ModFileDeleteOutcome::Managed);
+        assert_eq!(
+            fs::read(&source).expect("restored managed source"),
+            b"managed bytes"
+        );
+        assert_eq!(
+            ContentManifest::load(&root).expect("load manifest"),
+            manifest
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn uninstall_rejects_removing_a_live_required_dependency() {
         for version_only in [false, true] {
             let root = test_root(if version_only {
@@ -697,9 +1291,17 @@ mod tests {
             fs::write(root.join("mods/dependency.jar"), b"dependency").expect("dependency file");
             fs::write(root.join("mods/dependent.jar"), b"dependent").expect("dependent file");
 
-            let dependency = recorded("dependency", "dependency.jar");
+            let mut dependency = recorded("dependency", "dependency.jar");
+            dependency.sha512 = Some(
+                crate::manifest::sha512_file(&root.join("mods/dependency.jar"))
+                    .expect("dependency hash"),
+            );
             let dependency_id = dependency.canonical_id.clone();
             let mut dependent = recorded("dependent", "dependent.jar");
+            dependent.sha512 = Some(
+                crate::manifest::sha512_file(&root.join("mods/dependent.jar"))
+                    .expect("dependent hash"),
+            );
             dependent.dependencies.push(ContentDependency {
                 project_id: (!version_only).then(|| dependency.project_id.clone()),
                 version_id: Some(dependency.version_id.clone()),

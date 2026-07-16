@@ -22,22 +22,22 @@ use crate::application::{
 use crate::state::{AppState, InstanceLifecycleLease, ProducerLease, RequestProducerHandoff};
 use axial_content::{
     CanonicalContent, CanonicalId, ContentDetail, ContentError, ContentKind, ContentManifest,
-    ContentQuery, ContentVersion, EntrySource, ManifestEntry, Page, ProviderId, SortOrder,
-    UnidentifiedRecord, UnmanagedFile, entry_file_present, install_and_record, reconcile,
-    sha512_file, uninstall_many,
+    ContentQuery, ContentVersion, ManifestEntry, Page, ProviderId, SortOrder, entry_file_present,
+    install_and_record, uninstall_many,
 };
-use axial_minecraft::DownloadProgress;
+use axial_minecraft::{DownloadProgress, download::ExecutionDownloadFact};
 use axum::{Json, http::StatusCode};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 pub use compat::{CompatCandidate, CompatDrop};
 pub(crate) use pack::execute_modpack_install;
 pub(crate) use pack::queue_modpack_install_after;
+pub(crate) use pack::validate_modpack_file_selection_ids;
 pub use pack::{
     ModpackFileOption, ModpackFilesPlan, ModpackInstallRequest, ModpackInstallResponse,
-    ModpackTarget, modpack_files, queue_modpack_install,
+    ModpackTarget, modpack_files,
 };
 pub use resolve::{ConflictKind, PlanConflict, PlanItem, PlanReason, ResolutionPlan};
 pub use target::TargetRef;
@@ -45,11 +45,40 @@ pub use target::TargetRef;
 use futures_util::{StreamExt, stream};
 use resolve::{
     canonicalize_version_only_dependencies, has_unresolved_version_only_incompatibility,
-    newer_version, resolve, version_conflicts_with_installed,
+    newer_version, resolve, resolve_for_execution, version_conflicts_with_installed,
 };
 use target::{require_instance_game_dir, resolve_target};
 
 pub type ContentApiError = (StatusCode, Json<serde_json::Value>);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ContentExecutionFailureKind {
+    FileOperation,
+    MetadataInvalid,
+    NetworkFailure,
+    PermissionDenied,
+    ProviderFailure,
+}
+
+pub(crate) struct ContentExecutionError {
+    response: ContentApiError,
+    failure_kind: Option<ContentExecutionFailureKind>,
+}
+
+impl ContentExecutionError {
+    pub(crate) fn into_parts(self) -> (ContentApiError, Option<ContentExecutionFailureKind>) {
+        (self.response, self.failure_kind)
+    }
+}
+
+impl From<ContentApiError> for ContentExecutionError {
+    fn from(response: ContentApiError) -> Self {
+        Self {
+            response,
+            failure_kind: None,
+        }
+    }
+}
 
 const DEFAULT_SEARCH_LIMIT: u32 = 40;
 const MAX_SEARCH_LIMIT: u32 = 100;
@@ -141,7 +170,6 @@ pub struct InstanceContentEntry {
     pub version_id: String,
     pub filename: String,
     pub enabled: bool,
-    pub source: EntrySource,
 }
 
 #[derive(Debug, Serialize)]
@@ -282,7 +310,7 @@ pub async fn content_plan(
     Ok(resolution.into_plan(instance_id, &target))
 }
 
-pub async fn queue_content_install(
+pub(crate) async fn queue_content_install(
     state: &AppState,
     request: ContentInstallRequest,
     handoff: RequestProducerHandoff,
@@ -339,13 +367,15 @@ fn content_install_queue_request(
     }
 }
 
-pub(crate) async fn execute_content_install<F>(
+pub(crate) async fn execute_content_install<F, G>(
     state: &AppState,
     request: ContentInstallRequest,
     mut on_progress: F,
-) -> Result<(), ContentApiError>
+    mut on_download_fact: G,
+) -> Result<(), ContentExecutionError>
 where
     F: FnMut(DownloadProgress),
+    G: FnMut(ExecutionDownloadFact),
 {
     on_progress(DownloadProgress {
         phase: "planning".to_string(),
@@ -367,7 +397,8 @@ where
         return Err(json_error(
             StatusCode::CONFLICT,
             "cannot change content while the instance is running; stop the game first",
-        ));
+        )
+        .into());
     }
 
     let game_dir = target
@@ -375,14 +406,14 @@ where
         .clone()
         .ok_or_else(|| json_error(StatusCode::NOT_FOUND, "instance not found"))?;
     let manifest = ContentManifest::load(&game_dir).map_err(content_error_response)?;
-    let resolution = resolve(state, &target, &request.selections, &manifest).await?;
+    let resolution = resolve_for_execution(state, &target, &request.selections, &manifest).await?;
 
     let has_unavailable = resolution
         .conflicts
         .iter()
         .any(|conflict| conflict.kind == ConflictKind::Unavailable);
     if has_unavailable || (!request.allow_incompatible && !resolution.conflicts.is_empty()) {
-        return Err(conflicts_error(&resolution.conflicts));
+        return Err(conflicts_error(&resolution.conflicts).into());
     }
 
     let planned = resolution.to_install();
@@ -392,17 +423,19 @@ where
             &game_dir,
             &planned,
             &mut on_progress,
+            &mut on_download_fact,
         )
         .await
-        .map_err(content_error_response)?;
+        .map_err(content_execution_error)?;
     }
     Ok(())
 }
 
 /// Which instances a staged set of content could live in. Drives the flow where
 /// someone picks content before they have anywhere to put it.
-pub async fn content_compatibility(
+pub(crate) async fn content_compatibility(
     state: &AppState,
+    producer: &ProducerLease,
     request: ContentCompatRequest,
 ) -> Result<ContentCompatResponse, ContentApiError> {
     if request.selections.is_empty() {
@@ -460,7 +493,7 @@ pub async fn content_compatibility(
             best.loader.as_str()
         };
         Some(
-            serde_json::to_value(handle_create_instance_view(state, Some(source)).await)
+            serde_json::to_value(handle_create_instance_view(state, producer, Some(source)).await)
                 .expect("create view should serialize"),
         )
     } else {
@@ -473,7 +506,7 @@ pub async fn content_compatibility(
     })
 }
 
-pub async fn queue_content_uninstall(
+pub(crate) async fn queue_content_uninstall(
     state: &AppState,
     instance_id: &str,
     canonical_id: &str,
@@ -482,7 +515,7 @@ pub async fn queue_content_uninstall(
     queue_content_uninstalls(state, instance_id, vec![canonical_id.to_string()], handoff).await
 }
 
-pub async fn queue_content_uninstalls(
+pub(crate) async fn queue_content_uninstalls(
     state: &AppState,
     instance_id: &str,
     canonical_ids: Vec<String>,
@@ -504,21 +537,22 @@ pub(crate) async fn execute_content_uninstalls(
     state: &AppState,
     instance_id: &str,
     canonical_ids: &[String],
-) -> Result<(), ContentApiError> {
+) -> Result<(), ContentExecutionError> {
     let _lifecycle_guard = lock_instance_for_content_mutation(state, instance_id).await?;
     let game_dir = require_instance_game_dir(state, instance_id)?;
     if state.sessions().has_active_instance(instance_id).await {
         return Err(json_error(
             StatusCode::CONFLICT,
             "cannot change content while the instance is running; stop the game first",
-        ));
+        )
+        .into());
     }
     let canonical_ids = canonical_ids
         .iter()
         .cloned()
         .map(CanonicalId)
         .collect::<Vec<_>>();
-    uninstall_many(&game_dir, &canonical_ids).map_err(content_error_response)?;
+    uninstall_many(&game_dir, &canonical_ids).map_err(content_execution_error)?;
     Ok(())
 }
 
@@ -537,40 +571,29 @@ async fn lock_instance_for_content_mutation(
         })
 }
 
-/// List an instance's tracked content. Along the way it reconciles the manifest
-/// against disk (dropping vanished files) and retrofits unmanaged files by
-/// hashing them and identifying them upstream.
+/// List current launcher-managed content without modifying provenance. Missing
+/// or manually replaced files are drift and remain recorded in the manifest,
+/// but are omitted from this live projection.
 pub async fn instance_content(
     state: &AppState,
     instance_id: &str,
 ) -> Result<InstanceContentResponse, ContentApiError> {
     let game_dir = require_instance_game_dir(state, instance_id)?;
     let _lifecycle_guard = lock_instance_for_content_mutation(state, instance_id).await?;
-    let mut manifest = ContentManifest::load(&game_dir).map_err(content_error_response)?;
-    let report = reconcile(&game_dir, &manifest);
+    let manifest = ContentManifest::load(&game_dir).map_err(content_error_response)?;
+    Ok(InstanceContentResponse {
+        entries: live_instance_content_entries(&game_dir, &manifest),
+    })
+}
 
-    let mut changed = false;
-    for missing in &report.missing {
-        if manifest.remove(missing).is_some() {
-            changed = true;
-        }
-    }
-
-    if manifest.prune_unidentified(&report.unmanaged) {
-        changed = true;
-    }
-
-    if retrofit_unmanaged(state, &report.unmanaged, &mut manifest).await {
-        changed = true;
-    }
-
-    if changed {
-        manifest.save(&game_dir).map_err(content_error_response)?;
-    }
-
-    let entries = manifest
+fn live_instance_content_entries(
+    game_dir: &Path,
+    manifest: &ContentManifest,
+) -> Vec<InstanceContentEntry> {
+    manifest
         .entries
         .iter()
+        .filter(|entry| entry_file_present(game_dir, entry))
         .map(|entry| InstanceContentEntry {
             canonical_id: entry.canonical_id.clone(),
             title: entry.title.clone(),
@@ -580,10 +603,8 @@ pub async fn instance_content(
             version_id: entry.version_id.clone(),
             filename: entry.filename.clone(),
             enabled: entry.enabled,
-            source: entry.source,
         })
-        .collect();
-    Ok(InstanceContentResponse { entries })
+        .collect()
 }
 
 const UPDATE_CHECK_CONCURRENCY: usize = 6;
@@ -690,135 +711,6 @@ pub(super) async fn project_titles(
     state.content().titles(ids).await.unwrap_or_default()
 }
 
-/// Hash whatever is sitting in the content directories that we did not put there,
-/// ask the provider what it is, and adopt what it recognizes. This is how an
-/// instance that predates Discover gains provenance. Every managed kind is
-/// covered, not just mods. Negative provider results are remembered by hash, so
-/// unchanged files avoid another provider request while same-size replacements
-/// are detected and checked again.
-async fn retrofit_unmanaged(
-    state: &AppState,
-    unmanaged: &[UnmanagedFile],
-    manifest: &mut ContentManifest,
-) -> bool {
-    if unmanaged.is_empty() {
-        return false;
-    }
-
-    let known: HashMap<(ContentKind, String, u64), String> = manifest
-        .unidentified
-        .iter()
-        .map(|record| {
-            (
-                (record.kind, record.filename.clone(), record.size),
-                record.sha512.clone(),
-            )
-        })
-        .collect();
-    let files = unmanaged.to_vec();
-    let hashed = tokio::task::spawn_blocking(move || {
-        let mut hashes: Vec<(String, UnmanagedFile, u64)> = Vec::new();
-        for file in files {
-            let Ok(size) = std::fs::metadata(&file.path).map(|meta| meta.len()) else {
-                continue;
-            };
-            if let Ok(hash) = sha512_file(&file.path) {
-                if negative_cache_matches(&known, file.kind, &file.disk_filename(), size, &hash) {
-                    continue;
-                }
-                hashes.push((hash, file, size));
-            }
-        }
-        hashes
-    })
-    .await
-    .unwrap_or_default();
-
-    if hashed.is_empty() {
-        return false;
-    }
-
-    let by_hash = group_unmanaged_by_hash(hashed);
-    let hashes: Vec<String> = by_hash.keys().cloned().collect();
-    let Ok(identified) = state.content().identify(&hashes).await else {
-        return false;
-    };
-
-    let ids: Vec<CanonicalId> = identified
-        .values()
-        .map(|identity| CanonicalId::for_project(identity.provider, &identity.project_id))
-        .collect();
-    let titles = project_titles(state, &ids).await;
-
-    let mut changed = false;
-    for (hash, files) in &by_hash {
-        let identity = identified.get(hash).cloned();
-        for (file, size) in files {
-            let cache_filename = file.disk_filename();
-            match identity.clone() {
-                Some(mut identity) => {
-                    let id = CanonicalId::for_project(identity.provider, &identity.project_id);
-                    if manifest.find(&id).is_some() {
-                        manifest.record_unidentified(UnidentifiedRecord {
-                            kind: file.kind,
-                            filename: cache_filename,
-                            size: *size,
-                            sha512: hash.clone(),
-                        });
-                        changed = true;
-                        continue;
-                    }
-                    if let Some(title) = titles.get(&id) {
-                        identity.title = Some(title.clone());
-                    }
-                    manifest.forget_unidentified(file.kind, &cache_filename);
-                    let mut entry =
-                        ManifestEntry::imported(file.kind, file.filename.clone(), identity);
-                    entry.sha512 = Some(hash.clone());
-                    entry.size = Some(*size);
-                    entry.enabled = !cache_filename.ends_with(".disabled");
-                    manifest.upsert(entry);
-                }
-                None => {
-                    manifest.record_unidentified(UnidentifiedRecord {
-                        kind: file.kind,
-                        filename: cache_filename,
-                        size: *size,
-                        sha512: hash.clone(),
-                    });
-                }
-            }
-            changed = true;
-        }
-    }
-    changed
-}
-
-fn group_unmanaged_by_hash(
-    hashed: Vec<(String, UnmanagedFile, u64)>,
-) -> BTreeMap<String, Vec<(UnmanagedFile, u64)>> {
-    let mut grouped: BTreeMap<String, Vec<(UnmanagedFile, u64)>> = BTreeMap::new();
-    for (hash, file, size) in hashed {
-        grouped.entry(hash).or_default().push((file, size));
-    }
-    for files in grouped.values_mut() {
-        files.sort_by_key(|(file, _)| file.path.clone());
-    }
-    grouped
-}
-
-fn negative_cache_matches(
-    known: &HashMap<(ContentKind, String, u64), String>,
-    kind: ContentKind,
-    filename: &str,
-    size: u64,
-    sha512: &str,
-) -> bool {
-    known
-        .get(&(kind, filename.to_string(), size))
-        .is_some_and(|cached| cached == sha512)
-}
-
 pub fn content_error_response(error: ContentError) -> ContentApiError {
     tracing::warn!(target: "content", error = %error, "content operation failed");
     let (status, message) = match error {
@@ -827,6 +719,10 @@ pub fn content_error_response(error: ContentError) -> ContentApiError {
             "content is not available for this instance",
         ),
         ContentError::Invalid(_) => (StatusCode::BAD_REQUEST, "invalid content request"),
+        ContentError::ProviderMetadataInvalid(_) => (
+            StatusCode::BAD_GATEWAY,
+            "the content provider returned invalid metadata; try again later",
+        ),
         ContentError::Status { status, .. } if status.as_u16() == 404 => {
             (StatusCode::NOT_FOUND, "content not found")
         }
@@ -838,12 +734,40 @@ pub fn content_error_response(error: ContentError) -> ContentApiError {
             StatusCode::BAD_GATEWAY,
             "a content download failed; check your connection and try again",
         ),
+        ContentError::DownloadPreparation(_) => (
+            StatusCode::BAD_GATEWAY,
+            "could not prepare a content download; check your connection and try again",
+        ),
         ContentError::Io(_) | ContentError::Parse(_) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             "could not complete the content operation",
         ),
     };
     json_error(status, message)
+}
+
+pub(crate) fn content_execution_error(error: ContentError) -> ContentExecutionError {
+    let failure_kind = match &error {
+        ContentError::Request(_) | ContentError::DownloadPreparation(_) => {
+            Some(ContentExecutionFailureKind::NetworkFailure)
+        }
+        ContentError::Status { .. } => Some(ContentExecutionFailureKind::ProviderFailure),
+        ContentError::ProviderMetadataInvalid(_) => {
+            Some(ContentExecutionFailureKind::MetadataInvalid)
+        }
+        ContentError::Io(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+            Some(ContentExecutionFailureKind::PermissionDenied)
+        }
+        ContentError::Io(_) => Some(ContentExecutionFailureKind::FileOperation),
+        ContentError::Download(_)
+        | ContentError::Parse(_)
+        | ContentError::Unavailable
+        | ContentError::Invalid(_) => None,
+    };
+    ContentExecutionError {
+        response: content_error_response(error),
+        failure_kind,
+    }
 }
 
 fn conflicts_error(conflicts: &[PlanConflict]) -> ContentApiError {
@@ -866,48 +790,11 @@ pub fn json_error(status: StatusCode, message: &str) -> ContentApiError {
 mod tests {
     use super::*;
     use axial_content::FileRef;
+    use sha2::{Digest, Sha512};
     use std::fs;
 
-    #[test]
-    fn same_size_negative_cache_entries_require_the_same_hash() {
-        let mut known = HashMap::new();
-        known.insert(
-            (ContentKind::Mod, "mystery.jar".to_string(), 42),
-            "old-hash".to_string(),
-        );
-
-        assert!(negative_cache_matches(
-            &known,
-            ContentKind::Mod,
-            "mystery.jar",
-            42,
-            "old-hash"
-        ));
-        assert!(!negative_cache_matches(
-            &known,
-            ContentKind::Mod,
-            "mystery.jar",
-            42,
-            "new-hash"
-        ));
-    }
-
-    #[test]
-    fn identical_unmanaged_hashes_retain_every_file_deterministically() {
-        let file = |name: &str| UnmanagedFile {
-            kind: ContentKind::Mod,
-            filename: name.to_string(),
-            path: std::path::PathBuf::from("mods").join(name),
-        };
-        let grouped = group_unmanaged_by_hash(vec![
-            ("same-hash".to_string(), file("copy-b.jar"), 42),
-            ("same-hash".to_string(), file("copy-a.jar"), 42),
-        ]);
-
-        let files = grouped.get("same-hash").expect("hash group");
-        assert_eq!(files.len(), 2);
-        assert_eq!(files[0].0.filename, "copy-a.jar");
-        assert_eq!(files[1].0.filename, "copy-b.jar");
+    fn test_sha512(bytes: &[u8]) -> String {
+        hex::encode(Sha512::digest(bytes))
     }
 
     #[test]
@@ -926,7 +813,7 @@ mod tests {
             url: "https://example.invalid/tracked.jar".to_string(),
             filename: "tracked.jar".to_string(),
             sha1: None,
-            sha512: None,
+            sha512: Some(test_sha512(b"tracked")),
             size: None,
             primary: true,
         };
@@ -947,6 +834,65 @@ mod tests {
         fs::write(root.join("mods/tracked.jar"), b"tracked").expect("tracked file");
         assert!(present_installed_ids(&root, &manifest, &candidates).contains(&id));
 
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn instance_content_is_a_read_only_live_projection() {
+        let root = std::env::temp_dir().join(format!(
+            "axial-content-live-projection-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock")
+                .as_nanos()
+        ));
+        fs::create_dir_all(root.join("mods")).expect("mods");
+        let mut manifest = ContentManifest::default();
+        let live = ManifestEntry::managed(
+            CanonicalId::for_project(ProviderId::Modrinth, "live"),
+            ProviderId::Modrinth,
+            "live".to_string(),
+            "live-version".to_string(),
+            ContentKind::Mod,
+            &FileRef {
+                url: "https://example.invalid/live.jar".to_string(),
+                filename: "live.jar".to_string(),
+                sha1: None,
+                sha512: Some(test_sha512(b"live")),
+                size: None,
+                primary: true,
+            },
+            Vec::new(),
+            Some("Live".to_string()),
+        );
+        let missing = ManifestEntry::managed(
+            CanonicalId::for_project(ProviderId::Modrinth, "missing"),
+            ProviderId::Modrinth,
+            "missing".to_string(),
+            "missing-version".to_string(),
+            ContentKind::Mod,
+            &FileRef {
+                url: "https://example.invalid/missing.jar".to_string(),
+                filename: "missing.jar".to_string(),
+                sha1: None,
+                sha512: Some(test_sha512(b"missing")),
+                size: None,
+                primary: true,
+            },
+            Vec::new(),
+            Some("Missing".to_string()),
+        );
+        manifest.upsert(live);
+        manifest.upsert(missing);
+        fs::write(root.join("mods/live.jar"), b"live").expect("live file");
+        let before = manifest.clone();
+
+        let entries = live_instance_content_entries(&root, &manifest);
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].canonical_id.as_str(), "modrinth:live");
+        assert_eq!(manifest, before, "projection must not rewrite provenance");
         let _ = fs::remove_dir_all(root);
     }
 }

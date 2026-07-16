@@ -36,7 +36,9 @@ export function ModpackPicker({
       .then((next) => {
         if (cancelled) return;
         setPlan(next);
-        setSelected(new Set(next.files.filter((file) => file.compatible && !file.installed).map((file) => file.path)));
+        setSelected(
+          new Set(next.files.filter((file) => file.compatible && !file.installed).map((file) => file.selection_id)),
+        );
       })
       .catch((reason: unknown) => {
         if (!cancelled) setError(errMessage(reason));
@@ -47,7 +49,10 @@ export function ModpackPicker({
   }, [open, instanceId, canonicalId, versionId]);
 
   const files = useMemo(() => plan?.files.filter((file) => file.compatible && !file.installed) ?? [], [plan]);
-  const selectedBytes = files.reduce((total, file) => total + (selected.has(file.path) ? (file.size ?? 0) : 0), 0);
+  const selectedBytes = files.reduce(
+    (total, file) => total + (selected.has(file.selection_id) ? (file.size ?? 0) : 0),
+    0,
+  );
 
   if (!open) return null;
   const submit = async (): Promise<void> => {
@@ -56,7 +61,7 @@ export function ModpackPicker({
     setError('');
     try {
       const queue = await installModpack(instanceId, canonicalId, plan.version_id, {
-        selectedPaths: [...selected],
+        selectedFileIds: [...selected],
         includeOverrides: false,
       });
       await applyInstallQueueResponse(queue, { showNotice: true, connectActive: true });
@@ -81,7 +86,9 @@ export function ModpackPicker({
               variant="ghost"
               size="sm"
               onClick={() =>
-                setSelected(selected.size === files.length ? new Set() : new Set(files.map((file) => file.path)))
+                setSelected(
+                  selected.size === files.length ? new Set() : new Set(files.map((file) => file.selection_id)),
+                )
               }
             >
               {selected.size === files.length ? 'Clear' : 'Select all'}
@@ -95,14 +102,14 @@ export function ModpackPicker({
             <div class="cp-resource-note">This pack has no compatible files that are not already installed.</div>
           )}
           {files.map((file) => (
-            <label class="cp-pack-picker-row" key={file.path}>
+            <label class="cp-pack-picker-row" key={file.selection_id}>
               <input
                 type="checkbox"
-                checked={selected.has(file.path)}
+                checked={selected.has(file.selection_id)}
                 onChange={() => {
                   const next = new Set(selected);
-                  if (next.has(file.path)) next.delete(file.path);
-                  else next.add(file.path);
+                  if (next.has(file.selection_id)) next.delete(file.selection_id);
+                  else next.add(file.selection_id);
                   setSelected(next);
                 }}
               />

@@ -105,9 +105,13 @@ async fn handle_install(
 
 async fn handle_compatibility(
     State(state): State<AppState>,
+    Extension(handoff): Extension<RequestProducerHandoff>,
     Json(payload): Json<ContentCompatRequest>,
 ) -> Result<Json<ContentCompatResponse>, (StatusCode, Json<serde_json::Value>)> {
-    application::content_compatibility(&state, payload)
+    let producer = handoff
+        .try_claim()
+        .map_err(super::producer_claim_error_response)?;
+    application::content_compatibility(&state, &producer, payload)
         .await
         .map(Json)
 }

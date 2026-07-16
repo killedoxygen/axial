@@ -1,30 +1,31 @@
 use crate::error::{ContentError, ContentResult};
-use crate::model::{
-    CanonicalId, ContentDependency, ContentKind, FileRef, ProviderId, VersionIdentity,
-};
+use crate::model::{CanonicalId, ContentDependency, ContentKind, FileRef, ProviderId};
 use crate::transaction::promote_replacement;
 use serde::{Deserialize, Serialize};
 use sha1::Sha1;
-use sha2::{Digest, Sha512};
+use sha2::{Digest, Sha256, Sha512};
 use std::collections::HashSet;
 use std::fs;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const MANIFEST_FILE: &str = "axial.content.json";
-pub const MANIFEST_TEMP_FILE: &str = "axial.content.json.tmp";
 const MANIFEST_SCHEMA_VERSION: u32 = 1;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum EntrySource {
-    /// Installed through Discover; the launcher owns it end to end.
-    Managed,
-    /// A file that was already present and identified after the fact.
-    Imported,
-}
+const MANIFEST_TEMP_PREFIX: &str = ".axial.content.json.tmp";
+const MAX_MANIFEST_BYTES: usize = 4 * 1024 * 1024;
+const MAX_MANIFEST_ENTRIES: usize = 4096;
+const MAX_ENTRY_DEPENDENCIES: usize = 256;
+const MAX_ID_BYTES: usize = 512;
+const MAX_FILENAME_BYTES: usize = 255;
+const MAX_TITLE_BYTES: usize = 1024;
+const MAX_INSTALLED_AT_BYTES: usize = 64;
+const MANIFEST_TEMP_ATTEMPTS: usize = 16;
+static MANIFEST_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ManifestEntry {
     pub canonical_id: CanonicalId,
     pub provider: ProviderId,
@@ -40,13 +41,53 @@ pub struct ManifestEntry {
     pub sha512: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub size: Option<u64>,
-    #[serde(default)]
+    #[serde(default, with = "strict_dependencies")]
     pub dependencies: Vec<ContentDependency>,
     pub enabled: bool,
-    pub source: EntrySource,
     pub installed_at: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
+}
+
+mod strict_dependencies {
+    use crate::model::{ContentDependency, DependencyKind};
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct StrictDependency {
+        #[serde(default)]
+        project_id: Option<String>,
+        #[serde(default)]
+        version_id: Option<String>,
+        kind: DependencyKind,
+    }
+
+    pub(super) fn serialize<S>(
+        dependencies: &[ContentDependency],
+        serializer: S,
+    ) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        dependencies.serialize(serializer)
+    }
+
+    pub(super) fn deserialize<'de, D>(deserializer: D) -> Result<Vec<ContentDependency>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Vec::<StrictDependency>::deserialize(deserializer).map(|dependencies| {
+            dependencies
+                .into_iter()
+                .map(|dependency| ContentDependency {
+                    project_id: dependency.project_id,
+                    version_id: dependency.version_id,
+                    kind: dependency.kind,
+                })
+                .collect()
+        })
+    }
 }
 
 impl ManifestEntry {
@@ -73,67 +114,50 @@ impl ManifestEntry {
             size: file.size,
             dependencies,
             enabled: true,
-            source: EntrySource::Managed,
-            installed_at: now_rfc3339(),
-            title,
-        }
-    }
-
-    pub fn imported(kind: ContentKind, filename: String, identity: VersionIdentity) -> Self {
-        let VersionIdentity {
-            provider,
-            project_id,
-            version_id,
-            dependencies,
-            title,
-            ..
-        } = identity;
-        Self {
-            canonical_id: CanonicalId::for_project(provider, &project_id),
-            provider,
-            project_id,
-            version_id,
-            kind,
-            filename,
-            sha1: None,
-            sha512: None,
-            size: None,
-            dependencies,
-            enabled: true,
-            source: EntrySource::Imported,
             installed_at: now_rfc3339(),
             title,
         }
     }
 }
 
-/// A file we hashed and asked the provider about that came back unknown.
-/// Remembering its hash avoids repeating provider requests while still letting
-/// callers detect same-size replacements reliably.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct UnidentifiedRecord {
-    pub kind: ContentKind,
-    pub filename: String,
-    pub size: u64,
-    pub sha512: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ContentManifest {
-    #[serde(default = "default_schema_version")]
     pub schema_version: u32,
-    #[serde(default)]
     pub entries: Vec<ManifestEntry>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub unidentified: Vec<UnidentifiedRecord>,
+    #[doc(hidden)]
+    #[serde(skip)]
+    pub origin: ManifestOrigin,
 }
+
+#[derive(Debug, Clone, Copy)]
+#[doc(hidden)]
+pub enum ManifestOrigin {
+    Untracked,
+    Missing,
+    Present([u8; 32]),
+}
+
+impl Default for ManifestOrigin {
+    fn default() -> Self {
+        Self::Untracked
+    }
+}
+
+impl PartialEq for ContentManifest {
+    fn eq(&self, other: &Self) -> bool {
+        self.schema_version == other.schema_version && self.entries == other.entries
+    }
+}
+
+impl Eq for ContentManifest {}
 
 impl Default for ContentManifest {
     fn default() -> Self {
         Self {
             schema_version: MANIFEST_SCHEMA_VERSION,
             entries: Vec::new(),
-            unidentified: Vec::new(),
+            origin: ManifestOrigin::Untracked,
         }
     }
 }
@@ -141,28 +165,73 @@ impl Default for ContentManifest {
 impl ContentManifest {
     pub fn load(game_dir: &Path) -> ContentResult<Self> {
         let path = manifest_path(game_dir);
-        match fs::read(&path) {
-            Ok(bytes) => Ok(serde_json::from_slice(&bytes)?),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
-            Err(error) => Err(ContentError::Io(error)),
-        }
+        let Some(bytes) = read_manifest_bytes(&path)? else {
+            return Ok(Self {
+                origin: ManifestOrigin::Missing,
+                ..Self::default()
+            });
+        };
+        Self::parse_and_validate(&bytes)
     }
 
-    pub fn save(&self, game_dir: &Path) -> ContentResult<()> {
+    fn parse_and_validate(bytes: &[u8]) -> ContentResult<Self> {
+        if bytes.len() > MAX_MANIFEST_BYTES {
+            return Err(ContentError::Invalid(
+                "content manifest exceeds its size bound".to_string(),
+            ));
+        }
+        let mut manifest: Self = serde_json::from_slice(bytes)?;
+        manifest.validate()?;
+        manifest.origin = ManifestOrigin::Present(manifest_digest(bytes));
+        Ok(manifest)
+    }
+
+    /// Persist this launcher-owned manifest.
+    ///
+    /// Mutation callers must exclusively serialize the complete load, filesystem
+    /// effect, and save transaction. Origin validation detects stale snapshots
+    /// observed before promotion; it is not a cross-process compare-and-swap.
+    pub fn save(&mut self, game_dir: &Path) -> ContentResult<()> {
+        self.save_with_before_commit(game_dir, || {})
+    }
+
+    fn save_with_before_commit<F>(&mut self, game_dir: &Path, before_commit: F) -> ContentResult<()>
+    where
+        F: FnOnce(),
+    {
+        self.validate()?;
         let path = manifest_path(game_dir);
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
+        let current = read_valid_manifest_snapshot(&path)?;
+        self.validate_origin(current.as_deref())?;
         let body = serde_json::to_vec_pretty(self)?;
-        let temp = game_dir.join(MANIFEST_TEMP_FILE);
-        fs::write(&temp, &body)?;
-        match promote_replacement(&temp, &path) {
-            Ok(()) => Ok(()),
-            Err(error) => {
-                let _ = fs::remove_file(temp);
-                Err(error)
-            }
+        if body.len() > MAX_MANIFEST_BYTES {
+            return Err(ContentError::Invalid(
+                "content manifest exceeds its size bound".to_string(),
+            ));
         }
+        let (temp, mut file) = create_manifest_temp(game_dir)?;
+        let result = (|| {
+            file.write_all(&body)?;
+            file.sync_all()?;
+            drop(file);
+
+            before_commit();
+            if read_valid_manifest_snapshot(&path)? != current {
+                return Err(ContentError::Invalid(
+                    "content manifest changed while it was being saved".to_string(),
+                ));
+            }
+            promote_replacement(&temp, &path)
+        })();
+        if result.is_err() {
+            let _ = fs::remove_file(&temp);
+        } else {
+            self.origin = ManifestOrigin::Present(manifest_digest(&body));
+        }
+        result
     }
 
     pub fn find(&self, canonical_id: &CanonicalId) -> Option<&ManifestEntry> {
@@ -193,116 +262,213 @@ impl ContentManifest {
             .map(|index| self.entries.remove(index))
     }
 
-    pub fn known_unidentified(
-        &self,
-        kind: ContentKind,
-        filename: &str,
-        size: u64,
-        sha512: &str,
-    ) -> bool {
-        self.unidentified.iter().any(|record| {
-            record.kind == kind
-                && record.filename == filename
-                && record.size == size
-                && record.sha512 == sha512
-        })
+    fn validate(&self) -> ContentResult<()> {
+        if self.schema_version != MANIFEST_SCHEMA_VERSION {
+            return Err(ContentError::Invalid(format!(
+                "unsupported content manifest schema version: {}",
+                self.schema_version
+            )));
+        }
+        if self.entries.len() > MAX_MANIFEST_ENTRIES {
+            return Err(ContentError::Invalid(
+                "content manifest has too many entries".to_string(),
+            ));
+        }
+
+        let mut canonical_ids = HashSet::with_capacity(self.entries.len());
+        let mut owned_files = HashSet::with_capacity(self.entries.len());
+        for entry in &self.entries {
+            validate_entry(entry)?;
+            if !canonical_ids.insert(entry.canonical_id.clone()) {
+                return Err(ContentError::Invalid(
+                    "content manifest contains a duplicate canonical id".to_string(),
+                ));
+            }
+            let file_key = (entry.kind, entry.filename.to_ascii_lowercase());
+            if !owned_files.insert(file_key) {
+                return Err(ContentError::Invalid(
+                    "content manifest contains a duplicate owned file".to_string(),
+                ));
+            }
+        }
+        Ok(())
     }
 
-    pub fn record_unidentified(&mut self, record: UnidentifiedRecord) {
-        self.unidentified.retain(|existing| {
-            !(existing.kind == record.kind && existing.filename == record.filename)
-        });
-        self.unidentified.push(record);
-    }
-
-    pub fn forget_unidentified(&mut self, kind: ContentKind, filename: &str) {
-        self.unidentified
-            .retain(|record| !(record.kind == kind && record.filename == filename));
-    }
-
-    /// Drop cached negatives whose file is no longer sitting unmanaged on disk,
-    /// so a removed or later-identified file does not leave a stale record.
-    /// Returns whether anything was dropped.
-    pub fn prune_unidentified(&mut self, unmanaged: &[UnmanagedFile]) -> bool {
-        let live: HashSet<(ContentKind, String)> = unmanaged
-            .iter()
-            .map(|file| (file.kind, file.disk_filename()))
-            .collect();
-        let before = self.unidentified.len();
-        self.unidentified
-            .retain(|record| live.contains(&(record.kind, record.filename.clone())));
-        self.unidentified.len() != before
-    }
-}
-
-/// The result of comparing the manifest against what is actually on disk.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct ReconcileReport {
-    /// Managed/imported entries whose file is missing on disk.
-    pub missing: Vec<CanonicalId>,
-    /// Files on disk in a managed subdirectory that no entry accounts for.
-    pub unmanaged: Vec<UnmanagedFile>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct UnmanagedFile {
-    pub kind: ContentKind,
-    pub filename: String,
-    pub path: PathBuf,
-}
-
-impl UnmanagedFile {
-    pub fn disk_filename(&self) -> String {
-        self.path
-            .file_name()
-            .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_else(|| self.filename.clone())
-    }
-}
-
-/// Pure filesystem reconcile: flags entries whose file vanished and files that no
-/// entry accounts for. Network identification of unmanaged files happens a layer
-/// up (it needs a provider).
-pub fn reconcile(game_dir: &Path, manifest: &ContentManifest) -> ReconcileReport {
-    let mut report = ReconcileReport::default();
-    let mut recorded = HashSet::with_capacity(manifest.entries.len());
-    for entry in &manifest.entries {
-        if let Some(filename) = matching_entry_filename(game_dir, entry) {
-            recorded.insert((entry.kind, filename));
+    fn validate_origin(&self, current: Option<&[u8]>) -> ContentResult<()> {
+        let unchanged = match (self.origin, current) {
+            (ManifestOrigin::Untracked | ManifestOrigin::Missing, None) => true,
+            (ManifestOrigin::Present(expected), Some(current)) => {
+                manifest_digest(current) == expected
+            }
+            _ => false,
+        };
+        if unchanged {
+            Ok(())
         } else {
-            report.missing.push(entry.canonical_id.clone());
+            Err(ContentError::Invalid(
+                "content manifest changed since it was loaded".to_string(),
+            ))
         }
     }
+}
 
-    for kind in [
-        ContentKind::Mod,
-        ContentKind::ResourcePack,
-        ContentKind::ShaderPack,
-    ] {
-        let Some(kind_dir) = kind.install_subdir() else {
-            continue;
-        };
-        let dir = game_dir.join(kind_dir);
-        let Ok(entries) = fs::read_dir(&dir) else {
-            continue;
-        };
-        for dir_entry in entries.filter_map(Result::ok) {
-            if !dir_entry.path().is_file() {
-                continue;
-            }
-            let raw = dir_entry.file_name().to_string_lossy().to_string();
-            if recorded.contains(&(kind, raw.clone())) {
-                continue;
-            }
-            report.unmanaged.push(UnmanagedFile {
-                kind,
-                filename: enabled_base_name(&raw),
-                path: dir_entry.path(),
-            });
+fn manifest_digest(bytes: &[u8]) -> [u8; 32] {
+    Sha256::digest(bytes).into()
+}
+
+fn validate_entry(entry: &ManifestEntry) -> ContentResult<()> {
+    validate_required_text("canonical id", entry.canonical_id.as_str(), MAX_ID_BYTES)?;
+    validate_required_text("project id", &entry.project_id, MAX_ID_BYTES)?;
+    validate_required_text("version id", &entry.version_id, MAX_ID_BYTES)?;
+    if entry.canonical_id != CanonicalId::for_project(entry.provider, &entry.project_id) {
+        return Err(ContentError::Invalid(
+            "content manifest canonical id does not match its provider project".to_string(),
+        ));
+    }
+    validate_filename(entry.kind, &entry.filename)?;
+    validate_optional_hash("sha1", entry.sha1.as_deref(), 40)?;
+    validate_optional_hash("sha512", entry.sha512.as_deref(), 128)?;
+    if entry.kind != ContentKind::Modpack && entry.sha1.is_none() && entry.sha512.is_none() {
+        return Err(ContentError::Invalid(
+            "content manifest file entry is missing an integrity checksum".to_string(),
+        ));
+    }
+    if entry.dependencies.len() > MAX_ENTRY_DEPENDENCIES {
+        return Err(ContentError::Invalid(
+            "content manifest entry has too many dependencies".to_string(),
+        ));
+    }
+    for dependency in &entry.dependencies {
+        if let Some(project_id) = dependency.project_id.as_deref() {
+            validate_required_text("dependency project id", project_id, MAX_ID_BYTES)?;
+        }
+        if let Some(version_id) = dependency.version_id.as_deref() {
+            validate_required_text("dependency version id", version_id, MAX_ID_BYTES)?;
         }
     }
+    validate_required_text(
+        "installed timestamp",
+        &entry.installed_at,
+        MAX_INSTALLED_AT_BYTES,
+    )?;
+    if chrono::DateTime::parse_from_rfc3339(&entry.installed_at).is_err() {
+        return Err(ContentError::Invalid(
+            "content manifest has an invalid installed timestamp".to_string(),
+        ));
+    }
+    if let Some(title) = entry.title.as_deref()
+        && title.len() > MAX_TITLE_BYTES
+    {
+        return Err(ContentError::Invalid(
+            "content manifest title exceeds its size bound".to_string(),
+        ));
+    }
+    Ok(())
+}
 
-    report
+fn validate_required_text(label: &str, value: &str, max_bytes: usize) -> ContentResult<()> {
+    if value.is_empty() || value.len() > max_bytes || value.contains('\0') {
+        return Err(ContentError::Invalid(format!(
+            "content manifest {label} is invalid"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_filename(kind: ContentKind, filename: &str) -> ContentResult<()> {
+    if kind == ContentKind::Modpack {
+        if filename.is_empty() {
+            return Ok(());
+        }
+    } else {
+        validate_required_text("filename", filename, MAX_FILENAME_BYTES)?;
+    }
+    if filename.len() > MAX_FILENAME_BYTES
+        || filename == "."
+        || filename == ".."
+        || filename.contains(['/', '\\', '\0'])
+        || filename.ends_with(".disabled")
+    {
+        return Err(ContentError::Invalid(
+            "content manifest filename is invalid".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_optional_hash(label: &str, value: Option<&str>, length: usize) -> ContentResult<()> {
+    if value.is_some_and(|value| {
+        value.len() != length || !value.bytes().all(|byte| byte.is_ascii_hexdigit())
+    }) {
+        return Err(ContentError::Invalid(format!(
+            "content manifest {label} is invalid"
+        )));
+    }
+    Ok(())
+}
+
+fn read_manifest_bytes(path: &Path) -> ContentResult<Option<Vec<u8>>> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(ContentError::Io(error)),
+    };
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return Err(ContentError::Invalid(
+            "content manifest path is not a regular file".to_string(),
+        ));
+    }
+    if metadata.len() > MAX_MANIFEST_BYTES as u64 {
+        return Err(ContentError::Invalid(
+            "content manifest exceeds its size bound".to_string(),
+        ));
+    }
+
+    let file = fs::File::open(path)?;
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.take((MAX_MANIFEST_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > MAX_MANIFEST_BYTES {
+        return Err(ContentError::Invalid(
+            "content manifest exceeds its size bound".to_string(),
+        ));
+    }
+    Ok(Some(bytes))
+}
+
+fn read_valid_manifest_snapshot(path: &Path) -> ContentResult<Option<Vec<u8>>> {
+    let Some(bytes) = read_manifest_bytes(path)? else {
+        return Ok(None);
+    };
+    ContentManifest::parse_and_validate(&bytes)?;
+    Ok(Some(bytes))
+}
+
+fn create_manifest_temp(game_dir: &Path) -> ContentResult<(PathBuf, fs::File)> {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    for _ in 0..MANIFEST_TEMP_ATTEMPTS {
+        let sequence = MANIFEST_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let path = game_dir.join(format!(
+            "{MANIFEST_TEMP_PREFIX}-{}-{nanos:x}-{sequence:x}",
+            std::process::id()
+        ));
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(file) => return Ok((path, file)),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(ContentError::Io(error)),
+        }
+    }
+    Err(ContentError::Io(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "could not allocate a unique content manifest temporary file",
+    )))
 }
 
 /// Whether an entry still owns a regular file on disk. When provenance carries
@@ -347,18 +513,11 @@ pub fn entry_path_matches(path: &Path, entry: &ManifestEntry) -> bool {
     if let Some(expected) = entry.sha1.as_deref() {
         return hash_file::<Sha1>(path).is_ok_and(|actual| actual.eq_ignore_ascii_case(expected));
     }
-    true
+    false
 }
 
 pub fn manifest_path(game_dir: &Path) -> PathBuf {
     game_dir.join(MANIFEST_FILE)
-}
-
-pub fn enabled_base_name(filename: &str) -> String {
-    filename
-        .strip_suffix(".disabled")
-        .unwrap_or(filename)
-        .to_string()
 }
 
 pub fn sha512_file(path: &Path) -> ContentResult<String> {
@@ -382,10 +541,6 @@ where
     Ok(hex::encode(hasher.finalize()))
 }
 
-fn default_schema_version() -> u32 {
-    MANIFEST_SCHEMA_VERSION
-}
-
 fn now_rfc3339() -> String {
     chrono::Utc::now().to_rfc3339()
 }
@@ -393,7 +548,7 @@ fn now_rfc3339() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{DependencyKind, FileRef};
+    use crate::model::FileRef;
 
     fn temp_game_dir(name: &str) -> PathBuf {
         let path = std::env::temp_dir().join(format!(
@@ -412,7 +567,7 @@ mod tests {
         FileRef {
             url: format!("https://example.invalid/{filename}"),
             filename: filename.to_string(),
-            sha1: None,
+            sha1: Some("0".repeat(40)),
             sha512: None,
             size: None,
             primary: true,
@@ -462,6 +617,59 @@ mod tests {
     }
 
     #[test]
+    fn save_detects_a_manifest_change_before_final_validation() {
+        let dir = temp_game_dir("changed-during-save");
+        let mut initial = ContentManifest::default();
+        initial.upsert(managed_entry("AAA", "initial.jar"));
+        initial.save(&dir).expect("initial save");
+
+        let mut replacement = initial.clone();
+        replacement.upsert(managed_entry("AAA", "replacement.jar"));
+        let mut external = ContentManifest::default();
+        external.upsert(managed_entry("BBB", "external.jar"));
+        let external_bytes = serde_json::to_vec_pretty(&external).expect("external manifest");
+        let path = manifest_path(&dir);
+
+        let error = replacement
+            .save_with_before_commit(&dir, || {
+                fs::write(&path, &external_bytes).expect("external replacement");
+            })
+            .expect_err("change observed before final validation must fail");
+
+        assert!(matches!(error, ContentError::Invalid(_)));
+        assert_eq!(
+            ContentManifest::load(&dir).expect("load external manifest"),
+            external
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn save_rejects_a_manifest_changed_since_load() {
+        let dir = temp_game_dir("changed-since-load");
+        let mut initial = ContentManifest::default();
+        initial.upsert(managed_entry("AAA", "initial.jar"));
+        initial.save(&dir).expect("initial save");
+        let mut stale = ContentManifest::load(&dir).expect("load stale snapshot");
+
+        let mut external = ContentManifest::load(&dir).expect("load external snapshot");
+        external.upsert(managed_entry("BBB", "external.jar"));
+        external.save(&dir).expect("external save");
+        stale.upsert(managed_entry("CCC", "stale.jar"));
+
+        let error = stale
+            .save(&dir)
+            .expect_err("stale snapshot must not overwrite external changes");
+
+        assert!(matches!(error, ContentError::Invalid(_)));
+        assert_eq!(
+            ContentManifest::load(&dir).expect("load external manifest"),
+            external
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn load_missing_manifest_is_empty() {
         let dir = temp_game_dir("missing");
         let loaded = ContentManifest::load(&dir).expect("load");
@@ -488,150 +696,178 @@ mod tests {
     }
 
     #[test]
-    fn imported_identity_keeps_dependency_metadata() {
-        let entry = ManifestEntry::imported(
-            ContentKind::Mod,
-            "project-a.jar".to_string(),
-            VersionIdentity {
-                provider: ProviderId::Modrinth,
-                project_id: "project-a".to_string(),
-                version_id: "version-a".to_string(),
-                game_versions: vec!["1.21.6".to_string()],
-                loaders: vec!["fabric".to_string()],
-                dependencies: vec![ContentDependency {
-                    project_id: Some("project-b".to_string()),
-                    version_id: None,
-                    kind: DependencyKind::Incompatible,
-                }],
-                title: Some("Project A".to_string()),
-            },
-        );
+    fn load_requires_the_exact_v1_schema() {
+        let dir = temp_game_dir("strict-schema");
+        let path = manifest_path(&dir);
+        let cases = [
+            r#"{"entries":[]}"#,
+            r#"{"schema_version":2,"entries":[]}"#,
+            r#"{"schema_version":1,"entries":[],"unidentified":[]}"#,
+            r#"{"schema_version":1,"entries":[],"extra":true}"#,
+        ];
 
-        assert_eq!(entry.dependencies.len(), 1);
-        assert_eq!(
-            entry.dependencies[0].project_id.as_deref(),
-            Some("project-b")
-        );
-        assert_eq!(entry.dependencies[0].kind, DependencyKind::Incompatible);
-    }
-
-    #[test]
-    fn reconcile_flags_missing_and_unmanaged() {
-        let dir = temp_game_dir("reconcile");
-        let mods_dir = dir.join("mods");
-        fs::create_dir_all(&mods_dir).expect("mods dir");
-        fs::write(mods_dir.join("present.jar"), b"jar").expect("present");
-        fs::write(mods_dir.join("dropped.jar"), b"jar").expect("dropped");
-
-        let mut manifest = ContentManifest::default();
-        manifest.upsert(managed_entry("AAA", "present.jar"));
-        manifest.upsert(managed_entry("BBB", "vanished.jar"));
-
-        let report = reconcile(&dir, &manifest);
-        assert_eq!(
-            report.missing,
-            vec![CanonicalId::for_project(ProviderId::Modrinth, "BBB")]
-        );
-        assert_eq!(report.unmanaged.len(), 1);
-        assert_eq!(report.unmanaged[0].filename, "dropped.jar");
+        for body in cases {
+            fs::write(&path, body).expect("write malformed manifest");
+            assert!(
+                ContentManifest::load(&dir).is_err(),
+                "manifest should fail closed: {body}"
+            );
+        }
         fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
-    fn unidentified_records_roundtrip_and_match_on_size_and_hash() {
-        let dir = temp_game_dir("unidentified");
-        let mut manifest = ContentManifest::default();
-        manifest.record_unidentified(UnidentifiedRecord {
-            kind: ContentKind::Mod,
-            filename: "mystery.jar".to_string(),
-            size: 42,
-            sha512: "c".repeat(128),
-        });
-        manifest.save(&dir).expect("save");
+    fn load_rejects_legacy_source_and_unknown_entry_fields() {
+        let dir = temp_game_dir("strict-entry");
+        let path = manifest_path(&dir);
+        let entry = managed_entry("AAA", "sodium.jar");
+        let mut value = serde_json::to_value(ContentManifest {
+            entries: vec![entry],
+            ..ContentManifest::default()
+        })
+        .expect("manifest value");
 
-        let loaded = ContentManifest::load(&dir).expect("load");
-        assert!(loaded.known_unidentified(ContentKind::Mod, "mystery.jar", 42, &"c".repeat(128)));
-        assert!(!loaded.known_unidentified(ContentKind::Mod, "mystery.jar", 42, &"d".repeat(128)));
-        assert!(!loaded.known_unidentified(ContentKind::Mod, "mystery.jar", 43, &"c".repeat(128)));
-        assert!(!loaded.known_unidentified(
-            ContentKind::ResourcePack,
-            "mystery.jar",
-            42,
-            &"c".repeat(128)
-        ));
+        value["entries"][0]["source"] = serde_json::json!("managed");
+        fs::write(
+            &path,
+            serde_json::to_vec(&value).expect("legacy source body"),
+        )
+        .expect("write legacy source");
+        assert!(ContentManifest::load(&dir).is_err());
+
+        value["entries"][0]
+            .as_object_mut()
+            .expect("entry object")
+            .remove("source");
+        value["entries"][0]["unknown"] = serde_json::json!(true);
+        fs::write(
+            &path,
+            serde_json::to_vec(&value).expect("unknown field body"),
+        )
+        .expect("write unknown field");
+        assert!(ContentManifest::load(&dir).is_err());
+
+        value["entries"][0]
+            .as_object_mut()
+            .expect("entry object")
+            .remove("unknown");
+        value["entries"][0]["dependencies"] = serde_json::json!([{
+            "project_id": "dependency",
+            "kind": "required",
+            "unknown": true
+        }]);
+        fs::write(
+            &path,
+            serde_json::to_vec(&value).expect("unknown dependency field body"),
+        )
+        .expect("write unknown dependency field");
+        assert!(ContentManifest::load(&dir).is_err());
         fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
-    fn prune_unidentified_drops_records_for_files_no_longer_unmanaged() {
-        let mut manifest = ContentManifest::default();
-        manifest.record_unidentified(UnidentifiedRecord {
-            kind: ContentKind::Mod,
-            filename: "still-here.jar".to_string(),
-            size: 1,
-            sha512: "d".repeat(128),
-        });
-        manifest.record_unidentified(UnidentifiedRecord {
-            kind: ContentKind::Mod,
-            filename: "gone.jar".to_string(),
-            size: 2,
-            sha512: "e".repeat(128),
-        });
+    fn load_rejects_duplicate_canonical_ids_and_owned_files() {
+        let dir = temp_game_dir("duplicates");
+        let path = manifest_path(&dir);
+        let first = managed_entry("AAA", "first.jar");
+        let mut duplicate_id = managed_entry("AAA", "second.jar");
+        duplicate_id.version_id = "AAA-v2".to_string();
+        let duplicate_ids = ContentManifest {
+            entries: vec![first.clone(), duplicate_id],
+            ..ContentManifest::default()
+        };
+        fs::write(
+            &path,
+            serde_json::to_vec(&duplicate_ids).expect("duplicate id body"),
+        )
+        .expect("write duplicate ids");
+        assert!(ContentManifest::load(&dir).is_err());
 
-        let unmanaged = vec![UnmanagedFile {
-            kind: ContentKind::Mod,
-            filename: "still-here.jar".to_string(),
-            path: PathBuf::from("mods/still-here.jar"),
-        }];
-        assert!(manifest.prune_unidentified(&unmanaged));
-        assert_eq!(manifest.unidentified.len(), 1);
-        assert_eq!(manifest.unidentified[0].filename, "still-here.jar");
-        assert!(!manifest.prune_unidentified(&unmanaged));
-    }
-
-    #[test]
-    fn reconcile_treats_disabled_suffix_as_same_file() {
-        let dir = temp_game_dir("disabled");
-        let mods_dir = dir.join("mods");
-        fs::create_dir_all(&mods_dir).expect("mods dir");
-        fs::write(mods_dir.join("sodium.jar.disabled"), b"jar").expect("disabled file");
-
-        let mut manifest = ContentManifest::default();
-        manifest.upsert(managed_entry("AAA", "sodium.jar"));
-
-        let report = reconcile(&dir, &manifest);
-        assert!(report.missing.is_empty(), "disabled file still counts");
-        assert!(report.unmanaged.is_empty(), "disabled file is recorded");
+        let duplicate_files = ContentManifest {
+            entries: vec![first, managed_entry("BBB", "FIRST.JAR")],
+            ..ContentManifest::default()
+        };
+        fs::write(
+            &path,
+            serde_json::to_vec(&duplicate_files).expect("duplicate file body"),
+        )
+        .expect("write duplicate files");
+        assert!(ContentManifest::load(&dir).is_err());
         fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
-    fn reconcile_reports_the_extra_enabled_or_disabled_variant_as_unmanaged() {
-        let dir = temp_game_dir("duplicate-variant");
-        let mods_dir = dir.join("mods");
-        fs::create_dir_all(&mods_dir).expect("mods dir");
-        fs::write(mods_dir.join("sodium.jar"), b"jar").expect("enabled file");
-        fs::write(mods_dir.join("sodium.jar.disabled"), b"jar").expect("disabled file");
+    fn load_rejects_unbounded_or_unsafe_entries() {
+        let dir = temp_game_dir("bounded-entry");
+        let path = manifest_path(&dir);
+        let mut entry = managed_entry("AAA", "tracked.jar");
+        entry.filename = "x".repeat(MAX_FILENAME_BYTES + 1);
+        fs::write(
+            &path,
+            serde_json::to_vec(&ContentManifest {
+                entries: vec![entry],
+                ..ContentManifest::default()
+            })
+            .expect("oversized entry body"),
+        )
+        .expect("write oversized entry");
+        assert!(ContentManifest::load(&dir).is_err());
 
-        let mut manifest = ContentManifest::default();
-        manifest.upsert(managed_entry("AAA", "sodium.jar"));
+        let mut entry = managed_entry("AAA", "../tracked.jar");
+        entry.sha512 = Some("not-a-hash".to_string());
+        fs::write(
+            &path,
+            serde_json::to_vec(&ContentManifest {
+                entries: vec![entry],
+                ..ContentManifest::default()
+            })
+            .expect("unsafe entry body"),
+        )
+        .expect("write unsafe entry");
+        assert!(ContentManifest::load(&dir).is_err());
 
-        let report = reconcile(&dir, &manifest);
-        assert!(report.missing.is_empty());
-        assert_eq!(report.unmanaged.len(), 1);
-        assert_eq!(
-            report.unmanaged[0]
-                .path
-                .file_name()
-                .and_then(|name| name.to_str()),
-            Some("sodium.jar.disabled")
-        );
+        fs::write(&path, vec![b' '; MAX_MANIFEST_BYTES + 1]).expect("oversized manifest");
+        assert!(ContentManifest::load(&dir).is_err());
         fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
-    fn reconcile_treats_a_same_name_hash_mismatch_as_unmanaged() {
-        let dir = temp_game_dir("replaced-in-place");
+    fn file_entries_require_integrity_before_they_can_own_a_path() {
+        let dir = temp_game_dir("checksum-required");
+        let path = manifest_path(&dir);
+        let mut entry = managed_entry("AAA", "tracked.jar");
+        entry.sha1 = None;
+        entry.sha512 = None;
+        fs::write(
+            &path,
+            serde_json::to_vec(&ContentManifest {
+                entries: vec![entry.clone()],
+                ..ContentManifest::default()
+            })
+            .expect("manifest body"),
+        )
+        .expect("write manifest");
+
+        assert!(ContentManifest::load(&dir).is_err());
+        let tracked = dir.join("mods").join("tracked.jar");
+        fs::create_dir_all(tracked.parent().expect("mods dir")).expect("create mods");
+        fs::write(&tracked, b"unverified").expect("write unverified file");
+        assert!(!entry_path_matches(&tracked, &entry));
+
+        fs::remove_file(&path).expect("remove rejected manifest");
+        entry.kind = ContentKind::Modpack;
+        entry.filename.clear();
+        let mut manifest = ContentManifest::default();
+        manifest.upsert(entry);
+        manifest
+            .save(&dir)
+            .expect("save provenance-only pack entry");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn entry_presence_accepts_disabled_state_but_rejects_replacement() {
+        let dir = temp_game_dir("entry-presence");
         let mods_dir = dir.join("mods");
         fs::create_dir_all(&mods_dir).expect("mods dir");
         let path = mods_dir.join("tracked.jar");
@@ -640,18 +876,14 @@ mod tests {
         let mut entry = managed_entry("AAA", "tracked.jar");
         entry.size = Some(3);
         entry.sha512 = Some(sha512_file(&path).expect("tracked hash"));
-        let mut manifest = ContentManifest::default();
-        manifest.upsert(entry);
+        assert!(entry_file_present(&dir, &entry));
 
         fs::write(&path, b"new").expect("replace tracked file");
-        let report = reconcile(&dir, &manifest);
+        assert!(!entry_file_present(&dir, &entry));
 
-        assert_eq!(
-            report.missing,
-            vec![CanonicalId::for_project(ProviderId::Modrinth, "AAA")]
-        );
-        assert_eq!(report.unmanaged.len(), 1);
-        assert_eq!(report.unmanaged[0].filename, "tracked.jar");
+        fs::write(&path, b"old").expect("restore tracked file");
+        fs::rename(&path, mods_dir.join("tracked.jar.disabled")).expect("disable");
+        assert!(entry_file_present(&dir, &entry));
         fs::remove_dir_all(&dir).ok();
     }
 }

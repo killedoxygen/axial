@@ -531,7 +531,7 @@ where
 }
 
 async fn acquire_runtime_source_for_ensure(
-    cache: &ManagedRuntimeCache,
+    _cache: &ManagedRuntimeCache,
     component: &RuntimeId,
     source: RuntimeEnsureSource,
 ) -> Result<RuntimeSourceReceipt, JavaRuntimeLookupError> {
@@ -541,7 +541,7 @@ async fn acquire_runtime_source_for_ensure(
         }
         #[cfg(feature = "test-support")]
         RuntimeEnsureSource::PersistedManifest => {
-            acquire_persisted_runtime_source_for_test(cache, component).await
+            acquire_persisted_runtime_source_for_test(_cache, component).await
         }
     }
 }

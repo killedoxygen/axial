@@ -1,7 +1,7 @@
 use super::*;
 use crate::state::{
     AppState, AppStateInit, IdleSweepCancellation, IdleSweepReservation, IdleSweepTerminal,
-    InstallStore, ProducerLease, RequestLease, SessionStore,
+    InstallStore, ProducerLease, RequestLease, SessionStore, UpdateApplyAdmissionError,
 };
 use axial_config::{AppPaths, ConfigStore, InstanceRegistrySnapshot, InstanceStore};
 use axial_launcher::{LaunchSessionRecord, LaunchState, SessionId};
@@ -640,6 +640,44 @@ fn instance_mod_names_reject_path_traversal_hidden_and_non_mod_names() {
     }
 }
 
+fn save_managed_mod_manifest(
+    game_dir: &FsPath,
+    filename: &str,
+    enabled: bool,
+    bytes: &[u8],
+) -> axial_content::ContentManifest {
+    let disk_name = if enabled {
+        filename.to_string()
+    } else {
+        format!("{filename}.disabled")
+    };
+    let path = game_dir.join("mods").join(disk_name);
+    fs::write(&path, bytes).expect("write managed mod");
+    let file = axial_content::FileRef {
+        url: format!("https://example.invalid/{filename}"),
+        filename: filename.to_string(),
+        sha1: None,
+        sha512: Some(axial_content::sha512_file(&path).expect("hash managed mod")),
+        size: Some(bytes.len() as u64),
+        primary: true,
+    };
+    let mut entry = axial_content::ManifestEntry::managed(
+        axial_content::CanonicalId::for_project(axial_content::ProviderId::Modrinth, "managed-mod"),
+        axial_content::ProviderId::Modrinth,
+        "managed-mod".to_string(),
+        "managed-version".to_string(),
+        axial_content::ContentKind::Mod,
+        &file,
+        Vec::new(),
+        None,
+    );
+    entry.enabled = enabled;
+    let mut manifest = axial_content::ContentManifest::default();
+    manifest.upsert(entry);
+    manifest.save(game_dir).expect("save managed manifest");
+    manifest
+}
+
 #[tokio::test]
 async fn instance_mod_update_reports_not_found_conflict_and_success() {
     let fixture = TestFixture::new("mod-update");
@@ -716,6 +754,193 @@ async fn instance_mod_update_reports_not_found_conflict_and_success() {
 }
 
 #[tokio::test]
+async fn instance_mod_mutation_admission_blocks_update_apply_for_its_full_lease() {
+    let fixture = TestFixture::new("mod-update-admission");
+    let lease =
+        super::resources::admit_instance_mod_mutation(&fixture.state).expect("admit mod mutation");
+
+    assert_eq!(
+        fixture.state.try_begin_update_apply().unwrap_err(),
+        UpdateApplyAdmissionError::ActiveOperations
+    );
+
+    drop(lease);
+    fixture
+        .state
+        .try_begin_update_apply()
+        .expect("released mod mutation reopens update apply");
+}
+
+#[tokio::test]
+async fn update_apply_rejects_mod_toggle_and_delete_before_disk_mutation() {
+    let fixture = TestFixture::new("mod-update-apply-rejection");
+    let _apply = fixture
+        .state
+        .try_begin_update_apply()
+        .expect("begin update apply");
+
+    assert_update_admission_rejects_mod_mutations(
+        &fixture,
+        "Content changes are unavailable while an update is being applied.",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn update_restart_pending_rejects_mod_toggle_and_delete_before_disk_mutation() {
+    let fixture = TestFixture::new("mod-update-restart-pending-rejection");
+    fixture
+        .state
+        .try_begin_update_apply()
+        .expect("begin update apply")
+        .mark_restart_pending();
+
+    assert_update_admission_rejects_mod_mutations(
+        &fixture,
+        "Restart Axial to finish the applied update before changing content.",
+    )
+    .await;
+}
+
+async fn assert_update_admission_rejects_mod_mutations(
+    fixture: &TestFixture,
+    expected_message: &str,
+) {
+    let instance = fixture
+        .state
+        .instances()
+        .insert_for_test(
+            "Update apply mod boundary".to_string(),
+            "1.21.1".to_string(),
+        )
+        .expect("add instance");
+    let mods_dir = fixture
+        .state
+        .instances()
+        .game_dir(&instance.id)
+        .join("mods");
+    fs::create_dir_all(&mods_dir).expect("create mods dir");
+    fs::write(mods_dir.join("toggle.jar"), b"toggle").expect("write toggle mod");
+    fs::write(mods_dir.join("delete.jar"), b"delete").expect("write delete mod");
+
+    let (toggle_status, Json(toggle_body)) = handle_update_instance_mod(
+        &fixture.state,
+        &instance.id,
+        "toggle.jar",
+        UpdateModRequest { enabled: false },
+    )
+    .await
+    .expect_err("update apply must reject mod toggle");
+    assert_eq!(toggle_status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_bounded_error_body(&toggle_body, expected_message);
+
+    let (delete_status, Json(delete_body)) =
+        handle_delete_instance_mod(&fixture.state, &instance.id, "delete.jar")
+            .await
+            .expect_err("update apply must reject mod delete");
+    assert_eq!(delete_status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_bounded_error_body(&delete_body, expected_message);
+
+    assert_eq!(
+        fs::read(mods_dir.join("toggle.jar")).expect("toggle mod remains"),
+        b"toggle"
+    );
+    assert!(!mods_dir.join("toggle.jar.disabled").exists());
+    assert_eq!(
+        fs::read(mods_dir.join("delete.jar")).expect("delete mod remains"),
+        b"delete"
+    );
+}
+
+#[tokio::test]
+async fn instance_mod_disable_treats_drifted_managed_filename_as_local() {
+    let fixture = TestFixture::new("mod-disable-drift");
+    let instance = fixture
+        .state
+        .instances()
+        .insert_for_test("Disable drifted mod".to_string(), "1.21.1".to_string())
+        .expect("add instance");
+    let game_dir = fixture.state.instances().game_dir(&instance.id);
+    let mods_dir = game_dir.join("mods");
+    fs::create_dir_all(&mods_dir).expect("create mods dir");
+    let manifest = save_managed_mod_manifest(&game_dir, "drift.jar", true, b"managed");
+    let manifest_path = game_dir.join("axial.content.json");
+    let manifest_before = fs::read(&manifest_path).expect("read manifest before disable");
+    fs::write(mods_dir.join("drift.jar"), b"drifted").expect("replace managed mod");
+
+    let body = handle_update_instance_mod(
+        &fixture.state,
+        &instance.id,
+        "drift.jar",
+        UpdateModRequest { enabled: false },
+    )
+    .await
+    .expect("disable drifted mod");
+
+    assert_eq!(
+        body,
+        serde_json::json!({ "status": "ok", "name": "drift.jar.disabled", "enabled": false })
+    );
+    assert!(!mods_dir.join("drift.jar").exists());
+    assert_eq!(
+        fs::read(mods_dir.join("drift.jar.disabled")).expect("read disabled replacement"),
+        b"drifted"
+    );
+    assert_eq!(
+        fs::read(&manifest_path).expect("read manifest after disable"),
+        manifest_before
+    );
+    assert_eq!(
+        axial_content::ContentManifest::load(&game_dir).expect("load manifest after disable"),
+        manifest
+    );
+}
+
+#[tokio::test]
+async fn instance_mod_enable_treats_drifted_managed_filename_as_local() {
+    let fixture = TestFixture::new("mod-enable-drift");
+    let instance = fixture
+        .state
+        .instances()
+        .insert_for_test("Enable drifted mod".to_string(), "1.21.1".to_string())
+        .expect("add instance");
+    let game_dir = fixture.state.instances().game_dir(&instance.id);
+    let mods_dir = game_dir.join("mods");
+    fs::create_dir_all(&mods_dir).expect("create mods dir");
+    let manifest = save_managed_mod_manifest(&game_dir, "drift.jar", false, b"managed");
+    let manifest_path = game_dir.join("axial.content.json");
+    let manifest_before = fs::read(&manifest_path).expect("read manifest before enable");
+    fs::write(mods_dir.join("drift.jar.disabled"), b"drifted").expect("replace managed mod");
+
+    let body = handle_update_instance_mod(
+        &fixture.state,
+        &instance.id,
+        "drift.jar.disabled",
+        UpdateModRequest { enabled: true },
+    )
+    .await
+    .expect("enable drifted mod");
+
+    assert_eq!(
+        body,
+        serde_json::json!({ "status": "ok", "name": "drift.jar", "enabled": true })
+    );
+    assert!(!mods_dir.join("drift.jar.disabled").exists());
+    assert_eq!(
+        fs::read(mods_dir.join("drift.jar")).expect("read enabled replacement"),
+        b"drifted"
+    );
+    assert_eq!(
+        fs::read(&manifest_path).expect("read manifest after enable"),
+        manifest_before
+    );
+    assert_eq!(
+        axial_content::ContentManifest::load(&game_dir).expect("load manifest after enable"),
+        manifest
+    );
+}
+
+#[tokio::test]
 async fn instance_mod_delete_removes_only_named_mod_file() {
     let fixture = TestFixture::new("mod-delete");
     let instance = fixture
@@ -741,6 +966,38 @@ async fn instance_mod_delete_removes_only_named_mod_file() {
     assert_eq!(
         fs::read_to_string(mods_dir.join("keep.jar")).expect("read kept mod"),
         "kept"
+    );
+}
+
+#[tokio::test]
+async fn instance_mod_delete_treats_drifted_managed_filename_as_local() {
+    let fixture = TestFixture::new("mod-delete-drift");
+    let instance = fixture
+        .state
+        .instances()
+        .insert_for_test("Delete drifted mod".to_string(), "1.21.1".to_string())
+        .expect("add instance");
+    let game_dir = fixture.state.instances().game_dir(&instance.id);
+    let mods_dir = game_dir.join("mods");
+    fs::create_dir_all(&mods_dir).expect("create mods dir");
+    let manifest = save_managed_mod_manifest(&game_dir, "drift.jar", true, b"managed");
+    let manifest_path = game_dir.join("axial.content.json");
+    let manifest_before = fs::read(&manifest_path).expect("read manifest before delete");
+    fs::write(mods_dir.join("drift.jar"), b"drifted").expect("replace managed mod");
+
+    let body = handle_delete_instance_mod(&fixture.state, &instance.id, "drift.jar")
+        .await
+        .expect("delete drifted mod");
+
+    assert_eq!(body, serde_json::json!({ "status": "ok" }));
+    assert!(!mods_dir.join("drift.jar").exists());
+    assert_eq!(
+        fs::read(&manifest_path).expect("read manifest after delete"),
+        manifest_before
+    );
+    assert_eq!(
+        axial_content::ContentManifest::load(&game_dir).expect("load manifest after delete"),
+        manifest
     );
 }
 
@@ -2416,7 +2673,8 @@ fn loader_create_selection_allows_stale_exact_build_when_already_installed() {
         CreateSelection::Loader {
             component_id,
             build_id: build.build_id,
-            target_version_id: build.version_id
+            target_version_id: build.version_id,
+            minecraft_version: build.minecraft_version,
         }
     );
 }

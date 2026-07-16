@@ -152,7 +152,7 @@ pub enum InstallQueueContentActionRequest {
         canonical_id: String,
         version_id: String,
         #[serde(default)]
-        selected_paths: Vec<String>,
+        selected_file_ids: Vec<String>,
         #[serde(default)]
         include_overrides: bool,
     },

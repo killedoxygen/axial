@@ -34,6 +34,7 @@ use crate::state::contracts::OperationPhase;
 use crate::state::launch_reports::{LaunchBenchmarkMetadata, LaunchProofResourceBudget};
 use crate::state::{
     AppState, InstanceLifecycleLease, IntegrityForegroundLease, LaunchSessionRecord,
+    UpdateOperationAdmissionError, UpdateOperationLease,
 };
 use auth::{LaunchAuthRefreshOptions, resolve_launch_auth_context};
 use axial_config::{AppConfig, Instance};
@@ -83,6 +84,7 @@ pub struct LaunchRequest {
 }
 
 pub(crate) struct LaunchSessionTask {
+    pub update_admission: UpdateOperationLease,
     pub integrity_foreground: IntegrityForegroundLease,
     pub application: LaunchInstanceStaging,
     pub preflight_stage_evidence: Vec<LaunchStageEvidence>,
@@ -217,6 +219,9 @@ async fn prepare_launch_session_with_auth_refresh(
     runtime_rebuild_source: RuntimeComponentRebuildSource,
 ) -> Result<PreparedLaunch, (StatusCode, Json<serde_json::Value>)> {
     let started_at = Instant::now();
+    let update_admission = state
+        .try_admit_update_sensitive_operation()
+        .map_err(launch_update_admission_error_response)?;
     let integrity_foreground = state
         .register_integrity_foreground()
         .map_err(launch_integrity_admission_error_response)?
@@ -430,6 +435,7 @@ async fn prepare_launch_session_with_auth_refresh(
 
     Ok(PreparedLaunch {
         task: LaunchSessionTask {
+            update_admission,
             integrity_foreground,
             application,
             preflight_stage_evidence: preflight.preflight_stage_evidence,
@@ -442,6 +448,23 @@ async fn prepare_launch_session_with_auth_refresh(
             java_probe_receipt: preflight.java_probe_receipt,
         },
     })
+}
+
+fn launch_update_admission_error_response(
+    error: UpdateOperationAdmissionError,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let message = match error {
+        UpdateOperationAdmissionError::ApplyInProgress => {
+            "Launches are unavailable while an update is being applied."
+        }
+        UpdateOperationAdmissionError::RestartPending => {
+            "Restart Axial to finish the applied update before launching."
+        }
+    };
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(json!({ "error": message })),
+    )
 }
 
 fn launch_instance_root_error_response(

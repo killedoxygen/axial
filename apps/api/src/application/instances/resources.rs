@@ -1,6 +1,8 @@
-use crate::state::AppState;
+use crate::state::{AppState, UpdateOperationAdmissionError, UpdateOperationLease};
 use async_stream::stream;
-use axial_content::{ContentKind, ContentManifest};
+use axial_content::{
+    ModFileDeleteOutcome, ModFileMutationError, delete_local_mod_file, toggle_mod_file,
+};
 use axum::{
     Json,
     body::{Body, Bytes},
@@ -223,6 +225,7 @@ pub(crate) async fn handle_update_instance_mod(
     name: &str,
     payload: UpdateModRequest,
 ) -> Result<serde_json::Value, (StatusCode, Json<serde_json::Value>)> {
+    let _update_admission = admit_instance_mod_mutation(state)?;
     let _lifecycle_guard = state
         .try_acquire_instance_lifecycle(id)
         .await
@@ -239,43 +242,13 @@ pub(crate) async fn handle_update_instance_mod(
     let mods_dir = game_dir.join("mods");
     let source = mods_dir.join(name);
     require_mod_file(&source)?;
-    let target_name = mod_enabled_name(name, payload.enabled)?;
-    let target = mods_dir.join(&target_name);
-    let renamed = target_name != name;
-    if renamed && target_exists(&target) {
+    let requested_name = requested_mod_filename(name, payload.enabled);
+    if requested_name != name && target_exists(&mods_dir.join(&requested_name)) {
         return Err(json_error(StatusCode::CONFLICT, "mod already exists"));
     }
-
-    let mut manifest = ContentManifest::load(&game_dir).map_err(mod_manifest_error_response)?;
-    let base_name = mod_base_name(name);
-    let tracked = manifest
-        .entries
-        .iter_mut()
-        .find(|entry| entry.kind == ContentKind::Mod && entry.filename == base_name);
-    let manifest_changed = tracked
-        .as_ref()
-        .is_some_and(|entry| entry.enabled != payload.enabled);
-    if let Some(entry) = tracked {
-        entry.enabled = payload.enabled;
-    }
-
-    if renamed {
-        fs::rename(&source, &target).map_err(mod_file_write_error_response)?;
-    }
-    if manifest_changed && let Err(error) = manifest.save(&game_dir) {
-        if renamed && let Err(rollback_error) = fs::rename(&target, &source) {
-            tracing::error!(
-                instance_id = id,
-                current_name = target_name,
-                original_name = name,
-                manifest_error = %error,
-                rollback_error = %rollback_error,
-                "failed to restore mod filename after manifest persistence failure"
-            );
-        }
-        return Err(mod_manifest_error_response(error));
-    }
-    Ok(serde_json::json!({ "status": "ok", "name": target_name, "enabled": payload.enabled }))
+    let outcome = toggle_mod_file(&game_dir, name, payload.enabled)
+        .map_err(mod_content_mutation_error_response)?;
+    Ok(serde_json::json!({ "status": "ok", "name": outcome.filename, "enabled": payload.enabled }))
 }
 
 pub(crate) async fn handle_delete_instance_mod(
@@ -283,6 +256,7 @@ pub(crate) async fn handle_delete_instance_mod(
     id: &str,
     name: &str,
 ) -> Result<serde_json::Value, (StatusCode, Json<serde_json::Value>)> {
+    let _update_admission = admit_instance_mod_mutation(state)?;
     let _lifecycle_guard = state
         .try_acquire_instance_lifecycle(id)
         .await
@@ -298,19 +272,31 @@ pub(crate) async fn handle_delete_instance_mod(
     let game_dir = instance_game_dir(state, id)?;
     let source = game_dir.join("mods").join(name);
     require_mod_file(&source)?;
-    let manifest = ContentManifest::load(&game_dir).map_err(mod_manifest_error_response)?;
-    if manifest
-        .entries
-        .iter()
-        .any(|entry| entry.kind == ContentKind::Mod && entry.filename == mod_base_name(name))
-    {
-        return Err(json_error(
+    match delete_local_mod_file(&game_dir, name).map_err(mod_content_mutation_error_response)? {
+        ModFileDeleteOutcome::Deleted => Ok(serde_json::json!({ "status": "ok" })),
+        ModFileDeleteOutcome::Managed => Err(json_error(
             StatusCode::CONFLICT,
             "managed mods must be removed through content operations",
-        ));
+        )),
     }
-    fs::remove_file(source).map_err(mod_file_write_error_response)?;
-    Ok(serde_json::json!({ "status": "ok" }))
+}
+
+pub(super) fn admit_instance_mod_mutation(
+    state: &AppState,
+) -> Result<UpdateOperationLease, (StatusCode, Json<serde_json::Value>)> {
+    state
+        .try_admit_update_sensitive_operation()
+        .map_err(|error| {
+            let message = match error {
+                UpdateOperationAdmissionError::ApplyInProgress => {
+                    "Content changes are unavailable while an update is being applied."
+                }
+                UpdateOperationAdmissionError::RestartPending => {
+                    "Restart Axial to finish the applied update before changing content."
+                }
+            };
+            json_error(StatusCode::SERVICE_UNAVAILABLE, message)
+        })
 }
 
 pub(crate) async fn handle_instance_screenshots(
@@ -810,15 +796,6 @@ fn mod_file_read_error_response(_error: std::io::Error) -> (StatusCode, Json<ser
     )
 }
 
-fn mod_file_write_error_response(_error: std::io::Error) -> (StatusCode, Json<serde_json::Value>) {
-    (
-        StatusCode::INTERNAL_SERVER_ERROR,
-        Json(serde_json::json!({
-            "error": "Could not update mod files. Check instance folder permissions and try again."
-        })),
-    )
-}
-
 fn mod_manifest_error_response(
     _error: axial_content::ContentError,
 ) -> (StatusCode, Json<serde_json::Value>) {
@@ -828,6 +805,19 @@ fn mod_manifest_error_response(
             "error": "Could not update mod files. Check instance folder permissions and try again."
         })),
     )
+}
+
+fn mod_content_mutation_error_response(
+    error: ModFileMutationError,
+) -> (StatusCode, Json<serde_json::Value>) {
+    match error {
+        ModFileMutationError::NotFound => json_error(StatusCode::NOT_FOUND, "mod not found"),
+        ModFileMutationError::Conflict => json_error(
+            StatusCode::CONFLICT,
+            "mod files changed while they were being updated; refresh and try again",
+        ),
+        ModFileMutationError::Failed(error) => mod_manifest_error_response(error),
+    }
 }
 
 pub(super) fn screenshot_file_read_error_response(
@@ -978,33 +968,14 @@ fn is_mod_name(name: &str) -> bool {
     (lower.ends_with(".jar") || lower.ends_with(".jar.disabled")) && is_safe_resource_name(name)
 }
 
-fn mod_base_name(name: &str) -> &str {
-    if name.to_ascii_lowercase().ends_with(".disabled") {
-        &name[..name.len() - ".disabled".len()]
-    } else {
-        name
-    }
-}
-
-fn mod_enabled_name(
-    name: &str,
-    enabled: bool,
-) -> Result<String, (StatusCode, Json<serde_json::Value>)> {
+fn requested_mod_filename(name: &str, enabled: bool) -> String {
     let lower = name.to_ascii_lowercase();
-    if enabled {
-        if lower.ends_with(".jar") {
-            Ok(name.to_string())
-        } else if lower.ends_with(".jar.disabled") {
-            Ok(name[..name.len() - ".disabled".len()].to_string())
-        } else {
-            Err(json_error(StatusCode::BAD_REQUEST, "invalid mod filename"))
-        }
-    } else if lower.ends_with(".jar.disabled") {
-        Ok(name.to_string())
-    } else if lower.ends_with(".jar") {
-        Ok(format!("{name}.disabled"))
+    if enabled && lower.ends_with(".disabled") {
+        name[..name.len() - ".disabled".len()].to_string()
+    } else if !enabled && !lower.ends_with(".disabled") {
+        format!("{name}.disabled")
     } else {
-        Err(json_error(StatusCode::BAD_REQUEST, "invalid mod filename"))
+        name.to_string()
     }
 }
 
