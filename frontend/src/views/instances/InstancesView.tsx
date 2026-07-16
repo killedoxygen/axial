@@ -6,7 +6,7 @@ import { Segmented } from '../../ui/Segmented';
 import { Icon } from '../../ui/Icons';
 import { InstanceCard } from '../../ui/InstanceCard';
 import { openContextMenu } from '../../ui/ContextMenu';
-import { SelectionActionPill, SelectionCheckbox } from '../../ui/SelectionActionPill';
+import { SelectionActionTray, SelectionCheckbox } from '../../ui/SelectionActionTray';
 import { selectionMenuItem, selectionToggleLabel, useSelection } from '../../ui/selection';
 import { useTheme } from '../../hooks/use-theme';
 import { instances, versionById, runningSessions } from '../../store';
@@ -14,7 +14,7 @@ import { instanceInstallStatus } from '../../instance-install-status';
 import { navigate, openCreate } from '../../ui-state';
 import { instanceMenuItems } from '../instance/instance-menu';
 import { deleteInstancesFlow } from '../instance/instance-actions';
-import { fmtRelativeCompact } from '../instance/format';
+import { fmtRelativeCompact } from '../../format';
 import type { EnrichedInstance } from '../../types-instance';
 
 const LIST_COLS = '28px 52px 2.4fr 1fr 1fr 1fr 140px';
@@ -135,7 +135,7 @@ export function InstancesView(): JSX.Element {
         <div>
           <h1>Instances</h1>
           <div class="cp-page-sub">
-            {all.length} total · {all.reduce((s, i) => s + (i.mods_count ?? 0), 0)} mods across all
+            {all.length} total, {all.reduce((s, i) => s + (i.mods_count ?? 0), 0)} mods across all
           </div>
         </div>
         <div style={{ flex: 1 }} />
@@ -199,7 +199,7 @@ export function InstancesView(): JSX.Element {
           ))}
         </div>
       )}
-      <SelectionActionPill
+      <SelectionActionTray
         selection={selection}
         itemLabel="instance"
         actions={[{ label: 'Delete', icon: 'trash', danger: true, onClick: () => void deleteSelected() }]}

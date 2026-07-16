@@ -167,28 +167,10 @@ function loaderDisplay(
   };
 }
 
-export function fmtMem(gb: number): string {
-  return gb === Math.floor(gb) ? `${gb}\u00A0GB` : `${gb.toFixed(1)}\u00A0GB`;
-}
-
-export function formatBytes(bytes: number): string {
-  if (bytes < 1024) return bytes + ' B';
-  if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
-  if (bytes < 1024 * 1024 * 1024) return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
-  return (bytes / (1024 * 1024 * 1024)).toFixed(2) + ' GB';
-}
-
-export function formatRelativeTime(date: Date): string {
-  const now = new Date();
-  const diff = now.getTime() - date.getTime();
-  const mins = Math.floor(diff / 60000);
-  if (mins < 1) return 'just now';
-  if (mins < 60) return `${mins}m ago`;
-  const hrs = Math.floor(mins / 60);
-  if (hrs < 24) return `${hrs}h ago`;
-  const days = Math.floor(hrs / 24);
-  if (days < 7) return `${days}d ago`;
-  return new Intl.DateTimeFormat(undefined, { dateStyle: 'medium' }).format(date);
+/** Disk name of a mod without its `.disabled` suffix; the manifest keys mods by
+ * this enabled-state base name. */
+export function modBaseName(name: string): string {
+  return name.toLowerCase().endsWith('.disabled') ? name.slice(0, -'.disabled'.length) : name;
 }
 
 export const USERNAME_MIN_LEN = 3;

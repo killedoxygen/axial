@@ -9,6 +9,7 @@ pub mod accounts;
 pub mod auth;
 pub mod commands;
 pub mod config;
+pub mod content;
 pub mod flags;
 mod guardian_conversion;
 pub mod install;
@@ -60,16 +61,27 @@ pub use commands::{
     phase_one_command_kinds,
 };
 pub use config::{ConfigPatch, current_config, update_config};
+pub use content::{
+    ContentApiError, ContentCompatRequest, ContentCompatResponse, ContentInstallRequest,
+    ContentPlanRequest, ContentSearchParams, ContentUpdatesResponse, InstanceContentResponse,
+    ModpackFilesPlan, ModpackInstallRequest, ModpackInstallResponse, ModpackTarget, ResolutionPlan,
+    SearchHit, content_compatibility, content_detail, content_plan, content_search,
+    instance_content, instance_content_updates,
+    pack::{modpack_files, modpack_target, queue_modpack_install},
+    queue_content_install, queue_content_uninstall, queue_content_uninstalls,
+};
 pub use flags::{
     FlagOverridePatch, FlagSource, FlagViewModel, FlagsResponse, list_flags, update_flag,
 };
+pub(crate) use install::enqueue_install_with_dependency;
 pub use install::{
     InstallApplicationError, InstallProgressStepViewModel, InstallProgressViewModel,
-    InstallQueueRequest, InstallQueueStateResponse, InstallStartResponse, InstallStatusResponse,
-    InstallVersionStaging, InstallVersionStartRequest, LoaderBuildsRequest,
-    LoaderInstallStartRequest, begin_install_operation_journal, install_events_stream,
-    install_operation_id, install_status, loader_builds, loader_components, loader_game_versions,
-    loader_install_events_stream, loader_install_progress_view_model,
+    InstallQueueContentActionRequest, InstallQueueContentItemViewModel,
+    InstallQueueContentSelection, InstallQueueRequest, InstallQueueStateResponse,
+    InstallStartResponse, InstallStatusResponse, InstallVersionStaging, InstallVersionStartRequest,
+    LoaderBuildsRequest, LoaderInstallStartRequest, begin_install_operation_journal,
+    install_events_stream, install_operation_id, install_status, loader_builds, loader_components,
+    loader_game_versions, loader_install_events_stream, loader_install_progress_view_model,
     loader_pre_operation_error_response, public_loader_install_progress_json,
     public_vanilla_install_progress_json, record_install_operation_interrupted,
     record_install_operation_progress, remove_queued_install, sanitize_install_progress,
@@ -119,7 +131,11 @@ pub(crate) use skin::flush_pending_saved_skin_applies_for_launch;
 pub use skin::flush_pending_saved_skin_applies_for_shutdown;
 pub use status::{StatusResponse, launcher_status};
 pub use telemetry::{FrontendErrorReportRequest, report_frontend_error};
-pub use update::{UpdateResponse, update_status};
+pub use update::{
+    UpdateDownloadRequest, UpdateFlowResponse, UpdateResponse, apply_staged_update,
+    update_flow_state, update_status,
+};
+pub(crate) use update::{cleanup_update_staging, start_update_download};
 pub use version::{
     CatalogEntry, CatalogResponse, DeleteVersionRequest, SharedDataInfo, VersionInfoResponse,
     VersionsResponse, WorldInfo, open_version_folder,

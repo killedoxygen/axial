@@ -1,7 +1,8 @@
 import type { JSX } from 'preact';
 import { RangeSlider } from './RangeSlider';
 import type { SliderZone } from './Slider';
-import { fmtMem, getMemoryRecommendation } from '../utils';
+import { fmtMem } from '../format';
+import { getMemoryRecommendation } from '../utils';
 
 export function heapCeilingGb(totalGb: number): number {
   return Math.max(2, Math.min(32, totalGb));

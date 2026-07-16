@@ -3,6 +3,7 @@
 export { default as Archive } from '../../node_modules/@openai/apps-sdk-ui/dist/es/components/Icon/svg/Archive.js';
 export { default as ArrowLeft } from '../../node_modules/@openai/apps-sdk-ui/dist/es/components/Icon/svg/ArrowLeft.js';
 export { default as ArrowRight } from '../../node_modules/@openai/apps-sdk-ui/dist/es/components/Icon/svg/ArrowRight.js';
+export { default as ArrowUp } from '../../node_modules/@openai/apps-sdk-ui/dist/es/components/Icon/svg/ArrowUp.js';
 export { default as Check } from '../../node_modules/@openai/apps-sdk-ui/dist/es/components/Icon/svg/Check.js';
 export { default as CheckCircle } from '../../node_modules/@openai/apps-sdk-ui/dist/es/components/Icon/svg/CheckCircle.js';
 export { default as ChevronDown } from '../../node_modules/@openai/apps-sdk-ui/dist/es/components/Icon/svg/ChevronDown.js';

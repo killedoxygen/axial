@@ -2,6 +2,7 @@ mod create;
 mod create_cache;
 mod create_policy;
 mod resources;
+mod setup;
 
 #[cfg(test)]
 pub(crate) use create::handle_create_instance;
@@ -15,6 +16,11 @@ pub(crate) use create_cache::{
     create_view_cache_contains_root_for_tests, seed_create_view_cache_for_tests,
 };
 pub(crate) use create_cache::{invalidate_create_view_root, invalidate_create_view_source};
+pub(crate) use setup::{
+    InstanceSetupExecuteRequest, InstanceSetupPlanRequest, InstanceSetupPlanResponse,
+    ModpackInstanceSetupRequest, execute_instance_setup, execute_modpack_instance_setup,
+    plan_instance_setup,
+};
 
 #[cfg(test)]
 use create::{CreateSelection, resolve_loader_create_selection_from_build_catalog};
@@ -265,6 +271,21 @@ fn unconfigured_versions_scan() -> InstalledVersionsScan {
             detail: None,
         },
     }
+}
+
+pub(crate) async fn instance_version_is_installed_and_launchable(
+    state: &AppState,
+    producer: &ProducerLease,
+    instance_id: &str,
+) -> bool {
+    let Some(instance) = state.instances().get(instance_id) else {
+        return false;
+    };
+    let (scan, _, _, _) = indexed_current_versions(state, producer).await;
+    !scan.is_degraded()
+        && scan.versions.iter().any(|version| {
+            version.id == instance.version_id && version.installed && version.launchable
+        })
 }
 
 async fn enrich_instance_for_state_indexed(

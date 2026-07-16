@@ -56,7 +56,7 @@ use std::{
 };
 use tracing::error;
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize)]
 pub(crate) struct CreateInstanceRequest {
     pub name: String,
     #[serde(default)]
@@ -432,10 +432,14 @@ pub(crate) async fn handle_create_instance_owned(
     payload: CreateInstanceRequest,
     handoff: RequestProducerHandoff,
 ) -> Result<CreateInstanceResponse, (StatusCode, Json<serde_json::Value>)> {
+    let producer = handoff
+        .try_claim()
+        .map_err(instance_shutdown_error_response)?;
     handle_create_instance_owned_with_rebuild(
         state,
         payload,
-        handoff,
+        producer,
+        true,
         |state, foreground, producer, instance_id| async move {
             rebuild_registered_known_good(&state, &foreground, &producer, &instance_id).await
         },
@@ -446,7 +450,8 @@ pub(crate) async fn handle_create_instance_owned(
 async fn handle_create_instance_owned_with_rebuild<Rebuild, RebuildFuture>(
     state: &AppState,
     payload: CreateInstanceRequest,
-    handoff: RequestProducerHandoff,
+    producer: ProducerLease,
+    seed_shared_files: bool,
     rebuild: Rebuild,
 ) -> Result<CreateInstanceResponse, (StatusCode, Json<serde_json::Value>)>
 where
@@ -456,9 +461,6 @@ where
     RebuildFuture:
         Future<Output = Result<(), crate::state::KnownGoodRebuildError>> + Send + 'static,
 {
-    let producer = handoff
-        .try_claim()
-        .map_err(instance_shutdown_error_response)?;
     let foreground = state
         .register_integrity_foreground()
         .map_err(instance_shutdown_error_response)?;
@@ -476,11 +478,14 @@ where
             if installed_scan.is_degraded() {
                 return Err(version_scan_degraded_response());
             }
-            let selection =
-                resolve_create_selection(&installed_lookup, &installed_scan.versions, &payload)
-                    .await?;
+            let selection = resolve_create_selection_from_lookup(
+                &installed_lookup,
+                &installed_scan.versions,
+                &payload,
+            )
+            .await?;
             let preset = normalize_create_jvm_preset(payload.jvm_preset_id.as_deref());
-            let mc_dir = Some(installed_lookup.library_dir().to_path_buf());
+            let mc_dir = seed_shared_files.then(|| installed_lookup.library_dir().to_path_buf());
             let install_request = create_install_queue_request_if_needed(
                 &transaction_state,
                 &installed_lookup,
@@ -599,6 +604,7 @@ pub(super) enum CreateSelection {
         component_id: LoaderComponentId,
         build_id: String,
         target_version_id: String,
+        minecraft_version: String,
     },
 }
 
@@ -609,6 +615,25 @@ impl CreateSelection {
             Self::Loader {
                 target_version_id, ..
             } => target_version_id,
+        }
+    }
+
+    /// The loader short key the instance is being created with, empty for vanilla.
+    fn loader_key(&self) -> &str {
+        match self {
+            Self::Vanilla { .. } => "",
+            Self::Loader { component_id, .. } => component_id.short_key(),
+        }
+    }
+
+    /// The Minecraft version behind the selection, which for vanilla is the
+    /// version id itself.
+    pub(super) fn minecraft_version(&self) -> &str {
+        match self {
+            Self::Vanilla { version_id } => version_id,
+            Self::Loader {
+                minecraft_version, ..
+            } => minecraft_version,
         }
     }
 
@@ -627,9 +652,43 @@ impl CreateSelection {
             }),
         }
     }
+
+    pub(super) fn exact_selection_id(&self) -> String {
+        match self {
+            Self::Vanilla { version_id } => format!("vanilla|{version_id}"),
+            Self::Loader {
+                component_id,
+                build_id,
+                ..
+            } => format!("loader_build|{}|{build_id}", component_id.as_str()),
+        }
+    }
 }
 
-async fn resolve_create_selection(
+pub(super) async fn resolve_create_selection(
+    state: &AppState,
+    payload: &CreateInstanceRequest,
+) -> Result<CreateSelection, (StatusCode, Json<serde_json::Value>)> {
+    let producer = state
+        .try_claim_producer()
+        .map_err(instance_shutdown_error_response)?;
+    let foreground = state
+        .register_integrity_foreground()
+        .map_err(instance_shutdown_error_response)?
+        .wait_for_settlement()
+        .await;
+    let installed_lookup = state
+        .installed_versions_snapshot_with_foreground(&producer, foreground)
+        .await
+        .ok_or_else(library_not_configured_response)?;
+    let installed_scan = installed_versions_scan(&installed_lookup.snapshot);
+    if installed_scan.is_degraded() {
+        return Err(version_scan_degraded_response());
+    }
+    resolve_create_selection_from_lookup(&installed_lookup, &installed_scan.versions, payload).await
+}
+
+async fn resolve_create_selection_from_lookup(
     installed_lookup: &InstalledVersionsLookup,
     installed_versions: &[VersionEntry],
     payload: &CreateInstanceRequest,
@@ -748,6 +807,7 @@ async fn resolve_loader_create_selection(
         component_id: build.component_id,
         build_id: build.build_id,
         target_version_id: build.version_id,
+        minecraft_version: build.minecraft_version,
     })
 }
 
@@ -779,6 +839,7 @@ pub(super) fn resolve_loader_create_selection_from_build_catalog(
         component_id: build.component_id,
         build_id: build.build_id,
         target_version_id: build.version_id,
+        minecraft_version: build.minecraft_version,
     })
 }
 
@@ -821,6 +882,8 @@ fn build_created_instance(
         payload.icon.clone(),
         payload.accent.clone(),
     );
+    instance.loader_key = selection.loader_key().to_string();
+    instance.minecraft_version = selection.minecraft_version().to_string();
     if let Some(art_seed) = payload.art_seed {
         instance.art_seed = art_seed;
     }
@@ -869,7 +932,28 @@ pub(crate) async fn handle_create_instance(
     state: &AppState,
     payload: CreateInstanceRequest,
 ) -> Result<CreateInstanceResponse, (StatusCode, Json<serde_json::Value>)> {
-    handle_create_instance_with_rebuild(state, payload, |_, _, _, _| async { Ok(()) }).await
+    let request = state
+        .try_admit_request()
+        .map_err(instance_shutdown_error_response)?;
+    handle_create_instance_owned(state, payload, request.producer_handoff()).await
+}
+
+pub(super) async fn handle_create_instance_from_continuation(
+    state: &AppState,
+    payload: CreateInstanceRequest,
+    seed_shared_files: bool,
+    producer: ProducerLease,
+) -> Result<CreateInstanceResponse, (StatusCode, Json<serde_json::Value>)> {
+    handle_create_instance_owned_with_rebuild(
+        state,
+        payload,
+        producer,
+        seed_shared_files,
+        |state, foreground, producer, instance_id| async move {
+            rebuild_registered_known_good(&state, &foreground, &producer, &instance_id).await
+        },
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -888,8 +972,11 @@ where
     let request = state
         .try_admit_request()
         .expect("admit test create request");
-    handle_create_instance_owned_with_rebuild(state, payload, request.producer_handoff(), rebuild)
-        .await
+    let producer = request
+        .producer_handoff()
+        .try_claim()
+        .expect("claim test create producer");
+    handle_create_instance_owned_with_rebuild(state, payload, producer, true, rebuild).await
 }
 
 fn version_is_launch_ready_or_user_blocked(
@@ -977,6 +1064,7 @@ fn install_queue_item_matches_request(
         } => item.loader.as_ref().is_some_and(|loader| {
             loader.component_id == component_id.as_str() && loader.build_id == *build_id
         }),
+        InstallQueueRequest::Content { .. } => false,
     }
 }
 

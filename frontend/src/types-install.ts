@@ -8,6 +8,7 @@ export interface InstallItem {
     minecraftVersion: string;
     loaderVersion: string;
   };
+  content?: InstallQueueContentItemViewModel;
 }
 
 export interface InstallProgressStepViewModel {
@@ -75,11 +76,18 @@ export type InstallQueueRequest =
   | {
       kind: 'vanilla';
       version_id: string;
+      manifest_url?: string;
     }
   | {
       kind: 'loader';
       component_id: LoaderComponentId;
       build_id: string;
+    }
+  | {
+      kind: 'content';
+      instance_id: string;
+      label?: string;
+      content_action: InstallQueueContentAction;
     };
 
 export interface InstallQueueLoaderItemViewModel {
@@ -92,12 +100,39 @@ export interface InstallQueueLoaderItemViewModel {
 export interface InstallQueueInstallItemViewModel {
   version_id: string;
   loader?: InstallQueueLoaderItemViewModel | null;
+  content?: InstallQueueContentItemViewModel | null;
+}
+
+export interface InstallQueueContentSelection {
+  canonical_id: string;
+  kind: 'mod' | 'modpack' | 'resource_pack' | 'shader_pack';
+  version_id?: string | null;
+}
+
+export type InstallQueueContentAction =
+  | {
+      kind: 'install';
+      selections: InstallQueueContentSelection[];
+      allow_incompatible: boolean;
+    }
+  | { kind: 'uninstall'; canonical_ids: string[] }
+  | {
+      kind: 'modpack';
+      canonical_id: string;
+      version_id: string;
+      selected_paths: string[];
+      include_overrides: boolean;
+    };
+
+export interface InstallQueueContentItemViewModel {
+  instance_id: string;
+  action: InstallQueueContentAction;
 }
 
 export interface InstallQueuedItemViewModel {
   queue_id: string;
   state_id: string;
-  kind: 'vanilla' | 'loader';
+  kind: 'vanilla' | 'loader' | 'content';
   title: string;
   label: string;
   summary: string;
@@ -113,7 +148,7 @@ export interface InstallQueueActiveViewModel {
   install_id?: string | null;
   operation_id?: string | null;
   install_started_at_ms?: number | null;
-  kind: 'vanilla' | 'loader';
+  kind: 'vanilla' | 'loader' | 'content';
   title: string;
   label: string;
   summary: string;
@@ -149,4 +184,5 @@ export interface InstallQueueStateResponse {
   view_model: InstallQueueViewModel;
   notice?: InstallQueueNoticeViewModel | null;
   started_install?: InstallStartResponse | null;
+  removed_instance_id?: string | null;
 }

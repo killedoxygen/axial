@@ -36,8 +36,8 @@ function PerformanceLabSlot(): JSX.Element | null {
 }
 
 const FLAG_STAGE_NOTES = {
-  experimental: 'Experimental — may change or break.',
-  beta: 'Beta — may still change.',
+  experimental: 'Experimental. May change or break.',
+  beta: 'Beta. May still change.',
 } as const;
 
 export function ExperimentalFlagRows(): JSX.Element | null {

@@ -17,6 +17,7 @@
   transition:
     background 120ms,
     color 120ms,
+    box-shadow 120ms ease,
     scale 70ms ease;
 }
 .cp-pills > button:hover:not(:disabled):not([data-active='true']) {
@@ -37,4 +38,13 @@
 .cp-pills > button[data-active='true'] {
   background: var(--accent-fill);
   color: var(--accent-on);
+  box-shadow:
+    inset 0 1px 0 oklch(1 0 0 / 0.14),
+    0 1px 0 oklch(0 0 0 / 0.18);
+}
+.cp-pills > button[data-active='true']:focus-visible {
+  box-shadow:
+    inset 0 1px 0 oklch(1 0 0 / 0.14),
+    0 1px 0 oklch(0 0 0 / 0.18),
+    var(--focus-ring);
 }

@@ -323,6 +323,8 @@ mod tests {
             auto_optimize: false,
             icon: String::new(),
             accent: String::new(),
+            loader_key: String::new(),
+            minecraft_version: String::new(),
         }
     }
 

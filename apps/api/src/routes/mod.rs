@@ -2,6 +2,7 @@ mod accounts;
 mod auth;
 mod catalog;
 mod config;
+mod content;
 mod flags;
 mod install;
 mod instances;
@@ -43,6 +44,7 @@ pub fn router(state: AppState) -> Router {
         .merge(flags::router())
         .merge(setup::router())
         .merge(catalog::router())
+        .merge(content::router())
         .merge(instances::router())
         .merge(install::router())
         .merge(music::router())

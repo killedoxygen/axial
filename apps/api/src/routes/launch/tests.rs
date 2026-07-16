@@ -4347,6 +4347,8 @@ async fn test_launch_session_task(
             auto_optimize: false,
             icon: String::new(),
             accent: String::new(),
+            loader_key: String::new(),
+            minecraft_version: String::new(),
         },
         intent: LaunchIntent {
             session_id: "session-queued".to_string(),

@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "generated_at": "2026-04-02T00:00:00Z",
-  "minimum_app_version": "0.4.0-alpha",
+  "minimum_app_version": "0.4.0-dev.1",
   "rule_channel": "bundled",
   "artifacts": [
     {"id": "sodium", "type": "mod", "source": {"provider": "modrinth", "project_id": "sodium", "slug": "sodium"}, "checksum_policy": "provider_sha512", "ownership_class": "composition_managed"},

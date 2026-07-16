@@ -687,8 +687,13 @@ fn install_progress_label(progress: &DownloadProgress, kind: InstallProgressKind
         "log_config" => "Downloading log config".to_string(),
         "java_runtime" => java_runtime_label(progress),
         "java_runtime_ready" => "Java runtime ready".to_string(),
+        "planning" => "Checking content".to_string(),
+        "download" => count_label("Downloading content", progress),
+        "overrides" => "Applying pack configuration".to_string(),
+        "commit" => "Finishing content changes".to_string(),
+        "removing" => "Removing content".to_string(),
         "done" => "Complete".to_string(),
-        "error" => progress
+        "error" | "error_instance_removed" => progress
             .error
             .clone()
             .unwrap_or_else(|| INSTALL_FAILURE_MESSAGE.to_string()),
@@ -720,7 +725,12 @@ fn install_progress_pct(progress: &DownloadProgress, kind: InstallProgressKind) 
     // artifacts, processors), and journal-replayed history.
     let pct = match (kind, progress.phase.as_str()) {
         (_, "done") => 100,
-        (_, "error") => 100,
+        (_, "error" | "error_instance_removed") => 100,
+        (_, "planning") => 3,
+        (_, "download") => 5 + (progress_fraction(progress) * 85.0).round() as i32,
+        (_, "overrides") => 92,
+        (_, "commit") => 96,
+        (_, "removing") => 50,
         (InstallProgressKind::Vanilla, "version_json") => 2,
         (InstallProgressKind::Vanilla, "client_jar") => 7,
         (InstallProgressKind::Vanilla, "libraries") => {
@@ -782,7 +792,7 @@ fn install_active_step_view_model(
 ) -> Option<InstallProgressStepViewModel> {
     if !matches!(
         progress.phase.as_str(),
-        "java_runtime" | "loader_processors" | "processors"
+        "java_runtime" | "loader_processors" | "processors" | "download"
     ) {
         return None;
     }

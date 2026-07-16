@@ -1,6 +1,36 @@
 use super::*;
 
 #[tokio::test]
+async fn prepare_launch_session_rejects_active_content_mutation() {
+    let fixture = TestFixture::new("prepare-content-mutation");
+    fixture.write_ready_install("1.21.1");
+    let instance_id = fixture.add_instance("Busy", "1.21.1");
+    let _mutation = fixture.state.acquire_instance_lifecycle(&instance_id).await;
+
+    let error = match prepare_launch_session(
+        &fixture.state,
+        LaunchRequest {
+            instance_id,
+            username: None,
+            max_memory_mb: None,
+            min_memory_mb: None,
+            client_started_at_ms: None,
+        },
+    )
+    .await
+    {
+        Ok(_) => panic!("launch must reject an active content mutation"),
+        Err(error) => error,
+    };
+
+    assert_eq!(error.0, StatusCode::CONFLICT);
+    assert_eq!(
+        error.1.0["error"],
+        "instance is busy with another launch or content operation"
+    );
+}
+
+#[tokio::test]
 async fn launch_foreground_cancels_sweep_before_lifecycle_or_launch_effects() {
     let fixture = TestFixture::new("launch-foreground-settlement-barrier");
     fixture.write_ready_install("1.21.1");

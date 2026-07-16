@@ -426,6 +426,320 @@ html[data-desktop-chrome='mac-overlay'] .cp-rail-brand {
   margin: 4px 2px;
 }
 
+.cp-status-slot {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  flex: 0 0 auto;
+}
+.cp-status-slot[data-update='true'] > .cp-status-pill {
+  border-top-right-radius: 0;
+  border-bottom-right-radius: 0;
+}
+.cp-status-slot[data-update='true'] .cp-update-dock-wrap {
+  margin-left: -1px;
+}
+.cp-status-slot[data-session='true'] > .cp-status-pill {
+  border-top-right-radius: 999px;
+  border-bottom-right-radius: 999px;
+}
+
+.cp-update-collapse {
+  display: grid;
+  grid-template-columns: 1fr;
+  min-width: 0;
+  transition: grid-template-columns 420ms cubic-bezier(0.32, 0.72, 0, 1);
+}
+.cp-update-collapse .cp-update-dock-wrap {
+  min-width: 0;
+  transform-origin: left center;
+  transition:
+    opacity 200ms ease 60ms,
+    scale 380ms cubic-bezier(0.32, 0.72, 0, 1),
+    translate 380ms cubic-bezier(0.32, 0.72, 0, 1);
+}
+.cp-update-collapse[data-collapsed='true'] {
+  grid-template-columns: 0fr;
+}
+.cp-update-collapse[data-collapsed='true'] .cp-update-dock-wrap {
+  opacity: 0;
+  scale: 0.8;
+  translate: -6px 0;
+  pointer-events: none;
+  transition:
+    opacity 140ms ease,
+    scale 380ms cubic-bezier(0.32, 0.72, 0, 1),
+    translate 380ms cubic-bezier(0.32, 0.72, 0, 1);
+}
+
+.cp-update-dock-wrap {
+  position: relative;
+  display: inline-flex;
+  flex: 0 0 auto;
+}
+.cp-update-dock {
+  --cp-update-ratio: 0;
+  position: relative;
+  isolation: isolate;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 30px;
+  padding: 0 13px 0 11px;
+  border: 0;
+  border-radius: 0 999px 999px 0;
+  background: color-mix(in oklab, var(--surface) 92%, var(--bg));
+  color: color-mix(in oklab, var(--accent) 72%, var(--text));
+  font-family: inherit;
+  font-size: 12.5px;
+  font-weight: 600;
+  cursor: pointer;
+  overflow: hidden;
+  box-shadow:
+    inset 0 1px 0 color-mix(in oklab, var(--surface-3) 62%, transparent),
+    0 1px 0 oklch(0 0 0 / 0.14);
+  transition:
+    background 140ms ease,
+    color 140ms ease,
+    scale 70ms ease;
+  animation: cp-update-dock-in 220ms cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+.cp-update-dock::after {
+  content: '';
+  position: absolute;
+  left: 0;
+  top: 7px;
+  bottom: 7px;
+  width: 1px;
+  background: color-mix(in oklab, var(--text) 12%, transparent);
+  pointer-events: none;
+}
+.cp-update-dock:hover {
+  background: color-mix(in oklab, var(--surface) 84%, var(--accent));
+  color: color-mix(in oklab, var(--accent) 84%, var(--text));
+}
+.cp-update-dock:active {
+  scale: 0.97;
+}
+.cp-update-dock:focus-visible {
+  outline: none;
+  box-shadow: var(--focus-ring);
+}
+.cp-update-dock[data-open='true'] {
+  background: color-mix(in oklab, var(--surface) 80%, var(--accent));
+  color: color-mix(in oklab, var(--accent) 84%, var(--text));
+}
+.cp-update-dock > * {
+  position: relative;
+  z-index: 1;
+}
+.cp-status-slot[data-busy='true'] {
+  border-radius: 999px;
+  overflow: hidden;
+  background: color-mix(in oklab, var(--surface) 92%, var(--bg));
+  box-shadow:
+    inset 0 1px 0 color-mix(in oklab, var(--surface-3) 62%, transparent),
+    0 1px 0 oklch(0 0 0 / 0.14);
+}
+.cp-status-slot[data-busy='true']::after {
+  content: '';
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 0;
+  z-index: 0;
+  width: calc(var(--cp-update-ratio, 0) * 100%);
+  background: linear-gradient(
+    90deg,
+    color-mix(in oklab, var(--accent) 12%, transparent),
+    color-mix(in oklab, var(--accent) 28%, transparent)
+  );
+  box-shadow: inset -1px 0 0 color-mix(in oklab, var(--accent) 45%, transparent);
+  transition: width 280ms cubic-bezier(0.22, 1, 0.36, 1);
+  pointer-events: none;
+}
+.cp-status-slot[data-busy='true'][data-indeterminate='true']::after {
+  width: 38%;
+  box-shadow: none;
+  will-change: transform;
+  animation: cp-status-fill-slide 1200ms ease-in-out infinite;
+  transition: none;
+}
+.cp-status-slot[data-busy='true'] > .cp-status-pill,
+.cp-status-slot[data-busy='true'] .cp-update-dock {
+  background: transparent;
+  box-shadow: none;
+}
+.cp-status-slot[data-busy='true'] > .cp-status-pill,
+.cp-status-slot[data-busy='true'] .cp-update-dock-wrap {
+  z-index: 1;
+}
+.cp-update-dock-icon {
+  flex: 0 0 auto;
+  display: inline-flex;
+  color: var(--accent);
+  animation: cp-update-glyph-in 180ms cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+.cp-update-dock-icon svg {
+  display: block;
+}
+.cp-update-dock-label {
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+
+.cp-update-card {
+  position: absolute;
+  top: calc(100% + 9px);
+  right: 0;
+  width: 266px;
+  background: var(--surface);
+  border: none;
+  border-radius: var(--r-md);
+  padding: 15px 15px 13px;
+  box-shadow:
+    inset 0 0 0 1px var(--line),
+    inset 0 1px 0 oklch(1 0 0 / 0.06),
+    0 14px 34px -14px oklch(0 0 0 / 0.55),
+    0 3px 10px -4px oklch(0 0 0 / 0.32);
+  z-index: 60;
+  display: flex;
+  flex-direction: column;
+  gap: 13px;
+  animation: cp-update-card-in 160ms cubic-bezier(0.22, 1, 0.36, 1) both;
+  transform-origin: top right;
+}
+.cp-update-card-head {
+  display: flex;
+  align-items: center;
+  gap: 11px;
+}
+.cp-update-card-badge {
+  flex: 0 0 auto;
+  width: 30px;
+  height: 30px;
+  border-radius: 10px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--surface-2);
+  color: color-mix(in oklab, var(--accent) 78%, var(--text));
+  box-shadow:
+    inset 0 0 0 1px var(--line),
+    inset 0 1px 0 oklch(1 0 0 / 0.05);
+}
+.cp-update-card-badge[data-tone='error'] {
+  color: color-mix(in oklab, var(--err) 82%, var(--text));
+}
+.cp-update-card-badge svg {
+  display: block;
+}
+.cp-update-card-heading {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+.cp-update-card-title {
+  font-size: 13.5px;
+  font-weight: 700;
+  letter-spacing: -0.01em;
+  color: var(--text);
+}
+.cp-update-card-sub {
+  font-size: 11.5px;
+  font-weight: 500;
+  line-height: 1.35;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-dim);
+}
+.cp-update-card-sub[data-tone='error'] {
+  color: color-mix(in oklab, var(--err) 80%, var(--text));
+}
+.cp-update-progress {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.cp-update-progress .cp-boot-bar {
+  position: relative;
+  flex: 1;
+  width: auto;
+}
+.cp-update-progress .cp-boot-bar-fill[data-indeterminate='true'] {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 0;
+  width: 40%;
+  will-change: transform;
+  animation: cp-update-bar-slide 1200ms ease-in-out infinite;
+  transition: none;
+}
+.cp-update-progress-pct {
+  flex: 0 0 auto;
+  font-size: 11.5px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  color: color-mix(in oklab, var(--accent) 70%, var(--text));
+}
+.cp-update-card-actions {
+  display: flex;
+}
+.cp-update-card-links {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin-top: -3px;
+}
+
+@keyframes cp-update-glyph-in {
+  from {
+    opacity: 0;
+    transform: scale(0.85);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+@keyframes cp-update-dock-in {
+  from {
+    opacity: 0;
+    clip-path: inset(0 0 0 100%);
+  }
+  to {
+    opacity: 1;
+    clip-path: inset(0 0 0 0);
+  }
+}
+@keyframes cp-update-card-in {
+  from {
+    opacity: 0;
+    transform: translateY(-6px) scale(0.98);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+@keyframes cp-status-fill-slide {
+  from {
+    transform: translateX(-100%);
+  }
+  to {
+    transform: translateX(263%);
+  }
+}
+@keyframes cp-update-bar-slide {
+  from {
+    transform: translateX(-100%);
+  }
+  to {
+    transform: translateX(250%);
+  }
+}
+
 @keyframes cp-userm-in {
   from {
     opacity: 0;
@@ -455,10 +769,37 @@ html[data-desktop-chrome='mac-overlay'] .cp-rail-brand {
   .cp-status-pill,
   .cp-status-pill .cp-status-mark,
   .cp-status-pill--installing::before,
-  .cp-music-eq > span {
+  .cp-music-eq > span,
+  .cp-update-dock,
+  .cp-update-dock-icon,
+  .cp-update-card,
+  .cp-status-slot[data-busy='true']::after,
+  .cp-update-progress .cp-boot-bar-fill {
     animation: none !important;
     animation-duration: 0s !important;
     animation-iteration-count: 1 !important;
+    transition: none !important;
+  }
+  .cp-update-progress .cp-boot-bar-fill[data-indeterminate='true'],
+  .cp-status-slot[data-busy='true'][data-indeterminate='true']::after {
+    left: 0;
+    width: 100%;
+    box-shadow: none;
+  }
+  .cp-update-progress .cp-boot-bar-fill[data-indeterminate='true'] {
+    opacity: 0.45;
+  }
+  .cp-status-slot[data-busy='true'][data-indeterminate='true']::after {
+    opacity: 0.65;
+  }
+  .cp-status-glyph,
+  .cp-status-glyph > span,
+  .cp-status-glyph > span::after,
+  .cp-status-pill-swap,
+  .cp-status-pill-body,
+  .cp-update-collapse,
+  .cp-update-collapse .cp-update-dock-wrap {
+    animation: none !important;
     transition: none !important;
   }
 }
@@ -528,16 +869,22 @@ html[data-desktop-chrome='mac-overlay'] .cp-rail-brand {
   transition:
     filter 140ms ease,
     box-shadow 140ms ease,
+    border-radius 200ms ease,
+    background 320ms ease,
+    color 320ms ease,
     scale 70ms ease;
 }
-button.cp-status-pill:hover {
+button.cp-status-pill:enabled:hover {
   filter: brightness(1.07);
 }
-html[data-color-mode='light'] button.cp-status-pill:hover {
+html[data-color-mode='light'] button.cp-status-pill:enabled:hover {
   filter: brightness(0.98);
 }
-button.cp-status-pill:active {
+button.cp-status-pill:enabled:active {
   scale: 0.97;
+}
+button.cp-status-pill:disabled {
+  cursor: default;
 }
 .cp-status-pill > * {
   position: relative;
@@ -574,6 +921,15 @@ button.cp-status-pill:active {
   transition: right 280ms cubic-bezier(0.22, 1, 0.36, 1);
   pointer-events: none;
 }
+.cp-status-pill--content {
+  --cp-status-color: color-mix(in oklab, var(--accent) 74%, var(--text));
+  --cp-status-bg: color-mix(in oklab, var(--surface) 92%, var(--accent));
+  --cp-status-accent: color-mix(in oklab, var(--accent) 66%, var(--text));
+  --cp-status-accent-soft: color-mix(in oklab, var(--accent) 16%, transparent);
+}
+button.cp-status-pill--content {
+  cursor: pointer;
+}
 .cp-status-pill--preparing {
   --cp-status-color: color-mix(in oklab, var(--accent) 56%, var(--text));
   --cp-status-bg: color-mix(in oklab, var(--surface) 90%, var(--accent));
@@ -605,10 +961,556 @@ button.cp-status-pill:active {
   border-radius: 999px;
   background: var(--cp-status-accent-soft);
   color: var(--cp-status-accent);
+  transition:
+    background 320ms ease,
+    color 320ms ease;
 }
 .cp-status-mark svg {
   display: block;
 }
+
+.cp-status-glyph {
+  position: relative;
+  contain: strict;
+}
+.cp-status-glyph > span {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  width: 3px;
+  height: 3px;
+  margin: -1.5px 0 0 -1.5px;
+  opacity: 0.85;
+  transition:
+    transform 420ms cubic-bezier(0.34, 1.2, 0.64, 1),
+    opacity 300ms ease;
+}
+.cp-status-glyph > span::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  border-radius: 999px;
+  background: currentColor;
+}
+.cp-status-glyph > span:nth-child(2) {
+  transition-delay: 25ms;
+}
+.cp-status-glyph > span:nth-child(3) {
+  transition-delay: 50ms;
+}
+.cp-status-glyph > span:nth-child(4) {
+  transition-delay: 75ms;
+}
+.cp-status-glyph > span:nth-child(5) {
+  transition-delay: 100ms;
+}
+.cp-status-glyph > span:nth-child(6) {
+  transition-delay: 125ms;
+}
+.cp-status-glyph > span:nth-child(7) {
+  transition-delay: 150ms;
+}
+.cp-status-glyph > span:nth-child(8) {
+  transition-delay: 175ms;
+}
+.cp-status-glyph > span:nth-child(9) {
+  transition-delay: 200ms;
+}
+.cp-status-glyph > span:nth-child(1) {
+  transform: translate(-4.5px, -4.5px);
+}
+.cp-status-glyph > span:nth-child(2) {
+  transform: translate(0, -4.5px);
+}
+.cp-status-glyph > span:nth-child(3) {
+  transform: translate(4.5px, -4.5px);
+}
+.cp-status-glyph > span:nth-child(4) {
+  transform: translate(-4.5px, 0);
+}
+.cp-status-glyph > span:nth-child(5) {
+  transform: translate(0, 0);
+}
+.cp-status-glyph > span:nth-child(6) {
+  transform: translate(4.5px, 0);
+}
+.cp-status-glyph > span:nth-child(7) {
+  transform: translate(-4.5px, 4.5px);
+}
+.cp-status-glyph > span:nth-child(8) {
+  transform: translate(0, 4.5px);
+}
+.cp-status-glyph > span:nth-child(9) {
+  transform: translate(4.5px, 4.5px);
+}
+
+.cp-status-glyph[data-state='idle'] > span::after {
+  animation: cp-glyph-breathe 5200ms ease-in-out infinite;
+}
+.cp-status-glyph[data-state='idle'] > span:nth-child(2)::after,
+.cp-status-glyph[data-state='idle'] > span:nth-child(4)::after {
+  animation-delay: 180ms;
+}
+.cp-status-glyph[data-state='idle'] > span:nth-child(3)::after,
+.cp-status-glyph[data-state='idle'] > span:nth-child(5)::after,
+.cp-status-glyph[data-state='idle'] > span:nth-child(7)::after {
+  animation-delay: 360ms;
+}
+.cp-status-glyph[data-state='idle'] > span:nth-child(6)::after,
+.cp-status-glyph[data-state='idle'] > span:nth-child(8)::after {
+  animation-delay: 540ms;
+}
+.cp-status-glyph[data-state='idle'] > span:nth-child(9)::after {
+  animation-delay: 720ms;
+}
+
+.cp-status-glyph[data-state='preparing'] > span::after {
+  animation: cp-glyph-chase 1350ms linear infinite;
+}
+.cp-status-glyph[data-state='preparing'] > span:nth-child(2) {
+  transform: translate(0, -6px);
+}
+.cp-status-glyph[data-state='preparing'] > span:nth-child(3) {
+  transform: translate(4.2px, -4.2px);
+}
+.cp-status-glyph[data-state='preparing'] > span:nth-child(3)::after {
+  animation-delay: 170ms;
+}
+.cp-status-glyph[data-state='preparing'] > span:nth-child(6) {
+  transform: translate(6px, 0);
+}
+.cp-status-glyph[data-state='preparing'] > span:nth-child(6)::after {
+  animation-delay: 340ms;
+}
+.cp-status-glyph[data-state='preparing'] > span:nth-child(9) {
+  transform: translate(4.2px, 4.2px);
+}
+.cp-status-glyph[data-state='preparing'] > span:nth-child(9)::after {
+  animation-delay: 510ms;
+}
+.cp-status-glyph[data-state='preparing'] > span:nth-child(8) {
+  transform: translate(0, 6px);
+}
+.cp-status-glyph[data-state='preparing'] > span:nth-child(8)::after {
+  animation-delay: 680ms;
+}
+.cp-status-glyph[data-state='preparing'] > span:nth-child(7) {
+  transform: translate(-4.2px, 4.2px);
+}
+.cp-status-glyph[data-state='preparing'] > span:nth-child(7)::after {
+  animation-delay: 850ms;
+}
+.cp-status-glyph[data-state='preparing'] > span:nth-child(4) {
+  transform: translate(-6px, 0);
+}
+.cp-status-glyph[data-state='preparing'] > span:nth-child(4)::after {
+  animation-delay: 1020ms;
+}
+.cp-status-glyph[data-state='preparing'] > span:nth-child(1) {
+  transform: translate(-4.2px, -4.2px);
+}
+.cp-status-glyph[data-state='preparing'] > span:nth-child(1)::after {
+  animation-delay: 1190ms;
+}
+.cp-status-glyph[data-state='preparing'] > span:nth-child(5) {
+  opacity: 0.3;
+}
+.cp-status-glyph[data-state='preparing'] > span:nth-child(5)::after {
+  animation: none;
+}
+
+.cp-status-glyph[data-state='monitoring'] > span::after {
+  animation: cp-glyph-ping 2200ms ease-in-out infinite;
+}
+.cp-status-glyph[data-state='monitoring'] > span:nth-child(1) {
+  transform: translate(-3.4px, -3.4px);
+}
+.cp-status-glyph[data-state='monitoring'] > span:nth-child(2) {
+  transform: translate(0, -5.6px);
+}
+.cp-status-glyph[data-state='monitoring'] > span:nth-child(3) {
+  transform: translate(3.4px, -3.4px);
+}
+.cp-status-glyph[data-state='monitoring'] > span:nth-child(4) {
+  transform: translate(-5.6px, 0);
+}
+.cp-status-glyph[data-state='monitoring'] > span:nth-child(6) {
+  transform: translate(5.6px, 0);
+}
+.cp-status-glyph[data-state='monitoring'] > span:nth-child(7) {
+  transform: translate(-3.4px, 3.4px);
+}
+.cp-status-glyph[data-state='monitoring'] > span:nth-child(8) {
+  transform: translate(0, 5.6px);
+}
+.cp-status-glyph[data-state='monitoring'] > span:nth-child(9) {
+  transform: translate(3.4px, 3.4px);
+}
+.cp-status-glyph[data-state='monitoring'] > span:nth-child(2)::after,
+.cp-status-glyph[data-state='monitoring'] > span:nth-child(4)::after,
+.cp-status-glyph[data-state='monitoring'] > span:nth-child(6)::after,
+.cp-status-glyph[data-state='monitoring'] > span:nth-child(8)::after {
+  animation-delay: 160ms;
+}
+.cp-status-glyph[data-state='monitoring'] > span:nth-child(1)::after,
+.cp-status-glyph[data-state='monitoring'] > span:nth-child(3)::after,
+.cp-status-glyph[data-state='monitoring'] > span:nth-child(7)::after,
+.cp-status-glyph[data-state='monitoring'] > span:nth-child(9)::after {
+  animation-delay: 320ms;
+}
+
+.cp-status-glyph[data-state='playing'] > span::after {
+  animation: cp-glyph-shimmer 2200ms ease-in-out infinite;
+}
+.cp-status-glyph[data-state='playing'] > span:nth-child(1) {
+  transform: translate(-4px, -5px);
+}
+.cp-status-glyph[data-state='playing'] > span:nth-child(4) {
+  transform: translate(-4px, -1.7px);
+}
+.cp-status-glyph[data-state='playing'] > span:nth-child(7) {
+  transform: translate(-4px, 1.7px);
+}
+.cp-status-glyph[data-state='playing'] > span:nth-child(8) {
+  transform: translate(-4px, 5px);
+}
+.cp-status-glyph[data-state='playing'] > span:nth-child(2) {
+  transform: translate(-0.7px, -3.3px);
+}
+.cp-status-glyph[data-state='playing'] > span:nth-child(5) {
+  transform: translate(-0.7px, 3.3px);
+}
+.cp-status-glyph[data-state='playing'] > span:nth-child(2)::after,
+.cp-status-glyph[data-state='playing'] > span:nth-child(5)::after {
+  animation-delay: 220ms;
+}
+.cp-status-glyph[data-state='playing'] > span:nth-child(3) {
+  transform: translate(2.7px, -1.7px);
+}
+.cp-status-glyph[data-state='playing'] > span:nth-child(9) {
+  transform: translate(2.7px, 1.7px);
+}
+.cp-status-glyph[data-state='playing'] > span:nth-child(3)::after,
+.cp-status-glyph[data-state='playing'] > span:nth-child(9)::after {
+  animation-delay: 440ms;
+}
+.cp-status-glyph[data-state='playing'] > span:nth-child(6) {
+  transform: translate(6px, 0);
+}
+.cp-status-glyph[data-state='playing'] > span:nth-child(6)::after {
+  animation-delay: 660ms;
+}
+
+.cp-status-glyph[data-state='stopping'] > span {
+  opacity: 0.55;
+}
+.cp-status-glyph[data-state='stopping'] > span::after {
+  animation: cp-glyph-ember 2000ms ease-in-out infinite;
+}
+.cp-status-glyph[data-state='stopping'] > span:nth-child(1) {
+  transform: translate(-1.8px, -1.8px);
+}
+.cp-status-glyph[data-state='stopping'] > span:nth-child(2) {
+  transform: translate(0, -1.8px);
+}
+.cp-status-glyph[data-state='stopping'] > span:nth-child(3) {
+  transform: translate(1.8px, -1.8px);
+}
+.cp-status-glyph[data-state='stopping'] > span:nth-child(4) {
+  transform: translate(-1.8px, 0);
+}
+.cp-status-glyph[data-state='stopping'] > span:nth-child(6) {
+  transform: translate(1.8px, 0);
+}
+.cp-status-glyph[data-state='stopping'] > span:nth-child(7) {
+  transform: translate(-1.8px, 1.8px);
+}
+.cp-status-glyph[data-state='stopping'] > span:nth-child(8) {
+  transform: translate(0, 1.8px);
+}
+.cp-status-glyph[data-state='stopping'] > span:nth-child(9) {
+  transform: translate(1.8px, 1.8px);
+}
+
+.cp-status-glyph[data-state='downloading'] > span::after {
+  animation: cp-glyph-rain 1200ms ease-in-out infinite;
+}
+.cp-status-glyph[data-state='downloading'] > span:nth-child(1) {
+  transform: translate(-3.6px, -5.2px);
+}
+.cp-status-glyph[data-state='downloading'] > span:nth-child(2) {
+  transform: translate(0, -5.2px);
+}
+.cp-status-glyph[data-state='downloading'] > span:nth-child(3) {
+  transform: translate(3.6px, -5.2px);
+}
+.cp-status-glyph[data-state='downloading'] > span:nth-child(4) {
+  transform: translate(-3.6px, 0);
+}
+.cp-status-glyph[data-state='downloading'] > span:nth-child(6) {
+  transform: translate(3.6px, 0);
+}
+.cp-status-glyph[data-state='downloading'] > span:nth-child(7) {
+  transform: translate(-3.6px, 5.2px);
+}
+.cp-status-glyph[data-state='downloading'] > span:nth-child(8) {
+  transform: translate(0, 5.2px);
+}
+.cp-status-glyph[data-state='downloading'] > span:nth-child(9) {
+  transform: translate(3.6px, 5.2px);
+}
+.cp-status-glyph[data-state='downloading'] > span:nth-child(2)::after {
+  animation-delay: 50ms;
+}
+.cp-status-glyph[data-state='downloading'] > span:nth-child(3)::after {
+  animation-delay: 100ms;
+}
+.cp-status-glyph[data-state='downloading'] > span:nth-child(4)::after {
+  animation-delay: 150ms;
+}
+.cp-status-glyph[data-state='downloading'] > span:nth-child(5)::after {
+  animation-delay: 200ms;
+}
+.cp-status-glyph[data-state='downloading'] > span:nth-child(6)::after {
+  animation-delay: 250ms;
+}
+.cp-status-glyph[data-state='downloading'] > span:nth-child(7)::after {
+  animation-delay: 300ms;
+}
+.cp-status-glyph[data-state='downloading'] > span:nth-child(8)::after {
+  animation-delay: 350ms;
+}
+.cp-status-glyph[data-state='downloading'] > span:nth-child(9)::after {
+  animation-delay: 400ms;
+}
+
+.cp-status-glyph[data-state='queued'] > span::after {
+  animation: cp-glyph-flow 1900ms ease-in-out infinite;
+}
+.cp-status-glyph[data-state='queued'] > span:nth-child(1) {
+  transform: translate(-5.2px, -3.6px);
+}
+.cp-status-glyph[data-state='queued'] > span:nth-child(2) {
+  transform: translate(0, -3.6px);
+}
+.cp-status-glyph[data-state='queued'] > span:nth-child(3) {
+  transform: translate(5.2px, -3.6px);
+}
+.cp-status-glyph[data-state='queued'] > span:nth-child(4) {
+  transform: translate(-5.2px, 0);
+}
+.cp-status-glyph[data-state='queued'] > span:nth-child(6) {
+  transform: translate(5.2px, 0);
+}
+.cp-status-glyph[data-state='queued'] > span:nth-child(7) {
+  transform: translate(-5.2px, 3.6px);
+}
+.cp-status-glyph[data-state='queued'] > span:nth-child(8) {
+  transform: translate(0, 3.6px);
+}
+.cp-status-glyph[data-state='queued'] > span:nth-child(9) {
+  transform: translate(5.2px, 3.6px);
+}
+.cp-status-glyph[data-state='queued'] > span:nth-child(2)::after,
+.cp-status-glyph[data-state='queued'] > span:nth-child(5)::after,
+.cp-status-glyph[data-state='queued'] > span:nth-child(8)::after {
+  animation-delay: 260ms;
+}
+.cp-status-glyph[data-state='queued'] > span:nth-child(3)::after,
+.cp-status-glyph[data-state='queued'] > span:nth-child(6)::after,
+.cp-status-glyph[data-state='queued'] > span:nth-child(9)::after {
+  animation-delay: 520ms;
+}
+
+.cp-status-glyph[data-state='failed'] {
+  animation: cp-glyph-jolt 420ms cubic-bezier(0.36, 0.07, 0.19, 0.97) 1 480ms;
+}
+.cp-status-glyph[data-state='failed'] > span:nth-child(2) {
+  transform: translate(0, -5.5px);
+}
+.cp-status-glyph[data-state='failed'] > span:nth-child(5) {
+  transform: translate(0, -2.75px);
+}
+.cp-status-glyph[data-state='failed'] > span:nth-child(8) {
+  transform: translate(0, 0);
+}
+.cp-status-glyph[data-state='failed'] > span:nth-child(9) {
+  transform: translate(0, 5px);
+}
+.cp-status-glyph[data-state='failed'] > span:nth-child(1) {
+  transform: translate(-4.5px, -4.5px) scale(0.2);
+  opacity: 0;
+}
+.cp-status-glyph[data-state='failed'] > span:nth-child(3) {
+  transform: translate(4.5px, -4.5px) scale(0.2);
+  opacity: 0;
+}
+.cp-status-glyph[data-state='failed'] > span:nth-child(4) {
+  transform: translate(-4.5px, 0) scale(0.2);
+  opacity: 0;
+}
+.cp-status-glyph[data-state='failed'] > span:nth-child(6) {
+  transform: translate(4.5px, 0) scale(0.2);
+  opacity: 0;
+}
+.cp-status-glyph[data-state='failed'] > span:nth-child(7) {
+  transform: translate(-4.5px, 4.5px) scale(0.2);
+  opacity: 0;
+}
+
+.cp-topbar[data-calm='true'] .cp-status-glyph,
+.cp-topbar[data-calm='true'] .cp-status-glyph > span::after,
+.cp-topbar[data-calm='true'] .cp-music-eq > span,
+.cp-topbar[data-calm='true'] .cp-status-slot[data-busy='true']::after,
+.cp-topbar[data-calm='true'] .cp-update-progress .cp-boot-bar-fill {
+  animation: none;
+}
+
+@keyframes cp-glyph-breathe {
+  0%,
+  42%,
+  100% {
+    opacity: 1;
+    transform: none;
+  }
+  21% {
+    opacity: 0.3;
+    transform: scale(0.6);
+  }
+}
+@keyframes cp-glyph-chase {
+  0%,
+  100% {
+    opacity: 1;
+    transform: none;
+  }
+  9% {
+    opacity: 1;
+    transform: scale(1.2);
+  }
+  26% {
+    opacity: 0.28;
+    transform: none;
+  }
+  88% {
+    opacity: 0.28;
+  }
+}
+@keyframes cp-glyph-ping {
+  0%,
+  100% {
+    opacity: 1;
+    transform: none;
+  }
+  7% {
+    opacity: 1;
+    transform: scale(1.25);
+  }
+  22% {
+    opacity: 0.38;
+    transform: none;
+  }
+  80% {
+    opacity: 0.38;
+  }
+}
+@keyframes cp-glyph-shimmer {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.45;
+  }
+}
+@keyframes cp-glyph-ember {
+  0%,
+  100% {
+    opacity: 1;
+    transform: none;
+  }
+  50% {
+    opacity: 0.35;
+    transform: scale(0.75);
+  }
+}
+@keyframes cp-glyph-rain {
+  0%,
+  100% {
+    transform: none;
+    opacity: 1;
+  }
+  38% {
+    transform: translateY(3px);
+    opacity: 0;
+  }
+  62% {
+    transform: translateY(-3px);
+    opacity: 0;
+  }
+}
+@keyframes cp-glyph-flow {
+  0%,
+  100% {
+    transform: none;
+    opacity: 1;
+  }
+  38% {
+    transform: translateX(2.6px);
+    opacity: 0;
+  }
+  62% {
+    transform: translateX(-2.6px);
+    opacity: 0;
+  }
+}
+@keyframes cp-glyph-jolt {
+  0%,
+  100% {
+    transform: translateX(0);
+  }
+  20% {
+    transform: translateX(-2px);
+  }
+  40% {
+    transform: translateX(2px);
+  }
+  60% {
+    transform: translateX(-1.5px);
+  }
+  80% {
+    transform: translateX(1.5px);
+  }
+}
+
+.cp-status-pill-swap {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 7px;
+  width: max-content;
+  animation: cp-status-swap-in 260ms cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+@keyframes cp-status-swap-in {
+  from {
+    opacity: 0;
+    transform: translateY(3px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+.cp-status-pill-body {
+  display: flex;
+  align-items: center;
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 100%;
+  overflow: hidden;
+  transition: width 380ms cubic-bezier(0.32, 0.72, 0, 1);
+}
+
 .cp-status-pill-label {
   min-width: 0;
   max-width: 100%;
@@ -650,6 +1552,7 @@ button.cp-status-pill:active {
   border-radius: 999px;
   background: var(--cp-status-accent-soft);
   color: var(--cp-status-accent);
+  align-self: center;
 }
 
 .cp-music-widget {
@@ -766,9 +1669,6 @@ button.cp-status-pill:active {
   overflow: auto;
   width: 100%;
   background-color: var(--bg);
-  background-image: var(--bg-noise);
-  background-repeat: repeat;
-  background-size: 140px 140px;
   border-top-left-radius: var(--r-lg);
 }
 

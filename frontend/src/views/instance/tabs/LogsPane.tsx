@@ -3,9 +3,9 @@ import { useEffect, useMemo, useState } from 'preact/hooks';
 import { Button, Pill } from '../../../ui/Atoms';
 import { SelectField } from '../../../ui/Select';
 import { Icon } from '../../../ui/Icons';
+import { formatBytes, fmtRelative } from '../../../format';
 import { errMessage } from '../../../utils';
 import type { EnrichedInstance, InstanceLogTail } from '../../../types-instance';
-import { fmtBytes, fmtRelative } from '../format';
 import type { ResourceLoadState } from '../resources';
 import {
   LOG_FILTER_LABELS,
@@ -138,7 +138,7 @@ export function LogsPane({
             </div>
             {selectedEntry && (
               <span class="cp-logview-meta">
-                {fmtBytes(selectedEntry.size)} · {fmtRelative(selectedEntry.modified_at)}
+                {formatBytes(selectedEntry.size)}, {fmtRelative(selectedEntry.modified_at)}
               </span>
             )}
           </div>
@@ -159,8 +159,8 @@ export function LogsPane({
               <>
                 {tail.data?.truncated && (
                   <div class="cp-logview-truncated">
-                    Showing the last {fmtBytes(tail.data.size > 0 ? Math.min(tail.data.size, 128 * 1024) : 0)} of this
-                    log.
+                    Showing the last {formatBytes(tail.data.size > 0 ? Math.min(tail.data.size, 128 * 1024) : 0)} of
+                    this log.
                   </div>
                 )}
                 <LogLines text={tail.data?.text ?? ''} filter={filter} />

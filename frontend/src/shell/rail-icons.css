@@ -44,6 +44,9 @@
 .cp-rail-btn[data-icon='home']:is(:hover, :focus-visible) .cp-rail-icon > svg {
   transform: translateY(-1.1px) scale(1.025);
 }
+.cp-rail-btn[data-icon='compass']:is(:hover, :focus-visible) .cp-rail-icon > svg {
+  animation: cp-rail-compass-spin 440ms cubic-bezier(0.22, 0.72, 0.24, 1);
+}
 .cp-rail-btn[data-icon='plus']:is(:hover, :focus-visible) .cp-rail-icon > svg {
   transform: rotate(90deg) scale(1.02);
 }
@@ -52,6 +55,15 @@
   transform-box: fill-box;
   transform-origin: center;
   transition: transform 340ms cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+@keyframes cp-rail-compass-spin {
+  from {
+    transform: rotate(0deg);
+  }
+  to {
+    transform: rotate(360deg);
+  }
 }
 
 @media (prefers-reduced-motion: reduce) {

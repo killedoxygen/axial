@@ -2,6 +2,7 @@ use super::super::{ApplicationCommand, CommandResult, InstallVersionPayload};
 use crate::guardian::GuardianInstallOutcomeSummary;
 use crate::observability::OperationProofRecord;
 use crate::state::contracts::OperationId;
+use axial_content::ContentKind;
 use axial_minecraft::{DownloadProgress, LoaderComponentId};
 use serde::{Deserialize, Serialize};
 
@@ -119,6 +120,42 @@ pub enum InstallQueueRequest {
         component_id: LoaderComponentId,
         build_id: String,
     },
+    Content {
+        instance_id: String,
+        label: String,
+        action: InstallQueueContentActionRequest,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InstallQueueContentSelection {
+    pub canonical_id: String,
+    pub kind: ContentKind,
+    #[serde(default)]
+    pub version_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(deny_unknown_fields)]
+pub enum InstallQueueContentActionRequest {
+    Install {
+        selections: Vec<InstallQueueContentSelection>,
+        #[serde(default)]
+        allow_incompatible: bool,
+    },
+    Uninstall {
+        canonical_ids: Vec<String>,
+    },
+    Modpack {
+        canonical_id: String,
+        version_id: String,
+        #[serde(default)]
+        selected_paths: Vec<String>,
+        #[serde(default)]
+        include_overrides: bool,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -126,6 +163,14 @@ pub struct InstallQueueInstallItemViewModel {
     pub version_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub loader: Option<InstallQueueLoaderItemViewModel>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content: Option<InstallQueueContentItemViewModel>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct InstallQueueContentItemViewModel {
+    pub instance_id: String,
+    pub action: InstallQueueContentActionRequest,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -207,4 +252,6 @@ pub struct InstallQueueStateResponse {
     pub notice: Option<InstallQueueNoticeViewModel>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub started_install: Option<InstallStartResponse>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub removed_instance_id: Option<String>,
 }

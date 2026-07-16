@@ -1,25 +1,31 @@
+mod flow;
+
+pub use flow::{UpdateDownloadRequest, UpdateFlowResponse, apply_staged_update, update_flow_state};
+pub(crate) use flow::{cleanup_update_staging, start_update_download};
+
 use crate::state::AppState;
 use axum::{Json, http::StatusCode};
 use futures_util::StreamExt;
 use reqwest::header::{ACCEPT, USER_AGENT};
 use serde::{Deserialize, Serialize};
 use std::{
-    sync::OnceLock,
-    time::{Duration, SystemTime},
+    sync::{Mutex, OnceLock},
+    time::{Duration, Instant, SystemTime},
 };
 
-const GITHUB_LATEST_RELEASE_URL: &str =
-    "https://api.github.com/repos/mateoltd/axial/releases/latest";
+const GITHUB_RELEASES_URL: &str =
+    "https://api.github.com/repos/mateoltd/axial/releases?per_page=30";
 const GITHUB_RELEASE_PAGE_TAG_PREFIX: &str = "https://github.com/mateoltd/axial/releases/tag/";
 const GITHUB_RELEASE_DOWNLOAD_PREFIX: &str = "https://github.com/mateoltd/axial/releases/download/";
 const UPDATE_CHECK_TIMEOUT: Duration = Duration::from_secs(3);
 const UPDATE_CHECK_CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
 const UPDATE_CHECK_UNAVAILABLE_MESSAGE: &str = "update check unavailable";
-const MAX_UPDATE_RELEASE_BYTES: u64 = 512 << 10;
+const MAX_UPDATE_RELEASE_BYTES: u64 = 2 << 20;
+const UPDATE_CHECK_CACHE_TTL: Duration = Duration::from_secs(300);
 
 type ApiErrorResponse = (StatusCode, Json<serde_json::Value>);
 
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 pub struct UpdateResponse {
     pub current_version: String,
     pub latest_version: String,
@@ -27,6 +33,7 @@ pub struct UpdateResponse {
     pub platform: String,
     pub arch: String,
     pub kind: &'static str,
+    pub install_mode: &'static str,
     pub notes_url: String,
     pub action_url: String,
     pub checksum_url: Option<String>,
@@ -35,7 +42,7 @@ pub struct UpdateResponse {
 }
 
 #[derive(Debug, Deserialize)]
-struct GithubLatestRelease {
+struct GithubRelease {
     tag_name: String,
     html_url: String,
     #[serde(default)]
@@ -48,27 +55,56 @@ struct GithubReleaseAsset {
     browser_download_url: String,
 }
 
-pub async fn update_status(state: &AppState) -> Result<UpdateResponse, ApiErrorResponse> {
+pub async fn update_status(
+    state: &AppState,
+    force: bool,
+) -> Result<UpdateResponse, ApiErrorResponse> {
+    if !force && let Some(cached) = cached_update_response() {
+        return Ok(cached);
+    }
+
     let current_version = state.version().to_string();
     let checked_at = timestamp_utc();
 
-    update_response_from_release_fetch(
+    let response = update_response_from_release_fetch(
         &current_version,
         &checked_at,
         fetch_latest_release(&current_version).await,
-    )
+    )?;
+    store_cached_update_response(&response);
+    Ok(response)
 }
 
-async fn fetch_latest_release(
-    current_version: &str,
-) -> Result<GithubLatestRelease, UpdateFetchError> {
-    fetch_latest_release_from_url(GITHUB_LATEST_RELEASE_URL, current_version).await
+fn update_check_cache() -> &'static Mutex<Option<(Instant, UpdateResponse)>> {
+    static CACHE: OnceLock<Mutex<Option<(Instant, UpdateResponse)>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(None))
+}
+
+fn cached_update_response() -> Option<UpdateResponse> {
+    let cache = update_check_cache()
+        .lock()
+        .expect("update check cache lock");
+    cache
+        .as_ref()
+        .filter(|(checked, _)| checked.elapsed() < UPDATE_CHECK_CACHE_TTL)
+        .map(|(_, response)| response.clone())
+}
+
+fn store_cached_update_response(response: &UpdateResponse) {
+    let mut cache = update_check_cache()
+        .lock()
+        .expect("update check cache lock");
+    *cache = Some((Instant::now(), response.clone()));
+}
+
+async fn fetch_latest_release(current_version: &str) -> Result<GithubRelease, UpdateFetchError> {
+    fetch_latest_release_from_url(GITHUB_RELEASES_URL, current_version).await
 }
 
 async fn fetch_latest_release_from_url(
     url: &str,
     current_version: &str,
-) -> Result<GithubLatestRelease, UpdateFetchError> {
+) -> Result<GithubRelease, UpdateFetchError> {
     let response = update_http_client()
         .get(url)
         .header(USER_AGENT, format!("Axial/{current_version}"))
@@ -97,7 +133,21 @@ async fn fetch_latest_release_from_url(
         body.extend_from_slice(&chunk);
     }
 
-    serde_json::from_slice::<GithubLatestRelease>(&body).map_err(UpdateFetchError::Json)
+    let releases =
+        serde_json::from_slice::<Vec<GithubRelease>>(&body).map_err(UpdateFetchError::Json)?;
+    select_newest_release(releases).ok_or(UpdateFetchError::NoRelease)
+}
+
+fn select_newest_release(releases: Vec<GithubRelease>) -> Option<GithubRelease> {
+    releases
+        .into_iter()
+        .filter_map(|release| parse_semver(&release.tag_name).map(|version| (version, release)))
+        .max_by(|(left, _), (right, _)| compare_versions(left, right))
+        .map(|(_, release)| release)
+}
+
+fn parse_semver(tag: &str) -> Option<semver::Version> {
+    semver::Version::parse(normalized_version_str(tag)).ok()
 }
 
 #[derive(Debug)]
@@ -106,6 +156,7 @@ enum UpdateFetchError {
     HttpStatus(StatusCode),
     Json(serde_json::Error),
     TooLarge,
+    NoRelease,
 }
 
 impl std::fmt::Display for UpdateFetchError {
@@ -115,6 +166,7 @@ impl std::fmt::Display for UpdateFetchError {
             Self::HttpStatus(status) => write!(formatter, "HTTP {status}"),
             Self::Json(error) => write!(formatter, "parse failed: {error}"),
             Self::TooLarge => write!(formatter, "response too large"),
+            Self::NoRelease => write!(formatter, "no compatible release found"),
         }
     }
 }
@@ -140,6 +192,7 @@ fn fallback_response(current_version: &str, checked_at: &str) -> UpdateResponse 
         platform: std::env::consts::OS.to_string(),
         arch: std::env::consts::ARCH.to_string(),
         kind: "none",
+        install_mode: "external",
         notes_url: String::new(),
         action_url: String::new(),
         checksum_url: None,
@@ -151,7 +204,7 @@ fn fallback_response(current_version: &str, checked_at: &str) -> UpdateResponse 
 fn release_response(
     current_version: &str,
     checked_at: &str,
-    release: GithubLatestRelease,
+    release: GithubRelease,
 ) -> UpdateResponse {
     release_response_for_platform(
         current_version,
@@ -165,7 +218,7 @@ fn release_response(
 fn release_response_for_platform(
     current_version: &str,
     checked_at: &str,
-    release: GithubLatestRelease,
+    release: GithubRelease,
     os: &str,
     arch: &str,
 ) -> UpdateResponse {
@@ -179,6 +232,11 @@ fn release_response_for_platform(
 
     let asset = matching_release_asset(&release.assets, &latest_version, os, arch);
     if let Some(asset) = asset {
+        let install_mode = if asset.checksum_url.is_some() {
+            "in-app"
+        } else {
+            "external"
+        };
         return UpdateResponse {
             current_version: current_version.to_string(),
             latest_version,
@@ -186,6 +244,7 @@ fn release_response_for_platform(
             platform: os.to_string(),
             arch: arch.to_string(),
             kind: "release-asset",
+            install_mode,
             notes_url: release_url,
             action_url: asset.url,
             checksum_url: asset.checksum_url,
@@ -201,6 +260,7 @@ fn release_response_for_platform(
         platform: os.to_string(),
         arch: arch.to_string(),
         kind: "release-page",
+        install_mode: "external",
         notes_url: release_url.clone(),
         action_url: release_url,
         checksum_url: None,
@@ -212,7 +272,7 @@ fn release_response_for_platform(
 fn update_response_from_release_fetch<E>(
     current_version: &str,
     checked_at: &str,
-    result: Result<GithubLatestRelease, E>,
+    result: Result<GithubRelease, E>,
 ) -> Result<UpdateResponse, ApiErrorResponse> {
     result
         .map(|release| release_response(current_version, checked_at, release))
@@ -227,7 +287,7 @@ fn update_unavailable_response() -> ApiErrorResponse {
 }
 
 fn normalized_version(version: &str) -> String {
-    version.trim().trim_start_matches(['v', 'V']).to_string()
+    normalized_version_str(version).to_string()
 }
 
 fn sane_release_page_url(url: &str, latest_version: &str) -> Option<String> {
@@ -264,33 +324,39 @@ fn matching_release_asset(
     os: &str,
     arch: &str,
 ) -> Option<ReleaseAssetSelection> {
-    let expected_name = release_asset_name(latest_version, os, arch)?;
+    let expected_name = update_package_name(latest_version, os, arch)?;
     let url = assets
         .iter()
         .filter(|asset| asset.name == expected_name)
-        .find_map(|asset| sane_release_asset_url(&asset.browser_download_url, &expected_name))?;
+        .find_map(|asset| {
+            sane_release_asset_url(&asset.browser_download_url, &expected_name, latest_version)
+        })?;
     let checksum_name = format!("{expected_name}.sha256");
     let checksum_url = assets
         .iter()
         .filter(|asset| asset.name == checksum_name)
-        .find_map(|asset| sane_release_asset_url(&asset.browser_download_url, &checksum_name));
+        .find_map(|asset| {
+            sane_release_asset_url(&asset.browser_download_url, &checksum_name, latest_version)
+        });
 
     Some(ReleaseAssetSelection { url, checksum_url })
 }
 
-fn release_asset_name(latest_version: &str, os: &str, arch: &str) -> Option<String> {
+fn update_package_name(latest_version: &str, os: &str, arch: &str) -> Option<String> {
     let platform = match os {
         "linux" => "linux",
         "windows" => "windows",
+        "macos" => "macos",
         _ => return None,
     };
     let archive_ext = match os {
-        "linux" => "tar.gz",
+        "linux" | "macos" => "tar.gz",
         "windows" => "zip",
         _ => return None,
     };
-    let package_arch = match arch {
-        "x86_64" => "amd64",
+    let package_arch = match (os, arch) {
+        ("linux" | "windows" | "macos", "x86_64") => "amd64",
+        ("macos", "aarch64") => "arm64",
         _ => return None,
     };
 
@@ -299,15 +365,11 @@ fn release_asset_name(latest_version: &str, os: &str, arch: &str) -> Option<Stri
     ))
 }
 
-fn release_asset_version_from_name(name: &str) -> Option<&str> {
-    let archive_name = name.strip_suffix(".sha256").unwrap_or(name);
-    let archive_suffix = archive_name.rsplit_once('-')?.1;
-    archive_suffix
-        .strip_suffix(".tar.gz")
-        .or_else(|| archive_suffix.strip_suffix(".zip"))
-}
-
-fn sane_release_asset_url(url: &str, expected_name: &str) -> Option<String> {
+fn sane_release_asset_url(
+    url: &str,
+    expected_name: &str,
+    expected_version: &str,
+) -> Option<String> {
     let trimmed = url.trim();
     let download_path = trimmed.strip_prefix(GITHUB_RELEASE_DOWNLOAD_PREFIX)?;
     if trimmed != url {
@@ -317,7 +379,6 @@ fn sane_release_asset_url(url: &str, expected_name: &str) -> Option<String> {
     if filename != expected_name {
         return None;
     }
-    let expected_version = release_asset_version_from_name(expected_name)?;
     let expected_v_tag = format!("v{expected_version}");
     let expected_upper_v_tag = format!("V{expected_version}");
     if tag != expected_version && tag != expected_v_tag && tag != expected_upper_v_tag {
@@ -328,42 +389,44 @@ fn sane_release_asset_url(url: &str, expected_name: &str) -> Option<String> {
 }
 
 fn is_version_greater(candidate: &str, current: &str) -> bool {
-    let Some(candidate_parts) = parse_numeric_version(candidate) else {
-        return false;
-    };
-    let Some(current_parts) = parse_numeric_version(current) else {
-        return false;
-    };
-
-    let width = candidate_parts.len().max(current_parts.len());
-    for index in 0..width {
-        let candidate_part = candidate_parts.get(index).copied().unwrap_or(0);
-        let current_part = current_parts.get(index).copied().unwrap_or(0);
-        if candidate_part > current_part {
-            return true;
-        }
-        if candidate_part < current_part {
-            return false;
-        }
+    match (parse_semver(candidate), parse_semver(current)) {
+        (Some(candidate), Some(current)) => compare_versions(&candidate, &current).is_gt(),
+        _ => false,
     }
-    false
 }
 
-fn parse_numeric_version(version: &str) -> Option<Vec<u64>> {
-    let normalized = normalized_version(version);
-    if normalized.is_empty() {
-        return None;
+fn compare_versions(left: &semver::Version, right: &semver::Version) -> std::cmp::Ordering {
+    for ordering in [
+        left.major.cmp(&right.major),
+        left.minor.cmp(&right.minor),
+        left.patch.cmp(&right.patch),
+    ] {
+        if !ordering.is_eq() {
+            return ordering;
+        }
     }
+    match (left.pre.is_empty(), right.pre.is_empty()) {
+        (true, true) => std::cmp::Ordering::Equal,
+        (true, false) => std::cmp::Ordering::Greater,
+        (false, true) => std::cmp::Ordering::Less,
+        (false, false) => prerelease_channel_rank(left.pre.as_str())
+            .cmp(&prerelease_channel_rank(right.pre.as_str()))
+            .then_with(|| left.pre.cmp(&right.pre)),
+    }
+}
 
-    normalized
-        .split('.')
-        .map(|part| {
-            if part.is_empty() || !part.chars().all(|ch| ch.is_ascii_digit()) {
-                return None;
-            }
-            part.parse::<u64>().ok()
-        })
-        .collect()
+fn prerelease_channel_rank(pre_release: &str) -> u8 {
+    match pre_release.split('.').next().unwrap_or_default() {
+        "dev" => 0,
+        "alpha" => 1,
+        "beta" => 2,
+        "rc" => 3,
+        _ => 0,
+    }
+}
+
+fn normalized_version_str(version: &str) -> &str {
+    version.trim().trim_start_matches(['v', 'V'])
 }
 
 fn timestamp_utc() -> String {
@@ -393,11 +456,70 @@ mod tests {
     }
 
     #[test]
-    fn version_comparison_rejects_unknown_suffixes() {
-        assert!(!is_version_greater("1.2.4-beta", "1.2.3"));
-        assert!(!is_version_greater("1.2.4+build", "1.2.3"));
+    fn version_comparison_orders_prereleases_and_rejects_non_semver() {
+        assert!(is_version_greater("1.2.4-beta", "1.2.3"));
+        assert!(is_version_greater("1.2.4+build", "1.2.3"));
+        assert!(is_version_greater("1.2.4-rc.2", "1.2.4-rc.1"));
+        assert!(is_version_greater("1.2.4-dev.2", "1.2.4-dev.1"));
+        assert!(is_version_greater("1.2.4-alpha.1", "1.2.4-dev.1"));
+        assert!(!is_version_greater("1.2.4-alpha", "1.2.4"));
         assert!(!is_version_greater("release-1.2.4", "1.2.3"));
         assert!(!is_version_greater("1.2.4", "dev"));
+    }
+
+    #[test]
+    fn newest_release_selection_prefers_highest_semver() {
+        let selected = select_newest_release(vec![
+            GithubRelease {
+                tag_name: "music-v2".to_string(),
+                html_url: String::new(),
+                assets: Vec::new(),
+            },
+            GithubRelease {
+                tag_name: "v0.3.1".to_string(),
+                html_url: String::new(),
+                assets: Vec::new(),
+            },
+            GithubRelease {
+                tag_name: "v0.4.0-dev.1".to_string(),
+                html_url: String::new(),
+                assets: Vec::new(),
+            },
+            GithubRelease {
+                tag_name: "v0.4.0-dev.2".to_string(),
+                html_url: String::new(),
+                assets: Vec::new(),
+            },
+        ])
+        .expect("a semver-tagged release");
+        assert_eq!(selected.tag_name, "v0.4.0-dev.2");
+    }
+
+    #[test]
+    fn prerelease_asset_urls_validate_against_hyphenated_version() {
+        let asset_url = matching_release_asset_url(
+            &[release_asset(
+                "axial-linux-amd64-0.4.0-dev.1.tar.gz",
+                "https://github.com/mateoltd/axial/releases/download/v0.4.0-dev.1/axial-linux-amd64-0.4.0-dev.1.tar.gz",
+            )],
+            "0.4.0-dev.1",
+            "linux",
+            "x86_64",
+        )
+        .expect("hyphenated prerelease asset should validate");
+        assert_eq!(
+            asset_url,
+            "https://github.com/mateoltd/axial/releases/download/v0.4.0-dev.1/axial-linux-amd64-0.4.0-dev.1.tar.gz"
+        );
+    }
+
+    #[test]
+    fn version_comparison_treats_plain_release_as_newer_than_its_prerelease() {
+        assert!(is_version_greater("0.4.0", "0.4.0-alpha"));
+        assert!(is_version_greater("v0.4.1", "0.4.0-alpha"));
+        assert!(!is_version_greater("0.4.0", "0.4.0"));
+        assert!(!is_version_greater("0.3.9", "0.4.0-alpha"));
+        assert!(!is_version_greater("0.4.0", "0.4.1-alpha"));
     }
 
     #[test]
@@ -405,7 +527,7 @@ mod tests {
         let response = release_response(
             "1.2.3",
             "2026-01-01T00:00:00Z",
-            GithubLatestRelease {
+            GithubRelease {
                 tag_name: "v1.2.4".to_string(),
                 html_url: "https://github.com/mateoltd/axial/releases/tag/v1.2.4".to_string(),
                 assets: Vec::new(),
@@ -424,7 +546,7 @@ mod tests {
         let same = release_response(
             "1.2.3",
             "2026-01-01T00:00:00Z",
-            GithubLatestRelease {
+            GithubRelease {
                 tag_name: "v1.2.3".to_string(),
                 html_url: "https://github.com/mateoltd/axial/releases/tag/v1.2.3".to_string(),
                 assets: Vec::new(),
@@ -434,23 +556,23 @@ mod tests {
         assert_eq!(same.latest_version, "1.2.3");
         assert_eq!(same.kind, "none");
 
-        let suffix = release_response(
+        let non_semver = release_response(
             "1.2.3",
             "2026-01-01T00:00:00Z",
-            GithubLatestRelease {
-                tag_name: "v1.2.4-beta".to_string(),
-                html_url: "https://github.com/mateoltd/axial/releases/tag/v1.2.4-beta".to_string(),
+            GithubRelease {
+                tag_name: "nightly".to_string(),
+                html_url: "https://github.com/mateoltd/axial/releases/tag/nightly".to_string(),
                 assets: Vec::new(),
             },
         );
-        assert!(!suffix.available);
-        assert_eq!(suffix.latest_version, "1.2.3");
-        assert_eq!(suffix.kind, "none");
+        assert!(!non_semver.available);
+        assert_eq!(non_semver.latest_version, "1.2.3");
+        assert_eq!(non_semver.kind, "none");
 
         let wrong_url = release_response(
             "1.2.3",
             "2026-01-01T00:00:00Z",
-            GithubLatestRelease {
+            GithubRelease {
                 tag_name: "v1.2.4".to_string(),
                 html_url: "https://example.com/mateoltd/axial/releases/tag/v1.2.4".to_string(),
                 assets: Vec::new(),
@@ -463,7 +585,7 @@ mod tests {
         let mismatched_page_tag = release_response(
             "1.2.3",
             "2026-01-01T00:00:00Z",
-            GithubLatestRelease {
+            GithubRelease {
                 tag_name: "v1.2.4".to_string(),
                 html_url: "https://github.com/mateoltd/axial/releases/tag/v1.2.5".to_string(),
                 assets: Vec::new(),
@@ -583,6 +705,42 @@ mod tests {
     }
 
     #[test]
+    fn macos_asset_selection_matches_native_architecture() {
+        let assets = [
+            release_asset(
+                "axial-macos-amd64-1.2.4.dmg",
+                "https://github.com/mateoltd/axial/releases/download/v1.2.4/axial-macos-amd64-1.2.4.dmg",
+            ),
+            release_asset(
+                "axial-macos-amd64-1.2.4.tar.gz",
+                "https://github.com/mateoltd/axial/releases/download/v1.2.4/axial-macos-amd64-1.2.4.tar.gz",
+            ),
+            release_asset(
+                "axial-macos-arm64-1.2.4.dmg",
+                "https://github.com/mateoltd/axial/releases/download/v1.2.4/axial-macos-arm64-1.2.4.dmg",
+            ),
+            release_asset(
+                "axial-macos-arm64-1.2.4.tar.gz",
+                "https://github.com/mateoltd/axial/releases/download/v1.2.4/axial-macos-arm64-1.2.4.tar.gz",
+            ),
+        ];
+
+        let intel = matching_release_asset_url(&assets, "1.2.4", "macos", "x86_64")
+            .expect("macOS x86_64 should select amd64 asset");
+        assert_eq!(
+            intel,
+            "https://github.com/mateoltd/axial/releases/download/v1.2.4/axial-macos-amd64-1.2.4.tar.gz"
+        );
+
+        let apple_silicon = matching_release_asset_url(&assets, "1.2.4", "macos", "aarch64")
+            .expect("macOS aarch64 should select arm64 asset");
+        assert_eq!(
+            apple_silicon,
+            "https://github.com/mateoltd/axial/releases/download/v1.2.4/axial-macos-arm64-1.2.4.tar.gz"
+        );
+    }
+
+    #[test]
     fn asset_selection_rejects_missing_or_unsafe_assets() {
         let missing = matching_release_asset_url(
             &[release_asset(
@@ -645,7 +803,7 @@ mod tests {
         let response = release_response_for_platform(
             "1.2.3",
             "2026-01-01T00:00:00Z",
-            GithubLatestRelease {
+            GithubRelease {
                 tag_name: "v1.2.4".to_string(),
                 html_url: "https://github.com/mateoltd/axial/releases/tag/v1.2.4".to_string(),
                 assets: vec![release_asset(
@@ -660,6 +818,7 @@ mod tests {
         assert_eq!(response.kind, "release-asset");
         assert_eq!(response.action_label, "Download update");
         assert_eq!(response.checksum_url, None);
+        assert_eq!(response.install_mode, "external");
         assert_eq!(
             response.notes_url,
             "https://github.com/mateoltd/axial/releases/tag/v1.2.4"
@@ -675,7 +834,7 @@ mod tests {
         let response = release_response_for_platform(
             "1.2.3",
             "2026-01-01T00:00:00Z",
-            GithubLatestRelease {
+            GithubRelease {
                 tag_name: "v1.2.4".to_string(),
                 html_url: "https://github.com/mateoltd/axial/releases/tag/v1.2.4".to_string(),
                 assets: vec![
@@ -694,6 +853,7 @@ mod tests {
         );
 
         assert_eq!(response.kind, "release-asset");
+        assert_eq!(response.install_mode, "in-app");
         assert_eq!(
             response.checksum_url.as_deref(),
             Some(
@@ -707,7 +867,7 @@ mod tests {
         let wrong_host = release_response_for_platform(
             "1.2.3",
             "2026-01-01T00:00:00Z",
-            GithubLatestRelease {
+            GithubRelease {
                 tag_name: "v1.2.4".to_string(),
                 html_url: "https://github.com/mateoltd/axial/releases/tag/v1.2.4".to_string(),
                 assets: vec![
@@ -730,7 +890,7 @@ mod tests {
         let wrong_tag = release_response_for_platform(
             "1.2.3",
             "2026-01-01T00:00:00Z",
-            GithubLatestRelease {
+            GithubRelease {
                 tag_name: "v1.2.4".to_string(),
                 html_url: "https://github.com/mateoltd/axial/releases/tag/v1.2.4".to_string(),
                 assets: vec![
@@ -756,7 +916,7 @@ mod tests {
         let missing = release_response_for_platform(
             "1.2.3",
             "2026-01-01T00:00:00Z",
-            GithubLatestRelease {
+            GithubRelease {
                 tag_name: "v1.2.4".to_string(),
                 html_url: "https://github.com/mateoltd/axial/releases/tag/v1.2.4".to_string(),
                 assets: Vec::new(),
@@ -771,7 +931,7 @@ mod tests {
         let unsafe_asset = release_response_for_platform(
             "1.2.3",
             "2026-01-01T00:00:00Z",
-            GithubLatestRelease {
+            GithubRelease {
                 tag_name: "v1.2.4".to_string(),
                 html_url: "https://github.com/mateoltd/axial/releases/tag/v1.2.4".to_string(),
                 assets: vec![release_asset(
@@ -792,7 +952,7 @@ mod tests {
         let response = update_response_from_release_fetch::<()>(
             "1.2.3",
             "2026-01-01T00:00:00Z",
-            Ok(GithubLatestRelease {
+            Ok(GithubRelease {
                 tag_name: "v1.2.4".to_string(),
                 html_url: "https://example.com/mateoltd/axial/releases/tag/v1.2.4".to_string(),
                 assets: Vec::new(),
@@ -837,11 +997,11 @@ mod tests {
 
     fn sample_release_json(tag: &str) -> String {
         format!(
-            r#"{{
+            r#"[{{
                 "tag_name": "{tag}",
                 "html_url": "https://github.com/mateoltd/axial/releases/tag/{tag}",
                 "assets": []
-            }}"#
+            }}]"#
         )
     }
 }

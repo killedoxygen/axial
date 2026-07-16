@@ -55,6 +55,7 @@ pub async fn start_application_background_workflows(state: &AppState) -> bool {
     if !crate::application::settle_startup_persisted_state_repairs(state).await {
         return false;
     }
+    crate::application::cleanup_update_staging(state).await;
     spawn_known_good_rebuilds(state);
     spawn_idle_integrity_scheduler(state);
     spawn_performance_operations_resume(state);

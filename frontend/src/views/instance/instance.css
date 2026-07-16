@@ -75,18 +75,6 @@ html[data-color-mode='light'] .cp-instance-aurora {
   .cp-instance-view[data-running='true'] .cp-instance-aurora--b1 {
     animation: cp-aurora-drift-a 33s ease-in-out infinite alternate;
   }
-  .cp-instance-view[data-running='true'] .cp-instance-aurora--b2 {
-    animation: cp-aurora-drift-b 24s ease-in-out infinite alternate;
-    animation-delay: -13s;
-  }
-  .cp-instance-view[data-running='true'] .cp-instance-aurora--b3 {
-    animation: cp-aurora-drift-c 39s ease-in-out infinite alternate;
-    animation-delay: -21s;
-  }
-  .cp-instance-view[data-running='true'] .cp-instance-aurora--b4 {
-    animation: cp-aurora-drift-d 28s ease-in-out infinite alternate;
-    animation-delay: -7s;
-  }
 }
 @keyframes cp-aurora-drift-a {
   from {
@@ -96,31 +84,6 @@ html[data-color-mode='light'] .cp-instance-aurora {
     transform: translate3d(4%, 0.8%, 0);
   }
 }
-@keyframes cp-aurora-drift-b {
-  from {
-    transform: translate3d(0, 0, 0);
-  }
-  to {
-    transform: translate3d(-3.2%, -0.6%, 0);
-  }
-}
-@keyframes cp-aurora-drift-c {
-  from {
-    transform: translate3d(0, 0, 0);
-  }
-  to {
-    transform: translate3d(-4.4%, 0.7%, 0);
-  }
-}
-@keyframes cp-aurora-drift-d {
-  from {
-    transform: translate3d(0, 0, 0);
-  }
-  to {
-    transform: translate3d(2.8%, -0.9%, 0);
-  }
-}
-
 .cp-instance-hero {
   position: relative;
   display: grid;
@@ -166,9 +129,7 @@ html[data-color-mode='light'] .cp-instance-hero-tile {
   margin-bottom: 9px;
 }
 .cp-instance-hero-kicker .cp-pill {
-  background: color-mix(in oklab, var(--surface-2) 72%, transparent);
-  -webkit-backdrop-filter: blur(8px);
-  backdrop-filter: blur(8px);
+  background: color-mix(in oklab, var(--surface-2) 88%, var(--bg));
   box-shadow: inset 0 0 0 1px var(--line);
   color: var(--text-dim);
 }
@@ -192,7 +153,7 @@ html[data-color-mode='light'] .cp-instance-hero-tile {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
-  gap: 5px 12px;
+  gap: 6px 16px;
   color: var(--text-dim);
   font-size: 12.5px;
   letter-spacing: 0;
@@ -201,10 +162,6 @@ html[data-color-mode='light'] .cp-instance-hero-tile {
   color: var(--text);
   font-weight: 600;
   font-variant-numeric: tabular-nums;
-}
-.cp-instance-hero-meta-sep {
-  color: var(--text-mute);
-  opacity: 0.55;
 }
 .cp-instance-status {
   display: inline-flex;
@@ -249,13 +206,6 @@ html[data-color-mode='light'] .cp-instance-hero-tile {
   font-weight: 700;
   font-variant-numeric: tabular-nums;
 }
-.cp-session-dot {
-  width: 7px;
-  height: 7px;
-  border-radius: 999px;
-  background: var(--accent);
-  animation: cp-live-pulse 1.8s ease-in-out infinite;
-}
 .cp-session-stop {
   display: inline-flex;
   align-items: center;
@@ -282,12 +232,6 @@ html[data-color-mode='light'] .cp-instance-hero-tile {
   outline: none;
   box-shadow: var(--focus-ring-inset);
 }
-@media (prefers-reduced-motion: reduce) {
-  .cp-session-dot {
-    animation: none;
-  }
-}
-
 .cp-instance-split-launch {
   display: inline-flex;
   height: 46px;
@@ -387,73 +331,6 @@ html[data-color-mode='light'] .cp-instance-hero-tile {
   max-width: 158px;
 }
 
-.cp-instance-tabs {
-  display: flex;
-  align-items: center;
-  flex-wrap: wrap;
-  gap: 6px;
-  min-height: 36px;
-}
-.cp-instance-tabs button {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  gap: 9px;
-  height: 36px;
-  padding: 0 14px;
-  border: none;
-  border-radius: var(--r-sm);
-  background: transparent;
-  color: color-mix(in oklab, var(--text) 76%, transparent);
-  font-family: inherit;
-  font-size: 13px;
-  font-weight: 600;
-  letter-spacing: 0;
-  white-space: nowrap;
-  cursor: pointer;
-  transition:
-    background 120ms ease,
-    color 120ms ease;
-}
-.cp-tab-icon {
-  display: inline-grid;
-  place-items: center;
-  width: 16px;
-  height: 16px;
-  flex: 0 0 16px;
-}
-.cp-tab-icon svg {
-  opacity: 0.96;
-}
-.cp-instance-tabs button:hover {
-  background: var(--surface-2);
-  color: var(--text);
-}
-.cp-instance-tabs button:focus-visible {
-  outline: none;
-  box-shadow: var(--focus-ring);
-}
-.cp-instance-tabs button[data-active='true'] {
-  background: var(--accent-fill);
-  color: var(--accent-on);
-}
-.cp-instance-tabs button[data-active='true'] .cp-tab-icon svg {
-  opacity: 1;
-}
-.cp-tab-count {
-  padding: 1px 7px;
-  border-radius: 999px;
-  background: var(--surface-3);
-  color: var(--text-mute);
-  font-size: 11px;
-  font-weight: 600;
-  font-variant-numeric: tabular-nums;
-}
-.cp-instance-tabs button[data-active='true'] .cp-tab-count {
-  background: oklch(1 0 0 / 0.18);
-  color: var(--accent-on);
-}
-
 .cp-instance-install-pane {
   display: flex;
   flex-direction: column;
@@ -463,7 +340,9 @@ html[data-color-mode='light'] .cp-instance-hero-tile {
   padding: 24px;
   border-radius: var(--r-lg);
   background: var(--surface);
-  box-shadow: var(--shadow-raised);
+  box-shadow:
+    inset 0 1px 0 oklch(1 0 0 / 0.05),
+    var(--shadow-raised);
 }
 .cp-instance-install-pane > .cp-notice {
   box-shadow: none;
@@ -559,7 +438,9 @@ html[data-color-mode='light'] .cp-instance-hero-tile {
   border-radius: var(--r-lg);
   overflow: hidden;
   background: var(--surface);
-  box-shadow: var(--shadow-raised);
+  box-shadow:
+    inset 0 1px 0 oklch(1 0 0 / 0.05),
+    var(--shadow-raised);
 }
 .cp-logview-bar {
   flex-shrink: 0;
@@ -743,13 +624,17 @@ html[data-color-mode='light'] .cp-instance-hero-tile {
 }
 .cp-resource-toolbar .cp-field {
   height: 30px;
+  border-radius: 999px;
+  padding: 0 12px;
 }
 
 .cp-resource-note {
   padding: 12px 14px;
   border-radius: var(--r-md);
   background: var(--surface);
-  box-shadow: var(--shadow-raised);
+  box-shadow:
+    inset 0 1px 0 oklch(1 0 0 / 0.05),
+    var(--shadow-raised);
   color: var(--text-dim);
   font-size: 13px;
   margin-bottom: 12px;
@@ -803,7 +688,9 @@ html[data-color-mode='light'] .cp-instance-hero-tile {
   border-radius: var(--r-lg);
   overflow: hidden;
   background: var(--surface);
-  box-shadow: var(--shadow-raised);
+  box-shadow:
+    inset 0 1px 0 oklch(1 0 0 / 0.05),
+    var(--shadow-raised);
 }
 .cp-resource-row {
   display: grid;
@@ -920,6 +807,54 @@ html[data-color-mode='light'] .cp-instance-hero-tile {
   color: var(--text);
   font-size: 14px;
   margin-bottom: 4px;
+}
+.cp-mods-updates {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 8px 8px 14px;
+  border-radius: var(--r-md);
+  background: color-mix(in oklab, var(--accent-fill) 12%, var(--surface));
+  color: var(--text);
+  font-size: 12.5px;
+  margin-bottom: 12px;
+}
+.cp-mods-updates-action {
+  margin-left: auto;
+}
+
+.cp-mod-name-cell {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+.cp-mod-update {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  height: 20px;
+  padding: 0 8px;
+  border: none;
+  border-radius: 999px;
+  background: var(--accent-fill);
+  color: var(--accent-on);
+  font-size: 11px;
+  font-weight: 600;
+  cursor: pointer;
+}
+.cp-mod-update:hover {
+  filter: brightness(1.08);
+}
+.cp-mod-source {
+  color: var(--text-dim);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.cp-mod-source[data-provider='local'] {
+  color: var(--text-mute);
 }
 .cp-mods-file-icon {
   width: 30px;
@@ -1155,8 +1090,7 @@ html[data-color-mode='light'] .cp-instance-hero-tile {
   right: 12px;
 }
 .cp-shot-lightbox-nav .cp-ibtn {
-  backdrop-filter: blur(8px);
-  -webkit-backdrop-filter: blur(8px);
+  background: var(--surface-2);
   opacity: 0.8;
   transition: opacity 120ms ease;
 }
@@ -1180,15 +1114,6 @@ html[data-color-mode='light'] .cp-instance-hero-tile {
   .cp-instance-hero-actions {
     grid-column: 1 / -1;
     justify-content: flex-start;
-  }
-}
-
-@media (max-width: 640px) {
-  .cp-instance-tabs button {
-    padding: 0 10px;
-  }
-  .cp-instance-tabs .cp-tab-label {
-    display: none;
   }
 }
 

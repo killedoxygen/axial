@@ -5,6 +5,7 @@ import { prompt, showChoice } from '../../ui/Dialog';
 import { addInstance, removeInstance, updateInstanceInList } from '../../actions';
 import type { Instance } from '../../types-instance';
 import { partialFailureMessage, runBulkMutation } from './bulk-actions';
+import { clearModProvenance } from './mod-provenance-cache';
 
 export async function openInstanceFolder(id: string, sub?: string): Promise<void> {
   try {
@@ -59,6 +60,7 @@ export async function deleteInstanceFlow(inst: Instance, onDone?: () => void): P
     const res: any = await api('DELETE', `/instances/${encodeURIComponent(inst.id)}${suffix}`);
     if (res?.error) throw new Error(res.error);
     removeInstance(inst.id);
+    clearModProvenance(inst.id);
     toast(keepFiles ? 'Removed from launcher; files kept on disk' : 'Instance deleted');
     onDone?.();
   } catch (err) {
@@ -89,6 +91,7 @@ export async function deleteInstancesFlow(selected: Instance[], onDone?: () => v
       const res: any = await api('DELETE', `/instances/${encodeURIComponent(inst.id)}${suffix}`);
       if (res?.error) throw new Error(res.error);
       removeInstance(inst.id);
+      clearModProvenance(inst.id);
     },
     success: (count) => (keepFiles ? `${count} instances removed; files kept on disk` : `${count} instances deleted`),
     partial: (done, total, err) => partialFailureMessage('Removed', done, total, err),

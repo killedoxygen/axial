@@ -34,7 +34,7 @@ function runtimeLabel(runtime: JavaRuntime): string {
   const major = /(\d+)/.exec(runtime.component)?.[1];
   const name = major ? `Java ${major}` : runtime.component || 'Java runtime';
   const tail = runtime.path.split(/[\\/]/).filter(Boolean).slice(-2).join('/');
-  return tail ? `${name} · …/${tail}` : name;
+  return tail ? `${name} (…/${tail})` : name;
 }
 
 export function JavaPathField({

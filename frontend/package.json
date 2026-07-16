@@ -23,6 +23,8 @@
     "@openai/apps-sdk-ui": "^0.2.2",
     "@preact/signals": "^2.0.0",
     "preact": "^10.25.0",
+    "react-markdown": "^9.1.0",
+    "remark-gfm": "^4.0.1",
     "three": "^0.184.0"
   }
 }

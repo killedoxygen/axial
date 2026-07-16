@@ -90,7 +90,7 @@ task dev:web
 task dev:windows
 ```
 
-`task build:windows` produces a raw Windows executable rather than a signed installer or updater package. Tagged GitHub releases publish desktop archives with matching SHA-256 checksum files.
+`task build:windows` produces a raw Windows executable rather than a signed installer or updater package. Tagged GitHub releases publish a raw Linux executable, a Windows executable, and native macOS DMGs for manual downloads. The in-app updater uses separate archives containing standalone executables. Every asset has a matching SHA-256 checksum file; the raw Linux download may need `chmod +x <file>` after downloading.
 
 ## Documentation
 

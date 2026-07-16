@@ -1,5 +1,6 @@
 use crate::state::AppState;
 use async_stream::stream;
+use axial_content::{ContentKind, ContentManifest};
 use axum::{
     Json,
     body::{Body, Bytes},
@@ -222,6 +223,15 @@ pub(crate) async fn handle_update_instance_mod(
     name: &str,
     payload: UpdateModRequest,
 ) -> Result<serde_json::Value, (StatusCode, Json<serde_json::Value>)> {
+    let _lifecycle_guard = state
+        .try_acquire_instance_lifecycle(id)
+        .await
+        .ok_or_else(|| {
+            json_error(
+                StatusCode::CONFLICT,
+                "another launch or content operation is already using this instance",
+            )
+        })?;
     reject_running_instance(state, id, "mods").await?;
     validate_mod_name(name)?;
 
@@ -230,16 +240,41 @@ pub(crate) async fn handle_update_instance_mod(
     let source = mods_dir.join(name);
     require_mod_file(&source)?;
     let target_name = mod_enabled_name(name, payload.enabled)?;
-    if target_name == name {
-        return Ok(serde_json::json!({ "status": "ok", "name": name, "enabled": payload.enabled }));
-    }
-
     let target = mods_dir.join(&target_name);
-    if target_exists(&target) {
+    let renamed = target_name != name;
+    if renamed && target_exists(&target) {
         return Err(json_error(StatusCode::CONFLICT, "mod already exists"));
     }
 
-    fs::rename(source, target).map_err(mod_file_write_error_response)?;
+    let mut manifest = ContentManifest::load(&game_dir).map_err(mod_manifest_error_response)?;
+    let base_name = mod_base_name(name);
+    let tracked = manifest
+        .entries
+        .iter_mut()
+        .find(|entry| entry.kind == ContentKind::Mod && entry.filename == base_name);
+    let manifest_changed = tracked
+        .as_ref()
+        .is_some_and(|entry| entry.enabled != payload.enabled);
+    if let Some(entry) = tracked {
+        entry.enabled = payload.enabled;
+    }
+
+    if renamed {
+        fs::rename(&source, &target).map_err(mod_file_write_error_response)?;
+    }
+    if manifest_changed && let Err(error) = manifest.save(&game_dir) {
+        if renamed && let Err(rollback_error) = fs::rename(&target, &source) {
+            tracing::error!(
+                instance_id = id,
+                current_name = target_name,
+                original_name = name,
+                manifest_error = %error,
+                rollback_error = %rollback_error,
+                "failed to restore mod filename after manifest persistence failure"
+            );
+        }
+        return Err(mod_manifest_error_response(error));
+    }
     Ok(serde_json::json!({ "status": "ok", "name": target_name, "enabled": payload.enabled }))
 }
 
@@ -248,12 +283,32 @@ pub(crate) async fn handle_delete_instance_mod(
     id: &str,
     name: &str,
 ) -> Result<serde_json::Value, (StatusCode, Json<serde_json::Value>)> {
+    let _lifecycle_guard = state
+        .try_acquire_instance_lifecycle(id)
+        .await
+        .ok_or_else(|| {
+            json_error(
+                StatusCode::CONFLICT,
+                "another launch or content operation is already using this instance",
+            )
+        })?;
     reject_running_instance(state, id, "mods").await?;
     validate_mod_name(name)?;
 
     let game_dir = instance_game_dir(state, id)?;
     let source = game_dir.join("mods").join(name);
     require_mod_file(&source)?;
+    let manifest = ContentManifest::load(&game_dir).map_err(mod_manifest_error_response)?;
+    if manifest
+        .entries
+        .iter()
+        .any(|entry| entry.kind == ContentKind::Mod && entry.filename == mod_base_name(name))
+    {
+        return Err(json_error(
+            StatusCode::CONFLICT,
+            "managed mods must be removed through content operations",
+        ));
+    }
     fs::remove_file(source).map_err(mod_file_write_error_response)?;
     Ok(serde_json::json!({ "status": "ok" }))
 }
@@ -764,6 +819,17 @@ fn mod_file_write_error_response(_error: std::io::Error) -> (StatusCode, Json<se
     )
 }
 
+fn mod_manifest_error_response(
+    _error: axial_content::ContentError,
+) -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(serde_json::json!({
+            "error": "Could not update mod files. Check instance folder permissions and try again."
+        })),
+    )
+}
+
 pub(super) fn screenshot_file_read_error_response(
     _error: std::io::Error,
 ) -> (StatusCode, Json<serde_json::Value>) {
@@ -910,6 +976,14 @@ fn is_screenshot_name(name: &str) -> bool {
 fn is_mod_name(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
     (lower.ends_with(".jar") || lower.ends_with(".jar.disabled")) && is_safe_resource_name(name)
+}
+
+fn mod_base_name(name: &str) -> &str {
+    if name.to_ascii_lowercase().ends_with(".disabled") {
+        &name[..name.len() - ".disabled".len()]
+    } else {
+        name
+    }
 }
 
 fn mod_enabled_name(

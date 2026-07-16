@@ -98,7 +98,10 @@ function RailButton({
   tooltip: RailTooltipController;
 }): JSX.Element {
   const current = route.value;
-  const active = isRouteActive(target, current) || (target.name === 'instances' && current.name === 'instance');
+  const active =
+    isRouteActive(target, current) ||
+    (target.name === 'instances' && current.name === 'instance') ||
+    (target.name === 'discover' && current.name === 'content');
   return (
     <button
       class="cp-rail-btn"
@@ -190,7 +193,7 @@ function RailInstances({ tooltip }: { tooltip: RailTooltipController }): JSX.Ele
                   openInstanceContextMenu(e, inst);
                 }}
                 aria-label={installing ? `${inst.name}: ${installLabel}` : inst.name}
-                {...railTipAttrs(installing ? `${inst.name} · ${installLabel}` : inst.name, tooltip)}
+                {...railTipAttrs(installing ? `${inst.name}: ${installLabel}` : inst.name, tooltip)}
               >
                 <InstanceTile inst={inst} radius={12} className="cp-rail-tile-art" />
                 {installing && (
@@ -380,6 +383,7 @@ export function Sidebar(): JSX.Element {
       </button>
       <RailButton icon="home" label="Home" target={{ name: 'home' }} tooltip={tooltip} />
       <RailButton icon="stack" label="Instances" target={{ name: 'instances' }} tooltip={tooltip} />
+      <RailButton icon="compass" label="Discover" target={{ name: 'discover' }} tooltip={tooltip} />
       <button
         class="cp-rail-btn"
         data-accent="true"

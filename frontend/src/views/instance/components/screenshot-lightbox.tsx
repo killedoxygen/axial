@@ -2,8 +2,8 @@ import type { JSX } from 'preact';
 import { useEffect } from 'preact/hooks';
 import { Modal, ModalContent } from '../../../ui/Modal';
 import { IconButton } from '../../../ui/Atoms';
+import { formatBytes, fmtRelative } from '../../../format';
 import type { EnrichedInstance, InstanceScreenshot } from '../../../types-instance';
-import { fmtBytes, fmtRelative } from '../format';
 import { openInstanceFolder } from '../instance-actions';
 import { deleteScreenshots, renameScreenshot, screenshotFileUrl } from '../screenshot-actions';
 
@@ -67,7 +67,7 @@ export function ScreenshotLightbox({
           <div class="cp-shot-lightbox-title">
             <strong title={shot.name}>{shot.name}</strong>
             <div class="cp-shot-lightbox-meta">
-              <span>{fmtBytes(shot.size)}</span>
+              <span>{formatBytes(shot.size)}</span>
               <span>{fmtRelative(shot.modified_at)}</span>
             </div>
           </div>

@@ -1,7 +1,8 @@
 import type { JSX } from 'preact';
-import { InstanceTile } from './InstanceVisual';
+import { guardedInstanceHue, InstanceTile } from './InstanceVisual';
+import { useTheme } from '../hooks/use-theme';
 import { Icon } from './Icons';
-import { SelectionCheckbox } from './SelectionActionPill';
+import { SelectionCheckbox } from './SelectionActionTray';
 import { selectionToggleLabel } from './selection';
 import { navigate } from '../ui-state';
 import { runningSessions, versionById } from '../store';
@@ -19,6 +20,7 @@ export function InstanceCard({
   selected?: boolean;
   onToggleSelect?: (e: MouseEvent) => void;
 }): JSX.Element {
+  const theme = useTheme();
   const running = !!runningSessions.value[inst.id];
   const version = versionById(inst.version_id);
   const install = instanceInstallStatus(inst, version);
@@ -41,6 +43,7 @@ export function InstanceCard({
   return (
     <div
       class="cp-icard"
+      style={{ ['--cp-tile-h' as any]: guardedInstanceHue(inst, theme) }}
       role="button"
       tabIndex={0}
       aria-label={installing ? `Open ${inst.name}. ${installBadge}` : `Open ${inst.name}`}
@@ -86,7 +89,7 @@ export function InstanceCard({
           {inst.name}
         </div>
         <div class="cp-icard-sub">
-          {installing ? `${installBadge} · ` : ''}
+          {installing ? `${installBadge}, ` : ''}
           {inst.version_display.summary_label}
         </div>
       </div>

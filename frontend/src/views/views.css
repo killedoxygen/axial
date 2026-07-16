@@ -205,7 +205,7 @@
   position: absolute;
   inset: 0;
   border-radius: inherit;
-  box-shadow: inset 0 1px 0 oklch(1 0 0 / 0.05);
+  box-shadow: inset 0 1px 0 oklch(1 0 0 / 0.07);
   transition: box-shadow 160ms ease;
   pointer-events: none;
   z-index: 3;
@@ -214,7 +214,7 @@
   transform: translateY(-2px);
 }
 .cp-feature:hover::after {
-  box-shadow: inset 0 1px 0 oklch(1 0 0 / 0.09);
+  box-shadow: inset 0 1px 0 oklch(1 0 0 / 0.12);
 }
 .cp-feature:active {
   scale: 0.995;
@@ -235,15 +235,6 @@
     radial-gradient(52% 110% at 8% -10%, oklch(0.6 0.1 var(--cp-tile-h) / 0.1), transparent 72%),
     linear-gradient(200deg, color-mix(in oklab, var(--surface-2) 40%, transparent), transparent 55%);
   opacity: 0.98;
-  will-change: opacity;
-}
-.cp-feature-glow::after {
-  content: '';
-  position: absolute;
-  inset: 0;
-  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='128' height='128'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2' stitchTiles='stitch'/%3E%3CfeColorMatrix type='saturate' values='0'/%3E%3C/filter%3E%3Crect width='128' height='128' filter='url(%23n)'/%3E%3C/svg%3E");
-  background-size: 128px 128px;
-  opacity: 0.05;
 }
 .cp-feature-glyph {
   position: absolute;
@@ -333,7 +324,7 @@
   position: absolute;
   inset: 0;
   border-radius: inherit;
-  box-shadow: inset 0 1px 0 oklch(1 0 0 / 0.05);
+  box-shadow: inset 0 1px 0 oklch(1 0 0 / 0.07);
   transition: box-shadow 160ms ease;
   pointer-events: none;
   z-index: 3;
@@ -343,7 +334,7 @@
   background: color-mix(in oklab, var(--surface-2) 52%, var(--surface));
 }
 .cp-icard:hover::after {
-  box-shadow: inset 0 1px 0 oklch(1 0 0 / 0.09);
+  box-shadow: inset 0 1px 0 oklch(1 0 0 / 0.12);
 }
 .cp-icard:active {
   scale: 0.98;
@@ -426,7 +417,6 @@
     opacity 120ms ease,
     transform 180ms cubic-bezier(0.22, 1, 0.36, 1);
   contain: layout paint;
-  will-change: opacity, transform;
 }
 .cp-icard:hover .cp-icard-play,
 .cp-icard:focus-visible .cp-icard-play {
@@ -445,9 +435,7 @@
   font-size: 10.5px;
   font-weight: 700;
   color: #fff;
-  background: rgba(0, 0, 0, 0.45);
-  backdrop-filter: blur(6px);
-  -webkit-backdrop-filter: blur(6px);
+  background: rgba(0, 0, 0, 0.62);
 }
 .cp-icard-live > span {
   width: 6px;
@@ -470,13 +458,18 @@
   font-weight: 700;
   color: var(--accent-on);
   background: var(--accent-fill);
-  box-shadow: 0 6px 16px -10px color-mix(in oklab, var(--accent) 64%, transparent);
+  box-shadow:
+    inset 0 1px 0 oklch(1 0 0 / 0.14),
+    0 1px 0 oklch(0 0 0 / 0.18),
+    0 6px 16px -10px color-mix(in oklab, var(--accent) 64%, transparent);
 }
 .cp-icard-install svg {
   flex: 0 0 auto;
 }
 .cp-icard-body {
   padding: 11px 13px 12px;
+  background: inherit;
+  box-shadow: inset 0 1px 0 oklch(1 0 0 / 0.05);
 }
 .cp-icard-name {
   font-size: 13.5px;
@@ -595,4 +588,101 @@
   font-size: 12.5px;
   color: var(--text-dim);
   margin-top: 3px;
+}
+
+.cp-mods-empty-actions {
+  margin-top: 10px;
+}
+
+.cp-tabs {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  min-height: 36px;
+}
+.cp-tabs button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 9px;
+  height: 36px;
+  padding: 0 14px;
+  border: none;
+  border-radius: var(--r-sm);
+  background: transparent;
+  color: color-mix(in oklab, var(--text) 76%, transparent);
+  font-family: inherit;
+  font-size: 13px;
+  font-weight: 600;
+  letter-spacing: 0;
+  white-space: nowrap;
+  cursor: pointer;
+  transition:
+    background 120ms ease,
+    color 120ms ease,
+    box-shadow 120ms ease,
+    scale 70ms ease;
+}
+.cp-tab-icon {
+  display: inline-grid;
+  place-items: center;
+  width: 16px;
+  height: 16px;
+  flex: 0 0 16px;
+}
+.cp-tab-icon svg {
+  opacity: 0.96;
+}
+.cp-tabs button:hover {
+  background: var(--surface-2);
+  color: var(--text);
+  box-shadow:
+    var(--shadow-raised),
+    inset 0 1px 0 oklch(1 0 0 / 0.05);
+}
+.cp-tabs button:active {
+  scale: 0.96;
+}
+.cp-tabs button:focus-visible {
+  outline: none;
+  box-shadow: var(--focus-ring);
+}
+.cp-tabs button[data-active='true'] {
+  background: var(--accent-fill);
+  color: var(--accent-on);
+  box-shadow:
+    inset 0 1px 0 oklch(1 0 0 / 0.14),
+    0 1px 0 oklch(0 0 0 / 0.18);
+}
+.cp-tabs button[data-active='true']:focus-visible {
+  box-shadow:
+    inset 0 1px 0 oklch(1 0 0 / 0.14),
+    0 1px 0 oklch(0 0 0 / 0.18),
+    var(--focus-ring);
+}
+.cp-tabs button[data-active='true'] .cp-tab-icon svg {
+  opacity: 1;
+}
+.cp-tab-count {
+  padding: 1px 7px;
+  border-radius: 999px;
+  background: var(--surface-3);
+  color: var(--text-mute);
+  font-size: 11px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+.cp-tabs button[data-active='true'] .cp-tab-count {
+  background: oklch(1 0 0 / 0.18);
+  color: var(--accent-on);
+}
+
+@media (max-width: 640px) {
+  .cp-tabs button {
+    padding: 0 10px;
+  }
+  .cp-tabs .cp-tab-label {
+    display: none;
+  }
 }

@@ -1,5 +1,5 @@
 use crate::paths::AppPaths;
-use axial_minecraft::VersionEntry;
+use axial_minecraft::{LoaderComponentId, VersionEntry};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::fs;
@@ -8,6 +8,17 @@ use std::ops::Deref;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use thiserror::Error;
+
+pub const INSTANCE_LAYOUT_DIRS: [&str; 7] = [
+    "mods",
+    "saves",
+    "resourcepacks",
+    "shaderpacks",
+    "config",
+    "screenshots",
+    "logs",
+];
+pub const SHARED_INSTANCE_FILES: [&str; 2] = ["options.txt", "servers.dat"];
 
 /// `art_seed` is the source of truth for the instance identity tile: the
 /// frontend derives the tile hues from it, and "shuffle" rewrites it.
@@ -31,6 +42,8 @@ pub struct Instance {
     pub auto_optimize: bool,
     pub icon: String,
     pub accent: String,
+    pub loader_key: String,
+    pub minecraft_version: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -65,12 +78,24 @@ pub struct InstanceVersionDisplay {
 }
 
 impl InstanceVersionDisplay {
-    fn from_version(version: Option<&VersionEntry>) -> Self {
-        let loader_key = version_loader_key(version);
-        let loader_label = version_loader_label(version);
+    fn from_version(version: Option<&VersionEntry>, declared: &Instance) -> Self {
+        let loader = version
+            .and_then(|entry| entry.loader.as_ref())
+            .map(|loader| loader.component_id)
+            .or_else(|| loader_component_from_short_key(declared.loader_key.trim()));
+        let loader_key = loader
+            .map(|id| id.short_key().to_string())
+            .unwrap_or_else(|| "vanilla".to_string());
+        let loader_label = loader
+            .map(|id| id.display_name().to_string())
+            .unwrap_or_else(|| "Vanilla".to_string());
         let minecraft_label = version
             .map(minecraft_label_for_version)
             .filter(|value| !value.trim().is_empty())
+            .or_else(|| {
+                let declared = declared.minecraft_version.trim();
+                (!declared.is_empty()).then(|| declared.to_string())
+            })
             .unwrap_or_else(|| "Unknown".to_string());
         let loader_version_label = version
             .and_then(|entry| entry.loader.as_ref())
@@ -81,12 +106,12 @@ impl InstanceVersionDisplay {
         let loader_detail_label = if loader_version_label.trim().is_empty() {
             loader_label.clone()
         } else {
-            format!("{loader_label} · {loader_version_label}")
+            format!("{loader_label} {loader_version_label}")
         };
-        let supports_mods = version.is_some_and(|entry| entry.loader.is_some());
+        let supports_mods = loader.is_some();
 
         Self {
-            summary_label: format!("{loader_label} · {minecraft_label}"),
+            summary_label: format!("{loader_label} {minecraft_label}"),
             loader_key,
             loader_label,
             minecraft_label,
@@ -94,6 +119,16 @@ impl InstanceVersionDisplay {
             loader_detail_label,
             supports_mods,
         }
+    }
+}
+
+fn loader_component_from_short_key(loader_key: &str) -> Option<LoaderComponentId> {
+    match loader_key {
+        "fabric" => Some(LoaderComponentId::Fabric),
+        "quilt" => Some(LoaderComponentId::Quilt),
+        "forge" => Some(LoaderComponentId::Forge),
+        "neoforge" => Some(LoaderComponentId::NeoForge),
+        _ => None,
     }
 }
 
@@ -203,7 +238,7 @@ impl EnrichedInstance {
             .unwrap_or_default();
 
         Self {
-            version_display: InstanceVersionDisplay::from_version(version),
+            version_display: InstanceVersionDisplay::from_version(version, &instance),
             launch_action: LaunchActionState::from_readiness(
                 launchable,
                 &status_detail,
@@ -220,20 +255,6 @@ impl EnrichedInstance {
             instance,
         }
     }
-}
-
-fn version_loader_key(version: Option<&VersionEntry>) -> String {
-    version
-        .and_then(|entry| entry.loader.as_ref())
-        .map(|loader| loader.component_id.short_key().to_string())
-        .unwrap_or_else(|| "vanilla".to_string())
-}
-
-fn version_loader_label(version: Option<&VersionEntry>) -> String {
-    version
-        .and_then(|entry| entry.loader.as_ref())
-        .map(|loader| loader.component_id.display_name().to_string())
-        .unwrap_or_else(|| "Vanilla".to_string())
 }
 
 fn minecraft_label_for_version(version: &VersionEntry) -> String {
@@ -275,7 +296,7 @@ impl Deref for EnrichedInstance {
     }
 }
 
-pub const INSTANCE_REGISTRY_SCHEMA_VERSION: u32 = 1;
+pub const INSTANCE_REGISTRY_SCHEMA_VERSION: u32 = 2;
 pub const INSTANCE_REGISTRY_MAX_BYTES: u64 = 1024 * 1024;
 pub const INSTANCE_REGISTRY_MAX_ENTRIES: usize = 1024;
 const INSTANCE_NAME_MAX_CHARS: usize = 128;
@@ -585,9 +606,22 @@ fn validate_instance(instance: &Instance) -> Result<(), InstanceStoreError> {
         || !is_bounded_token(&instance.performance_mode, INSTANCE_TOKEN_MAX_CHARS, true)
         || !is_bounded_display_text(&instance.icon, INSTANCE_TOKEN_MAX_CHARS, true)
         || !is_bounded_display_text(&instance.accent, INSTANCE_TOKEN_MAX_CHARS, true)
+        || !is_bounded_token(&instance.loader_key, INSTANCE_TOKEN_MAX_CHARS, true)
     {
         return Err(InstanceStoreError::Validation(
             "instance text field is invalid",
+        ));
+    }
+    if !instance.minecraft_version.is_empty() && !is_safe_version_id(&instance.minecraft_version) {
+        return Err(InstanceStoreError::Validation(
+            "instance Minecraft version is invalid",
+        ));
+    }
+    if !instance.loader_key.is_empty()
+        && loader_component_from_short_key(&instance.loader_key).is_none()
+    {
+        return Err(InstanceStoreError::Validation(
+            "instance loader key is invalid",
         ));
     }
     Ok(())
@@ -669,6 +703,8 @@ mod tests {
             auto_optimize: false,
             icon: String::new(),
             accent: String::new(),
+            loader_key: String::new(),
+            minecraft_version: String::new(),
         }
     }
 
@@ -713,6 +749,23 @@ mod tests {
     }
 
     #[test]
+    fn declared_loader_identity_is_available_before_install_completion() {
+        let mut instance = instance("0000000000000001", "Fabric");
+        instance.version_id = "fabric-loader-0.17.2-1.21.6".to_string();
+        instance.loader_key = "fabric".to_string();
+        instance.minecraft_version = "1.21.6".to_string();
+
+        let enriched = EnrichedInstance::from_instance_without_resource_counts(instance, None);
+
+        assert_eq!(enriched.version_display.loader_key, "fabric");
+        assert_eq!(enriched.version_display.loader_label, "Fabric");
+        assert_eq!(enriched.version_display.minecraft_label, "1.21.6");
+        assert_eq!(enriched.version_display.summary_label, "Fabric 1.21.6");
+        assert!(enriched.version_display.supports_mods);
+        assert!(!enriched.launchable);
+    }
+
+    #[test]
     fn missing_registry_is_admitted_as_empty() {
         let paths = test_paths("missing");
 
@@ -731,10 +784,10 @@ mod tests {
 
     #[test]
     fn unknown_or_missing_fields_are_rejected_without_rewrite() {
-        let unknown = br#"{"schema_version":1,"instances":[],"last_instance_id":"","pending_deletions":[],"legacy":true}"#;
+        let unknown = br#"{"schema_version":2,"instances":[],"last_instance_id":"","pending_deletions":[],"legacy":true}"#;
         assert_rejected_without_rewrite("unknown-field", unknown);
 
-        let missing = br#"{"schema_version":1,"instances":[],"last_instance_id":""}"#;
+        let missing = br#"{"schema_version":2,"instances":[],"last_instance_id":""}"#;
         assert_rejected_without_rewrite("missing-field", missing);
     }
 

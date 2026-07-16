@@ -12,9 +12,6 @@ concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: false
 
-env:
-  AXIAL_MSA_CLIENT_ID: ${{ vars.AXIAL_MSA_CLIENT_ID }}
-
 jobs:
   verify:
     runs-on: ubuntu-24.04
@@ -58,12 +55,10 @@ jobs:
             exit 1
           fi
 
-      - name: Verify Microsoft auth client id provisioning
-        run: |
-          if [ -z "${AXIAL_MSA_CLIENT_ID//[[:space:]]/}" ]; then
-            echo "::error::Release builds require repository variable AXIAL_MSA_CLIENT_ID with the public Microsoft application client id."
+          node -e "const version = process.argv[1]; if (!/^(0|[1-9]\\d*)\\.(0|[1-9]\\d*)\\.(0|[1-9]\\d*)(?:-[0-9A-Za-z-]+(?:\\.[0-9A-Za-z-]+)*)?(?:\\+[0-9A-Za-z-]+(?:\\.[0-9A-Za-z-]+)*)?$/.test(version)) process.exit(1)" "$TAG_VERSION" || {
+            echo "Release version '$TAG_VERSION' is not valid SemVer." >&2
             exit 1
-          fi
+          }
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -95,48 +90,40 @@ jobs:
       - name: Rust tests
         run: cargo test --workspace --locked
 
-      - name: Release desktop build
+      - name: Build linux release desktop binary
         env:
           # Telemetry key is a public write-only PostHog project token; keyless builds never upload (docs/TELEMETRY.md).
           AXIAL_POSTHOG_API_KEY: ${{ secrets.POSTHOG_API_KEY }}
         run: cargo build --locked -p axial-desktop --release
 
+      - name: Upload frontend bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-frontend
+          path: |
+            frontend/static/app.css
+            frontend/static/app.js
+            frontend/static/chunks
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Upload linux release desktop binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-linux-amd64
+          path: target/release/axial-desktop
+          if-no-files-found: error
+          retention-days: 1
+
   linux-desktop:
     needs: verify
     runs-on: ubuntu-24.04
-    container:
-      image: ghcr.io/mateoltd/axial-linux-ci:latest
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Trust checkout as a safe git directory
-        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
-
-      - uses: pnpm/action-setup@v4
+      - name: Download linux release desktop binary
+        uses: actions/download-artifact@v4
         with:
-          version: 11.1.3
-          run_install: false
-
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-          cache: pnpm
-          cache-dependency-path: frontend/pnpm-lock.yaml
-
-      - uses: dtolnay/rust-toolchain@stable
-
-      - uses: Swatinem/rust-cache@v2
-
-      - name: Install frontend dependencies
-        run: pnpm --dir frontend install --frozen-lockfile --ignore-scripts
-
-      - name: Build frontend bundle
-        run: pnpm --dir frontend run build
-
-      - name: Build release desktop binary
-        env:
-          AXIAL_POSTHOG_API_KEY: ${{ secrets.POSTHOG_API_KEY }}
-        run: cargo build --locked -p axial-desktop --release
+          name: release-linux-amd64
+          path: target/release
 
       - name: Package linux desktop binary
         run: |
@@ -144,15 +131,20 @@ jobs:
           mkdir -p dist/linux
           cp target/release/axial-desktop dist/linux/axial
           chmod +x dist/linux/axial
+          cp dist/linux/axial "dist/axial-linux-amd64-${VERSION}"
           tar -C dist/linux -czf "dist/axial-linux-amd64-${VERSION}.tar.gz" axial
-          sha256sum "dist/axial-linux-amd64-${VERSION}.tar.gz" > "dist/axial-linux-amd64-${VERSION}.tar.gz.sha256"
+          (
+            cd dist
+            sha256sum "axial-linux-amd64-${VERSION}" > "axial-linux-amd64-${VERSION}.sha256"
+            sha256sum "axial-linux-amd64-${VERSION}.tar.gz" > "axial-linux-amd64-${VERSION}.tar.gz.sha256"
+          )
 
       - name: Upload linux release asset
         uses: softprops/action-gh-release@v2
         with:
+          prerelease: ${{ contains(github.ref_name, '-') }}
           files: |
-            dist/axial-linux-amd64-*.tar.gz
-            dist/axial-linux-amd64-*.tar.gz.sha256
+            dist/axial-linux-amd64-*
 
   windows-desktop:
     needs: verify
@@ -160,26 +152,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: pnpm/action-setup@v4
+      - name: Download frontend bundle
+        uses: actions/download-artifact@v4
         with:
-          version: 11.1.3
-          run_install: false
-
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-          cache: pnpm
-          cache-dependency-path: frontend/pnpm-lock.yaml
+          name: release-frontend
+          path: frontend/static
 
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@v2
-
-      - name: Install frontend dependencies
-        run: pnpm --dir frontend install --frozen-lockfile --ignore-scripts
-
-      - name: Build frontend bundle
-        run: pnpm --dir frontend run build
 
       - name: Build release desktop binary
         env:
@@ -192,14 +173,94 @@ jobs:
           $version = $env:GITHUB_REF_NAME.TrimStart('v')
           New-Item -ItemType Directory -Force -Path dist/windows | Out-Null
           Copy-Item target/release/axial-desktop.exe dist/windows/axial.exe
+          $executable = "dist/axial-windows-amd64-$version.exe"
+          Copy-Item dist/windows/axial.exe $executable
           $archive = "dist/axial-windows-amd64-$version.zip"
           Compress-Archive -Path dist/windows/axial.exe -DestinationPath $archive -Force
+          $executableHash = Get-FileHash -Algorithm SHA256 -Path $executable
+          "$($executableHash.Hash.ToLowerInvariant())  $(Split-Path -Leaf $executable)" | Set-Content -Path "$executable.sha256" -NoNewline -Encoding ascii
           $hash = Get-FileHash -Algorithm SHA256 -Path $archive
           "$($hash.Hash.ToLowerInvariant())  $(Split-Path -Leaf $archive)" | Set-Content -Path "$archive.sha256" -NoNewline -Encoding ascii
 
       - name: Upload windows release asset
         uses: softprops/action-gh-release@v2
         with:
+          prerelease: ${{ contains(github.ref_name, '-') }}
           files: |
+            dist/axial-windows-amd64-*.exe
+            dist/axial-windows-amd64-*.exe.sha256
             dist/axial-windows-amd64-*.zip
             dist/axial-windows-amd64-*.zip.sha256
+
+  macos-desktop:
+    needs: verify
+    strategy:
+      matrix:
+        include:
+          - runner: macos-15-intel
+            arch: amd64
+          - runner: macos-15
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download frontend bundle
+        uses: actions/download-artifact@v4
+        with:
+          name: release-frontend
+          path: frontend/static
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install Tauri CLI
+        run: cargo install tauri-cli --version "^2.9" --locked
+
+      - name: Build macOS app and DMG
+        env:
+          AXIAL_POSTHOG_API_KEY: ${{ secrets.POSTHOG_API_KEY }}
+        working-directory: apps/desktop
+        run: cargo tauri build --bundles dmg --config '{"build":{"beforeBuildCommand":""}}' -- --locked
+
+      - name: Package macOS release assets
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          mkdir -p dist/macos
+          cp target/release/axial-desktop dist/macos/axial
+          chmod +x dist/macos/axial
+          tar -C dist/macos -czf "dist/axial-macos-${{ matrix.arch }}-${VERSION}.tar.gz" axial
+          set -- target/release/bundle/dmg/*.dmg
+          if [ "$#" -ne 1 ] || [ ! -f "$1" ]; then
+            echo "Expected exactly one macOS DMG, found $#" >&2
+            exit 1
+          fi
+          cp "$1" "dist/axial-macos-${{ matrix.arch }}-${VERSION}.dmg"
+          (
+            cd dist
+            shasum -a 256 "axial-macos-${{ matrix.arch }}-${VERSION}.dmg" > "axial-macos-${{ matrix.arch }}-${VERSION}.dmg.sha256"
+            shasum -a 256 "axial-macos-${{ matrix.arch }}-${VERSION}.tar.gz" > "axial-macos-${{ matrix.arch }}-${VERSION}.tar.gz.sha256"
+          )
+
+      - name: Upload macOS release asset
+        uses: softprops/action-gh-release@v2
+        with:
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          files: |
+            dist/axial-macos-${{ matrix.arch }}-*
+
+  verify-release:
+    needs: [linux-desktop, windows-desktop, macos-desktop]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Verify release assets are published and downloadable
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: node scripts/verify-release-assets.mjs

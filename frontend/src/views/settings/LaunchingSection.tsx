@@ -10,7 +10,7 @@ import { useJvmPresets, jvmPresetSelectLabel, normalizeJvmPreset } from '../../h
 import { useAutoSave } from '../../hooks/use-autosave';
 import { api } from '../../api';
 import { config, systemInfo } from '../../store';
-import { fmtMem } from '../../utils';
+import { fmtMem } from '../../format';
 import type { Config } from '../../types-settings';
 
 export function LaunchingSection(): JSX.Element {

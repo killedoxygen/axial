@@ -1,7 +1,10 @@
+use axial_config::Instance;
+use axial_content::ContentKind;
 use axial_minecraft::{LoaderComponentId, download::DownloadProgress};
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     future::Future,
+    path::PathBuf,
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -74,6 +77,55 @@ impl InstallProgressRecord {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct QueuedContentSelection {
+    pub canonical_id: String,
+    pub kind: ContentKind,
+    pub version_id: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SetupInstanceCleanup {
+    pub baseline: Option<Box<SetupInstanceBaseline>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SetupInstanceBaseline {
+    pub instance: Instance,
+    pub paths: Vec<SetupInstancePathSnapshot>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SetupInstancePathSnapshot {
+    pub relative_path: PathBuf,
+    pub kind: SetupInstancePathKind,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SetupInstancePathKind {
+    Directory,
+    File { size: u64, sha512: String },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ContentQueueAction {
+    Install {
+        selections: Vec<QueuedContentSelection>,
+        allow_incompatible: bool,
+        setup_cleanup: Option<SetupInstanceCleanup>,
+    },
+    Uninstall {
+        canonical_ids: Vec<String>,
+    },
+    Modpack {
+        canonical_id: String,
+        version_id: String,
+        selected_paths: Vec<String>,
+        include_overrides: bool,
+        setup_cleanup: Option<SetupInstanceCleanup>,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum InstallQueueSpec {
     Vanilla {
         version_id: String,
@@ -84,6 +136,12 @@ pub enum InstallQueueSpec {
         target_version_id: String,
         minecraft_version: String,
         loader_version: String,
+    },
+    Content {
+        instance_id: String,
+        label: String,
+        action: ContentQueueAction,
+        prerequisite_queue_id: Option<String>,
     },
 }
 
@@ -116,11 +174,16 @@ impl InstallQueueSpec {
             Self::Loader {
                 target_version_id, ..
             } => target_version_id,
+            Self::Content { instance_id, .. } => instance_id,
         }
     }
 
     pub fn is_loader(&self) -> bool {
         matches!(self, Self::Loader { .. })
+    }
+
+    pub fn is_content(&self) -> bool {
+        matches!(self, Self::Content { .. })
     }
 }
 
@@ -165,7 +228,11 @@ pub enum InstallQueueEnqueueOutcome {
 struct InstallQueueInner {
     active: Option<ActiveQueuedInstallEntry>,
     pending: VecDeque<QueuedInstallEntry>,
+    completed: HashMap<String, bool>,
+    completed_order: VecDeque<String>,
 }
+
+const MAX_COMPLETED_QUEUE_OUTCOMES: usize = 256;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum InstallKey {
@@ -339,7 +406,7 @@ impl InstallStore {
             let Some(entry) = installs.get_mut(install_id) else {
                 return false;
             };
-            if entry.done {
+            if entry.done || entry.terminalizing {
                 return false;
             }
 
@@ -442,18 +509,40 @@ impl InstallStore {
         H: FnOnce(DownloadProgress) -> HFut + Send + 'static,
         HFut: Future<Output = bool> + Send + 'static,
     {
+        Self::spawn_tracked_worker_with_interrupt_progress_owned(
+            store,
+            producer,
+            install_id,
+            interrupted_progress,
+            worker,
+            move |fallback| async move { on_interrupted(fallback.clone()).await.then_some(fallback) },
+        )
+    }
+
+    pub(crate) fn spawn_tracked_worker_with_interrupt_progress_owned<F, H, HFut>(
+        store: Arc<Self>,
+        producer: ProducerLease,
+        install_id: String,
+        interrupted_progress: DownloadProgress,
+        worker: F,
+        on_interrupted: H,
+    ) -> JoinHandle<()>
+    where
+        F: Future<Output = ()> + Send + 'static,
+        H: FnOnce(DownloadProgress) -> HFut + Send + 'static,
+        HFut: Future<Output = Option<DownloadProgress>> + Send + 'static,
+    {
         let worker = producer.claim_child().spawn_joinable(worker);
         producer.spawn_joinable(async move {
             let _ = worker.await;
             if !store.reserve_terminal_if_active(&install_id).await {
                 return;
             }
-            if on_interrupted(interrupted_progress.clone()).await {
-                let _ = store
-                    .finish_reserved(&install_id, interrupted_progress)
-                    .await;
-            } else {
-                store.cancel_reserved_terminal(&install_id).await;
+            match on_interrupted(interrupted_progress).await {
+                Some(progress) => {
+                    let _ = store.finish_reserved(&install_id, progress).await;
+                }
+                None => store.cancel_reserved_terminal(&install_id).await,
             }
         })
     }
@@ -644,7 +733,46 @@ impl InstallStore {
         {
             return None;
         }
-        queue.active.take()
+        let cleared = queue.active.take();
+        prune_queue_outcomes(&mut queue);
+        cleared
+    }
+
+    pub async fn complete_active_queued_install(
+        &self,
+        install_id: &str,
+        succeeded: bool,
+    ) -> Option<ActiveQueuedInstallEntry> {
+        let mut queue = self.queue.write().await;
+        if queue
+            .active
+            .as_ref()
+            .and_then(|active| active.install_id.as_deref())
+            != Some(install_id)
+        {
+            return None;
+        }
+        let completed = queue.active.take()?;
+        record_queue_outcome(&mut queue, &completed.queue_id, succeeded);
+        Some(completed)
+    }
+
+    pub async fn complete_reserved_queued_install(
+        &self,
+        queue_id: &str,
+        succeeded: bool,
+    ) -> Option<ActiveQueuedInstallEntry> {
+        let mut queue = self.queue.write().await;
+        if queue.active.as_ref().map(|active| active.queue_id.as_str()) != Some(queue_id) {
+            return None;
+        }
+        let completed = queue.active.take()?;
+        record_queue_outcome(&mut queue, &completed.queue_id, succeeded);
+        Some(completed)
+    }
+
+    pub async fn queued_install_succeeded(&self, queue_id: &str) -> Option<bool> {
+        self.queue.read().await.completed.get(queue_id).copied()
     }
 
     pub async fn release_active_queued_install_to_front(&self, queue_id: &str) -> bool {
@@ -668,6 +796,7 @@ impl InstallStore {
             return false;
         }
         queue.active.take();
+        prune_queue_outcomes(&mut queue);
         true
     }
 
@@ -677,7 +806,9 @@ impl InstallStore {
             .pending
             .iter()
             .position(|entry| entry.queue_id == queue_id)?;
-        queue.pending.remove(position)
+        let removed = queue.pending.remove(position);
+        prune_queue_outcomes(&mut queue);
+        removed
     }
 
     pub async fn queue_snapshot(&self) -> InstallQueueSnapshot {
@@ -723,6 +854,45 @@ fn now_unix_ms() -> u64 {
         .unwrap_or_default()
 }
 
+fn record_queue_outcome(queue: &mut InstallQueueInner, queue_id: &str, succeeded: bool) {
+    queue
+        .completed_order
+        .retain(|completed_id| completed_id != queue_id);
+    queue.completed.insert(queue_id.to_string(), succeeded);
+    queue.completed_order.push_back(queue_id.to_string());
+    prune_queue_outcomes(queue);
+}
+
+fn prune_queue_outcomes(queue: &mut InstallQueueInner) {
+    let referenced: HashSet<String> = queue
+        .active
+        .iter()
+        .map(|entry| &entry.spec)
+        .chain(queue.pending.iter().map(|entry| &entry.spec))
+        .filter_map(|spec| match spec {
+            InstallQueueSpec::Content {
+                prerequisite_queue_id,
+                ..
+            } => prerequisite_queue_id.clone(),
+            _ => None,
+        })
+        .collect();
+    while queue.completed_order.len() > MAX_COMPLETED_QUEUE_OUTCOMES {
+        let Some(position) = queue
+            .completed_order
+            .iter()
+            .position(|queue_id| !referenced.contains(queue_id))
+        else {
+            break;
+        };
+        let expired = queue
+            .completed_order
+            .remove(position)
+            .expect("completed outcome position is valid");
+        queue.completed.remove(&expired);
+    }
+}
+
 impl Default for InstallStore {
     fn default() -> Self {
         Self::new()
@@ -733,6 +903,85 @@ impl Default for InstallStore {
 mod tests {
     use super::*;
     use axial_minecraft::build_id_for;
+
+    #[test]
+    fn queue_outcomes_keep_reused_ids_recent_and_unique() {
+        let mut queue = InstallQueueInner::default();
+        record_queue_outcome(&mut queue, "reused", false);
+        for index in 0..MAX_COMPLETED_QUEUE_OUTCOMES - 1 {
+            record_queue_outcome(&mut queue, &format!("older-{index}"), true);
+        }
+
+        record_queue_outcome(&mut queue, "reused", true);
+        record_queue_outcome(&mut queue, "newest", true);
+
+        assert_eq!(queue.completed.get("reused"), Some(&true));
+        assert_eq!(
+            queue
+                .completed_order
+                .iter()
+                .filter(|queue_id| queue_id.as_str() == "reused")
+                .count(),
+            1
+        );
+        assert_eq!(queue.completed_order.len(), MAX_COMPLETED_QUEUE_OUTCOMES);
+        assert!(!queue.completed.contains_key("older-0"));
+        assert_eq!(queue.completed.get("newest"), Some(&true));
+    }
+
+    #[tokio::test]
+    async fn queue_outcomes_remain_until_pending_dependents_finish() {
+        let store = InstallStore::new();
+        store
+            .enqueue_queued_install(
+                "dependent".to_string(),
+                InstallQueueSpec::Content {
+                    instance_id: "instance".to_string(),
+                    label: "Dependent content".to_string(),
+                    action: ContentQueueAction::Install {
+                        selections: Vec::new(),
+                        allow_incompatible: false,
+                        setup_cleanup: None,
+                    },
+                    prerequisite_queue_id: Some("prerequisite".to_string()),
+                },
+                InstallQueuePlacement::Back,
+            )
+            .await;
+        {
+            let mut queue = store.queue.write().await;
+            record_queue_outcome(&mut queue, "prerequisite", true);
+            for index in 0..MAX_COMPLETED_QUEUE_OUTCOMES {
+                record_queue_outcome(&mut queue, &format!("newer-{index}"), true);
+            }
+            assert_eq!(queue.completed_order.len(), MAX_COMPLETED_QUEUE_OUTCOMES);
+        }
+
+        assert_eq!(
+            store.queued_install_succeeded("prerequisite").await,
+            Some(true)
+        );
+        let dependent = store
+            .reserve_next_queued_install()
+            .await
+            .expect("reserve dependent");
+        assert_eq!(dependent.queue_id, "dependent");
+        assert_eq!(
+            store.queued_install_succeeded("prerequisite").await,
+            Some(true),
+            "the active dependent must retain its prerequisite outcome"
+        );
+
+        store
+            .complete_reserved_queued_install("dependent", true)
+            .await
+            .expect("complete dependent");
+        assert_eq!(store.queued_install_succeeded("prerequisite").await, None);
+        assert_eq!(
+            store.queue.read().await.completed_order.len(),
+            MAX_COMPLETED_QUEUE_OUTCOMES
+        );
+    }
 
     #[tokio::test]
     async fn install_insert_or_existing_reuses_active_matching_key() {

@@ -6,11 +6,17 @@ import type {
 } from './types-install';
 
 export function cloneInstallItem(item: InstallItem): InstallItem {
-  return item.loader ? { versionId: item.versionId, loader: { ...item.loader } } : { versionId: item.versionId };
+  if (item.loader) return { versionId: item.versionId, loader: { ...item.loader } };
+  if (item.content) return { versionId: item.versionId, content: structuredClone(item.content) };
+  return { versionId: item.versionId };
 }
 
 export function isSameInstallItem(left: InstallItem, right: InstallItem): boolean {
   if (left.versionId !== right.versionId) return false;
+  if (left.content || right.content) {
+    if (!left.content || !right.content) return false;
+    return JSON.stringify(left.content) === JSON.stringify(right.content);
+  }
   if (!left.loader && !right.loader) return true;
   if (!left.loader || !right.loader) return false;
   return left.loader.componentId === right.loader.componentId && left.loader.buildId === right.loader.buildId;
@@ -18,6 +24,7 @@ export function isSameInstallItem(left: InstallItem, right: InstallItem): boolea
 
 export function installItemFromQueueInstallItem(value: InstallQueueInstallItemViewModel): InstallItem {
   const versionId = value.version_id;
+  if (value.content) return { versionId, content: value.content };
   if (!value.loader) return { versionId };
   return {
     versionId,
@@ -35,6 +42,13 @@ export function installItemFromQueuedViewModel(item: InstallQueuedItemViewModel)
 }
 
 export function installQueueRequestFromItem(item: InstallItem): InstallQueueRequest {
+  if (item.content) {
+    return {
+      kind: 'content',
+      instance_id: item.content.instance_id,
+      content_action: item.content.action,
+    };
+  }
   if (!item.loader) {
     return {
       kind: 'vanilla',

@@ -83,6 +83,71 @@ fn known_good_acceptance_failure_replaces_terminal_success_with_bounded_failure(
 }
 
 #[test]
+fn content_queue_request_is_strict_and_cannot_claim_setup_cleanup() {
+    let request = serde_json::from_value::<InstallQueueRequest>(serde_json::json!({
+        "kind": "content",
+        "instance_id": "0000000000000001",
+        "label": "Adding content",
+        "action": {
+            "kind": "install",
+            "selections": [{
+                "canonical_id": "modrinth:sodium",
+                "kind": "mod",
+                "version_id": "version-2"
+            }],
+            "allow_incompatible": false,
+            "remove_instance_on_failure": true
+        }
+    }));
+
+    assert!(request.is_err());
+}
+
+#[test]
+fn content_queue_view_model_retains_semantic_intent_without_urls() {
+    let spec = InstallQueueSpec::Content {
+        instance_id: "0000000000000001".to_string(),
+        label: "Updating Sodium".to_string(),
+        prerequisite_queue_id: None,
+        action: ContentQueueAction::Install {
+            selections: vec![QueuedContentSelection {
+                canonical_id: "modrinth:sodium".to_string(),
+                kind: axial_content::ContentKind::Mod,
+                version_id: Some("version-2".to_string()),
+            }],
+            allow_incompatible: false,
+            setup_cleanup: None,
+        },
+    };
+
+    let item = install_queue_install_item(&spec);
+    let content = item.content.expect("content queue item");
+    let encoded = serde_json::to_string(&content).expect("serialize content item");
+
+    assert_eq!(content.instance_id, "0000000000000001");
+    assert!(encoded.contains("modrinth:sodium"));
+    assert!(!encoded.contains("https://"));
+    assert!(!encoded.contains("remove_instance_on_failure"));
+}
+
+#[test]
+fn retry_is_disabled_after_setup_cleanup_removes_the_instance() {
+    let progress = InstallProgressViewModel {
+        phase_id: CONTENT_INSTANCE_REMOVED_PHASE.to_string(),
+        label: "Setup failed and the incomplete instance was removed".to_string(),
+        progress_pct: 100,
+        terminal: true,
+        failed: true,
+        active_step: None,
+    };
+
+    let failure = install_failure_view_model(&progress, None).expect("failure view model");
+
+    assert_eq!(failure.state_id, "failed_instance_removed");
+    assert!(!failure.retry_action.enabled);
+}
+
+#[test]
 fn effective_install_version_id_trims_version_id() {
     let payload = InstallVersionStartRequest {
         version_id: " 1.21.5 ".to_string(),

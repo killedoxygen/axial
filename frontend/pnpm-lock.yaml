@@ -17,6 +17,12 @@ importers:
       preact:
         specifier: ^10.25.0
         version: 10.29.0
+      react-markdown:
+        specifier: ^9.1.0
+        version: 9.1.0(@types/react@19.2.14)(react@19.2.6)
+      remark-gfm:
+        specifier: ^4.0.1
+        version: 4.0.1
       three:
         specifier: ^0.184.0
         version: 0.184.0

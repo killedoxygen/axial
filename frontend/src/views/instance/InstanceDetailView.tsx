@@ -10,9 +10,9 @@ import { selectInstance } from '../../actions';
 import { launchGame, killGame } from '../../launch';
 import { handleInstallClick, retryFailedInstall } from '../../machines/downloads';
 import { errMessage } from '../../utils';
+import { formatDate, fmtRelative } from '../../format';
 import { instanceInstallStatus } from '../../instance-install-status';
 import type { EnrichedInstance } from '../../types-instance';
-import { fmtJoined, fmtRelative } from './format';
 import { fetchInstanceResources, type ResourceLoadState } from './resources';
 import { LOG_RESOURCE_POLL_MS } from './logs';
 import { deleteInstanceFlow, duplicateInstance, openInstanceFolder, renameInstance } from './instance-actions';
@@ -227,17 +227,11 @@ export function InstanceDetailView({ id }: { id: string }): JSX.Element {
               <span class="cp-instance-status" data-running={running}>
                 {running ? 'Playing now' : 'Ready'}
               </span>
-              <span class="cp-instance-hero-meta-sep" aria-hidden="true">
-                ·
-              </span>
               <span>
                 Last played <b>{fmtRelative(inst.last_played_at)}</b>
               </span>
-              <span class="cp-instance-hero-meta-sep" aria-hidden="true">
-                ·
-              </span>
               <span>
-                Created <b>{fmtJoined(inst.created_at)}</b>
+                Created <b>{formatDate(inst.created_at, 'unknown')}</b>
               </span>
             </div>
           </div>
@@ -246,7 +240,6 @@ export function InstanceDetailView({ id }: { id: string }): JSX.Element {
               {running ? (
                 <div class="cp-session">
                   <span class="cp-session-time">
-                    <span class="cp-session-dot" aria-hidden="true" />
                     <span>{fmtElapsed(session?.launchedAt, now)}</span>
                   </span>
                   <button class="cp-session-stop" type="button" onClick={onStop}>
@@ -301,7 +294,7 @@ export function InstanceDetailView({ id }: { id: string }): JSX.Element {
         </header>
 
         {!installLocked && (
-          <div class="cp-instance-tabs" role="tablist">
+          <div class="cp-tabs" role="tablist">
             {visibleTabs.map((t) => {
               const count = tabCount(t.id);
               return (

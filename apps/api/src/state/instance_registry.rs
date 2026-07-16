@@ -716,6 +716,8 @@ pub(crate) fn new_instance(
         auto_optimize: false,
         icon,
         accent,
+        loader_key: String::new(),
+        minecraft_version: String::new(),
     }
 }
 

@@ -27,11 +27,34 @@ type AccountSwitcherHostComponent = (typeof import('./views/accounts/AccountSwit
 let loadedCommandPalette: CommandPaletteComponent | null = null;
 let loadedAccountSwitcherHost: AccountSwitcherHostComponent | null = null;
 
+const deferredViewPreloads: (() => Promise<void>)[] = [
+  async () => {
+    loadedCommandPalette ??= (await import('./ui/CommandPalette')).CommandPalette;
+  },
+  async () => {
+    loadedAccountSwitcherHost ??= (await import('./views/accounts/AccountSwitcherHost')).AccountSwitcherHost;
+  },
+];
+
+/* Warm every lazily loaded view during idle time so the first navigation (or
+   first New Instance) renders synchronously instead of hitting a chunk load.
+   Failures are ignored: the lazy path retries on actual navigation. */
+export function preloadDeferredViews(): void {
+  for (const preload of deferredViewPreloads) {
+    void preload().catch(() => undefined);
+  }
+}
+
 const InstanceDetailRoute = createRouteLoader<{ id: string }>(
   async () => (await import('./views/instance/InstanceDetailView')).InstanceDetailView,
 );
 
 const InstancesRoute = createRouteLoader(async () => (await import('./views/instances/InstancesView')).InstancesView);
+
+const DiscoverRoute = createRouteLoader(async () => (await import('./views/discover/DiscoverView')).DiscoverView);
+const ContentDetailRoute = createRouteLoader(
+  async () => (await import('./views/discover/ContentDetailView')).ContentDetailView,
+);
 
 const CreateOverlay = createRouteLoader(async () => (await import('./views/create/CreateView')).CreateView);
 
@@ -51,6 +74,10 @@ const DevLabRouteView = loadDevLabView ? createRouteLoader(loadDevLabView) : nul
 
 function createRouteLoader<P extends object>(load: () => Promise<ComponentType<P>>): ComponentType<P> {
   let loadedView: ComponentType<P> | null = null;
+
+  deferredViewPreloads.push(async () => {
+    loadedView ??= await load();
+  });
 
   return function LazyRouteView(props: P): JSX.Element {
     const [View, setView] = useState<ComponentType<P> | null>(() => loadedView);
@@ -142,7 +169,7 @@ function LazyAccountSwitcherHost(): JSX.Element | null {
 
 function CurrentView(): JSX.Element {
   const r = route.value;
-  const routeKey = r.name === 'instance' ? `instance:${r.id}` : r.name;
+  const routeKey = r.name === 'instance' || r.name === 'content' ? `${r.name}:${r.id}` : r.name;
   useEffect(() => {
     resetViewScroll();
   }, [routeKey]);
@@ -153,6 +180,10 @@ function CurrentView(): JSX.Element {
       return <InstancesRoute />;
     case 'instance':
       return <InstanceDetailRoute id={r.id} />;
+    case 'discover':
+      return <DiscoverRoute />;
+    case 'content':
+      return <ContentDetailRoute />;
     case 'dev-lab':
       return <DevLabRoute />;
     case 'downloads':

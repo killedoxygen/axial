@@ -32,6 +32,7 @@ mod remote_flags;
 mod sessions;
 mod shutdown;
 pub mod skins;
+pub mod updater;
 mod user_config_snapshots;
 mod user_mod_witness;
 
@@ -40,6 +41,7 @@ use axial_config::{
     InstanceStore as StartupInstanceStore, InstanceStoreError, find_flag, generate_instance_id,
     is_canonical_instance_id,
 };
+use axial_content::ContentRegistry;
 pub use axial_launcher::{LaunchEvent, LaunchLogEvent, LaunchSessionRecord, LaunchStatusEvent};
 use axial_minecraft::ManagedRuntimeCache;
 pub use axial_minecraft::download::DownloadProgress;
@@ -70,9 +72,10 @@ pub use failure_memory::GuardianFailureMemoryStore;
 pub(crate) use installed_versions::{InstalledVersionsLookup, InstalledVersionsSnapshot};
 pub(crate) use installs::InstallInitializationStatus;
 pub use installs::{
-    ActiveQueuedInstallEntry, InstallProgressRecord, InstallQueueEnqueueOutcome,
-    InstallQueuePlacement, InstallQueueSnapshot, InstallQueueSpec, InstallSnapshot, InstallStore,
-    QueuedInstallEntry,
+    ActiveQueuedInstallEntry, ContentQueueAction, InstallProgressRecord,
+    InstallQueueEnqueueOutcome, InstallQueuePlacement, InstallQueueSnapshot, InstallQueueSpec,
+    InstallSnapshot, InstallStore, QueuedContentSelection, QueuedInstallEntry,
+    SetupInstanceBaseline, SetupInstanceCleanup, SetupInstancePathKind, SetupInstancePathSnapshot,
 };
 pub use instance_registry::AppInstanceStore;
 pub(crate) use instance_registry::instance_not_found_error;
@@ -157,6 +160,7 @@ pub(crate) use sessions::{LaunchFailureTermination, LaunchFailureTerminationErro
 pub use sessions::{SessionAdmissionError, SessionStopError, SessionStore, StartupOutcome};
 use shutdown::AppShutdownCoordinator;
 pub use shutdown::{AppShutdownError, AppShutdownStep};
+pub use updater::{UpdateFlowPhase, UpdateFlowSnapshot, UpdaterStore};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -184,6 +188,8 @@ pub struct AppState {
     performance: Arc<AppPerformanceStore>,
     telemetry: Arc<TelemetryHub>,
     remote_flags: Arc<RemoteFlagStore>,
+    updater: Arc<UpdaterStore>,
+    content: Arc<ContentRegistry>,
     launch_reports: Arc<launch_reports::LaunchReportStore>,
     persisted_state_load: Arc<PersistedStateLoadEvidence>,
     persisted_state_rejection_streaks:
@@ -635,6 +641,8 @@ impl AppState {
                 instances.list().into_iter().map(|instance| instance.id),
             )?;
         }
+        let updater = Arc::new(UpdaterStore::new(&config.paths().config_dir));
+        let content = Arc::new(ContentRegistry::new(content_http_client()));
         let (config_changes, _) = broadcast::channel(32);
 
         Ok(Self {
@@ -662,6 +670,8 @@ impl AppState {
             performance,
             telemetry,
             remote_flags,
+            updater,
+            content,
             launch_reports,
             persisted_state_load,
             persisted_state_rejection_streaks,
@@ -741,6 +751,10 @@ impl AppState {
 
     pub fn installs(&self) -> &Arc<InstallStore> {
         &self.installs
+    }
+
+    pub fn content(&self) -> &Arc<ContentRegistry> {
+        &self.content
     }
 
     pub fn failure_memory(&self) -> &Arc<GuardianFailureMemoryStore> {
@@ -1012,6 +1026,14 @@ impl AppState {
 
     pub(crate) fn remote_flags(&self) -> &Arc<RemoteFlagStore> {
         &self.remote_flags
+    }
+
+    pub fn updater(&self) -> &Arc<UpdaterStore> {
+        &self.updater
+    }
+
+    pub fn content(&self) -> &Arc<ContentRegistry> {
+        &self.content
     }
 
     pub(crate) fn launch_reports(&self) -> &Arc<launch_reports::LaunchReportStore> {
@@ -1325,6 +1347,92 @@ impl AppState {
             )));
         }
         result
+    }
+
+    pub(crate) async fn delete_pristine_setup_instance(
+        &self,
+        foreground: &IntegrityForegroundLease,
+        instance_id: String,
+        cleanup: &SetupInstanceCleanup,
+    ) -> Result<bool, InstanceStoreError> {
+        self.validate_integrity_foreground(foreground)
+            .map_err(|_| InstanceStoreError::Persistence(foreign_integrity_foreground_error()))?;
+        let Some(baseline) = cleanup.baseline.as_deref() else {
+            return Ok(false);
+        };
+        if baseline.instance.id != instance_id {
+            return Ok(false);
+        }
+        let lifecycle = self
+            .acquire_integrity_instance_lifecycle(foreground, &instance_id)
+            .await
+            .map_err(|_| InstanceStoreError::Persistence(foreign_integrity_foreground_error()))?;
+        if self.sessions.has_active_instance(&instance_id).await {
+            return Ok(false);
+        }
+        let instances = self.instances.clone();
+        let gate = instances.acquire_mutation().await?;
+        if instances.get(&instance_id).as_ref() != Some(&baseline.instance) {
+            return Ok(false);
+        }
+        let game_dir = instances.game_dir(&instance_id);
+        if !setup_instance_paths_match(&game_dir, &baseline.paths) {
+            return Ok(false);
+        }
+
+        let retirement = self
+            .performance
+            .retire_managed(&instance_id)
+            .await
+            .map_err(|error| {
+                InstanceStoreError::Persistence(std::io::Error::other(error.to_string()))
+            })?;
+        let known_good_retirement = self
+            .known_good
+            .reserve_retirement(&instance_id)
+            .map_err(InstanceStoreError::Persistence)?;
+        let _lifecycle = lifecycle;
+        let retained_instance_id = instance_id.clone();
+        let result = instances.delete_with_gate(instance_id, true, gate).await;
+        if instances.get(&retained_instance_id).is_none() {
+            retirement.commit();
+            if known_good_retirement.commit().await.is_err() {
+                tracing::warn!(
+                    instance_id = retained_instance_id,
+                    "known-good retirement cleanup was retained for retry"
+                );
+            }
+            if self
+                .user_mod_witnesses
+                .remove(&retained_instance_id)
+                .await
+                .is_err()
+            {
+                tracing::warn!(
+                    instance_id = retained_instance_id,
+                    "user mod witness retirement cleanup was retained for retry"
+                );
+            }
+            if self
+                .user_config_snapshots
+                .retire_instance(retained_instance_id.clone())
+                .await
+                .is_err()
+            {
+                tracing::warn!(
+                    instance_id = retained_instance_id,
+                    "user config snapshot retirement cleanup was retained for retry"
+                );
+            }
+            result?;
+            return Ok(true);
+        }
+        if result.is_ok() {
+            return Err(InstanceStoreError::Persistence(std::io::Error::other(
+                "instance registry reported successful deletion without removing the instance",
+            )));
+        }
+        result.map(|_| false)
     }
 
     pub(crate) async fn update_instance(
@@ -2614,4 +2722,67 @@ mod known_good_identity_tests {
 
         let _ = std::fs::remove_dir_all(root);
     }
+}
+
+fn content_http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(15))
+        .build()
+        .expect("content HTTP client configuration must be valid")
+}
+
+fn setup_instance_paths_match(game_dir: &Path, expected: &[SetupInstancePathSnapshot]) -> bool {
+    let Ok(root_metadata) = std::fs::symlink_metadata(game_dir) else {
+        return false;
+    };
+    if !root_metadata.is_dir() || root_metadata.file_type().is_symlink() {
+        return false;
+    }
+    let mut expected_by_path = std::collections::HashMap::with_capacity(expected.len());
+    for entry in expected {
+        if entry.relative_path.as_os_str().is_empty()
+            || !entry
+                .relative_path
+                .components()
+                .all(|component| matches!(component, std::path::Component::Normal(_)))
+            || expected_by_path
+                .insert(entry.relative_path.as_path(), &entry.kind)
+                .is_some()
+        {
+            return false;
+        }
+    }
+
+    let mut seen = std::collections::HashSet::with_capacity(expected.len());
+    let mut pending = vec![game_dir.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        let Ok(entries) = std::fs::read_dir(&directory) else {
+            return false;
+        };
+        for entry in entries {
+            let Ok(entry) = entry else { return false };
+            let path = entry.path();
+            let Ok(relative) = path.strip_prefix(game_dir) else {
+                return false;
+            };
+            let Some(expected_kind) = expected_by_path.get(relative) else {
+                return false;
+            };
+            let Ok(metadata) = std::fs::symlink_metadata(&path) else {
+                return false;
+            };
+            if metadata.file_type().is_symlink() || !seen.insert(relative.to_path_buf()) {
+                return false;
+            }
+            match expected_kind {
+                SetupInstancePathKind::Directory if metadata.is_dir() => pending.push(path),
+                SetupInstancePathKind::File { size, sha512 }
+                    if metadata.is_file()
+                        && metadata.len() == *size
+                        && axial_content::sha512_file(&path).ok().as_ref() == Some(sha512) => {}
+                _ => return false,
+            }
+        }
+    }
+    seen.len() == expected_by_path.len()
 }
