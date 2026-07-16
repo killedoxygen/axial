@@ -2819,7 +2819,7 @@ async fn startup_rejects_matching_plan_with_malformed_terminal_transition() {
 }
 
 #[tokio::test]
-async fn startup_invalid_terminal_status_cannot_republish_matching_success_proof() {
+async fn startup_invalid_terminal_status_is_rejected_without_effect() {
     let (root, install_id, _, lock_path) = seed_restart_checkpoint(
         "restart-terminal-missing-identity",
         RestartCheckpoint::Terminal,
@@ -2830,22 +2830,39 @@ async fn startup_invalid_terminal_status_cannot_republish_matching_success_proof
 
     assert_eq!(
         resume_pending_performance_operations(state.clone()).await,
-        1
+        0
     );
     assert!(
         lock_path.is_file(),
         "invalid terminal status cannot replay effect"
     );
-    let public = performance_operation_status(&state, &install_id)
-        .await
-        .expect("invalid terminal public status");
-    assert_eq!(public.status.state, "failed");
-    assert!(public.proof.is_none());
+    assert!(
+        state
+            .performance_operations()
+            .get(&install_id)
+            .await
+            .is_none()
+    );
+    assert!(matches!(
+        performance_operation_status(&state, &install_id).await,
+        Err((StatusCode::NOT_FOUND, _))
+    ));
+    assert!(
+        state
+            .persisted_state_load_evidence()
+            .rejected_records()
+            .iter()
+            .any(|record| {
+                record.target().id == install_id
+                    && format!("{:?}", record.store()) == "PerformanceOperation"
+                    && format!("{:?}", record.rejection()) == "InvalidSemantics"
+            })
+    );
     let _ = fs::remove_dir_all(root);
 }
 
 #[tokio::test]
-async fn startup_unknown_status_state_fails_without_effect() {
+async fn startup_unknown_status_state_is_rejected_without_effect() {
     let root = test_root("restart-unknown-state");
     let state = build_test_state(&root, None, None);
     let instance_id = insert_persisted_test_instance(&state, "Managed", "1.20.4-fabric")
@@ -2872,24 +2889,30 @@ async fn startup_unknown_status_state_fails_without_effect() {
     let reloaded = build_test_state(&root, None, None);
     assert_eq!(
         resume_pending_performance_operations(reloaded.clone()).await,
-        1
+        0
     );
     assert!(lock_path.is_file(), "unknown state cannot authorize effect");
-    assert_eq!(
+    assert!(
         reloaded
             .performance_operations()
             .get(&install_id)
             .await
-            .expect("unknown status retained")
-            .state,
-        "failed"
-    );
-    assert!(
-        performance_operation_status(&reloaded, &install_id)
-            .await
-            .expect("unknown public status")
-            .proof
             .is_none()
+    );
+    assert!(matches!(
+        performance_operation_status(&reloaded, &install_id).await,
+        Err((StatusCode::NOT_FOUND, _))
+    ));
+    assert!(
+        reloaded
+            .persisted_state_load_evidence()
+            .rejected_records()
+            .iter()
+            .any(|record| {
+                record.target().id == install_id
+                    && format!("{:?}", record.store()) == "PerformanceOperation"
+                    && format!("{:?}", record.rejection()) == "InvalidSemantics"
+            })
     );
     let _ = fs::remove_dir_all(root);
 }

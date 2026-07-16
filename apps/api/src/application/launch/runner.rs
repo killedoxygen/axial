@@ -3417,7 +3417,20 @@ mod tests {
             state.instances().last_instance_id().as_deref(),
             Some(registered.id.as_str())
         );
-        assert!(state.subscribe_integrity_idle().borrow().is_stably_idle());
+        let mut integrity_idle = state.subscribe_integrity_idle();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if integrity_idle.borrow_and_update().is_stably_idle() {
+                    break;
+                }
+                integrity_idle
+                    .changed()
+                    .await
+                    .expect("integrity activity remains observable");
+            }
+        })
+        .await
+        .expect("metadata and witness foreground settle");
         let _ = state.sessions().kill(session_id).await;
         let _ = fs::remove_dir_all(root);
     }

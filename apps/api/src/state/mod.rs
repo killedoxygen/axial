@@ -397,9 +397,7 @@ impl AppState {
                 .expect("failed to create isolated managed runtime cache"),
             RejectionStreakStartupMode::Discard,
         )
-        .unwrap_or_else(|error| {
-            panic!("failed to initialize known-good inventory persistence: {error}")
-        })
+        .unwrap_or_else(|error| panic!("failed to initialize application persistence: {error}"))
     }
 
     pub async fn load(mut init: AppStateInit) -> std::io::Result<Self> {
