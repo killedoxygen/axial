@@ -134,9 +134,9 @@
       "outcome": {
         "decision": "Block",
         "phase": "Downloading",
-        "summary": "Guardian paused install retry after repeated provider failure.",
+        "summary": "Guardian paused further install retries after repeated provider failure.",
         "details": [
-          "The install stopped because the same provider or network download failure repeated within the retry cooldown."
+          "The same provider or network download failure repeated while the retry cooldown was active."
         ],
         "guidance": [
           "Wait a few minutes, then retry after checking connection and storage availability."

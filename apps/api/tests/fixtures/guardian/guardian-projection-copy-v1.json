@@ -145,8 +145,8 @@
         "diagnosis_id": "download_unavailable",
         "facts": [
           "guardian_outcome_decision:block",
-          "guardian_outcome_summary:Guardian paused install retry after repeated provider failure.",
-          "guardian_outcome_detail:The install stopped because the same provider or network download failure repeated within the retry cooldown."
+          "guardian_outcome_summary:Guardian paused further install retries after repeated provider failure.",
+          "guardian_outcome_detail:The same provider or network download failure repeated while the retry cooldown was active."
         ]
       },
       "output": {
@@ -154,8 +154,8 @@
         "outcome": {
           "diagnosis_id": "download_unavailable",
           "decision": "block",
-          "label": "Guardian paused install retry after repeated provider failure.",
-          "detail": "The install stopped because the same provider or network download failure repeated within the retry cooldown.",
+          "label": "Guardian paused further install retries after repeated provider failure.",
+          "detail": "The same provider or network download failure repeated while the retry cooldown was active.",
           "guidance": [
             "Wait a few minutes, then retry after checking connection and storage availability."
           ]

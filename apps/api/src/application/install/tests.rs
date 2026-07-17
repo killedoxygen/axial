@@ -5210,6 +5210,92 @@ fn install_journal_outcome_replay_rejects_duplicate_markers() {
 }
 
 #[tokio::test]
+async fn provider_retry_memory_is_not_published_before_terminal_journal_reconciliation() {
+    let root = temp_root("provider-memory-after-terminal-journal");
+    let (backend, journals) = install_journal_persistence_fixture(&root);
+    let failure_memory = Arc::new(GuardianFailureMemoryStore::new());
+    let operation_id = install_operation_id("provider-memory-after-terminal-journal");
+    begin_install_operation_journal(&journals, &operation_id, "1.21.5")
+        .await
+        .expect("record install journal");
+    let facts = [download_fact(
+        ExecutionDownloadFactKind::ProviderFailure,
+        "minecraft_client_1.21.5",
+    )];
+    let evidence = install_failure_evidence_from_download_facts(&operation_id, &facts);
+    record_install_operation_guardian_evidence(
+        &journals,
+        &operation_id,
+        &evidence,
+        OperationPhase::Downloading,
+    )
+    .await
+    .expect("record Guardian evidence");
+
+    let attempts_before = backend.attempts.load(Ordering::SeqCst);
+    backend.fail_next();
+    let retry_gate = backend.gate_attempt(attempts_before + 2);
+    let terminal = tokio::spawn({
+        let journals = journals.clone();
+        let failure_memory = failure_memory.clone();
+        let operation_id = operation_id.clone();
+        let evidence = evidence.clone();
+        async move {
+            let assessment = assess_install_guardian_failure(
+                Some(&failure_memory),
+                &operation_id,
+                &evidence,
+                OperationPhase::Downloading,
+                "2026-06-16T10:00:00+00:00",
+            )
+            .expect("provider failure assessment");
+            record_install_guardian_terminal_outcome(
+                &journals,
+                Some(&failure_memory),
+                &operation_id,
+                &evidence,
+                OperationPhase::Downloading,
+                &assessment,
+                "2026-06-16T10:00:00+00:00",
+            )
+            .await
+        }
+    });
+
+    timeout(
+        Duration::from_secs(1),
+        backend.wait_for_attempt(attempts_before + 2),
+    )
+    .await
+    .expect("terminal journal reconciliation retries");
+    assert!(failure_memory.list().is_empty());
+    assert!(
+        journals
+            .get(&operation_id)
+            .and_then(|entry| install_guardian_outcome_summary_from_journal(&entry))
+            .is_none()
+    );
+
+    retry_gate.release();
+    timeout(Duration::from_secs(1), terminal)
+        .await
+        .expect("terminal reconciliation completes")
+        .expect("terminal task")
+        .expect("record terminal outcome");
+    assert_eq!(failure_memory.list().len(), 1);
+    let entry = journals.get(&operation_id).expect("reconciled journal");
+    assert_eq!(
+        install_guardian_outcome_summary_from_journal(&entry)
+            .expect("reconciled Guardian outcome")
+            .decision(),
+        "retry"
+    );
+
+    journals.close().await.expect("close journals");
+    fs::remove_dir_all(root).expect("cleanup");
+}
+
+#[tokio::test]
 async fn vanilla_provider_failure_records_guardian_retry_then_suppression_without_raw_details() {
     let journals = OperationJournalStore::new();
     let failure_memory = GuardianFailureMemoryStore::new();
@@ -5252,7 +5338,16 @@ async fn vanilla_provider_failure_records_guardian_retry_then_suppression_withou
             .label()
             .contains("install download failure as retryable")
     );
-    assert_eq!(failure_memory.list().len(), 1);
+    let retry_memory = failure_memory.list();
+    assert_eq!(retry_memory.len(), 1);
+    let retry_memory = retry_memory[0].clone();
+    assert_eq!(retry_memory.occurrence_count, 1);
+    assert_eq!(retry_memory.first_observed_at, "2026-06-16T10:00:00+00:00");
+    assert_eq!(retry_memory.last_observed_at, "2026-06-16T10:00:00+00:00");
+    assert_eq!(
+        retry_memory.suppression_until.as_deref(),
+        Some("2026-06-16T10:05:00+00:00")
+    );
     assert_no_sensitive_fragments(&serde_json::to_string(&entry).expect("journal json"));
 
     let suppressed_operation_id = install_operation_id("vanilla-provider-failure-again");
@@ -5285,7 +5380,7 @@ async fn vanilla_provider_failure_records_guardian_retry_then_suppression_withou
     assert!(
         suppressed
             .label()
-            .contains("paused install retry after repeated provider failure")
+            .contains("paused further install retries after repeated provider failure")
     );
     assert!(
         suppressed
@@ -5293,9 +5388,44 @@ async fn vanilla_provider_failure_records_guardian_retry_then_suppression_withou
             .iter()
             .any(|guidance| guidance.contains("Wait a few minutes"))
     );
-    assert_eq!(failure_memory.list().len(), 1);
+    assert_eq!(failure_memory.list(), vec![retry_memory]);
     assert_no_sensitive_fragments(&serde_json::to_string(&suppressed_entry).expect("journal json"));
     assert_no_sensitive_fragments(&serde_json::to_string(&suppressed).expect("summary json"));
+
+    let boundary_operation_id = install_operation_id("vanilla-provider-failure-at-boundary");
+    begin_install_operation_journal(&journals, &boundary_operation_id, "1.21.5")
+        .await
+        .expect("record boundary install journal");
+    record_install_failure_outcome(
+        &journals,
+        &failure_memory,
+        &boundary_operation_id,
+        &facts,
+        "2026-06-16T10:05:00+00:00",
+    )
+    .await;
+
+    let boundary_entry = journals
+        .get(&boundary_operation_id)
+        .expect("boundary journal");
+    let boundary = install_guardian_outcome_summary_from_journal(&boundary_entry)
+        .expect("boundary Guardian outcome");
+    assert_eq!(boundary.decision(), "retry");
+    let renewed_memory = failure_memory.list();
+    assert_eq!(renewed_memory.len(), 1);
+    assert_eq!(renewed_memory[0].occurrence_count, 2);
+    assert_eq!(
+        renewed_memory[0].first_observed_at,
+        "2026-06-16T10:00:00+00:00"
+    );
+    assert_eq!(
+        renewed_memory[0].last_observed_at,
+        "2026-06-16T10:05:00+00:00"
+    );
+    assert_eq!(
+        renewed_memory[0].suppression_until.as_deref(),
+        Some("2026-06-16T10:10:00+00:00")
+    );
 }
 
 #[tokio::test]
@@ -5348,7 +5478,9 @@ async fn loader_provider_failure_records_guardian_retry_then_suppression_without
             .label()
             .contains("install download failure as retryable")
     );
-    assert_eq!(failure_memory.list().len(), 1);
+    let retry_memory = failure_memory.list();
+    assert_eq!(retry_memory.len(), 1);
+    let retry_memory = retry_memory[0].clone();
     assert_no_sensitive_fragments(&serde_json::to_string(&entry).expect("journal json"));
 
     let suppressed_operation_id = install_operation_id("loader-provider-failure-again");
@@ -5383,7 +5515,7 @@ async fn loader_provider_failure_records_guardian_retry_then_suppression_without
     assert!(
         suppressed
             .label()
-            .contains("paused install retry after repeated provider failure")
+            .contains("paused further install retries after repeated provider failure")
     );
     assert!(
         suppressed
@@ -5391,7 +5523,7 @@ async fn loader_provider_failure_records_guardian_retry_then_suppression_without
             .iter()
             .any(|guidance| guidance.contains("Wait a few minutes"))
     );
-    assert_eq!(failure_memory.list().len(), 1);
+    assert_eq!(failure_memory.list(), vec![retry_memory]);
     assert_no_sensitive_fragments(&serde_json::to_string(&suppressed_entry).expect("journal json"));
     assert_no_sensitive_fragments(&serde_json::to_string(&suppressed).expect("summary json"));
 }

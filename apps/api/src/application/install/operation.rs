@@ -1567,6 +1567,15 @@ async fn record_operation_guardian_terminal_outcome(
     let Some(outcome) = terminal.assessment.terminal_outcome() else {
         return Ok(());
     };
+    let facts = guardian_install_outcome_persistence_facts(&outcome.user_outcome);
+    record_guardian_evidence_with_reconciliation(
+        journals,
+        operation_id,
+        terminal.command,
+        facts,
+        vec![outcome.diagnosis_id],
+    )
+    .await?;
     record_provider_failure_memory_if_needed(
         failure_memory,
         Some(operation_id.clone()),
@@ -1576,15 +1585,7 @@ async fn record_operation_guardian_terminal_outcome(
         outcome,
         terminal.observed_at,
     );
-    let facts = guardian_install_outcome_persistence_facts(&outcome.user_outcome);
-    record_guardian_evidence_with_reconciliation(
-        journals,
-        operation_id,
-        terminal.command,
-        facts,
-        vec![outcome.diagnosis_id],
-    )
-    .await
+    Ok(())
 }
 
 fn install_guardian_terminal_update(
@@ -1830,7 +1831,9 @@ fn record_provider_failure_memory_if_needed(
     outcome: &crate::guardian::GuardianInstallFailureOutcome,
     observed_at: &str,
 ) {
-    if outcome.diagnosis_id != DiagnosisId::DownloadUnavailable {
+    if outcome.diagnosis_id != DiagnosisId::DownloadUnavailable
+        || outcome.decision != GuardianActionKind::Retry
+    {
         return;
     }
     let Some(memory) = failure_memory else {
@@ -1848,11 +1851,6 @@ fn record_provider_failure_memory_if_needed(
         return;
     };
     let suppression_until = provider_failure_suppression_until(observed_at);
-    let action_outcome = match outcome.decision {
-        GuardianActionKind::Retry => FailureMemoryActionOutcome::Retried,
-        GuardianActionKind::Block => FailureMemoryActionOutcome::Blocked,
-        _ => return,
-    };
     let entry = GuardianFailureMemoryEntry::observed(
         diagnosis.id(),
         diagnosis.domain(),
@@ -1861,7 +1859,10 @@ fn record_provider_failure_memory_if_needed(
         Some(PROVIDER_FAILURE_MEMORY_SOURCE),
         observed_at.to_string(),
     )
-    .with_action(outcome.decision, action_outcome)
+    .with_action(
+        GuardianActionKind::Retry,
+        FailureMemoryActionOutcome::Retried,
+    )
     .with_suppression_until(suppression_until);
     if let Err(error) = memory.record(entry) {
         warn!(

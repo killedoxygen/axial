@@ -2058,9 +2058,9 @@ const GUARDIAN_COPY_RULES: &[GuardianCopyRule] = &[
             CopyContextKey::InstallFailure,
         ),
         OperationPhase::Downloading,
-        "Guardian paused install retry after repeated provider failure.",
+        "Guardian paused further install retries after repeated provider failure.",
         &[CopyLine::Static(
-            "The install stopped because the same provider or network download failure repeated within the retry cooldown.",
+            "The same provider or network download failure repeated while the retry cooldown was active.",
         )],
         &[CopyLine::Static(
             "Wait a few minutes, then retry after checking connection and storage availability.",
