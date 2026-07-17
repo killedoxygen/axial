@@ -14,7 +14,8 @@ import {
   installQueueNoticePresentation,
   unresolvedFailureViewModel,
 } from '../src/machines/download-view-models';
-import { backendLaunchNotice, launchSessionOutcome, launchStatusViewModel } from '../src/launch';
+import { launchSessionOutcome, launchStatusViewModel } from '../src/launch';
+import { backendLaunchNotice, createBackendLaunchNoticeTracker } from '../src/launch-notice-tracker';
 import { launchNotices, runningSessions } from '../src/store';
 import { startupWarningMessages } from '../src/startup-warnings';
 import type { GuardianSummary } from '../src/types-guardian';
@@ -112,6 +113,94 @@ test('launch notice adapters preserve backend copy for every rendered tone and i
 
   assert.equal(backendLaunchNotice({ message: 'No tone', tone: 'warning' }), null);
   assert.equal(backendLaunchNotice({ message: '', tone: 'error' }), null);
+});
+
+test('launch notice tracker seeds from the initial response and keeps dismissal across duplicate transports', () => {
+  launchNotices.value = {};
+  const tracker = createBackendLaunchNoticeTracker();
+  const initial = {
+    message: 'Guardian adjusted this launch.',
+    detail: 'Managed Java was selected.',
+    details: ['Managed Java was selected.'],
+    tone: 'intervened',
+  } as const;
+
+  const presented = tracker.consume(initial);
+  assert.ok(presented);
+  setLaunchNotice('instance-a', presented);
+  clearLaunchNotice('instance-a');
+
+  assert.equal(tracker.consume({ ...initial }), null);
+  assert.equal(
+    tracker.consume({
+      ...initial,
+      message: `  ${initial.message}  `,
+      detail: ` ${initial.detail} `,
+      details: [` ${initial.details[0]} `],
+    }),
+    null,
+  );
+  assert.equal(launchNotices.value['instance-a'], undefined);
+  launchNotices.value = {};
+});
+
+test('launch notice tracker surfaces late backend Healing copy and never infers from raw summaries', () => {
+  const tracker = createBackendLaunchNoticeTracker();
+  assert.equal(tracker.consume(null), null);
+  assert.equal(
+    tracker.consume({
+      guardian: {
+        decision: 'intervened',
+        message: 'Raw Guardian summary must not become frontend copy.',
+      },
+      healing: {
+        fallback_applied: 'Raw Healing summary must not become frontend copy.',
+      },
+      outcome: { kind: 'failed', summary: 'Raw outcome must not become frontend copy.' },
+      raw_error: sensitiveFragments.join(' '),
+    }),
+    null,
+  );
+
+  const healingNotice = tracker.consume({
+    message: 'Healing retried startup with safer settings.',
+    detail: 'The backend selected a compatible preset.',
+    tone: 'success',
+    guardian: { message: 'Ignored raw Guardian copy.' },
+    raw_error: sensitiveFragments.join(' '),
+  });
+  assert.deepEqual(healingNotice, {
+    message: 'Healing retried startup with safer settings.',
+    detail: 'The backend selected a compatible preset.',
+    details: [],
+    tone: 'success',
+  });
+  assertExcludesSensitive(healingNotice);
+});
+
+test('launch notice tracker accepts distinct live and terminal notices while suppressing stale and null replay', () => {
+  const tracker = createBackendLaunchNoticeTracker();
+  const liveA = { message: 'Guardian warned about launch settings.', tone: 'warned' } as const;
+  const liveB = { message: 'Guardian applied a safer launch plan.', tone: 'intervened' } as const;
+  const terminal = { message: 'Minecraft stopped during startup.', tone: 'error' } as const;
+
+  assert.deepEqual(tracker.consume(liveA), { ...liveA, detail: '', details: [] });
+  assert.deepEqual(tracker.consume(liveB), { ...liveB, detail: '', details: [] });
+  assert.equal(tracker.consume(liveA), null);
+  assert.equal(tracker.consume(liveB), null);
+  assert.deepEqual(tracker.consume(terminal), { ...terminal, detail: '', details: [] });
+  assert.equal(tracker.consume({ ...terminal }), null);
+  assert.equal(tracker.consume(null), null);
+});
+
+test('launch notice tracker resets for a fresh session', () => {
+  const notice = { message: 'Guardian selected managed Java.', tone: 'intervened' } as const;
+  const firstSession = createBackendLaunchNoticeTracker();
+  assert.ok(firstSession.consume(notice));
+  assert.equal(firstSession.consume(notice), null);
+
+  const nextSession = createBackendLaunchNoticeTracker();
+  assert.deepEqual(nextSession.consume(notice), { ...notice, detail: '', details: [] });
 });
 
 test('launch action presentation follows backend launch, install, blocked, queued, and progress states', () => {

@@ -25,6 +25,7 @@ import {
 import type { LaunchNotice, LaunchSessionOutcome, LaunchStatusViewModel } from './types-launch';
 import type { Instance } from './types-instance';
 import type { Config } from './types-settings';
+import { createBackendLaunchNoticeTracker, type BackendLaunchNoticeTracker } from './launch-notice-tracker';
 
 const LIVE_LAUNCH_UPDATES_UNAVAILABLE = 'Live launch updates are unavailable.';
 
@@ -89,38 +90,13 @@ export function launchStatusViewModel(value: unknown): LaunchStatusViewModel | n
   };
 }
 
-function primaryNoticeDetail(details: string[]): string {
-  return details[0] || '';
-}
-
-export function backendLaunchNotice(value: unknown): LaunchNotice | null {
-  if (!value || typeof value !== 'object') return null;
-  const candidate = value as Partial<LaunchNotice>;
-  if (typeof candidate.message !== 'string' || !candidate.message.trim()) return null;
-  if (
-    candidate.tone !== 'info' &&
-    candidate.tone !== 'success' &&
-    candidate.tone !== 'warned' &&
-    candidate.tone !== 'intervened' &&
-    candidate.tone !== 'error'
-  ) {
-    return null;
-  }
-  const details = Array.isArray(candidate.details)
-    ? candidate.details.filter((detail): detail is string => typeof detail === 'string' && Boolean(detail.trim()))
-    : [];
-  const detail =
-    typeof candidate.detail === 'string' && candidate.detail.trim() ? candidate.detail : primaryNoticeDetail(details);
-  return {
-    message: candidate.message,
-    detail,
-    details,
-    tone: candidate.tone,
-  };
-}
-
-function surfaceBackendLaunchNotice(value: unknown, instanceId: string, instanceName: string): boolean {
-  const notice = backendLaunchNotice(value);
+function surfaceBackendLaunchNotice(
+  value: unknown,
+  instanceId: string,
+  instanceName: string,
+  tracker: BackendLaunchNoticeTracker,
+): boolean {
+  const notice = tracker.consume(value);
   if (!notice) return false;
   for (const detail of notice.details || []) {
     appendLog('system', detail, instanceId, instanceName);
@@ -144,6 +120,7 @@ export async function launchGame(): Promise<void> {
 
   const cfg = config.value;
   const username = cfg?.username || 'Player';
+  const noticeTracker = createBackendLaunchNoticeTracker();
 
   Sound.init();
 
@@ -194,7 +171,7 @@ export async function launchGame(): Promise<void> {
     });
 
     if (res.error) {
-      if (!surfaceBackendLaunchNotice(res.notice, inst.id, inst.name)) {
+      if (!surfaceBackendLaunchNotice(res.notice, inst.id, inst.name, noticeTracker)) {
         showError(res.error);
       }
       launchCommitted = false;
@@ -219,12 +196,12 @@ export async function launchGame(): Promise<void> {
       guardian: res.guardian,
     });
     launchCommitted = true;
-    surfaceBackendLaunchNotice(res.notice, inst.id, inst.name);
+    surfaceBackendLaunchNotice(res.notice, inst.id, inst.name, noticeTracker);
 
     Music.suppress();
     let launchStarted = false;
     try {
-      await connectLaunchEvents(res.session_id, inst.id, inst.name, () => {
+      await connectLaunchEvents(res.session_id, inst.id, inst.name, noticeTracker, () => {
         if (launchStarted) return;
         launchStarted = true;
         Sound.ui('launchSuccess');
@@ -252,7 +229,9 @@ export async function launchGame(): Promise<void> {
         error?: string;
         notice?: LaunchNotice;
       };
-      if (!surfaceBackendLaunchNotice(payload.notice, inst.id, inst.name)) showError(payload.error || err.message);
+      if (!surfaceBackendLaunchNotice(payload.notice, inst.id, inst.name, noticeTracker)) {
+        showError(payload.error || err.message);
+      }
       if (!launchCommitted) rollbackLaunch(inst.id);
       return;
     }
@@ -301,6 +280,7 @@ async function connectLaunchEvents(
   sessionId: string,
   instanceId: string,
   instanceName: string,
+  noticeTracker: BackendLaunchNoticeTracker,
   onStarted?: () => void,
 ): Promise<void> {
   const onStatus = (data: any, handle: { close(): void }): void => {
@@ -308,6 +288,7 @@ async function connectLaunchEvents(
     const prep = launchState.value;
     const matchingPrep = prep.status === 'preparing' && prep.instanceId === instanceId;
     if (session?.sessionId !== sessionId && !matchingPrep) return;
+    surfaceBackendLaunchNotice(data.notice, instanceId, instanceName, noticeTracker);
     const outcome = launchSessionOutcome(data.outcome);
     const viewModel = launchStatusViewModel(data.view_model);
     if (viewModel) updateLaunchPrepView(instanceId, viewModel);
@@ -424,7 +405,6 @@ function onGameExited(
 
   if (Object.keys(runningSessions.value).length === 0) Music.unsuppress();
   appendLog('system', outcome?.summary || `${instanceName || instanceId} session ended.`, instanceId, instanceName);
-  surfaceBackendLaunchNotice(data.notice, instanceId, instanceName);
 }
 
 export async function killGame(): Promise<void> {
