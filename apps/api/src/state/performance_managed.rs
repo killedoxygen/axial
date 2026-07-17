@@ -21,6 +21,7 @@ struct ManagedInstanceEntry {
 
 pub(super) struct ManagedCompositionOwner {
     authority: ManagedCompositionAuthority,
+    managed_artifact_epoch: super::managed_artifact_epoch::ManagedArtifactMutationEpochCoordinator,
     entries: Arc<Mutex<HashMap<String, Arc<ManagedInstanceEntry>>>>,
     lifecycle: Arc<AsyncRwLock<()>>,
     instance_lifecycle: super::instance_lifecycle::InstanceLifecycleGates,
@@ -46,6 +47,7 @@ enum ManagedOwnerPhase {
 
 pub(crate) struct ManagedCompositionAdmission {
     authority: ManagedCompositionAuthority,
+    managed_artifact_epoch: super::managed_artifact_epoch::ManagedArtifactMutationEpochCoordinator,
     entry: Arc<ManagedInstanceEntry>,
     _lifecycle: OwnedRwLockReadGuard<()>,
     _gate: OwnedMutexGuard<()>,
@@ -154,9 +156,11 @@ impl ManagedCompositionOwner {
     pub(super) fn claim(
         authority: ManagedCompositionAuthority,
         instance_lifecycle: super::instance_lifecycle::InstanceLifecycleGates,
+        managed_artifact_epoch: super::managed_artifact_epoch::ManagedArtifactMutationEpochCoordinator,
     ) -> Self {
         Self {
             authority,
+            managed_artifact_epoch,
             entries: Arc::new(Mutex::new(HashMap::new())),
             lifecycle: Arc::new(AsyncRwLock::new(())),
             instance_lifecycle,
@@ -190,6 +194,7 @@ impl ManagedCompositionOwner {
         }
         let admission = ManagedCompositionAdmission {
             authority: self.authority.clone(),
+            managed_artifact_epoch: self.managed_artifact_epoch.clone(),
             entry: entry.clone(),
             _lifecycle: lifecycle,
             _gate: gate,
@@ -225,6 +230,10 @@ impl ManagedCompositionOwner {
         match entry.phase() {
             ManagedEntryPhase::Open => entry.store_phase(ManagedEntryPhase::Retired),
             ManagedEntryPhase::Latched => {
+                let _mutation = self
+                    .managed_artifact_epoch
+                    .admit()
+                    .map_err(|_| ManagedCompositionAdmissionError::RecoveryFailed)?;
                 if self
                     .authority
                     .recover_and_inspect(&entry.identity)
@@ -292,7 +301,15 @@ impl ManagedCompositionOwner {
             if entry.phase() != ManagedEntryPhase::Latched {
                 continue;
             }
-            if !recover_entry_owned(self.authority.clone(), entry, instance_lifecycle, gate).await {
+            if !recover_entry_owned(
+                self.authority.clone(),
+                self.managed_artifact_epoch.clone(),
+                entry,
+                instance_lifecycle,
+                gate,
+            )
+            .await
+            {
                 recovery_failed = true;
             }
         }
@@ -354,11 +371,14 @@ async fn recover_admission_owned(
 ) -> Result<AppManagedCompositionAdmission, ManagedCompositionAdmissionError> {
     let (completed_tx, completed_rx) = tokio::sync::oneshot::channel();
     tokio::spawn(async move {
-        let recovered = admission
-            .authority
-            .recover_and_inspect(&admission.entry.identity)
-            .await
-            .is_ok();
+        let recovered = match admission.managed_artifact_epoch.admit() {
+            Ok(_mutation) => admission
+                .authority
+                .recover_and_inspect(&admission.entry.identity)
+                .await
+                .is_ok(),
+            Err(_) => false,
+        };
         if recovered {
             admission.entry.store_phase(ManagedEntryPhase::Open);
             let _ = completed_tx.send(Ok(AppManagedCompositionAdmission::bind(
@@ -376,6 +396,7 @@ async fn recover_admission_owned(
 
 async fn recover_entry_owned(
     authority: ManagedCompositionAuthority,
+    managed_artifact_epoch: super::managed_artifact_epoch::ManagedArtifactMutationEpochCoordinator,
     entry: Arc<ManagedInstanceEntry>,
     instance_lifecycle: OwnedMutexGuard<()>,
     gate: OwnedMutexGuard<()>,
@@ -384,7 +405,10 @@ async fn recover_entry_owned(
     tokio::spawn(async move {
         let _instance_lifecycle = instance_lifecycle;
         let _gate = gate;
-        let recovered = authority.recover_and_inspect(&entry.identity).await.is_ok();
+        let recovered = match managed_artifact_epoch.admit() {
+            Ok(_mutation) => authority.recover_and_inspect(&entry.identity).await.is_ok(),
+            Err(_) => false,
+        };
         if recovered {
             entry.store_phase(ManagedEntryPhase::Open);
         }
@@ -406,6 +430,8 @@ impl ManagedCompositionAdmission {
         &self,
         plan: Option<&CompositionPlan>,
     ) -> Result<ManagedCompositionInspection, ManagedMutationError> {
+        // Core inspection also reconciles interrupted managed publications and removals.
+        let _mutation = self.managed_mutation_admission()?;
         let result = self.authority.inspect(&self.entry.identity, plan).await;
         self.latch_indeterminate(&result);
         result
@@ -415,6 +441,8 @@ impl ManagedCompositionAdmission {
         &self,
         request: ResolutionRequest,
     ) -> Result<ManagedResolvedInspection, ManagedMutationError> {
+        // Core inspection also reconciles interrupted managed publications and removals.
+        let _mutation = self.managed_mutation_admission()?;
         let result = self
             .authority
             .resolve_and_inspect(&self.entry.identity, request)
@@ -428,6 +456,7 @@ impl ManagedCompositionAdmission {
         plan: &CompositionPlan,
         game_version: &str,
     ) -> Result<CompositionState, ManagedMutationError> {
+        let _mutation = self.managed_mutation_admission()?;
         let result = self
             .authority
             .ensure_installed(&self.entry.identity, plan, game_version)
@@ -437,6 +466,7 @@ impl ManagedCompositionAdmission {
     }
 
     pub(crate) async fn remove_managed(&self) -> Result<(), ManagedMutationError> {
+        let _mutation = self.managed_mutation_admission()?;
         let result = self.authority.remove_managed(&self.entry.identity).await;
         self.latch_indeterminate(&result);
         result
@@ -446,6 +476,7 @@ impl ManagedCompositionAdmission {
         &self,
         snapshot_id: Option<&str>,
     ) -> Result<CompositionState, ManagedMutationError> {
+        let _mutation = self.managed_mutation_admission()?;
         let result = match snapshot_id {
             Some(snapshot_id) => {
                 self.authority
@@ -462,6 +493,16 @@ impl ManagedCompositionAdmission {
         if matches!(result, Err(ManagedMutationError::Indeterminate(_))) {
             self.entry.store_phase(ManagedEntryPhase::Latched);
         }
+    }
+
+    fn managed_mutation_admission(
+        &self,
+    ) -> Result<super::ManagedArtifactMutationAdmission, ManagedMutationError> {
+        self.managed_artifact_epoch.admit().map_err(|error| {
+            ManagedMutationError::Definite(axial_performance::InstallError::Io(io::Error::other(
+                error.to_string(),
+            )))
+        })
     }
 }
 
@@ -513,6 +554,7 @@ mod tests {
                 owner: Arc::new(ManagedCompositionOwner::claim(
                     authority,
                     instance_lifecycle.clone(),
+                    super::super::managed_artifact_epoch::ManagedArtifactMutationEpochCoordinator::default(),
                 )),
                 instance_lifecycle,
             }

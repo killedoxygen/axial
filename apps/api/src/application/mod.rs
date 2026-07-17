@@ -87,12 +87,13 @@ pub use install::{
     loader_game_versions, loader_install_events_stream, loader_install_progress_view_model,
     loader_pre_operation_error_response, public_loader_install_progress_json,
     public_vanilla_install_progress_json, record_install_operation_interrupted,
-    record_install_operation_progress, remove_queued_install, sanitize_install_progress,
-    stage_install_version_command, vanilla_install_progress_view_model,
+    record_install_operation_progress, sanitize_install_progress, stage_install_version_command,
+    vanilla_install_progress_view_model,
 };
 pub(crate) use install::{
     enqueue_install_from_continuation, enqueue_install_owned, install_queue_status_owned,
-    retry_install_owned, settle_startup_install_guardian_failure_memory,
+    remove_queued_install_owned, retry_install_owned,
+    settle_startup_install_guardian_failure_memory,
 };
 pub(crate) use integrity_scheduler::spawn_idle_integrity_scheduler;
 pub use java::{JavaRuntimesResponse, java_runtimes};

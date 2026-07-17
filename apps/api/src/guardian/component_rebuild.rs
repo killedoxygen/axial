@@ -14,8 +14,9 @@ use crate::state::failure_memory::{
 };
 use crate::state::{
     ASSETS_COMPONENT_REBUILD_STEP, COMPONENT_QUARANTINE_STEP, COMPONENT_REBUILD_START_STEP,
-    LIBRARIES_COMPONENT_REBUILD_STEP, MAX_OPERATION_JOURNAL_STEP_FACTS, OperationJournalStoreError,
-    RUNTIME_COMPONENT_REBUILD_STEP, ReconciliationAttemptReservation,
+    LIBRARIES_COMPONENT_REBUILD_STEP, MAX_OPERATION_JOURNAL_STEP_FACTS,
+    ManagedArtifactMutationAdmission, ManagedArtifactMutationEpochUnavailable,
+    OperationJournalStoreError, RUNTIME_COMPONENT_REBUILD_STEP, ReconciliationAttemptReservation,
     RegisteredAssetsComponentRebuildEffect, RegisteredComponentRebuildAdmission,
     RegisteredLibrariesComponentRebuildEffect, RegisteredManagedArtifactCommitPostcheck,
     RegisteredManagedArtifactComponentCompletion,
@@ -50,6 +51,7 @@ tokio::task_local! {
 
 pub(crate) struct ManagedRuntimeComponentRebuildEffect {
     admission: RegisteredComponentRebuildAdmission,
+    mutation: Option<ManagedArtifactMutationAdmission>,
     reservation: ReconciliationAttemptReservation,
     identity: Arc<()>,
 }
@@ -60,6 +62,7 @@ pub(crate) struct RuntimeComponentRebuildEffectResult {
 
 pub(crate) struct ManagedLibrariesComponentRebuildEffect {
     completion: RegisteredManagedArtifactComponentCompletion,
+    mutation: ManagedArtifactMutationAdmission,
     reservation: ReconciliationAttemptReservation,
     request: RegisteredLibrariesComponentRebuildEffect,
     identity: Arc<()>,
@@ -67,6 +70,7 @@ pub(crate) struct ManagedLibrariesComponentRebuildEffect {
 
 pub(crate) struct ManagedVersionBundleComponentRebuildEffect {
     completion: RegisteredManagedArtifactComponentCompletion,
+    mutation: ManagedArtifactMutationAdmission,
     reservation: ReconciliationAttemptReservation,
     request: RegisteredVersionBundleComponentRebuildEffect,
     identity: Arc<()>,
@@ -82,6 +86,7 @@ pub(crate) struct LibrariesComponentRebuildEffectResult {
 
 struct ManagedAssetsComponentRebuildEffect {
     completion: RegisteredManagedArtifactComponentCompletion,
+    mutation: ManagedArtifactMutationAdmission,
     reservation: ReconciliationAttemptReservation,
     request: RegisteredAssetsComponentRebuildEffect,
     identity: Arc<()>,
@@ -162,12 +167,14 @@ enum RuntimeComponentRebuildEffectResultInner {
 impl ManagedRuntimeComponentRebuildEffect {
     fn new(
         admission: RegisteredComponentRebuildAdmission,
+        mutation: Option<ManagedArtifactMutationAdmission>,
         reservation: ReconciliationAttemptReservation,
     ) -> (Self, Arc<()>) {
         let identity = Arc::new(());
         (
             Self {
                 admission,
+                mutation,
                 reservation,
                 identity: identity.clone(),
             },
@@ -229,6 +236,7 @@ impl ManagedRuntimeComponentRebuildEffect {
 impl ManagedLibrariesComponentRebuildEffect {
     fn new(
         completion: RegisteredManagedArtifactComponentCompletion,
+        mutation: ManagedArtifactMutationAdmission,
         reservation: ReconciliationAttemptReservation,
         request: RegisteredLibrariesComponentRebuildEffect,
     ) -> (Self, Arc<()>) {
@@ -236,6 +244,7 @@ impl ManagedLibrariesComponentRebuildEffect {
         (
             Self {
                 completion,
+                mutation,
                 reservation,
                 request,
                 identity: identity.clone(),
@@ -296,6 +305,7 @@ impl ManagedLibrariesComponentRebuildEffect {
 impl ManagedVersionBundleComponentRebuildEffect {
     fn new(
         completion: RegisteredManagedArtifactComponentCompletion,
+        mutation: ManagedArtifactMutationAdmission,
         reservation: ReconciliationAttemptReservation,
         request: RegisteredVersionBundleComponentRebuildEffect,
     ) -> (Self, Arc<()>) {
@@ -303,6 +313,7 @@ impl ManagedVersionBundleComponentRebuildEffect {
         (
             Self {
                 completion,
+                mutation,
                 reservation,
                 request,
                 identity: identity.clone(),
@@ -363,6 +374,7 @@ impl ManagedVersionBundleComponentRebuildEffect {
 impl ManagedAssetsComponentRebuildEffect {
     fn new(
         completion: RegisteredManagedArtifactComponentCompletion,
+        mutation: ManagedArtifactMutationAdmission,
         reservation: ReconciliationAttemptReservation,
         request: RegisteredAssetsComponentRebuildEffect,
     ) -> (Self, Arc<()>) {
@@ -370,6 +382,7 @@ impl ManagedAssetsComponentRebuildEffect {
         (
             Self {
                 completion,
+                mutation,
                 reservation,
                 request,
                 identity: identity.clone(),
@@ -440,13 +453,42 @@ pub(crate) struct GuardianComponentRebuildOutcome {
     pub(crate) facts: Vec<String>,
 }
 
+async fn await_component_rebuild_owner<Owner>(
+    owner: Owner,
+) -> Result<GuardianComponentRebuildOutcome, OperationJournalStoreError>
+where
+    Owner: Future<Output = Result<GuardianComponentRebuildOutcome, OperationJournalStoreError>>
+        + Send
+        + 'static,
+{
+    #[cfg(test)]
+    let exact_proof_lifetime = REGISTERED_ARTIFACT_EXACT_PROOF_LIFETIME
+        .try_with(Arc::clone)
+        .ok();
+    let owner = tokio::spawn(async move {
+        #[cfg(test)]
+        if let Some(exact_proof_lifetime) = exact_proof_lifetime {
+            return REGISTERED_ARTIFACT_EXACT_PROOF_LIFETIME
+                .scope(exact_proof_lifetime, owner)
+                .await;
+        }
+        owner.await
+    });
+    owner.await.map_err(|_| {
+        invalid_component_rebuild_error(
+            std::io::ErrorKind::Other,
+            "component rebuild effect owner stopped unexpectedly",
+        )
+    })?
+}
+
 pub(crate) async fn execute_managed_runtime_component_rebuild<Effect, EffectFuture>(
     admission: RegisteredComponentRebuildAdmission,
     effect: Effect,
 ) -> Result<GuardianComponentRebuildOutcome, OperationJournalStoreError>
 where
-    Effect: FnOnce(ManagedRuntimeComponentRebuildEffect) -> EffectFuture + Send,
-    EffectFuture: Future<Output = RuntimeComponentRebuildEffectResult> + Send,
+    Effect: FnOnce(ManagedRuntimeComponentRebuildEffect) -> EffectFuture + Send + 'static,
+    EffectFuture: Future<Output = RuntimeComponentRebuildEffectResult> + Send + 'static,
 {
     validate_managed_runtime_admission(&admission)?;
     settle_reconciliation_memory(admission.failure_memory())
@@ -465,7 +507,7 @@ where
     })?;
 
     if let Some(plan_error) = create_component_rebuild_plan(&admission).await? {
-        let (effect, _) = ManagedRuntimeComponentRebuildEffect::new(admission, reservation);
+        let (effect, _) = ManagedRuntimeComponentRebuildEffect::new(admission, None, reservation);
         terminalize_component_rebuild(
             effect,
             ComponentRebuildTerminal::FailedBeforeEffect {
@@ -477,45 +519,64 @@ where
         return Err(plan_error);
     }
 
-    let (effect_capability, effect_identity) =
-        ManagedRuntimeComponentRebuildEffect::new(admission, reservation);
-    match effect(effect_capability).await.inner {
-        RuntimeComponentRebuildEffectResultInner::Succeeded {
-            effect,
-            receipt,
-            facts,
-        } => {
-            validate_effect_identity(&effect, &effect_identity)?;
-            terminalize_component_rebuild(
+    await_component_rebuild_owner(async move {
+        let mutation = match admission.admit_managed_artifact_mutation() {
+            Ok(mutation) => mutation,
+            Err(error) => {
+                let (effect, _) =
+                    ManagedRuntimeComponentRebuildEffect::new(admission, None, reservation);
+                return terminalize_component_rebuild(
+                    effect,
+                    ComponentRebuildTerminal::FailedBeforeEffect {
+                        facts: vec![managed_artifact_mutation_admission_fact(error)],
+                        step_id: RUNTIME_COMPONENT_REBUILD_STEP,
+                    },
+                )
+                .await;
+            }
+        };
+
+        let (effect_capability, effect_identity) =
+            ManagedRuntimeComponentRebuildEffect::new(admission, Some(mutation), reservation);
+        match effect(effect_capability).await.inner {
+            RuntimeComponentRebuildEffectResultInner::Succeeded {
                 effect,
-                ComponentRebuildTerminal::Succeeded { receipt, facts },
-            )
-            .await
-        }
-        RuntimeComponentRebuildEffectResultInner::FailedBeforeEffect { effect, facts } => {
-            validate_effect_identity(&effect, &effect_identity)?;
-            terminalize_component_rebuild(
+                receipt,
+                facts,
+            } => {
+                validate_effect_identity(&effect, &effect_identity)?;
+                terminalize_component_rebuild(
+                    effect,
+                    ComponentRebuildTerminal::Succeeded { receipt, facts },
+                )
+                .await
+            }
+            RuntimeComponentRebuildEffectResultInner::FailedBeforeEffect { effect, facts } => {
+                validate_effect_identity(&effect, &effect_identity)?;
+                terminalize_component_rebuild(
+                    effect,
+                    ComponentRebuildTerminal::FailedBeforeEffect {
+                        facts,
+                        step_id: RUNTIME_COMPONENT_REBUILD_STEP,
+                    },
+                )
+                .await
+            }
+            RuntimeComponentRebuildEffectResultInner::FailedAfterEffect {
                 effect,
-                ComponentRebuildTerminal::FailedBeforeEffect {
-                    facts,
-                    step_id: RUNTIME_COMPONENT_REBUILD_STEP,
-                },
-            )
-            .await
+                receipt,
+                facts,
+            } => {
+                validate_effect_identity(&effect, &effect_identity)?;
+                terminalize_component_rebuild(
+                    effect,
+                    ComponentRebuildTerminal::FailedAfterEffect { receipt, facts },
+                )
+                .await
+            }
         }
-        RuntimeComponentRebuildEffectResultInner::FailedAfterEffect {
-            effect,
-            receipt,
-            facts,
-        } => {
-            validate_effect_identity(&effect, &effect_identity)?;
-            terminalize_component_rebuild(
-                effect,
-                ComponentRebuildTerminal::FailedAfterEffect { receipt, facts },
-            )
-            .await
-        }
-    }
+    })
+    .await
 }
 
 pub(crate) async fn execute_managed_libraries_component_rebuild<Effect, EffectFuture>(
@@ -523,8 +584,8 @@ pub(crate) async fn execute_managed_libraries_component_rebuild<Effect, EffectFu
     effect: Effect,
 ) -> Result<GuardianComponentRebuildOutcome, OperationJournalStoreError>
 where
-    Effect: FnOnce(ManagedLibrariesComponentRebuildEffect) -> EffectFuture + Send,
-    EffectFuture: Future<Output = LibrariesComponentRebuildEffectResult> + Send,
+    Effect: FnOnce(ManagedLibrariesComponentRebuildEffect) -> EffectFuture + Send + 'static,
+    EffectFuture: Future<Output = LibrariesComponentRebuildEffectResult> + Send + 'static,
 {
     validate_managed_artifact_admission(&admission, ManagedArtifactGuardianComponent::Libraries)?;
     settle_reconciliation_memory(admission.failure_memory())
@@ -560,58 +621,84 @@ where
         return Err(plan_error);
     }
 
-    let (request, completion) = match admission.into_libraries_effect() {
-        RegisteredManagedArtifactComponentEffectAdmission::Admitted {
-            request,
-            completion,
-        } => (request, *completion),
-        RegisteredManagedArtifactComponentEffectAdmission::Refused(settlement) => {
-            return persist_managed_artifact_component_terminal(
-                &settlement,
-                reservation,
-                vec!["libraries_component_authority_changed".to_string()],
-                LIBRARIES_COMPONENT_REBUILD_STEP,
-                RollbackState::NotApplicable,
-            )
-            .await;
-        }
-    };
-    let (effect_capability, effect_identity) =
-        ManagedLibrariesComponentRebuildEffect::new(completion, reservation, request);
-    match effect(effect_capability).await.inner {
-        LibrariesComponentRebuildEffectResultInner::Committed {
-            effect,
-            receipt,
-            facts,
-        } => {
-            validate_libraries_effect_identity(&effect, &effect_identity)?;
-            terminalize_libraries_component_rebuild(
+    await_component_rebuild_owner(async move {
+        let mutation = match admission.admit_managed_artifact_mutation() {
+            Ok(mutation) => mutation,
+            Err(error) => {
+                let settlement = match admission.into_libraries_effect() {
+                    RegisteredManagedArtifactComponentEffectAdmission::Admitted {
+                        completion,
+                        ..
+                    } => (*completion).into_failed_settlement(),
+                    RegisteredManagedArtifactComponentEffectAdmission::Refused(settlement) => {
+                        *settlement
+                    }
+                };
+                return persist_managed_artifact_component_terminal(
+                    &settlement,
+                    reservation,
+                    vec![managed_artifact_mutation_admission_fact(error)],
+                    LIBRARIES_COMPONENT_REBUILD_STEP,
+                    RollbackState::NotApplicable,
+                )
+                .await;
+            }
+        };
+
+        let (request, completion) = match admission.into_libraries_effect() {
+            RegisteredManagedArtifactComponentEffectAdmission::Admitted {
+                request,
+                completion,
+            } => (request, *completion),
+            RegisteredManagedArtifactComponentEffectAdmission::Refused(settlement) => {
+                return persist_managed_artifact_component_terminal(
+                    &settlement,
+                    reservation,
+                    vec!["libraries_component_authority_changed".to_string()],
+                    LIBRARIES_COMPONENT_REBUILD_STEP,
+                    RollbackState::NotApplicable,
+                )
+                .await;
+            }
+        };
+        let (effect_capability, effect_identity) =
+            ManagedLibrariesComponentRebuildEffect::new(completion, mutation, reservation, request);
+        match effect(effect_capability).await.inner {
+            LibrariesComponentRebuildEffectResultInner::Committed {
                 effect,
-                LibrariesComponentRebuildTerminal::Committed { receipt, facts },
-            )
-            .await
-        }
-        LibrariesComponentRebuildEffectResultInner::FailedBeforeEffect { effect, facts } => {
-            validate_libraries_effect_identity(&effect, &effect_identity)?;
-            terminalize_libraries_component_rebuild(
+                receipt,
+                facts,
+            } => {
+                validate_libraries_effect_identity(&effect, &effect_identity)?;
+                terminalize_libraries_component_rebuild(
+                    effect,
+                    LibrariesComponentRebuildTerminal::Committed { receipt, facts },
+                )
+                .await
+            }
+            LibrariesComponentRebuildEffectResultInner::FailedBeforeEffect { effect, facts } => {
+                validate_libraries_effect_identity(&effect, &effect_identity)?;
+                terminalize_libraries_component_rebuild(
+                    effect,
+                    LibrariesComponentRebuildTerminal::FailedBeforeEffect { facts },
+                )
+                .await
+            }
+            LibrariesComponentRebuildEffectResultInner::RolledBack {
                 effect,
-                LibrariesComponentRebuildTerminal::FailedBeforeEffect { facts },
-            )
-            .await
+                receipt,
+                facts,
+            } => {
+                validate_libraries_effect_identity(&effect, &effect_identity)?;
+                terminalize_libraries_component_rebuild(
+                    effect,
+                    LibrariesComponentRebuildTerminal::RolledBack { receipt, facts },
+                )
+                .await
+            }
         }
-        LibrariesComponentRebuildEffectResultInner::RolledBack {
-            effect,
-            receipt,
-            facts,
-        } => {
-            validate_libraries_effect_identity(&effect, &effect_identity)?;
-            terminalize_libraries_component_rebuild(
-                effect,
-                LibrariesComponentRebuildTerminal::RolledBack { receipt, facts },
-            )
-            .await
-        }
-    }
+    })
+    .await
 }
 
 pub(crate) async fn execute_managed_version_bundle_component_rebuild<Effect, EffectFuture>(
@@ -619,8 +706,8 @@ pub(crate) async fn execute_managed_version_bundle_component_rebuild<Effect, Eff
     effect: Effect,
 ) -> Result<GuardianComponentRebuildOutcome, OperationJournalStoreError>
 where
-    Effect: FnOnce(ManagedVersionBundleComponentRebuildEffect) -> EffectFuture + Send,
-    EffectFuture: Future<Output = VersionBundleComponentRebuildEffectResult> + Send,
+    Effect: FnOnce(ManagedVersionBundleComponentRebuildEffect) -> EffectFuture + Send + 'static,
+    EffectFuture: Future<Output = VersionBundleComponentRebuildEffectResult> + Send + 'static,
 {
     validate_managed_artifact_admission(
         &admission,
@@ -659,58 +746,91 @@ where
         return Err(plan_error);
     }
 
-    let (request, completion) = match admission.into_version_bundle_effect() {
-        RegisteredManagedArtifactComponentEffectAdmission::Admitted {
-            request,
+    await_component_rebuild_owner(async move {
+        let mutation = match admission.admit_managed_artifact_mutation() {
+            Ok(mutation) => mutation,
+            Err(error) => {
+                let settlement = match admission.into_version_bundle_effect() {
+                    RegisteredManagedArtifactComponentEffectAdmission::Admitted {
+                        completion,
+                        ..
+                    } => (*completion).into_failed_settlement(),
+                    RegisteredManagedArtifactComponentEffectAdmission::Refused(settlement) => {
+                        *settlement
+                    }
+                };
+                return persist_managed_artifact_component_terminal(
+                    &settlement,
+                    reservation,
+                    vec![managed_artifact_mutation_admission_fact(error)],
+                    VERSION_BUNDLE_COMPONENT_REBUILD_STEP,
+                    RollbackState::NotApplicable,
+                )
+                .await;
+            }
+        };
+
+        let (request, completion) = match admission.into_version_bundle_effect() {
+            RegisteredManagedArtifactComponentEffectAdmission::Admitted {
+                request,
+                completion,
+            } => (request, *completion),
+            RegisteredManagedArtifactComponentEffectAdmission::Refused(settlement) => {
+                return persist_managed_artifact_component_terminal(
+                    &settlement,
+                    reservation,
+                    vec!["version_bundle_component_authority_changed".to_string()],
+                    VERSION_BUNDLE_COMPONENT_REBUILD_STEP,
+                    RollbackState::NotApplicable,
+                )
+                .await;
+            }
+        };
+        let (effect_capability, effect_identity) = ManagedVersionBundleComponentRebuildEffect::new(
             completion,
-        } => (request, *completion),
-        RegisteredManagedArtifactComponentEffectAdmission::Refused(settlement) => {
-            return persist_managed_artifact_component_terminal(
-                &settlement,
-                reservation,
-                vec!["version_bundle_component_authority_changed".to_string()],
-                VERSION_BUNDLE_COMPONENT_REBUILD_STEP,
-                RollbackState::NotApplicable,
-            )
-            .await;
-        }
-    };
-    let (effect_capability, effect_identity) =
-        ManagedVersionBundleComponentRebuildEffect::new(completion, reservation, request);
-    match effect(effect_capability).await.inner {
-        VersionBundleComponentRebuildEffectResultInner::Committed {
-            effect,
-            receipt,
-            facts,
-        } => {
-            validate_version_bundle_effect_identity(&effect, &effect_identity)?;
-            terminalize_version_bundle_component_rebuild(
+            mutation,
+            reservation,
+            request,
+        );
+        match effect(effect_capability).await.inner {
+            VersionBundleComponentRebuildEffectResultInner::Committed {
                 effect,
-                VersionBundleComponentRebuildTerminal::Committed { receipt, facts },
-            )
-            .await
-        }
-        VersionBundleComponentRebuildEffectResultInner::FailedBeforeEffect { effect, facts } => {
-            validate_version_bundle_effect_identity(&effect, &effect_identity)?;
-            terminalize_version_bundle_component_rebuild(
+                receipt,
+                facts,
+            } => {
+                validate_version_bundle_effect_identity(&effect, &effect_identity)?;
+                terminalize_version_bundle_component_rebuild(
+                    effect,
+                    VersionBundleComponentRebuildTerminal::Committed { receipt, facts },
+                )
+                .await
+            }
+            VersionBundleComponentRebuildEffectResultInner::FailedBeforeEffect {
                 effect,
-                VersionBundleComponentRebuildTerminal::FailedBeforeEffect { facts },
-            )
-            .await
-        }
-        VersionBundleComponentRebuildEffectResultInner::RolledBack {
-            effect,
-            receipt,
-            facts,
-        } => {
-            validate_version_bundle_effect_identity(&effect, &effect_identity)?;
-            terminalize_version_bundle_component_rebuild(
+                facts,
+            } => {
+                validate_version_bundle_effect_identity(&effect, &effect_identity)?;
+                terminalize_version_bundle_component_rebuild(
+                    effect,
+                    VersionBundleComponentRebuildTerminal::FailedBeforeEffect { facts },
+                )
+                .await
+            }
+            VersionBundleComponentRebuildEffectResultInner::RolledBack {
                 effect,
-                VersionBundleComponentRebuildTerminal::RolledBack { receipt, facts },
-            )
-            .await
+                receipt,
+                facts,
+            } => {
+                validate_version_bundle_effect_identity(&effect, &effect_identity)?;
+                terminalize_version_bundle_component_rebuild(
+                    effect,
+                    VersionBundleComponentRebuildTerminal::RolledBack { receipt, facts },
+                )
+                .await
+            }
         }
-    }
+    })
+    .await
 }
 
 pub(crate) async fn execute_managed_assets_component_rebuild(
@@ -739,8 +859,8 @@ async fn execute_managed_assets_component_rebuild_with_driver<Driver, DriverFutu
     driver: Driver,
 ) -> Result<GuardianComponentRebuildOutcome, OperationJournalStoreError>
 where
-    Driver: FnOnce(ManagedAssetsComponentRebuildEffect) -> DriverFuture + Send,
-    DriverFuture: Future<Output = AssetsComponentRebuildEffectResult> + Send,
+    Driver: FnOnce(ManagedAssetsComponentRebuildEffect) -> DriverFuture + Send + 'static,
+    DriverFuture: Future<Output = AssetsComponentRebuildEffectResult> + Send + 'static,
 {
     validate_managed_artifact_admission(&admission, ManagedArtifactGuardianComponent::Assets)?;
     settle_reconciliation_memory(admission.failure_memory())
@@ -776,58 +896,84 @@ where
         return Err(plan_error);
     }
 
-    let (request, completion) = match admission.into_assets_effect() {
-        RegisteredManagedArtifactComponentEffectAdmission::Admitted {
-            request,
-            completion,
-        } => (request, *completion),
-        RegisteredManagedArtifactComponentEffectAdmission::Refused(settlement) => {
-            return persist_managed_artifact_component_terminal(
-                &settlement,
-                reservation,
-                vec!["assets_component_authority_changed".to_string()],
-                ASSETS_COMPONENT_REBUILD_STEP,
-                RollbackState::NotApplicable,
-            )
-            .await;
-        }
-    };
-    let (effect_capability, effect_identity) =
-        ManagedAssetsComponentRebuildEffect::new(completion, reservation, request);
-    match driver(effect_capability).await.inner {
-        AssetsComponentRebuildEffectResultInner::Committed {
-            effect,
-            receipt,
-            facts,
-        } => {
-            validate_assets_effect_identity(&effect, &effect_identity)?;
-            terminalize_assets_component_rebuild(
+    await_component_rebuild_owner(async move {
+        let mutation = match admission.admit_managed_artifact_mutation() {
+            Ok(mutation) => mutation,
+            Err(error) => {
+                let settlement = match admission.into_assets_effect() {
+                    RegisteredManagedArtifactComponentEffectAdmission::Admitted {
+                        completion,
+                        ..
+                    } => (*completion).into_failed_settlement(),
+                    RegisteredManagedArtifactComponentEffectAdmission::Refused(settlement) => {
+                        *settlement
+                    }
+                };
+                return persist_managed_artifact_component_terminal(
+                    &settlement,
+                    reservation,
+                    vec![managed_artifact_mutation_admission_fact(error)],
+                    ASSETS_COMPONENT_REBUILD_STEP,
+                    RollbackState::NotApplicable,
+                )
+                .await;
+            }
+        };
+
+        let (request, completion) = match admission.into_assets_effect() {
+            RegisteredManagedArtifactComponentEffectAdmission::Admitted {
+                request,
+                completion,
+            } => (request, *completion),
+            RegisteredManagedArtifactComponentEffectAdmission::Refused(settlement) => {
+                return persist_managed_artifact_component_terminal(
+                    &settlement,
+                    reservation,
+                    vec!["assets_component_authority_changed".to_string()],
+                    ASSETS_COMPONENT_REBUILD_STEP,
+                    RollbackState::NotApplicable,
+                )
+                .await;
+            }
+        };
+        let (effect_capability, effect_identity) =
+            ManagedAssetsComponentRebuildEffect::new(completion, mutation, reservation, request);
+        match driver(effect_capability).await.inner {
+            AssetsComponentRebuildEffectResultInner::Committed {
                 effect,
-                AssetsComponentRebuildTerminal::Committed { receipt, facts },
-            )
-            .await
-        }
-        AssetsComponentRebuildEffectResultInner::FailedBeforeEffect { effect, facts } => {
-            validate_assets_effect_identity(&effect, &effect_identity)?;
-            terminalize_assets_component_rebuild(
+                receipt,
+                facts,
+            } => {
+                validate_assets_effect_identity(&effect, &effect_identity)?;
+                terminalize_assets_component_rebuild(
+                    effect,
+                    AssetsComponentRebuildTerminal::Committed { receipt, facts },
+                )
+                .await
+            }
+            AssetsComponentRebuildEffectResultInner::FailedBeforeEffect { effect, facts } => {
+                validate_assets_effect_identity(&effect, &effect_identity)?;
+                terminalize_assets_component_rebuild(
+                    effect,
+                    AssetsComponentRebuildTerminal::FailedBeforeEffect { facts },
+                )
+                .await
+            }
+            AssetsComponentRebuildEffectResultInner::RolledBack {
                 effect,
-                AssetsComponentRebuildTerminal::FailedBeforeEffect { facts },
-            )
-            .await
+                receipt,
+                facts,
+            } => {
+                validate_assets_effect_identity(&effect, &effect_identity)?;
+                terminalize_assets_component_rebuild(
+                    effect,
+                    AssetsComponentRebuildTerminal::RolledBack { receipt, facts },
+                )
+                .await
+            }
         }
-        AssetsComponentRebuildEffectResultInner::RolledBack {
-            effect,
-            receipt,
-            facts,
-        } => {
-            validate_assets_effect_identity(&effect, &effect_identity)?;
-            terminalize_assets_component_rebuild(
-                effect,
-                AssetsComponentRebuildTerminal::RolledBack { receipt, facts },
-            )
-            .await
-        }
-    }
+    })
+    .await
 }
 
 #[cfg(test)]
@@ -1147,6 +1293,7 @@ async fn terminalize_component_rebuild(
 ) -> Result<GuardianComponentRebuildOutcome, OperationJournalStoreError> {
     let ManagedRuntimeComponentRebuildEffect {
         admission,
+        mutation: _mutation,
         reservation,
         identity: _,
     } = effect;
@@ -1266,6 +1413,7 @@ async fn terminalize_libraries_component_rebuild(
 ) -> Result<GuardianComponentRebuildOutcome, OperationJournalStoreError> {
     let ManagedLibrariesComponentRebuildEffect {
         completion,
+        mutation: _mutation,
         reservation,
         request: _,
         identity: _,
@@ -1325,6 +1473,7 @@ async fn terminalize_version_bundle_component_rebuild(
 ) -> Result<GuardianComponentRebuildOutcome, OperationJournalStoreError> {
     let ManagedVersionBundleComponentRebuildEffect {
         completion,
+        mutation: _mutation,
         reservation,
         request: _,
         identity: _,
@@ -1392,6 +1541,7 @@ async fn terminalize_assets_component_rebuild(
 ) -> Result<GuardianComponentRebuildOutcome, OperationJournalStoreError> {
     let ManagedAssetsComponentRebuildEffect {
         completion,
+        mutation: _mutation,
         reservation,
         request: _,
         identity: _,
@@ -1606,6 +1756,23 @@ fn bounded_fact_ids(facts: impl IntoIterator<Item = String>) -> Vec<String> {
         .filter_map(|fact| sanitize_evidence_token(&fact, RedactionAudience::UserVisible, 96))
         .take(MAX_OPERATION_JOURNAL_STEP_FACTS)
         .collect()
+}
+
+fn managed_artifact_mutation_admission_fact(
+    error: ManagedArtifactMutationEpochUnavailable,
+) -> String {
+    match error {
+        ManagedArtifactMutationEpochUnavailable::MutationInFlight => {
+            "managed_artifact_mutation_in_flight"
+        }
+        ManagedArtifactMutationEpochUnavailable::EpochChanged => {
+            "managed_artifact_mutation_epoch_changed"
+        }
+        ManagedArtifactMutationEpochUnavailable::Exhausted(_) => {
+            "managed_artifact_mutation_epoch_exhausted"
+        }
+    }
+    .to_string()
 }
 
 fn component_rebuild_memory_error(error: FailureMemoryStoreError) -> OperationJournalStoreError {
@@ -2322,6 +2489,26 @@ mod tests {
         refused
     }
 
+    async fn wait_for_component_owner_settlement(fixture: &Fixture, operation_id: &OperationId) {
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if fixture
+                    .journals
+                    .get(operation_id)
+                    .is_some_and(|journal| journal.reconciliation_terminal().is_some())
+                    && fixture
+                        .state
+                        .managed_artifact_mutation_epoch_is_capturable_for_test()
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("detached component owner settlement");
+    }
+
     async fn assert_receipt_is_retained_until_persistence_retry(
         fixture: &Fixture,
         backend: Arc<ControlledWriteBackend>,
@@ -2479,6 +2666,40 @@ mod tests {
             Some(terminal.clone())
         );
 
+        cleanup(fixture).await;
+    }
+
+    #[tokio::test]
+    async fn managed_version_bundle_commit_rejects_an_intervening_artifact_epoch() {
+        let fixture = fixture("version-bundle-intervening-epoch");
+        let mut admission =
+            version_bundle_component_admission(&fixture, "version-bundle-intervening-epoch").await;
+        admission.bind_managed_artifact_epoch_for_test();
+        let root = PathBuf::from(fixture.state.library_dir().expect("library root"));
+        let state = fixture.state.clone();
+
+        let outcome =
+            execute_managed_version_bundle_component_rebuild(admission, move |effect| async move {
+                let receipt = axial_minecraft::rebuild_managed_version_bundle_fixture_for_test(
+                    root, "1.21.1",
+                )
+                .await
+                .expect("sealed VersionBundle fixture receipt");
+                drop(
+                    state
+                        .admit_managed_artifact_mutation()
+                        .expect("intervening managed artifact writer"),
+                );
+                effect.committed(receipt, ["version_bundle_component_rebuilt".to_string()])
+            })
+            .await
+            .expect("stale VersionBundle rebuild settles durably");
+
+        assert_eq!(outcome.status, GuardianComponentRebuildStatus::Failed);
+        assert_eq!(
+            outcome.facts,
+            vec!["version_bundle_component_postcondition_failed"]
+        );
         cleanup(fixture).await;
     }
 
@@ -3210,6 +3431,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn managed_runtime_success_rejects_an_intervening_artifact_epoch() {
+        let fixture = fixture("runtime-intervening-epoch");
+        let (mut admission, _) = component_admission(&fixture, "runtime-intervening-epoch").await;
+        admission.bind_managed_artifact_epoch_for_test();
+        let state = fixture.state.clone();
+
+        let outcome = execute_managed_runtime_component_rebuild(admission, move |effect| {
+            let (runtime_cache, component) = effect.core_request();
+            async move {
+                let receipt = axial_minecraft::rebuild_managed_runtime_fixture_for_test(
+                    &runtime_cache,
+                    component,
+                )
+                .await
+                .expect("sealed managed Runtime fixture receipt");
+                drop(
+                    state
+                        .admit_managed_artifact_mutation()
+                        .expect("intervening managed artifact writer"),
+                );
+                effect.succeeded(receipt, ["runtime_component_rebuilt".to_string()])
+            }
+        })
+        .await
+        .expect("stale Runtime rebuild settles durably");
+
+        assert_eq!(outcome.status, GuardianComponentRebuildStatus::Failed);
+        assert_eq!(
+            outcome.facts,
+            vec!["runtime_component_postcondition_failed"]
+        );
+        cleanup(fixture).await;
+    }
+
+    #[tokio::test]
     async fn journal_persistence_retry_retains_runtime_receipt_until_terminal_is_durable() {
         let backend = Arc::new(ControlledWriteBackend::default());
         let fixture = fixture_with_backends("journal-retry", Some(backend.clone()), None);
@@ -3271,6 +3527,40 @@ mod tests {
                 if error.kind() == std::io::ErrorKind::WouldBlock
         ));
 
+        cleanup(fixture).await;
+    }
+
+    #[tokio::test]
+    async fn cancelled_runtime_waiter_retains_mutation_epoch_until_owner_settles() {
+        let fixture = fixture("runtime-cancelled-waiter");
+        let (admission, _) = component_admission(&fixture, "runtime-cancelled-waiter").await;
+        let operation_id = admission.attempt().operation_id().clone();
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let rebuild = tokio::spawn(execute_managed_runtime_component_rebuild(
+            admission,
+            move |effect| async move {
+                let _ = entered_tx.send(());
+                release_rx.await.expect("release Runtime driver");
+                effect.failed_before_effect(["runtime_driver_cancelled".to_string()])
+            },
+        ));
+        entered_rx.await.expect("Runtime driver entered");
+        assert!(
+            !fixture
+                .state
+                .managed_artifact_mutation_epoch_is_capturable_for_test()
+        );
+
+        rebuild.abort();
+        assert!(matches!(rebuild.await, Err(error) if error.is_cancelled()));
+        assert!(
+            !fixture
+                .state
+                .managed_artifact_mutation_epoch_is_capturable_for_test()
+        );
+        release_tx.send(()).expect("detached Runtime owner");
+        wait_for_component_owner_settlement(&fixture, &operation_id).await;
         cleanup(fixture).await;
     }
 

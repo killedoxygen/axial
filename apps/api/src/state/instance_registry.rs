@@ -481,11 +481,27 @@ impl AppInstanceStore {
             .store(2, Ordering::Release);
     }
 
+    #[cfg(test)]
     pub(crate) async fn close(&self) -> Result<(), InstanceStoreError> {
+        self.close_admitted(|| Ok(None::<()>)).await
+    }
+
+    pub(super) async fn close_admitted<Admit, Admission>(
+        &self,
+        admit: Admit,
+    ) -> Result<(), InstanceStoreError>
+    where
+        Admit: FnOnce() -> Result<Option<Admission>, InstanceStoreError>,
+    {
         let gate = self.mutation_gate.clone().lock_owned().await;
         if self.closed.load(Ordering::Acquire) {
             return Ok(());
         }
+        let _reconciliation_admission = if self.has_managed_artifact_reconciliation() {
+            admit()?
+        } else {
+            None
+        };
         let _gate = self.reconcile_obligations(gate).await?;
         self.persistence
             .owner
@@ -494,6 +510,21 @@ impl AppInstanceStore {
             .map_err(instance_persistence_error)?;
         self.closed.store(true, Ordering::Release);
         Ok(())
+    }
+
+    pub(super) fn has_managed_artifact_reconciliation(&self) -> bool {
+        let state = self.state.lock().expect(INSTANCE_REGISTRY_LOCK_INVARIANT);
+        if !state.visible.pending_deletions.is_empty() {
+            return true;
+        }
+        state
+            .retry_candidate
+            .as_ref()
+            .is_some_and(|(_, candidate)| {
+                !candidate.pending_deletions.is_empty()
+                    || candidate.pending_deletions != state.visible.pending_deletions
+                    || !same_managed_instance_identities(&state.visible, candidate)
+            })
     }
 
     async fn reconcile_retry(
@@ -688,6 +719,20 @@ impl AppInstanceStore {
         state.visible = candidate;
         Ok(())
     }
+}
+
+fn same_managed_instance_identities(
+    left: &InstanceRegistrySnapshot,
+    right: &InstanceRegistrySnapshot,
+) -> bool {
+    left.instances.len() == right.instances.len()
+        && left.instances.iter().all(|left_instance| {
+            right.instances.iter().any(|right_instance| {
+                left_instance.id == right_instance.id
+                    && left_instance.version_id == right_instance.version_id
+                    && left_instance.created_at == right_instance.created_at
+            })
+        })
 }
 
 pub(crate) fn new_instance(
@@ -1124,6 +1169,9 @@ fn closed_instance_registry_error() -> InstanceStoreError {
 mod tests {
     use super::*;
     use crate::execution::persistence::AtomicWriteBackend;
+    use crate::state::managed_artifact_epoch::{
+        ManagedArtifactMutationEpochCoordinator, ManagedArtifactMutationEpochUnavailable,
+    };
     use axial_config::INSTANCE_REGISTRY_MAX_BYTES;
     use std::sync::atomic::{AtomicU64, AtomicUsize};
     use std::sync::{Condvar, Mutex};
@@ -1544,6 +1592,98 @@ mod tests {
         cleanup_test_store(&store);
     }
 
+    #[tokio::test]
+    async fn failed_create_retry_reacquires_epoch_until_identity_publication() {
+        let (store, backend) =
+            test_store("create-retry-epoch", InstanceRegistrySnapshot::default(), 1);
+        let instance = test_instance("0000000000000001", "Epoch create retry");
+        let gate = store
+            .acquire_mutation()
+            .await
+            .expect("acquire create mutation");
+        let first = store.create_with_gate(instance.clone(), None, gate).await;
+        assert!(matches!(first, Err(InstanceStoreError::Persistence(_))));
+        assert!(store.current().instances.is_empty());
+
+        let epoch = ManagedArtifactMutationEpochCoordinator::default();
+        assert!(epoch.capture().is_ok(), "failed attempt releases its epoch");
+        let write_gate = backend.gate_next();
+        let owner_epoch = epoch.clone();
+        let owner_store = store.clone();
+        let close = tokio::spawn(async move {
+            owner_store
+                .close_admitted(move || {
+                    owner_epoch.admit().map(Some).map_err(|error| {
+                        InstanceStoreError::Persistence(std::io::Error::other(error.to_string()))
+                    })
+                })
+                .await
+        });
+        backend.wait_for_attempt(2).await;
+
+        assert!(matches!(
+            epoch.capture(),
+            Err(ManagedArtifactMutationEpochUnavailable::MutationInFlight)
+        ));
+        assert!(store.current().instances.is_empty());
+        write_gate.release();
+        close
+            .await
+            .expect("close retry owner")
+            .expect("close retries failed create");
+
+        assert!(epoch.capture().is_ok());
+        assert_eq!(store.current().instances, vec![instance]);
+        cleanup_test_store(&store);
+    }
+
+    #[tokio::test]
+    async fn failed_keep_files_delete_retry_reacquires_epoch_until_identity_publication() {
+        let snapshot = snapshot_with_one();
+        let instance = snapshot.instances[0].clone();
+        let (store, backend) = test_store("keep-files-retry-epoch", snapshot, 1);
+        let gate = store
+            .acquire_mutation()
+            .await
+            .expect("acquire delete mutation");
+        let first = store
+            .delete_with_gate(instance.id.clone(), false, gate)
+            .await;
+        assert!(matches!(first, Err(InstanceStoreError::Persistence(_))));
+        assert_eq!(store.current().instances, vec![instance.clone()]);
+
+        let epoch = ManagedArtifactMutationEpochCoordinator::default();
+        assert!(epoch.capture().is_ok(), "failed attempt releases its epoch");
+        let write_gate = backend.gate_next();
+        let owner_epoch = epoch.clone();
+        let owner_store = store.clone();
+        let close = tokio::spawn(async move {
+            owner_store
+                .close_admitted(move || {
+                    owner_epoch.admit().map(Some).map_err(|error| {
+                        InstanceStoreError::Persistence(std::io::Error::other(error.to_string()))
+                    })
+                })
+                .await
+        });
+        backend.wait_for_attempt(2).await;
+
+        assert!(matches!(
+            epoch.capture(),
+            Err(ManagedArtifactMutationEpochUnavailable::MutationInFlight)
+        ));
+        assert_eq!(store.current().instances, vec![instance]);
+        write_gate.release();
+        close
+            .await
+            .expect("close retry owner")
+            .expect("close retries keep-files deletion");
+
+        assert!(epoch.capture().is_ok());
+        assert!(store.current().instances.is_empty());
+        cleanup_test_store(&store);
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn create_rejects_symlinked_seed_file_and_cleans_uncommitted_directory() {
@@ -1600,10 +1740,37 @@ mod tests {
         std::fs::create_dir(&instance_path).expect("create retryable instance directory");
         std::fs::write(instance_path.join("owned.txt"), b"owned").expect("seed instance directory");
 
-        store
-            .close()
+        let write_gate = backend.gate_next();
+        let mutation_epoch =
+            super::super::managed_artifact_epoch::ManagedArtifactMutationEpochCoordinator::default(
+            );
+        let owner_epoch = mutation_epoch.clone();
+        let owner_store = store.clone();
+        let close = tokio::spawn(async move {
+            owner_store
+                .close_admitted(move || {
+                    owner_epoch.admit().map(Some).map_err(|error| {
+                        InstanceStoreError::Persistence(std::io::Error::other(error.to_string()))
+                    })
+                })
+                .await
+        });
+        backend.wait_for_attempt(2).await;
+
+        assert!(!instance_path.exists());
+        assert!(matches!(
+            mutation_epoch.capture(),
+            Err(
+                super::super::managed_artifact_epoch::ManagedArtifactMutationEpochUnavailable::MutationInFlight
+            )
+        ));
+        write_gate.release();
+        close
             .await
+            .expect("close cleanup owner")
             .expect("close retries pending deletion cleanup");
+
+        assert!(mutation_epoch.capture().is_ok());
         assert!(!instance_path.exists());
         assert!(store.current().pending_deletions.is_empty());
         assert_eq!(backend.attempts.load(Ordering::SeqCst), 2);

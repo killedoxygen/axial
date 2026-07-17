@@ -1,6 +1,6 @@
 use crate::application::{
     InstallQueueRequest, InstallQueueStateResponse, InstallStatusResponse, enqueue_install_owned,
-    install_events_stream, install_queue_status_owned, install_status, remove_queued_install,
+    install_events_stream, install_queue_status_owned, install_status, remove_queued_install_owned,
     retry_install_owned,
 };
 use crate::state::{AppState, RequestProducerHandoff};
@@ -90,8 +90,11 @@ async fn handle_install_queue_retry(
 async fn handle_install_queue_remove(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    Extension(handoff): Extension<RequestProducerHandoff>,
 ) -> Result<Json<InstallQueueStateResponse>, (StatusCode, Json<serde_json::Value>)> {
-    remove_queued_install(&state, &id).await.map(Json)
+    remove_queued_install_owned(&state, &id, handoff)
+        .await
+        .map(Json)
 }
 
 async fn handle_install_events(

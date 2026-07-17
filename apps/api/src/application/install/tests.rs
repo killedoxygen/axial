@@ -1500,6 +1500,103 @@ async fn selected_queue_skips_and_cleans_a_failed_prerequisite_dependent() {
 }
 
 #[tokio::test]
+async fn cancelled_queue_removal_caller_cannot_cancel_setup_cleanup_owner() {
+    let root = temp_root("queue-remove-cancellation-owner");
+    let state = build_test_state(&root);
+    let instance = state
+        .instances()
+        .insert_for_test("Cancelled queue removal", "1.21.5")
+        .expect("create setup instance");
+    let instance_dir = state.instances().game_dir(&instance.id);
+    let cleanup = setup_instance_cleanup(&state, &instance, false);
+    let queue_id = "cancelled-remove-queue";
+    state
+        .installs()
+        .enqueue_queued_install(
+            queue_id.to_string(),
+            InstallQueueSpec::Content {
+                instance_id: instance.id.clone(),
+                label: "Cancelled queue removal".to_string(),
+                action: ContentQueueAction::Install {
+                    selections: Vec::new(),
+                    allow_incompatible: false,
+                    setup_cleanup: Some(cleanup),
+                },
+                prerequisite_queue_id: None,
+            },
+            InstallQueuePlacement::Back,
+        )
+        .await;
+    let lifecycle = state.acquire_instance_lifecycle(&instance.id).await;
+    let request = state
+        .try_admit_request()
+        .expect("admit queue removal request");
+    let mut removal = Box::pin(remove_queued_install_owned(
+        &state,
+        queue_id,
+        request.producer_handoff(),
+    ));
+    {
+        let waker = futures_util::task::noop_waker();
+        let mut context = std::task::Context::from_waker(&waker);
+        assert!(matches!(
+            std::future::Future::poll(removal.as_mut(), &mut context),
+            std::task::Poll::Pending
+        ));
+    }
+    timeout(Duration::from_secs(1), async {
+        loop {
+            let snapshot = state.installs().queue_snapshot().await;
+            if snapshot
+                .pending
+                .iter()
+                .all(|entry| entry.queue_id != queue_id)
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("owned removal consumes queue entry");
+    assert!(state.instances().get(&instance.id).is_some());
+
+    drop(removal);
+    drop(request);
+    let shutdown_state = state.clone();
+    let quiesce = tokio::spawn(async move { shutdown_state.quiesce().await });
+    tokio::task::yield_now().await;
+    assert!(!quiesce.is_finished());
+    drop(lifecycle);
+    timeout(Duration::from_secs(5), quiesce)
+        .await
+        .expect("queue removal owner drains")
+        .expect("quiesce task")
+        .expect("quiesce succeeds");
+
+    assert!(state.instances().get(&instance.id).is_none());
+    assert!(!instance_dir.exists());
+    state
+        .close_instance_registry()
+        .await
+        .expect("close instance registry");
+    state
+        .close_known_good_inventories()
+        .await
+        .expect("close known-good store");
+    state
+        .close_user_mod_witnesses()
+        .await
+        .expect("close mod witnesses");
+    state
+        .close_user_config_snapshots()
+        .await
+        .expect("close config snapshots");
+    drop(state);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
 async fn enqueue_settles_its_selected_item_after_an_older_head_start_failure() {
     let root = temp_root("install-queue-enqueue-selected-settlement");
     let state = build_test_state(&root);

@@ -203,6 +203,24 @@ pub(crate) async fn execute_managed_runtime_ready_marker_repair(
         ));
     }
 
+    let _mutation = match authority.admit_managed_artifact_mutation() {
+        Ok(mutation) => mutation,
+        Err(_) => {
+            return finish_runtime_repair(
+                &terminal_context,
+                operation_id,
+                RuntimeTerminal::Failed {
+                    step_id: READY_MARKER_REPAIR_STEP,
+                    action,
+                    facts: Vec::new(),
+                    summary: "managed_runtime_mutation_epoch_exhausted",
+                    suppression_until: Some(attempt.suppression_until().to_string()),
+                },
+            )
+            .await;
+        }
+    };
+
     match repair_managed_runtime(
         ManagedRuntimeRepairRequest::new(target.clone(), runtime_root)
             .with_operation_id(operation_id.clone()),

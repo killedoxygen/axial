@@ -18,6 +18,7 @@ pub(crate) struct KnownGoodTier2Ticket {
     library_root: PathBuf,
     managed_runtime_cache: ManagedRuntimeCache,
     inventory: Arc<KnownGoodInventory>,
+    managed_artifact_epoch: super::ManagedArtifactMutationEpoch,
 }
 
 impl KnownGoodTier2Ticket {
@@ -83,6 +84,9 @@ impl AppState {
                 &library_root,
             )
             .ok_or(KnownGoodVerificationUnavailable::LiveAuthorityUnavailable)?;
+        let managed_artifact_epoch = self
+            .capture_managed_artifact_mutation_epoch()
+            .map_err(|_| KnownGoodVerificationUnavailable::LiveAuthorityUnavailable)?;
         let ticket = KnownGoodTier2Ticket {
             sweep_authority: sweep_authority.clone(),
             instance_id: instance.id,
@@ -91,6 +95,7 @@ impl AppState {
             library_root,
             managed_runtime_cache: self.managed_runtime_cache.clone(),
             inventory,
+            managed_artifact_epoch,
         };
         if !self.idle_sweep_authority_is_current(sweep_authority) {
             return Err(KnownGoodVerificationUnavailable::SweepAuthorityUnavailable);
@@ -143,6 +148,7 @@ impl AppState {
             library_root,
             managed_runtime_cache,
             inventory,
+            managed_artifact_epoch,
         } = ticket;
         let audit_authority = sweep_authority.clone();
         let authority = KnownGoodVerificationLease {
@@ -154,6 +160,9 @@ impl AppState {
             library_root,
             managed_runtime_cache,
             inventory,
+            managed_artifact_epoch: Some(Arc::new(std::sync::atomic::AtomicU64::new(
+                managed_artifact_epoch.value(),
+            ))),
         };
         before_seal();
         match self.seal_registered_artifact_findings(authority, observations) {
@@ -165,14 +174,16 @@ impl AppState {
     }
 
     fn known_good_tier2_ticket_identity_is_current(&self, ticket: &KnownGoodTier2Ticket) -> bool {
-        self.known_good_authority_is_current(
-            &ticket.instance_id,
-            &ticket.version_id,
-            &ticket.created_at,
-            &ticket.library_root,
-            &ticket.managed_runtime_cache,
-            &ticket.inventory,
-        )
+        self.managed_artifact_mutation_epoch()
+            .is_ok_and(|epoch| epoch == ticket.managed_artifact_epoch)
+            && self.known_good_authority_is_current(
+                &ticket.instance_id,
+                &ticket.version_id,
+                &ticket.created_at,
+                &ticket.library_root,
+                &ticket.managed_runtime_cache,
+                &ticket.inventory,
+            )
     }
 }
 
@@ -318,6 +329,27 @@ mod tests {
         drop(lifecycle);
         assert!(fixture.state.known_good_tier2_ticket_is_current(&ticket));
         drop(reservation);
+        fixture.close().await;
+    }
+
+    #[tokio::test]
+    async fn shared_root_mutation_invalidates_an_existing_ticket() {
+        let fixture = Fixture::new("shared-root-mutation");
+        let reservation = fixture.reserve_sweep();
+        let ticket = fixture
+            .state
+            .mint_known_good_tier2_ticket(&reservation.authority(), &fixture.instance.id)
+            .await
+            .expect("ticket");
+        let shared_root_writer = fixture.state.clone();
+
+        let _mutation = shared_root_writer
+            .admit_managed_artifact_mutation()
+            .expect("shared-root mutation");
+
+        assert!(!fixture.state.known_good_tier2_ticket_is_current(&ticket));
+        drop(ticket);
+        reservation.settle(super::super::IdleSweepTerminal::Cancelled);
         fixture.close().await;
     }
 

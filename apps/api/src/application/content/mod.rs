@@ -422,6 +422,11 @@ where
 
     let planned = resolution.to_install();
     if !planned.is_empty() {
+        let _mutation = state.admit_managed_artifact_mutation().map_err(|error| {
+            content_execution_error(axial_content::ContentError::Io(std::io::Error::other(
+                error.to_string(),
+            )))
+        })?;
         install_and_record(
             state.content().client(),
             &game_dir,
@@ -558,6 +563,11 @@ pub(crate) async fn execute_content_uninstalls(
         .cloned()
         .map(CanonicalId)
         .collect::<Vec<_>>();
+    let _mutation = state.admit_managed_artifact_mutation().map_err(|error| {
+        content_execution_error(axial_content::ContentError::Io(std::io::Error::other(
+            error.to_string(),
+        )))
+    })?;
     uninstall_many(&game_dir, &canonical_ids).map_err(content_execution_error)?;
     Ok(())
 }

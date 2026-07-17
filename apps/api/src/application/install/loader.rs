@@ -2,7 +2,7 @@ use super::{
     BASE_INSTALL_FAILED_MESSAGE, INSTALL_FAILURE_MESSAGE, InstallApplicationError,
     InstallForegroundActivity, InstallProgressCoalescer, InstallProgressJournalTracker,
     InstallProgressViewModel, InstallStartResponse, LOADER_INSTALL_INTERRUPTED_MESSAGE,
-    LoaderBuildsRequest, LoaderInstallStartRequest,
+    LoaderBuildsRequest, LoaderInstallStartRequest, await_managed_install_settlement,
     begin_install_journal_with_owned_reconciliation, emit_install_failed,
     finish_install_progress_task, generate_install_id, install_journal_error_response,
     install_operation_id, known_good_acceptance_download_error,
@@ -262,26 +262,28 @@ pub(super) async fn start_loader_install_with_foreground(
 
             let final_progress = Arc::new(Mutex::new(None::<DownloadProgress>));
             let final_progress_for_install = Arc::clone(&final_progress);
-            let result = {
-                let install = install_build(
-                    &library_dir,
-                    worker_runtime_cache.clone(),
-                    build.clone(),
-                    |progress| {
-                        if progress.done {
-                            if let Ok(mut final_progress) = final_progress_for_install.lock() {
-                                *final_progress = Some(progress);
+            let result = match worker_state.admit_managed_artifact_mutation() {
+                Ok(mutation) => {
+                    let install = install_build(
+                        &library_dir,
+                        worker_runtime_cache.clone(),
+                        build.clone(),
+                        |progress| {
+                            if progress.done {
+                                if let Ok(mut final_progress) = final_progress_for_install.lock() {
+                                    *final_progress = Some(progress);
+                                }
+                                return;
                             }
-                            return;
-                        }
-                        let _ = progress_tx.send(progress);
-                    },
-                );
-                tokio::pin!(install);
-                tokio::select! {
-                    result = &mut install => Some(result),
-                    () = journal_failed.notified() => None,
+                            let _ = progress_tx.send(progress);
+                        },
+                    );
+                    await_managed_install_settlement(mutation, install, journal_failed.notified())
+                        .await
                 }
+                Err(error) => Some(Err(LoaderInstallError::from(LoaderError::Io(
+                    std::io::Error::other(error.to_string()),
+                )))),
             };
             let Some(result) = result else {
                 drop(progress_tx);
@@ -798,5 +800,16 @@ fn active_loader_install_error_message(failure: &LoaderActiveInstallFailure) -> 
         LoaderInstallFailureKind::InstallExecutionFailed => {
             "Loader installer could not complete. Restart Axial and try again."
         }
+    }
+}
+
+#[cfg(test)]
+mod managed_install_settlement_tests {
+    #[tokio::test]
+    async fn loader_journal_failure_retains_mutation_until_install_settles() {
+        super::super::managed_install_settlement_tests::assert_journal_failure_retains_mutation(
+            "loader",
+        )
+        .await;
     }
 }

@@ -500,6 +500,17 @@ impl RegisteredArtifactRepairAdmission {
         &self.mutation
     }
 
+    pub(crate) fn admit_managed_artifact_mutation(
+        &self,
+    ) -> Result<
+        super::ManagedArtifactMutationAdmission,
+        super::ManagedArtifactMutationEpochUnavailable,
+    > {
+        self.findings
+            .state
+            .admit_managed_artifact_mutation_for_verification(&self.findings.authority)
+    }
+
     pub(crate) fn plan(&self) -> RegisteredArtifactRepairPlanRef<'_> {
         match &self.plan {
             RegisteredArtifactRepairPlan::DownloadMissing {

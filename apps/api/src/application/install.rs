@@ -51,6 +51,28 @@ use std::time::{Duration, SystemTime};
 use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::mpsc;
 
+async fn await_managed_install_settlement<Mutation, Install, JournalFailure>(
+    mutation: Mutation,
+    install: Install,
+    journal_failure: JournalFailure,
+) -> Option<Install::Output>
+where
+    Install: Future,
+    JournalFailure: Future<Output = ()>,
+{
+    tokio::pin!(install);
+    tokio::pin!(journal_failure);
+    let result = tokio::select! {
+        result = &mut install => Some(result),
+        () = &mut journal_failure => {
+            let _ = install.await;
+            None
+        }
+    };
+    drop(mutation);
+    result
+}
+
 pub(crate) async fn settle_startup_install_guardian_failure_memory(state: &AppState) -> bool {
     let Ok(producer) = state.try_claim_producer() else {
         return false;
@@ -742,27 +764,29 @@ async fn start_install_version_with_foreground(
             let progress_tx_for_downloader = progress_tx.clone();
             let terminal_progress_for_downloader = Arc::clone(&terminal_progress);
             let mut install_facts = Vec::new();
-            let install_result = {
-                let install = downloader.install_version_with_facts(
-                    &version_id,
-                    move |progress| {
-                        if progress.done {
-                            if let Ok(mut terminal_progress) =
-                                terminal_progress_for_downloader.lock()
-                            {
-                                *terminal_progress = Some(progress);
+            let install_result = match worker_state.admit_managed_artifact_mutation() {
+                Ok(mutation) => {
+                    let install = downloader.install_version_with_facts(
+                        &version_id,
+                        move |progress| {
+                            if progress.done {
+                                if let Ok(mut terminal_progress) =
+                                    terminal_progress_for_downloader.lock()
+                                {
+                                    *terminal_progress = Some(progress);
+                                }
+                                return;
                             }
-                            return;
-                        }
-                        let _ = progress_tx_for_downloader.send(progress);
-                    },
-                    |fact| install_facts.push(fact),
-                );
-                tokio::pin!(install);
-                tokio::select! {
-                    result = &mut install => Some(result),
-                    () = journal_failed.notified() => None,
+                            let _ = progress_tx_for_downloader.send(progress);
+                        },
+                        |fact| install_facts.push(fact),
+                    );
+                    await_managed_install_settlement(mutation, install, journal_failed.notified())
+                        .await
                 }
+                Err(error) => Some(Err(DownloadError::FileOperation(std::io::Error::other(
+                    error.to_string(),
+                )))),
             };
             let Some(install_result) = install_result else {
                 drop(progress_tx);
@@ -1240,7 +1264,23 @@ pub(crate) async fn retry_install_owned(
     .await
 }
 
-pub async fn remove_queued_install(
+pub(crate) async fn remove_queued_install_owned(
+    state: &AppState,
+    queue_id: &str,
+    handoff: RequestProducerHandoff,
+) -> Result<InstallQueueStateResponse, InstallApplicationError> {
+    let producer = handoff
+        .try_claim()
+        .map_err(|_| install_shutdown_error_response())?;
+    let owner_state = state.clone();
+    let queue_id = queue_id.to_string();
+    producer
+        .spawn_joinable(async move { remove_queued_install(&owner_state, &queue_id).await })
+        .await
+        .map_err(|_| install_queue_remove_stopped_error_response())?
+}
+
+async fn remove_queued_install(
     state: &AppState,
     queue_id: &str,
 ) -> Result<InstallQueueStateResponse, InstallApplicationError> {
@@ -2573,6 +2613,15 @@ fn install_queue_start_stopped_error_response() -> InstallApplicationError {
     )
 }
 
+fn install_queue_remove_stopped_error_response() -> InstallApplicationError {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(serde_json::json!({
+            "error": "The queued install removal stopped before cleanup settled. Try again."
+        })),
+    )
+}
+
 fn selected_queue_missing_error_response() -> InstallApplicationError {
     (
         StatusCode::CONFLICT,
@@ -3085,6 +3134,165 @@ fn generate_install_id(prefix: &str) -> String {
         .map(|value| value.as_nanos())
         .unwrap_or_default();
     format!("{prefix}-{:032x}", nanos)
+}
+
+#[cfg(test)]
+mod managed_install_settlement_tests {
+    use super::*;
+    use crate::state::{
+        AppStateInit, IdleSweepReservation, IdleSweepTerminal, InstallStore,
+        KnownGoodVerificationUnavailable, SessionStore,
+    };
+    use axial_config::{AppPaths, ConfigStore, InstanceRegistrySnapshot, InstanceStore};
+    use axial_minecraft::known_good::{
+        KnownGoodArtifactKind, KnownGoodInventory, TestKnownGoodEntry, TestKnownGoodIntegrity,
+        TestKnownGoodRoot,
+    };
+    use std::time::{SystemTime, UNIX_EPOCH};
+    use tokio::sync::oneshot;
+
+    struct Fixture {
+        root: PathBuf,
+        state: AppState,
+        instance_id: String,
+    }
+
+    impl Fixture {
+        fn new(name: &str) -> Self {
+            let root = std::env::temp_dir().join(format!(
+                "axial-managed-install-settlement-{name}-{}-{}",
+                std::process::id(),
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .expect("clock")
+                    .as_nanos()
+            ));
+            let config_dir = root.join("config");
+            let library_dir = root.join("library");
+            std::fs::create_dir_all(&library_dir).expect("library directory");
+            let paths = AppPaths {
+                config_file: config_dir.join("config.json"),
+                instances_file: config_dir.join("instances.json"),
+                instances_dir: root.join("instances"),
+                music_dir: root.join("music"),
+                library_dir: library_dir.clone(),
+                config_dir,
+            };
+            let config = Arc::new(ConfigStore::load_from(paths.clone()).expect("config"));
+            let instances = Arc::new(
+                InstanceStore::from_snapshot(paths.clone(), InstanceRegistrySnapshot::default())
+                    .expect("instances"),
+            );
+            let state = AppState::new(AppStateInit {
+                app_name: "Axial".to_string(),
+                version: "test".to_string(),
+                config,
+                instances,
+                installs: Arc::new(InstallStore::new()),
+                sessions: Arc::new(SessionStore::new()),
+                performance: Arc::new(
+                    axial_performance::PerformanceManager::load_for_startup(&paths.config_dir)
+                        .expect("performance"),
+                ),
+                startup_warnings: Vec::new(),
+                frontend_dir: root.join("frontend"),
+            });
+            state.set_library_dir_for_test(library_dir.to_string_lossy().into_owned());
+            let instance = state
+                .instances()
+                .insert_for_test("Managed install settlement", "1.21.5")
+                .expect("instance");
+            let inventory = KnownGoodInventory::from_test_entries([TestKnownGoodEntry {
+                root: TestKnownGoodRoot::Versions,
+                path: "client.jar".to_string(),
+                kind: KnownGoodArtifactKind::ClientJar,
+                integrity: TestKnownGoodIntegrity::File { size: 1 },
+            }])
+            .expect("known-good inventory");
+            state.activate_known_good_inventory_for_test(&instance.id, inventory);
+            Self {
+                root,
+                state,
+                instance_id: instance.id,
+            }
+        }
+
+        fn reserve_sweep(&self) -> IdleSweepReservation {
+            let epoch = self.state.subscribe_integrity_idle().borrow().epoch();
+            let producer = self
+                .state
+                .try_claim_producer()
+                .expect("idle sweep producer");
+            self.state
+                .try_reserve_idle_sweep(epoch, producer)
+                .expect("idle sweep reservation")
+        }
+
+        async fn close(self) {
+            self.state
+                .close_known_good_inventories()
+                .await
+                .expect("close known-good store");
+            drop(self.state);
+            let _ = std::fs::remove_dir_all(self.root);
+        }
+    }
+
+    pub(super) async fn assert_journal_failure_retains_mutation(name: &str) {
+        let fixture = Fixture::new(name);
+        let reservation = fixture.reserve_sweep();
+        let mutation = fixture
+            .state
+            .admit_managed_artifact_mutation()
+            .expect("managed mutation admission");
+        let (install_started_tx, install_started_rx) = oneshot::channel();
+        let (release_install_tx, release_install_rx) = oneshot::channel();
+        let (fail_journal_tx, fail_journal_rx) = oneshot::channel();
+        let (journal_selected_tx, journal_selected_rx) = oneshot::channel();
+        let install = async move {
+            install_started_tx.send(()).expect("signal install start");
+            release_install_rx.await.expect("release install");
+        };
+        let journal_failure = async move {
+            fail_journal_rx.await.expect("fail journal");
+            journal_selected_tx
+                .send(())
+                .expect("signal journal selection");
+        };
+        let settlement = tokio::spawn(await_managed_install_settlement(
+            mutation,
+            install,
+            journal_failure,
+        ));
+
+        install_started_rx.await.expect("install started");
+        fail_journal_tx.send(()).expect("trigger journal failure");
+        journal_selected_rx.await.expect("journal failure selected");
+        assert!(!settlement.is_finished());
+        assert!(matches!(
+            fixture
+                .state
+                .mint_known_good_tier2_ticket(&reservation.authority(), &fixture.instance_id)
+                .await,
+            Err(KnownGoodVerificationUnavailable::LiveAuthorityUnavailable)
+        ));
+
+        release_install_tx.send(()).expect("settle install");
+        assert_eq!(settlement.await.expect("settlement task"), None);
+        let ticket = fixture
+            .state
+            .mint_known_good_tier2_ticket(&reservation.authority(), &fixture.instance_id)
+            .await
+            .expect("ticket after install settlement");
+        drop(ticket);
+        reservation.settle(IdleSweepTerminal::Cancelled);
+        fixture.close().await;
+    }
+
+    #[tokio::test]
+    async fn vanilla_journal_failure_retains_mutation_until_install_settles() {
+        assert_journal_failure_retains_mutation("vanilla").await;
+    }
 }
 
 #[cfg(test)]

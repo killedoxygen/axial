@@ -73,6 +73,7 @@ impl AppPerformanceStore {
         config_dir: &Path,
         instances_root: &Path,
         instance_lifecycle: super::instance_lifecycle::InstanceLifecycleGates,
+        managed_artifact_epoch: super::managed_artifact_epoch::ManagedArtifactMutationEpochCoordinator,
     ) -> Result<Self, RulesRefreshError> {
         let authority = manager
             .claim_rules_authority(config_dir)
@@ -83,6 +84,7 @@ impl AppPerformanceStore {
                 .claim_managed_authority(instances_root)
                 .map_err(managed_authority_claim_error)?,
             instance_lifecycle,
+            managed_artifact_epoch,
         );
         Ok(Self {
             manager,
@@ -113,6 +115,7 @@ impl AppPerformanceStore {
                 .claim_managed_authority(&config_dir.join("instances"))
                 .map_err(managed_authority_claim_error)?,
             super::instance_lifecycle::InstanceLifecycleGates::default(),
+            super::managed_artifact_epoch::ManagedArtifactMutationEpochCoordinator::default(),
         );
         Ok(Self {
             manager,

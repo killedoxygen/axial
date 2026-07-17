@@ -245,6 +245,23 @@ async fn execute_admitted_artifact_repair(
         }
     };
 
+    let _mutation = match context.admission.admit_managed_artifact_mutation() {
+        Ok(mutation) => mutation,
+        Err(_) => {
+            return finish_artifact_repair(
+                &context,
+                operation_id,
+                ArtifactTerminal::Failed {
+                    step_id: "admit_managed_artifact_mutation",
+                    rollback: RollbackState::NotApplicable,
+                    facts: Vec::new(),
+                    quarantine_checkpoint: ReconciliationQuarantineCheckpoint::default(),
+                },
+            )
+            .await;
+        }
+    };
+
     let quarantine_checkpoint = if context.quarantines_existing() {
         let quarantine_facts = match context
             .admission

@@ -192,6 +192,28 @@ impl GuardianWholeInstanceRematerializationError {
     }
 }
 
+async fn await_whole_instance_owner<Owner>(
+    owner: Owner,
+) -> Result<
+    GuardianWholeInstanceRematerializationOutcome,
+    GuardianWholeInstanceRematerializationError,
+>
+where
+    Owner: Future<
+            Output = Result<
+                GuardianWholeInstanceRematerializationOutcome,
+                GuardianWholeInstanceRematerializationError,
+            >,
+        > + Send
+        + 'static,
+{
+    tokio::spawn(owner)
+        .await
+        .map_err(|_| GuardianWholeInstanceRematerializationError {
+            class: "invalid_guardian_outcome",
+        })?
+}
+
 pub(crate) async fn execute_whole_instance_rematerialization(
     admission: RegisteredWholeInstanceRematerializationAdmission,
 ) -> Result<
@@ -216,51 +238,54 @@ pub(crate) async fn execute_whole_instance_rematerialization_with<Driver, Driver
 >
 where
     Driver: FnOnce(PathBuf, axial_minecraft::runtime::ManagedRuntimeCache, String) -> DriverFuture
-        + Send,
+        + Send
+        + 'static,
     DriverFuture: Future<Output = Result<ManagedWholeInstanceCommitReceipt, ManagedWholeInstanceRebuildError>>
-        + Send,
+        + Send
+        + 'static,
 {
-    let preparation = admission.into_effect().await.map_err(|error| {
-        GuardianWholeInstanceRematerializationError {
-            class: error.class(),
-        }
-    })?;
-    let (request, completion) = match preparation {
-        RegisteredWholeInstancePreparation::Admitted {
-            request,
-            completion,
-        } => (request, *completion),
-        RegisteredWholeInstancePreparation::Closed(outcome) => {
-            return Ok(guardian_outcome(*outcome));
-        }
-    };
-    let (root, runtime_cache, version_id) = {
-        let (root, runtime_cache, version_id) = request.core_request();
-        (
-            root.to_path_buf(),
-            runtime_cache.clone(),
-            version_id.to_string(),
-        )
-    };
-    let settlement = match driver(root, runtime_cache, version_id).await {
-        Ok(receipt) => completion.settle_commit(receipt).await,
-        Err(ManagedWholeInstanceRebuildError::RolledBack(receipt)) => {
-            completion.settle_rollback(receipt).await
-        }
-        Err(
-            ManagedWholeInstanceRebuildError::Reconstruction(_)
-            | ManagedWholeInstanceRebuildError::Preparation
-            | ManagedWholeInstanceRebuildError::RuntimePreparation,
-        ) => completion.into_failed_settlement(),
-    };
-    let outcome =
-        settlement
-            .settle()
-            .await
-            .map_err(|error| GuardianWholeInstanceRematerializationError {
+    await_whole_instance_owner(async move {
+        let preparation = admission.into_effect().await.map_err(|error| {
+            GuardianWholeInstanceRematerializationError {
                 class: error.class(),
-            })?;
-    Ok(guardian_outcome(outcome))
+            }
+        })?;
+        let (request, completion) = match preparation {
+            RegisteredWholeInstancePreparation::Admitted {
+                request,
+                completion,
+            } => (request, *completion),
+            RegisteredWholeInstancePreparation::Closed(outcome) => {
+                return Ok(guardian_outcome(*outcome));
+            }
+        };
+        let (root, runtime_cache, version_id) = {
+            let (root, runtime_cache, version_id) = request.core_request();
+            (
+                root.to_path_buf(),
+                runtime_cache.clone(),
+                version_id.to_string(),
+            )
+        };
+        let settlement = match driver(root, runtime_cache, version_id).await {
+            Ok(receipt) => completion.settle_commit(receipt).await,
+            Err(ManagedWholeInstanceRebuildError::RolledBack(receipt)) => {
+                completion.settle_rollback(receipt).await
+            }
+            Err(
+                ManagedWholeInstanceRebuildError::Reconstruction(_)
+                | ManagedWholeInstanceRebuildError::Preparation
+                | ManagedWholeInstanceRebuildError::RuntimePreparation,
+            ) => completion.into_failed_settlement(),
+        };
+        let outcome = settlement.settle().await.map_err(|error| {
+            GuardianWholeInstanceRematerializationError {
+                class: error.class(),
+            }
+        })?;
+        Ok(guardian_outcome(outcome))
+    })
+    .await
 }
 
 fn guardian_outcome(
@@ -345,7 +370,7 @@ mod tests {
 
         assert!(!guardian.contains("impl GuardianUserConfigRestoreOffer"));
         assert!(!state.contains("impl RegisteredUserConfigRestoreEligibility"));
-        assert!(!guardian.contains("tokio::spawn"));
+        assert!(!guardian.contains("tokio::time::interval"));
         assert!(!store.contains("std::fs::write"));
         assert!(!store.contains("File::create"));
         assert!(!store.contains("OpenOptions"));

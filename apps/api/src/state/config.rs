@@ -48,6 +48,12 @@ struct PendingConfigCommit {
 
 pub(super) type CommitObserver = Arc<dyn Fn(AppConfig, AppConfig) + Send + Sync>;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum ConfigCommitAdmissionContext {
+    NewCandidate,
+    RetainedRetry,
+}
+
 pub struct AppConfigStore {
     paths: AppPaths,
     mutation_allowed: bool,
@@ -153,7 +159,36 @@ impl AppConfigStore {
     where
         Mutation: FnOnce(&mut AppConfig) -> Result<(), ConfigStoreError> + Send + 'static,
     {
-        let gate = self.reconcile_retry(gate, observer.clone()).await?;
+        self.mutate_with_gate_admitted(
+            mutation,
+            export_configured,
+            observer,
+            |_, _, _| Ok(None::<()>),
+            gate,
+        )
+        .await
+    }
+
+    pub(super) async fn mutate_with_gate_admitted<Mutation, Admit, Admission>(
+        &self,
+        mutation: Mutation,
+        export_configured: bool,
+        observer: CommitObserver,
+        admit: Admit,
+        gate: OwnedMutexGuard<()>,
+    ) -> Result<AppConfig, ConfigStoreError>
+    where
+        Mutation: FnOnce(&mut AppConfig) -> Result<(), ConfigStoreError> + Send + 'static,
+        Admit: Fn(
+                ConfigCommitAdmissionContext,
+                &AppConfig,
+                &AppConfig,
+            ) -> Result<Option<Admission>, ConfigStoreError>
+            + Send
+            + Sync,
+        Admission: Send + 'static,
+    {
+        let gate = self.reconcile_retry(gate, observer.clone(), &admit).await?;
         let mut candidate = self.current();
         mutation(&mut candidate)?;
         let mut candidate = candidate.normalized()?;
@@ -163,15 +198,35 @@ impl AppConfigStore {
             drop(gate);
             return Ok(candidate);
         }
-        self.commit(candidate, gate, observer).await
+        self.commit(candidate, gate, observer, &admit).await
     }
 
+    #[cfg(test)]
     pub(crate) async fn close(&self, observer: CommitObserver) -> Result<(), ConfigStoreError> {
+        self.close_admitted(observer, |_, _, _| Ok(None::<()>))
+            .await
+    }
+
+    pub(super) async fn close_admitted<Admit, Admission>(
+        &self,
+        observer: CommitObserver,
+        admit: Admit,
+    ) -> Result<(), ConfigStoreError>
+    where
+        Admit: Fn(
+                ConfigCommitAdmissionContext,
+                &AppConfig,
+                &AppConfig,
+            ) -> Result<Option<Admission>, ConfigStoreError>
+            + Send
+            + Sync,
+        Admission: Send + 'static,
+    {
         let gate = self.mutation_gate.clone().lock_owned().await;
         if self.closed.load(Ordering::Acquire) {
             return Ok(());
         }
-        let _gate = self.reconcile_retry(gate, observer).await?;
+        let _gate = self.reconcile_retry(gate, observer, &admit).await?;
         self.persistence
             .owner
             .close()
@@ -187,11 +242,22 @@ impl AppConfigStore {
         Ok(())
     }
 
-    async fn reconcile_retry(
+    async fn reconcile_retry<Admit, Admission>(
         &self,
         gate: OwnedMutexGuard<()>,
         observer: CommitObserver,
-    ) -> Result<OwnedMutexGuard<()>, ConfigStoreError> {
+        admit: &Admit,
+    ) -> Result<OwnedMutexGuard<()>, ConfigStoreError>
+    where
+        Admit: Fn(
+                ConfigCommitAdmissionContext,
+                &AppConfig,
+                &AppConfig,
+            ) -> Result<Option<Admission>, ConfigStoreError>
+            + Send
+            + Sync,
+        Admission: Send + 'static,
+    {
         let retained = self
             .state
             .lock()
@@ -201,6 +267,12 @@ impl AppConfigStore {
         let Some((candidate_revision, candidate)) = retained else {
             return Ok(gate);
         };
+        let current = self.current();
+        let admission = admit(
+            ConfigCommitAdmissionContext::RetainedRetry,
+            &current,
+            &candidate,
+        )?;
         let ticket = self
             .persistence
             .writer
@@ -219,18 +291,36 @@ impl AppConfigStore {
             },
             gate,
             observer,
+            admission,
         )
         .await
         .map(|(_, gate)| gate)
     }
 
-    async fn commit(
+    async fn commit<Admit, Admission>(
         &self,
         candidate: AppConfig,
         gate: OwnedMutexGuard<()>,
         observer: CommitObserver,
-    ) -> Result<AppConfig, ConfigStoreError> {
+        admit: &Admit,
+    ) -> Result<AppConfig, ConfigStoreError>
+    where
+        Admit: Fn(
+                ConfigCommitAdmissionContext,
+                &AppConfig,
+                &AppConfig,
+            ) -> Result<Option<Admission>, ConfigStoreError>
+            + Send
+            + Sync,
+        Admission: Send + 'static,
+    {
         let (candidate, encoded) = encode_config(candidate).await?;
+        let current = self.current();
+        let admission = admit(
+            ConfigCommitAdmissionContext::NewCandidate,
+            &current,
+            &candidate,
+        )?;
         let ticket = self
             .persistence
             .writer
@@ -246,21 +336,27 @@ impl AppConfigStore {
                 },
                 gate,
                 observer,
+                admission,
             )
             .await?;
         drop(gate);
         Ok(candidate)
     }
 
-    async fn await_commit(
+    async fn await_commit<Admission>(
         &self,
         commit: PendingConfigCommit,
         gate: OwnedMutexGuard<()>,
         observer: CommitObserver,
-    ) -> Result<(AppConfig, OwnedMutexGuard<()>), ConfigStoreError> {
+        admission: Option<Admission>,
+    ) -> Result<(AppConfig, OwnedMutexGuard<()>), ConfigStoreError>
+    where
+        Admission: Send + 'static,
+    {
         let state = self.state.clone();
         let (completed_tx, completed_rx) = tokio::sync::oneshot::channel();
         commit.ticket.observe(move |result| {
+            let _admission = admission;
             let result = match result {
                 Ok(_) => {
                     let (previous, current) = {
@@ -361,7 +457,7 @@ mod tests {
     use axial_config::{InstanceRegistrySnapshot, InstanceStore};
     use axial_performance::PerformanceManager;
     use std::path::Path;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Condvar, Mutex};
     use std::time::Duration;
     use tokio::sync::Notify;
@@ -378,6 +474,14 @@ mod tests {
     struct WriteGate {
         released: Mutex<bool>,
         changed: Condvar,
+    }
+
+    struct AdmissionProbe(Arc<AtomicBool>);
+
+    impl Drop for AdmissionProbe {
+        fn drop(&mut self) {
+            self.0.store(false, Ordering::Release);
+        }
     }
 
     impl RecordingBackend {
@@ -568,6 +672,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn precommit_admission_is_retained_until_the_physical_commit_settles() {
+        let (store, backend) = test_store("precommit-admission", 0);
+        let write_gate = backend.gate_next();
+        let admission_active = Arc::new(AtomicBool::new(false));
+        let task_active = admission_active.clone();
+        let candidate_library = store.paths().library_dir.to_string_lossy().into_owned();
+        let expected_library = candidate_library.clone();
+        let task_store = store.clone();
+        let commit = tokio::spawn(async move {
+            let gate = task_store
+                .acquire_mutation()
+                .await
+                .expect("config mutation gate");
+            task_store
+                .mutate_with_gate_admitted(
+                    move |config| {
+                        config.library_dir = candidate_library;
+                        Ok(())
+                    },
+                    false,
+                    no_op_observer(),
+                    move |context, previous, candidate| {
+                        assert_eq!(context, ConfigCommitAdmissionContext::NewCandidate);
+                        assert!(previous.library_dir.is_empty());
+                        assert_eq!(candidate.library_dir, expected_library);
+                        assert!(
+                            task_active
+                                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire,)
+                                .is_ok(),
+                            "one precommit admission per physical write"
+                        );
+                        Ok(Some(AdmissionProbe(task_active.clone())))
+                    },
+                    gate,
+                )
+                .await
+        });
+
+        backend.wait_for_attempt(1).await;
+        assert!(
+            admission_active.load(Ordering::Acquire),
+            "admission must precede persistence acceptance and remain active while blocked"
+        );
+        write_gate.release();
+        commit
+            .await
+            .expect("config commit task")
+            .expect("admitted config commit");
+        assert!(!admission_active.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
     async fn cancellation_before_app_state_admission_drops_mutation_before_close() {
         let state = test_app_state("pre-admission-cancellation");
         let gate = state
@@ -643,6 +799,86 @@ mod tests {
         assert_eq!(retained.music_volume, None);
         assert_eq!(successor.theme, "retained");
         assert_eq!(successor.music_volume, Some(19));
+    }
+
+    #[tokio::test]
+    async fn retained_identity_retry_reacquires_admission_before_publication() {
+        let (store, backend) = test_store("retained-identity-admission", 1);
+        let managed_library_dir = store.paths().library_dir.to_string_lossy().into_owned();
+        let first_gate = store
+            .acquire_mutation()
+            .await
+            .expect("initial config mutation gate");
+        let first = store
+            .mutate_with_gate(
+                move |config| {
+                    config.library_dir = managed_library_dir;
+                    Ok(())
+                },
+                false,
+                no_op_observer(),
+                first_gate,
+            )
+            .await;
+        assert!(matches!(first, Err(ConfigStoreError::Persistence(_))));
+
+        let contexts = Arc::new(Mutex::new(Vec::new()));
+        let observed_contexts = contexts.clone();
+        let admission_active = Arc::new(AtomicBool::new(false));
+        let admitted_active = admission_active.clone();
+        let observer_active = admission_active.clone();
+        let observer: CommitObserver = Arc::new(move |previous, current| {
+            if previous.library_mode != current.library_mode {
+                assert!(
+                    observer_active.load(Ordering::Acquire),
+                    "the retained identity admission must cover observer publication"
+                );
+            }
+        });
+        let second_gate = store
+            .acquire_mutation()
+            .await
+            .expect("successor config mutation gate");
+        store
+            .mutate_with_gate_admitted(
+                |config| {
+                    config.theme = "after-retained-identity".to_string();
+                    Ok(())
+                },
+                false,
+                observer,
+                move |context, previous, candidate| {
+                    let identity_changed = previous.library_dir != candidate.library_dir
+                        || previous.library_mode != candidate.library_mode;
+                    observed_contexts
+                        .lock()
+                        .expect("admission context lock")
+                        .push((context, identity_changed));
+                    if !identity_changed {
+                        return Ok(None);
+                    }
+                    admitted_active.store(true, Ordering::Release);
+                    Ok(Some(AdmissionProbe(admitted_active.clone())))
+                },
+                second_gate,
+            )
+            .await
+            .expect("successor reconciles retained identity bytes");
+
+        assert_eq!(
+            *contexts.lock().expect("admission context lock"),
+            vec![
+                (ConfigCommitAdmissionContext::RetainedRetry, true),
+                (ConfigCommitAdmissionContext::NewCandidate, false),
+            ]
+        );
+        assert!(!admission_active.load(Ordering::Acquire));
+        assert_eq!(
+            store.current().library_dir,
+            store.paths().library_dir.to_string_lossy()
+        );
+        assert_eq!(store.current().theme, "after-retained-identity");
+        assert_eq!(backend.attempts.load(Ordering::SeqCst), 3);
     }
 
     #[tokio::test]

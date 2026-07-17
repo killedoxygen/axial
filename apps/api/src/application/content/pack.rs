@@ -655,6 +655,11 @@ where
         selected_paths.is_empty(),
     )
     .await?;
+    let _mutation = state.admit_managed_artifact_mutation().map_err(|error| {
+        content_execution_error(axial_content::ContentError::Io(std::io::Error::other(
+            error.to_string(),
+        )))
+    })?;
     let install = install_pack_files_with_finalize(
         &game_dir,
         archive.path(),

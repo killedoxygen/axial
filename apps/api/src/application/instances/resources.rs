@@ -246,6 +246,11 @@ pub(crate) async fn handle_update_instance_mod(
     if requested_name != name && target_exists(&mods_dir.join(&requested_name)) {
         return Err(json_error(StatusCode::CONFLICT, "mod already exists"));
     }
+    let _mutation = state.admit_managed_artifact_mutation().map_err(|error| {
+        mod_manifest_error_response(axial_content::ContentError::Io(std::io::Error::other(
+            error.to_string(),
+        )))
+    })?;
     let outcome = toggle_mod_file(&game_dir, name, payload.enabled)
         .map_err(mod_content_mutation_error_response)?;
     Ok(serde_json::json!({ "status": "ok", "name": outcome.filename, "enabled": payload.enabled }))

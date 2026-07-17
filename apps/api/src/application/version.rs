@@ -300,6 +300,9 @@ pub(crate) async fn delete_version(
         ));
     }
 
+    let _mutation = state
+        .admit_managed_artifact_mutation()
+        .map_err(|error| version_delete_error_response(std::io::Error::other(error.to_string())))?;
     let mut deleted = Vec::new();
     if payload.cascade_dependents {
         for id in to_delete.iter().filter(|id| id.as_str() != version_id) {

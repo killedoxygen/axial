@@ -18,6 +18,7 @@ mod known_good_rebuilds;
 mod known_good_tier2;
 pub(crate) mod launch_reports;
 mod lifecycle;
+mod managed_artifact_epoch;
 pub mod ownership;
 mod performance_managed;
 pub mod performance_operations;
@@ -52,9 +53,11 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 #[cfg(test)]
 use std::sync::RwLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::broadcast;
 
 use crate::observability::telemetry::TelemetryHub;
+use config::ConfigCommitAdmissionContext;
 
 const STARTUP_WARNING_LIMIT: usize = 8;
 const STARTUP_WARNING_MAX_CHARS: usize = 240;
@@ -105,6 +108,10 @@ pub(crate) use lifecycle::{
 };
 #[cfg(test)]
 pub(crate) use lifecycle::{AppLifecyclePhase, LifecycleQuiesceError};
+pub(crate) use managed_artifact_epoch::{
+    ManagedArtifactMutationAdmission, ManagedArtifactMutationEpoch,
+    ManagedArtifactMutationEpochExhausted, ManagedArtifactMutationEpochUnavailable,
+};
 pub(crate) use performance_managed::{
     AppManagedCompositionAdmission, ManagedCompositionCloseError, ManagedInspectionError,
     ManagedInstanceAdmissionError,
@@ -202,6 +209,7 @@ pub struct AppState {
     persisted_state_load: Arc<PersistedStateLoadEvidence>,
     persisted_state_rejection_streaks:
         Arc<persisted_state_rejection_streaks::PersistedStateRejectionStreaks>,
+    managed_artifact_epoch: managed_artifact_epoch::ManagedArtifactMutationEpochCoordinator,
     integrity_activity: integrity_activity::IntegrityActivityCoordinator,
     instance_lifecycle_gates: instance_lifecycle::InstanceLifecycleGates,
     lifecycle: AppLifecycle,
@@ -256,6 +264,7 @@ pub(crate) struct KnownGoodVerificationLease {
     library_root: PathBuf,
     managed_runtime_cache: ManagedRuntimeCache,
     inventory: Arc<axial_minecraft::known_good::KnownGoodInventory>,
+    managed_artifact_epoch: Option<Arc<AtomicU64>>,
 }
 
 enum KnownGoodVerificationOwner {
@@ -278,6 +287,7 @@ pub(crate) struct IntegrityForegroundOwnershipError;
 pub(crate) struct ManagedLibrarySetupTarget {
     owner: Arc<AppConfigStore>,
     library_dir: PathBuf,
+    _mutation: ManagedArtifactMutationAdmission,
 }
 
 impl ManagedLibrarySetupTarget {
@@ -330,6 +340,7 @@ impl KnownGoodVerificationLease {
             library_root: self.library_root.clone(),
             managed_runtime_cache: self.managed_runtime_cache.clone(),
             inventory: self.inventory.clone(),
+            managed_artifact_epoch: self.managed_artifact_epoch.clone(),
         }
     }
 
@@ -554,12 +565,15 @@ impl AppState {
             |error| panic!("failed to initialize instance registry persistence: {error}"),
         ));
         let instance_lifecycle_gates = instance_lifecycle::InstanceLifecycleGates::default();
+        let managed_artifact_epoch =
+            managed_artifact_epoch::ManagedArtifactMutationEpochCoordinator::default();
         let performance = Arc::new(
             AppPerformanceStore::claim(
                 init.performance,
                 &config.paths().config_dir,
                 &instances.paths().instances_dir,
                 instance_lifecycle_gates.clone(),
+                managed_artifact_epoch.clone(),
             )
             .unwrap_or_else(|error| {
                 panic!("failed to initialize performance rules persistence: {error}")
@@ -686,6 +700,7 @@ impl AppState {
             launch_reports,
             persisted_state_load,
             persisted_state_rejection_streaks,
+            managed_artifact_epoch,
             integrity_activity: integrity_activity::IntegrityActivityCoordinator::new(),
             instance_lifecycle_gates,
             lifecycle: AppLifecycle::new(),
@@ -709,6 +724,52 @@ impl AppState {
 
     pub fn config(&self) -> &Arc<AppConfigStore> {
         &self.config
+    }
+
+    pub(crate) fn managed_artifact_mutation_epoch(
+        &self,
+    ) -> Result<ManagedArtifactMutationEpoch, ManagedArtifactMutationEpochExhausted> {
+        self.managed_artifact_epoch.current()
+    }
+
+    fn capture_managed_artifact_mutation_epoch(
+        &self,
+    ) -> Result<ManagedArtifactMutationEpoch, ManagedArtifactMutationEpochUnavailable> {
+        self.managed_artifact_epoch.capture()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn managed_artifact_mutation_epoch_is_capturable_for_test(&self) -> bool {
+        self.managed_artifact_epoch.capture().is_ok()
+    }
+
+    pub(crate) fn admit_managed_artifact_mutation(
+        &self,
+    ) -> Result<ManagedArtifactMutationAdmission, ManagedArtifactMutationEpochExhausted> {
+        self.managed_artifact_epoch.admit()
+    }
+
+    fn admit_managed_artifact_mutation_for_verification(
+        &self,
+        verification: &KnownGoodVerificationLease,
+    ) -> Result<ManagedArtifactMutationAdmission, ManagedArtifactMutationEpochUnavailable> {
+        match &verification.managed_artifact_epoch {
+            Some(expected) => self.managed_artifact_epoch.admit_from_expected(expected),
+            None => self
+                .managed_artifact_epoch
+                .admit()
+                .map_err(ManagedArtifactMutationEpochUnavailable::from),
+        }
+    }
+
+    fn managed_artifact_mutation_epoch_is_current(
+        &self,
+        expected: Option<&Arc<AtomicU64>>,
+    ) -> bool {
+        expected.is_none_or(|expected| {
+            self.managed_artifact_mutation_epoch()
+                .is_ok_and(|current| current.value() == expected.load(Ordering::Acquire))
+        })
     }
 
     pub(crate) fn take_persisted_state_repair_eligibilities(
@@ -865,6 +926,12 @@ impl AppState {
                 "known-good activation candidate count exceeds the instance registry limit",
             ));
         }
+        if candidates.is_empty() {
+            return Ok(());
+        }
+        let _mutation = self
+            .admit_managed_artifact_mutation()
+            .map_err(|error| std::io::Error::other(error.to_string()))?;
         let inventory = Arc::new(inventory);
         let version_id = version_id.as_str();
         let installed_library_root = installed_library_root.as_path();
@@ -1166,6 +1233,9 @@ impl AppState {
 
     #[cfg(test)]
     pub(crate) fn replace_config_for_test(&self, config: AppConfig) {
+        let _mutation = self
+            .admit_managed_artifact_mutation()
+            .expect("test config mutation epoch");
         let previous = self.config.current();
         self.config
             .replace_for_test(config)
@@ -1185,10 +1255,11 @@ impl AppState {
         let gate = config.acquire_mutation().await?;
         let export_configured = self.telemetry.export_configured();
         let observer = self.config_commit_observer();
+        let admission = self.config_managed_artifact_admission();
         let (completed_tx, completed_rx) = tokio::sync::oneshot::channel();
         tokio::spawn(async move {
             let result = config
-                .mutate_with_gate(mutation, export_configured, observer, gate)
+                .mutate_with_gate_admitted(mutation, export_configured, observer, admission, gate)
                 .await;
             let _ = completed_tx.send(result);
         });
@@ -1200,7 +1271,12 @@ impl AppState {
     }
 
     pub(crate) async fn close_config(&self) -> Result<(), ConfigStoreError> {
-        self.config.close(self.config_commit_observer()).await
+        self.config
+            .close_admitted(
+                self.config_commit_observer(),
+                self.config_managed_artifact_admission(),
+            )
+            .await
     }
 
     pub(crate) fn managed_library_setup_target(
@@ -1209,9 +1285,13 @@ impl AppState {
     ) -> Result<ManagedLibrarySetupTarget, ConfigStoreError> {
         self.validate_integrity_foreground(foreground)
             .map_err(|_| ConfigStoreError::Persistence(foreign_integrity_foreground_error()))?;
+        let mutation = self.admit_managed_artifact_mutation().map_err(|error| {
+            ConfigStoreError::Persistence(std::io::Error::other(error.to_string()))
+        })?;
         Ok(ManagedLibrarySetupTarget {
             owner: self.config.clone(),
             library_dir: self.config.paths().library_dir.clone(),
+            _mutation: mutation,
         })
     }
 
@@ -1259,6 +1339,9 @@ impl AppState {
             .map_err(|_| InstanceStoreError::Persistence(foreign_integrity_foreground_error()))?;
         let instances = self.instances.clone();
         let gate = instances.acquire_mutation().await?;
+        let _mutation = self.admit_managed_artifact_mutation().map_err(|error| {
+            InstanceStoreError::Persistence(std::io::Error::other(error.to_string()))
+        })?;
         instances
             .create_with_gate(instance, library_dir, gate)
             .await
@@ -1293,6 +1376,9 @@ impl AppState {
             .map_err(|_| InstanceStoreError::Persistence(foreign_integrity_foreground_error()))?;
         let instances = self.instances.clone();
         let gate = instances.acquire_mutation().await?;
+        let _mutation = self.admit_managed_artifact_mutation().map_err(|error| {
+            InstanceStoreError::Persistence(std::io::Error::other(error.to_string()))
+        })?;
         instances
             .duplicate_with_gate(source_id, target_id, requested_name, gate)
             .await
@@ -1325,6 +1411,9 @@ impl AppState {
         if self.instances.get(&instance_id).is_none() {
             return Err(instance_not_found_error());
         }
+        let _mutation = self.admit_managed_artifact_mutation().map_err(|error| {
+            InstanceStoreError::Persistence(std::io::Error::other(error.to_string()))
+        })?;
         let retirement = self
             .performance
             .retire_managed(&instance_id)
@@ -1416,6 +1505,10 @@ impl AppState {
             return Ok(false);
         }
 
+        let _mutation = self.admit_managed_artifact_mutation().map_err(|error| {
+            InstanceStoreError::Persistence(std::io::Error::other(error.to_string()))
+        })?;
+
         let retirement = self
             .performance
             .retire_managed(&instance_id)
@@ -1485,6 +1578,14 @@ impl AppState {
             .map_err(|_| InstanceStoreError::Persistence(foreign_integrity_foreground_error()))?;
         let instances = self.instances.clone();
         let gate = instances.acquire_mutation().await?;
+        let _reconciliation_mutation = instances
+            .has_managed_artifact_reconciliation()
+            .then(|| {
+                self.admit_managed_artifact_mutation().map_err(|error| {
+                    InstanceStoreError::Persistence(std::io::Error::other(error.to_string()))
+                })
+            })
+            .transpose()?;
         instances.update_with_gate(instance_id, update, gate).await
     }
 
@@ -1502,6 +1603,14 @@ impl AppState {
             .map_err(|_| InstanceStoreError::Persistence(foreign_integrity_foreground_error()))?;
         let instances = self.instances.clone();
         let gate = instances.acquire_mutation().await?;
+        let _reconciliation_mutation = instances
+            .has_managed_artifact_reconciliation()
+            .then(|| {
+                self.admit_managed_artifact_mutation().map_err(|error| {
+                    InstanceStoreError::Persistence(std::io::Error::other(error.to_string()))
+                })
+            })
+            .transpose()?;
         instances
             .record_successful_launch_with_gate(instance_id, last_played_at, gate)
             .await
@@ -1611,6 +1720,9 @@ impl AppState {
                 &library_root,
             )
             .ok_or(KnownGoodVerificationUnavailable::LiveAuthorityUnavailable)?;
+        let managed_artifact_epoch = self
+            .capture_managed_artifact_mutation_epoch()
+            .map_err(|_| KnownGoodVerificationUnavailable::LiveAuthorityUnavailable)?;
 
         Ok(KnownGoodVerificationLease {
             owner: KnownGoodVerificationOwner::Foreground(foreground.retained()),
@@ -1621,6 +1733,7 @@ impl AppState {
             library_root,
             managed_runtime_cache: self.managed_runtime_cache.clone(),
             inventory,
+            managed_artifact_epoch: Some(Arc::new(AtomicU64::new(managed_artifact_epoch.value()))),
         })
     }
 
@@ -1659,6 +1772,8 @@ impl AppState {
         lease: &KnownGoodVerificationLease,
     ) -> bool {
         self.instance_lifecycle_gates.owns(&lease._lifecycle.owner)
+            && self
+                .managed_artifact_mutation_epoch_is_current(lease.managed_artifact_epoch.as_ref())
             && self.known_good_authority_is_current(
                 &lease.instance_id,
                 &lease.version_id,
@@ -1725,6 +1840,9 @@ impl AppState {
         instance_id: &str,
         inventory: axial_minecraft::known_good::KnownGoodInventory,
     ) -> Arc<axial_minecraft::known_good::KnownGoodInventory> {
+        let _mutation = self
+            .admit_managed_artifact_mutation()
+            .expect("test known-good mutation epoch");
         let instance = self.instances.get(instance_id).expect("test instance");
         let library_root = self
             .library_dir()
@@ -1917,7 +2035,15 @@ impl AppState {
     }
 
     pub(crate) async fn close_instance_registry(&self) -> Result<(), InstanceStoreError> {
-        self.instances.close().await
+        self.instances
+            .close_admitted(|| {
+                self.admit_managed_artifact_mutation()
+                    .map(Some)
+                    .map_err(|error| {
+                        InstanceStoreError::Persistence(std::io::Error::other(error.to_string()))
+                    })
+            })
+            .await
     }
 
     pub(crate) async fn close_known_good_inventories(&self) -> std::io::Result<()> {
@@ -1942,17 +2068,46 @@ impl AppState {
             if previous.telemetry_enabled && !current.telemetry_enabled {
                 telemetry.clear_queue();
             }
+            let managed_identity_changed = previous.library_dir != current.library_dir
+                || previous.library_mode != current.library_mode;
             if previous.library_dir != current.library_dir {
                 known_good.clear_active();
             }
-            if previous.library_dir != current.library_dir
-                || previous.library_mode != current.library_mode
-            {
+            if managed_identity_changed {
                 installed_versions.invalidate();
             }
             integrity_activity.invalidate_idle_epoch();
             let _ = changes.send(());
         })
+    }
+
+    fn config_managed_artifact_admission(
+        &self,
+    ) -> impl Fn(
+        ConfigCommitAdmissionContext,
+        &AppConfig,
+        &AppConfig,
+    ) -> Result<Option<ManagedArtifactMutationAdmission>, ConfigStoreError>
+    + Send
+    + Sync
+    + 'static {
+        let managed_artifact_epoch = self.managed_artifact_epoch.clone();
+        move |context, previous, current| {
+            if previous.library_dir == current.library_dir
+                && previous.library_mode == current.library_mode
+            {
+                return Ok(None);
+            }
+            if context == ConfigCommitAdmissionContext::NewCandidate {
+                return Err(ConfigStoreError::Persistence(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "managed library identity changes require setup authority",
+                )));
+            }
+            managed_artifact_epoch.admit().map(Some).map_err(|error| {
+                ConfigStoreError::Persistence(std::io::Error::other(error.to_string()))
+            })
+        }
     }
 
     pub fn flag_enabled(&self, key: &str) -> bool {
@@ -2392,7 +2547,7 @@ mod known_good_identity_tests {
     }
 
     #[tokio::test]
-    async fn library_root_config_commit_invalidates_installed_version_cache() {
+    async fn library_root_replacement_invalidates_installed_version_cache() {
         let root = std::env::temp_dir().join(format!(
             "axial-installed-cache-root-commit-{}-{}",
             std::process::id(),
@@ -2409,15 +2564,10 @@ mod known_good_identity_tests {
         std::fs::create_dir_all(axial_minecraft::versions_dir(&second_root))
             .expect("create second versions root");
 
-        let first_root_config = first_root.to_string_lossy().into_owned();
-        state
-            .mutate_config(move |latest| {
-                latest.library_dir = first_root_config;
-                latest.library_mode = "existing".to_string();
-                Ok(())
-            })
-            .await
-            .expect("publish first library root");
+        let mut config = state.config.current();
+        config.library_dir = first_root.to_string_lossy().into_owned();
+        config.library_mode = "existing".to_string();
+        state.replace_config_for_test(config);
         let producer = state.try_claim_producer().expect("claim lookup producer");
         state
             .installed_versions_snapshot(&producer)
@@ -2429,14 +2579,9 @@ mod known_good_identity_tests {
             .expect("reuse first library root snapshot");
         assert_eq!(state.installed_versions_walk_count(), 1);
 
-        let second_root_config = second_root.to_string_lossy().into_owned();
-        state
-            .mutate_config(move |latest| {
-                latest.library_dir = second_root_config;
-                Ok(())
-            })
-            .await
-            .expect("publish changed library root");
+        let mut config = state.config.current();
+        config.library_dir = second_root.to_string_lossy().into_owned();
+        state.replace_config_for_test(config);
         state
             .installed_versions_snapshot(&producer)
             .await
@@ -2448,6 +2593,282 @@ mod known_good_identity_tests {
             .close_known_good_inventories()
             .await
             .expect("close known-good store");
+        drop(state);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn unrelated_config_commit_does_not_advance_managed_artifact_epoch() {
+        let root = std::env::temp_dir().join(format!(
+            "axial-managed-artifact-config-epoch-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let state = known_good_state_fixture(&root);
+        let before = state
+            .managed_artifact_mutation_epoch()
+            .expect("managed artifact epoch");
+
+        state
+            .mutate_config(|latest| {
+                latest.theme = "managed-epoch-unrelated".to_string();
+                Ok(())
+            })
+            .await
+            .expect("unrelated config mutation");
+
+        assert_eq!(
+            state.managed_artifact_mutation_epoch(),
+            Ok(before),
+            "unrelated preferences must not invalidate managed artifact freshness"
+        );
+
+        state
+            .close_known_good_inventories()
+            .await
+            .expect("close known-good store");
+        drop(state);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn generic_config_mutation_rejects_a_new_library_identity_before_persistence() {
+        let root = std::env::temp_dir().join(format!(
+            "axial-managed-artifact-config-identity-epoch-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let state = known_good_state_fixture(&root);
+        let before = state.config.current();
+        let epoch_before = state
+            .managed_artifact_mutation_epoch()
+            .expect("managed artifact epoch");
+        let config_path = state.config.paths().config_file.clone();
+        let persisted_before = std::fs::read(&config_path).ok();
+
+        let result = state
+            .mutate_config(|latest| {
+                latest.library_mode = "existing".to_string();
+                Ok(())
+            })
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(ConfigStoreError::Persistence(ref error))
+                if error.kind() == std::io::ErrorKind::PermissionDenied
+        ));
+        assert_eq!(state.config.current(), before);
+        assert_eq!(std::fs::read(config_path).ok(), persisted_before);
+        assert_eq!(state.managed_artifact_mutation_epoch(), Ok(epoch_before));
+
+        state
+            .close_known_good_inventories()
+            .await
+            .expect("close known-good store");
+        drop(state);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn managed_library_setup_advances_managed_artifact_epoch_exactly_once() {
+        let root = std::env::temp_dir().join(format!(
+            "axial-managed-artifact-setup-epoch-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let state = known_good_state_fixture(&root);
+        let before = state
+            .managed_artifact_mutation_epoch()
+            .expect("managed artifact epoch");
+        let foreground = state
+            .register_integrity_foreground()
+            .expect("register setup foreground")
+            .wait_for_settlement()
+            .await;
+        let target = state
+            .managed_library_setup_target(&foreground)
+            .expect("managed setup target");
+        let admitted = state
+            .managed_artifact_mutation_epoch()
+            .expect("managed artifact epoch after setup admission");
+        assert_eq!(admitted.value(), before.value() + 1);
+        std::fs::create_dir_all(target.library_dir()).expect("create managed library root");
+
+        state
+            .commit_managed_library_setup(&foreground, &target)
+            .await
+            .expect("commit managed library setup");
+
+        assert_eq!(
+            state.managed_artifact_mutation_epoch(),
+            Ok(admitted),
+            "the setup target already owns the only epoch transition"
+        );
+        drop((target, foreground));
+        state
+            .close_known_good_inventories()
+            .await
+            .expect("close known-good store");
+        drop(state);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn ordinary_instance_metadata_update_does_not_advance_managed_artifact_epoch() {
+        let root = std::env::temp_dir().join(format!(
+            "axial-managed-artifact-instance-metadata-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let state = known_good_state_fixture(&root);
+        let instance = state
+            .instances()
+            .insert_for_test("Metadata only", "1.21.5")
+            .expect("insert instance");
+        let before = state
+            .managed_artifact_mutation_epoch()
+            .expect("managed artifact epoch");
+        let foreground = state
+            .register_integrity_foreground()
+            .expect("register metadata foreground")
+            .wait_for_settlement()
+            .await;
+
+        state
+            .update_instance(
+                &foreground,
+                instance.id,
+                InstanceUpdate {
+                    name: Some("Metadata renamed".to_string()),
+                    ..InstanceUpdate::default()
+                },
+            )
+            .await
+            .expect("update instance metadata");
+
+        assert_eq!(state.managed_artifact_mutation_epoch(), Ok(before));
+        drop(foreground);
+        state
+            .close_instance_registry()
+            .await
+            .expect("close instance registry");
+        state
+            .close_known_good_inventories()
+            .await
+            .expect("close known-good store");
+        drop(state);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn retained_instance_deletion_cleanup_advances_managed_artifact_epoch() {
+        let root = std::env::temp_dir().join(format!(
+            "axial-managed-artifact-instance-cleanup-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let state = known_good_state_fixture(&root);
+        let instance = state
+            .instances()
+            .insert_for_test("Retained cleanup", "1.21.5")
+            .expect("insert instance");
+        let instance_path = state.instances().game_dir(&instance.id);
+        std::fs::remove_dir_all(&instance_path).expect("remove instance directory");
+        std::fs::write(&instance_path, b"blocks directory deletion")
+            .expect("block instance directory cleanup");
+        let gate = state
+            .instances()
+            .acquire_mutation()
+            .await
+            .expect("acquire instance registry mutation");
+        let deletion = state
+            .instances()
+            .delete_with_gate(instance.id.clone(), true, gate)
+            .await;
+        assert!(matches!(deletion, Err(InstanceStoreError::Persistence(_))));
+        assert_eq!(
+            state.instances().current().pending_deletions,
+            vec![instance.id]
+        );
+        std::fs::remove_file(&instance_path).expect("remove cleanup blocker");
+        std::fs::create_dir(&instance_path).expect("restore instance directory");
+        std::fs::write(instance_path.join("owned.txt"), b"owned").expect("seed retained cleanup");
+        let before = state
+            .managed_artifact_mutation_epoch()
+            .expect("managed artifact epoch");
+
+        state
+            .close_instance_registry()
+            .await
+            .expect("close settles retained cleanup");
+
+        let after = state
+            .managed_artifact_mutation_epoch()
+            .expect("managed artifact epoch after cleanup");
+        assert!(after > before);
+        assert!(!instance_path.exists());
+        state
+            .close_known_good_inventories()
+            .await
+            .expect("close known-good store");
+        drop(state);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn same_valued_known_good_replacement_advances_managed_artifact_epoch() {
+        use axial_minecraft::known_good::{KnownGoodInventory, TestKnownGoodEntry};
+
+        let root = std::env::temp_dir().join(format!(
+            "axial-managed-artifact-known-good-epoch-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let state = known_good_state_fixture(&root);
+        std::fs::create_dir_all(root.join("library")).expect("create library root");
+        state.set_library_dir_for_test(root.join("library").to_string_lossy().into_owned());
+        let instance = state
+            .instances()
+            .insert_for_test("Known Good Epoch", "1.21.5")
+            .expect("insert instance");
+
+        state.activate_known_good_inventory_for_test(
+            &instance.id,
+            KnownGoodInventory::from_test_entries(Vec::<TestKnownGoodEntry>::new())
+                .expect("first inventory"),
+        );
+        let first = state
+            .managed_artifact_mutation_epoch()
+            .expect("first activation epoch");
+        state.activate_known_good_inventory_for_test(
+            &instance.id,
+            KnownGoodInventory::from_test_entries(Vec::<TestKnownGoodEntry>::new())
+                .expect("replacement inventory"),
+        );
+        let replacement = state
+            .managed_artifact_mutation_epoch()
+            .expect("replacement activation epoch");
+
+        assert!(replacement > first);
         drop(state);
         let _ = std::fs::remove_dir_all(root);
     }

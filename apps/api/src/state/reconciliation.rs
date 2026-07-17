@@ -187,6 +187,7 @@ pub(crate) struct RegisteredWholeInstanceRematerializationAdmission {
     attempt: ReconciliationAttempt,
     predecessor: ReconciliationTerminal,
     known_good: RegisteredKnownGoodInventory,
+    managed_artifact_epoch: std::sync::Arc<std::sync::atomic::AtomicU64>,
     lifecycle: InstanceLifecycleLease,
     component_mutation: SharedComponentMutationLease,
     config_mutation: tokio::sync::OwnedMutexGuard<()>,
@@ -255,7 +256,9 @@ pub(crate) struct RegisteredWholeInstanceCompletion {
     durable: WholeInstanceDurableAuthority,
     known_good: RegisteredKnownGoodInventory,
     runtime_cache: ManagedRuntimeCache,
+    managed_artifact_epoch: std::sync::Arc<std::sync::atomic::AtomicU64>,
     user_config_snapshot: super::user_config_snapshots::UserConfigSnapshotReceipt,
+    _mutation: super::ManagedArtifactMutationAdmission,
 }
 
 pub(crate) struct RegisteredWholeInstanceSettlement {
@@ -400,6 +403,7 @@ struct ManagedArtifactCompletionAuthority {
     runtime_cache: ManagedRuntimeCache,
     provenance: RegisteredArtifactProvenance,
     component: ManagedArtifactRebuildComponent,
+    managed_artifact_epoch: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
 }
 
 struct ManagedArtifactDurableAuthority {
@@ -558,6 +562,28 @@ impl RegisteredWholeInstanceRematerializationAdmission {
             runtime_cache: durable.state.managed_runtime_cache.clone(),
             version_id: self.known_good.version_id.clone(),
         };
+        let mutation = match durable
+            .state
+            .managed_artifact_epoch
+            .admit_from_expected(&self.managed_artifact_epoch)
+        {
+            Ok(mutation) => mutation,
+            Err(_) => {
+                let outcome = durable
+                    .failed(
+                        ReconciliationQuarantineCheckpoint::default(),
+                        None,
+                        Some(user_config_snapshot),
+                        WHOLE_INSTANCE_REMATERIALIZATION_STEP,
+                    )
+                    .settle()
+                    .await
+                    .map_err(RegisteredWholeInstancePreparationError::Settlement)?;
+                return Ok(RegisteredWholeInstancePreparation::Closed(Box::new(
+                    outcome,
+                )));
+            }
+        };
         let runtime_cache = request.runtime_cache.clone();
         Ok(RegisteredWholeInstancePreparation::Admitted {
             request,
@@ -565,7 +591,9 @@ impl RegisteredWholeInstanceRematerializationAdmission {
                 durable,
                 known_good: self.known_good,
                 runtime_cache,
+                managed_artifact_epoch: self.managed_artifact_epoch,
                 user_config_snapshot,
+                _mutation: mutation,
             }),
         })
     }
@@ -658,6 +686,10 @@ impl RegisteredWholeInstanceCompletion {
             inventory_fingerprint,
         } = self.durable.attempt.scope();
         self.durable.lifecycle.matches(instance_id)
+            && self
+                .durable
+                .state
+                .managed_artifact_mutation_epoch_is_current(Some(&self.managed_artifact_epoch))
             && self
                 .durable
                 .state
@@ -1071,10 +1103,12 @@ impl RegisteredManagedArtifactComponentCompletion {
         self,
         receipt: ManagedLibrariesCommitReceipt,
     ) -> RegisteredManagedArtifactCommitPostcheck {
+        let epoch_is_current = self.authority.managed_artifact_epoch_is_current();
         let publication = ManagedArtifactPublicationLease::LibrariesCommit(receipt);
         let valid = match &publication {
             ManagedArtifactPublicationLease::LibrariesCommit(receipt) => {
-                self.authority.component == ManagedArtifactRebuildComponent::Libraries
+                epoch_is_current
+                    && self.authority.component == ManagedArtifactRebuildComponent::Libraries
                     && receipt.version_id() == self.authority.known_good.version_id
                     && receipt
                         .matches_root(&self.authority.known_good.library_root)
@@ -1091,7 +1125,8 @@ impl RegisteredManagedArtifactComponentCompletion {
         self,
         receipt: ManagedVersionBundleCommitReceipt,
     ) -> RegisteredManagedArtifactCommitPostcheck {
-        let valid = self.authority.component == ManagedArtifactRebuildComponent::VersionBundle
+        let valid = self.authority.managed_artifact_epoch_is_current()
+            && self.authority.component == ManagedArtifactRebuildComponent::VersionBundle
             && receipt.version_id() == self.authority.known_good.version_id
             && receipt
                 .matches_root(&self.authority.known_good.library_root)
@@ -1107,10 +1142,12 @@ impl RegisteredManagedArtifactComponentCompletion {
         self,
         receipt: ManagedAssetsCommitReceipt,
     ) -> RegisteredManagedArtifactCommitPostcheck {
+        let epoch_is_current = self.authority.managed_artifact_epoch_is_current();
         let publication = ManagedArtifactPublicationLease::AssetsCommit(receipt);
         let valid = match &publication {
             ManagedArtifactPublicationLease::AssetsCommit(receipt) => {
-                self.authority.component == ManagedArtifactRebuildComponent::Assets
+                epoch_is_current
+                    && self.authority.component == ManagedArtifactRebuildComponent::Assets
                     && receipt.version_id() == self.authority.known_good.version_id
                     && receipt
                         .matches_root(&self.authority.known_good.library_root)
@@ -1183,7 +1220,7 @@ impl RegisteredManagedArtifactComponentCompletion {
         publication: ManagedArtifactPublicationLease,
         receipt_is_valid: bool,
     ) -> RegisteredManagedArtifactCommitPostcheck {
-        if !receipt_is_valid {
+        if !receipt_is_valid || !self.authority.managed_artifact_epoch_is_current() {
             return RegisteredManagedArtifactCommitPostcheck::Failed(
                 self.authority.durable.failed(Some(publication)),
             );
@@ -1262,8 +1299,15 @@ impl RegisteredManagedArtifactPendingPostcheck {
 }
 
 impl ManagedArtifactCompletionAuthority {
+    fn managed_artifact_epoch_is_current(&self) -> bool {
+        self.durable
+            .state
+            .managed_artifact_mutation_epoch_is_current(self.managed_artifact_epoch.as_ref())
+    }
+
     fn is_live_with(&self, lifecycle: &InstanceLifecycleLease) -> bool {
         if !lifecycle.matches(&self.known_good.instance_id)
+            || !self.managed_artifact_epoch_is_current()
             || !self.owner_is_live()
             || !self.durable.state.known_good_authority_is_current(
                 &self.known_good.instance_id,
@@ -1504,6 +1548,7 @@ pub(crate) struct RegisteredReconciliationAuthority {
     state: AppState,
     lifecycle: InstanceLifecycleLease,
     verification: Option<KnownGoodVerificationLease>,
+    managed_artifact_epoch: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1602,6 +1647,29 @@ impl RegisteredComponentRebuildAdmission {
 
     pub(crate) fn attempt(&self) -> &ReconciliationAttempt {
         &self.attempt
+    }
+
+    #[cfg(test)]
+    pub(crate) fn bind_managed_artifact_epoch_for_test(&mut self) {
+        let epoch = self
+            .authority
+            .state
+            .managed_artifact_mutation_epoch()
+            .expect("test managed artifact epoch");
+        let expected = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(epoch.value()));
+        self.authority.managed_artifact_epoch = Some(expected.clone());
+        if let Some(verification) = &mut self.authority.verification {
+            verification.managed_artifact_epoch = Some(expected);
+        }
+    }
+
+    pub(crate) fn admit_managed_artifact_mutation(
+        &self,
+    ) -> Result<
+        super::ManagedArtifactMutationAdmission,
+        super::ManagedArtifactMutationEpochUnavailable,
+    > {
+        self.authority.admit_managed_artifact_mutation()
     }
 
     pub(crate) fn runtime_core_request(
@@ -1738,6 +1806,7 @@ impl RegisteredComponentRebuildAdmission {
             state,
             lifecycle,
             verification,
+            managed_artifact_epoch,
         } = authority;
         let durable = ManagedArtifactDurableAuthority {
             state,
@@ -1759,6 +1828,7 @@ impl RegisteredComponentRebuildAdmission {
             library_root: _,
             managed_runtime_cache,
             inventory: _,
+            managed_artifact_epoch: _,
         } = verification;
         drop(_lifecycle);
         if !structurally_valid {
@@ -1774,6 +1844,7 @@ impl RegisteredComponentRebuildAdmission {
                     runtime_cache: managed_runtime_cache,
                     provenance,
                     component,
+                    managed_artifact_epoch,
                 },
             },
         ))
@@ -1795,6 +1866,7 @@ impl RegisteredComponentRebuildAdmission {
     where
         AfterActivation: FnOnce(),
     {
+        self.require_managed_artifact_epoch_current()?;
         self.validate_runtime_receipt_identity(receipt)?;
         if !receipt
             .revalidate(
@@ -1805,6 +1877,7 @@ impl RegisteredComponentRebuildAdmission {
         {
             return Err(ReconciliationEvidenceRejection::JournalMismatch);
         }
+        self.require_managed_artifact_epoch_current()?;
         self.validate_runtime_receipt_identity(receipt)?;
         let refreshed_inventory = std::sync::Arc::new(
             receipt
@@ -1830,6 +1903,7 @@ impl RegisteredComponentRebuildAdmission {
             )
             .await
             .map_err(|_| ReconciliationEvidenceRejection::RootAuthorityUnavailable)?;
+        self.require_managed_artifact_epoch_current()?;
         after_activation();
         let activated_inventory = match self.validate_runtime_identity_against(
             receipt.component(),
@@ -1867,6 +1941,7 @@ impl RegisteredComponentRebuildAdmission {
             self.seal_failed_runtime_projection(refreshed_inventory)?;
             return Err(ReconciliationEvidenceRejection::JournalMismatch);
         }
+        self.require_managed_artifact_epoch_current()?;
         Ok(ReconciliationTerminal::from_attempt(
             self.attempt.clone(),
             ReconciliationTerminalOutcome::Succeeded,
@@ -1930,6 +2005,18 @@ impl RegisteredComponentRebuildAdmission {
             receipt.component(),
             receipt.matches_cache(&self.authority.state.managed_runtime_cache),
         )
+    }
+
+    fn require_managed_artifact_epoch_current(
+        &self,
+    ) -> Result<(), ReconciliationEvidenceRejection> {
+        self.authority
+            .state
+            .managed_artifact_mutation_epoch_is_current(
+                self.authority.managed_artifact_epoch.as_ref(),
+            )
+            .then_some(())
+            .ok_or(ReconciliationEvidenceRejection::IncarnationMismatch)
     }
 
     fn validate_managed_artifact_admission(
@@ -2115,6 +2202,23 @@ impl RegisteredReconciliationAuthority {
         self.state.failure_memory.as_ref()
     }
 
+    pub(crate) fn admit_managed_artifact_mutation(
+        &self,
+    ) -> Result<
+        super::ManagedArtifactMutationAdmission,
+        super::ManagedArtifactMutationEpochUnavailable,
+    > {
+        if let Some(expected) = &self.managed_artifact_epoch {
+            self.state
+                .managed_artifact_epoch
+                .admit_from_expected(expected)
+        } else {
+            self.state
+                .admit_managed_artifact_mutation()
+                .map_err(super::ManagedArtifactMutationEpochUnavailable::from)
+        }
+    }
+
     pub(crate) fn registered_artifact_findings_are_live(
         &self,
         findings: &super::RegisteredArtifactFindings,
@@ -2123,24 +2227,27 @@ impl RegisteredReconciliationAuthority {
     }
 
     pub(crate) fn attempt_is_current(&self, attempt: &ReconciliationAttempt) -> bool {
-        self.verification.as_ref().is_none_or(|verification| {
-            self.state
-                .known_good_verification_lease_is_live(verification)
-        }) && self
-            .state
-            .current_reconciliation_incarnation(&self.lifecycle.instance_id)
-            .is_ok_and(|current| {
-                matches!(
-                    attempt.scope(),
-                    ReconciliationScope::RegisteredInstance {
-                        instance_id,
-                        fingerprint,
-                        inventory_fingerprint,
-                    } if instance_id == &self.lifecycle.instance_id
-                        && fingerprint == &current.fingerprint
-                        && inventory_fingerprint == &current.inventory_fingerprint
-                )
+        self.state
+            .managed_artifact_mutation_epoch_is_current(self.managed_artifact_epoch.as_ref())
+            && self.verification.as_ref().is_none_or(|verification| {
+                self.state
+                    .known_good_verification_lease_is_live(verification)
             })
+            && self
+                .state
+                .current_reconciliation_incarnation(&self.lifecycle.instance_id)
+                .is_ok_and(|current| {
+                    matches!(
+                        attempt.scope(),
+                        ReconciliationScope::RegisteredInstance {
+                            instance_id,
+                            fingerprint,
+                            inventory_fingerprint,
+                        } if instance_id == &self.lifecycle.instance_id
+                            && fingerprint == &current.fingerprint
+                            && inventory_fingerprint == &current.inventory_fingerprint
+                    )
+                })
     }
 
     pub(super) fn into_registered_artifact_failed_repair(
@@ -2151,9 +2258,22 @@ impl RegisteredReconciliationAuthority {
             state,
             lifecycle,
             verification,
+            managed_artifact_epoch,
         } = self;
         let verification =
             verification.ok_or(ReconciliationEvidenceRejection::IncarnationMismatch)?;
+        if !match (
+            managed_artifact_epoch.as_ref(),
+            verification.managed_artifact_epoch.as_ref(),
+        ) {
+            (Some(authority), Some(verification)) => {
+                std::sync::Arc::ptr_eq(authority, verification)
+            }
+            (None, None) => true,
+            _ => false,
+        } {
+            return Err(ReconciliationEvidenceRejection::IncarnationMismatch);
+        }
         let evidence = state.recorded_reconciliation_failure_at(
             &lifecycle,
             attempt.operation_id(),
@@ -2807,11 +2927,17 @@ impl AppState {
             return Err(ReconciliationEvidenceRejection::NonAdjacentRung);
         }
         self.refuse_active_whole_instance_window(&authorization.instance_id, observed_at)?;
+        let managed_artifact_epoch = self
+            .capture_managed_artifact_mutation_epoch()
+            .map_err(|_| ReconciliationEvidenceRejection::IncarnationMismatch)?;
         Ok(RegisteredWholeInstanceRematerializationAdmission {
             state: self.clone(),
             attempt,
             predecessor: predecessor.terminal,
             known_good,
+            managed_artifact_epoch: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
+                managed_artifact_epoch.value(),
+            )),
             lifecycle,
             component_mutation,
             config_mutation,
@@ -2830,6 +2956,7 @@ impl AppState {
             state: self.clone(),
             lifecycle: lifecycle.retained(),
             verification: None,
+            managed_artifact_epoch: None,
         })
     }
 
@@ -2844,6 +2971,7 @@ impl AppState {
         Ok(RegisteredReconciliationAuthority {
             state: self.clone(),
             lifecycle: verification._lifecycle.retained(),
+            managed_artifact_epoch: verification.managed_artifact_epoch.clone(),
             verification: Some(verification.retained()),
         })
     }
@@ -6908,16 +7036,13 @@ mod tests {
             )
             .await
             .expect("component admission");
-        let replacement_library = fixture.root.join("replacement-library-after-admission");
-        fs::create_dir_all(&replacement_library).expect("replacement library root");
-        let replacement_library = replacement_library.to_string_lossy().into_owned();
         let (mutation_entered_tx, mut mutation_entered_rx) = tokio::sync::oneshot::channel();
         let state = fixture.state.clone();
         let mutation = tokio::spawn(async move {
             state
                 .mutate_config(move |config| {
                     let _ = mutation_entered_tx.send(());
-                    config.library_dir = replacement_library;
+                    config.theme = "component-admission-released".to_string();
                     Ok(())
                 })
                 .await
@@ -7357,6 +7482,87 @@ mod tests {
             Some(WHOLE_INSTANCE_REMATERIALIZATION_START_STEP)
         );
         drop((component, config));
+        cleanup(fixture).await;
+    }
+
+    #[tokio::test]
+    async fn whole_instance_effect_handoff_rejects_an_active_managed_artifact_writer() {
+        let fixture = fixture("whole-instance-active-artifact-writer");
+        let admission = whole_instance_admission(
+            &fixture,
+            "whole-instance-active-artifact-writer",
+            GuardianMode::Managed,
+        )
+        .await;
+        let writer = fixture
+            .state
+            .admit_managed_artifact_mutation()
+            .expect("active managed artifact writer");
+        assert!(
+            !fixture
+                .state
+                .managed_artifact_mutation_epoch_is_capturable_for_test()
+        );
+
+        let Ok(preparation) = admission.into_effect().await else {
+            panic!("active writer must close rung-three durably");
+        };
+        let RegisteredWholeInstancePreparation::Closed(outcome) = preparation else {
+            panic!("an active writer must block the rung-three effect handoff");
+        };
+        assert!(!outcome.succeeded());
+        assert_eq!(
+            outcome.terminal().outcome(),
+            ReconciliationTerminalOutcome::Failed
+        );
+
+        drop(writer);
+        assert!(
+            fixture
+                .state
+                .managed_artifact_mutation_epoch_is_capturable_for_test()
+        );
+        cleanup(fixture).await;
+    }
+
+    #[tokio::test]
+    async fn whole_instance_effect_handoff_rejects_an_earlier_managed_artifact_writer() {
+        let fixture = fixture("whole-instance-earlier-artifact-writer");
+        let admission = whole_instance_admission(
+            &fixture,
+            "whole-instance-earlier-artifact-writer",
+            GuardianMode::Managed,
+        )
+        .await;
+        drop(
+            fixture
+                .state
+                .admit_managed_artifact_mutation()
+                .expect("earlier managed artifact writer"),
+        );
+        assert!(
+            fixture
+                .state
+                .managed_artifact_mutation_epoch_is_capturable_for_test()
+        );
+
+        let Ok(preparation) = admission.into_effect().await else {
+            panic!("earlier writer must close rung-three durably");
+        };
+        let RegisteredWholeInstancePreparation::Closed(outcome) = preparation else {
+            panic!("an earlier writer must stale the rung-three effect handoff");
+        };
+        assert!(!outcome.succeeded());
+        assert_eq!(
+            outcome.terminal().outcome(),
+            ReconciliationTerminalOutcome::Failed
+        );
+
+        assert!(
+            fixture
+                .state
+                .managed_artifact_mutation_epoch_is_capturable_for_test()
+        );
         cleanup(fixture).await;
     }
 
@@ -8016,6 +8222,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn guardian_whole_instance_commit_rejects_an_intervening_artifact_epoch() {
+        const RUNTIME_BYTES: &[u8] = b"Guardian whole-instance intervening epoch Runtime";
+        let fixture = fixture("guardian-whole-intervening-epoch");
+        let core_fixture = prepare_core_whole_instance_fixture(&fixture, RUNTIME_BYTES).await;
+        fixture.state.activate_known_good_inventory_for_test(
+            INSTANCE_ID,
+            core_fixture.known_good_inventory(),
+        );
+        let admission = whole_instance_admission(
+            &fixture,
+            "guardian-whole-intervening-epoch",
+            GuardianMode::Managed,
+        )
+        .await;
+        let expected_inventory = fixture
+            .state
+            .current_reconciliation_incarnation(INSTANCE_ID)
+            .expect("current reconciliation incarnation")
+            .inventory;
+        let state = fixture.state.clone();
+
+        let outcome = crate::guardian::execute_whole_instance_rematerialization_with(
+            admission,
+            move |_, runtime_cache, _| async move {
+                let receipt = axial_minecraft::publish_managed_whole_instance_fixture_for_test(
+                    core_fixture,
+                    &runtime_cache,
+                )
+                .await?;
+                drop(
+                    state
+                        .admit_managed_artifact_mutation()
+                        .expect("intervening managed artifact writer"),
+                );
+                Ok(receipt)
+            },
+        )
+        .await
+        .expect("stale sealed commit settles canonically");
+
+        assert_eq!(
+            outcome.status(),
+            crate::guardian::GuardianWholeInstanceRematerializationStatus::Failed
+        );
+        assert!(outcome.into_restore_offer().is_none());
+        let current_inventory = fixture
+            .state
+            .current_reconciliation_incarnation(INSTANCE_ID)
+            .expect("current reconciliation incarnation after stale commit")
+            .inventory;
+        assert!(Arc::ptr_eq(&expected_inventory, &current_inventory));
+        assert!(
+            fixture
+                .state
+                .managed_artifact_mutation_epoch_is_capturable_for_test()
+        );
+        cleanup(fixture).await;
+    }
+
+    #[tokio::test]
     async fn application_whole_instance_owner_rejects_a_foreign_state_handoff_before_admission() {
         let owner = fixture("application-whole-owner-foreign-handoff");
         let foreign = fixture("application-whole-owner-foreign-handoff-source");
@@ -8073,6 +8339,10 @@ mod tests {
         )
         .await;
         let offer = whole_instance_offer(&fixture, GuardianMode::Managed).await;
+        let epoch_before_effect = fixture
+            .state
+            .managed_artifact_mutation_epoch()
+            .expect("managed artifact epoch before rung-three effect");
         let operation_id = OperationId::new("application-whole-owner-cancellation-whole");
         let request = fixture.state.try_admit_request().expect("admit request");
         let handoff = request.producer_handoff();
@@ -8123,6 +8393,16 @@ mod tests {
             OperationStatus::Planned
         );
         assert_whole_instance_ownership_is_held(&fixture).await;
+        let effect_epoch = fixture
+            .state
+            .managed_artifact_mutation_epoch()
+            .expect("managed artifact epoch while rung-three effect is active");
+        assert!(effect_epoch > epoch_before_effect);
+        assert!(
+            !fixture
+                .state
+                .managed_artifact_mutation_epoch_is_capturable_for_test()
+        );
         drop(result);
         tokio::time::timeout(Duration::from_secs(1), async {
             while fixture.state.lifecycle_phase()
@@ -8138,6 +8418,15 @@ mod tests {
                 .await
                 .is_err(),
             "shutdown must wait for detached whole-instance owner"
+        );
+        assert_eq!(
+            fixture.state.managed_artifact_mutation_epoch(),
+            Ok(effect_epoch)
+        );
+        assert!(
+            !fixture
+                .state
+                .managed_artifact_mutation_epoch_is_capturable_for_test()
         );
 
         let _ = release_tx.send(());
@@ -8162,6 +8451,15 @@ mod tests {
             Some(terminal)
         );
         assert!(!fixture.state.instance_lifecycle_is_held(INSTANCE_ID).await);
+        assert_eq!(
+            fixture.state.managed_artifact_mutation_epoch(),
+            Ok(effect_epoch)
+        );
+        assert!(
+            fixture
+                .state
+                .managed_artifact_mutation_epoch_is_capturable_for_test()
+        );
         cleanup(fixture).await;
     }
 

@@ -3518,6 +3518,7 @@ mod tests {
         GuardianActionPlan, GuardianArtifactRepairSettlement, GuardianArtifactRepairStatus,
         GuardianConfidence, GuardianDecision, GuardianDomain, GuardianMode,
         execute_failed_managed_assets_component_rebuild_for_test,
+        execute_managed_assets_component_rebuild_fixture_for_test,
         execute_registered_guardian_artifact_repair,
     };
     use crate::state::contracts::{
@@ -4292,6 +4293,48 @@ mod tests {
         state
             .mint_known_good_verification_lease(&foreground, lifecycle, expected_library_root)
             .expect("mint test verification lease")
+    }
+
+    #[tokio::test]
+    async fn foreground_verification_refuses_an_active_managed_artifact_writer() {
+        let (state, root) = state_fixture("foreground-active-artifact-writer", None);
+        let instance = state
+            .instances()
+            .insert_for_test("Foreground active artifact writer", "1.21.5")
+            .expect("instance");
+        let inventory = KnownGoodInventory::from_test_entries([entry(
+            TestKnownGoodRoot::Libraries,
+            "active/library.jar",
+            KnownGoodArtifactKind::Library,
+            TestKnownGoodIntegrity::File { size: 7 },
+        )])
+        .expect("inventory");
+        state.activate_known_good_inventory_for_test(&instance.id, inventory);
+        let foreground = test_integrity_foreground(&state).await;
+        let lifecycle = state.acquire_instance_lifecycle(&instance.id).await;
+        let writer = state
+            .admit_managed_artifact_mutation()
+            .expect("active managed artifact writer");
+
+        assert!(matches!(
+            state.mint_known_good_verification_lease(
+                &foreground,
+                &lifecycle,
+                &root.join("private-library-root"),
+            ),
+            Err(KnownGoodVerificationUnavailable::LiveAuthorityUnavailable)
+        ));
+
+        drop(writer);
+        let verification = state
+            .mint_known_good_verification_lease(
+                &foreground,
+                &lifecycle,
+                &root.join("private-library-root"),
+            )
+            .expect("quiet epoch permits foreground verification");
+        drop((verification, lifecycle, foreground));
+        close_fixture(state, root).await;
     }
 
     async fn seal_registered_leaf_finding(
@@ -6128,6 +6171,77 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fresh_foreground_artifact_repair_rejects_active_and_earlier_writers() {
+        let (state, root) = state_fixture("fresh-r1-artifact-epoch", None);
+        let instance = state
+            .instances()
+            .insert_for_test("Fresh R1 artifact epoch", "1.21.5")
+            .expect("instance");
+        let inventory = KnownGoodInventory::from_test_entries([entry(
+            TestKnownGoodRoot::Libraries,
+            "fresh/missing.jar",
+            KnownGoodArtifactKind::Library,
+            TestKnownGoodIntegrity::File { size: 7 },
+        )])
+        .expect("inventory")
+        .with_test_standalone_leaf_repair_source(0, "https://example.invalid/fresh-missing.jar")
+        .expect("repair source");
+        state.activate_known_good_inventory_for_test(&instance.id, inventory);
+        fs::create_dir_all(root.join("private-library-root/libraries/fresh"))
+            .expect("managed library parent");
+        let foreground = test_integrity_foreground(&state).await;
+        let lifecycle = state.acquire_instance_lifecycle(&instance.id).await;
+        let report = sense_integrity_tier1(
+            &state,
+            &foreground,
+            &lifecycle,
+            &root.join("private-library-root"),
+        )
+        .await
+        .expect("foreground Tier one report");
+        let (_, findings) = report.into_parts();
+        let target = findings
+            .repair_candidate()
+            .map(|candidate| candidate.target())
+            .expect("fresh repair target")
+            .clone();
+        let authorization = findings
+            .authorize_repair(&registered_artifact_decision(target, GuardianMode::Managed))
+            .expect("fresh repair authorization");
+        let crate::state::RegisteredArtifactRecoveryEntry::Fresh(authorization) = state
+            .registered_artifact_recovery_entry(authorization)
+            .expect("fresh recovery entry")
+        else {
+            panic!("new foreground finding must enter R1 as Fresh")
+        };
+        let admission = state
+            .admit_registered_artifact_repair(
+                authorization,
+                OperationId::new("fresh-r1-artifact-epoch"),
+                chrono::Duration::minutes(15),
+            )
+            .await
+            .expect("fresh R1 admission");
+        let writer = state
+            .admit_managed_artifact_mutation()
+            .expect("intervening active writer");
+
+        assert!(matches!(
+            admission.admit_managed_artifact_mutation(),
+            Err(crate::state::ManagedArtifactMutationEpochUnavailable::MutationInFlight)
+        ));
+
+        drop(writer);
+        assert!(matches!(
+            admission.admit_managed_artifact_mutation(),
+            Err(crate::state::ManagedArtifactMutationEpochUnavailable::EpochChanged)
+        ));
+
+        drop((admission, lifecycle, foreground));
+        close_fixture(state, root).await;
+    }
+
+    #[tokio::test]
     async fn registered_artifact_authorization_is_managed_exact_and_source_backed() {
         let (state, root) = state_fixture("registered-artifact-authorization", None);
         let instance = state
@@ -6585,6 +6699,116 @@ mod tests {
         assert_eq!(component.attempt().target(), &target);
 
         drop((component, lifecycle));
+        close_fixture(state, root).await;
+    }
+
+    #[tokio::test]
+    async fn foreground_component_rebuild_rejects_an_intervening_writer() {
+        let expected = b"foreground-assets-epoch";
+        let corrupt = vec![b'x'; expected.len()];
+        let (state, root) = state_fixture("foreground-r2-artifact-epoch", None);
+        let instance = state
+            .instances()
+            .insert_for_test("Foreground R2 artifact epoch", "1.21.5")
+            .expect("instance");
+        let inventory = KnownGoodInventory::from_test_entries([entry(
+            TestKnownGoodRoot::Assets,
+            "indexes/foreground-epoch.json",
+            KnownGoodArtifactKind::AssetIndex,
+            TestKnownGoodIntegrity::Sha1 {
+                digest: format!("{:x}", Sha1::digest(expected)),
+                size: expected.len() as u64,
+            },
+        )])
+        .expect("inventory")
+        .with_test_standalone_leaf_repair_source(0, "https://example.invalid/foreground-epoch.json")
+        .expect("repair source");
+        state.activate_known_good_inventory_for_test(&instance.id, inventory);
+        let destination = root.join("private-library-root/assets/indexes/foreground-epoch.json");
+        fs::create_dir_all(destination.parent().expect("Assets index parent"))
+            .expect("Assets index parent");
+        fs::write(&destination, &corrupt).expect("corrupt Assets index");
+        let foreground = test_integrity_foreground(&state).await;
+        let lifecycle = state.acquire_instance_lifecycle(&instance.id).await;
+        let verification = state
+            .mint_known_good_verification_lease(
+                &foreground,
+                &lifecycle,
+                &root.join("private-library-root"),
+            )
+            .expect("foreground verification");
+        let observation = verification
+            .registered_artifact_observation(0, RegisteredArtifactCondition::Corrupt)
+            .expect("repairable Assets observation");
+        let findings = state
+            .seal_registered_artifact_findings(verification, vec![observation])
+            .expect("foreground Assets finding");
+        let target = findings
+            .repair_candidate()
+            .map(|candidate| candidate.target())
+            .expect("Assets repair target")
+            .clone();
+        let authorization = findings
+            .authorize_repair(&registered_artifact_decision(target, GuardianMode::Managed))
+            .expect("Assets repair authorization");
+        let crate::state::RegisteredArtifactRecoveryEntry::Fresh(authorization) = state
+            .registered_artifact_recovery_entry(authorization)
+            .expect("fresh Assets recovery entry")
+        else {
+            panic!("new foreground finding must enter R1 as Fresh")
+        };
+        let r1_admission = state
+            .admit_registered_artifact_repair(
+                authorization,
+                OperationId::new("foreground-r2-artifact-epoch-r1"),
+                chrono::Duration::minutes(15),
+            )
+            .await
+            .expect("fresh R1 admission");
+        let failure = match execute_registered_guardian_artifact_repair(
+            r1_admission,
+            &reqwest::Client::new(),
+        )
+        .await
+        .expect("R1 component-required settlement")
+        {
+            GuardianArtifactRepairSettlement::Failed(failure) => failure,
+            GuardianArtifactRepairSettlement::Completed(_) => {
+                panic!("corrupt Assets finding must continue to R2")
+            }
+        };
+        let component = state
+            .admit_registered_artifact_component_rebuild(
+                (*failure).into_continuation(),
+                OperationId::new("foreground-r2-artifact-epoch-r2"),
+                chrono::Duration::minutes(15),
+            )
+            .await
+            .expect("natural foreground R2 admission");
+
+        drop(
+            state
+                .admit_managed_artifact_mutation()
+                .expect("intervening managed artifact writer"),
+        );
+        let outcome = execute_managed_assets_component_rebuild_fixture_for_test(component)
+            .await
+            .expect("stale R2 settlement");
+
+        assert_eq!(
+            outcome.status,
+            crate::guardian::GuardianComponentRebuildStatus::Failed
+        );
+        assert_eq!(
+            outcome.facts,
+            vec!["managed_artifact_mutation_epoch_changed"]
+        );
+        assert_eq!(
+            fs::read(&destination).expect("unchanged Assets index"),
+            corrupt
+        );
+
+        drop((lifecycle, foreground));
         close_fixture(state, root).await;
     }
 

@@ -760,41 +760,55 @@ async fn launch_session_inner_with_control(
             drop(preparation_event_sender);
             Err(error)
         } else {
-            #[cfg(test)]
-            if control.runtime_prepare_source() == LaunchRuntimePrepareSource::PersistedManifest {
-                axial_launcher::prepare_launch_attempt_with_persisted_runtime_manifest_for_test(
-                    state.managed_runtime_cache(),
-                    &intent,
-                    &attempt,
-                    java_probe_receipt.as_ref(),
-                    move |event| {
-                        let _ = preparation_event_sender.send(event);
-                    },
-                )
-                .await
-            } else {
-                prepare_launch_attempt_with_events(
-                    state.managed_runtime_cache(),
-                    &intent,
-                    &attempt,
-                    java_probe_receipt.as_ref(),
-                    move |event| {
-                        let _ = preparation_event_sender.send(event);
-                    },
-                )
-                .await
+            match state.admit_managed_artifact_mutation() {
+                Err(error) => {
+                    drop(preparation_event_sender);
+                    Err(axial_launcher::LaunchPreparationError {
+                        message: error.to_string(),
+                        failure_class: Some(LaunchFailureClass::Unknown),
+                        healing: None,
+                    })
+                }
+                Ok(_runtime_mutation) => {
+                    #[cfg(test)]
+                    if control.runtime_prepare_source()
+                        == LaunchRuntimePrepareSource::PersistedManifest
+                    {
+                        axial_launcher::prepare_launch_attempt_with_persisted_runtime_manifest_for_test(
+                            state.managed_runtime_cache(),
+                            &intent,
+                            &attempt,
+                            java_probe_receipt.as_ref(),
+                            move |event| {
+                                let _ = preparation_event_sender.send(event);
+                            },
+                        )
+                        .await
+                    } else {
+                        prepare_launch_attempt_with_events(
+                            state.managed_runtime_cache(),
+                            &intent,
+                            &attempt,
+                            java_probe_receipt.as_ref(),
+                            move |event| {
+                                let _ = preparation_event_sender.send(event);
+                            },
+                        )
+                        .await
+                    }
+                    #[cfg(not(test))]
+                    prepare_launch_attempt_with_events(
+                        state.managed_runtime_cache(),
+                        &intent,
+                        &attempt,
+                        java_probe_receipt.as_ref(),
+                        move |event| {
+                            let _ = preparation_event_sender.send(event);
+                        },
+                    )
+                    .await
+                }
             }
-            #[cfg(not(test))]
-            prepare_launch_attempt_with_events(
-                state.managed_runtime_cache(),
-                &intent,
-                &attempt,
-                java_probe_receipt.as_ref(),
-                move |event| {
-                    let _ = preparation_event_sender.send(event);
-                },
-            )
-            .await
         };
         drop(preparation_event_tx);
         let _ = preparation_status_done_rx.await;
@@ -1019,8 +1033,19 @@ async fn launch_session_inner_with_control(
             }
         };
 
-        let asset_repair =
-            repair_legacy_virtual_assets_before_launch(&intent.library_dir, &prepared.plan).await;
+        let asset_repair = if prepared.plan.requires_virtual_asset_repair {
+            match state.admit_managed_artifact_mutation() {
+                Ok(_mutation) => {
+                    repair_legacy_virtual_assets_before_launch(&intent.library_dir, &prepared.plan)
+                        .await
+                }
+                Err(error) => Err(axial_minecraft::download::DownloadError::FileOperation(
+                    std::io::Error::other(error.to_string()),
+                )),
+            }
+        } else {
+            repair_legacy_virtual_assets_before_launch(&intent.library_dir, &prepared.plan).await
+        };
         match &asset_repair {
             Ok(outcome) => trace_launch_event(
                 &session_id,
