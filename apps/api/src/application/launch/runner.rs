@@ -39,8 +39,9 @@ use crate::state::{
     LaunchStatusEvent, OperationJournalStoreError, RegisteredArtifactFindings, StartupOutcome,
 };
 use axial_launcher::{
-    LaunchFailureClass, LaunchSessionExitReason, LaunchSessionOutcome, LaunchSessionOutcomeKind,
-    LaunchState, PreparedLaunchAttempt, build_healing_summary, prepare_launch_attempt_with_events,
+    LaunchFailureClass, LaunchIntent, LaunchPreparationEvent, LaunchSessionExitReason,
+    LaunchSessionOutcome, LaunchSessionOutcomeKind, LaunchState, PreparedLaunchAttempt,
+    build_healing_summary, prepare_launch_attempt_with_events,
 };
 use axial_minecraft::download::repair_virtual_assets_from_index;
 use axial_minecraft::paths::assets_dir;
@@ -760,55 +761,17 @@ async fn launch_session_inner_with_control(
             drop(preparation_event_sender);
             Err(error)
         } else {
-            match state.admit_managed_artifact_mutation() {
-                Err(error) => {
-                    drop(preparation_event_sender);
-                    Err(axial_launcher::LaunchPreparationError {
-                        message: error.to_string(),
-                        failure_class: Some(LaunchFailureClass::Unknown),
-                        healing: None,
-                    })
-                }
-                Ok(_runtime_mutation) => {
-                    #[cfg(test)]
-                    if control.runtime_prepare_source()
-                        == LaunchRuntimePrepareSource::PersistedManifest
-                    {
-                        axial_launcher::prepare_launch_attempt_with_persisted_runtime_manifest_for_test(
-                            state.managed_runtime_cache(),
-                            &intent,
-                            &attempt,
-                            java_probe_receipt.as_ref(),
-                            move |event| {
-                                let _ = preparation_event_sender.send(event);
-                            },
-                        )
-                        .await
-                    } else {
-                        prepare_launch_attempt_with_events(
-                            state.managed_runtime_cache(),
-                            &intent,
-                            &attempt,
-                            java_probe_receipt.as_ref(),
-                            move |event| {
-                                let _ = preparation_event_sender.send(event);
-                            },
-                        )
-                        .await
-                    }
-                    #[cfg(not(test))]
-                    prepare_launch_attempt_with_events(
-                        state.managed_runtime_cache(),
-                        &intent,
-                        &attempt,
-                        java_probe_receipt.as_ref(),
-                        move |event| {
-                            let _ = preparation_event_sender.send(event);
-                        },
-                    )
-                    .await
-                }
-            }
+            prepare_launch_attempt_for_runner(
+                &state,
+                &intent,
+                &attempt,
+                java_probe_receipt.as_ref(),
+                control,
+                move |event| {
+                    let _ = preparation_event_sender.send(event);
+                },
+            )
+            .await
         };
         drop(preparation_event_tx);
         let _ = preparation_status_done_rx.await;
@@ -1707,6 +1670,63 @@ async fn launch_session_inner_with_control(
     }
 }
 
+async fn prepare_launch_attempt_for_runner<F>(
+    state: &AppState,
+    intent: &LaunchIntent,
+    attempt: &axial_launcher::service::AttemptOverrides,
+    java_probe_receipt: Option<&axial_minecraft::JavaRuntimeProbeReceipt>,
+    _control: &LaunchLoopControl,
+    observer: F,
+) -> Result<PreparedLaunchAttempt, axial_launcher::LaunchPreparationError>
+where
+    F: FnMut(LaunchPreparationEvent),
+{
+    let runtime_mutation_state = state.clone();
+    #[cfg(test)]
+    let refuse_runtime_mutation_admission = _control.refuse_runtime_mutation_admission;
+    let admit_managed_runtime_mutation = move || {
+        #[cfg(test)]
+        if refuse_runtime_mutation_admission {
+            return Err(axial_minecraft::ManagedRuntimeMutationRefused);
+        }
+        runtime_mutation_state
+            .admit_managed_artifact_mutation()
+            .map_err(|_| axial_minecraft::ManagedRuntimeMutationRefused)
+    };
+    #[cfg(test)]
+    if _control.runtime_prepare_source() == LaunchRuntimePrepareSource::PersistedManifest {
+        axial_launcher::prepare_launch_attempt_with_persisted_runtime_manifest_for_test(
+            state.managed_runtime_cache(),
+            intent,
+            attempt,
+            java_probe_receipt,
+            admit_managed_runtime_mutation,
+            observer,
+        )
+        .await
+    } else {
+        prepare_launch_attempt_with_events(
+            state.managed_runtime_cache(),
+            intent,
+            attempt,
+            java_probe_receipt,
+            admit_managed_runtime_mutation,
+            observer,
+        )
+        .await
+    }
+    #[cfg(not(test))]
+    prepare_launch_attempt_with_events(
+        state.managed_runtime_cache(),
+        intent,
+        attempt,
+        java_probe_receipt,
+        admit_managed_runtime_mutation,
+        observer,
+    )
+    .await
+}
+
 #[derive(Default)]
 struct LaunchLoopControl {
     #[cfg(test)]
@@ -1718,6 +1738,8 @@ struct LaunchLoopControl {
         Option<std::sync::Arc<std::sync::Mutex<Vec<crate::guardian::GuardianFactId>>>>,
     #[cfg(test)]
     runtime_prepare_source: Option<LaunchRuntimePrepareSource>,
+    #[cfg(test)]
+    refuse_runtime_mutation_admission: bool,
 }
 
 #[cfg(test)]
@@ -2174,6 +2196,165 @@ mod tests {
             "net/fabricmc/intermediary/1.21.1/intermediary-1.21.1.jar",
         ),
     ];
+
+    #[tokio::test]
+    async fn ready_managed_runtime_launch_preparation_keeps_artifact_epoch() {
+        let root = unique_test_dir("launch-ready-runtime-epoch");
+        let state = test_app_state(&root);
+        let intent = write_managed_runtime_launch_fixture(&root);
+        let receipt = axial_minecraft::rebuild_managed_runtime_fixture_for_test(
+            state.managed_runtime_cache(),
+            RuntimeId::from("java-runtime-delta"),
+        )
+        .await
+        .expect("ready managed runtime fixture");
+        drop(receipt);
+        let epoch_before = state
+            .managed_artifact_mutation_epoch()
+            .expect("managed artifact epoch");
+        let mut events = Vec::new();
+
+        let prepared = prepare_launch_attempt_for_runner(
+            &state,
+            &intent,
+            &axial_launcher::service::AttemptOverrides::default(),
+            None,
+            &LaunchLoopControl {
+                runtime_prepare_source: Some(LaunchRuntimePrepareSource::PersistedManifest),
+                ..LaunchLoopControl::default()
+            },
+            |event| events.push(event),
+        )
+        .await
+        .expect("ready managed runtime preparation");
+
+        assert_eq!(
+            state.managed_artifact_mutation_epoch(),
+            Ok(epoch_before),
+            "a healthy runtime must not invalidate managed-artifact readers"
+        );
+        assert_eq!(prepared.runtime.effective_source, "managed");
+        assert!(!events.contains(&LaunchPreparationEvent::DownloadingRuntime));
+        drop(state);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn missing_managed_runtime_launch_preparation_advances_artifact_epoch_once() {
+        let root = unique_test_dir("launch-missing-runtime-epoch");
+        let state = test_app_state(&root);
+        let intent = write_managed_runtime_launch_fixture(&root);
+        let java_bytes = b"managed runtime launch fixture";
+        let (java_url, server) = serve_launch_runtime_once(java_bytes).await;
+        let runtime_root = axial_minecraft::persist_managed_runtime_source_fixture_for_test(
+            state.managed_runtime_cache(),
+            RuntimeId::from("java-runtime-delta"),
+            java_url,
+            java_bytes,
+        )
+        .expect("persisted runtime source");
+        let epoch_before = state
+            .managed_artifact_mutation_epoch()
+            .expect("managed artifact epoch");
+        let mut events = Vec::new();
+
+        let prepared = prepare_launch_attempt_for_runner(
+            &state,
+            &intent,
+            &axial_launcher::service::AttemptOverrides::default(),
+            None,
+            &LaunchLoopControl {
+                runtime_prepare_source: Some(LaunchRuntimePrepareSource::PersistedManifest),
+                ..LaunchLoopControl::default()
+            },
+            |event| events.push(event),
+        )
+        .await
+        .expect("missing managed runtime preparation");
+        server.await.expect("runtime fixture server");
+
+        let epoch_after = state
+            .managed_artifact_mutation_epoch()
+            .expect("managed artifact epoch after install");
+        assert_eq!(epoch_after.value(), epoch_before.value() + 1);
+        assert_eq!(prepared.runtime.effective_source, "managed");
+        assert!(events.contains(&LaunchPreparationEvent::DownloadingRuntime));
+        assert!(managed_runtime_java_path_for_runner_test(&runtime_root).is_file());
+        assert!(runtime_root.join(".axial-ready").is_file());
+        drop(state);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn refused_runtime_mutation_is_terminal_and_has_no_artifact_effects() {
+        let root = unique_test_dir("launch-runtime-admission-refusal");
+        let state = test_app_state(&root);
+        let mut intent = write_managed_runtime_launch_fixture(&root);
+        intent.requested_java = "/explicit/java".to_string();
+        intent.guardian.java_override_origin = Some(OverrideOrigin::Instance);
+        let runtime_root = axial_minecraft::persist_managed_runtime_source_fixture_for_test(
+            state.managed_runtime_cache(),
+            RuntimeId::from("java-runtime-delta"),
+            "http://127.0.0.1:9/java".to_string(),
+            b"must not download",
+        )
+        .expect("persisted runtime source");
+        let epoch_before = state
+            .managed_artifact_mutation_epoch()
+            .expect("managed artifact epoch");
+        let attempt = axial_launcher::service::AttemptOverrides {
+            force_managed_runtime: true,
+            ..Default::default()
+        };
+
+        let error = prepare_launch_attempt_for_runner(
+            &state,
+            &intent,
+            &attempt,
+            None,
+            &LaunchLoopControl {
+                runtime_prepare_source: Some(LaunchRuntimePrepareSource::PersistedManifest),
+                refuse_runtime_mutation_admission: true,
+                ..LaunchLoopControl::default()
+            },
+            |_| {},
+        )
+        .await
+        .expect_err("managed runtime mutation refusal");
+
+        assert_eq!(
+            error.message,
+            "resolve java: managed runtime mutation was refused before effects"
+        );
+        assert_eq!(error.failure_class, Some(LaunchFailureClass::Unknown));
+        assert_eq!(
+            state.managed_artifact_mutation_epoch(),
+            Ok(epoch_before),
+            "a refused callback must not advance the epoch"
+        );
+        assert!(
+            !axial_minecraft::runtime_component_executable_present_without_probe(
+                state.managed_runtime_cache(),
+                "java-runtime-delta",
+            )
+        );
+        assert!(!runtime_root.join(".axial-ready").exists());
+
+        let outcome = guardian_prepare_failure_outcome(GuardianPrepareFailureRequest {
+            mode: api_guardian_mode(intent.guardian.mode),
+            failure_class: error.failure_class.expect("bounded failure class"),
+            public_error: &error.message,
+            requested_java_present: true,
+            explicit_java_override_present: true,
+            explicit_jvm_args_present: false,
+            runtime_intervention_applied: false,
+            raw_jvm_args_intervention_applied: false,
+        });
+        assert_eq!(outcome.guardian_decision.kind(), GuardianActionKind::Block);
+        assert!(outcome.directive.is_none());
+        drop(state);
+        let _ = fs::remove_dir_all(root);
+    }
 
     #[test]
     fn tier1_integrity_has_an_exhaustive_closed_failure_class_trigger() {
@@ -6455,6 +6636,115 @@ exit 1
                 "stage evidence leaked fragment {fragment:?}: {text}"
             );
         }
+    }
+
+    fn write_managed_runtime_launch_fixture(root: &Path) -> LaunchIntent {
+        let library_dir = root.join("library");
+        let version_dir = library_dir.join("versions").join("1.21.1");
+        let game_dir = root.join("instance");
+        fs::create_dir_all(&version_dir).expect("managed launch version directory");
+        fs::create_dir_all(&game_dir).expect("managed launch game directory");
+        fs::create_dir_all(library_dir.join("assets/indexes"))
+            .expect("managed launch asset indexes");
+        fs::write(
+            version_dir.join("1.21.1.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "id": "1.21.1",
+                "type": "release",
+                "mainClass": "net.minecraft.client.main.Main",
+                "assetIndex": { "id": "launch-runtime-epoch" },
+                "javaVersion": {
+                    "component": "java-runtime-delta",
+                    "majorVersion": 21
+                },
+                "arguments": { "jvm": [], "game": [] },
+                "libraries": []
+            }))
+            .expect("managed launch version JSON"),
+        )
+        .expect("managed launch version metadata");
+        fs::write(version_dir.join("1.21.1.jar"), b"client jar")
+            .expect("managed launch client jar");
+        fs::write(
+            library_dir.join("assets/indexes/launch-runtime-epoch.json"),
+            br#"{"objects":{}}"#,
+        )
+        .expect("managed launch asset index");
+
+        LaunchIntent {
+            session_id: "launch-runtime-epoch".to_string(),
+            library_dir,
+            instance_id: "instance".to_string(),
+            version_id: "1.21.1".to_string(),
+            target_version_id: "1.21.1".to_string(),
+            loader: "vanilla".to_string(),
+            is_modded: false,
+            username: "Player".to_string(),
+            auth: LaunchAuthContext::offline("Player"),
+            requested_java: String::new(),
+            requested_preset: String::new(),
+            extra_jvm_args: Vec::new(),
+            max_memory_mb: 4096,
+            min_memory_mb: 1024,
+            resolution: None,
+            launcher_name: "axial".to_string(),
+            launcher_version: "test".to_string(),
+            game_dir: Some(game_dir),
+            guardian: LaunchGuardianContext {
+                mode: axial_launcher::GuardianMode::Managed,
+                java_override_origin: None,
+                preset_override_origin: None,
+                raw_jvm_args_origin: None,
+            },
+            performance_mode: "managed".to_string(),
+        }
+    }
+
+    fn managed_runtime_java_path_for_runner_test(runtime_root: &Path) -> PathBuf {
+        if cfg!(target_os = "macos") {
+            return runtime_root.join("jre.bundle/Contents/Home/bin/java");
+        }
+        runtime_root
+            .join("bin")
+            .join(if cfg!(target_os = "windows") {
+                "javaw.exe"
+            } else {
+                "java"
+            })
+    }
+
+    async fn serve_launch_runtime_once(
+        bytes: &'static [u8],
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("launch Runtime fixture server");
+        let address = listener
+            .local_addr()
+            .expect("launch Runtime fixture address");
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener
+                .accept()
+                .await
+                .expect("launch Runtime fixture request");
+            let mut request = [0_u8; 1024];
+            let _ = socket.read(&mut request).await;
+            let headers = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                bytes.len()
+            );
+            socket
+                .write_all(headers.as_bytes())
+                .await
+                .expect("launch Runtime response headers");
+            socket
+                .write_all(bytes)
+                .await
+                .expect("launch Runtime response body");
+        });
+        (format!("http://{address}/java"), server)
     }
 
     fn unique_test_dir(prefix: &str) -> PathBuf {

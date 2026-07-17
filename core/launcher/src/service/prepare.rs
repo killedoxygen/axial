@@ -10,8 +10,8 @@ use crate::types::LaunchFailureClass;
 #[cfg(feature = "test-support")]
 use axial_minecraft::ensure_runtime_with_persisted_manifest_for_test;
 use axial_minecraft::{
-    JavaRuntimeInfo, JavaRuntimeProbeReceipt, JavaVersion, ManagedRuntimeCache, RuntimeEnsureEvent,
-    ensure_runtime_with_events, resolve_version,
+    JavaRuntimeInfo, JavaRuntimeProbeReceipt, JavaVersion, ManagedRuntimeCache,
+    ManagedRuntimeMutationRefused, RuntimeEnsureEvent, ensure_runtime_with_events, resolve_version,
 };
 use std::time::Instant;
 
@@ -24,15 +24,17 @@ pub enum LaunchPreparationEvent {
     Preparing,
 }
 
-pub async fn prepare_launch_attempt_with_events<F>(
+pub async fn prepare_launch_attempt_with_events<F, Admit, Permit>(
     runtime_cache: &ManagedRuntimeCache,
     intent: &LaunchIntent,
     attempt: &AttemptOverrides,
     probe_receipt: Option<&JavaRuntimeProbeReceipt>,
+    admit_managed_runtime_mutation: Admit,
     observer: F,
 ) -> Result<PreparedLaunchAttempt, LaunchPreparationError>
 where
     F: FnMut(LaunchPreparationEvent),
+    Admit: FnOnce() -> Result<Permit, ManagedRuntimeMutationRefused>,
 {
     prepare_launch_attempt_with_runtime_source(
         runtime_cache,
@@ -40,21 +42,24 @@ where
         attempt,
         probe_receipt,
         RuntimePrepareSource::Production,
+        admit_managed_runtime_mutation,
         observer,
     )
     .await
 }
 
 #[cfg(feature = "test-support")]
-pub async fn prepare_launch_attempt_with_persisted_runtime_manifest_for_test<F>(
+pub async fn prepare_launch_attempt_with_persisted_runtime_manifest_for_test<F, Admit, Permit>(
     runtime_cache: &ManagedRuntimeCache,
     intent: &LaunchIntent,
     attempt: &AttemptOverrides,
     probe_receipt: Option<&JavaRuntimeProbeReceipt>,
+    admit_managed_runtime_mutation: Admit,
     observer: F,
 ) -> Result<PreparedLaunchAttempt, LaunchPreparationError>
 where
     F: FnMut(LaunchPreparationEvent),
+    Admit: FnOnce() -> Result<Permit, ManagedRuntimeMutationRefused>,
 {
     prepare_launch_attempt_with_runtime_source(
         runtime_cache,
@@ -62,6 +67,7 @@ where
         attempt,
         probe_receipt,
         RuntimePrepareSource::PersistedManifest,
+        admit_managed_runtime_mutation,
         observer,
     )
     .await
@@ -74,16 +80,18 @@ enum RuntimePrepareSource {
     PersistedManifest,
 }
 
-async fn prepare_launch_attempt_with_runtime_source<F>(
+async fn prepare_launch_attempt_with_runtime_source<F, Admit, Permit>(
     runtime_cache: &ManagedRuntimeCache,
     intent: &LaunchIntent,
     attempt: &AttemptOverrides,
     probe_receipt: Option<&JavaRuntimeProbeReceipt>,
     source: RuntimePrepareSource,
+    admit_managed_runtime_mutation: Admit,
     mut observer: F,
 ) -> Result<PreparedLaunchAttempt, LaunchPreparationError>
 where
     F: FnMut(LaunchPreparationEvent),
+    Admit: FnOnce() -> Result<Permit, ManagedRuntimeMutationRefused>,
 {
     let started_at = Instant::now();
     observer(LaunchPreparationEvent::Planning);
@@ -108,6 +116,7 @@ where
                 &intent.requested_java,
                 attempt.force_managed_runtime,
                 probe_receipt,
+                admit_managed_runtime_mutation,
                 |event| observer(launch_preparation_event_for_runtime_event(event)),
             )
             .await
@@ -120,24 +129,37 @@ where
                 &intent.requested_java,
                 attempt.force_managed_runtime,
                 probe_receipt,
+                admit_managed_runtime_mutation,
                 |event| observer(launch_preparation_event_for_runtime_event(event)),
             )
             .await
         }
     }
-    .map_err(|error| LaunchPreparationError {
-        message: format!("resolve java: {error}"),
-        failure_class: Some(LaunchFailureClass::JavaRuntimeMismatch),
-        healing: build_healing_summary(HealingSummaryInput {
-            auth_mode,
-            requested_java_path: &intent.requested_java,
-            requested_preset: &intent.requested_preset,
-            effective_java_path: None,
-            effective_preset: None,
-            fallback_applied: attempt.fallback_applied.as_deref(),
-            retry_count: attempt.retry_count,
-            failure_class: Some(LaunchFailureClass::JavaRuntimeMismatch),
-        }),
+    .map_err(|error| {
+        // Admission refusal is an execution-coordination failure, not evidence
+        // that the selected Java runtime is incompatible.
+        let failure_class = if matches!(
+            &error,
+            axial_minecraft::JavaRuntimeLookupError::ManagedMutationRefused
+        ) {
+            LaunchFailureClass::Unknown
+        } else {
+            LaunchFailureClass::JavaRuntimeMismatch
+        };
+        LaunchPreparationError {
+            message: format!("resolve java: {error}"),
+            failure_class: Some(failure_class),
+            healing: build_healing_summary(HealingSummaryInput {
+                auth_mode,
+                requested_java_path: &intent.requested_java,
+                requested_preset: &intent.requested_preset,
+                effective_java_path: None,
+                effective_preset: None,
+                fallback_applied: attempt.fallback_applied.as_deref(),
+                retry_count: attempt.retry_count,
+                failure_class: Some(failure_class),
+            }),
+        }
     })?;
     let runtime_ms = runtime_started_at.elapsed().as_millis();
     let probe_usage = ensured_runtime.probe_usage;
@@ -451,6 +473,7 @@ mod tests {
                 &intent,
                 &AttemptOverrides::default(),
                 None,
+                || Ok(()),
                 |_| {},
             )
             .await
@@ -592,6 +615,7 @@ mod tests {
             &intent,
             &AttemptOverrides::default(),
             None,
+            || Ok(()),
             |_| {},
         )
         .await
@@ -674,6 +698,7 @@ mod tests {
             &intent,
             &AttemptOverrides::default(),
             None,
+            || Ok(()),
             |_| {},
         )
         .await
@@ -770,6 +795,7 @@ mod tests {
             &intent,
             &AttemptOverrides::default(),
             None,
+            || Ok(()),
             |_| {},
         )
         .await
@@ -855,6 +881,7 @@ mod tests {
             &intent,
             &AttemptOverrides::default(),
             None,
+            || Ok(()),
             |event| {
                 events.push(event);
             },
@@ -876,6 +903,68 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    #[cfg(feature = "test-support")]
+    #[tokio::test]
+    async fn runtime_mutation_refusal_is_distinct_and_precedes_download_events() {
+        let root = unique_temp_root("axial-prepare-runtime-mutation-refusal");
+        let runtime_cache = isolated_runtime_cache();
+        let mut intent = write_receipt_test_intent(&root, Path::new(""));
+        intent.requested_java.clear();
+        intent.guardian = LaunchGuardianContext {
+            mode: GuardianMode::Managed,
+            ..LaunchGuardianContext::default()
+        };
+        let runtime_root = axial_minecraft::persist_managed_runtime_source_fixture_for_test(
+            &runtime_cache,
+            axial_minecraft::RuntimeId::from("java-runtime-delta"),
+            "http://127.0.0.1:9/java".to_string(),
+            b"unused Java",
+        )
+        .expect("persisted runtime source");
+        let admissions = std::sync::atomic::AtomicUsize::new(0);
+        let mut events = Vec::new();
+
+        let error = prepare_launch_attempt_with_persisted_runtime_manifest_for_test(
+            &runtime_cache,
+            &intent,
+            &AttemptOverrides::default(),
+            None,
+            || {
+                admissions.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Err::<(), _>(ManagedRuntimeMutationRefused)
+            },
+            |event| events.push(event),
+        )
+        .await
+        .expect_err("runtime mutation refusal");
+
+        assert_eq!(
+            admissions.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "unexpected pre-admission error: {error:?}"
+        );
+        assert_eq!(
+            error.message,
+            "resolve java: managed runtime mutation was refused before effects"
+        );
+        assert_eq!(error.failure_class, Some(LaunchFailureClass::Unknown));
+        assert_eq!(
+            events,
+            vec![
+                LaunchPreparationEvent::Planning,
+                LaunchPreparationEvent::EnsuringRuntime,
+            ]
+        );
+        assert!(
+            !axial_minecraft::runtime_component_executable_present_without_probe(
+                &runtime_cache,
+                "java-runtime-delta",
+            )
+        );
+        assert!(!runtime_root.join(".axial-ready").exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn preflight_receipt_reuses_java_info_without_a_second_probe_spawn() {
@@ -893,6 +982,7 @@ mod tests {
             &intent,
             &AttemptOverrides::default(),
             Some(&receipt),
+            || Ok(()),
             |_| {},
         )
         .await
@@ -927,6 +1017,7 @@ mod tests {
             &intent,
             &AttemptOverrides::default(),
             Some(&receipt),
+            || Ok(()),
             |_| {},
         )
         .await
@@ -971,6 +1062,7 @@ mod tests {
             &intent,
             &AttemptOverrides::default(),
             Some(&receipt),
+            || Ok(()),
             |_| {},
         )
         .await
@@ -1012,6 +1104,7 @@ mod tests {
             &intent,
             &AttemptOverrides::default(),
             Some(&receipt),
+            || Ok(()),
             |_| {},
         )
         .await

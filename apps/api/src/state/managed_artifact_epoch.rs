@@ -131,7 +131,7 @@ fn advance(
 }
 
 impl ManagedArtifactMutationEpoch {
-    pub(super) const fn value(self) -> u64 {
+    pub(crate) const fn value(self) -> u64 {
         self.0
     }
 }

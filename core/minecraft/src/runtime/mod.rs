@@ -28,7 +28,8 @@ pub(crate) use ensure::{
 pub use ensure::{ensure_runtime_with_events, rebuild_managed_runtime_component};
 #[cfg(feature = "test-support")]
 pub use ensure::{
-    ensure_runtime_with_persisted_manifest_for_test, rebuild_managed_runtime_fixture_for_test,
+    ensure_runtime_with_persisted_manifest_for_test,
+    persist_managed_runtime_source_fixture_for_test, rebuild_managed_runtime_fixture_for_test,
 };
 #[cfg(any(test, feature = "test-support"))]
 pub(crate) use install::finalize_managed_runtime_commit_with_failure_for_test;
@@ -44,10 +45,10 @@ pub(crate) use install::{
 pub use layout::ManagedRuntimeCache;
 pub(crate) use layout::runtime_java_relative_path;
 pub use model::{
-    JavaRuntimeInfo, JavaRuntimeLookupError, JavaRuntimeResult, RuntimeEnsureEvent,
-    RuntimeEnsureResult, RuntimeId, RuntimeInstallState, RuntimeOverride, RuntimeProbeSource,
-    RuntimeProbeUsage, RuntimeRecord, RuntimeRequirement, RuntimeSource, RuntimeSourceFailure,
-    RuntimeSourceFailureKind,
+    JavaRuntimeInfo, JavaRuntimeLookupError, JavaRuntimeResult, ManagedRuntimeMutationRefused,
+    RuntimeEnsureEvent, RuntimeEnsureResult, RuntimeId, RuntimeInstallState, RuntimeOverride,
+    RuntimeProbeSource, RuntimeProbeUsage, RuntimeRecord, RuntimeRequirement, RuntimeSource,
+    RuntimeSourceFailure, RuntimeSourceFailureKind,
 };
 pub use probe::{
     JavaRuntimeProbeReceipt, JavaRuntimeProbeResolution, JavaRuntimeProbeResolutionError,

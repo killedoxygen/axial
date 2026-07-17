@@ -84,12 +84,12 @@ pub use runtime::{
     JavaRuntimeInfo, JavaRuntimeLookupError, JavaRuntimeProbeReceipt, JavaRuntimeProbeResolution,
     JavaRuntimeProbeResolutionError, JavaRuntimeProbeSnapshot, JavaRuntimeResult,
     ManagedRuntimeCache, ManagedRuntimeCommitReceipt, ManagedRuntimeFailureReceipt,
-    ManagedRuntimeQuarantineObligation, ManagedRuntimeQuarantineObservation,
-    ManagedRuntimeRebuildError, RuntimeEnsureEvent, RuntimeEnsureResult, RuntimeId,
-    RuntimeInstallState, RuntimeOverride, RuntimeProbeSource, RuntimeProbeUsage, RuntimeRecord,
-    RuntimeRequirement, RuntimeSource, RuntimeSourceFailure, RuntimeSourceFailureKind,
-    ensure_runtime_with_events, is_known_runtime_component, list_java_runtimes,
-    managed_runtime_contents_verified_without_probe, parse_runtime_override,
+    ManagedRuntimeMutationRefused, ManagedRuntimeQuarantineObligation,
+    ManagedRuntimeQuarantineObservation, ManagedRuntimeRebuildError, RuntimeEnsureEvent,
+    RuntimeEnsureResult, RuntimeId, RuntimeInstallState, RuntimeOverride, RuntimeProbeSource,
+    RuntimeProbeUsage, RuntimeRecord, RuntimeRequirement, RuntimeSource, RuntimeSourceFailure,
+    RuntimeSourceFailureKind, ensure_runtime_with_events, is_known_runtime_component,
+    list_java_runtimes, managed_runtime_contents_verified_without_probe, parse_runtime_override,
     preferred_runtime_component, probe_java_runtime_receipt, rebuild_managed_runtime_component,
     resolve_java_runtime_probe, runtime_component_executable_present_without_probe,
     runtime_component_ready_without_probe, runtime_component_structurally_ready_without_probe,
@@ -97,7 +97,8 @@ pub use runtime::{
 };
 #[cfg(feature = "test-support")]
 pub use runtime::{
-    ensure_runtime_with_persisted_manifest_for_test, rebuild_managed_runtime_fixture_for_test,
+    ensure_runtime_with_persisted_manifest_for_test,
+    persist_managed_runtime_source_fixture_for_test, rebuild_managed_runtime_fixture_for_test,
 };
 pub use types::{VersionEntry, VersionLoaderAttachment, VersionSubjectKind};
 pub use version::{

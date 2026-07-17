@@ -82,6 +82,7 @@ async fn direct_launch_receipt_keeps_preparation_retries_to_one_probe_spawn() {
             &prepared.task.intent,
             &attempt,
             Some(receipt),
+            || Ok(()),
             |_| {},
         )
         .await
@@ -206,6 +207,7 @@ async fn run_override_preflight_measurement(
         &prepared.task.intent,
         &axial_launcher::service::AttemptOverrides::default(),
         receipt,
+        || Ok(()),
         |_| {},
     )
     .await

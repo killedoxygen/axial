@@ -11,8 +11,9 @@ use super::install::{
 use super::layout::{ManagedRuntimeCache, runtime_os_arch};
 use super::manifest::{RuntimeSourceReceipt, acquire_runtime_source};
 use super::model::{
-    JavaRuntimeLookupError, RuntimeEnsureEvent, RuntimeEnsureResult, RuntimeId, RuntimeOverride,
-    RuntimeProbeUsage, RuntimeRecord, RuntimeRequirement, RuntimeSource,
+    JavaRuntimeLookupError, ManagedRuntimeMutationRefused, RuntimeEnsureEvent, RuntimeEnsureResult,
+    RuntimeId, RuntimeOverride, RuntimeProbeUsage, RuntimeRecord, RuntimeRequirement,
+    RuntimeSource,
 };
 use super::probe::{JavaRuntimeProbeReceipt, probe_java_runtime_receipt};
 use crate::launch::JavaVersion;
@@ -155,6 +156,37 @@ exit 0
     Ok(receipt)
 }
 
+#[cfg(feature = "test-support")]
+pub fn persist_managed_runtime_source_fixture_for_test(
+    cache: &ManagedRuntimeCache,
+    component: RuntimeId,
+    java_url: String,
+    java_bytes: &[u8],
+) -> Result<PathBuf, JavaRuntimeLookupError> {
+    if !is_known_runtime_component(component.as_str()) {
+        return Err(JavaRuntimeLookupError::Install(
+            "runtime source fixture target is outside the closed managed component vocabulary"
+                .to_string(),
+        ));
+    }
+    let root = cache
+        .component_root(component.as_str())
+        .ok_or_else(|| JavaRuntimeLookupError::Install("invalid runtime source fixture".into()))?;
+    let source = super::manifest::authenticated_runtime_rebuild_fixture_source(
+        component, java_url, java_bytes,
+    )?;
+    let proof = super::manifest::component_manifest_proof_bytes(source.manifest())
+        .map_err(|error| JavaRuntimeLookupError::Install(error.to_string()))?;
+    std::fs::create_dir_all(&root)
+        .map_err(|error| JavaRuntimeLookupError::Install(error.to_string()))?;
+    std::fs::write(
+        root.join(super::manifest::COMPONENT_MANIFEST_PROOF_FILE),
+        proof,
+    )
+    .map_err(|error| JavaRuntimeLookupError::Install(error.to_string()))?;
+    Ok(root)
+}
+
 pub(crate) async fn rebuild_managed_runtime_component_from_source(
     cache: &ManagedRuntimeCache,
     component: &RuntimeId,
@@ -271,16 +303,18 @@ where
     Ok(source_receipt)
 }
 
-pub async fn ensure_runtime_with_events<F>(
+pub async fn ensure_runtime_with_events<F, Admit, Permit>(
     cache: &ManagedRuntimeCache,
     java_version: &JavaVersion,
     override_path: &str,
     force_managed: bool,
     probe_receipt: Option<&JavaRuntimeProbeReceipt>,
+    admit_managed_mutation: Admit,
     observer: F,
 ) -> Result<RuntimeEnsureResult, JavaRuntimeLookupError>
 where
     F: FnMut(RuntimeEnsureEvent),
+    Admit: FnOnce() -> Result<Permit, ManagedRuntimeMutationRefused>,
 {
     ensure_runtime_with_events_from_source(
         cache,
@@ -289,22 +323,25 @@ where
         force_managed,
         probe_receipt,
         RuntimeEnsureSource::Production,
+        admit_managed_mutation,
         observer,
     )
     .await
 }
 
 #[cfg(feature = "test-support")]
-pub async fn ensure_runtime_with_persisted_manifest_for_test<F>(
+pub async fn ensure_runtime_with_persisted_manifest_for_test<F, Admit, Permit>(
     cache: &ManagedRuntimeCache,
     java_version: &JavaVersion,
     override_path: &str,
     force_managed: bool,
     probe_receipt: Option<&JavaRuntimeProbeReceipt>,
+    admit_managed_mutation: Admit,
     observer: F,
 ) -> Result<RuntimeEnsureResult, JavaRuntimeLookupError>
 where
     F: FnMut(RuntimeEnsureEvent),
+    Admit: FnOnce() -> Result<Permit, ManagedRuntimeMutationRefused>,
 {
     ensure_runtime_with_events_from_source(
         cache,
@@ -313,6 +350,7 @@ where
         force_managed,
         probe_receipt,
         RuntimeEnsureSource::PersistedManifest,
+        admit_managed_mutation,
         observer,
     )
     .await
@@ -325,18 +363,21 @@ enum RuntimeEnsureSource {
     PersistedManifest,
 }
 
-async fn ensure_runtime_with_events_from_source<F>(
+async fn ensure_runtime_with_events_from_source<F, Admit, Permit>(
     cache: &ManagedRuntimeCache,
     java_version: &JavaVersion,
     override_path: &str,
     force_managed: bool,
     probe_receipt: Option<&JavaRuntimeProbeReceipt>,
     source: RuntimeEnsureSource,
+    admit_managed_mutation: Admit,
     mut observer: F,
 ) -> Result<RuntimeEnsureResult, JavaRuntimeLookupError>
 where
     F: FnMut(RuntimeEnsureEvent),
+    Admit: FnOnce() -> Result<Permit, ManagedRuntimeMutationRefused>,
 {
+    let mut mutation_admission = Some(admit_managed_mutation);
     let requirement = runtime_requirement(java_version);
     let requested_override = parse_runtime_override(override_path);
 
@@ -378,6 +419,7 @@ where
             requested_runtime,
             java_version.major_version,
             source,
+            &mut mutation_admission,
             &mut observer,
         )
         .await?;
@@ -388,8 +430,14 @@ where
         });
     }
 
-    let managed =
-        ensure_managed_runtime_with_events(cache, &requirement, source, &mut observer).await?;
+    let managed = ensure_managed_runtime_with_events(
+        cache,
+        &requirement,
+        source,
+        &mut mutation_admission,
+        &mut observer,
+    )
+    .await?;
 
     Ok(RuntimeEnsureResult {
         requested,
@@ -401,14 +449,16 @@ struct ManagedEnsure {
     effective: RuntimeRecord,
 }
 
-async fn ensure_managed_runtime_with_events<F>(
+async fn ensure_managed_runtime_with_events<F, Admit, Permit>(
     cache: &ManagedRuntimeCache,
     requirement: &RuntimeRequirement,
     source: RuntimeEnsureSource,
+    mutation_admission: &mut Option<Admit>,
     observer: &mut F,
 ) -> Result<ManagedEnsure, JavaRuntimeLookupError>
 where
     F: FnMut(RuntimeEnsureEvent),
+    Admit: FnOnce() -> Result<Permit, ManagedRuntimeMutationRefused>,
 {
     let preferred = &requirement.preferred_component;
     match resolve_managed_runtime(cache, preferred) {
@@ -418,6 +468,7 @@ where
                 runtime,
                 requirement.required_java.major_version,
                 source,
+                mutation_admission,
                 observer,
             )
             .await?;
@@ -453,6 +504,7 @@ where
         Err(_) => {}
     }
 
+    let mutation_permit = admit_managed_runtime_mutation(mutation_admission)?;
     observer(RuntimeEnsureEvent::DownloadingManagedRuntime {
         component: preferred.as_str().to_string(),
     });
@@ -471,6 +523,7 @@ where
     observer(RuntimeEnsureEvent::ManagedRuntimeReady {
         component: preferred.as_str().to_string(),
     });
+    drop(mutation_permit);
     Ok(ManagedEnsure { effective: runtime })
 }
 
@@ -479,15 +532,17 @@ struct RefreshedRuntime {
     install_performed: bool,
 }
 
-async fn refresh_ready_managed_runtime<F>(
+async fn refresh_ready_managed_runtime<F, Admit, Permit>(
     cache: &ManagedRuntimeCache,
     runtime: RuntimeRecord,
     required_major: i32,
     source: RuntimeEnsureSource,
+    mutation_admission: &mut Option<Admit>,
     observer: &mut F,
 ) -> Result<RefreshedRuntime, JavaRuntimeLookupError>
 where
     F: FnMut(RuntimeEnsureEvent),
+    Admit: FnOnce() -> Result<Permit, ManagedRuntimeMutationRefused>,
 {
     if runtime.source != RuntimeSource::Managed {
         return Ok(RefreshedRuntime {
@@ -507,6 +562,7 @@ where
         });
     }
 
+    let mutation_permit = admit_managed_runtime_mutation(mutation_admission)?;
     observer(RuntimeEnsureEvent::DownloadingManagedRuntime {
         component: component.as_str().to_string(),
     });
@@ -524,10 +580,23 @@ where
     observer(RuntimeEnsureEvent::ManagedRuntimeReady {
         component: component.as_str().to_string(),
     });
+    drop(mutation_permit);
     Ok(RefreshedRuntime {
         effective,
         install_performed: true,
     })
+}
+
+fn admit_managed_runtime_mutation<Admit, Permit>(
+    admission: &mut Option<Admit>,
+) -> Result<Permit, JavaRuntimeLookupError>
+where
+    Admit: FnOnce() -> Result<Permit, ManagedRuntimeMutationRefused>,
+{
+    let admit = admission
+        .take()
+        .ok_or(JavaRuntimeLookupError::ManagedMutationRefused)?;
+    admit().map_err(|_| JavaRuntimeLookupError::ManagedMutationRefused)
 }
 
 async fn acquire_runtime_source_for_ensure(

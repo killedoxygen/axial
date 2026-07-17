@@ -221,4 +221,10 @@ pub enum JavaRuntimeLookupError {
     ProbeTimedOut,
     #[error("failed to probe java runtime: {0}")]
     Probe(String),
+    #[error("managed runtime mutation was refused before effects")]
+    ManagedMutationRefused,
 }
+
+#[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
+#[error("managed runtime mutation was refused")]
+pub struct ManagedRuntimeMutationRefused;

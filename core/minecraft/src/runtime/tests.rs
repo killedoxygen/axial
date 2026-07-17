@@ -1,13 +1,16 @@
+#[cfg(feature = "test-support")]
+use super::ensure_runtime_with_persisted_manifest_for_test;
 use super::file_download::component_manifest_link_target_path;
 use super::{
     ComponentManifest, ComponentManifestDownload, ComponentManifestDownloads,
     ComponentManifestFile, JavaRuntimeInfo, JavaRuntimeLookupError, MachOArm64Compatibility,
-    ManagedRuntimeCache, ManagedRuntimeRebuildError, RosettaRuntimeDecision, RuntimeDownloadActual,
-    RuntimeDownloadEvidence, RuntimeDownloadIntegrityError, RuntimeDownloadManifest,
-    RuntimeEnsureEvent, RuntimeId, RuntimeInstallState, RuntimeManifest, RuntimeRecord,
-    RuntimeSource, RuntimeSourceFailure, RuntimeSourceFailureKind, RuntimeSourceReceipt,
-    acquire_runtime_source_for_test, authenticated_runtime_source_from_manifest_for_test,
-    component_manifest_destination, detect_distribution, detect_runtime_state,
+    ManagedRuntimeCache, ManagedRuntimeMutationRefused, ManagedRuntimeRebuildError,
+    RosettaRuntimeDecision, RuntimeDownloadActual, RuntimeDownloadEvidence,
+    RuntimeDownloadIntegrityError, RuntimeDownloadManifest, RuntimeEnsureEvent, RuntimeId,
+    RuntimeInstallState, RuntimeManifest, RuntimeRecord, RuntimeSource, RuntimeSourceFailure,
+    RuntimeSourceFailureKind, RuntimeSourceReceipt, acquire_runtime_source_for_test,
+    authenticated_runtime_source_from_manifest_for_test, component_manifest_destination,
+    component_manifest_proof_bytes, detect_distribution, detect_runtime_state,
     ensure_runtime_with_events, fetch_runtime_file, fetch_runtime_manifest_bytes_for_test,
     finalize_managed_runtime_commit_with_failure_for_test,
     finalize_managed_runtime_commit_with_removed_quarantine_failure_for_test,
@@ -40,6 +43,18 @@ use std::sync::{
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
+
+#[cfg(feature = "test-support")]
+struct RuntimeMutationPermitProbe {
+    active: Arc<AtomicUsize>,
+}
+
+#[cfg(feature = "test-support")]
+impl Drop for RuntimeMutationPermitProbe {
+    fn drop(&mut self) {
+        assert_eq!(self.active.swap(0, Ordering::SeqCst), 1);
+    }
+}
 
 fn expected(size: Option<u64>, sha1: Option<&str>) -> RuntimeDownloadEvidence {
     RuntimeDownloadEvidence {
@@ -2590,6 +2605,171 @@ async fn runtime_file_download_rejects_stream_past_expected_size_and_removes_tem
     let _ = fs::remove_dir_all(root);
 }
 
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn ready_managed_runtime_does_not_request_mutation_admission() {
+    let cache = ManagedRuntimeCache::isolated_for_test().expect("runtime cache");
+    let component = test_runtime_component();
+    let root = cache
+        .component_root(component.as_str())
+        .expect("managed runtime root");
+    let java_bytes = b"ready managed java";
+    let manifest = persisted_java_manifest(&root, "https://example.invalid/java", java_bytes);
+    write_persisted_runtime_source(&root, &manifest);
+    let java = java_executable(&root);
+    fs::create_dir_all(java.parent().expect("java parent")).expect("java parent dir");
+    fs::write(&java, java_bytes).expect("java fixture");
+    make_executable(&java);
+    fs::write(root.join(".axial-ready"), b"ready").expect("ready marker");
+    let admissions = AtomicUsize::new(0);
+    let mut events = Vec::new();
+
+    let ensured = ensure_runtime_with_persisted_manifest_for_test(
+        &cache,
+        &JavaVersion {
+            component: component.as_str().to_string(),
+            major_version: 21,
+        },
+        "",
+        false,
+        None,
+        || {
+            admissions.fetch_add(1, Ordering::SeqCst);
+            Ok::<(), ManagedRuntimeMutationRefused>(())
+        },
+        |event| events.push(event),
+    )
+    .await
+    .expect("ready runtime ensure");
+
+    assert_eq!(admissions.load(Ordering::SeqCst), 0);
+    assert_eq!(ensured.effective.install_state, RuntimeInstallState::Ready);
+    assert_eq!(
+        events,
+        vec![RuntimeEnsureEvent::ManagedRuntimeReady {
+            component: component.as_str().to_string(),
+        }]
+    );
+}
+
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn missing_managed_runtime_admits_once_and_holds_permit_through_ready() {
+    let cache = ManagedRuntimeCache::isolated_for_test().expect("runtime cache");
+    let component = test_runtime_component();
+    let root = cache
+        .component_root(component.as_str())
+        .expect("managed runtime root");
+    let java_bytes = b"installed managed java".to_vec();
+    let java_url = serve_runtime_download(java_bytes.clone()).await;
+    let manifest = persisted_java_manifest(&root, &java_url, &java_bytes);
+    write_persisted_runtime_source(&root, &manifest);
+    let admissions = Arc::new(AtomicUsize::new(0));
+    let active = Arc::new(AtomicUsize::new(0));
+    let admission_count = Arc::clone(&admissions);
+    let admitted_active = Arc::clone(&active);
+    let observed_active = Arc::clone(&active);
+    let mut events = Vec::new();
+
+    let ensured = ensure_runtime_with_persisted_manifest_for_test(
+        &cache,
+        &JavaVersion {
+            component: component.as_str().to_string(),
+            major_version: 21,
+        },
+        "",
+        false,
+        None,
+        move || {
+            assert_eq!(admission_count.fetch_add(1, Ordering::SeqCst), 0);
+            assert_eq!(admitted_active.swap(1, Ordering::SeqCst), 0);
+            Ok(RuntimeMutationPermitProbe {
+                active: admitted_active,
+            })
+        },
+        |event| {
+            assert_eq!(observed_active.load(Ordering::SeqCst), 1);
+            events.push(event);
+        },
+    )
+    .await
+    .expect("missing runtime install");
+
+    assert_eq!(admissions.load(Ordering::SeqCst), 1);
+    assert_eq!(active.load(Ordering::SeqCst), 0);
+    assert_eq!(ensured.effective.install_state, RuntimeInstallState::Ready);
+    assert_eq!(
+        fs::read(java_executable(&root)).expect("installed java"),
+        java_bytes
+    );
+    assert!(matches!(
+        events.first(),
+        Some(RuntimeEnsureEvent::DownloadingManagedRuntime { component: observed })
+            if observed == component.as_str()
+    ));
+    assert!(matches!(
+        events.last(),
+        Some(RuntimeEnsureEvent::ManagedRuntimeReady { component: observed })
+            if observed == component.as_str()
+    ));
+}
+
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn refused_managed_runtime_admission_has_no_install_effects() {
+    let cache = ManagedRuntimeCache::isolated_for_test().expect("runtime cache");
+    let component = test_runtime_component();
+    let root = cache
+        .component_root(component.as_str())
+        .expect("managed runtime root");
+    let java_bytes = b"must not download";
+    let manifest = persisted_java_manifest(&root, "http://127.0.0.1:9/java", java_bytes);
+    write_persisted_runtime_source(&root, &manifest);
+    let original_proof = component_manifest_proof_bytes(&manifest).expect("manifest proof");
+    let admissions = AtomicUsize::new(0);
+    let mut events = Vec::new();
+
+    let error = ensure_runtime_with_persisted_manifest_for_test(
+        &cache,
+        &JavaVersion {
+            component: component.as_str().to_string(),
+            major_version: 21,
+        },
+        "",
+        false,
+        None,
+        || {
+            admissions.fetch_add(1, Ordering::SeqCst);
+            Err::<(), _>(ManagedRuntimeMutationRefused)
+        },
+        |event| events.push(event),
+    )
+    .await
+    .expect_err("mutation refusal must stop runtime install");
+
+    assert!(matches!(
+        error,
+        JavaRuntimeLookupError::ManagedMutationRefused
+    ));
+    assert_eq!(admissions.load(Ordering::SeqCst), 1);
+    assert!(events.is_empty());
+    assert!(!java_executable(&root).exists());
+    assert!(!root.join(".axial-ready").exists());
+    assert_eq!(
+        fs::read(root.join(".axial-runtime-manifest.json")).expect("preserved proof"),
+        original_proof
+    );
+    let mut cache_entries = fs::read_dir(cache.root())
+        .expect("runtime cache entries")
+        .map(|entry| entry.expect("runtime cache entry").file_name())
+        .collect::<Vec<_>>();
+    cache_entries.sort();
+    assert_eq!(
+        cache_entries,
+        vec![std::ffi::OsString::from(component.as_str())]
+    );
+}
+
 #[test]
 fn runtime_install_futures_stay_small_enough_for_tokio_workers() {
     let root = Path::new("/tmp/axial-runtime-future-size");
@@ -2650,10 +2830,35 @@ fn runtime_install_futures_stay_small_enough_for_tokio_workers() {
             "",
             false,
             None,
+            || Ok(()),
             |_| {},
         )) < 4096,
         "managed-runtime ensure future should stay small"
     );
+}
+
+#[cfg(feature = "test-support")]
+fn persisted_java_manifest(root: &Path, url: &str, java_bytes: &[u8]) -> ComponentManifest {
+    let relative_java = java_executable(root)
+        .strip_prefix(root)
+        .expect("java under managed runtime root")
+        .to_string_lossy()
+        .replace('\\', "/");
+    let mut file = downloadable_manifest_file(url, java_bytes.len() as u64, &sha1_hex(java_bytes));
+    file.executable = true;
+    ComponentManifest {
+        files: HashMap::from([(relative_java, file)]),
+    }
+}
+
+#[cfg(feature = "test-support")]
+fn write_persisted_runtime_source(root: &Path, manifest: &ComponentManifest) {
+    fs::create_dir_all(root).expect("managed runtime root");
+    fs::write(
+        root.join(".axial-runtime-manifest.json"),
+        component_manifest_proof_bytes(manifest).expect("canonical runtime manifest proof"),
+    )
+    .expect("persisted runtime source");
 }
 
 fn unique_temp_root(label: &str) -> PathBuf {
