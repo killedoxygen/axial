@@ -46,7 +46,8 @@ pub(crate) use layout::runtime_java_relative_path;
 pub use model::{
     JavaRuntimeInfo, JavaRuntimeLookupError, JavaRuntimeResult, RuntimeEnsureEvent,
     RuntimeEnsureResult, RuntimeId, RuntimeInstallState, RuntimeOverride, RuntimeProbeSource,
-    RuntimeProbeUsage, RuntimeRecord, RuntimeRequirement, RuntimeSource,
+    RuntimeProbeUsage, RuntimeRecord, RuntimeRequirement, RuntimeSource, RuntimeSourceFailure,
+    RuntimeSourceFailureKind,
 };
 pub use probe::{
     JavaRuntimeProbeReceipt, JavaRuntimeProbeResolution, JavaRuntimeProbeResolutionError,
@@ -151,6 +152,7 @@ use manifest::{
     MAX_RUNTIME_MANIFEST_BYTES, RuntimeDownloadManifest, RuntimeManifest,
     acquire_runtime_source_for_test, fetch_runtime_manifest_bytes_for_test,
     runtime_source_url_is_secure_for_test, select_runtime_manifest,
+    validate_runtime_file_source_urls_for_test,
 };
 #[cfg(test)]
 use probe::detect_distribution;

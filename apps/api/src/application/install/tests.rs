@@ -2,7 +2,7 @@ use super::*;
 use crate::application::InstallVersionCommand;
 use crate::execution::file::{FileWriteRequest, write_file_atomically};
 use crate::execution::persistence::{AtomicWriteBackend, PersistenceCoordinator};
-use crate::guardian::DiagnosisId;
+use crate::guardian::{DiagnosisId, GuardianInstallArtifactFailureKind};
 use crate::state::contracts::{
     CommandKind, JournalId, OperationId, OperationJournalStep, OperationOutcome, OperationPhase,
     OperationStatus, OperationStepResult, OwnershipClass, RollbackState, StabilizationSystem,
@@ -16,7 +16,8 @@ use axial_config::{AppPaths, ConfigStore, InstanceRegistrySnapshot, InstanceStor
 use axial_minecraft::download::{ExecutionDownloadFact, ExecutionDownloadFactKind};
 use axial_minecraft::{
     DownloadError, DownloadProgress, LoaderComponentId, LoaderError, LoaderInstallError,
-    LoaderProviderFailureKind, build_id_for,
+    LoaderProviderFailureKind, RuntimeId, RuntimeSourceFailure, RuntimeSourceFailureKind,
+    build_id_for,
 };
 use axial_performance::PerformanceManager;
 use axum::{body::to_bytes, response::IntoResponse};
@@ -2613,12 +2614,23 @@ async fn local_runtime_install_failure_cannot_record_provider_failure_memory() {
 }
 
 #[tokio::test]
-async fn runtime_source_failure_records_typed_provider_failure_memory() {
+async fn unavailable_runtime_source_failure_records_component_provider_memory() {
     let journals = OperationJournalStore::new();
     let failure_memory = GuardianFailureMemoryStore::new();
     let operation_id = install_operation_id("runtime-source-failure");
-    let error = DownloadError::RuntimeSource(
-        "https://provider.invalid/runtime?token=private returned 503".to_string(),
+    let error = DownloadError::RuntimeSource(RuntimeSourceFailure::new(
+        RuntimeId::from("java-runtime-delta"),
+        RuntimeSourceFailureKind::Unavailable,
+        "https://provider.invalid/runtime?token=private returned 503",
+    ));
+    let evidence = typed_runtime_failure_evidence(&operation_id, &error)
+        .expect("typed runtime source evidence");
+    assert_eq!(
+        evidence.fields,
+        vec![
+            ("component".to_string(), "java-runtime-delta".to_string()),
+            ("source_failure_kind".to_string(), "unavailable".to_string(),),
+        ]
     );
     begin_install_operation_journal(&journals, &operation_id, "26.2")
         .await
@@ -2637,7 +2649,10 @@ async fn runtime_source_failure_records_typed_provider_failure_memory() {
     let entries = failure_memory.list();
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0].diagnosis_id, DiagnosisId::DownloadUnavailable);
-    assert_eq!(entries[0].target.id, "java_runtime_source");
+    assert_eq!(
+        entries[0].target.id,
+        "java_runtime_source_java-runtime-delta"
+    );
     let entry = journals.get(&operation_id).expect("journal");
     let summary = install_guardian_outcome_summary_from_journal(&entry)
         .expect("runtime source Guardian outcome");
@@ -2647,6 +2662,115 @@ async fn runtime_source_failure_records_typed_provider_failure_memory() {
     assert!(!encoded.contains("provider.invalid"));
     assert!(!encoded.contains("token"));
     assert!(!encoded.contains("private"));
+}
+
+#[tokio::test]
+async fn permanent_runtime_source_failures_block_without_provider_memory_or_stale_fact_override() {
+    for kind in [
+        RuntimeSourceFailureKind::MetadataInvalid,
+        RuntimeSourceFailureKind::IntegrityMismatch,
+        RuntimeSourceFailureKind::PolicyRejected,
+    ] {
+        let journals = OperationJournalStore::new();
+        let failure_memory = GuardianFailureMemoryStore::new();
+        let operation_id = install_operation_id(&format!("runtime-source-{kind:?}"));
+        let error = DownloadError::RuntimeSource(RuntimeSourceFailure::new(
+            RuntimeId::from("java-runtime-gamma"),
+            kind,
+            "/private/runtime?token=source-secret",
+        ));
+        let evidence = typed_runtime_failure_evidence(&operation_id, &error)
+            .expect("typed runtime source evidence");
+        assert_eq!(evidence.target_id, "java_runtime_source_java-runtime-gamma");
+        assert_eq!(evidence.ownership, OwnershipClass::ExternalProviderDerived);
+        assert_eq!(
+            evidence.kind,
+            GuardianInstallArtifactFailureKind::MetadataInvalid
+        );
+        assert_eq!(
+            evidence.fields,
+            vec![
+                ("component".to_string(), "java-runtime-gamma".to_string()),
+                ("source_failure_kind".to_string(), kind.as_str().to_string(),),
+            ]
+        );
+        let facts = [download_fact(
+            ExecutionDownloadFactKind::ProviderFailure,
+            "stale_provider_fact",
+        )];
+        begin_install_operation_journal(&journals, &operation_id, "26.2")
+            .await
+            .expect("create install journal");
+
+        record_install_failure_outcome_for_error(
+            &journals,
+            &failure_memory,
+            &operation_id,
+            &error,
+            &facts,
+            "2026-07-17T10:05:00+00:00",
+        )
+        .await;
+
+        assert!(failure_memory.list().is_empty(), "{kind:?}");
+        let entry = journals.get(&operation_id).expect("journal");
+        let summary = install_guardian_outcome_summary_from_journal(&entry)
+            .expect("runtime source Guardian outcome");
+        assert_eq!(
+            summary.diagnosis_id(),
+            DiagnosisId::InstallArtifactMetadataInvalid,
+            "{kind:?}"
+        );
+        assert_eq!(summary.decision(), "block", "{kind:?}");
+        let encoded = serde_json::to_string(&entry).expect("journal json");
+        assert!(!encoded.contains("/private/runtime"));
+        assert!(!encoded.contains("source-secret"));
+        assert!(!encoded.contains("stale_provider_fact"));
+    }
+}
+
+#[tokio::test]
+async fn runtime_source_failure_memory_is_isolated_by_component() {
+    let journals = OperationJournalStore::new();
+    let failure_memory = GuardianFailureMemoryStore::new();
+
+    for (suffix, component) in [
+        ("delta", "java-runtime-delta"),
+        ("gamma", "java-runtime-gamma"),
+    ] {
+        let operation_id = install_operation_id(&format!("runtime-source-{suffix}"));
+        let error = DownloadError::RuntimeSource(RuntimeSourceFailure::new(
+            RuntimeId::from(component),
+            RuntimeSourceFailureKind::Unavailable,
+            "provider unavailable",
+        ));
+        begin_install_operation_journal(&journals, &operation_id, "26.2")
+            .await
+            .expect("create install journal");
+        record_install_failure_outcome_for_error(
+            &journals,
+            &failure_memory,
+            &operation_id,
+            &error,
+            &[],
+            "2026-07-17T10:05:00+00:00",
+        )
+        .await;
+    }
+
+    let mut targets = failure_memory
+        .list()
+        .into_iter()
+        .map(|entry| entry.target.id)
+        .collect::<Vec<_>>();
+    targets.sort();
+    assert_eq!(
+        targets,
+        vec![
+            "java_runtime_source_java-runtime-delta",
+            "java_runtime_source_java-runtime-gamma",
+        ]
+    );
 }
 
 #[tokio::test]

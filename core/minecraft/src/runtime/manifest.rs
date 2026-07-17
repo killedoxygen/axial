@@ -1,4 +1,6 @@
-use super::model::JavaRuntimeLookupError;
+use super::model::{
+    JavaRuntimeLookupError, RuntimeId, RuntimeSourceFailure, RuntimeSourceFailureKind,
+};
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use sha1::{Digest as _, Sha1};
@@ -14,7 +16,7 @@ const RUNTIME_MANIFEST_READ_TIMEOUT_SECS: u64 = 30;
 #[derive(Clone, Copy)]
 enum RuntimeSourceTransportPolicy {
     HttpsOnly,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     AllowHttpForTest,
 }
 
@@ -22,55 +24,116 @@ impl RuntimeSourceTransportPolicy {
     fn requires_https(self) -> bool {
         match self {
             Self::HttpsOnly => true,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             Self::AllowHttpForTest => false,
         }
     }
 }
 
+#[cfg(test)]
 fn runtime_source_url_is_secure(url: &str) -> bool {
     reqwest::Url::parse(url).is_ok_and(|url| url.scheme() == "https" && url.host_str().is_some())
 }
 
+fn runtime_source_failure(
+    component: &RuntimeId,
+    kind: RuntimeSourceFailureKind,
+    detail: impl Into<String>,
+) -> JavaRuntimeLookupError {
+    JavaRuntimeLookupError::RuntimeSource(RuntimeSourceFailure::new(
+        component.clone(),
+        kind,
+        detail,
+    ))
+}
+
+fn runtime_source_status_kind(status: reqwest::StatusCode) -> RuntimeSourceFailureKind {
+    if status.is_server_error() || matches!(status.as_u16(), 408 | 425 | 429) {
+        RuntimeSourceFailureKind::Unavailable
+    } else {
+        RuntimeSourceFailureKind::MetadataInvalid
+    }
+}
+
 async fn fetch_bounded_runtime_bytes(
+    component: &RuntimeId,
     url: &str,
     policy: RuntimeSourceTransportPolicy,
 ) -> Result<Vec<u8>, JavaRuntimeLookupError> {
-    if policy.requires_https() && !runtime_source_url_is_secure(url) {
-        return Err(JavaRuntimeLookupError::Source(
-            "runtime source must use HTTPS".to_string(),
+    let parsed_url = reqwest::Url::parse(url).map_err(|error| {
+        runtime_source_failure(
+            component,
+            RuntimeSourceFailureKind::MetadataInvalid,
+            error.to_string(),
+        )
+    })?;
+    if policy.requires_https() && parsed_url.scheme() != "https" {
+        return Err(runtime_source_failure(
+            component,
+            RuntimeSourceFailureKind::PolicyRejected,
+            "runtime source must use HTTPS",
+        ));
+    }
+    if parsed_url.host_str().is_none() {
+        return Err(runtime_source_failure(
+            component,
+            RuntimeSourceFailureKind::MetadataInvalid,
+            "runtime source URL has no host",
         ));
     }
     let response = runtime_manifest_client()
-        .get(url)
+        .get(parsed_url)
         .send()
         .await
-        .map_err(|error| JavaRuntimeLookupError::Source(error.to_string()))?;
+        .map_err(|error| {
+            let kind = if error.is_redirect() {
+                RuntimeSourceFailureKind::PolicyRejected
+            } else {
+                RuntimeSourceFailureKind::Unavailable
+            };
+            runtime_source_failure(component, kind, error.to_string())
+        })?;
     if policy.requires_https() && response.url().scheme() != "https" {
-        return Err(JavaRuntimeLookupError::Source(
-            "runtime source redirected to an insecure URL".to_string(),
+        return Err(runtime_source_failure(
+            component,
+            RuntimeSourceFailureKind::PolicyRejected,
+            "runtime source redirected to an insecure URL",
         ));
     }
     let status = response.status();
     if !status.is_success() {
-        return Err(JavaRuntimeLookupError::Source(format!("HTTP {status}")));
+        return Err(runtime_source_failure(
+            component,
+            runtime_source_status_kind(status),
+            format!("HTTP {status}"),
+        ));
     }
     if response
         .content_length()
         .is_some_and(|content_length| content_length > MAX_RUNTIME_MANIFEST_BYTES)
     {
-        return Err(JavaRuntimeLookupError::Source(
-            "runtime manifest response too large".to_string(),
+        return Err(runtime_source_failure(
+            component,
+            RuntimeSourceFailureKind::PolicyRejected,
+            "runtime manifest response too large",
         ));
     }
 
     let mut body = Vec::new();
     let mut stream = response.bytes_stream();
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|error| JavaRuntimeLookupError::Source(error.to_string()))?;
+        let chunk = chunk.map_err(|error| {
+            runtime_source_failure(
+                component,
+                RuntimeSourceFailureKind::Unavailable,
+                error.to_string(),
+            )
+        })?;
         if body.len() as u64 + chunk.len() as u64 > MAX_RUNTIME_MANIFEST_BYTES {
-            return Err(JavaRuntimeLookupError::Source(
-                "runtime manifest response too large".to_string(),
+            return Err(runtime_source_failure(
+                component,
+                RuntimeSourceFailureKind::PolicyRejected,
+                "runtime manifest response too large",
             ));
         }
         body.extend_from_slice(&chunk);
@@ -84,12 +147,18 @@ pub(super) async fn acquire_runtime_source(
     primary_platform: &str,
 ) -> Result<RuntimeSourceReceipt, JavaRuntimeLookupError> {
     let catalog_bytes = fetch_bounded_runtime_bytes(
+        component,
         RUNTIME_MANIFEST_URL,
         RuntimeSourceTransportPolicy::HttpsOnly,
     )
     .await?;
-    let catalog = serde_json::from_slice::<RuntimeManifest>(&catalog_bytes)
-        .map_err(|error| JavaRuntimeLookupError::Source(error.to_string()))?;
+    let catalog = serde_json::from_slice::<RuntimeManifest>(&catalog_bytes).map_err(|error| {
+        runtime_source_failure(
+            component,
+            RuntimeSourceFailureKind::MetadataInvalid,
+            error.to_string(),
+        )
+    })?;
     let expected = select_runtime_manifest(&catalog, component, primary_platform)?.clone();
     acquire_runtime_source_from_descriptor(
         component.clone(),
@@ -104,18 +173,25 @@ async fn acquire_runtime_source_from_descriptor(
     expected: RuntimeDownloadManifest,
     policy: RuntimeSourceTransportPolicy,
 ) -> Result<RuntimeSourceReceipt, JavaRuntimeLookupError> {
-    let bytes = fetch_bounded_runtime_bytes(&expected.url, policy).await?;
-    authenticate_runtime_source_bytes(component, expected, bytes)
+    let bytes = fetch_bounded_runtime_bytes(&component, &expected.url, policy).await?;
+    authenticate_runtime_source_bytes(component, expected, bytes, policy)
 }
 
 fn authenticate_runtime_source_bytes(
     component: super::model::RuntimeId,
     expected: RuntimeDownloadManifest,
     bytes: Vec<u8>,
+    policy: RuntimeSourceTransportPolicy,
 ) -> Result<RuntimeSourceReceipt, JavaRuntimeLookupError> {
-    verify_component_manifest_bytes(&bytes, &expected)?;
-    let manifest = serde_json::from_slice::<ComponentManifest>(&bytes)
-        .map_err(|error| JavaRuntimeLookupError::Source(error.to_string()))?;
+    verify_component_manifest_bytes(&component, &bytes, &expected)?;
+    let manifest = serde_json::from_slice::<ComponentManifest>(&bytes).map_err(|error| {
+        runtime_source_failure(
+            &component,
+            RuntimeSourceFailureKind::MetadataInvalid,
+            error.to_string(),
+        )
+    })?;
+    validate_runtime_file_source_urls(&component, &manifest, policy)?;
 
     Ok(RuntimeSourceReceipt {
         component,
@@ -125,24 +201,67 @@ fn authenticate_runtime_source_bytes(
     })
 }
 
+fn validate_runtime_file_source_urls(
+    component: &RuntimeId,
+    manifest: &ComponentManifest,
+    policy: RuntimeSourceTransportPolicy,
+) -> Result<(), JavaRuntimeLookupError> {
+    for download in manifest
+        .files
+        .values()
+        .filter_map(|file| file.downloads.as_ref())
+        .flat_map(|downloads| downloads.raw.iter().chain(downloads.lzma.iter()))
+    {
+        let url = reqwest::Url::parse(&download.url).map_err(|error| {
+            runtime_source_failure(
+                component,
+                RuntimeSourceFailureKind::MetadataInvalid,
+                error.to_string(),
+            )
+        })?;
+        if policy.requires_https() && url.scheme() != "https" {
+            return Err(runtime_source_failure(
+                component,
+                RuntimeSourceFailureKind::PolicyRejected,
+                "runtime file source must use HTTPS",
+            ));
+        }
+        if url.host_str().is_none() {
+            return Err(runtime_source_failure(
+                component,
+                RuntimeSourceFailureKind::MetadataInvalid,
+                "runtime file source URL has no host",
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn verify_component_manifest_bytes(
+    component: &RuntimeId,
     bytes: &[u8],
     expected: &RuntimeDownloadManifest,
 ) -> Result<(), JavaRuntimeLookupError> {
     if bytes.len() as u64 != expected.size {
-        return Err(JavaRuntimeLookupError::Source(
-            "runtime component manifest size mismatch".to_string(),
+        return Err(runtime_source_failure(
+            component,
+            RuntimeSourceFailureKind::IntegrityMismatch,
+            "runtime component manifest size mismatch",
         ));
     }
     if expected.sha1.len() != 40 || !expected.sha1.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        return Err(JavaRuntimeLookupError::Source(
-            "runtime component manifest has invalid checksum proof".to_string(),
+        return Err(runtime_source_failure(
+            component,
+            RuntimeSourceFailureKind::MetadataInvalid,
+            "runtime component manifest has invalid checksum proof",
         ));
     }
     let actual_sha1 = format!("{:x}", Sha1::digest(bytes));
     if !actual_sha1.eq_ignore_ascii_case(&expected.sha1) {
-        return Err(JavaRuntimeLookupError::Source(
-            "runtime component manifest checksum mismatch".to_string(),
+        return Err(runtime_source_failure(
+            component,
+            RuntimeSourceFailureKind::IntegrityMismatch,
+            "runtime component manifest checksum mismatch",
         ));
     }
     Ok(())
@@ -268,6 +387,7 @@ pub(super) fn authenticated_runtime_source_fixture_for_test(
             size: MANIFEST.len() as u64,
         },
         MANIFEST.to_vec(),
+        RuntimeSourceTransportPolicy::HttpsOnly,
     )
 }
 
@@ -276,8 +396,13 @@ pub(crate) fn authenticated_runtime_source_from_manifest_for_test(
     component: super::model::RuntimeId,
     manifest: ComponentManifest,
 ) -> Result<RuntimeSourceReceipt, JavaRuntimeLookupError> {
-    let bytes = serde_json::to_vec(&manifest)
-        .map_err(|error| JavaRuntimeLookupError::Source(error.to_string()))?;
+    let bytes = serde_json::to_vec(&manifest).map_err(|error| {
+        runtime_source_failure(
+            &component,
+            RuntimeSourceFailureKind::MetadataInvalid,
+            error.to_string(),
+        )
+    })?;
     authenticate_runtime_source_bytes(
         component,
         RuntimeDownloadManifest {
@@ -286,6 +411,7 @@ pub(crate) fn authenticated_runtime_source_from_manifest_for_test(
             size: bytes.len() as u64,
         },
         bytes,
+        RuntimeSourceTransportPolicy::AllowHttpForTest,
     )
 }
 
@@ -314,8 +440,13 @@ pub(super) fn authenticated_runtime_rebuild_fixture_source(
             },
         )]),
     };
-    let bytes = serde_json::to_vec(&manifest)
-        .map_err(|error| JavaRuntimeLookupError::Source(error.to_string()))?;
+    let bytes = serde_json::to_vec(&manifest).map_err(|error| {
+        runtime_source_failure(
+            &component,
+            RuntimeSourceFailureKind::MetadataInvalid,
+            error.to_string(),
+        )
+    })?;
     authenticate_runtime_source_bytes(
         component,
         RuntimeDownloadManifest {
@@ -324,6 +455,7 @@ pub(super) fn authenticated_runtime_rebuild_fixture_source(
             size: bytes.len() as u64,
         },
         bytes,
+        RuntimeSourceTransportPolicy::AllowHttpForTest,
     )
 }
 
@@ -331,12 +463,25 @@ pub(super) fn authenticated_runtime_rebuild_fixture_source(
 pub(super) async fn fetch_runtime_manifest_bytes_for_test(
     url: &str,
 ) -> Result<Vec<u8>, JavaRuntimeLookupError> {
-    fetch_bounded_runtime_bytes(url, RuntimeSourceTransportPolicy::AllowHttpForTest).await
+    fetch_bounded_runtime_bytes(
+        &RuntimeId::from("java-runtime-delta"),
+        url,
+        RuntimeSourceTransportPolicy::AllowHttpForTest,
+    )
+    .await
 }
 
 #[cfg(test)]
 pub(super) fn runtime_source_url_is_secure_for_test(url: &str) -> bool {
     runtime_source_url_is_secure(url)
+}
+
+#[cfg(test)]
+pub(super) fn validate_runtime_file_source_urls_for_test(
+    component: &RuntimeId,
+    manifest: &ComponentManifest,
+) -> Result<(), JavaRuntimeLookupError> {
+    validate_runtime_file_source_urls(component, manifest, RuntimeSourceTransportPolicy::HttpsOnly)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

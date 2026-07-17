@@ -1,5 +1,7 @@
 use super::manifest::ComponentManifestDownload;
-use super::model::JavaRuntimeLookupError;
+use super::model::{
+    JavaRuntimeLookupError, RuntimeId, RuntimeSourceFailure, RuntimeSourceFailureKind,
+};
 use futures_util::StreamExt;
 use sha1::{Digest as _, Sha1};
 use std::borrow::Cow;
@@ -36,14 +38,19 @@ pub(super) fn runtime_file_download_concurrency_for(cores: usize) -> usize {
 }
 
 pub(super) fn component_manifest_destination(
+    component: &RuntimeId,
     temp_dir: &Path,
     relative_path: &str,
 ) -> Result<PathBuf, JavaRuntimeLookupError> {
     if relative_path.is_empty() || has_unsafe_path_component(Path::new(relative_path)) {
-        return Err(JavaRuntimeLookupError::Source(format!(
-            "unsafe runtime manifest path: {}",
-            bounded_manifest_file_label(relative_path)
-        )));
+        return Err(runtime_source_failure(
+            component,
+            RuntimeSourceFailureKind::PolicyRejected,
+            format!(
+                "unsafe runtime manifest path: {}",
+                bounded_manifest_file_label(relative_path)
+            ),
+        ));
     }
 
     let mut destination = temp_dir.to_path_buf();
@@ -52,10 +59,14 @@ pub(super) fn component_manifest_destination(
             || segment.contains(':')
             || has_unsafe_path_component(Path::new(segment))
         {
-            return Err(JavaRuntimeLookupError::Source(format!(
-                "unsafe runtime manifest path: {}",
-                bounded_manifest_file_label(relative_path)
-            )));
+            return Err(runtime_source_failure(
+                component,
+                RuntimeSourceFailureKind::PolicyRejected,
+                format!(
+                    "unsafe runtime manifest path: {}",
+                    bounded_manifest_file_label(relative_path)
+                ),
+            ));
         }
         destination.push(segment);
     }
@@ -64,26 +75,35 @@ pub(super) fn component_manifest_destination(
 }
 
 pub(super) fn component_manifest_link_target_path(
+    component: &RuntimeId,
     component_root: &Path,
     link_destination: &Path,
     link_relative_path: &str,
     target: &str,
 ) -> Result<PathBuf, JavaRuntimeLookupError> {
     if target.trim().is_empty() || Path::new(target).is_absolute() {
-        return Err(JavaRuntimeLookupError::Source(format!(
-            "unsafe runtime manifest link target for {}",
-            bounded_manifest_file_label(link_relative_path)
-        )));
+        return Err(runtime_source_failure(
+            component,
+            RuntimeSourceFailureKind::PolicyRejected,
+            format!(
+                "unsafe runtime manifest link target for {}",
+                bounded_manifest_file_label(link_relative_path)
+            ),
+        ));
     }
     for segment in target.split(['/', '\\']) {
         if segment.is_empty() || segment == "." {
             continue;
         }
         if segment.contains(':') {
-            return Err(JavaRuntimeLookupError::Source(format!(
-                "unsafe runtime manifest link target for {}",
-                bounded_manifest_file_label(link_relative_path)
-            )));
+            return Err(runtime_source_failure(
+                component,
+                RuntimeSourceFailureKind::PolicyRejected,
+                format!(
+                    "unsafe runtime manifest link target for {}",
+                    bounded_manifest_file_label(link_relative_path)
+                ),
+            ));
         }
     }
 
@@ -91,10 +111,14 @@ pub(super) fn component_manifest_link_target_path(
     let parent = link_destination.parent().unwrap_or(component_root);
     let target_path = normalize_path_lexically(&parent.join(target));
     if !target_path.starts_with(&root) {
-        return Err(JavaRuntimeLookupError::Source(format!(
-            "unsafe runtime manifest link target for {}",
-            bounded_manifest_file_label(link_relative_path)
-        )));
+        return Err(runtime_source_failure(
+            component,
+            RuntimeSourceFailureKind::PolicyRejected,
+            format!(
+                "unsafe runtime manifest link target for {}",
+                bounded_manifest_file_label(link_relative_path)
+            ),
+        ));
     }
 
     Ok(target_path)
@@ -133,6 +157,7 @@ pub(super) fn runtime_download_temp_path(destination: &Path) -> PathBuf {
 }
 
 pub(super) async fn fetch_runtime_file(
+    component: &RuntimeId,
     download_client: &reqwest::Client,
     url: &str,
     temp_path: &Path,
@@ -142,6 +167,7 @@ pub(super) async fn fetch_runtime_file(
     let mut attempt = 1_u64;
     loop {
         let result = stream_runtime_file_to_temp_attempt(
+            component,
             download_client,
             url,
             temp_path,
@@ -151,45 +177,57 @@ pub(super) async fn fetch_runtime_file(
         .await;
         match result {
             Ok(()) => return Ok(()),
-            Err(error) if error.retryable && attempt < RUNTIME_DOWNLOAD_ATTEMPTS => {
+            Err(JavaRuntimeLookupError::RuntimeSource(failure))
+                if failure.kind().is_retryable() && attempt < RUNTIME_DOWNLOAD_ATTEMPTS =>
+            {
                 let _ = async_fs::remove_file(runtime_filesystem_path(temp_path).as_ref()).await;
                 tokio::time::sleep(std::time::Duration::from_millis(250 * attempt)).await;
                 attempt += 1;
             }
             Err(error) => {
                 let _ = async_fs::remove_file(runtime_filesystem_path(temp_path).as_ref()).await;
-                return Err(error.error);
+                return Err(error);
             }
         }
     }
 }
 
 async fn stream_runtime_file_to_temp_attempt(
+    component: &RuntimeId,
     download_client: &reqwest::Client,
     url: &str,
     temp_path: &Path,
     expected: &RuntimeDownloadEvidence,
     relative_path: &str,
-) -> Result<(), RuntimeFileDownloadAttemptError> {
-    let response = download_client
-        .get(url)
-        .send()
-        .await
-        .map_err(RuntimeFileDownloadAttemptError::retryable_source)?;
+) -> Result<(), JavaRuntimeLookupError> {
+    let response = download_client.get(url).send().await.map_err(|error| {
+        let kind = if error.is_redirect() {
+            RuntimeSourceFailureKind::PolicyRejected
+        } else {
+            RuntimeSourceFailureKind::Unavailable
+        };
+        runtime_source_failure(component, kind, error.to_string())
+    })?;
     let status = response.status();
     if !status.is_success() {
-        let retryable =
-            status.is_server_error() || status == reqwest::StatusCode::TOO_MANY_REQUESTS;
-        return Err(RuntimeFileDownloadAttemptError::from_parts(
-            JavaRuntimeLookupError::Source(format!("HTTP {status}")),
-            retryable,
+        let kind = if status.is_server_error() || matches!(status.as_u16(), 408 | 425 | 429) {
+            RuntimeSourceFailureKind::Unavailable
+        } else {
+            RuntimeSourceFailureKind::MetadataInvalid
+        };
+        return Err(runtime_source_failure(
+            component,
+            kind,
+            format!("HTTP {status}"),
         ));
     }
     if let Some(expected_size) = expected.size
         && let Some(content_length) = response.content_length()
         && content_length > expected_size
     {
-        return Err(RuntimeFileDownloadAttemptError::fatal_source(
+        return Err(runtime_source_failure(
+            component,
+            RuntimeSourceFailureKind::IntegrityMismatch,
             RuntimeDownloadIntegrityError::SizeMismatch {
                 file: bounded_manifest_file_label(relative_path),
                 expected: expected_size,
@@ -200,18 +238,26 @@ async fn stream_runtime_file_to_temp_attempt(
     }
     let mut output = async_fs::File::create(runtime_filesystem_path(temp_path).as_ref())
         .await
-        .map_err(RuntimeFileDownloadAttemptError::fatal_install)?;
+        .map_err(|error| JavaRuntimeLookupError::Install(error.to_string()))?;
     let mut stream = response.bytes_stream();
     let mut hasher = Sha1::new();
     let mut actual_size = 0_u64;
 
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(RuntimeFileDownloadAttemptError::retryable_source)?;
+        let chunk = chunk.map_err(|error| {
+            runtime_source_failure(
+                component,
+                RuntimeSourceFailureKind::Unavailable,
+                error.to_string(),
+            )
+        })?;
         let next_size = actual_size.saturating_add(chunk.len() as u64);
         if let Some(expected_size) = expected.size
             && next_size > expected_size
         {
-            return Err(RuntimeFileDownloadAttemptError::fatal_source(
+            return Err(runtime_source_failure(
+                component,
+                RuntimeSourceFailureKind::IntegrityMismatch,
                 RuntimeDownloadIntegrityError::SizeMismatch {
                     file: bounded_manifest_file_label(relative_path),
                     expected: expected_size,
@@ -223,45 +269,38 @@ async fn stream_runtime_file_to_temp_attempt(
         output
             .write_all(&chunk)
             .await
-            .map_err(RuntimeFileDownloadAttemptError::fatal_install)?;
+            .map_err(|error| JavaRuntimeLookupError::Install(error.to_string()))?;
         hasher.update(&chunk);
         actual_size = next_size;
     }
     output
         .flush()
         .await
-        .map_err(RuntimeFileDownloadAttemptError::fatal_install)?;
+        .map_err(|error| JavaRuntimeLookupError::Install(error.to_string()))?;
 
     let actual = RuntimeDownloadActual {
         size: actual_size,
         sha1: format!("{:x}", hasher.finalize()),
     };
-    verify_runtime_download(relative_path, expected, &actual)
-        .map_err(|error| RuntimeFileDownloadAttemptError::fatal_source(error.to_string()))
+    verify_runtime_download(relative_path, expected, &actual).map_err(|error| {
+        runtime_source_failure(
+            component,
+            RuntimeSourceFailureKind::IntegrityMismatch,
+            error.to_string(),
+        )
+    })
 }
 
-#[derive(Debug)]
-struct RuntimeFileDownloadAttemptError {
-    error: JavaRuntimeLookupError,
-    retryable: bool,
-}
-
-impl RuntimeFileDownloadAttemptError {
-    fn from_parts(error: JavaRuntimeLookupError, retryable: bool) -> Self {
-        Self { error, retryable }
-    }
-
-    fn retryable_source(error: impl ToString) -> Self {
-        Self::from_parts(JavaRuntimeLookupError::Source(error.to_string()), true)
-    }
-
-    fn fatal_source(error: impl ToString) -> Self {
-        Self::from_parts(JavaRuntimeLookupError::Source(error.to_string()), false)
-    }
-
-    fn fatal_install(error: impl ToString) -> Self {
-        Self::from_parts(JavaRuntimeLookupError::Install(error.to_string()), false)
-    }
+fn runtime_source_failure(
+    component: &RuntimeId,
+    kind: RuntimeSourceFailureKind,
+    detail: impl Into<String>,
+) -> JavaRuntimeLookupError {
+    JavaRuntimeLookupError::RuntimeSource(RuntimeSourceFailure::new(
+        component.clone(),
+        kind,
+        detail,
+    ))
 }
 
 pub(super) fn runtime_download_client() -> reqwest::Client {
@@ -275,6 +314,15 @@ pub(super) fn runtime_download_client() -> reqwest::Client {
                 .read_timeout(std::time::Duration::from_secs(
                     RUNTIME_DOWNLOAD_CLIENT_READ_TIMEOUT_SECS,
                 ))
+                .redirect(reqwest::redirect::Policy::custom(|attempt| {
+                    if attempt.previous().len() >= 10 {
+                        attempt.error("runtime file redirect limit exceeded")
+                    } else if attempt.url().scheme() == "https" {
+                        attempt.follow()
+                    } else {
+                        attempt.error("runtime file redirect must use HTTPS")
+                    }
+                }))
                 .user_agent("axial/0.3")
                 .pool_max_idle_per_host(MAX_RUNTIME_FILE_DOWNLOAD_CONCURRENCY)
                 .pool_idle_timeout(std::time::Duration::from_secs(

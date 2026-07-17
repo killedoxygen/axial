@@ -10,7 +10,10 @@ use super::manifest::{
     ComponentManifestDownloads, ComponentManifestFile, RuntimeSourceReceipt,
     component_manifest_proof_bytes,
 };
-use super::model::{JavaRuntimeLookupError, RuntimeEnsureEvent, RuntimeId};
+use super::model::{
+    JavaRuntimeLookupError, RuntimeEnsureEvent, RuntimeId, RuntimeSourceFailure,
+    RuntimeSourceFailureKind,
+};
 use crate::known_good::{
     KnownGoodArtifactKind, KnownGoodIntegrity, KnownGoodInventory, KnownGoodRoot,
     known_good_link_target_matches,
@@ -27,6 +30,18 @@ const MAX_RUNTIME_TREE_DEPTH: usize = 16;
 const MAX_RUNTIME_RELATIVE_PATH_BYTES: usize = 4096;
 const MAX_RUNTIME_FILE_BYTES: u64 = 128 << 20;
 const MAX_RUNTIME_TREE_TOTAL_BYTES: u64 = 512 << 20;
+
+fn runtime_source_failure(
+    component: &RuntimeId,
+    kind: RuntimeSourceFailureKind,
+    detail: impl Into<String>,
+) -> JavaRuntimeLookupError {
+    JavaRuntimeLookupError::RuntimeSource(RuntimeSourceFailure::new(
+        component.clone(),
+        kind,
+        detail,
+    ))
+}
 
 pub(crate) struct StagedManagedRuntime {
     cache: ManagedRuntimeCache,
@@ -866,10 +881,11 @@ pub(super) async fn runtime_tree_matches_source(
         return false;
     }
     let root = root.to_path_buf();
+    let component = source.component().clone();
     let source_manifest = source.manifest().clone();
     tokio::task::spawn_blocking(move || {
-        super::discovery::managed_runtime_contents_verified_without_probe(&root)
-            && runtime_tree_shape_matches_manifest(&root, &source_manifest)
+        super::discovery::managed_runtime_contents_verified_for_component(&root, &component)
+            && runtime_tree_shape_matches_manifest(&component, &root, &source_manifest)
     })
     .await
     .unwrap_or(false)
@@ -898,7 +914,11 @@ enum RuntimeTreeNodeKind {
     Link,
 }
 
-fn runtime_tree_shape_matches_manifest(root: &Path, manifest: &ComponentManifest) -> bool {
+fn runtime_tree_shape_matches_manifest(
+    component: &RuntimeId,
+    root: &Path,
+    manifest: &ComponentManifest,
+) -> bool {
     let filesystem_root = runtime_filesystem_path(root).into_owned();
     let Ok(root_metadata) = std::fs::symlink_metadata(&filesystem_root) else {
         return false;
@@ -920,7 +940,7 @@ fn runtime_tree_shape_matches_manifest(root: &Path, manifest: &ComponentManifest
         return false;
     }
     for (relative, file) in &manifest.files {
-        let Ok(path) = component_manifest_destination(Path::new(""), relative) else {
+        let Ok(path) = component_manifest_destination(component, Path::new(""), relative) else {
             return false;
         };
         let kind = match file.kind.as_str() {
@@ -1016,7 +1036,11 @@ mod runtime_tree_shape_tests {
             ]),
         };
 
-        assert!(runtime_tree_shape_matches_manifest(root.path(), &manifest));
+        assert!(runtime_tree_shape_matches_manifest(
+            &super::RuntimeId::from("java-runtime-gamma"),
+            root.path(),
+            &manifest,
+        ));
     }
 }
 
@@ -1405,7 +1429,7 @@ async fn materialize_runtime_tree_with_concurrency(
         persist_component_manifest_proof(dest_dir, component_manifest).await?;
 
         install_runtime_manifest_files_with_concurrency(
-            component.as_str(),
+            component,
             dest_dir,
             component_manifest.files.clone(),
             observer,
@@ -1444,6 +1468,7 @@ fn validate_ephemeral_processor_manifest(
     max_bytes: u64,
 ) -> Result<RuntimeManifestAdmission, JavaRuntimeLookupError> {
     validate_runtime_manifest_contract(
+        source.component(),
         source.manifest(),
         source.bytes().len() as u64,
         max_entries.min(MAX_RUNTIME_TREE_ENTRIES),
@@ -1457,6 +1482,7 @@ fn validate_managed_runtime_source(
     download_concurrency: usize,
 ) -> Result<RuntimeManifestAdmission, JavaRuntimeLookupError> {
     validate_runtime_manifest_contract(
+        source.component(),
         source.manifest(),
         source.bytes().len() as u64,
         MAX_RUNTIME_TREE_ENTRIES,
@@ -1471,6 +1497,7 @@ struct RuntimeManifestAdmission {
 }
 
 fn validate_runtime_manifest_contract(
+    component: &RuntimeId,
     manifest: &ComponentManifest,
     manifest_bytes: u64,
     max_entries: usize,
@@ -1478,8 +1505,10 @@ fn validate_runtime_manifest_contract(
     download_concurrency: usize,
 ) -> Result<RuntimeManifestAdmission, JavaRuntimeLookupError> {
     if manifest.files.len() > max_entries {
-        return Err(JavaRuntimeLookupError::Source(
-            "runtime manifest exceeds the entry bound".to_string(),
+        return Err(runtime_source_failure(
+            component,
+            RuntimeSourceFailureKind::PolicyRejected,
+            "runtime manifest exceeds the entry bound",
         ));
     }
     let contract_root = Path::new("runtime");
@@ -1492,52 +1521,67 @@ fn validate_runtime_manifest_contract(
     let mut lzma_entries = 0_usize;
     for (relative_path, file) in &manifest.files {
         if relative_path.len() > MAX_RUNTIME_RELATIVE_PATH_BYTES {
-            return Err(JavaRuntimeLookupError::Source(
-                "runtime manifest path exceeds the length bound".to_string(),
+            return Err(runtime_source_failure(
+                component,
+                RuntimeSourceFailureKind::PolicyRejected,
+                "runtime manifest path exceeds the length bound",
             ));
         }
-        let destination = component_manifest_destination(contract_root, relative_path)?;
+        let destination = component_manifest_destination(component, contract_root, relative_path)?;
         let normalized_relative = destination
             .strip_prefix(contract_root)
             .expect("validated runtime destination remains below its contract root")
             .to_path_buf();
         if normalized_relative.components().count() > MAX_RUNTIME_TREE_DEPTH {
-            return Err(JavaRuntimeLookupError::Source(
-                "runtime manifest exceeds the depth bound".to_string(),
+            return Err(runtime_source_failure(
+                component,
+                RuntimeSourceFailureKind::PolicyRejected,
+                "runtime manifest exceeds the depth bound",
             ));
         }
         if !declared_paths.insert(normalized_relative.clone()) {
-            return Err(JavaRuntimeLookupError::Source(
-                "runtime manifest contains colliding paths".to_string(),
+            return Err(runtime_source_failure(
+                component,
+                RuntimeSourceFailureKind::PolicyRejected,
+                "runtime manifest contains colliding paths",
             ));
         }
 
         let kind = match file.kind.as_str() {
             "directory" => {
                 if file.downloads.is_some() || file.target.is_some() {
-                    return Err(JavaRuntimeLookupError::Source(
-                        "runtime directory contains incompatible metadata".to_string(),
+                    return Err(runtime_source_failure(
+                        component,
+                        RuntimeSourceFailureKind::MetadataInvalid,
+                        "runtime directory contains incompatible metadata",
                     ));
                 }
                 RuntimeTreeNodeKind::Directory
             }
             "link" => {
                 if file.downloads.is_some() {
-                    return Err(JavaRuntimeLookupError::Source(
-                        "runtime link contains incompatible metadata".to_string(),
+                    return Err(runtime_source_failure(
+                        component,
+                        RuntimeSourceFailureKind::MetadataInvalid,
+                        "runtime link contains incompatible metadata",
                     ));
                 }
                 let target = file.target.as_deref().ok_or_else(|| {
-                    JavaRuntimeLookupError::Source(
-                        "runtime manifest link is missing its target".to_string(),
+                    runtime_source_failure(
+                        component,
+                        RuntimeSourceFailureKind::MetadataInvalid,
+                        "runtime manifest link is missing its target",
                     )
                 })?;
                 if target.len() > MAX_RUNTIME_RELATIVE_PATH_BYTES {
-                    return Err(JavaRuntimeLookupError::Source(
-                        "runtime manifest link target exceeds the length bound".to_string(),
+                    return Err(runtime_source_failure(
+                        component,
+                        RuntimeSourceFailureKind::PolicyRejected,
+                        "runtime manifest link target exceeds the length bound",
                     ));
                 }
                 component_manifest_link_target_path(
+                    component,
                     contract_root,
                     &destination,
                     relative_path,
@@ -1547,39 +1591,52 @@ fn validate_runtime_manifest_contract(
             }
             "file" => {
                 if file.target.is_some() {
-                    return Err(JavaRuntimeLookupError::Source(
-                        "runtime file contains incompatible link metadata".to_string(),
+                    return Err(runtime_source_failure(
+                        component,
+                        RuntimeSourceFailureKind::MetadataInvalid,
+                        "runtime file contains incompatible link metadata",
                     ));
                 }
                 let downloads = file.downloads.as_ref().ok_or_else(|| {
-                    JavaRuntimeLookupError::Source(
-                        "runtime file is missing exact download proof".to_string(),
+                    runtime_source_failure(
+                        component,
+                        RuntimeSourceFailureKind::MetadataInvalid,
+                        "runtime file is missing exact download proof",
                     )
                 })?;
                 let raw = downloads.raw.as_ref().ok_or_else(|| {
-                    JavaRuntimeLookupError::Source(
-                        "runtime file is missing exact raw proof".to_string(),
+                    runtime_source_failure(
+                        component,
+                        RuntimeSourceFailureKind::MetadataInvalid,
+                        "runtime file is missing exact raw proof",
                     )
                 })?;
-                let raw_size = exact_runtime_download_size(raw, "raw")?;
+                let raw_size = exact_runtime_download_size(component, raw, "raw")?;
                 raw_total = raw_total.checked_add(raw_size).ok_or_else(|| {
-                    JavaRuntimeLookupError::Source(
-                        "runtime manifest byte total overflowed".to_string(),
+                    runtime_source_failure(
+                        component,
+                        RuntimeSourceFailureKind::PolicyRejected,
+                        "runtime manifest byte total overflowed",
                     )
                 })?;
                 let selected_size = if let Some(lzma) = downloads.lzma.as_ref() {
-                    let compressed_size = exact_runtime_download_size(lzma, "compressed")?;
+                    let compressed_size =
+                        exact_runtime_download_size(component, lzma, "compressed")?;
                     compressed_total =
                         compressed_total
                             .checked_add(compressed_size)
                             .ok_or_else(|| {
-                                JavaRuntimeLookupError::Source(
-                                    "runtime manifest byte total overflowed".to_string(),
+                                runtime_source_failure(
+                                    component,
+                                    RuntimeSourceFailureKind::PolicyRejected,
+                                    "runtime manifest byte total overflowed",
                                 )
                             })?;
                     lzma_entries = lzma_entries.checked_add(1).ok_or_else(|| {
-                        JavaRuntimeLookupError::Source(
-                            "runtime manifest entry total overflowed".to_string(),
+                        runtime_source_failure(
+                            component,
+                            RuntimeSourceFailureKind::PolicyRejected,
+                            "runtime manifest entry total overflowed",
                         )
                     })?;
                     compressed_size
@@ -1587,26 +1644,34 @@ fn validate_runtime_manifest_contract(
                     raw_size
                 };
                 download_total = download_total.checked_add(selected_size).ok_or_else(|| {
-                    JavaRuntimeLookupError::Source(
-                        "runtime manifest byte total overflowed".to_string(),
+                    runtime_source_failure(
+                        component,
+                        RuntimeSourceFailureKind::PolicyRejected,
+                        "runtime manifest byte total overflowed",
                     )
                 })?;
                 file_entries = file_entries.checked_add(1).ok_or_else(|| {
-                    JavaRuntimeLookupError::Source(
-                        "runtime manifest entry total overflowed".to_string(),
+                    runtime_source_failure(
+                        component,
+                        RuntimeSourceFailureKind::PolicyRejected,
+                        "runtime manifest entry total overflowed",
                     )
                 })?;
                 RuntimeTreeNodeKind::File
             }
             _ => {
-                return Err(JavaRuntimeLookupError::Source(
-                    "runtime manifest contains an unsupported entry".to_string(),
+                return Err(runtime_source_failure(
+                    component,
+                    RuntimeSourceFailureKind::MetadataInvalid,
+                    "runtime manifest contains an unsupported entry",
                 ));
             }
         };
         if !insert_runtime_tree_node(&mut filesystem_entries, normalized_relative, kind) {
-            return Err(JavaRuntimeLookupError::Source(
-                "runtime manifest contains an invalid path topology".to_string(),
+            return Err(runtime_source_failure(
+                component,
+                RuntimeSourceFailureKind::PolicyRejected,
+                "runtime manifest contains an invalid path topology",
             ));
         }
     }
@@ -1615,7 +1680,11 @@ fn validate_runtime_manifest_contract(
         .and_then(|total| total.checked_add(manifest_bytes))
         .and_then(|total| total.checked_add(64))
         .ok_or_else(|| {
-            JavaRuntimeLookupError::Source("runtime manifest byte total overflowed".to_string())
+            runtime_source_failure(
+                component,
+                RuntimeSourceFailureKind::PolicyRejected,
+                "runtime manifest byte total overflowed",
+            )
         })?;
     let concurrent_files = file_entries.min(download_concurrency.max(1));
     let concurrent_lzma = lzma_entries.min(download_concurrency.max(1));
@@ -1623,17 +1692,27 @@ fn validate_runtime_manifest_contract(
         .checked_add(concurrent_files)
         .and_then(|entries| entries.checked_add(concurrent_lzma))
         .ok_or_else(|| {
-            JavaRuntimeLookupError::Source("runtime manifest entry total overflowed".to_string())
+            runtime_source_failure(
+                component,
+                RuntimeSourceFailureKind::PolicyRejected,
+                "runtime manifest entry total overflowed",
+            )
         })?;
     let peak_entries = filesystem_entries
         .len()
         .checked_add(transient_entries)
         .ok_or_else(|| {
-            JavaRuntimeLookupError::Source("runtime manifest entry total overflowed".to_string())
+            runtime_source_failure(
+                component,
+                RuntimeSourceFailureKind::PolicyRejected,
+                "runtime manifest entry total overflowed",
+            )
         })?;
     if peak_entries > max_entries || raw_total > max_bytes || admitted_total > max_bytes {
-        return Err(JavaRuntimeLookupError::Source(
-            "runtime manifest exceeds the aggregate bound".to_string(),
+        return Err(runtime_source_failure(
+            component,
+            RuntimeSourceFailureKind::PolicyRejected,
+            "runtime manifest exceeds the aggregate bound",
         ));
     }
     Ok(RuntimeManifestAdmission {
@@ -1647,6 +1726,7 @@ pub(super) fn validate_ephemeral_processor_manifest_for_test(
     manifest_bytes: u64,
 ) -> Result<(), JavaRuntimeLookupError> {
     validate_runtime_manifest_contract(
+        &RuntimeId::from("java-runtime-gamma"),
         manifest,
         manifest_bytes,
         MAX_RUNTIME_TREE_ENTRIES,
@@ -1657,26 +1737,37 @@ pub(super) fn validate_ephemeral_processor_manifest_for_test(
 }
 
 fn exact_runtime_download_size(
+    component: &RuntimeId,
     download: &ComponentManifestDownload,
     label: &str,
 ) -> Result<u64, JavaRuntimeLookupError> {
     if download.url.trim().is_empty() {
-        return Err(JavaRuntimeLookupError::Source(format!(
-            "runtime {label} file is missing its source URL"
-        )));
+        return Err(runtime_source_failure(
+            component,
+            RuntimeSourceFailureKind::MetadataInvalid,
+            format!("runtime {label} file is missing its source URL"),
+        ));
     }
     let size = download.size.filter(|size| *size > 0).ok_or_else(|| {
-        JavaRuntimeLookupError::Source(format!("runtime {label} file is missing exact size"))
+        runtime_source_failure(
+            component,
+            RuntimeSourceFailureKind::MetadataInvalid,
+            format!("runtime {label} file is missing exact size"),
+        )
     })?;
     if size > MAX_RUNTIME_FILE_BYTES {
-        return Err(JavaRuntimeLookupError::Source(format!(
-            "runtime {label} file exceeds the per-file bound"
-        )));
+        return Err(runtime_source_failure(
+            component,
+            RuntimeSourceFailureKind::PolicyRejected,
+            format!("runtime {label} file exceeds the per-file bound"),
+        ));
     }
     if !download.sha1.as_deref().is_some_and(runtime_sha1_is_valid) {
-        return Err(JavaRuntimeLookupError::Source(format!(
-            "runtime {label} file is missing exact checksum"
-        )));
+        return Err(runtime_source_failure(
+            component,
+            RuntimeSourceFailureKind::MetadataInvalid,
+            format!("runtime {label} file is missing exact checksum"),
+        ));
     }
     Ok(size)
 }
@@ -1695,7 +1786,7 @@ async fn persist_component_manifest_proof(
 
 #[cfg(test)]
 pub(super) async fn install_runtime_manifest_files(
-    component: &str,
+    component: &RuntimeId,
     temp_dir: &Path,
     files: HashMap<String, ComponentManifestFile>,
     observer: &mut impl FnMut(RuntimeEnsureEvent),
@@ -1706,7 +1797,7 @@ pub(super) async fn install_runtime_manifest_files(
             .filter(|file| file.kind == "file")
             .try_fold(0_u64, |total, file| {
                 total
-                    .checked_add(runtime_manifest_file_download_bytes(file)?)
+                    .checked_add(runtime_manifest_file_download_bytes(component, file)?)
                     .ok_or_else(|| {
                         JavaRuntimeLookupError::Install(
                             "runtime manifest download byte total overflowed".to_string(),
@@ -1725,7 +1816,7 @@ pub(super) async fn install_runtime_manifest_files(
 }
 
 async fn install_runtime_manifest_files_with_concurrency(
-    component: &str,
+    component: &RuntimeId,
     temp_dir: &Path,
     files: HashMap<String, ComponentManifestFile>,
     observer: &mut impl FnMut(RuntimeEnsureEvent),
@@ -1736,15 +1827,21 @@ async fn install_runtime_manifest_files_with_concurrency(
     let download_client = runtime_download_client();
 
     for (relative_path, file) in plan.directory_entries.into_iter().chain(plan.other_entries) {
-        install_runtime_manifest_file(download_client.clone(), temp_dir, &relative_path, file)
-            .await?;
+        install_runtime_manifest_file(
+            component,
+            download_client.clone(),
+            temp_dir,
+            &relative_path,
+            file,
+        )
+        .await?;
     }
 
     let total_files = plan.file_entries.len() + plan.link_entries.len();
     let total_bytes = admitted_download_bytes;
     if total_files > 0 {
         observer(RuntimeEnsureEvent::InstallingManagedRuntimeFiles {
-            component: component.to_string(),
+            component: component.as_str().to_string(),
             current: 0,
             total: total_files,
             bytes_done: 0,
@@ -1756,10 +1853,12 @@ async fn install_runtime_manifest_files_with_concurrency(
         futures_util::stream::iter(plan.file_entries.into_iter().map(|entry| {
             let download_client = download_client.clone();
             let temp_dir = temp_dir.to_path_buf();
+            let component = component.clone();
             async move {
                 let (relative_path, file) = entry;
-                let bytes = runtime_manifest_file_download_bytes(&file)?;
+                let bytes = runtime_manifest_file_download_bytes(&component, &file)?;
                 Box::pin(install_runtime_manifest_file(
+                    &component,
                     download_client,
                     &temp_dir,
                     &relative_path,
@@ -1786,7 +1885,7 @@ async fn install_runtime_manifest_files_with_concurrency(
                 )
             })?;
         observer(RuntimeEnsureEvent::InstallingManagedRuntimeFiles {
-            component: component.to_string(),
+            component: component.as_str().to_string(),
             current: completed_files,
             total: total_files,
             bytes_done: completed_bytes,
@@ -1795,11 +1894,17 @@ async fn install_runtime_manifest_files_with_concurrency(
     }
 
     for (relative_path, file) in plan.link_entries {
-        install_runtime_manifest_file(download_client.clone(), temp_dir, &relative_path, file)
-            .await?;
+        install_runtime_manifest_file(
+            component,
+            download_client.clone(),
+            temp_dir,
+            &relative_path,
+            file,
+        )
+        .await?;
         completed_files += 1;
         observer(RuntimeEnsureEvent::InstallingManagedRuntimeFiles {
-            component: component.to_string(),
+            component: component.as_str().to_string(),
             current: completed_files,
             total: total_files,
             bytes_done: completed_bytes,
@@ -1815,6 +1920,7 @@ pub(super) struct CompletedRuntimeManifestFile {
 }
 
 fn runtime_manifest_file_download_bytes(
+    component: &RuntimeId,
     file: &ComponentManifestFile,
 ) -> Result<u64, JavaRuntimeLookupError> {
     file.downloads
@@ -1822,8 +1928,10 @@ fn runtime_manifest_file_download_bytes(
         .and_then(|downloads| downloads.lzma.as_ref().or(downloads.raw.as_ref()))
         .and_then(|raw| raw.size)
         .ok_or_else(|| {
-            JavaRuntimeLookupError::Source(
-                "runtime file is missing its admitted download size".to_string(),
+            runtime_source_failure(
+                component,
+                RuntimeSourceFailureKind::MetadataInvalid,
+                "runtime file is missing its admitted download size",
             )
         })
 }
@@ -1856,12 +1964,13 @@ pub(crate) fn plan_runtime_manifest_files(
 }
 
 pub(super) async fn install_runtime_manifest_file(
+    component: &RuntimeId,
     download_client: reqwest::Client,
     temp_dir: &Path,
     relative_path: &str,
     file: ComponentManifestFile,
 ) -> Result<(), JavaRuntimeLookupError> {
-    let destination = component_manifest_destination(temp_dir, relative_path)?;
+    let destination = component_manifest_destination(component, temp_dir, relative_path)?;
     if file.kind == "directory" {
         async_fs::create_dir_all(runtime_filesystem_path(&destination).as_ref())
             .await
@@ -1869,17 +1978,28 @@ pub(super) async fn install_runtime_manifest_file(
         return Ok(());
     }
     if file.kind == "link" {
-        return install_runtime_manifest_link(temp_dir, &destination, relative_path, &file).await;
+        return install_runtime_manifest_link(
+            component,
+            temp_dir,
+            &destination,
+            relative_path,
+            &file,
+        )
+        .await;
     }
     if file.kind != "file" {
-        return Err(JavaRuntimeLookupError::Source(format!(
-            "unsupported runtime manifest entry {} ({})",
-            bounded_manifest_file_label(relative_path),
-            file.kind
-        )));
+        return Err(runtime_source_failure(
+            component,
+            RuntimeSourceFailureKind::MetadataInvalid,
+            format!(
+                "unsupported runtime manifest entry {} ({})",
+                bounded_manifest_file_label(relative_path),
+                file.kind
+            ),
+        ));
     }
     let RuntimeFileDownloadSelection { raw, lzma } =
-        select_runtime_file_downloads(relative_path, file.downloads)?;
+        select_runtime_file_downloads(component, relative_path, file.downloads)?;
 
     if let Some(parent) = destination.parent() {
         async_fs::create_dir_all(runtime_filesystem_path(parent).as_ref())
@@ -1890,6 +2010,7 @@ pub(super) async fn install_runtime_manifest_file(
     let temp_path = runtime_download_temp_path(&destination);
     if let Some(lzma) = lzma {
         Box::pin(fetch_lzma_runtime_file(
+            component,
             &download_client,
             &lzma,
             &raw,
@@ -1900,6 +2021,7 @@ pub(super) async fn install_runtime_manifest_file(
     } else {
         let expected = RuntimeDownloadEvidence::from(&raw);
         Box::pin(fetch_runtime_file(
+            component,
             &download_client,
             &raw.url,
             &temp_path,
@@ -1936,24 +2058,33 @@ struct RuntimeFileDownloadSelection {
 }
 
 fn select_runtime_file_downloads(
+    component: &RuntimeId,
     relative_path: &str,
     downloads: Option<ComponentManifestDownloads>,
 ) -> Result<RuntimeFileDownloadSelection, JavaRuntimeLookupError> {
     let Some(downloads) = downloads else {
-        return Err(JavaRuntimeLookupError::Source(format!(
-            "runtime manifest file {} is missing download proof",
-            bounded_manifest_file_label(relative_path)
-        )));
+        return Err(runtime_source_failure(
+            component,
+            RuntimeSourceFailureKind::MetadataInvalid,
+            format!(
+                "runtime manifest file {} is missing download proof",
+                bounded_manifest_file_label(relative_path)
+            ),
+        ));
     };
     let Some(raw) = downloads.raw else {
-        return Err(JavaRuntimeLookupError::Source(format!(
-            "runtime manifest file {} is missing download proof",
-            bounded_manifest_file_label(relative_path)
-        )));
+        return Err(runtime_source_failure(
+            component,
+            RuntimeSourceFailureKind::MetadataInvalid,
+            format!(
+                "runtime manifest file {} is missing download proof",
+                bounded_manifest_file_label(relative_path)
+            ),
+        ));
     };
-    validate_runtime_download_checksum(relative_path, &raw, "file")?;
+    validate_runtime_download_checksum(component, relative_path, &raw, "file")?;
     if let Some(lzma) = downloads.lzma.as_ref() {
-        validate_runtime_download_checksum(relative_path, lzma, "lzma file")?;
+        validate_runtime_download_checksum(component, relative_path, lzma, "lzma file")?;
     }
     Ok(RuntimeFileDownloadSelection {
         raw,
@@ -1962,6 +2093,7 @@ fn select_runtime_file_downloads(
 }
 
 fn validate_runtime_download_checksum(
+    component: &RuntimeId,
     relative_path: &str,
     download: &ComponentManifestDownload,
     label: &str,
@@ -1969,13 +2101,18 @@ fn validate_runtime_download_checksum(
     if download.sha1.as_deref().is_some_and(runtime_sha1_is_valid) {
         return Ok(());
     }
-    Err(JavaRuntimeLookupError::Source(format!(
-        "runtime manifest {label} {} is missing checksum proof",
-        bounded_manifest_file_label(relative_path)
-    )))
+    Err(runtime_source_failure(
+        component,
+        RuntimeSourceFailureKind::MetadataInvalid,
+        format!(
+            "runtime manifest {label} {} is missing checksum proof",
+            bounded_manifest_file_label(relative_path)
+        ),
+    ))
 }
 
 async fn fetch_lzma_runtime_file(
+    component: &RuntimeId,
     download_client: &reqwest::Client,
     lzma: &ComponentManifestDownload,
     raw: &ComponentManifestDownload,
@@ -1987,6 +2124,7 @@ async fn fetch_lzma_runtime_file(
     let raw_expected = RuntimeDownloadEvidence::from(raw);
     let result = async {
         Box::pin(fetch_runtime_file(
+            component,
             download_client,
             &lzma.url,
             &lzma_temp_path,
@@ -1995,6 +2133,7 @@ async fn fetch_lzma_runtime_file(
         ))
         .await?;
         decompress_lzma_runtime_file_to_temp(
+            component.clone(),
             &lzma_temp_path,
             temp_path,
             raw_expected,
@@ -2021,6 +2160,7 @@ fn runtime_lzma_download_temp_path(temp_path: &Path) -> std::path::PathBuf {
 }
 
 async fn decompress_lzma_runtime_file_to_temp(
+    component: RuntimeId,
     compressed_path: &Path,
     output_path: &Path,
     expected: RuntimeDownloadEvidence,
@@ -2034,20 +2174,31 @@ async fn decompress_lzma_runtime_file_to_temp(
         let output = std::fs::File::create(runtime_filesystem_path(&output_path).as_ref())
             .map_err(|error| JavaRuntimeLookupError::Install(error.to_string()))?;
         let mut input = RuntimeInstallReader::new(BufReader::new(input));
-        let mut output = RuntimeIntegrityWriter::new(output, expected.clone(), &relative_path);
-        decompress_lzma_stream(&mut input, &mut output)?;
+        let mut output = RuntimeIntegrityWriter::new(
+            output,
+            component.clone(),
+            expected.clone(),
+            &relative_path,
+        );
+        decompress_lzma_stream(&component, &mut input, &mut output)?;
         output
             .flush()
             .map_err(|error| JavaRuntimeLookupError::Install(error.to_string()))?;
         let actual = output.actual();
-        verify_runtime_download(&relative_path, &expected, &actual)
-            .map_err(|error| JavaRuntimeLookupError::Source(error.to_string()))
+        verify_runtime_download(&relative_path, &expected, &actual).map_err(|error| {
+            runtime_source_failure(
+                &component,
+                RuntimeSourceFailureKind::IntegrityMismatch,
+                error.to_string(),
+            )
+        })
     })
     .await
     .map_err(|error| JavaRuntimeLookupError::Install(error.to_string()))?
 }
 
 fn decompress_lzma_stream<R: BufRead, W: Write>(
+    component: &RuntimeId,
     input: &mut RuntimeInstallReader<R>,
     output: &mut RuntimeIntegrityWriter<W>,
 ) -> Result<(), JavaRuntimeLookupError> {
@@ -2055,7 +2206,13 @@ fn decompress_lzma_stream<R: BufRead, W: Write>(
         return Err(output
             .take_failure()
             .or_else(|| input.take_failure())
-            .unwrap_or_else(|| JavaRuntimeLookupError::Source(error.to_string())));
+            .unwrap_or_else(|| {
+                runtime_source_failure(
+                    component,
+                    RuntimeSourceFailureKind::IntegrityMismatch,
+                    error.to_string(),
+                )
+            }));
     }
     Ok(())
 }
@@ -2104,6 +2261,7 @@ impl<R: BufRead> BufRead for RuntimeInstallReader<R> {
 
 struct RuntimeIntegrityWriter<W> {
     output: W,
+    component: RuntimeId,
     expected: RuntimeDownloadEvidence,
     relative_path: String,
     hasher: Sha1,
@@ -2112,9 +2270,15 @@ struct RuntimeIntegrityWriter<W> {
 }
 
 impl<W> RuntimeIntegrityWriter<W> {
-    fn new(output: W, expected: RuntimeDownloadEvidence, relative_path: &str) -> Self {
+    fn new(
+        output: W,
+        component: RuntimeId,
+        expected: RuntimeDownloadEvidence,
+        relative_path: &str,
+    ) -> Self {
         Self {
             output,
+            component,
             expected,
             relative_path: relative_path.to_string(),
             hasher: Sha1::new(),
@@ -2147,7 +2311,11 @@ impl<W: Write> Write for RuntimeIntegrityWriter<W> {
                 actual: next_size,
             }
             .to_string();
-            self.failure = Some(JavaRuntimeLookupError::Source(message.clone()));
+            self.failure = Some(runtime_source_failure(
+                &self.component,
+                RuntimeSourceFailureKind::IntegrityMismatch,
+                message.clone(),
+            ));
             return Err(std::io::Error::other(message));
         }
         let written = match self.output.write(buffer) {
@@ -2175,18 +2343,23 @@ impl<W: Write> Write for RuntimeIntegrityWriter<W> {
 }
 
 async fn install_runtime_manifest_link(
+    component: &RuntimeId,
     temp_dir: &Path,
     destination: &Path,
     relative_path: &str,
     file: &ComponentManifestFile,
 ) -> Result<(), JavaRuntimeLookupError> {
     let Some(target) = file.target.as_deref() else {
-        return Err(JavaRuntimeLookupError::Source(format!(
-            "runtime manifest link {} is missing target",
-            bounded_manifest_file_label(relative_path)
-        )));
+        return Err(runtime_source_failure(
+            component,
+            RuntimeSourceFailureKind::MetadataInvalid,
+            format!(
+                "runtime manifest link {} is missing target",
+                bounded_manifest_file_label(relative_path)
+            ),
+        ));
     };
-    component_manifest_link_target_path(temp_dir, destination, relative_path, target)?;
+    component_manifest_link_target_path(component, temp_dir, destination, relative_path, target)?;
     if let Some(parent) = destination.parent() {
         async_fs::create_dir_all(runtime_filesystem_path(parent).as_ref())
             .await
@@ -2226,8 +2399,8 @@ fn runtime_sha1_is_valid(value: &str) -> bool {
 #[cfg(test)]
 mod lzma_failure_classification_tests {
     use super::{
-        JavaRuntimeLookupError, RuntimeDownloadEvidence, RuntimeInstallReader,
-        RuntimeIntegrityWriter, decompress_lzma_stream,
+        JavaRuntimeLookupError, RuntimeDownloadEvidence, RuntimeId, RuntimeInstallReader,
+        RuntimeIntegrityWriter, RuntimeSourceFailureKind, decompress_lzma_stream,
     };
     use std::io::{BufRead, Cursor, Read, Write};
 
@@ -2275,34 +2448,42 @@ mod lzma_failure_classification_tests {
 
     #[test]
     fn lzma_input_io_failure_stays_local_install_failure() {
+        let component = RuntimeId::from("java-runtime-gamma");
         let mut input = RuntimeInstallReader::new(FailingReader);
-        let mut output = RuntimeIntegrityWriter::new(Vec::new(), evidence(13), "bin/java");
+        let mut output =
+            RuntimeIntegrityWriter::new(Vec::new(), component.clone(), evidence(13), "bin/java");
 
         assert!(matches!(
-            decompress_lzma_stream(&mut input, &mut output),
+            decompress_lzma_stream(&component, &mut input, &mut output),
             Err(JavaRuntimeLookupError::Install(_))
         ));
     }
 
     #[test]
     fn lzma_output_io_failure_stays_local_install_failure() {
+        let component = RuntimeId::from("java-runtime-gamma");
         let mut input = RuntimeInstallReader::new(Cursor::new(compressed_fixture()));
-        let mut output = RuntimeIntegrityWriter::new(FailingWriter, evidence(13), "bin/java");
+        let mut output =
+            RuntimeIntegrityWriter::new(FailingWriter, component.clone(), evidence(13), "bin/java");
 
         assert!(matches!(
-            decompress_lzma_stream(&mut input, &mut output),
+            decompress_lzma_stream(&component, &mut input, &mut output),
             Err(JavaRuntimeLookupError::Install(_))
         ));
     }
 
     #[test]
     fn invalid_lzma_bytes_stay_runtime_source_failure() {
+        let component = RuntimeId::from("java-runtime-gamma");
         let mut input = RuntimeInstallReader::new(Cursor::new(b"not lzma"));
-        let mut output = RuntimeIntegrityWriter::new(Vec::new(), evidence(13), "bin/java");
+        let mut output =
+            RuntimeIntegrityWriter::new(Vec::new(), component.clone(), evidence(13), "bin/java");
 
         assert!(matches!(
-            decompress_lzma_stream(&mut input, &mut output),
-            Err(JavaRuntimeLookupError::Source(_))
+            decompress_lzma_stream(&component, &mut input, &mut output),
+            Err(JavaRuntimeLookupError::RuntimeSource(failure))
+                if failure.component() == &component
+                    && failure.kind() == RuntimeSourceFailureKind::IntegrityMismatch
         ));
     }
 }

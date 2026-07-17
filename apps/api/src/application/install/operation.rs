@@ -34,7 +34,7 @@ use crate::state::{
 use axial_minecraft::LoaderInstallFailureKind;
 use axial_minecraft::download::{ExecutionDownloadFact, ExecutionDownloadFactKind};
 use axial_minecraft::loaders::LoaderActiveInstallFailure;
-use axial_minecraft::{DownloadError, DownloadProgress};
+use axial_minecraft::{DownloadError, DownloadProgress, RuntimeSourceFailureKind};
 use serde_json::{Value, json};
 use tracing::warn;
 
@@ -1274,7 +1274,7 @@ pub(super) fn install_failure_evidence_from_download_error_or_facts(
     install_failure_evidence_from_download_facts(operation_id, facts)
 }
 
-fn typed_runtime_failure_evidence(
+pub(super) fn typed_runtime_failure_evidence(
     operation_id: &OperationId,
     error: &DownloadError,
 ) -> Option<GuardianInstallArtifactFailureEvidence> {
@@ -1299,14 +1299,29 @@ fn typed_runtime_failure_evidence(
             )
             .with_field("component", component.as_str()),
         ),
-        DownloadError::RuntimeSource(_) => Some(
-            GuardianInstallArtifactFailureEvidence::launcher_managed(
-                Some(operation_id.clone()),
-                "java_runtime_source",
-                GuardianInstallArtifactFailureKind::ProviderFailure,
+        DownloadError::RuntimeSource(failure) => {
+            let component = failure.component().as_str();
+            let kind = match failure.kind() {
+                RuntimeSourceFailureKind::Unavailable => {
+                    GuardianInstallArtifactFailureKind::ProviderFailure
+                }
+                RuntimeSourceFailureKind::MetadataInvalid
+                | RuntimeSourceFailureKind::IntegrityMismatch
+                | RuntimeSourceFailureKind::PolicyRejected => {
+                    GuardianInstallArtifactFailureKind::MetadataInvalid
+                }
+            };
+            Some(
+                GuardianInstallArtifactFailureEvidence::launcher_managed(
+                    Some(operation_id.clone()),
+                    format!("java_runtime_source_{component}"),
+                    kind,
+                )
+                .with_ownership(OwnershipClass::ExternalProviderDerived)
+                .with_field("component", component)
+                .with_field("source_failure_kind", failure.kind().as_str()),
             )
-            .with_ownership(OwnershipClass::ExternalProviderDerived),
-        ),
+        }
         DownloadError::PrepareRuntime(_) => {
             Some(GuardianInstallArtifactFailureEvidence::launcher_managed(
                 Some(operation_id.clone()),

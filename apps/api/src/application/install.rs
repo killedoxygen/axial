@@ -507,6 +507,8 @@ pub use model::{
     InstallQueuedItemViewModel, InstallStartResponse, InstallStatusResponse, InstallVersionStaging,
     InstallVersionStartRequest, LoaderBuildsRequest, LoaderInstallStartRequest,
 };
+#[cfg(test)]
+use operation::typed_runtime_failure_evidence;
 use operation::{
     ContentDownloadFactAccumulator, InstallProgressCoalescer, assess_install_guardian_failure,
     begin_content_operation_journal, install_failure_evidence_from_download_error_or_facts,
@@ -879,7 +881,18 @@ fn install_error_log_kind(error: &DownloadError) -> &'static str {
         DownloadError::Request(_) => "request",
         DownloadError::ParseVersion(_) => "parse_version",
         DownloadError::PrepareRuntime(_) => "prepare_runtime",
-        DownloadError::RuntimeSource(_) => "runtime_source",
+        DownloadError::RuntimeSource(failure) => match failure.kind() {
+            axial_minecraft::RuntimeSourceFailureKind::Unavailable => "runtime_source_unavailable",
+            axial_minecraft::RuntimeSourceFailureKind::MetadataInvalid => {
+                "runtime_source_metadata_invalid"
+            }
+            axial_minecraft::RuntimeSourceFailureKind::IntegrityMismatch => {
+                "runtime_source_integrity_mismatch"
+            }
+            axial_minecraft::RuntimeSourceFailureKind::PolicyRejected => {
+                "runtime_source_policy_rejected"
+            }
+        },
         DownloadError::RuntimeUnavailableForPlatform { .. } => "runtime_unavailable_for_platform",
         DownloadError::RuntimeRosettaRequired { .. } => "runtime_rosetta_required",
         DownloadError::Integrity(_) => "integrity",

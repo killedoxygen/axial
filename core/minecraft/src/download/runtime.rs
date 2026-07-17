@@ -195,7 +195,7 @@ pub(super) fn runtime_lookup_error_to_download_error(
         JavaRuntimeLookupError::RosettaRequired { component } => {
             DownloadError::RuntimeRosettaRequired { component }
         }
-        JavaRuntimeLookupError::Source(message) => DownloadError::RuntimeSource(message),
+        JavaRuntimeLookupError::RuntimeSource(failure) => DownloadError::RuntimeSource(failure),
         error => DownloadError::PrepareRuntime(error.to_string()),
     }
 }
@@ -249,13 +249,18 @@ mod tests {
 
     #[test]
     fn runtime_source_errors_map_to_typed_download_errors() {
-        let error = runtime_lookup_error_to_download_error(JavaRuntimeLookupError::Source(
-            "provider unavailable".to_string(),
+        let failure = crate::runtime::RuntimeSourceFailure::new(
+            crate::runtime::RuntimeId::from("java-runtime-gamma"),
+            crate::runtime::RuntimeSourceFailureKind::Unavailable,
+            "provider unavailable",
+        );
+        let error = runtime_lookup_error_to_download_error(JavaRuntimeLookupError::RuntimeSource(
+            failure.clone(),
         ));
 
         assert!(matches!(
             error,
-            DownloadError::RuntimeSource(message) if message == "provider unavailable"
+            DownloadError::RuntimeSource(actual) if actual == failure
         ));
     }
 }

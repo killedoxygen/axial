@@ -42,6 +42,68 @@ impl From<&str> for RuntimeId {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimeSourceFailureKind {
+    Unavailable,
+    MetadataInvalid,
+    IntegrityMismatch,
+    PolicyRejected,
+}
+
+impl RuntimeSourceFailureKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Unavailable => "unavailable",
+            Self::MetadataInvalid => "metadata_invalid",
+            Self::IntegrityMismatch => "integrity_mismatch",
+            Self::PolicyRejected => "policy_rejected",
+        }
+    }
+
+    pub const fn is_retryable(self) -> bool {
+        matches!(self, Self::Unavailable)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeSourceFailure {
+    component: RuntimeId,
+    kind: RuntimeSourceFailureKind,
+    detail: String,
+}
+
+impl RuntimeSourceFailure {
+    pub fn new(
+        component: RuntimeId,
+        kind: RuntimeSourceFailureKind,
+        detail: impl Into<String>,
+    ) -> Self {
+        Self {
+            component,
+            kind,
+            detail: detail.into(),
+        }
+    }
+
+    pub fn component(&self) -> &RuntimeId {
+        &self.component
+    }
+
+    pub const fn kind(&self) -> RuntimeSourceFailureKind {
+        self.kind
+    }
+
+    pub fn detail(&self) -> &str {
+        &self.detail
+    }
+}
+
+impl std::fmt::Display for RuntimeSourceFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.detail)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RuntimeSource {
@@ -148,7 +210,7 @@ pub enum JavaRuntimeLookupError {
     #[error("failed to install java runtime: {0}")]
     Install(String),
     #[error("failed to acquire java runtime source: {0}")]
-    Source(String),
+    RuntimeSource(RuntimeSourceFailure),
     #[error("java runtime {component} is not available for {platform}")]
     UnsupportedPlatform { component: String, platform: String },
     #[error(

@@ -1,4 +1,5 @@
 use crate::artifact_path::ArtifactRelativePath;
+use crate::runtime::RuntimeSourceFailure;
 use serde::{Deserialize, Serialize};
 use std::io;
 use thiserror::Error;
@@ -35,7 +36,7 @@ pub enum DownloadError {
     #[error("prepare java runtime: {0}")]
     PrepareRuntime(String),
     #[error("acquire java runtime source: {0}")]
-    RuntimeSource(String),
+    RuntimeSource(RuntimeSourceFailure),
     #[error("java runtime {component} is not available for {platform}")]
     RuntimeUnavailableForPlatform { component: String, platform: String },
     #[error(

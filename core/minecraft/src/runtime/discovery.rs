@@ -84,8 +84,23 @@ pub fn runtime_executable_ready_without_probe(java_exe: &Path) -> bool {
 }
 
 pub fn managed_runtime_contents_verified_without_probe(runtime_root: &Path) -> bool {
+    let Some(component) = runtime_root
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|component| is_known_runtime_component(component))
+        .map(RuntimeId::from)
+    else {
+        return false;
+    };
+    managed_runtime_contents_verified_for_component(runtime_root, &component)
+}
+
+pub(super) fn managed_runtime_contents_verified_for_component(
+    runtime_root: &Path,
+    component: &RuntimeId,
+) -> bool {
     runtime_executable_ready(&java_executable(runtime_root))
-        && persisted_runtime_manifest_verified(runtime_root)
+        && persisted_runtime_manifest_verified(runtime_root, component)
 }
 
 pub fn preferred_runtime_component(java_version: &JavaVersion) -> String {
@@ -318,7 +333,10 @@ pub(super) fn detect_runtime_state(runtime_root: &Path) -> RuntimeInstallState {
     RuntimeInstallState::Missing
 }
 
-fn persisted_runtime_manifest_verified(runtime_root: &Path) -> bool {
+fn persisted_runtime_manifest_verified(runtime_root: &Path, component: &RuntimeId) -> bool {
+    if !is_known_runtime_component(component.as_str()) {
+        return false;
+    }
     let manifest_path = runtime_root.join(COMPONENT_MANIFEST_PROOF_FILE);
     let Ok(data) = std::fs::read(runtime_filesystem_path(&manifest_path).as_ref()) else {
         return false;
@@ -332,7 +350,8 @@ fn persisted_runtime_manifest_verified(runtime_root: &Path) -> bool {
     let mut link_jobs = Vec::new();
     let mut saw_file = false;
     for (relative_path, file) in manifest.files {
-        let Ok(path) = component_manifest_destination(runtime_root, &relative_path) else {
+        let Ok(path) = component_manifest_destination(component, runtime_root, &relative_path)
+        else {
             return false;
         };
         match file.kind.as_str() {
@@ -370,6 +389,7 @@ fn persisted_runtime_manifest_verified(runtime_root: &Path) -> bool {
                         return false;
                     };
                     let Ok(target_path) = component_manifest_link_target_path(
+                        component,
                         runtime_root,
                         &path,
                         &relative_path,

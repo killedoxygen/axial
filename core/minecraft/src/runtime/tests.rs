@@ -4,10 +4,11 @@ use super::{
     ManagedRuntimeCache, ManagedRuntimeRebuildError, RosettaRuntimeDecision, RuntimeDownloadActual,
     RuntimeDownloadEvidence, RuntimeDownloadIntegrityError, RuntimeDownloadManifest,
     RuntimeEnsureEvent, RuntimeId, RuntimeInstallState, RuntimeManifest, RuntimeRecord,
-    RuntimeSource, RuntimeSourceReceipt, acquire_runtime_source_for_test,
-    authenticated_runtime_source_from_manifest_for_test, component_manifest_destination,
-    detect_distribution, detect_runtime_state, ensure_runtime_with_events, fetch_runtime_file,
-    fetch_runtime_manifest_bytes_for_test, finalize_managed_runtime_commit_with_failure_for_test,
+    RuntimeSource, RuntimeSourceFailure, RuntimeSourceFailureKind, RuntimeSourceReceipt,
+    acquire_runtime_source_for_test, authenticated_runtime_source_from_manifest_for_test,
+    component_manifest_destination, detect_distribution, detect_runtime_state,
+    ensure_runtime_with_events, fetch_runtime_file, fetch_runtime_manifest_bytes_for_test,
+    finalize_managed_runtime_commit_with_failure_for_test,
     finalize_managed_runtime_commit_with_removed_quarantine_failure_for_test,
     install_runtime_manifest_file, install_runtime_manifest_files, java_executable,
     java_executable_for_os, managed_runtime_contents_verified_without_probe,
@@ -22,7 +23,8 @@ use super::{
     runtime_file_download_concurrency_for, runtime_install_lock_file_path, runtime_os_arch_for,
     runtime_record_matches_source_for_test, runtime_source_url_is_secure_for_test,
     runtime_windows_verbatim_path_string, select_runtime_manifest, stage_managed_runtime,
-    validate_ephemeral_processor_manifest_for_test, verify_runtime_download,
+    validate_ephemeral_processor_manifest_for_test, validate_runtime_file_source_urls_for_test,
+    verify_runtime_download,
 };
 use crate::JavaVersion;
 use serde::Deserialize;
@@ -43,6 +45,10 @@ fn expected(size: Option<u64>, sha1: Option<&str>) -> RuntimeDownloadEvidence {
         size,
         sha1: sha1.map(str::to_string),
     }
+}
+
+fn test_runtime_component() -> RuntimeId {
+    RuntimeId::from("java-runtime-delta")
 }
 
 fn actual(size: u64, sha1: &str) -> RuntimeDownloadActual {
@@ -128,8 +134,28 @@ fn planned_paths(entries: &[(String, ComponentManifestFile)]) -> Vec<&str> {
 
 fn unsafe_manifest_path_message(result: Result<PathBuf, JavaRuntimeLookupError>) -> String {
     match result {
-        Err(JavaRuntimeLookupError::Source(message)) => message,
+        Err(JavaRuntimeLookupError::RuntimeSource(failure))
+            if failure.component() == &test_runtime_component()
+                && failure.kind() == RuntimeSourceFailureKind::PolicyRejected =>
+        {
+            failure.detail().to_string()
+        }
         other => panic!("expected unsafe manifest path error, got {other:?}"),
+    }
+}
+
+fn expect_runtime_source_failure(
+    error: JavaRuntimeLookupError,
+    expected_kind: RuntimeSourceFailureKind,
+) -> RuntimeSourceFailure {
+    match error {
+        JavaRuntimeLookupError::RuntimeSource(failure)
+            if failure.component() == &test_runtime_component()
+                && failure.kind() == expected_kind =>
+        {
+            failure
+        }
+        other => panic!("expected {expected_kind:?} runtime source failure, got {other:?}"),
     }
 }
 
@@ -214,7 +240,8 @@ fn detect_runtime_distribution_classifies_missing_identity_as_unknown() {
 #[test]
 fn component_manifest_destination_accepts_safe_nested_path() {
     let temp_dir = Path::new("runtime-temp");
-    let destination = component_manifest_destination(temp_dir, "bin/java").unwrap();
+    let destination =
+        component_manifest_destination(&test_runtime_component(), temp_dir, "bin/java").unwrap();
 
     assert_eq!(destination, temp_dir.join("bin").join("java"));
 }
@@ -222,8 +249,11 @@ fn component_manifest_destination_accepts_safe_nested_path() {
 #[test]
 fn component_manifest_destination_rejects_traversal() {
     let temp_dir = Path::new("runtime-temp");
-    let message =
-        unsafe_manifest_path_message(component_manifest_destination(temp_dir, "bin/../java"));
+    let message = unsafe_manifest_path_message(component_manifest_destination(
+        &test_runtime_component(),
+        temp_dir,
+        "bin/../java",
+    ));
 
     assert!(message.contains("unsafe runtime manifest path"));
     assert!(message.contains("bin/../java"));
@@ -238,8 +268,11 @@ fn component_manifest_destination_rejects_absolute_path() {
     } else {
         "/etc/passwd"
     };
-    let message =
-        unsafe_manifest_path_message(component_manifest_destination(temp_dir, absolute_path));
+    let message = unsafe_manifest_path_message(component_manifest_destination(
+        &test_runtime_component(),
+        temp_dir,
+        absolute_path,
+    ));
 
     assert!(message.contains("unsafe runtime manifest path"));
     assert!(message.contains(absolute_path));
@@ -250,6 +283,7 @@ fn component_manifest_destination_rejects_absolute_path() {
 fn component_manifest_destination_rejects_drive_like_path_with_slashes() {
     let temp_dir = Path::new("runtime-temp");
     let message = unsafe_manifest_path_message(component_manifest_destination(
+        &test_runtime_component(),
         temp_dir,
         "C:/Windows/System32",
     ));
@@ -263,6 +297,7 @@ fn component_manifest_destination_rejects_drive_like_path_with_slashes() {
 fn component_manifest_destination_rejects_drive_like_path_with_backslashes() {
     let temp_dir = Path::new("runtime-temp");
     let message = unsafe_manifest_path_message(component_manifest_destination(
+        &test_runtime_component(),
         temp_dir,
         r"C:\Windows\System32",
     ));
@@ -359,7 +394,7 @@ async fn runtime_manifest_install_reports_file_progress() {
     );
     let mut events = Vec::new();
 
-    install_runtime_manifest_files("java-runtime-delta", &root, files, &mut |event| {
+    install_runtime_manifest_files(&test_runtime_component(), &root, files, &mut |event| {
         events.push(event);
     })
     .await
@@ -413,7 +448,7 @@ async fn runtime_manifest_install_creates_link_entries_and_counts_them() {
     );
     let mut events = Vec::new();
 
-    install_runtime_manifest_files("java-runtime-delta", &root, files, &mut |event| {
+    install_runtime_manifest_files(&test_runtime_component(), &root, files, &mut |event| {
         events.push(event);
     })
     .await
@@ -451,6 +486,7 @@ async fn runtime_manifest_install_creates_link_entries_and_counts_them() {
 async fn runtime_manifest_link_rejects_target_escape() {
     let root = unique_temp_root("axial-runtime-link-escape-test");
     let result = install_runtime_manifest_file(
+        &test_runtime_component(),
         runtime_download_client().clone(),
         &root,
         "bin/java-link",
@@ -460,8 +496,10 @@ async fn runtime_manifest_link_rejects_target_escape() {
 
     assert!(matches!(
         result,
-        Err(JavaRuntimeLookupError::Source(message))
-            if message.contains("unsafe runtime manifest link target")
+        Err(JavaRuntimeLookupError::RuntimeSource(failure))
+            if failure.component() == &test_runtime_component()
+                && failure.kind() == RuntimeSourceFailureKind::PolicyRejected
+                && failure.detail().contains("unsafe runtime manifest link target")
     ));
     assert!(!root.join("bin").join("java-link").exists());
     let _ = fs::remove_dir_all(root);
@@ -472,6 +510,7 @@ async fn runtime_manifest_link_rejects_target_escape() {
 async fn runtime_manifest_link_fails_explicitly_on_non_unix() {
     let root = unique_temp_root("axial-runtime-link-non-unix-test");
     let result = install_runtime_manifest_file(
+        &test_runtime_component(),
         runtime_download_client().clone(),
         &root,
         "bin/java-link",
@@ -513,7 +552,29 @@ async fn runtime_manifest_json_fetch_rejects_http_errors() {
         .await
         .expect_err("HTTP error should fail");
 
-    assert!(error.to_string().contains("HTTP 503"), "{error}");
+    let failure = expect_runtime_source_failure(error, RuntimeSourceFailureKind::Unavailable);
+    assert!(failure.detail().contains("HTTP 503"), "{failure:?}");
+}
+
+#[tokio::test]
+async fn runtime_manifest_json_fetch_classifies_permanent_http_status_as_metadata_invalid() {
+    let url = serve_runtime_json(404, b"missing".to_vec(), None).await;
+
+    let error = fetch_runtime_manifest_bytes_for_test(&url)
+        .await
+        .expect_err("permanent HTTP error should fail");
+
+    let failure = expect_runtime_source_failure(error, RuntimeSourceFailureKind::MetadataInvalid);
+    assert!(failure.detail().contains("HTTP 404"), "{failure:?}");
+}
+
+#[tokio::test]
+async fn runtime_manifest_json_fetch_classifies_transport_failure_as_unavailable() {
+    let error = fetch_runtime_manifest_bytes_for_test("http://127.0.0.1:9/runtime.json")
+        .await
+        .expect_err("connection failure should fail");
+
+    expect_runtime_source_failure(error, RuntimeSourceFailureKind::Unavailable);
 }
 
 #[tokio::test]
@@ -529,10 +590,8 @@ async fn runtime_manifest_json_fetch_rejects_oversized_content_length() {
         .await
         .expect_err("oversized manifest should fail");
 
-    assert_eq!(
-        error.to_string(),
-        "failed to acquire java runtime source: runtime manifest response too large"
-    );
+    let failure = expect_runtime_source_failure(error, RuntimeSourceFailureKind::PolicyRejected);
+    assert_eq!(failure.detail(), "runtime manifest response too large");
 }
 
 #[test]
@@ -547,6 +606,34 @@ fn production_runtime_source_policy_accepts_only_https_urls() {
         "file:///tmp/runtime.json"
     ));
     assert!(!runtime_source_url_is_secure_for_test("not a URL"));
+}
+
+#[test]
+fn runtime_file_source_policy_classifies_invalid_and_insecure_urls() {
+    for (url, expected_kind) in [
+        ("not a URL", RuntimeSourceFailureKind::MetadataInvalid),
+        (
+            "http://provider.invalid/runtime.bin",
+            RuntimeSourceFailureKind::PolicyRejected,
+        ),
+        (
+            "file:///tmp/runtime.bin",
+            RuntimeSourceFailureKind::PolicyRejected,
+        ),
+    ] {
+        let manifest = ComponentManifest {
+            files: HashMap::from([(
+                "bin/java".to_string(),
+                downloadable_manifest_file(url, 1, "0000000000000000000000000000000000000000"),
+            )]),
+        };
+
+        let error =
+            validate_runtime_file_source_urls_for_test(&test_runtime_component(), &manifest)
+                .expect_err("invalid runtime file source should fail");
+
+        expect_runtime_source_failure(error, expected_kind);
+    }
 }
 
 #[tokio::test]
@@ -622,10 +709,8 @@ async fn runtime_source_receipt_rejects_size_mismatch_before_parse() {
     .await
     .expect_err("size mismatch must reject the source");
 
-    assert_eq!(
-        error.to_string(),
-        "failed to acquire java runtime source: runtime component manifest size mismatch"
-    );
+    let failure = expect_runtime_source_failure(error, RuntimeSourceFailureKind::IntegrityMismatch);
+    assert_eq!(failure.detail(), "runtime component manifest size mismatch");
 }
 
 #[tokio::test]
@@ -643,9 +728,10 @@ async fn runtime_source_receipt_rejects_checksum_mismatch_before_parse() {
     .await
     .expect_err("checksum mismatch must reject the source");
 
+    let failure = expect_runtime_source_failure(error, RuntimeSourceFailureKind::IntegrityMismatch);
     assert_eq!(
-        error.to_string(),
-        "failed to acquire java runtime source: runtime component manifest checksum mismatch"
+        failure.detail(),
+        "runtime component manifest checksum mismatch"
     );
 }
 
@@ -664,7 +750,8 @@ async fn runtime_source_receipt_parses_only_after_integrity_validation() {
     .await
     .expect_err("authenticated malformed JSON must fail parsing");
 
-    assert!(error.to_string().contains("expected ident"), "{error}");
+    let failure = expect_runtime_source_failure(error, RuntimeSourceFailureKind::MetadataInvalid);
+    assert!(failure.detail().contains("expected ident"), "{failure:?}");
 }
 
 #[test]
@@ -829,7 +916,8 @@ fn structural_runtime_discovery_does_not_parse_missing_raw_download_proof() {
 
 #[test]
 fn explicit_full_runtime_verifier_detects_same_root_content_drift() {
-    let root = unique_temp_root("axial-managed-runtime-manifest-drift-test");
+    let temp = unique_temp_root("axial-managed-runtime-manifest-drift-test");
+    let root = temp.join("java-runtime-delta");
     write_runtime_executable_fixture(&root);
     write_runtime_manifest_proof_for_java(&root);
     fs::write(root.join(".axial-ready"), b"ready").expect("ready marker");
@@ -842,13 +930,14 @@ fn explicit_full_runtime_verifier_detects_same_root_content_drift() {
     assert_eq!(detect_runtime_state(&root), RuntimeInstallState::Ready);
     assert!(!managed_runtime_contents_verified_without_probe(&root));
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(temp);
 }
 
 #[cfg(unix)]
 #[test]
 fn explicit_full_runtime_verifier_detects_manifest_link_drift() {
-    let root = unique_temp_root("axial-managed-runtime-link-proof-test");
+    let temp = unique_temp_root("axial-managed-runtime-link-proof-test");
+    let root = temp.join("java-runtime-delta");
     write_runtime_executable_fixture(&root);
     let link = java_executable(&root).with_file_name("java-link");
     std::os::unix::fs::symlink("java", &link).expect("runtime symlink");
@@ -862,7 +951,7 @@ fn explicit_full_runtime_verifier_detects_manifest_link_drift() {
     assert_eq!(detect_runtime_state(&root), RuntimeInstallState::Ready);
     assert!(!managed_runtime_contents_verified_without_probe(&root));
 
-    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(temp);
 }
 
 #[test]
@@ -1792,7 +1881,10 @@ async fn assert_managed_manifest_rejection_preserves_state(
     let result =
         stage_managed_runtime(&cache, &component, source, &mut |event| events.push(event)).await;
 
-    assert!(matches!(result, Err(JavaRuntimeLookupError::Source(_))));
+    assert!(matches!(
+        result,
+        Err(JavaRuntimeLookupError::RuntimeSource(failure)) if failure.component() == &component
+    ));
     tokio::task::yield_now().await;
     assert_eq!(requests.load(Ordering::SeqCst), 0);
     assert!(events.is_empty());
@@ -1964,6 +2056,7 @@ async fn runtime_file_download_streams_and_verifies_to_temp() {
     let client = runtime_download_client();
 
     fetch_runtime_file(
+        &test_runtime_component(),
         &client,
         &url,
         &temp_path,
@@ -2011,7 +2104,12 @@ fn runtime_manifest_admission_rejects_checked_byte_overflow() {
 
     let error = validate_ephemeral_processor_manifest_for_test(&manifest, u64::MAX)
         .expect_err("manifest admission total must use checked arithmetic");
-    assert!(error.to_string().contains("overflowed"));
+    assert!(matches!(
+        error,
+        JavaRuntimeLookupError::RuntimeSource(failure)
+            if failure.kind() == RuntimeSourceFailureKind::PolicyRejected
+                && failure.detail().contains("overflowed")
+    ));
 }
 
 #[test]
@@ -2049,6 +2147,7 @@ async fn runtime_file_download_retries_transient_status_errors() {
     let client = runtime_download_client();
 
     fetch_runtime_file(
+        &test_runtime_component(),
         &client,
         &url,
         &temp_path,
@@ -2075,6 +2174,7 @@ async fn runtime_file_download_removes_temp_on_verification_error() {
     let client = runtime_download_client();
 
     let result = fetch_runtime_file(
+        &test_runtime_component(),
         &client,
         &url,
         &temp_path,
@@ -2083,7 +2183,12 @@ async fn runtime_file_download_removes_temp_on_verification_error() {
     )
     .await;
 
-    assert!(matches!(&result, Err(JavaRuntimeLookupError::Source(_))));
+    assert!(matches!(
+        &result,
+        Err(JavaRuntimeLookupError::RuntimeSource(failure))
+            if failure.component() == &test_runtime_component()
+                && failure.kind() == RuntimeSourceFailureKind::IntegrityMismatch
+    ));
     assert!(!temp_path.exists());
     let _ = fs::remove_dir_all(root);
 }
@@ -2097,6 +2202,7 @@ async fn runtime_file_download_rejects_oversized_content_length() {
     let client = runtime_download_client();
 
     let result = fetch_runtime_file(
+        &test_runtime_component(),
         &client,
         &url,
         &temp_path,
@@ -2105,7 +2211,12 @@ async fn runtime_file_download_rejects_oversized_content_length() {
     )
     .await;
 
-    assert!(matches!(&result, Err(JavaRuntimeLookupError::Source(_))));
+    assert!(matches!(
+        &result,
+        Err(JavaRuntimeLookupError::RuntimeSource(failure))
+            if failure.component() == &test_runtime_component()
+                && failure.kind() == RuntimeSourceFailureKind::IntegrityMismatch
+    ));
     assert!(!temp_path.exists());
     assert!(
         result
@@ -2133,14 +2244,21 @@ async fn runtime_manifest_file_requires_checksum_proof() {
         target: None,
     };
 
-    let result =
-        install_runtime_manifest_file(runtime_download_client().clone(), &root, "bin/java", file)
-            .await;
+    let result = install_runtime_manifest_file(
+        &test_runtime_component(),
+        runtime_download_client().clone(),
+        &root,
+        "bin/java",
+        file,
+    )
+    .await;
 
     assert!(matches!(
         result,
-        Err(JavaRuntimeLookupError::Source(message))
-            if message.contains("missing checksum proof")
+        Err(JavaRuntimeLookupError::RuntimeSource(failure))
+            if failure.component() == &test_runtime_component()
+                && failure.kind() == RuntimeSourceFailureKind::MetadataInvalid
+                && failure.detail().contains("missing checksum proof")
     ));
     assert!(!root.join("bin").join("java").exists());
     let _ = fs::remove_dir_all(root);
@@ -2161,9 +2279,15 @@ async fn runtime_manifest_file_prefers_lzma_and_verifies_decompressed_output() {
         &sha1_hex(&compressed_bytes),
     );
 
-    install_runtime_manifest_file(runtime_download_client().clone(), &root, "bin/java", file)
-        .await
-        .expect("runtime lzma file install");
+    install_runtime_manifest_file(
+        &test_runtime_component(),
+        runtime_download_client().clone(),
+        &root,
+        "bin/java",
+        file,
+    )
+    .await
+    .expect("runtime lzma file install");
 
     assert_eq!(
         fs::read(root.join("bin").join("java")).expect("decompressed runtime file"),
@@ -2189,14 +2313,21 @@ async fn runtime_manifest_file_rejects_invalid_checksum_proof() {
         target: None,
     };
 
-    let result =
-        install_runtime_manifest_file(runtime_download_client().clone(), &root, "bin/java", file)
-            .await;
+    let result = install_runtime_manifest_file(
+        &test_runtime_component(),
+        runtime_download_client().clone(),
+        &root,
+        "bin/java",
+        file,
+    )
+    .await;
 
     assert!(matches!(
         result,
-        Err(JavaRuntimeLookupError::Source(message))
-            if message.contains("missing checksum proof")
+        Err(JavaRuntimeLookupError::RuntimeSource(failure))
+            if failure.component() == &test_runtime_component()
+                && failure.kind() == RuntimeSourceFailureKind::MetadataInvalid
+                && failure.detail().contains("missing checksum proof")
     ));
     assert!(!root.join("bin").join("java").exists());
     let _ = fs::remove_dir_all(root);
@@ -2211,6 +2342,7 @@ async fn runtime_file_download_rejects_stream_past_expected_size_and_removes_tem
     let client = runtime_download_client();
 
     let result = fetch_runtime_file(
+        &test_runtime_component(),
         &client,
         &url,
         &temp_path,
@@ -2219,7 +2351,12 @@ async fn runtime_file_download_rejects_stream_past_expected_size_and_removes_tem
     )
     .await;
 
-    assert!(matches!(&result, Err(JavaRuntimeLookupError::Source(_))));
+    assert!(matches!(
+        &result,
+        Err(JavaRuntimeLookupError::RuntimeSource(failure))
+            if failure.component() == &test_runtime_component()
+                && failure.kind() == RuntimeSourceFailureKind::IntegrityMismatch
+    ));
     assert!(!temp_path.exists());
     assert!(
         result
@@ -2246,6 +2383,7 @@ fn runtime_install_futures_stay_small_enough_for_tokio_workers() {
     let spawned_file = file.clone();
     let spawned_future = async move {
         Box::pin(install_runtime_manifest_file(
+            &test_runtime_component(),
             spawned_client,
             &spawned_root,
             "bin/java",
@@ -2256,6 +2394,7 @@ fn runtime_install_futures_stay_small_enough_for_tokio_workers() {
 
     assert!(
         std::mem::size_of_val(&fetch_runtime_file(
+            &test_runtime_component(),
             &client,
             "https://example.test/runtime.bin",
             &root.join("java.axial-tmp"),
@@ -2266,6 +2405,7 @@ fn runtime_install_futures_stay_small_enough_for_tokio_workers() {
     );
     assert!(
         std::mem::size_of_val(&install_runtime_manifest_file(
+            &test_runtime_component(),
             client.clone(),
             root,
             "bin/java",
