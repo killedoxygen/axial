@@ -2,7 +2,13 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import { clearLaunchNotice, confirmLaunch, setLaunchNotice, updateRunningSessionState } from '../src/actions';
-import { createResultToastMessage, createToastKind } from '../src/instance-create';
+import {
+  createNoticePresentation,
+  createResultToastMessage,
+  createToastKind,
+  type CreateNotice,
+  type CreateResultPresentationSource,
+} from '../src/create-presenters';
 import {
   clearDownloadFailure,
   clearDownloadFailureForItem,
@@ -14,19 +20,17 @@ import {
   installQueueNoticePresentation,
   unresolvedFailureViewModel,
 } from '../src/machines/download-view-models';
-import { launchSessionOutcome, launchStatusViewModel } from '../src/launch';
 import { backendLaunchNotice, createBackendLaunchNoticeTracker } from '../src/launch-notice-tracker';
+import { launchActionPresentation, launchNoticePresentation } from '../src/launch-presenters';
+import { launchProofGuardianEvidence } from '../src/launch-proof-presenters';
+import { launchSessionOutcome, launchStatusViewModel } from '../src/launch-response-adapters';
+import { performanceHealthNotice } from '../src/performance-presenters';
+import { GUARDIAN_OPTIONS, guardianModeFrom } from '../src/guardian-settings';
 import { launchNotices, runningSessions } from '../src/store';
 import { startupWarningMessages } from '../src/startup-warnings';
 import type { GuardianSummary } from '../src/types-guardian';
 import type { InstallFailureViewModel, InstallItem, InstallQueueNoticeViewModel } from '../src/types-install';
 import type { LaunchHealingSummary, LaunchNotice, RunningSession } from '../src/types-launch';
-import type { PerformanceHealthResponse } from '../src/types-performance';
-import { createNoticePresentation } from '../src/views/create/CreateView';
-import { launchActionPresentation, launchNoticePresentation } from '../src/views/instance/components/launch';
-import { performanceHealthNotice } from '../src/views/instance/performance-mode';
-import { launchProofGuardianEvidence } from '../src/views/settings/PerformanceLabProofHistory';
-import { GUARDIAN_OPTIONS, guardianModeFrom } from '../src/views/settings/PerformanceSection';
 
 const sensitiveFragments = [
   '/home/alice/.axial',
@@ -36,6 +40,9 @@ const sensitiveFragments = [
   'java.exe',
   'at installWorker',
 ];
+
+type LaunchProofFixture = Parameters<typeof launchProofGuardianEvidence>[0] & Record<string, unknown>;
+type PerformanceHealthFixture = NonNullable<Parameters<typeof performanceHealthNotice>[0]> & Record<string, unknown>;
 
 function assertExcludesSensitive(value: unknown): void {
   const serialized = JSON.stringify(value);
@@ -268,7 +275,7 @@ test('launch action presentation follows backend launch, install, blocked, queue
       primary_action: 'install',
     },
     installQueued: true,
-    installQueuedView: { title: 'Retry queued', summary: 'Backend queue summary.' } as never,
+    installQueuedView: { title: 'Retry queued', summary: 'Backend queue summary.' },
   });
   assert.equal(queued.label, 'Retry queued');
   assert.equal(queued.icon, 'clock');
@@ -442,12 +449,13 @@ test('install failure dismissal and item transitions are scoped to the matching 
 });
 
 test('create surfaces preserve backend Guardian copy and map every rendered notice tone', () => {
+  const createResult: CreateResultPresentationSource & Record<string, unknown> = {
+    view_model: { summary: 'Instance created.', detail: 'Install queued.' },
+    guardian_notice: { message: 'Guardian adjusted the preset.', detail: 'Automatic preset selected.' },
+    raw_error: sensitiveFragments.join(' '),
+  };
   assert.equal(
-    createResultToastMessage({
-      view_model: { summary: 'Instance created.', detail: 'Install queued.' },
-      guardian_notice: { message: 'Guardian adjusted the preset.', detail: 'Automatic preset selected.' },
-      raw_error: sensitiveFragments.join(' '),
-    } as never),
+    createResultToastMessage(createResult),
     'Instance created. Guardian adjusted the preset. Install queued. Automatic preset selected.',
   );
   assert.equal(createToastKind('error'), 'error');
@@ -463,32 +471,27 @@ test('create surfaces preserve backend Guardian copy and map every rendered noti
     success: ['success', 'check-circle'],
   } as const;
   for (const [tone, [normalized, icon]] of Object.entries(tones)) {
-    assert.deepEqual(
-      createNoticePresentation({ state_id: `notice-${tone}`, tone, message: `Backend ${tone} copy` } as never),
-      { tone: normalized, icon },
-    );
+    const notice: CreateNotice = { state_id: `notice-${tone}`, tone, message: `Backend ${tone} copy` };
+    assert.deepEqual(createNoticePresentation(notice), { tone: normalized, icon });
   }
 });
 
 test('performance health, Guardian settings, and proof evidence remain backend-authored display contracts', () => {
-  const warningHealth = {
+  const warningHealth: PerformanceHealthFixture = {
     health: 'degraded',
     view_model: {
       tone: 'warn',
       title: 'Backend performance warning',
       detail: 'Backend performance detail',
-      raw_error: sensitiveFragments.join(' '),
     },
-  } as unknown as PerformanceHealthResponse;
+    raw_error: sensitiveFragments.join(' '),
+  };
   assert.deepEqual(performanceHealthNotice(warningHealth), {
     tone: 'warned',
     title: 'Backend performance warning',
     detail: 'Backend performance detail',
   });
-  assert.equal(
-    performanceHealthNotice({ health: 'healthy', view_model: { tone: 'ok' } } as unknown as PerformanceHealthResponse),
-    null,
-  );
+  assert.equal(performanceHealthNotice({ view_model: { tone: 'ok' } }), null);
 
   assert.equal(guardianModeFrom('managed'), 'managed');
   assert.equal(guardianModeFrom('custom'), 'custom');
@@ -501,13 +504,14 @@ test('performance health, Guardian settings, and proof evidence remain backend-a
     ],
   );
 
-  const evidence = launchProofGuardianEvidence({
+  const proofRecord: LaunchProofFixture = {
     guardian: { message: sensitiveFragments.join(' ') },
     healing: { warnings: [sensitiveFragments.join(' ')] },
     view_model: {
       evidence: { tone: 'warn', label: 'Guardian intervened', detail: 'Backend sanitized proof detail' },
     },
-  } as never);
+  };
+  const evidence = launchProofGuardianEvidence(proofRecord);
   assert.deepEqual(evidence, {
     tone: 'warn',
     label: 'Guardian intervened',

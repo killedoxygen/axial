@@ -9,32 +9,11 @@ import { toast } from '../../../toast';
 import type { LaunchState } from '../../../store';
 import type { DownloadFailure } from '../../../machines/downloads';
 import type { InstanceInstallProgress } from '../../../instance-install-status';
-import type { LaunchActionState, LaunchNotice, LaunchNoticeTone } from '../../../types-launch';
+import type { LaunchActionState, LaunchNotice } from '../../../types-launch';
 import type { EnrichedInstance } from '../../../types-instance';
 import type { InstallQueuedItemViewModel } from '../../../types-install';
+import { launchActionPresentation, launchNoticePresentation } from '../../../launch-presenters';
 import { openInstanceFolder } from '../instance-actions';
-
-function launchNoticeIcon(tone: LaunchNoticeTone): string {
-  if (tone === 'success') return 'check-circle';
-  if (tone === 'error') return 'alert';
-  if (tone === 'warned') return 'alert';
-  if (tone === 'intervened') return 'shield-check';
-  return 'info';
-}
-
-export function launchNoticePresentation(notice: LaunchNotice): {
-  icon: string;
-  primaryDetail: string;
-  listDetails: string[];
-} {
-  const details = (notice.details ?? []).map((detail) => detail.trim()).filter(Boolean);
-  const primaryDetail = notice.detail?.trim() || (details.length === 1 ? details[0] : '');
-  return {
-    icon: launchNoticeIcon(notice.tone),
-    primaryDetail,
-    listDetails: details.length > 1 ? details.filter((detail) => !primaryDetail || detail !== primaryDetail) : [],
-  };
-}
 
 export function LaunchOutcomeNotice({ inst, notice }: { inst: EnrichedInstance; notice: LaunchNotice }): JSX.Element {
   const { icon, primaryDetail, listDetails } = launchNoticePresentation(notice);
@@ -170,41 +149,6 @@ export function LaunchSplitButton({
       {progress?.determinate && <span class="cp-instance-launch-status">{Math.round(pct)}%</span>}
     </div>
   );
-}
-
-export function launchActionPresentation({
-  launchAction,
-  installQueued,
-  installQueuedView,
-  installProgress,
-  preparing,
-}: {
-  launchAction: LaunchActionState;
-  installQueued: boolean;
-  installQueuedView?: InstallQueuedItemViewModel;
-  installProgress: { pct: number; label: string } | null;
-  preparing: Extract<LaunchState, { status: 'preparing' }> | null;
-}): {
-  progress: { pct: number; label: string; determinate: boolean } | null;
-  usesInstallAction: boolean;
-  blocked: boolean;
-  label: string;
-  icon: string;
-  pct: number;
-  disabled: boolean;
-} {
-  const progress = preparing
-    ? { pct: preparing.pct, label: preparing.label, determinate: preparing.determinate !== false }
-    : installProgress
-      ? { ...installProgress, determinate: true }
-      : null;
-  const usesInstallAction = launchAction.primary_action === 'install';
-  const blocked = launchAction.primary_action === 'blocked';
-  const label = progress?.label || (installQueued ? installQueuedView?.title || 'Queued' : launchAction.label);
-  const icon = progress || installQueued ? 'clock' : blocked ? 'alert' : usesInstallAction ? 'download' : 'play';
-  const pct = progress?.determinate ? progress.pct : 0;
-  const disabled = Boolean(progress) || installQueued || blocked;
-  return { progress, usesInstallAction, blocked, label, icon, pct, disabled };
 }
 
 function OpenDownloadsButton(): JSX.Element {

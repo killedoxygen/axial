@@ -22,6 +22,7 @@ import { errMessage, getMemoryRecommendation } from '../../utils';
 import { hashStr } from '../../tokens';
 import { Sound } from '../../sound';
 import { createInstance } from '../../instance-create';
+import { createNoticePresentation, type CreateNotice } from '../../create-presenters';
 import type { LoaderComponentId } from '../../types-loader';
 import {
   defaultIconFor,
@@ -106,13 +107,6 @@ interface CreateLoaderBuildIdentity {
     last_error?: string | null;
     last_failure_kind?: string | null;
   };
-}
-
-interface CreateNotice {
-  state_id: string;
-  tone: string;
-  message: string;
-  detail?: string | null;
 }
 
 interface CreateOptimizeOption {
@@ -209,26 +203,6 @@ function normalizeChannel(value: string | undefined): Channel {
 
 function normalizeDownloadState(value: string | undefined): VersionDownloadState {
   return value === 'base' || value === 'full' ? value : 'none';
-}
-
-function noticeTone(value: string): string {
-  if (value === 'warn' || value === 'warned') return 'warned';
-  if (value === 'error') return 'error';
-  if (value === 'intervened') return 'intervened';
-  if (value === 'success') return 'success';
-  return 'info';
-}
-
-function noticeIcon(tone: string): string {
-  if (tone === 'success') return 'check-circle';
-  if (tone === 'error' || tone === 'warned') return 'alert';
-  if (tone === 'intervened') return 'shield-check';
-  return 'info';
-}
-
-export function createNoticePresentation(notice: CreateNotice): { tone: string; icon: string } {
-  const tone = noticeTone(notice.tone);
-  return { tone, icon: noticeIcon(tone) };
 }
 
 function normalizeVersionTags(tags: CreateVersionTag[] | undefined): VersionRowTagModel[] {

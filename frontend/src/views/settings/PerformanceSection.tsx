@@ -9,6 +9,7 @@ import { config } from '../../store';
 import type { Config } from '../../types-settings';
 import type { GuardianMode } from '../../types-guardian';
 import type { PerformanceMode } from '../../types-performance';
+import { GUARDIAN_OPTIONS, guardianModeFrom } from '../../guardian-settings';
 
 const PERFORMANCE_OPTIONS: Array<ChoicePillOption<PerformanceMode>> = [
   { value: 'managed', label: 'Managed', note: 'Axial applies recommended tuning and optimizations for you.' },
@@ -16,22 +17,9 @@ const PERFORMANCE_OPTIONS: Array<ChoicePillOption<PerformanceMode>> = [
   { value: 'custom', label: 'Custom', note: 'You set the tuning. Your manual choices are kept as-is.' },
 ];
 
-export const GUARDIAN_OPTIONS: Array<ChoicePillOption<GuardianMode>> = [
-  { value: 'managed', label: 'Managed', note: 'Catches risky launch settings and fixes them automatically.' },
-  {
-    value: 'custom',
-    label: 'Custom',
-    note: 'Keeps your choices, warns instead of changing, blocks only fatal setups.',
-  },
-];
-
 function performanceModeFrom(value: string | undefined): PerformanceMode {
   if (value === 'vanilla' || value === 'custom') return value;
   return 'managed';
-}
-
-export function guardianModeFrom(value: string | undefined): GuardianMode {
-  return value === 'custom' ? 'custom' : 'managed';
 }
 
 export function PerformanceSection(): JSX.Element {

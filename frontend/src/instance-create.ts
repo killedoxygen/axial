@@ -4,9 +4,9 @@ import { errMessage } from './utils';
 import { navigate } from './ui-state';
 import { addInstance } from './actions';
 import { applyInstallQueueResponse } from './machines/downloads';
+import { createResultToastMessage, createToastKind, type CreateResultPresentationSource } from './create-presenters';
 import type { Instance } from './types-instance';
 import type { InstallQueueStateResponse } from './types-install';
-import type { ToastKind } from './types-ui';
 
 export interface InitialInstanceSettings {
   max_memory_mb?: number;
@@ -33,14 +33,6 @@ export interface CreateInstanceResult {
   error?: string;
 }
 
-interface CreateResultViewModel {
-  state_id?: string;
-  tone?: string;
-  title?: string;
-  summary?: string;
-  detail?: string | null;
-}
-
 interface CreateQueuedInstallSummary {
   state_id?: string;
   kind?: string;
@@ -50,49 +42,11 @@ interface CreateQueuedInstallSummary {
   operation_id?: string | null;
 }
 
-interface CreateGuardianNotice {
-  state_id?: string;
-  tone?: string;
-  message?: string;
-  detail?: string | null;
-}
-
-interface CreateResponse {
+interface CreateResponse extends CreateResultPresentationSource {
   id?: string;
   error?: string;
-  view_model?: CreateResultViewModel;
   install_queue?: InstallQueueStateResponse;
   queued_install?: CreateQueuedInstallSummary;
-  guardian_notice?: CreateGuardianNotice;
-}
-
-function trimmed(value: unknown): string {
-  return typeof value === 'string' ? value.trim() : '';
-}
-
-export function createToastKind(tone: string | undefined): ToastKind {
-  if (tone === 'error') return 'error';
-  if (tone === 'warn') return 'info';
-  return 'success';
-}
-
-function appendUnique(parts: string[], value: string): void {
-  if (!value || parts.some((part) => part.includes(value))) return;
-  parts.push(value);
-}
-
-export function createResultToastMessage(res: CreateResponse): string {
-  const summary = trimmed(res.view_model?.summary);
-  const detail = trimmed(res.view_model?.detail);
-  const guardianMessage = trimmed(res.guardian_notice?.message);
-  const guardianDetail = trimmed(res.guardian_notice?.detail);
-  const parts: string[] = [];
-
-  appendUnique(parts, summary);
-  appendUnique(parts, guardianMessage);
-  appendUnique(parts, detail);
-  appendUnique(parts, guardianDetail);
-  return parts.join(' ');
 }
 
 function isInstance(value: CreateResponse & Partial<Instance>): value is CreateResponse & Instance {

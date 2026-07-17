@@ -8,7 +8,8 @@ import { fmtMem } from '../../format';
 import { errMessage } from '../../utils';
 import { minecraftVersionLabel } from '../../version-display';
 import type { LaunchReportsState } from './PerformanceLabTypes';
-import type { LaunchProofEvidenceViewModel, LaunchProofRecord } from '../../types-launch';
+import type { LaunchProofRecord } from '../../types-launch';
+import { launchProofGuardianEvidence } from '../../launch-proof-presenters';
 import { formatDurationMs, formatProofDate, labelFromToken } from './PerformanceLabFormat';
 
 function stableJsonValue(value: unknown): unknown {
@@ -34,16 +35,6 @@ function proofCopyFailureMessage(err: unknown): string {
   if (message.includes('not found') || message.includes('404')) return 'Launch proof was not found.';
   if (message.includes('network') || message.includes('fetch')) return 'Launch proof service is unreachable.';
   return 'Launch proof could not be copied.';
-}
-
-export function launchProofGuardianEvidence(record: LaunchProofRecord): LaunchProofEvidenceViewModel | null {
-  const evidence = record.view_model.evidence;
-  if (!evidence) return null;
-  return {
-    tone: evidence.tone,
-    label: evidence.label,
-    detail: evidence.detail ?? null,
-  };
 }
 
 export function LaunchProofHistoryBlock({ state }: { state: LaunchReportsState }): JSX.Element {

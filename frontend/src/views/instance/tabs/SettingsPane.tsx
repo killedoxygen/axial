@@ -15,10 +15,10 @@ import { updateInstanceInList } from '../../../actions';
 import { fmtMem, memoryGb } from '../../../format';
 import type { InstancePerformanceMode } from '../../../types-performance';
 import type { EnrichedInstance } from '../../../types-instance';
+import { performanceHealthNotice } from '../../../performance-presenters';
 import {
   fetchPerformanceHealth,
   globalPerformanceMode,
-  performanceHealthNotice,
   performanceModeFrom,
   performanceModeLabel,
 } from '../performance-mode';
