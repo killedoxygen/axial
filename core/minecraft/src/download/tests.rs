@@ -1321,7 +1321,7 @@ async fn runtime_task_is_aborted_when_artifact_install_fails() {
 #[tokio::test]
 async fn runtime_error_is_reported_when_artifact_install_succeeds() {
     let task = tokio::spawn(async {
-        Err::<Option<RuntimeSourceReceipt>, _>(crate::runtime::JavaRuntimeLookupError::Download(
+        Err::<Option<RuntimeSourceReceipt>, _>(crate::runtime::JavaRuntimeLookupError::Install(
             "runtime failed".to_string(),
         ))
     });
@@ -1340,7 +1340,7 @@ async fn runtime_error_is_reported_when_artifact_install_succeeds() {
 #[tokio::test]
 async fn artifact_error_is_preserved_when_runtime_also_fails() {
     let task = tokio::spawn(async {
-        Err::<Option<RuntimeSourceReceipt>, _>(crate::runtime::JavaRuntimeLookupError::Download(
+        Err::<Option<RuntimeSourceReceipt>, _>(crate::runtime::JavaRuntimeLookupError::Install(
             "runtime failed".to_string(),
         ))
     });

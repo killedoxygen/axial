@@ -186,6 +186,27 @@
       }
     },
     {
+      "id": "install_failure.execution_failed",
+      "input": {
+        "surface": "install_failure",
+        "diagnosis": "install_execution_failed",
+        "decision": "Block",
+        "component": null,
+        "platform": null
+      },
+      "outcome": {
+        "decision": "Block",
+        "phase": "Installing",
+        "summary": "Guardian blocked install because installation could not complete.",
+        "details": [
+          "A launcher-managed installation step failed before verification completed."
+        ],
+        "guidance": [
+          "Retry the install. If it repeats, restart Axial before trying again."
+        ]
+      }
+    },
+    {
       "id": "install_failure.runtime_unavailable",
       "input": {
         "surface": "install_failure",

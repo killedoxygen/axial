@@ -181,7 +181,9 @@ where
     }
 }
 
-fn runtime_lookup_error_to_download_error(error: JavaRuntimeLookupError) -> DownloadError {
+pub(super) fn runtime_lookup_error_to_download_error(
+    error: JavaRuntimeLookupError,
+) -> DownloadError {
     match error {
         JavaRuntimeLookupError::UnsupportedPlatform {
             component,
@@ -193,6 +195,7 @@ fn runtime_lookup_error_to_download_error(error: JavaRuntimeLookupError) -> Down
         JavaRuntimeLookupError::RosettaRequired { component } => {
             DownloadError::RuntimeRosettaRequired { component }
         }
+        JavaRuntimeLookupError::Source(message) => DownloadError::RuntimeSource(message),
         error => DownloadError::PrepareRuntime(error.to_string()),
     }
 }
@@ -234,13 +237,25 @@ mod tests {
 
     #[test]
     fn other_runtime_errors_stay_prepare_runtime_errors() {
-        let error = runtime_lookup_error_to_download_error(JavaRuntimeLookupError::Download(
+        let error = runtime_lookup_error_to_download_error(JavaRuntimeLookupError::Install(
             "network failed".to_string(),
         ));
 
         assert!(matches!(
             error,
             DownloadError::PrepareRuntime(message) if message == "failed to install java runtime: network failed"
+        ));
+    }
+
+    #[test]
+    fn runtime_source_errors_map_to_typed_download_errors() {
+        let error = runtime_lookup_error_to_download_error(JavaRuntimeLookupError::Source(
+            "provider unavailable".to_string(),
+        ));
+
+        assert!(matches!(
+            error,
+            DownloadError::RuntimeSource(message) if message == "provider unavailable"
         ));
     }
 }

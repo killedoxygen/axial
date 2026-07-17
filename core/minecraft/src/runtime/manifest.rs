@@ -37,7 +37,7 @@ async fn fetch_bounded_runtime_bytes(
     policy: RuntimeSourceTransportPolicy,
 ) -> Result<Vec<u8>, JavaRuntimeLookupError> {
     if policy.requires_https() && !runtime_source_url_is_secure(url) {
-        return Err(JavaRuntimeLookupError::Download(
+        return Err(JavaRuntimeLookupError::Source(
             "runtime source must use HTTPS".to_string(),
         ));
     }
@@ -45,21 +45,21 @@ async fn fetch_bounded_runtime_bytes(
         .get(url)
         .send()
         .await
-        .map_err(|error| JavaRuntimeLookupError::Download(error.to_string()))?;
+        .map_err(|error| JavaRuntimeLookupError::Source(error.to_string()))?;
     if policy.requires_https() && response.url().scheme() != "https" {
-        return Err(JavaRuntimeLookupError::Download(
+        return Err(JavaRuntimeLookupError::Source(
             "runtime source redirected to an insecure URL".to_string(),
         ));
     }
     let status = response.status();
     if !status.is_success() {
-        return Err(JavaRuntimeLookupError::Download(format!("HTTP {status}")));
+        return Err(JavaRuntimeLookupError::Source(format!("HTTP {status}")));
     }
     if response
         .content_length()
         .is_some_and(|content_length| content_length > MAX_RUNTIME_MANIFEST_BYTES)
     {
-        return Err(JavaRuntimeLookupError::Download(
+        return Err(JavaRuntimeLookupError::Source(
             "runtime manifest response too large".to_string(),
         ));
     }
@@ -67,9 +67,9 @@ async fn fetch_bounded_runtime_bytes(
     let mut body = Vec::new();
     let mut stream = response.bytes_stream();
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|error| JavaRuntimeLookupError::Download(error.to_string()))?;
+        let chunk = chunk.map_err(|error| JavaRuntimeLookupError::Source(error.to_string()))?;
         if body.len() as u64 + chunk.len() as u64 > MAX_RUNTIME_MANIFEST_BYTES {
-            return Err(JavaRuntimeLookupError::Download(
+            return Err(JavaRuntimeLookupError::Source(
                 "runtime manifest response too large".to_string(),
             ));
         }
@@ -89,7 +89,7 @@ pub(super) async fn acquire_runtime_source(
     )
     .await?;
     let catalog = serde_json::from_slice::<RuntimeManifest>(&catalog_bytes)
-        .map_err(|error| JavaRuntimeLookupError::Download(error.to_string()))?;
+        .map_err(|error| JavaRuntimeLookupError::Source(error.to_string()))?;
     let expected = select_runtime_manifest(&catalog, component, primary_platform)?.clone();
     acquire_runtime_source_from_descriptor(
         component.clone(),
@@ -115,7 +115,7 @@ fn authenticate_runtime_source_bytes(
 ) -> Result<RuntimeSourceReceipt, JavaRuntimeLookupError> {
     verify_component_manifest_bytes(&bytes, &expected)?;
     let manifest = serde_json::from_slice::<ComponentManifest>(&bytes)
-        .map_err(|error| JavaRuntimeLookupError::Download(error.to_string()))?;
+        .map_err(|error| JavaRuntimeLookupError::Source(error.to_string()))?;
 
     Ok(RuntimeSourceReceipt {
         component,
@@ -130,18 +130,18 @@ fn verify_component_manifest_bytes(
     expected: &RuntimeDownloadManifest,
 ) -> Result<(), JavaRuntimeLookupError> {
     if bytes.len() as u64 != expected.size {
-        return Err(JavaRuntimeLookupError::Download(
+        return Err(JavaRuntimeLookupError::Source(
             "runtime component manifest size mismatch".to_string(),
         ));
     }
     if expected.sha1.len() != 40 || !expected.sha1.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        return Err(JavaRuntimeLookupError::Download(
+        return Err(JavaRuntimeLookupError::Source(
             "runtime component manifest has invalid checksum proof".to_string(),
         ));
     }
     let actual_sha1 = format!("{:x}", Sha1::digest(bytes));
     if !actual_sha1.eq_ignore_ascii_case(&expected.sha1) {
-        return Err(JavaRuntimeLookupError::Download(
+        return Err(JavaRuntimeLookupError::Source(
             "runtime component manifest checksum mismatch".to_string(),
         ));
     }
@@ -277,7 +277,7 @@ pub(crate) fn authenticated_runtime_source_from_manifest_for_test(
     manifest: ComponentManifest,
 ) -> Result<RuntimeSourceReceipt, JavaRuntimeLookupError> {
     let bytes = serde_json::to_vec(&manifest)
-        .map_err(|error| JavaRuntimeLookupError::Download(error.to_string()))?;
+        .map_err(|error| JavaRuntimeLookupError::Source(error.to_string()))?;
     authenticate_runtime_source_bytes(
         component,
         RuntimeDownloadManifest {
@@ -315,7 +315,7 @@ pub(super) fn authenticated_runtime_rebuild_fixture_source(
         )]),
     };
     let bytes = serde_json::to_vec(&manifest)
-        .map_err(|error| JavaRuntimeLookupError::Download(error.to_string()))?;
+        .map_err(|error| JavaRuntimeLookupError::Source(error.to_string()))?;
     authenticate_runtime_source_bytes(
         component,
         RuntimeDownloadManifest {

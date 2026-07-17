@@ -14,7 +14,7 @@ const SNAPSHOT_FIXTURE: &str = include_str!(concat!(
     "/tests/fixtures/guardian/guardian-outcome-copy-v1.json"
 ));
 const REGENERATE_ENV: &str = "AXIAL_REGENERATE_GUARDIAN_OUTCOME_COPY_SNAPSHOT";
-const EXPECTED_CASE_COUNT: usize = 27;
+const EXPECTED_CASE_COUNT: usize = 28;
 const EXPECTED_CASE_IDS: [&str; EXPECTED_CASE_COUNT] = [
     "runtime_repair.repaired",
     "runtime_repair.blocked",
@@ -26,6 +26,7 @@ const EXPECTED_CASE_IDS: [&str; EXPECTED_CASE_COUNT] = [
     "install_failure.download_block",
     "install_failure.metadata_invalid",
     "install_failure.dependency_failed",
+    "install_failure.execution_failed",
     "install_failure.runtime_unavailable",
     "install_failure.rosetta_required",
     "install_failure.permission_denied",
@@ -364,7 +365,7 @@ fn assert_snapshot_coverage(snapshot: &GuardianOutcomeCopySnapshot) {
         };
         axis_counts[axis] += 1;
     }
-    assert_eq!(axis_counts, [3, 3, 10, 4, 6, 1]);
+    assert_eq!(axis_counts, [3, 3, 11, 4, 6, 1]);
 }
 
 fn canonical_case_id(input: &GuardianOutcomeCopyInput) -> String {
@@ -420,6 +421,9 @@ fn install_failure_case_id(
         }
         (DiagnosisId::InstallDependencyFailed, GuardianActionKind::Block, None, None) => {
             "install_failure.dependency_failed"
+        }
+        (DiagnosisId::InstallExecutionFailed, GuardianActionKind::Block, None, None) => {
+            "install_failure.execution_failed"
         }
         (
             DiagnosisId::ManagedRuntimeUnavailableForPlatform,

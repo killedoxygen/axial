@@ -44,14 +44,14 @@ impl ProcessorWorkspaceOwner {
         source: crate::runtime::RuntimeSourceReceipt,
     ) -> Result<crate::runtime::ProcessorRuntime, crate::runtime::JavaRuntimeLookupError> {
         self.temporary_root.revalidate().map_err(|_| {
-            crate::runtime::JavaRuntimeLookupError::Download(
+            crate::runtime::JavaRuntimeLookupError::Install(
                 "processor temporary root identity changed".to_string(),
             )
         })?;
         self.temporary_root
             .validate_exact_child_directories(&["processor-stage"])
             .map_err(|_| {
-                crate::runtime::JavaRuntimeLookupError::Download(
+                crate::runtime::JavaRuntimeLookupError::Install(
                     "processor temporary root identity changed".to_string(),
                 )
             })?;
@@ -60,19 +60,19 @@ impl ProcessorWorkspaceOwner {
             .stage
             .validate_tree_usage_no_links(ManagedTreeLimits::processor_stage())
             .map_err(|_| {
-                crate::runtime::JavaRuntimeLookupError::Download(
+                crate::runtime::JavaRuntimeLookupError::Install(
                     "processor temporary root exceeds its admitted bound".to_string(),
                 )
             })?;
         let remaining_entries = 4096_usize
             .checked_sub(usage.entries().saturating_add(1))
             .ok_or_else(|| {
-                crate::runtime::JavaRuntimeLookupError::Download(
+                crate::runtime::JavaRuntimeLookupError::Install(
                     "processor temporary root exceeds its entry bound".to_string(),
                 )
             })?;
         let remaining_bytes = (512_u64 << 20).checked_sub(usage.bytes()).ok_or_else(|| {
-            crate::runtime::JavaRuntimeLookupError::Download(
+            crate::runtime::JavaRuntimeLookupError::Install(
                 "processor temporary root exceeds its byte bound".to_string(),
             )
         })?;
@@ -86,12 +86,12 @@ impl ProcessorWorkspaceOwner {
         )
         .await?;
         self.temporary_root.revalidate().map_err(|_| {
-            crate::runtime::JavaRuntimeLookupError::Download(
+            crate::runtime::JavaRuntimeLookupError::Install(
                 "processor temporary root identity changed".to_string(),
             )
         })?;
         self.workspace.validate_live_bounds().map_err(|_| {
-            crate::runtime::JavaRuntimeLookupError::Download(
+            crate::runtime::JavaRuntimeLookupError::Install(
                 "processor runtime destination identity changed".to_string(),
             )
         })?;

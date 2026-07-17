@@ -1299,6 +1299,21 @@ fn typed_runtime_failure_evidence(
             )
             .with_field("component", component.as_str()),
         ),
+        DownloadError::RuntimeSource(_) => Some(
+            GuardianInstallArtifactFailureEvidence::launcher_managed(
+                Some(operation_id.clone()),
+                "java_runtime_source",
+                GuardianInstallArtifactFailureKind::ProviderFailure,
+            )
+            .with_ownership(OwnershipClass::ExternalProviderDerived),
+        ),
+        DownloadError::PrepareRuntime(_) => {
+            Some(GuardianInstallArtifactFailureEvidence::launcher_managed(
+                Some(operation_id.clone()),
+                "java_runtime",
+                GuardianInstallArtifactFailureKind::ExecutionFailed,
+            ))
+        }
         _ => None,
     }
 }
@@ -1340,11 +1355,9 @@ fn install_failure_target_and_kind_from_download_error(
             "library_metadata",
             GuardianInstallArtifactFailureKind::MetadataInvalid,
         ),
-        DownloadError::PrepareRuntime(_) => (
-            "java_runtime",
-            GuardianInstallArtifactFailureKind::ProviderFailure,
-        ),
-        DownloadError::RuntimeRosettaRequired { .. }
+        DownloadError::PrepareRuntime(_)
+        | DownloadError::RuntimeSource(_)
+        | DownloadError::RuntimeRosettaRequired { .. }
         | DownloadError::RuntimeUnavailableForPlatform { .. } => return None,
         DownloadError::Integrity(_) => return None,
     };
@@ -1366,10 +1379,7 @@ fn terminal_download_failure_facts_for_error(
 fn should_prefer_terminal_download_facts(error: &DownloadError) -> bool {
     matches!(
         error,
-        DownloadError::FileOperation(_)
-            | DownloadError::Request(_)
-            | DownloadError::PrepareRuntime(_)
-            | DownloadError::Integrity(_)
+        DownloadError::FileOperation(_) | DownloadError::Request(_) | DownloadError::Integrity(_)
     )
 }
 

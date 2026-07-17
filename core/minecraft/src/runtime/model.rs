@@ -146,7 +146,9 @@ pub enum JavaRuntimeLookupError {
     #[error("java runtime not found: {component} (Java {major}) not installed")]
     NotFound { component: String, major: i32 },
     #[error("failed to install java runtime: {0}")]
-    Download(String),
+    Install(String),
+    #[error("failed to acquire java runtime source: {0}")]
+    Source(String),
     #[error("java runtime {component} is not available for {platform}")]
     UnsupportedPlatform { component: String, platform: String },
     #[error(

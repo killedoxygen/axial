@@ -879,6 +879,7 @@ fn install_error_log_kind(error: &DownloadError) -> &'static str {
         DownloadError::Request(_) => "request",
         DownloadError::ParseVersion(_) => "parse_version",
         DownloadError::PrepareRuntime(_) => "prepare_runtime",
+        DownloadError::RuntimeSource(_) => "runtime_source",
         DownloadError::RuntimeUnavailableForPlatform { .. } => "runtime_unavailable_for_platform",
         DownloadError::RuntimeRosettaRequired { .. } => "runtime_rosetta_required",
         DownloadError::Integrity(_) => "integrity",

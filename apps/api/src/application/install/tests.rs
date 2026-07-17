@@ -2576,6 +2576,80 @@ async fn request_install_error_keeps_terminal_artifact_target_for_failure_memory
 }
 
 #[tokio::test]
+async fn local_runtime_install_failure_cannot_record_provider_failure_memory() {
+    let journals = OperationJournalStore::new();
+    let failure_memory = GuardianFailureMemoryStore::new();
+    let operation_id = install_operation_id("local-runtime-install-failure");
+    let error = DownloadError::PrepareRuntime(
+        "/private/runtime/staging failed after provider download".to_string(),
+    );
+    let facts = [download_fact(
+        ExecutionDownloadFactKind::ProviderFailure,
+        "stale_runtime_provider_fact",
+    )];
+    begin_install_operation_journal(&journals, &operation_id, "26.2")
+        .await
+        .expect("create install journal");
+
+    record_install_failure_outcome_for_error(
+        &journals,
+        &failure_memory,
+        &operation_id,
+        &error,
+        &facts,
+        "2026-07-17T10:05:00+00:00",
+    )
+    .await;
+
+    assert!(failure_memory.list().is_empty());
+    let entry = journals.get(&operation_id).expect("journal");
+    let summary = install_guardian_outcome_summary_from_journal(&entry)
+        .expect("local runtime Guardian outcome");
+    assert_eq!(summary.diagnosis_id(), DiagnosisId::InstallExecutionFailed);
+    assert_eq!(summary.decision(), "block");
+    let encoded = serde_json::to_string(&entry).expect("journal json");
+    assert!(!encoded.contains("/private/runtime"));
+    assert!(!encoded.contains("stale_runtime_provider_fact"));
+}
+
+#[tokio::test]
+async fn runtime_source_failure_records_typed_provider_failure_memory() {
+    let journals = OperationJournalStore::new();
+    let failure_memory = GuardianFailureMemoryStore::new();
+    let operation_id = install_operation_id("runtime-source-failure");
+    let error = DownloadError::RuntimeSource(
+        "https://provider.invalid/runtime?token=private returned 503".to_string(),
+    );
+    begin_install_operation_journal(&journals, &operation_id, "26.2")
+        .await
+        .expect("create install journal");
+
+    record_install_failure_outcome_for_error(
+        &journals,
+        &failure_memory,
+        &operation_id,
+        &error,
+        &[],
+        "2026-07-17T10:05:00+00:00",
+    )
+    .await;
+
+    let entries = failure_memory.list();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].diagnosis_id, DiagnosisId::DownloadUnavailable);
+    assert_eq!(entries[0].target.id, "java_runtime_source");
+    let entry = journals.get(&operation_id).expect("journal");
+    let summary = install_guardian_outcome_summary_from_journal(&entry)
+        .expect("runtime source Guardian outcome");
+    assert_eq!(summary.diagnosis_id(), DiagnosisId::DownloadUnavailable);
+    assert_eq!(summary.decision(), "retry");
+    let encoded = serde_json::to_string(&entry).expect("journal json");
+    assert!(!encoded.contains("provider.invalid"));
+    assert!(!encoded.contains("token"));
+    assert!(!encoded.contains("private"));
+}
+
+#[tokio::test]
 async fn install_status_exposes_backend_authored_guardian_blocking_safety_outcomes() {
     let root = temp_root("install-status-guardian-blocking-failures");
     let state = build_test_state(&root);

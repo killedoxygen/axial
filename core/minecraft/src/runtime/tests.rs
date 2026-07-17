@@ -128,7 +128,7 @@ fn planned_paths(entries: &[(String, ComponentManifestFile)]) -> Vec<&str> {
 
 fn unsafe_manifest_path_message(result: Result<PathBuf, JavaRuntimeLookupError>) -> String {
     match result {
-        Err(JavaRuntimeLookupError::Download(message)) => message,
+        Err(JavaRuntimeLookupError::Source(message)) => message,
         other => panic!("expected unsafe manifest path error, got {other:?}"),
     }
 }
@@ -460,7 +460,7 @@ async fn runtime_manifest_link_rejects_target_escape() {
 
     assert!(matches!(
         result,
-        Err(JavaRuntimeLookupError::Download(message))
+        Err(JavaRuntimeLookupError::Source(message))
             if message.contains("unsafe runtime manifest link target")
     ));
     assert!(!root.join("bin").join("java-link").exists());
@@ -481,7 +481,7 @@ async fn runtime_manifest_link_fails_explicitly_on_non_unix() {
 
     assert!(matches!(
         result,
-        Err(JavaRuntimeLookupError::Download(message))
+        Err(JavaRuntimeLookupError::Install(message))
             if message.contains("unsupported on this platform")
     ));
     let _ = fs::remove_dir_all(root);
@@ -531,7 +531,7 @@ async fn runtime_manifest_json_fetch_rejects_oversized_content_length() {
 
     assert_eq!(
         error.to_string(),
-        "failed to install java runtime: runtime manifest response too large"
+        "failed to acquire java runtime source: runtime manifest response too large"
     );
 }
 
@@ -624,7 +624,7 @@ async fn runtime_source_receipt_rejects_size_mismatch_before_parse() {
 
     assert_eq!(
         error.to_string(),
-        "failed to install java runtime: runtime component manifest size mismatch"
+        "failed to acquire java runtime source: runtime component manifest size mismatch"
     );
 }
 
@@ -645,7 +645,7 @@ async fn runtime_source_receipt_rejects_checksum_mismatch_before_parse() {
 
     assert_eq!(
         error.to_string(),
-        "failed to install java runtime: runtime component manifest checksum mismatch"
+        "failed to acquire java runtime source: runtime component manifest checksum mismatch"
     );
 }
 
@@ -1792,7 +1792,7 @@ async fn assert_managed_manifest_rejection_preserves_state(
     let result =
         stage_managed_runtime(&cache, &component, source, &mut |event| events.push(event)).await;
 
-    assert!(matches!(result, Err(JavaRuntimeLookupError::Download(_))));
+    assert!(matches!(result, Err(JavaRuntimeLookupError::Source(_))));
     tokio::task::yield_now().await;
     assert_eq!(requests.load(Ordering::SeqCst), 0);
     assert!(events.is_empty());
@@ -2083,7 +2083,7 @@ async fn runtime_file_download_removes_temp_on_verification_error() {
     )
     .await;
 
-    assert!(matches!(&result, Err(JavaRuntimeLookupError::Download(_))));
+    assert!(matches!(&result, Err(JavaRuntimeLookupError::Source(_))));
     assert!(!temp_path.exists());
     let _ = fs::remove_dir_all(root);
 }
@@ -2105,7 +2105,7 @@ async fn runtime_file_download_rejects_oversized_content_length() {
     )
     .await;
 
-    assert!(matches!(&result, Err(JavaRuntimeLookupError::Download(_))));
+    assert!(matches!(&result, Err(JavaRuntimeLookupError::Source(_))));
     assert!(!temp_path.exists());
     assert!(
         result
@@ -2139,7 +2139,7 @@ async fn runtime_manifest_file_requires_checksum_proof() {
 
     assert!(matches!(
         result,
-        Err(JavaRuntimeLookupError::Download(message))
+        Err(JavaRuntimeLookupError::Source(message))
             if message.contains("missing checksum proof")
     ));
     assert!(!root.join("bin").join("java").exists());
@@ -2195,7 +2195,7 @@ async fn runtime_manifest_file_rejects_invalid_checksum_proof() {
 
     assert!(matches!(
         result,
-        Err(JavaRuntimeLookupError::Download(message))
+        Err(JavaRuntimeLookupError::Source(message))
             if message.contains("missing checksum proof")
     ));
     assert!(!root.join("bin").join("java").exists());
@@ -2219,7 +2219,7 @@ async fn runtime_file_download_rejects_stream_past_expected_size_and_removes_tem
     )
     .await;
 
-    assert!(matches!(&result, Err(JavaRuntimeLookupError::Download(_))));
+    assert!(matches!(&result, Err(JavaRuntimeLookupError::Source(_))));
     assert!(!temp_path.exists());
     assert!(
         result

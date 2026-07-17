@@ -2103,12 +2103,12 @@ const GUARDIAN_COPY_RULES: &[GuardianCopyRule] = &[
             CopyContextKey::InstallFailure,
         ),
         OperationPhase::Installing,
-        "Guardian blocked loader install because installation could not complete.",
+        "Guardian blocked install because installation could not complete.",
         &[CopyLine::Static(
-            "A launcher-managed loader installation step failed before verification completed.",
+            "A launcher-managed installation step failed before verification completed.",
         )],
         &[CopyLine::Static(
-            "Retry the loader install. If it repeats, restart Axial before trying again.",
+            "Retry the install. If it repeats, restart Axial before trying again.",
         )],
     ),
     fixed_rule(

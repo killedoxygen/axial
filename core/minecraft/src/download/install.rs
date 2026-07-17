@@ -1915,7 +1915,7 @@ impl Downloader {
             Some(
                 self.acquire_runtime_source(&version.java_version)
                     .await
-                    .map_err(|error| DownloadError::PrepareRuntime(error.to_string()))?,
+                    .map_err(super::runtime::runtime_lookup_error_to_download_error)?,
             )
         } else {
             None

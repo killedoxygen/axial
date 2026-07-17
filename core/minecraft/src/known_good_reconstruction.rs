@@ -813,7 +813,7 @@ async fn publish_managed_whole_instance_reconstruction_inner(
         || !runtime.matches_known_good_inventory(projection.inventory())
     {
         let ManagedRuntimeRebuildError::Effect(runtime) =
-            runtime.into_failure(crate::runtime::JavaRuntimeLookupError::Download(
+            runtime.into_failure(crate::runtime::JavaRuntimeLookupError::Install(
                 "whole-instance Runtime failed its exact postcheck".to_string(),
             ))
         else {

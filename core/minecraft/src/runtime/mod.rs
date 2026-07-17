@@ -91,7 +91,7 @@ pub(crate) async fn acquire_preferred_runtime_source(
 ) -> Result<RuntimeSourceReceipt, JavaRuntimeLookupError> {
     let component = RuntimeId::from(preferred_runtime_component(java_version));
     if !is_known_runtime_component(component.as_str()) {
-        return Err(JavaRuntimeLookupError::Download(
+        return Err(JavaRuntimeLookupError::Install(
             "preferred runtime component is not in the closed managed-runtime vocabulary"
                 .to_string(),
         ));
@@ -115,7 +115,7 @@ pub(crate) async fn acquire_test_runtime_source(
 ) -> Result<RuntimeSourceReceipt, JavaRuntimeLookupError> {
     let preferred = RuntimeId::from(preferred_runtime_component(java_version));
     if descriptor.component != preferred || !is_known_runtime_component(preferred.as_str()) {
-        return Err(JavaRuntimeLookupError::Download(
+        return Err(JavaRuntimeLookupError::Install(
             "test runtime source does not match the preferred managed component".to_string(),
         ));
     }
@@ -136,7 +136,7 @@ pub(crate) fn authenticated_test_runtime_source(
 ) -> Result<RuntimeSourceReceipt, JavaRuntimeLookupError> {
     let preferred = RuntimeId::from(preferred_runtime_component(java_version));
     if !is_known_runtime_component(preferred.as_str()) {
-        return Err(JavaRuntimeLookupError::Download(
+        return Err(JavaRuntimeLookupError::Install(
             "test runtime source does not match the closed managed-runtime vocabulary".to_string(),
         ));
     }

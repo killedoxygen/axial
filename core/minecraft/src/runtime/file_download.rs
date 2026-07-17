@@ -40,7 +40,7 @@ pub(super) fn component_manifest_destination(
     relative_path: &str,
 ) -> Result<PathBuf, JavaRuntimeLookupError> {
     if relative_path.is_empty() || has_unsafe_path_component(Path::new(relative_path)) {
-        return Err(JavaRuntimeLookupError::Download(format!(
+        return Err(JavaRuntimeLookupError::Source(format!(
             "unsafe runtime manifest path: {}",
             bounded_manifest_file_label(relative_path)
         )));
@@ -52,7 +52,7 @@ pub(super) fn component_manifest_destination(
             || segment.contains(':')
             || has_unsafe_path_component(Path::new(segment))
         {
-            return Err(JavaRuntimeLookupError::Download(format!(
+            return Err(JavaRuntimeLookupError::Source(format!(
                 "unsafe runtime manifest path: {}",
                 bounded_manifest_file_label(relative_path)
             )));
@@ -70,7 +70,7 @@ pub(super) fn component_manifest_link_target_path(
     target: &str,
 ) -> Result<PathBuf, JavaRuntimeLookupError> {
     if target.trim().is_empty() || Path::new(target).is_absolute() {
-        return Err(JavaRuntimeLookupError::Download(format!(
+        return Err(JavaRuntimeLookupError::Source(format!(
             "unsafe runtime manifest link target for {}",
             bounded_manifest_file_label(link_relative_path)
         )));
@@ -80,7 +80,7 @@ pub(super) fn component_manifest_link_target_path(
             continue;
         }
         if segment.contains(':') {
-            return Err(JavaRuntimeLookupError::Download(format!(
+            return Err(JavaRuntimeLookupError::Source(format!(
                 "unsafe runtime manifest link target for {}",
                 bounded_manifest_file_label(link_relative_path)
             )));
@@ -91,7 +91,7 @@ pub(super) fn component_manifest_link_target_path(
     let parent = link_destination.parent().unwrap_or(component_root);
     let target_path = normalize_path_lexically(&parent.join(target));
     if !target_path.starts_with(&root) {
-        return Err(JavaRuntimeLookupError::Download(format!(
+        return Err(JavaRuntimeLookupError::Source(format!(
             "unsafe runtime manifest link target for {}",
             bounded_manifest_file_label(link_relative_path)
         )));
@@ -175,13 +175,13 @@ async fn stream_runtime_file_to_temp_attempt(
         .get(url)
         .send()
         .await
-        .map_err(RuntimeFileDownloadAttemptError::retryable)?;
+        .map_err(RuntimeFileDownloadAttemptError::retryable_source)?;
     let status = response.status();
     if !status.is_success() {
         let retryable =
             status.is_server_error() || status == reqwest::StatusCode::TOO_MANY_REQUESTS;
         return Err(RuntimeFileDownloadAttemptError::from_parts(
-            JavaRuntimeLookupError::Download(format!("HTTP {status}")),
+            JavaRuntimeLookupError::Source(format!("HTTP {status}")),
             retryable,
         ));
     }
@@ -189,7 +189,7 @@ async fn stream_runtime_file_to_temp_attempt(
         && let Some(content_length) = response.content_length()
         && content_length > expected_size
     {
-        return Err(RuntimeFileDownloadAttemptError::fatal(
+        return Err(RuntimeFileDownloadAttemptError::fatal_source(
             RuntimeDownloadIntegrityError::SizeMismatch {
                 file: bounded_manifest_file_label(relative_path),
                 expected: expected_size,
@@ -200,18 +200,18 @@ async fn stream_runtime_file_to_temp_attempt(
     }
     let mut output = async_fs::File::create(runtime_filesystem_path(temp_path).as_ref())
         .await
-        .map_err(RuntimeFileDownloadAttemptError::fatal)?;
+        .map_err(RuntimeFileDownloadAttemptError::fatal_install)?;
     let mut stream = response.bytes_stream();
     let mut hasher = Sha1::new();
     let mut actual_size = 0_u64;
 
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(RuntimeFileDownloadAttemptError::retryable)?;
+        let chunk = chunk.map_err(RuntimeFileDownloadAttemptError::retryable_source)?;
         let next_size = actual_size.saturating_add(chunk.len() as u64);
         if let Some(expected_size) = expected.size
             && next_size > expected_size
         {
-            return Err(RuntimeFileDownloadAttemptError::fatal(
+            return Err(RuntimeFileDownloadAttemptError::fatal_source(
                 RuntimeDownloadIntegrityError::SizeMismatch {
                     file: bounded_manifest_file_label(relative_path),
                     expected: expected_size,
@@ -223,21 +223,21 @@ async fn stream_runtime_file_to_temp_attempt(
         output
             .write_all(&chunk)
             .await
-            .map_err(RuntimeFileDownloadAttemptError::fatal)?;
+            .map_err(RuntimeFileDownloadAttemptError::fatal_install)?;
         hasher.update(&chunk);
         actual_size = next_size;
     }
     output
         .flush()
         .await
-        .map_err(RuntimeFileDownloadAttemptError::fatal)?;
+        .map_err(RuntimeFileDownloadAttemptError::fatal_install)?;
 
     let actual = RuntimeDownloadActual {
         size: actual_size,
         sha1: format!("{:x}", hasher.finalize()),
     };
     verify_runtime_download(relative_path, expected, &actual)
-        .map_err(|error| RuntimeFileDownloadAttemptError::fatal(error.to_string()))
+        .map_err(|error| RuntimeFileDownloadAttemptError::fatal_source(error.to_string()))
 }
 
 #[derive(Debug)]
@@ -251,12 +251,16 @@ impl RuntimeFileDownloadAttemptError {
         Self { error, retryable }
     }
 
-    fn retryable(error: impl ToString) -> Self {
-        Self::from_parts(JavaRuntimeLookupError::Download(error.to_string()), true)
+    fn retryable_source(error: impl ToString) -> Self {
+        Self::from_parts(JavaRuntimeLookupError::Source(error.to_string()), true)
     }
 
-    fn fatal(error: impl ToString) -> Self {
-        Self::from_parts(JavaRuntimeLookupError::Download(error.to_string()), false)
+    fn fatal_source(error: impl ToString) -> Self {
+        Self::from_parts(JavaRuntimeLookupError::Source(error.to_string()), false)
+    }
+
+    fn fatal_install(error: impl ToString) -> Self {
+        Self::from_parts(JavaRuntimeLookupError::Install(error.to_string()), false)
     }
 }
 

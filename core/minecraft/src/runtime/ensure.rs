@@ -43,7 +43,7 @@ where
 {
     if !is_known_runtime_component(component.as_str()) {
         return Err(ManagedRuntimeRebuildError::Preparation(
-            JavaRuntimeLookupError::Download(
+            JavaRuntimeLookupError::Install(
                 "runtime rebuild target is outside the closed managed component vocabulary"
                     .to_string(),
             ),
@@ -63,7 +63,7 @@ where
     )
     .await?;
     if !receipt.revalidate(cache, &component).await {
-        return Err(receipt.into_failure(JavaRuntimeLookupError::Download(
+        return Err(receipt.into_failure(JavaRuntimeLookupError::Install(
             "rebuilt runtime failed exact commit receipt verification".to_string(),
         )));
     }
@@ -100,7 +100,7 @@ exit 0
     const JAVA_BYTES: &[u8] = b"axial managed runtime fixture";
     if !is_known_runtime_component(component.as_str()) {
         return Err(ManagedRuntimeRebuildError::Preparation(
-            JavaRuntimeLookupError::Download(
+            JavaRuntimeLookupError::Install(
                 "runtime rebuild fixture target is outside the closed component vocabulary"
                     .to_string(),
             ),
@@ -109,12 +109,12 @@ exit 0
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .map_err(|error| {
-            ManagedRuntimeRebuildError::Preparation(JavaRuntimeLookupError::Download(
+            ManagedRuntimeRebuildError::Preparation(JavaRuntimeLookupError::Install(
                 error.to_string(),
             ))
         })?;
     let address = listener.local_addr().map_err(|error| {
-        ManagedRuntimeRebuildError::Preparation(JavaRuntimeLookupError::Download(error.to_string()))
+        ManagedRuntimeRebuildError::Preparation(JavaRuntimeLookupError::Install(error.to_string()))
     })?;
     tokio::spawn(async move {
         let Ok((mut socket, _)) = listener.accept().await else {
@@ -137,7 +137,7 @@ exit 0
     )
     .map_err(ManagedRuntimeRebuildError::Preparation)?;
     let inventory = crate::known_good::runtime_inventory_from_source(&source).map_err(|_| {
-        ManagedRuntimeRebuildError::Preparation(JavaRuntimeLookupError::Download(
+        ManagedRuntimeRebuildError::Preparation(JavaRuntimeLookupError::Install(
             "runtime rebuild fixture inventory derivation failed".to_string(),
         ))
     })?;
@@ -148,7 +148,7 @@ exit 0
     if !receipt.revalidate(cache, &component).await
         || !receipt.matches_known_good_inventory(&inventory)
     {
-        return Err(receipt.into_failure(JavaRuntimeLookupError::Download(
+        return Err(receipt.into_failure(JavaRuntimeLookupError::Install(
             "runtime rebuild fixture failed sealed postcondition verification".to_string(),
         )));
     }
@@ -189,7 +189,7 @@ pub(crate) async fn materialize_ephemeral_processor_runtime(
     let requirement = runtime_requirement(java_version);
     let component = requirement.preferred_component;
     if source_receipt.component() != &component || !is_known_runtime_component(component.as_str()) {
-        return Err(JavaRuntimeLookupError::Download(
+        return Err(JavaRuntimeLookupError::Install(
             "processor runtime source does not match the authenticated base requirement"
                 .to_string(),
         ));
@@ -239,7 +239,7 @@ where
 {
     let component = RuntimeId::from(preferred_runtime_component(java_version));
     if source_receipt.component() != &component || !is_known_runtime_component(component.as_str()) {
-        return Err(JavaRuntimeLookupError::Download(
+        return Err(JavaRuntimeLookupError::Install(
             "runtime source does not match the preferred managed component".to_string(),
         ));
     }
@@ -261,7 +261,7 @@ where
     };
     let runtime = resolve_axial_cached_runtime(cache, &component, java_version.major_version)?;
     if !runtime_record_matches_source(&runtime, &source_receipt).await {
-        return Err(JavaRuntimeLookupError::Download(
+        return Err(JavaRuntimeLookupError::Install(
             "installed runtime does not match its authenticated source".to_string(),
         ));
     }
@@ -464,7 +464,7 @@ where
     let runtime =
         resolve_component_runtime(cache, preferred, requirement.required_java.major_version)?;
     if !runtime_record_matches_source(&runtime, &source_receipt).await {
-        return Err(JavaRuntimeLookupError::Download(
+        return Err(JavaRuntimeLookupError::Install(
             "installed runtime does not match its authenticated source".to_string(),
         ));
     }
@@ -517,7 +517,7 @@ where
             .into_source_receipt();
     let effective = resolve_component_runtime(cache, &component, required_major)?;
     if !runtime_record_matches_source(&effective, &source_receipt).await {
-        return Err(JavaRuntimeLookupError::Download(
+        return Err(JavaRuntimeLookupError::Install(
             "installed runtime does not match its authenticated source".to_string(),
         ));
     }
@@ -555,30 +555,30 @@ async fn acquire_persisted_runtime_source_for_test(
     use tokio::io::AsyncReadExt as _;
 
     let runtime_root = cache.component_root(component.as_str()).ok_or_else(|| {
-        JavaRuntimeLookupError::Download(
+        JavaRuntimeLookupError::Install(
             "runtime component is outside the managed cache vocabulary".to_string(),
         )
     })?;
     let proof_path = runtime_root.join(COMPONENT_MANIFEST_PROOF_FILE);
     let file = tokio::fs::File::open(proof_path)
         .await
-        .map_err(|error| JavaRuntimeLookupError::Download(error.to_string()))?;
+        .map_err(|error| JavaRuntimeLookupError::Install(error.to_string()))?;
     let mut bytes = Vec::new();
     file.take(super::manifest::MAX_RUNTIME_MANIFEST_BYTES + 1)
         .read_to_end(&mut bytes)
         .await
-        .map_err(|error| JavaRuntimeLookupError::Download(error.to_string()))?;
+        .map_err(|error| JavaRuntimeLookupError::Install(error.to_string()))?;
     if bytes.len() as u64 > super::manifest::MAX_RUNTIME_MANIFEST_BYTES {
-        return Err(JavaRuntimeLookupError::Download(
+        return Err(JavaRuntimeLookupError::Install(
             "persisted runtime manifest proof is too large".to_string(),
         ));
     }
     let manifest = serde_json::from_slice::<ComponentManifest>(&bytes)
-        .map_err(|error| JavaRuntimeLookupError::Download(error.to_string()))?;
+        .map_err(|error| JavaRuntimeLookupError::Install(error.to_string()))?;
     let canonical = super::manifest::component_manifest_proof_bytes(&manifest)
-        .map_err(|error| JavaRuntimeLookupError::Download(error.to_string()))?;
+        .map_err(|error| JavaRuntimeLookupError::Install(error.to_string()))?;
     if bytes != canonical {
-        return Err(JavaRuntimeLookupError::Download(
+        return Err(JavaRuntimeLookupError::Install(
             "persisted runtime manifest proof is not canonical".to_string(),
         ));
     }

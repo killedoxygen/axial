@@ -34,6 +34,8 @@ pub enum DownloadError {
     ParseVersion(#[from] serde_json::Error),
     #[error("prepare java runtime: {0}")]
     PrepareRuntime(String),
+    #[error("acquire java runtime source: {0}")]
+    RuntimeSource(String),
     #[error("java runtime {component} is not available for {platform}")]
     RuntimeUnavailableForPlatform { component: String, platform: String },
     #[error(
