@@ -13,6 +13,7 @@ use super::contracts::{
     ReconciliationScope, ReconciliationTerminal, ReconciliationTerminalOutcome,
 };
 use super::ownership::{CurrentArtifact, classify_current_artifact};
+use crate::execution::anchored_record::{AnchoredRecordDirectory, AnchoredRecordObservation};
 use crate::execution::persistence::{
     AcceptedWrite, AtomicSnapshotWriter, PersistenceCoordinator, PersistenceOwnerLease,
     WriteUrgency,
@@ -23,7 +24,6 @@ use chrono::{DateTime, FixedOffset, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
-use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
@@ -32,6 +32,13 @@ use tokio::sync::{Mutex as AsyncMutex, MutexGuard as AsyncMutexGuard};
 pub const FAILURE_MEMORY_SCHEMA: &str = "axial.guardian.failure_memory.v4";
 pub const DEFAULT_FAILURE_MEMORY_LIMIT: usize = RECONCILIATION_EVIDENCE_CAPACITY;
 const FAILURE_MEMORY_FILE: &str = "failure-memory.json";
+// The outer read bound follows the v4 record budget and fixed 128-entry capacity.
+const MAX_FAILURE_MEMORY_ENTRY_BYTES: u64 = 16 * 1024;
+const FAILURE_MEMORY_SNAPSHOT_FIXED_BYTES: u64 =
+    (r#"{"schema":"","entries":[]}"#.len() + FAILURE_MEMORY_SCHEMA.len()) as u64;
+const MAX_FAILURE_MEMORY_SNAPSHOT_BYTES: u64 = FAILURE_MEMORY_SNAPSHOT_FIXED_BYTES
+    + DEFAULT_FAILURE_MEMORY_LIMIT as u64 * MAX_FAILURE_MEMORY_ENTRY_BYTES
+    + (DEFAULT_FAILURE_MEMORY_LIMIT - 1) as u64;
 const FAILURE_MEMORY_LOCK_INVARIANT: &str =
     "Guardian failure-memory records lock poisoned; in-memory and persisted state may diverge";
 
@@ -457,6 +464,9 @@ impl FailureMemorySnapshot {
         }
         let mut keys = BTreeSet::new();
         for entry in &self.entries {
+            if serde_json::to_vec(entry)?.len() as u64 > MAX_FAILURE_MEMORY_ENTRY_BYTES {
+                return Err(FailureMemoryLoadError::TooLarge);
+            }
             entry.validate()?;
             if !keys.insert(entry.key.as_str()) {
                 return Err(FailureMemoryLoadError::DuplicateKey);
@@ -470,6 +480,7 @@ impl FailureMemorySnapshot {
 pub enum FailureMemoryLoadError {
     Json(serde_json::Error),
     InvalidSchema,
+    TooLarge,
     TooManyEntries,
     InvalidEntry(FailureMemoryValidationError),
     DuplicateKey,
@@ -655,13 +666,46 @@ impl GuardianFailureMemoryStore {
             Some(FailureMemoryPersistence::claim(&storage_path, coordinator)?),
         );
 
-        match fs::read_to_string(&storage_path) {
-            Ok(data) => store.load_snapshot(FailureMemorySnapshot::from_json(&data)?)?,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => return Err(FailureMemoryStoreError::Persistence(error)),
-        }
+        store.load_from_path(&storage_path)?;
 
         Ok(store)
+    }
+
+    fn load_from_path(&self, storage_path: &Path) -> Result<(), FailureMemoryStoreError> {
+        let Some(parent) = storage_path.parent() else {
+            return Err(FailureMemoryStoreError::Persistence(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Guardian failure-memory path has no parent",
+            )));
+        };
+        let Some(file_name) = storage_path.file_name() else {
+            return Err(FailureMemoryStoreError::Persistence(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Guardian failure-memory path has no file name",
+            )));
+        };
+        let directory = match AnchoredRecordDirectory::open(parent) {
+            Ok(directory) => directory,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(FailureMemoryStoreError::Persistence(error)),
+        };
+        let observation =
+            match directory.read_for_mutation(file_name, MAX_FAILURE_MEMORY_SNAPSHOT_BYTES) {
+                Ok(observation) => observation,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+                Err(error) => return Err(FailureMemoryStoreError::Persistence(error)),
+            };
+        let bytes = match observation {
+            AnchoredRecordObservation::Bytes { bytes, .. } => bytes,
+            AnchoredRecordObservation::Oversized { .. } => {
+                return Err(FailureMemoryLoadError::TooLarge.into());
+            }
+        };
+        let data = String::from_utf8(bytes).map_err(|error| {
+            FailureMemoryStoreError::Persistence(io::Error::new(io::ErrorKind::InvalidData, error))
+        })?;
+        self.load_snapshot(FailureMemorySnapshot::from_json(&data)?)?;
+        Ok(())
     }
 
     fn with_max_entries_and_persistence(
@@ -1527,10 +1571,17 @@ fn failure_memory_target() -> TargetDescriptor {
 }
 
 fn encode_snapshot(snapshot: FailureMemorySnapshot) -> io::Result<Vec<u8>> {
-    snapshot
+    let encoded = snapshot
         .to_json()
         .map(String::into_bytes)
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    if encoded.len() as u64 > MAX_FAILURE_MEMORY_SNAPSHOT_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Guardian failure-memory snapshot exceeds its persistence bound",
+        ));
+    }
+    Ok(encoded)
 }
 
 #[cfg(test)]
@@ -1644,6 +1695,159 @@ mod tests {
         let decoded = FailureMemorySnapshot::from_json(&encoded).expect("deserialize snapshot");
 
         assert_eq!(decoded.entries, vec![entry]);
+    }
+
+    #[tokio::test]
+    async fn failure_memory_store_loads_a_valid_bounded_snapshot() {
+        let root = test_root("bounded-valid-load");
+        let paths = test_paths(&root);
+        let path = super::failure_memory_path(&paths);
+        fs::create_dir_all(path.parent().expect("failure-memory parent"))
+            .expect("create failure-memory parent");
+        let entry =
+            retry_entry("2026-06-15T10:00:00Z").with_suppression_until("2026-06-15T10:30:00Z");
+        let snapshot = FailureMemorySnapshot::new(vec![entry.clone()]).expect("valid snapshot");
+        fs::write(&path, snapshot.to_json().expect("encode valid snapshot"))
+            .expect("write valid snapshot");
+
+        let store = GuardianFailureMemoryStore::try_load_from_paths(&paths)
+            .expect("load valid bounded snapshot");
+        assert_eq!(store.get(&entry.key), Some(entry));
+
+        store.close().await.expect("close valid loaded store");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn failure_memory_store_reads_the_exact_snapshot_byte_bound() {
+        let root = test_root("exact-snapshot-bound");
+        let paths = test_paths(&root);
+        let path = super::failure_memory_path(&paths);
+        fs::create_dir_all(path.parent().expect("failure-memory parent"))
+            .expect("create failure-memory parent");
+        let file = fs::File::create(&path).expect("create exact-bound snapshot");
+        file.set_len(super::MAX_FAILURE_MEMORY_SNAPSHOT_BYTES)
+            .expect("size exact-bound snapshot");
+        drop(file);
+
+        assert!(matches!(
+            GuardianFailureMemoryStore::try_load_from_paths(&paths),
+            Err(FailureMemoryStoreError::Snapshot(
+                FailureMemoryLoadError::Json(_)
+            ))
+        ));
+        assert_eq!(
+            fs::metadata(&path)
+                .expect("exact-bound snapshot remains")
+                .len(),
+            super::MAX_FAILURE_MEMORY_SNAPSHOT_BYTES
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn failure_memory_store_rejects_an_oversized_regular_file_without_replacing_it() {
+        let root = test_root("oversized-snapshot");
+        let paths = test_paths(&root);
+        let path = super::failure_memory_path(&paths);
+        fs::create_dir_all(path.parent().expect("failure-memory parent"))
+            .expect("create failure-memory parent");
+        let file = fs::File::create(&path).expect("create oversized snapshot");
+        file.set_len(super::MAX_FAILURE_MEMORY_SNAPSHOT_BYTES + 1)
+            .expect("size oversized snapshot");
+        drop(file);
+
+        assert!(matches!(
+            GuardianFailureMemoryStore::try_load_from_paths(&paths),
+            Err(FailureMemoryStoreError::Snapshot(
+                FailureMemoryLoadError::TooLarge
+            ))
+        ));
+        assert_eq!(
+            fs::metadata(&path)
+                .expect("oversized snapshot remains")
+                .len(),
+            super::MAX_FAILURE_MEMORY_SNAPSHOT_BYTES + 1
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failure_memory_store_rejects_a_symlink_without_following_it() {
+        use std::os::unix::fs::symlink;
+
+        let root = test_root("symlink-snapshot");
+        let outside = test_root("symlink-snapshot-outside");
+        let paths = test_paths(&root);
+        let path = super::failure_memory_path(&paths);
+        let outside_path = outside.join("outside-failure-memory.json");
+        fs::create_dir_all(path.parent().expect("failure-memory parent"))
+            .expect("create failure-memory parent");
+        fs::write(&outside_path, FAILURE_MEMORY_V4_FIXTURE).expect("write outside snapshot");
+        symlink(&outside_path, &path).expect("link failure-memory snapshot");
+
+        assert!(matches!(
+            GuardianFailureMemoryStore::try_load_from_paths(&paths),
+            Err(FailureMemoryStoreError::Persistence(_))
+        ));
+        assert_eq!(
+            fs::read_to_string(&outside_path).expect("outside snapshot remains readable"),
+            FAILURE_MEMORY_V4_FIXTURE
+        );
+        assert!(
+            fs::symlink_metadata(&path)
+                .expect("failure-memory link remains")
+                .file_type()
+                .is_symlink()
+        );
+
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&outside);
+    }
+
+    #[test]
+    fn failure_memory_encoder_accepts_the_exact_snapshot_bound_and_rejects_one_more_byte() {
+        let mut snapshot = FailureMemorySnapshot {
+            schema: String::new(),
+            entries: Vec::new(),
+        };
+        let overhead = serde_json::to_vec(&snapshot)
+            .expect("serialize empty snapshot")
+            .len();
+        assert_eq!(
+            (overhead + super::FAILURE_MEMORY_SCHEMA.len()) as u64,
+            super::FAILURE_MEMORY_SNAPSHOT_FIXED_BYTES
+        );
+        snapshot.schema = "x".repeat(super::MAX_FAILURE_MEMORY_SNAPSHOT_BYTES as usize - overhead);
+
+        let encoded = super::encode_snapshot(snapshot.clone()).expect("accept exact size bound");
+        assert_eq!(
+            encoded.len() as u64,
+            super::MAX_FAILURE_MEMORY_SNAPSHOT_BYTES
+        );
+
+        snapshot.schema.push('x');
+        assert_eq!(
+            super::encode_snapshot(snapshot)
+                .expect_err("oversized snapshots must not be persisted")
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+    }
+
+    #[test]
+    fn failure_memory_snapshot_rejects_an_entry_over_its_schema_budget() {
+        let mut entry = retry_entry("2026-06-15T10:00:00Z");
+        entry.target_content_hash =
+            Some("x".repeat(super::MAX_FAILURE_MEMORY_ENTRY_BYTES as usize));
+
+        assert!(matches!(
+            FailureMemorySnapshot::new(vec![entry]),
+            Err(FailureMemoryLoadError::TooLarge)
+        ));
     }
 
     #[test]
