@@ -1,6 +1,7 @@
 mod commands;
 mod discord_presence;
 mod events;
+mod smoke;
 mod state;
 
 use axial_api::app::{spawn_background, start_application_background_workflows};
@@ -11,7 +12,7 @@ use axial_api::state::{AppState, AppStateInit, InstallStore, SessionStore};
 use axial_config::{AppPaths, ConfigStore, InstanceStore};
 use axial_performance::PerformanceManager;
 use std::sync::Arc;
-use tauri::{Emitter, Manager, WindowEvent};
+use tauri::{Emitter, Manager, WebviewWindowBuilder, WindowEvent};
 use tokio::runtime::Builder as TokioRuntimeBuilder;
 use tracing::info;
 
@@ -26,6 +27,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
+    let webview_data_directory = smoke::webview_data_directory()?;
+    let mut context = tauri::generate_context!();
+    let isolated_main_window = smoke::isolate_main_window(
+        &mut context.config_mut().app.windows,
+        webview_data_directory,
+    )?;
     tracing_subscriber::fmt::init();
 
     let paths = AppPaths::detect();
@@ -150,6 +157,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         })
         .setup(move |app| {
             app.manage(setup_api_runtime.clone());
+            if let Some(window) = isolated_main_window {
+                WebviewWindowBuilder::from_config(app.handle(), &window.config)?
+                    .data_directory(window.data_directory)
+                    .build()?;
+            }
             let handle = app.handle().clone();
             let api = setup_api_runtime.clone();
             tauri::async_runtime::spawn(async move {
@@ -158,7 +170,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             });
             Ok(())
         })
-        .run(tauri::generate_context!());
+        .run(context);
 
     if let Err(error) = run_result {
         emit_startup_failed(&telemetry);
