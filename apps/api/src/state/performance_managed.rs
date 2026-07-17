@@ -430,9 +430,13 @@ impl ManagedCompositionAdmission {
         &self,
         plan: Option<&CompositionPlan>,
     ) -> Result<ManagedCompositionInspection, ManagedMutationError> {
-        // Core inspection also reconciles interrupted managed publications and removals.
-        let _mutation = self.managed_mutation_admission()?;
-        let result = self.authority.inspect(&self.entry.identity, plan).await;
+        let managed_artifact_epoch = self.managed_artifact_epoch.clone();
+        let result = self
+            .authority
+            .inspect(&self.entry.identity, plan, move || {
+                managed_mutation_admission(&managed_artifact_epoch)
+            })
+            .await;
         self.latch_indeterminate(&result);
         result
     }
@@ -441,11 +445,12 @@ impl ManagedCompositionAdmission {
         &self,
         request: ResolutionRequest,
     ) -> Result<ManagedResolvedInspection, ManagedMutationError> {
-        // Core inspection also reconciles interrupted managed publications and removals.
-        let _mutation = self.managed_mutation_admission()?;
+        let managed_artifact_epoch = self.managed_artifact_epoch.clone();
         let result = self
             .authority
-            .resolve_and_inspect(&self.entry.identity, request)
+            .resolve_and_inspect(&self.entry.identity, request, move || {
+                managed_mutation_admission(&managed_artifact_epoch)
+            })
             .await;
         self.latch_indeterminate(&result);
         result
@@ -498,12 +503,18 @@ impl ManagedCompositionAdmission {
     fn managed_mutation_admission(
         &self,
     ) -> Result<super::ManagedArtifactMutationAdmission, ManagedMutationError> {
-        self.managed_artifact_epoch.admit().map_err(|error| {
-            ManagedMutationError::Definite(axial_performance::InstallError::Io(io::Error::other(
-                error.to_string(),
-            )))
-        })
+        managed_mutation_admission(&self.managed_artifact_epoch)
     }
+}
+
+fn managed_mutation_admission(
+    managed_artifact_epoch: &super::managed_artifact_epoch::ManagedArtifactMutationEpochCoordinator,
+) -> Result<super::ManagedArtifactMutationAdmission, ManagedMutationError> {
+    managed_artifact_epoch.admit().map_err(|error| {
+        ManagedMutationError::Definite(axial_performance::InstallError::Io(io::Error::other(
+            error.to_string(),
+        )))
+    })
 }
 
 pub(super) fn managed_authority_claim_error(
@@ -518,7 +529,9 @@ mod tests {
         ManagedCompositionAdmissionError, ManagedCompositionOwner, ManagedEntryPhase,
         ManagedMutationError,
     };
-    use axial_performance::PerformanceManager;
+    use axial_performance::{
+        HardwareProfile, PerformanceManager, PerformanceMode, ResolutionRequest,
+    };
     use std::future::Future;
     use std::pin::Pin;
     use std::sync::Arc;
@@ -531,6 +544,8 @@ mod tests {
     struct OwnerFixture {
         root: std::path::PathBuf,
         owner: Arc<ManagedCompositionOwner>,
+        managed_artifact_epoch:
+            super::super::managed_artifact_epoch::ManagedArtifactMutationEpochCoordinator,
         instance_lifecycle: super::super::instance_lifecycle::InstanceLifecycleGates,
     }
 
@@ -549,13 +564,16 @@ mod tests {
                 .expect("claim managed authority");
             let instance_lifecycle =
                 super::super::instance_lifecycle::InstanceLifecycleGates::default();
+            let managed_artifact_epoch = super::super::managed_artifact_epoch::
+                ManagedArtifactMutationEpochCoordinator::default();
             Self {
                 root,
                 owner: Arc::new(ManagedCompositionOwner::claim(
                     authority,
                     instance_lifecycle.clone(),
-                    super::super::managed_artifact_epoch::ManagedArtifactMutationEpochCoordinator::default(),
+                    managed_artifact_epoch.clone(),
                 )),
+                managed_artifact_epoch,
                 instance_lifecycle,
             }
         }
@@ -586,6 +604,13 @@ mod tests {
             self.owner
                 .admit(instance_id, lifecycle, recovery_allowed)
                 .await
+        }
+
+        fn artifact_epoch(&self) -> u64 {
+            self.managed_artifact_epoch
+                .current()
+                .expect("managed artifact epoch")
+                .value()
         }
     }
 
@@ -755,6 +780,68 @@ mod tests {
                     .is_empty()
             );
         }
+    }
+
+    #[tokio::test]
+    async fn healthy_inspection_and_resolution_leave_the_artifact_epoch_unchanged() {
+        let fixture = OwnerFixture::new("healthy-inspection-epoch");
+        let admitted = fixture.admit(INSTANCE_A).await.expect("admission");
+        let initial_epoch = fixture.artifact_epoch();
+
+        admitted.inspect(None).await.expect("healthy inspection");
+        admitted
+            .resolve_and_inspect(ResolutionRequest {
+                game_version: "1.21.1".to_string(),
+                loader: "fabric".to_string(),
+                mode: PerformanceMode::Managed,
+                hardware: HardwareProfile::default(),
+                installed_mods: Vec::new(),
+            })
+            .await
+            .expect("healthy resolved inspection");
+
+        assert_eq!(fixture.artifact_epoch(), initial_epoch);
+    }
+
+    #[tokio::test]
+    async fn effectful_inspection_advances_the_artifact_epoch_once() {
+        let fixture = OwnerFixture::new("effectful-inspection-epoch");
+        let mods_dir = fixture.mods_dir(INSTANCE_A);
+        std::fs::create_dir_all(&mods_dir).expect("create instance mods directory");
+        let staged = mods_dir.join(".axial-lock.json.new.tmp");
+        std::fs::write(
+            &staged,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "schema_version": 1,
+                "state": {
+                    "composition_id": "core",
+                    "tier": "core",
+                    "installed_mods": [],
+                    "installed_at": "2026-07-17T00:00:00Z",
+                    "failure_count": 0,
+                    "last_failure": ""
+                }
+            }))
+            .expect("serialize staged state"),
+        )
+        .expect("seed interrupted state publication");
+        let admitted = fixture.admit(INSTANCE_A).await.expect("admission");
+        let initial_epoch = fixture.artifact_epoch();
+
+        admitted
+            .inspect(None)
+            .await
+            .expect("recover interrupted publication");
+
+        assert_eq!(fixture.artifact_epoch(), initial_epoch + 1);
+        assert!(!staged.exists());
+        assert!(mods_dir.join(".axial-lock.json").is_file());
+
+        admitted
+            .inspect(None)
+            .await
+            .expect("settled follow-up inspection");
+        assert_eq!(fixture.artifact_epoch(), initial_epoch + 1);
     }
 
     #[tokio::test]

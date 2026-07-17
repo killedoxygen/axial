@@ -27,10 +27,23 @@ use ed25519_dalek::{Signer, SigningKey};
 use sha2::Digest;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 const CURRENT_FAMILY_F_REPRESENTATIVE: &str = "1.21.1";
+
+struct StagedPublicationPermit {
+    staged: PathBuf,
+    drop_count: Arc<AtomicUsize>,
+}
+
+impl Drop for StagedPublicationPermit {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.staged);
+        self.drop_count.fetch_add(1, Ordering::SeqCst);
+    }
+}
 
 fn managed_install_error(error: &ManagedMutationError) -> Option<&InstallError> {
     match error {
@@ -1195,7 +1208,7 @@ async fn authority_inspection_classifies_invalid_admitted_state_as_definite() {
     let identity = authority.identify(instance_id).expect("identify instance");
 
     let error = authority
-        .inspect(&identity, None)
+        .inspect(&identity, None, || Ok(()))
         .await
         .expect_err("invalid admitted state should fail inspection");
 
@@ -1203,6 +1216,155 @@ async fn authority_inspection_classifies_invalid_admitted_state_as_definite() {
         error,
         ManagedMutationError::Definite(InstallError::State(StateError::Parse(_)))
     ));
+    let _ = fs::remove_dir_all(instances_root);
+}
+
+#[tokio::test]
+async fn healthy_authority_inspections_do_not_request_mutation_admission() {
+    let instances_root = test_root("authority-healthy-inspection-admission");
+    let instance_id = "0123456789abcdef";
+    let mods_dir = instances_root.join(instance_id).join("mods");
+    fs::create_dir_all(
+        mods_dir
+            .join(crate::state::STATE_DIR_NAME)
+            .join("mutations")
+            .join("removals")
+            .join("0".repeat(128)),
+    )
+    .expect("create empty removal root");
+    for child in ["files", "history", "tmp"] {
+        fs::create_dir_all(
+            mods_dir
+                .join(crate::state::STATE_DIR_NAME)
+                .join("rollback")
+                .join(child),
+        )
+        .expect("create empty rollback root");
+    }
+    let manager = Arc::new(PerformanceManager::new().expect("performance manager"));
+    let authority = manager
+        .claim_managed_authority(&instances_root)
+        .expect("claim managed authority");
+    let identity = authority.identify(instance_id).expect("identify instance");
+    let admission_count = Arc::new(AtomicUsize::new(0));
+
+    let inspect_count = admission_count.clone();
+    authority
+        .inspect(&identity, None, move || {
+            inspect_count.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        })
+        .await
+        .expect("healthy inspection");
+    let resolve_count = admission_count.clone();
+    authority
+        .resolve_and_inspect(
+            &identity,
+            ResolutionRequest {
+                game_version: "1.21.1".to_string(),
+                loader: "fabric".to_string(),
+                mode: PerformanceMode::Managed,
+                hardware: Default::default(),
+                installed_mods: Vec::new(),
+            },
+            move || {
+                resolve_count.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            },
+        )
+        .await
+        .expect("healthy resolved inspection");
+
+    assert_eq!(admission_count.load(Ordering::SeqCst), 0);
+    let _ = fs::remove_dir_all(instances_root);
+}
+
+#[tokio::test]
+async fn effectful_inspection_requests_one_mutation_admission() {
+    let instances_root = test_root("authority-effectful-inspection-admission");
+    let instance_id = "0123456789abcdef";
+    let mods_dir = instances_root.join(instance_id).join("mods");
+    fs::create_dir_all(&mods_dir).expect("create instance mods directory");
+    let state = test_state("core", Vec::new());
+    save_state(&mods_dir, &state).expect("save managed state");
+    let staged = mods_dir.join(".axial-lock.json.new.tmp");
+    fs::rename(crate::state::lock_file_path(&mods_dir), &staged)
+        .expect("seed interrupted state publication");
+    let manager = Arc::new(PerformanceManager::new().expect("performance manager"));
+    let authority = manager
+        .claim_managed_authority(&instances_root)
+        .expect("claim managed authority");
+    let identity = authority.identify(instance_id).expect("identify instance");
+    let admission_count = Arc::new(AtomicUsize::new(0));
+    let permit_drop_count = Arc::new(AtomicUsize::new(0));
+    let callback_count = admission_count.clone();
+    let callback_drop_count = permit_drop_count.clone();
+    let permit_staged = staged.clone();
+
+    let inspection = authority
+        .inspect(&identity, None, move || {
+            callback_count.fetch_add(1, Ordering::SeqCst);
+            Ok(StagedPublicationPermit {
+                staged: permit_staged,
+                drop_count: callback_drop_count,
+            })
+        })
+        .await
+        .expect("recover interrupted publication");
+
+    assert_eq!(inspection.state, Some(state));
+    assert_eq!(admission_count.load(Ordering::SeqCst), 1);
+    assert_eq!(permit_drop_count.load(Ordering::SeqCst), 1);
+    assert!(!staged.exists());
+    assert!(crate::state::lock_file_path(&mods_dir).is_file());
+    let _ = fs::remove_dir_all(instances_root);
+}
+
+#[tokio::test]
+async fn refused_inspection_admission_preserves_recovery_obligations() {
+    let instances_root = test_root("authority-refused-inspection-admission");
+    let instance_id = "0123456789abcdef";
+    let mods_dir = instances_root.join(instance_id).join("mods");
+    fs::create_dir_all(&mods_dir).expect("create instance mods directory");
+    save_state(&mods_dir, &test_state("core", Vec::new())).expect("save managed state");
+    let staged = mods_dir.join(".axial-lock.json.new.tmp");
+    fs::rename(crate::state::lock_file_path(&mods_dir), &staged)
+        .expect("seed interrupted state publication");
+    let staged_bytes = fs::read(&staged).expect("read staged state");
+    let manager = Arc::new(PerformanceManager::new().expect("performance manager"));
+    let authority = manager
+        .claim_managed_authority(&instances_root)
+        .expect("claim managed authority");
+    let identity = authority.identify(instance_id).expect("identify instance");
+    let admission_count = Arc::new(AtomicUsize::new(0));
+    let callback_count = admission_count.clone();
+
+    let error = authority
+        .inspect(&identity, None, move || {
+            callback_count.fetch_add(1, Ordering::SeqCst);
+            Err::<(), _>(ManagedMutationError::Definite(InstallError::Io(
+                std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "test mutation admission refused",
+                ),
+            )))
+        })
+        .await
+        .expect_err("refused mutation admission");
+
+    assert!(matches!(
+        error,
+        ManagedMutationError::Definite(InstallError::Io(ref source))
+            if source.kind() == std::io::ErrorKind::PermissionDenied
+    ));
+    assert_eq!(admission_count.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        fs::read(&staged).expect("staged state remains"),
+        staged_bytes
+    );
+    assert!(!crate::state::lock_file_path(&mods_dir).exists());
+    assert!(!mods_dir.join(".axial-lock.json.previous.tmp").exists());
+    assert!(!mods_dir.join(".axial-lock.json.delete.tmp").exists());
     let _ = fs::remove_dir_all(instances_root);
 }
 

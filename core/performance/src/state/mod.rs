@@ -200,6 +200,57 @@ pub(crate) fn load_state_admitted(
     )
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct ManagedInspectionReconciliation {
+    state_publication: bool,
+    managed_removal: bool,
+    rollback_publication: bool,
+}
+
+impl ManagedInspectionReconciliation {
+    pub(crate) const fn state_publication_required(self) -> bool {
+        self.state_publication
+    }
+
+    pub(crate) const fn admitted_state_reconciliation_required(self) -> bool {
+        self.managed_removal || self.rollback_publication
+    }
+}
+
+pub(crate) fn preflight_managed_inspection_reconciliation(
+    instance_mods_dir: &Path,
+) -> Result<ManagedInspectionReconciliation, StateError> {
+    Ok(ManagedInspectionReconciliation {
+        state_publication: state_publication_reconciliation_required(instance_mods_dir)?,
+        managed_removal: managed_removal_reconciliation_required(instance_mods_dir)?,
+        rollback_publication: rollback_publication_reconciliation_required(instance_mods_dir)?,
+    })
+}
+
+pub(crate) fn reconcile_managed_inspection_publication(
+    instance_mods_dir: &Path,
+    preflight: ManagedInspectionReconciliation,
+) -> Result<(), StateError> {
+    if preflight.state_publication {
+        reconcile_state_publication(instance_mods_dir)?;
+    }
+    Ok(())
+}
+
+pub(crate) fn reconcile_managed_inspection_obligations(
+    instance_mods_dir: &Path,
+    preflight: ManagedInspectionReconciliation,
+    state: Option<&CompositionState>,
+) -> Result<(), StateError> {
+    if preflight.managed_removal {
+        reconcile_managed_removal_obligations(instance_mods_dir, state)?;
+    }
+    if preflight.rollback_publication {
+        reconcile_rollback_metadata(instance_mods_dir)?;
+    }
+    Ok(())
+}
+
 pub(crate) fn save_state(
     instance_mods_dir: &Path,
     state: &CompositionState,
@@ -265,6 +316,24 @@ fn state_backup_path(instance_mods_dir: &Path) -> PathBuf {
 
 fn state_delete_path(instance_mods_dir: &Path) -> PathBuf {
     instance_mods_dir.join(LOCK_DELETE_FILE_NAME)
+}
+
+fn state_publication_reconciliation_required(instance_mods_dir: &Path) -> Result<bool, StateError> {
+    let destination = lock_file_path(instance_mods_dir);
+    let staged = state_staged_path(instance_mods_dir);
+    let backup = state_backup_path(instance_mods_dir);
+    let deletion = state_delete_path(instance_mods_dir);
+    let deletion_present = read_delete_marker_if_present(&deletion)?;
+    let staged_present = path_exists(&staged)?;
+    let backup_present = path_exists(&backup)?;
+    if !deletion_present && !staged_present && !backup_present {
+        return Ok(false);
+    }
+
+    read_state_snapshot_if_present(&destination)?;
+    read_state_snapshot_if_present(&staged)?;
+    read_state_snapshot_if_present(&backup)?;
+    Ok(true)
 }
 
 fn publication(phase: StatePublicationPhase, source: std::io::Error) -> StateError {
@@ -1770,6 +1839,59 @@ fn ensure_mutation_directory_tree(instance_mods_dir: &Path, leaf: &Path) -> Resu
     Ok(())
 }
 
+fn managed_removal_reconciliation_required(instance_mods_dir: &Path) -> Result<bool, StateError> {
+    let state_root = instance_mods_dir.join(STATE_DIR_NAME);
+    let mutation_root = state_root.join(MUTATION_DIR_NAME);
+    let root = mutation_root.join(REMOVAL_DIR_NAME);
+    for path in [&state_root, &mutation_root, &root] {
+        validate_managed_recovery_directory(path)?;
+    }
+    let digest_dirs = match fs::read_dir(&root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(StateError::Read(error)),
+    };
+    let mut count = 0_usize;
+    let mut required = false;
+    for digest_dir in digest_dirs {
+        let digest_dir = digest_dir?;
+        admit_recovery_entry(&mut count, "managed removal obligations")?;
+        if !digest_dir.file_type()?.is_dir() {
+            return Err(StateError::InvalidState(
+                "managed removal digest path is not a directory".to_string(),
+            ));
+        }
+        let digest = digest_dir
+            .file_name()
+            .to_str()
+            .filter(|value| {
+                value.len() == 128 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+            })
+            .ok_or_else(|| {
+                StateError::InvalidState("managed removal digest is invalid".to_string())
+            })?
+            .to_string();
+        for entry in fs::read_dir(digest_dir.path())? {
+            let entry = entry?;
+            admit_recovery_entry(&mut count, "managed removal obligations")?;
+            let filename = entry
+                .file_name()
+                .to_str()
+                .ok_or_else(|| StateError::InvalidFilename("managed removal".to_string()))?
+                .to_string();
+            validate_managed_filename(&filename)?;
+            if !entry.file_type()?.is_file() || !path_matches_sha512(&entry.path(), &digest)? {
+                return Err(StateError::InvalidIntegrity {
+                    filename,
+                    reason: "managed removal obligation ownership cannot be proven".to_string(),
+                });
+            }
+            required = true;
+        }
+    }
+    Ok(required)
+}
+
 pub(crate) fn reconcile_managed_removal_obligations(
     instance_mods_dir: &Path,
     current_state: Option<&CompositionState>,
@@ -3270,6 +3392,29 @@ fn rollback_metadata_backup_path(path: &Path) -> PathBuf {
     path.with_extension("json.previous.tmp")
 }
 
+fn rollback_publication_reconciliation_required(
+    instance_mods_dir: &Path,
+) -> Result<bool, StateError> {
+    validate_rollback_internal_roots(instance_mods_dir)?;
+    let path = rollback_file_path(instance_mods_dir);
+    let backup = rollback_metadata_backup_path(&path);
+    match fs::symlink_metadata(&backup) {
+        Ok(_) => {
+            admitted_rollback_file_sha512(&backup)?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(StateError::Read(error)),
+    }
+    match fs::symlink_metadata(&path) {
+        Ok(_) => {
+            admitted_rollback_file_sha512(&path)?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(StateError::Read(error)),
+    }
+    Ok(true)
+}
+
 fn reconcile_rollback_metadata_publication(path: &Path) -> Result<(), StateError> {
     let backup = rollback_metadata_backup_path(path);
     let previous_sha512 = match fs::symlink_metadata(&backup) {
@@ -3629,6 +3774,25 @@ mod tests {
     }
 
     #[test]
+    fn inspection_preflight_detects_removal_without_settling_it() {
+        let root = test_root("preflight-removal-obligation");
+        let installed = test_mod("sodium", "managed-a.jar");
+        fs::write(root.join(&installed.filename), b"managed-a").expect("write managed artifact");
+        save_state(&root, &test_state("core", vec![installed.clone()]))
+            .expect("save managed state");
+        let backup = stage_managed_artifact_removal(&root, &installed)
+            .expect("stage managed artifact removal");
+
+        let preflight = preflight_managed_inspection_reconciliation(&root)
+            .expect("preflight removal obligation");
+
+        assert!(preflight.admitted_state_reconciliation_required());
+        assert!(backup.exists());
+        assert!(!root.join(&installed.filename).exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn managed_recovery_settles_exact_removal_obligation_and_proves_state() {
         let root = test_root("recover-removal-obligation");
         let installed = test_mod("sodium", "managed-a.jar");
@@ -3911,6 +4075,24 @@ mod tests {
             snapshot.id
         );
         assert!(!backup.exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn inspection_preflight_detects_rollback_publication_without_settling_it() {
+        let root = test_root("preflight-rollback-publication");
+        save_rollback_snapshot(&root, &test_state("core", Vec::new()))
+            .expect("save rollback snapshot");
+        let latest = rollback_file_path(&root);
+        let backup = rollback_metadata_backup_path(&latest);
+        fs::rename(&latest, &backup).expect("stage rollback metadata obligation");
+
+        let preflight = preflight_managed_inspection_reconciliation(&root)
+            .expect("preflight rollback obligation");
+
+        assert!(preflight.admitted_state_reconciliation_required());
+        assert!(backup.exists());
+        assert!(!latest.exists());
         let _ = fs::remove_dir_all(root);
     }
 

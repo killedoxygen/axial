@@ -190,43 +190,55 @@ impl ManagedCompositionAuthority {
             .await
     }
 
-    pub async fn inspect(
+    pub async fn inspect<AdmitMutation, MutationPermit>(
         &self,
         identity: &ManagedInstanceIdentity,
         plan: Option<&CompositionPlan>,
-    ) -> Result<ManagedCompositionInspection, ManagedMutationError> {
+        admit_mutation: AdmitMutation,
+    ) -> Result<ManagedCompositionInspection, ManagedMutationError>
+    where
+        AdmitMutation: FnOnce() -> Result<MutationPermit, ManagedMutationError> + Send + 'static,
+        MutationPermit: Send + 'static,
+    {
         self.validate_identity(identity).await?;
         let mods_dir = identity.mods_dir().to_path_buf();
         let plan = plan.cloned();
         tokio::task::spawn_blocking(move || -> Result<_, ManagedMutationError> {
-            let state = admitted_inspection_state(&mods_dir)?;
+            let (state, mutation_permit) = admitted_inspection_state(&mods_dir, admit_mutation)?;
             let (health, warnings) =
                 crate::health::derive_health(state.as_ref(), plan.as_ref(), &mods_dir);
             let installed_mod_evidence = installed_mod_evidence(&mods_dir, state.as_ref());
             let rollback_snapshots = crate::state::list_rollback_snapshots_admitted(&mods_dir)
                 .map_err(ManagedMutationError::definite)?;
-            Ok(ManagedCompositionInspection {
+            let inspection = ManagedCompositionInspection {
                 state,
                 health,
                 warnings,
                 installed_mod_evidence,
                 rollback_snapshots,
-            })
+            };
+            drop(mutation_permit);
+            Ok(inspection)
         })
         .await
         .map_err(|_| ManagedMutationError::task_stopped("inspect"))?
     }
 
-    pub async fn resolve_and_inspect(
+    pub async fn resolve_and_inspect<AdmitMutation, MutationPermit>(
         &self,
         identity: &ManagedInstanceIdentity,
         mut request: ResolutionRequest,
-    ) -> Result<ManagedResolvedInspection, ManagedMutationError> {
+        admit_mutation: AdmitMutation,
+    ) -> Result<ManagedResolvedInspection, ManagedMutationError>
+    where
+        AdmitMutation: FnOnce() -> Result<MutationPermit, ManagedMutationError> + Send + 'static,
+        MutationPermit: Send + 'static,
+    {
         self.validate_identity(identity).await?;
         let mods_dir = identity.mods_dir().to_path_buf();
         let manager = self.manager.clone();
         tokio::task::spawn_blocking(move || -> Result<_, ManagedMutationError> {
-            let state = admitted_inspection_state(&mods_dir)?;
+            let (state, mutation_permit) = admitted_inspection_state(&mods_dir, admit_mutation)?;
             let installed_mod_evidence = installed_mod_evidence(&mods_dir, state.as_ref());
             request.installed_mods = installed_mod_evidence.clone();
             let plan = manager.get_plan(request);
@@ -234,7 +246,7 @@ impl ManagedCompositionAuthority {
                 crate::health::derive_health(state.as_ref(), Some(&plan), &mods_dir);
             let rollback_snapshots = crate::state::list_rollback_snapshots_admitted(&mods_dir)
                 .map_err(ManagedMutationError::definite)?;
-            Ok(ManagedResolvedInspection {
+            let inspection = ManagedResolvedInspection {
                 inspection: ManagedCompositionInspection {
                     state,
                     health,
@@ -243,7 +255,9 @@ impl ManagedCompositionAuthority {
                     rollback_snapshots,
                 },
                 plan,
-            })
+            };
+            drop(mutation_permit);
+            Ok(inspection)
         })
         .await
         .map_err(|_| ManagedMutationError::task_stopped("inspect"))?
@@ -299,18 +313,45 @@ fn recovered_inspection(
     })
 }
 
-fn admitted_inspection_state(
+fn admitted_inspection_state<AdmitMutation, MutationPermit>(
     instance_mods_dir: &Path,
-) -> Result<Option<CompositionState>, ManagedMutationError> {
-    crate::state::reconcile_state_publication(instance_mods_dir)
+    admit_mutation: AdmitMutation,
+) -> Result<(Option<CompositionState>, Option<MutationPermit>), ManagedMutationError>
+where
+    AdmitMutation: FnOnce() -> Result<MutationPermit, ManagedMutationError>,
+{
+    let preflight = crate::state::preflight_managed_inspection_reconciliation(instance_mods_dir)
+        .map_err(|error| ManagedMutationError::indeterminate("inspect_reconcile", error))?;
+    let mut admit_mutation = Some(admit_mutation);
+    let mut mutation_permit = None;
+    if preflight.state_publication_required() {
+        mutation_permit = Some(admit_inspection_mutation(&mut admit_mutation)?);
+    }
+    crate::state::reconcile_managed_inspection_publication(instance_mods_dir, preflight)
         .map_err(|error| ManagedMutationError::indeterminate("inspect_reconcile", error))?;
     let state = crate::state::load_state_admitted(instance_mods_dir)
         .map_err(ManagedMutationError::definite)?;
-    crate::state::reconcile_managed_removal_obligations(instance_mods_dir, state.as_ref())
-        .map_err(|error| ManagedMutationError::indeterminate("inspect_reconcile", error))?;
-    crate::state::reconcile_rollback_metadata(instance_mods_dir)
-        .map_err(|error| ManagedMutationError::indeterminate("inspect_reconcile", error))?;
-    Ok(state)
+    if mutation_permit.is_none() && preflight.admitted_state_reconciliation_required() {
+        mutation_permit = Some(admit_inspection_mutation(&mut admit_mutation)?);
+    }
+    crate::state::reconcile_managed_inspection_obligations(
+        instance_mods_dir,
+        preflight,
+        state.as_ref(),
+    )
+    .map_err(|error| ManagedMutationError::indeterminate("inspect_reconcile", error))?;
+    Ok((state, mutation_permit))
+}
+
+fn admit_inspection_mutation<AdmitMutation, MutationPermit>(
+    admit_mutation: &mut Option<AdmitMutation>,
+) -> Result<MutationPermit, ManagedMutationError>
+where
+    AdmitMutation: FnOnce() -> Result<MutationPermit, ManagedMutationError>,
+{
+    admit_mutation
+        .take()
+        .expect("inspection mutation callback is available before the first effect")()
 }
 
 fn validate_real_directory_if_present(path: &Path) -> Result<(), std::io::Error> {
