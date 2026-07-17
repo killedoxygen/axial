@@ -70,7 +70,7 @@ function trimmed(value: unknown): string {
   return typeof value === 'string' ? value.trim() : '';
 }
 
-function createToastKind(tone: string | undefined): ToastKind {
+export function createToastKind(tone: string | undefined): ToastKind {
   if (tone === 'error') return 'error';
   if (tone === 'warn') return 'info';
   return 'success';
@@ -81,7 +81,7 @@ function appendUnique(parts: string[], value: string): void {
   parts.push(value);
 }
 
-function createResultToastMessage(res: CreateResponse): string {
+export function createResultToastMessage(res: CreateResponse): string {
   const summary = trimmed(res.view_model?.summary);
   const detail = trimmed(res.view_model?.detail);
   const guardianMessage = trimmed(res.guardian_notice?.message);

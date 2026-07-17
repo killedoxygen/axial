@@ -16,7 +16,7 @@ const PERFORMANCE_OPTIONS: Array<ChoicePillOption<PerformanceMode>> = [
   { value: 'custom', label: 'Custom', note: 'You set the tuning. Your manual choices are kept as-is.' },
 ];
 
-const GUARDIAN_OPTIONS: Array<ChoicePillOption<GuardianMode>> = [
+export const GUARDIAN_OPTIONS: Array<ChoicePillOption<GuardianMode>> = [
   { value: 'managed', label: 'Managed', note: 'Catches risky launch settings and fixes them automatically.' },
   {
     value: 'custom',
@@ -30,7 +30,7 @@ function performanceModeFrom(value: string | undefined): PerformanceMode {
   return 'managed';
 }
 
-function guardianModeFrom(value: string | undefined): GuardianMode {
+export function guardianModeFrom(value: string | undefined): GuardianMode {
   return value === 'custom' ? 'custom' : 'managed';
 }
 

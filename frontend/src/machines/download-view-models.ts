@@ -104,25 +104,12 @@ function dismissFailureAction(): InstallActionViewModel {
   };
 }
 
-function boundedFailureMessage(message: string): string {
-  const firstUsefulLine = String(message || '')
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .find((line) => line && !line.startsWith('at '));
-  const squashed = (firstUsefulLine || 'Install failed before Axial received error details.')
-    .replace(/\s+/g, ' ')
-    .trim();
-  if (squashed.length <= 220) return squashed;
-  return `${squashed.slice(0, 217).trimEnd()}...`;
-}
-
-export function unresolvedFailureViewModel(message: string): InstallFailureViewModel {
-  const summary = boundedFailureMessage(message);
+export function unresolvedFailureViewModel(_message: string): InstallFailureViewModel {
   return {
     state_id: 'failure_details_unavailable',
     title: 'Install failed',
     tone: 'err',
-    summary,
+    summary: 'Install failed before Axial received safe error details.',
     detail: null,
     details: [],
     retry_action: unavailableFailureAction('retry', 'Retry unavailable'),
@@ -134,4 +121,12 @@ export function queueNoticeToastKind(notice: InstallQueueNoticeViewModel): 'succ
   if (notice.tone === 'error' || notice.tone === 'err') return 'error';
   if (notice.tone === 'warn' || notice.tone === 'warning') return 'info';
   return notice.state_id === 'queued' || notice.state_id === 'retry_queued' ? 'success' : 'info';
+}
+
+export function installQueueNoticePresentation(
+  notice: InstallQueueNoticeViewModel | null | undefined,
+): { message: string; kind: 'success' | 'error' | 'info' } | null {
+  if (!notice?.message?.trim()) return null;
+  const message = notice.detail?.trim() ? `${notice.message.trim()}: ${notice.detail.trim()}` : notice.message.trim();
+  return { message, kind: queueNoticeToastKind(notice) };
 }

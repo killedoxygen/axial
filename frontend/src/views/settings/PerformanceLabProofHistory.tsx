@@ -8,6 +8,7 @@ import { fmtMem } from '../../format';
 import { errMessage } from '../../utils';
 import { minecraftVersionLabel } from '../../version-display';
 import type { LaunchReportsState } from './PerformanceLabTypes';
+import type { LaunchProofEvidenceViewModel, LaunchProofRecord } from '../../types-launch';
 import { formatDurationMs, formatProofDate, labelFromToken } from './PerformanceLabFormat';
 
 function stableJsonValue(value: unknown): unknown {
@@ -33,6 +34,16 @@ function proofCopyFailureMessage(err: unknown): string {
   if (message.includes('not found') || message.includes('404')) return 'Launch proof was not found.';
   if (message.includes('network') || message.includes('fetch')) return 'Launch proof service is unreachable.';
   return 'Launch proof could not be copied.';
+}
+
+export function launchProofGuardianEvidence(record: LaunchProofRecord): LaunchProofEvidenceViewModel | null {
+  const evidence = record.view_model.evidence;
+  if (!evidence) return null;
+  return {
+    tone: evidence.tone,
+    label: evidence.label,
+    detail: evidence.detail ?? null,
+  };
 }
 
 export function LaunchProofHistoryBlock({ state }: { state: LaunchReportsState }): JSX.Element {
@@ -89,7 +100,7 @@ export function LaunchProofHistoryBlock({ state }: { state: LaunchReportsState }
             const viewModel = record.view_model;
             const comparison = viewModel.comparison;
             const budgetSummary = viewModel.resource_budget;
-            const evidenceSummary = viewModel.evidence;
+            const evidenceSummary = launchProofGuardianEvidence(record);
             const memory = scenario.requested_memory_mb ? fmtMem(scenario.requested_memory_mb / 1024) : null;
             const bootDuration = Number.isFinite(record.boot_duration_ms)
               ? `Boot ${formatDurationMs(record.boot_duration_ms as number)}`

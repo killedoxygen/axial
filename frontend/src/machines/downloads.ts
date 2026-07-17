@@ -22,8 +22,8 @@ import {
 } from '../install-item';
 import {
   installFailureViewModel,
+  installQueueNoticePresentation,
   installProgressViewModel,
-  queueNoticeToastKind,
   unresolvedFailureViewModel,
 } from './download-view-models';
 import type { LoaderBuildRecord } from '../types-loader';
@@ -241,9 +241,9 @@ async function recordBackendInstallFailure(
 }
 
 function showInstallQueueNotice(notice: InstallQueueNoticeViewModel | null | undefined): void {
-  if (!notice?.message?.trim()) return;
-  const message = notice.detail?.trim() ? `${notice.message}: ${notice.detail.trim()}` : notice.message.trim();
-  toast(message, queueNoticeToastKind(notice));
+  const presentation = installQueueNoticePresentation(notice);
+  if (!presentation) return;
+  toast(presentation.message, presentation.kind);
 }
 
 export async function refreshInstallQueue(

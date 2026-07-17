@@ -28,6 +28,23 @@ import type { Config } from './types-settings';
 
 const LIVE_LAUNCH_UPDATES_UNAVAILABLE = 'Live launch updates are unavailable.';
 
+const LAUNCH_SESSION_EXIT_REASONS = new Set<LaunchSessionOutcome['reason']>([
+  'clean_exit',
+  'external_user_closed',
+  'launcher_stopped',
+  'spawn_failed',
+  'startup_failed',
+  'startup_stalled',
+  'watchdog_killed',
+  'crashed_before_boot',
+  'crashed_after_boot',
+  'unknown_exit',
+]);
+
+function isLaunchSessionExitReason(value: unknown): value is LaunchSessionOutcome['reason'] {
+  return typeof value === 'string' && LAUNCH_SESSION_EXIT_REASONS.has(value as LaunchSessionOutcome['reason']);
+}
+
 function rollbackLaunch(instanceId: string): void {
   endSession(instanceId);
   if (Object.keys(runningSessions.value).length === 0) Music.unsuppress();
@@ -39,7 +56,7 @@ function updateRunningSession(instanceId: string, patch: Partial<import('./types
   updateRunningSessionState(instanceId, patch);
 }
 
-function launchSessionOutcome(value: unknown): LaunchSessionOutcome | undefined {
+export function launchSessionOutcome(value: unknown): LaunchSessionOutcome | undefined {
   if (!value || typeof value !== 'object') return undefined;
   const candidate = value as Partial<LaunchSessionOutcome>;
   if (
@@ -50,11 +67,15 @@ function launchSessionOutcome(value: unknown): LaunchSessionOutcome | undefined 
   ) {
     return undefined;
   }
-  if (typeof candidate.reason !== 'string' || typeof candidate.summary !== 'string') return undefined;
-  return candidate as LaunchSessionOutcome;
+  if (!isLaunchSessionExitReason(candidate.reason) || typeof candidate.summary !== 'string') return undefined;
+  return {
+    reason: candidate.reason,
+    kind: candidate.kind,
+    summary: candidate.summary,
+  };
 }
 
-function launchStatusViewModel(value: unknown): LaunchStatusViewModel | null {
+export function launchStatusViewModel(value: unknown): LaunchStatusViewModel | null {
   if (!value || typeof value !== 'object') return null;
   const candidate = value as Partial<LaunchStatusViewModel>;
   if (typeof candidate.state_id !== 'string' || typeof candidate.label !== 'string') return null;
@@ -72,7 +93,7 @@ function primaryNoticeDetail(details: string[]): string {
   return details[0] || '';
 }
 
-function backendLaunchNotice(value: unknown): LaunchNotice | null {
+export function backendLaunchNotice(value: unknown): LaunchNotice | null {
   if (!value || typeof value !== 'object') return null;
   const candidate = value as Partial<LaunchNotice>;
   if (typeof candidate.message !== 'string' || !candidate.message.trim()) return null;

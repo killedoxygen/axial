@@ -32,6 +32,7 @@ import { refreshFlags } from './flags';
 import { toast } from './toast';
 import { errMessage } from './utils';
 import { restoreRoute, showOnboardingOverlay } from './ui-state';
+import { startupWarningMessages } from './startup-warnings';
 
 async function init(): Promise<void> {
   initErrorReporting();
@@ -121,13 +122,8 @@ async function init(): Promise<void> {
     scheduleDeferredViewWarmup();
     if (!setupRequired) refreshAccountSkin();
 
-    const startupWarnings = Array.isArray(statusRes?.warnings) ? statusRes.warnings : [];
-    const shownStartupWarnings = new Set<string>();
-    for (const startupWarning of startupWarnings) {
-      if (typeof startupWarning === 'string' && startupWarning.trim() && !shownStartupWarnings.has(startupWarning)) {
-        shownStartupWarnings.add(startupWarning);
-        toast(startupWarning, 'info');
-      }
+    for (const startupWarning of startupWarningMessages(statusRes?.warnings)) {
+      toast(startupWarning, 'info');
     }
 
     if (!setupRequired && configRes && configRes.onboarding_done === false) {

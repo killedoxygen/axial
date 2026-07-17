@@ -226,6 +226,11 @@ function noticeIcon(tone: string): string {
   return 'info';
 }
 
+export function createNoticePresentation(notice: CreateNotice): { tone: string; icon: string } {
+  const tone = noticeTone(notice.tone);
+  return { tone, icon: noticeIcon(tone) };
+}
+
 function normalizeVersionTags(tags: CreateVersionTag[] | undefined): VersionRowTagModel[] {
   return Array.isArray(tags)
     ? tags
@@ -1120,7 +1125,7 @@ function CreateCard(): JSX.Element {
             {createNotices.length > 0 && (
               <div class="cp-cr-notices" aria-live="polite">
                 {createNotices.map((notice) => {
-                  const tone = noticeTone(notice.tone);
+                  const { tone, icon } = createNoticePresentation(notice);
                   return (
                     <section
                       key={notice.state_id}
@@ -1129,7 +1134,7 @@ function CreateCard(): JSX.Element {
                       role={tone === 'warned' || tone === 'error' ? 'alert' : 'status'}
                     >
                       <span class="cp-notice-mark" aria-hidden="true">
-                        <Icon name={noticeIcon(tone)} size={15} stroke={2.2} />
+                        <Icon name={icon} size={15} stroke={2.2} />
                       </span>
                       <div class="cp-notice-copy">
                         <strong>{notice.message}</strong>

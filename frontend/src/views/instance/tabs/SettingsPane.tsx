@@ -18,6 +18,7 @@ import type { EnrichedInstance } from '../../../types-instance';
 import {
   fetchPerformanceHealth,
   globalPerformanceMode,
+  performanceHealthNotice,
   performanceModeFrom,
   performanceModeLabel,
 } from '../performance-mode';
@@ -46,11 +47,7 @@ export function SettingsPane({ inst }: { inst: EnrichedInstance }): JSX.Element 
 
   const [healthRefreshKey, setHealthRefreshKey] = useState(0);
   const bumpHealth = (): void => setHealthRefreshKey((current) => current + 1);
-  const [healthNotice, setHealthNotice] = useState<{
-    tone: 'warned' | 'error';
-    title: string;
-    detail: string;
-  } | null>(null);
+  const [healthNotice, setHealthNotice] = useState<ReturnType<typeof performanceHealthNotice>>(null);
 
   const memoryOverridden = (inst.max_memory_mb ?? 0) > 0 || (inst.min_memory_mb ?? 0) > 0;
   const savedMaxGb = memoryGb(inst.max_memory_mb, cfg?.max_memory_mb ?? 4096);
@@ -107,16 +104,7 @@ export function SettingsPane({ inst }: { inst: EnrichedInstance }): JSX.Element 
     void fetchPerformanceHealth(inst.id)
       .then((health) => {
         if (cancelled) return;
-        const viewModel = health?.view_model;
-        if (viewModel && (viewModel.tone === 'warn' || viewModel.tone === 'err')) {
-          setHealthNotice({
-            tone: viewModel.tone === 'warn' ? 'warned' : 'error',
-            title: viewModel.title,
-            detail: viewModel.detail,
-          });
-        } else {
-          setHealthNotice(null);
-        }
+        setHealthNotice(performanceHealthNotice(health));
       })
       .catch(() => {
         if (!cancelled) setHealthNotice(null);

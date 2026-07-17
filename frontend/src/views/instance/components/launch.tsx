@@ -22,16 +22,28 @@ function launchNoticeIcon(tone: LaunchNoticeTone): string {
   return 'info';
 }
 
-export function LaunchOutcomeNotice({ inst, notice }: { inst: EnrichedInstance; notice: LaunchNotice }): JSX.Element {
+export function launchNoticePresentation(notice: LaunchNotice): {
+  icon: string;
+  primaryDetail: string;
+  listDetails: string[];
+} {
   const details = (notice.details ?? []).map((detail) => detail.trim()).filter(Boolean);
   const primaryDetail = notice.detail?.trim() || (details.length === 1 ? details[0] : '');
-  const listDetails = details.length > 1 ? details.filter((detail) => !primaryDetail || detail !== primaryDetail) : [];
+  return {
+    icon: launchNoticeIcon(notice.tone),
+    primaryDetail,
+    listDetails: details.length > 1 ? details.filter((detail) => !primaryDetail || detail !== primaryDetail) : [],
+  };
+}
+
+export function LaunchOutcomeNotice({ inst, notice }: { inst: EnrichedInstance; notice: LaunchNotice }): JSX.Element {
+  const { icon, primaryDetail, listDetails } = launchNoticePresentation(notice);
 
   return (
     <div class="cp-instance-notice-shell">
       <section class="cp-notice" data-tone={notice.tone} aria-live="polite">
         <span class="cp-notice-mark" aria-hidden="true">
-          <Icon name={launchNoticeIcon(notice.tone)} size={15} stroke={2.2} />
+          <Icon name={icon} size={15} stroke={2.2} />
         </span>
         <div class="cp-notice-copy">
           <strong>{notice.message}</strong>
@@ -83,17 +95,13 @@ export function LaunchSplitButton({
   onOpenSettings: () => void;
   preparing: Extract<LaunchState, { status: 'preparing' }> | null;
 }): JSX.Element {
-  const progress = preparing
-    ? { pct: preparing.pct, label: preparing.label, determinate: preparing.determinate !== false }
-    : installProgress
-      ? { ...installProgress, determinate: true }
-      : null;
-  const usesInstallAction = launchAction.primary_action === 'install';
-  const blocked = launchAction.primary_action === 'blocked';
-  const label = progress?.label || (installQueued ? installQueuedView?.title || 'Queued' : launchAction.label);
-  const icon = progress || installQueued ? 'clock' : blocked ? 'alert' : usesInstallAction ? 'download' : 'play';
-  const pct = progress?.determinate ? progress.pct : 0;
-  const disabled = Boolean(progress) || installQueued || blocked;
+  const { progress, usesInstallAction, blocked, label, icon, pct, disabled } = launchActionPresentation({
+    launchAction,
+    installQueued,
+    installQueuedView,
+    installProgress,
+    preparing,
+  });
   const primaryAction = usesInstallAction ? onInstall : onLaunch;
   const primaryMenuItem = blocked
     ? {
@@ -162,6 +170,41 @@ export function LaunchSplitButton({
       {progress?.determinate && <span class="cp-instance-launch-status">{Math.round(pct)}%</span>}
     </div>
   );
+}
+
+export function launchActionPresentation({
+  launchAction,
+  installQueued,
+  installQueuedView,
+  installProgress,
+  preparing,
+}: {
+  launchAction: LaunchActionState;
+  installQueued: boolean;
+  installQueuedView?: InstallQueuedItemViewModel;
+  installProgress: { pct: number; label: string } | null;
+  preparing: Extract<LaunchState, { status: 'preparing' }> | null;
+}): {
+  progress: { pct: number; label: string; determinate: boolean } | null;
+  usesInstallAction: boolean;
+  blocked: boolean;
+  label: string;
+  icon: string;
+  pct: number;
+  disabled: boolean;
+} {
+  const progress = preparing
+    ? { pct: preparing.pct, label: preparing.label, determinate: preparing.determinate !== false }
+    : installProgress
+      ? { ...installProgress, determinate: true }
+      : null;
+  const usesInstallAction = launchAction.primary_action === 'install';
+  const blocked = launchAction.primary_action === 'blocked';
+  const label = progress?.label || (installQueued ? installQueuedView?.title || 'Queued' : launchAction.label);
+  const icon = progress || installQueued ? 'clock' : blocked ? 'alert' : usesInstallAction ? 'download' : 'play';
+  const pct = progress?.determinate ? progress.pct : 0;
+  const disabled = Boolean(progress) || installQueued || blocked;
+  return { progress, usesInstallAction, blocked, label, icon, pct, disabled };
 }
 
 function OpenDownloadsButton(): JSX.Element {
