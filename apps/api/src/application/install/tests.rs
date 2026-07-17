@@ -6573,100 +6573,108 @@ async fn startup_reloads_journal_only_retry_and_blocks_the_next_matching_failure
 
 #[tokio::test]
 async fn persistent_retry_startup_serves_restart_loaded_status_without_reassessment() {
-    let root = temp_root("persistent-retry-live-api-restart");
-    let paths = test_app_paths(&root);
-    let install_id = "persistent-retry-live-api";
-    let operation_id = install_operation_id(install_id);
-    let observed_at = chrono::Utc::now().to_rfc3339();
+    let fixture = TempRootFixture::new("persistent-retry-live-api-restart");
+    let root = fixture.path().to_path_buf();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("build isolated loopback client");
 
-    let state = load_persistent_test_state(&root).await;
-    begin_install_operation_journal(state.journals(), &operation_id, "1.21.5")
-        .await
-        .expect("persist install journal");
-    let mut progress_journal = InstallProgressJournalTracker::default();
-    record_install_operation_progress(
-        state.journals(),
-        &operation_id,
-        &observed_install_failure_progress(),
-        &mut progress_journal,
-    )
-    .await
-    .expect("persist terminal install progress");
-    let facts = [download_fact(
-        ExecutionDownloadFactKind::ProviderFailure,
-        "minecraft_client_1.21.5",
-    )];
-    let producer = state
-        .try_claim_producer()
-        .expect("claim install failure producer");
-    let detached_memory = Arc::new(GuardianFailureMemoryStore::new());
-    let ((), authoring_policy_evaluations) =
-        crate::guardian::with_guardian_policy_evaluation_count(record_install_failure_outcome(
-            &producer,
-            state.journals().clone(),
-            detached_memory.clone(),
+    timeout(Duration::from_secs(10), async {
+        let paths = test_app_paths(&root);
+        let install_id = "persistent-retry-live-api";
+        let operation_id = install_operation_id(install_id);
+        let observed_at = chrono::Utc::now().to_rfc3339();
+
+        let state = load_persistent_test_state(&root).await;
+        begin_install_operation_journal(state.journals(), &operation_id, "1.21.5")
+            .await
+            .expect("persist install journal");
+        let mut progress_journal = InstallProgressJournalTracker::default();
+        record_install_operation_progress(
+            state.journals(),
             &operation_id,
-            &facts,
-            &observed_at,
-        ))
-        .await;
-    drop(producer);
-
-    assert_eq!(authoring_policy_evaluations, 1);
-    assert_eq!(detached_memory.list().len(), 1);
-    assert!(state.failure_memory().list().is_empty());
-    assert!(!crate::state::failure_memory::failure_memory_path(&paths).exists());
-    let carrier = state
-        .journals()
-        .get(&operation_id)
-        .and_then(|entry| install_guardian_outcome_summary_from_journal(&entry))
-        .expect("current Retry carrier");
-    assert_eq!(carrier.decision(), "retry");
-
-    let (startup_ready, first_startup_policy_evaluations) =
-        crate::guardian::with_guardian_policy_evaluation_count(
-            crate::app::start_application_background_workflows(&state),
+            &observed_install_failure_progress(),
+            &mut progress_journal,
         )
-        .await;
-    assert!(startup_ready);
-    assert_eq!(first_startup_policy_evaluations, 0);
-    let restored_memory = state.failure_memory().list();
-    assert_eq!(restored_memory.len(), 1);
-    assert!(crate::state::failure_memory::failure_memory_path(&paths).is_file());
-
-    let server = crate::app::spawn_background(state.clone())
         .await
-        .expect("start embedded API");
-    assert_live_retry_install_transport(server.addr, install_id).await;
-    server.shutdown().await.expect("stop embedded API");
-    state.shutdown().await.expect("shutdown first application");
-    drop(server);
-    drop(state);
+        .expect("persist terminal install progress");
+        let facts = [download_fact(
+            ExecutionDownloadFactKind::ProviderFailure,
+            "minecraft_client_1.21.5",
+        )];
+        let producer = state
+            .try_claim_producer()
+            .expect("claim install failure producer");
+        let detached_memory = Arc::new(GuardianFailureMemoryStore::new());
+        let ((), authoring_policy_evaluations) =
+            crate::guardian::with_guardian_policy_evaluation_count(record_install_failure_outcome(
+                &producer,
+                state.journals().clone(),
+                detached_memory.clone(),
+                &operation_id,
+                &facts,
+                &observed_at,
+            ))
+            .await;
+        drop(producer);
 
-    let reloaded = load_persistent_test_state(&root).await;
-    assert_eq!(reloaded.failure_memory().list(), restored_memory);
-    let (startup_ready, second_startup_policy_evaluations) =
-        crate::guardian::with_guardian_policy_evaluation_count(
-            crate::app::start_application_background_workflows(&reloaded),
-        )
-        .await;
-    assert!(startup_ready);
-    assert_eq!(second_startup_policy_evaluations, 0);
-    assert_eq!(reloaded.failure_memory().list(), restored_memory);
+        assert_eq!(authoring_policy_evaluations, 1);
+        assert_eq!(detached_memory.list().len(), 1);
+        assert!(state.failure_memory().list().is_empty());
+        assert!(!crate::state::failure_memory::failure_memory_path(&paths).exists());
+        let carrier = state
+            .journals()
+            .get(&operation_id)
+            .and_then(|entry| install_guardian_outcome_summary_from_journal(&entry))
+            .expect("current Retry carrier");
+        assert_eq!(carrier.decision(), "retry");
 
-    let server = crate::app::spawn_background(reloaded.clone())
-        .await
-        .expect("restart embedded API");
-    assert_live_retry_install_transport(server.addr, install_id).await;
-    server.shutdown().await.expect("stop restarted API");
-    reloaded
-        .shutdown()
-        .await
-        .expect("shutdown restarted application");
-    drop(server);
-    drop(reloaded);
+        let (startup_ready, first_startup_policy_evaluations) =
+            crate::guardian::with_guardian_policy_evaluation_count(
+                crate::app::start_application_background_workflows(&state),
+            )
+            .await;
+        assert!(startup_ready);
+        assert_eq!(first_startup_policy_evaluations, 0);
+        let restored_memory = state.failure_memory().list();
+        assert_eq!(restored_memory.len(), 1);
+        assert!(crate::state::failure_memory::failure_memory_path(&paths).is_file());
 
-    fs::remove_dir_all(root).expect("cleanup persistent live API fixture");
+        let server = crate::app::spawn_background(state.clone())
+            .await
+            .expect("start embedded API");
+        assert_live_retry_install_transport(&client, server.addr, install_id).await;
+        server.shutdown().await.expect("stop embedded API");
+        state.shutdown().await.expect("shutdown first application");
+        drop(server);
+        drop(state);
+
+        let reloaded = load_persistent_test_state(&root).await;
+        assert_eq!(reloaded.failure_memory().list(), restored_memory);
+        let (startup_ready, second_startup_policy_evaluations) =
+            crate::guardian::with_guardian_policy_evaluation_count(
+                crate::app::start_application_background_workflows(&reloaded),
+            )
+            .await;
+        assert!(startup_ready);
+        assert_eq!(second_startup_policy_evaluations, 0);
+        assert_eq!(reloaded.failure_memory().list(), restored_memory);
+
+        let server = crate::app::spawn_background(reloaded.clone())
+            .await
+            .expect("restart embedded API");
+        assert_live_retry_install_transport(&client, server.addr, install_id).await;
+        server.shutdown().await.expect("stop restarted API");
+        reloaded
+            .shutdown()
+            .await
+            .expect("shutdown restarted application");
+        drop(server);
+        drop(reloaded);
+    })
+    .await
+    .expect("persistent Retry startup lifecycle exceeded its 10 second bound");
 }
 
 #[tokio::test]
@@ -7666,11 +7674,20 @@ async fn load_persistent_test_state(root: &Path) -> AppState {
     state
 }
 
-async fn assert_live_retry_install_transport(addr: std::net::SocketAddr, install_id: &str) {
+async fn assert_live_retry_install_transport(
+    client: &reqwest::Client,
+    addr: std::net::SocketAddr,
+    install_id: &str,
+) {
+    assert!(
+        addr.ip().is_loopback(),
+        "embedded API must bind to loopback"
+    );
     let base_url = format!("http://{addr}");
-    let frontend = timeout(Duration::from_secs(2), reqwest::get(format!("{base_url}/")))
+    let frontend = client
+        .get(format!("{base_url}/"))
+        .send()
         .await
-        .expect("embedded frontend request completes")
         .expect("request embedded frontend");
     assert_eq!(frontend.status(), reqwest::StatusCode::OK);
     assert_eq!(
@@ -7686,13 +7703,11 @@ async fn assert_live_retry_install_transport(addr: std::net::SocketAddr, install
     assert!(frontend.contains("<div id=\"app\"></div>"));
     assert_no_public_raw_fragments(&frontend);
 
-    let status = timeout(
-        Duration::from_secs(2),
-        reqwest::get(format!("{base_url}/api/v1/install/{install_id}/status")),
-    )
-    .await
-    .expect("install status request completes")
-    .expect("request install status");
+    let status = client
+        .get(format!("{base_url}/api/v1/install/{install_id}/status"))
+        .send()
+        .await
+        .expect("request install status");
     assert_eq!(status.status(), reqwest::StatusCode::OK);
     let status = status
         .json::<serde_json::Value>()
@@ -7705,13 +7720,11 @@ async fn assert_live_retry_install_transport(addr: std::net::SocketAddr, install
     assert!(status["proof"].is_object());
     assert_no_public_raw_fragments(&status.to_string());
 
-    let events = timeout(
-        Duration::from_secs(2),
-        reqwest::get(format!("{base_url}/api/v1/install/{install_id}/events")),
-    )
-    .await
-    .expect("install events request completes")
-    .expect("request install events");
+    let events = client
+        .get(format!("{base_url}/api/v1/install/{install_id}/events"))
+        .send()
+        .await
+        .expect("request install events");
     assert_eq!(events.status(), reqwest::StatusCode::OK);
     assert_eq!(
         events
@@ -7720,10 +7733,7 @@ async fn assert_live_retry_install_transport(addr: std::net::SocketAddr, install
             .and_then(|value| value.to_str().ok()),
         Some("text/event-stream")
     );
-    let events = timeout(Duration::from_secs(2), events.text())
-        .await
-        .expect("terminal install event stream completes")
-        .expect("read install event stream");
+    let events = events.text().await.expect("read install event stream");
     assert!(events.contains("event: progress"));
     assert!(events.contains("\"phase\":\"error\""));
     assert!(events.contains("\"done\":true"));
@@ -8070,6 +8080,36 @@ async fn wait_for_queue_empty(state: &AppState) {
         "queue did not settle to empty: {:?}",
         state.installs().queue_snapshot().await
     );
+}
+
+struct TempRootFixture {
+    path: PathBuf,
+}
+
+impl TempRootFixture {
+    fn new(name: &str) -> Self {
+        Self {
+            path: temp_root(name),
+        }
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for TempRootFixture {
+    fn drop(&mut self) {
+        if let Err(error) = fs::remove_dir_all(&self.path)
+            && error.kind() != io::ErrorKind::NotFound
+            && !std::thread::panicking()
+        {
+            panic!(
+                "failed to clean temporary install fixture {}: {error}",
+                self.path.display()
+            );
+        }
+    }
 }
 
 fn temp_root(name: &str) -> PathBuf {
