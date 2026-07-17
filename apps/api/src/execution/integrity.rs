@@ -2329,6 +2329,108 @@ pub(crate) struct Tier2RegisteredArtifactSealRequest {
     observations: Vec<RegisteredArtifactObservation>,
 }
 
+pub(crate) struct Tier2CleanSealRequest {
+    ticket: KnownGoodTier2Ticket,
+    metrics: Tier2CleanMetrics,
+}
+
+struct Tier2CleanMetrics {
+    complete: bool,
+    fact_count: usize,
+    suppressed_fact_count: usize,
+    repairable_observation_count: usize,
+    selected_entry_count: usize,
+    processed_entry_count: usize,
+    verified_entry_count: usize,
+    hashed_entry_count: usize,
+    metadata_lookup_count: usize,
+    link_lookup_count: usize,
+    expected_content_byte_count: u64,
+    content_read_byte_count: u64,
+}
+
+impl Tier2CleanSealRequest {
+    fn new(ticket: KnownGoodTier2Ticket, report: &IntegrityTier2Report) -> Self {
+        Self {
+            ticket,
+            metrics: Tier2CleanMetrics::from_report(report),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn exact_clean_for_test(ticket: KnownGoodTier2Ticket) -> Self {
+        Self {
+            ticket,
+            metrics: Tier2CleanMetrics {
+                complete: true,
+                fact_count: 0,
+                suppressed_fact_count: 0,
+                repairable_observation_count: 0,
+                selected_entry_count: 0,
+                processed_entry_count: 0,
+                verified_entry_count: 0,
+                hashed_entry_count: 0,
+                metadata_lookup_count: 0,
+                link_lookup_count: 0,
+                expected_content_byte_count: 0,
+                content_read_byte_count: 0,
+            },
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_fact_for_test(mut self) -> Self {
+        self.metrics.fact_count = 1;
+        self
+    }
+
+    pub(crate) fn ticket(&self) -> &KnownGoodTier2Ticket {
+        &self.ticket
+    }
+
+    pub(crate) fn into_ticket(self) -> KnownGoodTier2Ticket {
+        self.ticket
+    }
+
+    pub(crate) fn is_exact_clean(&self) -> bool {
+        self.metrics.is_exact_clean()
+    }
+}
+
+impl Tier2CleanMetrics {
+    fn from_report(report: &IntegrityTier2Report) -> Self {
+        Self {
+            complete: report.status == IntegrityTier2Status::Complete,
+            fact_count: report.facts.len(),
+            suppressed_fact_count: report.suppressed_fact_count,
+            repairable_observation_count: report.repairable_observations.len(),
+            selected_entry_count: report.selected_entry_count,
+            processed_entry_count: report.processed_entry_count,
+            verified_entry_count: report.verified_entry_count,
+            hashed_entry_count: report.hashed_entry_count,
+            metadata_lookup_count: report.metadata_lookup_count,
+            link_lookup_count: report.link_lookup_count,
+            expected_content_byte_count: report.expected_content_byte_count,
+            content_read_byte_count: report.content_read_byte_count,
+        }
+    }
+
+    fn is_exact_clean(&self) -> bool {
+        self.complete
+            && self.fact_count == 0
+            && self.suppressed_fact_count == 0
+            && self.repairable_observation_count == 0
+            && self.selected_entry_count == self.processed_entry_count
+            && self.selected_entry_count == self.verified_entry_count
+            && self
+                .hashed_entry_count
+                .checked_add(self.metadata_lookup_count)
+                == Some(self.selected_entry_count)
+            && self.link_lookup_count <= self.metadata_lookup_count
+            && self.content_read_byte_count == self.expected_content_byte_count
+    }
+}
+
 impl Tier2RegisteredArtifactSealRequest {
     fn new(ticket: KnownGoodTier2Ticket, observations: Vec<RegisteredArtifactObservation>) -> Self {
         Self {
@@ -2346,6 +2448,7 @@ impl Tier2RegisteredArtifactSealRequest {
 struct IntegrityTier2SealedResult {
     report: IntegrityTier2Report,
     findings: Option<RegisteredArtifactFindings>,
+    clean_seal: Option<crate::state::KnownGoodTier2CleanSeal>,
     settlement: IdleSweepSettlementOwner,
 }
 
@@ -2362,12 +2465,44 @@ impl IntegrityTier2OwnedResult {
             return IntegrityTier2SealedResult {
                 report,
                 findings: None,
+                clean_seal: None,
                 settlement,
             };
         }
 
+        let seal = match state
+            .seal_known_good_tier2_clean_request(Tier2CleanSealRequest::new(ticket, &report))
+            .await
+        {
+            Ok(crate::state::KnownGoodTier2CleanClassification::Clean(clean_seal)) => {
+                return IntegrityTier2SealedResult {
+                    report,
+                    findings: None,
+                    clean_seal: Some(clean_seal),
+                    settlement,
+                };
+            }
+            Ok(crate::state::KnownGoodTier2CleanClassification::NonClean(ticket)) => ticket,
+            Err(_) if !settlement.is_current() => {
+                return IntegrityTier2SealedResult {
+                    report: report.cancel(),
+                    findings: None,
+                    clean_seal: None,
+                    settlement,
+                };
+            }
+            Err(_) => {
+                return IntegrityTier2SealedResult {
+                    report: report.refuse(tier2_authority_refused_fact()),
+                    findings: None,
+                    clean_seal: None,
+                    settlement,
+                };
+            }
+        };
+
         let request = Tier2RegisteredArtifactSealRequest::new(
-            ticket,
+            seal,
             report.registered_artifact_observations(),
         );
         let findings = match state.seal_tier2_registered_artifact_request(request).await {
@@ -2376,6 +2511,7 @@ impl IntegrityTier2OwnedResult {
                 return IntegrityTier2SealedResult {
                     report: report.cancel(),
                     findings: None,
+                    clean_seal: None,
                     settlement,
                 };
             }
@@ -2383,6 +2519,7 @@ impl IntegrityTier2OwnedResult {
                 return IntegrityTier2SealedResult {
                     report: report.refuse(tier2_authority_refused_fact()),
                     findings: None,
+                    clean_seal: None,
                     settlement,
                 };
             }
@@ -2391,12 +2528,14 @@ impl IntegrityTier2OwnedResult {
             return IntegrityTier2SealedResult {
                 report: report.refuse(tier2_authority_refused_fact()),
                 findings: None,
+                clean_seal: None,
                 settlement,
             };
         }
         IntegrityTier2SealedResult {
             report,
             findings: Some(findings),
+            clean_seal: None,
             settlement,
         }
     }
@@ -2404,7 +2543,12 @@ impl IntegrityTier2OwnedResult {
     pub(crate) async fn settle_after_registered_artifact_recovery<Prepare, Recovery, Error>(
         self,
         prepare: Prepare,
-    ) -> (IntegrityTier2Report, IdleSweepSettlement, Option<Error>)
+    ) -> (
+        IntegrityTier2Report,
+        IdleSweepSettlement,
+        Option<Error>,
+        Option<crate::state::KnownGoodTier2CleanSeal>,
+    )
     where
         Prepare: FnOnce(&IntegrityTier2Report, RegisteredArtifactFindings) -> Recovery,
         Recovery: Future<Output = Result<(), Error>>,
@@ -2413,9 +2557,14 @@ impl IntegrityTier2OwnedResult {
         let IntegrityTier2SealedResult {
             mut report,
             findings,
+            mut clean_seal,
             settlement,
         } = sealed;
-        let recovery_error = if report.status == IntegrityTier2Status::Complete {
+        let recovery_error = if clean_seal.is_some() {
+            debug_assert_eq!(report.status, IntegrityTier2Status::Complete);
+            debug_assert!(findings.is_none());
+            None
+        } else if report.status == IntegrityTier2Status::Complete {
             let findings = findings.expect("complete Tier 2 seal must retain exact findings");
             match prepare(&report, findings).await {
                 Ok(()) => None,
@@ -2440,7 +2589,12 @@ impl IntegrityTier2OwnedResult {
         {
             report = report.cancel();
         }
-        (report, outcome, recovery_error)
+        if outcome != IdleSweepSettlement::Authoritative
+            || report.status != IntegrityTier2Status::Complete
+        {
+            clean_seal = None;
+        }
+        (report, outcome, recovery_error, clean_seal)
     }
 }
 
@@ -4264,15 +4418,57 @@ mod tests {
         (state, root, work)
     }
 
+    async fn tier2_clean_owned_work_fixture(
+        label: &str,
+    ) -> (AppState, PathBuf, IntegrityTier2OwnedWork) {
+        let (state, root) = state_fixture(label, None);
+        let managed_parent = root.join("private-library-root/libraries/clean");
+        fs::create_dir_all(&managed_parent).expect("managed library parent");
+        fs::write(managed_parent.join("library.jar"), [7_u8]).expect("managed library");
+        let instance = state
+            .instances()
+            .insert_for_test("Tier two clean owned work", "1.21.5")
+            .expect("instance");
+        state.activate_known_good_inventory_for_test(
+            &instance.id,
+            KnownGoodInventory::from_test_entries([entry(
+                TestKnownGoodRoot::Libraries,
+                "clean/library.jar",
+                KnownGoodArtifactKind::Library,
+                TestKnownGoodIntegrity::Sha1 {
+                    digest: hex::encode(Sha1::digest([7_u8])),
+                    size: 1,
+                },
+            )])
+            .expect("non-empty clean inventory"),
+        );
+        let idle_epoch = state.subscribe_integrity_idle().borrow().epoch();
+        let producer = state
+            .try_claim_producer()
+            .expect("claim idle sweep producer");
+        let reservation = state
+            .try_reserve_idle_sweep(idle_epoch, producer)
+            .expect("idle sweep reservation");
+        let settlement = IdleSweepSettlementOwner::new(reservation);
+        let ticket = state
+            .mint_known_good_tier2_ticket(&settlement.authority(), &instance.id)
+            .await
+            .expect("Tier 2 ticket");
+        let work = IntegrityTier2OwnedWork::new(state.clone(), ticket, settlement)
+            .expect("matching Tier 2 ownership");
+        (state, root, work)
+    }
+
     async fn settle_tier2_result(
         result: IntegrityTier2OwnedResult,
     ) -> (IntegrityTier2Report, IdleSweepSettlement) {
-        let (report, settlement, recovery_error) = result
+        let (report, settlement, recovery_error, clean_seal) = result
             .settle_after_registered_artifact_recovery(|_, _| {
                 std::future::ready(Ok::<(), std::convert::Infallible>(()))
             })
             .await;
         assert!(recovery_error.is_none());
+        assert!(clean_seal.is_none());
         (report, settlement)
     }
 
@@ -4611,6 +4807,10 @@ mod tests {
         assert_eq!(report.link_lookup_count, 1);
         assert_eq!(report.suppressed_fact_count, 0);
         assert!(report.facts.is_empty());
+        assert!(
+            Tier2CleanMetrics::from_report(&report).is_exact_clean(),
+            "non-empty fully verified inventory must classify exact clean"
+        );
         assert_eq!(
             reader
                 .content
@@ -5085,6 +5285,66 @@ mod tests {
     }
 
     #[test]
+    fn tier_two_clean_classification_requires_status_facts_and_completion_relations() {
+        fn clean_report() -> IntegrityTier2Report {
+            let mut report = IntegrityTier2Report::new(3, 9);
+            report.status = IntegrityTier2Status::Complete;
+            report.processed_entry_count = 3;
+            report.verified_entry_count = 3;
+            report.hashed_entry_count = 3;
+            report.content_read_byte_count = 9;
+            report
+        }
+
+        let assert_dirty = |report: IntegrityTier2Report| {
+            assert!(!Tier2CleanMetrics::from_report(&report).is_exact_clean());
+        };
+        assert!(
+            Tier2CleanMetrics::from_report(&clean_report()).is_exact_clean(),
+            "all exact clean relations must classify clean"
+        );
+
+        let mut report = clean_report();
+        report.status = IntegrityTier2Status::Refused;
+        assert_dirty(report);
+        let mut report = clean_report();
+        report.facts.push(tier2_worker_refused_fact());
+        assert_dirty(report);
+        let mut report = clean_report();
+        report.suppressed_fact_count = 1;
+        assert_dirty(report);
+        let mut report = clean_report();
+        report
+            .repairable_observations
+            .push(Tier2RepairableObservation {
+                fact_index: 0,
+                observation: RegisteredArtifactObservation::new(
+                    0,
+                    RegisteredArtifactCondition::Missing,
+                ),
+            });
+        assert_dirty(report);
+        let mut report = clean_report();
+        report.processed_entry_count = 2;
+        assert_dirty(report);
+        let mut report = clean_report();
+        report.verified_entry_count = 2;
+        assert_dirty(report);
+        let mut report = clean_report();
+        report.hashed_entry_count = 2;
+        assert_dirty(report);
+        let mut report = clean_report();
+        report.metadata_lookup_count = 1;
+        assert_dirty(report);
+        let mut report = clean_report();
+        report.link_lookup_count = 1;
+        assert_dirty(report);
+        let mut report = clean_report();
+        report.content_read_byte_count = 8;
+        assert_dirty(report);
+    }
+
+    #[test]
     fn tier_two_suppression_and_noncomplete_reports_discard_repair_sidecars() {
         let mut inventory = KnownGoodInventory::from_test_entries((0..=64).map(|index| {
             entry(
@@ -5407,13 +5667,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn exact_clean_seal_bypasses_registered_artifact_recovery() {
+        let (state, root, work) =
+            tier2_clean_owned_work_fixture("tier2-clean-recovery-bypass").await;
+        let result = work.spawn().join().await.expect("dedicated worker result");
+        let recovery_calls = AtomicUsize::new(0);
+
+        let (report, settlement, recovery_error, clean_seal) = result
+            .settle_after_registered_artifact_recovery(|_, _| {
+                recovery_calls.fetch_add(1, AtomicOrdering::SeqCst);
+                std::future::ready(Ok::<(), std::convert::Infallible>(()))
+            })
+            .await;
+
+        assert_eq!(report.status, IntegrityTier2Status::Complete);
+        assert_eq!(report.selected_entry_count, 1);
+        assert_eq!(report.hashed_entry_count, 1);
+        assert!(report.facts.is_empty());
+        assert_eq!(settlement, IdleSweepSettlement::Authoritative);
+        assert!(recovery_error.is_none());
+        assert_eq!(recovery_calls.load(AtomicOrdering::SeqCst), 0);
+        let receipt = state
+            .accept_known_good_tier2_clean_seal(
+                clean_seal.expect("clean authority"),
+                tokio::time::Instant::now(),
+            )
+            .expect("current clean receipt");
+        assert!(state.known_good_tier2_clean_receipt_is_current(&receipt));
+        close_fixture(state, root).await;
+    }
+
+    #[tokio::test]
     async fn tier_two_owned_result_seals_exact_opaque_assets_target_before_settlement() {
         let (state, root, work) =
             tier2_assets_owned_work_fixture("tier2-assets-exact-sealing").await;
 
         let result = work.spawn().join().await.expect("dedicated worker result");
         assert!(result.settlement.is_current());
-        let (report, settlement, recovery_error) = result
+        let (report, settlement, recovery_error, clean_seal) = result
             .settle_after_registered_artifact_recovery(|report, findings| {
                 assert_eq!(report.status, IntegrityTier2Status::Complete);
                 assert!(report.repairable_observations.is_empty());
@@ -5439,6 +5730,7 @@ mod tests {
             })
             .await;
         assert!(recovery_error.is_none());
+        assert!(clean_seal.is_none());
         assert_eq!(settlement, IdleSweepSettlement::Authoritative);
         assert_eq!(report.status, IntegrityTier2Status::Complete);
         close_fixture(state, root).await;
@@ -5473,7 +5765,7 @@ mod tests {
         release_tx
             .send(())
             .expect("release recovery terminalization");
-        let (report, sweep_settlement, recovery_error) =
+        let (report, sweep_settlement, recovery_error, clean_seal) =
             settlement.await.expect("recovery settlement task");
 
         assert_eq!(sweep_settlement, IdleSweepSettlement::Superseded);
@@ -5482,6 +5774,7 @@ mod tests {
             Some("injected child terminal persistence failure")
         );
         assert_eq!(report.status, IntegrityTier2Status::Refused);
+        assert!(clean_seal.is_none());
         assert_eq!(report.facts.len(), 1);
         assert_eq!(report.facts[0].kind, ExecutionFactKind::ArtifactMissing);
         assert!(state.subscribe_integrity_idle().borrow().is_stably_idle());
@@ -5516,7 +5809,7 @@ mod tests {
         assert!(!settlement.is_finished());
         assert!(!state.subscribe_integrity_idle().borrow().is_stably_idle());
         release_tx.send(()).expect("release cancelled recovery");
-        let (report, sweep_settlement, recovery_error) = settlement
+        let (report, sweep_settlement, recovery_error, clean_seal) = settlement
             .await
             .expect("cancelled recovery settlement task");
 
@@ -5526,6 +5819,7 @@ mod tests {
             Some("injected child terminal persistence failure")
         );
         assert_eq!(report.status, IntegrityTier2Status::Cancelled);
+        assert!(clean_seal.is_none());
         assert!(report.facts.is_empty());
         assert_eq!(report.suppressed_fact_count, 0);
         assert!(state.subscribe_integrity_idle().borrow().is_stably_idle());

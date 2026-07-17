@@ -102,7 +102,10 @@ pub(crate) use journals::{
 };
 pub use journals::{OperationJournalStore, OperationJournalStoreError};
 pub(crate) use known_good_rebuilds::KnownGoodRebuildError;
-pub(crate) use known_good_tier2::KnownGoodTier2Ticket;
+pub(crate) use known_good_tier2::{
+    KnownGoodTier2CleanClassification, KnownGoodTier2CleanReceipt, KnownGoodTier2CleanSeal,
+    KnownGoodTier2Ticket,
+};
 pub(crate) use lifecycle::{
     AppLifecycle, LifecycleAdmissionError, ProducerLease, RequestLease, RequestProducerHandoff,
 };

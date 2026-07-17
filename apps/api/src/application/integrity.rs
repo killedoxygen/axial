@@ -18,9 +18,9 @@ use crate::state::contracts::{
 };
 use crate::state::{
     AppState, IdleSweepCancellation, IdleSweepReserveError, IdleSweepSettlement,
-    IdleSweepSettlementOwner, IdleSweepTerminal, IntegrityIdleEpoch,
-    KnownGoodVerificationUnavailable, OperationJournalReconciliation, OperationJournalStore,
-    OperationJournalStoreError, ProducerLease,
+    IdleSweepSettlementOwner, IdleSweepTerminal, IntegrityIdleEpoch, KnownGoodTier2CleanReceipt,
+    KnownGoodTier2CleanSeal, KnownGoodVerificationUnavailable, OperationJournalReconciliation,
+    OperationJournalStore, OperationJournalStoreError, ProducerLease,
 };
 use axial_config::is_canonical_instance_id;
 use std::time::Duration;
@@ -36,6 +36,24 @@ pub(super) enum IdleIntegrityTerminal {
     Succeeded,
     Cancelled,
     Refused,
+}
+
+pub(super) struct IdleIntegrityCompletion {
+    terminal: IdleIntegrityTerminal,
+    clean_receipt: Option<KnownGoodTier2CleanReceipt>,
+}
+
+impl IdleIntegrityCompletion {
+    fn without_receipt(terminal: IdleIntegrityTerminal) -> Self {
+        Self {
+            terminal,
+            clean_receipt: None,
+        }
+    }
+
+    pub(super) fn into_parts(self) -> (IdleIntegrityTerminal, Option<KnownGoodTier2CleanReceipt>) {
+        (self.terminal, self.clean_receipt)
+    }
 }
 
 #[must_use = "a planned integrity sweep must execute or be cancelled"]
@@ -54,7 +72,7 @@ pub(super) struct ReservedIntegritySweep {
 
 #[must_use = "a started integrity sweep must be awaited or deliberately detached"]
 pub(super) struct IntegritySweepExecution {
-    completion: tokio::task::JoinHandle<Result<IdleIntegrityTerminal, Tier2IntegritySweepError>>,
+    completion: tokio::task::JoinHandle<Result<IdleIntegrityCompletion, Tier2IntegritySweepError>>,
 }
 
 #[must_use = "a failed integrity reservation must cancel its durable plan"]
@@ -264,7 +282,7 @@ async fn execute_reserved_owned<AfterSpawn>(
     journal: OperationJournalEntry,
     settlement: IdleSweepSettlementOwner,
     after_spawn: AfterSpawn,
-) -> Result<IdleIntegrityTerminal, Tier2IntegritySweepError>
+) -> Result<IdleIntegrityCompletion, Tier2IntegritySweepError>
 where
     AfterSpawn: FnOnce(IdleSweepCancellation),
 {
@@ -291,7 +309,7 @@ async fn execute_reserved_owned_with_source<AfterSpawn>(
     #[cfg(all(test, target_os = "linux"))] progress_observer: Option<
         IntegrityTier2ProgressObserver,
     >,
-) -> Result<IdleIntegrityTerminal, Tier2IntegritySweepError>
+) -> Result<IdleIntegrityCompletion, Tier2IntegritySweepError>
 where
     AfterSpawn: FnOnce(IdleSweepCancellation),
 {
@@ -305,7 +323,9 @@ where
             settlement.settle(IdleSweepTerminal::Cancelled);
             let transition = Tier2TerminalTransition::cancelled(Tier2IntegrityCounters::default());
             record_terminal_reconciled(state.journals(), &journal, &transition).await?;
-            return Ok(IdleIntegrityTerminal::Cancelled);
+            return Ok(IdleIntegrityCompletion::without_receipt(
+                IdleIntegrityTerminal::Cancelled,
+            ));
         }
         Err(
             KnownGoodVerificationUnavailable::InstanceNotRegistered
@@ -318,7 +338,9 @@ where
                 Tier2IntegrityGuardianEvidence::empty(),
             );
             record_terminal_reconciled(state.journals(), &journal, &transition).await?;
-            return Ok(IdleIntegrityTerminal::Refused);
+            return Ok(IdleIntegrityCompletion::without_receipt(
+                IdleIntegrityTerminal::Refused,
+            ));
         }
     };
 
@@ -340,7 +362,7 @@ where
                 ),
             };
             record_terminal_reconciled(state.journals(), &journal, &transition).await?;
-            return Ok(terminal);
+            return Ok(IdleIntegrityCompletion::without_receipt(terminal));
         }
     };
     #[cfg(all(test, target_os = "linux"))]
@@ -351,13 +373,13 @@ where
     let worker = work.spawn();
     after_spawn(cancellation);
     let result = worker.join().await;
-    let (transition, terminal) = match result {
+    let (transition, terminal, clean_seal) = match result {
         Ok(result) => {
             let recovery_state = state.clone();
             let recovery_operation_id = journal.operation_id.clone();
-            let client = reqwest::Client::new();
-            let (report, settlement, recovery_error) = result
+            let (report, settlement, recovery_error, clean_seal) = result
                 .settle_after_registered_artifact_recovery(move |report, findings| {
+                    let client = reqwest::Client::new();
                     let recovery = prepare_tier2_registered_artifact_recovery(
                         recovery_state,
                         &recovery_operation_id,
@@ -389,11 +411,13 @@ where
                     (
                         Tier2TerminalTransition::succeeded(counters, evidence),
                         IdleIntegrityTerminal::Succeeded,
+                        clean_seal,
                     )
                 }
                 IntegrityTier2Status::Cancelled => (
                     Tier2TerminalTransition::cancelled(Tier2IntegrityCounters::from(&report)),
                     IdleIntegrityTerminal::Cancelled,
+                    None,
                 ),
                 IntegrityTier2Status::Refused => {
                     debug_assert_eq!(settlement, IdleSweepSettlement::Superseded);
@@ -403,6 +427,7 @@ where
                     (
                         Tier2TerminalTransition::failed(counters, evidence),
                         IdleIntegrityTerminal::Refused,
+                        None,
                     )
                 }
             }
@@ -413,10 +438,21 @@ where
                 Tier2IntegrityGuardianEvidence::empty(),
             ),
             IdleIntegrityTerminal::Refused,
+            None,
         ),
     };
+    let verified_at = clean_seal.as_ref().map(|_| tokio::time::Instant::now());
     record_terminal_reconciled(state.journals(), &journal, &transition).await?;
-    Ok(terminal)
+    let clean_receipt = clean_seal.and_then(|seal: KnownGoodTier2CleanSeal| {
+        state.accept_known_good_tier2_clean_seal(
+            seal,
+            verified_at.expect("clean Tier 2 seal must retain verification time"),
+        )
+    });
+    Ok(IdleIntegrityCompletion {
+        terminal,
+        clean_receipt,
+    })
 }
 
 impl ReservedIntegritySweep {
@@ -430,7 +466,10 @@ impl ReservedIntegritySweep {
 
     #[cfg(test)]
     pub(super) async fn execute(self) -> Result<IdleIntegrityTerminal, Tier2IntegritySweepError> {
-        self.start().wait().await
+        self.start()
+            .wait()
+            .await
+            .map(|completion| completion.terminal)
     }
 
     #[cfg(all(test, target_os = "linux"))]
@@ -447,6 +486,16 @@ impl ReservedIntegritySweep {
         self,
         rebuild_source: RegisteredArtifactComponentRebuildSource,
     ) -> Result<IdleIntegrityTerminal, Tier2IntegritySweepError> {
+        self.execute_completion_with_rebuild_source(rebuild_source)
+            .await
+            .map(|completion| completion.terminal)
+    }
+
+    #[cfg(test)]
+    async fn execute_completion_with_rebuild_source(
+        self,
+        rebuild_source: RegisteredArtifactComponentRebuildSource,
+    ) -> Result<IdleIntegrityCompletion, Tier2IntegritySweepError> {
         self.planned
             .start_execute_reserved_with_source(self.settlement, |_| {}, rebuild_source)
             .wait()
@@ -466,11 +515,12 @@ impl ReservedIntegritySweep {
             .start_execute_reserved_with(self.settlement, |cancellation| cancellation.cancel())
             .wait()
             .await
+            .map(|completion| completion.terminal)
     }
 }
 
 impl IntegritySweepExecution {
-    pub(super) async fn wait(self) -> Result<IdleIntegrityTerminal, Tier2IntegritySweepError> {
+    pub(super) async fn wait(self) -> Result<IdleIntegrityCompletion, Tier2IntegritySweepError> {
         self.completion
             .await
             .expect("owned Tier 2 sweep task must return its terminal result")
@@ -1880,7 +1930,11 @@ exec sleep 30
             paired_impact.push(concurrent_elapsed.saturating_sub(baseline_elapsed));
             concurrent.push(concurrent_elapsed);
             assert_eq!(
-                execution.wait().await.expect("R5 cancelled sweep terminal"),
+                execution
+                    .wait()
+                    .await
+                    .expect("R5 cancelled sweep terminal")
+                    .terminal,
                 IdleIntegrityTerminal::Cancelled
             );
             let journal = state
@@ -2083,9 +2137,17 @@ exec sleep 30
         assert_eq!(plan.operation_id().as_str(), FIRST_OPERATION_ID);
         let reserved = reserve(plan, idle_epoch(&state));
 
-        let terminal = reserved.execute().await.expect("execute healthy sweep");
+        let completion = reserved
+            .start()
+            .wait()
+            .await
+            .expect("execute healthy sweep");
+        let (terminal, clean_receipt) = completion.into_parts();
 
         assert_eq!(terminal, IdleIntegrityTerminal::Succeeded);
+        assert!(state.known_good_tier2_clean_receipt_is_current(
+            clean_receipt.as_ref().expect("healthy clean receipt")
+        ));
         let journal = state
             .journals()
             .get(&OperationId::new(FIRST_OPERATION_ID))
@@ -2110,7 +2172,7 @@ exec sleep 30
         let reserved = reserve(plan, idle_epoch(&state));
         let gate = backend.gate_next();
         let terminal_attempt = backend.attempts.load(Ordering::SeqCst) + 1;
-        let execution = tokio::spawn(reserved.execute());
+        let execution = tokio::spawn(reserved.start().wait());
 
         backend.wait_for_attempt(terminal_attempt).await;
         assert!(!execution.is_finished());
@@ -2139,13 +2201,22 @@ exec sleep 30
         tokio::task::yield_now().await;
         assert!(!quiesce.is_finished());
 
+        drop(
+            state
+                .admit_managed_artifact_mutation()
+                .expect("mutation during terminal journal persistence"),
+        );
+
         gate.release();
-        assert_eq!(
-            execution
-                .await
-                .expect("execution waiter")
-                .expect("terminal journal commit"),
-            IdleIntegrityTerminal::Succeeded
+        let completion = execution
+            .await
+            .expect("execution waiter")
+            .expect("terminal journal commit");
+        let (terminal, clean_receipt) = completion.into_parts();
+        assert_eq!(terminal, IdleIntegrityTerminal::Succeeded);
+        assert!(
+            clean_receipt.is_none(),
+            "mutation during terminal persistence must invalidate the clean seal"
         );
         quiesce
             .await
@@ -2175,12 +2246,16 @@ exec sleep 30
         let plan = fixed_plan(&state, &instance.id, FIRST_OPERATION_ID).await;
         let reserved = reserve(plan, idle_epoch(&state));
 
-        let terminal = reserved
-            .execute_with_rebuild_source(RegisteredArtifactComponentRebuildSource::Fixture)
+        let completion = reserved
+            .execute_completion_with_rebuild_source(
+                RegisteredArtifactComponentRebuildSource::Fixture,
+            )
             .await
             .expect("execute corrupt sweep");
+        let (terminal, clean_receipt) = completion.into_parts();
 
         assert_eq!(terminal, IdleIntegrityTerminal::Succeeded);
+        assert!(clean_receipt.is_none(), "repaired sweep must not receipt");
         let journal = state
             .journals()
             .get(&OperationId::new(FIRST_OPERATION_ID))
@@ -2514,9 +2589,15 @@ exec sleep 30
         let plan = fixed_plan(&state, &instance.id, FIRST_OPERATION_ID).await;
         let reserved = reserve(plan, idle_epoch(&state));
 
-        let terminal = reserved.execute().await.expect("record ticket refusal");
+        let completion = reserved
+            .start()
+            .wait()
+            .await
+            .expect("record ticket refusal");
+        let (terminal, clean_receipt) = completion.into_parts();
 
         assert_eq!(terminal, IdleIntegrityTerminal::Refused);
+        assert!(clean_receipt.is_none(), "refused sweep must not receipt");
         let journal = state
             .journals()
             .get(&OperationId::new(FIRST_OPERATION_ID))

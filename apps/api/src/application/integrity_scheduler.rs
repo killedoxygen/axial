@@ -1,13 +1,16 @@
 use super::integrity::{
-    PlannedIntegritySweep, ReservedIntegritySweep, Tier2IntegritySweepError,
-    plan_tier2_integrity_sweep, reconcile_interrupted_tier2_integrity_sweeps,
+    IdleIntegrityCompletion, PlannedIntegritySweep, ReservedIntegritySweep,
+    Tier2IntegritySweepError, plan_tier2_integrity_sweep,
+    reconcile_interrupted_tier2_integrity_sweeps,
 };
 use crate::guardian::GuardianMode;
 use crate::state::{
-    AppState, IntegrityIdleEpoch, IntegrityIdleSnapshot, OperationJournalStoreError, ProducerLease,
+    AppState, IntegrityIdleEpoch, IntegrityIdleSnapshot, KnownGoodTier2CleanReceipt,
+    OperationJournalStoreError, ProducerLease,
 };
 use axial_config::is_canonical_instance_id;
 use futures_util::future::BoxFuture;
+use std::collections::BTreeMap;
 use std::time::Duration;
 use tokio::sync::{broadcast, watch};
 
@@ -18,6 +21,78 @@ use std::sync::{
 };
 
 const IDLE_INTEGRITY_THRESHOLD: Duration = Duration::from_secs(5 * 60);
+const CLEAN_RECEIPT_MAX_AGE: Duration = Duration::from_secs(60 * 60);
+
+struct SchedulerExecution {
+    clean_receipt: Option<KnownGoodTier2CleanReceipt>,
+}
+
+impl SchedulerExecution {
+    #[cfg(test)]
+    fn nonclean() -> Self {
+        Self {
+            clean_receipt: None,
+        }
+    }
+
+    fn from_completion(completion: IdleIntegrityCompletion) -> Self {
+        let (_, clean_receipt) = completion.into_parts();
+        Self { clean_receipt }
+    }
+}
+
+#[derive(Default)]
+struct KnownGoodTier2ReceiptCache {
+    receipts: BTreeMap<String, KnownGoodTier2CleanReceipt>,
+}
+
+impl KnownGoodTier2ReceiptCache {
+    fn due_registered_instances(
+        &mut self,
+        state: &AppState,
+        cursor: Option<&str>,
+        now: tokio::time::Instant,
+    ) -> Vec<String> {
+        let ids = registered_instance_ids(state);
+        self.receipts.retain(|instance_id, receipt| {
+            ids.binary_search(instance_id).is_ok()
+                && receipt.instance_id() == instance_id
+                && state.known_good_tier2_clean_receipt_is_current(receipt)
+        });
+        let mut due = ids
+            .into_iter()
+            .filter(|instance_id| {
+                self.receipts.get(instance_id).is_none_or(|receipt| {
+                    now.saturating_duration_since(receipt.verified_at()) >= CLEAN_RECEIPT_MAX_AGE
+                })
+            })
+            .collect::<Vec<_>>();
+        let split = cursor
+            .map(|cursor| due.partition_point(|instance_id| instance_id.as_str() <= cursor))
+            .unwrap_or(0);
+        due.rotate_left(split);
+        due
+    }
+
+    fn record_terminal(
+        &mut self,
+        state: &AppState,
+        instance_id: &str,
+        execution: SchedulerExecution,
+    ) {
+        let Some(receipt) = execution.clean_receipt else {
+            self.receipts.remove(instance_id);
+            return;
+        };
+        if receipt.instance_id() == instance_id
+            && state.known_good_tier2_clean_receipt_is_current(&receipt)
+        {
+            self.receipts.insert(instance_id.to_string(), receipt);
+        } else {
+            self.receipts.remove(instance_id);
+        }
+    }
+}
 
 trait IntegritySchedulerTransactions: Clone + Send + Sync + 'static {
     type Planned: Send + 'static;
@@ -62,7 +137,10 @@ trait IntegritySchedulerTransactions: Clone + Send + Sync + 'static {
         reserved: Self::Reserved,
     ) -> BoxFuture<'static, Result<(), &'static str>>;
 
-    fn execute(&self, reserved: Self::Reserved) -> BoxFuture<'static, Result<(), &'static str>>;
+    fn execute(
+        &self,
+        reserved: Self::Reserved,
+    ) -> BoxFuture<'static, Result<SchedulerExecution, &'static str>>;
 }
 
 #[cfg(test)]
@@ -221,13 +299,16 @@ impl IntegritySchedulerTransactions for ProductionIntegrityTransactions {
         })
     }
 
-    fn execute(&self, reserved: Self::Reserved) -> BoxFuture<'static, Result<(), &'static str>> {
+    fn execute(
+        &self,
+        reserved: Self::Reserved,
+    ) -> BoxFuture<'static, Result<SchedulerExecution, &'static str>> {
         let execution = reserved.start();
         Box::pin(async move {
             execution
                 .wait()
                 .await
-                .map(drop)
+                .map(SchedulerExecution::from_completion)
                 .map_err(|error| error.class())
         })
     }
@@ -302,6 +383,7 @@ async fn run_idle_integrity_scheduler<Transactions>(
     let mut idle = state.subscribe_integrity_idle();
     let mut config_changes = state.subscribe_config_changes();
     let mut cursor = None;
+    let mut receipts = KnownGoodTier2ReceiptCache::default();
 
     loop {
         let Some(epoch) = wait_for_stable_idle_epoch(
@@ -317,106 +399,123 @@ async fn run_idle_integrity_scheduler<Transactions>(
         else {
             return;
         };
-        let Some(instance_id) = next_registered_instance(&state, cursor.as_deref()) else {
-            continue;
-        };
-
-        let Some(plan) = await_transaction_until_shutdown(
-            transactions.plan(state.clone(), supervisor.claim_child(), instance_id.clone()),
-            &mut shutdown,
-        )
-        .await
-        else {
-            return;
-        };
-        let planned = match plan {
-            Ok(planned) => {
-                #[cfg(test)]
-                instrumentation.plan_accepted();
-                planned
-            }
-            Err(SchedulerPlanError::TargetRace) => continue,
-            Err(SchedulerPlanError::DeferredCapacity) => {
-                tracing::warn!(
-                    error_class = "capacity_exhausted",
-                    "idle integrity plan deferred because operation journal capacity is exhausted"
-                );
-                continue;
-            }
-            Err(SchedulerPlanError::Failed(error_class)) => {
-                tracing::warn!(error_class, "idle integrity plan persistence failed");
-                return;
-            }
-        };
-
-        if !planned_admission_is_current(
+        let candidates = receipts.due_registered_instances(
             &state,
-            epoch,
-            &mut shutdown,
-            &mut idle,
-            &mut config_changes,
-        ) {
-            if !terminalize_planned(&transactions, planned, &mut shutdown).await {
-                return;
-            }
+            cursor.as_deref(),
+            tokio::time::Instant::now(),
+        );
+        if candidates.is_empty() {
             continue;
         }
 
-        let Some(reservation) =
-            await_transaction_until_shutdown(transactions.reserve(planned, epoch), &mut shutdown)
-                .await
-        else {
-            return;
-        };
-        let reserved = match reservation {
-            Ok(reserved) => reserved,
-            Err(failure) => {
-                let error_class = transactions.reservation_failure_class(&failure);
-                let Some(cancellation) = await_transaction_until_shutdown(
-                    transactions.cancel_reservation_failure(failure),
-                    &mut shutdown,
-                )
-                .await
-                else {
-                    return;
-                };
-                if let Err(cancellation_error_class) = cancellation {
+        for instance_id in candidates {
+            let Some(plan) = await_transaction_until_shutdown(
+                transactions.plan(state.clone(), supervisor.claim_child(), instance_id.clone()),
+                &mut shutdown,
+            )
+            .await
+            else {
+                return;
+            };
+            let planned = match plan {
+                Ok(planned) => {
+                    #[cfg(test)]
+                    instrumentation.plan_accepted();
+                    planned
+                }
+                Err(SchedulerPlanError::TargetRace) => {
+                    receipts.receipts.remove(&instance_id);
+                    continue;
+                }
+                Err(SchedulerPlanError::DeferredCapacity) => {
                     tracing::warn!(
-                        error_class,
-                        cancellation_error_class,
-                        "idle integrity reservation cancellation failed"
+                        error_class = "capacity_exhausted",
+                        "idle integrity plan deferred because operation journal capacity is exhausted"
                     );
+                    break;
+                }
+                Err(SchedulerPlanError::Failed(error_class)) => {
+                    tracing::warn!(error_class, "idle integrity plan persistence failed");
                     return;
                 }
-                continue;
-            }
-        };
+            };
 
-        if !reserved_admission_is_current(
-            &state,
-            &transactions,
-            &reserved,
-            &mut shutdown,
-            &mut config_changes,
-        ) {
-            if !terminalize_reserved(&transactions, reserved, &mut shutdown).await {
-                return;
+            if !planned_admission_is_current(
+                &state,
+                epoch,
+                &mut shutdown,
+                &mut idle,
+                &mut config_changes,
+            ) {
+                if !terminalize_planned(&transactions, planned, &mut shutdown).await {
+                    return;
+                }
+                break;
             }
-            continue;
-        }
 
-        #[cfg(test)]
-        instrumentation.execution_started();
-        let Some(execution) =
-            await_transaction_until_shutdown(transactions.execute(reserved), &mut shutdown).await
-        else {
-            return;
-        };
-        match execution {
-            Ok(_) => cursor = Some(instance_id),
-            Err(error_class) => {
-                tracing::warn!(error_class, "idle integrity terminal persistence failed");
+            let Some(reservation) = await_transaction_until_shutdown(
+                transactions.reserve(planned, epoch),
+                &mut shutdown,
+            )
+            .await
+            else {
                 return;
+            };
+            let reserved = match reservation {
+                Ok(reserved) => reserved,
+                Err(failure) => {
+                    let error_class = transactions.reservation_failure_class(&failure);
+                    let Some(cancellation) = await_transaction_until_shutdown(
+                        transactions.cancel_reservation_failure(failure),
+                        &mut shutdown,
+                    )
+                    .await
+                    else {
+                        return;
+                    };
+                    if let Err(cancellation_error_class) = cancellation {
+                        tracing::warn!(
+                            error_class,
+                            cancellation_error_class,
+                            "idle integrity reservation cancellation failed"
+                        );
+                        return;
+                    }
+                    break;
+                }
+            };
+
+            if !reserved_admission_is_current(
+                &state,
+                &transactions,
+                &reserved,
+                &mut shutdown,
+                &mut config_changes,
+            ) {
+                if !terminalize_reserved(&transactions, reserved, &mut shutdown).await {
+                    return;
+                }
+                break;
+            }
+
+            #[cfg(test)]
+            instrumentation.execution_started();
+            let Some(execution) =
+                await_transaction_until_shutdown(transactions.execute(reserved), &mut shutdown)
+                    .await
+            else {
+                return;
+            };
+            match execution {
+                Ok(execution) => {
+                    cursor = Some(instance_id.clone());
+                    receipts.record_terminal(&state, &instance_id, execution);
+                    break;
+                }
+                Err(error_class) => {
+                    tracing::warn!(error_class, "idle integrity terminal persistence failed");
+                    return;
+                }
             }
         }
     }
@@ -592,7 +691,7 @@ fn idle_integrity_enabled(state: &AppState) -> bool {
         && GuardianMode::from_config(&config.guardian_mode) == GuardianMode::Managed
 }
 
-fn next_registered_instance(state: &AppState, cursor: Option<&str>) -> Option<String> {
+fn registered_instance_ids(state: &AppState) -> Vec<String> {
     let mut ids = state
         .instances()
         .list()
@@ -602,10 +701,7 @@ fn next_registered_instance(state: &AppState, cursor: Option<&str>) -> Option<St
         .collect::<Vec<_>>();
     ids.sort_unstable();
     ids.dedup();
-    cursor
-        .and_then(|cursor| ids.iter().find(|instance_id| instance_id.as_str() > cursor))
-        .cloned()
-        .or_else(|| ids.into_iter().next())
+    ids
 }
 
 fn shutdown_requested(shutdown: &mut watch::Receiver<bool>) -> bool {
@@ -649,6 +745,7 @@ fn drain_config_changes(config_changes: &mut broadcast::Receiver<()>) -> ConfigD
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::execution::integrity::Tier2CleanSealRequest;
     use crate::state::contracts::{
         CommandKind, JournalId, OperationId, OperationJournalEntry, OperationJournalStep,
         OperationOutcome, OperationPhase, OperationStatus, OperationStepResult, OwnershipClass,
@@ -656,7 +753,7 @@ mod tests {
     };
     use crate::state::{
         AppStateInit, IdleSweepCancellation, IdleSweepReservation, IdleSweepTerminal, InstallStore,
-        OperationJournalStore, SessionStore,
+        KnownGoodTier2CleanClassification, OperationJournalStore, SessionStore,
     };
     use axial_config::{AppPaths, ConfigStore, InstanceRegistrySnapshot, InstanceStore};
     use axial_minecraft::known_good::{KnownGoodInventory, TestKnownGoodEntry};
@@ -723,6 +820,7 @@ mod tests {
         next_operation: AtomicUsize,
         worker_starts: AtomicUsize,
         terminal_targets: Mutex<Vec<String>>,
+        target_races: Mutex<Vec<String>>,
         worker_cancellation: Mutex<Option<IdleSweepCancellation>>,
         reconcile_gate: PhaseGate,
         plan_gate: PhaseGate,
@@ -788,6 +886,14 @@ mod tests {
                 .lock()
                 .expect("terminal targets")
                 .clone()
+        }
+
+        fn race_plan_once(&self, instance_id: &str) {
+            self.inner
+                .target_races
+                .lock()
+                .expect("target races")
+                .push(instance_id.to_string());
         }
 
         async fn wait_for_event(&self, expected: &'static str) {
@@ -903,6 +1009,22 @@ mod tests {
             let transactions = self.clone();
             Box::pin(async move {
                 transactions.record("plan_started");
+                let raced = {
+                    let mut races = transactions
+                        .inner
+                        .target_races
+                        .lock()
+                        .expect("target races");
+                    races
+                        .iter()
+                        .position(|target| target == &instance_id)
+                        .map(|index| races.remove(index))
+                        .is_some()
+                };
+                if raced {
+                    transactions.record("plan_target_race");
+                    return Err(SchedulerPlanError::TargetRace);
+                }
                 let journal = transactions.planned_entry(&instance_id);
                 let operation_id = journal.operation_id.clone();
                 if transactions.persist_journals {
@@ -1013,7 +1135,7 @@ mod tests {
         fn execute(
             &self,
             reserved: Self::Reserved,
-        ) -> BoxFuture<'static, Result<(), &'static str>> {
+        ) -> BoxFuture<'static, Result<SchedulerExecution, &'static str>> {
             let transactions = self.clone();
             Box::pin(async move {
                 let ScriptedReserved {
@@ -1080,7 +1202,7 @@ mod tests {
                     .expect("terminal targets")
                     .push(planned.instance_id);
                 transactions.record("terminal_persisted");
-                Ok(())
+                Ok(SchedulerExecution::nonclean())
             })
         }
     }
@@ -1136,6 +1258,100 @@ mod tests {
             .expect("empty healthy inventory");
         state.activate_known_good_inventory_for_test(&instance.id, inventory);
         instance.id
+    }
+
+    async fn exact_clean_receipt(
+        state: &AppState,
+        instance_id: &str,
+        verified_at: tokio::time::Instant,
+    ) -> KnownGoodTier2CleanReceipt {
+        let epoch = state.subscribe_integrity_idle().borrow().epoch();
+        let reservation = state
+            .try_reserve_idle_sweep(
+                epoch,
+                state
+                    .try_claim_producer()
+                    .expect("claim clean receipt producer"),
+            )
+            .expect("reserve clean receipt sweep");
+        let ticket = state
+            .mint_known_good_tier2_ticket(&reservation.authority(), instance_id)
+            .await
+            .expect("mint clean receipt ticket");
+        let classification = state
+            .seal_known_good_tier2_clean_request(Tier2CleanSealRequest::exact_clean_for_test(
+                ticket,
+            ))
+            .await
+            .expect("seal clean receipt");
+        let KnownGoodTier2CleanClassification::Clean(seal) = classification else {
+            panic!("exact clean request must produce clean seal")
+        };
+        reservation.settle(IdleSweepTerminal::Complete);
+        state
+            .accept_known_good_tier2_clean_seal(seal, verified_at)
+            .expect("accept exact clean receipt")
+    }
+
+    async fn with_real_time_watchdog<T>(
+        label: &'static str,
+        future: impl std::future::Future<Output = T>,
+    ) -> T {
+        let (cancel_tx, cancel_rx) = std::sync::mpsc::channel();
+        let (expired_tx, expired_rx) = tokio::sync::oneshot::channel();
+        let watchdog = std::thread::spawn(move || {
+            if cancel_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .is_err()
+            {
+                let _ = expired_tx.send(());
+            }
+        });
+        tokio::pin!(future);
+        let output = tokio::select! {
+            output = &mut future => Some(output),
+            _ = expired_rx => None,
+        };
+        let _ = cancel_tx.send(());
+        watchdog.join().expect("real-time watchdog thread");
+        output.unwrap_or_else(|| panic!("{label} exceeded the five-second real-time watchdog"))
+    }
+
+    async fn execute_production_receipt_pass(
+        state: &AppState,
+        supervisor: &ProducerLease,
+        instance_id: &str,
+        cache: &mut KnownGoodTier2ReceiptCache,
+        instrumentation: &SchedulerTestInstrumentation,
+    ) {
+        let transactions = ProductionIntegrityTransactions;
+        let planned = with_real_time_watchdog(
+            "production scheduler plan",
+            transactions.plan(
+                state.clone(),
+                supervisor.claim_child(),
+                instance_id.to_string(),
+            ),
+        )
+        .await
+        .expect("production scheduler plan");
+        instrumentation.plan_accepted();
+        let epoch = state.subscribe_integrity_idle().borrow().epoch();
+        let reserved = match transactions.reserve(planned, epoch).await {
+            Ok(reserved) => reserved,
+            Err(failure) => panic!(
+                "production scheduler reservation: {}",
+                transactions.reservation_failure_class(&failure)
+            ),
+        };
+        instrumentation.execution_started();
+        let execution = with_real_time_watchdog(
+            "production scheduler execution",
+            transactions.execute(reserved),
+        )
+        .await
+        .expect("production scheduler execution");
+        cache.record_terminal(state, instance_id, execution);
     }
 
     fn integrity_journals(state: &AppState) -> Vec<OperationJournalEntry> {
@@ -1281,6 +1497,208 @@ mod tests {
                 SchedulerPlanError::Failed(expected_class)
             );
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn exact_receipt_age_skips_five_to_fifty_five_minutes_and_is_due_at_sixty() {
+        let (state, root) = state_fixture("receipt-age");
+        let young_id = register_healthy_instance(&state, "Receipt age five");
+        let middle_id = register_healthy_instance(&state, "Receipt age fifty five");
+        let due_id = register_healthy_instance(&state, "Receipt age sixty");
+        let now = tokio::time::Instant::now();
+        let mut cache = KnownGoodTier2ReceiptCache::default();
+        for (instance_id, age) in [
+            (young_id.clone(), Duration::from_secs(5 * 60)),
+            (middle_id.clone(), Duration::from_secs(55 * 60)),
+            (due_id.clone(), CLEAN_RECEIPT_MAX_AGE),
+        ] {
+            let receipt = exact_clean_receipt(&state, &instance_id, now - age).await;
+            cache.receipts.insert(instance_id, receipt);
+        }
+
+        assert_eq!(cache.due_registered_instances(&state, None, now), [due_id]);
+        let due_after_five =
+            cache.due_registered_instances(&state, None, now + Duration::from_secs(5 * 60));
+        assert!(due_after_five.contains(&middle_id));
+        assert_eq!(due_after_five.len(), 2);
+        assert!(!due_after_five.contains(&young_id));
+        close_fixture(state, &root).await;
+    }
+
+    #[tokio::test]
+    async fn production_scheduler_reuses_clean_receipt_until_the_sixty_minute_boundary() {
+        let (state, root) = state_fixture("production-receipt-age");
+        let instance_id = register_healthy_instance(&state, "Production receipt age");
+        let supervisor = state.try_claim_producer().expect("claim scheduler");
+        let instrumentation = SchedulerTestInstrumentation::default();
+        let mut cache = KnownGoodTier2ReceiptCache::default();
+
+        execute_production_receipt_pass(
+            &state,
+            &supervisor,
+            &instance_id,
+            &mut cache,
+            &instrumentation,
+        )
+        .await;
+        assert_eq!(terminal_integrity_journals(&state).len(), 1);
+        assert_eq!(instrumentation.accepted_plan_count(), 1);
+        assert_eq!(instrumentation.execution_start_count(), 1);
+        let verified_at = cache
+            .receipts
+            .get(&instance_id)
+            .expect("first production clean receipt")
+            .verified_at();
+
+        assert!(
+            cache
+                .due_registered_instances(&state, None, verified_at + Duration::from_secs(5 * 60),)
+                .is_empty()
+        );
+        assert_eq!(instrumentation.accepted_plan_count(), 1);
+        assert_eq!(instrumentation.execution_start_count(), 1);
+
+        assert!(
+            cache
+                .due_registered_instances(&state, None, verified_at + Duration::from_secs(55 * 60),)
+                .is_empty()
+        );
+        assert_eq!(instrumentation.accepted_plan_count(), 1);
+        assert_eq!(instrumentation.execution_start_count(), 1);
+
+        assert_eq!(
+            cache.due_registered_instances(&state, None, verified_at + CLEAN_RECEIPT_MAX_AGE,),
+            [instance_id.clone()]
+        );
+        execute_production_receipt_pass(
+            &state,
+            &supervisor,
+            &instance_id,
+            &mut cache,
+            &instrumentation,
+        )
+        .await;
+        assert_eq!(terminal_integrity_journals(&state).len(), 2);
+        assert_eq!(instrumentation.accepted_plan_count(), 2);
+        assert_eq!(instrumentation.execution_start_count(), 2);
+        drop(supervisor);
+        with_real_time_watchdog(
+            "production receipt fixture close",
+            close_fixture(state, &root),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn circular_due_selection_skips_young_receipts_after_the_cursor() {
+        let (state, root) = state_fixture("receipt-circular-fairness");
+        let mut instance_ids = [
+            register_healthy_instance(&state, "Receipt cursor first"),
+            register_healthy_instance(&state, "Receipt cursor second"),
+            register_healthy_instance(&state, "Receipt cursor third"),
+        ];
+        instance_ids.sort();
+        let now = tokio::time::Instant::now();
+        let young = exact_clean_receipt(&state, &instance_ids[1], now).await;
+        let due = exact_clean_receipt(&state, &instance_ids[2], now - CLEAN_RECEIPT_MAX_AGE).await;
+        let mut cache = KnownGoodTier2ReceiptCache::default();
+        cache.receipts.insert(instance_ids[1].clone(), young);
+        cache.receipts.insert(instance_ids[2].clone(), due);
+
+        assert_eq!(
+            cache.due_registered_instances(&state, Some(&instance_ids[0]), now),
+            [instance_ids[2].clone(), instance_ids[0].clone()]
+        );
+        close_fixture(state, &root).await;
+    }
+
+    #[tokio::test]
+    async fn receipt_selection_prunes_deletion_identity_drift_and_epoch_drift() {
+        let (state, root) = state_fixture("receipt-invalidation");
+        let deleted_id = register_healthy_instance(&state, "Deleted receipt");
+        let replaced_id = register_healthy_instance(&state, "Replaced receipt");
+        let epoch_id = register_healthy_instance(&state, "Epoch receipt");
+        let now = tokio::time::Instant::now();
+        let mut cache = KnownGoodTier2ReceiptCache::default();
+        for instance_id in [&deleted_id, &replaced_id, &epoch_id] {
+            cache.receipts.insert(
+                instance_id.clone(),
+                exact_clean_receipt(&state, instance_id, now).await,
+            );
+        }
+
+        state
+            .instances()
+            .remove_for_test(&deleted_id)
+            .expect("delete receipted instance");
+        assert!(cache.due_registered_instances(&state, None, now).is_empty());
+        assert!(!cache.receipts.contains_key(&deleted_id));
+
+        let mut replacement = state
+            .instances()
+            .get(&replaced_id)
+            .expect("replaced instance");
+        replacement.version_id = "1.21.6".to_string();
+        state
+            .instances()
+            .replace_for_test(replacement)
+            .expect("replace receipted identity");
+        assert_eq!(
+            cache.due_registered_instances(&state, None, now),
+            [replaced_id.clone()]
+        );
+        assert!(!cache.receipts.contains_key(&replaced_id));
+        state
+            .instances()
+            .remove_for_test(&replaced_id)
+            .expect("delete identity-drifted instance");
+        assert!(cache.due_registered_instances(&state, None, now).is_empty());
+
+        drop(
+            state
+                .admit_managed_artifact_mutation()
+                .expect("advance managed artifact epoch"),
+        );
+        assert_eq!(
+            cache.due_registered_instances(&state, None, now),
+            [epoch_id]
+        );
+        assert!(cache.receipts.is_empty());
+        close_fixture(state, &root).await;
+    }
+
+    #[tokio::test]
+    async fn process_restart_cache_is_empty_and_nonclean_terminal_evicts_receipt() {
+        let (state, root) = state_fixture("receipt-process-cache");
+        let instance_id = register_healthy_instance(&state, "Process-local receipt");
+        let now = tokio::time::Instant::now();
+        let receipt = exact_clean_receipt(&state, &instance_id, now).await;
+        let mut populated = KnownGoodTier2ReceiptCache::default();
+        populated.record_terminal(
+            &state,
+            &instance_id,
+            SchedulerExecution {
+                clean_receipt: Some(receipt),
+            },
+        );
+        assert!(
+            populated
+                .due_registered_instances(&state, None, now)
+                .is_empty()
+        );
+
+        populated.record_terminal(&state, &instance_id, SchedulerExecution::nonclean());
+        assert_eq!(
+            populated.due_registered_instances(&state, None, now),
+            [instance_id.clone()]
+        );
+
+        let mut restarted = KnownGoodTier2ReceiptCache::default();
+        assert_eq!(
+            restarted.due_registered_instances(&state, None, now),
+            [instance_id]
+        );
+        close_fixture(state, &root).await;
     }
 
     #[tokio::test(start_paused = true)]
@@ -1487,6 +1905,43 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn circular_selection_scans_past_a_target_race_without_starving_the_next_instance() {
+        let (state, root) = state_fixture("target-race-circular-selection");
+        let mut instance_ids = [
+            register_healthy_instance(&state, "Target race first"),
+            register_healthy_instance(&state, "Target race second"),
+        ];
+        instance_ids.sort();
+        let transactions = ScriptedTransactions::in_memory();
+        transactions.race_plan_once(&instance_ids[0]);
+        start_scripted_scheduler(&state, &transactions, TEST_THRESHOLD).await;
+        transactions.wait_for_threshold_arms(1).await;
+
+        tokio::time::advance(TEST_THRESHOLD).await;
+        transactions.wait_for_event("terminal_persisted").await;
+        assert_eq!(transactions.terminal_targets(), [instance_ids[1].clone()]);
+        assert_eq!(
+            transactions
+                .events()
+                .into_iter()
+                .filter(|event| *event == "plan_target_race")
+                .count(),
+            1
+        );
+
+        transactions.wait_for_threshold_arms(2).await;
+        tokio::time::advance(TEST_THRESHOLD).await;
+        transactions
+            .wait_for_event_count("terminal_persisted", 2)
+            .await;
+        assert_eq!(
+            transactions.terminal_targets(),
+            [instance_ids[1].clone(), instance_ids[0].clone()]
+        );
+        close_fixture(state, &root).await;
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn empty_registry_consumes_a_threshold_without_carrying_admission() {
         let (state, root) = state_fixture("empty-registry");
         let transactions = ScriptedTransactions::in_memory();
@@ -1571,6 +2026,7 @@ mod tests {
     async fn durable_plan_is_cancelled_after_post_plan_config_change_without_starting_a_worker() {
         let (state, root) = state_fixture("post-plan-config");
         register_healthy_instance(&state, "Post plan config");
+        register_healthy_instance(&state, "Post plan config second");
         let transactions = ScriptedTransactions::default();
         transactions.inner.plan_gate.block();
         spawn_scripted_scheduler(&state, transactions.clone());
@@ -1590,6 +2046,19 @@ mod tests {
             OperationStatus::Cancelled
         );
         assert_eq!(transactions.worker_start_count(), 0);
+        for _ in 0..64 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(integrity_journals(&state).len(), 1);
+        assert_eq!(
+            transactions
+                .events()
+                .into_iter()
+                .filter(|event| *event == "plan_started")
+                .count(),
+            1,
+            "post-plan config reset must require a fresh threshold before another target"
+        );
         assert_eq!(
             transactions.events(),
             [
@@ -1649,6 +2118,7 @@ mod tests {
     async fn foreground_race_during_reservation_durably_cancels_the_plan() {
         let (state, root) = state_fixture("reserve-foreground-race");
         register_healthy_instance(&state, "Reserve foreground race");
+        register_healthy_instance(&state, "Reserve foreground race second");
         let transactions = ScriptedTransactions::default();
         transactions.inner.reserve_gate.block();
         spawn_scripted_scheduler(&state, transactions.clone());
@@ -1674,6 +2144,19 @@ mod tests {
             OperationStatus::Cancelled
         );
         assert_eq!(transactions.worker_start_count(), 0);
+        for _ in 0..64 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(integrity_journals(&state).len(), 1);
+        assert_eq!(
+            transactions
+                .events()
+                .into_iter()
+                .filter(|event| *event == "plan_started")
+                .count(),
+            1,
+            "reservation reset must require a fresh threshold before another target"
+        );
         assert_eq!(
             transactions.events(),
             [

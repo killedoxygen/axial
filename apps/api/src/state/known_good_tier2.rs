@@ -3,11 +3,11 @@ use super::{
     KnownGoodVerificationOwner, KnownGoodVerificationUnavailable, RegisteredArtifactFindings,
     RegisteredArtifactObservation,
 };
-use crate::execution::integrity::Tier2RegisteredArtifactSealRequest;
+use crate::execution::integrity::{Tier2CleanSealRequest, Tier2RegisteredArtifactSealRequest};
 use axial_config::is_canonical_instance_id;
 use axial_minecraft::{ManagedRuntimeCache, known_good::KnownGoodInventory};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 /// Move-only snapshot of exact live known-good authority for a Tier 2 sweep.
 pub(crate) struct KnownGoodTier2Ticket {
@@ -19,6 +19,54 @@ pub(crate) struct KnownGoodTier2Ticket {
     managed_runtime_cache: ManagedRuntimeCache,
     inventory: Arc<KnownGoodInventory>,
     managed_artifact_epoch: super::ManagedArtifactMutationEpoch,
+}
+
+/// Exact clean authority retained across durable Tier 2 terminalization.
+pub(crate) struct KnownGoodTier2CleanSeal {
+    instance_id: String,
+    version_id: String,
+    created_at: String,
+    library_root: PathBuf,
+    managed_runtime_cache: ManagedRuntimeCache,
+    inventory: Arc<KnownGoodInventory>,
+    managed_artifact_epoch: super::ManagedArtifactMutationEpoch,
+}
+
+pub(crate) enum KnownGoodTier2CleanClassification {
+    Clean(KnownGoodTier2CleanSeal),
+    NonClean(KnownGoodTier2Ticket),
+}
+
+/// Process-local proof that one exact live instance identity was clean.
+pub(crate) struct KnownGoodTier2CleanReceipt {
+    instance_id: String,
+    version_id: String,
+    created_at: String,
+    library_root: PathBuf,
+    managed_runtime_cache: ManagedRuntimeCache,
+    inventory: Weak<KnownGoodInventory>,
+    managed_artifact_epoch: super::ManagedArtifactMutationEpoch,
+    verified_at: tokio::time::Instant,
+}
+
+impl KnownGoodTier2CleanReceipt {
+    pub(crate) fn instance_id(&self) -> &str {
+        &self.instance_id
+    }
+
+    pub(crate) fn verified_at(&self) -> tokio::time::Instant {
+        self.verified_at
+    }
+
+    #[cfg(test)]
+    fn exact_identity_for_test(&self) -> (&str, &str, &str, &Path) {
+        (
+            &self.instance_id,
+            &self.version_id,
+            &self.created_at,
+            &self.library_root,
+        )
+    }
 }
 
 impl KnownGoodTier2Ticket {
@@ -109,6 +157,113 @@ impl AppState {
             && self.idle_sweep_authority_is_current(&ticket.sweep_authority)
     }
 
+    pub(crate) async fn seal_known_good_tier2_clean_request(
+        &self,
+        request: Tier2CleanSealRequest,
+    ) -> Result<KnownGoodTier2CleanClassification, KnownGoodVerificationUnavailable> {
+        self.seal_known_good_tier2_clean_request_with_observer(request, || {})
+            .await
+    }
+
+    async fn seal_known_good_tier2_clean_request_with_observer<BeforeSeal>(
+        &self,
+        request: Tier2CleanSealRequest,
+        before_seal: BeforeSeal,
+    ) -> Result<KnownGoodTier2CleanClassification, KnownGoodVerificationUnavailable>
+    where
+        BeforeSeal: FnOnce(),
+    {
+        if !self.known_good_tier2_ticket_is_current(request.ticket()) {
+            return Err(KnownGoodVerificationUnavailable::SweepAuthorityUnavailable);
+        }
+        let lifecycle = InstanceLifecycleLease::bind(
+            &request.ticket().instance_id,
+            self.instance_lifecycle_gates.clone(),
+            self.instance_lifecycle_gates
+                .acquire(&request.ticket().instance_id)
+                .await,
+        );
+        before_seal();
+        if !self.known_good_tier2_ticket_is_current(request.ticket()) {
+            return Err(KnownGoodVerificationUnavailable::SweepAuthorityUnavailable);
+        }
+        let exact_clean = request.is_exact_clean();
+        let ticket = request.into_ticket();
+        if !exact_clean {
+            drop(lifecycle);
+            return Ok(KnownGoodTier2CleanClassification::NonClean(ticket));
+        }
+        let KnownGoodTier2Ticket {
+            sweep_authority: _,
+            instance_id,
+            version_id,
+            created_at,
+            library_root,
+            managed_runtime_cache,
+            inventory,
+            managed_artifact_epoch,
+        } = ticket;
+        drop(lifecycle);
+        Ok(KnownGoodTier2CleanClassification::Clean(
+            KnownGoodTier2CleanSeal {
+                instance_id,
+                version_id,
+                created_at,
+                library_root,
+                managed_runtime_cache,
+                inventory,
+                managed_artifact_epoch,
+            },
+        ))
+    }
+
+    pub(crate) fn accept_known_good_tier2_clean_seal(
+        &self,
+        seal: KnownGoodTier2CleanSeal,
+        verified_at: tokio::time::Instant,
+    ) -> Option<KnownGoodTier2CleanReceipt> {
+        if !self.known_good_tier2_exact_identity_is_current(
+            &seal.instance_id,
+            &seal.version_id,
+            &seal.created_at,
+            &seal.library_root,
+            &seal.managed_runtime_cache,
+            &seal.inventory,
+            seal.managed_artifact_epoch,
+        ) {
+            return None;
+        }
+        let inventory = Arc::downgrade(&seal.inventory);
+        Some(KnownGoodTier2CleanReceipt {
+            instance_id: seal.instance_id,
+            version_id: seal.version_id,
+            created_at: seal.created_at,
+            library_root: seal.library_root,
+            managed_runtime_cache: seal.managed_runtime_cache,
+            inventory,
+            managed_artifact_epoch: seal.managed_artifact_epoch,
+            verified_at,
+        })
+    }
+
+    pub(crate) fn known_good_tier2_clean_receipt_is_current(
+        &self,
+        receipt: &KnownGoodTier2CleanReceipt,
+    ) -> bool {
+        let Some(inventory) = receipt.inventory.upgrade() else {
+            return false;
+        };
+        self.known_good_tier2_exact_identity_is_current(
+            &receipt.instance_id,
+            &receipt.version_id,
+            &receipt.created_at,
+            &receipt.library_root,
+            &receipt.managed_runtime_cache,
+            &inventory,
+            receipt.managed_artifact_epoch,
+        )
+    }
+
     pub(crate) async fn seal_tier2_registered_artifact_request(
         &self,
         request: Tier2RegisteredArtifactSealRequest,
@@ -174,15 +329,39 @@ impl AppState {
     }
 
     fn known_good_tier2_ticket_identity_is_current(&self, ticket: &KnownGoodTier2Ticket) -> bool {
+        self.known_good_tier2_exact_identity_is_current(
+            &ticket.instance_id,
+            &ticket.version_id,
+            &ticket.created_at,
+            &ticket.library_root,
+            &ticket.managed_runtime_cache,
+            &ticket.inventory,
+            ticket.managed_artifact_epoch,
+        )
+    }
+
+    fn known_good_tier2_exact_identity_is_current(
+        &self,
+        instance_id: &str,
+        version_id: &str,
+        created_at: &str,
+        library_root: &Path,
+        managed_runtime_cache: &ManagedRuntimeCache,
+        inventory: &Arc<KnownGoodInventory>,
+        managed_artifact_epoch: super::ManagedArtifactMutationEpoch,
+    ) -> bool {
         self.managed_artifact_mutation_epoch()
-            .is_ok_and(|epoch| epoch == ticket.managed_artifact_epoch)
+            .is_ok_and(|epoch| epoch == managed_artifact_epoch)
+            && self
+                .managed_runtime_cache
+                .shares_identity_with(managed_runtime_cache)
             && self.known_good_authority_is_current(
-                &ticket.instance_id,
-                &ticket.version_id,
-                &ticket.created_at,
-                &ticket.library_root,
-                &ticket.managed_runtime_cache,
-                &ticket.inventory,
+                instance_id,
+                version_id,
+                created_at,
+                library_root,
+                managed_runtime_cache,
+                inventory,
             )
     }
 }
@@ -208,6 +387,8 @@ mod tests {
 
     const _: fn() = || {
         let _ = <KnownGoodTier2Ticket as AmbiguousIfClone<_>>::assert_not_clone;
+        let _ = <KnownGoodTier2CleanSeal as AmbiguousIfClone<_>>::assert_not_clone;
+        let _ = <KnownGoodTier2CleanReceipt as AmbiguousIfClone<_>>::assert_not_clone;
     };
 
     struct Fixture {
@@ -665,6 +846,191 @@ mod tests {
         );
         drop(reservation);
         drop(foreground);
+        fixture.close().await;
+    }
+
+    #[tokio::test]
+    async fn exact_clean_seal_mints_a_process_local_exact_receipt() {
+        let fixture = Fixture::new("clean-receipt");
+        let reservation = fixture.reserve_sweep();
+        let ticket = fixture
+            .state
+            .mint_known_good_tier2_ticket(&reservation.authority(), &fixture.instance.id)
+            .await
+            .expect("ticket");
+        let classification = fixture
+            .state
+            .seal_known_good_tier2_clean_request(Tier2CleanSealRequest::exact_clean_for_test(
+                ticket,
+            ))
+            .await
+            .expect("clean seal");
+        let KnownGoodTier2CleanClassification::Clean(seal) = classification else {
+            panic!("exact clean report must seal clean authority")
+        };
+        reservation.settle(super::super::IdleSweepTerminal::Complete);
+        let verified_at = tokio::time::Instant::now();
+        let receipt = fixture
+            .state
+            .accept_known_good_tier2_clean_seal(seal, verified_at)
+            .expect("exact receipt");
+
+        assert_eq!(receipt.verified_at(), verified_at);
+        assert_eq!(
+            receipt.exact_identity_for_test(),
+            (
+                fixture.instance.id.as_str(),
+                fixture.instance.version_id.as_str(),
+                fixture.instance.created_at.as_str(),
+                fixture.library_root.as_path(),
+            )
+        );
+        assert!(
+            fixture
+                .state
+                .known_good_tier2_clean_receipt_is_current(&receipt)
+        );
+        fixture.close().await;
+    }
+
+    #[tokio::test]
+    async fn dirty_report_is_returned_for_findings_sealing_without_clean_authority() {
+        let fixture = Fixture::new("dirty-classification");
+        let reservation = fixture.reserve_sweep();
+        let ticket = fixture
+            .state
+            .mint_known_good_tier2_ticket(&reservation.authority(), &fixture.instance.id)
+            .await
+            .expect("ticket");
+        let classification = fixture
+            .state
+            .seal_known_good_tier2_clean_request(
+                Tier2CleanSealRequest::exact_clean_for_test(ticket).with_fact_for_test(),
+            )
+            .await
+            .expect("dirty classification");
+        let KnownGoodTier2CleanClassification::NonClean(ticket) = classification else {
+            panic!("dirty report must not produce clean authority")
+        };
+        assert!(fixture.state.known_good_tier2_ticket_is_current(&ticket));
+        drop(ticket);
+        reservation.settle(super::super::IdleSweepTerminal::Cancelled);
+        fixture.close().await;
+    }
+
+    #[tokio::test]
+    async fn managed_artifact_epoch_race_before_clean_seal_is_rejected() {
+        let fixture = Fixture::new("clean-before-seal-race");
+        let reservation = fixture.reserve_sweep();
+        let ticket = fixture
+            .state
+            .mint_known_good_tier2_ticket(&reservation.authority(), &fixture.instance.id)
+            .await
+            .expect("ticket");
+        let mutating_state = fixture.state.clone();
+        let result = fixture
+            .state
+            .seal_known_good_tier2_clean_request_with_observer(
+                Tier2CleanSealRequest::exact_clean_for_test(ticket),
+                move || {
+                    drop(
+                        mutating_state
+                            .admit_managed_artifact_mutation()
+                            .expect("racing managed mutation"),
+                    );
+                },
+            )
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(KnownGoodVerificationUnavailable::SweepAuthorityUnavailable)
+        ));
+        reservation.settle(super::super::IdleSweepTerminal::Cancelled);
+        fixture.close().await;
+    }
+
+    #[tokio::test]
+    async fn mutation_after_clean_seal_prevents_final_receipt_acceptance() {
+        let fixture = Fixture::new("clean-after-seal-race");
+        let reservation = fixture.reserve_sweep();
+        let ticket = fixture
+            .state
+            .mint_known_good_tier2_ticket(&reservation.authority(), &fixture.instance.id)
+            .await
+            .expect("ticket");
+        let classification = fixture
+            .state
+            .seal_known_good_tier2_clean_request(Tier2CleanSealRequest::exact_clean_for_test(
+                ticket,
+            ))
+            .await
+            .expect("clean seal");
+        let KnownGoodTier2CleanClassification::Clean(seal) = classification else {
+            panic!("exact clean report must seal clean authority")
+        };
+        reservation.settle(super::super::IdleSweepTerminal::Complete);
+        drop(
+            fixture
+                .state
+                .admit_managed_artifact_mutation()
+                .expect("post-seal managed mutation"),
+        );
+
+        assert!(
+            fixture
+                .state
+                .accept_known_good_tier2_clean_seal(seal, tokio::time::Instant::now())
+                .is_none()
+        );
+        fixture.close().await;
+    }
+
+    #[tokio::test]
+    async fn clean_receipt_does_not_retain_a_replaced_inventory() {
+        let fixture = Fixture::new("receipt-weak-inventory");
+        let retained_inventory = fixture
+            .state
+            .activate_known_good_inventory_for_test_with_identity(
+                &fixture.instance.id,
+                inventory("retained.jar"),
+            );
+        let inventory_identity = Arc::downgrade(&retained_inventory);
+        let reservation = fixture.reserve_sweep();
+        let ticket = fixture
+            .state
+            .mint_known_good_tier2_ticket(&reservation.authority(), &fixture.instance.id)
+            .await
+            .expect("ticket");
+        let classification = fixture
+            .state
+            .seal_known_good_tier2_clean_request(Tier2CleanSealRequest::exact_clean_for_test(
+                ticket,
+            ))
+            .await
+            .expect("clean seal");
+        let KnownGoodTier2CleanClassification::Clean(seal) = classification else {
+            panic!("exact clean report must seal clean authority")
+        };
+        reservation.settle(super::super::IdleSweepTerminal::Complete);
+        let receipt = fixture
+            .state
+            .accept_known_good_tier2_clean_seal(seal, tokio::time::Instant::now())
+            .expect("clean receipt");
+        drop(retained_inventory);
+
+        fixture.state.activate_known_good_inventory_for_test(
+            &fixture.instance.id,
+            inventory("replacement.jar"),
+        );
+
+        assert!(inventory_identity.upgrade().is_none());
+        assert!(receipt.inventory.upgrade().is_none());
+        assert!(
+            !fixture
+                .state
+                .known_good_tier2_clean_receipt_is_current(&receipt)
+        );
         fixture.close().await;
     }
 }
