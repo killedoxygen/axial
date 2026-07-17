@@ -8,11 +8,13 @@
     "dev:desktop": "node esbuild.mjs serve --strict-port",
     "dev:mock": "node esbuild.mjs serve --strict-port --mock",
     "watch": "node esbuild.mjs watch",
+    "test": "tsc --noEmit -p tsconfig.test.json && node test/run.mjs",
     "check": "tsc --noEmit",
     "format": "prettier --write .",
     "format:check": "prettier --check ."
   },
   "devDependencies": {
+    "@types/node": "^26.1.1",
     "@types/three": "^0.184.1",
     "esbuild": "^0.25.0",
     "prettier": "^3.8.4",

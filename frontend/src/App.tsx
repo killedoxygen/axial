@@ -1,6 +1,6 @@
 import { h } from 'preact';
 import type { ComponentChildren, ComponentType, JSX } from 'preact';
-import { useEffect, useErrorBoundary, useState } from 'preact/hooks';
+import { useEffect, useErrorBoundary, useLayoutEffect, useState } from 'preact/hooks';
 import { AppFrame } from './shell/AppFrame';
 import { BootSplash } from './shell/BootSplash';
 import { HomeView } from './views/home/HomeView';
@@ -12,8 +12,10 @@ import {
   accountSwitcherOpen,
   commandPaletteOpen,
   createOpen,
-  resetViewScroll,
+  prepareViewScroll,
+  restoreViewScroll,
   route,
+  routeScrollKey,
   showOnboardingOverlay,
 } from './ui-state';
 import { devMode } from './store';
@@ -51,7 +53,7 @@ const InstanceDetailRoute = createRouteLoader<{ id: string }>(
 
 const InstancesRoute = createRouteLoader(async () => (await import('./views/instances/InstancesView')).InstancesView);
 
-const DiscoverRoute = createRouteLoader(async () => (await import('./views/discover/DiscoverView')).DiscoverView);
+const DiscoverRoute = createPageRouteLoader(async () => (await import('./views/discover/DiscoverView')).DiscoverView);
 const ContentDetailRoute = createRouteLoader(
   async () => (await import('./views/discover/ContentDetailView')).ContentDetailView,
 );
@@ -62,7 +64,9 @@ const AccountsRoute = createRouteLoader(async () => (await import('./views/accou
 
 const SettingsRoute = createRouteLoader(async () => (await import('./views/settings/SettingsView')).SettingsView);
 
-const DownloadsRoute = createRouteLoader(async () => (await import('./views/downloads/DownloadsView')).DownloadsView);
+const DownloadsRoute = createPageRouteLoader(
+  async () => (await import('./views/downloads/DownloadsView')).DownloadsView,
+);
 
 const OnboardingOverlay = createRouteLoader(async () => (await import('./views/onboarding/Onboarding')).Onboarding);
 
@@ -72,7 +76,14 @@ const loadDevLabView = __AXIAL_ENABLE_DEV_LAB__
 
 const DevLabRouteView = loadDevLabView ? createRouteLoader(loadDevLabView) : null;
 
-function createRouteLoader<P extends object>(load: () => Promise<ComponentType<P>>): ComponentType<P> {
+function createPageRouteLoader<P extends object>(load: () => Promise<ComponentType<P>>): ComponentType<P> {
+  return createRouteLoader(load, true);
+}
+
+function createRouteLoader<P extends object>(
+  load: () => Promise<ComponentType<P>>,
+  restoresViewScroll = false,
+): ComponentType<P> {
   let loadedView: ComponentType<P> | null = null;
 
   deferredViewPreloads.push(async () => {
@@ -100,8 +111,16 @@ function createRouteLoader<P extends object>(load: () => Promise<ComponentType<P
       };
     }, [View]);
 
-    return View ? h(View, props) : <RouteLoadingFallback failed={failed} />;
+    if (!View) return <RouteLoadingFallback failed={failed} />;
+    const content = h(View, props);
+    return restoresViewScroll ? <RouteScrollReady>{content}</RouteScrollReady> : content;
   };
+}
+
+function RouteScrollReady({ children }: { children: ComponentChildren }): JSX.Element {
+  const key = routeScrollKey(route.value);
+  useLayoutEffect(() => restoreViewScroll(key), [key]);
+  return <>{children}</>;
 }
 
 function RouteLoadingFallback({ failed = false }: { failed?: boolean }): JSX.Element {
@@ -169,13 +188,17 @@ function LazyAccountSwitcherHost(): JSX.Element | null {
 
 function CurrentView(): JSX.Element {
   const r = route.value;
-  const routeKey = r.name === 'instance' || r.name === 'content' ? `${r.name}:${r.id}` : r.name;
-  useEffect(() => {
-    resetViewScroll();
+  const routeKey = routeScrollKey(r);
+  useLayoutEffect(() => {
+    prepareViewScroll(routeKey);
   }, [routeKey]);
   switch (r.name) {
     case 'home':
-      return <HomeView />;
+      return (
+        <RouteScrollReady>
+          <HomeView />
+        </RouteScrollReady>
+      );
     case 'instances':
       return <InstancesRoute />;
     case 'instance':

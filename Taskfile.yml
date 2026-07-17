@@ -120,6 +120,7 @@ tasks:
     cmds:
       - pnpm --dir frontend run format:check
       - pnpm --dir frontend run check
+      - pnpm --dir frontend run test
       - cargo fmt --all --check
       - cargo check --workspace --locked
       - cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
