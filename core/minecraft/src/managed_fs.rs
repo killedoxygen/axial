@@ -4932,8 +4932,10 @@ mod platform {
         }
     }
 
-    pub(super) fn sync_directory(directory: &DirectoryHandle) -> io::Result<()> {
-        directory.sync_all()
+    pub(super) fn sync_directory(_directory: &DirectoryHandle) -> io::Result<()> {
+        // Windows has no supported per-directory flush. Managed publication therefore relies on
+        // individually synced files, recoverable namespace operations, and identity revalidation.
+        Ok(())
     }
 
     pub(super) fn entry_kind(
