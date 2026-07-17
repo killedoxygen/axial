@@ -565,8 +565,9 @@ use operation::{
     record_loader_install_operation_guardian_failure_outcome,
 };
 pub use operation::{
-    begin_install_operation_journal, install_guardian_outcome_summary_from_journal,
-    install_operation_id, loader_install_progress_view_model, public_loader_install_progress_json,
+    InstallProgressJournalTracker, begin_install_operation_journal,
+    install_guardian_outcome_summary_from_journal, install_operation_id,
+    loader_install_progress_view_model, public_loader_install_progress_json,
     public_vanilla_install_progress_json, record_install_operation_interrupted,
     record_install_operation_progress, sanitize_install_progress, stage_install_version_command,
     vanilla_install_progress_view_model,
@@ -699,7 +700,7 @@ async fn start_install_version_with_foreground(
                 let journal_failed = journal_failed.clone();
                 progress_owner.spawn_joinable(async move {
                     let mut coalescer = InstallProgressCoalescer::default();
-                    let mut last_journal_phase = None;
+                    let mut progress_journal = InstallProgressJournalTracker::default();
                     while let Some(progress) = progress_rx.recv().await {
                         let progress = sanitize_install_progress(progress);
                         for progress in coalescer.push(progress) {
@@ -709,7 +710,7 @@ async fn start_install_version_with_foreground(
                                 &operation_id,
                                 &install_id,
                                 progress,
-                                &mut last_journal_phase,
+                                &mut progress_journal,
                             )
                             .await
                             {
@@ -725,7 +726,7 @@ async fn start_install_version_with_foreground(
                             &operation_id,
                             &install_id,
                             progress,
-                            &mut last_journal_phase,
+                            &mut progress_journal,
                         )
                         .await
                     {
@@ -1001,9 +1002,9 @@ async fn record_and_emit_install_progress(
     operation_id: &OperationId,
     install_id: &str,
     progress: DownloadProgress,
-    last_journal_phase: &mut Option<String>,
+    progress_journal: &mut InstallProgressJournalTracker,
 ) -> bool {
-    if record_install_operation_progress(journals, operation_id, &progress, last_journal_phase)
+    if record_install_operation_progress(journals, operation_id, &progress, progress_journal)
         .await
         .is_err()
     {
@@ -2018,7 +2019,7 @@ where
             let progress_task = {
                 let journal_failed = journal_failed.clone();
                 progress_owner.spawn_joinable(async move {
-                    let mut last_journal_phase = None;
+                    let mut progress_journal = InstallProgressJournalTracker::default();
                     while let Some(progress) = progress_rx.recv().await {
                         if progress.done {
                             continue;
@@ -2028,7 +2029,7 @@ where
                             &progress_operation_id,
                             &progress,
                             &[],
-                            &mut last_journal_phase,
+                            &mut progress_journal,
                         )
                         .await
                         .is_err()
@@ -2308,13 +2309,13 @@ async fn commit_and_emit_content_terminal_progress(
         )
         .await?;
     }
-    let mut last_journal_phase = None;
+    let mut progress_journal = InstallProgressJournalTracker::default();
     record_content_operation_progress(
         &journals,
         terminal.operation_id,
         &terminal.progress,
         terminal.journal_facts,
-        &mut last_journal_phase,
+        &mut progress_journal,
     )
     .await?;
     store

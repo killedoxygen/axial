@@ -78,8 +78,8 @@ pub use flags::{
 };
 pub(crate) use install::enqueue_install_with_dependency_admitted;
 pub use install::{
-    InstallApplicationError, InstallProgressStepViewModel, InstallProgressViewModel,
-    InstallQueueContentActionRequest, InstallQueueContentItemViewModel,
+    InstallApplicationError, InstallProgressJournalTracker, InstallProgressStepViewModel,
+    InstallProgressViewModel, InstallQueueContentActionRequest, InstallQueueContentItemViewModel,
     InstallQueueContentSelection, InstallQueueRequest, InstallQueueStateResponse,
     InstallStartResponse, InstallStatusResponse, InstallVersionStaging, InstallVersionStartRequest,
     LoaderBuildsRequest, LoaderInstallStartRequest, begin_install_operation_journal,

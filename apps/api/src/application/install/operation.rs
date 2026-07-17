@@ -83,6 +83,21 @@ pub(crate) struct ContentDownloadFactAccumulator {
     counts: [usize; 13],
 }
 
+#[derive(Debug, Default)]
+pub struct InstallProgressJournalTracker {
+    recorded_nonterminal_phases: BTreeSet<String>,
+}
+
+impl InstallProgressJournalTracker {
+    fn contains(&self, phase: &str) -> bool {
+        self.recorded_nonterminal_phases.contains(phase)
+    }
+
+    fn record(&mut self, phase: String) {
+        self.recorded_nonterminal_phases.insert(phase);
+    }
+}
+
 impl ContentDownloadFactAccumulator {
     pub(crate) fn record(&mut self, fact: ExecutionDownloadFact) {
         self.counts[execution_download_fact_kind_index(fact.kind)] =
@@ -282,7 +297,7 @@ pub async fn record_install_operation_progress(
     journals: &OperationJournalStore,
     operation_id: &OperationId,
     progress: &DownloadProgress,
-    last_recorded_phase: &mut Option<String>,
+    progress_journal: &mut InstallProgressJournalTracker,
 ) -> Result<(), OperationJournalStoreError> {
     record_operation_progress(
         journals,
@@ -291,7 +306,7 @@ pub async fn record_install_operation_progress(
         "install",
         progress,
         &[],
-        last_recorded_phase,
+        progress_journal,
     )
     .await
 }
@@ -301,7 +316,7 @@ pub(crate) async fn record_content_operation_progress(
     operation_id: &OperationId,
     progress: &DownloadProgress,
     download_facts: &[String],
-    last_recorded_phase: &mut Option<String>,
+    progress_journal: &mut InstallProgressJournalTracker,
 ) -> Result<(), OperationJournalStoreError> {
     record_operation_progress(
         journals,
@@ -310,7 +325,7 @@ pub(crate) async fn record_content_operation_progress(
         "content",
         progress,
         download_facts,
-        last_recorded_phase,
+        progress_journal,
     )
     .await
 }
@@ -322,11 +337,11 @@ async fn record_operation_progress(
     step_namespace: &str,
     progress: &DownloadProgress,
     terminal_facts: &[String],
-    last_recorded_phase: &mut Option<String>,
+    progress_journal: &mut InstallProgressJournalTracker,
 ) -> Result<(), OperationJournalStoreError> {
     let phase = safe_progress_phase(&progress.phase);
     let terminal = progress.done;
-    if !terminal && last_recorded_phase.as_deref() == Some(phase.as_str()) {
+    if !terminal && progress_journal.contains(&phase) {
         return Ok(());
     }
 
@@ -369,7 +384,9 @@ async fn record_operation_progress(
 
         match result {
             Ok(()) => {
-                *last_recorded_phase = Some(phase);
+                if !terminal {
+                    progress_journal.record(phase);
+                }
                 return Ok(());
             }
             Err(error) => {
@@ -386,7 +403,9 @@ async fn record_operation_progress(
                 .await?
                 {
                     InstallJournalReconciliation::MutationCommitted => {
-                        *last_recorded_phase = Some(phase);
+                        if !terminal {
+                            progress_journal.record(phase);
+                        }
                         return Ok(());
                     }
                     InstallJournalReconciliation::RetryMutation => {}

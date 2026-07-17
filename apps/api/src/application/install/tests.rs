@@ -1979,12 +1979,12 @@ async fn restart_interrupted_install_status_preserves_stale_temp_without_promoti
         begin_install_operation_journal(state.journals(), &operation_id, "1.21.5")
             .await
             .expect("record install journal");
-        let mut last_phase = None;
+        let mut progress_journal = InstallProgressJournalTracker::default();
         record_install_operation_progress(
             state.journals(),
             &operation_id,
             &progress("client_jar", false, None),
-            &mut last_phase,
+            &mut progress_journal,
         )
         .await
         .expect("record install journal");
@@ -2052,12 +2052,12 @@ async fn install_status_reconstructs_journal_progress_when_snapshot_is_missing()
     begin_install_operation_journal(state.journals(), &operation_id, "1.21.5")
         .await
         .expect("record install journal");
-    let mut last_phase = None;
+    let mut progress_journal = InstallProgressJournalTracker::default();
     record_install_operation_progress(
         state.journals(),
         &operation_id,
         &progress("libraries", false, None),
-        &mut last_phase,
+        &mut progress_journal,
     )
     .await
     .expect("record install journal");
@@ -2117,12 +2117,12 @@ async fn install_events_replay_journal_terminal_progress_when_snapshot_is_missin
     begin_install_operation_journal(state.journals(), &operation_id, "1.21.5")
         .await
         .expect("record install journal");
-    let mut last_phase = None;
+    let mut progress_journal = InstallProgressJournalTracker::default();
     record_install_operation_progress(
         state.journals(),
         &operation_id,
         &progress("done", true, None),
-        &mut last_phase,
+        &mut progress_journal,
     )
     .await
     .expect("record install journal");
@@ -2154,12 +2154,12 @@ async fn install_events_replay_restart_loaded_journal_when_snapshot_is_missing()
         begin_install_operation_journal(state.journals(), &operation_id, "1.21.5")
             .await
             .expect("record install journal");
-        let mut last_phase = None;
+        let mut progress_journal = InstallProgressJournalTracker::default();
         record_install_operation_progress(
             state.journals(),
             &operation_id,
             &progress("done", true, None),
-            &mut last_phase,
+            &mut progress_journal,
         )
         .await
         .expect("record install journal");
@@ -2197,12 +2197,12 @@ async fn install_status_exposes_backend_authored_guardian_download_failure_outco
     begin_install_operation_journal(state.journals(), &operation_id, "1.21.5")
         .await
         .expect("record install journal");
-    let mut last_phase = None;
+    let mut progress_journal = InstallProgressJournalTracker::default();
     record_install_operation_progress(
         state.journals(),
         &operation_id,
         &observed_install_failure_progress(),
-        &mut last_phase,
+        &mut progress_journal,
     )
     .await
     .expect("record install journal");
@@ -2288,12 +2288,12 @@ async fn install_status_exposes_runtime_unavailable_failure_without_retry() {
     begin_install_operation_journal(state.journals(), &operation_id, "1.11.2")
         .await
         .expect("record install journal");
-    let mut last_phase = None;
+    let mut progress_journal = InstallProgressJournalTracker::default();
     record_install_operation_progress(
         state.journals(),
         &operation_id,
         &terminal_progress,
-        &mut last_phase,
+        &mut progress_journal,
     )
     .await
     .expect("record install journal");
@@ -2381,12 +2381,12 @@ async fn install_status_exposes_rosetta_required_failure_with_retry() {
     begin_install_operation_journal(state.journals(), &operation_id, "1.11.2")
         .await
         .expect("record install journal");
-    let mut last_phase = None;
+    let mut progress_journal = InstallProgressJournalTracker::default();
     record_install_operation_progress(
         state.journals(),
         &operation_id,
         &terminal_progress,
-        &mut last_phase,
+        &mut progress_journal,
     )
     .await
     .expect("record install journal");
@@ -2476,12 +2476,12 @@ async fn network_install_error_wins_over_benign_accumulated_download_facts() {
     begin_install_operation_journal(state.journals(), &operation_id, "1.21.5")
         .await
         .expect("record install journal");
-    let mut last_phase = None;
+    let mut progress_journal = InstallProgressJournalTracker::default();
     record_install_operation_progress(
         state.journals(),
         &operation_id,
         &observed_install_failure_progress(),
-        &mut last_phase,
+        &mut progress_journal,
     )
     .await
     .expect("record install journal");
@@ -2844,12 +2844,12 @@ async fn install_status_exposes_backend_authored_guardian_blocking_safety_outcom
         begin_install_operation_journal(state.journals(), &operation_id, "1.21.5")
             .await
             .expect("record install journal");
-        let mut last_phase = None;
+        let mut progress_journal = InstallProgressJournalTracker::default();
         record_install_operation_progress(
             state.journals(),
             &operation_id,
             &observed_install_failure_progress(),
-            &mut last_phase,
+            &mut progress_journal,
         )
         .await
         .expect("record install journal");
@@ -4344,7 +4344,7 @@ async fn transient_terminal_failure_retries_and_emits_exactly_once() {
         .expect("install subscription");
     let attempts_before = backend.attempts.load(Ordering::SeqCst);
     backend.fail_next();
-    let mut last_phase = None;
+    let mut progress_journal = InstallProgressJournalTracker::default();
     assert!(
         record_and_emit_install_progress(
             &installs,
@@ -4352,7 +4352,7 @@ async fn transient_terminal_failure_retries_and_emits_exactly_once() {
             &operation_id,
             install_id,
             progress("error", true, Some("sanitized failure")),
-            &mut last_phase,
+            &mut progress_journal,
         )
         .await
     );
@@ -4525,13 +4525,13 @@ async fn content_journal_uses_instance_command_and_exports_bounded_redacted_succ
         });
     }
     let journal_facts = download_facts.journal_facts();
-    let mut last_phase = None;
+    let mut progress_journal = InstallProgressJournalTracker::default();
     super::operation::record_content_operation_progress(
         &journals,
         &operation_id,
         &progress("planning", false, None),
         &[],
-        &mut last_phase,
+        &mut progress_journal,
     )
     .await
     .expect("record planning");
@@ -4540,7 +4540,7 @@ async fn content_journal_uses_instance_command_and_exports_bounded_redacted_succ
         &operation_id,
         &progress("done", true, None),
         &journal_facts,
-        &mut last_phase,
+        &mut progress_journal,
     )
     .await
     .expect("record success");
@@ -4608,13 +4608,13 @@ async fn content_journal_records_download_failure_guardian_outcome_and_proof() {
     )
     .await
     .expect("record content Guardian outcome");
-    let mut last_phase = None;
+    let mut progress_journal = InstallProgressJournalTracker::default();
     super::operation::record_content_operation_progress(
         &journals,
         &operation_id,
         &progress("error", true, Some("content failed")),
         &journal_facts,
-        &mut last_phase,
+        &mut progress_journal,
     )
     .await
     .expect("record content failure");
@@ -4673,13 +4673,13 @@ async fn content_journal_records_typed_metadata_failure_without_download_facts()
     )
     .await
     .expect("record content Guardian outcome");
-    let mut last_phase = None;
+    let mut progress_journal = InstallProgressJournalTracker::default();
     super::operation::record_content_operation_progress(
         &journals,
         &operation_id,
         &progress("error", true, Some("content failed")),
         &[],
-        &mut last_phase,
+        &mut progress_journal,
     )
     .await
     .expect("record content failure");
@@ -4864,14 +4864,14 @@ async fn late_terminal_persistence_recovery_returns_original_content_terminal() 
     .await
     .expect("record Guardian outcome before terminal");
     backend.fail_attempts(64);
-    let mut last_phase = None;
+    let mut progress_journal = InstallProgressJournalTracker::default();
     assert!(
         super::operation::record_content_operation_progress(
             &journals,
             &operation_id,
             &terminal,
             &[],
-            &mut last_phase,
+            &mut progress_journal,
         )
         .await
         .is_err()
@@ -4965,14 +4965,14 @@ async fn content_provider_terminal_replay_does_not_reassess_or_refresh_memory() 
     assert_eq!(initial_memory.len(), 1);
 
     backend.fail_attempts(64);
-    let mut last_phase = None;
+    let mut progress_journal = InstallProgressJournalTracker::default();
     assert!(
         super::operation::record_content_operation_progress(
             &journals,
             &operation_id,
             &progress("error", true, Some("content failed")),
             &[],
-            &mut last_phase,
+            &mut progress_journal,
         )
         .await
         .is_err()
@@ -5089,12 +5089,12 @@ async fn install_journal_records_progress_success_and_redacts_fields() {
     .await
     .expect("record install journal");
 
-    let mut last_phase = None;
+    let mut progress_journal = InstallProgressJournalTracker::default();
     record_install_operation_progress(
         &journals,
         &operation_id,
         &progress("libraries", false, None),
-        &mut last_phase,
+        &mut progress_journal,
     )
     .await
     .expect("record install journal");
@@ -5102,15 +5102,15 @@ async fn install_journal_records_progress_success_and_redacts_fields() {
         &journals,
         &operation_id,
         &progress("libraries", false, None),
-        &mut last_phase,
+        &mut progress_journal,
     )
     .await
     .expect("record install journal");
     record_install_operation_progress(
         &journals,
         &operation_id,
-        &progress("done", true, None),
-        &mut last_phase,
+        &progress("libraries", true, None),
+        &mut progress_journal,
     )
     .await
     .expect("record install journal");
@@ -5119,6 +5119,11 @@ async fn install_journal_records_progress_success_and_redacts_fields() {
     assert_eq!(entry.status, OperationStatus::Succeeded);
     assert_eq!(entry.outcome, Some(OperationOutcome::Succeeded));
     assert_eq!(entry.completed_steps.len(), 2);
+    assert!(
+        entry.completed_steps[1]
+            .generated_facts
+            .contains(&"install_done:true".to_string())
+    );
     assert!(entry.completed_steps.iter().any(|step| {
         step.result == OperationStepResult::Completed
             && step
@@ -5130,30 +5135,149 @@ async fn install_journal_records_progress_success_and_redacts_fields() {
 }
 
 #[tokio::test]
+async fn install_journal_records_each_phase_once_across_alternating_provider_progress() {
+    const SOURCE_EVENT_COUNT: usize = 300;
+    const SOURCE_COMPLETED_STEP_LIMIT: usize = 256;
+    const PHASES: [&str; 4] = ["libraries", "assets", "processors", "loader_libraries"];
+
+    let root = temp_root("install-progress-phase-set");
+    let (_backend, journals) = install_journal_persistence_fixture(&root);
+    let install_id = "alternating-provider-progress";
+    let operation_id = install_operation_id(install_id);
+    begin_install_operation_journal(&journals, &operation_id, "1.21.5")
+        .await
+        .expect("record install journal");
+
+    let mut progress_journal = InstallProgressJournalTracker::default();
+    for index in 0..SOURCE_EVENT_COUNT {
+        record_install_operation_progress(
+            &journals,
+            &operation_id,
+            &progress(PHASES[index % PHASES.len()], false, None),
+            &mut progress_journal,
+        )
+        .await
+        .expect("alternating progress remains bounded");
+    }
+    record_install_operation_progress(
+        &journals,
+        &operation_id,
+        &progress("done", true, None),
+        &mut progress_journal,
+    )
+    .await
+    .expect("terminal progress always commits");
+
+    let entry = journals
+        .get(&operation_id)
+        .expect("terminal install journal");
+    assert_eq!(entry.status, OperationStatus::Succeeded);
+    assert_eq!(entry.completed_steps.len(), PHASES.len() + 1);
+    let recorded_phases = install_progress_history_from_journal(&entry)
+        .into_iter()
+        .map(|progress| progress.phase)
+        .collect::<Vec<_>>();
+    assert_eq!(recorded_phases, [PHASES.as_slice(), &["done"]].concat());
+
+    let optimized_snapshot = journals.snapshot().expect("optimized snapshot");
+    let optimized_snapshot_bytes = optimized_snapshot
+        .to_json()
+        .expect("serialize optimized snapshot")
+        .len();
+    let mut source_baseline_snapshot = optimized_snapshot.clone();
+    let source_baseline_entry = source_baseline_snapshot
+        .entries
+        .first_mut()
+        .expect("source baseline entry");
+    source_baseline_entry.status = OperationStatus::Running;
+    source_baseline_entry.outcome = None;
+    source_baseline_entry.completed_steps = (0..SOURCE_COMPLETED_STEP_LIMIT)
+        .map(|index| entry.completed_steps[index % PHASES.len()].clone())
+        .collect();
+    let source_baseline_snapshot_bytes = source_baseline_snapshot
+        .to_json()
+        .expect("serialize source baseline snapshot")
+        .len();
+    let baseline_store = OperationJournalStore::new();
+    baseline_store
+        .load_snapshot(source_baseline_snapshot.clone())
+        .expect("the source baseline reaches the exact completed-step limit");
+    source_baseline_snapshot.entries[0]
+        .completed_steps
+        .push(entry.completed_steps[0].clone());
+    assert!(
+        baseline_store
+            .load_snapshot(source_baseline_snapshot)
+            .is_err(),
+        "the source alternating stream fails on completed step {}",
+        SOURCE_COMPLETED_STEP_LIMIT + 1
+    );
+    assert!(
+        optimized_snapshot_bytes.saturating_mul(20) < source_baseline_snapshot_bytes,
+        "optimized snapshot {optimized_snapshot_bytes} bytes must remain at least 20x below the source baseline {source_baseline_snapshot_bytes} bytes"
+    );
+
+    journals.close().await.expect("close install journals");
+    drop(journals);
+
+    let state = build_test_state(&root);
+    let status = install_status(&state, install_id)
+        .await
+        .expect("restart-loaded install status");
+    assert!(status.done);
+    assert_eq!(status.progress.len(), PHASES.len() + 1);
+    assert_eq!(
+        status
+            .progress
+            .iter()
+            .map(|progress| progress.phase.as_str())
+            .collect::<Vec<_>>(),
+        [PHASES.as_slice(), &["done"]].concat()
+    );
+
+    state.shutdown().await.expect("shutdown test state");
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
 async fn install_journal_records_failure_and_interruption() {
     let journals = OperationJournalStore::new();
     let failed_operation = install_operation_id("install-failed");
     begin_install_operation_journal(&journals, &failed_operation, "1.21.5")
         .await
         .expect("record install journal");
-    let mut last_phase = None;
+    let mut progress_journal = InstallProgressJournalTracker::default();
+    let failed_phase = r"C:\Users\Alice\.minecraft -Xmx8192M --accessToken provider_payload";
+    record_install_operation_progress(
+        &journals,
+        &failed_operation,
+        &progress(failed_phase, false, None),
+        &mut progress_journal,
+    )
+    .await
+    .expect("record nonterminal install phase");
     record_install_operation_progress(
         &journals,
         &failed_operation,
         &progress(
-            r"C:\Users\Alice\.minecraft -Xmx8192M --accessToken provider_payload",
+            failed_phase,
             true,
             Some(
                 "failed in /Users/alice/.axial with token secret provider_payload={\"token\":\"secret\"}",
             ),
         ),
-        &mut last_phase,
+        &mut progress_journal,
     )
         .await
         .expect("record install journal");
     let failed = journals.get(&failed_operation).expect("failed journal");
     assert_eq!(failed.status, OperationStatus::Failed);
     assert_eq!(failed.outcome, Some(OperationOutcome::Failed));
+    assert_eq!(failed.completed_steps.len(), 2);
+    assert_eq!(
+        failed.completed_steps[1].result,
+        OperationStepResult::Failed
+    );
     assert_no_sensitive_fragments(&serde_json::to_string(&failed).expect("journal json"));
 
     let interrupted_operation = install_operation_id("install-interrupted");
@@ -5184,12 +5308,12 @@ async fn install_journal_rejects_late_non_terminal_progress_after_terminal_state
     begin_install_operation_journal(&journals, &operation_id, "1.21.5")
         .await
         .expect("record install journal");
-    let mut last_phase = None;
+    let mut progress_journal = InstallProgressJournalTracker::default();
     record_install_operation_progress(
         &journals,
         &operation_id,
         &progress("error", true, Some("sanitized failure")),
-        &mut last_phase,
+        &mut progress_journal,
     )
     .await
     .expect("record terminal install journal");
@@ -5197,7 +5321,7 @@ async fn install_journal_rejects_late_non_terminal_progress_after_terminal_state
         &journals,
         &operation_id,
         &progress("libraries", false, None),
-        &mut last_phase,
+        &mut progress_journal,
     )
     .await
     .expect_err("terminal install journal must reject late progress");
@@ -5217,12 +5341,12 @@ async fn install_journal_records_guardian_evidence_from_core_download_facts() {
     begin_install_operation_journal(&journals, &operation_id, "1.21.5")
         .await
         .expect("record install journal");
-    let mut last_phase = None;
+    let mut progress_journal = InstallProgressJournalTracker::default();
     record_install_operation_progress(
         &journals,
         &operation_id,
         &progress("error", true, Some("sanitized failure")),
-        &mut last_phase,
+        &mut progress_journal,
     )
     .await
     .expect("record install journal");
@@ -5290,12 +5414,12 @@ async fn install_journal_treats_temp_discard_as_non_terminal_evidence_only() {
     begin_install_operation_journal(&journals, &operation_id, "1.21.5")
         .await
         .expect("record install journal");
-    let mut last_phase = None;
+    let mut progress_journal = InstallProgressJournalTracker::default();
     record_install_operation_progress(
         &journals,
         &operation_id,
         &progress("error", true, Some("sanitized failure")),
-        &mut last_phase,
+        &mut progress_journal,
     )
     .await
     .expect("record install journal");
@@ -5338,12 +5462,12 @@ async fn install_journal_records_guardian_download_failure_outcome_without_raw_d
     begin_install_operation_journal(&journals, &operation_id, "1.21.5")
         .await
         .expect("record install journal");
-    let mut last_phase = None;
+    let mut progress_journal = InstallProgressJournalTracker::default();
     record_install_operation_progress(
         &journals,
         &operation_id,
         &progress("error", true, Some("sanitized failure")),
-        &mut last_phase,
+        &mut progress_journal,
     )
     .await
     .expect("record install journal");
@@ -6459,12 +6583,12 @@ async fn persistent_retry_startup_serves_restart_loaded_status_without_reassessm
     begin_install_operation_journal(state.journals(), &operation_id, "1.21.5")
         .await
         .expect("persist install journal");
-    let mut last_phase = None;
+    let mut progress_journal = InstallProgressJournalTracker::default();
     record_install_operation_progress(
         state.journals(),
         &operation_id,
         &observed_install_failure_progress(),
-        &mut last_phase,
+        &mut progress_journal,
     )
     .await
     .expect("persist terminal install progress");
@@ -7132,12 +7256,12 @@ async fn vanilla_provider_failure_records_guardian_retry_then_suppression_withou
     begin_install_operation_journal(&journals, &operation_id, "1.21.5")
         .await
         .expect("record install journal");
-    let mut last_phase = None;
+    let mut progress_journal = InstallProgressJournalTracker::default();
     record_install_operation_progress(
         &journals,
         &operation_id,
         &progress("error", true, Some("sanitized failure")),
-        &mut last_phase,
+        &mut progress_journal,
     )
     .await
     .expect("record install journal");
@@ -7184,12 +7308,12 @@ async fn vanilla_provider_failure_records_guardian_retry_then_suppression_withou
     begin_install_operation_journal(&journals, &suppressed_operation_id, "1.21.5")
         .await
         .expect("record install journal");
-    let mut suppressed_last_phase = None;
+    let mut suppressed_progress_journal = InstallProgressJournalTracker::default();
     record_install_operation_progress(
         &journals,
         &suppressed_operation_id,
         &progress("error", true, Some("sanitized failure")),
-        &mut suppressed_last_phase,
+        &mut suppressed_progress_journal,
     )
     .await
     .expect("record install journal");
@@ -7268,12 +7392,12 @@ async fn loader_provider_failure_records_guardian_retry_then_suppression_without
     begin_install_operation_journal(&journals, &operation_id, "fabric-loader")
         .await
         .expect("record install journal");
-    let mut last_phase = None;
+    let mut progress_journal = InstallProgressJournalTracker::default();
     record_install_operation_progress(
         &journals,
         &operation_id,
         &progress("error", true, Some("sanitized failure")),
-        &mut last_phase,
+        &mut progress_journal,
     )
     .await
     .expect("record install journal");
@@ -7320,12 +7444,12 @@ async fn loader_provider_failure_records_guardian_retry_then_suppression_without
     begin_install_operation_journal(&journals, &suppressed_operation_id, "fabric-loader")
         .await
         .expect("record install journal");
-    let mut suppressed_last_phase = None;
+    let mut suppressed_progress_journal = InstallProgressJournalTracker::default();
     record_install_operation_progress(
         &journals,
         &suppressed_operation_id,
         &progress("error", true, Some("sanitized failure")),
-        &mut suppressed_last_phase,
+        &mut suppressed_progress_journal,
     )
     .await
     .expect("record install journal");
