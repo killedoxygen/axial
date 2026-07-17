@@ -5013,6 +5013,10 @@ async fn content_provider_terminal_replay_does_not_reassess_or_refresh_memory() 
         "guardian_outcome_memory_binding:",
         "guardian_outcome_memory_observed_at:",
         "guardian_outcome_memory_suppression_until:",
+        "guardian_outcome_memory_target_system:",
+        "guardian_outcome_memory_target_kind:",
+        "guardian_outcome_memory_target_ownership:",
+        "guardian_outcome_memory_target_id:",
     ] {
         assert_eq!(
             entry
@@ -5411,6 +5415,10 @@ fn persisted_download_outcome_entry() -> OperationJournalEntry {
             .to_string(),
         "guardian_outcome_memory_observed_at:2026-06-16T10:00:00+00:00".to_string(),
         "guardian_outcome_memory_suppression_until:2026-06-16T10:05:00+00:00".to_string(),
+        "guardian_outcome_memory_target_system:execution".to_string(),
+        "guardian_outcome_memory_target_kind:artifact".to_string(),
+        "guardian_outcome_memory_target_ownership:launcher_managed".to_string(),
+        "guardian_outcome_memory_target_id:minecraft_client_1.21.5".to_string(),
     ];
     entry.completed_steps.push(step);
     entry
@@ -5439,6 +5447,10 @@ fn install_journal_outcome_replay_rejects_duplicate_markers() {
         "guardian_outcome_memory_binding:",
         "guardian_outcome_memory_observed_at:",
         "guardian_outcome_memory_suppression_until:",
+        "guardian_outcome_memory_target_system:",
+        "guardian_outcome_memory_target_kind:",
+        "guardian_outcome_memory_target_ownership:",
+        "guardian_outcome_memory_target_id:",
     ] {
         let mut duplicated = entry.clone();
         let step = duplicated.completed_steps.last_mut().expect("outcome step");
@@ -6332,6 +6344,502 @@ async fn expired_provider_terminal_replay_does_not_resurrect_retry_memory() {
         .and_then(|entry| install_guardian_outcome_summary_from_journal(&entry))
         .expect("persisted Guardian outcome");
     assert_eq!(summary.decision(), "retry");
+}
+
+#[tokio::test]
+async fn startup_reloads_journal_only_retry_and_blocks_the_next_matching_failure() {
+    let root = temp_root("startup-provider-retry-reload");
+    let (_journal_backend, journals) = install_journal_persistence_fixture(&root);
+    let (memory_backend, failure_memory) = failure_memory_persistence_fixture(&root);
+    let operation_id = install_operation_id("startup-provider-retry-reload");
+    begin_install_operation_journal(&journals, &operation_id, "1.21.5")
+        .await
+        .expect("persist install journal");
+    let facts = [download_fact(
+        ExecutionDownloadFactKind::ProviderFailure,
+        "minecraft_client_1.21.5",
+    )];
+    let evidence = install_failure_evidence_from_download_facts(&operation_id, &facts);
+    memory_backend.fail_attempts(64);
+
+    let result = record_install_guardian_failure_outcome(
+        &test_producer(),
+        journals.clone(),
+        failure_memory.clone(),
+        &operation_id,
+        &evidence,
+        OperationPhase::Downloading,
+        "2026-07-17T10:00:00+00:00",
+    )
+    .await;
+    assert!(matches!(
+        result,
+        Err(OperationJournalStoreError::GuardianFailureMemoryUnavailable)
+    ));
+    assert_eq!(
+        journals
+            .get(&operation_id)
+            .and_then(|entry| install_guardian_outcome_summary_from_journal(&entry))
+            .expect("durable journal Retry")
+            .decision(),
+        "retry"
+    );
+    assert!(failure_memory.list().is_empty());
+    assert!(!crate::state::failure_memory::failure_memory_path(&test_app_paths(&root)).exists());
+
+    journals.close().await.expect("close durable journals");
+    drop(journals);
+    drop(failure_memory);
+    drop(memory_backend);
+
+    let (_reloaded_journal_backend, journals) = install_journal_persistence_fixture(&root);
+    let (_reloaded_memory_backend, failure_memory) = failure_memory_persistence_fixture(&root);
+    let (result, policy_evaluations) = crate::guardian::with_guardian_policy_evaluation_count(
+        super::operation::settle_startup_install_guardian_failure_memory(
+            &journals,
+            &failure_memory,
+            "2026-07-17T10:01:00+00:00",
+        ),
+    )
+    .await;
+    result.expect("restore startup Retry memory");
+    assert_eq!(policy_evaluations, 0);
+    let restored = failure_memory.list();
+    assert_eq!(restored.len(), 1);
+    assert_eq!(restored[0].occurrence_count, 1);
+    assert_eq!(restored[0].last_observed_at, "2026-07-17T10:00:00+00:00");
+    assert_eq!(
+        restored[0].suppression_until.as_deref(),
+        Some("2026-07-17T10:05:00+00:00")
+    );
+
+    let next_operation_id = install_operation_id("startup-provider-retry-blocked");
+    begin_install_operation_journal(&journals, &next_operation_id, "1.21.5")
+        .await
+        .expect("persist next install journal");
+    let next_evidence = install_failure_evidence_from_download_facts(&next_operation_id, &facts);
+    record_install_guardian_failure_outcome(
+        &test_producer(),
+        journals.clone(),
+        failure_memory.clone(),
+        &next_operation_id,
+        &next_evidence,
+        OperationPhase::Downloading,
+        "2026-07-17T10:02:00+00:00",
+    )
+    .await
+    .expect("settle blocked matching failure");
+    assert_eq!(
+        journals
+            .get(&next_operation_id)
+            .and_then(|entry| install_guardian_outcome_summary_from_journal(&entry))
+            .expect("blocked Guardian outcome")
+            .decision(),
+        "block"
+    );
+    assert_eq!(failure_memory.list(), restored);
+
+    journals.close().await.expect("close reloaded journals");
+    failure_memory
+        .close()
+        .await
+        .expect("close reloaded failure memory");
+    fs::remove_dir_all(root).expect("cleanup");
+}
+
+#[tokio::test]
+async fn cancelled_startup_waiter_keeps_retry_backfill_owned_until_quiescence() {
+    let state_root = temp_root("startup-provider-retry-cancel-state");
+    let memory_root = temp_root("startup-provider-retry-cancel-memory");
+    let journals = Arc::new(OperationJournalStore::new());
+    let assessment_memory = Arc::new(GuardianFailureMemoryStore::new());
+    let operation_id = install_operation_id("startup-provider-retry-cancel");
+    let observed_at = chrono::Utc::now().to_rfc3339();
+    begin_install_operation_journal(&journals, &operation_id, "1.21.5")
+        .await
+        .expect("record install journal");
+    let facts = [download_fact(
+        ExecutionDownloadFactKind::ProviderFailure,
+        "minecraft_client_1.21.5",
+    )];
+    record_install_failure_outcome(
+        &test_producer(),
+        journals.clone(),
+        assessment_memory,
+        &operation_id,
+        &facts,
+        &observed_at,
+    )
+    .await;
+
+    let (backend, failure_memory) = failure_memory_persistence_fixture(&memory_root);
+    let gate = backend.gate_attempt(1);
+    let state =
+        build_test_state(&state_root).with_reconciliation_stores(journals, failure_memory.clone());
+    let waiter = tokio::spawn({
+        let state = state.clone();
+        async move { settle_startup_install_guardian_failure_memory(&state).await }
+    });
+    backend.wait_for_attempt(1).await;
+    waiter.abort();
+    assert!(
+        waiter
+            .await
+            .expect_err("cancel startup waiter")
+            .is_cancelled()
+    );
+
+    let quiesce = tokio::spawn({
+        let state = state.clone();
+        async move { state.quiesce().await }
+    });
+    tokio::task::yield_now().await;
+    assert!(!quiesce.is_finished());
+    gate.release();
+    timeout(Duration::from_secs(1), quiesce)
+        .await
+        .expect("quiescence waits for startup backfill")
+        .expect("join quiescence")
+        .expect("quiesce state");
+    assert_eq!(failure_memory.list().len(), 1);
+
+    failure_memory.close().await.expect("close failure memory");
+    fs::remove_dir_all(state_root).expect("cleanup state");
+    fs::remove_dir_all(memory_root).expect("cleanup memory");
+}
+
+#[tokio::test]
+async fn startup_retry_persistence_failure_stops_later_workflow_hooks() {
+    let state_root = temp_root("startup-provider-retry-barrier-state");
+    let memory_root = temp_root("startup-provider-retry-barrier-memory");
+    let journals = Arc::new(OperationJournalStore::new());
+    let operation_id = install_operation_id("startup-provider-retry-barrier");
+    begin_install_operation_journal(&journals, &operation_id, "1.21.5")
+        .await
+        .expect("record install journal");
+    record_install_failure_outcome(
+        &test_producer(),
+        journals.clone(),
+        Arc::new(GuardianFailureMemoryStore::new()),
+        &operation_id,
+        &[download_fact(
+            ExecutionDownloadFactKind::ProviderFailure,
+            "minecraft_client_1.21.5",
+        )],
+        &chrono::Utc::now().to_rfc3339(),
+    )
+    .await;
+
+    let (backend, failure_memory) = failure_memory_persistence_fixture(&memory_root);
+    backend.fail_attempts(64);
+    let state =
+        build_test_state(&state_root).with_reconciliation_stores(journals, failure_memory.clone());
+    let staging_dir = state.updater().staging_dir().to_path_buf();
+    fs::create_dir_all(&staging_dir).expect("create update staging fixture");
+    let staging_marker = staging_dir.join("must-survive-blocked-startup");
+    fs::write(&staging_marker, b"pending").expect("write update staging marker");
+
+    assert!(!crate::app::start_application_background_workflows(&state).await);
+    assert_eq!(backend.attempts.load(Ordering::SeqCst), 4);
+    assert!(
+        staging_marker.is_file(),
+        "update cleanup ran after the Guardian startup barrier failed"
+    );
+    state
+        .quiesce()
+        .await
+        .expect("quiesce blocked startup state");
+
+    drop(failure_memory);
+    fs::remove_dir_all(state_root).expect("cleanup state");
+    fs::remove_dir_all(memory_root).expect("cleanup memory");
+}
+
+#[tokio::test]
+async fn startup_retry_scan_skips_boundary_expiry_and_rejects_duplicate_active_keys() {
+    let journals = Arc::new(OperationJournalStore::new());
+    let facts = [download_fact(
+        ExecutionDownloadFactKind::ProviderFailure,
+        "minecraft_client_1.21.5",
+    )];
+    for suffix in ["first", "second"] {
+        let operation_id = install_operation_id(&format!("startup-duplicate-{suffix}"));
+        begin_install_operation_journal(&journals, &operation_id, "1.21.5")
+            .await
+            .expect("record install journal");
+        record_install_failure_outcome(
+            &test_producer(),
+            journals.clone(),
+            Arc::new(GuardianFailureMemoryStore::new()),
+            &operation_id,
+            &facts,
+            "2026-07-17T10:00:00+00:00",
+        )
+        .await;
+    }
+
+    let boundary_memory = GuardianFailureMemoryStore::new();
+    super::operation::settle_startup_install_guardian_failure_memory(
+        &journals,
+        &boundary_memory,
+        "2026-07-17T10:05:00+00:00",
+    )
+    .await
+    .expect("expiry boundary is inactive");
+    assert!(boundary_memory.list().is_empty());
+
+    let active_memory = GuardianFailureMemoryStore::new();
+    let (result, policy_evaluations) = crate::guardian::with_guardian_policy_evaluation_count(
+        super::operation::settle_startup_install_guardian_failure_memory(
+            &journals,
+            &active_memory,
+            "2026-07-17T10:01:00+00:00",
+        ),
+    )
+    .await;
+    assert!(matches!(
+        result,
+        Err(OperationJournalStoreError::InvalidGuardianOutcome)
+    ));
+    assert_eq!(policy_evaluations, 0);
+    assert!(active_memory.list().is_empty());
+}
+
+#[tokio::test]
+async fn startup_retry_scan_rejects_forged_target_and_binding_without_policy() {
+    let source = Arc::new(OperationJournalStore::new());
+    let operation_id = install_operation_id("startup-forged-carrier-source");
+    begin_install_operation_journal(&source, &operation_id, "1.21.5")
+        .await
+        .expect("record source install journal");
+    record_install_failure_outcome(
+        &test_producer(),
+        source.clone(),
+        Arc::new(GuardianFailureMemoryStore::new()),
+        &operation_id,
+        &[download_fact(
+            ExecutionDownloadFactKind::ProviderFailure,
+            "minecraft_client_1.21.5",
+        )],
+        "2026-06-16T10:00:00+00:00",
+    )
+    .await;
+    let valid = source.get(&operation_id).expect("valid v3 Retry carrier");
+
+    for (name, prefix, replacement) in [
+        (
+            "binding",
+            "guardian_outcome_memory_binding:",
+            "guardian_outcome_memory_binding:0000000000000000000000000000000000000000000000000000000000000000",
+        ),
+        (
+            "target",
+            "guardian_outcome_memory_target_system:",
+            "guardian_outcome_memory_target_system:state",
+        ),
+    ] {
+        let mut entry = valid.clone();
+        let marker = entry
+            .completed_steps
+            .iter_mut()
+            .flat_map(|step| step.generated_facts.iter_mut())
+            .find(|fact| fact.starts_with(prefix))
+            .expect("tampered carrier marker");
+        *marker = replacement.to_string();
+        let journals = OperationJournalStore::new();
+        journals
+            .create(entry)
+            .await
+            .expect("record forged startup carrier fixture");
+        let failure_memory = GuardianFailureMemoryStore::new();
+        let (result, policy_evaluations) = crate::guardian::with_guardian_policy_evaluation_count(
+            super::operation::settle_startup_install_guardian_failure_memory(
+                &journals,
+                &failure_memory,
+                "2026-06-16T10:01:00+00:00",
+            ),
+        )
+        .await;
+
+        assert!(
+            matches!(
+                result,
+                Err(OperationJournalStoreError::InvalidGuardianOutcome)
+            ),
+            "forged {name} carrier was accepted"
+        );
+        assert_eq!(policy_evaluations, 0);
+        assert!(failure_memory.list().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn startup_retry_scan_merges_newer_window_once_and_is_idempotent() {
+    let facts = [download_fact(
+        ExecutionDownloadFactKind::ProviderFailure,
+        "minecraft_client_1.21.5",
+    )];
+    let old_journals = Arc::new(OperationJournalStore::new());
+    let failure_memory = Arc::new(GuardianFailureMemoryStore::new());
+    let old_operation = install_operation_id("startup-stale-memory-old");
+    begin_install_operation_journal(&old_journals, &old_operation, "1.21.5")
+        .await
+        .expect("record old install journal");
+    record_install_failure_outcome(
+        &test_producer(),
+        old_journals,
+        failure_memory.clone(),
+        &old_operation,
+        &facts,
+        "2026-07-17T10:00:00+00:00",
+    )
+    .await;
+
+    let journals = Arc::new(OperationJournalStore::new());
+    let newer_operation = install_operation_id("startup-stale-memory-newer");
+    begin_install_operation_journal(&journals, &newer_operation, "1.21.5")
+        .await
+        .expect("record newer install journal");
+    record_install_failure_outcome(
+        &test_producer(),
+        journals.clone(),
+        Arc::new(GuardianFailureMemoryStore::new()),
+        &newer_operation,
+        &facts,
+        "2026-07-17T10:10:00+00:00",
+    )
+    .await;
+
+    for _ in 0..2 {
+        let (result, policy_evaluations) = crate::guardian::with_guardian_policy_evaluation_count(
+            super::operation::settle_startup_install_guardian_failure_memory(
+                &journals,
+                &failure_memory,
+                "2026-07-17T10:11:00+00:00",
+            ),
+        )
+        .await;
+        result.expect("merge newer startup Retry window");
+        assert_eq!(policy_evaluations, 0);
+    }
+    let merged = failure_memory.list();
+    assert_eq!(merged.len(), 1);
+    assert_eq!(merged[0].occurrence_count, 2);
+    assert_eq!(merged[0].first_observed_at, "2026-07-17T10:00:00+00:00");
+    assert_eq!(merged[0].last_observed_at, "2026-07-17T10:10:00+00:00");
+    assert_eq!(
+        merged[0].suppression_until.as_deref(),
+        Some("2026-07-17T10:15:00+00:00")
+    );
+}
+
+#[tokio::test]
+async fn startup_retry_scan_fails_atomically_when_active_set_exceeds_capacity() {
+    let journals = Arc::new(OperationJournalStore::new());
+    for (suffix, target) in [
+        ("vanilla", "minecraft_client_1.21.5"),
+        ("loader", "loader_fabric_build_1_21_5"),
+    ] {
+        let operation_id = install_operation_id(&format!("startup-capacity-{suffix}"));
+        begin_install_operation_journal(&journals, &operation_id, "1.21.5")
+            .await
+            .expect("record capacity install journal");
+        record_install_failure_outcome(
+            &test_producer(),
+            journals.clone(),
+            Arc::new(GuardianFailureMemoryStore::new()),
+            &operation_id,
+            &[download_fact(
+                ExecutionDownloadFactKind::ProviderFailure,
+                target,
+            )],
+            "2026-07-17T10:00:00+00:00",
+        )
+        .await;
+    }
+    let failure_memory = GuardianFailureMemoryStore::with_max_entries(1);
+
+    assert!(matches!(
+        super::operation::settle_startup_install_guardian_failure_memory(
+            &journals,
+            &failure_memory,
+            "2026-07-17T10:01:00+00:00",
+        )
+        .await,
+        Err(OperationJournalStoreError::GuardianFailureMemoryUnavailable)
+    ));
+    assert!(failure_memory.list().is_empty());
+}
+
+#[tokio::test]
+async fn startup_retry_scan_restores_vanilla_and_external_provider_ownership() {
+    let journals = Arc::new(OperationJournalStore::new());
+    let vanilla_operation = install_operation_id("startup-ownership-vanilla");
+    begin_install_operation_journal(&journals, &vanilla_operation, "1.21.5")
+        .await
+        .expect("record vanilla install journal");
+    record_install_failure_outcome(
+        &test_producer(),
+        journals.clone(),
+        Arc::new(GuardianFailureMemoryStore::new()),
+        &vanilla_operation,
+        &[download_fact(
+            ExecutionDownloadFactKind::ProviderFailure,
+            "minecraft_client_1.21.5",
+        )],
+        "2026-07-17T10:00:00+00:00",
+    )
+    .await;
+
+    let external_operation = install_operation_id("startup-ownership-runtime-provider");
+    begin_install_operation_journal(&journals, &external_operation, "26.2")
+        .await
+        .expect("record runtime install journal");
+    let LoaderInstallError::Active(external_failure) =
+        LoaderInstallError::from(LoaderError::ProviderUnavailable {
+            kind: LoaderProviderFailureKind::HttpServer,
+            status: Some(503),
+        })
+    else {
+        panic!("provider failure must cross the active loader boundary")
+    };
+    dispatch_loader_install_failure(
+        &test_producer(),
+        journals.clone(),
+        Arc::new(GuardianFailureMemoryStore::new()),
+        &external_operation,
+        "loader_fabric_build_startup",
+        "26.2",
+        LoaderInstallError::Active(external_failure),
+        "2026-07-17T10:00:00+00:00",
+    )
+    .await;
+
+    let restored = GuardianFailureMemoryStore::new();
+    super::operation::settle_startup_install_guardian_failure_memory(
+        &journals,
+        &restored,
+        "2026-07-17T10:01:00+00:00",
+    )
+    .await
+    .expect("restore distinct provider ownership");
+    let mut ownership = restored
+        .list()
+        .into_iter()
+        .map(|entry| entry.target.ownership)
+        .collect::<Vec<_>>();
+    ownership.sort_by_key(|ownership| match ownership {
+        OwnershipClass::LauncherManaged => 0,
+        OwnershipClass::ExternalProviderDerived => 1,
+        _ => 2,
+    });
+    assert_eq!(
+        ownership,
+        vec![
+            OwnershipClass::LauncherManaged,
+            OwnershipClass::ExternalProviderDerived,
+        ]
+    );
 }
 
 #[tokio::test]

@@ -51,6 +51,49 @@ use std::time::{Duration, SystemTime};
 use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::mpsc;
 
+pub(crate) async fn settle_startup_install_guardian_failure_memory(state: &AppState) -> bool {
+    let Ok(producer) = state.try_claim_producer() else {
+        return false;
+    };
+    let journals = state.journals().clone();
+    let failure_memory = state.failure_memory().clone();
+    let observed_at = chrono::Utc::now().to_rfc3339();
+    match producer
+        .spawn_joinable(async move {
+            operation::settle_startup_install_guardian_failure_memory(
+                &journals,
+                &failure_memory,
+                &observed_at,
+            )
+            .await
+        })
+        .await
+    {
+        Ok(Ok(())) => true,
+        Ok(Err(error)) => {
+            tracing::error!(
+                error_class = error.class(),
+                "Guardian install startup failure-memory barrier remains unsettled"
+            );
+            false
+        }
+        Err(error) => {
+            let join_failure_kind = if error.is_panic() {
+                "panic"
+            } else if error.is_cancelled() {
+                "cancelled"
+            } else {
+                "unknown"
+            };
+            tracing::error!(
+                join_failure_kind,
+                "Guardian install startup failure-memory task stopped unexpectedly"
+            );
+            false
+        }
+    }
+}
+
 pub(crate) const INSTALL_FAILURE_MESSAGE: &str =
     "Install failed. Check your connection and app data permissions, then try again.";
 pub(crate) const LOADER_INSTALL_INTERRUPTED_MESSAGE: &str =

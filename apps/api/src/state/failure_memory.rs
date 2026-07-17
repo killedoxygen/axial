@@ -19,7 +19,7 @@ use crate::execution::persistence::{
 };
 use crate::guardian::{DiagnosisId, GuardianActionKind, GuardianDomain, GuardianMode};
 use axial_config::AppPaths;
-use chrono::{DateTime, FixedOffset};
+use chrono::{DateTime, FixedOffset, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
@@ -502,6 +502,7 @@ pub enum FailureMemoryValidationError {
     ReconciliationTerminalMismatch,
     InvalidPersistedStateRepairTerminal,
     PersistedStateRepairTerminalMismatch,
+    InstallGuardianRetryMismatch,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -704,6 +705,80 @@ impl GuardianFailureMemoryStore {
         self.await_commit(pending).await
     }
 
+    pub(crate) async fn reconcile_install_guardian_retry(
+        &self,
+        entry: GuardianFailureMemoryEntry,
+    ) -> Result<(), FailureMemoryStoreError> {
+        self.reconcile_install_guardian_retry_batch(vec![entry])
+            .await
+    }
+
+    pub(crate) async fn reconcile_install_guardian_retry_batch(
+        &self,
+        entries: Vec<GuardianFailureMemoryEntry>,
+    ) -> Result<(), FailureMemoryStoreError> {
+        let pending = self.reconcile_install_guardian_retry_batch_candidate(entries)?;
+        self.await_commit(pending).await
+    }
+
+    fn reconcile_install_guardian_retry_batch_candidate(
+        &self,
+        entries: Vec<GuardianFailureMemoryEntry>,
+    ) -> Result<Option<PendingFailureMemoryCommit>, FailureMemoryStoreError> {
+        let mut protected_keys = BTreeSet::new();
+        for entry in &entries {
+            entry.validate()?;
+            install_guardian_retry_observation(entry)?;
+            if !protected_keys.insert(entry.key.as_str().to_string()) {
+                return Err(FailureMemoryValidationError::InstallGuardianRetryMismatch.into());
+            }
+        }
+        let mut records = self.records.write().expect(FAILURE_MEMORY_LOCK_INVARIANT);
+        if records.retry_candidate.is_some() || records.critical_pending {
+            return Err(FailureMemoryStoreError::Persistence(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "Guardian failure-memory persistence requires retry",
+            )));
+        }
+        let mut candidate = records.visible.clone();
+        let mut changed = false;
+        for entry in entries {
+            changed |= apply_install_guardian_startup_retry(&mut candidate, entry)?;
+        }
+        if !changed {
+            return Ok(None);
+        }
+        if !prune_records_protecting(&mut candidate, self.max_entries, &protected_keys) {
+            return Err(FailureMemoryStoreError::CapacityExhausted);
+        }
+        let snapshot = FailureMemorySnapshot::new(candidate.values().cloned().collect())?;
+        if self.persistence.is_some() {
+            records.critical_pending = true;
+        }
+        let ticket = match self.persistence.as_ref().map(|persistence| {
+            persistence
+                .writer
+                .accept(snapshot, WriteUrgency::Immediate, encode_snapshot)
+                .map_err(|error| FailureMemoryStoreError::Persistence(error.into()))
+        }) {
+            Some(Ok(ticket)) => Some(ticket),
+            Some(Err(error)) => {
+                records.critical_pending = false;
+                return Err(error);
+            }
+            None => None,
+        };
+        let Some(ticket) = ticket else {
+            records.visible = candidate;
+            return Ok(None);
+        };
+        Ok(Some(PendingFailureMemoryCommit {
+            revision: ticket.revision().get(),
+            ticket,
+            candidate,
+        }))
+    }
+
     /// Accepts the updated snapshot for persistence before publishing it in memory.
     ///
     /// Success means the revision is owned by the persistence coordinator. Call
@@ -722,6 +797,22 @@ impl GuardianFailureMemoryStore {
         ),
         urgency: WriteUrgency,
     ) -> Result<Option<PendingFailureMemoryCommit>, FailureMemoryStoreError> {
+        self.record_with_checked(entry, urgency, false, |records, entry| {
+            apply(records, entry);
+            Ok(true)
+        })
+    }
+
+    fn record_with_checked(
+        &self,
+        entry: GuardianFailureMemoryEntry,
+        urgency: WriteUrgency,
+        protect_entry: bool,
+        apply: impl FnOnce(
+            &mut BTreeMap<String, GuardianFailureMemoryEntry>,
+            GuardianFailureMemoryEntry,
+        ) -> Result<bool, FailureMemoryStoreError>,
+    ) -> Result<Option<PendingFailureMemoryCommit>, FailureMemoryStoreError> {
         let mut records = self.records.write().expect(FAILURE_MEMORY_LOCK_INVARIANT);
         if records.retry_candidate.is_some() || records.critical_pending {
             return Err(FailureMemoryStoreError::Persistence(io::Error::new(
@@ -730,11 +821,14 @@ impl GuardianFailureMemoryStore {
             )));
         }
         entry.validate()?;
-        let protected_key = (entry.reconciliation_terminal().is_some()
+        let protected_key = (protect_entry
+            || entry.reconciliation_terminal().is_some()
             || entry.persisted_state_repair_terminal().is_some())
         .then(|| entry.key.as_str().to_string());
         let mut candidate = records.visible.clone();
-        apply(&mut candidate, entry);
+        if !apply(&mut candidate, entry)? {
+            return Ok(None);
+        }
         if !prune_records(&mut candidate, self.max_entries, protected_key.as_deref()) {
             return Err(FailureMemoryStoreError::CapacityExhausted);
         }
@@ -1158,6 +1252,18 @@ fn prune_records(
     max_entries: usize,
     protected_key: Option<&str>,
 ) -> bool {
+    let protected_keys = protected_key
+        .map(str::to_string)
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    prune_records_protecting(records, max_entries, &protected_keys)
+}
+
+fn prune_records_protecting(
+    records: &mut BTreeMap<String, GuardianFailureMemoryEntry>,
+    max_entries: usize,
+    protected_keys: &BTreeSet<String>,
+) -> bool {
     if records.len() <= max_entries {
         return true;
     }
@@ -1165,7 +1271,7 @@ fn prune_records(
     let mut ordered = records
         .values()
         .filter(|entry| {
-            protected_key != Some(entry.key.as_str()) && !active_durable_terminal(entry)
+            !protected_keys.contains(entry.key.as_str()) && !active_durable_terminal(entry)
         })
         .map(|entry| {
             (
@@ -1215,6 +1321,120 @@ fn apply_record(
     } else {
         records.insert(key, entry);
     }
+}
+
+fn apply_install_guardian_startup_retry(
+    records: &mut BTreeMap<String, GuardianFailureMemoryEntry>,
+    replacement: GuardianFailureMemoryEntry,
+) -> Result<bool, FailureMemoryStoreError> {
+    let replacement_observed = install_guardian_retry_observation(&replacement)?;
+    let key = replacement.key.as_str().to_string();
+    let Some(existing) = records.get_mut(&key) else {
+        records.insert(key, replacement);
+        return Ok(true);
+    };
+    let existing_first_observed =
+        canonical_install_guardian_retry_timestamp(&existing.first_observed_at)?;
+    let existing_last_observed =
+        canonical_install_guardian_retry_timestamp(&existing.last_observed_at)?;
+    let existing_suppression_until = existing
+        .suppression_until
+        .as_deref()
+        .ok_or(FailureMemoryValidationError::InstallGuardianRetryMismatch)
+        .and_then(canonical_install_guardian_retry_timestamp)?;
+    if existing.reconciliation_terminal().is_some()
+        || existing.persisted_state_repair_terminal().is_some()
+        || existing.last_action_kind != Some(GuardianActionKind::Retry)
+        || existing_last_observed.checked_add_signed(chrono::Duration::minutes(5))
+            != Some(existing_suppression_until)
+        || !install_guardian_retry_identity_matches(existing, &replacement)
+    {
+        return Err(FailureMemoryValidationError::InstallGuardianRetryMismatch.into());
+    }
+
+    if existing == &replacement {
+        return Ok(false);
+    }
+    if existing.last_observed_at == replacement.last_observed_at
+        && existing.suppression_until == replacement.suppression_until
+    {
+        if existing_first_observed <= replacement_observed && existing.occurrence_count >= 1 {
+            return Ok(false);
+        }
+        return Err(FailureMemoryValidationError::InstallGuardianRetryMismatch.into());
+    }
+    if existing_suppression_until > replacement_observed {
+        return Err(FailureMemoryValidationError::InstallGuardianRetryMismatch.into());
+    }
+
+    let occurrence_count = existing
+        .occurrence_count
+        .checked_add(1)
+        .ok_or(FailureMemoryValidationError::InstallGuardianRetryMismatch)?;
+    let first_observed_at = existing.first_observed_at.clone();
+    *existing = replacement;
+    existing.first_observed_at = first_observed_at;
+    existing.occurrence_count = occurrence_count;
+    existing.validate()?;
+    Ok(true)
+}
+
+fn install_guardian_retry_observation(
+    entry: &GuardianFailureMemoryEntry,
+) -> Result<DateTime<Utc>, FailureMemoryStoreError> {
+    if entry.occurrence_count != 1
+        || entry.first_observed_at != entry.last_observed_at
+        || entry.last_action_kind != Some(GuardianActionKind::Retry)
+        || entry.reconciliation_terminal().is_some()
+        || entry.persisted_state_repair_terminal().is_some()
+    {
+        return Err(FailureMemoryValidationError::InstallGuardianRetryMismatch.into());
+    }
+    let observed_at = canonical_install_guardian_retry_timestamp(&entry.first_observed_at)?;
+    let suppression_until = entry
+        .suppression_until
+        .as_deref()
+        .ok_or(FailureMemoryValidationError::InstallGuardianRetryMismatch)
+        .and_then(canonical_install_guardian_retry_timestamp)?;
+    if observed_at.checked_add_signed(chrono::Duration::minutes(5)) != Some(suppression_until) {
+        return Err(FailureMemoryValidationError::InstallGuardianRetryMismatch.into());
+    }
+    Ok(observed_at)
+}
+
+fn canonical_install_guardian_retry_timestamp(
+    value: &str,
+) -> Result<DateTime<Utc>, FailureMemoryValidationError> {
+    if value.len() > 40 {
+        return Err(FailureMemoryValidationError::InstallGuardianRetryMismatch);
+    }
+    let parsed = DateTime::parse_from_rfc3339(value)
+        .map_err(|_| FailureMemoryValidationError::InstallGuardianRetryMismatch)?
+        .with_timezone(&Utc);
+    if parsed.to_rfc3339() != value {
+        return Err(FailureMemoryValidationError::InstallGuardianRetryMismatch);
+    }
+    Ok(parsed)
+}
+
+fn install_guardian_retry_identity_matches(
+    existing: &GuardianFailureMemoryEntry,
+    replacement: &GuardianFailureMemoryEntry,
+) -> bool {
+    existing.key == replacement.key
+        && existing.diagnosis_id == replacement.diagnosis_id
+        && existing.domain == replacement.domain
+        && existing.mode == replacement.mode
+        && existing.target == replacement.target
+        && existing.ownership == replacement.ownership
+        && existing.last_action_kind == replacement.last_action_kind
+        && existing.last_action_outcome == replacement.last_action_outcome
+        && existing.repair_attempt_count == replacement.repair_attempt_count
+        && existing.quarantine_checkpoint == replacement.quarantine_checkpoint
+        && existing.target_content_hash == replacement.target_content_hash
+        && existing.user_intent_hash == replacement.user_intent_hash
+        && existing.reconciliation_terminal == replacement.reconciliation_terminal
+        && existing.persisted_state_repair_terminal == replacement.persisted_state_repair_terminal
 }
 
 fn apply_reconciliation_record(
@@ -1747,6 +1967,166 @@ mod tests {
         assert_eq!(stored_repair.repair_attempt_count, 2);
     }
 
+    #[tokio::test]
+    async fn startup_install_retry_reconciliation_is_atomic_and_idempotent() {
+        let store = GuardianFailureMemoryStore::new();
+        let initial = retry_entry("2026-06-15T10:00:00+00:00")
+            .with_suppression_until("2026-06-15T10:05:00+00:00");
+        let key = initial.key.clone();
+        let replacement = retry_entry("2026-06-15T10:10:00+00:00")
+            .with_suppression_until("2026-06-15T10:15:00+00:00");
+
+        store
+            .reconcile_install_guardian_retry(initial.clone())
+            .await
+            .expect("insert initial startup Retry");
+        store
+            .reconcile_install_guardian_retry(initial)
+            .await
+            .expect("exact startup Retry is a no-op");
+        assert_eq!(store.get(&key).expect("initial Retry").occurrence_count, 1);
+
+        store
+            .reconcile_install_guardian_retry(replacement.clone())
+            .await
+            .expect("merge later non-overlapping Retry");
+        let merged = store.get(&key).expect("merged Retry");
+        assert_eq!(merged.first_observed_at, "2026-06-15T10:00:00+00:00");
+        assert_eq!(merged.last_observed_at, "2026-06-15T10:10:00+00:00");
+        assert_eq!(merged.occurrence_count, 2);
+        assert_eq!(
+            merged.suppression_until.as_deref(),
+            Some("2026-06-15T10:15:00+00:00")
+        );
+
+        store
+            .reconcile_install_guardian_retry(replacement)
+            .await
+            .expect("repeated merged Retry is a no-op");
+        assert_eq!(store.get(&key).expect("idempotent merged Retry"), merged);
+    }
+
+    #[tokio::test]
+    async fn startup_install_retry_batch_protects_every_active_key_atomically() {
+        let retry = |target_id: &str| {
+            GuardianFailureMemoryEntry::observed(
+                DiagnosisId::DownloadUnavailable,
+                GuardianDomain::Download,
+                TargetDescriptor::new(
+                    StabilizationSystem::Execution,
+                    TargetKind::Artifact,
+                    target_id,
+                    OwnershipClass::LauncherManaged,
+                ),
+                GuardianMode::Managed,
+                Some("install_provider"),
+                "2026-06-15T10:00:00+00:00",
+            )
+            .with_action(
+                GuardianActionKind::Retry,
+                FailureMemoryActionOutcome::Retried,
+            )
+            .with_suppression_until("2026-06-15T10:05:00+00:00")
+        };
+        let entries = vec![
+            retry("minecraft_client_1.21.5"),
+            retry("loader_fabric_build"),
+        ];
+
+        let undersized = GuardianFailureMemoryStore::with_max_entries(1);
+        assert!(matches!(
+            undersized
+                .reconcile_install_guardian_retry_batch(entries.clone())
+                .await,
+            Err(FailureMemoryStoreError::CapacityExhausted)
+        ));
+        assert!(undersized.list().is_empty());
+
+        let store = GuardianFailureMemoryStore::with_max_entries(2);
+        store
+            .reconcile_install_guardian_retry_batch(entries.clone())
+            .await
+            .expect("persist complete active Retry set");
+        let restored = store.list();
+        assert_eq!(restored.len(), 2);
+        store
+            .reconcile_install_guardian_retry_batch(entries)
+            .await
+            .expect("exact active Retry batch is a no-op");
+        assert_eq!(store.list(), restored);
+    }
+
+    #[tokio::test]
+    async fn startup_install_retry_reconciliation_rejects_drift_and_ambiguous_time() {
+        let store = GuardianFailureMemoryStore::new();
+        let initial = retry_entry("2026-06-15T10:00:00+00:00")
+            .with_suppression_until("2026-06-15T10:05:00+00:00");
+        let key = initial.key.clone();
+        store
+            .reconcile_install_guardian_retry(initial.clone())
+            .await
+            .expect("insert initial startup Retry");
+
+        let replacement = || {
+            retry_entry("2026-06-15T10:10:00+00:00")
+                .with_suppression_until("2026-06-15T10:15:00+00:00")
+        };
+        let mut ownership_drift = replacement();
+        ownership_drift.ownership = OwnershipClass::LauncherManaged;
+        ownership_drift.target.ownership = OwnershipClass::LauncherManaged;
+        let mut target_drift = replacement();
+        target_drift.target.id = "different_target".to_string();
+        let mut domain_drift = replacement();
+        domain_drift.domain = GuardianDomain::Runtime;
+        let mut mode_drift = replacement();
+        mode_drift.mode = GuardianMode::Custom;
+        let mut diagnosis_drift = replacement();
+        diagnosis_drift.diagnosis_id = DiagnosisId::OutOfMemory;
+        let action_drift = replacement().with_action(
+            GuardianActionKind::Retry,
+            FailureMemoryActionOutcome::Blocked,
+        );
+        let mut intent_drift = replacement();
+        intent_drift.user_intent_hash = Some("different_intent".to_string());
+        let overlapping = retry_entry("2026-06-15T10:04:00+00:00")
+            .with_suppression_until("2026-06-15T10:09:00+00:00");
+        let reverse = retry_entry("2026-06-15T09:50:00+00:00")
+            .with_suppression_until("2026-06-15T09:55:00+00:00");
+        let mut ambiguous = replacement();
+        ambiguous.last_observed_at = "2026-06-15T10:11:00+00:00".to_string();
+        let expired = retry_entry("2026-06-15T10:10:00+00:00")
+            .with_suppression_until("2026-06-15T10:10:00+00:00");
+        let wrong_deadline = retry_entry("2026-06-15T10:10:00+00:00")
+            .with_suppression_until("2026-06-15T10:16:00+00:00");
+        let noncanonical_utc =
+            retry_entry("2026-06-15T10:10:00Z").with_suppression_until("2026-06-15T10:15:00Z");
+        let offset_time = retry_entry("2026-06-15T11:10:00+01:00")
+            .with_suppression_until("2026-06-15T11:15:00+01:00");
+
+        for rejected in [
+            ownership_drift,
+            target_drift,
+            domain_drift,
+            mode_drift,
+            diagnosis_drift,
+            action_drift,
+            intent_drift,
+            overlapping,
+            reverse,
+            ambiguous,
+            expired,
+            wrong_deadline,
+            noncanonical_utc,
+            offset_time,
+        ] {
+            assert!(matches!(
+                store.reconcile_install_guardian_retry(rejected).await,
+                Err(FailureMemoryStoreError::Validation(_))
+            ));
+            assert_eq!(store.get(&key), Some(initial.clone()));
+        }
+    }
+
     #[test]
     fn changed_target_hash_reset_shape_is_explicit() {
         let entry = retry_entry("2026-06-15T12:00:00Z").with_target_content_hash("sha256_old123");
@@ -2041,6 +2421,47 @@ mod tests {
         assert_eq!(snapshot.entries[0].occurrence_count, 2);
         assert_eq!(snapshot.entries[0].last_observed_at, "2026-06-15T10:01:00Z");
 
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn failed_startup_install_retry_persistence_stays_hidden_until_retry() {
+        let (root, paths, backend, _coordinator, store) =
+            persistence_fixture("startup-install-retry-hidden");
+        let entry = retry_entry("2026-06-15T10:00:00+00:00")
+            .with_suppression_until("2026-06-15T10:05:00+00:00");
+        let key = entry.key.clone();
+        backend.fail_next();
+
+        assert!(matches!(
+            store.reconcile_install_guardian_retry(entry.clone()).await,
+            Err(FailureMemoryStoreError::Persistence(_))
+        ));
+        assert!(store.get(&key).is_none());
+        assert!(
+            store
+                .records
+                .read()
+                .expect(super::FAILURE_MEMORY_LOCK_INVARIANT)
+                .retry_candidate
+                .is_some()
+        );
+
+        store.retry().await.expect("persist hidden Retry candidate");
+        assert_eq!(store.get(&key), Some(entry.clone()));
+        assert_eq!(backend.attempts.load(Ordering::SeqCst), 2);
+
+        store
+            .reconcile_install_guardian_retry(entry.clone())
+            .await
+            .expect("persisted Retry replay is a no-op");
+        assert_eq!(backend.attempts.load(Ordering::SeqCst), 2);
+        let encoded = fs::read_to_string(super::failure_memory_path(&paths))
+            .expect("read persisted startup Retry");
+        let snapshot = FailureMemorySnapshot::from_json(&encoded).expect("decode startup Retry");
+        assert_eq!(snapshot.entries, vec![entry]);
+
+        store.close().await.expect("close startup Retry store");
         let _ = fs::remove_dir_all(&root);
     }
 

@@ -11,7 +11,9 @@ use crate::observability::{
     RedactionAudience, sanitize_evidence_text, sanitize_evidence_token,
     sanitize_public_diagnostic_text,
 };
-use crate::state::contracts::OperationPhase;
+use crate::state::contracts::{
+    OperationPhase, OwnershipClass, StabilizationSystem, TargetDescriptor, TargetKind,
+};
 use crate::state::failure_memory::FailureMemoryKey;
 use axial_launcher::{
     CrashEvidence, GuardianMode as LauncherGuardianMode, HealingEventKind, LaunchFailureClass,
@@ -185,8 +187,13 @@ const GUARDIAN_OUTCOME_MEMORY_BINDING_PREFIX: &str = "guardian_outcome_memory_bi
 const GUARDIAN_OUTCOME_MEMORY_OBSERVED_AT_PREFIX: &str = "guardian_outcome_memory_observed_at:";
 const GUARDIAN_OUTCOME_MEMORY_SUPPRESSION_UNTIL_PREFIX: &str =
     "guardian_outcome_memory_suppression_until:";
+const GUARDIAN_OUTCOME_MEMORY_TARGET_SYSTEM_PREFIX: &str = "guardian_outcome_memory_target_system:";
+const GUARDIAN_OUTCOME_MEMORY_TARGET_KIND_PREFIX: &str = "guardian_outcome_memory_target_kind:";
+const GUARDIAN_OUTCOME_MEMORY_TARGET_OWNERSHIP_PREFIX: &str =
+    "guardian_outcome_memory_target_ownership:";
+const GUARDIAN_OUTCOME_MEMORY_TARGET_ID_PREFIX: &str = "guardian_outcome_memory_target_id:";
 const GUARDIAN_OUTCOME_MEMORY_BINDING_DOMAIN: &[u8] =
-    b"axial.guardian.install_failure_memory_binding.v2\0";
+    b"axial.guardian.install_failure_memory_binding.v3\0";
 
 pub(crate) fn guardian_summary_from_persisted_value(value: &Value) -> Option<GuardianSummary> {
     guardian_summary_from_persisted_value_with_limits(
@@ -901,12 +908,21 @@ pub(crate) struct GuardianInstallOutcomeMemoryBinding([u8; 32]);
 impl GuardianInstallOutcomeMemoryBinding {
     fn for_failure_memory(
         key: &FailureMemoryKey,
+        target: &TargetDescriptor,
         observed_at: &str,
         suppression_until: &str,
     ) -> Self {
         let mut digest = Sha256::new();
         digest.update(GUARDIAN_OUTCOME_MEMORY_BINDING_DOMAIN);
-        for value in [key.as_str(), observed_at, suppression_until] {
+        for value in [
+            key.as_str(),
+            target_system_persisted_id(target.system),
+            target_kind_persisted_id(target.kind),
+            target_ownership_persisted_id(target.ownership),
+            target.id.as_str(),
+            observed_at,
+            suppression_until,
+        ] {
             digest.update((value.len() as u64).to_be_bytes());
             digest.update(value.as_bytes());
         }
@@ -943,6 +959,7 @@ impl GuardianInstallOutcomeMemoryBinding {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct GuardianInstallOutcomeMemoryPersistence {
     binding: GuardianInstallOutcomeMemoryBinding,
+    target: TargetDescriptor,
     observed_at: String,
     suppression_until: String,
 }
@@ -950,6 +967,7 @@ pub(crate) struct GuardianInstallOutcomeMemoryPersistence {
 impl GuardianInstallOutcomeMemoryPersistence {
     pub(crate) fn for_failure_memory_key(
         key: &FailureMemoryKey,
+        target: TargetDescriptor,
         observed_at: String,
         suppression_until: String,
     ) -> Option<Self> {
@@ -958,34 +976,78 @@ impl GuardianInstallOutcomeMemoryPersistence {
         if observed.checked_add_signed(chrono::Duration::minutes(5))? != suppression {
             return None;
         }
+        if TargetDescriptor::new(target.system, target.kind, &target.id, target.ownership) != target
+        {
+            return None;
+        }
         Some(Self {
             binding: GuardianInstallOutcomeMemoryBinding::for_failure_memory(
                 key,
+                &target,
                 &observed_at,
                 &suppression_until,
             ),
+            target,
             observed_at,
             suppression_until,
         })
     }
 
-    fn from_persisted(binding: &str, observed_at: &str, suppression_until: &str) -> Option<Self> {
+    fn from_persisted(
+        binding: &str,
+        target_system: &str,
+        target_kind: &str,
+        target_ownership: &str,
+        target_id: &str,
+        observed_at: &str,
+        suppression_until: &str,
+    ) -> Option<Self> {
         let observed = canonical_failure_memory_timestamp(observed_at)?;
         let suppression = canonical_failure_memory_timestamp(suppression_until)?;
         if observed.checked_add_signed(chrono::Duration::minutes(5))? != suppression {
             return None;
         }
+        let target = TargetDescriptor::new(
+            target_system_from_persisted_id(target_system)?,
+            target_kind_from_persisted_id(target_kind)?,
+            target_id,
+            target_ownership_from_persisted_id(target_ownership)?,
+        );
+        if target.id != target_id {
+            return None;
+        }
         Some(Self {
             binding: GuardianInstallOutcomeMemoryBinding::from_persisted(binding)?,
+            target,
             observed_at: observed_at.to_string(),
             suppression_until: suppression_until.to_string(),
         })
     }
 
-    pub(crate) fn matches_failure_memory_key(&self, key: &FailureMemoryKey) -> bool {
+    pub(crate) fn matches_failure_memory_key(
+        &self,
+        key: &FailureMemoryKey,
+        target: &TargetDescriptor,
+    ) -> bool {
+        self.target == *target
+            && self.binding
+                == GuardianInstallOutcomeMemoryBinding::for_failure_memory(
+                    key,
+                    target,
+                    &self.observed_at,
+                    &self.suppression_until,
+                )
+    }
+
+    pub(crate) fn target(&self) -> &TargetDescriptor {
+        &self.target
+    }
+
+    pub(crate) fn binding_matches_target(&self, key: &FailureMemoryKey) -> bool {
         self.binding
             == GuardianInstallOutcomeMemoryBinding::for_failure_memory(
                 key,
+                &self.target,
                 &self.observed_at,
                 &self.suppression_until,
             )
@@ -1008,6 +1070,83 @@ fn canonical_failure_memory_timestamp(value: &str) -> Option<DateTime<Utc>> {
         .ok()?
         .with_timezone(&Utc);
     (parsed.to_rfc3339() == value).then_some(parsed)
+}
+
+const fn target_system_persisted_id(system: StabilizationSystem) -> &'static str {
+    match system {
+        StabilizationSystem::Application => "application",
+        StabilizationSystem::Execution => "execution",
+        StabilizationSystem::Guardian => "guardian",
+        StabilizationSystem::Performance => "performance",
+        StabilizationSystem::Observability => "observability",
+        StabilizationSystem::State => "state",
+        StabilizationSystem::Interface => "interface",
+    }
+}
+
+fn target_system_from_persisted_id(value: &str) -> Option<StabilizationSystem> {
+    match value {
+        "application" => Some(StabilizationSystem::Application),
+        "execution" => Some(StabilizationSystem::Execution),
+        "guardian" => Some(StabilizationSystem::Guardian),
+        "performance" => Some(StabilizationSystem::Performance),
+        "observability" => Some(StabilizationSystem::Observability),
+        "state" => Some(StabilizationSystem::State),
+        "interface" => Some(StabilizationSystem::Interface),
+        _ => None,
+    }
+}
+
+const fn target_kind_persisted_id(kind: TargetKind) -> &'static str {
+    match kind {
+        TargetKind::Instance => "instance",
+        TargetKind::Version => "version",
+        TargetKind::Artifact => "artifact",
+        TargetKind::Runtime => "runtime",
+        TargetKind::Session => "session",
+        TargetKind::Account => "account",
+        TargetKind::Config => "config",
+        TargetKind::PerformanceComposition => "performance_composition",
+        TargetKind::FilesystemPath => "filesystem_path",
+        TargetKind::NetworkResource => "network_resource",
+    }
+}
+
+fn target_kind_from_persisted_id(value: &str) -> Option<TargetKind> {
+    match value {
+        "instance" => Some(TargetKind::Instance),
+        "version" => Some(TargetKind::Version),
+        "artifact" => Some(TargetKind::Artifact),
+        "runtime" => Some(TargetKind::Runtime),
+        "session" => Some(TargetKind::Session),
+        "account" => Some(TargetKind::Account),
+        "config" => Some(TargetKind::Config),
+        "performance_composition" => Some(TargetKind::PerformanceComposition),
+        "filesystem_path" => Some(TargetKind::FilesystemPath),
+        "network_resource" => Some(TargetKind::NetworkResource),
+        _ => None,
+    }
+}
+
+const fn target_ownership_persisted_id(ownership: OwnershipClass) -> &'static str {
+    match ownership {
+        OwnershipClass::LauncherManaged => "launcher_managed",
+        OwnershipClass::CompositionManaged => "composition_managed",
+        OwnershipClass::UserOwned => "user_owned",
+        OwnershipClass::ExternalProviderDerived => "external_provider_derived",
+        OwnershipClass::Unknown => "unknown",
+    }
+}
+
+fn target_ownership_from_persisted_id(value: &str) -> Option<OwnershipClass> {
+    match value {
+        "launcher_managed" => Some(OwnershipClass::LauncherManaged),
+        "composition_managed" => Some(OwnershipClass::CompositionManaged),
+        "user_owned" => Some(OwnershipClass::UserOwned),
+        "external_provider_derived" => Some(OwnershipClass::ExternalProviderDerived),
+        "unknown" => Some(OwnershipClass::Unknown),
+        _ => None,
+    }
 }
 
 fn lower_hex_nibble(value: u8) -> Option<u8> {
@@ -1046,6 +1185,22 @@ pub(crate) fn guardian_install_outcome_persistence_facts(
                 "{GUARDIAN_OUTCOME_MEMORY_SUPPRESSION_UNTIL_PREFIX}{}",
                 memory.suppression_until
             ));
+            facts.push(format!(
+                "{GUARDIAN_OUTCOME_MEMORY_TARGET_SYSTEM_PREFIX}{}",
+                target_system_persisted_id(memory.target.system)
+            ));
+            facts.push(format!(
+                "{GUARDIAN_OUTCOME_MEMORY_TARGET_KIND_PREFIX}{}",
+                target_kind_persisted_id(memory.target.kind)
+            ));
+            facts.push(format!(
+                "{GUARDIAN_OUTCOME_MEMORY_TARGET_OWNERSHIP_PREFIX}{}",
+                target_ownership_persisted_id(memory.target.ownership)
+            ));
+            facts.push(format!(
+                "{GUARDIAN_OUTCOME_MEMORY_TARGET_ID_PREFIX}{}",
+                memory.target.id
+            ));
         }
         (GuardianActionKind::Retry, None) | (_, Some(_)) => return None,
         (_, None) => {}
@@ -1081,6 +1236,10 @@ pub(crate) fn guardian_install_outcome_fact_group<'a>(
     let mut memory_binding = None;
     let mut memory_observed_at = None;
     let mut memory_suppression_until = None;
+    let mut memory_target_system = None;
+    let mut memory_target_kind = None;
+    let mut memory_target_ownership = None;
+    let mut memory_target_id = None;
     let mut has_marker = false;
     let mut invalid = false;
     for fact in facts {
@@ -1101,6 +1260,22 @@ pub(crate) fn guardian_install_outcome_fact_group<'a>(
                     fact.strip_prefix(GUARDIAN_OUTCOME_MEMORY_SUPPRESSION_UNTIL_PREFIX)
                         .map(|value| (&mut memory_suppression_until, value))
                 })
+                .or_else(|| {
+                    fact.strip_prefix(GUARDIAN_OUTCOME_MEMORY_TARGET_SYSTEM_PREFIX)
+                        .map(|value| (&mut memory_target_system, value))
+                })
+                .or_else(|| {
+                    fact.strip_prefix(GUARDIAN_OUTCOME_MEMORY_TARGET_KIND_PREFIX)
+                        .map(|value| (&mut memory_target_kind, value))
+                })
+                .or_else(|| {
+                    fact.strip_prefix(GUARDIAN_OUTCOME_MEMORY_TARGET_OWNERSHIP_PREFIX)
+                        .map(|value| (&mut memory_target_ownership, value))
+                })
+                .or_else(|| {
+                    fact.strip_prefix(GUARDIAN_OUTCOME_MEMORY_TARGET_ID_PREFIX)
+                        .map(|value| (&mut memory_target_id, value))
+                })
         };
         if let Some((slot, value)) = marker {
             has_marker = true;
@@ -1118,11 +1293,31 @@ pub(crate) fn guardian_install_outcome_fact_group<'a>(
     let Some(summary) = summary else {
         return GuardianInstallOutcomeFactGroupParse::Invalid;
     };
-    let persisted_memory = (memory_binding, memory_observed_at, memory_suppression_until);
+    let persisted_memory = (
+        memory_binding,
+        memory_observed_at,
+        memory_suppression_until,
+        memory_target_system,
+        memory_target_kind,
+        memory_target_ownership,
+        memory_target_id,
+    );
     let memory = match persisted_memory {
-        (Some(binding), Some(observed_at), Some(suppression_until)) => {
+        (
+            Some(binding),
+            Some(observed_at),
+            Some(suppression_until),
+            Some(target_system),
+            Some(target_kind),
+            Some(target_ownership),
+            Some(target_id),
+        ) => {
             match GuardianInstallOutcomeMemoryPersistence::from_persisted(
                 binding,
+                target_system,
+                target_kind,
+                target_ownership,
+                target_id,
                 observed_at,
                 suppression_until,
             ) {
@@ -1130,12 +1325,12 @@ pub(crate) fn guardian_install_outcome_fact_group<'a>(
                 None => return GuardianInstallOutcomeFactGroupParse::Invalid,
             }
         }
-        (None, None, None) => None,
+        (None, None, None, None, None, None, None) => None,
         _ => return GuardianInstallOutcomeFactGroupParse::Invalid,
     };
     let binding_shape_valid = match decision {
         GuardianActionKind::Retry => memory.is_some(),
-        _ => persisted_memory == (None, None, None),
+        _ => persisted_memory == (None, None, None, None, None, None, None),
     };
     if invalid || !binding_shape_valid {
         return GuardianInstallOutcomeFactGroupParse::Invalid;

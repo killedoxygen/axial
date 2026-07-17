@@ -7,7 +7,7 @@ use crate::application::{
     InstallVersionPayload, OperationCommandCarrier,
 };
 use crate::guardian::{
-    DiagnosisId, GuardianActionKind, GuardianInstallArtifactFailureEvidence,
+    DiagnosisId, GuardianActionKind, GuardianDomain, GuardianInstallArtifactFailureEvidence,
     GuardianInstallArtifactFailureKind, GuardianInstallAssessment,
     GuardianInstallOutcomeFactGroupParse, GuardianInstallOutcomeMemoryPersistence, GuardianMode,
     GuardianPolicyContext, assess_install_artifact_failure_with_context, diagnose,
@@ -38,6 +38,7 @@ use axial_minecraft::download::{ExecutionDownloadFact, ExecutionDownloadFactKind
 use axial_minecraft::loaders::LoaderActiveInstallFailure;
 use axial_minecraft::{DownloadError, DownloadProgress, RuntimeSourceFailureKind};
 use serde_json::{Value, json};
+use std::collections::BTreeSet;
 use std::io;
 use std::sync::Arc;
 use std::time::Duration;
@@ -795,9 +796,158 @@ enum PersistedInstallGuardianOutcome {
     Absent,
     Valid {
         summary: crate::guardian::GuardianInstallOutcomeSummary,
-        memory: Option<GuardianInstallOutcomeMemoryPersistence>,
+        memory: Option<Box<GuardianInstallOutcomeMemoryPersistence>>,
     },
     Invalid,
+}
+
+pub(super) async fn settle_startup_install_guardian_failure_memory(
+    journals: &OperationJournalStore,
+    failure_memory: &GuardianFailureMemoryStore,
+    observed_at: &str,
+) -> Result<(), OperationJournalStoreError> {
+    let observed = chrono::DateTime::parse_from_rfc3339(observed_at)
+        .map_err(|_| OperationJournalStoreError::InvalidGuardianOutcome)?
+        .with_timezone(&chrono::Utc);
+    if observed.to_rfc3339() != observed_at {
+        return Err(OperationJournalStoreError::InvalidGuardianOutcome);
+    }
+
+    let _settlement = failure_memory.lock_install_guardian_settlement().await;
+    let mut pending_retries = 0;
+    settle_startup_install_guardian_pending(failure_memory, &mut pending_retries).await?;
+
+    let mut active_keys = BTreeSet::new();
+    let mut candidates = Vec::new();
+    for entry in journals.list() {
+        if !matches!(
+            entry.command,
+            CommandKind::InstallVersion | CommandKind::ModifyInstanceContent
+        ) {
+            continue;
+        }
+        let (summary, memory) = match persisted_install_guardian_outcome(&entry) {
+            PersistedInstallGuardianOutcome::Absent => continue,
+            PersistedInstallGuardianOutcome::Invalid => {
+                return Err(OperationJournalStoreError::InvalidGuardianOutcome);
+            }
+            PersistedInstallGuardianOutcome::Valid { summary, memory } => (summary, memory),
+        };
+        if !summary.decision_is(GuardianActionKind::Retry) {
+            continue;
+        }
+        if !install_journal_identity_matches(&entry, &entry.operation_id, entry.command)
+            || !install_retry_carrier_journal_state_is_valid(&entry)
+            || summary.diagnosis_id() != DiagnosisId::DownloadUnavailable
+        {
+            return Err(OperationJournalStoreError::InvalidGuardianOutcome);
+        }
+        let Some(memory) = memory else {
+            return Err(OperationJournalStoreError::InvalidGuardianOutcome);
+        };
+        if !suppression_deadline_active(memory.suppression_until(), observed_at) {
+            continue;
+        }
+        if !install_provider_retry_target_is_valid(memory.target()) {
+            return Err(OperationJournalStoreError::InvalidGuardianOutcome);
+        }
+        let candidate = GuardianFailureMemoryEntry::observed(
+            DiagnosisId::DownloadUnavailable,
+            GuardianDomain::Download,
+            memory.target().clone(),
+            GuardianMode::Managed,
+            Some(PROVIDER_FAILURE_MEMORY_SOURCE),
+            memory.observed_at().to_string(),
+        )
+        .with_action(
+            GuardianActionKind::Retry,
+            FailureMemoryActionOutcome::Retried,
+        )
+        .with_suppression_until(memory.suppression_until().to_string());
+        if !memory.binding_matches_target(&candidate.key)
+            || !active_keys.insert(candidate.key.as_str().to_string())
+        {
+            return Err(OperationJournalStoreError::InvalidGuardianOutcome);
+        }
+        candidates.push(candidate);
+    }
+
+    settle_startup_install_guardian_retry_batch(failure_memory, candidates).await
+}
+
+fn install_retry_carrier_journal_state_is_valid(entry: &OperationJournalEntry) -> bool {
+    match (entry.status, entry.outcome) {
+        (OperationStatus::Planned | OperationStatus::Running, None) => {
+            entry.failure_point.is_none()
+        }
+        (OperationStatus::Failed, Some(OperationOutcome::Failed)) => entry.failure_point.is_some(),
+        _ => false,
+    }
+}
+
+fn install_provider_retry_target_is_valid(target: &TargetDescriptor) -> bool {
+    target.system == StabilizationSystem::Execution
+        && target.kind == TargetKind::Artifact
+        && matches!(
+            target.ownership,
+            OwnershipClass::LauncherManaged | OwnershipClass::ExternalProviderDerived
+        )
+}
+
+async fn settle_startup_install_guardian_pending(
+    failure_memory: &GuardianFailureMemoryStore,
+    retries: &mut usize,
+) -> Result<(), OperationJournalStoreError> {
+    loop {
+        match failure_memory.settle_install_guardian_pending().await {
+            Ok(()) => return Ok(()),
+            Err(error)
+                if retry_install_guardian_memory_persistence(
+                    &error,
+                    retries,
+                    "startup_pending",
+                )
+                .await => {}
+            Err(_) => {
+                return Err(OperationJournalStoreError::GuardianFailureMemoryUnavailable);
+            }
+        }
+    }
+}
+
+async fn settle_startup_install_guardian_retry_batch(
+    failure_memory: &GuardianFailureMemoryStore,
+    entries: Vec<GuardianFailureMemoryEntry>,
+) -> Result<(), OperationJournalStoreError> {
+    let mut retries = 0;
+    loop {
+        match failure_memory
+            .reconcile_install_guardian_retry_batch(entries.clone())
+            .await
+        {
+            Ok(()) => return Ok(()),
+            Err(error @ FailureMemoryStoreError::Validation(_)) => {
+                warn!(
+                    failure_memory_error = error.class(),
+                    "Guardian startup Retry carrier conflicts with failure memory"
+                );
+                return Err(OperationJournalStoreError::InvalidGuardianOutcome);
+            }
+            Err(error)
+                if retry_install_guardian_memory_persistence(
+                    &error,
+                    &mut retries,
+                    "startup_publication",
+                )
+                .await =>
+            {
+                settle_startup_install_guardian_pending(failure_memory, &mut retries).await?;
+            }
+            Err(_) => {
+                return Err(OperationJournalStoreError::GuardianFailureMemoryUnavailable);
+            }
+        }
+    }
 }
 
 fn persisted_install_guardian_outcome(
@@ -846,7 +996,10 @@ fn persisted_install_guardian_outcome(
     if outcomes.next().is_some() {
         return PersistedInstallGuardianOutcome::Invalid;
     }
-    PersistedInstallGuardianOutcome::Valid { summary, memory }
+    PersistedInstallGuardianOutcome::Valid {
+        summary,
+        memory: memory.map(Box::new),
+    }
 }
 
 pub fn sanitize_install_progress(mut progress: DownloadProgress) -> DownloadProgress {
@@ -1790,7 +1943,7 @@ async fn settle_operation_guardian_failure(
                     summary.diagnosis_id(),
                     summary.decision_is(GuardianActionKind::Retry),
                     &memory_window.observed_at,
-                    ProviderMemoryPublication::Replay(memory),
+                    ProviderMemoryPublication::Replay(memory.map(|memory| *memory)),
                 )
                 .await?;
                 return Ok(());
@@ -2154,13 +2307,11 @@ async fn publish_provider_failure_memory_if_needed(
         FailureMemoryActionOutcome::Retried,
     )
     .with_suppression_until(memory_persistence.suppression_until().to_string());
-    if !memory_persistence.matches_failure_memory_key(&entry.key) {
+    if !memory_persistence.matches_failure_memory_key(&entry.key, &entry.target) {
         return Ok(());
     }
     if replay {
-        if memory.get(&entry.key).is_some() {
-            return Ok(());
-        }
+        return memory.reconcile_install_guardian_retry(entry).await;
     }
     memory.record_install_guardian_retry(entry).await
 }
@@ -2173,9 +2324,22 @@ fn install_failure_memory_persistence(
     diagnosis_id: DiagnosisId,
     memory_window: &ProviderFailureObservationWindow,
 ) -> Option<GuardianInstallOutcomeMemoryPersistence> {
-    let key = install_failure_memory_key(operation_id, mode, phase, evidence, diagnosis_id)?;
+    let safety_case = install_artifact_failure_safety_case(operation_id, mode, phase, evidence);
+    let diagnosis = safety_case
+        .diagnoses
+        .iter()
+        .find(|diagnosis| diagnosis.id() == diagnosis_id)?;
+    let target = diagnosis.affected_targets().first()?.clone();
+    let key = FailureMemoryKey::for_observation(
+        diagnosis.domain(),
+        &diagnosis.id(),
+        &target,
+        mode,
+        Some(PROVIDER_FAILURE_MEMORY_SOURCE),
+    );
     GuardianInstallOutcomeMemoryPersistence::for_failure_memory_key(
         &key,
+        target,
         memory_window.observed_at.clone(),
         memory_window.suppression_until.clone(),
     )

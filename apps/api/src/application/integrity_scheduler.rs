@@ -1813,11 +1813,15 @@ mod tests {
     }
 
     #[test]
-    fn shared_startup_aggregator_orders_repair_before_every_supervisor() {
+    fn shared_startup_aggregator_orders_guardian_memory_and_repair_before_every_supervisor() {
         let app = include_str!("../app.rs");
+        let guardian_memory = app
+            .find("settle_startup_install_guardian_failure_memory(state).await")
+            .expect("awaited Guardian install failure-memory barrier");
         let repair = app
             .find("settle_startup_persisted_state_repairs(state).await")
             .expect("awaited persisted-state repair barrier");
+        assert!(guardian_memory < repair);
         for call in [
             "spawn_known_good_rebuilds(state);",
             "spawn_idle_integrity_scheduler(state);",
