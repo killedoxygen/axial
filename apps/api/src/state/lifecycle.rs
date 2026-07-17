@@ -348,6 +348,19 @@ impl AppLifecycle {
 }
 
 impl ProducerLease {
+    pub(crate) fn wait_for_request_drain_start(&self) -> impl Future<Output = ()> + Send + 'static {
+        let lifecycle = self
+            .lifecycle
+            .as_ref()
+            .expect("producer lease was already consumed")
+            .clone();
+        async move {
+            lifecycle
+                .wait_for_phase(AppLifecyclePhase::DrainingRequests)
+                .await;
+        }
+    }
+
     pub(crate) fn claim_child(&self) -> ProducerLease {
         self.lifecycle
             .as_ref()

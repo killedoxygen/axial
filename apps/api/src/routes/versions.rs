@@ -41,15 +41,24 @@ async fn handle_version_watch(
     application::installed_versions(&state, &producer).await?;
 
     let stream = async_stream::stream! {
+        let request_drain = producer.wait_for_request_drain_start();
+        tokio::pin!(request_drain);
         let mut ticker = interval(Duration::from_secs(5));
         let mut last_payload = String::new();
 
         loop {
-            ticker.tick().await;
-            let payload = application::installed_versions_event_payload(&state, &producer).await;
-            if payload != last_payload {
-                last_payload = payload.clone();
-                yield Ok(Event::default().event("versions_changed").data(payload));
+            tokio::select! {
+                biased;
+                _ = &mut request_drain => return,
+                payload = async {
+                    ticker.tick().await;
+                    application::installed_versions_event_payload(&state, &producer).await
+                } => {
+                    if payload != last_payload {
+                        last_payload = payload.clone();
+                        yield Ok(Event::default().event("versions_changed").data(payload));
+                    }
+                }
             }
         }
     };

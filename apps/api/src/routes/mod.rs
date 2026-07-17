@@ -334,6 +334,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn live_version_watch_finishes_when_request_drain_begins() {
+        let fixture = TestFixture::new("version-watch-request-drain");
+        let library_dir = fixture.root.join("library");
+        fs::create_dir_all(&library_dir).expect("create version library");
+        fixture
+            .state
+            .set_library_dir_for_test(library_dir.to_string_lossy().into_owned());
+
+        let response = router(fixture.state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/versions/watch")
+                    .body(Body::empty())
+                    .expect("version watch request"),
+            )
+            .await
+            .expect("version watch response");
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let mut body = response.into_body();
+        let initial_frame = tokio::time::timeout(Duration::from_secs(1), body.frame())
+            .await
+            .expect("initial version event arrives")
+            .expect("version watch remains open")
+            .expect("initial version frame");
+        let initial_event = String::from_utf8(
+            initial_frame
+                .into_data()
+                .expect("initial version event is data")
+                .to_vec(),
+        )
+        .expect("initial version event is utf-8");
+        assert!(initial_event.contains("event: versions_changed"));
+        assert!(initial_event.contains("\"versions\":[]"));
+
+        let shutdown_state = fixture.state.clone();
+        let quiesce = tokio::spawn(async move { shutdown_state.quiesce().await });
+        let (remaining, quiesce_result) = tokio::time::timeout(Duration::from_secs(1), async {
+            tokio::join!(to_bytes(body, 1024), quiesce)
+        })
+        .await
+        .expect("version watch and quiescence complete");
+
+        assert!(remaining.expect("remaining version watch body").is_empty());
+        quiesce_result
+            .expect("quiesce task")
+            .expect("quiesce follows version watch completion");
+        assert_eq!(
+            fixture.state.lifecycle_phase(),
+            crate::state::AppLifecyclePhase::Quiesced
+        );
+    }
+
+    #[tokio::test]
     async fn live_request_handoff_is_the_only_producer_admission_during_drain() {
         let fixture = TestFixture::new("request-producer-handoff");
         let gate = Arc::new(HandoffGate::default());
