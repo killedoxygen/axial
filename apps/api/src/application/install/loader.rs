@@ -131,6 +131,7 @@ pub(super) async fn start_loader_install_with_foreground(
     let worker_state = state.clone();
     let worker_runtime_cache = state.managed_runtime_cache().clone();
     let progress_owner = producer.claim_child();
+    let guardian_owner = producer.claim_child();
     let foreground = InstallForegroundActivity::new_with_update_admission(
         reservation.hand_off(),
         update_admission,
@@ -292,8 +293,9 @@ pub(super) async fn start_loader_install_with_foreground(
                     let observed_at = chrono::Utc::now().to_rfc3339();
                     let progress = loader_install_error_progress(&error);
                     dispatch_loader_install_failure(
-                        worker_journals.as_ref(),
-                        worker_failure_memory.as_ref(),
+                        &guardian_owner,
+                        worker_journals.clone(),
+                        worker_failure_memory.clone(),
                         &worker_operation_id,
                         &loader_target_id,
                         &base_version_id,
@@ -437,8 +439,9 @@ where
 }
 
 pub(super) async fn dispatch_loader_install_failure(
-    journals: &crate::state::OperationJournalStore,
-    failure_memory: &crate::state::GuardianFailureMemoryStore,
+    producer: &ProducerLease,
+    journals: Arc<crate::state::OperationJournalStore>,
+    failure_memory: Arc<crate::state::GuardianFailureMemoryStore>,
     operation_id: &crate::state::contracts::OperationId,
     loader_target_id: &str,
     base_version_id: &str,
@@ -449,7 +452,7 @@ pub(super) async fn dispatch_loader_install_failure(
         LoaderInstallError::BaseInstallFailed(failure) => {
             if failure.facts().is_empty() {
                 record_loader_base_install_dependency_guardian_failure_outcome(
-                    journals,
+                    &journals,
                     operation_id,
                     loader_target_id,
                     base_version_id,
@@ -459,6 +462,7 @@ pub(super) async fn dispatch_loader_install_failure(
                 return;
             }
             record_install_failure_outcome_for_error(
+                producer,
                 journals,
                 failure_memory,
                 operation_id,
@@ -470,6 +474,7 @@ pub(super) async fn dispatch_loader_install_failure(
         }
         LoaderInstallError::ArtifactDownloadFailed(failure) => {
             record_install_failure_outcome(
+                producer,
                 journals,
                 failure_memory,
                 operation_id,
@@ -480,6 +485,7 @@ pub(super) async fn dispatch_loader_install_failure(
         }
         LoaderInstallError::Active(failure) => {
             record_loader_install_operation_guardian_failure_outcome(
+                producer,
                 journals,
                 failure_memory,
                 operation_id,

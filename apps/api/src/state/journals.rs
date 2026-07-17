@@ -33,6 +33,7 @@ use tracing::warn;
 pub const OPERATION_JOURNAL_SCHEMA: &str = "axial.state.operation_journals.v4";
 pub const DEFAULT_OPERATION_JOURNAL_LIMIT: usize = RECONCILIATION_EVIDENCE_CAPACITY;
 pub(crate) const MAX_OPERATION_JOURNAL_STEP_FACTS: usize = 64;
+const GUARDIAN_OUTCOME_MEMORY_BINDING_PREFIX: &str = "guardian_outcome_memory_binding:";
 pub(crate) const MAX_OPERATION_JOURNAL_DIAGNOSES: usize = 32;
 const OPERATION_JOURNAL_FILE: &str = "operation-journals.json";
 const MAX_OPERATION_JOURNAL_SNAPSHOT_BYTES: u64 = 8 * 1024 * 1024;
@@ -65,6 +66,10 @@ pub enum OperationJournalStoreError {
     RetryRequired,
     #[error("operation journal capacity is exhausted by active operations")]
     CapacityExhausted,
+    #[error("operation journal contains an invalid Guardian install outcome")]
+    InvalidGuardianOutcome,
+    #[error("Guardian install failure memory could not be settled")]
+    GuardianFailureMemoryUnavailable,
     #[error("operation journal persistence failed: {0}")]
     Persistence(#[source] io::Error),
 }
@@ -79,6 +84,8 @@ impl OperationJournalStoreError {
             Self::AlreadyExists => "already_exists",
             Self::RetryRequired => "retry_required",
             Self::CapacityExhausted => "capacity_exhausted",
+            Self::InvalidGuardianOutcome => "invalid_guardian_outcome",
+            Self::GuardianFailureMemoryUnavailable => "guardian_failure_memory_unavailable",
             Self::Persistence(_) => "persistence",
         }
     }
@@ -1372,11 +1379,29 @@ fn validate_step(step: &OperationJournalStep) -> Result<(), OperationJournalVali
         return Err(OperationJournalValidationError::TooManyFacts);
     }
     for fact in &step.generated_facts {
-        if !safe_public_fragment(fact, 320) {
+        if !safe_generated_fact(fact) {
             return Err(OperationJournalValidationError::UnsafeGeneratedFact);
         }
     }
     Ok(())
+}
+
+fn safe_generated_fact(value: &str) -> bool {
+    if value.contains(GUARDIAN_OUTCOME_MEMORY_BINDING_PREFIX) {
+        return safe_guardian_outcome_memory_binding(value);
+    }
+    safe_public_fragment(value, 320)
+}
+
+fn safe_guardian_outcome_memory_binding(value: &str) -> bool {
+    value
+        .strip_prefix(GUARDIAN_OUTCOME_MEMORY_BINDING_PREFIX)
+        .is_some_and(|binding| {
+            binding.len() == 64
+                && binding
+                    .bytes()
+                    .all(|value| value.is_ascii_digit() || (b'a'..=b'f').contains(&value))
+        })
 }
 
 fn safe_token(value: &str, max_chars: usize) -> bool {
@@ -1562,7 +1587,7 @@ mod tests {
     use super::{
         OPERATION_JOURNAL_LOCK_INVARIANT, OperationJournalReconciliation, OperationJournalSnapshot,
         OperationJournalStore, OperationJournalStoreError, operation_journal_path,
-        operation_journal_plan_is_visible,
+        operation_journal_plan_is_visible, safe_generated_fact,
     };
     use crate::execution::file::{FileWriteRequest, write_file_atomically};
     use crate::execution::persistence::{AtomicWriteBackend, PersistenceCoordinator};
@@ -1588,6 +1613,31 @@ mod tests {
         env!("CARGO_MANIFEST_DIR"),
         "/tests/fixtures/guardian/operation-journals-v4.json"
     ));
+
+    #[test]
+    fn guardian_memory_binding_generated_fact_has_exact_safe_shape() {
+        let binding = "0123456789abcdef".repeat(4);
+        let fact = format!("guardian_outcome_memory_binding:{binding}");
+        assert!(safe_generated_fact(&fact));
+
+        assert!(!safe_generated_fact(&format!(
+            "guardian_outcome_memory_binding:{}",
+            binding.to_ascii_uppercase()
+        )));
+        assert!(!safe_generated_fact(&format!(
+            "guardian_outcome_memory_binding:{}",
+            &binding[..63]
+        )));
+        assert!(!safe_generated_fact(&format!(
+            "guardian_outcome_memory_binding:{binding}0"
+        )));
+        assert!(!safe_generated_fact(&format!(
+            "guardian_outcome_memory_binding:{}g",
+            &binding[..63]
+        )));
+        assert!(!safe_generated_fact(&format!("x{fact}")));
+        assert!(!safe_generated_fact(&format!("{fact}:suffix")));
+    }
 
     struct RecordingFileBackend {
         attempts: AtomicUsize,

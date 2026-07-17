@@ -510,14 +510,14 @@ pub use model::{
 #[cfg(test)]
 use operation::typed_runtime_failure_evidence;
 use operation::{
-    ContentDownloadFactAccumulator, InstallProgressCoalescer, assess_install_guardian_failure,
-    begin_content_operation_journal, install_failure_evidence_from_download_error_or_facts,
+    ContentDownloadFactAccumulator, InstallProgressCoalescer, begin_content_operation_journal,
+    install_failure_evidence_from_download_error_or_facts,
     install_failure_evidence_from_download_facts, install_failure_point_from_journal,
     install_journal_is_terminal, install_progress_history_from_journal, install_progress_record,
     install_progress_with_terminal_error, interrupted_install_progress,
     observed_install_failure_progress, public_install_id, record_content_failure_outcome,
     record_content_operation_interrupted, record_content_operation_progress,
-    record_install_guardian_terminal_outcome, record_install_operation_guardian_evidence,
+    record_install_guardian_failure_outcome,
     record_loader_base_install_dependency_guardian_failure_outcome,
     record_loader_install_operation_guardian_failure_outcome,
 };
@@ -625,6 +625,7 @@ async fn start_install_version_with_foreground(
     let worker_state = state.clone();
     let worker_runtime_cache = state.managed_runtime_cache().clone();
     let progress_owner = producer.claim_child();
+    let guardian_owner = producer.claim_child();
     let foreground = InstallForegroundActivity::new_with_update_admission(
         reservation.hand_off(),
         update_admission,
@@ -772,8 +773,9 @@ async fn start_install_version_with_foreground(
                         "install worker observed failed install"
                     );
                     record_install_failure_outcome_for_error(
-                        worker_journals.as_ref(),
-                        worker_failure_memory.as_ref(),
+                        &guardian_owner,
+                        worker_journals.clone(),
+                        worker_failure_memory.clone(),
                         &worker_operation_id,
                         &install_error,
                         &install_facts,
@@ -837,14 +839,16 @@ async fn start_install_version_with_foreground(
 }
 
 pub(super) async fn record_install_failure_outcome(
-    journals: &crate::state::OperationJournalStore,
-    failure_memory: &crate::state::GuardianFailureMemoryStore,
+    producer: &ProducerLease,
+    journals: Arc<crate::state::OperationJournalStore>,
+    failure_memory: Arc<crate::state::GuardianFailureMemoryStore>,
     operation_id: &crate::state::contracts::OperationId,
     install_facts: &[ExecutionDownloadFact],
     observed_at: &str,
 ) {
     let evidence = install_failure_evidence_from_download_facts(operation_id, install_facts);
     record_install_failure_evidence(
+        producer,
         journals,
         failure_memory,
         operation_id,
@@ -855,8 +859,9 @@ pub(super) async fn record_install_failure_outcome(
 }
 
 pub(super) async fn record_install_failure_outcome_for_error(
-    journals: &crate::state::OperationJournalStore,
-    failure_memory: &crate::state::GuardianFailureMemoryStore,
+    producer: &ProducerLease,
+    journals: Arc<crate::state::OperationJournalStore>,
+    failure_memory: Arc<crate::state::GuardianFailureMemoryStore>,
     operation_id: &crate::state::contracts::OperationId,
     error: &DownloadError,
     install_facts: &[ExecutionDownloadFact],
@@ -865,6 +870,7 @@ pub(super) async fn record_install_failure_outcome_for_error(
     let evidence =
         install_failure_evidence_from_download_error_or_facts(operation_id, error, install_facts);
     record_install_failure_evidence(
+        producer,
         journals,
         failure_memory,
         operation_id,
@@ -901,40 +907,20 @@ fn install_error_log_kind(error: &DownloadError) -> &'static str {
 }
 
 async fn record_install_failure_evidence(
-    journals: &crate::state::OperationJournalStore,
-    failure_memory: &crate::state::GuardianFailureMemoryStore,
+    producer: &ProducerLease,
+    journals: Arc<crate::state::OperationJournalStore>,
+    failure_memory: Arc<crate::state::GuardianFailureMemoryStore>,
     operation_id: &crate::state::contracts::OperationId,
     evidence: &[GuardianInstallArtifactFailureEvidence],
     observed_at: &str,
 ) {
-    if record_install_operation_guardian_evidence(
+    if record_install_guardian_failure_outcome(
+        producer,
         journals,
+        failure_memory,
         operation_id,
         evidence,
         crate::state::contracts::OperationPhase::Downloading,
-    )
-    .await
-    .is_err()
-    {
-        tracing::warn!("failed to commit install Guardian evidence");
-        return;
-    }
-    let Some(assessment) = assess_install_guardian_failure(
-        Some(failure_memory),
-        operation_id,
-        evidence,
-        crate::state::contracts::OperationPhase::Downloading,
-        observed_at,
-    ) else {
-        return;
-    };
-    if record_install_guardian_terminal_outcome(
-        journals,
-        Some(failure_memory),
-        operation_id,
-        evidence,
-        crate::state::contracts::OperationPhase::Downloading,
-        &assessment,
         observed_at,
     )
     .await
@@ -1961,6 +1947,8 @@ where
     let download_facts = Arc::new(Mutex::new(ContentDownloadFactAccumulator::default()));
     let worker_read_owner = producer.claim_child();
     let progress_owner = producer.claim_child();
+    let worker_guardian_owner = producer.claim_child();
+    let interrupted_guardian_owner = producer.claim_child();
     let interrupted_state = state.clone();
     let interrupted_journals = state.journals().clone();
     let interrupted_operation_id = operation_id.clone();
@@ -2177,8 +2165,9 @@ where
                 Some((terminal.clone(), failure_kind));
             if commit_and_emit_content_terminal_progress(
                 worker_store.as_ref(),
-                worker_journals.as_ref(),
-                worker_state.failure_memory(),
+                &worker_guardian_owner,
+                worker_journals.clone(),
+                worker_state.failure_memory().clone(),
                 ContentTerminalProgress {
                     operation_id: &worker_operation_id,
                     install_id: &worker_install_id,
@@ -2213,8 +2202,9 @@ where
                 .expect("content terminal progress lock poisoned")
                 .clone();
             settle_content_worker_interruption(
-                &interrupted_journals,
-                interrupted_state.failure_memory(),
+                &interrupted_guardian_owner,
+                interrupted_journals.clone(),
+                interrupted_state.failure_memory().clone(),
                 &interrupted_operation_id,
                 progress,
                 &journal_facts,
@@ -2251,8 +2241,9 @@ struct ContentTerminalProgress<'a> {
 
 async fn commit_and_emit_content_terminal_progress(
     store: &InstallStore,
-    journals: &OperationJournalStore,
-    failure_memory: &crate::state::GuardianFailureMemoryStore,
+    producer: &ProducerLease,
+    journals: Arc<OperationJournalStore>,
+    failure_memory: Arc<crate::state::GuardianFailureMemoryStore>,
     terminal: ContentTerminalProgress<'_>,
 ) -> Result<(), OperationJournalStoreError> {
     if terminal.progress.error.is_some() {
@@ -2263,7 +2254,8 @@ async fn commit_and_emit_content_terminal_progress(
                 (Some(evidence), phase)
             });
         record_content_failure_outcome(
-            journals,
+            producer,
+            journals.clone(),
             failure_memory,
             terminal.operation_id,
             terminal.execution_facts,
@@ -2275,7 +2267,7 @@ async fn commit_and_emit_content_terminal_progress(
     }
     let mut last_journal_phase = None;
     record_content_operation_progress(
-        journals,
+        &journals,
         terminal.operation_id,
         &terminal.progress,
         terminal.journal_facts,
@@ -2292,8 +2284,9 @@ async fn commit_and_emit_content_terminal_progress(
 }
 
 async fn settle_content_worker_interruption(
-    journals: &OperationJournalStore,
-    failure_memory: &crate::state::GuardianFailureMemoryStore,
+    producer: &ProducerLease,
+    journals: Arc<OperationJournalStore>,
+    failure_memory: Arc<crate::state::GuardianFailureMemoryStore>,
     operation_id: &OperationId,
     fallback: DownloadProgress,
     journal_facts: &[String],
@@ -2313,8 +2306,9 @@ async fn settle_content_worker_interruption(
                     (Some(evidence), phase)
                 });
             if let Err(error) = record_content_failure_outcome(
-                journals,
-                failure_memory,
+                producer,
+                journals.clone(),
+                failure_memory.clone(),
                 operation_id,
                 execution_facts,
                 evidence,
@@ -2336,7 +2330,7 @@ async fn settle_content_worker_interruption(
             }
         }
         match record_content_operation_interrupted(
-            journals,
+            &journals,
             operation_id,
             &fallback,
             journal_facts,

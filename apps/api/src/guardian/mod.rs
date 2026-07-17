@@ -66,8 +66,9 @@ pub(crate) use component_rebuild::{
 };
 pub(crate) use copy::GuardianSummaryDecision;
 pub(crate) use copy::{
-    GuardianCopyRequest, GuardianLaunchAdmission, GuardianRuntimeRepairCopy, author_guardian_copy,
-    guardian_directive_description, guardian_failed_launch_recovery_log,
+    GuardianCopyRequest, GuardianInstallOutcomeFactGroupParse,
+    GuardianInstallOutcomeMemoryPersistence, GuardianLaunchAdmission, GuardianRuntimeRepairCopy,
+    author_guardian_copy, guardian_directive_description, guardian_failed_launch_recovery_log,
     guardian_install_outcome_fact_group, guardian_install_outcome_from_persisted_group,
     guardian_install_outcome_persistence_facts, guardian_launch_stage_evidence,
     guardian_proof_evidence, guardian_summary_from_admission,
@@ -101,8 +102,8 @@ pub use install_evidence::{
     install_artifact_failure_from_minecraft_download_fact, install_artifact_failure_guardian_fact,
 };
 pub(crate) use install_evidence::{
-    GuardianInstallAssessment, GuardianInstallFailureOutcome,
-    assess_install_artifact_failure_with_context, install_artifact_failure_safety_case,
+    GuardianInstallAssessment, assess_install_artifact_failure_with_context,
+    install_artifact_failure_safety_case,
 };
 pub(crate) use integrity::{
     TIER2_INTEGRITY_COUNTER_TOKEN_COUNT, Tier2IntegrityGuardianEvidence,
@@ -150,6 +151,10 @@ pub(super) use policy::PreflightAdmission;
 #[cfg(test)]
 pub(crate) use policy::with_guardian_policy_evaluation_count;
 pub use policy::{GuardianDecision, GuardianPolicyContext, decide_guardian_policy};
+#[cfg(test)]
+pub(crate) use policy::{
+    guardian_policy_evaluation_count_scope, with_guardian_policy_evaluation_count_scope,
+};
 pub use preflight::{
     GuardianPreflightOutcome, GuardianPreflightOutcomeRequest, GuardianPreflightOverrideSignals,
     GuardianPreflightReadiness, GuardianPreflightResourceSignals, guardian_preflight_outcome,

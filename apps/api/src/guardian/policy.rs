@@ -7,11 +7,15 @@ use crate::state::contracts::{OperationId, OwnershipClass, StabilizationSystem, 
 use serde::Serialize;
 
 #[cfg(test)]
-use std::{cell::Cell, future::Future};
+use std::future::Future;
+#[cfg(test)]
+use std::sync::Arc;
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 #[cfg(test)]
 tokio::task_local! {
-    static POLICY_EVALUATION_COUNT: Cell<usize>;
+    static POLICY_EVALUATION_COUNT: Arc<AtomicUsize>;
 }
 
 #[cfg(test)]
@@ -19,13 +23,32 @@ pub(crate) async fn with_guardian_policy_evaluation_count<F>(future: F) -> (F::O
 where
     F: Future,
 {
+    let count = Arc::new(AtomicUsize::new(0));
     POLICY_EVALUATION_COUNT
-        .scope(Cell::new(0), async move {
+        .scope(count.clone(), async move {
             let output = future.await;
-            let count = POLICY_EVALUATION_COUNT.with(Cell::get);
-            (output, count)
+            (output, count.load(Ordering::SeqCst))
         })
         .await
+}
+
+#[cfg(test)]
+pub(crate) fn guardian_policy_evaluation_count_scope() -> Option<Arc<AtomicUsize>> {
+    POLICY_EVALUATION_COUNT.try_with(Arc::clone).ok()
+}
+
+#[cfg(test)]
+pub(crate) async fn with_guardian_policy_evaluation_count_scope<F>(
+    count: Option<Arc<AtomicUsize>>,
+    future: F,
+) -> F::Output
+where
+    F: Future,
+{
+    match count {
+        Some(count) => POLICY_EVALUATION_COUNT.scope(count, future).await,
+        None => future.await,
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -396,7 +419,9 @@ pub fn decide_guardian_policy(
     context: GuardianPolicyContext,
 ) -> GuardianDecision {
     #[cfg(test)]
-    let _ = POLICY_EVALUATION_COUNT.try_with(|count| count.set(count.get().saturating_add(1)));
+    let _ = POLICY_EVALUATION_COUNT.try_with(|count| {
+        count.fetch_add(1, Ordering::SeqCst);
+    });
 
     let diagnoses = safety_case
         .diagnoses

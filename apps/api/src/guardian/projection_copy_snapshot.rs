@@ -1,7 +1,7 @@
 use super::{
-    DiagnosisId, GuardianSummaryDecision, guardian_install_outcome_fact_group,
-    guardian_install_outcome_from_persisted_group, guardian_proof_evidence,
-    guardian_summary_for_test,
+    DiagnosisId, GuardianInstallOutcomeFactGroupParse, GuardianSummaryDecision,
+    guardian_install_outcome_fact_group, guardian_install_outcome_from_persisted_group,
+    guardian_proof_evidence, guardian_summary_for_test,
 };
 use axial_launcher::GuardianMode;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -217,10 +217,14 @@ fn render_output(input: &GuardianProjectionCopyInput) -> GuardianProjectionCopyO
             diagnosis_id,
             facts,
         } => {
-            let outcome = guardian_install_outcome_fact_group(facts.iter().map(String::as_str))
-                .and_then(|group| {
-                    guardian_install_outcome_from_persisted_group(*diagnosis_id, group)
-                });
+            let outcome =
+                match guardian_install_outcome_fact_group(facts.iter().map(String::as_str)) {
+                    GuardianInstallOutcomeFactGroupParse::Valid(group) => {
+                        guardian_install_outcome_from_persisted_group(*diagnosis_id, group)
+                    }
+                    GuardianInstallOutcomeFactGroupParse::Absent
+                    | GuardianInstallOutcomeFactGroupParse::Invalid => None,
+                };
             let retry_disabled_reason = outcome
                 .as_ref()
                 .filter(|outcome| outcome.decision() == "block")

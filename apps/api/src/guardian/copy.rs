@@ -12,6 +12,7 @@ use crate::observability::{
     sanitize_public_diagnostic_text,
 };
 use crate::state::contracts::OperationPhase;
+use crate::state::failure_memory::FailureMemoryKey;
 use axial_launcher::{
     CrashEvidence, GuardianMode as LauncherGuardianMode, HealingEventKind, LaunchFailureClass,
     LaunchHealingSummary, LaunchNotice, LaunchNoticeTone, LaunchSessionExitReason,
@@ -21,6 +22,7 @@ use axial_launcher::{
 use chrono::{DateTime, Timelike, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -179,6 +181,12 @@ const PRIVATE_NOTICE_FALLBACK: &str = "Launch status details were hidden for pri
 const GUARDIAN_OUTCOME_DECISION_PREFIX: &str = "guardian_outcome_decision:";
 const GUARDIAN_OUTCOME_SUMMARY_PREFIX: &str = "guardian_outcome_summary:";
 const GUARDIAN_OUTCOME_DETAIL_PREFIX: &str = "guardian_outcome_detail:";
+const GUARDIAN_OUTCOME_MEMORY_BINDING_PREFIX: &str = "guardian_outcome_memory_binding:";
+const GUARDIAN_OUTCOME_MEMORY_OBSERVED_AT_PREFIX: &str = "guardian_outcome_memory_observed_at:";
+const GUARDIAN_OUTCOME_MEMORY_SUPPRESSION_UNTIL_PREFIX: &str =
+    "guardian_outcome_memory_suppression_until:";
+const GUARDIAN_OUTCOME_MEMORY_BINDING_DOMAIN: &[u8] =
+    b"axial.guardian.install_failure_memory_binding.v2\0";
 
 pub(crate) fn guardian_summary_from_persisted_value(value: &Value) -> Option<GuardianSummary> {
     guardian_summary_from_persisted_value_with_limits(
@@ -862,6 +870,10 @@ impl GuardianInstallOutcomeSummary {
         &self.decision
     }
 
+    pub(crate) fn decision_is(&self, decision: GuardianActionKind) -> bool {
+        self.decision == guardian_action_persisted_id(decision)
+    }
+
     pub fn label(&self) -> &str {
         &self.label
     }
@@ -883,9 +895,133 @@ impl GuardianInstallOutcomeSummary {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct GuardianInstallOutcomeMemoryBinding([u8; 32]);
+
+impl GuardianInstallOutcomeMemoryBinding {
+    fn for_failure_memory(
+        key: &FailureMemoryKey,
+        observed_at: &str,
+        suppression_until: &str,
+    ) -> Self {
+        let mut digest = Sha256::new();
+        digest.update(GUARDIAN_OUTCOME_MEMORY_BINDING_DOMAIN);
+        for value in [key.as_str(), observed_at, suppression_until] {
+            digest.update((value.len() as u64).to_be_bytes());
+            digest.update(value.as_bytes());
+        }
+        Self(digest.finalize().into())
+    }
+
+    fn from_persisted(value: &str) -> Option<Self> {
+        if value.len() != 64
+            || !value
+                .bytes()
+                .all(|value| value.is_ascii_digit() || (b'a'..=b'f').contains(&value))
+        {
+            return None;
+        }
+        let mut binding = [0_u8; 32];
+        for (output, pair) in binding.iter_mut().zip(value.as_bytes().chunks_exact(2)) {
+            *output = (lower_hex_nibble(pair[0])? << 4) | lower_hex_nibble(pair[1])?;
+        }
+        Some(Self(binding))
+    }
+
+    fn persisted(self) -> String {
+        const LOWER_HEX: &[u8; 16] = b"0123456789abcdef";
+
+        let mut persisted = String::with_capacity(64);
+        for byte in self.0 {
+            persisted.push(LOWER_HEX[usize::from(byte >> 4)] as char);
+            persisted.push(LOWER_HEX[usize::from(byte & 0x0f)] as char);
+        }
+        persisted
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct GuardianInstallOutcomeMemoryPersistence {
+    binding: GuardianInstallOutcomeMemoryBinding,
+    observed_at: String,
+    suppression_until: String,
+}
+
+impl GuardianInstallOutcomeMemoryPersistence {
+    pub(crate) fn for_failure_memory_key(
+        key: &FailureMemoryKey,
+        observed_at: String,
+        suppression_until: String,
+    ) -> Option<Self> {
+        let observed = canonical_failure_memory_timestamp(&observed_at)?;
+        let suppression = canonical_failure_memory_timestamp(&suppression_until)?;
+        if observed.checked_add_signed(chrono::Duration::minutes(5))? != suppression {
+            return None;
+        }
+        Some(Self {
+            binding: GuardianInstallOutcomeMemoryBinding::for_failure_memory(
+                key,
+                &observed_at,
+                &suppression_until,
+            ),
+            observed_at,
+            suppression_until,
+        })
+    }
+
+    fn from_persisted(binding: &str, observed_at: &str, suppression_until: &str) -> Option<Self> {
+        let observed = canonical_failure_memory_timestamp(observed_at)?;
+        let suppression = canonical_failure_memory_timestamp(suppression_until)?;
+        if observed.checked_add_signed(chrono::Duration::minutes(5))? != suppression {
+            return None;
+        }
+        Some(Self {
+            binding: GuardianInstallOutcomeMemoryBinding::from_persisted(binding)?,
+            observed_at: observed_at.to_string(),
+            suppression_until: suppression_until.to_string(),
+        })
+    }
+
+    pub(crate) fn matches_failure_memory_key(&self, key: &FailureMemoryKey) -> bool {
+        self.binding
+            == GuardianInstallOutcomeMemoryBinding::for_failure_memory(
+                key,
+                &self.observed_at,
+                &self.suppression_until,
+            )
+    }
+
+    pub(crate) fn observed_at(&self) -> &str {
+        &self.observed_at
+    }
+
+    pub(crate) fn suppression_until(&self) -> &str {
+        &self.suppression_until
+    }
+}
+
+fn canonical_failure_memory_timestamp(value: &str) -> Option<DateTime<Utc>> {
+    if value.len() > 40 {
+        return None;
+    }
+    let parsed = DateTime::parse_from_rfc3339(value)
+        .ok()?
+        .with_timezone(&Utc);
+    (parsed.to_rfc3339() == value).then_some(parsed)
+}
+
+fn lower_hex_nibble(value: u8) -> Option<u8> {
+    match value {
+        b'0'..=b'9' => Some(value - b'0'),
+        b'a'..=b'f' => Some(value - b'a' + 10),
+        _ => None,
+    }
+}
+
 pub(crate) fn guardian_install_outcome_persistence_facts(
     outcome: &GuardianUserOutcome,
-) -> Vec<String> {
+    memory: Option<&GuardianInstallOutcomeMemoryPersistence>,
+) -> Option<Vec<String>> {
     let mut facts = vec![
         format!(
             "{GUARDIAN_OUTCOME_DECISION_PREFIX}{}",
@@ -896,54 +1032,128 @@ pub(crate) fn guardian_install_outcome_persistence_facts(
     if let Some(detail) = outcome.details.first() {
         facts.push(format!("{GUARDIAN_OUTCOME_DETAIL_PREFIX}{detail}"));
     }
-    facts
+    match (outcome.decision, memory) {
+        (GuardianActionKind::Retry, Some(memory)) => {
+            facts.push(format!(
+                "{GUARDIAN_OUTCOME_MEMORY_BINDING_PREFIX}{}",
+                memory.binding.persisted()
+            ));
+            facts.push(format!(
+                "{GUARDIAN_OUTCOME_MEMORY_OBSERVED_AT_PREFIX}{}",
+                memory.observed_at
+            ));
+            facts.push(format!(
+                "{GUARDIAN_OUTCOME_MEMORY_SUPPRESSION_UNTIL_PREFIX}{}",
+                memory.suppression_until
+            ));
+        }
+        (GuardianActionKind::Retry, None) | (_, Some(_)) => return None,
+        (_, None) => {}
+    }
+    Some(facts)
 }
 
 pub(crate) struct GuardianInstallOutcomeFactGroup<'a> {
-    decision: Option<&'a str>,
-    summary: Option<&'a str>,
+    decision: GuardianActionKind,
+    summary: &'a str,
     detail: Option<&'a str>,
-    has_duplicate: bool,
+    memory: Option<GuardianInstallOutcomeMemoryPersistence>,
+}
+
+impl GuardianInstallOutcomeFactGroup<'_> {
+    pub(crate) fn memory(&self) -> Option<GuardianInstallOutcomeMemoryPersistence> {
+        self.memory.clone()
+    }
+}
+
+pub(crate) enum GuardianInstallOutcomeFactGroupParse<'a> {
+    Absent,
+    Valid(GuardianInstallOutcomeFactGroup<'a>),
+    Invalid,
 }
 
 pub(crate) fn guardian_install_outcome_fact_group<'a>(
     facts: impl IntoIterator<Item = &'a str>,
-) -> Option<GuardianInstallOutcomeFactGroup<'a>> {
-    let mut group = GuardianInstallOutcomeFactGroup {
-        decision: None,
-        summary: None,
-        detail: None,
-        has_duplicate: false,
-    };
+) -> GuardianInstallOutcomeFactGroupParse<'a> {
+    let mut decision = None;
+    let mut summary = None;
+    let mut detail = None;
+    let mut memory_binding = None;
+    let mut memory_observed_at = None;
+    let mut memory_suppression_until = None;
     let mut has_marker = false;
+    let mut invalid = false;
     for fact in facts {
         let marker = if let Some(value) = fact.strip_prefix(GUARDIAN_OUTCOME_DECISION_PREFIX) {
-            Some((&mut group.decision, value))
+            Some((&mut decision, value))
         } else if let Some(value) = fact.strip_prefix(GUARDIAN_OUTCOME_SUMMARY_PREFIX) {
-            Some((&mut group.summary, value))
+            Some((&mut summary, value))
+        } else if let Some(value) = fact.strip_prefix(GUARDIAN_OUTCOME_DETAIL_PREFIX) {
+            Some((&mut detail, value))
         } else {
-            fact.strip_prefix(GUARDIAN_OUTCOME_DETAIL_PREFIX)
-                .map(|value| (&mut group.detail, value))
+            fact.strip_prefix(GUARDIAN_OUTCOME_MEMORY_BINDING_PREFIX)
+                .map(|value| (&mut memory_binding, value))
+                .or_else(|| {
+                    fact.strip_prefix(GUARDIAN_OUTCOME_MEMORY_OBSERVED_AT_PREFIX)
+                        .map(|value| (&mut memory_observed_at, value))
+                })
+                .or_else(|| {
+                    fact.strip_prefix(GUARDIAN_OUTCOME_MEMORY_SUPPRESSION_UNTIL_PREFIX)
+                        .map(|value| (&mut memory_suppression_until, value))
+                })
         };
         if let Some((slot, value)) = marker {
             has_marker = true;
             if slot.replace(value).is_some() {
-                group.has_duplicate = true;
+                invalid = true;
             }
         }
     }
-    has_marker.then_some(group)
+    if !has_marker {
+        return GuardianInstallOutcomeFactGroupParse::Absent;
+    }
+    let Some(decision) = decision.and_then(guardian_action_from_persisted_id) else {
+        return GuardianInstallOutcomeFactGroupParse::Invalid;
+    };
+    let Some(summary) = summary else {
+        return GuardianInstallOutcomeFactGroupParse::Invalid;
+    };
+    let persisted_memory = (memory_binding, memory_observed_at, memory_suppression_until);
+    let memory = match persisted_memory {
+        (Some(binding), Some(observed_at), Some(suppression_until)) => {
+            match GuardianInstallOutcomeMemoryPersistence::from_persisted(
+                binding,
+                observed_at,
+                suppression_until,
+            ) {
+                Some(memory) => Some(memory),
+                None => return GuardianInstallOutcomeFactGroupParse::Invalid,
+            }
+        }
+        (None, None, None) => None,
+        _ => return GuardianInstallOutcomeFactGroupParse::Invalid,
+    };
+    let binding_shape_valid = match decision {
+        GuardianActionKind::Retry => memory.is_some(),
+        _ => persisted_memory == (None, None, None),
+    };
+    if invalid || !binding_shape_valid {
+        return GuardianInstallOutcomeFactGroupParse::Invalid;
+    }
+    GuardianInstallOutcomeFactGroupParse::Valid(GuardianInstallOutcomeFactGroup {
+        decision,
+        summary,
+        detail,
+        memory,
+    })
 }
 
 pub(crate) fn guardian_install_outcome_from_persisted_group(
     diagnosis_id: DiagnosisId,
     group: GuardianInstallOutcomeFactGroup<'_>,
 ) -> Option<GuardianInstallOutcomeSummary> {
-    if group.has_duplicate {
-        return None;
-    }
-    let decision = group.decision.and_then(guardian_action_from_persisted_id)?;
-    let persisted_summary = group.summary?;
+    let decision = group.decision;
+    let persisted_summary = group.summary;
     let persisted_detail = group.detail;
     let canonical = author_guardian_copy(GuardianCopyRequest::install_failure_replay(
         diagnosis_id,
@@ -4347,7 +4557,8 @@ mod tests {
         .expect("Rosetta install copy rule");
 
         assert_eq!(
-            guardian_install_outcome_persistence_facts(&outcome),
+            guardian_install_outcome_persistence_facts(&outcome, None)
+                .expect("blocking persistence facts"),
             vec![
                 "guardian_outcome_decision:block".to_string(),
                 "guardian_outcome_summary:This Minecraft version needs Rosetta 2 on Apple Silicon Macs."

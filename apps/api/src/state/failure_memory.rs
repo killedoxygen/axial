@@ -27,6 +27,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
+use tokio::sync::{Mutex as AsyncMutex, MutexGuard as AsyncMutexGuard};
 
 pub const FAILURE_MEMORY_SCHEMA: &str = "axial.guardian.failure_memory.v4";
 pub const DEFAULT_FAILURE_MEMORY_LIMIT: usize = RECONCILIATION_EVIDENCE_CAPACITY;
@@ -561,6 +562,7 @@ impl FailureMemoryPersistence {
 pub struct GuardianFailureMemoryStore {
     records: Arc<RwLock<FailureMemoryRecords>>,
     attempts: Arc<Mutex<BTreeSet<String>>>,
+    install_guardian_settlement: AsyncMutex<()>,
     max_entries: usize,
     persistence: Option<FailureMemoryPersistence>,
 }
@@ -632,6 +634,7 @@ impl GuardianFailureMemoryStore {
         Self {
             records: Arc::new(RwLock::new(FailureMemoryRecords::default())),
             attempts: Arc::new(Mutex::new(BTreeSet::new())),
+            install_guardian_settlement: AsyncMutex::new(()),
             max_entries: max_entries.clamp(1, DEFAULT_FAILURE_MEMORY_LIMIT),
             persistence: None,
         }
@@ -667,9 +670,38 @@ impl GuardianFailureMemoryStore {
         Self {
             records: Arc::new(RwLock::new(FailureMemoryRecords::default())),
             attempts: Arc::new(Mutex::new(BTreeSet::new())),
+            install_guardian_settlement: AsyncMutex::new(()),
             max_entries: max_entries.clamp(1, DEFAULT_FAILURE_MEMORY_LIMIT),
             persistence,
         }
+    }
+
+    pub(crate) async fn lock_install_guardian_settlement(&self) -> AsyncMutexGuard<'_, ()> {
+        self.install_guardian_settlement.lock().await
+    }
+
+    pub(crate) async fn settle_install_guardian_pending(
+        &self,
+    ) -> Result<(), FailureMemoryStoreError> {
+        let (critical_pending, retry_pending) = {
+            let records = self.records.read().expect(FAILURE_MEMORY_LOCK_INVARIANT);
+            (records.critical_pending, records.retry_candidate.is_some())
+        };
+        if retry_pending {
+            return self.retry().await;
+        }
+        if critical_pending {
+            return self.flush().await;
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn record_install_guardian_retry(
+        &self,
+        entry: GuardianFailureMemoryEntry,
+    ) -> Result<(), FailureMemoryStoreError> {
+        let pending = self.record_with(entry, apply_record, WriteUrgency::Immediate)?;
+        self.await_commit(pending).await
     }
 
     /// Accepts the updated snapshot for persistence before publishing it in memory.
