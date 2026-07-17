@@ -899,8 +899,8 @@ enum RuntimeTreeNodeKind {
 }
 
 fn runtime_tree_shape_matches_manifest(root: &Path, manifest: &ComponentManifest) -> bool {
-    let Ok(root_metadata) = std::fs::symlink_metadata(runtime_filesystem_path(root).as_ref())
-    else {
+    let filesystem_root = runtime_filesystem_path(root).into_owned();
+    let Ok(root_metadata) = std::fs::symlink_metadata(&filesystem_root) else {
         return false;
     };
     if root_metadata.file_type().is_symlink() || !root_metadata.is_dir() {
@@ -936,9 +936,9 @@ fn runtime_tree_shape_matches_manifest(root: &Path, manifest: &ComponentManifest
 
     let expected_node_count = expected.len();
     let mut observed_node_count = 0_usize;
-    let mut directories = vec![root.to_path_buf()];
+    let mut directories = vec![filesystem_root.clone()];
     while let Some(directory) = directories.pop() {
-        let Ok(entries) = std::fs::read_dir(runtime_filesystem_path(&directory).as_ref()) else {
+        let Ok(entries) = std::fs::read_dir(&directory) else {
             return false;
         };
         for entry in entries {
@@ -950,7 +950,7 @@ fn runtime_tree_shape_matches_manifest(root: &Path, manifest: &ComponentManifest
                 return false;
             };
             let path = entry.path();
-            let Ok(relative) = path.strip_prefix(root) else {
+            let Ok(relative) = path.strip_prefix(&filesystem_root) else {
                 return false;
             };
             let Ok(metadata) = std::fs::symlink_metadata(runtime_filesystem_path(&path).as_ref())
@@ -975,6 +975,49 @@ fn runtime_tree_shape_matches_manifest(root: &Path, manifest: &ComponentManifest
         }
     }
     expected.is_empty()
+}
+
+#[cfg(test)]
+mod runtime_tree_shape_tests {
+    use super::{ComponentManifest, ComponentManifestFile, runtime_tree_shape_matches_manifest};
+    use std::collections::HashMap;
+
+    #[test]
+    fn accepts_entries_returned_from_the_platform_filesystem_root() {
+        let root = tempfile::tempdir().expect("runtime tree root");
+        std::fs::create_dir(root.path().join("bin")).expect("runtime bin directory");
+        std::fs::write(root.path().join("bin/java.exe"), b"java").expect("runtime executable");
+        std::fs::write(
+            root.path().join(".axial-runtime-manifest.json"),
+            b"manifest",
+        )
+        .expect("runtime manifest proof");
+        std::fs::write(root.path().join(".axial-ready"), b"ready").expect("runtime ready marker");
+        let manifest = ComponentManifest {
+            files: HashMap::from([
+                (
+                    "bin".to_string(),
+                    ComponentManifestFile {
+                        kind: "directory".to_string(),
+                        executable: false,
+                        downloads: None,
+                        target: None,
+                    },
+                ),
+                (
+                    "bin/java.exe".to_string(),
+                    ComponentManifestFile {
+                        kind: "file".to_string(),
+                        executable: true,
+                        downloads: None,
+                        target: None,
+                    },
+                ),
+            ]),
+        };
+
+        assert!(runtime_tree_shape_matches_manifest(root.path(), &manifest));
+    }
 }
 
 fn insert_runtime_tree_node(
