@@ -21,6 +21,7 @@ export const total = signal(0);
 /** Signature of the search whose results are currently held, so remounts can skip refetching. */
 const loadedSearchKey = signal('');
 const loadedContextKey = signal('');
+const loadedAt = signal<number | null>(null);
 export const loading = signal(false);
 export const loadingMore = signal(false);
 export const searchError = signal<string | null>(null);
@@ -29,6 +30,7 @@ const discoverSearchLifecycle = createDiscoverSearchLifecycle({
   read: () => ({
     loadedSearchKey: loadedSearchKey.value,
     loadedContextKey: loadedContextKey.value,
+    loadedAt: loadedAt.value,
     results: results.value,
     total: total.value,
     loading: loading.value,
@@ -38,6 +40,7 @@ const discoverSearchLifecycle = createDiscoverSearchLifecycle({
   update: (patch) => {
     if (patch.loadedSearchKey !== undefined) loadedSearchKey.value = patch.loadedSearchKey;
     if (patch.loadedContextKey !== undefined) loadedContextKey.value = patch.loadedContextKey;
+    if (patch.loadedAt !== undefined) loadedAt.value = patch.loadedAt;
     if (patch.results !== undefined) results.value = patch.results;
     if (patch.total !== undefined) total.value = patch.total;
     if (patch.loading !== undefined) loading.value = patch.loading;

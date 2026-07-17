@@ -10,6 +10,7 @@ import {
 interface TestState {
   loadedSearchKey: string;
   loadedContextKey: string;
+  loadedAt: number | null;
   results: SearchHit[];
   total: number;
   loading: boolean;
@@ -79,10 +80,11 @@ function fakeScheduler(): {
   };
 }
 
-function harness() {
+function harness(now: () => number = Date.now) {
   const state: TestState = {
     loadedSearchKey: '',
     loadedContextKey: '',
+    loadedAt: null,
     results: [],
     total: 0,
     loading: false,
@@ -96,6 +98,7 @@ function harness() {
       update: (patch) => Object.assign(state, patch),
     },
     timers.scheduler,
+    now,
   );
   return { state, timers, lifecycle };
 }
@@ -243,4 +246,79 @@ test('context transitions hide stale actionable results immediately', async () =
   await settle();
   assert.equal(state.loadedContextKey, 'instance-b');
   assert.deepEqual(resultIds(state), ['compatible-with-b']);
+});
+
+test('completed searches revalidate after the freshness window', async () => {
+  let clock = 0;
+  const { state, timers, lifecycle } = harness(() => clock);
+  let calls = 0;
+  const request = searchRequest('freshness', async () => page([`result-${++calls}`]));
+
+  lifecycle.search(request);
+  timers.runNext();
+  await settle();
+
+  clock = 2 * 60 * 1_000 - 1;
+  lifecycle.search(request);
+  assert.equal(timers.size(), 0);
+  assert.equal(calls, 1);
+
+  clock += 1;
+  lifecycle.search(request);
+  assert.equal(state.loading, true);
+  assert.deepEqual(resultIds(state), ['result-1']);
+  timers.runNext();
+  await settle();
+  assert.equal(calls, 2);
+  assert.deepEqual(resultIds(state), ['result-2']);
+});
+
+test('initial rejection settles loading and exposes the error', async () => {
+  const { state, timers, lifecycle } = harness();
+  lifecycle.search(
+    searchRequest('broken', async () => {
+      throw new Error('offline');
+    }),
+  );
+  timers.runNext();
+  await settle();
+
+  assert.equal(state.loading, false);
+  assert.match(state.searchError ?? '', /offline/);
+});
+
+test('pagination rejection clears loading-more without losing results', async () => {
+  const { state, timers, lifecycle } = harness();
+  lifecycle.search(searchRequest('paged-error', async () => page(['first'], 2)));
+  timers.runNext();
+  await settle();
+
+  lifecycle.loadMore({
+    key: 'paged-error',
+    input: { kind: 'mod', query: 'paged-error', offset: 1 },
+    search: async () => {
+      throw new Error('offline');
+    },
+  });
+  await settle();
+
+  assert.equal(state.loadingMore, false);
+  assert.deepEqual(resultIds(state), ['first']);
+});
+
+test('forced retry supersedes a same-key in-flight request', async () => {
+  const { state, timers, lifecycle } = harness();
+  const first = deferred<ContentPage>();
+  const request = searchRequest('retry', () => first.promise);
+  lifecycle.search(request);
+  timers.runNext();
+
+  lifecycle.search({ ...request, force: true, search: async () => page(['retry-result']) });
+  timers.runNext();
+  await settle();
+  first.resolve(page(['stale-result']));
+  await settle();
+
+  assert.equal(state.loading, false);
+  assert.deepEqual(resultIds(state), ['retry-result']);
 });

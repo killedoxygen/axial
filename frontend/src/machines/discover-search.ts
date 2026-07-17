@@ -1,9 +1,12 @@
 import type { ContentSearchInput } from '../content';
 import type { ContentPage, SearchHit } from '../types-content';
 
+export const DISCOVER_SEARCH_FRESH_FOR_MS = 2 * 60 * 1_000;
+
 export interface DiscoverSearchSnapshot {
   loadedSearchKey: string;
   loadedContextKey: string;
+  loadedAt: number | null;
   results: SearchHit[];
   total: number;
   loading: boolean;
@@ -45,6 +48,7 @@ export function createDiscoverSearchLifecycle(
     set: (callback, delayMs) => window.setTimeout(callback, delayMs),
     clear: (handle) => window.clearTimeout(handle),
   },
+  now: () => number = Date.now,
 ): {
   search: (request: DiscoverSearchRequest) => void;
   loadMore: (request: DiscoverLoadMoreRequest) => void;
@@ -62,7 +66,12 @@ export function createDiscoverSearchLifecycle(
     const current = state.read();
     if (!request.force) {
       if (pendingInitialKey === request.key && current.loading) return;
-      if (current.loadedSearchKey === request.key && current.loadedContextKey === request.contextKey) {
+      const loadedSearchIsFresh = current.loadedAt !== null && now() - current.loadedAt < DISCOVER_SEARCH_FRESH_FOR_MS;
+      if (
+        loadedSearchIsFresh &&
+        current.loadedSearchKey === request.key &&
+        current.loadedContextKey === request.contextKey
+      ) {
         if (pendingInitialKey !== null) {
           generation += 1;
           cancelScheduled();
@@ -81,7 +90,7 @@ export function createDiscoverSearchLifecycle(
       loading: true,
       loadingMore: false,
       searchError: null,
-      ...(contextChanged ? { loadedSearchKey: '', loadedContextKey: '', results: [], total: 0 } : {}),
+      ...(contextChanged ? { loadedSearchKey: '', loadedContextKey: '', loadedAt: null, results: [], total: 0 } : {}),
     });
 
     scheduled = scheduler.set(() => {
@@ -93,6 +102,7 @@ export function createDiscoverSearchLifecycle(
           state.update({
             loadedSearchKey: request.key,
             loadedContextKey: request.contextKey,
+            loadedAt: now(),
             results: page.items,
             total: page.total,
             searchError: null,
