@@ -259,7 +259,7 @@
 
 .cp-discover-card {
   display: grid;
-  grid-template-columns: 56px minmax(0, 1fr) auto;
+  grid-template-columns: 56px minmax(0, 1fr);
   gap: 14px;
   align-items: start;
   padding: 16px;
@@ -268,28 +268,19 @@
   box-shadow:
     inset 0 1px 0 oklch(1 0 0 / 0.05),
     var(--shadow-raised);
+  cursor: pointer;
   text-align: left;
   transition:
     transform 180ms cubic-bezier(0.22, 1, 0.36, 1),
     background 160ms ease,
     box-shadow 180ms ease;
 }
-.cp-discover-card[role='button'] {
-  cursor: pointer;
-}
-.cp-discover-card[role='button']:hover {
+.cp-discover-card:hover {
   transform: translateY(-2px);
   background: color-mix(in oklab, var(--surface-2) 52%, var(--surface));
 }
-.cp-discover-card[role='button']:focus-visible {
-  outline: none;
+.cp-discover-card:has(.cp-discover-card-open:focus-visible) {
   box-shadow: var(--shadow-raised), var(--focus-ring);
-}
-.cp-discover-card[data-staged='true'] {
-  box-shadow:
-    inset 0 1px 0 oklch(1 0 0 / 0.05),
-    var(--shadow-raised),
-    0 0 0 2px var(--accent-fill);
 }
 .cp-discover-card-icon {
   width: 56px;
@@ -319,6 +310,7 @@
   min-width: 0;
 }
 .cp-discover-card-title {
+  min-width: 0;
   margin: 0;
   color: var(--text);
   font-size: 14.5px;
@@ -327,6 +319,25 @@
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+.cp-discover-card-open {
+  display: block;
+  width: 100%;
+  min-width: 0;
+  padding: 0;
+  border: 0;
+  outline: none;
+  overflow: hidden;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  cursor: pointer;
+}
+.cp-discover-card-open:focus-visible {
+  box-shadow: var(--focus-ring-inset);
 }
 .cp-discover-card-author {
   flex: 0 1 auto;
@@ -381,6 +392,9 @@
 .cp-discover-card-action {
   display: inline-flex;
   align-items: center;
+  align-self: flex-start;
+  flex: 0 0 auto;
+  margin-left: auto;
   min-height: 30px;
 }
 .cp-discover-installed {
