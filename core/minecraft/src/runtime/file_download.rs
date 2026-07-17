@@ -2,6 +2,7 @@ use super::manifest::ComponentManifestDownload;
 use super::model::{
     JavaRuntimeLookupError, RuntimeId, RuntimeSourceFailure, RuntimeSourceFailureKind,
 };
+use crate::artifact_path::ArtifactRelativePath;
 use futures_util::StreamExt;
 use sha1::{Digest as _, Sha1};
 use std::borrow::Cow;
@@ -42,36 +43,29 @@ pub(super) fn component_manifest_destination(
     temp_dir: &Path,
     relative_path: &str,
 ) -> Result<PathBuf, JavaRuntimeLookupError> {
-    if relative_path.is_empty() || has_unsafe_path_component(Path::new(relative_path)) {
-        return Err(runtime_source_failure(
-            component,
-            RuntimeSourceFailureKind::PolicyRejected,
-            format!(
-                "unsafe runtime manifest path: {}",
-                bounded_manifest_file_label(relative_path)
-            ),
-        ));
-    }
+    component_manifest_destination_with_key(component, temp_dir, relative_path)
+        .map(|(destination, _)| destination)
+}
 
-    let mut destination = temp_dir.to_path_buf();
-    for segment in relative_path.split(['/', '\\']) {
-        if segment.is_empty()
-            || segment.contains(':')
-            || has_unsafe_path_component(Path::new(segment))
-        {
-            return Err(runtime_source_failure(
-                component,
-                RuntimeSourceFailureKind::PolicyRejected,
-                format!(
-                    "unsafe runtime manifest path: {}",
-                    bounded_manifest_file_label(relative_path)
-                ),
-            ));
-        }
-        destination.push(segment);
-    }
+pub(super) fn component_manifest_destination_with_key(
+    component: &RuntimeId,
+    temp_dir: &Path,
+    relative_path: &str,
+) -> Result<(PathBuf, String), JavaRuntimeLookupError> {
+    admitted_runtime_manifest_path(component, relative_path)
+        .map(|(path, key)| (path.join_under(temp_dir), key))
+}
 
-    Ok(destination)
+fn admitted_runtime_manifest_path(
+    component: &RuntimeId,
+    relative_path: &str,
+) -> Result<(ArtifactRelativePath, String), JavaRuntimeLookupError> {
+    let path = ArtifactRelativePath::new(relative_path)
+        .map_err(|_| unsafe_runtime_manifest_path(component, relative_path))?;
+    let filesystem_key = path
+        .portable_persisted_key()
+        .map_err(|_| unsafe_runtime_manifest_path(component, relative_path))?;
+    Ok((path, filesystem_key))
 }
 
 pub(super) fn component_manifest_link_target_path(
@@ -81,7 +75,7 @@ pub(super) fn component_manifest_link_target_path(
     link_relative_path: &str,
     target: &str,
 ) -> Result<PathBuf, JavaRuntimeLookupError> {
-    if target.trim().is_empty() || Path::new(target).is_absolute() {
+    if target.trim().is_empty() || target.contains('\\') || Path::new(target).is_absolute() {
         return Err(runtime_source_failure(
             component,
             RuntimeSourceFailureKind::PolicyRejected,
@@ -92,10 +86,12 @@ pub(super) fn component_manifest_link_target_path(
         ));
     }
     for segment in target.split(['/', '\\']) {
-        if segment.is_empty() || segment == "." {
+        if matches!(segment, "" | "." | "..") {
             continue;
         }
-        if segment.contains(':') {
+        let portable_segment =
+            ArtifactRelativePath::new(segment).and_then(|path| path.portable_persisted_key());
+        if portable_segment.is_err() {
             return Err(runtime_source_failure(
                 component,
                 RuntimeSourceFailureKind::PolicyRejected,
@@ -124,6 +120,20 @@ pub(super) fn component_manifest_link_target_path(
     Ok(target_path)
 }
 
+fn unsafe_runtime_manifest_path(
+    component: &RuntimeId,
+    relative_path: &str,
+) -> JavaRuntimeLookupError {
+    runtime_source_failure(
+        component,
+        RuntimeSourceFailureKind::PolicyRejected,
+        format!(
+            "unsafe runtime manifest path: {}",
+            bounded_manifest_file_label(relative_path)
+        ),
+    )
+}
+
 fn normalize_path_lexically(path: &Path) -> PathBuf {
     let mut normalized = PathBuf::new();
     for component in path.components() {
@@ -140,11 +150,6 @@ fn normalize_path_lexically(path: &Path) -> PathBuf {
         }
     }
     normalized
-}
-
-pub(super) fn has_unsafe_path_component(path: &Path) -> bool {
-    path.components()
-        .any(|component| !matches!(component, std::path::Component::Normal(_)))
 }
 
 pub(super) fn runtime_download_temp_path(destination: &Path) -> PathBuf {

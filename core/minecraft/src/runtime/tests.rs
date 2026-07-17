@@ -1,3 +1,4 @@
+use super::file_download::component_manifest_link_target_path;
 use super::{
     ComponentManifest, ComponentManifestDownload, ComponentManifestDownloads,
     ComponentManifestFile, JavaRuntimeInfo, JavaRuntimeLookupError, MachOArm64Compatibility,
@@ -305,6 +306,51 @@ fn component_manifest_destination_rejects_drive_like_path_with_backslashes() {
     assert!(message.contains("unsafe runtime manifest path"));
     assert!(message.contains(r"C:\Windows\System32"));
     assert!(!message.contains("runtime-temp"));
+}
+
+#[test]
+fn component_manifest_destination_rejects_nonportable_segments() {
+    let overlong = "a".repeat(crate::artifact_path::MAX_ARTIFACT_PATH_SEGMENT_BYTES + 1);
+    for relative_path in [
+        "bin/NUL.txt",
+        "bin/java.",
+        "bin/java ",
+        "bin/ja*va",
+        "bin/ja\0va",
+        overlong.as_str(),
+    ] {
+        let message = unsafe_manifest_path_message(component_manifest_destination(
+            &test_runtime_component(),
+            Path::new("runtime-temp"),
+            relative_path,
+        ));
+
+        assert!(
+            message.contains("unsafe runtime manifest path"),
+            "unexpected rejection for {relative_path:?}: {message}"
+        );
+    }
+}
+
+#[test]
+fn component_manifest_link_target_rejects_nonportable_named_segments() {
+    for target in ["../NUL.txt", "../license.", "../license ", "../li*ense"] {
+        let result = component_manifest_link_target_path(
+            &test_runtime_component(),
+            Path::new("runtime"),
+            Path::new("runtime/legal/module/LICENSE"),
+            "legal/module/LICENSE",
+            target,
+        );
+
+        assert!(matches!(
+            result,
+            Err(JavaRuntimeLookupError::RuntimeSource(failure))
+                if failure.component() == &test_runtime_component()
+                    && failure.kind() == RuntimeSourceFailureKind::PolicyRejected
+                    && failure.detail().contains("unsafe runtime manifest link target")
+        ));
+    }
 }
 
 #[test]
@@ -1755,6 +1801,183 @@ async fn managed_runtime_admission_rejects_unsafe_sizes_before_effects() {
         files: HashMap::from([(runtime_java_manifest_path(), missing_size)]),
     };
     assert_managed_manifest_rejection_preserves_state(missing_size, missing_size_requests).await;
+}
+
+#[tokio::test]
+async fn managed_runtime_admission_rejects_case_aliases_before_effects() {
+    let (url, requests) = serve_runtime_retry_responses(vec![(200, b"unused".to_vec())]).await;
+    let file = downloadable_manifest_file(&url, 1, "0000000000000000000000000000000000000000");
+    let manifest = ComponentManifest {
+        files: HashMap::from([
+            ("bin/java.exe".to_string(), file.clone()),
+            ("BIN/JAVA.EXE".to_string(), file),
+        ]),
+    };
+
+    assert_managed_manifest_rejection_preserves_state(manifest, requests).await;
+}
+
+#[tokio::test]
+async fn managed_runtime_admission_rejects_explicit_folded_prefix_alias_before_effects() {
+    let (url, requests) = serve_runtime_retry_responses(vec![(200, b"unused".to_vec())]).await;
+    let manifest = ComponentManifest {
+        files: HashMap::from([
+            ("bin".to_string(), manifest_file("directory")),
+            (
+                "BIN/java".to_string(),
+                downloadable_manifest_file(&url, 1, "0000000000000000000000000000000000000000"),
+            ),
+        ]),
+    };
+
+    assert_managed_manifest_rejection_preserves_state(manifest, requests).await;
+}
+
+#[tokio::test]
+async fn managed_runtime_admission_rejects_implicit_folded_prefix_alias_before_effects() {
+    let (url, requests) = serve_runtime_retry_responses(vec![(200, b"unused".to_vec())]).await;
+    let file = downloadable_manifest_file(&url, 1, "0000000000000000000000000000000000000000");
+    let manifest = ComponentManifest {
+        files: HashMap::from([
+            ("bin/a".to_string(), file.clone()),
+            ("BIN/b".to_string(), file),
+        ]),
+    };
+
+    assert_managed_manifest_rejection_preserves_state(manifest, requests).await;
+}
+
+#[tokio::test]
+async fn managed_runtime_admission_rejects_case_mismatched_link_target_before_effects() {
+    let (url, requests) = serve_runtime_retry_responses(vec![(200, b"unused".to_vec())]).await;
+    let manifest = ComponentManifest {
+        files: HashMap::from([
+            (
+                "legal/base/LICENSE".to_string(),
+                downloadable_manifest_file(&url, 1, "0000000000000000000000000000000000000000"),
+            ),
+            (
+                "legal/module/LICENSE".to_string(),
+                manifest_link("../BASE/LICENSE"),
+            ),
+        ]),
+    };
+
+    assert_managed_manifest_rejection_preserves_state(manifest, requests).await;
+}
+
+#[tokio::test]
+async fn managed_runtime_admission_rejects_dangling_link_target_before_effects() {
+    let (url, requests) = serve_runtime_retry_responses(vec![(200, b"unused".to_vec())]).await;
+    let manifest = ComponentManifest {
+        files: HashMap::from([
+            (
+                "bin/java".to_string(),
+                downloadable_manifest_file(&url, 1, "0000000000000000000000000000000000000000"),
+            ),
+            (
+                "legal/module/LICENSE".to_string(),
+                manifest_link("../base/LICENSE"),
+            ),
+        ]),
+    };
+
+    assert_managed_manifest_rejection_preserves_state(manifest, requests).await;
+}
+
+#[tokio::test]
+async fn managed_runtime_admission_rejects_backslash_link_target_before_effects() {
+    let (url, requests) = serve_runtime_retry_responses(vec![(200, b"unused".to_vec())]).await;
+    let manifest = ComponentManifest {
+        files: HashMap::from([
+            (
+                "legal/base/LICENSE".to_string(),
+                downloadable_manifest_file(&url, 1, "0000000000000000000000000000000000000000"),
+            ),
+            (
+                "legal/module/LICENSE".to_string(),
+                manifest_link(r"..\base\LICENSE"),
+            ),
+        ]),
+    };
+
+    assert_managed_manifest_rejection_preserves_state(manifest, requests).await;
+}
+
+#[tokio::test]
+async fn managed_runtime_admission_rejects_link_loop_before_effects() {
+    let (url, requests) = serve_runtime_retry_responses(vec![(200, b"unused".to_vec())]).await;
+    let manifest = ComponentManifest {
+        files: HashMap::from([
+            (
+                "bin/java".to_string(),
+                downloadable_manifest_file(&url, 1, "0000000000000000000000000000000000000000"),
+            ),
+            ("legal/loop".to_string(), manifest_link("loop")),
+        ]),
+    };
+
+    assert_managed_manifest_rejection_preserves_state(manifest, requests).await;
+}
+
+#[test]
+fn runtime_manifest_admission_rejects_portable_and_runtime_owned_collisions() {
+    let file = downloadable_manifest_file(
+        "https://example.invalid/java",
+        1,
+        "0000000000000000000000000000000000000000",
+    );
+    let manifests = [
+        ComponentManifest {
+            files: HashMap::from([
+                ("bin/java".to_string(), file.clone()),
+                ("BIN/JAVA".to_string(), file.clone()),
+            ]),
+        },
+        ComponentManifest {
+            files: HashMap::from([
+                ("bin/java".to_string(), file.clone()),
+                ("bin/java.axial-tmp".to_string(), file.clone()),
+            ]),
+        },
+        ComponentManifest {
+            files: HashMap::from([(".AXIAL-READY".to_string(), file)]),
+        },
+    ];
+
+    for manifest in manifests {
+        let error = validate_ephemeral_processor_manifest_for_test(&manifest, 1)
+            .expect_err("filesystem alias must be rejected during source admission");
+        assert!(matches!(
+            error,
+            JavaRuntimeLookupError::RuntimeSource(failure)
+                if failure.kind() == RuntimeSourceFailureKind::PolicyRejected
+        ));
+    }
+}
+
+#[test]
+fn runtime_manifest_admission_accepts_declared_forward_slash_link_target() {
+    let manifest = ComponentManifest {
+        files: HashMap::from([
+            (
+                "legal/base/LICENSE".to_string(),
+                downloadable_manifest_file(
+                    "https://example.invalid/license",
+                    1,
+                    "0000000000000000000000000000000000000000",
+                ),
+            ),
+            (
+                "legal/module/LICENSE".to_string(),
+                manifest_link("../base/LICENSE"),
+            ),
+            ("legal/module/base".to_string(), manifest_link("../base")),
+        ]),
+    };
+
+    validate_ephemeral_processor_manifest_for_test(&manifest, 1)
+        .expect("declared and implicit portable link targets should be admitted");
 }
 
 #[tokio::test]
