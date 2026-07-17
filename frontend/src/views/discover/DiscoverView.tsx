@@ -17,6 +17,7 @@ import { Tray } from './Tray';
 import { ModpackPicker } from './ModpackPicker';
 import { setUpModpack } from './actions';
 import { InstallConflictSheet, useInstallFlow, type InstallFlow } from './install-flow';
+import { scheduleDetailPrefetch } from './detail-cache';
 import {
   category,
   gameVersion,
@@ -26,7 +27,8 @@ import {
   loadingMore,
   loader,
   query,
-  resetSearch,
+  requestDiscoverSearch,
+  requestMoreDiscoverResults,
   results,
   searchError,
   sort,
@@ -124,6 +126,8 @@ const KIND_CATEGORIES: Record<ContentKind, string[]> = {
 const RECENT_MC = ['1.21.6', '1.21.5', '1.21.4', '1.21.3', '1.21.1', '1.21', '1.20.6', '1.20.4', '1.20.1'];
 const PAGE_SIZE = 40;
 const SEARCH_DEBOUNCE_MS = 220;
+const PREFETCH_HOVER_MS = 150;
+const PREFETCH_FOCUS_MS = 250;
 
 function CardAction({
   item,
@@ -218,6 +222,7 @@ function CardAction({
       variant={staged ? 'primary' : 'secondary'}
       size="sm"
       icon={staged ? 'check' : 'plus'}
+      pressed={staged}
       title={staged ? 'Remove from selection' : 'Add to selection'}
       onClick={(event) => {
         event.stopPropagation();
@@ -240,21 +245,28 @@ function ContentCard({
   flow: InstallFlow;
 }): JSX.Element {
   const open = (): void => navigate({ name: 'content', id: item.canonical_id, target: instance?.id });
+  const openFromCard = (event: MouseEvent): void => {
+    const target = event.target;
+    if (target instanceof Element && target.closest('button, a, input, select, textarea, [role="button"]')) return;
+    open();
+  };
+  const cancelScheduledPrefetch = useRef<(() => void) | null>(null);
+  const prefetch = (delayMs: number): void => {
+    cancelScheduledPrefetch.current?.();
+    cancelScheduledPrefetch.current = scheduleDetailPrefetch(item.canonical_id, delayMs);
+  };
+  const cancelPrefetch = (): void => {
+    cancelScheduledPrefetch.current?.();
+    cancelScheduledPrefetch.current = null;
+  };
+  useEffect(() => cancelPrefetch, []);
 
   return (
     <article
       class="cp-discover-card"
-      data-staged={isStaged(item.canonical_id)}
-      role="button"
-      tabIndex={0}
-      aria-label={item.title}
-      onClick={open}
-      onKeyDown={(event: KeyboardEvent) => {
-        if (event.key === 'Enter' || event.key === ' ') {
-          event.preventDefault();
-          open();
-        }
-      }}
+      onClick={openFromCard}
+      onMouseEnter={() => prefetch(PREFETCH_HOVER_MS)}
+      onMouseLeave={cancelPrefetch}
     >
       <div class="cp-discover-card-icon" aria-hidden="true">
         <ContentIcon url={item.icon_url} kind={item.kind} />
@@ -262,9 +274,23 @@ function ContentCard({
       <div class="cp-discover-card-main">
         <div class="cp-discover-card-head">
           <h3 class="cp-discover-card-title" title={item.title}>
-            {item.title}
+            <button
+              type="button"
+              class="cp-discover-card-open"
+              onClick={(event) => {
+                event.stopPropagation();
+                open();
+              }}
+              onFocus={() => prefetch(PREFETCH_FOCUS_MS)}
+              onBlur={cancelPrefetch}
+            >
+              {item.title}
+            </button>
           </h3>
           {item.author && <span class="cp-discover-card-author">by {item.author}</span>}
+          <div class="cp-discover-card-action">
+            <CardAction item={item} instance={instance} flow={flow} />
+          </div>
         </div>
         <p class="cp-discover-card-summary">{item.summary}</p>
         <div class="cp-discover-card-tags">
@@ -289,16 +315,12 @@ function ContentCard({
           )}
         </div>
       </div>
-      <div class="cp-discover-card-action">
-        <CardAction item={item} instance={instance} flow={flow} />
-      </div>
     </article>
   );
 }
 
 export function DiscoverView(): JSX.Element {
   const instance = targetInstance.value;
-  const requestId = useRef(0);
   const [attempt, setAttempt] = useState(0);
   const flow = useInstallFlow(instance?.id);
 
@@ -342,67 +364,61 @@ export function DiscoverView(): JSX.Element {
   const currentContentRevision = contentRevision.value;
   const [filtersOpen, setFiltersOpen] = useState(false);
 
-  const searchInput = (offset?: number): ContentSearchInput => ({
+  const searchInput: ContentSearchInput = {
     kind: currentKind,
     query: currentQuery.trim() || undefined,
     loader: usesLoaderFilter(currentKind) ? activeLoader || undefined : undefined,
     gameVersion: activeVersion || undefined,
     category: currentCategory || undefined,
     sort: currentSort,
-    offset,
     limit: PAGE_SIZE,
     instanceId: instance?.id,
-  });
+  };
 
-  useEffect(() => {
-    const id = ++requestId.current;
-    loading.value = true;
-    loadingMore.value = false;
-    resetSearch();
-    const timer = window.setTimeout(() => {
-      searchContent(searchInput())
-        .then((page) => {
-          if (id !== requestId.current) return;
-          results.value = page.items;
-          total.value = page.total;
-        })
-        .catch((error) => {
-          if (id === requestId.current) searchError.value = errMessage(error);
-        })
-        .finally(() => {
-          if (id === requestId.current) loading.value = false;
-        });
-    }, SEARCH_DEBOUNCE_MS);
-    return () => {
-      window.clearTimeout(timer);
-      requestId.current += 1;
-    };
-  }, [
+  const trimmedQuery = currentQuery.trim();
+  const searchKey = JSON.stringify([
     currentKind,
-    currentQuery,
+    trimmedQuery,
     activeLoader,
     activeVersion,
     currentCategory,
     currentSort,
-    instance?.id,
-    attempt,
+    instance?.id ?? '',
     currentContentRevision,
   ]);
+  const searchContextKey = JSON.stringify([
+    currentKind,
+    activeLoader,
+    activeVersion,
+    currentCategory,
+    instance?.id ?? '',
+    currentContentRevision,
+  ]);
+  const prevQuery = useRef<string | null>(null);
+  const prevAttempt = useRef(attempt);
+
+  useEffect(() => {
+    const debounce = prevQuery.current !== null && prevQuery.current !== trimmedQuery ? SEARCH_DEBOUNCE_MS : 0;
+    const force = prevAttempt.current !== attempt;
+    prevQuery.current = trimmedQuery;
+    prevAttempt.current = attempt;
+    requestDiscoverSearch({
+      key: searchKey,
+      contextKey: searchContextKey,
+      input: searchInput,
+      search: searchContent,
+      errorMessage: errMessage,
+      debounceMs: debounce,
+      force,
+    });
+  }, [searchKey, attempt]);
 
   const loadMore = (): void => {
-    if (loadingMore.value || loading.value || results.value.length >= total.value) return;
-    const id = requestId.current;
-    loadingMore.value = true;
-    searchContent(searchInput(results.value.length))
-      .then((page) => {
-        if (id !== requestId.current) return;
-        results.value = [...results.value, ...page.items];
-        total.value = page.total;
-      })
-      .catch(() => {})
-      .finally(() => {
-        if (id === requestId.current) loadingMore.value = false;
-      });
+    requestMoreDiscoverResults({
+      key: searchKey,
+      input: { ...searchInput, offset: results.value.length },
+      search: searchContent,
+    });
   };
 
   const changeKind = (next: ContentKind): void => {
@@ -623,7 +639,7 @@ export function DiscoverView(): JSX.Element {
           </div>
           {hasMore && (
             <div class="cp-discover-loadmore">
-              <Button variant="secondary" onClick={loadMore} disabled={loadingMore.value}>
+              <Button variant="secondary" onClick={loadMore} disabled={isLoading || loadingMore.value}>
                 {loadingMore.value ? 'Loading…' : 'Load more'}
               </Button>
             </div>

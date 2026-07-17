@@ -20,6 +20,7 @@ export function Button({
   title,
   buttonRef,
   sound,
+  pressed,
 }: {
   children?: ComponentChildren;
   variant?: BtnVariant;
@@ -33,6 +34,7 @@ export function Button({
   title?: string;
   buttonRef?: { current: HTMLButtonElement | null };
   sound?: SoundKind | false;
+  pressed?: boolean;
 }): JSX.Element {
   const cls = `cp-btn cp-btn--${size} cp-btn--${variant}${full ? ' cp-btn--full' : ''}`;
   return (
@@ -43,6 +45,7 @@ export function Button({
       disabled={disabled}
       style={style}
       title={title}
+      aria-pressed={pressed}
       data-sound={sound || undefined}
       data-sound-silent={sound === false ? 'true' : undefined}
     >

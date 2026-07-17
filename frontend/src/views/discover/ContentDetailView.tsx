@@ -5,7 +5,7 @@ import { Icon } from '../../ui/Icons';
 import { Modal, ModalContent } from '../../ui/Modal';
 import { SelectField, type SelectFieldOption } from '../../ui/Select';
 import { navigate, route } from '../../ui-state';
-import { getContentDetail } from '../../content';
+import { cachedDetail, loadDetail } from './detail-cache';
 import { formatAge, formatBytes, formatCount, formatDate, plural } from '../../format';
 import { errMessage } from '../../utils';
 import type { ContentDetail, ContentVersion, GalleryImage, ReleaseChannel } from '../../types-content';
@@ -30,27 +30,39 @@ import {
 
 type Tab = 'about' | 'gallery' | 'versions';
 
+interface DetailViewState {
+  canonicalId: string;
+  detail: ContentDetail | null;
+  error: string | null;
+}
+
 export function ContentDetailView(): JSX.Element {
   const current = route.value;
   const canonicalId = current.name === 'content' ? current.id : '';
   const instance = targetInstance.value;
 
-  const [detail, setDetail] = useState<ContentDetail | null>(null);
-  const [error, setError] = useState<string | null>(null);
+  const [detailState, setDetailState] = useState<DetailViewState>(() => ({
+    canonicalId,
+    detail: cachedDetail(canonicalId) ?? null,
+    error: null,
+  }));
   const [tab, setTab] = useState<Tab>('about');
   const flow = useInstallFlow(instance?.id);
+  const currentDetailState = detailState.canonicalId === canonicalId ? detailState : null;
+  const detail = currentDetailState?.detail ?? null;
+  const error = currentDetailState?.error ?? null;
 
   useEffect(() => {
+    const cached = cachedDetail(canonicalId);
     let active = true;
-    setDetail(null);
-    setError(null);
+    setDetailState({ canonicalId, detail: cached ?? null, error: null });
     setTab('about');
-    getContentDetail(canonicalId)
+    loadDetail(canonicalId)
       .then((resolved) => {
-        if (active) setDetail(resolved);
+        if (active) setDetailState({ canonicalId, detail: resolved, error: null });
       })
       .catch((err) => {
-        if (active) setError(errMessage(err));
+        if (active && !cached) setDetailState({ canonicalId, detail: null, error: errMessage(err) });
       });
     return () => {
       active = false;

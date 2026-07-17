@@ -3,6 +3,11 @@ import { instances } from '../../store';
 import { route } from '../../ui-state';
 import type { ContentKind, ContentSelection, ContentSort, SearchHit } from '../../types-content';
 import type { EnrichedInstance } from '../../types-instance';
+import {
+  createDiscoverSearchLifecycle,
+  type DiscoverLoadMoreRequest,
+  type DiscoverSearchRequest,
+} from '../../machines/discover-search';
 
 export const query = signal('');
 export const kind = signal<ContentKind>('mod');
@@ -13,9 +18,44 @@ export const sort = signal<ContentSort>('relevance');
 
 export const results = signal<SearchHit[]>([]);
 export const total = signal(0);
+/** Signature of the search whose results are currently held, so remounts can skip refetching. */
+const loadedSearchKey = signal('');
+const loadedContextKey = signal('');
+const loadedAt = signal<number | null>(null);
 export const loading = signal(false);
 export const loadingMore = signal(false);
 export const searchError = signal<string | null>(null);
+
+const discoverSearchLifecycle = createDiscoverSearchLifecycle({
+  read: () => ({
+    loadedSearchKey: loadedSearchKey.value,
+    loadedContextKey: loadedContextKey.value,
+    loadedAt: loadedAt.value,
+    results: results.value,
+    total: total.value,
+    loading: loading.value,
+    loadingMore: loadingMore.value,
+    searchError: searchError.value,
+  }),
+  update: (patch) => {
+    if (patch.loadedSearchKey !== undefined) loadedSearchKey.value = patch.loadedSearchKey;
+    if (patch.loadedContextKey !== undefined) loadedContextKey.value = patch.loadedContextKey;
+    if (patch.loadedAt !== undefined) loadedAt.value = patch.loadedAt;
+    if (patch.results !== undefined) results.value = patch.results;
+    if (patch.total !== undefined) total.value = patch.total;
+    if (patch.loading !== undefined) loading.value = patch.loading;
+    if (patch.loadingMore !== undefined) loadingMore.value = patch.loadingMore;
+    if (patch.searchError !== undefined) searchError.value = patch.searchError;
+  },
+});
+
+export function requestDiscoverSearch(request: DiscoverSearchRequest): void {
+  discoverSearchLifecycle.search(request);
+}
+
+export function requestMoreDiscoverResults(request: DiscoverLoadMoreRequest): void {
+  discoverSearchLifecycle.loadMore(request);
+}
 
 export interface TrayItem {
   canonical_id: string;
@@ -87,10 +127,4 @@ export function markInstalled(canonicalIds: string[]): void {
   results.value = results.value.map((hit) =>
     installed.has(hit.canonical_id) ? { ...hit, install_state: 'installed' } : hit,
   );
-}
-
-export function resetSearch(): void {
-  results.value = [];
-  total.value = 0;
-  searchError.value = null;
 }
