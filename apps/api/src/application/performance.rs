@@ -132,11 +132,11 @@ pub fn performance_plan_summary_view_model(
     mode: PerformanceMode,
     plan: Option<&CompositionPlan>,
     health: BundleHealth,
-    health_tier: Option<CompositionTier>,
     rollback: RollbackState,
     managed_artifact_count: usize,
     warnings: &[String],
 ) -> PerformancePlanSummaryViewModel {
+    let plan_available = plan.is_some();
     if !matches!(mode, PerformanceMode::Managed) || matches!(health, BundleHealth::Disabled) {
         return PerformancePlanSummaryViewModel {
             state_id: "performance_summary_disabled".to_string(),
@@ -164,7 +164,7 @@ pub fn performance_plan_summary_view_model(
             health: Some(bundle_health_token(health).to_string()),
             composition_id: None,
             managed_artifact_count,
-            actions: performance_summary_actions(mode, health, rollback),
+            actions: performance_summary_actions(mode, health, rollback, plan_available),
         };
     }
 
@@ -177,14 +177,13 @@ pub fn performance_plan_summary_view_model(
             health: Some(bundle_health_token(health).to_string()),
             composition_id: None,
             managed_artifact_count,
-            actions: performance_summary_actions(mode, health, rollback),
+            actions: performance_summary_actions(mode, health, rollback, plan_available),
         };
     };
 
     let tier = composition_tier_label(plan.tier);
     let mod_count = plan.mods.len();
-    let fallback =
-        !plan.fallback_reason.trim().is_empty() || matches!(health, BundleHealth::Fallback);
+    let fallback = !plan.fallback_reason.trim().is_empty();
     let warning = plan
         .fallback_reason
         .trim()
@@ -205,34 +204,6 @@ pub fn performance_plan_summary_view_model(
     );
     let launcher_tuning = matches!(plan.tier, CompositionTier::VanillaEnhanced) || mod_count == 0;
 
-    if matches!(health, BundleHealth::Fallback) {
-        let fallback_tier = health_tier
-            .map(composition_tier_label)
-            .unwrap_or_else(|| composition_tier_label(CompositionTier::VanillaEnhanced));
-        return PerformancePlanSummaryViewModel {
-            state_id: "performance_summary_fallback".to_string(),
-            title: if fallback_tier == "Launcher tuning" {
-                "Using launcher tuning".to_string()
-            } else {
-                "Using fallback bundle".to_string()
-            },
-            detail: warning.unwrap_or_else(|| {
-                format!(
-                    "Axial chose {} because the preferred bundle could not be applied.",
-                    fallback_tier.to_ascii_lowercase()
-                )
-            }),
-            tone: health_view_tone(health),
-            health: Some(bundle_health_token(health).to_string()),
-            composition_id: Some(public_performance_descriptor(
-                &plan.composition_id,
-                "composition",
-            )),
-            managed_artifact_count,
-            actions: performance_summary_actions(mode, health, rollback),
-        };
-    }
-
     if launcher_tuning {
         return PerformancePlanSummaryViewModel {
             state_id: "performance_summary_launcher_tuning".to_string(),
@@ -241,14 +212,18 @@ pub fn performance_plan_summary_view_model(
                 "Axial will tune Java and memory for this version; no performance mod bundle is available."
                     .to_string()
             }),
-            tone: health_view_tone(health),
+            tone: if fallback {
+                ViewModelTone::Warn
+            } else {
+                health_view_tone(health)
+            },
             health: Some(bundle_health_token(health).to_string()),
             composition_id: Some(public_performance_descriptor(
                 &plan.composition_id,
                 "composition",
             )),
             managed_artifact_count,
-            actions: performance_summary_actions(mode, health, rollback),
+            actions: performance_summary_actions(mode, health, rollback, plan_available),
         };
     }
 
@@ -264,14 +239,18 @@ pub fn performance_plan_summary_view_model(
                 health_text
             )
         }),
-        tone: health_view_tone(health),
+        tone: if fallback {
+            ViewModelTone::Warn
+        } else {
+            health_view_tone(health)
+        },
         health: Some(bundle_health_token(health).to_string()),
         composition_id: Some(public_performance_descriptor(
             &plan.composition_id,
             "composition",
         )),
         managed_artifact_count,
-        actions: performance_summary_actions(mode, health, rollback),
+        actions: performance_summary_actions(mode, health, rollback, plan_available),
     }
 }
 
@@ -288,18 +267,22 @@ fn performance_summary_actions(
     mode: PerformanceMode,
     health: BundleHealth,
     rollback: RollbackState,
+    plan_available: bool,
 ) -> Vec<ViewModelAction> {
     if !matches!(mode, PerformanceMode::Managed) || matches!(health, BundleHealth::Disabled) {
         return Vec::new();
     }
 
-    let install_disabled_reason = matches!(health, BundleHealth::Invalid)
-        .then(|| "Managed performance state needs repair before this action can run.".to_string());
+    let install_disabled_reason = (!plan_available).then(|| {
+        if matches!(health, BundleHealth::Invalid) {
+            "Managed performance state needs repair before this action can run.".to_string()
+        } else {
+            "The managed performance plan is unavailable.".to_string()
+        }
+    });
     let install_label = match health {
         BundleHealth::Healthy => "Reapply managed bundle",
-        BundleHealth::Degraded | BundleHealth::Fallback | BundleHealth::Invalid => {
-            "Repair managed bundle"
-        }
+        BundleHealth::Invalid => "Repair managed bundle",
         BundleHealth::Disabled => "Apply managed bundle",
     };
     let mut actions = vec![performance_view_action(
@@ -347,8 +330,6 @@ fn composition_tier_label(tier: CompositionTier) -> String {
 fn health_label(health: BundleHealth) -> &'static str {
     match health {
         BundleHealth::Healthy => "healthy",
-        BundleHealth::Degraded => "degraded",
-        BundleHealth::Fallback => "fallback",
         BundleHealth::Invalid => "needs attention",
         BundleHealth::Disabled => "not installed",
     }
@@ -357,9 +338,7 @@ fn health_label(health: BundleHealth) -> &'static str {
 fn health_view_tone(health: BundleHealth) -> ViewModelTone {
     match health {
         BundleHealth::Healthy => ViewModelTone::Ok,
-        BundleHealth::Degraded | BundleHealth::Fallback | BundleHealth::Disabled => {
-            ViewModelTone::Warn
-        }
+        BundleHealth::Disabled => ViewModelTone::Warn,
         BundleHealth::Invalid => ViewModelTone::Err,
     }
 }
@@ -367,8 +346,6 @@ fn health_view_tone(health: BundleHealth) -> ViewModelTone {
 fn bundle_health_token(health: BundleHealth) -> &'static str {
     match health {
         BundleHealth::Healthy => "healthy",
-        BundleHealth::Degraded => "degraded",
-        BundleHealth::Fallback => "fallback",
         BundleHealth::Disabled => "disabled",
         BundleHealth::Invalid => "invalid",
     }
@@ -921,8 +898,6 @@ fn performance_rules_details_label(warning_count: usize) -> String {
 fn performance_rules_health_label(health: BundleHealth) -> &'static str {
     match health {
         BundleHealth::Healthy => "Healthy",
-        BundleHealth::Degraded => "Degraded",
-        BundleHealth::Fallback => "Fallback",
         BundleHealth::Disabled => "Disabled",
         BundleHealth::Invalid => "Invalid",
     }
@@ -1039,7 +1014,6 @@ mod tests {
             PerformanceMode::Managed,
             Some(&plan),
             BundleHealth::Healthy,
-            Some(CompositionTier::Core),
             RollbackState::Unavailable,
             1,
             &[],
@@ -1066,6 +1040,33 @@ mod tests {
     }
 
     #[test]
+    fn performance_summary_view_model_allows_repair_with_a_resolved_plan() {
+        let plan = test_plan(
+            "core",
+            CompositionTier::Core,
+            vec![test_mod("sodium", "Sodium")],
+            "",
+            Vec::new(),
+        );
+
+        let summary = performance_plan_summary_view_model(
+            PerformanceMode::Managed,
+            Some(&plan),
+            BundleHealth::Invalid,
+            RollbackState::Unavailable,
+            1,
+            &[],
+        );
+
+        assert!(summary.actions.iter().any(|action| {
+            action.action.as_deref() == Some("install")
+                && action.label == "Repair managed bundle"
+                && action.enabled
+                && action.disabled_reason.is_none()
+        }));
+    }
+
+    #[test]
     fn performance_summary_view_model_normalizes_fallback_warning() {
         let plan = test_plan(
             "fallback",
@@ -1078,15 +1079,14 @@ mod tests {
         let summary = performance_plan_summary_view_model(
             PerformanceMode::Managed,
             Some(&plan),
-            BundleHealth::Fallback,
-            Some(CompositionTier::VanillaEnhanced),
+            BundleHealth::Healthy,
             RollbackState::Available,
             0,
             &[],
         );
 
-        assert_eq!(summary.state_id, "performance_summary_fallback");
-        assert_eq!(summary.title, "Using launcher tuning");
+        assert_eq!(summary.state_id, "performance_summary_launcher_tuning");
+        assert_eq!(summary.title, "Launcher tuning");
         assert_eq!(
             summary.detail,
             "A faster performance bundle is not compatible with this instance, so Axial chose a safer option."
@@ -1110,7 +1110,6 @@ mod tests {
             PerformanceMode::Managed,
             None,
             BundleHealth::Invalid,
-            None,
             RollbackState::Unavailable,
             0,
             &warnings,
@@ -1143,7 +1142,6 @@ mod tests {
             PerformanceMode::Managed,
             Some(&plan),
             BundleHealth::Healthy,
-            Some(CompositionTier::Core),
             RollbackState::Available,
             1,
             &[],
@@ -1257,7 +1255,6 @@ mod tests {
             tier,
             mods,
             jvm_preset: String::new(),
-            fallback_chain: Vec::new(),
             warnings,
             fallback_reason: fallback_reason.to_string(),
         }

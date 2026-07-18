@@ -3978,39 +3978,95 @@ fn write_invalid_family_c_managed_state(fixture: &RouteTestFixture, instance_id:
 
 fn managed_state_fixture_bytes(state: &impl serde::Serialize) -> Vec<u8> {
     serde_json::to_vec(&serde_json::json!({
-        "schema_version": 1,
+        "schema_version": 2,
         "state": state,
     }))
     .expect("serialize managed state fixture")
 }
 
 fn family_c_managed_state() -> axial_performance::CompositionState {
+    let mut installed_mods = vec![
+        family_c_installed_mod("jupr7Bf5", "foamfix.jar"),
+        family_c_installed_mod("DSVgwcji", "ai-improvements.jar"),
+        family_c_installed_mod("Wnxd13zP", "clumps.jar"),
+    ];
+    installed_mods.sort_by(|left, right| left.project_id.cmp(&right.project_id));
+    let declarative = axial_performance::CompositionPlan {
+        composition_id: FAMILY_C_MANAGED_COMPOSITION_ID.to_string(),
+        family: axial_performance::types::VersionFamily::C,
+        loader: "forge".to_string(),
+        mode: axial_performance::PerformanceMode::Managed,
+        tier: axial_performance::CompositionTier::Core,
+        mods: installed_mods
+            .iter()
+            .map(|installed| axial_performance::types::ManagedMod {
+                artifact_id: installed.project_id.clone(),
+                project_id: installed.project_id.clone(),
+                slug: installed.project_id.clone(),
+                name: installed.project_id.clone(),
+                condition: axial_performance::types::ModCondition::Always,
+                version_range: String::new(),
+                exact_game_versions: Vec::new(),
+                hardware_req: None,
+                mutual_exclusions: Vec::new(),
+            })
+            .collect(),
+        jvm_preset: String::new(),
+        warnings: Vec::new(),
+        fallback_reason: String::new(),
+    };
+    let pins = installed_mods
+        .iter()
+        .map(|installed| {
+            axial_performance::ManagedArtifactPin::new(
+                &installed.project_id,
+                &installed.version_id,
+                &installed.filename,
+                format!(
+                    "https://cdn.modrinth.com/data/{}/versions/{}/{}",
+                    installed.project_id, installed.version_id, installed.filename
+                ),
+                installed.size,
+                &installed.integrity.sha512,
+                installed.role,
+            )
+            .expect("valid family C managed artifact")
+        })
+        .collect();
+    let sealed = axial_performance::ManagedCompositionInstallPlan::seal(
+        declarative,
+        "1.12.2",
+        "forge",
+        pins,
+        Vec::new(),
+    )
+    .expect("seal family C managed state");
     axial_performance::CompositionState {
         composition_id: FAMILY_C_MANAGED_COMPOSITION_ID.to_string(),
+        family: axial_performance::types::VersionFamily::C,
         tier: axial_performance::CompositionTier::Core,
-        installed_mods: vec![
-            family_c_installed_mod("jupr7Bf5", "foamfix.jar"),
-            family_c_installed_mod("DSVgwcji", "ai-improvements.jar"),
-            family_c_installed_mod("clumps", "clumps.jar"),
-        ],
+        game_version: "1.12.2".to_string(),
+        loader: "forge".to_string(),
+        graph_sha512: sealed.graph_digest().to_string(),
+        dependency_edges: Vec::new(),
+        installed_mods,
         installed_at: "2026-01-01T00:00:00.000Z".to_string(),
-        failure_count: 0,
-        last_failure: String::new(),
     }
 }
 
 fn family_c_installed_mod(project_id: &str, filename: &str) -> axial_performance::InstalledMod {
     axial_performance::InstalledMod {
         project_id: project_id.to_string(),
-        version_id: format!("{project_id}-version"),
+        version_id: project_id.to_string(),
         filename: filename.to_string(),
+        role: axial_performance::ManagedArtifactRole::Root,
+        size: 1,
         ownership_class: axial_performance::OwnershipClass::CompositionManaged,
         source: axial_performance::ManagedArtifactSource {
             provider: axial_performance::ManagedArtifactProvider::Modrinth,
         },
         integrity: axial_performance::ManagedArtifactIntegrity {
             sha512: "a".repeat(128),
-            sha512_verified: true,
         },
     }
 }

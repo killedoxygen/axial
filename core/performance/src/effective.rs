@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 
 const MAX_PUBLIC_SUMMARY_CHARS: usize = 180;
 const MAX_PUBLIC_DETAIL_CHARS: usize = 240;
+const MAX_PUBLIC_DETAILS: usize = 16;
 const MAX_PUBLIC_TOKEN_CHARS: usize = 96;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -259,6 +260,14 @@ fn explanation(
     if let Some(reason) = fallback_reason {
         details.push(reason.to_string());
     }
+    for warning in &plan.warnings {
+        let Some(warning) = public_text(warning, MAX_PUBLIC_DETAIL_CHARS) else {
+            continue;
+        };
+        if !details.contains(&warning) {
+            details.push(warning);
+        }
+    }
     match plan.mode {
         PerformanceMode::Managed if plan.mods.is_empty() => details.push(
             "The plan remains launchable without installing managed performance mods.".to_string(),
@@ -282,6 +291,7 @@ fn explanation(
         details: details
             .into_iter()
             .filter_map(|detail| public_text(&detail, MAX_PUBLIC_DETAIL_CHARS))
+            .take(MAX_PUBLIC_DETAILS)
             .collect(),
     }
 }
@@ -472,13 +482,16 @@ mod tests {
             tier: CompositionTier::Extended,
             mods: vec![managed_mod("bad id with spaces / path", &long_text)],
             jvm_preset: "performance with spaces".to_string(),
-            warnings: vec![long_text.clone()],
+            warnings: std::iter::once(long_text.clone())
+                .chain((0..32).map(|index| format!("bounded warning {index}")))
+                .collect(),
             fallback_reason: long_text,
         };
 
         let effective = effective_performance_plan(&plan);
 
         assert!(effective.explanation.summary.len() <= 180);
+        assert!(effective.explanation.details.len() <= 16);
         assert!(
             effective
                 .explanation

@@ -33,12 +33,13 @@ async fn status_reports_bundled_rules_without_remote_refresh() {
         status.health_states,
         vec![
             BundleHealth::Healthy,
-            BundleHealth::Degraded,
-            BundleHealth::Fallback,
             BundleHealth::Disabled,
             BundleHealth::Invalid,
         ]
     );
+    let encoded = serde_json::to_string(&response).expect("serialize status response");
+    assert!(!encoded.contains("degraded"));
+    assert!(!encoded.contains("fallback"));
     assert_eq!(
         status.ownership_classes,
         vec![
@@ -773,36 +774,19 @@ fn bounded_performance_data_error_omits_raw_internal_details() {
 }
 
 #[test]
-fn bounded_install_errors_omit_raw_provider_artifact_and_os_details() {
-    let cases = [
-        performance_install_error(InstallError::Modrinth(ModrinthError::Http {
-            status: 500,
-            body: "provider failure from https://api.modrinth.com/v2/project/sodium/version"
-                .to_string(),
-        })),
-        performance_install_error(InstallError::ManagedArtifactTargetExists(
-            "sodium-fabric-mc1.20.4-0.5.8.jar".to_string(),
-        )),
-        performance_install_error(InstallError::Io(std::io::Error::new(
+fn bounded_install_io_error_omits_raw_os_details() {
+    let cases = [performance_install_error(InstallError::Io(
+        std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
             "Permission denied (os error 13)",
-        ))),
-    ];
+        ),
+    ))];
 
     for error in cases {
         let body = json_error_message(&error);
 
         assert_eq!(error.0, StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(body, PERFORMANCE_INSTALL_INTERNAL_ERROR);
-        assert_omits_raw_fragments(
-            &body,
-            &[
-                "https://api.modrinth.com",
-                "modrinth",
-                "sodium-fabric-mc1.20.4-0.5.8.jar",
-                "Permission denied",
-                "os error 13",
-            ],
-        );
+        assert_omits_raw_fragments(&body, &["Permission denied", "os error 13"]);
     }
 }

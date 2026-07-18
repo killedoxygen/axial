@@ -1,5 +1,6 @@
 use axial_performance::{
-    CompositionPlan, CompositionState, ManagedCompositionAuthority, ManagedCompositionInspection,
+    CompositionPlan, ManagedCompositionAuthority, ManagedCompositionInspection,
+    ManagedCompositionInstallPlan, ManagedInstallExecutionError, ManagedInstallExecutionOutcome,
     ManagedInstanceIdentity, ManagedMutationError, ManagedResolvedInspection,
     ManagedRollbackOutcome, ResolutionRequest,
 };
@@ -457,17 +458,35 @@ impl ManagedCompositionAdmission {
         result
     }
 
-    pub(crate) async fn ensure_installed(
+    pub(crate) async fn ensure_installed<
+        BeforeTargetEffect,
+        BeforeTargetEffectFuture,
+        BeforeTargetEffectError,
+    >(
         &self,
-        plan: &CompositionPlan,
-        game_version: &str,
-    ) -> Result<CompositionState, ManagedMutationError> {
-        let _mutation = self.managed_mutation_admission()?;
+        plan: &ManagedCompositionInstallPlan,
+        client: &reqwest::Client,
+        before_target_effect: BeforeTargetEffect,
+    ) -> Result<ManagedInstallExecutionOutcome, ManagedInstallExecutionError<BeforeTargetEffectError>>
+    where
+        BeforeTargetEffect: FnOnce() -> BeforeTargetEffectFuture,
+        BeforeTargetEffectFuture: std::future::Future<Output = Result<(), BeforeTargetEffectError>>,
+    {
+        let _mutation = self
+            .managed_mutation_admission()
+            .map_err(|error| ManagedInstallExecutionError::from_mutation(error, false))?;
         let result = self
             .authority
-            .ensure_installed(&self.entry.identity, plan, game_version)
+            .ensure_installed(&self.entry.identity, plan, client, before_target_effect)
             .await;
-        self.latch_indeterminate(&result);
+        if let Some(error) = result
+            .as_ref()
+            .err()
+            .and_then(ManagedInstallExecutionError::mutation_error)
+            && matches!(error, ManagedMutationError::Indeterminate(_))
+        {
+            self.entry.store_phase(ManagedEntryPhase::Latched);
+        }
         result
     }
 
@@ -530,8 +549,10 @@ mod tests {
         ManagedCompositionAdmissionError, ManagedCompositionOwner, ManagedEntryPhase,
         ManagedMutationError,
     };
+    use axial_performance::types::VersionFamily;
     use axial_performance::{
-        HardwareProfile, PerformanceManager, PerformanceMode, ResolutionRequest,
+        CompositionPlan, CompositionTier, HardwareProfile, ManagedCompositionInstallPlan,
+        PerformanceManager, PerformanceMode, ResolutionRequest,
     };
     use std::future::Future;
     use std::pin::Pin;
@@ -810,17 +831,38 @@ mod tests {
         let mods_dir = fixture.mods_dir(INSTANCE_A);
         std::fs::create_dir_all(&mods_dir).expect("create instance mods directory");
         let staged = mods_dir.join(".axial-lock.json.new.tmp");
+        let plan = ManagedCompositionInstallPlan::seal(
+            CompositionPlan {
+                composition_id: "core".to_string(),
+                family: VersionFamily::F,
+                loader: "fabric".to_string(),
+                mode: PerformanceMode::Managed,
+                tier: CompositionTier::Core,
+                mods: Vec::new(),
+                jvm_preset: String::new(),
+                warnings: Vec::new(),
+                fallback_reason: String::new(),
+            },
+            "1.21.1",
+            "fabric",
+            Vec::new(),
+            Vec::new(),
+        )
+        .expect("seal staged state fixture");
         std::fs::write(
             &staged,
             serde_json::to_vec_pretty(&serde_json::json!({
-                "schema_version": 1,
+                "schema_version": 2,
                 "state": {
                     "composition_id": "core",
+                    "family": "F",
                     "tier": "core",
+                    "game_version": "1.21.1",
+                    "loader": "fabric",
+                    "graph_sha512": plan.graph_digest(),
+                    "dependency_edges": [],
                     "installed_mods": [],
-                    "installed_at": "2026-07-17T00:00:00Z",
-                    "failure_count": 0,
-                    "last_failure": ""
+                    "installed_at": "2026-07-17T00:00:00Z"
                 }
             }))
             .expect("serialize staged state"),

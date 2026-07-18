@@ -5,7 +5,6 @@ use crate::state::performance_operations::{
 use crate::state::{AppStateInit, DownloadProgress, IdleSweepTerminal, InstallStore, SessionStore};
 use axial_config::{AppConfig, AppPaths, ConfigStore, InstanceStore};
 use axial_launcher::{LaunchSessionRecord, LaunchState, SessionId};
-use axial_performance::modrinth::ModrinthError;
 use axial_performance::{CompositionState, InstalledMod, PerformanceManager};
 use axum::{
     body::{Body, to_bytes},
@@ -40,7 +39,7 @@ const MANAGED_STATE_FILE_NAME: &str = ".axial-lock.json";
 
 fn managed_state_fixture_bytes(state: &impl serde::Serialize) -> Vec<u8> {
     serde_json::to_vec(&serde_json::json!({
-        "schema_version": 1,
+        "schema_version": 2,
         "state": state,
     }))
     .expect("serialize managed state fixture")
@@ -89,13 +88,12 @@ fn write_rollback_fixture(
                 "version_id": installed.version_id,
                 "ownership_class": installed.ownership_class,
                 "sha512": installed.integrity.sha512,
-                "sha512_verified": installed.integrity.sha512_verified,
             })
         })
         .collect::<Vec<_>>();
     let snapshot = serde_json::json!({
         "id": id,
-        "schema_version": 2,
+        "schema_version": 3,
         "created_at": created_at,
         "target": {
             "kind": "managed_composition",
@@ -696,28 +694,84 @@ fn signed_rules_response(manifest: &axial_performance::Manifest) -> SignedRulesR
 
 fn test_composition_state(
     composition_id: &str,
-    installed_mods: Vec<InstalledMod>,
+    mut installed_mods: Vec<InstalledMod>,
 ) -> CompositionState {
+    installed_mods.sort_by(|left, right| left.project_id.cmp(&right.project_id));
+    let declarative = axial_performance::CompositionPlan {
+        composition_id: composition_id.to_string(),
+        family: axial_performance::types::VersionFamily::F,
+        loader: "fabric".to_string(),
+        mode: PerformanceMode::Managed,
+        tier: CompositionTier::Core,
+        mods: installed_mods
+            .iter()
+            .filter(|installed| installed.role == axial_performance::ManagedArtifactRole::Root)
+            .map(|installed| axial_performance::types::ManagedMod {
+                artifact_id: installed.project_id.clone(),
+                project_id: installed.project_id.clone(),
+                slug: installed.project_id.clone(),
+                name: installed.project_id.clone(),
+                condition: axial_performance::types::ModCondition::Always,
+                version_range: String::new(),
+                exact_game_versions: Vec::new(),
+                hardware_req: None,
+                mutual_exclusions: Vec::new(),
+            })
+            .collect(),
+        jvm_preset: String::new(),
+        warnings: Vec::new(),
+        fallback_reason: String::new(),
+    };
+    let pins = installed_mods
+        .iter()
+        .map(|installed| {
+            axial_performance::ManagedArtifactPin::new(
+                &installed.project_id,
+                &installed.version_id,
+                &installed.filename,
+                format!(
+                    "https://cdn.modrinth.com/data/{}/versions/{}/{}",
+                    installed.project_id, installed.version_id, installed.filename
+                ),
+                installed.size,
+                &installed.integrity.sha512,
+                installed.role,
+            )
+            .expect("valid managed artifact fixture")
+        })
+        .collect();
+    let sealed = axial_performance::ManagedCompositionInstallPlan::seal(
+        declarative,
+        "1.20.4",
+        "fabric",
+        pins,
+        Vec::new(),
+    )
+    .expect("seal managed composition fixture");
     CompositionState {
         composition_id: composition_id.to_string(),
+        family: axial_performance::types::VersionFamily::F,
         tier: CompositionTier::Core,
+        game_version: "1.20.4".to_string(),
+        loader: "fabric".to_string(),
+        graph_sha512: sealed.graph_digest().to_string(),
+        dependency_edges: Vec::new(),
         installed_mods,
         installed_at: "2026-05-30T00:00:00Z".to_string(),
-        failure_count: 0,
-        last_failure: String::new(),
     }
 }
 
 fn test_installed_mod(project_id: &str, filename: &str) -> InstalledMod {
     InstalledMod {
         project_id: project_id.to_string(),
-        version_id: "version".to_string(),
+        version_id: "NFkjnzWE".to_string(),
         filename: filename.to_string(),
+        role: axial_performance::ManagedArtifactRole::Root,
+        size: 1,
         ownership_class: axial_performance::OwnershipClass::CompositionManaged,
         source: test_modrinth_source(),
         integrity: axial_performance::ManagedArtifactIntegrity {
-            sha512: String::new(),
-            sha512_verified: false,
+            sha512: "0".repeat(128),
         },
     }
 }

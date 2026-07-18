@@ -13,6 +13,8 @@ use sha2::{Digest, Sha512};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 struct FakeOwnedStage {
     installed: InstalledMod,
@@ -186,12 +188,29 @@ async fn provider_stage_failure_has_zero_managed_or_snapshot_effect() {
     let instance_anchor =
         axial_minecraft::managed_path::AnchoredDirectory::open(&instance).expect("anchor instance");
 
+    let callback_called = Arc::new(AtomicBool::new(false));
+    let callback_probe = callback_called.clone();
     let error = manager
-        .ensure_installed(&failed_plan, &reqwest::Client::new(), &instance_anchor)
+        .ensure_installed(
+            &failed_plan,
+            &reqwest::Client::new(),
+            &instance_anchor,
+            move || async move {
+                callback_probe.store(true, Ordering::Release);
+                Ok::<(), ()>(())
+            },
+        )
         .await
         .expect_err("provider stage must fail");
 
-    assert!(matches!(error, super::ManagedMutationError::Definite(_)));
+    assert!(matches!(
+        error,
+        super::ManagedInstallExecutionError::Mutation {
+            rollback_ready: false,
+            ..
+        }
+    ));
+    assert!(!callback_called.load(Ordering::Acquire));
     assert_graph_files(&mods, b"root", b"dependency");
     assert_eq!(
         fs::read(mods.join(".axial-lock.json")).expect("lock bytes"),
@@ -214,6 +233,7 @@ async fn provider_stage_failure_has_zero_managed_or_snapshot_effect() {
             &failed_plan,
             &reqwest::Client::new(),
             &fresh_instance_anchor,
+            || async { Ok::<(), ()>(()) },
         )
         .await
         .expect_err("fresh provider stage must fail");
@@ -221,9 +241,99 @@ async fn provider_stage_failure_has_zero_managed_or_snapshot_effect() {
     let _ = fs::remove_dir_all(fresh_instance);
 }
 
+#[tokio::test]
+async fn exact_graph_noop_skips_the_target_effect_boundary() {
+    let instance = test_root("exact-noop-boundary");
+    let mods = instance.join("mods");
+    fs::create_dir(&mods).expect("create mods");
+    let plan = graph_plan(b"root", b"dependency");
+    let state = state_from_plan(&plan, installed_from_plan(&plan));
+    write_graph_files(&mods, b"root", b"dependency");
+    crate::state::save_state(&mods, &state).expect("save exact managed state");
+    let manager = super::PerformanceManager::new().expect("manager");
+    let instance_anchor =
+        axial_minecraft::managed_path::AnchoredDirectory::open(&instance).expect("anchor instance");
+    let callback_called = Arc::new(AtomicBool::new(false));
+    let callback_probe = callback_called.clone();
+
+    let outcome = manager
+        .ensure_installed(
+            &plan,
+            &reqwest::Client::new(),
+            &instance_anchor,
+            move || async move {
+                callback_probe.store(true, Ordering::Release);
+                Ok::<(), ()>(())
+            },
+        )
+        .await
+        .expect("exact graph is a no-op");
+
+    assert!(!outcome.target_changed());
+    assert!(!outcome.rollback_ready());
+    assert!(!callback_called.load(Ordering::Acquire));
+    assert!(
+        crate::state::load_rollback_snapshot(&mods)
+            .expect("load rollback")
+            .is_none()
+    );
+    let _ = fs::remove_dir_all(instance);
+}
+
+#[tokio::test]
+async fn target_effect_boundary_follows_snapshot_and_precedes_managed_mutation() {
+    let instance = test_root("snapshot-effect-boundary");
+    let mods = instance.join("mods");
+    fs::create_dir(&mods).expect("create mods");
+    let previous_plan = graph_plan(b"root", b"dependency");
+    let previous = state_from_plan(&previous_plan, installed_from_plan(&previous_plan));
+    write_graph_files(&mods, b"root", b"dependency");
+    crate::state::save_state(&mods, &previous).expect("save previous managed state");
+    let next_plan = graph_plan_named_at(
+        "replacement-core",
+        b"root",
+        b"dependency",
+        "https://cdn.example.invalid",
+    );
+    let manager = super::PerformanceManager::new().expect("manager");
+    let instance_anchor =
+        axial_minecraft::managed_path::AnchoredDirectory::open(&instance).expect("anchor instance");
+    let callback_mods = mods.clone();
+
+    let outcome = manager
+        .ensure_installed(
+            &next_plan,
+            &reqwest::Client::new(),
+            &instance_anchor,
+            move || async move {
+                assert!(
+                    crate::state::load_rollback_snapshot(&callback_mods)
+                        .expect("load rollback at effect boundary")
+                        .is_some()
+                );
+                assert_eq!(
+                    crate::state::load_state(&callback_mods)
+                        .expect("load state at effect boundary")
+                        .expect("previous state")
+                        .composition_id,
+                    "core"
+                );
+                assert_graph_files(&callback_mods, b"root", b"dependency");
+                Ok::<(), ()>(())
+            },
+        )
+        .await
+        .expect("commit replacement composition");
+
+    assert!(outcome.target_changed());
+    assert!(outcome.rollback_ready());
+    assert_eq!(outcome.into_state().composition_id, "replacement-core");
+    let _ = fs::remove_dir_all(instance);
+}
+
 #[cfg(any(target_os = "linux", windows))]
 #[tokio::test]
-async fn managed_authority_rejects_ancestor_substitution_for_all_observations() {
+async fn managed_authority_retains_state_and_evidence_across_ancestor_substitution() {
     let container = test_root("authority-ancestor-substitution");
     let root = container.join("instances");
     let moved = container.with_extension("moved");
@@ -233,6 +343,7 @@ async fn managed_authority_rejects_ancestor_substitution_for_all_observations() 
     let plan = graph_plan(b"root", b"dependency");
     let state = state_from_plan(&plan, installed_from_plan(&plan));
     write_graph_files(&mods, b"root", b"dependency");
+    fs::write(mods.join("user-evidence.jar"), b"user-owned").expect("write user jar evidence");
     crate::state::save_state(&mods, &state).expect("save admitted state");
     let manager = std::sync::Arc::new(super::PerformanceManager::new().expect("manager"));
     let authority = manager
@@ -256,6 +367,35 @@ async fn managed_authority_rejects_ancestor_substitution_for_all_observations() 
     assert!(proofs.iter().any(|proof| {
         proof.matches_observation("root.jar", &hex::encode(Sha512::digest(b"root")))
     }));
+    let resolved = authority
+        .resolve_and_inspect(
+            &identity,
+            crate::types::ResolutionRequest {
+                game_version: "1.21.11".to_string(),
+                loader: "fabric".to_string(),
+                mode: PerformanceMode::Managed,
+                hardware: crate::types::HardwareProfile::default(),
+                installed_mods: vec!["caller-supplied-evidence".to_string()],
+            },
+            || Ok(()),
+        )
+        .await
+        .expect("resolve and inspect through retained authority");
+    assert_eq!(resolved.inspection.state, Some(state));
+    assert!(
+        resolved
+            .inspection
+            .installed_mod_evidence
+            .iter()
+            .any(|evidence| evidence == "user-evidence")
+    );
+    assert!(
+        !resolved
+            .inspection
+            .installed_mod_evidence
+            .iter()
+            .any(|evidence| evidence == "caller-supplied-evidence")
+    );
 
     drop(authority);
     let _ = fs::remove_dir_all(container);
@@ -348,8 +488,17 @@ fn graph_plan(root: &[u8], dependency: &[u8]) -> ManagedCompositionInstallPlan {
 }
 
 fn graph_plan_at(root: &[u8], dependency: &[u8], base_url: &str) -> ManagedCompositionInstallPlan {
+    graph_plan_named_at("core", root, dependency, base_url)
+}
+
+fn graph_plan_named_at(
+    composition_id: &str,
+    root: &[u8],
+    dependency: &[u8],
+    base_url: &str,
+) -> ManagedCompositionInstallPlan {
     let declarative = CompositionPlan {
-        composition_id: "core".to_string(),
+        composition_id: composition_id.to_string(),
         family: VersionFamily::F,
         loader: "fabric".to_string(),
         mode: PerformanceMode::Managed,

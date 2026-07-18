@@ -98,7 +98,6 @@
         "custom_java_override_present",
         "custom_jvm_preset_present",
         "custom_jvm_args_present",
-        "performance_health_degraded",
         "performance_health_invalid",
         "jvm_preset_adjusted",
         "launch_prepare_failed",

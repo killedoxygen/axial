@@ -2279,7 +2279,6 @@ enum CopyContextKey {
     PerformanceMissingJournal,
     PerformanceUnsafePublicBoundary,
     PerformanceGuardianBlocked,
-    PerformanceFallbackUnavailable,
     PerformanceRollbackUnavailable,
     PersistedStateLoad,
 }
@@ -2670,17 +2669,6 @@ const GUARDIAN_COPY_RULES: &[GuardianCopyRule] = &[
             None,
             GuardianActionKind::Block,
             CopyContextKey::PerformanceGuardianBlocked,
-        ),
-        phase: CopyPhase::PerformanceContext,
-        summary: PERFORMANCE_SUMMARY,
-        details: &[],
-        guidance: &[],
-    },
-    GuardianCopyRule {
-        key: key(
-            None,
-            GuardianActionKind::Block,
-            CopyContextKey::PerformanceFallbackUnavailable,
         ),
         phase: CopyPhase::PerformanceContext,
         summary: PERFORMANCE_SUMMARY,
@@ -3365,9 +3353,6 @@ impl GuardianCopyContext<'_> {
                 }
                 GuardianPerformanceSupervisionRejection::GuardianBlocked => {
                     CopyContextKey::PerformanceGuardianBlocked
-                }
-                GuardianPerformanceSupervisionRejection::FallbackUnavailable => {
-                    CopyContextKey::PerformanceFallbackUnavailable
                 }
                 GuardianPerformanceSupervisionRejection::RollbackUnavailable => {
                     CopyContextKey::PerformanceRollbackUnavailable
@@ -4790,7 +4775,6 @@ mod tests {
                 | CopyContextKey::PerformanceMissingJournal
                 | CopyContextKey::PerformanceUnsafePublicBoundary
                 | CopyContextKey::PerformanceGuardianBlocked
-                | CopyContextKey::PerformanceFallbackUnavailable
                 | CopyContextKey::PerformanceRollbackUnavailable => 3,
                 CopyContextKey::PersistedStateLoad => 4,
             };
@@ -4799,7 +4783,7 @@ mod tests {
             assert!(rule.details.len() <= MAX_COLLECTION_LINES);
             assert!(rule.guidance.len() <= MAX_COLLECTION_LINES);
         }
-        assert_eq!(counts, [3, 3, 14, 6, 1]);
+        assert_eq!(counts, [3, 3, 14, 5, 1]);
     }
 
     #[test]

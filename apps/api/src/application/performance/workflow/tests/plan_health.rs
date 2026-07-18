@@ -78,16 +78,20 @@ async fn plan_custom_mode_serializes_as_inactive() {
     .expect("custom plan should serialize");
 
     assert!(!response.active);
-    assert_eq!(response.plan.mode, PerformanceMode::Custom);
-    assert_eq!(response.plan.loader, "fabric");
-    assert!(response.plan.mods.is_empty());
+    assert_eq!(response.effective.selected_mode, PerformanceMode::Custom);
+    assert_eq!(response.effective.loader, "fabric");
+    assert!(response.effective.managed_artifacts.is_empty());
 }
 
 #[tokio::test]
 async fn plan_effective_contract_covers_managed_vanilla_and_custom_modes() {
     let fixture = TestFixture::new("plan-effective-contract-modes");
 
-    for (raw_mode, expected_active) in [("managed", true), ("vanilla", false), ("custom", false)] {
+    for (raw_mode, expected_mode, expected_active) in [
+        ("managed", PerformanceMode::Managed, true),
+        ("vanilla", PerformanceMode::Vanilla, false),
+        ("custom", PerformanceMode::Custom, false),
+    ] {
         let Json(response) = handle_plan(
             State(fixture.state.clone()),
             Query(PlanQuery {
@@ -102,9 +106,12 @@ async fn plan_effective_contract_covers_managed_vanilla_and_custom_modes() {
 
         assert_eq!(response.active, expected_active);
         assert_eq!(response.effective.active, expected_active);
-        assert_eq!(response.effective.selected_mode, response.plan.mode);
-        assert_eq!(response.effective.version_family, response.plan.family);
-        assert_eq!(response.effective.loader, response.plan.loader);
+        assert_eq!(response.effective.selected_mode, expected_mode);
+        assert_eq!(
+            response.effective.version_family,
+            axial_performance::types::VersionFamily::F
+        );
+        assert_eq!(response.effective.loader, "fabric");
         assert!(!response.effective.explanation.summary.trim().is_empty());
         assert!(
             response.effective.explanation.summary.len() <= 180,
@@ -115,7 +122,7 @@ async fn plan_effective_contract_covers_managed_vanilla_and_custom_modes() {
 }
 
 #[tokio::test]
-async fn plan_route_preserves_flat_legacy_fields_and_adds_effective_payload() {
+async fn plan_route_exposes_only_the_effective_contract() {
     let fixture = TestFixture::new("plan-effective-route-shape");
 
     let response = router()
@@ -136,20 +143,27 @@ async fn plan_route_preserves_flat_legacy_fields_and_adds_effective_payload() {
     let value: serde_json::Value = serde_json::from_slice(&body).expect("plan json");
 
     assert_eq!(value["active"], true);
-    assert_eq!(value["mode"], "managed");
-    assert!(value.get("composition_id").is_some());
     assert!(value["guardian_facts"].is_array());
     assert_eq!(value["effective"]["active"], true);
     assert_eq!(value["effective"]["selected_mode"], "managed");
-    assert_eq!(value["effective"]["version_family"], value["family"]);
-    assert_eq!(value["effective"]["loader"], value["loader"]);
     assert!(value["effective"]["composition"]["tier"].is_string());
     assert!(value["effective"]["managed_artifacts"].is_array());
-    assert!(
-        value["effective"]["explanation"]["summary"]
-            .as_str()
-            .is_some_and(|summary| !summary.trim().is_empty())
-    );
+    for removed in [
+        "composition_id",
+        "family",
+        "loader",
+        "mode",
+        "tier",
+        "mods",
+        "jvm_preset",
+        "warnings",
+        "fallback_reason",
+    ] {
+        assert!(
+            value.get(removed).is_none(),
+            "removed flat plan field {removed} must stay absent"
+        );
+    }
 }
 
 #[tokio::test]
@@ -168,11 +182,10 @@ async fn plan_effective_contract_preserves_hyphenated_family_d_composition_id() 
     .await
     .expect("family d plan should serialize");
 
-    assert_eq!(response.plan.composition_id, "family-d-vanilla-enhanced");
     assert!(response.effective.composition.selected);
     assert_eq!(
         response.effective.composition.id.as_deref(),
-        Some(response.plan.composition_id.as_str())
+        Some("family-d-vanilla-enhanced")
     );
 }
 
@@ -267,12 +280,12 @@ async fn plan_without_instance_id_stays_request_only() {
 
     assert!(
         response
-            .plan
-            .mods
+            .effective
+            .managed_artifacts
             .iter()
             .any(|managed_mod| managed_mod.slug == "nvidium")
     );
-    assert!(response.plan.warnings.is_empty());
+    assert!(!response.effective.fallback.selected);
 }
 
 #[tokio::test]
@@ -320,15 +333,16 @@ async fn plan_with_instance_id_uses_user_installed_iris_file_for_nvidium_exclusi
 
     assert!(
         response
-            .plan
-            .mods
+            .effective
+            .managed_artifacts
             .iter()
             .all(|managed_mod| managed_mod.slug != "nvidium")
     );
     assert!(
         response
-            .plan
-            .warnings
+            .effective
+            .explanation
+            .details
             .iter()
             .any(|warning| { warning == "nvidium skipped: incompatible with managed mod iris" })
     );
@@ -397,14 +411,15 @@ async fn health_response_includes_bounded_managed_artifact_summary() {
         &test_composition_state(
             "core",
             vec![InstalledMod {
-                project_id: "sodium".to_string(),
-                version_id: "version-a".to_string(),
+                project_id: "AANobbMI".to_string(),
+                version_id: "NFkjnzWE".to_string(),
                 filename: "managed.jar".to_string(),
+                role: axial_performance::ManagedArtifactRole::Root,
+                size: 7,
                 ownership_class: axial_performance::OwnershipClass::CompositionManaged,
                 source: test_modrinth_source(),
                 integrity: axial_performance::ManagedArtifactIntegrity {
                     sha512: sha512(b"managed"),
-                    sha512_verified: true,
                 },
             }],
         ),
@@ -422,17 +437,18 @@ async fn health_response_includes_bounded_managed_artifact_summary() {
     assert_eq!(fixture.state.installed_versions_walk_count(), 1);
 
     assert!(response.active);
+    assert_eq!(response.health, BundleHealth::Invalid);
     assert_eq!(response.installed_count, 1);
     assert_eq!(
         response.managed_artifacts,
         vec![PerformanceManagedArtifactSummary {
-            project_id: "sodium".to_string(),
-            version_id: "version-a".to_string(),
+            project_id: "AANobbMI".to_string(),
+            version_id: "NFkjnzWE".to_string(),
             filename: "managed.jar".to_string(),
             ownership_class: axial_performance::OwnershipClass::CompositionManaged,
             source_provider: axial_performance::ManagedArtifactProvider::Modrinth,
-            sha512_present: true,
-            sha512_verified: true,
+            role: axial_performance::ManagedArtifactRole::Root,
+            size: 7,
         }]
     );
     let value = serde_json::to_value(&response).expect("serialize response");
@@ -468,6 +484,7 @@ async fn health_response_includes_bounded_managed_artifact_summary() {
         action.action.as_deref() == Some("install")
             && !action.label.trim().is_empty()
             && action.enabled
+            && action.disabled_reason.is_none()
     }));
     assert!(response.view_model.actions.iter().any(|action| {
         action.action.as_deref() == Some("rollback")
@@ -516,14 +533,15 @@ async fn health_response_bounds_public_composition_identifiers() {
         &test_composition_state(
             raw_composition_id,
             vec![InstalledMod {
-                project_id: "sodium".to_string(),
-                version_id: "version-a".to_string(),
+                project_id: "AANobbMI".to_string(),
+                version_id: "NFkjnzWE".to_string(),
                 filename: "managed.jar".to_string(),
+                role: axial_performance::ManagedArtifactRole::Root,
+                size: 7,
                 ownership_class: axial_performance::OwnershipClass::CompositionManaged,
                 source: test_modrinth_source(),
                 integrity: axial_performance::ManagedArtifactIntegrity {
                     sha512: sha512(b"managed"),
-                    sha512_verified: true,
                 },
             }],
         ),
@@ -562,165 +580,6 @@ async fn health_response_bounds_public_composition_identifiers() {
         assert!(!proof.contains(forbidden), "{forbidden}");
         assert!(!view_model.contains(forbidden), "{forbidden}");
     }
-}
-
-#[tokio::test]
-async fn health_response_exposes_degraded_and_fallback_guardian_view_models_and_proofs() {
-    let degraded = TestFixture::new("health-degraded-contract");
-    let version_id = fabric_version_id("1.20.4");
-    let degraded_instance = degraded.add_instance("Managed", &version_id);
-    degraded.write_fabric_version(&version_id, "1.20.4");
-    let degraded_mods_dir = degraded
-        .state
-        .instances()
-        .game_dir(&degraded_instance)
-        .join("mods");
-    fs::create_dir_all(&degraded_mods_dir).expect("create degraded mods dir");
-    fs::write(degraded_mods_dir.join("managed.jar"), b"managed")
-        .expect("write degraded managed file");
-    let mut degraded_state = test_composition_state(
-        "family-f-fabric-core",
-        vec![InstalledMod {
-            project_id: "sodium".to_string(),
-            version_id: "version-a".to_string(),
-            filename: "managed.jar".to_string(),
-            ownership_class: axial_performance::OwnershipClass::CompositionManaged,
-            source: test_modrinth_source(),
-            integrity: axial_performance::ManagedArtifactIntegrity {
-                sha512: sha512(b"managed"),
-                sha512_verified: true,
-            },
-        }],
-    );
-    degraded_state.failure_count = 1;
-    degraded_state.last_failure = "managed artifact install failed".to_string();
-    write_managed_state_fixture(&degraded_mods_dir, &degraded_state);
-    write_rollback_fixture(
-        &degraded_mods_dir,
-        "rb-health-degraded",
-        "2026-07-10T00:00:00Z",
-        &degraded_state,
-        true,
-    );
-
-    let Json(degraded_response) = handle_health(
-        State(degraded.state.clone()),
-        Query(HealthQuery {
-            instance_id: Some(degraded_instance),
-        }),
-    )
-    .await
-    .expect("degraded health should serialize");
-
-    assert_eq!(degraded_response.health, BundleHealth::Degraded);
-    assert_eq!(degraded_response.proof.health, "degraded");
-    assert_eq!(degraded_response.proof.rollback, RollbackState::Available);
-    assert_eq!(
-        degraded_response.view_model.state_id,
-        "performance_summary_degraded"
-    );
-    assert_eq!(
-        degraded_response.view_model.health.as_deref(),
-        Some("degraded")
-    );
-    assert!(degraded_response.view_model.actions.iter().any(|action| {
-        action.action.as_deref() == Some("install")
-            && action.label == "Repair managed bundle"
-            && action.enabled
-    }));
-    assert!(
-        degraded_response
-            .view_model
-            .actions
-            .iter()
-            .any(|action| { action.action.as_deref() == Some("rollback") && action.enabled })
-    );
-    let degraded_fact = degraded_response
-        .guardian_facts
-        .iter()
-        .find(|fact| fact.id.as_str() == "performance_health_degraded")
-        .expect("degraded Guardian fact");
-    assert_eq!(
-        degraded_fact.ownership,
-        crate::state::contracts::OwnershipClass::CompositionManaged
-    );
-    assert_eq!(
-        degraded_fact.severity,
-        Some(crate::guardian::GuardianSeverity::Degraded)
-    );
-
-    let fallback = TestFixture::new("health-fallback-contract");
-    let version_id = fabric_version_id("1.20.4");
-    let fallback_instance = fallback.add_instance("Managed", &version_id);
-    fallback.write_fabric_version(&version_id, "1.20.4");
-    let fallback_mods_dir = fallback
-        .state
-        .instances()
-        .game_dir(&fallback_instance)
-        .join("mods");
-    fs::create_dir_all(&fallback_mods_dir).expect("create fallback mods dir");
-    let fallback_state = CompositionState {
-        composition_id: "family-f-vanilla-enhanced".to_string(),
-        tier: CompositionTier::VanillaEnhanced,
-        installed_mods: Vec::new(),
-        installed_at: "2026-05-30T00:00:00Z".to_string(),
-        failure_count: 0,
-        last_failure: String::new(),
-    };
-    write_managed_state_fixture(&fallback_mods_dir, &fallback_state);
-    write_rollback_fixture(
-        &fallback_mods_dir,
-        "rb-health-fallback",
-        "2026-07-10T00:00:00Z",
-        &fallback_state,
-        true,
-    );
-
-    let Json(fallback_response) = handle_health(
-        State(fallback.state.clone()),
-        Query(HealthQuery {
-            instance_id: Some(fallback_instance),
-        }),
-    )
-    .await
-    .expect("fallback health should serialize");
-
-    assert_eq!(fallback_response.health, BundleHealth::Fallback);
-    assert_eq!(fallback_response.proof.health, "fallback");
-    assert_eq!(fallback_response.proof.rollback, RollbackState::Available);
-    assert_eq!(
-        fallback_response.view_model.state_id,
-        "performance_summary_fallback"
-    );
-    assert_eq!(
-        fallback_response.view_model.health.as_deref(),
-        Some("fallback")
-    );
-    assert!(fallback_response.view_model.actions.iter().any(|action| {
-        action.action.as_deref() == Some("install")
-            && action.label == "Repair managed bundle"
-            && action.enabled
-    }));
-    assert!(
-        fallback_response
-            .view_model
-            .actions
-            .iter()
-            .any(|action| { action.action.as_deref() == Some("rollback") && action.enabled })
-    );
-    let fallback_fact = fallback_response
-        .guardian_facts
-        .iter()
-        .find(|fact| fact.id.as_str() == "performance_health_fallback")
-        .expect("fallback Guardian fact");
-    assert_eq!(
-        fallback_fact.ownership,
-        crate::state::contracts::OwnershipClass::CompositionManaged
-    );
-    assert_eq!(
-        fallback_fact.severity,
-        Some(crate::guardian::GuardianSeverity::Warning)
-    );
 }
 
 #[tokio::test]
@@ -793,23 +652,26 @@ async fn health_invalidates_user_managed_artifact_in_tracked_state() {
         .game_dir(&instance_id)
         .join("mods");
     fs::create_dir_all(&mods_dir).expect("create mods dir");
+    let mut invalid_state = serde_json::to_value(test_composition_state(
+        "core",
+        vec![InstalledMod {
+            project_id: "AANobbMI".to_string(),
+            version_id: "NFkjnzWE".to_string(),
+            filename: "user.jar".to_string(),
+            role: axial_performance::ManagedArtifactRole::Root,
+            size: 4,
+            ownership_class: axial_performance::OwnershipClass::CompositionManaged,
+            source: test_modrinth_source(),
+            integrity: axial_performance::ManagedArtifactIntegrity {
+                sha512: sha512(b"user"),
+            },
+        }],
+    ))
+    .expect("serialize invalid ownership state");
+    invalid_state["installed_mods"][0]["ownership_class"] = serde_json::json!("user_managed");
     fs::write(
         mods_dir.join(".axial-lock.json"),
-        managed_state_fixture_bytes(&serde_json::json!({
-            "composition_id": "core",
-            "tier": "core",
-            "installed_mods": [{
-                "project_id": "sodium",
-                "version_id": "version",
-                "filename": "user.jar",
-                "ownership_class": "user_managed",
-                "source": { "provider": "modrinth" },
-                "integrity": { "sha512": "", "sha512_verified": false }
-            }],
-            "installed_at": "2026-05-30T00:00:00Z",
-            "failure_count": 0,
-            "last_failure": ""
-        })),
+        managed_state_fixture_bytes(&invalid_state),
     )
     .expect("write state");
 

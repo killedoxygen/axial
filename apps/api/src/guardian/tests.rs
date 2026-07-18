@@ -571,10 +571,7 @@ fn nine_multi_fact_rule_families_emit_once_with_declared_support_order() {
         ),
         (
             DiagnosisId::PerformanceFallbackSelected,
-            &[
-                GuardianFactId::PerformanceFallbackSelected,
-                GuardianFactId::PerformanceHealthFallback,
-            ],
+            &[GuardianFactId::PerformanceFallbackSelected],
         ),
         (
             DiagnosisId::ProcessLifecycleObserved,
@@ -623,48 +620,6 @@ fn nine_multi_fact_rule_families_emit_once_with_declared_support_order() {
             1
         );
         assert_eq!(diagnosis.fact_ids(), *expected_fact_ids);
-    }
-}
-
-#[test]
-fn fused_rules_fold_ownership_and_fact_values_independent_of_input_order() {
-    let mut defaulted = guardian_test_fact(
-        GuardianFactId::PerformanceFallbackSelected,
-        GuardianDomain::Performance,
-        OperationPhase::Planning,
-        FactReliability::DirectStructured,
-        OwnershipClass::ExternalProviderDerived,
-    );
-    defaulted.severity = None;
-    defaulted.confidence = None;
-    let mut lower = guardian_test_fact(
-        GuardianFactId::PerformanceHealthFallback,
-        GuardianDomain::Performance,
-        OperationPhase::Planning,
-        FactReliability::DirectStructured,
-        OwnershipClass::UserOwned,
-    );
-    lower.severity = Some(GuardianSeverity::Info);
-    lower.confidence = Some(GuardianConfidence::Low);
-
-    for facts in [
-        vec![defaulted.clone(), lower.clone()],
-        vec![lower.clone(), defaulted.clone()],
-    ] {
-        let diagnosis = diagnose(&facts, OperationPhase::Planning)
-            .into_iter()
-            .find(|diagnosis| diagnosis.id() == DiagnosisId::PerformanceFallbackSelected)
-            .expect("performance fallback diagnosis");
-        assert_eq!(diagnosis.severity(), GuardianSeverity::Warning);
-        assert_eq!(diagnosis.confidence(), GuardianConfidence::High);
-        assert_eq!(diagnosis.ownership(), OwnershipClass::UserOwned);
-        assert_eq!(
-            diagnosis.fact_ids(),
-            vec![
-                GuardianFactId::PerformanceFallbackSelected,
-                GuardianFactId::PerformanceHealthFallback,
-            ]
-        );
     }
 }
 
@@ -1866,7 +1821,6 @@ fn performance_supervision_request(
             ownership,
         ),
         facts: &[],
-        fallback_chain_len: 0,
         rollback_state: RollbackState::NotApplicable,
         context: GuardianPolicyContext::current_operation(),
     }

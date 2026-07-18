@@ -465,21 +465,6 @@
       }
     },
     {
-      "id": "performance_rejection.fallback_unavailable",
-      "input": {
-        "surface": "performance_rejection",
-        "rejection": "fallback_unavailable",
-        "phase": "Installing"
-      },
-      "outcome": {
-        "decision": "Block",
-        "phase": "Installing",
-        "summary": "performance update was blocked by Guardian safety supervision",
-        "details": [],
-        "guidance": []
-      }
-    },
-    {
       "id": "performance_rejection.rollback_unavailable",
       "input": {
         "surface": "performance_rejection",

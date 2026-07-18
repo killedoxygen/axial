@@ -97,8 +97,6 @@
   "ownership_unknown",
   "parent_version_missing",
   "performance_fallback_selected",
-  "performance_health_degraded",
-  "performance_health_fallback",
   "performance_health_invalid",
   "performance_rules_invalid",
   "performance_user_owned_conflict",

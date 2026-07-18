@@ -33,6 +33,7 @@ use tracing::warn;
 pub const OPERATION_JOURNAL_SCHEMA: &str = "axial.state.operation_journals.v4";
 pub const DEFAULT_OPERATION_JOURNAL_LIMIT: usize = RECONCILIATION_EVIDENCE_CAPACITY;
 pub(crate) const MAX_OPERATION_JOURNAL_STEP_FACTS: usize = 64;
+pub(crate) const PERFORMANCE_PLAN_GRAPH_SHA512_FACT_PREFIX: &str = "performance_plan_graph_sha512_";
 const GUARDIAN_OUTCOME_MEMORY_BINDING_PREFIX: &str = "guardian_outcome_memory_binding:";
 pub(crate) const MAX_OPERATION_JOURNAL_DIAGNOSES: usize = 32;
 const OPERATION_JOURNAL_FILE: &str = "operation-journals.json";
@@ -709,6 +710,33 @@ impl OperationJournalStore {
         self.await_commit(ticket, mutation).await
     }
 
+    pub(crate) async fn record_idempotent_checkpoint(
+        &self,
+        operation_id: &OperationId,
+        checkpoint: OperationJournalStep,
+    ) -> Result<(), OperationJournalStoreError> {
+        let mutation = self.mutation_gate.clone().lock_owned().await;
+        let ticket = self.update(operation_id, WriteUrgency::Immediate, |entry| {
+            if operation_journal_status_is_terminal(entry.status) {
+                return Err(OperationJournalStoreError::AlreadyTerminal);
+            }
+            if entry.completed_steps.iter().any(|step| step == &checkpoint) {
+                return Ok(());
+            }
+            if entry
+                .completed_steps
+                .iter()
+                .any(|step| step.step_id == checkpoint.step_id)
+            {
+                return Err(OperationJournalStoreError::AlreadyExists);
+            }
+            entry.status = OperationStatus::Running;
+            entry.completed_steps.push(checkpoint);
+            Ok(())
+        })?;
+        self.await_commit(ticket, mutation).await
+    }
+
     pub async fn record_guardian_evidence(
         &self,
         operation_id: &OperationId,
@@ -718,6 +746,23 @@ impl OperationJournalStore {
         let mutation = self.mutation_gate.clone().lock_owned().await;
         let ticket = self.update(operation_id, WriteUrgency::Immediate, |entry| {
             apply_guardian_evidence(entry, fact_ids, diagnosis_ids);
+            Ok(())
+        })?;
+        self.await_commit(ticket, mutation).await
+    }
+
+    pub(crate) async fn record_idempotent_guardian_evidence(
+        &self,
+        operation_id: &OperationId,
+        fact_ids: Vec<String>,
+        diagnosis_ids: Vec<DiagnosisId>,
+    ) -> Result<(), OperationJournalStoreError> {
+        let mutation = self.mutation_gate.clone().lock_owned().await;
+        let ticket = self.update(operation_id, WriteUrgency::Immediate, |entry| {
+            if operation_journal_status_is_terminal(entry.status) {
+                return Err(OperationJournalStoreError::AlreadyTerminal);
+            }
+            apply_idempotent_guardian_evidence(entry, fact_ids, diagnosis_ids);
             Ok(())
         })?;
         self.await_commit(ticket, mutation).await
@@ -1014,6 +1059,37 @@ fn apply_guardian_evidence(
         for fact_id in fact_ids {
             if !step.generated_facts.contains(&fact_id) {
                 step.generated_facts.push(fact_id);
+            }
+        }
+    }
+    for diagnosis_id in diagnosis_ids {
+        if !entry.guardian_diagnosis_ids.contains(&diagnosis_id) {
+            entry.guardian_diagnosis_ids.push(diagnosis_id);
+        }
+    }
+}
+
+fn apply_idempotent_guardian_evidence(
+    entry: &mut OperationJournalEntry,
+    fact_ids: Vec<String>,
+    diagnosis_ids: Vec<DiagnosisId>,
+) {
+    if !fact_ids.is_empty() {
+        let evidence_index = entry
+            .completed_steps
+            .iter()
+            .position(|step| step.step_id == "guardian_evidence")
+            .unwrap_or_else(|| {
+                let mut step =
+                    OperationJournalStep::new("guardian_evidence", OperationPhase::Running);
+                step.result = OperationStepResult::Completed;
+                entry.completed_steps.push(step);
+                entry.completed_steps.len() - 1
+            });
+        let evidence = &mut entry.completed_steps[evidence_index];
+        for fact_id in fact_ids {
+            if !evidence.generated_facts.contains(&fact_id) {
+                evidence.generated_facts.push(fact_id);
             }
         }
     }
@@ -1387,10 +1463,24 @@ fn validate_step(step: &OperationJournalStep) -> Result<(), OperationJournalVali
 }
 
 fn safe_generated_fact(value: &str) -> bool {
+    if value.contains(PERFORMANCE_PLAN_GRAPH_SHA512_FACT_PREFIX) {
+        return safe_performance_plan_graph_sha512_fact(value);
+    }
     if value.contains(GUARDIAN_OUTCOME_MEMORY_BINDING_PREFIX) {
         return safe_guardian_outcome_memory_binding(value);
     }
     safe_public_fragment(value, 320)
+}
+
+fn safe_performance_plan_graph_sha512_fact(value: &str) -> bool {
+    value
+        .strip_prefix(PERFORMANCE_PLAN_GRAPH_SHA512_FACT_PREFIX)
+        .is_some_and(|digest| {
+            digest.len() == 128
+                && digest
+                    .bytes()
+                    .all(|value| value.is_ascii_digit() || (b'a'..=b'f').contains(&value))
+        })
 }
 
 fn safe_guardian_outcome_memory_binding(value: &str) -> bool {
@@ -1637,6 +1727,32 @@ mod tests {
         )));
         assert!(!safe_generated_fact(&format!("x{fact}")));
         assert!(!safe_generated_fact(&format!("{fact}:suffix")));
+    }
+
+    #[test]
+    fn performance_plan_graph_generated_fact_has_exact_safe_shape() {
+        let digest = "0123456789abcdef".repeat(8);
+        let fact = format!("performance_plan_graph_sha512_{digest}");
+        assert!(safe_generated_fact(&fact));
+
+        assert!(!safe_generated_fact(&format!(
+            "performance_plan_graph_sha512_{}",
+            digest.to_ascii_uppercase()
+        )));
+        assert!(!safe_generated_fact(&format!(
+            "performance_plan_graph_sha512_{}",
+            &digest[..127]
+        )));
+        assert!(!safe_generated_fact(&format!(
+            "performance_plan_graph_sha512_{digest}0"
+        )));
+        assert!(!safe_generated_fact(&format!(
+            "performance_plan_graph_sha512_{}g",
+            &digest[..127]
+        )));
+        assert!(!safe_generated_fact(&format!("x{fact}")));
+        assert!(!safe_generated_fact(&format!("{fact}:suffix")));
+        assert!(!safe_generated_fact(&format!("opaque_identity_{digest}")));
     }
 
     struct RecordingFileBackend {

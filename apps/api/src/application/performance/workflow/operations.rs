@@ -1,5 +1,9 @@
 use super::PerformanceInstallResponse;
-use super::mutation::{execute_performance_operation, performance_operation_journal_identity};
+use super::managed_plan::ManagedPlanResolutionError;
+use super::mutation::{
+    execute_performance_operation_with_resolver_and_progress,
+    performance_operation_journal_identity, resolve_performance_install_plan,
+};
 use super::plan_health::{performance_artifacts_target, performance_composition_target};
 use crate::guardian::{DiagnosisId, GuardianPerformanceSupervisionPlan};
 use crate::observability::{
@@ -19,9 +23,10 @@ use crate::state::performance_operations::{
 };
 use crate::state::{
     AppState, DownloadProgress, InstalledVersionsSnapshot, IntegrityForegroundLease,
-    IntegrityForegroundRegistration, OperationJournalStoreError, ProducerLease,
-    RequestProducerHandoff,
+    IntegrityForegroundRegistration, OperationJournalStoreError,
+    PERFORMANCE_PLAN_GRAPH_SHA512_FACT_PREFIX, ProducerLease, RequestProducerHandoff,
 };
+use axial_performance::ManagedCompositionInstallPlan;
 use axum::{Json, http::StatusCode};
 use serde::Serialize;
 use std::{
@@ -34,9 +39,15 @@ const INVALID_PERSISTED_OPERATION_ERROR: &str = "invalid persisted performance o
 pub(super) const PERFORMANCE_JOURNAL_ERROR: &str =
     "Could not save performance operation safety state. Check app data permissions and try again.";
 const PERFORMANCE_EFFECT_GATE_FACT: &str = "performance_effect_gate_v1";
+const PERFORMANCE_PLAN_RESOLVED_FACT: &str = "performance_plan_resolved_v1";
+const PERFORMANCE_PLAN_ARTIFACT_COUNT_PREFIX: &str = "performance_plan_artifact_count_";
+const PERFORMANCE_PLAN_AGGREGATE_BYTES_PREFIX: &str = "performance_plan_aggregate_bytes_";
 const PERFORMANCE_EFFECT_STARTED_FACT: &str = "performance_effect_started_v1";
 const PERFORMANCE_TERMINAL_SUCCESS_FACT: &str = "performance_terminal_success_v1";
 const PERFORMANCE_TERMINAL_FAILURE_FACT: &str = "performance_terminal_failure_v1";
+const PERFORMANCE_TERMINAL_TARGET_CHANGED_FACT: &str = "performance_terminal_target_changed_v1";
+const PERFORMANCE_TERMINAL_TARGET_UNCHANGED_FACT: &str = "performance_terminal_target_unchanged_v1";
+const PERFORMANCE_TERMINAL_RESULT_TARGET_PREFIX: &str = "performance_terminal_result_target_";
 const PERFORMANCE_INVALID_JOURNAL_FAILURE_POINT: &str = "performance_journal_invalid";
 const PERFORMANCE_RECONCILIATION_FAILURE: &str =
     "performance operation outcome could not be confirmed after restart";
@@ -118,6 +129,14 @@ pub(super) enum PerformanceJournalTransition {
         fact_ids: Vec<String>,
         diagnosis_ids: Vec<DiagnosisId>,
     },
+    PlanResolved {
+        action: PerformanceInstallAction,
+        target_id: String,
+        rollback: RollbackState,
+        graph_digest: String,
+        artifact_count: usize,
+        aggregate_bytes: u64,
+    },
     EffectStarted {
         action: PerformanceInstallAction,
         target_id: String,
@@ -129,6 +148,7 @@ pub(super) enum PerformanceJournalTransition {
         result_target_id: String,
         rollback: RollbackState,
         succeeded: bool,
+        changed_target: bool,
     },
     Terminal {
         action: PerformanceInstallAction,
@@ -136,6 +156,7 @@ pub(super) enum PerformanceJournalTransition {
         result_target_id: String,
         rollback: RollbackState,
         succeeded: bool,
+        changed_target: bool,
     },
 }
 
@@ -183,12 +204,29 @@ impl PerformanceJournalTransition {
         }
     }
 
+    pub(super) fn plan_resolved(
+        action: PerformanceInstallAction,
+        target_id: &str,
+        rollback: RollbackState,
+        plan: &ManagedCompositionInstallPlan,
+    ) -> Self {
+        Self::PlanResolved {
+            action,
+            target_id: target_id.to_string(),
+            rollback,
+            graph_digest: plan.graph_digest().to_string(),
+            artifact_count: plan.pins().len(),
+            aggregate_bytes: plan.aggregate_bytes(),
+        }
+    }
+
     pub(super) fn terminal_intent(
         action: PerformanceInstallAction,
         base_target_id: &str,
         result_target_id: &str,
         rollback: RollbackState,
         succeeded: bool,
+        changed_target: bool,
     ) -> Self {
         Self::TerminalIntent {
             action,
@@ -196,6 +234,7 @@ impl PerformanceJournalTransition {
             result_target_id: result_target_id.to_string(),
             rollback,
             succeeded,
+            changed_target,
         }
     }
 
@@ -205,6 +244,7 @@ impl PerformanceJournalTransition {
         result_target_id: &str,
         rollback: RollbackState,
         succeeded: bool,
+        changed_target: bool,
     ) -> Self {
         Self::Terminal {
             action,
@@ -212,10 +252,11 @@ impl PerformanceJournalTransition {
             result_target_id: result_target_id.to_string(),
             rollback,
             succeeded,
+            changed_target,
         }
     }
 
-    fn matches(&self, journal: &OperationJournalEntry) -> bool {
+    pub(super) fn matches(&self, journal: &OperationJournalEntry) -> bool {
         match self {
             Self::Created {
                 action,
@@ -244,35 +285,44 @@ impl PerformanceJournalTransition {
                             .any(|candidate| candidate == diagnosis_id)
                     })
             }
+            Self::PlanResolved {
+                action,
+                target_id,
+                rollback,
+                graph_digest,
+                artifact_count,
+                aggregate_bytes,
+            } => {
+                let expected = performance_plan_resolved_step(
+                    *action,
+                    target_id,
+                    *rollback,
+                    graph_digest,
+                    *artifact_count,
+                    *aggregate_bytes,
+                );
+                performance_journal_matches(journal, *action, target_id, *rollback)
+                    && journal.completed_steps.iter().any(|step| step == &expected)
+            }
             Self::EffectStarted {
                 action,
                 target_id,
                 rollback,
-            } => {
-                performance_journal_matches(journal, *action, target_id, *rollback)
-                    && journal.completed_steps.iter().any(|step| {
-                        step.step_id == "performance_effect_started"
-                            && step.result == OperationStepResult::Completed
-                            && step.rollback == *rollback
-                            && step.changed_target.is_none()
-                            && step
-                                .generated_facts
-                                .iter()
-                                .any(|fact| fact == PERFORMANCE_EFFECT_STARTED_FACT)
-                    })
-            }
+            } => performance_effect_started_matches(journal, *action, target_id, *rollback),
             Self::TerminalIntent {
                 action,
                 base_target_id,
                 result_target_id,
                 rollback,
                 succeeded,
+                changed_target,
             } => performance_terminal_intent(journal).is_some_and(|intent| {
                 intent.action == *action
                     && intent.base_target_id == *base_target_id
                     && intent.result_target_id == *result_target_id
                     && intent.rollback == *rollback
                     && intent.succeeded == *succeeded
+                    && intent.changed_target == *changed_target
             }),
             Self::Terminal {
                 action,
@@ -280,12 +330,14 @@ impl PerformanceJournalTransition {
                 result_target_id,
                 rollback,
                 succeeded,
+                changed_target,
             } => performance_terminal_transition(journal).is_some_and(|intent| {
                 intent.action == *action
                     && intent.base_target_id == *base_target_id
                     && intent.result_target_id == *result_target_id
                     && intent.rollback == *rollback
                     && intent.succeeded == *succeeded
+                    && intent.changed_target == *changed_target
             }),
         }
     }
@@ -1030,6 +1082,7 @@ async fn terminalize_orphaned_performance_journal(
                 &base_target_id,
                 journal.rollback,
                 false,
+                false,
             );
             loop {
                 match record_performance_terminal_intent(
@@ -1038,6 +1091,7 @@ async fn terminalize_orphaned_performance_journal(
                     action,
                     &base_target_id,
                     journal.rollback,
+                    false,
                     false,
                 )
                 .await
@@ -1074,12 +1128,15 @@ async fn terminalize_orphaned_performance_journal(
     };
     let succeeded = intent.succeeded;
     let result_target_id = intent.result_target_id;
+    let terminal_rollback = intent.rollback;
+    let changed_target = intent.changed_target;
     let expected = PerformanceJournalTransition::terminal(
         action,
         &base_target_id,
         &result_target_id,
-        journal.rollback,
+        terminal_rollback,
         succeeded,
+        changed_target,
     );
     loop {
         let result = if succeeded {
@@ -1088,7 +1145,8 @@ async fn terminalize_orphaned_performance_journal(
                 &journal.operation_id,
                 action,
                 &result_target_id,
-                journal.rollback,
+                terminal_rollback,
+                changed_target,
             )
             .await
         } else {
@@ -1097,7 +1155,8 @@ async fn terminalize_orphaned_performance_journal(
                 &journal.operation_id,
                 action,
                 &result_target_id,
-                journal.rollback,
+                terminal_rollback,
+                changed_target,
             )
             .await
         };
@@ -1207,7 +1266,57 @@ pub(super) async fn run_queued_performance_operation(
     run_owned_performance_operation(state, operation, store, install_id, None, &foreground).await;
 }
 
+#[cfg(test)]
+pub(super) async fn run_queued_performance_operation_with_resolver<Resolver, ResolutionFuture>(
+    state: AppState,
+    operation: PerformanceOperation,
+    store: std::sync::Arc<crate::state::InstallStore>,
+    install_id: String,
+    foreground: IntegrityForegroundLease,
+    resolver: Resolver,
+) where
+    Resolver: Fn(AppState, axial_performance::CompositionPlan, String, String) -> ResolutionFuture
+        + Clone,
+    ResolutionFuture:
+        Future<Output = Result<ManagedCompositionInstallPlan, ManagedPlanResolutionError>>,
+{
+    run_owned_performance_operation_with_resolver(
+        state,
+        operation,
+        store,
+        install_id,
+        None,
+        &foreground,
+        resolver,
+    )
+    .await;
+}
+
 async fn run_owned_performance_operation(
+    state: AppState,
+    operation: PerformanceOperation,
+    store: std::sync::Arc<crate::state::InstallStore>,
+    install_id: String,
+    completion: Option<
+        tokio::sync::oneshot::Sender<
+            Result<PerformanceInstallResponse, PerformanceApplicationError>,
+        >,
+    >,
+    foreground: &IntegrityForegroundLease,
+) {
+    run_owned_performance_operation_with_resolver(
+        state,
+        operation,
+        store,
+        install_id,
+        completion,
+        foreground,
+        resolve_performance_install_plan,
+    )
+    .await;
+}
+
+async fn run_owned_performance_operation_with_resolver<Resolver, ResolutionFuture>(
     state: AppState,
     operation: PerformanceOperation,
     store: std::sync::Arc<crate::state::InstallStore>,
@@ -1218,7 +1327,13 @@ async fn run_owned_performance_operation(
         >,
     >,
     foreground: &IntegrityForegroundLease,
-) {
+    resolver: Resolver,
+) where
+    Resolver: Fn(AppState, axial_performance::CompositionPlan, String, String) -> ResolutionFuture
+        + Clone,
+    ResolutionFuture:
+        Future<Output = Result<ManagedCompositionInstallPlan, ManagedPlanResolutionError>>,
+{
     record_performance_progress_status(&state, &install_id, "queued").await;
     emit_performance_progress(
         &store,
@@ -1243,27 +1358,34 @@ async fn run_owned_performance_operation(
         false,
     )
     .await;
-    record_performance_progress_status(
-        &state,
-        &install_id,
-        operation_progress_phase(operation.action),
-    )
-    .await;
-    emit_performance_progress(
-        &store,
-        &install_id,
-        operation_progress_phase(operation.action),
-        2,
-        4,
-        Some(operation_progress_label(operation.action)),
-        None,
-        false,
-    )
-    .await;
-
     loop {
         let mut reapply_requested_mutation = false;
-        match execute_performance_operation(&state, &operation, foreground).await {
+        let progress_state = state.clone();
+        let progress_store = store.clone();
+        let progress_id = install_id.clone();
+        match execute_performance_operation_with_resolver_and_progress(
+            &state,
+            &operation,
+            foreground,
+            resolver.clone(),
+            move |action| async move {
+                let phase = operation_progress_phase(action);
+                record_performance_progress_status(&progress_state, &progress_id, phase).await;
+                emit_performance_progress(
+                    &progress_store,
+                    &progress_id,
+                    phase,
+                    2,
+                    4,
+                    Some(operation_progress_label(action)),
+                    None,
+                    false,
+                )
+                .await;
+            },
+        )
+        .await
+        {
             Ok(response) => {
                 let operation_id = OperationId::new(install_id.clone());
                 let Some(journal) = state.journals().get(&operation_id) else {
@@ -1588,6 +1710,17 @@ async fn prepare_resumed_performance_operation(
     }
 }
 
+#[cfg(test)]
+pub(super) async fn performance_restart_is_pre_effect_replayable(
+    state: &AppState,
+    status: &PerformanceOperationStatus,
+    store: &crate::state::InstallStore,
+) -> bool {
+    prepare_resumed_performance_operation(state, status, store)
+        .await
+        .is_some()
+}
+
 fn performance_status_requires_reconciliation(status: &str) -> bool {
     matches!(
         status,
@@ -1693,6 +1826,7 @@ async fn finish_performance_terminal_intent(
     let action = intent.action;
     let base_target_id = intent.base_target_id;
     let result_target_id = intent.result_target_id;
+    let changed_target = intent.changed_target;
     loop {
         let result = if succeeded {
             record_performance_operation_success(
@@ -1701,6 +1835,7 @@ async fn finish_performance_terminal_intent(
                 action,
                 &result_target_id,
                 intent.rollback,
+                changed_target,
             )
             .await
         } else {
@@ -1710,6 +1845,7 @@ async fn finish_performance_terminal_intent(
                 action,
                 &result_target_id,
                 intent.rollback,
+                changed_target,
             )
             .await
         };
@@ -1719,6 +1855,7 @@ async fn finish_performance_terminal_intent(
             &result_target_id,
             intent.rollback,
             succeeded,
+            changed_target,
         );
         match result {
             Ok(()) => break,
@@ -1865,17 +2002,27 @@ async fn terminalize_uncertain_performance_operation(
     };
     let journal_action = identity.action;
     let base_target_id = identity.target_id;
-    let result_target_id = performance_terminal_intent(&journal)
-        .map(|intent| intent.result_target_id)
+    let terminal_intent = performance_terminal_intent(&journal);
+    let result_target_id = terminal_intent
+        .as_ref()
+        .map(|intent| intent.result_target_id.clone())
         .unwrap_or_else(|| base_target_id.clone());
-    if performance_terminal_intent(&journal).is_none() {
+    let terminal_rollback = terminal_intent
+        .as_ref()
+        .map(|intent| intent.rollback)
+        .unwrap_or(journal.rollback);
+    let terminal_changed_target = terminal_intent
+        .as_ref()
+        .is_some_and(|intent| intent.changed_target);
+    if terminal_intent.is_none() {
         loop {
             match record_performance_terminal_intent(
                 state,
                 &operation_id,
                 journal_action,
                 &result_target_id,
-                journal.rollback,
+                terminal_rollback,
+                false,
                 false,
             )
             .await
@@ -1889,7 +2036,8 @@ async fn terminalize_uncertain_performance_operation(
                         journal_action,
                         &base_target_id,
                         &result_target_id,
-                        journal.rollback,
+                        terminal_rollback,
+                        false,
                         false,
                     ),
                 )
@@ -1919,15 +2067,17 @@ async fn terminalize_uncertain_performance_operation(
                 journal_action,
                 &base_target_id,
                 &result_target_id,
-                journal.rollback,
+                terminal_rollback,
                 false,
+                terminal_changed_target,
             );
             match record_performance_operation_failure(
                 state,
                 &operation_id,
                 journal_action,
                 &result_target_id,
-                journal.rollback,
+                terminal_rollback,
+                terminal_changed_target,
             )
             .await
             {
@@ -2292,6 +2442,7 @@ struct ParsedPerformanceTerminalIntent {
     result_target_id: String,
     rollback: RollbackState,
     succeeded: bool,
+    changed_target: bool,
 }
 
 fn performance_terminal_intent(
@@ -2324,14 +2475,39 @@ fn performance_terminal_intent(
         return None;
     }
     let succeeded = success_markers == 1;
-    let result_target_id = step.changed_target.as_ref()?.id.clone();
+    let changed_markers = step
+        .generated_facts
+        .iter()
+        .filter(|fact| fact.as_str() == PERFORMANCE_TERMINAL_TARGET_CHANGED_FACT)
+        .count();
+    let unchanged_markers = step
+        .generated_facts
+        .iter()
+        .filter(|fact| fact.as_str() == PERFORMANCE_TERMINAL_TARGET_UNCHANGED_FACT)
+        .count();
+    if changed_markers + unchanged_markers != 1 {
+        return None;
+    }
+    let changed_target = changed_markers == 1;
+    let mut result_targets = step.generated_facts.iter().filter_map(|fact| {
+        fact.strip_prefix(PERFORMANCE_TERMINAL_RESULT_TARGET_PREFIX)
+            .filter(|target_id| !target_id.is_empty())
+    });
+    let result_target_id = result_targets.next()?.to_string();
+    if result_targets.next().is_some() {
+        return None;
+    }
     let mut expected = performance_operation_journal_step(
         identity.action,
         OperationStepResult::Completed,
         &result_target_id,
-        identity.rollback,
+        step.rollback,
     );
     expected.step_id = "performance_terminal_intent".to_string();
+    expected.changed_target = None;
+    expected.generated_facts.push(format!(
+        "{PERFORMANCE_TERMINAL_RESULT_TARGET_PREFIX}{result_target_id}"
+    ));
     expected.generated_facts.push(
         if succeeded {
             PERFORMANCE_TERMINAL_SUCCESS_FACT
@@ -2340,7 +2516,35 @@ fn performance_terminal_intent(
         }
         .to_string(),
     );
+    expected.generated_facts.push(
+        if changed_target {
+            PERFORMANCE_TERMINAL_TARGET_CHANGED_FACT
+        } else {
+            PERFORMANCE_TERMINAL_TARGET_UNCHANGED_FACT
+        }
+        .to_string(),
+    );
     if step != &expected {
+        return None;
+    }
+    let rollback_became_available = matches!(identity.action, PerformanceInstallAction::Install)
+        && identity.rollback == RollbackState::Unavailable
+        && step.rollback == RollbackState::Available
+        && performance_effect_started_matches(
+            journal,
+            identity.action,
+            &identity.target_id,
+            RollbackState::Available,
+        );
+    let pre_effect_failure_lost_planned_rollback =
+        matches!(identity.action, PerformanceInstallAction::Install)
+            && !succeeded
+            && identity.rollback == RollbackState::Available
+            && step.rollback == RollbackState::Unavailable;
+    if step.rollback != identity.rollback
+        && !rollback_became_available
+        && !pre_effect_failure_lost_planned_rollback
+    {
         return None;
     }
 
@@ -2348,8 +2552,9 @@ fn performance_terminal_intent(
         action: identity.action,
         base_target_id: identity.target_id,
         result_target_id,
-        rollback: identity.rollback,
+        rollback: step.rollback,
         succeeded,
+        changed_target,
     })
 }
 
@@ -2401,6 +2606,10 @@ fn performance_terminal_transition(
         &intent.result_target_id,
         terminal_rollback,
     );
+    let mut expected_step = expected_step;
+    expected_step.changed_target = intent
+        .changed_target
+        .then(|| performance_composition_target(&intent.result_target_id));
     (terminal_step == &expected_step).then_some(intent)
 }
 
@@ -2701,11 +2910,21 @@ fn performance_operation_proof(
         return None;
     }
     let operation_id = OperationId::new(status.id.clone());
-    state
-        .journals()
-        .get(&operation_id)
-        .filter(|journal| performance_terminal_matches_status(journal, status))
-        .map(|journal| operation_journal_proof_record(&journal))
+    state.journals().get(&operation_id).and_then(|journal| {
+        let terminal = performance_terminal_transition(&journal)?;
+        if !performance_terminal_matches_status(&journal, status) {
+            return None;
+        }
+        let mut proof = operation_journal_proof_record(&journal);
+        proof.rollback = if terminal.succeeded
+            && matches!(terminal.action, PerformanceInstallAction::Rollback)
+        {
+            RollbackState::Applied
+        } else {
+            terminal.rollback
+        };
+        Some(proof)
+    })
 }
 
 fn performance_status_is_terminal(status: &str) -> bool {
@@ -2917,6 +3136,34 @@ fn performance_journal_matches(
     })
 }
 
+fn performance_effect_started_matches(
+    journal: &OperationJournalEntry,
+    action: PerformanceInstallAction,
+    target_id: &str,
+    rollback: RollbackState,
+) -> bool {
+    let Some(identity) = performance_journal_identity(journal) else {
+        return false;
+    };
+    let rollback_matches = identity.rollback == rollback
+        || (matches!(action, PerformanceInstallAction::Install)
+            && identity.rollback == RollbackState::Unavailable
+            && rollback == RollbackState::Available);
+    identity.action == action
+        && identity.target_id == target_id
+        && rollback_matches
+        && journal.completed_steps.iter().any(|step| {
+            step.step_id == "performance_effect_started"
+                && step.result == OperationStepResult::Completed
+                && step.rollback == rollback
+                && step.changed_target.is_none()
+                && step
+                    .generated_facts
+                    .iter()
+                    .any(|fact| fact == PERFORMANCE_EFFECT_STARTED_FACT)
+        })
+}
+
 async fn begin_performance_reconciliation_journal(
     state: &AppState,
     action: PerformanceInstallAction,
@@ -2979,7 +3226,57 @@ pub(super) async fn record_performance_effect_started(
     step.changed_target = None;
     step.generated_facts
         .push(PERFORMANCE_EFFECT_STARTED_FACT.to_string());
-    state.journals().record_checkpoint(operation_id, step).await
+    state
+        .journals()
+        .record_idempotent_checkpoint(operation_id, step)
+        .await
+}
+
+pub(super) async fn record_performance_plan_resolved(
+    state: &AppState,
+    operation_id: &OperationId,
+    action: PerformanceInstallAction,
+    target_id: &str,
+    rollback: RollbackState,
+    plan: &ManagedCompositionInstallPlan,
+) -> Result<(), OperationJournalStoreError> {
+    let step = performance_plan_resolved_step(
+        action,
+        target_id,
+        rollback,
+        plan.graph_digest(),
+        plan.pins().len(),
+        plan.aggregate_bytes(),
+    );
+    state
+        .journals()
+        .record_idempotent_checkpoint(operation_id, step)
+        .await
+}
+
+fn performance_plan_resolved_step(
+    action: PerformanceInstallAction,
+    target_id: &str,
+    rollback: RollbackState,
+    graph_digest: &str,
+    artifact_count: usize,
+    aggregate_bytes: u64,
+) -> OperationJournalStep {
+    let mut step = performance_operation_journal_step(
+        action,
+        OperationStepResult::Completed,
+        target_id,
+        rollback,
+    );
+    step.step_id = "performance_plan_resolved".to_string();
+    step.changed_target = None;
+    step.generated_facts = vec![
+        PERFORMANCE_PLAN_RESOLVED_FACT.to_string(),
+        format!("{PERFORMANCE_PLAN_GRAPH_SHA512_FACT_PREFIX}{graph_digest}"),
+        format!("{PERFORMANCE_PLAN_ARTIFACT_COUNT_PREFIX}{artifact_count}"),
+        format!("{PERFORMANCE_PLAN_AGGREGATE_BYTES_PREFIX}{aggregate_bytes}"),
+    ];
+    step
 }
 
 pub(super) async fn record_performance_terminal_intent(
@@ -2989,6 +3286,7 @@ pub(super) async fn record_performance_terminal_intent(
     target_id: &str,
     rollback: RollbackState,
     succeeded: bool,
+    changed_target: bool,
 ) -> Result<(), OperationJournalStoreError> {
     let mut step = performance_operation_journal_step(
         action,
@@ -2997,11 +3295,24 @@ pub(super) async fn record_performance_terminal_intent(
         rollback,
     );
     step.step_id = "performance_terminal_intent".to_string();
+    step.changed_target = None;
+    step.generated_facts.push(format!(
+        "{PERFORMANCE_TERMINAL_RESULT_TARGET_PREFIX}{}",
+        performance_composition_target(target_id).id
+    ));
     step.generated_facts.push(
         if succeeded {
             PERFORMANCE_TERMINAL_SUCCESS_FACT
         } else {
             PERFORMANCE_TERMINAL_FAILURE_FACT
+        }
+        .to_string(),
+    );
+    step.generated_facts.push(
+        if changed_target {
+            PERFORMANCE_TERMINAL_TARGET_CHANGED_FACT
+        } else {
+            PERFORMANCE_TERMINAL_TARGET_UNCHANGED_FACT
         }
         .to_string(),
     );
@@ -3357,7 +3668,8 @@ pub(super) async fn record_performance_operation_result(
     operation_id: &OperationId,
     action: PerformanceInstallAction,
     fallback_target_id: &str,
-    rollback: RollbackState,
+    terminal_rollback: RollbackState,
+    changed_target: bool,
     result: &Result<PerformanceInstallResponse, PerformanceApplicationError>,
     failure_signal: Option<&PerformancePersistenceFailureSignal>,
 ) -> Result<(), PerformanceOperationExecutionError> {
@@ -3377,8 +3689,9 @@ pub(super) async fn record_performance_operation_result(
         operation_id,
         action,
         target_id,
-        rollback,
+        terminal_rollback,
         result.is_ok(),
+        changed_target,
     )
     .await
     .map_err(|error| {
@@ -3389,47 +3702,60 @@ pub(super) async fn record_performance_operation_result(
                 action,
                 fallback_target_id,
                 target_id,
-                rollback,
+                terminal_rollback,
                 result.is_ok(),
+                changed_target,
             ),
         )
     })?;
     record_performance_terminal_intent_status(state, operation_id, result, failure_signal).await?;
     match result {
-        Ok(_) => {
-            record_performance_operation_success(state, operation_id, action, target_id, rollback)
-                .await
-                .map_err(|error| {
-                    PerformanceOperationExecutionError::journal_transition(
-                        Some(operation_id.clone()),
-                        error,
-                        PerformanceJournalTransition::terminal(
-                            action,
-                            fallback_target_id,
-                            target_id,
-                            rollback,
-                            true,
-                        ),
-                    )
-                })
-        }
-        Err(_) => {
-            record_performance_operation_failure(state, operation_id, action, target_id, rollback)
-                .await
-                .map_err(|error| {
-                    PerformanceOperationExecutionError::journal_transition(
-                        Some(operation_id.clone()),
-                        error,
-                        PerformanceJournalTransition::terminal(
-                            action,
-                            fallback_target_id,
-                            target_id,
-                            rollback,
-                            false,
-                        ),
-                    )
-                })
-        }
+        Ok(_) => record_performance_operation_success(
+            state,
+            operation_id,
+            action,
+            target_id,
+            terminal_rollback,
+            changed_target,
+        )
+        .await
+        .map_err(|error| {
+            PerformanceOperationExecutionError::journal_transition(
+                Some(operation_id.clone()),
+                error,
+                PerformanceJournalTransition::terminal(
+                    action,
+                    fallback_target_id,
+                    target_id,
+                    terminal_rollback,
+                    true,
+                    changed_target,
+                ),
+            )
+        }),
+        Err(_) => record_performance_operation_failure(
+            state,
+            operation_id,
+            action,
+            target_id,
+            terminal_rollback,
+            changed_target,
+        )
+        .await
+        .map_err(|error| {
+            PerformanceOperationExecutionError::journal_transition(
+                Some(operation_id.clone()),
+                error,
+                PerformanceJournalTransition::terminal(
+                    action,
+                    fallback_target_id,
+                    target_id,
+                    terminal_rollback,
+                    false,
+                    changed_target,
+                ),
+            )
+        }),
     }
 }
 
@@ -3439,24 +3765,25 @@ async fn record_performance_operation_success(
     action: PerformanceInstallAction,
     target_id: &str,
     rollback: RollbackState,
+    changed_target: bool,
 ) -> Result<(), OperationJournalStoreError> {
     let rollback = if matches!(action, PerformanceInstallAction::Rollback) {
         RollbackState::Applied
     } else {
         rollback
     };
+    let mut step = performance_operation_journal_step(
+        action,
+        OperationStepResult::Completed,
+        target_id,
+        rollback,
+    );
+    if !changed_target {
+        step.changed_target = None;
+    }
     state
         .journals()
-        .record_success(
-            operation_id,
-            performance_operation_journal_step(
-                action,
-                OperationStepResult::Completed,
-                target_id,
-                rollback,
-            ),
-            OperationOutcome::Succeeded,
-        )
+        .record_success(operation_id, step, OperationOutcome::Succeeded)
         .await
 }
 
@@ -3466,17 +3793,22 @@ pub(super) async fn record_performance_operation_failure(
     action: PerformanceInstallAction,
     target_id: &str,
     rollback: RollbackState,
+    changed_target: bool,
 ) -> Result<(), OperationJournalStoreError> {
+    let mut step = performance_operation_journal_step(
+        action,
+        OperationStepResult::Failed,
+        target_id,
+        rollback,
+    );
+    if changed_target {
+        step.changed_target = Some(performance_composition_target(target_id));
+    }
     state
         .journals()
         .record_failure(
             operation_id,
-            performance_operation_journal_step(
-                action,
-                OperationStepResult::Failed,
-                target_id,
-                rollback,
-            ),
+            step,
             performance_operation_step_id(action),
             OperationOutcome::Failed,
         )
@@ -3490,7 +3822,7 @@ pub(super) async fn record_performance_guardian_supervision(
 ) -> Result<(), OperationJournalStoreError> {
     state
         .journals()
-        .record_guardian_evidence(
+        .record_idempotent_guardian_evidence(
             operation_id,
             supervision
                 .fact_ids
@@ -3520,7 +3852,7 @@ fn performance_operation_journal_step(
         step.generated_facts
             .push("performance_rollback_evidence".to_string());
     }
-    if result != OperationStepResult::Planned {
+    if result == OperationStepResult::Completed {
         step.changed_target = Some(performance_composition_target(target_id));
     }
     step

@@ -4,6 +4,7 @@ use sha2::{Digest, Sha512};
 fn test_installed_mod_for_bytes(project_id: &str, filename: &str, bytes: &[u8]) -> InstalledMod {
     let mut installed = test_installed_mod(project_id, filename);
     installed.integrity.sha512 = hex::encode(Sha512::digest(bytes));
+    installed.size = bytes.len() as u64;
     installed
 }
 
@@ -140,24 +141,14 @@ async fn install_custom_mode_removes_only_managed_artifacts() {
     fs::create_dir_all(&mods_dir).expect("create mods dir");
     fs::write(mods_dir.join("managed.jar"), b"managed").expect("write managed mod");
     fs::write(mods_dir.join("user.jar"), b"user").expect("write user mod");
-    let managed_state = axial_performance::CompositionState {
-        composition_id: "core".to_string(),
-        tier: CompositionTier::Core,
-        installed_mods: vec![axial_performance::InstalledMod {
-            project_id: "sodium".to_string(),
-            version_id: "version".to_string(),
-            filename: "managed.jar".to_string(),
-            ownership_class: axial_performance::OwnershipClass::CompositionManaged,
-            source: test_modrinth_source(),
-            integrity: axial_performance::ManagedArtifactIntegrity {
-                sha512: hex::encode(Sha512::digest(b"managed")),
-                sha512_verified: false,
-            },
-        }],
-        installed_at: "2026-05-30T00:00:00Z".to_string(),
-        failure_count: 0,
-        last_failure: String::new(),
-    };
+    let managed_state = test_composition_state(
+        "core",
+        vec![test_installed_mod_for_bytes(
+            "AANobbMI",
+            "managed.jar",
+            b"managed",
+        )],
+    );
     write_managed_state_fixture(&mods_dir, &managed_state);
 
     let Json(response) = handle_install(
@@ -252,7 +243,7 @@ async fn managed_remove_rejects_active_session_then_succeeds_after_settlement() 
     let managed_state = test_composition_state(
         "core",
         vec![test_installed_mod_for_bytes(
-            "sodium",
+            "AANobbMI",
             "managed.jar",
             b"managed",
         )],
@@ -314,23 +305,17 @@ async fn install_remove_rejects_invalid_ownership_without_deleting_files() {
         .join("mods");
     fs::create_dir_all(&mods_dir).expect("create mods dir");
     fs::write(mods_dir.join("user.jar"), b"user").expect("write user file");
+    let mut invalid_state = serde_json::to_value(test_composition_state(
+        "core",
+        vec![test_installed_mod_for_bytes(
+            "AANobbMI", "user.jar", b"user",
+        )],
+    ))
+    .expect("serialize invalid ownership fixture");
+    invalid_state["installed_mods"][0]["ownership_class"] = serde_json::json!("user_managed");
     fs::write(
         mods_dir.join(".axial-lock.json"),
-        managed_state_fixture_bytes(&serde_json::json!({
-            "composition_id": "core",
-            "tier": "core",
-            "installed_mods": [{
-                "project_id": "sodium",
-                "version_id": "version",
-                "filename": "user.jar",
-                "ownership_class": "user_managed",
-                "source": { "provider": "modrinth" },
-                "integrity": { "sha512": "", "sha512_verified": false }
-            }],
-            "installed_at": "2026-05-30T00:00:00Z",
-            "failure_count": 0,
-            "last_failure": ""
-        })),
+        managed_state_fixture_bytes(&invalid_state),
     )
     .expect("write invalid state");
 
@@ -374,23 +359,19 @@ async fn install_remove_rejects_invalid_integrity_without_deleting_files() {
         .join("mods");
     fs::create_dir_all(&mods_dir).expect("create mods dir");
     fs::write(mods_dir.join("managed.jar"), b"managed").expect("write managed file");
+    let mut invalid_state = serde_json::to_value(test_composition_state(
+        "core",
+        vec![test_installed_mod_for_bytes(
+            "AANobbMI",
+            "managed.jar",
+            b"managed",
+        )],
+    ))
+    .expect("serialize invalid integrity fixture");
+    invalid_state["installed_mods"][0]["integrity"]["sha512"] = serde_json::json!("abc123");
     fs::write(
         mods_dir.join(".axial-lock.json"),
-        managed_state_fixture_bytes(&serde_json::json!({
-            "composition_id": "core",
-            "tier": "core",
-            "installed_mods": [{
-                "project_id": "sodium",
-                "version_id": "version",
-                "filename": "managed.jar",
-                "ownership_class": "composition_managed",
-                "source": { "provider": "modrinth" },
-                "integrity": { "sha512": "abc123", "sha512_verified": true }
-            }],
-            "installed_at": "2026-05-30T00:00:00Z",
-            "failure_count": 0,
-            "last_failure": ""
-        })),
+        managed_state_fixture_bytes(&invalid_state),
     )
     .expect("write invalid state");
 
@@ -413,7 +394,7 @@ async fn install_remove_rejects_invalid_integrity_without_deleting_files() {
     assert_eq!(
         error.1.0,
         serde_json::json!({
-            "error": "invalid performance artifact integrity metadata"
+            "error": "invalid performance state metadata"
         })
     );
     assert_eq!(
@@ -465,7 +446,7 @@ async fn rollback_list_route_returns_snapshot_metadata() {
     let first_state = test_composition_state(
         "core-a",
         vec![test_installed_mod_for_bytes(
-            "sodium",
+            "AANobbMI",
             "managed-a.jar",
             b"managed-a",
         )],
@@ -480,7 +461,7 @@ async fn rollback_list_route_returns_snapshot_metadata() {
     let second_state = test_composition_state(
         "core-b",
         vec![test_installed_mod_for_bytes(
-            "lithium",
+            "gvQqBUqZ",
             "managed-b.jar",
             b"managed-b",
         )],
@@ -532,8 +513,8 @@ async fn rollback_list_route_returns_snapshot_metadata() {
 }
 
 #[tokio::test]
-async fn queued_first_install_reports_available_rollback_in_journal_status_and_proof() {
-    let fixture = TestFixture::new("first-install-available-rollback-proof");
+async fn queued_first_install_and_exact_reapply_report_factual_effect_proof() {
+    let mut fixture = TestFixture::new("first-install-available-rollback-proof");
     let version_id = "1.5.2";
     let instance_id = fixture
         .add_persisted_instance("First managed install proof", version_id)
@@ -571,7 +552,7 @@ async fn queued_first_install_reports_available_rollback_in_journal_status_and_p
             .as_ref()
             .expect("journal identity")
             .rollback,
-        RollbackState::Available
+        RollbackState::Unavailable
     );
     let journal = fixture
         .state
@@ -580,12 +561,12 @@ async fn queued_first_install_reports_available_rollback_in_journal_status_and_p
             operation_id.clone(),
         ))
         .expect("first-install journal");
-    assert_eq!(journal.rollback, RollbackState::Available);
+    assert_eq!(journal.rollback, RollbackState::Unavailable);
     assert!(
         journal
             .planned_steps
             .iter()
-            .all(|step| step.rollback == RollbackState::Available)
+            .all(|step| step.rollback == RollbackState::Unavailable)
     );
 
     let public = performance_operation_status(&fixture.state, &operation_id)
@@ -599,7 +580,7 @@ async fn queued_first_install_reports_available_rollback_in_journal_status_and_p
     let snapshots = performance_rollback_list(
         &fixture.state,
         RollbackQuery {
-            instance_id: Some(instance_id),
+            instance_id: Some(instance_id.clone()),
         },
     )
     .await
@@ -611,6 +592,94 @@ async fn queued_first_install_reports_available_rollback_in_journal_status_and_p
         axial_performance::RollbackSnapshotTarget::ManagedStateAbsent
     );
     assert!(snapshots[0].rollback_available);
+
+    let Json(reapplied) = handle_install(
+        State(fixture.state.clone()),
+        Json(InstallRequest {
+            instance_id: Some(instance_id),
+            game_version: Some(version_id.to_string()),
+            loader: Some("vanilla".to_string()),
+            mode: Some("managed".to_string()),
+            action: None,
+            rollback_id: None,
+            queued: Some(true),
+        }),
+    )
+    .await
+    .expect("queue exact managed reapply");
+    let reapply_id = reapplied.install_id.expect("exact reapply operation id");
+    let events = collect_install_events(&fixture.state, &reapply_id).await;
+    assert_eq!(
+        events.last().expect("reapply terminal progress").phase,
+        "complete"
+    );
+
+    let operation_id = crate::state::contracts::OperationId::new(reapply_id.clone());
+    let journal = fixture
+        .state
+        .journals()
+        .get(&operation_id)
+        .expect("exact reapply journal");
+    assert!(!journal.completed_steps.iter().any(|step| {
+        step.step_id == "performance_effect_started" || step.changed_target.is_some()
+    }));
+    assert!(journal.completed_steps.iter().any(|step| {
+        step.step_id == "performance_terminal_intent"
+            && step
+                .generated_facts
+                .iter()
+                .any(|fact| fact == "performance_terminal_target_unchanged_v1")
+    }));
+    let public = performance_operation_status(&fixture.state, &reapply_id)
+        .await
+        .expect("exact reapply public status");
+    assert_eq!(public.status.state, "complete");
+    assert!(
+        public
+            .proof
+            .expect("exact reapply proof")
+            .fields
+            .iter()
+            .all(|field| field.key != "latest_changed_target")
+    );
+
+    let root = fixture.preserve_root_for_restart();
+    fixture
+        .state
+        .performance_operations()
+        .close()
+        .await
+        .expect("close performance operations before exact reapply restart");
+    fixture
+        .state
+        .journals()
+        .close()
+        .await
+        .expect("close journals before exact reapply restart");
+    drop(fixture);
+
+    let restarted = build_test_state(&root, None, None);
+    let public = performance_operation_status(&restarted, &reapply_id)
+        .await
+        .expect("exact reapply status after restart");
+    assert_eq!(public.status.state, "complete");
+    assert!(
+        public
+            .proof
+            .expect("exact reapply proof after restart")
+            .fields
+            .iter()
+            .all(|field| field.key != "latest_changed_target")
+    );
+    let journal = restarted
+        .journals()
+        .get(&operation_id)
+        .expect("exact reapply journal after restart");
+    assert!(!journal.completed_steps.iter().any(|step| {
+        step.step_id == "performance_effect_started" || step.changed_target.is_some()
+    }));
+    drop(restarted);
+    let _ = fs::remove_dir_all(root);
 }
 
 #[tokio::test]
@@ -771,7 +840,7 @@ async fn rollback_list_route_bounds_public_snapshot_descriptors() {
     let state = test_composition_state(
         raw_composition_id,
         vec![test_installed_mod_for_bytes(
-            "sodium",
+            "AANobbMI",
             "managed.jar",
             b"managed",
         )],
@@ -837,7 +906,7 @@ async fn rollback_with_specific_snapshot_id_restores_older_snapshot() {
     let older_state = test_composition_state(
         "core-a",
         vec![test_installed_mod_for_bytes(
-            "sodium",
+            "AANobbMI",
             "managed-a.jar",
             b"managed-a",
         )],
@@ -854,7 +923,7 @@ async fn rollback_with_specific_snapshot_id_restores_older_snapshot() {
     let newer_state = test_composition_state(
         "core-b",
         vec![test_installed_mod_for_bytes(
-            "lithium",
+            "gvQqBUqZ",
             "managed-b.jar",
             b"managed-b",
         )],
@@ -888,13 +957,13 @@ async fn rollback_with_specific_snapshot_id_restores_older_snapshot() {
     assert_eq!(
         response.managed_artifacts,
         vec![PerformanceManagedArtifactSummary {
-            project_id: "sodium".to_string(),
-            version_id: "version".to_string(),
+            project_id: "AANobbMI".to_string(),
+            version_id: "NFkjnzWE".to_string(),
             filename: "managed-a.jar".to_string(),
             ownership_class: axial_performance::OwnershipClass::CompositionManaged,
             source_provider: axial_performance::ManagedArtifactProvider::Modrinth,
-            sha512_present: true,
-            sha512_verified: false,
+            role: axial_performance::ManagedArtifactRole::Root,
+            size: 9,
         }]
     );
     assert_eq!(
@@ -971,7 +1040,7 @@ async fn rollback_rejects_untracked_same_name_target_without_overwriting() {
     let snapshot_state = test_composition_state(
         "core-a",
         vec![test_installed_mod_for_bytes(
-            "sodium",
+            "AANobbMI",
             "managed-a.jar",
             b"snapshot-managed",
         )],

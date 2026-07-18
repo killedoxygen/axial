@@ -1,5 +1,6 @@
 use super::*;
 use crate::state::OperationJournalStoreError;
+use sha2::Digest;
 
 #[tokio::test]
 async fn install_target_staging_refreshes_once_cold_and_zero_times_warm() {
@@ -986,7 +987,7 @@ async fn pre_effect_journal_acceptance_failure_exits_without_retry_or_filesystem
             .await
             .expect("status stays resumable")
             .state,
-        "removing"
+        "planning"
     );
     let (events, _, done) = state
         .installs()
@@ -2526,6 +2527,7 @@ async fn startup_finishes_rollback_intent_with_distinct_result_target_and_proof(
         "restored-composition",
         RollbackState::Available,
         true,
+        true,
     )
     .await
     .expect("persist rollback terminal intent");
@@ -2629,6 +2631,673 @@ async fn startup_fails_effect_started_checkpoint_without_replaying_effect() {
             .filter(|step| step.step_id == "performance_effect_started")
             .count(),
         1
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn plan_resolved_checkpoint_is_exact_and_retry_matchable() {
+    let fixture = TestFixture::new("plan-resolved-checkpoint");
+    let target_id = "family-f-fabric-core";
+    let operation_id = begin_performance_operation_journal(
+        &fixture.state,
+        PerformanceInstallAction::Install,
+        target_id,
+        RollbackState::Unavailable,
+        None,
+    )
+    .await
+    .expect("begin performance journal");
+    let plan = test_empty_managed_install_plan(target_id, "1.20.4");
+
+    record_performance_plan_resolved(
+        &fixture.state,
+        &operation_id,
+        PerformanceInstallAction::Install,
+        target_id,
+        RollbackState::Unavailable,
+        &plan,
+    )
+    .await
+    .expect("record resolved plan");
+    record_performance_plan_resolved(
+        &fixture.state,
+        &operation_id,
+        PerformanceInstallAction::Install,
+        target_id,
+        RollbackState::Unavailable,
+        &plan,
+    )
+    .await
+    .expect("repeat resolved plan checkpoint idempotently");
+
+    let journal = fixture
+        .state
+        .journals()
+        .get(&operation_id)
+        .expect("resolved-plan journal");
+    let step = journal
+        .completed_steps
+        .iter()
+        .find(|step| step.step_id == "performance_plan_resolved")
+        .expect("resolved-plan checkpoint");
+    assert_eq!(
+        journal
+            .completed_steps
+            .iter()
+            .filter(|step| step.step_id == "performance_plan_resolved")
+            .count(),
+        1
+    );
+    assert_eq!(
+        step.generated_facts,
+        vec![
+            "performance_plan_resolved_v1".to_string(),
+            format!("performance_plan_graph_sha512_{}", plan.graph_digest()),
+            "performance_plan_artifact_count_0".to_string(),
+            "performance_plan_aggregate_bytes_0".to_string(),
+        ]
+    );
+    assert_eq!(
+        step.result,
+        crate::state::contracts::OperationStepResult::Completed
+    );
+    assert!(step.changed_target.is_none());
+
+    let expected = PerformanceJournalTransition::plan_resolved(
+        PerformanceInstallAction::Install,
+        target_id,
+        RollbackState::Unavailable,
+        &plan,
+    );
+    assert!(expected.matches(&journal));
+    let different = test_empty_managed_install_plan(target_id, "1.20.5");
+    assert!(
+        !PerformanceJournalTransition::plan_resolved(
+            PerformanceInstallAction::Install,
+            target_id,
+            RollbackState::Unavailable,
+            &different,
+        )
+        .matches(&journal)
+    );
+    let collision = record_performance_plan_resolved(
+        &fixture.state,
+        &operation_id,
+        PerformanceInstallAction::Install,
+        target_id,
+        RollbackState::Unavailable,
+        &different,
+    )
+    .await
+    .expect_err("different resolved graph must not replace the checkpoint");
+    assert_eq!(collision.class(), "already_exists");
+}
+
+#[tokio::test]
+async fn changed_resolved_plan_terminalizes_without_effect_or_retry_loop() {
+    let fixture = TestFixture::new("changed-plan-resolved-checkpoint");
+    let instance_id = fixture.add_instance("Managed", "1.20.4-fabric");
+    let mut operation = PerformanceOperation {
+        instance_id: instance_id.clone(),
+        game_version: Some("1.20.4".to_string()),
+        loader: Some("fabric".to_string()),
+        mode: Some("managed".to_string()),
+        action: PerformanceInstallAction::Install,
+        rollback_id: None,
+        status_operation_id: None,
+        persistence_failure: None,
+        installed_versions: None,
+    };
+    let foreground = fixture
+        .state
+        .register_integrity_foreground()
+        .expect("register changed-plan foreground")
+        .wait_for_settlement()
+        .await;
+    let identity = performance_operation_journal_identity(&fixture.state, &operation, &foreground)
+        .await
+        .expect("resolve changed-plan journal identity");
+    let target_id = identity.target_id.clone();
+    let status = fixture
+        .state
+        .performance_operations()
+        .start_with_identity(
+            instance_id,
+            "install".to_string(),
+            PerformanceOperationPayload {
+                game_version: operation.game_version.clone(),
+                loader: operation.loader.clone(),
+                mode: operation.mode.clone(),
+                rollback_id: None,
+            },
+            crate::state::performance_operations::PerformanceOperationJournalIdentity::new(
+                "install",
+                identity.target_id,
+                identity.rollback,
+            ),
+        )
+        .await
+        .expect("start changed-plan status");
+    operation.status_operation_id = Some(status.id.clone());
+    fixture.state.installs().insert(status.id.clone()).await;
+    let operation_id = begin_performance_operation_journal(
+        &fixture.state,
+        PerformanceInstallAction::Install,
+        &target_id,
+        RollbackState::Unavailable,
+        Some(&status.id),
+    )
+    .await
+    .expect("begin changed-plan journal");
+    let original = test_empty_managed_install_plan(&target_id, "1.20.4");
+    record_performance_plan_resolved(
+        &fixture.state,
+        &operation_id,
+        PerformanceInstallAction::Install,
+        &target_id,
+        RollbackState::Unavailable,
+        &original,
+    )
+    .await
+    .expect("record original resolved plan");
+
+    let changed = test_empty_managed_install_plan(&target_id, "1.20.5");
+    let resolver_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let resolver_counter = resolver_calls.clone();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        run_queued_performance_operation_with_resolver(
+            fixture.state.clone(),
+            operation,
+            fixture.state.installs().clone(),
+            status.id.clone(),
+            foreground,
+            move |_, _, _, _| {
+                let changed = changed.clone();
+                let resolver_counter = resolver_counter.clone();
+                async move {
+                    resolver_counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Ok(changed)
+                }
+            },
+        ),
+    )
+    .await
+    .expect("changed resolved plan must terminalize without looping");
+
+    assert_eq!(resolver_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    let terminal_status = fixture
+        .state
+        .performance_operations()
+        .get(&status.id)
+        .await
+        .expect("changed-plan terminal status");
+    assert_eq!(terminal_status.state, "failed");
+    let journal = fixture
+        .state
+        .journals()
+        .get(&operation_id)
+        .expect("changed-plan terminal journal");
+    assert_eq!(
+        journal.status,
+        crate::state::contracts::OperationStatus::Failed
+    );
+    assert_eq!(
+        journal
+            .completed_steps
+            .iter()
+            .filter(|step| step.step_id == "performance_plan_resolved")
+            .count(),
+        1
+    );
+    assert!(
+        PerformanceJournalTransition::plan_resolved(
+            PerformanceInstallAction::Install,
+            &target_id,
+            RollbackState::Unavailable,
+            &original,
+        )
+        .matches(&journal)
+    );
+    assert!(
+        !journal
+            .completed_steps
+            .iter()
+            .any(|step| step.step_id == "performance_effect_started")
+    );
+    assert!(
+        journal
+            .completed_steps
+            .iter()
+            .all(|step| step.changed_target.is_none())
+    );
+}
+
+#[tokio::test]
+async fn provider_resolution_failure_terminalizes_before_effect_started() {
+    let fixture = TestFixture::new("provider-resolution-pre-effect-failure");
+    let instance_id = fixture.add_instance("Managed", "1.20.4-fabric");
+    let mods_dir = fixture
+        .state
+        .instances()
+        .game_dir(&instance_id)
+        .join("mods");
+    fs::create_dir_all(&mods_dir).expect("create provider failure probe directory");
+    let sentinel = mods_dir.join("user-owned.jar");
+    fs::write(&sentinel, b"unchanged").expect("write provider failure probe");
+    let mut operation = PerformanceOperation {
+        instance_id: instance_id.clone(),
+        game_version: Some("1.20.4".to_string()),
+        loader: Some("fabric".to_string()),
+        mode: Some("managed".to_string()),
+        action: PerformanceInstallAction::Install,
+        rollback_id: None,
+        status_operation_id: None,
+        persistence_failure: None,
+        installed_versions: None,
+    };
+    let foreground = fixture
+        .state
+        .register_integrity_foreground()
+        .expect("register provider failure foreground")
+        .wait_for_settlement()
+        .await;
+    let identity = performance_operation_journal_identity(&fixture.state, &operation, &foreground)
+        .await
+        .expect("resolve queued journal identity");
+    assert_eq!(identity.rollback, RollbackState::Unavailable);
+    let status = fixture
+        .state
+        .performance_operations()
+        .start_with_identity(
+            instance_id.clone(),
+            "install".to_string(),
+            PerformanceOperationPayload {
+                game_version: operation.game_version.clone(),
+                loader: operation.loader.clone(),
+                mode: operation.mode.clone(),
+                rollback_id: None,
+            },
+            crate::state::performance_operations::PerformanceOperationJournalIdentity::new(
+                "install",
+                identity.target_id,
+                identity.rollback,
+            ),
+        )
+        .await
+        .expect("start queued provider failure status");
+    operation.status_operation_id = Some(status.id.clone());
+    fixture.state.installs().insert(status.id.clone()).await;
+    let (initial_events, mut pre_effect_events, done) = fixture
+        .state
+        .installs()
+        .subscribe(&status.id)
+        .await
+        .expect("provider failure progress session");
+    assert!(initial_events.is_empty());
+    assert!(!done);
+    let resolver_entered = Arc::new(tokio::sync::Notify::new());
+    let resolver_release = Arc::new(tokio::sync::Notify::new());
+    let entered = resolver_entered.clone();
+    let release = resolver_release.clone();
+    let worker_state = fixture.state.clone();
+    let worker_store = fixture.state.installs().clone();
+    let install_id = status.id.clone();
+    let worker = tokio::spawn(async move {
+        run_queued_performance_operation_with_resolver(
+            worker_state,
+            operation,
+            worker_store,
+            install_id,
+            foreground,
+            move |_, _, _, _| {
+                let entered = entered.clone();
+                let release = release.clone();
+                async move {
+                    entered.notify_one();
+                    release.notified().await;
+                    Err(ManagedPlanResolutionError::ResolutionFailed)
+                }
+            },
+        )
+        .await;
+    });
+    tokio::time::timeout(Duration::from_secs(2), resolver_entered.notified())
+        .await
+        .expect("queued resolver starts");
+    assert_eq!(
+        fixture
+            .state
+            .performance_operations()
+            .get(&status.id)
+            .await
+            .expect("resolving status")
+            .state,
+        "planning"
+    );
+    let mut pre_effect_phases = Vec::new();
+    while let Ok(event) = pre_effect_events.try_recv() {
+        pre_effect_phases.push(event.phase);
+    }
+    assert_eq!(pre_effect_phases, vec!["queued", "planning"]);
+    resolver_release.notify_one();
+    tokio::time::timeout(Duration::from_secs(2), worker)
+        .await
+        .expect("queued provider failure terminalizes")
+        .expect("queued provider worker task");
+    let events = collect_install_events(&fixture.state, &status.id).await;
+    assert_eq!(events.last().expect("terminal event").phase, "error");
+    assert_eq!(
+        fs::read(&sentinel).expect("read provider failure probe"),
+        b"unchanged"
+    );
+    assert!(!mods_dir.join(MANAGED_STATE_FILE_NAME).exists());
+    assert_eq!(
+        fs::read_dir(&mods_dir)
+            .expect("read provider failure probe directory")
+            .count(),
+        1,
+        "provider resolution failure must not create managed filesystem artifacts"
+    );
+    let journals = fixture.state.journals().list();
+    assert_eq!(journals.len(), 1);
+    let journal = &journals[0];
+    assert_eq!(
+        journal.status,
+        crate::state::contracts::OperationStatus::Failed
+    );
+    assert!(!journal.completed_steps.iter().any(|step| {
+        matches!(
+            step.step_id.as_str(),
+            "performance_plan_resolved" | "performance_effect_started"
+        )
+    }));
+    assert_eq!(journal.rollback, RollbackState::Unavailable);
+    assert!(journal.completed_steps.iter().all(|step| {
+        step.step_id != "performance_terminal_intent" || step.changed_target.is_none()
+    }));
+    let failure = journal
+        .completed_steps
+        .iter()
+        .find(|step| step.step_id == "apply_performance_plan")
+        .expect("terminal provider failure step");
+    assert_eq!(failure.rollback, RollbackState::Unavailable);
+    assert!(failure.changed_target.is_none());
+
+    let public = performance_operation_status(&fixture.state, &status.id)
+        .await
+        .expect("public provider failure status");
+    let proof = public.proof.expect("terminal provider failure proof");
+    assert_eq!(proof.rollback, RollbackState::Unavailable);
+    assert!(
+        proof
+            .fields
+            .iter()
+            .all(|field| field.key != "latest_changed_target")
+    );
+    assert_eq!(
+        performance_rollback_list(
+            &fixture.state,
+            RollbackQuery {
+                instance_id: Some(instance_id),
+            },
+        )
+        .await
+        .expect("provider failure rollback list")
+        .snapshots,
+        Vec::new()
+    );
+}
+
+#[tokio::test]
+async fn fresh_download_failure_has_no_effect_marker_or_rollback_proof() {
+    let fixture = TestFixture::new("fresh-download-pre-effect-failure");
+    let instance_id = fixture.add_instance("Managed", "1.20.4-fabric");
+    let mut operation = PerformanceOperation {
+        instance_id: instance_id.clone(),
+        game_version: Some("1.20.4".to_string()),
+        loader: Some("fabric".to_string()),
+        mode: Some("managed".to_string()),
+        action: PerformanceInstallAction::Install,
+        rollback_id: None,
+        status_operation_id: None,
+        persistence_failure: None,
+        installed_versions: None,
+    };
+    let foreground = fixture
+        .state
+        .register_integrity_foreground()
+        .expect("register failed download foreground")
+        .wait_for_settlement()
+        .await;
+    let identity = performance_operation_journal_identity(&fixture.state, &operation, &foreground)
+        .await
+        .expect("resolve failed download journal identity");
+    assert_eq!(identity.rollback, RollbackState::Unavailable);
+    let status = fixture
+        .state
+        .performance_operations()
+        .start_with_identity(
+            instance_id.clone(),
+            "install".to_string(),
+            PerformanceOperationPayload {
+                game_version: operation.game_version.clone(),
+                loader: operation.loader.clone(),
+                mode: operation.mode.clone(),
+                rollback_id: None,
+            },
+            crate::state::performance_operations::PerformanceOperationJournalIdentity::new(
+                "install",
+                identity.target_id,
+                identity.rollback,
+            ),
+        )
+        .await
+        .expect("start failed download status");
+    operation.status_operation_id = Some(status.id.clone());
+    fixture.state.installs().insert(status.id.clone()).await;
+    let plan = test_failed_download_install_plan("family-f-fabric-core", "1.20.4");
+
+    run_queued_performance_operation_with_resolver(
+        fixture.state.clone(),
+        operation,
+        fixture.state.installs().clone(),
+        status.id.clone(),
+        foreground,
+        move |_, _, _, _| {
+            let plan = plan.clone();
+            async move { Ok(plan) }
+        },
+    )
+    .await;
+
+    let operation_id = crate::state::contracts::OperationId::new(status.id.clone());
+    let journal = fixture
+        .state
+        .journals()
+        .get(&operation_id)
+        .expect("failed download journal");
+    assert_eq!(journal.rollback, RollbackState::Unavailable);
+    assert!(
+        journal
+            .completed_steps
+            .iter()
+            .any(|step| { step.step_id == "performance_plan_resolved" })
+    );
+    assert!(
+        !journal
+            .completed_steps
+            .iter()
+            .any(|step| { step.step_id == "performance_effect_started" })
+    );
+    let proof = performance_operation_status(&fixture.state, &status.id)
+        .await
+        .expect("public failed download status")
+        .proof
+        .expect("failed download proof");
+    assert_eq!(proof.rollback, RollbackState::Unavailable);
+    assert!(
+        performance_rollback_list(
+            &fixture.state,
+            RollbackQuery {
+                instance_id: Some(instance_id),
+            },
+        )
+        .await
+        .expect("failed download rollback list")
+        .snapshots
+        .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn restart_classifies_resolved_plan_without_effect_as_replayable() {
+    let root = test_root("restart-plan-resolved-pre-effect");
+    let state = build_test_state(&root, None, None);
+    let target_id = "family-f-fabric-core";
+    let status = state
+        .performance_operations()
+        .start_with_identity(
+            "0000000000000001".to_string(),
+            "install".to_string(),
+            test_operation_payload(),
+            crate::state::performance_operations::PerformanceOperationJournalIdentity::new(
+                "install",
+                target_id,
+                RollbackState::Unavailable,
+            ),
+        )
+        .await
+        .expect("start persisted install");
+    let operation_id = begin_performance_operation_journal(
+        &state,
+        PerformanceInstallAction::Install,
+        target_id,
+        RollbackState::Unavailable,
+        Some(&status.id),
+    )
+    .await
+    .expect("begin persisted install journal");
+    let fallback_plan = axial_performance::CompositionPlan {
+        composition_id: target_id.to_string(),
+        family: axial_performance::types::VersionFamily::F,
+        loader: "fabric".to_string(),
+        mode: PerformanceMode::Managed,
+        tier: CompositionTier::Core,
+        mods: Vec::new(),
+        jvm_preset: String::new(),
+        warnings: Vec::new(),
+        fallback_reason: "A higher performance tier is unavailable.".to_string(),
+    };
+    let guardian_facts = crate::guardian::performance_plan_guardian_facts(
+        &fallback_plan,
+        crate::state::contracts::OperationPhase::Installing,
+    );
+    let supervision = plan_performance_operation_supervision(
+        crate::guardian::GuardianMode::Managed,
+        &operation_id,
+        crate::guardian::GuardianPerformanceOperationKind::ApplyManagedComposition,
+        target_id,
+        crate::state::contracts::OperationPhase::Installing,
+        RollbackState::Unavailable,
+        &guardian_facts,
+    )
+    .expect("advisory fallback supervision");
+    record_performance_guardian_supervision(&state, &operation_id, &supervision)
+        .await
+        .expect("record fallback supervision");
+    let install_plan = test_empty_managed_install_plan(target_id, "1.20.4");
+    record_performance_plan_resolved(
+        &state,
+        &operation_id,
+        PerformanceInstallAction::Install,
+        target_id,
+        RollbackState::Unavailable,
+        &install_plan,
+    )
+    .await
+    .expect("record persisted resolved plan");
+    state
+        .performance_operations()
+        .close()
+        .await
+        .expect("close performance operations");
+    state.journals().close().await.expect("close journals");
+    drop(state);
+
+    let reloaded = build_test_state(&root, None, None);
+    let status = reloaded
+        .performance_operations()
+        .get(&status.id)
+        .await
+        .expect("reloaded status");
+    assert!(
+        performance_restart_is_pre_effect_replayable(&reloaded, &status, reloaded.installs()).await
+    );
+    record_performance_guardian_supervision(&reloaded, &operation_id, &supervision)
+        .await
+        .expect("replay fallback supervision idempotently");
+    record_performance_plan_resolved(
+        &reloaded,
+        &operation_id,
+        PerformanceInstallAction::Install,
+        target_id,
+        RollbackState::Unavailable,
+        &install_plan,
+    )
+    .await
+    .expect("replay exact resolved plan checkpoint");
+    let journal = reloaded
+        .journals()
+        .get(&operation_id)
+        .expect("reloaded journal");
+    assert!(
+        journal
+            .completed_steps
+            .iter()
+            .any(|step| { step.step_id == "performance_plan_resolved" })
+    );
+    assert!(
+        !journal
+            .completed_steps
+            .iter()
+            .any(|step| { step.step_id == "performance_effect_started" })
+    );
+    let evidence_steps = journal
+        .completed_steps
+        .iter()
+        .filter(|step| step.step_id == "guardian_evidence")
+        .collect::<Vec<_>>();
+    assert_eq!(evidence_steps.len(), 1);
+    assert_eq!(
+        evidence_steps[0].generated_facts,
+        vec!["performance_fallback_selected".to_string()]
+    );
+    assert_eq!(journal.guardian_diagnosis_ids.len(), 1);
+    assert_eq!(
+        journal.guardian_diagnosis_ids[0].as_str(),
+        "performance_fallback_selected"
+    );
+    let resolved_step = journal
+        .completed_steps
+        .iter()
+        .find(|step| step.step_id == "performance_plan_resolved")
+        .expect("resolved plan checkpoint");
+    assert!(
+        !resolved_step
+            .generated_facts
+            .iter()
+            .any(|fact| fact == "performance_fallback_selected")
+    );
+    assert!(
+        PerformanceJournalTransition::plan_resolved(
+            PerformanceInstallAction::Install,
+            target_id,
+            RollbackState::Unavailable,
+            &install_plan,
+        )
+        .matches(&journal)
     );
     let _ = fs::remove_dir_all(root);
 }
@@ -3410,14 +4079,7 @@ async fn missing_operation_status_route_returns_json_error() {
 
 fn seed_managed_lock(state: &AppState, instance_id: &str, composition_id: &str) -> PathBuf {
     let mods_dir = state.instances().game_dir(instance_id).join("mods");
-    let managed = CompositionState {
-        composition_id: composition_id.to_string(),
-        tier: CompositionTier::Core,
-        installed_mods: Vec::new(),
-        installed_at: "2026-07-10T00:00:00Z".to_string(),
-        failure_count: 0,
-        last_failure: String::new(),
-    };
+    let managed = test_composition_state(composition_id, Vec::new());
     write_managed_state_fixture(&mods_dir, &managed)
 }
 
@@ -3476,6 +4138,76 @@ enum RestartCheckpoint {
     Terminal,
     TerminalIntent,
     EffectStarted,
+}
+
+fn test_empty_managed_install_plan(
+    composition_id: &str,
+    game_version: &str,
+) -> axial_performance::ManagedCompositionInstallPlan {
+    axial_performance::ManagedCompositionInstallPlan::seal(
+        axial_performance::CompositionPlan {
+            composition_id: composition_id.to_string(),
+            family: axial_performance::types::VersionFamily::F,
+            loader: "fabric".to_string(),
+            mode: PerformanceMode::Managed,
+            tier: CompositionTier::Core,
+            mods: Vec::new(),
+            jvm_preset: String::new(),
+            warnings: Vec::new(),
+            fallback_reason: String::new(),
+        },
+        game_version,
+        "fabric",
+        Vec::new(),
+        Vec::new(),
+    )
+    .expect("seal empty managed install plan")
+}
+
+fn test_failed_download_install_plan(
+    composition_id: &str,
+    game_version: &str,
+) -> axial_performance::ManagedCompositionInstallPlan {
+    let bytes = b"never-downloaded";
+    axial_performance::ManagedCompositionInstallPlan::seal(
+        axial_performance::CompositionPlan {
+            composition_id: composition_id.to_string(),
+            family: axial_performance::types::VersionFamily::F,
+            loader: "fabric".to_string(),
+            mode: PerformanceMode::Managed,
+            tier: CompositionTier::Core,
+            mods: vec![axial_performance::types::ManagedMod {
+                artifact_id: "root".to_string(),
+                project_id: "AANobbMI".to_string(),
+                slug: "sodium".to_string(),
+                name: "Sodium".to_string(),
+                condition: axial_performance::types::ModCondition::Always,
+                version_range: String::new(),
+                exact_game_versions: Vec::new(),
+                hardware_req: None,
+                mutual_exclusions: Vec::new(),
+            }],
+            jvm_preset: String::new(),
+            warnings: Vec::new(),
+            fallback_reason: String::new(),
+        },
+        game_version,
+        "fabric",
+        vec![
+            axial_performance::ManagedArtifactPin::new(
+                "AANobbMI",
+                "NFkjnzWE",
+                "sodium.jar",
+                "https://127.0.0.1:1/sodium.jar",
+                bytes.len() as u64,
+                hex::encode(sha2::Sha512::digest(bytes)),
+                axial_performance::ManagedArtifactRole::Root,
+            )
+            .expect("failed download artifact pin"),
+        ],
+        Vec::new(),
+    )
+    .expect("seal failed download plan")
 }
 
 async fn insert_persisted_test_instance(
@@ -3542,6 +4274,7 @@ async fn seed_restart_checkpoint(
                 PerformanceInstallAction::Remove,
                 name,
                 RollbackState::Unavailable,
+                true,
                 true,
             )
             .await

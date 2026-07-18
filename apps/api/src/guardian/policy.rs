@@ -913,24 +913,14 @@ mod tests {
                 expected: DiagnosisId::ArtifactOwnershipUnsafe,
             },
             Case {
-                facts: vec![
-                    fact(
-                        GuardianFactId::PerformanceRulesInvalid,
-                        GuardianDomain::Performance,
-                        OperationPhase::Planning,
-                        OwnershipClass::CompositionManaged,
-                        Some(GuardianSeverity::Degraded),
-                        Some(GuardianConfidence::Confirmed),
-                    ),
-                    fact(
-                        GuardianFactId::PerformanceHealthDegraded,
-                        GuardianDomain::Performance,
-                        OperationPhase::Planning,
-                        OwnershipClass::CompositionManaged,
-                        Some(GuardianSeverity::Degraded),
-                        Some(GuardianConfidence::High),
-                    ),
-                ],
+                facts: vec![fact(
+                    GuardianFactId::PerformanceRulesInvalid,
+                    GuardianDomain::Performance,
+                    OperationPhase::Planning,
+                    OwnershipClass::CompositionManaged,
+                    Some(GuardianSeverity::Degraded),
+                    Some(GuardianConfidence::Confirmed),
+                )],
                 phase: OperationPhase::Planning,
                 expected: DiagnosisId::PerformanceRulesInvalid,
             },

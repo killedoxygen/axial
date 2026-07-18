@@ -1,8 +1,10 @@
+use super::managed_plan::{ManagedPlanResolutionError, resolve_managed_install_plan};
 use super::operations::{
     PerformanceApplicationError, PerformanceInstallAction, PerformanceJournalTransition,
     PerformanceOperationExecutionError, begin_performance_operation_journal,
     record_performance_effect_started, record_performance_effect_started_status,
     record_performance_guardian_supervision, record_performance_operation_result,
+    record_performance_plan_resolved,
 };
 use super::plan_health::{
     PerformanceManagedArtifactSummary, managed_artifact_summary, performance_composition_target,
@@ -22,12 +24,21 @@ use crate::observability::{RedactionAudience, sanitize_evidence_token};
 use crate::state::contracts::{OperationId, OperationPhase, RollbackState};
 use crate::state::{AppManagedCompositionAdmission, AppState, IntegrityForegroundLease};
 use axial_performance::{
-    BundleHealth, CompositionState, InstallError, ManagedRollbackOutcome, PerformanceMode,
-    ResolutionRequest, RollbackSnapshotSummary as CoreRollbackSnapshotSummary,
-    RollbackSnapshotTarget, StateError,
+    BundleHealth, CompositionPlan, CompositionState, InstallError, ManagedCompositionInstallPlan,
+    ManagedInstallExecutionError, ManagedRollbackOutcome, PerformanceMode, ResolutionRequest,
+    RollbackSnapshotSummary as CoreRollbackSnapshotSummary, RollbackSnapshotTarget, StateError,
 };
 use axum::{Json, http::StatusCode};
 use serde::Serialize;
+
+pub(super) async fn resolve_performance_install_plan(
+    state: AppState,
+    declarative: CompositionPlan,
+    game_version: String,
+    loader: String,
+) -> Result<ManagedCompositionInstallPlan, ManagedPlanResolutionError> {
+    resolve_managed_install_plan(&state, declarative, &game_version, &loader).await
+}
 
 pub(super) const PERFORMANCE_INSTALL_INTERNAL_ERROR: &str =
     "Could not update managed performance files. Check instance folder permissions and try again.";
@@ -102,11 +113,42 @@ fn public_performance_timestamp(value: &str) -> String {
         .unwrap_or_else(|| "created_at".to_string())
 }
 
+#[cfg(test)]
 pub(super) async fn execute_performance_operation(
     state: &AppState,
     operation: &PerformanceOperation,
     foreground: &IntegrityForegroundLease,
 ) -> Result<PerformanceInstallResponse, PerformanceOperationExecutionError> {
+    execute_performance_operation_with_resolver_and_progress(
+        state,
+        operation,
+        foreground,
+        resolve_performance_install_plan,
+        |_| async {},
+    )
+    .await
+}
+
+pub(super) async fn execute_performance_operation_with_resolver_and_progress<
+    Resolver,
+    ResolutionFuture,
+    Progress,
+    ProgressFuture,
+>(
+    state: &AppState,
+    operation: &PerformanceOperation,
+    foreground: &IntegrityForegroundLease,
+    resolver: Resolver,
+    progress: Progress,
+) -> Result<PerformanceInstallResponse, PerformanceOperationExecutionError>
+where
+    Resolver: FnOnce(AppState, CompositionPlan, String, String) -> ResolutionFuture,
+    ResolutionFuture: std::future::Future<
+            Output = Result<ManagedCompositionInstallPlan, ManagedPlanResolutionError>,
+        >,
+    Progress: FnOnce(PerformanceInstallAction) -> ProgressFuture,
+    ProgressFuture: std::future::Future<Output = ()>,
+{
     let instance = state
         .instances()
         .get(&operation.instance_id)
@@ -122,14 +164,14 @@ pub(super) async fn execute_performance_operation(
         .map_err(managed_admission_error)?;
 
     if matches!(operation.action, PerformanceInstallAction::Rollback) {
-        return execute_performance_rollback(state, &admitted, operation).await;
+        return execute_performance_rollback(state, &admitted, operation, progress).await;
     }
 
     let mode = resolve_instance_mode(state, &instance, operation.mode.as_deref())?;
     if matches!(operation.action, PerformanceInstallAction::Remove)
         || !matches!(mode, PerformanceMode::Managed)
     {
-        return execute_performance_remove(state, &admitted, operation).await;
+        return execute_performance_remove(state, &admitted, operation, progress).await;
     }
 
     let (game_version, loader) = resolve_instance_version_target(
@@ -138,7 +180,17 @@ pub(super) async fn execute_performance_operation(
         operation.game_version.as_deref(),
         operation.loader.as_deref(),
     )?;
-    execute_performance_install(state, &admitted, operation, mode, game_version, loader).await
+    execute_performance_install(
+        state,
+        &admitted,
+        operation,
+        mode,
+        game_version,
+        loader,
+        resolver,
+        progress,
+    )
+    .await
 }
 
 pub(super) async fn performance_operation_journal_identity(
@@ -217,7 +269,7 @@ pub(super) async fn performance_operation_journal_identity(
     });
     let rollback = preflight_current_performance_state(&admitted)
         .await
-        .map(|_| RollbackState::Available)
+        .map(|state| rollback_state_for_current_state(state.as_ref()))
         .unwrap_or(RollbackState::Unavailable);
     Ok(PerformanceJournalIdentity {
         action: PerformanceInstallAction::Install,
@@ -226,11 +278,16 @@ pub(super) async fn performance_operation_journal_identity(
     })
 }
 
-async fn execute_performance_rollback(
+async fn execute_performance_rollback<Progress, ProgressFuture>(
     state: &AppState,
     admitted: &AppManagedCompositionAdmission,
     operation: &PerformanceOperation,
-) -> Result<PerformanceInstallResponse, PerformanceOperationExecutionError> {
+    progress: Progress,
+) -> Result<PerformanceInstallResponse, PerformanceOperationExecutionError>
+where
+    Progress: FnOnce(PerformanceInstallAction) -> ProgressFuture,
+    ProgressFuture: std::future::Future<Output = ()>,
+{
     let preflight = rollback_preflight(admitted, operation.rollback_id.as_deref()).await;
     let (target_id, rollback_state) = match &preflight {
         Ok((target_id, rollback_state)) => (target_id.clone(), *rollback_state),
@@ -262,6 +319,7 @@ async fn execute_performance_rollback(
             operation.action,
             &target_id,
             rollback_state,
+            false,
             &result,
             operation.persistence_failure.as_ref(),
         )
@@ -276,7 +334,6 @@ async fn execute_performance_rollback(
         OperationPhase::RollingBack,
         rollback_state,
         &[],
-        0,
     ) {
         Ok(supervision) => supervision,
         Err(error) => {
@@ -290,6 +347,7 @@ async fn execute_performance_rollback(
                 operation.action,
                 &target_id,
                 rollback_state,
+                false,
                 &result,
                 operation.persistence_failure.as_ref(),
             )
@@ -336,6 +394,7 @@ async fn execute_performance_rollback(
         operation.persistence_failure.as_ref(),
     )
     .await?;
+    progress(operation.action).await;
 
     let result = async {
         let rollback_id = optional_value(operation.rollback_id.as_deref());
@@ -387,6 +446,7 @@ async fn execute_performance_rollback(
         operation.action,
         &target_id,
         rollback_state,
+        result.is_ok(),
         &result,
         operation.persistence_failure.as_ref(),
     )
@@ -395,13 +455,19 @@ async fn execute_performance_rollback(
     result.map_err(Into::into)
 }
 
-async fn execute_performance_remove(
+async fn execute_performance_remove<Progress, ProgressFuture>(
     state: &AppState,
     admitted: &AppManagedCompositionAdmission,
     operation: &PerformanceOperation,
-) -> Result<PerformanceInstallResponse, PerformanceOperationExecutionError> {
+    progress: Progress,
+) -> Result<PerformanceInstallResponse, PerformanceOperationExecutionError>
+where
+    Progress: FnOnce(PerformanceInstallAction) -> ProgressFuture,
+    ProgressFuture: std::future::Future<Output = ()>,
+{
     let journal_action = PerformanceInstallAction::Remove;
     let current_state = preflight_current_performance_state(admitted).await;
+    let remove_target_present = matches!(&current_state, Ok(Some(_)));
     let (target_id, rollback_state) = match &current_state {
         Ok(state) => (
             state
@@ -438,7 +504,6 @@ async fn execute_performance_remove(
         OperationPhase::Installing,
         rollback_state,
         &[],
-        0,
     ) {
         Ok(supervision) => supervision,
         Err(error) => {
@@ -452,6 +517,7 @@ async fn execute_performance_remove(
                 journal_action,
                 &target_id,
                 rollback_state,
+                false,
                 &result,
                 operation.persistence_failure.as_ref(),
             )
@@ -481,6 +547,7 @@ async fn execute_performance_remove(
             journal_action,
             &target_id,
             rollback_state,
+            false,
             &result,
             operation.persistence_failure.as_ref(),
         )
@@ -512,6 +579,7 @@ async fn execute_performance_remove(
         operation.persistence_failure.as_ref(),
     )
     .await?;
+    progress(journal_action).await;
 
     let result = admitted
         .remove_managed()
@@ -524,6 +592,7 @@ async fn execute_performance_remove(
         journal_action,
         &target_id,
         rollback_state,
+        remove_target_present && result.is_ok(),
         &result,
         operation.persistence_failure.as_ref(),
     )
@@ -532,17 +601,27 @@ async fn execute_performance_remove(
     result.map_err(Into::into)
 }
 
-async fn execute_performance_install(
+async fn execute_performance_install<Resolver, ResolutionFuture, Progress, ProgressFuture>(
     state: &AppState,
     admitted: &AppManagedCompositionAdmission,
     operation: &PerformanceOperation,
     mode: PerformanceMode,
     game_version: String,
     loader: String,
-) -> Result<PerformanceInstallResponse, PerformanceOperationExecutionError> {
+    resolver: Resolver,
+    progress: Progress,
+) -> Result<PerformanceInstallResponse, PerformanceOperationExecutionError>
+where
+    Resolver: FnOnce(AppState, CompositionPlan, String, String) -> ResolutionFuture,
+    ResolutionFuture: std::future::Future<
+            Output = Result<ManagedCompositionInstallPlan, ManagedPlanResolutionError>,
+        >,
+    Progress: FnOnce(PerformanceInstallAction) -> ProgressFuture,
+    ProgressFuture: std::future::Future<Output = ()>,
+{
     let plan = state.performance().get_plan(ResolutionRequest {
         game_version: game_version.clone(),
-        loader,
+        loader: loader.clone(),
         mode,
         hardware: state.performance().hardware(),
         installed_mods: admitted
@@ -552,10 +631,11 @@ async fn execute_performance_install(
             .unwrap_or_default(),
     });
     let current_state = preflight_current_performance_state(admitted).await;
-    let rollback_state = match &current_state {
-        Ok(_) => RollbackState::Available,
+    let pre_effect_rollback_state = match &current_state {
+        Ok(state) => rollback_state_for_current_state(state.as_ref()),
         Err(_) => RollbackState::Unavailable,
     };
+    let rollback_state = pre_effect_rollback_state;
     let operation_id = begin_performance_operation_journal(
         state,
         operation.action,
@@ -584,7 +664,6 @@ async fn execute_performance_install(
         OperationPhase::Installing,
         rollback_state,
         &guardian_facts,
-        plan.fallback_chain.len(),
     ) {
         Ok(supervision) => supervision,
         Err(error) => {
@@ -597,7 +676,8 @@ async fn execute_performance_install(
                 &operation_id,
                 operation.action,
                 &plan.composition_id,
-                rollback_state,
+                pre_effect_rollback_state,
+                false,
                 &result,
                 operation.persistence_failure.as_ref(),
             )
@@ -626,70 +706,131 @@ async fn execute_performance_install(
             &operation_id,
             operation.action,
             &plan.composition_id,
-            rollback_state,
+            pre_effect_rollback_state,
+            false,
             &result,
             operation.persistence_failure.as_ref(),
         )
         .await?;
         return result.map_err(Into::into);
     }
-    record_performance_effect_started(
+    let install_plan = match resolver(state.clone(), plan.clone(), game_version, loader).await {
+        Ok(install_plan) => install_plan,
+        Err(error) => {
+            let result = Err(managed_plan_resolution_error(error));
+            record_performance_operation_result(
+                state,
+                &operation_id,
+                operation.action,
+                &plan.composition_id,
+                pre_effect_rollback_state,
+                false,
+                &result,
+                operation.persistence_failure.as_ref(),
+            )
+            .await?;
+            return result.map_err(Into::into);
+        }
+    };
+    record_performance_plan_resolved(
         state,
         &operation_id,
         operation.action,
         &plan.composition_id,
         rollback_state,
+        &install_plan,
     )
     .await
     .map_err(|error| {
         PerformanceOperationExecutionError::journal_transition(
             Some(operation_id.clone()),
             error,
-            PerformanceJournalTransition::effect_started(
+            PerformanceJournalTransition::plan_resolved(
                 operation.action,
                 &plan.composition_id,
                 rollback_state,
+                &install_plan,
             ),
         )
     })?;
-    record_performance_effect_started_status(
-        state,
-        &operation_id,
-        operation.persistence_failure.as_ref(),
-    )
-    .await?;
-
-    let result = match admitted.ensure_installed(&plan, &game_version).await {
-        Ok(installed_state) => {
-            let inspection = admitted
-                .inspect(Some(&plan))
-                .await
-                .map_err(managed_mutation_error)?;
-            let health = inspection.health;
-            let warnings = response_warnings(&plan, inspection.warnings);
-            Ok(PerformanceInstallResponse {
-                active: true,
-                status: "complete".to_string(),
-                install_id: None,
-                health,
-                composition_id: super::super::public_performance_descriptor(
-                    &installed_state.composition_id,
-                    "composition",
-                ),
-                tier: tier_name(installed_state.tier).to_string(),
-                installed_count: installed_state.installed_mods.len(),
-                managed_artifacts: managed_artifact_summary(Some(&installed_state)),
-                warnings,
-            })
+    let execution = admitted
+        .ensure_installed(&install_plan, state.content().client(), || async {
+            let rollback_ready = RollbackState::Available;
+            record_performance_effect_started(
+                state,
+                &operation_id,
+                operation.action,
+                &plan.composition_id,
+                rollback_ready,
+            )
+            .await
+            .map_err(|error| {
+                PerformanceOperationExecutionError::journal_transition(
+                    Some(operation_id.clone()),
+                    error,
+                    PerformanceJournalTransition::effect_started(
+                        operation.action,
+                        &plan.composition_id,
+                        rollback_ready,
+                    ),
+                )
+            })?;
+            record_performance_effect_started_status(
+                state,
+                &operation_id,
+                operation.persistence_failure.as_ref(),
+            )
+            .await?;
+            progress(operation.action).await;
+            Ok(())
+        })
+        .await;
+    let (result, terminal_rollback, changed_target) = match execution {
+        Ok(outcome) => {
+            let terminal_rollback =
+                install_terminal_rollback(pre_effect_rollback_state, outcome.rollback_ready());
+            let changed_target = outcome.target_changed();
+            let installed_state = outcome.into_state();
+            let result = match admitted.inspect(Some(&plan)).await {
+                Ok(inspection) => {
+                    let health = inspection.health;
+                    let warnings = response_warnings(&plan, inspection.warnings);
+                    Ok(PerformanceInstallResponse {
+                        active: true,
+                        status: "complete".to_string(),
+                        install_id: None,
+                        health,
+                        composition_id: super::super::public_performance_descriptor(
+                            &installed_state.composition_id,
+                            "composition",
+                        ),
+                        tier: tier_name(installed_state.tier).to_string(),
+                        installed_count: installed_state.installed_mods.len(),
+                        managed_artifacts: managed_artifact_summary(Some(&installed_state)),
+                        warnings,
+                    })
+                }
+                Err(error) => Err(managed_mutation_error(error)),
+            };
+            (result, terminal_rollback, changed_target)
         }
-        Err(error) => Err(managed_mutation_error(error)),
+        Err(ManagedInstallExecutionError::Mutation {
+            source,
+            rollback_ready,
+        }) => (
+            Err(managed_mutation_error(source)),
+            install_terminal_rollback(pre_effect_rollback_state, rollback_ready),
+            false,
+        ),
+        Err(ManagedInstallExecutionError::BeforeTargetEffect { error, .. }) => return Err(error),
     };
     record_performance_operation_result(
         state,
         &operation_id,
         operation.action,
         &plan.composition_id,
-        rollback_state,
+        terminal_rollback,
+        changed_target,
         &result,
         operation.persistence_failure.as_ref(),
     )
@@ -698,7 +839,6 @@ async fn execute_performance_install(
     result.map_err(Into::into)
 }
 
-#[allow(clippy::too_many_arguments)]
 fn supervise_performance_operation(
     state: &AppState,
     operation_id: &OperationId,
@@ -707,7 +847,6 @@ fn supervise_performance_operation(
     phase: OperationPhase,
     rollback_state: RollbackState,
     facts: &[GuardianFact],
-    fallback_chain_len: usize,
 ) -> Result<GuardianPerformanceSupervisionPlan, GuardianPerformanceSupervisionRejection> {
     plan_performance_operation_supervision(
         GuardianMode::from_config(&state.config().current().guardian_mode),
@@ -717,12 +856,10 @@ fn supervise_performance_operation(
         phase,
         rollback_state,
         facts,
-        fallback_chain_len,
     )
 }
 
-#[allow(clippy::too_many_arguments)]
-fn plan_performance_operation_supervision(
+pub(super) fn plan_performance_operation_supervision(
     mode: GuardianMode,
     operation_id: &OperationId,
     operation: GuardianPerformanceOperationKind,
@@ -730,7 +867,6 @@ fn plan_performance_operation_supervision(
     phase: OperationPhase,
     rollback_state: RollbackState,
     facts: &[GuardianFact],
-    fallback_chain_len: usize,
 ) -> Result<GuardianPerformanceSupervisionPlan, GuardianPerformanceSupervisionRejection> {
     plan_performance_supervision(GuardianPerformanceSupervisionRequest {
         operation_id: Some(operation_id.clone()),
@@ -739,7 +875,6 @@ fn plan_performance_operation_supervision(
         operation,
         target: performance_composition_target(target_id),
         facts,
-        fallback_chain_len,
         rollback_state,
         context: GuardianPolicyContext::current_operation(),
     })
@@ -802,6 +937,17 @@ fn rollback_state_for_current_state(state: Option<&CompositionState>) -> Rollbac
     }
 }
 
+fn install_terminal_rollback(
+    pre_effect_rollback: RollbackState,
+    rollback_ready: bool,
+) -> RollbackState {
+    if rollback_ready || matches!(pre_effect_rollback, RollbackState::Available) {
+        RollbackState::Available
+    } else {
+        RollbackState::Unavailable
+    }
+}
+
 fn removed_install_response() -> PerformanceInstallResponse {
     PerformanceInstallResponse {
         active: false,
@@ -830,7 +976,6 @@ fn performance_supervision_error(
     let status = match &error {
         GuardianPerformanceSupervisionRejection::UnsafeOwnership
         | GuardianPerformanceSupervisionRejection::GuardianBlocked
-        | GuardianPerformanceSupervisionRejection::FallbackUnavailable
         | GuardianPerformanceSupervisionRejection::RollbackUnavailable => StatusCode::BAD_REQUEST,
         GuardianPerformanceSupervisionRejection::MissingJournal
         | GuardianPerformanceSupervisionRejection::UnsafePublicBoundary => {
@@ -872,7 +1017,7 @@ pub(super) fn performance_install_error(
                 "error": "invalid performance artifact metadata"
             })),
         ),
-        InstallError::State(StateError::Parse(_)) => (
+        InstallError::State(StateError::Parse(_) | StateError::InvalidState(_)) => (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({
                 "error": "invalid performance state metadata"
@@ -890,7 +1035,41 @@ pub(super) fn performance_install_error(
                 "error": "invalid performance artifact integrity metadata"
             })),
         ),
+        InstallError::Download(_) => (
+            StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({
+                "error": "Could not download managed performance files. Check the connection and try again."
+            })),
+        ),
         error => internal_install_error(error),
+    }
+}
+
+pub(super) fn managed_plan_resolution_error(
+    error: ManagedPlanResolutionError,
+) -> (StatusCode, Json<serde_json::Value>) {
+    match error {
+        ManagedPlanResolutionError::ResolutionFailed => (
+            StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({
+                "error": "Could not resolve managed performance dependencies. Check the connection and try again."
+            })),
+        ),
+        ManagedPlanResolutionError::ResolutionConflict => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": "Managed performance dependencies are unavailable for this Minecraft version and loader."
+            })),
+        ),
+        ManagedPlanResolutionError::InvalidRootSet
+        | ManagedPlanResolutionError::InvalidArtifactGraph
+        | ManagedPlanResolutionError::InvalidDependencyGraph
+        | ManagedPlanResolutionError::SealRejected => (
+            StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({
+                "error": "Managed performance provider data could not be trusted. Try again later."
+            })),
+        ),
     }
 }
 
@@ -929,7 +1108,8 @@ fn managed_mutation_error(
 #[cfg(test)]
 mod tests {
     use super::{
-        PERFORMANCE_INSTALL_INTERNAL_ERROR, performance_supervision_error,
+        ManagedPlanResolutionError, PERFORMANCE_INSTALL_INTERNAL_ERROR,
+        managed_plan_resolution_error, performance_supervision_error,
         plan_performance_operation_supervision,
     };
     use crate::guardian::{
@@ -955,10 +1135,6 @@ mod tests {
             ),
             (
                 GuardianPerformanceSupervisionRejection::GuardianBlocked,
-                StatusCode::BAD_REQUEST,
-            ),
-            (
-                GuardianPerformanceSupervisionRejection::FallbackUnavailable,
                 StatusCode::BAD_REQUEST,
             ),
             (
@@ -992,7 +1168,6 @@ mod tests {
             OperationPhase::Installing,
             RollbackState::NotApplicable,
             &[],
-            0,
         )
         .expect("managed removal supervision");
 
@@ -1001,5 +1176,36 @@ mod tests {
             Some(&operation_id),
             "Performance policy must use the already allocated journal identity"
         );
+    }
+
+    #[test]
+    fn managed_plan_resolution_errors_are_static_and_provider_safe() {
+        let cases = [
+            (
+                ManagedPlanResolutionError::ResolutionFailed,
+                StatusCode::BAD_GATEWAY,
+                "Could not resolve managed performance dependencies. Check the connection and try again.",
+            ),
+            (
+                ManagedPlanResolutionError::ResolutionConflict,
+                StatusCode::CONFLICT,
+                "Managed performance dependencies are unavailable for this Minecraft version and loader.",
+            ),
+            (
+                ManagedPlanResolutionError::InvalidArtifactGraph,
+                StatusCode::BAD_GATEWAY,
+                "Managed performance provider data could not be trusted. Try again later.",
+            ),
+        ];
+
+        for (error, expected_status, expected_message) in cases {
+            let (status, body) = managed_plan_resolution_error(error);
+            let message = body.0["error"].as_str().expect("safe provider error");
+            assert_eq!(status, expected_status);
+            assert_eq!(message, expected_message);
+            for secret in ["api.modrinth.com", "access_token", "/home/", "C:\\Users\\"] {
+                assert!(!message.contains(secret));
+            }
+        }
     }
 }

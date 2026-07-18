@@ -698,20 +698,32 @@ async fn family_c_qualification_managed_install_evidence(
         evidence.missing.push("managed_install_state_missing");
         return evidence;
     };
-    let composition_state = match state.inspect_managed_instance(&instance_id, None).await {
-        Ok(inspection) => match inspection.state {
-            Some(state) => state,
-            None => {
-                evidence.missing.push("managed_install_state_missing");
-                return evidence;
-            }
-        },
+    let inspection = match state.inspect_managed_instance(&instance_id, None).await {
+        Ok(inspection) => inspection,
         Err(_) => {
             evidence.missing.push("managed_install_state_invalid");
             return evidence;
         }
     };
+    let composition_state = match inspection.state {
+        Some(state) => state,
+        None => {
+            evidence.missing.push("managed_install_state_missing");
+            return evidence;
+        }
+    };
 
+    family_c_qualification_managed_install_state_evidence(&composition_state, inspection.health)
+}
+
+fn family_c_qualification_managed_install_state_evidence(
+    composition_state: &axial_performance::CompositionState,
+    health: axial_performance::BundleHealth,
+) -> FamilyCManagedInstallEvidence {
+    let mut evidence = FamilyCManagedInstallEvidence {
+        missing: Vec::new(),
+        payload: Value::Null,
+    };
     let installed_count = composition_state.installed_mods.len();
     let has_installed = installed_count > 0;
     let composition_matches = composition_state.composition_id == FAMILY_C_MANAGED_COMPOSITION_ID;
@@ -725,9 +737,15 @@ async fn family_c_qualification_managed_install_evidence(
         && composition_state.installed_mods.iter().all(|installed| {
             installed.source.provider == axial_performance::ManagedArtifactProvider::Modrinth
         });
-    let integrity = has_installed
+    let integrity = matches!(health, axial_performance::BundleHealth::Healthy)
+        && has_installed
         && composition_state.installed_mods.iter().all(|installed| {
-            installed.integrity.sha512_verified && !installed.integrity.sha512.trim().is_empty()
+            installed.integrity.sha512.len() == 128
+                && installed
+                    .integrity
+                    .sha512
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit())
         });
 
     if !composition_matches {
@@ -1080,11 +1098,20 @@ struct FamilyCManagedComparisonEvidence {
 
 #[cfg(test)]
 mod tests {
-    use super::family_c_managed_expected_artifacts_present;
-    use axial_performance::{
-        CompositionState, CompositionTier, InstalledMod, ManagedArtifactIntegrity,
-        ManagedArtifactProvider, ManagedArtifactSource, OwnershipClass,
+    use super::{
+        family_c_managed_expected_artifacts_present,
+        family_c_qualification_managed_install_state_evidence,
     };
+    use axial_performance::types::VersionFamily;
+    use axial_performance::{
+        BundleHealth, CompositionState, CompositionTier, InstalledMod, ManagedArtifactIntegrity,
+        ManagedArtifactProvider, ManagedArtifactRole, ManagedArtifactSource, OwnershipClass,
+        PerformanceManager,
+    };
+    use sha2::{Digest, Sha512};
+    use std::fs;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     #[test]
     fn managed_install_evidence_requires_exact_canonical_project_ids() {
@@ -1101,29 +1128,177 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn managed_install_evidence_rejects_a_missing_current_artifact() {
+        assert_tampered_managed_install_is_not_integral("missing", |path| {
+            fs::remove_file(path).expect("remove managed qualification artifact");
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn managed_install_evidence_rejects_a_corrupt_current_artifact() {
+        assert_tampered_managed_install_is_not_integral("corrupt", |path| {
+            fs::write(path, b"y").expect("corrupt managed qualification artifact");
+        })
+        .await;
+    }
+
+    async fn assert_tampered_managed_install_is_not_integral(
+        name: &str,
+        tamper: impl FnOnce(&std::path::Path),
+    ) {
+        let root = qualification_test_root(name);
+        let instance_id = "0000000000000001";
+        let mods_dir = root.join(instance_id).join("mods");
+        fs::create_dir_all(&mods_dir).expect("create managed qualification instance");
+        let state = composition_state(["jupr7Bf5", "DSVgwcji", "Wnxd13zP"]);
+        for installed in &state.installed_mods {
+            fs::write(mods_dir.join(&installed.filename), b"x")
+                .expect("write managed qualification artifact");
+        }
+        fs::write(
+            mods_dir.join(".axial-lock.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "schema_version": 2,
+                "state": state,
+            }))
+            .expect("serialize managed qualification state"),
+        )
+        .expect("write managed qualification state");
+        let manager = Arc::new(PerformanceManager::new().expect("performance manager"));
+        let authority = manager
+            .claim_managed_authority(&root)
+            .expect("claim qualification managed authority");
+        let identity = authority
+            .identify(instance_id)
+            .expect("identify qualification instance");
+        let healthy = authority
+            .inspect(&identity, None, || Ok(()))
+            .await
+            .expect("inspect intact managed qualification state");
+        assert_eq!(healthy.health, BundleHealth::Healthy);
+
+        tamper(
+            &mods_dir.join(
+                &healthy
+                    .state
+                    .as_ref()
+                    .expect("managed state")
+                    .installed_mods[0]
+                    .filename,
+            ),
+        );
+        let inspection = authority
+            .inspect(&identity, None, || Ok(()))
+            .await
+            .expect("inspect tampered managed qualification state");
+        assert_eq!(inspection.health, BundleHealth::Invalid);
+        let evidence = family_c_qualification_managed_install_state_evidence(
+            inspection
+                .state
+                .as_ref()
+                .expect("managed state remains valid"),
+            inspection.health,
+        );
+
+        assert_eq!(evidence.payload["integrity"], false);
+        assert!(
+            evidence
+                .missing
+                .contains(&"managed_install_integrity_missing")
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    fn qualification_test_root(name: &str) -> std::path::PathBuf {
+        static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+        std::env::temp_dir().join(format!(
+            "axial-family-c-qualification-{name}-{}-{}",
+            std::process::id(),
+            NEXT_ID.fetch_add(1, Ordering::Relaxed)
+        ))
+    }
+
     fn composition_state<const N: usize>(project_ids: [&str; N]) -> CompositionState {
-        CompositionState {
+        let mut installed_mods = project_ids
+            .into_iter()
+            .map(|project_id| InstalledMod {
+                project_id: project_id.to_string(),
+                version_id: project_id.to_string(),
+                filename: format!("{project_id}.jar"),
+                role: ManagedArtifactRole::Root,
+                size: 1,
+                ownership_class: OwnershipClass::CompositionManaged,
+                source: ManagedArtifactSource {
+                    provider: ManagedArtifactProvider::Modrinth,
+                },
+                integrity: ManagedArtifactIntegrity {
+                    sha512: hex::encode(Sha512::digest(b"x")),
+                },
+            })
+            .collect::<Vec<_>>();
+        installed_mods.sort_by(|left, right| left.project_id.cmp(&right.project_id));
+        let declarative = axial_performance::CompositionPlan {
             composition_id: "family-c-forge-core".to_string(),
+            family: VersionFamily::C,
+            loader: "forge".to_string(),
+            mode: axial_performance::PerformanceMode::Managed,
             tier: CompositionTier::Core,
-            installed_mods: project_ids
-                .into_iter()
-                .map(|project_id| InstalledMod {
-                    project_id: project_id.to_string(),
-                    version_id: "version".to_string(),
-                    filename: format!("{project_id}.jar"),
-                    ownership_class: OwnershipClass::CompositionManaged,
-                    source: ManagedArtifactSource {
-                        provider: ManagedArtifactProvider::Modrinth,
-                    },
-                    integrity: ManagedArtifactIntegrity {
-                        sha512: "0".repeat(128),
-                        sha512_verified: true,
-                    },
+            mods: installed_mods
+                .iter()
+                .map(|installed| axial_performance::types::ManagedMod {
+                    artifact_id: installed.project_id.clone(),
+                    project_id: installed.project_id.clone(),
+                    slug: installed.project_id.clone(),
+                    name: installed.project_id.clone(),
+                    condition: axial_performance::types::ModCondition::Always,
+                    version_range: String::new(),
+                    exact_game_versions: Vec::new(),
+                    hardware_req: None,
+                    mutual_exclusions: Vec::new(),
                 })
                 .collect(),
+            jvm_preset: String::new(),
+            warnings: Vec::new(),
+            fallback_reason: String::new(),
+        };
+        let pins = installed_mods
+            .iter()
+            .map(|installed| {
+                axial_performance::ManagedArtifactPin::new(
+                    &installed.project_id,
+                    &installed.version_id,
+                    &installed.filename,
+                    format!(
+                        "https://cdn.modrinth.com/data/{}/versions/{}/{}",
+                        installed.project_id, installed.version_id, installed.filename
+                    ),
+                    installed.size,
+                    &installed.integrity.sha512,
+                    installed.role,
+                )
+                .expect("valid managed qualification artifact")
+            })
+            .collect();
+        let sealed = axial_performance::ManagedCompositionInstallPlan::seal(
+            declarative,
+            "1.12.2",
+            "forge",
+            pins,
+            Vec::new(),
+        )
+        .expect("seal managed qualification graph");
+        CompositionState {
+            composition_id: "family-c-forge-core".to_string(),
+            family: VersionFamily::C,
+            tier: CompositionTier::Core,
+            game_version: "1.12.2".to_string(),
+            loader: "forge".to_string(),
+            graph_sha512: sealed.graph_digest().to_string(),
+            dependency_edges: Vec::new(),
+            installed_mods,
             installed_at: "2026-07-18T00:00:00Z".to_string(),
-            failure_count: 0,
-            last_failure: String::new(),
         }
     }
 }

@@ -397,9 +397,7 @@ const fn priority_profile(id: DiagnosisId) -> PriorityProfile {
         DiagnosisId::CustomJavaOverridePresent
         | DiagnosisId::CustomJvmPresetPresent
         | DiagnosisId::CustomJvmArgsPresent => PriorityProfile::CustomIntent,
-        DiagnosisId::PerformanceRulesInvalid | DiagnosisId::PerformanceHealthDegraded => {
-            PriorityProfile::Degraded
-        }
+        DiagnosisId::PerformanceRulesInvalid => PriorityProfile::Degraded,
         DiagnosisId::PerformanceFallbackSelected => PriorityProfile::PerformanceFallback,
         DiagnosisId::PersistedStateSchemaInvalid => PriorityProfile::PersistedState,
         DiagnosisId::ArtifactOwnershipUnsafe => PriorityProfile::OwnershipBoundary,
@@ -1127,15 +1125,6 @@ pub(super) const DIAGNOSIS_RULES: &[DiagnosisRule] = &[
         "performance_rules_invalid"
     ),
     rule!(
-        PerformanceHealthDegraded,
-        [PerformanceHealthDegraded],
-        RuleDomain::Fixed(GuardianDomain::Performance),
-        RuleSeverity::SupportingFactOr(GuardianSeverity::Degraded),
-        RuleConfidence::SupportingFactOr(GuardianConfidence::High),
-        [RecordOnly, Warn],
-        "performance_health_degraded"
-    ),
-    rule!(
         PerformanceHealthInvalid,
         [PerformanceHealthInvalid],
         RuleDomain::Fixed(GuardianDomain::Performance),
@@ -1146,7 +1135,7 @@ pub(super) const DIAGNOSIS_RULES: &[DiagnosisRule] = &[
     ),
     rule!(
         PerformanceFallbackSelected,
-        [PerformanceFallbackSelected, PerformanceHealthFallback],
+        [PerformanceFallbackSelected],
         RuleDomain::Fixed(GuardianDomain::Performance),
         RuleSeverity::SupportingFactOr(GuardianSeverity::Warning),
         RuleConfidence::SupportingFactOr(GuardianConfidence::High),

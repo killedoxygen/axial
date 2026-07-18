@@ -13,21 +13,26 @@ use crate::state::contracts::RollbackState;
 #[cfg(test)]
 use axial_performance::{CompositionTier, InstallError, PerformanceMode};
 #[cfg(test)]
+use managed_plan::ManagedPlanResolutionError;
+#[cfg(test)]
 use mutation::{
     PERFORMANCE_INSTALL_INTERNAL_ERROR, execute_performance_operation, performance_install_error,
+    performance_operation_journal_identity, plan_performance_operation_supervision,
 };
 pub use mutation::{PerformanceRollbackListResponse, performance_rollback_list};
 
 pub(crate) use operations::spawn_pending_performance_operations;
 #[cfg(test)]
 use operations::{
-    PERFORMANCE_JOURNAL_ERROR, PerformanceInstallAction, PerformanceOperationExecutionError,
-    PerformanceWorkerIdentity, begin_performance_operation_journal,
-    performance_journal_is_terminal, record_performance_effect_started,
+    PERFORMANCE_JOURNAL_ERROR, PerformanceInstallAction, PerformanceJournalTransition,
+    PerformanceOperationExecutionError, PerformanceWorkerIdentity,
+    begin_performance_operation_journal, performance_journal_is_terminal,
+    performance_restart_is_pre_effect_replayable, record_performance_effect_started,
+    record_performance_guardian_supervision, record_performance_plan_resolved,
     record_performance_terminal_intent, retry_performance_status_correction,
     retry_performance_status_transition, run_queued_performance_operation,
-    stage_performance_installed_versions, supervise_performance_worker,
-    terminalize_mismatched_performance_operation,
+    run_queued_performance_operation_with_resolver, stage_performance_installed_versions,
+    supervise_performance_worker, terminalize_mismatched_performance_operation,
 };
 pub use operations::{
     PerformanceInstanceOperationResponse, PerformanceOperationStatusResponse,

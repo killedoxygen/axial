@@ -32,6 +32,65 @@ pub struct ManagedResolvedInspection {
     pub inspection: ManagedCompositionInspection,
 }
 
+#[derive(Clone, Debug)]
+pub struct ManagedInstallExecutionOutcome {
+    state: CompositionState,
+    target_changed: bool,
+    rollback_ready: bool,
+}
+
+impl ManagedInstallExecutionOutcome {
+    pub fn into_state(self) -> CompositionState {
+        self.state
+    }
+
+    pub fn target_changed(&self) -> bool {
+        self.target_changed
+    }
+
+    pub fn rollback_ready(&self) -> bool {
+        self.rollback_ready
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ManagedInstallExecutionError<BeforeTargetEffectError> {
+    #[error("{source}")]
+    Mutation {
+        #[source]
+        source: ManagedMutationError,
+        rollback_ready: bool,
+    },
+    #[error("managed composition target-effect checkpoint was rejected")]
+    BeforeTargetEffect {
+        error: BeforeTargetEffectError,
+        rollback_ready: bool,
+    },
+}
+
+impl<BeforeTargetEffectError> ManagedInstallExecutionError<BeforeTargetEffectError> {
+    pub fn from_mutation(source: ManagedMutationError, rollback_ready: bool) -> Self {
+        Self::Mutation {
+            source,
+            rollback_ready,
+        }
+    }
+
+    pub fn rollback_ready(&self) -> bool {
+        match self {
+            Self::Mutation { rollback_ready, .. }
+            | Self::BeforeTargetEffect { rollback_ready, .. } => *rollback_ready,
+        }
+    }
+
+    pub fn mutation_error(&self) -> Option<&ManagedMutationError> {
+        match self {
+            Self::Mutation { source, .. } => Some(source),
+            Self::BeforeTargetEffect { .. } => None,
+        }
+    }
+}
+
 pub struct ManagedArtifactWitnessProof {
     filename: String,
     sha512: String,
@@ -109,9 +168,9 @@ impl ManagedCompositionAuthority {
         else {
             return Ok(Vec::new());
         };
-        let mods_dir = mods.path().to_path_buf();
         tokio::task::spawn_blocking(move || {
-            let state = crate::state::load_state_admitted(&mods_dir)
+            let mods_dir = mods.path();
+            let state = crate::state::load_state_admitted(mods_dir)
                 .map_err(ManagedMutationError::definite)?;
             let mut proofs = state
                 .into_iter()
@@ -141,25 +200,40 @@ impl ManagedCompositionAuthority {
         let Some(mods) = open_mods_if_present(instance.clone(), "recover").await? else {
             return Ok(absent_inspection(None, None, instance.path()));
         };
-        let mods_dir = mods.path().to_path_buf();
-        let recovery_dir = mods_dir.clone();
-        tokio::task::spawn_blocking(move || crate::state::recover_managed_storage(&recovery_dir))
-            .await
-            .map_err(|_| ManagedMutationError::task_stopped("recover"))?
-            .map_err(|error| ManagedMutationError::indeterminate("recover", error))?;
-        tokio::task::spawn_blocking(move || recovered_inspection(&mods_dir))
+        let recovery_mods = mods.clone();
+        tokio::task::spawn_blocking(move || {
+            crate::state::recover_managed_storage(recovery_mods.path())
+        })
+        .await
+        .map_err(|_| ManagedMutationError::task_stopped("recover"))?
+        .map_err(|error| ManagedMutationError::indeterminate("recover", error))?;
+        tokio::task::spawn_blocking(move || recovered_inspection(mods.path()))
             .await
             .map_err(|_| ManagedMutationError::task_stopped("recover"))?
     }
 
-    pub async fn ensure_installed(
+    pub async fn ensure_installed<
+        BeforeTargetEffect,
+        BeforeTargetEffectFuture,
+        BeforeTargetEffectError,
+    >(
         &self,
         identity: &ManagedInstanceIdentity,
         plan: &ManagedCompositionInstallPlan,
         client: &reqwest::Client,
-    ) -> Result<CompositionState, ManagedMutationError> {
-        let instance = self.validate_identity(identity).await?;
-        self.manager.ensure_installed(plan, client, &instance).await
+        before_target_effect: BeforeTargetEffect,
+    ) -> Result<ManagedInstallExecutionOutcome, ManagedInstallExecutionError<BeforeTargetEffectError>>
+    where
+        BeforeTargetEffect: FnOnce() -> BeforeTargetEffectFuture,
+        BeforeTargetEffectFuture: std::future::Future<Output = Result<(), BeforeTargetEffectError>>,
+    {
+        let instance = self
+            .validate_identity(identity)
+            .await
+            .map_err(|error| ManagedInstallExecutionError::from_mutation(error, false))?;
+        self.manager
+            .ensure_installed(plan, client, &instance, before_target_effect)
+            .await
     }
 
     pub async fn remove_managed(
@@ -216,14 +290,14 @@ impl ManagedCompositionAuthority {
         let Some(mods) = open_mods_if_present(instance.clone(), "inspect").await? else {
             return Ok(absent_inspection(plan, None, instance.path()));
         };
-        let mods_dir = mods.path().to_path_buf();
         let plan = plan.cloned();
         tokio::task::spawn_blocking(move || -> Result<_, ManagedMutationError> {
-            let (state, mutation_permit) = admitted_inspection_state(&mods_dir, admit_mutation)?;
+            let mods_dir = mods.path();
+            let (state, mutation_permit) = admitted_inspection_state(mods_dir, admit_mutation)?;
             let (health, warnings) =
-                crate::health::derive_health(state.as_ref(), plan.as_ref(), None, &mods_dir);
-            let installed_mod_evidence = installed_mod_evidence(&mods_dir, state.as_ref());
-            let rollback_snapshots = crate::state::list_rollback_snapshots_admitted(&mods_dir)
+                crate::health::derive_health(state.as_ref(), plan.as_ref(), None, mods_dir);
+            let installed_mod_evidence = installed_mod_evidence(mods_dir, state.as_ref());
+            let rollback_snapshots = crate::state::list_rollback_snapshots_admitted(mods_dir)
                 .map_err(ManagedMutationError::definite)?;
             let inspection = ManagedCompositionInspection {
                 state,
@@ -265,13 +339,11 @@ impl ManagedCompositionAuthority {
                 plan,
             });
         }
-        let mods_dir = mods
-            .expect("managed mods capability was checked")
-            .path()
-            .to_path_buf();
+        let mods = mods.expect("managed mods capability was checked");
         tokio::task::spawn_blocking(move || -> Result<_, ManagedMutationError> {
-            let (state, mutation_permit) = admitted_inspection_state(&mods_dir, admit_mutation)?;
-            let installed_mod_evidence = installed_mod_evidence(&mods_dir, state.as_ref());
+            let mods_dir = mods.path();
+            let (state, mutation_permit) = admitted_inspection_state(mods_dir, admit_mutation)?;
+            let installed_mod_evidence = installed_mod_evidence(mods_dir, state.as_ref());
             request.installed_mods = installed_mod_evidence.clone();
             let expected_game_version = request.game_version.clone();
             let plan = manager.get_plan(request);
@@ -279,9 +351,9 @@ impl ManagedCompositionAuthority {
                 state.as_ref(),
                 Some(&plan),
                 Some(&expected_game_version),
-                &mods_dir,
+                mods_dir,
             );
-            let rollback_snapshots = crate::state::list_rollback_snapshots_admitted(&mods_dir)
+            let rollback_snapshots = crate::state::list_rollback_snapshots_admitted(mods_dir)
                 .map_err(ManagedMutationError::definite)?;
             let inspection = ManagedResolvedInspection {
                 inspection: ManagedCompositionInspection {
@@ -479,13 +551,24 @@ fn starts_with_digit(value: &str) -> bool {
 }
 
 impl PerformanceManager {
-    pub(super) async fn ensure_installed(
+    pub(super) async fn ensure_installed<
+        BeforeTargetEffect,
+        BeforeTargetEffectFuture,
+        BeforeTargetEffectError,
+    >(
         &self,
         plan: &ManagedCompositionInstallPlan,
         client: &reqwest::Client,
         instance: &AnchoredDirectory,
-    ) -> Result<CompositionState, ManagedMutationError> {
-        let existing_mods = open_mods_if_present(instance.clone(), "install_preflight").await?;
+        before_target_effect: BeforeTargetEffect,
+    ) -> Result<ManagedInstallExecutionOutcome, ManagedInstallExecutionError<BeforeTargetEffectError>>
+    where
+        BeforeTargetEffect: FnOnce() -> BeforeTargetEffectFuture,
+        BeforeTargetEffectFuture: std::future::Future<Output = Result<(), BeforeTargetEffectError>>,
+    {
+        let existing_mods = open_mods_if_present(instance.clone(), "install_preflight")
+            .await
+            .map_err(|error| ManagedInstallExecutionError::from_mutation(error, false))?;
         let selection = match existing_mods.as_ref() {
             Some(mods) => managed_stage_selection(mods.path(), plan),
             None => Ok(ManagedStageSelection {
@@ -493,35 +576,53 @@ impl PerformanceManager {
                 pins: plan.pins().to_vec(),
             }),
         }
-        .map_err(ManagedMutationError::definite)?;
+        .map_err(ManagedMutationError::definite)
+        .map_err(|error| ManagedInstallExecutionError::from_mutation(error, false))?;
         if let Some(state) = selection.exact_state {
-            return Ok(state);
+            return Ok(ManagedInstallExecutionOutcome {
+                state,
+                target_changed: false,
+                rollback_ready: false,
+            });
         }
         // Provider and network work is completed while ownership remains entirely
         // in anonymous staging handles. No rollback or managed state effect exists yet.
         let staged = stage_managed_graph(client, selection.pins, instance.path())
             .await
-            .map_err(ManagedMutationError::definite)?;
+            .map_err(ManagedMutationError::definite)
+            .map_err(|error| ManagedInstallExecutionError::from_mutation(error, false))?;
         let mods = if let Some(mods) = existing_mods {
             mods
         } else {
             let instance = instance.clone();
             tokio::task::spawn_blocking(move || instance.open_or_create_child("mods"))
                 .await
-                .map_err(|_| ManagedMutationError::task_stopped("install_preflight"))?
-                .map_err(ManagedMutationError::definite)?
+                .map_err(|_| ManagedMutationError::task_stopped("install_preflight"))
+                .map_err(|error| ManagedInstallExecutionError::from_mutation(error, false))?
+                .map_err(ManagedMutationError::definite)
+                .map_err(|error| ManagedInstallExecutionError::from_mutation(error, false))?
         };
         let instance_mods_dir = mods.path();
         let previous_state = load_state(instance_mods_dir)
-            .map_err(|error| ManagedMutationError::indeterminate("install_preflight", error))?;
+            .map_err(|error| ManagedMutationError::indeterminate("install_preflight", error))
+            .map_err(|error| ManagedInstallExecutionError::from_mutation(error, false))?;
         match previous_state.as_ref() {
             Some(previous_state) => save_rollback_snapshot_async(instance_mods_dir, previous_state)
                 .await
-                .map_err(|error| ManagedMutationError::indeterminate("install_snapshot", error))?,
+                .map_err(|error| ManagedMutationError::indeterminate("install_snapshot", error))
+                .map_err(|error| ManagedInstallExecutionError::from_mutation(error, false))?,
             None => save_absent_rollback_snapshot_async(instance_mods_dir)
                 .await
-                .map_err(|error| ManagedMutationError::indeterminate("install_snapshot", error))?,
+                .map_err(|error| ManagedMutationError::indeterminate("install_snapshot", error))
+                .map_err(|error| ManagedInstallExecutionError::from_mutation(error, false))?,
         };
+
+        before_target_effect().await.map_err(|error| {
+            ManagedInstallExecutionError::BeforeTargetEffect {
+                error,
+                rollback_ready: true,
+            }
+        })?;
 
         let mods_dir = instance_mods_dir.to_path_buf();
         let previous_for_commit = previous_state.clone();
@@ -546,13 +647,15 @@ impl PerformanceManager {
                 .await
                 .map_err(|rollback| {
                     ManagedMutationError::indeterminate("install_restore", rollback)
-                })?
+                })
+                .map_err(|error| ManagedInstallExecutionError::from_mutation(error, true))?
                 .ok_or_else(|| {
                     ManagedMutationError::indeterminate(
                         "install_restore",
                         InstallError::NoRollbackSnapshot,
                     )
-                })?;
+                })
+                .map_err(|error| ManagedInstallExecutionError::from_mutation(error, true))?;
             restore_rollback_snapshot_classified_async(instance_mods_dir, &snapshot)
                 .await
                 .map_err(|rollback| match rollback {
@@ -560,10 +663,18 @@ impl PerformanceManager {
                     | RollbackRestoreError::Indeterminate(rollback) => {
                         ManagedMutationError::indeterminate("install_restore", rollback)
                     }
-                })?;
-            return Err(ManagedMutationError::definite(error));
+                })
+                .map_err(|error| ManagedInstallExecutionError::from_mutation(error, true))?;
+            return Err(ManagedInstallExecutionError::from_mutation(
+                ManagedMutationError::definite(error),
+                true,
+            ));
         }
-        Ok(state)
+        Ok(ManagedInstallExecutionOutcome {
+            state,
+            target_changed: true,
+            rollback_ready: true,
+        })
     }
 
     pub(super) async fn remove_managed_async(

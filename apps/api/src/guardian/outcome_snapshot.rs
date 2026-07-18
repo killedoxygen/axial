@@ -14,7 +14,7 @@ const SNAPSHOT_FIXTURE: &str = include_str!(concat!(
     "/tests/fixtures/guardian/guardian-outcome-copy-v1.json"
 ));
 const REGENERATE_ENV: &str = "AXIAL_REGENERATE_GUARDIAN_OUTCOME_COPY_SNAPSHOT";
-const EXPECTED_CASE_COUNT: usize = 28;
+const EXPECTED_CASE_COUNT: usize = 27;
 const EXPECTED_CASE_IDS: [&str; EXPECTED_CASE_COUNT] = [
     "runtime_repair.repaired",
     "runtime_repair.blocked",
@@ -41,7 +41,6 @@ const EXPECTED_CASE_IDS: [&str; EXPECTED_CASE_COUNT] = [
     "performance_rejection.missing_journal",
     "performance_rejection.unsafe_public_boundary",
     "performance_rejection.guardian_blocked",
-    "performance_rejection.fallback_unavailable",
     "performance_rejection.rollback_unavailable",
     "persisted_state.schema_invalid",
 ];
@@ -109,7 +108,6 @@ enum PerformanceRejectionInput {
     MissingJournal,
     UnsafePublicBoundary,
     GuardianBlocked,
-    FallbackUnavailable,
     RollbackUnavailable,
 }
 
@@ -306,7 +304,6 @@ impl From<PerformanceRejectionInput> for GuardianPerformanceSupervisionRejection
             PerformanceRejectionInput::MissingJournal => Self::MissingJournal,
             PerformanceRejectionInput::UnsafePublicBoundary => Self::UnsafePublicBoundary,
             PerformanceRejectionInput::GuardianBlocked => Self::GuardianBlocked,
-            PerformanceRejectionInput::FallbackUnavailable => Self::FallbackUnavailable,
             PerformanceRejectionInput::RollbackUnavailable => Self::RollbackUnavailable,
         }
     }
@@ -319,7 +316,6 @@ impl PerformanceRejectionInput {
             Self::MissingJournal => "missing_journal",
             Self::UnsafePublicBoundary => "unsafe_public_boundary",
             Self::GuardianBlocked => "guardian_blocked",
-            Self::FallbackUnavailable => "fallback_unavailable",
             Self::RollbackUnavailable => "rollback_unavailable",
         }
     }
@@ -365,7 +361,7 @@ fn assert_snapshot_coverage(snapshot: &GuardianOutcomeCopySnapshot) {
         };
         axis_counts[axis] += 1;
     }
-    assert_eq!(axis_counts, [3, 3, 11, 4, 6, 1]);
+    assert_eq!(axis_counts, [3, 3, 11, 4, 5, 1]);
 }
 
 fn canonical_case_id(input: &GuardianOutcomeCopyInput) -> String {

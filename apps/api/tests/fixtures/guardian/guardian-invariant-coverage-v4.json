@@ -5128,21 +5128,6 @@
       "memory_feedback": false
     },
     {
-      "diagnosis": "performance_health_degraded",
-      "triggers": [
-        "performance_health_degraded"
-      ],
-      "evidence": [
-        "performance_health_degraded"
-      ],
-      "phases": [],
-      "actions": [
-        "RecordOnly",
-        "Warn"
-      ],
-      "memory_feedback": false
-    },
-    {
       "diagnosis": "performance_health_invalid",
       "triggers": [
         "performance_health_invalid"
@@ -5160,12 +5145,10 @@
     {
       "diagnosis": "performance_fallback_selected",
       "triggers": [
-        "performance_fallback_selected",
-        "performance_health_fallback"
+        "performance_fallback_selected"
       ],
       "evidence": [
-        "performance_fallback_selected",
-        "performance_health_fallback"
+        "performance_fallback_selected"
       ],
       "phases": [],
       "actions": [
@@ -5959,16 +5942,6 @@
     },
     {
       "fact": "performance_fallback_selected",
-      "availability": "registered_current",
-      "referenced_by_rule": true
-    },
-    {
-      "fact": "performance_health_degraded",
-      "availability": "registered_current",
-      "referenced_by_rule": true
-    },
-    {
-      "fact": "performance_health_fallback",
       "availability": "registered_current",
       "referenced_by_rule": true
     },

@@ -14,8 +14,8 @@ use crate::state::{
 };
 use axial_performance::{
     BundleHealth, CompositionPlan, CompositionTier, InstallError, ManagedArtifactProvider,
-    ManagedMutationError, OwnershipClass, PerformanceMode, ResolutionRequest, StateError,
-    effective_performance_plan, parse_mode,
+    ManagedArtifactRole, ManagedMutationError, OwnershipClass, PerformanceMode, ResolutionRequest,
+    StateError, effective_performance_plan, parse_mode,
 };
 use axum::{Json, http::StatusCode};
 use serde::{Deserialize, Serialize};
@@ -42,8 +42,6 @@ pub struct PerformancePlanResponse {
     pub active: bool,
     pub effective: axial_performance::EffectivePerformancePlan,
     pub guardian_facts: Vec<GuardianFact>,
-    #[serde(flatten)]
-    pub plan: CompositionPlan,
 }
 
 #[derive(Debug, Serialize)]
@@ -68,8 +66,8 @@ pub struct PerformanceManagedArtifactSummary {
     pub filename: String,
     pub ownership_class: OwnershipClass,
     pub source_provider: ManagedArtifactProvider,
-    pub sha512_present: bool,
-    pub sha512_verified: bool,
+    pub role: ManagedArtifactRole,
+    pub size: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -133,7 +131,6 @@ pub async fn performance_plan(
         active: matches!(mode, PerformanceMode::Managed),
         effective: effective_performance_plan(&plan),
         guardian_facts,
-        plan,
     })
 }
 
@@ -230,7 +227,6 @@ pub(crate) async fn performance_health(
         mode,
         Some(&plan),
         health,
-        state_file.as_ref().map(|value| value.tier),
         rollback,
         installed_count,
         &warnings,
@@ -268,8 +264,8 @@ pub(super) fn managed_artifact_summary(
                     filename: installed.filename.clone(),
                     ownership_class: installed.ownership_class,
                     source_provider: installed.source.provider,
-                    sha512_present: !installed.integrity.sha512.trim().is_empty(),
-                    sha512_verified: installed.integrity.sha512_verified,
+                    role: installed.role,
+                    size: installed.size,
                 })
                 .collect()
         })
@@ -302,8 +298,6 @@ fn performance_health_proof(
 pub(super) fn bundle_health_token(health: BundleHealth) -> &'static str {
     match health {
         BundleHealth::Healthy => "healthy",
-        BundleHealth::Degraded => "degraded",
-        BundleHealth::Fallback => "fallback",
         BundleHealth::Disabled => "disabled",
         BundleHealth::Invalid => "invalid",
     }
@@ -459,7 +453,6 @@ fn disabled_health_response(
             mode,
             None,
             BundleHealth::Disabled,
-            None,
             RollbackState::NotApplicable,
             0,
             &[],
@@ -479,6 +472,7 @@ fn managed_state_invalid_response(
     };
     match state_error {
         StateError::Parse(_) => Some(("failed to parse performance state", Vec::new())),
+        StateError::InvalidState(_) => Some(("invalid performance state metadata", Vec::new())),
         StateError::InvalidOwnership { .. } => Some((
             "invalid performance artifact ownership metadata",
             performance_state_error_guardian_fact(state_error, OperationPhase::Validating)
@@ -521,7 +515,6 @@ fn invalid_managed_health_response(
             PerformanceMode::Managed,
             None,
             BundleHealth::Invalid,
-            None,
             RollbackState::Unavailable,
             0,
             &warnings,
@@ -558,10 +551,10 @@ fn managed_inspection_error(
             Json(serde_json::json!({ "error": error.to_string() })),
         ),
         ManagedInspectionError::Operation(ManagedMutationError::Definite(InstallError::State(
-            StateError::Parse(_),
+            StateError::Parse(_) | StateError::InvalidState(_),
         ))) => (
             StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({ "error": "failed to parse performance state" })),
+            Json(serde_json::json!({ "error": "invalid performance state metadata" })),
         ),
         ManagedInspectionError::Operation(ManagedMutationError::Definite(InstallError::State(
             StateError::InvalidOwnership { .. },

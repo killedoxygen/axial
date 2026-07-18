@@ -31,7 +31,6 @@ pub struct GuardianPerformanceSupervisionRequest<'a> {
     pub operation: GuardianPerformanceOperationKind,
     pub target: TargetDescriptor,
     pub facts: &'a [GuardianFact],
-    pub fallback_chain_len: usize,
     pub rollback_state: RollbackState,
     pub context: GuardianPolicyContext,
 }
@@ -42,9 +41,7 @@ pub struct GuardianPerformanceSupervisionPlan {
     pub target: TargetDescriptor,
     pub decision: GuardianDecision,
     pub fact_ids: Vec<GuardianFactId>,
-    pub fallback_authorized: bool,
     pub rollback_authorized: bool,
-    pub max_fallback_attempts: usize,
     pub public_summary: String,
 }
 
@@ -54,7 +51,6 @@ pub enum GuardianPerformanceSupervisionRejection {
     MissingJournal,
     UnsafePublicBoundary,
     GuardianBlocked,
-    FallbackUnavailable,
     RollbackUnavailable,
 }
 
@@ -90,24 +86,15 @@ pub fn plan_performance_supervision(
     if !performance_supervision_allows(request.operation, decision.kind()) {
         return Err(GuardianPerformanceSupervisionRejection::GuardianBlocked);
     }
-    if decision.kind() == GuardianActionKind::Fallback && request.fallback_chain_len == 0 {
-        return Err(GuardianPerformanceSupervisionRejection::FallbackUnavailable);
-    }
-
     Ok(GuardianPerformanceSupervisionPlan {
         operation: request.operation,
         target: request.target,
         decision,
         fact_ids: request.facts.iter().map(|fact| fact.id).collect(),
-        fallback_authorized: matches!(
-            request.operation,
-            GuardianPerformanceOperationKind::ApplyManagedComposition
-        ) && request.fallback_chain_len > 0,
         rollback_authorized: matches!(
             request.operation,
             GuardianPerformanceOperationKind::RollbackManagedComposition
         ) && request.rollback_state == RollbackState::Available,
-        max_fallback_attempts: request.fallback_chain_len,
         public_summary: performance_supervision_summary(request.operation),
     })
 }
@@ -157,10 +144,7 @@ pub fn performance_plan_guardian_facts(
         vec![
             token_field("composition_id", &plan.composition_id),
             token_field("tier", format!("{:?}", plan.tier)),
-            token_field(
-                "fallback_chain_count",
-                plan.fallback_chain.len().to_string(),
-            ),
+            token_field("warning_count", plan.warnings.len().to_string()),
         ],
     )]
 }
@@ -173,16 +157,6 @@ pub fn performance_health_guardian_facts(
 ) -> Vec<GuardianFact> {
     let (id, severity, confidence) = match health {
         BundleHealth::Healthy | BundleHealth::Disabled => return Vec::new(),
-        BundleHealth::Degraded => (
-            GuardianFactId::PerformanceHealthDegraded,
-            GuardianSeverity::Degraded,
-            GuardianConfidence::High,
-        ),
-        BundleHealth::Fallback => (
-            GuardianFactId::PerformanceHealthFallback,
-            GuardianSeverity::Warning,
-            GuardianConfidence::High,
-        ),
         BundleHealth::Invalid => (
             GuardianFactId::PerformanceHealthInvalid,
             GuardianSeverity::Blocking,
@@ -288,10 +262,7 @@ fn performance_supervision_allows(
     match operation {
         GuardianPerformanceOperationKind::ApplyManagedComposition => matches!(
             decision,
-            GuardianActionKind::Allow
-                | GuardianActionKind::RecordOnly
-                | GuardianActionKind::Warn
-                | GuardianActionKind::Fallback
+            GuardianActionKind::Allow | GuardianActionKind::RecordOnly | GuardianActionKind::Warn
         ),
         GuardianPerformanceOperationKind::RemoveManagedComposition => matches!(
             decision,
@@ -372,38 +343,27 @@ mod tests {
     }
 
     #[test]
-    fn degraded_fallback_and_invalid_health_map_to_distinct_facts() {
-        let cases = [
-            (
-                BundleHealth::Degraded,
-                "performance_health_degraded",
-                GuardianSeverity::Degraded,
-            ),
-            (
-                BundleHealth::Fallback,
-                "performance_health_fallback",
-                GuardianSeverity::Warning,
-            ),
-            (
-                BundleHealth::Invalid,
-                "performance_health_invalid",
-                GuardianSeverity::Blocking,
-            ),
-        ];
-
-        for (health, expected_id, expected_severity) in cases {
-            let facts = performance_health_guardian_facts(
-                health,
+    fn only_invalid_health_maps_to_a_guardian_fact() {
+        assert!(
+            performance_health_guardian_facts(
+                BundleHealth::Healthy,
                 "family-f-fabric-core",
-                &["managed composition warning".to_string()],
+                &[],
                 OperationPhase::Validating,
-            );
+            )
+            .is_empty()
+        );
 
-            assert_eq!(facts.len(), 1);
-            assert_eq!(facts[0].id.as_str(), expected_id);
-            assert_eq!(facts[0].severity, Some(expected_severity));
-            assert_eq!(facts[0].ownership, OwnershipClass::CompositionManaged);
-        }
+        let facts = performance_health_guardian_facts(
+            BundleHealth::Invalid,
+            "family-f-fabric-core",
+            &["managed composition warning".to_string()],
+            OperationPhase::Validating,
+        );
+        assert_eq!(facts.len(), 1);
+        assert_eq!(facts[0].id.as_str(), "performance_health_invalid");
+        assert_eq!(facts[0].severity, Some(GuardianSeverity::Blocking));
+        assert_eq!(facts[0].ownership, OwnershipClass::CompositionManaged);
     }
 
     #[test]
@@ -416,7 +376,6 @@ mod tests {
             tier: CompositionTier::Core,
             mods: Vec::new(),
             jvm_preset: String::new(),
-            fallback_chain: vec!["family-f-vanilla-enhanced".to_string()],
             warnings: Vec::new(),
             fallback_reason: "A faster performance bundle is not compatible.".to_string(),
         };
@@ -465,7 +424,7 @@ mod tests {
     }
 
     #[test]
-    fn performance_supervision_authorizes_managed_fallback_envelope() {
+    fn performance_supervision_records_declarative_selection_advisory() {
         let plan = CompositionPlan {
             composition_id: "family-f-fabric-core".to_string(),
             family: VersionFamily::F,
@@ -474,7 +433,6 @@ mod tests {
             tier: CompositionTier::Core,
             mods: Vec::new(),
             jvm_preset: String::new(),
-            fallback_chain: vec!["family-f-vanilla-enhanced".to_string()],
             warnings: Vec::new(),
             fallback_reason: "A faster performance bundle is not compatible.".to_string(),
         };
@@ -487,15 +445,12 @@ mod tests {
             operation: GuardianPerformanceOperationKind::ApplyManagedComposition,
             target: performance_target("family-f-fabric-core", OwnershipClass::CompositionManaged),
             facts: &facts,
-            fallback_chain_len: plan.fallback_chain.len(),
             rollback_state: RollbackState::Available,
             context: GuardianPolicyContext::current_operation(),
         })
         .expect("fallback supervision plan");
 
         assert_eq!(supervision.decision.kind(), GuardianActionKind::Warn);
-        assert!(supervision.fallback_authorized);
-        assert_eq!(supervision.max_fallback_attempts, 1);
         assert_eq!(
             supervision.fact_ids,
             vec![GuardianFactId::PerformanceFallbackSelected]
@@ -515,7 +470,6 @@ mod tests {
             operation: GuardianPerformanceOperationKind::ApplyManagedComposition,
             target: performance_target("user-mods", OwnershipClass::UserOwned),
             facts: &[],
-            fallback_chain_len: 0,
             rollback_state: RollbackState::Unavailable,
             context: GuardianPolicyContext::current_operation(),
         })
@@ -536,7 +490,6 @@ mod tests {
             operation: GuardianPerformanceOperationKind::RollbackManagedComposition,
             target: performance_target("family-f-fabric-core", OwnershipClass::CompositionManaged),
             facts: &[],
-            fallback_chain_len: 0,
             rollback_state: RollbackState::Unavailable,
             context: GuardianPolicyContext::current_operation(),
         })

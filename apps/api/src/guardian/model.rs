@@ -117,8 +117,6 @@ pub enum GuardianFactId {
     OwnershipUnknown,
     ParentVersionMissing,
     PerformanceFallbackSelected,
-    PerformanceHealthDegraded,
-    PerformanceHealthFallback,
     PerformanceHealthInvalid,
     PerformanceRulesInvalid,
     PerformanceUserOwnedConflict,
@@ -147,7 +145,7 @@ pub enum GuardianFactId {
 }
 
 impl GuardianFactId {
-    pub const ALL: [Self; 125] = [
+    pub const ALL: [Self; 123] = [
         Self::AgentHookFailed,
         Self::AgentUnavailable,
         Self::ArtifactChecksumMismatch,
@@ -246,8 +244,6 @@ impl GuardianFactId {
         Self::OwnershipUnknown,
         Self::ParentVersionMissing,
         Self::PerformanceFallbackSelected,
-        Self::PerformanceHealthDegraded,
-        Self::PerformanceHealthFallback,
         Self::PerformanceHealthInvalid,
         Self::PerformanceRulesInvalid,
         Self::PerformanceUserOwnedConflict,
@@ -381,8 +377,6 @@ impl GuardianFactId {
             Self::OwnershipUnknown => "ownership_unknown",
             Self::ParentVersionMissing => "parent_version_missing",
             Self::PerformanceFallbackSelected => "performance_fallback_selected",
-            Self::PerformanceHealthDegraded => "performance_health_degraded",
-            Self::PerformanceHealthFallback => "performance_health_fallback",
             Self::PerformanceHealthInvalid => "performance_health_invalid",
             Self::PerformanceRulesInvalid => "performance_rules_invalid",
             Self::PerformanceUserOwnedConflict => "performance_user_owned_conflict",
@@ -510,7 +504,6 @@ pub enum DiagnosisId {
     CustomJavaOverridePresent,
     CustomJvmPresetPresent,
     CustomJvmArgsPresent,
-    PerformanceHealthDegraded,
     PerformanceHealthInvalid,
     JvmPresetAdjusted,
     LaunchPrepareFailed,
@@ -536,7 +529,7 @@ pub enum DiagnosisId {
 }
 
 impl DiagnosisId {
-    pub const ALL: [Self; 80] = [
+    pub const ALL: [Self; 79] = [
         Self::ArtifactOwnershipUnsafe,
         Self::AtomicPromotionFailed,
         Self::DownloadUnavailable,
@@ -583,7 +576,6 @@ impl DiagnosisId {
         Self::CustomJavaOverridePresent,
         Self::CustomJvmPresetPresent,
         Self::CustomJvmArgsPresent,
-        Self::PerformanceHealthDegraded,
         Self::PerformanceHealthInvalid,
         Self::JvmPresetAdjusted,
         Self::LaunchPrepareFailed,
@@ -671,7 +663,6 @@ impl DiagnosisId {
             Self::CustomJavaOverridePresent => "custom_java_override_present",
             Self::CustomJvmPresetPresent => "custom_jvm_preset_present",
             Self::CustomJvmArgsPresent => "custom_jvm_args_present",
-            Self::PerformanceHealthDegraded => "performance_health_degraded",
             Self::PerformanceHealthInvalid => "performance_health_invalid",
             Self::JvmPresetAdjusted => "jvm_preset_adjusted",
             Self::LaunchPrepareFailed => "launch_prepare_failed",

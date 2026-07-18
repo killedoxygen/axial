@@ -267,7 +267,6 @@ mod tests {
             tier: CompositionTier::Core,
             mods: roots.iter().map(|root| managed_mod(root)).collect(),
             jvm_preset: String::new(),
-            fallback_chain: Vec::new(),
             warnings: Vec::new(),
             fallback_reason: String::new(),
         }

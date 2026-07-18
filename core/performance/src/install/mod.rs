@@ -15,7 +15,8 @@ pub use manager::{
 pub use model::{InstallError, PERFORMANCE_RULES_URL_ENV, RulesRefreshError, VerifiedRemoteRules};
 pub use mutation::{
     ManagedArtifactWitnessProof, ManagedCompositionInspection, ManagedIndeterminate,
-    ManagedMutationError, ManagedResolvedInspection,
+    ManagedInstallExecutionError, ManagedInstallExecutionOutcome, ManagedMutationError,
+    ManagedResolvedInspection,
 };
 pub use plan::{
     ManagedArtifactPin, ManagedArtifactRole, ManagedCompositionInstallPlan, ManagedDependencyEdge,
