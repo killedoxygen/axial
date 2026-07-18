@@ -478,7 +478,7 @@ test('create surfaces preserve backend Guardian copy and map every rendered noti
 
 test('performance health, Guardian settings, and proof evidence remain backend-authored display contracts', () => {
   const warningHealth: PerformanceHealthFixture = {
-    health: 'degraded',
+    health: 'healthy',
     view_model: {
       tone: 'warn',
       title: 'Backend performance warning',

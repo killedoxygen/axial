@@ -232,38 +232,10 @@ export type CompositionTier = 'extended' | 'core' | 'vanilla_enhanced';
 
 export type ModCondition = 'always' | 'hardware' | 'version_range' | 'recommend';
 
-export interface PerformanceHardwareRequirement {
-  gpu_vendor: string;
-  gpu_arch_min: number;
-  min_ram_mb: number;
-  min_cores: number;
-}
-
-export interface ManagedPerformanceMod {
-  project_id: string;
-  slug: string;
-  name: string;
-  condition: ModCondition;
-  version_range?: string;
-  exact_game_versions?: string[];
-  hardware_req?: PerformanceHardwareRequirement | null;
-  mutual_exclusions?: string[];
-}
-
 export interface PerformancePlanResponse {
   active: boolean;
   effective: EffectivePerformancePlan;
   guardian_facts: GuardianFact[];
-  composition_id: string;
-  family: CompositionFamily;
-  loader: string;
-  mode: PerformanceMode;
-  tier: CompositionTier;
-  mods: ManagedPerformanceMod[];
-  jvm_preset?: string;
-  fallback_chain?: string[];
-  warnings?: string[];
-  fallback_reason?: string;
 }
 
 export type PerformanceLoaderPosture = 'vanilla' | 'modded_loader';
@@ -305,9 +277,7 @@ export interface EffectivePerformancePlan {
   };
   fallback: {
     selected: boolean;
-    chain: string[];
     reason?: string | null;
-    launchable: boolean;
   };
   health_requirements: {
     expected_health: PerformanceHealthStatus;
@@ -324,7 +294,7 @@ export interface EffectivePerformancePlan {
   };
 }
 
-export type PerformanceHealthStatus = 'healthy' | 'degraded' | 'fallback' | 'disabled' | 'invalid';
+export type PerformanceHealthStatus = 'healthy' | 'disabled' | 'invalid';
 
 export type PerformanceRuleSource = 'built_in' | 'remote';
 
@@ -345,6 +315,8 @@ export interface PerformanceRulesCacheStatus {
 export type PerformanceOwnershipClass = 'composition_managed' | 'user_managed';
 
 export type PerformanceManagedArtifactProvider = 'modrinth';
+
+export type PerformanceManagedArtifactRole = 'root' | 'required_dependency';
 
 export type EmergencyDisableTarget = 'composition' | 'artifact';
 
@@ -467,8 +439,8 @@ export interface PerformanceManagedArtifactSummary {
   filename: string;
   ownership_class: PerformanceOwnershipClass;
   source_provider: PerformanceManagedArtifactProvider;
-  sha512_present: boolean;
-  sha512_verified: boolean;
+  role: PerformanceManagedArtifactRole;
+  size: number;
 }
 
 export interface PerformanceInstallResponse {
