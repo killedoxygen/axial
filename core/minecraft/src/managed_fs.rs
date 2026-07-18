@@ -20,6 +20,7 @@ const MAX_MANAGED_TREE_ENTRIES: usize = MAX_MANAGED_DIRECTORY_ENTRIES;
 const MAX_MANAGED_TREE_DEPTH: usize = 16;
 const MAX_MANAGED_TREE_FILE_BYTES: u64 = 128 << 20;
 const MAX_MANAGED_TREE_TOTAL_BYTES: u64 = 512 << 20;
+const MAX_EXACT_FILE_NAME_BYTES: usize = 255;
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_TEMPS: OnceLock<Mutex<HashSet<ActiveTempKey>>> = OnceLock::new();
 
@@ -34,6 +35,166 @@ pub struct AnchoredDirectory {
     stable_path: Arc<PathBuf>,
     _rename_blockers: Arc<Vec<platform::DirectoryRenameBlocker>>,
     _parent: Option<Arc<AnchoredDirectory>>,
+}
+
+#[derive(Debug)]
+pub enum AnchoredFileMoveOutcome {
+    PreMove(io::Error),
+    Applied(AnchoredFileMoveReceipt),
+    Indeterminate(io::Error),
+}
+
+#[derive(Debug)]
+pub enum AnchoredFileRestoreOutcome {
+    Restored,
+    SourceOccupied,
+    Indeterminate(io::Error),
+}
+
+pub struct AnchoredFileMoveReceipt {
+    source: AnchoredDirectory,
+    destination: AnchoredDirectory,
+    source_name: String,
+    destination_name: String,
+    moved_identity: platform::FileIdentity,
+    moved_size: u64,
+    exact_admitted_move: bool,
+    requires_resync: bool,
+}
+
+impl std::fmt::Debug for AnchoredFileMoveReceipt {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AnchoredFileMoveReceipt")
+            .field("exact_admitted_move", &self.exact_admitted_move)
+            .field("requires_resync", &self.requires_resync)
+            .finish_non_exhaustive()
+    }
+}
+
+impl AnchoredFileMoveReceipt {
+    pub fn is_exact_admitted_move(&self) -> bool {
+        self.exact_admitted_move
+    }
+
+    pub fn requires_resync(&self) -> bool {
+        self.requires_resync
+    }
+
+    pub fn resync(&mut self) -> io::Result<()> {
+        self.sync_anchors()?;
+        if !self
+            .destination
+            .directory
+            .exact_file_matches(&self.destination_name, self.moved_identity, self.moved_size)
+            .map_err(anchor_error)?
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "managed moved file changed before durability was proven",
+            ));
+        }
+        self.requires_resync = false;
+        Ok(())
+    }
+
+    fn sync_anchors(&self) -> io::Result<()> {
+        match (self.destination.sync(), self.source.sync()) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+            (Err(destination), Err(source)) => Err(io::Error::other(format!(
+                "managed move anchor synchronization failed: {destination}; {source}"
+            ))),
+        }
+    }
+
+    pub fn restore_create_only(self) -> AnchoredFileRestoreOutcome {
+        self.restore_create_only_inner()
+    }
+
+    fn restore_create_only_inner(self) -> AnchoredFileRestoreOutcome {
+        let destination_matches = match self.destination.directory.exact_file_matches(
+            &self.destination_name,
+            self.moved_identity,
+            self.moved_size,
+        ) {
+            Ok(matches) => matches,
+            Err(error) => {
+                return AnchoredFileRestoreOutcome::Indeterminate(anchor_error(error));
+            }
+        };
+        if !destination_matches {
+            return AnchoredFileRestoreOutcome::Indeterminate(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "managed moved file changed before restoration",
+            ));
+        }
+        match self
+            .source
+            .directory
+            .exact_child_name_state(&self.source_name)
+        {
+            Ok((true, _)) => return AnchoredFileRestoreOutcome::SourceOccupied,
+            Ok((false, _)) => {}
+            Err(error) => {
+                return AnchoredFileRestoreOutcome::Indeterminate(anchor_error(error));
+            }
+        }
+        let rename = platform::rename_entry_no_replace(
+            &self.destination.directory.inner.handle,
+            &self.destination.directory.inner.path,
+            OsStr::new(&self.destination_name),
+            &self.source.directory.inner.handle,
+            &self.source.directory.inner.path,
+            OsStr::new(&self.source_name),
+        );
+        let source_matches = self.source.directory.exact_file_matches(
+            &self.source_name,
+            self.moved_identity,
+            self.moved_size,
+        );
+        let destination_present = self
+            .destination
+            .directory
+            .exact_child_name_state(&self.destination_name)
+            .map(|(present, _)| present);
+        let source_present = self
+            .source
+            .directory
+            .exact_child_name_state(&self.source_name)
+            .map(|(present, _)| present);
+        match (rename, source_matches, source_present, destination_present) {
+            (_, Ok(true), _, Ok(false)) => {
+                if let Err(error) = self.sync_anchors() {
+                    return AnchoredFileRestoreOutcome::Indeterminate(error);
+                }
+                let restored = self
+                    .source
+                    .directory
+                    .exact_file_matches(&self.source_name, self.moved_identity, self.moved_size)
+                    .is_ok_and(|matches| matches)
+                    && self
+                        .destination
+                        .directory
+                        .exact_child_name_state(&self.destination_name)
+                        .is_ok_and(|(present, _)| !present);
+                if restored {
+                    AnchoredFileRestoreOutcome::Restored
+                } else {
+                    AnchoredFileRestoreOutcome::Indeterminate(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "managed moved file restoration changed after synchronization",
+                    ))
+                }
+            }
+            (Err(_), _, Ok(true), Ok(true)) => AnchoredFileRestoreOutcome::SourceOccupied,
+            (Err(error), _, _, _) => AnchoredFileRestoreOutcome::Indeterminate(error),
+            (Ok(()), _, _, _) => AnchoredFileRestoreOutcome::Indeterminate(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "managed moved file restoration topology is indeterminate",
+            )),
+        }
+    }
 }
 
 impl std::fmt::Debug for AnchoredDirectory {
@@ -70,6 +231,23 @@ impl AnchoredDirectory {
         &self.stable_path
     }
 
+    pub fn sync(&self) -> io::Result<()> {
+        self.directory.sync().map_err(anchor_error)
+    }
+
+    pub fn prove_empty(&self) -> io::Result<()> {
+        self.directory.revalidate().map_err(anchor_error)?;
+        if !platform::entry_names(&self.directory.inner.handle, &self.directory.inner.path, 1)?
+            .is_empty()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "anchored directory is not empty",
+            ));
+        }
+        self.directory.revalidate().map_err(anchor_error)
+    }
+
     pub fn remove_empty_child(&self, name: &str) -> io::Result<bool> {
         validate_segment(name).map_err(anchor_error)?;
         let child = match self.directory.open_child(name) {
@@ -100,48 +278,270 @@ impl AnchoredDirectory {
         destination: &Self,
         destination_name: &str,
     ) -> io::Result<()> {
-        validate_segment(source_name).map_err(anchor_error)?;
-        validate_segment(destination_name).map_err(anchor_error)?;
-        if destination
+        validate_exact_file_name(source_name).map_err(anchor_error)?;
+        validate_exact_file_name(destination_name).map_err(anchor_error)?;
+        self.directory.revalidate().map_err(anchor_error)?;
+        destination.directory.revalidate().map_err(anchor_error)?;
+        if self.directory.inner.identity == destination.directory.inner.identity
+            && portable_case_fold(source_name) == portable_case_fold(destination_name)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "managed rename source and destination are not distinct",
+            ));
+        }
+        if !self
             .directory
-            .portable_child_name_state(destination_name)
+            .exact_child_name_state(source_name)
             .map_err(anchor_error)?
             .0
         {
+            return Err(io::Error::from(io::ErrorKind::NotFound));
+        }
+        let (destination_exists, destination_entries) = destination
+            .directory
+            .exact_child_name_state(destination_name)
+            .map_err(anchor_error)?;
+        if destination_exists {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
                 "managed rename destination already exists",
             ));
         }
-        let guard = self
+        if self.directory.inner.identity != destination.directory.inner.identity
+            && destination_entries >= MAX_MANAGED_DIRECTORY_ENTRIES
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "managed rename destination exceeds its entry bound",
+            ));
+        }
+        let source_file = platform::open_file_read(
+            &self.directory.inner.handle,
+            &self.directory.inner.path,
+            OsStr::new(source_name),
+        )?;
+        let source_identity = platform::file_identity(&source_file)?;
+        let source_size = source_file.metadata()?.len();
+        if !self
             .directory
-            .inspect_regular_file(source_name)
+            .exact_file_matches(source_name, source_identity, source_size)
             .map_err(anchor_error)?
-            .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))?;
-        self.directory
-            .rename_guarded_file_no_replace(
-                source_name,
-                &guard,
-                &destination.directory,
-                destination_name,
-            )
-            .map_err(anchor_error)?;
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "managed rename source identity changed before publication",
+            ));
+        }
+        platform::rename_entry_no_replace(
+            &self.directory.inner.handle,
+            &self.directory.inner.path,
+            OsStr::new(source_name),
+            &destination.directory.inner.handle,
+            &destination.directory.inner.path,
+            OsStr::new(destination_name),
+        )?;
+
+        destination.directory.sync().map_err(anchor_error)?;
+        self.directory.sync().map_err(anchor_error)?;
         if !destination
             .directory
-            .has_portably_exact_child_name(destination_name)
+            .exact_file_matches(destination_name, source_identity, source_size)
             .map_err(anchor_error)?
             || self
                 .directory
-                .has_portably_exact_child_name(source_name)
+                .exact_child_name_state(source_name)
                 .map_err(anchor_error)?
+                .0
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "managed rename namespace changed during publication",
             ));
         }
-        destination.directory.sync().map_err(anchor_error)?;
-        self.directory.sync().map_err(anchor_error)
+        Ok(())
+    }
+
+    pub fn rename_admitted_file_no_replace(
+        &self,
+        source_name: &str,
+        destination: &Self,
+        destination_name: &str,
+        admitted_file: &std::fs::File,
+    ) -> AnchoredFileMoveOutcome {
+        self.rename_admitted_file_no_replace_inner(
+            source_name,
+            destination,
+            destination_name,
+            admitted_file,
+            || {},
+            || {},
+            false,
+        )
+    }
+
+    #[cfg(test)]
+    fn rename_admitted_file_no_replace_with_hooks(
+        &self,
+        source_name: &str,
+        destination: &Self,
+        destination_name: &str,
+        admitted_file: &std::fs::File,
+        before_rename: impl FnOnce(),
+        after_rename: impl FnOnce(),
+        force_resync: bool,
+    ) -> AnchoredFileMoveOutcome {
+        self.rename_admitted_file_no_replace_inner(
+            source_name,
+            destination,
+            destination_name,
+            admitted_file,
+            before_rename,
+            after_rename,
+            force_resync,
+        )
+    }
+
+    fn rename_admitted_file_no_replace_inner(
+        &self,
+        source_name: &str,
+        destination: &Self,
+        destination_name: &str,
+        admitted_file: &std::fs::File,
+        before_rename: impl FnOnce(),
+        after_rename: impl FnOnce(),
+        force_resync: bool,
+    ) -> AnchoredFileMoveOutcome {
+        let admitted = (|| -> io::Result<(platform::FileIdentity, u64)> {
+            validate_exact_file_name(source_name).map_err(anchor_error)?;
+            validate_exact_file_name(destination_name).map_err(anchor_error)?;
+            self.directory.revalidate().map_err(anchor_error)?;
+            destination.directory.revalidate().map_err(anchor_error)?;
+            if self.directory.inner.identity == destination.directory.inner.identity
+                && portable_case_fold(source_name) == portable_case_fold(destination_name)
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "managed rename source and destination are not distinct",
+                ));
+            }
+            let (destination_exists, destination_entries) = destination
+                .directory
+                .exact_child_name_state(destination_name)
+                .map_err(anchor_error)?;
+            if destination_exists {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "managed rename destination already exists",
+                ));
+            }
+            if self.directory.inner.identity != destination.directory.inner.identity
+                && destination_entries >= MAX_MANAGED_DIRECTORY_ENTRIES
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "managed rename destination exceeds its entry bound",
+                ));
+            }
+            let metadata = admitted_file.metadata()?;
+            if !metadata.is_file() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "managed admitted rename handle is not a regular file",
+                ));
+            }
+            let identity = platform::file_identity(admitted_file)?;
+            if !self
+                .directory
+                .exact_file_matches(source_name, identity, metadata.len())
+                .map_err(anchor_error)?
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "managed rename source differs from its admitted handle",
+                ));
+            }
+            Ok((identity, metadata.len()))
+        })();
+        let (admitted_identity, admitted_size) = match admitted {
+            Ok(admitted) => admitted,
+            Err(error) => return AnchoredFileMoveOutcome::PreMove(error),
+        };
+
+        before_rename();
+        let rename = platform::rename_entry_no_replace(
+            &self.directory.inner.handle,
+            &self.directory.inner.path,
+            OsStr::new(source_name),
+            &destination.directory.inner.handle,
+            &destination.directory.inner.path,
+            OsStr::new(destination_name),
+        );
+        after_rename();
+
+        let source_still_admitted =
+            match self
+                .directory
+                .exact_file_matches(source_name, admitted_identity, admitted_size)
+            {
+                Ok(matches) => matches,
+                Err(error) => {
+                    return AnchoredFileMoveOutcome::Indeterminate(anchor_error(error));
+                }
+            };
+        if let Err(error) = rename {
+            return if source_still_admitted {
+                AnchoredFileMoveOutcome::PreMove(error)
+            } else {
+                AnchoredFileMoveOutcome::Indeterminate(io::Error::other(format!(
+                    "managed rename failed after the admitted source topology changed: {error}"
+                )))
+            };
+        }
+        let moved_file = match platform::open_file_read(
+            &destination.directory.inner.handle,
+            &destination.directory.inner.path,
+            OsStr::new(destination_name),
+        ) {
+            Ok(file) => file,
+            Err(open_error) => {
+                return AnchoredFileMoveOutcome::Indeterminate(open_error);
+            }
+        };
+        let moved_identity = match platform::file_identity(&moved_file) {
+            Ok(identity) => identity,
+            Err(error) => return AnchoredFileMoveOutcome::Indeterminate(error),
+        };
+        let moved_size = match moved_file.metadata() {
+            Ok(metadata) => metadata.len(),
+            Err(error) => return AnchoredFileMoveOutcome::Indeterminate(error),
+        };
+        let exact_admitted_move = moved_identity == admitted_identity
+            && moved_size == admitted_size
+            && !source_still_admitted;
+        let destination_sync = destination.sync();
+        let source_sync = self.sync();
+        let requires_resync = force_resync || destination_sync.is_err() || source_sync.is_err();
+        if !destination
+            .directory
+            .exact_file_matches(destination_name, moved_identity, moved_size)
+            .is_ok_and(|matches| matches)
+        {
+            return AnchoredFileMoveOutcome::Indeterminate(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "managed rename destination changed after application",
+            ));
+        }
+        AnchoredFileMoveOutcome::Applied(AnchoredFileMoveReceipt {
+            source: self.clone(),
+            destination: destination.clone(),
+            source_name: source_name.to_string(),
+            destination_name: destination_name.to_string(),
+            moved_identity,
+            moved_size,
+            exact_admitted_move,
+            requires_resync,
+        })
     }
 
     pub(crate) fn managed_directory(&self) -> ManagedDir {
@@ -1132,8 +1532,18 @@ impl ManagedDir {
 
     fn portable_child_name_state(&self, expected: &str) -> Result<(bool, usize), LoaderError> {
         validate_segment(expected)?;
+        self.exact_child_name_state(expected)
+    }
+
+    fn exact_child_name_state(&self, expected: &str) -> Result<(bool, usize), LoaderError> {
+        validate_exact_file_name(expected)?;
+        self.revalidate()?;
         let expected_folded = portable_case_fold(expected);
-        let entries = self.entries_bounded(MAX_MANAGED_DIRECTORY_ENTRIES + 1)?;
+        let entries = platform::entry_names(
+            &self.inner.handle,
+            &self.inner.path,
+            MAX_MANAGED_DIRECTORY_ENTRIES + 1,
+        )?;
         if entries.len() > MAX_MANAGED_DIRECTORY_ENTRIES {
             return Err(LoaderError::Verify(
                 "managed directory exceeds the portable alias scan bound".to_string(),
@@ -1158,6 +1568,26 @@ impl ManagedDir {
             }
         }
         Ok((matching_name.is_some(), entry_count))
+    }
+
+    fn exact_file_matches(
+        &self,
+        name: &str,
+        identity: platform::FileIdentity,
+        size: u64,
+    ) -> Result<bool, LoaderError> {
+        validate_exact_file_name(name)?;
+        self.revalidate()?;
+        let current = match platform::open_file_read(
+            &self.inner.handle,
+            &self.inner.path,
+            OsStr::new(name),
+        ) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(LoaderError::Io(error)),
+        };
+        Ok(platform::file_identity(&current)? == identity && current.metadata()?.len() == size)
     }
 
     pub(crate) fn inspect_regular_file(
@@ -3427,6 +3857,41 @@ fn validate_segment(name: &str) -> Result<(), LoaderError> {
     })
 }
 
+fn validate_exact_file_name(name: &str) -> Result<(), LoaderError> {
+    if name.is_empty()
+        || name.len() > MAX_EXACT_FILE_NAME_BYTES
+        || name == "."
+        || name == ".."
+        || name.bytes().any(|byte| b"<>:\"/\\|?*".contains(&byte))
+        || name.chars().any(char::is_control)
+        || name.starts_with(' ')
+        || name.ends_with(['.', ' '])
+        || windows_device_file_name(name)
+        || Path::new(name)
+            .components()
+            .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        return Err(LoaderError::Verify(
+            "managed exact file name is not canonical".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn windows_device_file_name(name: &str) -> bool {
+    let basename = name.split('.').next().unwrap_or(name);
+    if ["CON", "PRN", "AUX", "NUL", "CLOCK$", "CONIN$", "CONOUT$"]
+        .iter()
+        .any(|device| basename.eq_ignore_ascii_case(device))
+    {
+        return true;
+    }
+    let bytes = basename.as_bytes();
+    bytes.len() == 4
+        && bytes[3].is_ascii_digit()
+        && (bytes[..3].eq_ignore_ascii_case(b"COM") || bytes[..3].eq_ignore_ascii_case(b"LPT"))
+}
+
 fn portable_case_fold(name: &str) -> String {
     name.chars().flat_map(char::to_lowercase).collect()
 }
@@ -4041,8 +4506,252 @@ mod tests {
             b"candidate"
         );
 
+        let long_source_name = format!("{}.tmp", "s".repeat(176));
+        let long_destination_name = format!("{}.park", "d".repeat(175));
+        fs::write(
+            source_path.join(&long_source_name),
+            b"long internal candidate",
+        )
+        .expect("write long internal candidate");
+        source
+            .rename_file_no_replace(&long_source_name, &destination, &long_destination_name)
+            .expect("publish long internal candidate create-only");
+        assert!(!source_path.join(long_source_name).exists());
+        assert_eq!(
+            fs::read(destination_path.join(long_destination_name))
+                .expect("read long internal candidate"),
+            b"long internal candidate"
+        );
+
         drop((source, destination));
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn admitted_file_rename_refuses_a_pre_move_identity_change() {
+        let root = test_root("admitted-file-rename-pre-move-change");
+        let source_path = root.join("source");
+        let destination_path = root.join("destination");
+        fs::create_dir_all(&source_path).expect("create source directory");
+        fs::create_dir_all(&destination_path).expect("create destination directory");
+        fs::write(source_path.join("candidate"), b"owned").expect("write admitted file");
+        let admitted = fs::File::open(source_path.join("candidate")).expect("open admitted file");
+        let source = AnchoredDirectory::open(&source_path).expect("anchor source");
+        let destination = AnchoredDirectory::open(&destination_path).expect("anchor destination");
+
+        fs::rename(source_path.join("candidate"), source_path.join("original"))
+            .expect("displace admitted file");
+        fs::write(source_path.join("candidate"), b"replacement").expect("write live replacement");
+        let outcome = source.rename_admitted_file_no_replace(
+            "candidate",
+            &destination,
+            "published",
+            &admitted,
+        );
+
+        assert!(matches!(outcome, AnchoredFileMoveOutcome::PreMove(_)));
+        assert_eq!(
+            fs::read(source_path.join("candidate")).expect("live replacement retained"),
+            b"replacement"
+        );
+        assert_eq!(
+            fs::read(source_path.join("original")).expect("admitted file retained"),
+            b"owned"
+        );
+        assert!(!destination_path.join("published").exists());
+        drop((source, destination, admitted));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn admitted_file_rename_restores_a_residual_window_replacement() {
+        let root = test_root("admitted-file-rename-residual-window");
+        let source_path = root.join("source");
+        let destination_path = root.join("destination");
+        fs::create_dir_all(&source_path).expect("create source directory");
+        fs::create_dir_all(&destination_path).expect("create destination directory");
+        fs::write(source_path.join("candidate"), b"owned").expect("write admitted file");
+        let admitted = fs::File::open(source_path.join("candidate")).expect("open admitted file");
+        let source = AnchoredDirectory::open(&source_path).expect("anchor source");
+        let destination = AnchoredDirectory::open(&destination_path).expect("anchor destination");
+
+        let outcome = source.rename_admitted_file_no_replace_with_hooks(
+            "candidate",
+            &destination,
+            "published",
+            &admitted,
+            || {
+                fs::rename(source_path.join("candidate"), source_path.join("original"))
+                    .expect("displace admitted file in residual window");
+                fs::write(source_path.join("candidate"), b"replacement")
+                    .expect("write residual-window replacement");
+            },
+            || {},
+            false,
+        );
+        let receipt = match outcome {
+            AnchoredFileMoveOutcome::Applied(receipt) => receipt,
+            other => panic!("expected applied move receipt, got {other:?}"),
+        };
+
+        assert!(!receipt.is_exact_admitted_move());
+        assert!(matches!(
+            receipt.restore_create_only(),
+            AnchoredFileRestoreOutcome::Restored
+        ));
+        assert_eq!(
+            fs::read(source_path.join("candidate")).expect("replacement restored live"),
+            b"replacement"
+        );
+        assert_eq!(
+            fs::read(source_path.join("original")).expect("admitted file retained"),
+            b"owned"
+        );
+        assert!(!destination_path.join("published").exists());
+        drop((source, destination, admitted));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn admitted_file_restore_preserves_an_occupied_live_name() {
+        let root = test_root("admitted-file-restore-source-occupied");
+        let source_path = root.join("source");
+        let destination_path = root.join("destination");
+        fs::create_dir_all(&source_path).expect("create source directory");
+        fs::create_dir_all(&destination_path).expect("create destination directory");
+        fs::write(source_path.join("candidate"), b"owned").expect("write admitted file");
+        let admitted = fs::File::open(source_path.join("candidate")).expect("open admitted file");
+        let source = AnchoredDirectory::open(&source_path).expect("anchor source");
+        let destination = AnchoredDirectory::open(&destination_path).expect("anchor destination");
+
+        let outcome = source.rename_admitted_file_no_replace_with_hooks(
+            "candidate",
+            &destination,
+            "published",
+            &admitted,
+            || {
+                fs::rename(source_path.join("candidate"), source_path.join("original"))
+                    .expect("displace admitted file in residual window");
+                fs::write(source_path.join("candidate"), b"replacement")
+                    .expect("write residual-window replacement");
+            },
+            || {},
+            false,
+        );
+        let receipt = match outcome {
+            AnchoredFileMoveOutcome::Applied(receipt) => receipt,
+            other => panic!("expected applied move receipt, got {other:?}"),
+        };
+        fs::write(source_path.join("candidate"), b"newer live entry")
+            .expect("occupy live name before restoration");
+
+        assert!(matches!(
+            receipt.restore_create_only(),
+            AnchoredFileRestoreOutcome::SourceOccupied
+        ));
+        assert_eq!(
+            fs::read(source_path.join("candidate")).expect("live occupant preserved"),
+            b"newer live entry"
+        );
+        assert_eq!(
+            fs::read(destination_path.join("published")).expect("moved replacement retained"),
+            b"replacement"
+        );
+        drop((source, destination, admitted));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn admitted_file_move_receipt_resynchronizes_both_anchors() {
+        let root = test_root("admitted-file-rename-resync");
+        let source_path = root.join("source");
+        let destination_path = root.join("destination");
+        fs::create_dir_all(&source_path).expect("create source directory");
+        fs::create_dir_all(&destination_path).expect("create destination directory");
+        fs::write(source_path.join("candidate"), b"owned").expect("write admitted file");
+        let admitted = fs::File::open(source_path.join("candidate")).expect("open admitted file");
+        let source = AnchoredDirectory::open(&source_path).expect("anchor source");
+        let destination = AnchoredDirectory::open(&destination_path).expect("anchor destination");
+
+        let outcome = source.rename_admitted_file_no_replace_with_hooks(
+            "candidate",
+            &destination,
+            "published",
+            &admitted,
+            || {},
+            || {},
+            true,
+        );
+        let mut receipt = match outcome {
+            AnchoredFileMoveOutcome::Applied(receipt) => receipt,
+            other => panic!("expected applied move receipt, got {other:?}"),
+        };
+
+        assert!(receipt.is_exact_admitted_move());
+        assert!(receipt.requires_resync());
+        receipt.resync().expect("resynchronize retained anchors");
+        assert!(!receipt.requires_resync());
+        assert!(!source_path.join("candidate").exists());
+        assert_eq!(
+            fs::read(destination_path.join("published")).expect("read moved file"),
+            b"owned"
+        );
+        drop((receipt, source, destination, admitted));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn admitted_file_rename_reports_indeterminate_post_move_topology() {
+        let root = test_root("admitted-file-rename-indeterminate");
+        let source_path = root.join("source");
+        let destination_path = root.join("destination");
+        fs::create_dir_all(&source_path).expect("create source directory");
+        fs::create_dir_all(&destination_path).expect("create destination directory");
+        fs::write(source_path.join("candidate"), b"owned").expect("write admitted file");
+        let admitted = fs::File::open(source_path.join("candidate")).expect("open admitted file");
+        let source = AnchoredDirectory::open(&source_path).expect("anchor source");
+        let destination = AnchoredDirectory::open(&destination_path).expect("anchor destination");
+
+        let outcome = source.rename_admitted_file_no_replace_with_hooks(
+            "candidate",
+            &destination,
+            "published",
+            &admitted,
+            || {},
+            || {
+                fs::rename(
+                    destination_path.join("published"),
+                    destination_path.join("displaced"),
+                )
+                .expect("displace moved file before receipt admission");
+            },
+            false,
+        );
+
+        assert!(matches!(outcome, AnchoredFileMoveOutcome::Indeterminate(_)));
+        assert!(!source_path.join("candidate").exists());
+        assert_eq!(
+            fs::read(destination_path.join("displaced")).expect("moved file remains reachable"),
+            b"owned"
+        );
+        drop((source, destination, admitted));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn anchored_file_rename_rejects_nonportable_exact_names() {
+        for name in [
+            r"nested\candidate",
+            "trailing.",
+            "trailing ",
+            "CON",
+            "lpt1.log",
+            "question?.park",
+        ] {
+            assert!(validate_exact_file_name(name).is_err(), "accepted {name:?}");
+        }
+        assert!(validate_exact_file_name("fabric-api+0.1.0.jar").is_ok());
+        assert!(validate_exact_file_name("candidate_[internal] (1).park").is_ok());
     }
 
     #[cfg(unix)]

@@ -20,9 +20,11 @@ pub(crate) struct AdmittedFile {
     settlement_capable: bool,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ExactFileSettlement {
+    #[cfg(windows)]
     Settled,
+    #[cfg(unix)]
+    IdentityRetained(AdmittedFile),
     #[cfg(unix)]
     PathChanged,
 }
@@ -126,10 +128,8 @@ fn platform_admit(_path: &Path, _settlement_capable: bool) -> io::Result<Admitte
 
 #[cfg(unix)]
 fn platform_settle_exact(admitted: AdmittedFile, path: &Path) -> io::Result<ExactFileSettlement> {
-    // POSIX cannot condition unlink on inode identity. Retain the proven inode instead of
-    // pathname-unlinking a possible last-window replacement.
     match platform_revalidate(path, admitted.identity, admitted.metadata.len()) {
-        Ok(()) => Ok(ExactFileSettlement::Settled),
+        Ok(()) => Ok(ExactFileSettlement::IdentityRetained(admitted)),
         Err(error)
             if matches!(
                 error.kind(),

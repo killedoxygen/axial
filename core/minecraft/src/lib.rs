@@ -20,7 +20,10 @@ mod managed_component_table;
 mod managed_fs;
 
 pub mod managed_path {
-    pub use crate::managed_fs::AnchoredDirectory;
+    pub use crate::managed_fs::{
+        AnchoredDirectory, AnchoredFileMoveOutcome, AnchoredFileMoveReceipt,
+        AnchoredFileRestoreOutcome,
+    };
 }
 mod managed_publication;
 pub mod manifest;

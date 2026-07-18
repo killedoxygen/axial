@@ -346,6 +346,7 @@ pub(crate) fn save_state(
     instance_mods_dir: &Path,
     state: &CompositionState,
 ) -> Result<(), StateError> {
+    require_cleanup_quarantine_empty(instance_mods_dir)?;
     validate_state(state)?;
     ensure_instance_mods_directory(instance_mods_dir)?;
     reconcile_state_publication_for_mutation(instance_mods_dir)?;
@@ -366,6 +367,7 @@ pub(crate) fn save_state(
 }
 
 pub(crate) fn remove_state(instance_mods_dir: &Path) -> Result<(), StateError> {
+    require_cleanup_quarantine_empty(instance_mods_dir)?;
     reconcile_state_publication_for_mutation(instance_mods_dir)?;
     let path = lock_file_path(instance_mods_dir);
     match fs::symlink_metadata(&path) {
@@ -509,6 +511,7 @@ fn publish_staged_state(
 }
 
 pub(crate) fn reconcile_state_publication(instance_mods_dir: &Path) -> Result<(), StateError> {
+    require_cleanup_quarantine_empty(instance_mods_dir)?;
     let destination = lock_file_path(instance_mods_dir);
     let staged = state_staged_path(instance_mods_dir);
     let backup = state_backup_path(instance_mods_dir);
@@ -767,6 +770,7 @@ fn save_rollback_snapshot_target(
     instance_mods_dir: &Path,
     target: RollbackSnapshotState,
 ) -> Result<RollbackSnapshot, StateError> {
+    require_cleanup_quarantine_empty(instance_mods_dir)?;
     let snapshot_id = new_rollback_snapshot_id();
     let planned = match &target {
         RollbackSnapshotState::ManagedStateAbsent => PlannedRollbackSnapshot {
@@ -1047,6 +1051,7 @@ fn commit_rollback_snapshot(
     planned: &PlannedRollbackSnapshot,
     snapshot: &RollbackSnapshot,
 ) -> Result<(), StateError> {
+    require_cleanup_quarantine_empty(instance_mods_dir)?;
     ensure_rollback_internal_roots(instance_mods_dir)?;
     let history_path = rollback_history_file_path(instance_mods_dir, &snapshot.id);
     preflight_rollback_candidate_namespace(instance_mods_dir, planned, &history_path)?;
@@ -1255,15 +1260,10 @@ fn stage_rollback_artifact_copy(artifact: &PlannedRollbackArtifact) -> Result<()
 }
 
 fn cleanup_created_rollback_artifacts(paths: &[&Path]) -> Result<(), StateError> {
-    let mut first_error = None;
     for path in paths {
-        if let Err(error) = remove_owned_file(path)
-            && first_error.is_none()
-        {
-            first_error = Some(error);
-        }
+        remove_owned_file(path)?;
     }
-    first_error.map_or(Ok(()), Err)
+    Ok(())
 }
 
 fn cleanup_unpublished_rollback_candidate(
@@ -1487,6 +1487,7 @@ pub(crate) fn restore_rollback_snapshot_classified(
     instance_mods_dir: &Path,
     snapshot: &RollbackSnapshot,
 ) -> Result<ManagedRollbackOutcome, RollbackRestoreError> {
+    require_cleanup_quarantine_empty(instance_mods_dir).map_err(RollbackRestoreError::Definite)?;
     validate_rollback_snapshot(snapshot).map_err(RollbackRestoreError::Definite)?;
 
     let snapshot_filenames: HashSet<String> = snapshot
@@ -1608,6 +1609,7 @@ pub(crate) fn stage_managed_artifact_removal(
     instance_mods_dir: &Path,
     installed: &InstalledMod,
 ) -> Result<PathBuf, StateError> {
+    require_cleanup_quarantine_empty(instance_mods_dir)?;
     let path = managed_artifact_path(instance_mods_dir, &installed.filename)?;
     let backup = removal_backup_path(instance_mods_dir, installed);
     if path_exists(&backup)? {
@@ -1664,6 +1666,7 @@ pub(crate) fn stage_managed_artifact_addition(
     sha512: &str,
     source_path: &Path,
 ) -> Result<PathBuf, StateError> {
+    require_cleanup_quarantine_empty(instance_mods_dir)?;
     validate_managed_filename(filename)?;
     if !is_valid_sha512(sha512) {
         return Err(StateError::InvalidIntegrity {
@@ -1761,6 +1764,7 @@ pub(crate) fn prepare_managed_artifact_addition(
     instance_mods_dir: &AnchoredDirectory,
     installed: &InstalledMod,
 ) -> Result<ManagedArtifactAdditionObligation, StateError> {
+    require_cleanup_quarantine_empty(instance_mods_dir.path())?;
     managed_artifact_addition_path(
         instance_mods_dir.path(),
         &installed.filename,
@@ -1811,6 +1815,7 @@ pub(crate) fn publish_managed_artifact_addition(
     installed: &InstalledMod,
     obligation: &ManagedArtifactAdditionObligation,
 ) -> Result<(), StateError> {
+    require_cleanup_quarantine_empty(instance_mods_dir)?;
     managed_artifact_addition_path(
         instance_mods_dir,
         &installed.filename,
@@ -1874,6 +1879,7 @@ pub(crate) fn reconcile_managed_addition_obligations(
     instance_mods_dir: &Path,
     current_state: Option<&CompositionState>,
 ) -> Result<(), StateError> {
+    require_cleanup_quarantine_empty(instance_mods_dir)?;
     let state_root = instance_mods_dir.join(STATE_DIR_NAME);
     let mutation_root = state_root.join(MUTATION_DIR_NAME);
     let root = mutation_root.join(ADDITION_DIR_NAME);
@@ -1897,6 +1903,7 @@ pub(crate) fn reconcile_managed_addition_obligations(
                 "managed addition digest path is not a directory".to_string(),
             ));
         }
+        validate_reserved_directory_metadata(&fs::symlink_metadata(digest_dir.path())?)?;
         let digest = digest_dir
             .file_name()
             .to_str()
@@ -2059,6 +2066,7 @@ pub(crate) fn settle_managed_artifact_removal(
     instance_mods_dir: &Path,
     installed: &InstalledMod,
 ) -> Result<(), StateError> {
+    require_cleanup_quarantine_empty(instance_mods_dir)?;
     let backup = removal_backup_path(instance_mods_dir, installed);
     if path_exists(&backup)? {
         if !path_matches_sha512(&backup, &installed.integrity.sha512)? {
@@ -2147,6 +2155,7 @@ fn managed_removal_reconciliation_required(instance_mods_dir: &Path) -> Result<b
                 "managed removal digest path is not a directory".to_string(),
             ));
         }
+        validate_reserved_directory_metadata(&fs::symlink_metadata(digest_dir.path())?)?;
         let digest = digest_dir
             .file_name()
             .to_str()
@@ -2182,6 +2191,7 @@ pub(crate) fn reconcile_managed_removal_obligations(
     instance_mods_dir: &Path,
     current_state: Option<&CompositionState>,
 ) -> Result<(), StateError> {
+    require_cleanup_quarantine_empty(instance_mods_dir)?;
     let state_root = instance_mods_dir.join(STATE_DIR_NAME);
     let mutation_root = state_root.join(MUTATION_DIR_NAME);
     let root = mutation_root.join(REMOVAL_DIR_NAME);
@@ -2351,7 +2361,10 @@ fn ensure_rollback_internal_roots(instance_mods_dir: &Path) -> Result<(), StateE
 
 fn validate_existing_directory(path: &Path) -> Result<bool, StateError> {
     match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_dir() => Ok(true),
+        Ok(metadata) if metadata.file_type().is_dir() => {
+            validate_reserved_directory_metadata(&metadata)?;
+            Ok(true)
+        }
         Ok(_) => Err(StateError::InvalidRollback(
             "rollback internal path is not a regular directory".to_string(),
         )),
@@ -2362,12 +2375,14 @@ fn validate_existing_directory(path: &Path) -> Result<bool, StateError> {
 
 fn ensure_managed_directory(path: &Path) -> Result<(), StateError> {
     match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_dir() => Ok(()),
+        Ok(metadata) if metadata.file_type().is_dir() => {
+            validate_reserved_directory_metadata(&metadata)
+        }
         Ok(_) => Err(StateError::InvalidRollback(
             "rollback internal path is not a regular directory".to_string(),
         )),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            fs::create_dir(path)?;
+            create_reserved_directory(path)?;
             if validate_existing_directory(path)? {
                 if let Some(parent) = path.parent() {
                     sync_rollback_directory(parent, RollbackDurabilityPoint::DirectoryCreated)?;
@@ -3191,7 +3206,43 @@ fn quarantine_remove_file_with_hook(
             "managed cleanup target digest changed after admission".to_string(),
         ));
     }
-    quarantine_remove_admitted_file_inner(path, admitted, expected_sha512, after_park, |_| {})
+    quarantine_remove_admitted_file_inner(
+        path,
+        admitted,
+        expected_sha512,
+        |_| {},
+        after_park,
+        |_| {},
+    )
+}
+
+#[cfg(test)]
+fn quarantine_remove_file_with_parking_hook(
+    path: &Path,
+    expected_sha512: &str,
+    max_bytes: u64,
+    before_park: impl FnOnce(&Path),
+) -> Result<(), StateError> {
+    let metadata = fs::symlink_metadata(path)?;
+    if !metadata.file_type().is_file() || metadata.len() > max_bytes {
+        return Err(StateError::InvalidState(
+            "managed cleanup target is not a bounded regular file".to_string(),
+        ));
+    }
+    let (admitted, digest) = admit_live_cleanup_file(path, metadata.len())?;
+    if !digest.eq_ignore_ascii_case(expected_sha512) {
+        return Err(StateError::InvalidState(
+            "managed cleanup target digest changed after admission".to_string(),
+        ));
+    }
+    quarantine_remove_admitted_file_inner(
+        path,
+        admitted,
+        expected_sha512,
+        before_park,
+        |_| {},
+        |_| {},
+    )
 }
 
 fn quarantine_remove_admitted_file(
@@ -3200,7 +3251,14 @@ fn quarantine_remove_admitted_file(
     expected_sha512: &str,
     after_park: impl FnOnce(&Path),
 ) -> Result<(), StateError> {
-    quarantine_remove_admitted_file_inner(path, admitted, expected_sha512, after_park, |_| {})
+    quarantine_remove_admitted_file_inner(
+        path,
+        admitted,
+        expected_sha512,
+        |_| {},
+        after_park,
+        |_| {},
+    )
 }
 
 #[cfg(test)]
@@ -3227,6 +3285,7 @@ fn quarantine_remove_file_with_settlement_hook(
         admitted,
         expected_sha512,
         |_| {},
+        |_| {},
         before_settlement,
     )
 }
@@ -3235,6 +3294,7 @@ fn quarantine_remove_admitted_file_inner(
     path: &Path,
     settlement: crate::file_identity::AdmittedFile,
     expected_sha512: &str,
+    before_park: impl FnOnce(&Path),
     after_park: impl FnOnce(&Path),
     before_settlement: impl FnOnce(&Path),
 ) -> Result<(), StateError> {
@@ -3245,44 +3305,101 @@ fn quarantine_remove_admitted_file_inner(
     }
     let admitted = settlement.identity();
     let admitted_len = settlement.metadata().len();
+    let admitted_file = settlement.try_clone_file()?;
     let instance_mods_dir = managed_cleanup_root(path)?;
-    let usage = inspect_cleanup_quarantine(&instance_mods_dir)?
-        .map(|inspection| inspection.usage)
-        .unwrap_or_default();
-    ensure_cleanup_quarantine_capacity(usage, admitted_len)?;
+    let quarantine = ReservedCleanupQuarantine::admit_empty(&instance_mods_dir)?;
     crate::file_identity::revalidate(path, admitted, admitted_len).map_err(|_| {
         StateError::InvalidState(
             "managed cleanup target identity changed before parking".to_string(),
         )
     })?;
-    let quarantine = cleanup_quarantine_path(&instance_mods_dir);
-    ensure_cleanup_quarantine(&instance_mods_dir)?;
     let mut nonce = [0_u8; 16];
     OsRng.try_fill_bytes(&mut nonce).map_err(|_| {
         StateError::Read(std::io::Error::other(
             "managed cleanup quarantine nonce generation failed",
         ))
     })?;
-    let parked = quarantine.join(format!(
+    let parked_name = format!(
         "{}.{}.park",
         expected_sha512.to_ascii_lowercase(),
         hex::encode(nonce)
-    ));
-    fs::rename(path, &parked)?;
+    );
+    let parked = quarantine.path(&parked_name);
+    before_park(&parked);
+    let source_parent = path.parent().ok_or_else(|| {
+        StateError::InvalidState("managed cleanup target has no parent".to_string())
+    })?;
+    let source_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| {
+            StateError::InvalidState("managed cleanup target name is invalid".to_string())
+        })?;
+    let source = AnchoredDirectory::open(&source_parent.join("."))?;
+    let mut receipt = match source.rename_admitted_file_no_replace(
+        source_name,
+        &quarantine.directory,
+        &parked_name,
+        &admitted_file,
+    ) {
+        axial_minecraft::managed_path::AnchoredFileMoveOutcome::PreMove(error)
+            if error.kind() == std::io::ErrorKind::InvalidData =>
+        {
+            return Err(StateError::InvalidState(error.to_string()));
+        }
+        axial_minecraft::managed_path::AnchoredFileMoveOutcome::PreMove(error) => {
+            return Err(StateError::Read(error));
+        }
+        axial_minecraft::managed_path::AnchoredFileMoveOutcome::Applied(receipt) => receipt,
+        axial_minecraft::managed_path::AnchoredFileMoveOutcome::Indeterminate(error) => {
+            return Err(StateError::Read(error));
+        }
+    };
+    if receipt.requires_resync() {
+        receipt.resync()?;
+    }
+    if !receipt.is_exact_admitted_move() {
+        return match receipt.restore_create_only() {
+            axial_minecraft::managed_path::AnchoredFileRestoreOutcome::Restored => {
+                Err(StateError::InvalidState(
+                    "managed cleanup live source changed during parking".to_string(),
+                ))
+            }
+            axial_minecraft::managed_path::AnchoredFileRestoreOutcome::SourceOccupied => {
+                Err(StateError::InvalidState(
+                    "managed cleanup live replacement could not be restored create-only"
+                        .to_string(),
+                ))
+            }
+            axial_minecraft::managed_path::AnchoredFileRestoreOutcome::Indeterminate(error) => {
+                Err(StateError::Read(error))
+            }
+        };
+    }
+    drop(receipt);
     after_park(&parked);
     let parked_matches = crate::file_identity::revalidate(&parked, admitted, admitted_len).is_ok()
         && path_matches_sha512(&parked, expected_sha512)?;
     if !parked_matches {
-        if !path_exists(path)? {
-            fs::hard_link(&parked, path)?;
-        }
         return Err(StateError::InvalidState(
             "managed cleanup parked identity changed after admission".to_string(),
         ));
     }
     before_settlement(&parked);
     match settlement.settle_exact(&parked)? {
-        crate::file_identity::ExactFileSettlement::Settled => Ok(()),
+        #[cfg(windows)]
+        crate::file_identity::ExactFileSettlement::Settled => {
+            quarantine.directory.prove_empty().map_err(|_| {
+                StateError::InvalidState(
+                    "managed cleanup quarantine residue remains after settlement".to_string(),
+                )
+            })?;
+            Ok(())
+        }
+        #[cfg(unix)]
+        crate::file_identity::ExactFileSettlement::IdentityRetained(retained) => {
+            quarantine.remove_proven_park(&parked, retained, expected_sha512)
+        }
         #[cfg(unix)]
         crate::file_identity::ExactFileSettlement::PathChanged => Err(StateError::InvalidState(
             "managed cleanup quarantine identity changed before settlement".to_string(),
@@ -3327,51 +3444,96 @@ fn ensure_cleanup_quarantine(instance_mods_dir: &Path) -> Result<(), StateError>
     Ok(())
 }
 
+struct ReservedCleanupQuarantine {
+    directory: AnchoredDirectory,
+}
+
+impl ReservedCleanupQuarantine {
+    fn admit_empty(instance_mods_dir: &Path) -> Result<Self, StateError> {
+        require_cleanup_quarantine_empty(instance_mods_dir)?;
+        ensure_cleanup_quarantine(instance_mods_dir)?;
+        require_cleanup_quarantine_empty(instance_mods_dir)?;
+        Ok(Self {
+            directory: AnchoredDirectory::open(&cleanup_quarantine_path(instance_mods_dir))?,
+        })
+    }
+
+    fn path(&self, name: &str) -> PathBuf {
+        self.directory.path().join(name)
+    }
+
+    #[cfg(unix)]
+    fn remove_proven_park(
+        &self,
+        parked: &Path,
+        retained: crate::file_identity::AdmittedFile,
+        expected_sha512: &str,
+    ) -> Result<(), StateError> {
+        let admitted = retained.identity();
+        let admitted_len = retained.metadata().len();
+        if parked.parent() != Some(self.directory.path())
+            || crate::file_identity::revalidate(parked, admitted, admitted_len).is_err()
+            || !path_matches_sha512(parked, expected_sha512)?
+        {
+            return Err(StateError::InvalidState(
+                "managed cleanup quarantine proof changed before settlement".to_string(),
+            ));
+        }
+        fs::remove_file(parked)?;
+        self.directory.sync()?;
+        self.directory.prove_empty().map_err(|_| {
+            StateError::InvalidState(
+                "managed cleanup quarantine residue remains after settlement".to_string(),
+            )
+        })?;
+        drop(retained);
+        Ok(())
+    }
+}
+
 fn cleanup_quarantine_reconciliation_required(
     instance_mods_dir: &Path,
 ) -> Result<bool, StateError> {
-    inspect_cleanup_quarantine(instance_mods_dir)?;
-    Ok(false)
+    Ok(inspect_cleanup_quarantine(instance_mods_dir)? != 0)
 }
 
 fn reconcile_cleanup_quarantine(instance_mods_dir: &Path) -> Result<(), StateError> {
-    inspect_cleanup_quarantine(instance_mods_dir)?;
+    require_cleanup_quarantine_empty(instance_mods_dir)
+}
+
+pub(crate) fn require_cleanup_quarantine_empty(instance_mods_dir: &Path) -> Result<(), StateError> {
+    if inspect_cleanup_quarantine(instance_mods_dir)? != 0 {
+        return Err(StateError::InvalidState(
+            "managed cleanup quarantine contains retained same-process obligations".to_string(),
+        ));
+    }
     Ok(())
 }
 
-#[derive(Clone, Copy, Default)]
-struct CleanupQuarantineUsage {
-    count: usize,
-    bytes: u64,
-}
-
-struct CleanupQuarantineInspection {
-    usage: CleanupQuarantineUsage,
-}
-
-fn inspect_cleanup_quarantine(
-    instance_mods_dir: &Path,
-) -> Result<Option<CleanupQuarantineInspection>, StateError> {
+fn inspect_cleanup_quarantine(instance_mods_dir: &Path) -> Result<usize, StateError> {
     let root = cleanup_quarantine_path(instance_mods_dir);
     match fs::symlink_metadata(&root) {
-        Ok(metadata) if metadata.file_type().is_dir() => {}
+        Ok(metadata) if metadata.file_type().is_dir() => {
+            validate_reserved_directory_metadata(&metadata)?;
+        }
         Ok(_) => {
             return Err(StateError::InvalidState(
                 "managed cleanup quarantine is not a regular directory".to_string(),
             ));
         }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
         Err(error) => return Err(StateError::Read(error)),
     }
     let entries = match fs::read_dir(&root) {
         Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
         Err(error) => return Err(StateError::Read(error)),
     };
-    let mut usage = CleanupQuarantineUsage::default();
+    let mut count = 0_usize;
+    let mut bytes = 0_u64;
     for entry in entries {
         let entry = entry?;
-        admit_recovery_entry(&mut usage.count, "managed cleanup quarantine")?;
+        admit_recovery_entry(&mut count, "managed cleanup quarantine")?;
         let path = entry.path();
         let metadata = fs::symlink_metadata(&path)?;
         if !metadata.file_type().is_file() || metadata.len() > MANAGED_ARTIFACT_MAX_BYTES {
@@ -3379,10 +3541,10 @@ fn inspect_cleanup_quarantine(
                 "managed cleanup quarantine contains an invalid entry".to_string(),
             ));
         }
-        usage.bytes = usage.bytes.checked_add(metadata.len()).ok_or_else(|| {
+        bytes = bytes.checked_add(metadata.len()).ok_or_else(|| {
             StateError::InvalidState("managed cleanup quarantine size overflowed".to_string())
         })?;
-        if usage.bytes > CLEANUP_QUARANTINE_MAX_BYTES {
+        if bytes > CLEANUP_QUARANTINE_MAX_BYTES {
             return Err(StateError::InvalidState(
                 "managed cleanup quarantine exceeds its byte budget".to_string(),
             ));
@@ -3420,22 +3582,7 @@ fn inspect_cleanup_quarantine(
             ));
         }
     }
-    Ok(Some(CleanupQuarantineInspection { usage }))
-}
-
-fn ensure_cleanup_quarantine_capacity(
-    usage: CleanupQuarantineUsage,
-    additional_bytes: u64,
-) -> Result<(), StateError> {
-    let bytes = usage.bytes.checked_add(additional_bytes).ok_or_else(|| {
-        StateError::InvalidState("managed cleanup quarantine size overflowed".to_string())
-    })?;
-    if usage.count >= RECOVERY_ENTRY_LIMIT || bytes > CLEANUP_QUARANTINE_MAX_BYTES {
-        return Err(StateError::InvalidState(
-            "managed cleanup quarantine has no remaining capacity".to_string(),
-        ));
-    }
-    Ok(())
+    Ok(count)
 }
 
 fn admit_live_cleanup_file(
@@ -3590,18 +3737,21 @@ fn admit_recovery_entry(count: &mut usize, label: &str) -> Result<(), StateError
 
 fn ensure_recovery_directory(path: &Path) -> Result<(), StateError> {
     match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_dir() => Ok(()),
+        Ok(metadata) if metadata.file_type().is_dir() => {
+            validate_reserved_directory_metadata(&metadata)
+        }
         Ok(_) => Err(StateError::InvalidState(
             "managed recovery path is not a regular directory".to_string(),
         )),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            match fs::create_dir(path) {
+            match create_reserved_directory(path) {
                 Ok(()) => {}
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
                 Err(error) => return Err(StateError::Read(error)),
             }
             match fs::symlink_metadata(path) {
                 Ok(metadata) if metadata.file_type().is_dir() => {
+                    validate_reserved_directory_metadata(&metadata)?;
                     if let Some(parent) = path.parent() {
                         sync_rollback_directory(parent, RollbackDurabilityPoint::DirectoryCreated)?;
                     }
@@ -3615,6 +3765,33 @@ fn ensure_recovery_directory(path: &Path) -> Result<(), StateError> {
         }
         Err(error) => Err(StateError::Read(error)),
     }
+}
+
+fn create_reserved_directory(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+
+        fs::DirBuilder::new().mode(0o700).create(path)
+    }
+    #[cfg(not(unix))]
+    {
+        fs::create_dir(path)
+    }
+}
+
+fn validate_reserved_directory_metadata(_metadata: &fs::Metadata) -> Result<(), StateError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        if _metadata.permissions().mode() & 0o077 != 0 {
+            return Err(StateError::InvalidState(
+                "managed internal directory is not owner-only".to_string(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn validate_managed_filename(filename: &str) -> Result<(), StateError> {
@@ -3724,6 +3901,7 @@ fn prove_managed_internal_roots(instance_mods_dir: &Path) -> Result<(), StateErr
                 "managed internal root contains an unknown entry".to_string(),
             ));
         }
+        validate_reserved_directory_metadata(&fs::symlink_metadata(entry.path())?)?;
     }
 
     let mutation_root = state_root.join(MUTATION_DIR_NAME);
@@ -3749,14 +3927,14 @@ fn prove_managed_internal_roots(instance_mods_dir: &Path) -> Result<(), StateErr
                 "managed mutation root contains an unknown entry".to_string(),
             ));
         }
+        validate_reserved_directory_metadata(&fs::symlink_metadata(entry.path())?)?;
     }
     if path_exists(&mutation_root.join(ADDITION_DIR_NAME))? {
         return Err(StateError::InvalidState(
             "managed addition obligation root remains after recovery".to_string(),
         ));
     }
-    inspect_cleanup_quarantine(instance_mods_dir)?;
-    Ok(())
+    require_cleanup_quarantine_empty(instance_mods_dir)
 }
 
 fn prove_removal_obligations_settled(instance_mods_dir: &Path) -> Result<(), StateError> {
@@ -3793,7 +3971,9 @@ fn prove_removal_obligations_settled(instance_mods_dir: &Path) -> Result<(), Sta
 
 fn validate_managed_recovery_directory(path: &Path) -> Result<(), StateError> {
     match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_dir() => Ok(()),
+        Ok(metadata) if metadata.file_type().is_dir() => {
+            validate_reserved_directory_metadata(&metadata)
+        }
         Ok(_) => Err(StateError::InvalidState(
             "managed recovery root is not a regular directory".to_string(),
         )),
@@ -4148,6 +4328,7 @@ fn reconcile_rollback_metadata_publication_for_write(path: &Path) -> Result<(), 
 }
 
 pub(crate) fn reconcile_rollback_metadata(instance_mods_dir: &Path) -> Result<(), StateError> {
+    require_cleanup_quarantine_empty(instance_mods_dir)?;
     validate_rollback_internal_roots(instance_mods_dir)?;
     reconcile_rollback_metadata_publication(&rollback_file_path(instance_mods_dir))
 }
@@ -4593,7 +4774,7 @@ mod tests {
     fn managed_recovery_preserves_unknown_restore_temp() {
         let root = test_root("recover-unknown-restore-temp");
         let rollback_tmp = rollback_tmp_dir_path(&root);
-        fs::create_dir_all(&rollback_tmp).expect("create rollback temp root");
+        ensure_rollback_internal_roots(&root).expect("create rollback roots");
         let unknown = rollback_tmp.join("unknown-restore.tmp");
         fs::write(&unknown, b"unknown").expect("write unknown restore temp");
 
@@ -4837,9 +5018,9 @@ mod tests {
             .join(STATE_DIR_NAME)
             .join(MUTATION_DIR_NAME)
             .join(REMOVAL_DIR_NAME);
-        fs::create_dir_all(&removals).expect("create removal root");
+        ensure_mutation_directory_tree(&root, &removals).expect("create removal root");
         for index in 0..8 {
-            fs::create_dir(removals.join(format!("{index:0128x}")))
+            create_reserved_directory(&removals.join(format!("{index:0128x}")))
                 .expect("create empty digest directory");
         }
 
@@ -5047,7 +5228,7 @@ mod tests {
     #[test]
     fn rollback_snapshot_rejects_missing_artifact_metadata() {
         let root = test_root("missing-rollback-artifact-metadata");
-        fs::create_dir_all(rollback_files_dir_path(&root)).expect("create rollback files dir");
+        ensure_rollback_internal_roots(&root).expect("create rollback roots");
         fs::write(
             rollback_files_dir_path(&root).join("missing-metadata.bin"),
             b"managed-a",
@@ -5671,7 +5852,7 @@ mod tests {
     fn rollback_snapshot_accounts_for_transient_candidate_storage() {
         let root = test_root("snapshot-total-storage-budget");
         let files_dir = rollback_files_dir_path(&root);
-        fs::create_dir_all(&files_dir).expect("create rollback files dir");
+        ensure_rollback_internal_roots(&root).expect("create rollback roots");
         fs::File::create(files_dir.join("retained.bin"))
             .expect("create retained sparse artifact")
             .set_len(ROLLBACK_TRANSIENT_MAX_BYTES)
@@ -6319,8 +6500,7 @@ mod tests {
     #[test]
     fn rollback_snapshot_rejects_missing_artifact_list() {
         let root = test_root("missing-rollback-artifacts");
-        let rollback_dir = rollback_dir_path(&root);
-        fs::create_dir_all(&rollback_dir).expect("create rollback dir");
+        ensure_rollback_internal_roots(&root).expect("create rollback roots");
         fs::write(
             rollback_file_path(&root),
             serde_json::to_vec(&serde_json::json!({
@@ -6347,8 +6527,7 @@ mod tests {
     #[test]
     fn rollback_snapshot_rejects_previous_schema_without_compatibility_parsing() {
         let root = test_root("previous-rollback-schema");
-        let rollback_dir = rollback_dir_path(&root);
-        fs::create_dir_all(&rollback_dir).expect("create rollback dir");
+        ensure_rollback_internal_roots(&root).expect("create rollback roots");
         fs::write(
             rollback_file_path(&root),
             serde_json::to_vec(&serde_json::json!({
@@ -6386,113 +6565,177 @@ mod tests {
             fs::read(&target).expect("replacement preserved"),
             b"replacement"
         );
-        #[cfg(unix)]
         assert_eq!(
-            inspect_cleanup_quarantine(&root)
-                .expect("inspect retained quarantine")
-                .expect("retained quarantine")
-                .usage
-                .count,
-            1
-        );
-        #[cfg(windows)]
-        assert_eq!(
-            fs::read_dir(cleanup_quarantine_path(&root))
-                .expect("read permanent quarantine")
-                .count(),
+            inspect_cleanup_quarantine(&root).expect("inspect empty quarantine"),
             0
         );
-        prove_managed_storage_recovered(&root, None).expect("prove permanent quarantine");
+        prove_managed_storage_recovered(&root, None).expect("prove empty quarantine");
         let _ = fs::remove_dir_all(root);
     }
 
     #[test]
-    fn cleanup_quarantine_restart_retains_self_consistent_unowned_entry() {
+    fn cleanup_quarantine_supports_an_anchored_instance_root() {
+        let root = test_root("cleanup-anchored-root");
+        fs::write(root.join("managed.jar"), b"owned").expect("write owned target");
+        let digest = hex::encode(Sha512::digest(b"owned"));
+        let anchor = AnchoredDirectory::open(&root).expect("anchor instance root");
+        let target = anchor.path().join("managed.jar");
+
+        quarantine_remove_file_with_hook(&target, &digest, 64, |_| {})
+            .expect("remove through anchored root");
+
+        assert!(!root.join("managed.jar").exists());
+        assert_eq!(
+            inspect_cleanup_quarantine(anchor.path()).expect("inspect anchored quarantine"),
+            0
+        );
+        drop(anchor);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cleanup_quarantine_restart_residue_latches_before_every_effect() {
         let root = test_root("cleanup-restart-unowned-entry");
         let quarantine = cleanup_quarantine_path(&root);
-        fs::create_dir_all(&quarantine).expect("create quarantine");
+        ensure_cleanup_quarantine(&root).expect("create reserved quarantine");
         let bytes = b"self-consistent-but-unowned";
         let digest = hex::encode(Sha512::digest(bytes));
         let injected = quarantine.join(format!("{digest}.{:032x}.park", 1));
         fs::write(&injected, bytes).expect("write injected entry");
 
-        reconcile_cleanup_quarantine(&root).expect("first restart reconciliation");
-        reconcile_cleanup_quarantine(&root).expect("second restart reconciliation");
+        assert!(reconcile_cleanup_quarantine(&root).is_err());
+        assert!(reconcile_cleanup_quarantine(&root).is_err());
 
         assert_eq!(fs::read(&injected).expect("injected entry retained"), bytes);
         let preflight =
             preflight_managed_inspection_reconciliation(&root).expect("preflight retained entry");
-        assert!(!preflight.cleanup_quarantine);
-        prove_managed_storage_recovered(&root, None).expect("prove bounded retained entry");
+        assert!(preflight.cleanup_quarantine);
+        assert!(prove_managed_storage_recovered(&root, None).is_err());
+
+        let target = root.join("managed.jar");
+        fs::write(&target, b"owned").expect("write live target");
+        let target_digest = hex::encode(Sha512::digest(b"owned"));
+        assert!(quarantine_remove_file_with_hook(&target, &target_digest, 64, |_| {}).is_err());
+        assert!(save_rollback_snapshot(&root, &test_state("core", Vec::new())).is_err());
+        assert_eq!(fs::read(&target).expect("live target remains"), b"owned");
+        assert_eq!(fs::read(&injected).expect("residue remains"), bytes);
+        assert!(!rollback_dir_path(&root).exists());
         let _ = fs::remove_dir_all(root);
     }
 
-    #[cfg(unix)]
     #[test]
-    fn cleanup_quarantine_retains_validated_bytes_outside_live_namespace() {
-        let root = test_root("cleanup-linux-retention");
+    fn cleanup_quarantine_repeated_success_remains_empty() {
+        let root = test_root("cleanup-success-plateau");
+        let target = root.join("managed.jar");
+        let digest = hex::encode(Sha512::digest(b"owned"));
+
+        for _ in 0..64 {
+            fs::write(&target, b"owned").expect("write owned target");
+            quarantine_remove_file_with_hook(&target, &digest, 64, |_| {})
+                .expect("settle owned target");
+            assert!(!target.exists());
+            assert_eq!(
+                inspect_cleanup_quarantine(&root).expect("inspect successful cleanup"),
+                0
+            );
+        }
+        prove_managed_storage_recovered(&root, None).expect("prove plateaued cleanup");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cleanup_quarantine_destination_collision_preserves_both_entries() {
+        let root = test_root("cleanup-destination-collision");
         let target = root.join("managed.jar");
         fs::write(&target, b"owned").expect("write owned target");
         let digest = hex::encode(Sha512::digest(b"owned"));
+        let collision = std::cell::RefCell::new(None);
 
-        quarantine_remove_file_with_hook(&target, &digest, 64, |_| {})
-            .expect("park validated target");
+        let error = quarantine_remove_file_with_parking_hook(&target, &digest, 64, |parked| {
+            fs::write(parked, b"collision").expect("write destination collision");
+            *collision.borrow_mut() = parked.file_name().map(ToOwned::to_owned);
+        })
+        .expect_err("create-only parking must reject a collision");
+        let collision =
+            cleanup_quarantine_path(&root).join(collision.into_inner().expect("collision name"));
 
+        assert!(matches!(error, StateError::Read(_)));
+        assert_eq!(fs::read(&target).expect("source retained"), b"owned");
+        assert_eq!(
+            fs::read(&collision).expect("collision retained"),
+            b"collision"
+        );
+        assert!(reconcile_cleanup_quarantine(&root).is_err());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cleanup_quarantine_live_source_replacement_before_move_fails_closed() {
+        let root = test_root("cleanup-live-source-replacement");
+        let target = root.join("managed.jar");
+        let displaced = root.join("original.jar");
+        fs::write(&target, b"owned").expect("write owned target");
+        let digest = hex::encode(Sha512::digest(b"owned"));
+
+        let error = quarantine_remove_file_with_parking_hook(&target, &digest, 64, |_| {
+            fs::rename(&target, &displaced).expect("displace admitted live source");
+            fs::write(&target, b"replacement").expect("write live replacement");
+        })
+        .expect_err("source replacement before move must fail closed");
+
+        assert!(matches!(error, StateError::InvalidState(_)));
+        assert_eq!(
+            fs::read(&target).expect("live replacement remains in place"),
+            b"replacement"
+        );
+        assert_eq!(
+            fs::read(&displaced).expect("original admitted bytes remain reachable"),
+            b"owned"
+        );
+        assert_eq!(
+            inspect_cleanup_quarantine(&root).expect("inspect empty quarantine"),
+            0
+        );
+        reconcile_cleanup_quarantine(&root).expect("empty quarantine remains settled");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cleanup_quarantine_rejects_concurrent_residue_after_settlement() {
+        let root = test_root("cleanup-post-settlement-residue");
+        let target = root.join("managed.jar");
+        fs::write(&target, b"owned").expect("write owned target");
+        let digest = hex::encode(Sha512::digest(b"owned"));
+        let residue_digest = hex::encode(Sha512::digest(b"residue"));
+        let residue_name = format!("{residue_digest}.{}.park", "f".repeat(32));
+
+        let error = quarantine_remove_file_with_settlement_hook(&target, &digest, 64, |parked| {
+            fs::write(
+                parked
+                    .parent()
+                    .expect("parked file has quarantine parent")
+                    .join(&residue_name),
+                b"residue",
+            )
+            .expect("inject concurrent canonical residue");
+        })
+        .expect_err("whole-quarantine settlement proof must reject residue");
+        let residue = cleanup_quarantine_path(&root).join(&residue_name);
+
+        assert!(matches!(error, StateError::InvalidState(_)));
         assert!(!target.exists());
-        let inspection = inspect_cleanup_quarantine(&root)
-            .expect("inspect quarantine")
-            .expect("retained quarantine");
-        assert_eq!(inspection.usage.count, 1);
-        assert_eq!(inspection.usage.bytes, 5);
-        let retained = fs::read_dir(cleanup_quarantine_path(&root))
-            .expect("read quarantine")
-            .next()
-            .expect("one retained entry")
-            .expect("retained entry")
-            .path();
-        assert_eq!(fs::read(retained).expect("read retained bytes"), b"owned");
-        prove_managed_storage_recovered(&root, None).expect("prove bounded retained quarantine");
+        assert_eq!(fs::read(&residue).expect("residue retained"), b"residue");
+        assert!(reconcile_cleanup_quarantine(&root).is_err());
         let _ = fs::remove_dir_all(root);
     }
 
-    #[cfg(unix)]
     #[test]
-    fn cleanup_quarantine_restart_reconciliation_is_idempotent() {
-        let root = test_root("cleanup-linux-restart");
-        let target = root.join("managed.jar");
-        fs::write(&target, b"owned").expect("write owned target");
-        let digest = hex::encode(Sha512::digest(b"owned"));
-        quarantine_remove_file_with_hook(&target, &digest, 64, |_| {})
-            .expect("park validated target");
-        inspect_cleanup_quarantine(&root)
-            .expect("inspect quarantine")
-            .expect("retained quarantine");
-        let retained = fs::read_dir(cleanup_quarantine_path(&root))
-            .expect("read quarantine")
-            .next()
-            .expect("one retained entry")
-            .expect("retained entry")
-            .path();
-
-        reconcile_cleanup_quarantine(&root).expect("first restart reconciliation");
-        reconcile_cleanup_quarantine(&root).expect("second restart reconciliation");
-
-        assert_eq!(fs::read(&retained).expect("retained bytes"), b"owned");
-        let preflight = preflight_managed_inspection_reconciliation(&root)
-            .expect("preflight retained quarantine");
-        assert!(!preflight.cleanup_quarantine);
-        prove_managed_storage_recovered(&root, None).expect("prove restart state");
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn cleanup_quarantine_capacity_blocks_before_live_target_move() {
-        let root = test_root("cleanup-linux-capacity");
+    fn cleanup_quarantine_structural_bound_blocks_before_live_target_move() {
+        let root = test_root("cleanup-structural-bound");
         let quarantine = cleanup_quarantine_path(&root);
-        fs::create_dir_all(&quarantine).expect("create quarantine");
+        ensure_cleanup_quarantine(&root).expect("create reserved quarantine");
         let digest = hex::encode(Sha512::digest(b""));
-        for index in 0..RECOVERY_ENTRY_LIMIT {
+        for index in 0..=RECOVERY_ENTRY_LIMIT {
             fs::write(quarantine.join(format!("{digest}.{index:032x}.park")), b"")
                 .expect("write retained entry");
         }
@@ -6501,23 +6744,13 @@ mod tests {
         let target_digest = hex::encode(Sha512::digest(b"owned"));
 
         let error = quarantine_remove_file_with_hook(&target, &target_digest, 64, |_| {})
-            .expect_err("full quarantine must block before parking");
+            .expect_err("out-of-bounds quarantine must block before parking");
 
         assert!(matches!(error, StateError::InvalidState(_)));
         assert_eq!(fs::read(&target).expect("live target remains"), b"owned");
         assert_eq!(
             fs::read_dir(&quarantine).expect("read quarantine").count(),
-            RECOVERY_ENTRY_LIMIT
-        );
-        assert!(
-            ensure_cleanup_quarantine_capacity(
-                CleanupQuarantineUsage {
-                    count: 0,
-                    bytes: CLEANUP_QUARANTINE_MAX_BYTES,
-                },
-                1,
-            )
-            .is_err()
+            RECOVERY_ENTRY_LIMIT + 1
         );
         let _ = fs::remove_dir_all(root);
     }
@@ -6534,31 +6767,31 @@ mod tests {
             let displaced = parked.with_extension("displaced");
             fs::rename(parked, &displaced).expect("displace admitted entry");
             fs::write(parked, b"owned").expect("write same-bytes replacement");
-            *observed.borrow_mut() = Some((parked.to_path_buf(), displaced));
+            *observed.borrow_mut() = Some((
+                parked.file_name().expect("parked name").to_owned(),
+                displaced.file_name().expect("displaced name").to_owned(),
+            ));
         });
-        let (parked, displaced) = observed.into_inner().expect("settlement paths");
+        let (parked, displaced) = observed.into_inner().expect("settlement names");
+        let quarantine = cleanup_quarantine_path(&root);
+        let parked = quarantine.join(parked);
+        let displaced = quarantine.join(displaced);
 
         #[cfg(unix)]
         {
-            assert!(matches!(result, Err(StateError::InvalidState(_))));
             assert_eq!(
                 fs::read(displaced).expect("admitted bytes retained"),
                 b"owned"
             );
         }
         #[cfg(windows)]
-        {
-            result.expect("retained handle settlement");
-            assert!(!displaced.exists());
-        }
+        assert!(!displaced.exists());
+        assert!(matches!(&result, Err(StateError::InvalidState(_))));
         assert_eq!(
             fs::read(&parked).expect("unknown replacement preserved"),
             b"owned"
         );
-        #[cfg(unix)]
         assert!(reconcile_cleanup_quarantine(&root).is_err());
-        #[cfg(windows)]
-        reconcile_cleanup_quarantine(&root).expect("retain structural restart entry");
         assert_eq!(
             fs::read(parked).expect("unknown replacement still preserved"),
             b"owned"
@@ -6581,12 +6814,72 @@ mod tests {
         .expect_err("parked replacement must fail closed");
 
         assert!(matches!(error, StateError::InvalidState(_)));
-        assert_eq!(
-            fs::read(&target).expect("replacement restored"),
-            b"replacement"
-        );
+        assert!(!target.exists());
+        let displaced = fs::read_dir(cleanup_quarantine_path(&root))
+            .expect("read retained entries")
+            .filter_map(Result::ok)
+            .find(|entry| {
+                entry
+                    .path()
+                    .extension()
+                    .is_some_and(|value| value == "displaced")
+            })
+            .expect("displaced admitted entry")
+            .path();
+        assert_eq!(fs::read(displaced).expect("read admitted bytes"), b"owned");
         assert!(cleanup_quarantine_path(&root).is_dir());
         assert!(reconcile_cleanup_quarantine(&root).is_err());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cleanup_quarantine_reproves_digest_after_same_inode_mutation() {
+        let root = test_root("cleanup-same-inode-mutation");
+        let target = root.join("managed.jar");
+        fs::write(&target, b"owned").expect("write owned target");
+        let digest = hex::encode(Sha512::digest(b"owned"));
+        let parked = std::cell::RefCell::new(None);
+
+        let error = quarantine_remove_file_with_settlement_hook(&target, &digest, 64, |path| {
+            let mut file = fs::OpenOptions::new()
+                .write(true)
+                .truncate(true)
+                .open(path)
+                .expect("open admitted inode for mutation");
+            file.write_all(b"other").expect("mutate admitted inode");
+            file.sync_all().expect("sync mutated inode");
+            *parked.borrow_mut() = path.file_name().map(ToOwned::to_owned);
+        })
+        .expect_err("same-inode digest mutation must fail closed");
+        let parked = cleanup_quarantine_path(&root).join(parked.into_inner().expect("parked name"));
+
+        assert!(matches!(error, StateError::InvalidState(_)));
+        assert!(!target.exists());
+        assert_eq!(fs::read(&parked).expect("mutated bytes retained"), b"other");
+        assert!(reconcile_cleanup_quarantine(&root).is_err());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cleanup_quarantine_directories_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = test_root("cleanup-owner-only");
+        ensure_cleanup_quarantine(&root).expect("create reserved quarantine");
+
+        for path in [
+            root.join(STATE_DIR_NAME),
+            root.join(STATE_DIR_NAME).join(MUTATION_DIR_NAME),
+            cleanup_quarantine_path(&root),
+        ] {
+            let mode = fs::symlink_metadata(path)
+                .expect("reserved directory metadata")
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o077, 0);
+        }
         let _ = fs::remove_dir_all(root);
     }
 

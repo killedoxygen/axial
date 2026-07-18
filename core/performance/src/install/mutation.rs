@@ -617,6 +617,10 @@ impl PerformanceManager {
                 .map_err(|error| ManagedInstallExecutionError::from_mutation(error, false))?,
         };
 
+        crate::state::require_cleanup_quarantine_empty(instance_mods_dir)
+            .map_err(ManagedMutationError::definite)
+            .map_err(|error| ManagedInstallExecutionError::from_mutation(error, true))?;
+
         before_target_effect().await.map_err(|error| {
             ManagedInstallExecutionError::BeforeTargetEffect {
                 error,
@@ -727,6 +731,7 @@ pub(super) fn commit_staged_graph<Stage: ManagedArtifactStage>(
     staged: Vec<Stage>,
 ) -> Result<(), InstallError> {
     let instance_mods_dir = instance_mods.path();
+    crate::state::require_cleanup_quarantine_empty(instance_mods_dir)?;
     let desired_by_filename = state
         .installed_mods
         .iter()
