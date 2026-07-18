@@ -260,7 +260,13 @@ fn log_scanner_returns_only_safe_instance_local_file_names() {
     fs::create_dir_all(logs_dir.join("nested")).expect("create nested dir");
     fs::write(logs_dir.join("nested").join("nested.log"), "nested").expect("write nested");
 
-    let names = scan_instance_logs(&logs_dir)
+    let mut budget = FilesystemScanBudget::new(FilesystemScanLimits {
+        max_depth: 4,
+        max_entries: 16,
+        max_bytes: 1024,
+    });
+    let names = scan_instance_logs(&logs_dir, &mut budget)
+        .expect("scan logs")
         .into_iter()
         .map(|log| log.name)
         .collect::<Vec<_>>();
@@ -1121,7 +1127,7 @@ async fn instance_world_delete_removes_only_named_world_directory() {
 }
 
 #[tokio::test]
-async fn instance_world_backup_copies_directory_to_instance_local_label() {
+async fn bounded_filesystem_world_backup_copies_directory_to_instance_local_label() {
     let fixture = TestFixture::new("world-backup");
     let instance = fixture
         .state
@@ -1163,7 +1169,14 @@ async fn instance_world_backup_copies_directory_to_instance_local_label() {
 }
 
 #[test]
-fn instance_world_backup_cleans_temp_directory_after_copy_failure() {
+fn bounded_filesystem_world_backup_preserves_established_capacity_envelope() {
+    assert_eq!(WORLD_BACKUP_MAX_DEPTH, 64);
+    assert_eq!(WORLD_BACKUP_MAX_ENTRIES, 100_000);
+    assert_eq!(WORLD_BACKUP_MAX_BYTES, 50 * 1024 * 1024 * 1024);
+}
+
+#[test]
+fn bounded_filesystem_world_backup_cleans_temp_directory_after_copy_failure() {
     let root = test_root("world-backup-copy-failure");
     let source = root.join("source");
     let backup_root = root.join("backups").join("worlds");
@@ -1178,7 +1191,7 @@ fn instance_world_backup_cleans_temp_directory_after_copy_failure() {
 
     let error = copy_world_backup_staged(&source, &backup_root, "Failed Backup")
         .expect_err("deep source should fail bounded copy");
-    assert_eq!(error.kind(), ErrorKind::InvalidInput);
+    assert!(matches!(error, FilesystemScanError::DepthLimit));
     assert!(!backup_root.join("Failed Backup").exists());
     let leftovers = fs::read_dir(&backup_root)
         .expect("read backup root")
@@ -1189,6 +1202,62 @@ fn instance_world_backup_cleans_temp_directory_after_copy_failure() {
         "backup temp entries should be removed after failure"
     );
 
+    let _ = fs::remove_dir_all(root);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn bounded_filesystem_world_scan_rejects_symlink_cycle_without_following_it() {
+    use std::os::unix::fs::symlink;
+
+    let fixture = TestFixture::new("world-scan-symlink-cycle");
+    let instance = fixture
+        .state
+        .instances()
+        .insert_for_test("Linked world".to_string(), "1.21.1".to_string())
+        .expect("add instance");
+    let world_dir = fixture
+        .state
+        .instances()
+        .game_dir(&instance.id)
+        .join("saves")
+        .join("World");
+    fs::create_dir_all(world_dir.join("nested")).expect("create world");
+    symlink(&world_dir, world_dir.join("nested").join("cycle")).expect("create cycle link");
+
+    let (status, Json(body)) = handle_instance_worlds(&fixture.state, &instance.id)
+        .await
+        .expect_err("linked world should be rejected");
+
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_bounded_error_body(
+        &body,
+        "instance resources contain unsupported filesystem entries",
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn bounded_filesystem_world_backup_rejects_links_and_cleans_staging() {
+    use std::os::unix::fs::symlink;
+
+    let root = test_root("world-backup-link");
+    let source = root.join("source");
+    let backup_root = root.join("backups").join("worlds");
+    fs::create_dir_all(&source).expect("create source");
+    fs::create_dir_all(&backup_root).expect("create backup root");
+    symlink(&root, source.join("outside")).expect("create source link");
+
+    let error = copy_world_backup_staged(&source, &backup_root, "Linked Backup")
+        .expect_err("linked source should fail");
+
+    assert!(matches!(error, FilesystemScanError::Link));
+    assert!(
+        fs::read_dir(&backup_root)
+            .expect("read backup root")
+            .next()
+            .is_none()
+    );
     let _ = fs::remove_dir_all(root);
 }
 
@@ -1674,6 +1743,42 @@ async fn list_instances_installed_ready_version_transitions_to_launch_action() {
         listed.launch_action.primary_action,
         axial_config::LaunchPrimaryAction::Launch
     );
+}
+
+#[test]
+fn bounded_filesystem_list_enrichment_reuses_exact_readiness_inspection_within_one_response() {
+    let fixture = TestFixture::new("list-readiness-deduplicated");
+    let first = add_test_instance(&fixture, "First", "1.21.1");
+    let second = add_test_instance(&fixture, "Second", "1.21.1");
+    let scan = InstalledVersionsScan {
+        versions: Vec::new(),
+        view_model: VersionScanViewModel {
+            state_id: "ready".to_string(),
+            label: "Installed versions ready".to_string(),
+            degraded: false,
+            detail: None,
+        },
+    };
+    let config = fixture.state.config().current();
+    let mut inspections = 0_usize;
+
+    let enriched = enrich_instances_for_scan_with_inspector(
+        vec![first, second],
+        &scan,
+        Some(&fixture.root),
+        &config,
+        |_, _| {
+            inspections += 1;
+            LaunchReadiness {
+                launchable: true,
+                reasons: Vec::new(),
+            }
+        },
+    );
+
+    assert_eq!(inspections, 1);
+    assert_eq!(enriched.len(), 2);
+    assert!(enriched.iter().all(|instance| instance.launchable));
 }
 
 #[tokio::test]

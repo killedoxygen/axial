@@ -1,4 +1,11 @@
-use crate::state::{AppState, InstalledVersionsSnapshot, ProducerLease};
+use crate::{
+    application::filesystem::{
+        BlockingFilesystemTaskError, FilesystemEntryKind, FilesystemScanBudget,
+        FilesystemScanError, FilesystemScanLimits, admit_exclusive_blocking_filesystem,
+        run_blocking_filesystem,
+    },
+    state::{AppState, InstalledVersionsSnapshot, ProducerLease},
+};
 use axial_minecraft::{
     LifecycleMeta, MinecraftVersionMeta, VersionEntry, VersionScanReport, VersionScanState,
     VersionSubjectKind, analyze_minecraft_version, enrich_version_entries,
@@ -17,6 +24,11 @@ const VERSION_DELETE_ERROR_MESSAGE: &str =
     "Could not delete the version files. Check library permissions and try again.";
 pub(crate) const VERSION_SCAN_DEGRADED_MESSAGE: &str =
     "Could not verify installed versions. Check the library folder and try again.";
+const VERSION_INFO_SCAN_LIMITS: FilesystemScanLimits = FilesystemScanLimits {
+    max_depth: 32,
+    max_entries: 100_000,
+    max_bytes: 1024 * 1024 * 1024 * 1024,
+};
 
 #[derive(Debug, Serialize)]
 pub struct VersionsResponse {
@@ -187,18 +199,8 @@ pub(crate) async fn version_info(
         ));
     }
 
-    let version_dir = versions_dir(&mc_dir).join(version_id);
-    if !version_dir.is_dir() {
-        return Err((
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({ "error": "version not found" })),
-        ));
-    }
-
     let scan = installed_versions_scan(&snapshot.snapshot);
-    if scan.is_degraded() {
-        return Err(version_scan_degraded_response());
-    }
+    let scan_degraded = scan.is_degraded();
     let all_versions = scan.versions;
     let dependents = all_versions
         .iter()
@@ -206,13 +208,46 @@ pub(crate) async fn version_info(
         .map(|version| version.id.clone())
         .collect();
 
-    Ok(VersionInfoResponse {
-        id: version_id.to_string(),
-        folder_size: dir_size(&version_dir),
-        dependents,
-        worlds: scan_worlds(&mc_dir.join("saves")),
-        shared_data: scan_shared_data(&mc_dir),
+    let response_id = version_id.to_string();
+    let version_dir = versions_dir(&mc_dir).join(version_id);
+    run_blocking_filesystem(move || {
+        match fs::symlink_metadata(&version_dir) {
+            Ok(metadata) if metadata.file_type().is_dir() => {}
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(VersionInfoFilesystemError::Scan(FilesystemScanError::Link));
+            }
+            Ok(_) => return Err(VersionInfoFilesystemError::VersionNotFound),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err(VersionInfoFilesystemError::VersionNotFound);
+            }
+            Err(error) => {
+                return Err(VersionInfoFilesystemError::Scan(FilesystemScanError::Io(
+                    error,
+                )));
+            }
+        }
+        if scan_degraded {
+            return Err(VersionInfoFilesystemError::ScanDegraded);
+        }
+        let mut budget = FilesystemScanBudget::new(VERSION_INFO_SCAN_LIMITS);
+        let folder_size = budget
+            .directory_size(&version_dir)
+            .map_err(VersionInfoFilesystemError::Scan)?;
+        let worlds = scan_worlds(&mc_dir.join("saves"), &mut budget)
+            .map_err(VersionInfoFilesystemError::Scan)?;
+        let shared_data =
+            scan_shared_data(&mc_dir, &mut budget).map_err(VersionInfoFilesystemError::Scan)?;
+        Ok::<_, VersionInfoFilesystemError>(VersionInfoResponse {
+            id: response_id,
+            folder_size,
+            dependents,
+            worlds,
+            shared_data,
+        })
     })
+    .await
+    .map_err(version_info_task_error_response)?
+    .map_err(version_info_scan_error_response)
 }
 
 pub fn open_version_folder(
@@ -265,7 +300,7 @@ pub(crate) async fn delete_version(
     }
 
     let version_dir = versions_dir(&mc_dir).join(version_id);
-    if !version_dir.is_dir() {
+    if !version_dir_is_regular_directory(&version_dir) {
         return Err((
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({ "error": "version not found" })),
@@ -300,19 +335,33 @@ pub(crate) async fn delete_version(
         ));
     }
 
-    let _mutation = state
+    let filesystem = admit_exclusive_blocking_filesystem()
+        .await
+        .map_err(version_delete_task_error_response)?;
+    let mutation = state
         .admit_managed_artifact_mutation()
         .map_err(|error| version_delete_error_response(std::io::Error::other(error.to_string())))?;
-    let mut deleted = Vec::new();
-    if payload.cascade_dependents {
-        for id in to_delete.iter().filter(|id| id.as_str() != version_id) {
-            remove_version_dir(state, versions_dir(&mc_dir).join(id))?;
-            deleted.push(id.clone());
-        }
-    }
-
-    remove_version_dir(state, version_dir)?;
-    deleted.push(version_id.to_string());
+    let state_for_delete = state.clone();
+    let primary_version_id = version_id.to_string();
+    let deleted = filesystem
+        .run(move || {
+            let _mutation = mutation;
+            let mut deleted = Vec::new();
+            if payload.cascade_dependents {
+                for id in to_delete
+                    .iter()
+                    .filter(|id| id.as_str() != primary_version_id)
+                {
+                    remove_version_dir(&state_for_delete, versions_dir(&mc_dir).join(id))?;
+                    deleted.push(id.clone());
+                }
+            }
+            remove_version_dir(&state_for_delete, version_dir)?;
+            deleted.push(primary_version_id);
+            Ok::<_, (StatusCode, Json<serde_json::Value>)>(deleted)
+        })
+        .await
+        .map_err(version_delete_task_error_response)??;
 
     let affected_instances = state
         .instances()
@@ -441,65 +490,125 @@ fn catalog_fetch_error_response(
     )
 }
 
-fn scan_worlds(saves_dir: &FsPath) -> Vec<WorldInfo> {
-    fs::read_dir(saves_dir)
-        .into_iter()
-        .flat_map(|entries| entries.filter_map(Result::ok))
-        .filter(|entry| entry.path().is_dir())
-        .map(|entry| {
-            let last_played = entry
-                .metadata()
-                .ok()
-                .and_then(|metadata| metadata.modified().ok())
-                .map(|time| chrono::DateTime::<chrono::Utc>::from(time).to_rfc3339())
-                .unwrap_or_default();
-            WorldInfo {
-                name: entry.file_name().to_string_lossy().to_string(),
-                size: dir_size(&entry.path()),
-                last_played,
-            }
-        })
-        .collect()
-}
-
-fn scan_shared_data(mc_dir: &FsPath) -> Vec<SharedDataInfo> {
-    ["mods", "resourcepacks", "shaderpacks"]
-        .iter()
-        .filter_map(|name| {
-            let path = mc_dir.join(name);
-            let entries = fs::read_dir(&path).ok()?;
-            let items: Vec<_> = entries.filter_map(Result::ok).collect();
-            if items.is_empty() {
-                return None;
-            }
-            let size = items
-                .iter()
-                .filter_map(|entry| entry.metadata().ok())
-                .map(|metadata| metadata.len())
-                .sum();
-            Some(SharedDataInfo {
-                name: (*name).to_string(),
-                count: items.len(),
-                size,
-            })
-        })
-        .collect()
-}
-
-fn dir_size(path: &FsPath) -> u64 {
-    let mut total = 0_u64;
-    if let Ok(entries) = fs::read_dir(path) {
-        for entry in entries.filter_map(Result::ok) {
-            if let Ok(metadata) = entry.metadata() {
-                if metadata.is_dir() {
-                    total += dir_size(&entry.path());
-                } else {
-                    total += metadata.len();
-                }
-            }
+fn scan_worlds(
+    saves_dir: &FsPath,
+    budget: &mut FilesystemScanBudget,
+) -> Result<Vec<WorldInfo>, FilesystemScanError> {
+    let mut worlds = Vec::new();
+    for entry in budget.read_optional_directory(saves_dir)? {
+        if entry.kind != FilesystemEntryKind::Directory {
+            continue;
         }
+        let last_played = entry
+            .metadata
+            .modified()
+            .ok()
+            .map(|time| chrono::DateTime::<chrono::Utc>::from(time).to_rfc3339())
+            .unwrap_or_default();
+        worlds.push(WorldInfo {
+            name: entry.name.to_string_lossy().into_owned(),
+            size: budget.directory_size(&entry.path)?,
+            last_played,
+        });
     }
-    total
+    Ok(worlds)
+}
+
+fn scan_shared_data(
+    mc_dir: &FsPath,
+    budget: &mut FilesystemScanBudget,
+) -> Result<Vec<SharedDataInfo>, FilesystemScanError> {
+    let mut shared_data = Vec::new();
+    for name in ["mods", "resourcepacks", "shaderpacks"] {
+        let entries = budget.read_optional_directory(&mc_dir.join(name))?;
+        if entries.is_empty() {
+            continue;
+        }
+        let mut size = 0_u64;
+        for entry in &entries {
+            let entry_size = match entry.kind {
+                FilesystemEntryKind::Directory => budget.directory_size(&entry.path)?,
+                FilesystemEntryKind::File => {
+                    budget.account_file_bytes(entry.metadata.len())?;
+                    entry.metadata.len()
+                }
+            };
+            size = size
+                .checked_add(entry_size)
+                .ok_or(FilesystemScanError::ByteLimit)?;
+        }
+        shared_data.push(SharedDataInfo {
+            name: name.to_string(),
+            count: entries.len(),
+            size,
+        });
+    }
+    Ok(shared_data)
+}
+
+fn version_dir_is_regular_directory(path: &FsPath) -> bool {
+    fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_dir())
+}
+
+#[derive(Debug)]
+enum VersionInfoFilesystemError {
+    VersionNotFound,
+    ScanDegraded,
+    Scan(FilesystemScanError),
+}
+
+fn version_info_scan_error_response(
+    error: VersionInfoFilesystemError,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let error = match error {
+        VersionInfoFilesystemError::VersionNotFound => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "error": "version not found" })),
+            );
+        }
+        VersionInfoFilesystemError::ScanDegraded => return version_scan_degraded_response(),
+        VersionInfoFilesystemError::Scan(error) => error,
+    };
+    if error.is_capacity_limit() {
+        return (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            Json(serde_json::json!({
+                "error": "version information exceeds safe scan limits"
+            })),
+        );
+    }
+    if error.is_unsupported_layout() {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({
+                "error": "version information contains unsupported filesystem entries"
+            })),
+        );
+    }
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(serde_json::json!({
+            "error": "Could not read version information. Check library permissions and try again."
+        })),
+    )
+}
+
+fn version_info_task_error_response(
+    _error: BlockingFilesystemTaskError,
+) -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(serde_json::json!({
+            "error": "Could not complete the version information scan. Try again."
+        })),
+    )
+}
+
+fn version_delete_task_error_response(
+    _error: BlockingFilesystemTaskError,
+) -> (StatusCode, Json<serde_json::Value>) {
+    version_delete_error_response(std::io::Error::other("version delete task failed"))
 }
 
 fn open_path(path: &FsPath) -> std::io::Result<()> {
@@ -689,6 +798,33 @@ mod tests {
                 !rendered.contains(fragment),
                 "public response exposed upstream detail: {fragment}"
             );
+        }
+    }
+
+    #[test]
+    fn bounded_filesystem_version_info_errors_distinguish_root_layout_and_capacity() {
+        let cases = [
+            (
+                VersionInfoFilesystemError::VersionNotFound,
+                StatusCode::NOT_FOUND,
+                "version not found",
+            ),
+            (
+                VersionInfoFilesystemError::Scan(FilesystemScanError::Link),
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "version information contains unsupported filesystem entries",
+            ),
+            (
+                VersionInfoFilesystemError::Scan(FilesystemScanError::EntryLimit),
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "version information exceeds safe scan limits",
+            ),
+        ];
+
+        for (error, expected_status, expected_message) in cases {
+            let (status, Json(body)) = version_info_scan_error_response(error);
+            assert_eq!(status, expected_status);
+            assert_eq!(body["error"], expected_message);
         }
     }
 }

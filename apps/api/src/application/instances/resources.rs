@@ -1,4 +1,11 @@
-use crate::state::{AppState, UpdateOperationAdmissionError, UpdateOperationLease};
+use crate::{
+    application::filesystem::{
+        BlockingFilesystemTaskError, FilesystemEntryKind, FilesystemScanBudget,
+        FilesystemScanError, FilesystemScanLimits, admit_blocking_filesystem,
+        admit_exclusive_blocking_filesystem, run_blocking_filesystem,
+    },
+    state::{AppState, UpdateOperationAdmissionError, UpdateOperationLease},
+};
 use async_stream::stream;
 use axial_content::{
     ModFileDeleteOutcome, ModFileMutationError, delete_local_mod_file, toggle_mod_file,
@@ -12,7 +19,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use std::{
     fs,
-    io::{ErrorKind, SeekFrom},
+    io::{ErrorKind, Read, SeekFrom, Write},
     path::{Path as FsPath, PathBuf},
 };
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
@@ -30,9 +37,19 @@ pub(super) use open_folder::{
 pub(super) const LOG_TAIL_LIMIT: u64 = 128 * 1024;
 pub(super) const SCREENSHOT_FILE_MAX_BYTES: u64 = 32 * 1024 * 1024;
 const SCREENSHOT_FILE_STREAM_CHUNK_BYTES: usize = 64 * 1024;
+const INSTANCE_RESOURCE_SCAN_LIMITS: FilesystemScanLimits = FilesystemScanLimits {
+    max_depth: 32,
+    max_entries: 50_000,
+    max_bytes: 1024 * 1024 * 1024 * 1024,
+};
 pub(super) const WORLD_BACKUP_MAX_DEPTH: usize = 64;
-const WORLD_BACKUP_MAX_ENTRIES: usize = 100_000;
-const WORLD_BACKUP_MAX_BYTES: u64 = 50 * 1024 * 1024 * 1024;
+pub(super) const WORLD_BACKUP_MAX_ENTRIES: usize = 100_000;
+pub(super) const WORLD_BACKUP_MAX_BYTES: u64 = 50 * 1024 * 1024 * 1024;
+const WORLD_BACKUP_SCAN_LIMITS: FilesystemScanLimits = FilesystemScanLimits {
+    max_depth: WORLD_BACKUP_MAX_DEPTH,
+    max_entries: WORLD_BACKUP_MAX_ENTRIES,
+    max_bytes: WORLD_BACKUP_MAX_BYTES,
+};
 pub(super) const INSTANCE_LOG_READ_ERROR_MESSAGE: &str =
     "Could not read the instance log. Check instance folder permissions and try again.";
 
@@ -123,21 +140,7 @@ pub(crate) async fn handle_instance_resources(
     id: &str,
 ) -> Result<InstanceResourcesResponse, (StatusCode, Json<serde_json::Value>)> {
     let game_dir = instance_game_dir(state, id)?;
-    let worlds = scan_instance_worlds(&game_dir.join("saves"));
-    let mods = scan_instance_mods(&game_dir.join("mods"));
-    let screenshots = scan_instance_screenshots(&game_dir.join("screenshots"));
-    let logs = scan_instance_logs(&game_dir.join("logs"));
-
-    Ok(InstanceResourcesResponse {
-        worlds_count: worlds.len(),
-        mods_count: mods.len(),
-        screenshots_count: screenshots.len(),
-        logs_count: logs.len(),
-        worlds,
-        mods,
-        screenshots,
-        logs,
-    })
+    run_resource_scan(move || scan_instance_resources(&game_dir)).await
 }
 
 pub(crate) async fn handle_instance_worlds(
@@ -145,7 +148,11 @@ pub(crate) async fn handle_instance_worlds(
     id: &str,
 ) -> Result<Vec<InstanceWorldInfo>, (StatusCode, Json<serde_json::Value>)> {
     let game_dir = instance_game_dir(state, id)?;
-    Ok(scan_instance_worlds(&game_dir.join("saves")))
+    run_resource_scan(move || {
+        let mut budget = FilesystemScanBudget::new(INSTANCE_RESOURCE_SCAN_LIMITS);
+        scan_instance_worlds(&game_dir.join("saves"), &mut budget)
+    })
+    .await
 }
 
 pub(crate) async fn handle_rename_instance_world(
@@ -154,20 +161,28 @@ pub(crate) async fn handle_rename_instance_world(
     name: &str,
     payload: RenameWorldRequest,
 ) -> Result<serde_json::Value, (StatusCode, Json<serde_json::Value>)> {
-    reject_running_instance(state, id, "worlds").await?;
     validate_world_name(name)?;
     validate_world_name(&payload.name)?;
 
+    let filesystem = admit_blocking_filesystem()
+        .await
+        .map_err(resource_filesystem_task_error_response)?;
+    let lifecycle_guard = acquire_instance_resource_lifecycle(state, id).await?;
+    reject_running_instance(state, id, "worlds").await?;
     let game_dir = instance_game_dir(state, id)?;
-    let saves_dir = game_dir.join("saves");
-    let source = saves_dir.join(name);
-    let target = saves_dir.join(&payload.name);
-    require_world_dir(&source)?;
-    if target_exists(&target) {
-        return Err(json_error(StatusCode::CONFLICT, "world already exists"));
-    }
-
-    fs::rename(source, target).map_err(world_file_write_error_response)?;
+    let source = game_dir.join("saves").join(name);
+    let target = game_dir.join("saves").join(&payload.name);
+    filesystem
+        .run(move || {
+            let _lifecycle_guard = lifecycle_guard;
+            require_world_dir(&source)?;
+            if target_exists(&target) {
+                return Err(json_error(StatusCode::CONFLICT, "world already exists"));
+            }
+            fs::rename(source, target).map_err(world_file_write_error_response)
+        })
+        .await
+        .map_err(resource_filesystem_task_error_response)??;
     Ok(serde_json::json!({ "status": "ok", "name": payload.name }))
 }
 
@@ -176,13 +191,22 @@ pub(crate) async fn handle_delete_instance_world(
     id: &str,
     name: &str,
 ) -> Result<serde_json::Value, (StatusCode, Json<serde_json::Value>)> {
-    reject_running_instance(state, id, "worlds").await?;
     validate_world_name(name)?;
-
+    let filesystem = admit_exclusive_blocking_filesystem()
+        .await
+        .map_err(resource_filesystem_task_error_response)?;
+    let lifecycle_guard = acquire_instance_resource_lifecycle(state, id).await?;
+    reject_running_instance(state, id, "worlds").await?;
     let game_dir = instance_game_dir(state, id)?;
     let source = game_dir.join("saves").join(name);
-    require_world_dir(&source)?;
-    fs::remove_dir_all(source).map_err(world_file_write_error_response)?;
+    filesystem
+        .run(move || {
+            let _lifecycle_guard = lifecycle_guard;
+            require_world_dir(&source)?;
+            fs::remove_dir_all(source).map_err(world_file_write_error_response)
+        })
+        .await
+        .map_err(resource_filesystem_task_error_response)??;
     Ok(serde_json::json!({ "status": "ok" }))
 }
 
@@ -191,18 +215,28 @@ pub(crate) async fn handle_backup_instance_world(
     id: &str,
     name: &str,
 ) -> Result<WorldBackupResponse, (StatusCode, Json<serde_json::Value>)> {
-    reject_running_instance(state, id, "worlds").await?;
     validate_world_name(name)?;
-
+    let filesystem = admit_exclusive_blocking_filesystem()
+        .await
+        .map_err(resource_filesystem_task_error_response)?;
+    let lifecycle_guard = acquire_instance_resource_lifecycle(state, id).await?;
+    reject_running_instance(state, id, "worlds").await?;
     let game_dir = instance_game_dir(state, id)?;
     let source = game_dir.join("saves").join(name);
-    require_world_dir(&source)?;
-
     let backup_root = game_dir.join("backups").join("worlds");
-    fs::create_dir_all(&backup_root).map_err(world_file_write_error_response)?;
-    let backup = available_world_backup_name(&backup_root, name)?;
-    copy_world_backup_staged(&source, &backup_root, &backup)
-        .map_err(world_file_write_error_response)?;
+    let world_name = name.to_string();
+    let backup = filesystem
+        .run(move || {
+            let _lifecycle_guard = lifecycle_guard;
+            require_world_dir(&source)?;
+            fs::create_dir_all(&backup_root).map_err(world_file_write_error_response)?;
+            let backup = available_world_backup_name(&backup_root, &world_name)?;
+            copy_world_backup_staged(&source, &backup_root, &backup)
+                .map_err(world_backup_copy_error_response)?;
+            Ok::<_, (StatusCode, Json<serde_json::Value>)>(backup)
+        })
+        .await
+        .map_err(resource_filesystem_task_error_response)??;
 
     Ok(WorldBackupResponse {
         status: "ok",
@@ -216,7 +250,11 @@ pub(crate) async fn handle_instance_mods(
     id: &str,
 ) -> Result<Vec<InstanceModInfo>, (StatusCode, Json<serde_json::Value>)> {
     let game_dir = instance_game_dir(state, id)?;
-    Ok(scan_instance_mods(&game_dir.join("mods")))
+    run_resource_scan(move || {
+        let mut budget = FilesystemScanBudget::new(INSTANCE_RESOURCE_SCAN_LIMITS);
+        scan_instance_mods(&game_dir.join("mods"), &mut budget)
+    })
+    .await
 }
 
 pub(crate) async fn handle_update_instance_mod(
@@ -225,34 +263,37 @@ pub(crate) async fn handle_update_instance_mod(
     name: &str,
     payload: UpdateModRequest,
 ) -> Result<serde_json::Value, (StatusCode, Json<serde_json::Value>)> {
-    let _update_admission = admit_instance_mod_mutation(state)?;
-    let _lifecycle_guard = state
-        .try_acquire_instance_lifecycle(id)
-        .await
-        .ok_or_else(|| {
-            json_error(
-                StatusCode::CONFLICT,
-                "another launch or content operation is already using this instance",
-            )
-        })?;
-    reject_running_instance(state, id, "mods").await?;
     validate_mod_name(name)?;
+    let filesystem = admit_blocking_filesystem()
+        .await
+        .map_err(resource_filesystem_task_error_response)?;
+    let update_admission = admit_instance_mod_mutation(state)?;
+    let lifecycle_guard = acquire_instance_resource_lifecycle(state, id).await?;
+    reject_running_instance(state, id, "mods").await?;
 
     let game_dir = instance_game_dir(state, id)?;
     let mods_dir = game_dir.join("mods");
     let source = mods_dir.join(name);
-    require_mod_file(&source)?;
     let requested_name = requested_mod_filename(name, payload.enabled);
-    if requested_name != name && target_exists(&mods_dir.join(&requested_name)) {
-        return Err(json_error(StatusCode::CONFLICT, "mod already exists"));
-    }
-    let _mutation = state.admit_managed_artifact_mutation().map_err(|error| {
+    let mutation = state.admit_managed_artifact_mutation().map_err(|error| {
         mod_manifest_error_response(axial_content::ContentError::Io(std::io::Error::other(
             error.to_string(),
         )))
     })?;
-    let outcome = toggle_mod_file(&game_dir, name, payload.enabled)
-        .map_err(mod_content_mutation_error_response)?;
+    let original_name = name.to_string();
+    let outcome = filesystem
+        .run(move || {
+            let (_update_admission, _lifecycle_guard, _mutation) =
+                (update_admission, lifecycle_guard, mutation);
+            require_mod_file(&source)?;
+            if requested_name != original_name && target_exists(&mods_dir.join(&requested_name)) {
+                return Err(json_error(StatusCode::CONFLICT, "mod already exists"));
+            }
+            toggle_mod_file(&game_dir, &original_name, payload.enabled)
+                .map_err(mod_content_mutation_error_response)
+        })
+        .await
+        .map_err(resource_filesystem_task_error_response)??;
     Ok(serde_json::json!({ "status": "ok", "name": outcome.filename, "enabled": payload.enabled }))
 }
 
@@ -261,23 +302,33 @@ pub(crate) async fn handle_delete_instance_mod(
     id: &str,
     name: &str,
 ) -> Result<serde_json::Value, (StatusCode, Json<serde_json::Value>)> {
-    let _update_admission = admit_instance_mod_mutation(state)?;
-    let _lifecycle_guard = state
-        .try_acquire_instance_lifecycle(id)
-        .await
-        .ok_or_else(|| {
-            json_error(
-                StatusCode::CONFLICT,
-                "another launch or content operation is already using this instance",
-            )
-        })?;
-    reject_running_instance(state, id, "mods").await?;
     validate_mod_name(name)?;
+    let filesystem = admit_blocking_filesystem()
+        .await
+        .map_err(resource_filesystem_task_error_response)?;
+    let update_admission = admit_instance_mod_mutation(state)?;
+    let lifecycle_guard = acquire_instance_resource_lifecycle(state, id).await?;
+    reject_running_instance(state, id, "mods").await?;
 
     let game_dir = instance_game_dir(state, id)?;
     let source = game_dir.join("mods").join(name);
-    require_mod_file(&source)?;
-    match delete_local_mod_file(&game_dir, name).map_err(mod_content_mutation_error_response)? {
+    let mutation = state.admit_managed_artifact_mutation().map_err(|error| {
+        mod_manifest_error_response(axial_content::ContentError::Io(std::io::Error::other(
+            error.to_string(),
+        )))
+    })?;
+    let original_name = name.to_string();
+    let outcome = filesystem
+        .run(move || {
+            let (_update_admission, _lifecycle_guard, _mutation) =
+                (update_admission, lifecycle_guard, mutation);
+            require_mod_file(&source)?;
+            delete_local_mod_file(&game_dir, &original_name)
+                .map_err(mod_content_mutation_error_response)
+        })
+        .await
+        .map_err(resource_filesystem_task_error_response)??;
+    match outcome {
         ModFileDeleteOutcome::Deleted => Ok(serde_json::json!({ "status": "ok" })),
         ModFileDeleteOutcome::Managed => Err(json_error(
             StatusCode::CONFLICT,
@@ -309,7 +360,11 @@ pub(crate) async fn handle_instance_screenshots(
     id: &str,
 ) -> Result<Vec<InstanceScreenshotInfo>, (StatusCode, Json<serde_json::Value>)> {
     let game_dir = instance_game_dir(state, id)?;
-    Ok(scan_instance_screenshots(&game_dir.join("screenshots")))
+    run_resource_scan(move || {
+        let mut budget = FilesystemScanBudget::new(INSTANCE_RESOURCE_SCAN_LIMITS);
+        scan_instance_screenshots(&game_dir.join("screenshots"), &mut budget)
+    })
+    .await
 }
 
 pub(crate) async fn handle_instance_screenshot_file(
@@ -377,15 +432,18 @@ pub(crate) async fn handle_rename_instance_screenshot(
     let screenshots_dir = game_dir.join("screenshots");
     let source = screenshots_dir.join(name);
     let target = screenshots_dir.join(&payload.name);
-    require_screenshot_file(&source)?;
-    if target_exists(&target) {
-        return Err(json_error(
-            StatusCode::CONFLICT,
-            "screenshot already exists",
-        ));
-    }
-
-    fs::rename(source, target).map_err(screenshot_file_write_error_response)?;
+    run_blocking_filesystem(move || {
+        require_screenshot_file(&source)?;
+        if target_exists(&target) {
+            return Err(json_error(
+                StatusCode::CONFLICT,
+                "screenshot already exists",
+            ));
+        }
+        fs::rename(source, target).map_err(screenshot_file_write_error_response)
+    })
+    .await
+    .map_err(resource_filesystem_task_error_response)??;
     Ok(serde_json::json!({ "status": "ok", "name": payload.name }))
 }
 
@@ -398,8 +456,12 @@ pub(crate) async fn handle_delete_instance_screenshot(
 
     let game_dir = instance_game_dir(state, id)?;
     let source = game_dir.join("screenshots").join(name);
-    require_screenshot_file(&source)?;
-    fs::remove_file(source).map_err(screenshot_file_write_error_response)?;
+    run_blocking_filesystem(move || {
+        require_screenshot_file(&source)?;
+        fs::remove_file(source).map_err(screenshot_file_write_error_response)
+    })
+    .await
+    .map_err(resource_filesystem_task_error_response)??;
     Ok(serde_json::json!({ "status": "ok" }))
 }
 
@@ -408,7 +470,11 @@ pub(crate) async fn handle_instance_logs(
     id: &str,
 ) -> Result<Vec<InstanceLogInfo>, (StatusCode, Json<serde_json::Value>)> {
     let game_dir = instance_game_dir(state, id)?;
-    Ok(scan_instance_logs(&game_dir.join("logs")))
+    run_resource_scan(move || {
+        let mut budget = FilesystemScanBudget::new(INSTANCE_RESOURCE_SCAN_LIMITS);
+        scan_instance_logs(&game_dir.join("logs"), &mut budget)
+    })
+    .await
 }
 
 pub(crate) async fn handle_instance_log_tail(
@@ -425,8 +491,8 @@ pub(crate) async fn handle_instance_log_tail(
     }
 
     let path = game_dir.join("logs").join(name);
-    let metadata = match tokio::fs::metadata(&path).await {
-        Ok(metadata) if metadata.is_file() => metadata,
+    let metadata = match tokio::fs::symlink_metadata(&path).await {
+        Ok(metadata) if metadata.file_type().is_file() => metadata,
         Ok(_) => {
             return Err((
                 StatusCode::NOT_FOUND,
@@ -489,6 +555,21 @@ fn instance_game_dir(
         )
     })?;
     Ok(state.instances().game_dir(&instance.id))
+}
+
+async fn acquire_instance_resource_lifecycle(
+    state: &AppState,
+    id: &str,
+) -> Result<crate::state::InstanceLifecycleLease, (StatusCode, Json<serde_json::Value>)> {
+    state
+        .try_acquire_instance_lifecycle(id)
+        .await
+        .ok_or_else(|| {
+            json_error(
+                StatusCode::CONFLICT,
+                "another launch or content operation is already using this instance",
+            )
+        })
 }
 
 async fn reject_running_instance(
@@ -653,20 +734,18 @@ pub(super) fn copy_world_backup_staged(
     source: &FsPath,
     backup_root: &FsPath,
     backup: &str,
-) -> std::io::Result<()> {
+) -> Result<(), FilesystemScanError> {
     if !is_safe_resource_name(backup) {
-        return Err(std::io::Error::new(
-            ErrorKind::InvalidInput,
-            "invalid world backup name",
-        ));
+        return Err(
+            std::io::Error::new(ErrorKind::InvalidInput, "invalid world backup name").into(),
+        );
     }
 
     let target = backup_root.join(backup);
     if target_exists(&target) {
-        return Err(std::io::Error::new(
-            ErrorKind::AlreadyExists,
-            "world backup already exists",
-        ));
+        return Err(
+            std::io::Error::new(ErrorKind::AlreadyExists, "world backup already exists").into(),
+        );
     }
 
     let temp = available_temp_world_backup_name(backup_root, backup)?;
@@ -680,32 +759,22 @@ pub(super) fn copy_world_backup_staged(
 
     if target_exists(&target) {
         let _ = fs::remove_dir_all(&temp);
-        return Err(std::io::Error::new(
-            ErrorKind::AlreadyExists,
-            "world backup already exists",
-        ));
+        return Err(
+            std::io::Error::new(ErrorKind::AlreadyExists, "world backup already exists").into(),
+        );
     }
 
     match fs::rename(&temp, &target) {
         Ok(()) => Ok(()),
         Err(error) => {
             let _ = fs::remove_dir_all(&temp);
-            Err(error)
+            Err(error.into())
         }
     }
 }
 
-#[derive(Debug)]
-struct CopyBudget {
-    entries: usize,
-    bytes: u64,
-}
-
-fn copy_world_dir_bounded(source: &FsPath, target: &FsPath) -> std::io::Result<()> {
-    let mut budget = CopyBudget {
-        entries: 0,
-        bytes: 0,
-    };
+fn copy_world_dir_bounded(source: &FsPath, target: &FsPath) -> Result<(), FilesystemScanError> {
+    let mut budget = FilesystemScanBudget::new(WORLD_BACKUP_SCAN_LIMITS);
     copy_world_dir_bounded_inner(source, target, 0, &mut budget)
 }
 
@@ -713,59 +782,86 @@ fn copy_world_dir_bounded_inner(
     source: &FsPath,
     target: &FsPath,
     depth: usize,
-    budget: &mut CopyBudget,
-) -> std::io::Result<()> {
+    budget: &mut FilesystemScanBudget,
+) -> Result<(), FilesystemScanError> {
     if depth > WORLD_BACKUP_MAX_DEPTH {
-        return Err(std::io::Error::new(
-            ErrorKind::InvalidInput,
-            "world backup is too deeply nested",
-        ));
-    }
-
-    let metadata = fs::symlink_metadata(source)?;
-    if !metadata.file_type().is_dir() {
-        return Err(std::io::Error::new(
-            ErrorKind::InvalidInput,
-            "world backup source is not a directory",
-        ));
+        return Err(FilesystemScanError::DepthLimit);
     }
 
     fs::create_dir_all(target)?;
-    for entry in fs::read_dir(source)? {
-        let entry = entry?;
-        let file_type = entry.file_type()?;
-        if file_type.is_symlink() {
-            return Err(std::io::Error::new(
-                ErrorKind::InvalidInput,
-                "world backup cannot include links",
-            ));
-        }
-
-        budget.entries = budget.entries.saturating_add(1);
-        if budget.entries > WORLD_BACKUP_MAX_ENTRIES {
-            return Err(std::io::Error::new(
-                ErrorKind::InvalidInput,
-                "world backup has too many files",
-            ));
-        }
-
-        let entry_path = entry.path();
-        let target_path = target.join(entry.file_name());
-        if file_type.is_dir() {
-            copy_world_dir_bounded_inner(&entry_path, &target_path, depth + 1, budget)?;
-        } else if file_type.is_file() {
-            let len = entry.metadata()?.len();
-            budget.bytes = budget.bytes.saturating_add(len);
-            if budget.bytes > WORLD_BACKUP_MAX_BYTES {
-                return Err(std::io::Error::new(
-                    ErrorKind::InvalidInput,
-                    "world backup is too large",
-                ));
+    for entry in budget.read_directory(source)? {
+        let target_path = target.join(&entry.name);
+        match entry.kind {
+            FilesystemEntryKind::Directory => {
+                copy_world_dir_bounded_inner(&entry.path, &target_path, depth + 1, budget)?;
             }
-            fs::copy(entry_path, target_path)?;
+            FilesystemEntryKind::File => {
+                budget.account_file_bytes(entry.metadata.len())?;
+                copy_regular_file_exact(&entry.path, &target_path, entry.metadata.len())?;
+            }
         }
     }
     Ok(())
+}
+
+fn copy_regular_file_exact(source: &FsPath, target: &FsPath, expected: u64) -> std::io::Result<()> {
+    let source_metadata = fs::symlink_metadata(source)?;
+    if !source_metadata.file_type().is_file() || source_metadata.len() != expected {
+        return Err(std::io::Error::new(
+            ErrorKind::WouldBlock,
+            "world backup source changed before copy",
+        ));
+    }
+    let input = open_regular_file_no_follow(source)?;
+    let opened_metadata = input.metadata()?;
+    if opened_metadata.file_type().is_symlink()
+        || !opened_metadata.is_file()
+        || opened_metadata.len() != expected
+    {
+        return Err(std::io::Error::new(
+            ErrorKind::WouldBlock,
+            "world backup source changed while opening",
+        ));
+    }
+    let mut output = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(target)?;
+    let copied = std::io::copy(&mut input.take(expected.saturating_add(1)), &mut output)?;
+    if copied != expected {
+        return Err(std::io::Error::new(
+            ErrorKind::WouldBlock,
+            "world backup source changed during copy",
+        ));
+    }
+    output.flush()?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn open_regular_file_no_follow(path: &FsPath) -> std::io::Result<fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+}
+
+#[cfg(windows)]
+fn open_regular_file_no_follow(path: &FsPath) -> std::io::Result<fs::File> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
+
+    fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn open_regular_file_no_follow(path: &FsPath) -> std::io::Result<fs::File> {
+    fs::File::open(path)
 }
 
 fn json_error(status: StatusCode, message: &'static str) -> (StatusCode, Json<serde_json::Value>) {
@@ -790,6 +886,42 @@ fn world_file_write_error_response(
             "error": "Could not update world files. Check instance folder permissions and try again."
         })),
     )
+}
+
+fn world_backup_copy_error_response(
+    error: FilesystemScanError,
+) -> (StatusCode, Json<serde_json::Value>) {
+    if error.is_capacity_limit() {
+        return json_error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "world backup exceeds safe size or file-count limits",
+        );
+    }
+    if error.is_unsupported_layout() {
+        return json_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "world backup contains unsupported filesystem entries",
+        );
+    }
+    if matches!(
+        &error,
+        FilesystemScanError::Io(error) if error.kind() == ErrorKind::AlreadyExists
+    ) {
+        return json_error(
+            StatusCode::CONFLICT,
+            "world backup already exists; try again in a moment",
+        );
+    }
+    if matches!(
+        &error,
+        FilesystemScanError::Io(error) if error.kind() == ErrorKind::WouldBlock
+    ) {
+        return json_error(
+            StatusCode::CONFLICT,
+            "world files changed during backup; refresh and try again",
+        );
+    }
+    world_file_write_error_response(std::io::Error::other("world backup filesystem task failed"))
 }
 
 fn mod_file_read_error_response(_error: std::io::Error) -> (StatusCode, Json<serde_json::Value>) {
@@ -847,109 +979,135 @@ pub(super) fn screenshot_file_write_error_response(
     )
 }
 
-fn scan_instance_worlds(saves_dir: &FsPath) -> Vec<InstanceWorldInfo> {
-    let mut worlds = fs::read_dir(saves_dir)
-        .into_iter()
-        .flat_map(|entries| entries.filter_map(Result::ok))
-        .filter(|entry| entry.path().is_dir())
-        .map(|entry| {
-            let path = entry.path();
-            let metadata = entry.metadata().ok();
-            InstanceWorldInfo {
-                name: entry.file_name().to_string_lossy().to_string(),
-                size: dir_size(&path),
-                modified_at: modified_at(metadata.as_ref()),
-            }
-        })
-        .collect::<Vec<_>>();
+fn scan_instance_resources(
+    game_dir: &FsPath,
+) -> Result<InstanceResourcesResponse, FilesystemScanError> {
+    let mut budget = FilesystemScanBudget::new(INSTANCE_RESOURCE_SCAN_LIMITS);
+    let worlds = scan_instance_worlds(&game_dir.join("saves"), &mut budget)?;
+    let mods = scan_instance_mods(&game_dir.join("mods"), &mut budget)?;
+    let screenshots = scan_instance_screenshots(&game_dir.join("screenshots"), &mut budget)?;
+    let logs = scan_instance_logs(&game_dir.join("logs"), &mut budget)?;
+    Ok(InstanceResourcesResponse {
+        worlds_count: worlds.len(),
+        mods_count: mods.len(),
+        screenshots_count: screenshots.len(),
+        logs_count: logs.len(),
+        worlds,
+        mods,
+        screenshots,
+        logs,
+    })
+}
+
+fn scan_instance_worlds(
+    saves_dir: &FsPath,
+    budget: &mut FilesystemScanBudget,
+) -> Result<Vec<InstanceWorldInfo>, FilesystemScanError> {
+    let mut worlds = Vec::new();
+    for entry in budget.read_optional_directory(saves_dir)? {
+        if entry.kind != FilesystemEntryKind::Directory {
+            continue;
+        }
+        worlds.push(InstanceWorldInfo {
+            name: entry.name.to_string_lossy().into_owned(),
+            size: budget.directory_size(&entry.path)?,
+            modified_at: modified_at(Some(&entry.metadata)),
+        });
+    }
     worlds.sort_by(|a, b| {
         b.modified_at
             .cmp(&a.modified_at)
             .then_with(|| a.name.cmp(&b.name))
     });
-    worlds
+    Ok(worlds)
 }
 
-fn scan_instance_mods(mods_dir: &FsPath) -> Vec<InstanceModInfo> {
-    let mut mods = fs::read_dir(mods_dir)
-        .into_iter()
-        .flat_map(|entries| entries.filter_map(Result::ok))
-        .filter(|entry| entry.path().is_file())
-        .filter_map(|entry| {
-            let name = entry.file_name().to_string_lossy().to_string();
-            let lower = name.to_ascii_lowercase();
-            let enabled = lower.ends_with(".jar");
-            if !enabled && !lower.ends_with(".jar.disabled") {
-                return None;
-            }
-            let metadata = entry.metadata().ok();
-            Some(InstanceModInfo {
-                name,
-                size: metadata.as_ref().map_or(0, fs::Metadata::len),
-                modified_at: modified_at(metadata.as_ref()),
-                enabled,
-            })
-        })
-        .collect::<Vec<_>>();
+fn scan_instance_mods(
+    mods_dir: &FsPath,
+    budget: &mut FilesystemScanBudget,
+) -> Result<Vec<InstanceModInfo>, FilesystemScanError> {
+    let mut mods = Vec::new();
+    for entry in budget.read_optional_directory(mods_dir)? {
+        if entry.kind != FilesystemEntryKind::File {
+            continue;
+        }
+        let name = entry.name.to_string_lossy().into_owned();
+        let lower = name.to_ascii_lowercase();
+        let enabled = lower.ends_with(".jar");
+        if !enabled && !lower.ends_with(".jar.disabled") {
+            continue;
+        }
+        budget.account_file_bytes(entry.metadata.len())?;
+        mods.push(InstanceModInfo {
+            name,
+            size: entry.metadata.len(),
+            modified_at: modified_at(Some(&entry.metadata)),
+            enabled,
+        });
+    }
     mods.sort_by(|a, b| {
         a.name
             .to_ascii_lowercase()
             .cmp(&b.name.to_ascii_lowercase())
     });
-    mods
+    Ok(mods)
 }
 
-fn scan_instance_screenshots(screenshots_dir: &FsPath) -> Vec<InstanceScreenshotInfo> {
-    let mut screenshots = fs::read_dir(screenshots_dir)
-        .into_iter()
-        .flat_map(|entries| entries.filter_map(Result::ok))
-        .filter(|entry| entry.path().is_file())
-        .filter_map(|entry| {
-            let name = entry.file_name().to_string_lossy().to_string();
-            if !is_screenshot_name(&name) {
-                return None;
-            }
-            let metadata = entry.metadata().ok();
-            Some(InstanceScreenshotInfo {
-                name,
-                size: metadata.as_ref().map_or(0, fs::Metadata::len),
-                modified_at: modified_at(metadata.as_ref()),
-            })
-        })
-        .collect::<Vec<_>>();
+fn scan_instance_screenshots(
+    screenshots_dir: &FsPath,
+    budget: &mut FilesystemScanBudget,
+) -> Result<Vec<InstanceScreenshotInfo>, FilesystemScanError> {
+    let mut screenshots = Vec::new();
+    for entry in budget.read_optional_directory(screenshots_dir)? {
+        if entry.kind != FilesystemEntryKind::File {
+            continue;
+        }
+        let name = entry.name.to_string_lossy().into_owned();
+        if !is_screenshot_name(&name) {
+            continue;
+        }
+        budget.account_file_bytes(entry.metadata.len())?;
+        screenshots.push(InstanceScreenshotInfo {
+            name,
+            size: entry.metadata.len(),
+            modified_at: modified_at(Some(&entry.metadata)),
+        });
+    }
     screenshots.sort_by(|a, b| {
         b.modified_at
             .cmp(&a.modified_at)
             .then_with(|| a.name.cmp(&b.name))
     });
-    screenshots
+    Ok(screenshots)
 }
 
-pub(super) fn scan_instance_logs(logs_dir: &FsPath) -> Vec<InstanceLogInfo> {
-    let mut logs = fs::read_dir(logs_dir)
-        .into_iter()
-        .flat_map(|entries| entries.filter_map(Result::ok))
-        .filter(|entry| entry.path().is_file())
-        .filter_map(|entry| {
-            let name = entry.file_name().to_string_lossy().to_string();
-            if !is_safe_resource_name(&name) {
-                return None;
-            }
-            let metadata = entry.metadata().ok();
-            Some(InstanceLogInfo {
-                name,
-                size: metadata.as_ref().map_or(0, fs::Metadata::len),
-                modified_at: modified_at(metadata.as_ref()),
-            })
-        })
-        .collect::<Vec<_>>();
+pub(super) fn scan_instance_logs(
+    logs_dir: &FsPath,
+    budget: &mut FilesystemScanBudget,
+) -> Result<Vec<InstanceLogInfo>, FilesystemScanError> {
+    let mut logs = Vec::new();
+    for entry in budget.read_optional_directory(logs_dir)? {
+        if entry.kind != FilesystemEntryKind::File {
+            continue;
+        }
+        let name = entry.name.to_string_lossy().into_owned();
+        if !is_safe_resource_name(&name) {
+            continue;
+        }
+        budget.account_file_bytes(entry.metadata.len())?;
+        logs.push(InstanceLogInfo {
+            name,
+            size: entry.metadata.len(),
+            modified_at: modified_at(Some(&entry.metadata)),
+        });
+    }
     logs.sort_by(|a, b| {
         latest_log_rank(&a.name)
             .cmp(&latest_log_rank(&b.name))
             .then_with(|| b.modified_at.cmp(&a.modified_at))
             .then_with(|| a.name.cmp(&b.name))
     });
-    logs
+    Ok(logs)
 }
 
 fn latest_log_rank(name: &str) -> u8 {
@@ -1017,18 +1175,43 @@ fn modified_at(metadata: Option<&fs::Metadata>) -> String {
         .unwrap_or_default()
 }
 
-fn dir_size(path: &FsPath) -> u64 {
-    let mut total = 0_u64;
-    if let Ok(entries) = fs::read_dir(path) {
-        for entry in entries.filter_map(Result::ok) {
-            if let Ok(metadata) = entry.metadata() {
-                if metadata.is_dir() {
-                    total += dir_size(&entry.path());
-                } else {
-                    total += metadata.len();
-                }
-            }
-        }
+async fn run_resource_scan<T, Work>(work: Work) -> Result<T, (StatusCode, Json<serde_json::Value>)>
+where
+    T: Send + 'static,
+    Work: FnOnce() -> Result<T, FilesystemScanError> + Send + 'static,
+{
+    run_blocking_filesystem(work)
+        .await
+        .map_err(resource_filesystem_task_error_response)?
+        .map_err(resource_scan_error_response)
+}
+
+fn resource_scan_error_response(
+    error: FilesystemScanError,
+) -> (StatusCode, Json<serde_json::Value>) {
+    if error.is_capacity_limit() {
+        return json_error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "instance resources exceed safe scan limits",
+        );
     }
-    total
+    if error.is_unsupported_layout() {
+        return json_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "instance resources contain unsupported filesystem entries",
+        );
+    }
+    json_error(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "Could not read instance resources. Check instance folder permissions and try again.",
+    )
+}
+
+fn resource_filesystem_task_error_response(
+    _error: BlockingFilesystemTaskError,
+) -> (StatusCode, Json<serde_json::Value>) {
+    json_error(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "Could not complete the instance filesystem operation. Try again.",
+    )
 }

@@ -10,6 +10,7 @@ pub mod auth;
 pub mod commands;
 pub mod config;
 pub mod content;
+mod filesystem;
 pub mod flags;
 mod guardian_conversion;
 pub mod install;

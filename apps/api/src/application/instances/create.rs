@@ -566,9 +566,10 @@ where
             let enriched = enrich_instance_for_scan(
                 &transaction_state,
                 instance,
-                &installed_scan,
-                Some(installed_lookup.library_dir()),
-            );
+                installed_scan.clone(),
+                Some(installed_lookup.library_dir().to_path_buf()),
+            )
+            .await;
             transaction_state
                 .telemetry()
                 .emit(TelemetryEvent::instance_created(Some(

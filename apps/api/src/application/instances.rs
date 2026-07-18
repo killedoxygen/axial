@@ -39,13 +39,20 @@ pub(crate) use resources::{
 #[cfg(test)]
 use resources::{
     INSTANCE_LOG_READ_ERROR_MESSAGE, LOG_TAIL_LIMIT, SCREENSHOT_FILE_MAX_BYTES,
-    WORLD_BACKUP_MAX_DEPTH, copy_world_backup_staged, instance_folder_open_error_response,
+    WORLD_BACKUP_MAX_BYTES, WORLD_BACKUP_MAX_DEPTH, WORLD_BACKUP_MAX_ENTRIES,
+    copy_world_backup_staged, instance_folder_open_error_response,
     instance_folder_prepare_error_response, instance_log_read_error_response,
     is_safe_resource_name, resolve_instance_folder, scan_instance_logs, screenshot_content_type,
     screenshot_file_read_error_response, screenshot_file_write_error_response, validate_mod_name,
     validate_screenshot_name, validate_world_name,
 };
 
+#[cfg(test)]
+use crate::application::filesystem::{
+    FilesystemScanBudget, FilesystemScanError, FilesystemScanLimits,
+};
+
+use crate::application::filesystem::run_blocking_filesystem;
 use crate::application::timing::{
     InstancesListTiming, trace_instances_list, trace_slow_instance_readiness,
 };
@@ -66,6 +73,7 @@ use axial_launcher::{
 use axum::{Json, http::StatusCode};
 use serde::{Deserialize, Serialize};
 use std::{
+    collections::HashMap,
     future::Future,
     io::ErrorKind,
     path::PathBuf,
@@ -221,17 +229,20 @@ pub(crate) async fn handle_list_instances(
         indexed_current_versions(state, producer).await;
     let scan_elapsed = scan_started_at.elapsed();
 
+    let version_count = scan.versions.len();
+    let degraded = scan.is_degraded();
+    let scan_state = scan.view_model.clone();
     let enrich_started_at = Instant::now();
-    let instances = enrich_instances_for_state(state, &scan, library_dir.as_deref());
+    let instances = enrich_instances_for_state(state, scan, library_dir).await;
     let enrich_elapsed = enrich_started_at.elapsed();
 
     trace_instances_list(InstancesListTiming {
         total: started_at.elapsed(),
         scan: scan_elapsed,
         enrich: enrich_elapsed,
-        version_count: scan.versions.len(),
+        version_count,
         instance_count: instances.len(),
-        degraded: scan.is_degraded(),
+        degraded,
         scan_source,
         refresh_count,
     });
@@ -239,7 +250,7 @@ pub(crate) async fn handle_list_instances(
     InstancesResponse {
         instances,
         last_instance_id: state.instances().last_instance_id(),
-        scan_state: scan.view_model,
+        scan_state,
     }
 }
 
@@ -294,7 +305,7 @@ async fn enrich_instance_for_state_indexed(
     instance: axial_config::Instance,
 ) -> EnrichedInstance {
     let (scan, _, _, library_dir) = indexed_current_versions(state, producer).await;
-    enrich_instance_for_scan(state, instance, &scan, library_dir.as_deref())
+    enrich_instance_for_scan(state, instance, scan, library_dir).await
 }
 
 async fn enrich_instance_for_state_with_foreground(
@@ -307,27 +318,71 @@ async fn enrich_instance_for_state_with_foreground(
         .installed_versions_snapshot_with_foreground(producer, foreground.retained())
         .await
     else {
-        return enrich_instance_for_scan(state, instance, &unconfigured_versions_scan(), None);
+        return enrich_instance_for_scan(state, instance, unconfigured_versions_scan(), None).await;
     };
     let library_dir = lookup.library_dir().to_path_buf();
     let scan = installed_versions_scan(&lookup.snapshot);
-    enrich_instance_for_scan(state, instance, &scan, Some(&library_dir))
+    enrich_instance_for_scan(state, instance, scan, Some(library_dir)).await
 }
 
-fn enrich_instances_for_state(
+async fn enrich_instances_for_state(
     state: &AppState,
-    scan: &InstalledVersionsScan,
-    library_dir: Option<&std::path::Path>,
+    scan: InstalledVersionsScan,
+    library_dir: Option<PathBuf>,
 ) -> Vec<EnrichedInstance> {
-    state
-        .instances()
-        .list()
-        .into_iter()
-        .map(|instance| enrich_instance_for_scan(state, instance, scan, library_dir))
-        .collect()
+    let instances = state.instances().list();
+    let fallback_instances = instances.clone();
+    let worker_state = state.clone();
+    match run_blocking_filesystem(move || {
+        enrich_instances_for_scan_blocking(&worker_state, instances, &scan, library_dir.as_deref())
+    })
+    .await
+    {
+        Ok(instances) => instances,
+        Err(_) => fallback_instances
+            .into_iter()
+            .map(|instance| {
+                let mut enriched = redact_runtime_overrides(
+                    EnrichedInstance::from_instance_without_resource_counts(instance, None),
+                );
+                apply_blocked_launch_action(
+                    &mut enriched,
+                    "Version readiness could not be inspected. Refresh and try again.",
+                );
+                enriched
+            })
+            .collect(),
+    }
 }
 
-pub(super) fn enrich_instance_for_scan(
+pub(super) async fn enrich_instance_for_scan(
+    state: &AppState,
+    instance: axial_config::Instance,
+    scan: InstalledVersionsScan,
+    library_dir: Option<PathBuf>,
+) -> EnrichedInstance {
+    let fallback_instance = instance.clone();
+    let worker_state = state.clone();
+    match run_blocking_filesystem(move || {
+        enrich_instance_for_scan_blocking(&worker_state, instance, &scan, library_dir.as_deref())
+    })
+    .await
+    {
+        Ok(enriched) => enriched,
+        Err(_) => {
+            let mut enriched = redact_runtime_overrides(
+                EnrichedInstance::from_instance_without_resource_counts(fallback_instance, None),
+            );
+            apply_blocked_launch_action(
+                &mut enriched,
+                "Version readiness could not be inspected. Refresh and try again.",
+            );
+            enriched
+        }
+    }
+}
+
+fn enrich_instance_for_scan_blocking(
     state: &AppState,
     instance: axial_config::Instance,
     scan: &InstalledVersionsScan,
@@ -371,6 +426,96 @@ pub(super) fn enrich_instance_for_scan(
     }
     apply_launch_readiness(&mut enriched, &readiness);
     enriched
+}
+
+#[derive(Debug, Eq, Hash, PartialEq)]
+struct ReadinessInspectionKey {
+    version_id: String,
+    requested_java: String,
+    guardian_mode: &'static str,
+}
+
+fn enrich_instances_for_scan_blocking(
+    state: &AppState,
+    instances: Vec<axial_config::Instance>,
+    scan: &InstalledVersionsScan,
+    library_dir: Option<&std::path::Path>,
+) -> Vec<EnrichedInstance> {
+    let config = state.config().current();
+    enrich_instances_for_scan_with_inspector(
+        instances,
+        scan,
+        library_dir,
+        &config,
+        |instance, request| {
+            let started_at = Instant::now();
+            let readiness =
+                inspect_launch_readiness_summary(state.managed_runtime_cache(), request);
+            let elapsed = started_at.elapsed();
+            if elapsed >= INSTANCE_READINESS_SLOW_SPAN {
+                trace_slow_instance_readiness(
+                    &instance.id,
+                    &instance.version_id,
+                    elapsed,
+                    readiness.launchable,
+                    readiness.reasons.len(),
+                );
+            }
+            readiness
+        },
+    )
+}
+
+fn enrich_instances_for_scan_with_inspector<Inspect>(
+    instances: Vec<axial_config::Instance>,
+    scan: &InstalledVersionsScan,
+    library_dir: Option<&std::path::Path>,
+    config: &axial_config::AppConfig,
+    mut inspect: Inspect,
+) -> Vec<EnrichedInstance>
+where
+    Inspect: FnMut(&axial_config::Instance, &LaunchReadinessRequest) -> LaunchReadiness,
+{
+    let mut readiness = HashMap::<ReadinessInspectionKey, LaunchReadiness>::new();
+    instances
+        .into_iter()
+        .map(|instance| {
+            let version = scan
+                .versions
+                .iter()
+                .find(|version| version.id == instance.version_id);
+            let mut enriched = redact_runtime_overrides(
+                EnrichedInstance::from_instance_without_resource_counts(instance.clone(), version),
+            );
+            if scan.is_degraded() {
+                apply_blocked_launch_action(&mut enriched, VERSION_SCAN_DEGRADED_MESSAGE);
+                return enriched;
+            }
+            let Some(library_dir) = library_dir else {
+                return enriched;
+            };
+            let requested_java = selected_java_override(&instance, config);
+            let guardian_mode = GuardianMode::from_config(&config.guardian_mode);
+            let key = ReadinessInspectionKey {
+                version_id: instance.version_id.clone(),
+                requested_java: requested_java.clone(),
+                guardian_mode: guardian_mode.as_str(),
+            };
+            let readiness = readiness.entry(key).or_insert_with(|| {
+                inspect(
+                    &instance,
+                    &LaunchReadinessRequest {
+                        library_dir: library_dir.to_path_buf(),
+                        requested_java,
+                        version_id: instance.version_id.clone(),
+                        guardian_mode,
+                    },
+                )
+            });
+            apply_launch_readiness(&mut enriched, readiness);
+            enriched
+        })
+        .collect()
 }
 
 fn selected_java_override(
