@@ -9,10 +9,10 @@ use crate::loaders::types::LoaderError;
 use crate::managed_component_effects::{
     ComponentCanonicalObservation, ComponentEffectsError, ComponentExecutionResult,
     ComponentIntentCandidate, ComponentIntentPublicationRecovery, ComponentIntentPublishFailure,
-    ComponentLane, ComponentPriorRecoveryRetryResult, ComponentRecoveryRetryResult,
-    ComponentSettledOutcome, ComponentSettlementResult, ComponentStartupRecoveryResult,
-    component_root_binding_sha256, component_slot_name, execute_component_intent,
-    plan_component_canonical_path, recover_component_intent_publication,
+    ComponentLane, ComponentPreparedCanonicalAuthority, ComponentPriorRecoveryRetryResult,
+    ComponentRecoveryRetryResult, ComponentSettledOutcome, ComponentSettlementResult,
+    ComponentStartupRecoveryResult, component_root_binding_sha256, component_slot_name,
+    execute_component_intent, plan_component_canonical_path, recover_component_intent_publication,
     recover_component_transaction, retry_component_recovery, retry_component_settlement,
     retry_prior_component_recovery, settle_component_transaction,
 };
@@ -27,7 +27,7 @@ use crate::managed_component_table::{
     ComponentTableBuilder, ComponentTableError, ComponentTableRow, ComponentTableSummary,
     ManagedComponentArtifactKind, ManagedComponentKind,
 };
-use crate::managed_fs::ManagedDir;
+use crate::managed_fs::{ManagedDir, ManagedFileIdentity};
 use crate::managed_publication::{
     ManagedPublicationError, ManagedPublicationLifetimeGuard, ManagedRootPublicationLease,
     run_publication_blocking,
@@ -48,6 +48,11 @@ pub(crate) struct ComponentPublicationSourceIdentity {
     sha1: [u8; 20],
 }
 
+pub(crate) struct StagedComponentPublicationSource {
+    source: ComponentPublicationSourceIdentity,
+    file: ManagedFileIdentity,
+}
+
 pub(crate) trait RetainedComponentPublicationSource: Send + Sized {
     fn relative_path(&self) -> &ArtifactRelativePath;
     fn kind(&self) -> ManagedComponentArtifactKind;
@@ -59,7 +64,7 @@ pub(crate) trait RetainedComponentPublicationSource: Send + Sized {
         staging_bucket: &ManagedDir,
         slot: &str,
         lifetime_guard: ManagedPublicationLifetimeGuard,
-    ) -> impl Future<Output = Result<ComponentPublicationSourceIdentity, LoaderError>> + Send;
+    ) -> impl Future<Output = Result<StagedComponentPublicationSource, LoaderError>> + Send;
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -118,6 +123,29 @@ impl ComponentPublicationSourceIdentity {
             && self.kind == kind
             && self.size == size
             && self.sha1 == sha1
+    }
+}
+
+impl StagedComponentPublicationSource {
+    pub(crate) fn new(
+        source: ComponentPublicationSourceIdentity,
+        file: ManagedFileIdentity,
+    ) -> Self {
+        Self { source, file }
+    }
+
+    pub(crate) fn matches(
+        &self,
+        relative_path: &ArtifactRelativePath,
+        kind: ManagedComponentArtifactKind,
+        size: u64,
+        sha1: [u8; 20],
+    ) -> bool {
+        self.source.matches(relative_path, kind, size, sha1)
+    }
+
+    fn file_identity(&self) -> ManagedFileIdentity {
+        self.file
     }
 }
 
@@ -218,6 +246,7 @@ struct SparseSourceCounts {
 
 struct PlannedComponentProjection {
     table_rows: Vec<ComponentTableRow>,
+    authority: Vec<ComponentPreparedCanonicalAuthority>,
     all_exact: bool,
 }
 
@@ -353,6 +382,7 @@ where
         lease,
         component,
         planned.table_rows,
+        planned.authority,
         sources,
         source_counts,
     )
@@ -620,6 +650,7 @@ where
         lease,
         component,
         planned.table_rows,
+        planned.authority,
         sources,
         source_counts,
     )
@@ -666,6 +697,7 @@ async fn prepare_component_intent_from_plan<S>(
     lease: ManagedRootPublicationLease,
     component: ManagedComponentKind,
     planned_rows: Vec<ComponentTableRow>,
+    planned_authority: Vec<ComponentPreparedCanonicalAuthority>,
     sources: BTreeMap<ArtifactRelativePath, S>,
     source_counts: SparseSourceCounts,
 ) -> Result<ComponentIntentCandidate, PrepareComponentIntentError>
@@ -688,19 +720,36 @@ where
             Ok::<_, PrepareComponentIntentError>((lease, lane, builder, spool, sources))
         })
         .await??;
+    if planned_rows.len() != planned_authority.len() {
+        return Err(PrepareComponentIntentError::SourceSet);
+    }
     let mut planned_rows = VecDeque::from(planned_rows);
+    let mut planned_authority = VecDeque::from(planned_authority);
     let mut staged_sources = 0_usize;
     let mut dropped_exact_sources = 0_usize;
     let mut shard_index = 0_usize;
+    let mut prepared_shards = Vec::new();
+    prepared_shards
+        .try_reserve_exact(total_rows.div_ceil(COMPONENT_TABLE_ROWS_PER_SHARD))
+        .map_err(|_| PrepareComponentIntentError::SourceSet)?;
     while !planned_rows.is_empty() {
         let shard_len = planned_rows.len().min(COMPONENT_TABLE_ROWS_PER_SHARD);
         let mut shard_rows = Vec::new();
+        let mut shard_authority = Vec::new();
         shard_rows
+            .try_reserve_exact(shard_len)
+            .map_err(|_| PrepareComponentIntentError::SourceSet)?;
+        shard_authority
             .try_reserve_exact(shard_len)
             .map_err(|_| PrepareComponentIntentError::SourceSet)?;
         for _ in 0..shard_len {
             shard_rows.push(
                 planned_rows
+                    .pop_front()
+                    .ok_or(PrepareComponentIntentError::SourceSet)?,
+            );
+            shard_authority.push(
+                planned_authority
                     .pop_front()
                     .ok_or(PrepareComponentIntentError::SourceSet)?,
             );
@@ -717,26 +766,41 @@ where
         table_rows
             .try_reserve_exact(shard_len)
             .map_err(|_| PrepareComponentIntentError::SourceSet)?;
-        for (row_in_shard, row) in shard_rows.into_iter().enumerate() {
+        let mut prepared_rows = Vec::new();
+        prepared_rows
+            .try_reserve_exact(shard_len)
+            .map_err(|_| PrepareComponentIntentError::SourceSet)?;
+        for (row_in_shard, (row, authority)) in
+            shard_rows.into_iter().zip(shard_authority).enumerate()
+        {
             let source = sources.remove(&row.path);
-            if row.prior_is_final() {
+            let staging = if row.prior_is_final() {
                 if let Some(source) = source {
                     drop(source);
                     dropped_exact_sources += 1;
                 }
+                None
             } else {
-                let source = source.ok_or(PrepareComponentIntentError::SourceSet)?;
-                let slot = component_slot_name(row_in_shard)?;
                 let staged = source
-                    .stage_create_new(buckets.staging(), &slot, lease.lifetime_guard())
+                    .ok_or(PrepareComponentIntentError::SourceSet)?
+                    .stage_create_new(
+                        buckets.staging(),
+                        &component_slot_name(row_in_shard)?,
+                        lease.lifetime_guard(),
+                    )
                     .await?;
                 if !staged.matches(&row.path, row.kind, row.final_size, row.final_sha1) {
                     return Err(PrepareComponentIntentError::SourceSet);
                 }
                 staged_sources += 1;
-            }
+                Some(staged)
+            };
+            prepared_rows.push(
+                authority.with_staging(staging.as_ref().map(|staged| staged.file_identity())),
+            );
             table_rows.push(row);
         }
+        prepared_shards.push(buckets.prepared_authority(prepared_rows)?);
         let pushed = run_publication_blocking(move || {
             let (encoded, descriptor) = builder.push_shard(table_rows)?;
             spool.append(encoded, descriptor)?;
@@ -746,7 +810,8 @@ where
         (lease, lane, builder, spool) = pushed;
         shard_index += 1;
     }
-    if !sources.is_empty()
+    if !planned_authority.is_empty()
+        || !sources.is_empty()
         || staged_sources != source_counts.required
         || dropped_exact_sources != source_counts.supplied_exact
     {
@@ -755,9 +820,15 @@ where
     let candidate = run_publication_blocking(move || {
         let (manifest, summary) = builder.finish()?;
         let replay = spool.finish(&manifest)?;
-        let durable_summary = lane.publish_table(replay, &manifest)?;
+        let (durable_summary, table_files) = lane.publish_table(replay, &manifest)?;
         validate_table_summary(&summary, &durable_summary, manifest.shards.len(), &manifest)?;
-        Ok::<_, PrepareComponentIntentError>(lane.into_intent_candidate(lease, manifest)?)
+        Ok::<_, PrepareComponentIntentError>(lane.into_prepared_intent_candidate(
+            lease,
+            manifest,
+            durable_summary,
+            table_files,
+            prepared_shards,
+        )?)
     })
     .await??;
     Ok(candidate)
@@ -865,13 +936,18 @@ fn plan_projection(
     projection: Vec<ComponentProjectionRow>,
 ) -> Result<PlannedComponentProjection, PrepareComponentIntentError> {
     let mut rows = Vec::new();
+    let mut authority = Vec::new();
     rows.try_reserve_exact(projection.len())
+        .map_err(|_| PrepareComponentIntentError::SourceSet)?;
+    authority
+        .try_reserve_exact(projection.len())
         .map_err(|_| PrepareComponentIntentError::SourceSet)?;
     let mut all_exact = true;
     for projected in projection {
         let path_plan = plan_component_canonical_path(lease.root(), component, &projected.path)?;
         let first_created_depth = path_plan.first_created_depth();
-        let prior = match path_plan.observe()? {
+        let (observed, prepared) = path_plan.observe_prepared()?;
+        let prior = match observed {
             ComponentCanonicalObservation::Absent => {
                 all_exact = false;
                 None
@@ -894,10 +970,12 @@ fn plan_projection(
             first_created_depth,
             prior,
         });
+        authority.push(prepared);
     }
     lease.revalidate()?;
     Ok(PlannedComponentProjection {
         table_rows: rows,
+        authority,
         all_exact,
     })
 }
@@ -1095,11 +1173,11 @@ mod tests {
             staging_bucket: &ManagedDir,
             slot: &str,
             lifetime_guard: ManagedPublicationLifetimeGuard,
-        ) -> Result<ComponentPublicationSourceIdentity, LoaderError> {
+        ) -> Result<StagedComponentPublicationSource, LoaderError> {
             if let Some(events) = &self.events {
                 events.staged.fetch_add(1, Ordering::SeqCst);
             }
-            staging_bucket
+            let file = staging_bucket
                 .import_authenticated_create_new(
                     slot,
                     std::io::Cursor::new(self.bytes.clone()),
@@ -1108,7 +1186,10 @@ mod tests {
                     lifetime_guard,
                 )
                 .await?;
-            Ok(self.identity.clone())
+            Ok(StagedComponentPublicationSource::new(
+                self.identity.clone(),
+                file,
+            ))
         }
     }
 
@@ -1172,6 +1253,55 @@ mod tests {
         ManagedRootPublicationLease::acquire(root)
             .await
             .expect("test publication lease")
+    }
+
+    async fn prepared_mixed_candidate(
+        temporary: &tempfile::TempDir,
+    ) -> (ComponentIntentCandidate, ArtifactRelativePath, Vec<u8>) {
+        let inherited_bytes = b"inherited-authority".to_vec();
+        let inherited = test_source(
+            "org/example/inherited.jar",
+            ManagedComponentArtifactKind::Library,
+            inherited_bytes.clone(),
+        );
+        let fresh = test_source(
+            "org/example/fresh.jar",
+            ManagedComponentArtifactKind::NativeLibrary,
+            b"fresh-authority".to_vec(),
+        );
+        let inherited_path = inherited.identity.relative_path.clone();
+        let canonical = inherited_path.join_under(&temporary.path().join("libraries"));
+        fs::create_dir_all(canonical.parent().expect("canonical parent")).unwrap();
+        fs::write(&canonical, &inherited_bytes).unwrap();
+        let authority =
+            test_authority(ManagedComponentKind::Libraries, &[inherited, fresh.clone()]);
+        let projection = authority
+            .component_projection(ManagedKnownGoodComponent::Libraries)
+            .expect("mixed projection");
+        let (candidate, _) = prepare_component_intent_projection(
+            test_lease(temporary).await,
+            projection,
+            ManagedComponentKind::Libraries,
+            vec![fresh],
+        )
+        .await
+        .expect("prepared mixed candidate");
+        (candidate, inherited_path, inherited_bytes)
+    }
+
+    fn observed_identity(
+        temporary: &tempfile::TempDir,
+        path: &ArtifactRelativePath,
+    ) -> ManagedFileIdentity {
+        let root = ManagedDir::open_root(temporary.path()).expect("managed test root");
+        let plan = plan_component_canonical_path(&root, ManagedComponentKind::Libraries, path)
+            .expect("canonical plan");
+        let ComponentCanonicalObservation::Regular(observed) =
+            plan.observe().expect("canonical observation")
+        else {
+            panic!("canonical test file must exist")
+        };
+        observed.guard().identity()
     }
 
     fn component_root_name(component: ManagedComponentKind) -> &'static str {
@@ -2049,9 +2179,61 @@ mod tests {
         let counts = take_sha1_full_read_counts(temporary.path());
         assert_eq!(
             counts.count(inherited_identity.size, inherited_identity.sha1),
-            9
+            8
         );
-        assert_eq!(counts.count(fresh_identity.size, fresh_identity.sha1), 10);
+        assert_eq!(counts.count(fresh_identity.size, fresh_identity.sha1), 9);
+    }
+
+    #[tokio::test]
+    async fn prepared_candidate_rejects_same_identity_same_size_content_mutation() {
+        let temporary = tempfile::tempdir().expect("test root");
+        let (candidate, inherited_path, inherited_bytes) =
+            prepared_mixed_candidate(&temporary).await;
+        let canonical = inherited_path.join_under(&temporary.path().join("libraries"));
+        let before = observed_identity(&temporary, &inherited_path);
+        let mutated = vec![b'x'; inherited_bytes.len()];
+
+        fs::write(&canonical, &mutated).expect("mutate canonical in place");
+        assert_eq!(observed_identity(&temporary, &inherited_path), before);
+
+        assert!(matches!(
+            candidate.publish_intent(),
+            Err(ComponentIntentPublishFailure::BeforePromotion { .. })
+        ));
+        assert!(
+            !temporary
+                .path()
+                .join(".axial-publication/libraries/intent.bin")
+                .exists()
+        );
+        assert_eq!(fs::read(canonical).unwrap(), mutated);
+    }
+
+    #[tokio::test]
+    async fn prepared_candidate_rejects_exact_content_identity_replacement() {
+        let temporary = tempfile::tempdir().expect("test root");
+        let (candidate, inherited_path, inherited_bytes) =
+            prepared_mixed_candidate(&temporary).await;
+        let canonical = inherited_path.join_under(&temporary.path().join("libraries"));
+        let displaced = canonical.with_extension("saved");
+        let before = observed_identity(&temporary, &inherited_path);
+
+        fs::rename(&canonical, &displaced).expect("retain original identity");
+        fs::write(&canonical, &inherited_bytes).expect("replace canonical with exact bytes");
+        assert_ne!(observed_identity(&temporary, &inherited_path), before);
+
+        assert!(matches!(
+            candidate.publish_intent(),
+            Err(ComponentIntentPublishFailure::BeforePromotion { .. })
+        ));
+        assert!(
+            !temporary
+                .path()
+                .join(".axial-publication/libraries/intent.bin")
+                .exists()
+        );
+        assert_eq!(fs::read(canonical).unwrap(), inherited_bytes);
+        assert!(displaced.is_file());
     }
 
     #[tokio::test]

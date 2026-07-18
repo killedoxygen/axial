@@ -77,8 +77,18 @@ pub(crate) struct ComponentLane {
 
 pub(crate) struct ComponentShardBuckets {
     staging: ManagedDir,
-    #[cfg(test)]
     quarantine: ManagedDir,
+}
+
+pub(crate) struct ComponentPreparedCanonicalAuthority {
+    canonical_anchor: ManagedDirectoryIdentity,
+    canonical: Option<ManagedFileIdentity>,
+}
+
+pub(crate) struct ComponentPreparedShardAuthority {
+    staging: ManagedDirectoryIdentity,
+    quarantine: ManagedDirectoryIdentity,
+    rows: Vec<ComponentPreintentRowAuthority>,
 }
 
 pub(crate) struct ComponentIntentCandidate {
@@ -144,7 +154,7 @@ struct ComponentPreintentShardAuthority {
 }
 
 #[derive(Eq, PartialEq)]
-struct ComponentPreintentRowAuthority {
+pub(crate) struct ComponentPreintentRowAuthority {
     staging: Option<ManagedFileIdentity>,
     canonical_anchor: ManagedDirectoryIdentity,
     canonical: Option<ManagedFileIdentity>,
@@ -328,13 +338,12 @@ impl ComponentLane {
         let name = component_bucket_name(shard_index)?;
         let staging = self.staging.create_child_new(&name)?;
         self.staging.sync()?;
-        let _quarantine_bucket = self.quarantine.create_child_new(&name)?;
+        let quarantine = self.quarantine.create_child_new(&name)?;
         self.quarantine.sync()?;
         self.lane.sync()?;
         Ok(ComponentShardBuckets {
             staging,
-            #[cfg(test)]
-            quarantine: _quarantine_bucket,
+            quarantine,
         })
     }
 
@@ -342,11 +351,15 @@ impl ComponentLane {
         &self,
         mut replay: ComponentTableReplay,
         manifest: &ComponentIntentManifest,
-    ) -> Result<ComponentTableSummary, ComponentEffectsError> {
+    ) -> Result<(ComponentTableSummary, Vec<ManagedFileIdentity>), ComponentEffectsError> {
         if manifest.component != self.component || !exact_entry_names(&self.table, 1)?.is_empty() {
             return Err(ComponentEffectsError::Topology);
         }
         let mut parser = ComponentTableParser::new(manifest.clone())?;
+        let mut identities = Vec::new();
+        identities
+            .try_reserve_exact(manifest.shards.len())
+            .map_err(|_| ComponentEffectsError::Topology)?;
         let mut next_shard = 0_usize;
         while let Some((descriptor, encoded)) = replay.next()? {
             let expected = manifest
@@ -378,15 +391,17 @@ impl ComponentLane {
                 return Err(error);
             }
             self.table.sync()?;
+            identities.push(guard.identity());
             next_shard += 1;
         }
         if next_shard != manifest.shards.len() {
             return Err(ComponentEffectsError::Topology);
         }
         self.lane.sync()?;
-        parser.finish().map_err(Into::into)
+        Ok((parser.finish()?, identities))
     }
 
+    #[cfg(test)]
     pub(crate) fn into_intent_candidate(
         self,
         lease: ManagedRootPublicationLease,
@@ -412,6 +427,58 @@ impl ComponentLane {
             authority,
         })
     }
+
+    pub(crate) fn into_prepared_intent_candidate(
+        self,
+        lease: ManagedRootPublicationLease,
+        manifest: ComponentIntentManifest,
+        summary: ComponentTableSummary,
+        table_files: Vec<ManagedFileIdentity>,
+        prepared_shards: Vec<ComponentPreparedShardAuthority>,
+    ) -> Result<ComponentIntentCandidate, ComponentEffectsError> {
+        lease.revalidate()?;
+        let expected_lane = lease
+            .publication_directory()
+            .open_child(component_lane_name(self.component))?;
+        if expected_lane.identity()? != self.lane.identity()?
+            || manifest.component != self.component
+            || table_files.len() != manifest.shards.len()
+            || prepared_shards.len() != manifest.shards.len()
+        {
+            return Err(ComponentEffectsError::Topology);
+        }
+        let encoded_intent = encode_component_intent_manifest(&manifest)?;
+        let shards = table_files
+            .into_iter()
+            .zip(prepared_shards)
+            .map(|(table, prepared)| ComponentPreintentShardAuthority {
+                table,
+                staging: prepared.staging,
+                quarantine: prepared.quarantine,
+                rows: prepared.rows,
+            })
+            .collect();
+        let authority = ComponentPreintentAuthority {
+            root: lease.root().identity()?,
+            publication: lease.publication_directory().identity()?,
+            lane: self.lane.identity()?,
+            table: self.table.identity()?,
+            staging: self.staging.identity()?,
+            quarantine: self.quarantine.identity()?,
+            ancestors: self.ancestors.identity()?,
+            ancestor_records: self.ancestor_records.identity()?,
+            ancestor_staging: self.ancestor_staging.identity()?,
+            shards,
+        };
+        Ok(ComponentIntentCandidate {
+            lane: self,
+            lease,
+            manifest,
+            encoded_intent,
+            summary,
+            authority,
+        })
+    }
 }
 
 impl ComponentShardBuckets {
@@ -422,6 +489,17 @@ impl ComponentShardBuckets {
     #[cfg(test)]
     pub(crate) fn quarantine(&self) -> &ManagedDir {
         &self.quarantine
+    }
+
+    pub(crate) fn prepared_authority(
+        &self,
+        rows: Vec<ComponentPreintentRowAuthority>,
+    ) -> Result<ComponentPreparedShardAuthority, ComponentEffectsError> {
+        Ok(ComponentPreparedShardAuthority {
+            staging: self.staging.identity()?,
+            quarantine: self.quarantine.identity()?,
+            rows,
+        })
     }
 }
 
@@ -598,6 +676,42 @@ impl ComponentCanonicalPathPlan {
                 sha1,
             },
         ))
+    }
+
+    pub(crate) fn observe_prepared(
+        &self,
+    ) -> Result<
+        (
+            ComponentCanonicalObservation,
+            ComponentPreparedCanonicalAuthority,
+        ),
+        ComponentEffectsError,
+    > {
+        let observation = self.observe()?;
+        let canonical = match &observation {
+            ComponentCanonicalObservation::Absent => None,
+            ComponentCanonicalObservation::Regular(observed) => Some(observed.guard.identity()),
+        };
+        Ok((
+            observation,
+            ComponentPreparedCanonicalAuthority {
+                canonical_anchor: self.creation_anchor.identity()?,
+                canonical,
+            },
+        ))
+    }
+}
+
+impl ComponentPreparedCanonicalAuthority {
+    pub(crate) fn with_staging(
+        self,
+        staging: Option<ManagedFileIdentity>,
+    ) -> ComponentPreintentRowAuthority {
+        ComponentPreintentRowAuthority {
+            staging,
+            canonical_anchor: self.canonical_anchor,
+            canonical: self.canonical,
+        }
     }
 }
 
@@ -3964,7 +4078,7 @@ mod tests {
         spool.append(encoded, descriptor).unwrap();
         let replay = spool.finish(&manifest).unwrap();
 
-        let durable_summary = lane.publish_table(replay, &manifest).unwrap();
+        let (durable_summary, _) = lane.publish_table(replay, &manifest).unwrap();
         assert_eq!(durable_summary, expected_summary);
         drop((durable_summary, lane));
 

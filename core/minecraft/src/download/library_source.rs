@@ -21,6 +21,7 @@ use crate::managed_blocking::{
 };
 use crate::managed_component_lifecycle::{
     ComponentPublicationSourceIdentity, RetainedComponentPublicationSource,
+    StagedComponentPublicationSource,
 };
 use crate::managed_component_source_spool::{
     RetainedComponentSourceAllocation, RetainedComponentSourceAppendError,
@@ -788,7 +789,7 @@ impl RetainedLibraryComponentSource {
         slot: &str,
         lifetime_guard: ManagedPublicationLifetimeGuard,
         blocking_hook: BlockingValidationHook,
-    ) -> Result<ComponentPublicationSourceIdentity, LoaderError> {
+    ) -> Result<StagedComponentPublicationSource, LoaderError> {
         let Self {
             storage,
             relative_path,
@@ -798,7 +799,7 @@ impl RetainedLibraryComponentSource {
             kind,
         } = self;
         let reader = storage.into_reader()?;
-        staging_bucket
+        let file = staging_bucket
             .import_authenticated_create_new_with_hook(
                 slot,
                 reader,
@@ -808,11 +809,14 @@ impl RetainedLibraryComponentSource {
                 blocking_hook,
             )
             .await?;
-        Ok(ComponentPublicationSourceIdentity::new(
-            relative_path,
-            component_source_kind(kind),
-            observed_size,
-            observed_sha1,
+        Ok(StagedComponentPublicationSource::new(
+            ComponentPublicationSourceIdentity::new(
+                relative_path,
+                component_source_kind(kind),
+                observed_size,
+                observed_sha1,
+            ),
+            file,
         ))
     }
 }
@@ -839,7 +843,7 @@ impl RetainedComponentPublicationSource for RetainedLibraryComponentSource {
         staging_bucket: &ManagedDir,
         slot: &str,
         lifetime_guard: ManagedPublicationLifetimeGuard,
-    ) -> Result<ComponentPublicationSourceIdentity, LoaderError> {
+    ) -> Result<StagedComponentPublicationSource, LoaderError> {
         let Self {
             storage,
             relative_path,
@@ -849,7 +853,7 @@ impl RetainedComponentPublicationSource for RetainedLibraryComponentSource {
             kind,
         } = self;
         let reader = storage.into_reader()?;
-        staging_bucket
+        let file = staging_bucket
             .import_authenticated_create_new(
                 slot,
                 reader,
@@ -858,11 +862,14 @@ impl RetainedComponentPublicationSource for RetainedLibraryComponentSource {
                 lifetime_guard,
             )
             .await?;
-        Ok(ComponentPublicationSourceIdentity::new(
-            relative_path,
-            component_source_kind(kind),
-            observed_size,
-            observed_sha1,
+        Ok(StagedComponentPublicationSource::new(
+            ComponentPublicationSourceIdentity::new(
+                relative_path,
+                component_source_kind(kind),
+                observed_size,
+                observed_sha1,
+            ),
+            file,
         ))
     }
 }
@@ -2329,15 +2336,12 @@ mod tests {
             .stage_create_new(&bucket, slot, lease.lifetime_guard())
             .await
             .expect("stage retained component source");
-        assert_eq!(
-            staged,
-            ComponentPublicationSourceIdentity::new(
-                fixture_relative_path(),
-                ManagedComponentArtifactKind::NativeLibrary,
-                body.len() as u64,
-                sha1_bytes(&body),
-            )
-        );
+        assert!(staged.matches(
+            &fixture_relative_path(),
+            ManagedComponentArtifactKind::NativeLibrary,
+            body.len() as u64,
+            sha1_bytes(&body),
+        ));
         assert_eq!(
             std::fs::read(bucket.path().join(slot)).expect("read staged source"),
             body

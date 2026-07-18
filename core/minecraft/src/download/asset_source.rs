@@ -10,6 +10,7 @@ use crate::loaders::types::LoaderError;
 use crate::managed_blocking::{ManagedBlockingTaskError, ManagedBlockingWorkers};
 use crate::managed_component_lifecycle::{
     ComponentPublicationSourceIdentity, RetainedComponentPublicationSource,
+    StagedComponentPublicationSource,
 };
 use crate::managed_component_source_spool::{
     RetainedComponentSourceAllocation, RetainedComponentSourceAppendError,
@@ -465,12 +466,12 @@ impl RetainedComponentPublicationSource for RetainedAssetComponentSource {
         staging_bucket: &ManagedDir,
         slot: &str,
         lifetime_guard: ManagedPublicationLifetimeGuard,
-    ) -> Result<ComponentPublicationSourceIdentity, LoaderError> {
+    ) -> Result<StagedComponentPublicationSource, LoaderError> {
         let reader = self
             .allocation
             .into_reader()
             .map_err(retained_spool_loader_error)?;
-        staging_bucket
+        let file = staging_bucket
             .import_authenticated_create_new(
                 slot,
                 reader,
@@ -479,11 +480,14 @@ impl RetainedComponentPublicationSource for RetainedAssetComponentSource {
                 lifetime_guard,
             )
             .await?;
-        Ok(ComponentPublicationSourceIdentity::new(
-            self.relative_path,
-            self.kind,
-            self.observed_size,
-            self.observed_sha1,
+        Ok(StagedComponentPublicationSource::new(
+            ComponentPublicationSourceIdentity::new(
+                self.relative_path,
+                self.kind,
+                self.observed_size,
+                self.observed_sha1,
+            ),
+            file,
         ))
     }
 }

@@ -2388,6 +2388,7 @@ impl ManagedDir {
                 },
             )
             .await
+            .map(|_| ())
     }
 
     pub(crate) async fn import_authenticated_create_new<R, G>(
@@ -2397,7 +2398,7 @@ impl ManagedDir {
         expected_size: u64,
         expected_sha1: [u8; 20],
         lifetime_guard: G,
-    ) -> Result<(), LoaderError>
+    ) -> Result<ManagedFileIdentity, LoaderError>
     where
         R: Read + Seek + Send + 'static,
         G: Send + 'static,
@@ -2433,7 +2434,7 @@ impl ManagedDir {
         expected_sha1: [u8; 20],
         lifetime_guard: G,
         blocking_hook: Box<dyn FnOnce() + Send + 'static>,
-    ) -> Result<(), LoaderError>
+    ) -> Result<ManagedFileIdentity, LoaderError>
     where
         R: Read + Seek + Send + 'static,
         G: Send + 'static,
@@ -2484,13 +2485,14 @@ impl ManagedDir {
             },
         )
         .await
+        .map(|_| ())
     }
 
     async fn import_authenticated_inner<R, G>(
         &self,
         name: &str,
         request: ManagedAuthenticatedImport<R, G>,
-    ) -> Result<(), LoaderError>
+    ) -> Result<ManagedFileIdentity, LoaderError>
     where
         R: Read + Seek + Send + 'static,
         G: Send + 'static,
@@ -2541,7 +2543,7 @@ impl ManagedDir {
         expected_sha1: [u8; 20],
         replace_existing: bool,
         #[cfg(test)] fail_after_promotion: bool,
-    ) -> Result<(), LoaderError> {
+    ) -> Result<ManagedFileIdentity, LoaderError> {
         validate_segment(name)?;
         source.seek(SeekFrom::Start(0))?;
         let temp_name = temp_name();
@@ -2647,10 +2649,28 @@ impl ManagedDir {
             ));
         }
         self.revalidate()?;
+        let promoted_identity = match promoted.as_ref().and_then(|pending| pending.guard.as_ref()) {
+            Some(guard) if self.file_guard_matches(name, guard)? => Some(guard.identity()),
+            Some(_) => {
+                return Err(LoaderError::Verify(
+                    "managed retained source identity changed after verification".to_string(),
+                ));
+            }
+            None => None,
+        };
         if let Some(promoted) = promoted.as_mut() {
             promoted.disarm();
         }
-        Ok(())
+        if let Some(identity) = promoted_identity {
+            return Ok(identity);
+        }
+        self.inspect_regular_file(name)?
+            .map(|guard| guard.identity())
+            .ok_or_else(|| {
+                LoaderError::Verify(
+                    "managed loader import disappeared after verification".to_string(),
+                )
+            })
     }
 
     pub(crate) async fn write_exact(&self, name: &str, bytes: &[u8]) -> Result<(), LoaderError> {
