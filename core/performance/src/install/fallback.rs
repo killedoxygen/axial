@@ -74,15 +74,22 @@ impl PerformanceManager {
                             .artifact_id
                             .eq_ignore_ascii_case(&managed_mod.artifact_id)
                     })?;
+                    if admitted_mod != managed_mod {
+                        warn!(
+                            "performance fallback artifact {} has a divergent declaration",
+                            managed_mod.artifact_id
+                        );
+                        return None;
+                    }
                     active_artifact_disable(
                         manifest,
-                        admitted_mod,
+                        managed_mod,
                         plan.family,
                         &plan.loader,
                         definition.tier,
                     )
                     .is_none()
-                    .then(|| admitted_mod.clone())
+                    .then(|| managed_mod.clone())
                 })
                 .collect();
 

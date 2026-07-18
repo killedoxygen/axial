@@ -222,31 +222,10 @@ impl PerformanceManager {
         loaders: &[String],
     ) -> Result<Vec<Version>, InstallError> {
         let game_versions = [game_version.to_string()];
-        let project_result = self
-            .modrinth
+        self.modrinth
             .list_versions(&managed_mod.project_id, &game_versions, loaders)
-            .await;
-        let distinct_slug =
-            !managed_mod.slug.is_empty() && managed_mod.project_id != managed_mod.slug;
-
-        match project_result {
-            Ok(versions) if !versions.is_empty() => Ok(versions),
-            Ok(versions) if !distinct_slug => Ok(versions),
-            Ok(_) => self
-                .modrinth
-                .list_versions(&managed_mod.slug, &game_versions, loaders)
-                .await
-                .map_err(InstallError::Modrinth),
-            Err(error @ ModrinthError::Http { status: 404, .. }) if !distinct_slug => {
-                Err(InstallError::Modrinth(error))
-            }
-            Err(ModrinthError::Http { status: 404, .. }) => self
-                .modrinth
-                .list_versions(&managed_mod.slug, &game_versions, loaders)
-                .await
-                .map_err(InstallError::Modrinth),
-            Err(error) => Err(InstallError::Modrinth(error)),
-        }
+            .await
+            .map_err(InstallError::Modrinth)
     }
 }
 

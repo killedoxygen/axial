@@ -532,6 +532,88 @@ async fn rollback_list_route_returns_snapshot_metadata() {
 }
 
 #[tokio::test]
+async fn queued_first_install_reports_available_rollback_in_journal_status_and_proof() {
+    let fixture = TestFixture::new("first-install-available-rollback-proof");
+    let version_id = "1.5.2";
+    let instance_id = fixture
+        .add_persisted_instance("First managed install proof", version_id)
+        .await;
+    fixture.write_vanilla_version(version_id);
+
+    let Json(queued) = handle_install(
+        State(fixture.state.clone()),
+        Json(InstallRequest {
+            instance_id: Some(instance_id.clone()),
+            game_version: Some(version_id.to_string()),
+            loader: Some("vanilla".to_string()),
+            mode: Some("managed".to_string()),
+            action: None,
+            rollback_id: None,
+            queued: Some(true),
+        }),
+    )
+    .await
+    .expect("queue first managed install");
+    let operation_id = queued.install_id.expect("queued operation id");
+    let events = collect_install_events(&fixture.state, &operation_id).await;
+    assert_eq!(events.last().expect("terminal progress").phase, "complete");
+
+    let status = fixture
+        .state
+        .performance_operations()
+        .get(&operation_id)
+        .await
+        .expect("durable first-install status");
+    assert_eq!(status.state, "complete");
+    assert_eq!(
+        status
+            .journal_identity
+            .as_ref()
+            .expect("journal identity")
+            .rollback,
+        RollbackState::Available
+    );
+    let journal = fixture
+        .state
+        .journals()
+        .get(&crate::state::contracts::OperationId::new(
+            operation_id.clone(),
+        ))
+        .expect("first-install journal");
+    assert_eq!(journal.rollback, RollbackState::Available);
+    assert!(
+        journal
+            .planned_steps
+            .iter()
+            .all(|step| step.rollback == RollbackState::Available)
+    );
+
+    let public = performance_operation_status(&fixture.state, &operation_id)
+        .await
+        .expect("public first-install status");
+    assert_eq!(public.status.state, "complete");
+    assert_eq!(
+        public.proof.expect("terminal operation proof").rollback,
+        RollbackState::Available
+    );
+    let snapshots = performance_rollback_list(
+        &fixture.state,
+        RollbackQuery {
+            instance_id: Some(instance_id),
+        },
+    )
+    .await
+    .expect("first-install rollback list")
+    .snapshots;
+    assert_eq!(snapshots.len(), 1);
+    assert_eq!(
+        snapshots[0].target,
+        axial_performance::RollbackSnapshotTarget::ManagedStateAbsent
+    );
+    assert!(snapshots[0].rollback_available);
+}
+
+#[tokio::test]
 async fn first_install_absence_rollback_lists_after_restart_and_preserves_user_files() {
     let mut fixture = TestFixture::new("first-install-absence-rollback");
     let version_id = "1.5.2";

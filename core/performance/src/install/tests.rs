@@ -245,83 +245,47 @@ async fn managed_install_uses_project_id_without_slug_fallback() {
 }
 
 #[tokio::test]
-async fn managed_install_falls_back_to_slug_after_project_id_404_or_no_compatible_version() {
+async fn managed_install_never_uses_slug_after_project_id_404_or_empty_result() {
     for (name, response) in [
         ("project-id-404", ProjectLookupResponse::NotFound),
         ("project-id-empty", ProjectLookupResponse::Empty),
     ] {
+        let root = test_root(name);
         let (base_url, requests) = spawn_modrinth_identity_server(response).await;
         let manager =
             PerformanceManager::new_with_modrinth_base_url(base_url).expect("performance manager");
-        let managed_mod = managed_mod("declared-project", "declared-slug");
-        let loaders = vec!["fabric".to_string()];
+        let plan = CompositionPlan {
+            composition_id: "strict-provider-identity".to_string(),
+            family: VersionFamily::F,
+            loader: "fabric".to_string(),
+            mode: PerformanceMode::Managed,
+            tier: CompositionTier::Core,
+            mods: vec![managed_mod("declared-project", "declared-slug")],
+            jvm_preset: String::new(),
+            fallback_chain: Vec::new(),
+            warnings: Vec::new(),
+            fallback_reason: String::new(),
+        };
 
-        let versions = manager
-            .resolve_managed_mod_versions(&managed_mod, "1.20.4", &loaders)
+        let state = manager
+            .attempt_install_plan(&plan, "1.20.4", &root, None)
             .await
-            .unwrap_or_else(|error| panic!("{name} should resolve by slug fallback: {error}"));
+            .unwrap_or_else(|error| panic!("{name} should have a definite outcome: {error}"));
 
-        assert_eq!(versions.len(), 1);
-        assert_eq!(versions[0].id, "declared-slug-version");
+        assert!(state.installed_mods.is_empty());
+        assert_eq!(state.failure_count, 1);
         let requests = requests.lock().expect("request log").clone();
-        assert!(request_log_contains(
-            &requests,
-            "/v2/project/declared-project/version"
-        ));
-        assert!(request_log_contains(
+        assert_eq!(
+            request_log_count(&requests, "/v2/project/declared-project/version"),
+            1
+        );
+        assert!(!request_log_contains(
             &requests,
             "/v2/project/declared-slug/version"
         ));
+        assert!(!request_log_contains(&requests, "/files/declared-slug.jar"));
+        let _ = fs::remove_dir_all(root);
     }
-}
-
-#[tokio::test]
-async fn managed_install_does_not_repeat_an_identical_project_and_slug_lookup() {
-    let (base_url, requests) = spawn_modrinth_identity_server(ProjectLookupResponse::Empty).await;
-    let manager =
-        PerformanceManager::new_with_modrinth_base_url(base_url).expect("performance manager");
-    let managed_mod = managed_mod("declared-project", "declared-project");
-    let loaders = vec!["fabric".to_string()];
-
-    let versions = manager
-        .resolve_managed_mod_versions(&managed_mod, "1.20.4", &loaders)
-        .await
-        .expect("empty exact lookup should remain empty");
-
-    assert!(versions.is_empty());
-    let requests = requests.lock().expect("request log").clone();
-    assert_eq!(
-        request_log_count(&requests, "/v2/project/declared-project/version"),
-        1
-    );
-}
-
-#[tokio::test]
-async fn managed_install_treats_case_distinct_project_and_slug_as_separate_aliases() {
-    let (base_url, requests) = spawn_modrinth_identity_server(ProjectLookupResponse::Empty).await;
-    let manager =
-        PerformanceManager::new_with_modrinth_base_url(base_url).expect("performance manager");
-    let managed_mod = managed_mod("declared-project", "DECLARED-PROJECT");
-    let loaders = vec!["fabric".to_string()];
-
-    let error = manager
-        .resolve_managed_mod_versions(&managed_mod, "1.20.4", &loaders)
-        .await
-        .expect_err("a case-distinct slug should receive its own fallback lookup");
-
-    assert!(matches!(
-        error,
-        InstallError::Modrinth(ModrinthError::Http { status: 404, .. })
-    ));
-    let requests = requests.lock().expect("request log").clone();
-    assert!(request_log_contains(
-        &requests,
-        "/v2/project/declared-project/version"
-    ));
-    assert!(request_log_contains(
-        &requests,
-        "/v2/project/DECLARED-PROJECT/version"
-    ));
 }
 
 #[tokio::test]
@@ -1118,6 +1082,101 @@ async fn severe_fallback_cannot_reintroduce_an_exact_version_exclusion() {
     assert!(!root.join("excluded.jar").exists());
 
     let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn severe_fallback_rejects_every_divergent_overlapping_declaration() {
+    for policy in ["exact", "range", "hardware", "mutual"] {
+        let root = test_root(&format!("fallback-divergent-{policy}"));
+        let manager = PerformanceManager::new_with_modrinth_base_url(
+            spawn_selective_modrinth_server(&["shared"]).await,
+        )
+        .expect("performance manager");
+        let mut fallback_mod = managed_mod("shared", "shared");
+        match policy {
+            "exact" => fallback_mod.exact_game_versions = vec!["1.21.4".to_string()],
+            "range" => {
+                fallback_mod.condition = ModCondition::VersionRange;
+                fallback_mod.version_range = ">=1.21.4".to_string();
+            }
+            "hardware" => {
+                fallback_mod.condition = ModCondition::Hardware;
+                fallback_mod.hardware_req = Some(crate::types::HardwareRequirement {
+                    min_ram_mb: 32_768,
+                    ..crate::types::HardwareRequirement::default()
+                });
+            }
+            "mutual" => fallback_mod.mutual_exclusions = vec!["conflicting-mod".to_string()],
+            _ => unreachable!(),
+        }
+        set_test_compositions(
+            &manager,
+            vec![composition_def(
+                "test-core",
+                CompositionTier::Core,
+                vec![fallback_mod],
+            )],
+        );
+        let plan = CompositionPlan {
+            composition_id: "test-extended".to_string(),
+            family: VersionFamily::F,
+            loader: "fabric".to_string(),
+            mode: PerformanceMode::Managed,
+            tier: CompositionTier::Extended,
+            mods: vec![
+                managed_mod("shared", "shared"),
+                managed_mod("unavailable-a", "unavailable-a"),
+                managed_mod("unavailable-b", "unavailable-b"),
+            ],
+            jvm_preset: String::new(),
+            fallback_chain: vec!["test-core".to_string()],
+            warnings: Vec::new(),
+            fallback_reason: String::new(),
+        };
+
+        let state = manager
+            .ensure_installed(&plan, "1.20.4", &root)
+            .await
+            .unwrap_or_else(|error| panic!("{policy} fallback should settle: {error}"));
+
+        assert_eq!(state.composition_id, "test-core", "{policy}");
+        assert!(state.installed_mods.is_empty(), "{policy}");
+        assert!(!root.join("shared.jar").exists(), "{policy}");
+        let _ = fs::remove_dir_all(root);
+    }
+}
+
+#[test]
+fn builtin_fallback_overlaps_reuse_identical_managed_mod_declarations() {
+    let manifest = builtin_manifest().expect("builtin manifest");
+
+    for definition in &manifest.compositions {
+        if definition.fallback_to.is_empty() {
+            continue;
+        }
+        let fallback = manifest
+            .compositions
+            .iter()
+            .find(|candidate| candidate.id == definition.fallback_to)
+            .expect("validated fallback definition");
+        for fallback_mod in &fallback.mods {
+            let admitted_mod = definition
+                .mods
+                .iter()
+                .find(|candidate| candidate.artifact_id == fallback_mod.artifact_id)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{} fallback artifact {} is not inherited from {}",
+                        fallback.id, fallback_mod.artifact_id, definition.id
+                    )
+                });
+            assert_eq!(
+                fallback_mod, admitted_mod,
+                "{} changes admitted policy for {}",
+                fallback.id, fallback_mod.artifact_id
+            );
+        }
+    }
 }
 
 #[test]

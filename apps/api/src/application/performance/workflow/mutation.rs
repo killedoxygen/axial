@@ -217,7 +217,7 @@ pub(super) async fn performance_operation_journal_identity(
     });
     let rollback = preflight_current_performance_state(&admitted)
         .await
-        .map(|current| rollback_state_for_current_state(current.as_ref()))
+        .map(|_| RollbackState::Available)
         .unwrap_or(RollbackState::Unavailable);
     Ok(PerformanceJournalIdentity {
         action: PerformanceInstallAction::Install,
@@ -553,7 +553,7 @@ async fn execute_performance_install(
     });
     let current_state = preflight_current_performance_state(admitted).await;
     let rollback_state = match &current_state {
-        Ok(state) => rollback_state_for_current_state(state.as_ref()),
+        Ok(_) => RollbackState::Available,
         Err(_) => RollbackState::Unavailable,
     };
     let operation_id = begin_performance_operation_journal(
