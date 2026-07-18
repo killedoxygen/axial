@@ -807,6 +807,8 @@ mod tests {
     #[tokio::test]
     async fn healthy_inspection_and_resolution_leave_the_artifact_epoch_unchanged() {
         let fixture = OwnerFixture::new("healthy-inspection-epoch");
+        std::fs::create_dir_all(fixture.mods_dir(INSTANCE_A))
+            .expect("create healthy instance mods directory");
         let admitted = fixture.admit(INSTANCE_A).await.expect("admission");
         let initial_epoch = fixture.artifact_epoch();
 

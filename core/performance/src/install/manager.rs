@@ -232,7 +232,7 @@ impl PerformanceManager {
             }
             Ok(_) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                std::fs::create_dir(instances_root)?;
+                std::fs::create_dir_all(instances_root)?;
             }
             Err(error) => return Err(error),
         }

@@ -61,6 +61,29 @@ fn sealed_graph_state_retains_required_dependency_identity() {
 }
 
 #[test]
+fn managed_authority_creates_a_fresh_instances_hierarchy() {
+    let container = test_root("managed-authority-fresh-hierarchy");
+    fs::remove_dir_all(&container).expect("remove precreated hierarchy");
+    let instances_root = container.join("nested").join("instances");
+    let manager = Arc::new(super::PerformanceManager::new().expect("performance manager"));
+
+    let authority = manager
+        .claim_managed_authority(&instances_root)
+        .expect("claim fresh managed authority");
+
+    assert!(instances_root.is_dir());
+    assert_eq!(
+        authority
+            .identify("0000000000000001")
+            .expect("identify beneath fresh hierarchy")
+            .instance_id(),
+        "0000000000000001"
+    );
+    drop(authority);
+    fs::remove_dir_all(container).expect("remove fresh authority hierarchy");
+}
+
+#[test]
 fn exact_healthy_graph_skips_provider_and_snapshot_work() {
     let root = test_root("healthy-noop");
     let plan = graph_plan(b"root", b"dependency");
