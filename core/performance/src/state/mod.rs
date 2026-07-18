@@ -1049,6 +1049,7 @@ fn commit_rollback_snapshot(
 ) -> Result<(), StateError> {
     ensure_rollback_internal_roots(instance_mods_dir)?;
     let history_path = rollback_history_file_path(instance_mods_dir, &snapshot.id);
+    preflight_rollback_candidate_namespace(instance_mods_dir, planned, &history_path)?;
     let history_temp = stage_new_rollback_snapshot(&history_path, snapshot)?;
     if let Err(error) = sync_rollback_directory(
         &rollback_history_dir_path(instance_mods_dir),
@@ -1088,6 +1089,64 @@ fn commit_rollback_snapshot(
             | RollbackMetadataPublicationFailure::Indeterminate(error) => error,
         }
     })
+}
+
+fn preflight_rollback_candidate_namespace(
+    instance_mods_dir: &Path,
+    planned: &PlannedRollbackSnapshot,
+    history_path: &Path,
+) -> Result<(), StateError> {
+    let history_temp = history_path.with_extension("json.new.tmp");
+    preflight_rollback_candidate_directory(
+        &rollback_history_dir_path(instance_mods_dir),
+        [history_path, history_temp.as_path()],
+    )?;
+    preflight_rollback_candidate_directory(
+        &rollback_files_dir_path(instance_mods_dir),
+        planned.artifacts.iter().flat_map(|artifact| {
+            [
+                artifact.stored_path.as_path(),
+                artifact.staged_path.as_path(),
+            ]
+        }),
+    )
+}
+
+fn preflight_rollback_candidate_directory<'a>(
+    directory: &Path,
+    candidates: impl IntoIterator<Item = &'a Path>,
+) -> Result<(), StateError> {
+    let candidate_names = candidates
+        .into_iter()
+        .map(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .map(|name| name.to_ascii_lowercase())
+                .ok_or_else(|| {
+                    StateError::InvalidRollback(
+                        "rollback candidate namespace name is invalid".to_string(),
+                    )
+                })
+        })
+        .collect::<Result<HashSet<_>, _>>()?;
+    let entries = fs::read_dir(directory)?;
+    let mut count = 0_usize;
+    for entry in entries {
+        let entry = entry?;
+        admit_recovery_entry(&mut count, "rollback candidate namespace entries")?;
+        let name = entry.file_name();
+        let name = name.to_str().ok_or_else(|| {
+            StateError::InvalidRollback(
+                "rollback candidate namespace contains an invalid name".to_string(),
+            )
+        })?;
+        if candidate_names.contains(&name.to_ascii_lowercase()) {
+            return Err(StateError::InvalidRollback(
+                "rollback candidate namespace is already occupied".to_string(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 struct RollbackArtifactCopyFailure {
@@ -5381,10 +5440,95 @@ mod tests {
         assert!(!staged_path.exists());
         assert!(!rollback_history_file_path(&root, &snapshot.id).exists());
         assert!(
-            rollback_history_file_path(&root, &snapshot.id)
+            !rollback_history_file_path(&root, &snapshot.id)
                 .with_extension("json.new.tmp")
                 .exists(),
-            "cleanup failure must retain the candidate ownership manifest"
+            "namespace preflight must reject before staging an ownership manifest"
+        );
+        assert!(!rollback_file_path(&root).exists());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn rollback_artifact_preflight_preserves_exact_content_collision() {
+        let root = test_root("snapshot-artifact-exact-collision");
+        fs::write(root.join("managed-a.jar"), b"managed-a").expect("write managed artifact");
+        let state = test_state("core-a", vec![test_mod("sodium", "managed-a.jar")]);
+        let (planned, snapshot) =
+            test_snapshot_candidate(&root, &state, "rb-artifact-exact-collision");
+        ensure_rollback_internal_roots(&root).expect("create rollback roots");
+        let final_path = planned.artifacts[0].stored_path.clone();
+        fs::write(&final_path, b"managed-a").expect("write exact-content collision");
+        let collision = crate::file_identity::admit(&final_path).expect("admit collision");
+        let collision_identity = collision.identity();
+        let collision_len = collision.metadata().len();
+        drop(collision);
+        ROLLBACK_DURABILITY_FAILURE.with(|failure| {
+            assert_eq!(
+                failure.replace(Some(RollbackDurabilityPoint::HistoryStaged)),
+                None
+            );
+        });
+
+        commit_rollback_snapshot(&root, &planned, &snapshot)
+            .expect_err("exact-content collision must reject before candidate publication");
+        ROLLBACK_DURABILITY_FAILURE.with(|failure| {
+            assert_eq!(
+                failure.replace(None),
+                Some(RollbackDurabilityPoint::HistoryStaged),
+                "namespace collision must reject before the history sync fault point"
+            );
+        });
+
+        crate::file_identity::revalidate(&final_path, collision_identity, collision_len)
+            .expect("exact-content collision identity must remain untouched");
+        assert_eq!(
+            fs::read(&final_path).expect("read exact-content collision"),
+            b"managed-a"
+        );
+        assert!(!planned.artifacts[0].staged_path.exists());
+        assert!(!rollback_history_file_path(&root, &snapshot.id).exists());
+        assert!(
+            !rollback_history_file_path(&root, &snapshot.id)
+                .with_extension("json.new.tmp")
+                .exists(),
+            "collision rejection must not leave a candidate ownership manifest"
+        );
+        assert!(!rollback_file_path(&root).exists());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rollback_artifact_preflight_preserves_portable_name_alias() {
+        let root = test_root("snapshot-artifact-portable-alias");
+        fs::write(root.join("managed-a.jar"), b"managed-a").expect("write managed artifact");
+        let state = test_state("core-a", vec![test_mod("sodium", "managed-a.jar")]);
+        let (planned, snapshot) =
+            test_snapshot_candidate(&root, &state, "rb-artifact-portable-alias");
+        ensure_rollback_internal_roots(&root).expect("create rollback roots");
+        let alias_name = planned.artifacts[0]
+            .stored_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("candidate filename")
+            .to_ascii_uppercase();
+        let alias = rollback_files_dir_path(&root).join(alias_name);
+        fs::write(&alias, b"portable-alias").expect("write portable alias");
+
+        commit_rollback_snapshot(&root, &planned, &snapshot)
+            .expect_err("portable name alias must reject before candidate publication");
+
+        assert_eq!(
+            fs::read(alias).expect("read preserved portable alias"),
+            b"portable-alias"
+        );
+        assert!(
+            !rollback_history_file_path(&root, &snapshot.id)
+                .with_extension("json.new.tmp")
+                .exists()
         );
         assert!(!rollback_file_path(&root).exists());
 
