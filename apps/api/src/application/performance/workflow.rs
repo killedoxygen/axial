@@ -3,6 +3,7 @@ use axial_performance::BundleHealth;
 use axum::{Json, http::StatusCode};
 use serde::{Deserialize, Serialize};
 
+mod managed_plan;
 mod mutation;
 mod operations;
 mod plan_health;
