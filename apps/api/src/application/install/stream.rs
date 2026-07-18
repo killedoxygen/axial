@@ -1,10 +1,8 @@
 use super::{
     InstallApplicationError, install_operation_id,
     operation::{install_journal_is_terminal, install_progress_history_from_journal},
-    sanitize_install_progress,
 };
 use crate::state::{AppState, InstallProgressRecord};
-use axial_minecraft::DownloadProgress;
 use axum::{
     Json,
     http::StatusCode,
@@ -119,20 +117,12 @@ async fn install_progress_events_stream(
 }
 
 fn install_progress_event(record: &InstallProgressRecord, loader_install: bool) -> Event {
-    if let Some(payload) = record.event_json(loader_install) {
-        return Event::default().event("progress").data(payload);
-    }
-    let progress = sanitize_install_progress(record.progress.clone());
+    let payload = if loader_install {
+        super::public_loader_install_progress_record_json(record)
+    } else {
+        super::public_vanilla_install_progress_record_json(record)
+    };
     Event::default()
         .event("progress")
-        .data(install_progress_json(&progress, loader_install))
-}
-
-fn install_progress_json(progress: &DownloadProgress, loader_install: bool) -> String {
-    let payload = if loader_install {
-        super::public_loader_install_progress_json(progress)
-    } else {
-        super::public_vanilla_install_progress_json(progress)
-    };
-    serde_json::to_string(&payload).unwrap_or_else(|_| "{}".to_string())
+        .data(serde_json::to_string(&payload).unwrap_or_else(|_| "{}".to_string()))
 }

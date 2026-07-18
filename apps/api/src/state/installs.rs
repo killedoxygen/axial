@@ -17,7 +17,6 @@ struct InstallEntry {
     key: Option<InstallKey>,
     started_at_ms: u64,
     latest: Option<InstallProgressRecord>,
-    events: broadcast::Sender<DownloadProgress>,
     record_events: broadcast::Sender<InstallProgressRecord>,
     done: bool,
     initializing: bool,
@@ -37,6 +36,7 @@ pub(crate) enum InstallInitializationStatus {
 pub struct InstallSnapshot {
     pub latest: Option<InstallProgressRecord>,
     pub done: bool,
+    pub loader_install: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -47,7 +47,7 @@ pub struct InstallProgressRecord {
 }
 
 impl InstallProgressRecord {
-    pub fn new(progress: DownloadProgress) -> Self {
+    pub(crate) fn new(progress: DownloadProgress) -> Self {
         Self {
             progress,
             vanilla_event_json: None,
@@ -55,7 +55,7 @@ impl InstallProgressRecord {
         }
     }
 
-    pub fn with_event_json(
+    pub(crate) fn with_event_json(
         progress: DownloadProgress,
         vanilla_event_json: String,
         loader_event_json: String,
@@ -67,7 +67,7 @@ impl InstallProgressRecord {
         }
     }
 
-    pub fn event_json(&self, loader_install: bool) -> Option<&str> {
+    pub(crate) fn event_json(&self, loader_install: bool) -> Option<&str> {
         if loader_install {
             self.loader_event_json.as_deref()
         } else {
@@ -376,13 +376,13 @@ impl InstallStore {
         installs.insert(install_id, new_install_entry(key));
     }
 
-    pub async fn emit(&self, install_id: &str, progress: DownloadProgress) {
+    pub(crate) async fn emit(&self, install_id: &str, progress: DownloadProgress) {
         self.emit_record(install_id, InstallProgressRecord::new(progress))
             .await;
     }
 
-    pub async fn emit_record(&self, install_id: &str, record: InstallProgressRecord) {
-        let senders = {
+    pub(crate) async fn emit_record(&self, install_id: &str, record: InstallProgressRecord) {
+        let sender = {
             let mut installs = self.installs.write().await;
             let Some(entry) = installs.get_mut(install_id) else {
                 return;
@@ -392,16 +392,15 @@ impl InstallStore {
             }
             entry.done = record.progress.done;
             entry.latest = Some(record.clone());
-            (entry.events.clone(), entry.record_events.clone())
+            entry.record_events.clone()
         };
-        let _ = senders.0.send(record.progress.clone());
-        let _ = senders.1.send(record);
+        let _ = sender.send(record);
     }
 
     pub async fn finish_if_active(&self, install_id: &str, mut progress: DownloadProgress) -> bool {
         progress.done = true;
         let record = InstallProgressRecord::new(progress);
-        let senders = {
+        let sender = {
             let mut installs = self.installs.write().await;
             let Some(entry) = installs.get_mut(install_id) else {
                 return false;
@@ -412,10 +411,9 @@ impl InstallStore {
 
             entry.done = true;
             entry.latest = Some(record.clone());
-            (entry.events.clone(), entry.record_events.clone())
+            entry.record_events.clone()
         };
-        let _ = senders.0.send(record.progress.clone());
-        let _ = senders.1.send(record);
+        let _ = sender.send(record);
         true
     }
 
@@ -434,7 +432,7 @@ impl InstallStore {
     async fn finish_reserved(&self, install_id: &str, mut progress: DownloadProgress) -> bool {
         progress.done = true;
         let record = InstallProgressRecord::new(progress);
-        let senders = {
+        let sender = {
             let mut installs = self.installs.write().await;
             let Some(entry) = installs.get_mut(install_id) else {
                 return false;
@@ -445,10 +443,9 @@ impl InstallStore {
             entry.terminalizing = false;
             entry.done = true;
             entry.latest = Some(record.clone());
-            (entry.events.clone(), entry.record_events.clone())
+            entry.record_events.clone()
         };
-        let _ = senders.0.send(record.progress.clone());
-        let _ = senders.1.send(record);
+        let _ = sender.send(record);
         true
     }
 
@@ -456,28 +453,6 @@ impl InstallStore {
         if let Some(entry) = self.installs.write().await.get_mut(install_id) {
             entry.terminalizing = false;
         }
-    }
-
-    pub async fn subscribe(
-        &self,
-        install_id: &str,
-    ) -> Option<(
-        Vec<DownloadProgress>,
-        broadcast::Receiver<DownloadProgress>,
-        bool,
-    )> {
-        let installs = self.installs.read().await;
-        installs.get(install_id).map(|entry| {
-            (
-                entry
-                    .latest
-                    .as_ref()
-                    .map(|record| vec![record.progress.clone()])
-                    .unwrap_or_default(),
-                entry.events.subscribe(),
-                entry.done,
-            )
-        })
     }
 
     pub async fn subscribe_records(
@@ -490,6 +465,7 @@ impl InstallStore {
                 InstallSnapshot {
                     latest: entry.latest.clone(),
                     done: entry.done,
+                    loader_install: matches!(entry.key.as_ref(), Some(InstallKey::Loader { .. })),
                 },
                 entry.record_events.subscribe(),
             )
@@ -606,6 +582,7 @@ impl InstallStore {
             .map(|entry| InstallSnapshot {
                 latest: entry.latest.clone(),
                 done: entry.done,
+                loader_install: matches!(entry.key.as_ref(), Some(InstallKey::Loader { .. })),
             })
     }
 
@@ -827,13 +804,11 @@ impl InstallStore {
 }
 
 fn new_install_entry(key: Option<InstallKey>) -> InstallEntry {
-    let (events, _) = broadcast::channel(256);
     let (record_events, _) = broadcast::channel(256);
     InstallEntry {
         key,
         started_at_ms: now_unix_ms(),
         latest: None,
-        events,
         record_events,
         done: false,
         initializing: false,

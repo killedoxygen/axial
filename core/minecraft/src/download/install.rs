@@ -23,7 +23,7 @@ use super::model::{
     DownloadError, DownloadProgress, ExactLibraryDownloadProof, ExecutionDownloadFact,
     ExpectedIntegrity, SelectedDownloadArtifactKind, progress,
 };
-use super::plan::TransferPlan;
+use super::plan::{TransferPlan, TransferPlanContribution};
 #[cfg(test)]
 use super::runtime::spawn_test_runtime_source_pipeline;
 use super::runtime::{
@@ -1558,7 +1558,7 @@ impl Downloader {
             let (sources, cache_proofs) = match asset_index_source.take() {
                 Some(source) => {
                     let plan = TransferPlan::shared();
-                    plan.expect_contribution();
+                    let contribution = plan.reserve_contribution();
                     let RetainedAssetsAcquisition {
                         asset_index_source: retained_index,
                         sources,
@@ -1571,6 +1571,7 @@ impl Downloader {
                             source,
                             None,
                             &plan,
+                            contribution,
                             |_| {},
                         )
                         .bind(source_pool, cache),
@@ -1681,10 +1682,22 @@ impl Downloader {
 
         let install_result = async {
             validate_install_version_id(version_id)?;
+            send(progress(
+                "version_json",
+                0,
+                1,
+                Some(format!("{version_id}.json")),
+            ));
             let version_manifest_entry = self.resolve_manifest_entry(version_id).await?;
             let authenticated = self
                 .acquire_vanilla_plan(version_id, &version_manifest_entry, fact_tx.as_ref())
                 .await?;
+            send(progress(
+                "version_json",
+                1,
+                1,
+                Some(format!("{version_id}.json")),
+            ));
             let prepared = self
                 .install_version_inner(
                     version_id,
@@ -1739,13 +1752,6 @@ impl Downloader {
     where
         F: FnMut(DownloadProgress),
     {
-        send(progress(
-            "version_json",
-            0,
-            1,
-            Some(format!("{version_id}.json")),
-        ));
-
         let AuthenticatedVanillaPlan {
             version,
             environment,
@@ -1755,35 +1761,14 @@ impl Downloader {
             asset_index_source,
             runtime_source,
         } = authenticated;
-        let library_cache_admission = ExactLibraryCacheAdmission::bind(self.managed_root()).await?;
-        send(progress(
-            "version_json",
-            1,
-            1,
-            Some(format!("{version_id}.json")),
-        ));
+        let version_json_bytes = version_json_source.observed_size();
+        plan.contribute_total(version_json_bytes);
+        plan.add_done(version_json_bytes);
         let asset_index_bytes = asset_index_source
             .as_ref()
             .map(AuthenticatedSelectedArtifactSource::observed_size)
             .unwrap_or(0);
-        if asset_index_source.is_some() {
-            plan.contribute_total(asset_index_bytes);
-            send(progress(
-                "asset_index",
-                0,
-                1,
-                Some(format!("{}.json", version.asset_index.id)),
-            ));
-        }
-        if asset_index_source.is_some() {
-            plan.add_done(asset_index_bytes);
-            send(progress(
-                "asset_index",
-                1,
-                1,
-                Some(format!("{}.json", version.asset_index.id)),
-            ));
-        }
+        plan.contribute_total(asset_index_bytes);
         let client_jar_bytes = version
             .downloads
             .client
@@ -1800,26 +1785,58 @@ impl Downloader {
             })
             .unwrap_or(0);
         plan.contribute_total(log_config_bytes);
-        let mut runtime_pipeline = if let Some(runtime_source) = runtime_source {
-            send(progress(
-                "java_runtime",
-                0,
-                0,
-                Some(format!(
-                    "Preparing {} (Java {})",
-                    if version.java_version.component.trim().is_empty() {
-                        "managed runtime".to_string()
-                    } else {
-                        version.java_version.component.clone()
-                    },
-                    version.java_version.major_version
-                )),
-            ));
+        let library_contributions = library_jobs
+            .iter()
+            .map(|classified| match classified.job().expected.size {
+                Some(bytes) => {
+                    plan.contribute_total(bytes);
+                    None
+                }
+                None => Some(plan.reserve_contribution()),
+            })
+            .collect::<Vec<_>>();
+        let asset_contribution = asset_index_source
+            .as_ref()
+            .map(|_| plan.reserve_contribution());
+        let runtime_contribution = runtime_source.as_ref().map(|_| plan.reserve_contribution());
 
-            let java_version = version.java_version.clone();
-            Some(self.spawn_runtime_pipeline(java_version, runtime_source, plan.clone()))
-        } else {
-            None
+        let library_cache_admission = ExactLibraryCacheAdmission::bind(self.managed_root()).await?;
+        if asset_index_source.is_some() {
+            plan.add_done(asset_index_bytes);
+            send(progress(
+                "asset_index",
+                1,
+                1,
+                Some(format!("{}.json", version.asset_index.id)),
+            ));
+        }
+        let mut runtime_pipeline = match (runtime_source, runtime_contribution) {
+            (Some(runtime_source), Some(contribution)) => {
+                send(progress(
+                    "java_runtime",
+                    0,
+                    0,
+                    Some(format!(
+                        "Preparing {} (Java {})",
+                        if version.java_version.component.trim().is_empty() {
+                            "managed runtime".to_string()
+                        } else {
+                            version.java_version.component.clone()
+                        },
+                        version.java_version.major_version
+                    )),
+                ));
+
+                let java_version = version.java_version.clone();
+                Some(self.spawn_runtime_pipeline(
+                    java_version,
+                    runtime_source,
+                    plan.clone(),
+                    contribution,
+                ))
+            }
+            (None, None) => None,
+            _ => unreachable!("runtime source and transfer contribution must stay paired"),
         };
 
         let artifact_result = async {
@@ -1890,8 +1907,8 @@ impl Downloader {
             } else {
                 None
             };
-            let mut asset_pipeline = asset_index_source.map(|source| {
-                spawn_asset_download_pipeline(
+            let mut asset_pipeline = match (asset_index_source, asset_contribution) {
+                (Some(source), Some(contribution)) => Some(spawn_asset_download_pipeline(
                     self.managed_root().to_path_buf(),
                     self.client.clone(),
                     Arc::clone(&self.asset_object_base_url),
@@ -1899,15 +1916,12 @@ impl Downloader {
                     source,
                     fact_tx.cloned(),
                     plan.clone(),
-                )
-            });
+                    contribution,
+                )),
+                (None, None) => None,
+                _ => unreachable!("asset source and transfer contribution must stay paired"),
+            };
 
-            plan.contribute_total(
-                library_jobs
-                    .iter()
-                    .map(|classified| classified.job().expected.size.unwrap_or(0))
-                    .sum::<u64>(),
-            );
             send(progress("libraries", 0, library_jobs.len() as i32, None));
             let client = self.client.clone();
             let source_pool = LibrarySourcePool::new()?;
@@ -1917,22 +1931,25 @@ impl Downloader {
                 let mut proofs = Vec::with_capacity(total_library_jobs as usize);
                 let mut sources = Vec::with_capacity(total_library_jobs as usize);
                 let mut library_downloads =
-                    futures_util::stream::iter(library_jobs.into_iter().map(|classified| {
-                        let client = client.clone();
-                        let fact_tx = fact_tx.cloned();
-                        let source_pool = source_pool.clone();
-                        let cache_admission = library_cache_admission.clone();
-                        async move {
-                            acquire_retained_classified_library(
-                                &client,
-                                classified,
-                                &cache_admission,
-                                &source_pool,
-                                fact_tx.as_ref(),
-                            )
-                            .await
-                        }
-                    }))
+                    futures_util::stream::iter(library_jobs.into_iter().zip(library_contributions).map(
+                        |(classified, contribution)| {
+                            let client = client.clone();
+                            let fact_tx = fact_tx.cloned();
+                            let source_pool = source_pool.clone();
+                            let cache_admission = library_cache_admission.clone();
+                            async move {
+                                let acquisition = acquire_retained_classified_library(
+                                    &client,
+                                    classified,
+                                    &cache_admission,
+                                    &source_pool,
+                                    fact_tx.as_ref(),
+                                )
+                                .await?;
+                                Ok::<_, DownloadError>((acquisition, contribution))
+                            }
+                        },
+                    ))
                     .buffer_unordered(library_download_concurrency());
                 let mut asset_progress_open = asset_pipeline.is_some();
                 let mut runtime_progress_open = runtime_pipeline.is_some();
@@ -1956,13 +1973,17 @@ impl Downloader {
                             let Some(result) = result else {
                                 break;
                             };
+                            let (acquisition, contribution) = result?;
                             let RetainedClassifiedLibraryAcquisition {
                                 relative_path: _,
                                 name,
                                 observed_size,
                                 proof,
                                 source,
-                            } = result?;
+                            } = acquisition;
+                            if let Some(contribution) = contribution {
+                                contribution.resolve(observed_size);
+                            }
                             if let Some(proof) = proof {
                                 proofs.push(proof);
                             }
@@ -2185,16 +2206,18 @@ impl Downloader {
         java_version: crate::launch::JavaVersion,
         source_receipt: RuntimeSourceReceipt,
         plan: Arc<TransferPlan>,
+        contribution: TransferPlanContribution,
     ) -> super::runtime::RuntimeEnsurePipeline {
         #[cfg(test)]
         if self.install_manifest.is_some() {
-            return spawn_test_runtime_source_pipeline(source_receipt, plan);
+            return spawn_test_runtime_source_pipeline(source_receipt, contribution);
         }
         spawn_runtime_ensure_pipeline(
             self.managed_runtime_cache().clone(),
             java_version,
             source_receipt,
             plan,
+            contribution,
         )
     }
 

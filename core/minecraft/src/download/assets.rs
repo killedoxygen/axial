@@ -13,7 +13,7 @@ use super::model::{
 use super::path_safety::{
     bounded_download_file_label, bounded_provider_path_label, filesystem_path, path_is_file,
 };
-use super::plan::TransferPlan;
+use super::plan::{TransferPlan, TransferPlanContribution};
 use super::transfer::{
     AuthenticatedSelectedArtifactSource, SelectedArtifactSourceRequest,
     acquire_authenticated_selected_artifact_source,
@@ -61,6 +61,7 @@ pub(super) struct AssetSourceAcquisitionRequest<'a, F> {
     asset_index_source: AuthenticatedSelectedArtifactSource,
     fact_tx: Option<mpsc::UnboundedSender<ExecutionDownloadFact>>,
     plan: &'a TransferPlan,
+    contribution: TransferPlanContribution,
     send: F,
 }
 
@@ -78,6 +79,7 @@ impl<'a, F> AssetSourceAcquisitionRequest<'a, F> {
         asset_index_source: AuthenticatedSelectedArtifactSource,
         fact_tx: Option<mpsc::UnboundedSender<ExecutionDownloadFact>>,
         plan: &'a TransferPlan,
+        contribution: TransferPlanContribution,
         send: F,
     ) -> Self {
         Self {
@@ -87,6 +89,7 @@ impl<'a, F> AssetSourceAcquisitionRequest<'a, F> {
             asset_index_source,
             fact_tx,
             plan,
+            contribution,
             send,
         }
     }
@@ -125,11 +128,8 @@ pub(super) fn spawn_asset_download_pipeline(
     asset_index_source: AuthenticatedSelectedArtifactSource,
     fact_tx: Option<mpsc::UnboundedSender<ExecutionDownloadFact>>,
     plan: Arc<TransferPlan>,
+    contribution: TransferPlanContribution,
 ) -> AssetDownloadPipeline {
-    // Asset-object bytes are unknown until the index is parsed; reserve the
-    // contribution so partial totals are not stamped as near-complete.
-    plan.expect_contribution();
-
     let (progress_tx, progress_rx) = mpsc::unbounded_channel();
     let task = tokio::spawn(async move {
         acquire_asset_sources_with_client(
@@ -141,6 +141,7 @@ pub(super) fn spawn_asset_download_pipeline(
                 asset_index_source,
                 fact_tx,
                 &plan,
+                contribution,
                 |progress| {
                     let _ = progress_tx.send(progress);
                 },
@@ -241,6 +242,7 @@ where
                 asset_index_source,
                 fact_tx,
                 plan,
+                contribution,
                 mut send,
             },
         source_pool,
@@ -273,7 +275,7 @@ where
             DownloadError::Integrity("asset object byte budget overflowed".to_string())
         })
     })?;
-    plan.resolve_contribution(object_bytes);
+    contribution.resolve(object_bytes);
     send(progress("assets", 0, jobs.len() as i32, None));
     let total_jobs = jobs.len() as i32;
     let mut completed_jobs = 0;

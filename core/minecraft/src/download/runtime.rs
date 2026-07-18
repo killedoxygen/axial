@@ -1,5 +1,5 @@
 use super::model::{DownloadError, DownloadProgress, progress};
-use super::plan::TransferPlan;
+use super::plan::{TransferPlan, TransferPlanContribution};
 use crate::launch::JavaVersion;
 use crate::runtime::{
     JavaRuntimeLookupError, ManagedRuntimeCache, RuntimeEnsureEvent, RuntimeSourceReceipt,
@@ -19,16 +19,13 @@ pub(super) fn spawn_runtime_ensure_pipeline(
     java_version: JavaVersion,
     source_receipt: RuntimeSourceReceipt,
     plan: Arc<TransferPlan>,
+    contribution: TransferPlanContribution,
 ) -> RuntimeEnsurePipeline {
-    // Runtime bytes are unknown until the component manifest is fetched (and
-    // zero when a cached runtime resolves); reserve the contribution so
-    // partial totals are not stamped as near-complete in the meantime.
-    plan.expect_contribution();
     let (progress_tx, progress_rx) = mpsc::unbounded_channel();
     let task = tokio::spawn(async move {
         let event_java_version = java_version.clone();
         let progress_tx = progress_tx.clone();
-        let mut plan_contribution_resolved = false;
+        let mut contribution = Some(contribution);
         let mut plan_done_seen = 0_u64;
         let source_receipt = materialize_preferred_runtime_source(
             &runtime_cache,
@@ -41,9 +38,10 @@ pub(super) fn spawn_runtime_ensure_pipeline(
                         bytes_total,
                         ..
                     } => {
-                        if !plan_contribution_resolved && *bytes_total > 0 {
-                            plan.resolve_contribution(*bytes_total);
-                            plan_contribution_resolved = true;
+                        if *bytes_total > 0
+                            && let Some(contribution) = contribution.take()
+                        {
+                            contribution.resolve(*bytes_total);
                         }
                         if *bytes_done > plan_done_seen {
                             plan.add_done(*bytes_done - plan_done_seen);
@@ -51,9 +49,8 @@ pub(super) fn spawn_runtime_ensure_pipeline(
                         }
                     }
                     RuntimeEnsureEvent::ManagedRuntimeReady { .. } => {
-                        if !plan_contribution_resolved {
-                            plan.resolve_contribution(0);
-                            plan_contribution_resolved = true;
+                        if let Some(contribution) = contribution.take() {
+                            contribution.resolve(0);
                         }
                     }
                     RuntimeEnsureEvent::DownloadingManagedRuntime { .. } => {}
@@ -62,10 +59,15 @@ pub(super) fn spawn_runtime_ensure_pipeline(
             },
         )
         .await;
-        if !plan_contribution_resolved {
-            plan.resolve_contribution(0);
+        match source_receipt {
+            Ok(source_receipt) => {
+                if let Some(contribution) = contribution.take() {
+                    contribution.resolve(0);
+                }
+                Ok(Some(source_receipt))
+            }
+            Err(error) => Err(error),
         }
-        Ok::<_, JavaRuntimeLookupError>(Some(source_receipt?))
     });
 
     RuntimeEnsurePipeline { task, progress_rx }
@@ -74,12 +76,11 @@ pub(super) fn spawn_runtime_ensure_pipeline(
 #[cfg(test)]
 pub(super) fn spawn_test_runtime_source_pipeline(
     source_receipt: RuntimeSourceReceipt,
-    plan: Arc<TransferPlan>,
+    contribution: TransferPlanContribution,
 ) -> RuntimeEnsurePipeline {
-    plan.expect_contribution();
     let (progress_tx, progress_rx) = mpsc::unbounded_channel();
     let task = tokio::spawn(async move {
-        plan.resolve_contribution(0);
+        contribution.resolve(0);
         drop(progress_tx);
         Ok(Some(source_receipt))
     });

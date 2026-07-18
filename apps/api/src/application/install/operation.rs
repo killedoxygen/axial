@@ -1122,31 +1122,68 @@ fn is_rosetta_required_terminal_install_failure_message(error: &str) -> bool {
         .is_some_and(|sanitized| sanitized == component)
 }
 
-pub fn vanilla_install_progress_view_model(
+pub(crate) fn vanilla_install_progress_view_model(
     progress: &DownloadProgress,
 ) -> InstallProgressViewModel {
     install_progress_view_model(progress, InstallProgressKind::Vanilla)
 }
 
-pub fn loader_install_progress_view_model(progress: &DownloadProgress) -> InstallProgressViewModel {
+#[cfg(test)]
+pub(crate) fn loader_install_progress_view_model(
+    progress: &DownloadProgress,
+) -> InstallProgressViewModel {
     install_progress_view_model(progress, InstallProgressKind::Loader)
 }
 
-pub fn public_vanilla_install_progress_json(progress: &DownloadProgress) -> Value {
-    public_install_progress_json(progress, InstallProgressKind::Vanilla)
+pub fn public_vanilla_install_progress_record_json(record: &InstallProgressRecord) -> Value {
+    public_install_progress_record_json(record, InstallProgressKind::Vanilla)
 }
 
-pub fn public_loader_install_progress_json(progress: &DownloadProgress) -> Value {
-    public_install_progress_json(progress, InstallProgressKind::Loader)
+pub fn public_loader_install_progress_record_json(record: &InstallProgressRecord) -> Value {
+    public_install_progress_record_json(record, InstallProgressKind::Loader)
 }
 
-pub(crate) fn install_progress_record(progress: DownloadProgress) -> InstallProgressRecord {
-    let vanilla_event_json =
-        serde_json::to_string(&public_vanilla_install_progress_json(&progress))
-            .unwrap_or_else(|_| "{}".to_string());
-    let loader_event_json = serde_json::to_string(&public_loader_install_progress_json(&progress))
-        .unwrap_or_else(|_| "{}".to_string());
-    InstallProgressRecord::with_event_json(progress, vanilla_event_json, loader_event_json)
+pub(crate) fn vanilla_install_progress_record_view_model(
+    record: &InstallProgressRecord,
+) -> InstallProgressViewModel {
+    install_progress_record_view_model(record, InstallProgressKind::Vanilla)
+}
+
+pub(crate) fn loader_install_progress_record_view_model(
+    record: &InstallProgressRecord,
+) -> InstallProgressViewModel {
+    install_progress_record_view_model(record, InstallProgressKind::Loader)
+}
+
+#[derive(Default)]
+pub(crate) struct InstallProgressPresenter {
+    high_watermarks: [u8; 2],
+    complete_denominator_seen: bool,
+}
+
+impl InstallProgressPresenter {
+    pub(crate) fn record(&mut self, progress: DownloadProgress) -> InstallProgressRecord {
+        self.complete_denominator_seen |= progress.bytes_total.is_some_and(|total| total > 0);
+        let vanilla = self.public_json(&progress, InstallProgressKind::Vanilla);
+        let loader = self.public_json(&progress, InstallProgressKind::Loader);
+        let vanilla_event_json =
+            serde_json::to_string(&vanilla).unwrap_or_else(|_| "{}".to_string());
+        let loader_event_json = serde_json::to_string(&loader).unwrap_or_else(|_| "{}".to_string());
+        InstallProgressRecord::with_event_json(progress, vanilla_event_json, loader_event_json)
+    }
+
+    fn public_json(&mut self, progress: &DownloadProgress, kind: InstallProgressKind) -> Value {
+        let mut view_model = install_progress_view_model(progress, kind);
+        if !view_model.terminal {
+            if !self.complete_denominator_seen {
+                view_model.progress_pct = view_model.progress_pct.min(kind.pre_transfer_ceiling());
+            }
+            let high_watermark = &mut self.high_watermarks[kind.index()];
+            view_model.progress_pct = view_model.progress_pct.max(*high_watermark);
+            *high_watermark = view_model.progress_pct;
+        }
+        public_install_progress_json_with_view_model(progress, view_model)
+    }
 }
 
 #[derive(Default)]
@@ -1240,10 +1277,53 @@ enum InstallProgressKind {
     Loader,
 }
 
+impl InstallProgressKind {
+    const fn index(self) -> usize {
+        match self {
+            Self::Vanilla => 0,
+            Self::Loader => 1,
+        }
+    }
+
+    const fn pre_transfer_ceiling(self) -> u8 {
+        match self {
+            Self::Vanilla => 2,
+            Self::Loader => 8,
+        }
+    }
+}
+
 fn public_install_progress_json(progress: &DownloadProgress, kind: InstallProgressKind) -> Value {
+    let view_model = install_progress_view_model(progress, kind);
+    public_install_progress_json_with_view_model(progress, view_model)
+}
+
+fn public_install_progress_record_json(
+    record: &InstallProgressRecord,
+    kind: InstallProgressKind,
+) -> Value {
+    record
+        .event_json(kind == InstallProgressKind::Loader)
+        .and_then(|payload| serde_json::from_str(payload).ok())
+        .unwrap_or_else(|| public_install_progress_json(&record.progress, kind))
+}
+
+fn install_progress_record_view_model(
+    record: &InstallProgressRecord,
+    kind: InstallProgressKind,
+) -> InstallProgressViewModel {
+    let payload = public_install_progress_record_json(record, kind);
+    serde_json::from_value(payload["view_model"].clone())
+        .unwrap_or_else(|_| install_progress_view_model(&record.progress, kind))
+}
+
+fn public_install_progress_json_with_view_model(
+    progress: &DownloadProgress,
+    view_model: InstallProgressViewModel,
+) -> Value {
     let progress = sanitize_install_progress(progress.clone());
     let mut payload = serde_json::to_value(&progress).unwrap_or_else(|_| json!({}));
-    payload["view_model"] = json!(install_progress_view_model(&progress, kind));
+    payload["view_model"] = json!(view_model);
     payload
 }
 
@@ -1272,8 +1352,6 @@ fn install_progress_view_model(
 
 fn install_progress_label(progress: &DownloadProgress, kind: InstallProgressKind) -> String {
     match progress.phase.as_str() {
-        "loader_meta" => "Fetching loader info".to_string(),
-        "loader_json" => "Preparing loader".to_string(),
         "profile" => progress
             .file
             .clone()
@@ -1283,14 +1361,28 @@ fn install_progress_label(progress: &DownloadProgress, kind: InstallProgressKind
             .clone()
             .unwrap_or_else(|| "Downloading loader artifacts".to_string()),
         "loader_libraries" => count_label("Loader libraries", progress),
-        "loader_processors" | "processors" => progress
+        "processors" => progress
             .file
             .clone()
             .unwrap_or_else(|| count_label("Running processors", progress)),
-        "version_json" => "Fetching version info".to_string(),
+        "loader_overlay" => "Applying loader archive".to_string(),
+        "loader_publish" => "Publishing loader version".to_string(),
+        "version_json" => {
+            if progress.current >= progress.total && progress.total > 0 {
+                "Version info ready".to_string()
+            } else {
+                "Resolving version info".to_string()
+            }
+        }
         "client_jar" => "Downloading game JAR".to_string(),
         "libraries" => count_label("Libraries", progress),
-        "asset_index" => "Downloading asset index".to_string(),
+        "asset_index" => {
+            if progress.current >= progress.total && progress.total > 0 {
+                "Asset index ready".to_string()
+            } else {
+                "Fetching asset index".to_string()
+            }
+        }
         "assets" => count_label("Assets", progress),
         "log_config" => "Downloading log config".to_string(),
         "java_runtime" => java_runtime_label(progress),
@@ -1328,9 +1420,8 @@ fn install_progress_pct(progress: &DownloadProgress, kind: InstallProgressKind) 
     if let Some(pct) = byte_weighted_install_pct(progress, kind) {
         return pct;
     }
-    // Fallback for events without transfer-plan facts: pre-plan phases
-    // (version_json), loader-specific head phases (loader metadata, installer
-    // artifacts, processors), and journal-replayed history.
+    // Fallback for events without transfer-plan facts: pre-plan phases,
+    // loader-specific work, and journal-replayed history.
     let pct = match (kind, progress.phase.as_str()) {
         (_, "done") => 100,
         (_, "error" | "error_instance_removed") => 100,
@@ -1349,25 +1440,28 @@ fn install_progress_pct(progress: &DownloadProgress, kind: InstallProgressKind) 
             21 + (progress_fraction(progress) * 72.0).round() as i32
         }
         (InstallProgressKind::Vanilla, "log_config") => 94,
-        (InstallProgressKind::Loader, "loader_meta") => 1,
-        (InstallProgressKind::Loader, "loader_json" | "profile") => 3,
-        (InstallProgressKind::Loader, "artifacts") => 6,
+        (InstallProgressKind::Loader, "artifacts") => 5,
+        (InstallProgressKind::Loader, "profile") => 82,
         (InstallProgressKind::Loader, "loader_libraries") => {
-            3 + (progress_fraction(progress) * 7.0).round() as i32
+            82 + (progress_fraction(progress) * 8.0).round() as i32
         }
-        (InstallProgressKind::Loader, "loader_processors" | "processors") => {
-            10 + (progress_fraction(progress) * 10.0).round() as i32
+        (InstallProgressKind::Loader, "processors") => {
+            90 + (progress_fraction(progress) * 9.0).round() as i32
         }
-        (InstallProgressKind::Loader, "version_json") => 21,
-        (InstallProgressKind::Loader, "client_jar") => 24,
+        (InstallProgressKind::Loader, "loader_overlay") => {
+            82 + (progress_fraction(progress) * 15.0).round() as i32
+        }
+        (InstallProgressKind::Loader, "loader_publish") => 99,
+        (InstallProgressKind::Loader, "version_json") => 8,
+        (InstallProgressKind::Loader, "client_jar") => 12,
         (InstallProgressKind::Loader, "libraries") => {
-            24 + (progress_fraction(progress) * 10.0).round() as i32
+            12 + (progress_fraction(progress) * 12.0).round() as i32
         }
-        (InstallProgressKind::Loader, "asset_index") => 35,
+        (InstallProgressKind::Loader, "asset_index") => 25,
         (InstallProgressKind::Loader, "assets") => {
-            35 + (progress_fraction(progress) * 58.0).round() as i32
+            25 + (progress_fraction(progress) * 50.0).round() as i32
         }
-        (InstallProgressKind::Loader, "log_config") => 94,
+        (InstallProgressKind::Loader, "log_config") => 76,
         _ => 0,
     };
     pct.clamp(0, 100) as u8
@@ -1376,8 +1470,8 @@ fn install_progress_pct(progress: &DownloadProgress, kind: InstallProgressKind) 
 /// Overall progress from the installer's transfer-plan facts: bytes of
 /// planned work completed across every concurrent phase (client jar,
 /// libraries, assets, managed Java runtime). Capped below 100 so only the
-/// terminal `done` event completes the bar. Loader installs reserve a head
-/// span for the loader-specific phases, which carry no byte facts.
+/// terminal `done` event completes the bar. Loader installs reserve an early
+/// provider span and a post-base span for phases that carry no byte facts.
 fn byte_weighted_install_pct(progress: &DownloadProgress, kind: InstallProgressKind) -> Option<u8> {
     if matches!(progress.phase.as_str(), "done" | "error") {
         return None;
@@ -1389,7 +1483,7 @@ fn byte_weighted_install_pct(progress: &DownloadProgress, kind: InstallProgressK
     let fraction = (done.min(total) as f64) / (total as f64);
     let (base, span) = match kind {
         InstallProgressKind::Vanilla => (0.0, 99.0),
-        InstallProgressKind::Loader => (20.0, 79.0),
+        InstallProgressKind::Loader => (8.0, 72.0),
     };
     Some((base + fraction * span).round().clamp(0.0, 99.0) as u8)
 }
@@ -1400,7 +1494,7 @@ fn install_active_step_view_model(
 ) -> Option<InstallProgressStepViewModel> {
     if !matches!(
         progress.phase.as_str(),
-        "java_runtime" | "loader_processors" | "processors" | "download"
+        "java_runtime" | "processors" | "download"
     ) {
         return None;
     }
@@ -2552,9 +2646,12 @@ fn install_operation_phase(progress: &DownloadProgress) -> OperationPhase {
 
     match progress.phase.trim() {
         "version_json" | "client_jar" | "libraries" | "asset_index" | "assets" | "log_config"
-        | "java_runtime" | "java_runtime_ready" | "loader_meta" | "loader_json" | "artifacts"
-        | "loader_libraries" | "download" => OperationPhase::Downloading,
-        "profile" | "loader_processors" | "processors" => OperationPhase::Installing,
+        | "java_runtime" | "java_runtime_ready" | "artifacts" | "loader_libraries" | "download" => {
+            OperationPhase::Downloading
+        }
+        "profile" | "processors" | "loader_overlay" | "loader_publish" => {
+            OperationPhase::Installing
+        }
         "planning" => OperationPhase::Planning,
         "overrides" | "commit" | "removing" => OperationPhase::Installing,
         _ => OperationPhase::Running,

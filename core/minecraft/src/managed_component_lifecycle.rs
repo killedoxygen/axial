@@ -68,6 +68,8 @@ pub(crate) enum PrepareComponentIntentError {
     Projection,
     #[error("retained component sources do not match the authenticated projection")]
     SourceSet,
+    #[error("managed component projection changed before no-effect settlement")]
+    CanonicalChanged,
     #[error("managed component table summaries disagree")]
     TableSummary,
     #[error(transparent)]
@@ -214,6 +216,11 @@ struct SparseSourceCounts {
     supplied_exact: usize,
 }
 
+struct PlannedComponentProjection {
+    table_rows: Vec<ComponentTableRow>,
+    all_exact: bool,
+}
+
 struct ComponentRetryBackoff {
     delay: Duration,
 }
@@ -230,6 +237,7 @@ struct ComponentLifecycleTestFaults {
     intent: Option<ComponentIntentPublishFault>,
     execution: Option<ComponentExecutionFault>,
     settlement: Option<ComponentSettlementFault>,
+    no_effect_before_final_validation: Option<Box<dyn FnOnce() + Send>>,
 }
 
 impl ComponentRetryBackoff {
@@ -317,8 +325,38 @@ where
     S: RetainedComponentPublicationSource + 'static,
 {
     let lease = settle_prior_component_transaction(lease, component).await?;
-    let (candidate, projection) =
-        prepare_component_intent_projection(lease, projection, component, sources).await?;
+    let (lease, projection, planned, sources, source_counts) =
+        plan_component_publication(lease, projection, component, sources).await?;
+    if planned.all_exact {
+        if source_counts.required != 0 || sources.len() != source_counts.supplied_exact {
+            return Err(PrepareComponentIntentError::SourceSet.into());
+        }
+        drop(sources);
+        #[cfg(test)]
+        if let Some(hook) = faults
+            .as_deref_mut()
+            .and_then(|faults| faults.no_effect_before_final_validation.take())
+        {
+            hook();
+        }
+        let lease =
+            revalidate_exact_component_projection(lease, component, planned.table_rows).await?;
+        return Ok(ManagedComponentLifecycleOutcome::Committed(
+            ManagedComponentCommittedReceipt {
+                component,
+                projection,
+                lease,
+            },
+        ));
+    }
+    let candidate = prepare_component_intent_from_plan(
+        lease,
+        component,
+        planned.table_rows,
+        sources,
+        source_counts,
+    )
+    .await?;
     let mut backoff = ComponentRetryBackoff::new();
     let execution = publish_current_component_intent(
         candidate,
@@ -566,6 +604,7 @@ async fn settle_current_component_transaction(
     settle_component_transaction(receipt).await
 }
 
+#[cfg(test)]
 async fn prepare_component_intent_projection<S>(
     lease: ManagedRootPublicationLease,
     projection: ManagedComponentProjection<'_>,
@@ -575,14 +614,67 @@ async fn prepare_component_intent_projection<S>(
 where
     S: RetainedComponentPublicationSource + 'static,
 {
+    let (lease, projection, planned, sources, source_counts) =
+        plan_component_publication(lease, projection, component, sources).await?;
+    let candidate = prepare_component_intent_from_plan(
+        lease,
+        component,
+        planned.table_rows,
+        sources,
+        source_counts,
+    )
+    .await?;
+    Ok((candidate, projection))
+}
+
+async fn plan_component_publication<S>(
+    lease: ManagedRootPublicationLease,
+    projection: ManagedComponentProjection<'_>,
+    component: ManagedComponentKind,
+    sources: Vec<S>,
+) -> Result<
+    (
+        ManagedRootPublicationLease,
+        Vec<ComponentProjectionRow>,
+        PlannedComponentProjection,
+        BTreeMap<ArtifactRelativePath, S>,
+        SparseSourceCounts,
+    ),
+    PrepareComponentIntentError,
+>
+where
+    S: RetainedComponentPublicationSource + 'static,
+{
     let projection_rows = projection_rows(component, &projection)?;
     let sources = index_sparse_sources(&projection_rows, sources)?;
     let retained_projection = projection_rows.clone();
-    let total_rows = projection_rows.len();
-    let (mut lease, mut lane, mut builder, mut spool, planned_rows, mut sources, source_counts) =
+    run_publication_blocking(move || {
+        let planned = plan_projection(&lease, component, projection_rows)?;
+        let source_counts = validate_sparse_source_coverage(&planned.table_rows, &sources)?;
+        Ok::<_, PrepareComponentIntentError>((
+            lease,
+            retained_projection,
+            planned,
+            sources,
+            source_counts,
+        ))
+    })
+    .await?
+}
+
+async fn prepare_component_intent_from_plan<S>(
+    lease: ManagedRootPublicationLease,
+    component: ManagedComponentKind,
+    planned_rows: Vec<ComponentTableRow>,
+    sources: BTreeMap<ArtifactRelativePath, S>,
+    source_counts: SparseSourceCounts,
+) -> Result<ComponentIntentCandidate, PrepareComponentIntentError>
+where
+    S: RetainedComponentPublicationSource + 'static,
+{
+    let total_rows = planned_rows.len();
+    let (mut lease, mut lane, mut builder, mut spool, mut sources) =
         run_publication_blocking(move || {
-            let planned_rows = plan_projection(&lease, component, projection_rows)?;
-            let source_counts = validate_sparse_source_coverage(&planned_rows, &sources)?;
             let lane = ComponentLane::prepare_fresh(&lease, component)?;
             let root_binding_sha256 = component_root_binding_sha256(lease.root())?;
             let transaction_nonce = *uuid::Uuid::new_v4().as_bytes();
@@ -593,15 +685,7 @@ where
                 root_binding_sha256,
             )?;
             let spool = ComponentTableSpool::new(total_rows)?;
-            Ok::<_, PrepareComponentIntentError>((
-                lease,
-                lane,
-                builder,
-                spool,
-                planned_rows,
-                sources,
-                source_counts,
-            ))
+            Ok::<_, PrepareComponentIntentError>((lease, lane, builder, spool, sources))
         })
         .await??;
     let mut planned_rows = VecDeque::from(planned_rows);
@@ -676,7 +760,7 @@ where
         Ok::<_, PrepareComponentIntentError>(lane.into_intent_candidate(lease, manifest)?)
     })
     .await??;
-    Ok((candidate, retained_projection))
+    Ok(candidate)
 }
 
 #[cfg(test)]
@@ -779,19 +863,27 @@ fn plan_projection(
     lease: &ManagedRootPublicationLease,
     component: ManagedComponentKind,
     projection: Vec<ComponentProjectionRow>,
-) -> Result<Vec<ComponentTableRow>, PrepareComponentIntentError> {
+) -> Result<PlannedComponentProjection, PrepareComponentIntentError> {
     let mut rows = Vec::new();
     rows.try_reserve_exact(projection.len())
         .map_err(|_| PrepareComponentIntentError::SourceSet)?;
+    let mut all_exact = true;
     for projected in projection {
         let path_plan = plan_component_canonical_path(lease.root(), component, &projected.path)?;
         let first_created_depth = path_plan.first_created_depth();
         let prior = match path_plan.observe()? {
-            ComponentCanonicalObservation::Absent => None,
-            ComponentCanonicalObservation::Regular(observed) => Some(ComponentPriorFile {
-                size: observed.size(),
-                sha1: observed.sha1(),
-            }),
+            ComponentCanonicalObservation::Absent => {
+                all_exact = false;
+                None
+            }
+            ComponentCanonicalObservation::Regular(observed) => {
+                let prior = Some(ComponentPriorFile {
+                    size: observed.size(),
+                    sha1: observed.sha1(),
+                });
+                all_exact &= observed.size() == projected.size && observed.sha1() == projected.sha1;
+                prior
+            }
         };
         rows.push(ComponentTableRow {
             inventory_ordinal: projected.inventory_ordinal,
@@ -804,7 +896,34 @@ fn plan_projection(
         });
     }
     lease.revalidate()?;
-    Ok(rows)
+    Ok(PlannedComponentProjection {
+        table_rows: rows,
+        all_exact,
+    })
+}
+
+async fn revalidate_exact_component_projection(
+    lease: ManagedRootPublicationLease,
+    component: ManagedComponentKind,
+    rows: Vec<ComponentTableRow>,
+) -> Result<ManagedRootPublicationLease, PrepareComponentIntentError> {
+    let lease = run_publication_blocking(move || {
+        lease.revalidate()?;
+        for row in rows {
+            let planned = plan_component_canonical_path(lease.root(), component, &row.path)?;
+            let ComponentCanonicalObservation::Regular(observed) = planned.observe()? else {
+                return Err(PrepareComponentIntentError::CanonicalChanged);
+            };
+            if observed.size() != row.final_size || observed.sha1() != row.final_sha1 {
+                return Err(PrepareComponentIntentError::CanonicalChanged);
+            }
+        }
+        lease.revalidate()?;
+        Ok::<_, PrepareComponentIntentError>(lease)
+    })
+    .await??;
+    lease.revalidate()?;
+    Ok(lease)
 }
 
 async fn revalidate_component_projection(
@@ -1101,6 +1220,20 @@ mod tests {
         }
     }
 
+    fn assert_component_lane_absent(
+        temporary: &tempfile::TempDir,
+        component: ManagedComponentKind,
+    ) {
+        assert!(
+            !temporary
+                .path()
+                .join(".axial-publication")
+                .join(component_root_name(component))
+                .exists(),
+            "exact component projection created a publication lane"
+        );
+    }
+
     fn assert_no_component_lanes(temporary: &tempfile::TempDir) {
         for name in ["libraries", "assets"] {
             assert!(
@@ -1124,6 +1257,242 @@ mod tests {
             publication_entries,
             [std::ffi::OsString::from("publication.lock")]
         );
+    }
+
+    #[tokio::test]
+    async fn exact_projection_drops_supplied_source_without_creating_a_lane() {
+        for component in [
+            ManagedComponentKind::Libraries,
+            ManagedComponentKind::Assets,
+        ] {
+            let temporary = tempfile::tempdir().expect("test root");
+            let (kind, _) = component_test_kinds(component);
+            let path = match component {
+                ManagedComponentKind::Libraries => "org/example/exact.jar",
+                ManagedComponentKind::Assets => "indexes/exact.json",
+            };
+            let bytes = format!("exact-{}", component_root_name(component)).into_bytes();
+            let (source, events) = tracked_test_source(path, kind, bytes.clone());
+            let authority = test_authority(component, std::slice::from_ref(&source));
+            let canonical = source
+                .identity
+                .relative_path
+                .join_under(&temporary.path().join(component_root_name(component)));
+            fs::create_dir_all(canonical.parent().expect("canonical parent")).unwrap();
+            fs::write(&canonical, &bytes).unwrap();
+            let mut faults = ComponentLifecycleTestFaults::default();
+
+            let outcome = publish_managed_component_with_faults(
+                test_lease(&temporary).await,
+                &authority,
+                component,
+                vec![source],
+                &mut faults,
+            )
+            .await
+            .expect("exact component no-effect publication");
+
+            assert!(matches!(
+                outcome,
+                ManagedComponentLifecycleOutcome::Committed(_)
+            ));
+            assert_eq!(events.staged.load(Ordering::SeqCst), 0);
+            assert_eq!(events.dropped.load(Ordering::SeqCst), 1);
+            assert_eq!(fs::read(canonical).unwrap(), bytes);
+            assert_component_lane_absent(&temporary, component);
+        }
+    }
+
+    #[tokio::test]
+    async fn large_exact_projection_streams_without_a_publication_lane() {
+        const ROWS: usize = 384;
+
+        let temporary = tempfile::tempdir().expect("test root");
+        let sources = (0..ROWS)
+            .map(|index| {
+                test_source(
+                    &format!("org/example/{index:03}.jar"),
+                    ManagedComponentArtifactKind::Library,
+                    format!("exact-{index:03}").into_bytes(),
+                )
+            })
+            .collect::<Vec<_>>();
+        for source in &sources {
+            let canonical = source
+                .identity
+                .relative_path
+                .join_under(&temporary.path().join("libraries"));
+            fs::create_dir_all(canonical.parent().expect("canonical parent")).unwrap();
+            fs::write(canonical, &source.bytes).unwrap();
+        }
+        let authority = test_authority(ManagedComponentKind::Libraries, &sources);
+        let mut faults = ComponentLifecycleTestFaults::default();
+
+        let outcome = publish_managed_component_with_faults::<TestSource>(
+            test_lease(&temporary).await,
+            &authority,
+            ManagedComponentKind::Libraries,
+            Vec::new(),
+            &mut faults,
+        )
+        .await
+        .expect("large exact projection must stream file guards");
+
+        assert!(matches!(
+            outcome,
+            ManagedComponentLifecycleOutcome::Committed(_)
+        ));
+        assert_component_lane_absent(&temporary, ManagedComponentKind::Libraries);
+    }
+
+    #[tokio::test]
+    async fn empty_projection_commits_without_creating_a_lane() {
+        for component in [
+            ManagedComponentKind::Libraries,
+            ManagedComponentKind::Assets,
+        ] {
+            let temporary = tempfile::tempdir().expect("test root");
+            let other_component = match component {
+                ManagedComponentKind::Libraries => ManagedComponentKind::Assets,
+                ManagedComponentKind::Assets => ManagedComponentKind::Libraries,
+            };
+            let (other_kind, _) = component_test_kinds(other_component);
+            let other_source = test_source(
+                match other_component {
+                    ManagedComponentKind::Libraries => "org/example/other.jar",
+                    ManagedComponentKind::Assets => "indexes/other.json",
+                },
+                other_kind,
+                b"other-component".to_vec(),
+            );
+            let authority = test_authority(other_component, &[other_source]);
+            let mut faults = ComponentLifecycleTestFaults::default();
+
+            let outcome = publish_managed_component_with_faults::<TestSource>(
+                test_lease(&temporary).await,
+                &authority,
+                component,
+                Vec::new(),
+                &mut faults,
+            )
+            .await
+            .expect("empty projection no-effect publication");
+
+            assert!(matches!(
+                outcome,
+                ManagedComponentLifecycleOutcome::Committed(_)
+            ));
+            assert_component_lane_absent(&temporary, component);
+        }
+    }
+
+    #[tokio::test]
+    async fn exact_projection_rejects_same_size_mutation_between_hash_passes() {
+        let temporary = tempfile::tempdir().expect("test root");
+        let source = test_source(
+            "org/example/exact.jar",
+            ManagedComponentArtifactKind::Library,
+            b"expected".to_vec(),
+        );
+        let authority = test_authority(
+            ManagedComponentKind::Libraries,
+            std::slice::from_ref(&source),
+        );
+        let canonical = source
+            .identity
+            .relative_path
+            .join_under(&temporary.path().join("libraries"));
+        fs::create_dir_all(canonical.parent().expect("canonical parent")).unwrap();
+        fs::write(&canonical, b"expected").unwrap();
+        let mutation_path = canonical.clone();
+        let mut faults = ComponentLifecycleTestFaults {
+            no_effect_before_final_validation: Some(Box::new(move || {
+                fs::write(mutation_path, b"mutated!").expect("same-size mutation");
+            })),
+            ..ComponentLifecycleTestFaults::default()
+        };
+
+        let error = match publish_managed_component_with_faults::<TestSource>(
+            test_lease(&temporary).await,
+            &authority,
+            ManagedComponentKind::Libraries,
+            Vec::new(),
+            &mut faults,
+        )
+        .await
+        {
+            Err(error) => error,
+            Ok(_) => panic!("second guarded hash must reject same-size mutation"),
+        };
+
+        assert!(matches!(
+            error,
+            ComponentLifecycleError::Prepare(PrepareComponentIntentError::CanonicalChanged)
+        ));
+        assert_eq!(fs::read(canonical).unwrap(), b"mutated!");
+        assert_component_lane_absent(&temporary, ManagedComponentKind::Libraries);
+    }
+
+    #[tokio::test]
+    async fn exact_projection_settles_prior_transaction_before_no_effect_return() {
+        let temporary = tempfile::tempdir().expect("test root");
+        let source = test_source(
+            "org/example/exact.jar",
+            ManagedComponentArtifactKind::Library,
+            b"expected".to_vec(),
+        );
+        let authority = test_authority(
+            ManagedComponentKind::Libraries,
+            std::slice::from_ref(&source),
+        );
+        let prior_candidate = prepare_component_intent(
+            test_lease(&temporary).await,
+            &authority,
+            ManagedComponentKind::Libraries,
+            vec![source.clone()],
+        )
+        .await
+        .expect("prepare prior transaction");
+        let prior_published = prior_candidate
+            .publish_intent()
+            .unwrap_or_else(|_| panic!("publish prior transaction"));
+        let ComponentExecutionResult::Committed(prior_receipt) =
+            execute_component_intent(prior_published).await
+        else {
+            panic!("prior transaction must commit")
+        };
+        let (lease, component) = prior_receipt.into_restart_seed();
+        assert_eq!(component, ManagedComponentKind::Libraries);
+        let lane = temporary.path().join(".axial-publication/libraries");
+        assert!(lane.join("outcome.bin").exists());
+        let reached_no_effect = Arc::new(AtomicUsize::new(0));
+        let hook_counter = Arc::clone(&reached_no_effect);
+        let hook_lane = lane.clone();
+        let mut faults = ComponentLifecycleTestFaults {
+            no_effect_before_final_validation: Some(Box::new(move || {
+                assert!(!hook_lane.join("outcome.bin").exists());
+                assert!(!hook_lane.join("settlement.bin").exists());
+                hook_counter.fetch_add(1, Ordering::SeqCst);
+            })),
+            ..ComponentLifecycleTestFaults::default()
+        };
+
+        let outcome = publish_managed_component_with_faults::<TestSource>(
+            lease,
+            &authority,
+            ManagedComponentKind::Libraries,
+            Vec::new(),
+            &mut faults,
+        )
+        .await
+        .expect("settle prior transaction before exact no-effect return");
+
+        assert!(matches!(
+            outcome,
+            ManagedComponentLifecycleOutcome::Committed(_)
+        ));
+        assert_eq!(reached_no_effect.load(Ordering::SeqCst), 1);
+        assert_component_lane_settled(&temporary, ManagedComponentKind::Libraries);
     }
 
     #[tokio::test]

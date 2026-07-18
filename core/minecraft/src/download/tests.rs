@@ -61,8 +61,10 @@ async fn install_version_emits_terminal_error_when_setup_fails() {
         .await;
 
     assert!(result.is_err());
-    assert_eq!(events.len(), 1);
-    let event = &events[0];
+    assert_eq!(events.len(), 2);
+    assert_eq!(events[0].phase, "version_json");
+    assert_eq!((events[0].current, events[0].total), (0, 1));
+    let event = &events[1];
     assert_eq!(event.phase, "error");
     assert_eq!(event.current, 0);
     assert_eq!(event.total, 0);
@@ -582,13 +584,55 @@ async fn nonempty_assets_publish_once_and_match_reconstruction() {
         0
     );
 
+    let mut progress_events = Vec::new();
     let installed = downloader
-        .install_version(version_id, |_| {})
+        .install_version(version_id, |progress| progress_events.push(progress))
         .await
         .expect("install nonempty assets")
         .into_activation_source()
         .into_parts();
     assert_eq!(installed, reconstructed);
+    let version_progress = progress_events
+        .iter()
+        .filter(|progress| progress.phase == "version_json")
+        .map(|progress| (progress.current, progress.total))
+        .collect::<Vec<_>>();
+    assert_eq!(version_progress, [(0, 1), (1, 1)]);
+    let asset_index_progress = progress_events
+        .iter()
+        .filter(|progress| progress.phase == "asset_index")
+        .map(|progress| (progress.current, progress.total))
+        .collect::<Vec<_>>();
+    assert_eq!(asset_index_progress, [(1, 1)]);
+    assert_eq!(
+        progress_events
+            .first()
+            .map(|progress| progress.phase.as_str()),
+        Some("version_json")
+    );
+    assert!(
+        progress_events
+            .iter()
+            .filter(|progress| progress.phase == "asset_index")
+            .all(|progress| progress.bytes_total.is_none()),
+        "asset-index completion must not expose a partial denominator"
+    );
+    let expected_total = (fixture.asset_index.len()
+        + fixture.version_json_size
+        + b"nonempty-asset-client".len()
+        + fixture.object.len()
+        + fixture.distinct.len()) as u64;
+    let stamped = progress_events
+        .iter()
+        .filter_map(|progress| progress.bytes_total.map(|total| (progress, total)))
+        .collect::<Vec<_>>();
+    assert!(!stamped.is_empty());
+    assert!(stamped.iter().all(|(_, total)| *total == expected_total));
+    assert!(stamped.iter().all(|(progress, total)| {
+        progress
+            .bytes_done
+            .is_some_and(|completed| completed <= *total)
+    }));
     let asset_entries = installed
         .1
         .entries()
@@ -682,7 +726,7 @@ async fn nonempty_assets_publish_once_and_match_reconstruction() {
     assert_eq!(request_count(&install_requests, &fixture.distinct_path), 1);
     assert_eq!(request_count(&install_requests, &fixture.empty_path), 1);
     assert_settled_assets_lane(&root);
-    assert_settled_libraries_lane(&root);
+    assert_component_lane_absent(&root, "libraries");
     assert_settled_version_bundle_lane(&root);
 
     let _ = fs::remove_dir_all(root);
@@ -790,7 +834,7 @@ async fn asset_sources_do_not_prewrite_while_the_shared_lease_is_held() {
                 && distinct_matches
                 && asset_object_path(&root, &fixture.empty_hash).is_file()
                 && assets_lane_is_settled(&root)
-                && libraries_lane_is_settled(&root)
+                && !root.join(".axial-publication/libraries").exists()
                 && version_bundle_lane_is_settled(&root)
             {
                 break;
@@ -2576,6 +2620,13 @@ fn assert_settled_assets_lane(root: &Path) {
     );
 }
 
+fn assert_component_lane_absent(root: &Path, name: &str) {
+    assert!(
+        !root.join(".axial-publication").join(name).exists(),
+        "{name} no-effect projection must not create a publication lane"
+    );
+}
+
 fn assets_lane_is_settled(root: &Path) -> bool {
     component_lane_is_settled(root, "assets")
 }
@@ -2755,6 +2806,7 @@ struct NonemptyAssetInstallServer {
     object_base_url: String,
     asset_index_id: String,
     asset_index: Vec<u8>,
+    version_json_size: usize,
     object: Vec<u8>,
     object_hash: String,
     distinct: Vec<u8>,
@@ -2808,6 +2860,7 @@ async fn spawn_nonempty_asset_install_server(version_id: &str) -> NonemptyAssetI
     .to_string()
     .into_bytes();
     let version_sha1 = sha1_hex(&version);
+    let version_json_size = version.len();
     let object_path = format!("/{}/{}", &object_hash[..2], object_hash);
     let distinct_path = format!("/{}/{}", &distinct_hash[..2], distinct_hash);
     let empty_path = format!("/{}/{}", &empty_hash[..2], empty_hash);
@@ -2845,6 +2898,7 @@ async fn spawn_nonempty_asset_install_server(version_id: &str) -> NonemptyAssetI
         object_base_url: base_url,
         asset_index_id,
         asset_index,
+        version_json_size,
         object,
         object_hash,
         distinct,

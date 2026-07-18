@@ -603,6 +603,12 @@ where
         .into_bytes_for(profile_url, &plan.record.version_id)?;
     let fragment = parse_profile_json(&profile_bytes, &plan.record.component_name)?;
     validate_profile_source_structure(&fragment, &plan.record, &source_proof)?;
+    send(progress(
+        "profile",
+        1,
+        1,
+        Some("Loader profile ready".to_string()),
+    ));
     let library_declarations = seal_profile_exact_library_declarations(
         fragment,
         source_proof,
@@ -657,7 +663,9 @@ where
         library_sources,
     )
     .map_err(loader_managed_install_error)?;
+    send(progress("loader_publish", 0, 1, None));
     let receipt = publish_loader_managed_install(library_dir, prepared).await?;
+    send(progress("loader_publish", 1, 1, None));
     send(done());
     Ok(receipt)
 }
@@ -689,6 +697,7 @@ where
         &plan.record.version_id,
     )
     .await?;
+    send(progress("artifacts", 1, 1, None));
     let authenticated =
         extract_installer_blocking(installer_source, plan.record.component_name.clone()).await?;
     let installer_plan = bind_authenticated_installer_plan(authenticated, &plan.record)
@@ -836,15 +845,6 @@ where
     )
     .map_err(|error| LoaderError::Verify(format!("derive loader authority: {error:?}")))?;
 
-    let child_client_differs = child_client.bytes() != base_client_bytes;
-    if child_client_differs {
-        send(progress(
-            "client_jar",
-            0,
-            1,
-            Some(format!("{installed_version_id}.jar")),
-        ));
-    }
     let child_client_bytes = child_client.into_bytes();
     let (authority, library_sources) = pending_receipt.into_parts();
     let prepared = prepare_local_managed_install(
@@ -855,15 +855,9 @@ where
         library_sources,
     )
     .map_err(loader_managed_install_error)?;
+    send(progress("loader_publish", 0, 1, None));
     let receipt = publish_loader_managed_install(library_dir, prepared).await?;
-    if child_client_differs {
-        send(progress(
-            "client_jar",
-            1,
-            1,
-            Some(format!("{installed_version_id}.jar")),
-        ));
-    }
+    send(progress("loader_publish", 1, 1, None));
 
     send(done());
     Ok(receipt)
@@ -1029,6 +1023,7 @@ where
         &plan.record.version_id,
     )
     .await?;
+    send(progress("artifacts", 1, 1, None));
     let base_receipt = Box::pin(ensure_base_version(
         library_dir,
         runtime_cache,
@@ -1059,6 +1054,7 @@ where
     validate_version_id(&plan.record.version_id, "installed loader version id")?;
     let archive_url = legacy_archive_source_url(&plan.record)?;
 
+    send(progress("loader_overlay", 0, 1, None));
     let base_client_bytes = read_installed_base_client(library_dir, base_receipt)?;
     let archive_bytes = archive_source.into_bytes_for(archive_url, &plan.record.version_id)?;
     let (version, version_bytes, child_client_bytes) = derive_legacy_archive_inputs(
@@ -1085,7 +1081,10 @@ where
         Vec::new(),
     )
     .map_err(loader_managed_install_error)?;
+    send(progress("loader_overlay", 1, 1, None));
+    send(progress("loader_publish", 0, 1, None));
     let receipt = publish_loader_managed_install(library_dir, prepared).await?;
+    send(progress("loader_publish", 1, 1, None));
     send(done());
     Ok(receipt)
 }
@@ -2967,15 +2966,39 @@ printf '%s' 'processor-terminal' > "$last"
         );
         let base = test_authenticated_receipt(&root, &record.minecraft_version);
 
+        let mut progress_events = Vec::new();
         let receipt = install_profile_source_after_authenticated_base(
             &root,
             &plan,
             &base,
             proof,
-            &mut |_progress| {},
+            &mut |progress| progress_events.push(progress),
         )
         .await
         .expect("Fabric profile install");
+        let phases = progress_events
+            .iter()
+            .map(|progress| progress.phase.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(phases.first().copied(), Some("profile"));
+        assert_eq!(
+            progress_events
+                .iter()
+                .filter(|progress| progress.phase == "profile")
+                .map(|progress| (progress.current, progress.total))
+                .collect::<Vec<_>>(),
+            vec![(0, 1), (1, 1)]
+        );
+        assert!(phases.contains(&"loader_libraries"));
+        assert_eq!(
+            progress_events
+                .iter()
+                .filter(|progress| progress.phase == "loader_publish")
+                .map(|progress| (progress.current, progress.total))
+                .collect::<Vec<_>>(),
+            vec![(0, 1), (1, 1)]
+        );
+        assert_eq!(phases.last().copied(), Some("done"));
         assert_eq!(fs::read(&destination).expect("fresh library"), fresh);
         let version_path = versions_dir(&root)
             .join(&record.version_id)
@@ -3337,8 +3360,8 @@ printf '%s' 'processor-terminal' > "$last"
             .await
             .expect("settled loader publication admits exact retry");
         assert_eq!(receipt.version_id(), record.version_id);
-        assert_settled_loader_assets_lane(&root);
-        assert_settled_loader_libraries_lane(&root);
+        assert_loader_component_lane_absent(&root, "assets");
+        assert_loader_component_lane_absent(&root, "libraries");
         let _ = fs::remove_dir_all(root);
     }
 
@@ -3823,8 +3846,25 @@ printf '%s' 'processor-terminal' > "$last"
             verified_test_source(&installer_server.url, "loader installer").await;
         let installer_plan = bind_test_installer(installer_source, &record);
 
-        let receipt = finish_test_installer(&root, &plan, installer_plan, &mut |_| {}).await;
+        let mut progress_events = Vec::new();
+        let receipt = finish_test_installer(&root, &plan, installer_plan, &mut |progress| {
+            progress_events.push(progress)
+        })
+        .await;
         assert_eq!(receipt.version_id(), record.version_id);
+        assert_eq!(
+            progress_events
+                .iter()
+                .filter(|progress| progress.phase == "loader_publish")
+                .map(|progress| (progress.current, progress.total))
+                .collect::<Vec<_>>(),
+            vec![(0, 1), (1, 1)]
+        );
+        assert!(
+            progress_events
+                .iter()
+                .all(|progress| progress.phase != "client_jar")
+        );
 
         let child_jar = versions_dir(&root)
             .join(&version_id)
@@ -3930,17 +3970,40 @@ printf '%s' 'processor-terminal' > "$last"
         let archive_source =
             verified_test_source_for(&server.url, "legacy Forge archive", &record.version_id).await;
         let base_receipt = test_authenticated_receipt(&root, &record.minecraft_version);
+        let mut progress_events = Vec::new();
         let receipt = install_legacy_archive_after_authenticated_base(
             &root,
             &plan,
             archive_source,
             &base_receipt,
-            &mut |_progress| {},
+            &mut |progress| progress_events.push(progress),
         )
         .await
         .expect("install legacy archive");
 
         assert_eq!(receipt.version_id(), record.version_id);
+        assert_eq!(
+            progress_events
+                .iter()
+                .filter(|progress| progress.phase == "loader_overlay")
+                .map(|progress| (progress.current, progress.total))
+                .collect::<Vec<_>>(),
+            vec![(0, 1), (1, 1)]
+        );
+        assert_eq!(
+            progress_events
+                .iter()
+                .filter(|progress| progress.phase == "loader_publish")
+                .map(|progress| (progress.current, progress.total))
+                .collect::<Vec<_>>(),
+            vec![(0, 1), (1, 1)]
+        );
+        assert_eq!(
+            progress_events
+                .last()
+                .map(|progress| progress.phase.as_str()),
+            Some("done")
+        );
         let installed_jar = versions_dir(&root)
             .join(&record.version_id)
             .join(format!("{}.jar", record.version_id));
@@ -5480,8 +5543,11 @@ esac
         assert_settled_loader_component_lane(root, "assets", "Assets");
     }
 
-    fn assert_settled_loader_libraries_lane(root: &Path) {
-        assert_settled_loader_component_lane(root, "libraries", "Libraries");
+    fn assert_loader_component_lane_absent(root: &Path, lane_name: &str) {
+        assert!(
+            !root.join(".axial-publication").join(lane_name).exists(),
+            "{lane_name} no-effect projection must not create a publication lane"
+        );
     }
 
     fn assert_settled_loader_component_lane(root: &Path, lane_name: &str, label: &str) {

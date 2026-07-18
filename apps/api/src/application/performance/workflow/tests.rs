@@ -228,12 +228,16 @@ mod plan_health;
 mod rules_status;
 
 async fn collect_install_events(state: &AppState, install_id: &str) -> Vec<DownloadProgress> {
-    let (mut events, mut receiver, done) = state
+    let (snapshot, mut receiver) = state
         .installs()
-        .subscribe(install_id)
+        .subscribe_records(install_id)
         .await
         .expect("install session should exist");
-    if done || events.iter().any(|event| event.done) {
+    let mut events = snapshot
+        .latest
+        .map(|record| vec![record.progress])
+        .unwrap_or_default();
+    if snapshot.done || events.iter().any(|event| event.done) {
         return events;
     }
 
@@ -242,8 +246,8 @@ async fn collect_install_events(state: &AppState, install_id: &str) -> Vec<Downl
             .await
             .expect("progress event should arrive")
             .expect("progress receiver should stay open");
-        let terminal = event.done;
-        events.push(event);
+        let terminal = event.progress.done;
+        events.push(event.progress);
         if terminal {
             return events;
         }

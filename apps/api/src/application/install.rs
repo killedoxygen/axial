@@ -572,28 +572,28 @@ pub use model::{
     InstallQueuedItemViewModel, InstallStartResponse, InstallStatusResponse, InstallVersionStaging,
     InstallVersionStartRequest, LoaderBuildsRequest, LoaderInstallStartRequest,
 };
-#[cfg(test)]
-use operation::typed_runtime_failure_evidence;
 use operation::{
-    ContentDownloadFactAccumulator, InstallProgressCoalescer, begin_content_operation_journal,
-    install_failure_evidence_from_download_error_or_facts,
+    ContentDownloadFactAccumulator, InstallProgressCoalescer, InstallProgressPresenter,
+    begin_content_operation_journal, install_failure_evidence_from_download_error_or_facts,
     install_failure_evidence_from_download_facts, install_failure_point_from_journal,
-    install_journal_is_terminal, install_progress_history_from_journal, install_progress_record,
+    install_journal_is_terminal, install_progress_history_from_journal,
     install_progress_with_terminal_error, interrupted_install_progress,
-    observed_install_failure_progress, public_install_id, record_content_failure_outcome,
-    record_content_operation_interrupted, record_content_operation_progress,
-    record_install_guardian_failure_outcome,
+    loader_install_progress_record_view_model, observed_install_failure_progress,
+    public_install_id, record_content_failure_outcome, record_content_operation_interrupted,
+    record_content_operation_progress, record_install_guardian_failure_outcome,
     record_loader_base_install_dependency_guardian_failure_outcome,
     record_loader_install_operation_guardian_failure_outcome,
+    vanilla_install_progress_record_view_model, vanilla_install_progress_view_model,
 };
 pub use operation::{
     InstallProgressJournalTracker, begin_install_operation_journal,
     install_guardian_outcome_summary_from_journal, install_operation_id,
-    loader_install_progress_view_model, public_loader_install_progress_json,
-    public_vanilla_install_progress_json, record_install_operation_interrupted,
-    record_install_operation_progress, sanitize_install_progress, stage_install_version_command,
-    vanilla_install_progress_view_model,
+    public_loader_install_progress_record_json, public_vanilla_install_progress_record_json,
+    record_install_operation_interrupted, record_install_operation_progress,
+    sanitize_install_progress, stage_install_version_command,
 };
+#[cfg(test)]
+use operation::{loader_install_progress_view_model, typed_runtime_failure_evidence};
 pub use stream::{install_events_stream, loader_install_events_stream};
 
 async fn start_install_version_with_foreground(
@@ -722,6 +722,7 @@ async fn start_install_version_with_foreground(
                 let journal_failed = journal_failed.clone();
                 progress_owner.spawn_joinable(async move {
                     let mut coalescer = InstallProgressCoalescer::default();
+                    let mut presenter = InstallProgressPresenter::default();
                     let mut progress_journal = InstallProgressJournalTracker::default();
                     while let Some(progress) = progress_rx.recv().await {
                         let progress = sanitize_install_progress(progress);
@@ -733,6 +734,7 @@ async fn start_install_version_with_foreground(
                                 &install_id,
                                 progress,
                                 &mut progress_journal,
+                                &mut presenter,
                             )
                             .await
                             {
@@ -749,6 +751,7 @@ async fn start_install_version_with_foreground(
                             &install_id,
                             progress,
                             &mut progress_journal,
+                            &mut presenter,
                         )
                         .await
                     {
@@ -1027,6 +1030,7 @@ async fn record_and_emit_install_progress(
     install_id: &str,
     progress: DownloadProgress,
     progress_journal: &mut InstallProgressJournalTracker,
+    presenter: &mut InstallProgressPresenter,
 ) -> bool {
     if record_install_operation_progress(journals, operation_id, &progress, progress_journal)
         .await
@@ -1036,7 +1040,7 @@ async fn record_and_emit_install_progress(
         return false;
     }
     store
-        .emit_record(install_id, install_progress_record(progress))
+        .emit_record(install_id, presenter.record(progress))
         .await;
     true
 }
@@ -1099,9 +1103,20 @@ pub async fn install_status(
         .into_iter()
         .map(sanitize_install_progress)
         .collect::<Vec<_>>();
-    let view_model = progress
-        .last()
-        .map(vanilla_install_progress_view_model)
+    let loader_install = snapshot
+        .as_ref()
+        .is_some_and(|snapshot| snapshot.loader_install);
+    let view_model = snapshot
+        .as_ref()
+        .and_then(|snapshot| snapshot.latest.as_ref())
+        .map(|record| {
+            if loader_install {
+                loader_install_progress_record_view_model(record)
+            } else {
+                vanilla_install_progress_record_view_model(record)
+            }
+        })
+        .or_else(|| progress.last().map(vanilla_install_progress_view_model))
         .unwrap_or_else(InstallProgressViewModel::starting);
     let failure_point = journal
         .as_ref()
@@ -2721,14 +2736,14 @@ async fn install_queue_active_progress_view_model(
     spec: &InstallQueueSpec,
 ) -> InstallProgressViewModel {
     let snapshot = state.installs().snapshot(install_id).await;
-    let progress = snapshot.and_then(|snapshot| snapshot.latest.map(|record| record.progress));
-    let Some(progress) = progress else {
+    let record = snapshot.and_then(|snapshot| snapshot.latest);
+    let Some(record) = record else {
         return InstallProgressViewModel::starting();
     };
     if spec.is_loader() {
-        loader_install_progress_view_model(&progress)
+        loader_install_progress_record_view_model(&record)
     } else {
-        vanilla_install_progress_view_model(&progress)
+        vanilla_install_progress_record_view_model(&record)
     }
 }
 

@@ -1,11 +1,11 @@
 use super::{
     BASE_INSTALL_FAILED_MESSAGE, INSTALL_FAILURE_MESSAGE, InstallApplicationError,
     InstallForegroundActivity, InstallProgressCoalescer, InstallProgressJournalTracker,
-    InstallProgressViewModel, InstallStartResponse, LOADER_INSTALL_INTERRUPTED_MESSAGE,
-    LoaderBuildsRequest, LoaderInstallStartRequest, await_managed_install_settlement,
-    begin_install_journal_with_owned_reconciliation, emit_install_failed,
-    finish_install_progress_task, generate_install_id, install_journal_error_response,
-    install_operation_id, known_good_acceptance_download_error,
+    InstallProgressPresenter, InstallProgressViewModel, InstallStartResponse,
+    LOADER_INSTALL_INTERRUPTED_MESSAGE, LoaderBuildsRequest, LoaderInstallStartRequest,
+    await_managed_install_settlement, begin_install_journal_with_owned_reconciliation,
+    emit_install_failed, finish_install_progress_task, generate_install_id,
+    install_journal_error_response, install_operation_id, known_good_acceptance_download_error,
     operation::install_progress_with_terminal_error, record_and_emit_install_progress,
     record_install_failure_outcome, record_install_failure_outcome_for_error,
     record_install_operation_interrupted,
@@ -162,6 +162,7 @@ pub(super) async fn start_loader_install_with_foreground(
                 let journal_failed = journal_failed.clone();
                 progress_owner.spawn_joinable(async move {
                     let mut coalescer = InstallProgressCoalescer::default();
+                    let mut presenter = InstallProgressPresenter::default();
                     let mut progress_journal = InstallProgressJournalTracker::default();
                     while let Some(progress) = progress_rx.recv().await {
                         let progress = sanitize_install_progress(progress);
@@ -173,6 +174,7 @@ pub(super) async fn start_loader_install_with_foreground(
                                 &install_id,
                                 progress,
                                 &mut progress_journal,
+                                &mut presenter,
                             )
                             .await
                             {
@@ -189,6 +191,7 @@ pub(super) async fn start_loader_install_with_foreground(
                             &install_id,
                             progress,
                             &mut progress_journal,
+                            &mut presenter,
                         )
                         .await
                     {

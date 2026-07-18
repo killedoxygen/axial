@@ -377,7 +377,7 @@ fn install_progress_pct_prefers_transfer_plan_bytes() {
     let loader = loader_install_progress_view_model(&progress);
 
     assert_eq!(vanilla.progress_pct, 50);
-    assert_eq!(loader.progress_pct, 60);
+    assert_eq!(loader.progress_pct, 44);
 }
 
 #[test]
@@ -478,6 +478,178 @@ fn install_progress_pct_falls_back_to_phase_table_without_bytes() {
     assert_eq!(view_model.progress_pct, 0);
 }
 
+fn install_progress(phase: &str, current: i32, total: i32) -> DownloadProgress {
+    DownloadProgress {
+        phase: phase.to_string(),
+        current,
+        total,
+        file: None,
+        error: None,
+        done: phase == "done",
+        bytes_done: None,
+        bytes_total: None,
+    }
+}
+
+fn loader_presented_percentages(phases: Vec<DownloadProgress>) -> Vec<u8> {
+    let mut presenter = InstallProgressPresenter::default();
+    phases
+        .into_iter()
+        .map(|progress| presenter.record(progress))
+        .map(|record| loader_install_progress_record_view_model(&record).progress_pct)
+        .collect()
+}
+
+fn completed_base_progress() -> DownloadProgress {
+    let mut progress = install_progress("java_runtime_ready", 1, 1);
+    progress.bytes_done = Some(100);
+    progress.bytes_total = Some(100);
+    progress
+}
+
+#[test]
+fn loader_progress_matches_every_strategy_producer_sequence() {
+    let base_ready = completed_base_progress();
+    for (strategy, phases, expected) in [
+        (
+            "profile",
+            vec![
+                base_ready.clone(),
+                install_progress("profile", 0, 1),
+                install_progress("profile", 1, 1),
+                install_progress("loader_libraries", 0, 8),
+                install_progress("loader_libraries", 8, 8),
+                install_progress("loader_publish", 0, 1),
+                install_progress("loader_publish", 1, 1),
+                install_progress("done", 1, 1),
+            ],
+            vec![80, 82, 82, 82, 90, 99, 99, 100],
+        ),
+        (
+            "installer_with_processors",
+            vec![
+                install_progress("artifacts", 0, 1),
+                install_progress("artifacts", 1, 1),
+                base_ready.clone(),
+                install_progress("loader_libraries", 8, 8),
+                install_progress("processors", 0, 4),
+                install_progress("processors", 4, 4),
+                install_progress("loader_publish", 0, 1),
+                install_progress("loader_publish", 1, 1),
+                install_progress("done", 1, 1),
+            ],
+            vec![5, 5, 80, 90, 90, 99, 99, 99, 100],
+        ),
+        (
+            "installer_without_processors",
+            vec![
+                install_progress("artifacts", 0, 1),
+                install_progress("artifacts", 1, 1),
+                base_ready.clone(),
+                install_progress("loader_libraries", 8, 8),
+                install_progress("loader_publish", 0, 1),
+                install_progress("loader_publish", 1, 1),
+                install_progress("done", 1, 1),
+            ],
+            vec![5, 5, 80, 90, 99, 99, 100],
+        ),
+        (
+            "legacy_archive",
+            vec![
+                install_progress("artifacts", 0, 1),
+                install_progress("artifacts", 1, 1),
+                base_ready.clone(),
+                install_progress("loader_overlay", 0, 1),
+                install_progress("loader_overlay", 1, 1),
+                install_progress("loader_publish", 0, 1),
+                install_progress("loader_publish", 1, 1),
+                install_progress("done", 1, 1),
+            ],
+            vec![5, 5, 80, 82, 97, 99, 99, 100],
+        ),
+    ] {
+        let percentages = loader_presented_percentages(phases);
+        assert_eq!(percentages, expected, "unexpected {strategy} progress");
+        assert!(
+            percentages.windows(2).all(|pair| pair[0] <= pair[1]),
+            "{strategy} progress regressed: {percentages:?}"
+        );
+    }
+}
+
+#[test]
+fn loader_operation_progress_advances_after_the_complete_denominator_resolves() {
+    let mut first_stamped = install_progress("assets", 0, 10);
+    first_stamped.bytes_done = Some(100);
+    first_stamped.bytes_total = Some(1_000);
+    let mut halfway = install_progress("libraries", 4, 8);
+    halfway.bytes_done = Some(500);
+    halfway.bytes_total = Some(1_000);
+    let mut base_ready = install_progress("java_runtime_ready", 1, 1);
+    base_ready.bytes_done = Some(1_000);
+    base_ready.bytes_total = Some(1_000);
+
+    let percentages = loader_presented_percentages(vec![
+        install_progress("version_json", 0, 1),
+        install_progress("asset_index", 1, 1),
+        install_progress("assets", 10, 10),
+        install_progress("java_runtime", 0, 0),
+        first_stamped,
+        halfway,
+        base_ready,
+        install_progress("profile", 0, 1),
+    ]);
+
+    assert_eq!(percentages, vec![8, 8, 8, 8, 15, 44, 80, 82]);
+
+    let fresh_operation = loader_presented_percentages(vec![install_progress("artifacts", 0, 1)]);
+    assert_eq!(fresh_operation, vec![5]);
+}
+
+#[test]
+fn pending_denominator_cannot_latch_a_late_phase_percentage() {
+    let mut presenter = InstallProgressPresenter::default();
+    let pending = presenter.record(install_progress("assets", 10, 10));
+
+    assert_eq!(
+        vanilla_install_progress_record_view_model(&pending).progress_pct,
+        2
+    );
+    assert_eq!(
+        loader_install_progress_record_view_model(&pending).progress_pct,
+        8
+    );
+
+    let mut resolved = install_progress("assets", 1, 10);
+    resolved.bytes_done = Some(200);
+    resolved.bytes_total = Some(1_000);
+    let resolved = presenter.record(resolved);
+    assert_eq!(
+        vanilla_install_progress_record_view_model(&resolved).progress_pct,
+        20
+    );
+    assert_eq!(
+        loader_install_progress_record_view_model(&resolved).progress_pct,
+        22
+    );
+}
+
+#[test]
+fn loader_operation_progress_preserves_terminal_failure_semantics() {
+    let mut presenter = InstallProgressPresenter::default();
+    let _ = presenter.record(completed_base_progress());
+    let mut failure = install_progress("error", 0, 0);
+    failure.done = true;
+    failure.error = Some(INSTALL_FAILURE_MESSAGE.to_string());
+
+    let record = presenter.record(failure);
+    let view_model = loader_install_progress_record_view_model(&record);
+
+    assert_eq!(view_model.progress_pct, 100);
+    assert!(view_model.terminal);
+    assert!(view_model.failed);
+}
+
 #[test]
 fn install_progress_view_model_authors_runtime_copy_from_typed_counts() {
     let mut progress = base_progress("java_runtime");
@@ -507,7 +679,7 @@ fn install_progress_view_model_authors_runtime_ready_copy_from_phase() {
 #[test]
 fn install_progress_view_model_authors_loader_active_step() {
     let progress = DownloadProgress {
-        phase: "loader_processors".to_string(),
+        phase: "processors".to_string(),
         current: 1,
         total: 4,
         file: None,
@@ -520,17 +692,18 @@ fn install_progress_view_model_authors_loader_active_step() {
     let view_model = loader_install_progress_view_model(&progress);
     let active_step = view_model.active_step.expect("active step");
 
-    assert_eq!(view_model.phase_id, "loader_processors");
+    assert_eq!(view_model.phase_id, "processors");
     assert_eq!(view_model.label, "Running processors (1/4)");
-    assert_eq!(view_model.progress_pct, 13);
-    assert_eq!(active_step.phase_id, "loader_processors");
+    assert_eq!(view_model.progress_pct, 92);
+    assert_eq!(active_step.phase_id, "processors");
     assert_eq!(active_step.label, "Running processors (1/4)");
     assert_eq!(active_step.progress_pct, 25);
 }
 
 #[test]
 fn public_install_progress_json_includes_backend_view_model() {
-    let payload = public_vanilla_install_progress_json(&DownloadProgress {
+    let mut presenter = InstallProgressPresenter::default();
+    let record = presenter.record(DownloadProgress {
         phase: "libraries".to_string(),
         current: 1,
         total: 4,
@@ -540,11 +713,80 @@ fn public_install_progress_json_includes_backend_view_model() {
         bytes_done: None,
         bytes_total: None,
     });
+    let payload = public_vanilla_install_progress_record_json(&record);
 
     assert_eq!(payload["phase"], "libraries");
     assert_eq!(payload["view_model"]["phase_id"], "libraries");
     assert_eq!(payload["view_model"]["label"], "Libraries (1/4)");
-    assert_eq!(payload["view_model"]["progress_pct"], 10);
+    assert_eq!(payload["view_model"]["progress_pct"], 2);
+}
+
+#[tokio::test]
+async fn loader_progress_presentation_matches_status_queue_and_event_transports() {
+    let root = temp_root("loader-progress-surface-parity");
+    let state = build_test_state(&root);
+    let install_id = "loader-progress-parity";
+    let (inserted_id, inserted) = state
+        .installs()
+        .insert_or_existing_loader(
+            install_id.to_string(),
+            LoaderComponentId::Fabric,
+            "0.16.14".to_string(),
+        )
+        .await;
+    assert!(inserted);
+    assert_eq!(inserted_id, install_id);
+    assert!(state.installs().mark_initialized(install_id).await);
+
+    let mut presenter = InstallProgressPresenter::default();
+    let record = presenter.record(DownloadProgress {
+        phase: "processors".to_string(),
+        current: 1,
+        total: 4,
+        file: None,
+        error: None,
+        done: false,
+        bytes_done: None,
+        bytes_total: None,
+    });
+    state
+        .installs()
+        .emit_record(install_id, record.clone())
+        .await;
+
+    let expected = loader_install_progress_record_view_model(&record);
+    let status = install_status(&state, install_id)
+        .await
+        .expect("loader install status");
+    assert_eq!(status.view_model, expected);
+
+    let queue_view_model = install_queue_active_progress_view_model(
+        &state,
+        install_id,
+        &InstallQueueSpec::loader(
+            LoaderComponentId::Fabric,
+            "0.16.14".to_string(),
+            "1.21.5-fabric-0.16.14".to_string(),
+            "1.21.5".to_string(),
+            "0.16.14".to_string(),
+        ),
+    )
+    .await;
+    assert_eq!(queue_view_model, expected);
+
+    let event_payload = public_loader_install_progress_record_json(&record);
+    assert_eq!(event_payload["view_model"], json!(expected));
+
+    let (snapshot, _) = state
+        .installs()
+        .subscribe_records(install_id)
+        .await
+        .expect("loader reconnect snapshot");
+    assert!(snapshot.loader_install);
+    assert_eq!(snapshot.latest, Some(record));
+
+    state.shutdown().await.expect("shutdown test state");
+    let _ = fs::remove_dir_all(root);
 }
 
 #[tokio::test]
@@ -4442,6 +4684,7 @@ async fn transient_terminal_failure_retries_and_emits_exactly_once() {
     let attempts_before = backend.attempts.load(Ordering::SeqCst);
     backend.fail_next();
     let mut progress_journal = InstallProgressJournalTracker::default();
+    let mut presenter = InstallProgressPresenter::default();
     assert!(
         record_and_emit_install_progress(
             &installs,
@@ -4450,6 +4693,7 @@ async fn transient_terminal_failure_retries_and_emits_exactly_once() {
             install_id,
             progress("error", true, Some("sanitized failure")),
             &mut progress_journal,
+            &mut presenter,
         )
         .await
     );

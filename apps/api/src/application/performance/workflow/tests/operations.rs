@@ -451,13 +451,18 @@ async fn terminal_journal_failure_retries_before_status_and_stream_release() {
         "terminal journal persistence retains performance foreground"
     );
 
-    let (events, _, done) = state
+    let (snapshot, _) = state
         .installs()
-        .subscribe(&install_id)
+        .subscribe_records(&install_id)
         .await
         .expect("progress session");
-    assert!(!done);
-    assert!(events.iter().all(|event| !event.done));
+    assert!(!snapshot.done);
+    assert!(
+        snapshot
+            .latest
+            .as_ref()
+            .is_none_or(|record| !record.progress.done)
+    );
     let status = state
         .performance_operations()
         .get(&install_id)
@@ -989,13 +994,18 @@ async fn pre_effect_journal_acceptance_failure_exits_without_retry_or_filesystem
             .state,
         "planning"
     );
-    let (events, _, done) = state
+    let (snapshot, _) = state
         .installs()
-        .subscribe(&status.id)
+        .subscribe_records(&status.id)
         .await
         .expect("progress session");
-    assert!(!done);
-    assert!(events.iter().all(|event| !event.done));
+    assert!(!snapshot.done);
+    assert!(
+        snapshot
+            .latest
+            .as_ref()
+            .is_none_or(|record| !record.progress.done)
+    );
     let _ = fs::remove_dir_all(root);
 }
 
@@ -2929,14 +2939,14 @@ async fn provider_resolution_failure_terminalizes_before_effect_started() {
         .expect("start queued provider failure status");
     operation.status_operation_id = Some(status.id.clone());
     fixture.state.installs().insert(status.id.clone()).await;
-    let (initial_events, mut pre_effect_events, done) = fixture
+    let (snapshot, mut pre_effect_events) = fixture
         .state
         .installs()
-        .subscribe(&status.id)
+        .subscribe_records(&status.id)
         .await
         .expect("provider failure progress session");
-    assert!(initial_events.is_empty());
-    assert!(!done);
+    assert!(snapshot.latest.is_none());
+    assert!(!snapshot.done);
     let resolver_entered = Arc::new(tokio::sync::Notify::new());
     let resolver_release = Arc::new(tokio::sync::Notify::new());
     let entered = resolver_entered.clone();
@@ -2978,7 +2988,7 @@ async fn provider_resolution_failure_terminalizes_before_effect_started() {
     );
     let mut pre_effect_phases = Vec::new();
     while let Ok(event) = pre_effect_events.try_recv() {
-        pre_effect_phases.push(event.phase);
+        pre_effect_phases.push(event.progress.phase);
     }
     assert_eq!(pre_effect_phases, vec!["queued", "planning"]);
     resolver_release.notify_one();

@@ -5,7 +5,7 @@ use crate::state::{
 };
 use axial_api::application::launch::{public_launch_status_json, snapshot_status};
 use axial_api::application::{
-    public_loader_install_progress_json, public_vanilla_install_progress_json,
+    public_loader_install_progress_record_json, public_vanilla_install_progress_record_json,
 };
 use axial_api::state::{AppState, LaunchEvent};
 use axial_launcher::is_terminal_state;
@@ -703,42 +703,41 @@ pub async fn start_install_events(
     state: State<'_, AppState>,
     install_id: String,
 ) -> Result<(), String> {
-    let (history, mut receiver, done) = state
+    let (snapshot, mut receiver) = state
         .installs()
-        .subscribe(&install_id)
+        .subscribe_records(&install_id)
         .await
         .ok_or_else(|| "install session not found".to_string())?;
     let event_name = events::install_progress(&install_id);
-    let installs = state.installs().clone();
 
     tauri::async_runtime::spawn(async move {
-        for progress in history {
-            let terminal = progress.done;
-            let _ = app.emit(&event_name, public_vanilla_install_progress_json(&progress));
+        if let Some(record) = snapshot.latest {
+            let terminal = record.progress.done;
+            let _ = app.emit(
+                &event_name,
+                public_vanilla_install_progress_record_json(&record),
+            );
             if terminal {
-                installs.remove(&install_id).await;
                 return;
             }
         }
-        if done {
-            installs.remove(&install_id).await;
+        if snapshot.done {
             return;
         }
         loop {
             match receiver.recv().await {
-                Ok(progress) => {
-                    let terminal = progress.done;
-                    let _ = app.emit(&event_name, public_vanilla_install_progress_json(&progress));
+                Ok(record) => {
+                    let terminal = record.progress.done;
+                    let _ = app.emit(
+                        &event_name,
+                        public_vanilla_install_progress_record_json(&record),
+                    );
                     if terminal {
-                        installs.remove(&install_id).await;
                         return;
                     }
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                    installs.remove(&install_id).await;
-                    return;
-                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
             }
         }
     });
@@ -752,42 +751,41 @@ pub async fn start_loader_install_events(
     state: State<'_, AppState>,
     install_id: String,
 ) -> Result<(), String> {
-    let (history, mut receiver, done) = state
+    let (snapshot, mut receiver) = state
         .installs()
-        .subscribe(&install_id)
+        .subscribe_records(&install_id)
         .await
         .ok_or_else(|| "loader install session not found".to_string())?;
     let event_name = events::loader_install_progress(&install_id);
-    let installs = state.installs().clone();
 
     tauri::async_runtime::spawn(async move {
-        for progress in history {
-            let terminal = progress.done;
-            let _ = app.emit(&event_name, public_loader_install_progress_json(&progress));
+        if let Some(record) = snapshot.latest {
+            let terminal = record.progress.done;
+            let _ = app.emit(
+                &event_name,
+                public_loader_install_progress_record_json(&record),
+            );
             if terminal {
-                installs.remove(&install_id).await;
                 return;
             }
         }
-        if done {
-            installs.remove(&install_id).await;
+        if snapshot.done {
             return;
         }
         loop {
             match receiver.recv().await {
-                Ok(progress) => {
-                    let terminal = progress.done;
-                    let _ = app.emit(&event_name, public_loader_install_progress_json(&progress));
+                Ok(record) => {
+                    let terminal = record.progress.done;
+                    let _ = app.emit(
+                        &event_name,
+                        public_loader_install_progress_record_json(&record),
+                    );
                     if terminal {
-                        installs.remove(&install_id).await;
                         return;
                     }
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                    installs.remove(&install_id).await;
-                    return;
-                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
             }
         }
     });
