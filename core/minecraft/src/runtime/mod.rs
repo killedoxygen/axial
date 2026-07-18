@@ -4,6 +4,7 @@
 //! runtime layout detection, Java probing, local discovery, managed runtime
 //! ensure orchestration, manifest fetching, file download/integrity, and tests.
 
+mod cancellation;
 mod discovery;
 mod ensure;
 mod file_download;
@@ -22,8 +23,13 @@ pub use discovery::{
     runtime_executable_ready_without_probe, runtime_requirement,
 };
 pub(crate) use ensure::{
-    ProcessorRuntime, materialize_ephemeral_processor_runtime,
+    ProcessorRuntime, RuntimeMaterializationCancelHandle, materialize_ephemeral_processor_runtime,
     materialize_preferred_runtime_source, rebuild_managed_runtime_component_from_source,
+    runtime_materialization_control,
+};
+#[cfg(test)]
+pub(crate) use ensure::{
+    RuntimeMaterializationCancellation, block_runtime_before_publication_claim_for_test,
 };
 pub use ensure::{ensure_runtime_with_events, rebuild_managed_runtime_component};
 #[cfg(feature = "test-support")]
@@ -38,6 +44,10 @@ pub(crate) use install::finalize_managed_runtime_commit_with_removed_quarantine_
 pub use install::{
     ManagedRuntimeCommitReceipt, ManagedRuntimeFailureReceipt, ManagedRuntimeQuarantineObligation,
     ManagedRuntimeQuarantineObservation, ManagedRuntimeRebuildError,
+};
+#[cfg(test)]
+pub(crate) use install::{
+    block_runtime_publication_for_test, runtime_publication_locks_available_for_test,
 };
 pub(crate) use install::{
     finalize_managed_runtime_commit, runtime_source_matches_known_good_inventory,
@@ -57,6 +67,8 @@ pub use probe::{
 };
 
 #[cfg(test)]
+use cancellation::runtime_cancellation_channel;
+#[cfg(test)]
 use discovery::detect_runtime_state;
 #[cfg(test)]
 use ensure::runtime_record_matches_source_for_test;
@@ -70,14 +82,16 @@ use file_download::{
 pub(crate) use install::plan_runtime_manifest_files;
 #[cfg(test)]
 use install::{
-    install_runtime_manifest_file, install_runtime_manifest_files, publish_staged_managed_runtime,
-    publish_staged_managed_runtime_and_finalize,
+    active_runtime_file_lock_workers_for_test, block_runtime_decompression_for_test,
+    discard_staged_managed_runtime, install_runtime_manifest_file, install_runtime_manifest_files,
+    publish_staged_managed_runtime, publish_staged_managed_runtime_and_finalize,
     publish_staged_managed_runtime_with_displacement_failure_for_test,
     publish_staged_managed_runtime_with_finalization_failure_for_test,
     publish_staged_managed_runtime_with_promotion_failure_for_test,
     publish_staged_managed_runtime_with_restoration_failure_for_test,
     publish_staged_managed_runtime_with_rotation_failure_for_test, runtime_install_lock_file_path,
-    stage_managed_runtime, validate_ephemeral_processor_manifest_for_test,
+    stage_managed_runtime, stage_managed_runtime_until_cancelled,
+    validate_ephemeral_processor_manifest_for_test,
 };
 #[cfg(test)]
 use layout::{java_executable, java_executable_for_os, runtime_os_arch_for};

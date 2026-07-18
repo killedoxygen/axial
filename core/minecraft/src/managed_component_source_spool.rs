@@ -1,3 +1,4 @@
+use crate::managed_blocking::{ManagedBlockingCheckpoint, ManagedCancellation};
 use sha1::{Digest as _, Sha1};
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom, Write};
@@ -43,6 +44,7 @@ impl std::error::Error for RetainedComponentSourceSpoolError {}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum RetainedComponentSourceAppendError {
+    Cancelled,
     SourceRejected,
     Spool(RetainedComponentSourceSpoolError),
 }
@@ -50,6 +52,7 @@ pub(crate) enum RetainedComponentSourceAppendError {
 impl std::fmt::Display for RetainedComponentSourceAppendError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::Cancelled => formatter.write_str("retained component source append cancelled"),
             Self::SourceRejected => {
                 formatter.write_str("retained component source authentication failed")
             }
@@ -180,16 +183,27 @@ impl RetainedComponentSourceSpool {
         mut source: R,
         expected_size: u64,
         expected_sha1: [u8; 20],
+        cancellation: &ManagedCancellation,
     ) -> Result<RetainedComponentSourceAllocation, RetainedComponentSourceAppendError>
     where
         R: Read + Seek,
     {
+        if cancellation.is_cancelled() {
+            return Err(RetainedComponentSourceAppendError::Cancelled);
+        }
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if cancellation.is_cancelled() {
+            return Err(RetainedComponentSourceAppendError::Cancelled);
+        }
         state.validate_integrity()?;
         self.budget.try_reserve(expected_size)?;
+        if cancellation.is_cancelled() {
+            self.budget.refund(expected_size)?;
+            return Err(RetainedComponentSourceAppendError::Cancelled);
+        }
         let offset = state.high_water;
         let Some(end) = offset.checked_add(expected_size) else {
             self.budget.refund(expected_size)?;
@@ -204,11 +218,16 @@ impl RetainedComponentSourceSpool {
             self.budget.refund(expected_size)?;
             return Err(RetainedComponentSourceSpoolError::operation_failed().into());
         }
+        cancellation.checkpoint(ManagedBlockingCheckpoint::SourceSpool);
 
         let mut observed = 0_u64;
         let mut hasher = Sha1::new();
         let mut chunk = [0_u8; 64 * 1024];
         loop {
+            if cancellation.is_cancelled() {
+                self.rollback_provisional(&mut state, offset, expected_size)?;
+                return Err(RetainedComponentSourceAppendError::Cancelled);
+            }
             let read = match source.read(&mut chunk) {
                 Ok(read) => read,
                 Err(_) => {
@@ -227,12 +246,20 @@ impl RetainedComponentSourceSpool {
                 self.rollback_provisional(&mut state, offset, expected_size)?;
                 return Err(RetainedComponentSourceAppendError::SourceRejected);
             }
+            if cancellation.is_cancelled() {
+                self.rollback_provisional(&mut state, offset, expected_size)?;
+                return Err(RetainedComponentSourceAppendError::Cancelled);
+            }
             if state.file.write_all(&chunk[..read]).is_err() {
                 self.rollback_provisional(&mut state, offset, expected_size)?;
                 return Err(RetainedComponentSourceSpoolError::operation_failed().into());
             }
             observed = next;
             hasher.update(&chunk[..read]);
+        }
+        if cancellation.is_cancelled() {
+            self.rollback_provisional(&mut state, offset, expected_size)?;
+            return Err(RetainedComponentSourceAppendError::Cancelled);
         }
         if observed != expected_size || <[u8; 20]>::from(hasher.finalize()) != expected_sha1 {
             self.rollback_provisional(&mut state, offset, expected_size)?;
@@ -414,8 +441,14 @@ mod tests {
         spool: &Arc<RetainedComponentSourceSpool>,
         bytes: &[u8],
     ) -> RetainedComponentSourceAllocation {
+        let cancellation = crate::managed_blocking::ManagedBlockingWorkers::new().cancellation();
         spool
-            .append_authenticated(Cursor::new(bytes), bytes.len() as u64, sha1(bytes))
+            .append_authenticated(
+                Cursor::new(bytes),
+                bytes.len() as u64,
+                sha1(bytes),
+                &cancellation,
+            )
             .expect("append authenticated component source")
     }
 
@@ -454,13 +487,24 @@ mod tests {
         let first_allocation = append(&spool, first);
         let available = spool.available_bytes();
 
+        let cancellation = crate::managed_blocking::ManagedBlockingWorkers::new().cancellation();
         assert!(matches!(
-            spool.append_authenticated(Cursor::new(tail), tail.len() as u64, [0; 20]),
+            spool.append_authenticated(
+                Cursor::new(tail),
+                tail.len() as u64,
+                [0; 20],
+                &cancellation,
+            ),
             Err(RetainedComponentSourceAppendError::SourceRejected)
         ));
         assert_eq!(spool.available_bytes(), available);
         assert!(matches!(
-            spool.append_authenticated(Cursor::new(b"x"), tail.len() as u64, sha1(b"x"),),
+            spool.append_authenticated(
+                Cursor::new(b"x"),
+                tail.len() as u64,
+                sha1(b"x"),
+                &cancellation,
+            ),
             Err(RetainedComponentSourceAppendError::SourceRejected)
         ));
         assert_eq!(spool.available_bytes(), available);
@@ -469,6 +513,7 @@ mod tests {
                 Cursor::new(tail),
                 tail.len() as u64 - 1,
                 sha1(&tail[..tail.len() - 1]),
+                &cancellation,
             ),
             Err(RetainedComponentSourceAppendError::SourceRejected)
         ));
@@ -539,8 +584,14 @@ mod tests {
 
         assert!(first_reader.read(&mut [0]).is_err());
         assert!(second_allocation.into_reader().is_err());
+        let cancellation = crate::managed_blocking::ManagedBlockingWorkers::new().cancellation();
         assert!(matches!(
-            spool.append_authenticated(Cursor::new(later), later.len() as u64, sha1(later)),
+            spool.append_authenticated(
+                Cursor::new(later),
+                later.len() as u64,
+                sha1(later),
+                &cancellation,
+            ),
             Err(RetainedComponentSourceAppendError::Spool(_))
         ));
         assert_eq!(spool.available_bytes(), remaining_before_corruption);

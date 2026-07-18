@@ -15,6 +15,7 @@ use crate::known_good_libraries::{
     PendingStreamedLibraryDeclarations, SealedLibraryDeclarationError,
 };
 use crate::launch::{Library, maven_to_path};
+use crate::managed_blocking::ManagedBlockingWorkers;
 use crate::managed_component_cache::{ManagedComponentExactCache, ManagedComponentExactCacheError};
 use crate::managed_component_table::ManagedComponentKind;
 use crate::managed_fs::ManagedDir;
@@ -90,19 +91,30 @@ pub(crate) struct ExactLibraryCacheAdmission {
 }
 
 impl ExactLibraryCacheAdmission {
-    pub(crate) async fn bind(managed_root: &Path) -> Result<Self, DownloadError> {
+    pub(crate) async fn bind_with_workers(
+        managed_root: &Path,
+        workers: ManagedBlockingWorkers,
+    ) -> Result<Self, DownloadError> {
         Ok(Self {
-            cache: ManagedComponentExactCache::bind(managed_root, ManagedComponentKind::Libraries)
-                .await
-                .map_err(cache_admission_error)?,
+            cache: ManagedComponentExactCache::bind_with_workers(
+                managed_root,
+                ManagedComponentKind::Libraries,
+                workers,
+            )
+            .await
+            .map_err(cache_admission_error)?,
         })
     }
 
-    pub(crate) async fn bind_guarded(managed_root: ManagedDir) -> Result<Self, DownloadError> {
+    pub(crate) async fn bind_guarded_with_workers(
+        managed_root: ManagedDir,
+        workers: ManagedBlockingWorkers,
+    ) -> Result<Self, DownloadError> {
         Ok(Self {
-            cache: ManagedComponentExactCache::bind_guarded(
+            cache: ManagedComponentExactCache::bind_guarded_with_workers(
                 managed_root,
                 ManagedComponentKind::Libraries,
+                workers,
             )
             .await
             .map_err(cache_admission_error)?,
@@ -178,6 +190,10 @@ fn cache_admission_error(error: ManagedComponentExactCacheError) -> DownloadErro
         ManagedComponentExactCacheError::Admission => {
             DownloadError::Integrity("library cache admission failed".to_string())
         }
+        ManagedComponentExactCacheError::Cancelled => DownloadError::FileOperation(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "library cache admission was cancelled",
+        )),
         ManagedComponentExactCacheError::TaskStopped => DownloadError::FileOperation(
             io::Error::other("library cache admission task stopped unexpectedly"),
         ),
@@ -199,6 +215,7 @@ pub(super) async fn acquire_retained_classified_library(
     source_pool: &LibrarySourcePool,
     fact_tx: Option<&mpsc::UnboundedSender<ExecutionDownloadFact>>,
 ) -> Result<RetainedClassifiedLibraryAcquisition, DownloadError> {
+    source_pool.ensure_active()?;
     let (job, acquisition) = classified.into_parts();
     let requires_source = match acquisition {
         LibraryAcquisition::ExactDeclaration => {
@@ -316,6 +333,8 @@ where
     F: FnMut(DownloadProgress),
     G: FnMut(ExecutionDownloadFact),
 {
+    let workers = ManagedBlockingWorkers::new();
+    let attempt = workers.attempt_guard();
     let jobs = {
         let (libraries, environment) = declarations.profile_plan_inputs().ok_or_else(|| {
             profile_declaration_error(SealedLibraryDeclarationError::AncestorMismatch)
@@ -325,15 +344,31 @@ where
     let (declarations, jobs) = declarations
         .classify_jobs(jobs)
         .map_err(profile_declaration_error)?;
-    let cache_admission = ExactLibraryCacheAdmission::bind(mc_dir).await?;
-    let (fact_tx, mut fact_rx) = mpsc::unbounded_channel();
-    let result =
-        download_profile_retained_library_jobs(jobs, cache_admission, phase, send, Some(fact_tx))
-            .await;
-    while let Ok(fact) = fact_rx.try_recv() {
-        send_fact(fact);
+    let result = async {
+        let cache_admission =
+            ExactLibraryCacheAdmission::bind_with_workers(mc_dir, workers.clone()).await?;
+        let (fact_tx, mut fact_rx) = mpsc::unbounded_channel();
+        let result = download_profile_retained_library_jobs(
+            jobs,
+            cache_admission,
+            phase,
+            send,
+            Some(fact_tx),
+            workers.clone(),
+        )
+        .await;
+        while let Ok(fact) = fact_rx.try_recv() {
+            send_fact(fact);
+        }
+        result.map(|(proofs, sources)| (declarations, proofs, sources))
     }
-    result.map(|(proofs, sources)| (declarations, proofs, sources))
+    .await;
+    if result.is_err() {
+        workers.cancel();
+    }
+    workers.drain().await;
+    attempt.disarm();
+    result
 }
 
 fn profile_declaration_error(error: SealedLibraryDeclarationError) -> DownloadError {
@@ -360,13 +395,31 @@ where
     G: FnMut(ExecutionDownloadFact),
 {
     let (pending_execution, jobs) = install.into_parts();
-    let (fact_tx, mut fact_rx) = mpsc::unbounded_channel();
-    let result =
-        download_installer_classified_library_jobs(mc_dir, jobs, phase, send, Some(fact_tx)).await;
-    while let Ok(fact) = fact_rx.try_recv() {
-        send_fact(fact);
+    let workers = ManagedBlockingWorkers::new();
+    let attempt = workers.attempt_guard();
+    let result = async {
+        let (fact_tx, mut fact_rx) = mpsc::unbounded_channel();
+        let result = download_installer_classified_library_jobs(
+            mc_dir,
+            jobs,
+            phase,
+            send,
+            Some(fact_tx),
+            workers.clone(),
+        )
+        .await;
+        while let Ok(fact) = fact_rx.try_recv() {
+            send_fact(fact);
+        }
+        result.map(|materialized| (pending_execution, materialized))
     }
-    result.map(|materialized| (pending_execution, materialized))
+    .await;
+    if result.is_err() {
+        workers.cancel();
+    }
+    workers.drain().await;
+    attempt.disarm();
+    result
 }
 
 async fn download_profile_retained_library_jobs<F>(
@@ -375,6 +428,7 @@ async fn download_profile_retained_library_jobs<F>(
     phase: &str,
     mut send: F,
     fact_tx: Option<mpsc::UnboundedSender<ExecutionDownloadFact>>,
+    workers: ManagedBlockingWorkers,
 ) -> Result<
     (
         Vec<ExactLibraryDownloadProof>,
@@ -386,7 +440,7 @@ where
     F: FnMut(DownloadProgress),
 {
     let client = standard_minecraft_download_client();
-    let source_pool = LibrarySourcePool::new()?;
+    let source_pool = LibrarySourcePool::new_with_workers(workers)?;
     send(progress(phase, 0, jobs.len() as i32, None));
     let total_jobs = jobs.len() as i32;
     let mut completed_jobs = 0;
@@ -437,13 +491,14 @@ async fn download_installer_classified_library_jobs<F>(
     phase: &str,
     mut send: F,
     fact_tx: Option<mpsc::UnboundedSender<ExecutionDownloadFact>>,
+    workers: ManagedBlockingWorkers,
 ) -> Result<Vec<RetainedLibraryComponentSource>, DownloadError>
 where
     F: FnMut(DownloadProgress),
 {
     let client = standard_minecraft_download_client();
-    let source_pool = LibrarySourcePool::new()?;
-    let cache_admission = ExactLibraryCacheAdmission::bind(mc_dir).await?;
+    let source_pool = LibrarySourcePool::new_with_workers(workers.clone())?;
+    let cache_admission = ExactLibraryCacheAdmission::bind_with_workers(mc_dir, workers).await?;
     send(progress(phase, 0, jobs.len() as i32, None));
     let total_jobs = jobs.len() as i32;
     let mut completed_jobs = 0;
@@ -800,6 +855,7 @@ mod tests {
     use crate::download::library_source::{LIBRARY_SOURCE_MAX_BYTES, LibrarySourcePool};
     use crate::known_good_libraries::{ClassifiedLibraryDownload, LibraryAcquisition};
     use crate::launch::{Library, LibraryArtifact, LibraryDownload};
+    use crate::managed_blocking::ManagedBlockingWorkers;
     use sha1::{Digest as _, Sha1};
     use std::collections::HashMap;
     use std::fs;
@@ -931,7 +987,9 @@ mod tests {
     async fn exact_cache_admission_treats_missing_root_and_library_tree_as_misses() {
         let root = temp_root("missing");
         let job = exact_job(b"exact bytes");
-        let missing_root = ExactLibraryCacheAdmission::bind(&root)
+        let workers = ManagedBlockingWorkers::new();
+        let attempt = workers.attempt_guard();
+        let missing_root = ExactLibraryCacheAdmission::bind_with_workers(&root, workers.clone())
             .await
             .expect("bind missing root");
         assert!(
@@ -943,9 +1001,10 @@ mod tests {
         drop(missing_root);
 
         fs::create_dir_all(&root).expect("create managed root");
-        let missing_libraries = ExactLibraryCacheAdmission::bind(&root)
-            .await
-            .expect("bind missing Libraries tree");
+        let missing_libraries =
+            ExactLibraryCacheAdmission::bind_with_workers(&root, workers.clone())
+                .await
+                .expect("bind missing Libraries tree");
         assert!(
             missing_libraries
                 .requires_retained_source(&job)
@@ -953,6 +1012,8 @@ mod tests {
                 .expect("inspect missing Libraries tree")
         );
         drop(missing_libraries);
+        workers.drain().await;
+        attempt.disarm();
         fs::remove_dir_all(root).expect("remove missing-tree test root");
     }
 
@@ -965,7 +1026,9 @@ mod tests {
         fs::create_dir_all(path.parent().expect("artifact parent"))
             .expect("create artifact parent");
         fs::write(&path, bytes).expect("write exact library");
-        let admission = ExactLibraryCacheAdmission::bind(&root)
+        let workers = ManagedBlockingWorkers::new();
+        let attempt = workers.attempt_guard();
+        let admission = ExactLibraryCacheAdmission::bind_with_workers(&root, workers.clone())
             .await
             .expect("bind exact Libraries tree");
         assert!(
@@ -985,6 +1048,8 @@ mod tests {
                 .expect("classify corrupt library")
         );
         drop(admission);
+        workers.drain().await;
+        attempt.disarm();
         fs::remove_dir_all(root).expect("remove exact-corrupt test root");
     }
 
@@ -999,10 +1064,13 @@ mod tests {
         fs::write(&path, &body).expect("seed valid exact cache");
         let (url, requests, stop, task) = retained_test_server(body.clone()).await;
         job.url = url;
-        let admission = ExactLibraryCacheAdmission::bind(&root)
+        let workers = ManagedBlockingWorkers::new();
+        let attempt = workers.attempt_guard();
+        let admission = ExactLibraryCacheAdmission::bind_with_workers(&root, workers.clone())
             .await
             .expect("bind installer exact cache");
-        let pool = LibrarySourcePool::new().expect("retained source pool");
+        let pool =
+            LibrarySourcePool::new_with_workers(workers.clone()).expect("retained source pool");
         let (_, _, source) = acquire_retained_installer_library(
             &reqwest::Client::new(),
             ClassifiedLibraryDownload::from_test(job, LibraryAcquisition::ExactDeclaration),
@@ -1035,6 +1103,8 @@ mod tests {
         let _ = stop.send(());
         task.await.expect("stop retained test server");
         drop(admission);
+        workers.drain().await;
+        attempt.disarm();
         fs::remove_dir_all(root).expect("remove valid-exact-retention root");
     }
 
@@ -1052,10 +1122,13 @@ mod tests {
         fs::write(&path, &corrupt).expect("seed same-size corrupt exact cache");
         let (url, requests, stop, task) = retained_test_server(body.clone()).await;
         job.url = url;
-        let admission = ExactLibraryCacheAdmission::bind(&root)
+        let workers = ManagedBlockingWorkers::new();
+        let attempt = workers.attempt_guard();
+        let admission = ExactLibraryCacheAdmission::bind_with_workers(&root, workers.clone())
             .await
             .expect("bind installer exact cache");
-        let pool = LibrarySourcePool::new().expect("retained source pool");
+        let pool =
+            LibrarySourcePool::new_with_workers(workers.clone()).expect("retained source pool");
         let (_, _, source) = acquire_retained_installer_library(
             &reqwest::Client::new(),
             ClassifiedLibraryDownload::from_test(job.clone(), LibraryAcquisition::ExactDeclaration),
@@ -1088,6 +1161,8 @@ mod tests {
         let _ = stop.send(());
         task.await.expect("stop retained test server");
         drop(admission);
+        workers.drain().await;
+        attempt.disarm();
         fs::remove_dir_all(root).expect("remove corrupt-fallback root");
     }
 
@@ -1102,10 +1177,13 @@ mod tests {
         fs::write(&path, &body).expect("seed invalid exact cache JAR");
         let (url, requests, stop, task) = retained_test_server(body.clone()).await;
         job.url = url;
-        let admission = ExactLibraryCacheAdmission::bind(&root)
+        let workers = ManagedBlockingWorkers::new();
+        let attempt = workers.attempt_guard();
+        let admission = ExactLibraryCacheAdmission::bind_with_workers(&root, workers.clone())
             .await
             .expect("bind installer exact cache");
-        let pool = LibrarySourcePool::new().expect("retained source pool");
+        let pool =
+            LibrarySourcePool::new_with_workers(workers.clone()).expect("retained source pool");
 
         assert!(
             acquire_retained_installer_library(
@@ -1130,6 +1208,8 @@ mod tests {
         let _ = stop.send(());
         task.await.expect("stop retained test server");
         drop(admission);
+        workers.drain().await;
+        attempt.disarm();
         fs::remove_dir_all(root).expect("remove invalid-jar-fallback root");
     }
 
@@ -1138,7 +1218,9 @@ mod tests {
         let root = temp_root("invalid-topology");
         let job = exact_job(b"exact library bytes");
         fs::create_dir_all(exact_path(&root, &job)).expect("create directory at artifact path");
-        let admission = ExactLibraryCacheAdmission::bind(&root)
+        let workers = ManagedBlockingWorkers::new();
+        let attempt = workers.attempt_guard();
+        let admission = ExactLibraryCacheAdmission::bind_with_workers(&root, workers.clone())
             .await
             .expect("bind Libraries tree");
         let error = admission
@@ -1147,6 +1229,8 @@ mod tests {
             .expect_err("directory final must fail closed");
         assert!(error.to_string().contains("library cache admission failed"));
         drop(admission);
+        workers.drain().await;
+        attempt.disarm();
         fs::remove_dir_all(root).expect("remove invalid-topology test root");
     }
 }

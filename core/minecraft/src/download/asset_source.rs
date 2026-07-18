@@ -7,6 +7,7 @@ use crate::known_good::{
     MAX_TIER2_ARTIFACT_BYTES, ManagedComponentProjection, ManagedKnownGoodComponent,
 };
 use crate::loaders::types::LoaderError;
+use crate::managed_blocking::{ManagedBlockingTaskError, ManagedBlockingWorkers};
 use crate::managed_component_lifecycle::{
     ComponentPublicationSourceIdentity, RetainedComponentPublicationSource,
 };
@@ -32,6 +33,7 @@ const ASSET_SOURCE_BUDGET_UNITS: u32 =
 pub(crate) struct AssetSourcePool {
     acquisition_permits: Arc<Semaphore>,
     spool: Arc<RetainedComponentSourceSpool>,
+    workers: ManagedBlockingWorkers,
 }
 
 pub(super) struct AssetSourceScratchPermit {
@@ -66,18 +68,36 @@ pub(crate) struct AuthenticatedAssetCacheProofSet {
 }
 
 impl AssetSourcePool {
-    pub(crate) fn new() -> Result<Self, DownloadError> {
+    pub(crate) fn new_with_workers(workers: ManagedBlockingWorkers) -> Result<Self, DownloadError> {
         Ok(Self {
             acquisition_permits: Arc::new(Semaphore::new(ASSET_SOURCE_BUDGET_UNITS as usize)),
             spool: RetainedComponentSourceSpool::new(MAX_TIER2_AGGREGATE_BYTES)
                 .map_err(retained_spool_download_error)?,
+            workers,
         })
+    }
+
+    pub(super) fn ensure_active(&self) -> Result<(), DownloadError> {
+        self.workers
+            .ensure_active()
+            .map_err(managed_blocking_download_error)
+    }
+
+    #[cfg(test)]
+    fn available_bytes(&self) -> u64 {
+        self.acquisition_permits.available_permits() as u64 * ASSET_SOURCE_BUDGET_UNIT_BYTES
+    }
+
+    #[cfg(test)]
+    fn retained_available_bytes(&self) -> u64 {
+        self.spool.available_bytes()
     }
 
     pub(super) async fn reserve(
         &self,
         expected_size: u64,
     ) -> Result<AssetSourceScratchPermit, DownloadError> {
+        self.ensure_active()?;
         if expected_size > MAX_TIER2_ARTIFACT_BYTES {
             return Err(asset_source_integrity_error(
                 "exceeds the bounded scratch limit",
@@ -142,20 +162,27 @@ impl AssetSourcePool {
         let observed_size = source.observed_size();
         let observed_sha1 = source.observed_sha1();
         let spool = Arc::clone(&self.spool);
-        let allocation = tokio::task::spawn_blocking(move || {
-            let allocation =
-                spool.append_authenticated(Cursor::new(bytes), observed_size, observed_sha1);
-            drop(permit);
-            allocation
-        })
-        .await
-        .map_err(|error| {
-            DownloadError::FileOperation(io::Error::other(format!(
-                "retained asset source spool task stopped unexpectedly: {error}"
-            )))
-        })?;
+        let allocation = self
+            .workers
+            .run(move |cancellation| {
+                let allocation = spool.append_authenticated(
+                    Cursor::new(bytes),
+                    observed_size,
+                    observed_sha1,
+                    &cancellation,
+                );
+                drop(permit);
+                allocation
+            })
+            .await
+            .map_err(managed_blocking_download_error)?;
         let allocation = match allocation {
             Ok(allocation) => allocation,
+            Err(RetainedComponentSourceAppendError::Cancelled) => {
+                return Err(managed_blocking_download_error(
+                    ManagedBlockingTaskError::Cancelled,
+                ));
+            }
             Err(RetainedComponentSourceAppendError::SourceRejected) => {
                 return Err(asset_source_integrity_error(
                     "changed during retained admission",
@@ -192,26 +219,31 @@ impl AssetSourcePool {
         let observed_sha1 = Sha1::digest(&bytes).into();
         let permit = self.reserve(observed_size).await?;
         let spool = Arc::clone(&self.spool);
-        let allocation = tokio::task::spawn_blocking(move || {
-            let allocation =
-                spool.append_authenticated(Cursor::new(bytes), observed_size, observed_sha1);
-            drop(permit);
-            allocation
-        })
-        .await
-        .map_err(|error| {
-            DownloadError::FileOperation(io::Error::other(format!(
-                "retained local asset source spool task stopped unexpectedly: {error}"
-            )))
-        })?
-        .map_err(|error| match error {
-            RetainedComponentSourceAppendError::SourceRejected => {
-                asset_source_integrity_error("changed during retained local admission")
-            }
-            RetainedComponentSourceAppendError::Spool(error) => {
-                retained_spool_download_error(error)
-            }
-        })?;
+        let allocation = self
+            .workers
+            .run(move |cancellation| {
+                let allocation = spool.append_authenticated(
+                    Cursor::new(bytes),
+                    observed_size,
+                    observed_sha1,
+                    &cancellation,
+                );
+                drop(permit);
+                allocation
+            })
+            .await
+            .map_err(managed_blocking_download_error)?
+            .map_err(|error| match error {
+                RetainedComponentSourceAppendError::Cancelled => {
+                    managed_blocking_download_error(ManagedBlockingTaskError::Cancelled)
+                }
+                RetainedComponentSourceAppendError::SourceRejected => {
+                    asset_source_integrity_error("changed during retained local admission")
+                }
+                RetainedComponentSourceAppendError::Spool(error) => {
+                    retained_spool_download_error(error)
+                }
+            })?;
         Ok(RetainedAssetComponentSource {
             allocation,
             relative_path,
@@ -460,6 +492,20 @@ fn asset_source_integrity_error(message: &str) -> DownloadError {
     DownloadError::Integrity(format!("asset source {message}"))
 }
 
+fn managed_blocking_download_error(error: ManagedBlockingTaskError) -> DownloadError {
+    let (kind, message) = match error {
+        ManagedBlockingTaskError::Cancelled => (
+            io::ErrorKind::Interrupted,
+            "retained asset source work was cancelled",
+        ),
+        ManagedBlockingTaskError::TaskStopped => (
+            io::ErrorKind::Other,
+            "retained asset source task stopped unexpectedly",
+        ),
+    };
+    DownloadError::FileOperation(io::Error::new(kind, message))
+}
+
 fn retained_spool_download_error(error: RetainedComponentSourceSpoolError) -> DownloadError {
     if error.is_capacity_exceeded() {
         asset_source_integrity_error("exceeds the aggregate retained-source limit")
@@ -470,4 +516,76 @@ fn retained_spool_download_error(error: RetainedComponentSourceSpoolError) -> Do
 
 fn retained_spool_loader_error(error: RetainedComponentSourceSpoolError) -> LoaderError {
     LoaderError::Io(io::Error::other(error.to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::managed_blocking::{ManagedBlockingCheckpoint, ManagedBlockingWorkers};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Condvar, Mutex};
+    use tokio::sync::oneshot;
+
+    #[tokio::test]
+    async fn cancellation_drain_joins_blocked_asset_spool_and_restores_budgets() {
+        let (entered_tx, entered_rx) = oneshot::channel();
+        let entered_tx = Arc::new(Mutex::new(Some(entered_tx)));
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let exited = Arc::new(AtomicUsize::new(0));
+        let hook_release = Arc::clone(&release);
+        let hook_exited = Arc::clone(&exited);
+        let workers =
+            ManagedBlockingWorkers::new_with_checkpoint_hook(Arc::new(move |checkpoint| {
+                if checkpoint != ManagedBlockingCheckpoint::SourceSpool {
+                    return;
+                }
+                let Some(entered) = entered_tx.lock().expect("asset spool entered lock").take()
+                else {
+                    return;
+                };
+                let _ = entered.send(());
+                let (lock, condition) = &*hook_release;
+                let released = lock.lock().expect("asset spool gate lock");
+                drop(
+                    condition
+                        .wait_while(released, |released| !*released)
+                        .expect("asset spool gate wait"),
+                );
+                hook_exited.fetch_add(1, Ordering::Release);
+            }));
+        let pool = AssetSourcePool::new_with_workers(workers.clone()).expect("asset source pool");
+        let pool_for_task = pool.clone();
+        let task = tokio::spawn(async move {
+            pool_for_task
+                .retain_authenticated_local_bytes(
+                    ArtifactRelativePath::new("objects/aa/aa01").expect("asset path"),
+                    ManagedComponentArtifactKind::AssetObject,
+                    b"blocked asset spool".to_vec(),
+                )
+                .await
+        });
+
+        entered_rx.await.expect("asset spool worker entered");
+        assert!(pool.available_bytes() < MAX_TIER2_ARTIFACT_BYTES);
+        assert!(pool.retained_available_bytes() < MAX_TIER2_AGGREGATE_BYTES);
+        workers.cancel();
+        task.abort();
+        let _ = task.await;
+        let mut drain = Box::pin(workers.drain());
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(25), &mut drain)
+                .await
+                .is_err()
+        );
+
+        let (lock, condition) = &*release;
+        *lock.lock().expect("asset spool release lock") = true;
+        condition.notify_one();
+        tokio::time::timeout(std::time::Duration::from_secs(1), drain)
+            .await
+            .expect("asset spool worker must acknowledge cancellation");
+        assert_eq!(exited.load(Ordering::Acquire), 1);
+        assert_eq!(pool.available_bytes(), MAX_TIER2_ARTIFACT_BYTES);
+        assert_eq!(pool.retained_available_bytes(), MAX_TIER2_AGGREGATE_BYTES);
+    }
 }

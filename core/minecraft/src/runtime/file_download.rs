@@ -1,3 +1,6 @@
+use super::cancellation::RuntimeCancellationSet;
+#[cfg(test)]
+use super::cancellation::runtime_cancellation_channel;
 use super::manifest::ComponentManifestDownload;
 use super::model::{
     JavaRuntimeLookupError, RuntimeId, RuntimeSourceFailure, RuntimeSourceFailureKind,
@@ -161,6 +164,7 @@ pub(super) fn runtime_download_temp_path(destination: &Path) -> PathBuf {
     destination.with_file_name(name)
 }
 
+#[cfg(test)]
 pub(super) async fn fetch_runtime_file(
     component: &RuntimeId,
     download_client: &reqwest::Client,
@@ -168,6 +172,29 @@ pub(super) async fn fetch_runtime_file(
     temp_path: &Path,
     expected: RuntimeDownloadEvidence,
     relative_path: &str,
+) -> Result<(), JavaRuntimeLookupError> {
+    let (_cancellation_sender, cancellation) = runtime_cancellation_channel();
+    let mut cancellation = RuntimeCancellationSet::single(cancellation);
+    fetch_runtime_file_until_cancelled(
+        component,
+        download_client,
+        url,
+        temp_path,
+        expected,
+        relative_path,
+        &mut cancellation,
+    )
+    .await
+}
+
+pub(super) async fn fetch_runtime_file_until_cancelled(
+    component: &RuntimeId,
+    download_client: &reqwest::Client,
+    url: &str,
+    temp_path: &Path,
+    expected: RuntimeDownloadEvidence,
+    relative_path: &str,
+    cancellation: &mut RuntimeCancellationSet,
 ) -> Result<(), JavaRuntimeLookupError> {
     let mut attempt = 1_u64;
     loop {
@@ -178,6 +205,7 @@ pub(super) async fn fetch_runtime_file(
             temp_path,
             &expected,
             relative_path,
+            cancellation,
         )
         .await;
         match result {
@@ -186,7 +214,15 @@ pub(super) async fn fetch_runtime_file(
                 if failure.kind().is_retryable() && attempt < RUNTIME_DOWNLOAD_ATTEMPTS =>
             {
                 let _ = async_fs::remove_file(runtime_filesystem_path(temp_path).as_ref()).await;
-                tokio::time::sleep(std::time::Duration::from_millis(250 * attempt)).await;
+                if cancellation
+                    .wait(tokio::time::sleep(std::time::Duration::from_millis(
+                        250 * attempt,
+                    )))
+                    .await
+                    .is_none()
+                {
+                    return Err(runtime_download_cancelled());
+                }
                 attempt += 1;
             }
             Err(error) => {
@@ -204,15 +240,20 @@ async fn stream_runtime_file_to_temp_attempt(
     temp_path: &Path,
     expected: &RuntimeDownloadEvidence,
     relative_path: &str,
+    cancellation: &mut RuntimeCancellationSet,
 ) -> Result<(), JavaRuntimeLookupError> {
-    let response = download_client.get(url).send().await.map_err(|error| {
-        let kind = if error.is_redirect() {
-            RuntimeSourceFailureKind::PolicyRejected
-        } else {
-            RuntimeSourceFailureKind::Unavailable
-        };
-        runtime_source_failure(component, kind, error.to_string())
-    })?;
+    let response = cancellation
+        .wait(download_client.get(url).send())
+        .await
+        .ok_or_else(runtime_download_cancelled)?
+        .map_err(|error| {
+            let kind = if error.is_redirect() {
+                RuntimeSourceFailureKind::PolicyRejected
+            } else {
+                RuntimeSourceFailureKind::Unavailable
+            };
+            runtime_source_failure(component, kind, error.to_string())
+        })?;
     let status = response.status();
     if !status.is_success() {
         let kind = if status.is_server_error() || matches!(status.as_u16(), 408 | 425 | 429) {
@@ -244,11 +285,21 @@ async fn stream_runtime_file_to_temp_attempt(
     let mut output = async_fs::File::create(runtime_filesystem_path(temp_path).as_ref())
         .await
         .map_err(|error| JavaRuntimeLookupError::Install(error.to_string()))?;
+    if cancellation.is_cancelled() {
+        return Err(runtime_download_cancelled());
+    }
     let mut stream = response.bytes_stream();
     let mut hasher = Sha1::new();
     let mut actual_size = 0_u64;
 
-    while let Some(chunk) = stream.next().await {
+    loop {
+        let chunk = cancellation
+            .wait(stream.next())
+            .await
+            .ok_or_else(runtime_download_cancelled)?;
+        let Some(chunk) = chunk else {
+            break;
+        };
         let chunk = chunk.map_err(|error| {
             runtime_source_failure(
                 component,
@@ -275,6 +326,9 @@ async fn stream_runtime_file_to_temp_attempt(
             .write_all(&chunk)
             .await
             .map_err(|error| JavaRuntimeLookupError::Install(error.to_string()))?;
+        if cancellation.is_cancelled() {
+            return Err(runtime_download_cancelled());
+        }
         hasher.update(&chunk);
         actual_size = next_size;
     }
@@ -282,6 +336,9 @@ async fn stream_runtime_file_to_temp_attempt(
         .flush()
         .await
         .map_err(|error| JavaRuntimeLookupError::Install(error.to_string()))?;
+    if cancellation.is_cancelled() {
+        return Err(runtime_download_cancelled());
+    }
 
     let actual = RuntimeDownloadActual {
         size: actual_size,
@@ -294,6 +351,10 @@ async fn stream_runtime_file_to_temp_attempt(
             error.to_string(),
         )
     })
+}
+
+fn runtime_download_cancelled() -> JavaRuntimeLookupError {
+    JavaRuntimeLookupError::Install("runtime staging was cancelled".to_string())
 }
 
 fn runtime_source_failure(

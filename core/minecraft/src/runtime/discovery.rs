@@ -1,3 +1,4 @@
+use super::cancellation::RuntimeThreadCancellation;
 #[cfg(unix)]
 use super::file_download::component_manifest_link_target_path;
 use super::file_download::{
@@ -99,8 +100,31 @@ pub(super) fn managed_runtime_contents_verified_for_component(
     runtime_root: &Path,
     component: &RuntimeId,
 ) -> bool {
+    managed_runtime_contents_verified_for_component_inner(runtime_root, component, None)
+}
+
+pub(super) fn managed_runtime_contents_verified_for_component_until_cancelled(
+    runtime_root: &Path,
+    component: &RuntimeId,
+    cancellation: &RuntimeThreadCancellation,
+) -> bool {
+    managed_runtime_contents_verified_for_component_inner(
+        runtime_root,
+        component,
+        Some(cancellation),
+    )
+}
+
+fn managed_runtime_contents_verified_for_component_inner(
+    runtime_root: &Path,
+    component: &RuntimeId,
+    cancellation: Option<&RuntimeThreadCancellation>,
+) -> bool {
+    if cancellation.is_some_and(RuntimeThreadCancellation::is_cancelled) {
+        return false;
+    }
     runtime_executable_ready(&java_executable(runtime_root))
-        && persisted_runtime_manifest_verified(runtime_root, component)
+        && persisted_runtime_manifest_verified(runtime_root, component, cancellation)
 }
 
 pub fn preferred_runtime_component(java_version: &JavaVersion) -> String {
@@ -333,7 +357,14 @@ pub(super) fn detect_runtime_state(runtime_root: &Path) -> RuntimeInstallState {
     RuntimeInstallState::Missing
 }
 
-fn persisted_runtime_manifest_verified(runtime_root: &Path, component: &RuntimeId) -> bool {
+fn persisted_runtime_manifest_verified(
+    runtime_root: &Path,
+    component: &RuntimeId,
+    cancellation: Option<&RuntimeThreadCancellation>,
+) -> bool {
+    if cancellation.is_some_and(RuntimeThreadCancellation::is_cancelled) {
+        return false;
+    }
     if !is_known_runtime_component(component.as_str()) {
         return false;
     }
@@ -350,6 +381,9 @@ fn persisted_runtime_manifest_verified(runtime_root: &Path, component: &RuntimeI
     let mut link_jobs = Vec::new();
     let mut saw_file = false;
     for (relative_path, file) in manifest.files {
+        if cancellation.is_some_and(RuntimeThreadCancellation::is_cancelled) {
+            return false;
+        }
         let Ok(path) = component_manifest_destination(component, runtime_root, &relative_path)
         else {
             return false;
@@ -408,10 +442,12 @@ fn persisted_runtime_manifest_verified(runtime_root: &Path, component: &RuntimeI
         }
     }
 
-    saw_file && verify_runtime_jobs(file_jobs) && {
+    saw_file && verify_runtime_jobs(file_jobs, cancellation) && {
         #[cfg(unix)]
         {
-            link_jobs.into_iter().all(verify_runtime_link_job)
+            link_jobs
+                .into_iter()
+                .all(|job| verify_runtime_link_job(job, cancellation))
         }
         #[cfg(not(unix))]
         {
@@ -453,13 +489,18 @@ struct RuntimeVerificationJob {
     expected: RuntimeDownloadEvidence,
 }
 
-fn verify_runtime_jobs(jobs: Vec<RuntimeVerificationJob>) -> bool {
+fn verify_runtime_jobs(
+    jobs: Vec<RuntimeVerificationJob>,
+    cancellation: Option<&RuntimeThreadCancellation>,
+) -> bool {
     let worker_count = available_runtime_parallelism()
         .saturating_mul(2)
         .clamp(2, 16)
         .min(jobs.len());
     if worker_count <= 1 {
-        return jobs.into_iter().all(verify_runtime_job);
+        return jobs
+            .into_iter()
+            .all(|job| verify_runtime_job(job, cancellation));
     }
 
     let chunk_size = jobs.len().div_ceil(worker_count);
@@ -467,7 +508,12 @@ fn verify_runtime_jobs(jobs: Vec<RuntimeVerificationJob>) -> bool {
         .chunks(chunk_size)
         .map(|chunk| {
             let chunk = chunk.to_vec();
-            std::thread::spawn(move || chunk.into_iter().all(verify_runtime_job))
+            let cancellation = cancellation.cloned();
+            std::thread::spawn(move || {
+                chunk
+                    .into_iter()
+                    .all(|job| verify_runtime_job(job, cancellation.as_ref()))
+            })
         })
         .collect::<Vec<_>>();
 
@@ -476,8 +522,11 @@ fn verify_runtime_jobs(jobs: Vec<RuntimeVerificationJob>) -> bool {
         .all(|handle| handle.join().unwrap_or(false))
 }
 
-fn verify_runtime_job(job: RuntimeVerificationJob) -> bool {
-    let Ok(actual) = runtime_file_actual(&job.path) else {
+fn verify_runtime_job(
+    job: RuntimeVerificationJob,
+    cancellation: Option<&RuntimeThreadCancellation>,
+) -> bool {
+    let Ok(actual) = runtime_file_actual(&job.path, cancellation) else {
         return false;
     };
     verify_runtime_download(&job.relative_path, &job.expected, &actual).is_ok()
@@ -491,7 +540,13 @@ struct RuntimeLinkVerificationJob {
 }
 
 #[cfg(unix)]
-fn verify_runtime_link_job(job: RuntimeLinkVerificationJob) -> bool {
+fn verify_runtime_link_job(
+    job: RuntimeLinkVerificationJob,
+    cancellation: Option<&RuntimeThreadCancellation>,
+) -> bool {
+    if cancellation.is_some_and(RuntimeThreadCancellation::is_cancelled) {
+        return false;
+    }
     let Ok(metadata) = std::fs::symlink_metadata(runtime_filesystem_path(&job.path).as_ref())
     else {
         return false;
@@ -510,12 +565,21 @@ fn runtime_sha1_hex(value: &str) -> bool {
     value.len() == 40 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
-fn runtime_file_actual(path: &Path) -> std::io::Result<RuntimeDownloadActual> {
+fn runtime_file_actual(
+    path: &Path,
+    cancellation: Option<&RuntimeThreadCancellation>,
+) -> std::io::Result<RuntimeDownloadActual> {
     let mut file = std::fs::File::open(runtime_filesystem_path(path).as_ref())?;
     let mut hasher = Sha1::new();
     let mut size = 0_u64;
     let mut buffer = [0_u8; 64 * 1024];
     loop {
+        if cancellation.is_some_and(RuntimeThreadCancellation::is_cancelled) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "runtime verification was cancelled",
+            ));
+        }
         let read = file.read(&mut buffer)?;
         if read == 0 {
             break;

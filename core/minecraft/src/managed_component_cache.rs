@@ -1,5 +1,8 @@
 use crate::artifact_path::ArtifactRelativePath;
 use crate::loaders::types::LoaderError;
+use crate::managed_blocking::{
+    ManagedBlockingCheckpoint, ManagedBlockingTaskError, ManagedBlockingWorkers,
+};
 use crate::managed_component_publication::component_lane_name;
 use crate::managed_component_table::ManagedComponentKind;
 use crate::managed_fs::{ManagedBoundedFileReader, ManagedDir, ManagedFileGuard};
@@ -9,12 +12,15 @@ use std::path::Path;
 #[derive(Clone)]
 pub(crate) struct ManagedComponentExactCache {
     component_root: Option<ManagedDir>,
+    workers: ManagedBlockingWorkers,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
 pub(crate) enum ManagedComponentExactCacheError {
     #[error("managed component exact-cache admission failed")]
     Admission,
+    #[error("managed component exact-cache work was cancelled")]
+    Cancelled,
     #[error("managed component exact-cache task stopped")]
     TaskStopped,
 }
@@ -26,39 +32,64 @@ struct GuardedExactFile {
 }
 
 impl ManagedComponentExactCache {
-    pub(crate) async fn bind(
+    pub(crate) async fn bind_with_workers(
         managed_root: &Path,
         component: ManagedComponentKind,
+        workers: ManagedBlockingWorkers,
     ) -> Result<Self, ManagedComponentExactCacheError> {
         let managed_root = managed_root.to_path_buf();
-        tokio::task::spawn_blocking(move || {
-            let root = match ManagedDir::open_root(&managed_root) {
-                Ok(root) => root,
-                Err(LoaderError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
-                    return Ok(Self {
-                        component_root: None,
-                    });
-                }
-                Err(_) => return Err(ManagedComponentExactCacheError::Admission),
-            };
-            Self::bind_guarded_blocking(root, component)
-        })
-        .await
-        .map_err(|_| ManagedComponentExactCacheError::TaskStopped)?
+        let workers_for_cache = workers.clone();
+        workers
+            .run(move |cancellation| {
+                cancellation
+                    .check_io()
+                    .map_err(|_| ManagedComponentExactCacheError::Cancelled)?;
+                let root = match ManagedDir::open_root(&managed_root) {
+                    Ok(root) => root,
+                    Err(LoaderError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
+                        return Ok(Self {
+                            component_root: None,
+                            workers: workers_for_cache,
+                        });
+                    }
+                    Err(_) => return Err(ManagedComponentExactCacheError::Admission),
+                };
+                let cache = Self::bind_guarded_blocking(root, component, workers_for_cache)?;
+                cancellation
+                    .check_io()
+                    .map_err(|_| ManagedComponentExactCacheError::Cancelled)?;
+                Ok(cache)
+            })
+            .await
+            .map_err(cache_worker_error)?
     }
 
-    pub(crate) async fn bind_guarded(
+    pub(crate) async fn bind_guarded_with_workers(
         managed_root: ManagedDir,
         component: ManagedComponentKind,
+        workers: ManagedBlockingWorkers,
     ) -> Result<Self, ManagedComponentExactCacheError> {
-        tokio::task::spawn_blocking(move || Self::bind_guarded_blocking(managed_root, component))
+        let workers_for_cache = workers.clone();
+        workers
+            .run(move |cancellation| {
+                cancellation
+                    .check_io()
+                    .map_err(|_| ManagedComponentExactCacheError::Cancelled)?;
+                let cache =
+                    Self::bind_guarded_blocking(managed_root, component, workers_for_cache)?;
+                cancellation
+                    .check_io()
+                    .map_err(|_| ManagedComponentExactCacheError::Cancelled)?;
+                Ok(cache)
+            })
             .await
-            .map_err(|_| ManagedComponentExactCacheError::TaskStopped)?
+            .map_err(cache_worker_error)?
     }
 
     fn bind_guarded_blocking(
         root: ManagedDir,
         component: ManagedComponentKind,
+        workers: ManagedBlockingWorkers,
     ) -> Result<Self, ManagedComponentExactCacheError> {
         root.revalidate()
             .map_err(|_| ManagedComponentExactCacheError::Admission)?;
@@ -69,6 +100,7 @@ impl ManagedComponentExactCache {
         {
             return Ok(Self {
                 component_root: None,
+                workers,
             });
         }
         let component_root = root
@@ -76,6 +108,7 @@ impl ManagedComponentExactCache {
             .map_err(|_| ManagedComponentExactCacheError::Admission)?;
         Ok(Self {
             component_root: Some(component_root),
+            workers,
         })
     }
 
@@ -88,19 +121,36 @@ impl ManagedComponentExactCache {
             return Ok(None);
         };
         let relative_path = relative_path.clone();
-        tokio::task::spawn_blocking(move || {
-            let Some(source) = inspect_exact_file(component_root, &relative_path, expected_size)?
-            else {
-                return Ok(None);
-            };
-            source
-                .directory
-                .sha1_guarded_file_bytes(&source.name, &source.guard, expected_size)
-                .map(Some)
-                .map_err(|_| ManagedComponentExactCacheError::Admission)
-        })
-        .await
-        .map_err(|_| ManagedComponentExactCacheError::TaskStopped)?
+        self.workers
+            .run(move |cancellation| {
+                let Some(source) =
+                    inspect_exact_file(component_root, &relative_path, expected_size)?
+                else {
+                    return Ok(None);
+                };
+                cancellation
+                    .check_io()
+                    .map_err(|_| ManagedComponentExactCacheError::Cancelled)?;
+                cancellation.checkpoint(ManagedBlockingCheckpoint::CacheHash);
+                source
+                    .directory
+                    .sha1_guarded_file_bytes_with_check(
+                        &source.name,
+                        &source.guard,
+                        expected_size,
+                        || cancellation.check_io().map_err(LoaderError::Io),
+                    )
+                    .map(Some)
+                    .map_err(|_| {
+                        if cancellation.is_cancelled() {
+                            ManagedComponentExactCacheError::Cancelled
+                        } else {
+                            ManagedComponentExactCacheError::Admission
+                        }
+                    })
+            })
+            .await
+            .map_err(cache_worker_error)?
     }
 
     pub(crate) async fn bounded_reader(
@@ -112,15 +162,27 @@ impl ManagedComponentExactCache {
             return Ok(None);
         };
         let relative_path = relative_path.clone();
-        tokio::task::spawn_blocking(move || {
-            let Some(source) = inspect_exact_file(component_root, &relative_path, expected_size)?
-            else {
-                return Ok(None);
-            };
-            Ok(source.guard.into_bounded_reader(expected_size).ok())
-        })
-        .await
-        .map_err(|_| ManagedComponentExactCacheError::TaskStopped)?
+        self.workers
+            .run(move |cancellation| {
+                cancellation
+                    .check_io()
+                    .map_err(|_| ManagedComponentExactCacheError::Cancelled)?;
+                let Some(source) =
+                    inspect_exact_file(component_root, &relative_path, expected_size)?
+                else {
+                    return Ok(None);
+                };
+                Ok(source.guard.into_bounded_reader(expected_size).ok())
+            })
+            .await
+            .map_err(cache_worker_error)?
+    }
+}
+
+fn cache_worker_error(error: ManagedBlockingTaskError) -> ManagedComponentExactCacheError {
+    match error {
+        ManagedBlockingTaskError::Cancelled => ManagedComponentExactCacheError::Cancelled,
+        ManagedBlockingTaskError::TaskStopped => ManagedComponentExactCacheError::TaskStopped,
     }
 }
 
@@ -173,21 +235,28 @@ mod tests {
         Sha1::digest(bytes).into()
     }
 
+    async fn bind_cache(
+        managed_root: &Path,
+        component: ManagedComponentKind,
+        workers: &ManagedBlockingWorkers,
+    ) -> ManagedComponentExactCache {
+        ManagedComponentExactCache::bind_with_workers(managed_root, component, workers.clone())
+            .await
+            .expect("bind managed component cache")
+    }
+
     #[tokio::test]
     async fn missing_root_component_and_path_are_cache_misses() {
         let temporary = tempfile::tempdir().expect("cache test root");
         let missing_root = temporary.path().join("missing");
         let path = relative("objects/aa/aa01");
+        let workers = ManagedBlockingWorkers::new();
+        let attempt = workers.attempt_guard();
 
-        let cache = ManagedComponentExactCache::bind(&missing_root, ManagedComponentKind::Assets)
-            .await
-            .expect("bind missing root");
+        let cache = bind_cache(&missing_root, ManagedComponentKind::Assets, &workers).await;
         assert_eq!(cache.full_sha1(&path, 1).await.expect("missing root"), None);
 
-        let cache =
-            ManagedComponentExactCache::bind(temporary.path(), ManagedComponentKind::Assets)
-                .await
-                .expect("bind missing component");
+        let cache = bind_cache(temporary.path(), ManagedComponentKind::Assets, &workers).await;
         assert_eq!(
             cache.full_sha1(&path, 1).await.expect("missing component"),
             None
@@ -195,11 +264,10 @@ mod tests {
 
         std::fs::create_dir_all(temporary.path().join("assets/objects/aa"))
             .expect("create component directories");
-        let cache =
-            ManagedComponentExactCache::bind(temporary.path(), ManagedComponentKind::Assets)
-                .await
-                .expect("bind component");
+        let cache = bind_cache(temporary.path(), ManagedComponentKind::Assets, &workers).await;
         assert_eq!(cache.full_sha1(&path, 1).await.expect("missing path"), None);
+        workers.drain().await;
+        attempt.disarm();
     }
 
     #[tokio::test]
@@ -210,10 +278,9 @@ mod tests {
         let path = relative("objects/aa/aa01");
         let exact = b"exact-cache";
         std::fs::write(directory.join("aa01"), exact).expect("write exact object");
-        let cache =
-            ManagedComponentExactCache::bind(temporary.path(), ManagedComponentKind::Assets)
-                .await
-                .expect("bind component");
+        let workers = ManagedBlockingWorkers::new();
+        let attempt = workers.attempt_guard();
+        let cache = bind_cache(temporary.path(), ManagedComponentKind::Assets, &workers).await;
 
         assert_eq!(
             cache.full_sha1(&path, exact.len() as u64).await,
@@ -243,17 +310,23 @@ mod tests {
         let mut bytes = Vec::new();
         reader.read_to_end(&mut bytes).expect("read zero object");
         assert!(bytes.is_empty());
+        workers.drain().await;
+        attempt.disarm();
     }
 
     #[tokio::test]
     async fn invalid_final_intermediate_and_alias_topology_fail_closed() {
+        let workers = ManagedBlockingWorkers::new();
+        let attempt = workers.attempt_guard();
         let final_directory = tempfile::tempdir().expect("final topology root");
         std::fs::create_dir_all(final_directory.path().join("assets/objects/aa/aa01"))
             .expect("create directory at final path");
-        let cache =
-            ManagedComponentExactCache::bind(final_directory.path(), ManagedComponentKind::Assets)
-                .await
-                .expect("bind final topology");
+        let cache = bind_cache(
+            final_directory.path(),
+            ManagedComponentKind::Assets,
+            &workers,
+        )
+        .await;
         assert_eq!(
             cache.full_sha1(&relative("objects/aa/aa01"), 1).await,
             Err(ManagedComponentExactCacheError::Admission)
@@ -267,12 +340,12 @@ mod tests {
             b"not a directory",
         )
         .expect("write intermediate file");
-        let cache = ManagedComponentExactCache::bind(
+        let cache = bind_cache(
             intermediate_file.path(),
             ManagedComponentKind::Assets,
+            &workers,
         )
-        .await
-        .expect("bind intermediate topology");
+        .await;
         assert_eq!(
             cache.full_sha1(&relative("objects/aa/aa01"), 1).await,
             Err(ManagedComponentExactCacheError::Admission)
@@ -281,12 +354,12 @@ mod tests {
         let alias = tempfile::tempdir().expect("alias topology root");
         std::fs::create_dir_all(alias.path().join("assets/Objects"))
             .expect("create portable alias");
-        let cache = ManagedComponentExactCache::bind(alias.path(), ManagedComponentKind::Assets)
-            .await
-            .expect("bind alias topology");
+        let cache = bind_cache(alias.path(), ManagedComponentKind::Assets, &workers).await;
         assert_eq!(
             cache.full_sha1(&relative("objects/aa/aa01"), 1).await,
             Err(ManagedComponentExactCacheError::Admission)
         );
+        workers.drain().await;
+        attempt.disarm();
     }
 }

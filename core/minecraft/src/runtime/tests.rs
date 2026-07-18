@@ -6,10 +6,11 @@ use super::{
     RuntimeDownloadEvidence, RuntimeDownloadIntegrityError, RuntimeDownloadManifest,
     RuntimeEnsureEvent, RuntimeId, RuntimeInstallState, RuntimeManifest, RuntimeRecord,
     RuntimeSource, RuntimeSourceFailure, RuntimeSourceFailureKind, RuntimeSourceReceipt,
-    acquire_runtime_source_for_test, authenticated_runtime_source_from_manifest_for_test,
+    acquire_runtime_source_for_test, active_runtime_file_lock_workers_for_test,
+    authenticated_runtime_source_from_manifest_for_test, block_runtime_decompression_for_test,
     component_manifest_destination, detect_distribution, detect_runtime_state,
-    ensure_runtime_with_events, fetch_runtime_file, fetch_runtime_manifest_bytes_for_test,
-    finalize_managed_runtime_commit_with_failure_for_test,
+    discard_staged_managed_runtime, ensure_runtime_with_events, fetch_runtime_file,
+    fetch_runtime_manifest_bytes_for_test, finalize_managed_runtime_commit_with_failure_for_test,
     finalize_managed_runtime_commit_with_removed_quarantine_failure_for_test,
     install_runtime_manifest_file, install_runtime_manifest_files, java_executable,
     java_executable_for_os, managed_runtime_contents_verified_without_probe,
@@ -20,12 +21,12 @@ use super::{
     publish_staged_managed_runtime_with_promotion_failure_for_test,
     publish_staged_managed_runtime_with_restoration_failure_for_test,
     publish_staged_managed_runtime_with_rotation_failure_for_test,
-    rosetta_requirement_for_managed_runtime, runtime_download_client,
+    rosetta_requirement_for_managed_runtime, runtime_cancellation_channel, runtime_download_client,
     runtime_file_download_concurrency_for, runtime_install_lock_file_path, runtime_os_arch_for,
     runtime_record_matches_source_for_test, runtime_source_url_is_secure_for_test,
     runtime_windows_verbatim_path_string, select_runtime_manifest, stage_managed_runtime,
-    validate_ephemeral_processor_manifest_for_test, validate_runtime_file_source_urls_for_test,
-    verify_runtime_download,
+    stage_managed_runtime_until_cancelled, validate_ephemeral_processor_manifest_for_test,
+    validate_runtime_file_source_urls_for_test, verify_runtime_download,
 };
 #[cfg(feature = "test-support")]
 use super::{
@@ -45,6 +46,7 @@ use std::sync::{
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
+use tokio::sync::oneshot;
 
 #[cfg(feature = "test-support")]
 struct RuntimeMutationPermitProbe {
@@ -755,6 +757,292 @@ async fn ready_managed_runtime_matches_the_full_authenticated_source() {
     fs::write(java_executable(&root), b"tampered java").expect("tamper runtime file");
     make_executable(&java_executable(&root));
     assert!(!runtime_record_matches_source_for_test(&runtime, &source).await);
+}
+
+#[tokio::test]
+async fn cancelling_blocked_runtime_staging_removes_owned_sidecar() {
+    let cache = ManagedRuntimeCache::isolated_for_test().expect("runtime cache");
+    let component = RuntimeId::from("jre-legacy");
+    let root = cache
+        .component_root(component.as_str())
+        .expect("managed runtime component root");
+    let staging_root = root.with_file_name("jre-legacy.staging");
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("blocked runtime listener");
+    let address = listener.local_addr().expect("blocked runtime address");
+    let (request_started_tx, request_started_rx) = oneshot::channel();
+    let (connection_closed_tx, connection_closed_rx) = oneshot::channel();
+    tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.expect("runtime connection");
+        let mut request = [0_u8; 1024];
+        let _ = socket.read(&mut request).await;
+        let _ = request_started_tx.send(());
+        let mut remaining = Vec::new();
+        let _ = socket.read_to_end(&mut remaining).await;
+        let _ = connection_closed_tx.send(());
+    });
+    let java_bytes = b"blocked runtime";
+    let java_relative_path = java_executable(&root)
+        .strip_prefix(&root)
+        .expect("java path under runtime root")
+        .to_string_lossy()
+        .replace('\\', "/");
+    let mut java_file = downloadable_manifest_file(
+        &format!("http://{address}/runtime.bin"),
+        java_bytes.len() as u64,
+        &sha1_hex(java_bytes),
+    );
+    java_file.executable = true;
+    let source = authenticated_runtime_source_from_manifest_for_test(
+        component.clone(),
+        ComponentManifest {
+            files: HashMap::from([(java_relative_path, java_file)]),
+        },
+    )
+    .expect("authenticated blocked runtime source");
+    let (cancellation_tx, mut cancellation) = runtime_cancellation_channel();
+    let stage_cache = cache.clone();
+    let stage_component = component.clone();
+    let stage_task = tokio::spawn(async move {
+        stage_managed_runtime_until_cancelled(
+            &stage_cache,
+            &stage_component,
+            source,
+            &mut |_| {},
+            &mut cancellation,
+        )
+        .await
+    });
+
+    tokio::time::timeout(std::time::Duration::from_secs(1), request_started_rx)
+        .await
+        .expect("runtime download should begin")
+        .expect("runtime request signal");
+    assert!(staging_root.is_dir());
+    cancellation_tx.cancel();
+    let result = tokio::time::timeout(std::time::Duration::from_secs(1), stage_task)
+        .await
+        .expect("cancelled runtime stage should drain")
+        .expect("runtime stage task")
+        .expect("runtime stage cancellation should clean up");
+
+    assert!(result.is_none());
+    assert!(!staging_root.exists());
+    assert!(!root.exists());
+    tokio::time::timeout(std::time::Duration::from_secs(1), connection_closed_rx)
+        .await
+        .expect("cancelled runtime request should close")
+        .expect("runtime connection close signal");
+}
+
+#[tokio::test]
+async fn cancelling_external_file_lock_wait_leaves_no_worker_or_ghost_waiter() {
+    let cache = ManagedRuntimeCache::isolated_for_test().expect("runtime cache");
+    let component = RuntimeId::from("jre-legacy");
+    let root = cache
+        .component_root(component.as_str())
+        .expect("managed runtime component root");
+    let lock_path = runtime_install_lock_file_path(&root);
+    fs::create_dir_all(lock_path.parent().expect("runtime lock parent"))
+        .expect("runtime lock parent");
+    let external_lock = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .expect("external runtime lock");
+    external_lock.lock().expect("hold runtime install lock");
+    let java_bytes = b"locked runtime";
+    let java_relative_path = java_executable(&root)
+        .strip_prefix(&root)
+        .expect("java path under runtime root")
+        .to_string_lossy()
+        .replace('\\', "/");
+    let mut java_file = downloadable_manifest_file(
+        "https://example.invalid/runtime.bin",
+        java_bytes.len() as u64,
+        &sha1_hex(java_bytes),
+    );
+    java_file.executable = true;
+    let source = authenticated_runtime_source_from_manifest_for_test(
+        component.clone(),
+        ComponentManifest {
+            files: HashMap::from([(java_relative_path, java_file)]),
+        },
+    )
+    .expect("authenticated locked runtime source");
+    let (cancellation_tx, mut cancellation) = runtime_cancellation_channel();
+    let stage_cache = cache.clone();
+    let stage_component = component.clone();
+    let stage_task = tokio::spawn(async move {
+        stage_managed_runtime_until_cancelled(
+            &stage_cache,
+            &stage_component,
+            source,
+            &mut |_| {},
+            &mut cancellation,
+        )
+        .await
+    });
+
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        while active_runtime_file_lock_workers_for_test(&lock_path) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("runtime file-lock worker should begin polling");
+    cancellation_tx.cancel();
+    let result = tokio::time::timeout(std::time::Duration::from_secs(1), stage_task)
+        .await
+        .expect("cancelled file-lock wait should drain")
+        .expect("runtime stage task")
+        .expect("runtime file-lock cancellation");
+
+    assert!(result.is_none());
+    assert_eq!(active_runtime_file_lock_workers_for_test(&lock_path), 0);
+    assert!(!root.with_file_name("jre-legacy.staging").exists());
+    external_lock
+        .unlock()
+        .expect("release external runtime lock");
+    let contender = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+        .expect("runtime lock contender");
+    contender
+        .try_lock()
+        .expect("cancelled waiter must not acquire the lock later");
+    contender.unlock().expect("release runtime lock contender");
+}
+
+#[tokio::test]
+async fn cancelling_blocked_decompression_drains_worker_before_stage_cleanup() {
+    let cache = ManagedRuntimeCache::isolated_for_test().expect("runtime cache");
+    let component = RuntimeId::from("jre-legacy");
+    let root = cache
+        .component_root(component.as_str())
+        .expect("managed runtime component root");
+    let staging_root = root.with_file_name("jre-legacy.staging");
+    fs::create_dir(&root).expect("canonical runtime root");
+    fs::write(root.join("sentinel"), b"canonical").expect("canonical sentinel");
+    let raw_bytes = b"replacement java".to_vec();
+    let compressed_bytes = lzma_compress_bytes(&raw_bytes);
+    let compressed_url = serve_runtime_download(compressed_bytes.clone()).await;
+    let java_relative_path = java_executable(&root)
+        .strip_prefix(&root)
+        .expect("java path under runtime root")
+        .to_string_lossy()
+        .replace('\\', "/");
+    let mut java_file = downloadable_lzma_manifest_file(
+        &compressed_url,
+        raw_bytes.len() as u64,
+        &sha1_hex(&raw_bytes),
+        &compressed_url,
+        compressed_bytes.len() as u64,
+        &sha1_hex(&compressed_bytes),
+    );
+    java_file.executable = true;
+    let source = authenticated_runtime_source_from_manifest_for_test(
+        component.clone(),
+        ComponentManifest {
+            files: HashMap::from([(java_relative_path, java_file)]),
+        },
+    )
+    .expect("authenticated compressed runtime source");
+    let contender_source =
+        runtime_source_receipt_fixture(&component, &root, b"contender java").await;
+    let mut decompression_temp = java_executable(&staging_root);
+    let mut decompression_name = decompression_temp
+        .file_name()
+        .expect("staged java file name")
+        .to_os_string();
+    decompression_name.push(".axial-tmp");
+    decompression_temp.set_file_name(decompression_name);
+    let gate = block_runtime_decompression_for_test(decompression_temp);
+    let (cancellation_tx, mut cancellation) = runtime_cancellation_channel();
+    let stage_cache = cache.clone();
+    let stage_component = component.clone();
+    let mut stage_task = tokio::spawn(async move {
+        stage_managed_runtime_until_cancelled(
+            &stage_cache,
+            &stage_component,
+            source,
+            &mut |_| {},
+            &mut cancellation,
+        )
+        .await
+    });
+
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        loop {
+            match gate.started.try_recv() {
+                Ok(()) => break,
+                Err(std::sync::mpsc::TryRecvError::Empty) => tokio::task::yield_now().await,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    panic!("decompression test worker stopped before blocking")
+                }
+            }
+        }
+    })
+    .await
+    .expect("runtime decompression worker should block");
+    cancellation_tx.cancel();
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(25), &mut stage_task)
+            .await
+            .is_err(),
+        "stage must retain its worker, sidecar, and locks while decompression is blocked"
+    );
+    assert!(staging_root.exists());
+    assert_eq!(
+        fs::read(root.join("sentinel")).expect("canonical sentinel while cancelled"),
+        b"canonical"
+    );
+
+    let contender_cache = cache.clone();
+    let contender_component = component.clone();
+    let mut contender_task = tokio::spawn(async move {
+        stage_managed_runtime(
+            &contender_cache,
+            &contender_component,
+            contender_source,
+            &mut |_| {},
+        )
+        .await
+    });
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(25), &mut contender_task)
+            .await
+            .is_err(),
+        "contender must wait until the cancelled decompression worker releases ownership"
+    );
+    gate.release
+        .send(())
+        .expect("release runtime decompression worker");
+    let result = tokio::time::timeout(std::time::Duration::from_secs(1), stage_task)
+        .await
+        .expect("cancelled decompression should drain")
+        .expect("runtime stage task")
+        .expect("runtime decompression cancellation");
+    assert!(result.is_none());
+    assert!(!staging_root.exists());
+    assert_eq!(
+        fs::read(root.join("sentinel")).expect("canonical sentinel after cancellation"),
+        b"canonical"
+    );
+
+    let contender = tokio::time::timeout(std::time::Duration::from_secs(2), contender_task)
+        .await
+        .expect("runtime stage contender should acquire released ownership")
+        .expect("runtime stage contender task")
+        .expect("runtime stage contender");
+    discard_staged_managed_runtime(contender)
+        .await
+        .expect("discard runtime stage contender");
+    assert!(!staging_root.exists());
 }
 
 #[tokio::test]

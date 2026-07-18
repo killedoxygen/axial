@@ -2,10 +2,13 @@ use super::asset_source::{
     AssetSourcePool, AuthenticatedAssetCacheProofSet, RetainedAssetComponentSource,
     RetainedAssetSourceSet,
 };
+#[cfg(test)]
+use super::assets::AssetDownloadPipeline;
 use super::assets::{
-    ASSET_OBJECT_BASE_URL, AssetSourceAcquisitionRequest, RetainedAssetsAcquisition,
-    abort_asset_download_pipeline, acquire_asset_sources_with_cache, await_asset_download_pipeline,
-    recv_asset_progress, spawn_asset_download_pipeline,
+    ASSET_OBJECT_BASE_URL, AssetDownloadPipelineEvent, AssetSourceAcquisitionRequest,
+    RetainedAssetsAcquisition, abort_asset_download_pipeline, acquire_asset_sources_with_cache,
+    asset_cache_error, next_asset_download_pipeline_event, prepare_asset_download_pipeline,
+    spawn_asset_download_pipeline,
 };
 use super::client::{library_download_concurrency, standard_minecraft_download_client};
 use super::facts::selected_download_source_label;
@@ -27,7 +30,8 @@ use super::plan::{TransferPlan, TransferPlanContribution};
 #[cfg(test)]
 use super::runtime::spawn_test_runtime_source_pipeline;
 use super::runtime::{
-    finish_runtime_pipeline_after_artifacts, recv_runtime_progress, spawn_runtime_ensure_pipeline,
+    RuntimeEnsurePipelineEvent, next_runtime_pipeline_event, settle_runtime_pipeline_after_failure,
+    spawn_runtime_ensure_pipeline,
 };
 use super::transfer::{
     AuthenticatedSelectedArtifactSource, AuthenticatedSelectedArtifactVersionBundleParts,
@@ -47,6 +51,7 @@ use crate::known_good_libraries::{
     seal_vanilla_exact_library_declarations,
 };
 use crate::launch::{VersionJson, effective_java_version_for};
+use crate::managed_blocking::{ManagedBlockingAttemptGuard, ManagedBlockingWorkers};
 use crate::managed_component_cache::ManagedComponentExactCache;
 #[cfg(test)]
 use crate::managed_component_effects::ComponentExecutionFault;
@@ -76,7 +81,7 @@ use crate::version_bundle_publication::{
     VersionBundleTransactionEffect, VersionBundleTransactionSettledOutcome, publish_version_bundle,
     settle_version_bundle_publication,
 };
-use futures_util::StreamExt;
+use futures_util::{FutureExt, StreamExt};
 use sha1::{Digest as _, Sha1};
 use std::io;
 use std::path::Path;
@@ -92,6 +97,10 @@ pub struct Downloader {
     install_manifest: Option<VersionManifest>,
     #[cfg(test)]
     runtime_source: Option<TestRuntimeSourceDescriptor>,
+    #[cfg(test)]
+    acquisition_workers: Option<ManagedBlockingWorkers>,
+    #[cfg(test)]
+    wait_for_concurrent_terminals: bool,
 }
 
 enum DownloaderRoot {
@@ -100,6 +109,116 @@ enum DownloaderRoot {
         runtime_cache: ManagedRuntimeCache,
     },
     SourceOnly,
+}
+
+struct SelectedSourceTaskSpec {
+    kind: SelectedDownloadArtifactKind,
+    url: String,
+    logical_identity: String,
+    expected: ExpectedIntegrity,
+    max_bytes: usize,
+    target: String,
+    fact_tx: Option<mpsc::UnboundedSender<ExecutionDownloadFact>>,
+    label: &'static str,
+}
+
+struct SelectedSourcePipeline {
+    task:
+        Option<tokio::task::JoinHandle<Result<AuthenticatedSelectedArtifactSource, DownloadError>>>,
+    label: &'static str,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ReadyConcurrentLane {
+    AssetTerminal,
+    RuntimeTerminal,
+    BufferedLibrarySuccess,
+}
+
+fn ready_concurrent_lane(
+    asset_terminal: bool,
+    runtime_terminal: bool,
+    buffered_library_success: bool,
+) -> Option<ReadyConcurrentLane> {
+    if asset_terminal {
+        Some(ReadyConcurrentLane::AssetTerminal)
+    } else if runtime_terminal {
+        Some(ReadyConcurrentLane::RuntimeTerminal)
+    } else if buffered_library_success {
+        Some(ReadyConcurrentLane::BufferedLibrarySuccess)
+    } else {
+        None
+    }
+}
+
+impl SelectedSourceTaskSpec {
+    fn spawn(self, client: reqwest::Client) -> SelectedSourcePipeline {
+        let Self {
+            kind,
+            url,
+            logical_identity,
+            expected,
+            max_bytes,
+            target,
+            fact_tx,
+            label,
+        } = self;
+        let task = tokio::spawn(async move {
+            acquire_authenticated_selected_artifact_source(SelectedArtifactSourceRequest {
+                client: &client,
+                kind,
+                url: &url,
+                logical_identity: &logical_identity,
+                expected: &expected,
+                max_bytes,
+                target: &target,
+                fact_tx: fact_tx.as_ref(),
+            })
+            .await
+        });
+        SelectedSourcePipeline {
+            task: Some(task),
+            label,
+        }
+    }
+}
+
+impl SelectedSourcePipeline {
+    fn is_finished(&self) -> bool {
+        self.task
+            .as_ref()
+            .is_some_and(tokio::task::JoinHandle::is_finished)
+    }
+
+    async fn complete(&mut self) -> Result<AuthenticatedSelectedArtifactSource, DownloadError> {
+        let result = self
+            .task
+            .as_mut()
+            .expect("live selected-source pipeline owns its task")
+            .await;
+        self.task.take();
+        result.map_err(|error| selected_source_task_error(error, self.label))?
+    }
+
+    fn abort(&self) {
+        if let Some(task) = &self.task {
+            task.abort();
+        }
+    }
+
+    async fn drain(&mut self) {
+        if let Some(task) = self.task.take() {
+            let _ = task.await;
+        }
+    }
+}
+
+impl Drop for SelectedSourcePipeline {
+    fn drop(&mut self) {
+        if let Some(task) = &self.task {
+            task.abort();
+        }
+    }
 }
 
 pub(crate) struct AuthenticatedVersionBundleSource {
@@ -529,6 +648,19 @@ pub(crate) struct ReconstructedVanillaClientAuthority {
 #[derive(Clone)]
 pub(crate) struct ManagedReconstructionContext {
     mode: ManagedReconstructionMode,
+    workers: ManagedBlockingWorkers,
+    blocking_operation: Arc<tokio::sync::Mutex<()>>,
+}
+
+struct ManagedReconstructionAttempt {
+    operation: Option<tokio::sync::OwnedMutexGuard<()>>,
+    workers: ManagedBlockingWorkers,
+    runtime: tokio::runtime::Handle,
+}
+
+struct ManagedReconstructionDrainMonitor {
+    operation: tokio::sync::OwnedMutexGuard<()>,
+    workers: ManagedBlockingWorkers,
 }
 
 #[derive(Clone)]
@@ -560,73 +692,107 @@ struct ManagedAssetsReconstructionContext {
 
 impl ManagedReconstructionContext {
     pub(crate) fn proof_only() -> Self {
+        let workers = ManagedBlockingWorkers::new();
         Self {
             mode: ManagedReconstructionMode::ProofOnly,
+            workers,
+            blocking_operation: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
     pub(crate) async fn bind_libraries(managed_root: ManagedDir) -> Result<Self, DownloadError> {
-        Ok(Self {
-            mode: ManagedReconstructionMode::Libraries(ManagedLibrariesReconstructionContext {
-                source_pool: LibrarySourcePool::new()?,
-                cache_admission: ExactLibraryCacheAdmission::bind_guarded(managed_root).await?,
-                cache_proofs: Arc::new(std::sync::Mutex::new(
-                    AuthenticatedLibraryCacheProofSet::default(),
-                )),
-            }),
-        })
+        let workers = ManagedBlockingWorkers::new();
+        let attempt = workers.attempt_guard();
+        let result = async {
+            Ok(Self {
+                mode: ManagedReconstructionMode::Libraries(ManagedLibrariesReconstructionContext {
+                    source_pool: LibrarySourcePool::new_with_workers(workers.clone())?,
+                    cache_admission: ExactLibraryCacheAdmission::bind_guarded_with_workers(
+                        managed_root,
+                        workers.clone(),
+                    )
+                    .await?,
+                    cache_proofs: Arc::new(std::sync::Mutex::new(
+                        AuthenticatedLibraryCacheProofSet::default(),
+                    )),
+                }),
+                workers: workers.clone(),
+                blocking_operation: Arc::new(tokio::sync::Mutex::new(())),
+            })
+        }
+        .await;
+        settle_new_managed_blocking_scope(workers, attempt, result).await
     }
 
     pub(crate) async fn bind_assets(managed_root: ManagedDir) -> Result<Self, DownloadError> {
-        Ok(Self {
-            mode: ManagedReconstructionMode::Assets(ManagedAssetsReconstructionContext {
-                source_pool: AssetSourcePool::new()?,
-                cache: ManagedComponentExactCache::bind_guarded(
-                    managed_root,
-                    ManagedComponentKind::Assets,
-                )
-                .await
-                .map_err(|_| {
-                    DownloadError::Integrity(
-                        "managed Assets exact-cache admission failed".to_string(),
+        let workers = ManagedBlockingWorkers::new();
+        let attempt = workers.attempt_guard();
+        let result = async {
+            Ok(Self {
+                mode: ManagedReconstructionMode::Assets(ManagedAssetsReconstructionContext {
+                    source_pool: AssetSourcePool::new_with_workers(workers.clone())?,
+                    cache: ManagedComponentExactCache::bind_guarded_with_workers(
+                        managed_root,
+                        ManagedComponentKind::Assets,
+                        workers.clone(),
                     )
-                })?,
-                authority: Arc::new(std::sync::Mutex::new(None)),
-            }),
-        })
+                    .await
+                    .map_err(asset_cache_error)?,
+                    authority: Arc::new(std::sync::Mutex::new(None)),
+                }),
+                workers: workers.clone(),
+                blocking_operation: Arc::new(tokio::sync::Mutex::new(())),
+            })
+        }
+        .await;
+        settle_new_managed_blocking_scope(workers, attempt, result).await
     }
 
     pub(crate) fn version_bundle() -> Self {
+        let workers = ManagedBlockingWorkers::new();
         Self {
             mode: ManagedReconstructionMode::VersionBundle,
+            workers,
+            blocking_operation: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
     pub(crate) async fn bind_whole_instance(
         managed_root: ManagedDir,
     ) -> Result<Self, DownloadError> {
-        let libraries = ManagedLibrariesReconstructionContext {
-            source_pool: LibrarySourcePool::new()?,
-            cache_admission: ExactLibraryCacheAdmission::bind_guarded(managed_root.clone()).await?,
-            cache_proofs: Arc::new(std::sync::Mutex::new(
-                AuthenticatedLibraryCacheProofSet::default(),
-            )),
-        };
-        let assets = ManagedAssetsReconstructionContext {
-            source_pool: AssetSourcePool::new()?,
-            cache: ManagedComponentExactCache::bind_guarded(
-                managed_root,
-                ManagedComponentKind::Assets,
-            )
-            .await
-            .map_err(|_| {
-                DownloadError::Integrity("managed Assets exact-cache admission failed".to_string())
-            })?,
-            authority: Arc::new(std::sync::Mutex::new(None)),
-        };
-        Ok(Self {
-            mode: ManagedReconstructionMode::WholeInstance { libraries, assets },
-        })
+        let workers = ManagedBlockingWorkers::new();
+        let attempt = workers.attempt_guard();
+        let result = async {
+            let libraries = ManagedLibrariesReconstructionContext {
+                source_pool: LibrarySourcePool::new_with_workers(workers.clone())?,
+                cache_admission: ExactLibraryCacheAdmission::bind_guarded_with_workers(
+                    managed_root.clone(),
+                    workers.clone(),
+                )
+                .await?,
+                cache_proofs: Arc::new(std::sync::Mutex::new(
+                    AuthenticatedLibraryCacheProofSet::default(),
+                )),
+            };
+            let assets = ManagedAssetsReconstructionContext {
+                source_pool: AssetSourcePool::new_with_workers(workers.clone())?,
+                cache: ManagedComponentExactCache::bind_guarded_with_workers(
+                    managed_root,
+                    ManagedComponentKind::Assets,
+                    workers.clone(),
+                )
+                .await
+                .map_err(asset_cache_error)?,
+                authority: Arc::new(std::sync::Mutex::new(None)),
+            };
+            Ok(Self {
+                mode: ManagedReconstructionMode::WholeInstance { libraries, assets },
+                workers: workers.clone(),
+                blocking_operation: Arc::new(tokio::sync::Mutex::new(())),
+            })
+        }
+        .await;
+        settle_new_managed_blocking_scope(workers, attempt, result).await
     }
 
     fn retains_version_bundle_sources(&self) -> bool {
@@ -635,6 +801,28 @@ impl ManagedReconstructionContext {
             ManagedReconstructionMode::VersionBundle
                 | ManagedReconstructionMode::WholeInstance { .. }
         )
+    }
+
+    async fn blocking_attempt(&self) -> ManagedReconstructionAttempt {
+        let operation = Arc::clone(&self.blocking_operation).lock_owned().await;
+        ManagedReconstructionAttempt {
+            operation: Some(operation),
+            workers: self.workers.clone(),
+            runtime: tokio::runtime::Handle::current(),
+        }
+    }
+
+    async fn settle_blocking_attempt<T>(
+        &self,
+        mut attempt: ManagedReconstructionAttempt,
+        result: Result<T, DownloadError>,
+    ) -> Result<T, DownloadError> {
+        if result.is_err() {
+            attempt.workers.cancel();
+        }
+        attempt.workers.drain().await;
+        drop(attempt.operation.take());
+        result
     }
 
     pub(crate) fn retains_library_sources(&self) -> bool {
@@ -653,7 +841,9 @@ impl ManagedReconstructionContext {
             }
             ManagedReconstructionMode::ProofOnly
             | ManagedReconstructionMode::VersionBundle
-            | ManagedReconstructionMode::Assets(_) => LibrarySourcePool::new(),
+            | ManagedReconstructionMode::Assets(_) => {
+                LibrarySourcePool::new_with_workers(self.workers.clone())
+            }
         }
     }
 
@@ -809,6 +999,15 @@ impl ManagedReconstructionContext {
         &self,
         sources: Vec<AuthenticatedLocalLibraryBytes>,
     ) -> Result<RetainedLibrarySourceSet, DownloadError> {
+        let attempt = self.blocking_attempt().await;
+        let result = self.retain_local_sources_unsettled(sources).await;
+        self.settle_blocking_attempt(attempt, result).await
+    }
+
+    async fn retain_local_sources_unsettled(
+        &self,
+        sources: Vec<AuthenticatedLocalLibraryBytes>,
+    ) -> Result<RetainedLibrarySourceSet, DownloadError> {
         if sources.is_empty() {
             return Ok(RetainedLibrarySourceSet::new());
         }
@@ -834,6 +1033,44 @@ impl ManagedReconstructionContext {
         }
         Ok(retained)
     }
+}
+
+impl ManagedReconstructionDrainMonitor {
+    async fn drain(self) {
+        self.workers.drain().await;
+        drop(self.operation);
+    }
+}
+
+impl Drop for ManagedReconstructionAttempt {
+    fn drop(&mut self) {
+        let Some(operation) = self.operation.take() else {
+            return;
+        };
+        self.workers.cancel();
+        drop(
+            self.runtime.spawn(
+                ManagedReconstructionDrainMonitor {
+                    operation,
+                    workers: self.workers.clone(),
+                }
+                .drain(),
+            ),
+        );
+    }
+}
+
+async fn settle_new_managed_blocking_scope<T>(
+    workers: ManagedBlockingWorkers,
+    attempt: ManagedBlockingAttemptGuard,
+    result: Result<T, DownloadError>,
+) -> Result<T, DownloadError> {
+    if result.is_err() {
+        workers.cancel();
+    }
+    workers.drain().await;
+    attempt.disarm();
+    result
 }
 
 fn take_library_cache_proofs(
@@ -1105,6 +1342,10 @@ impl Downloader {
             install_manifest: None,
             #[cfg(test)]
             runtime_source: None,
+            #[cfg(test)]
+            acquisition_workers: None,
+            #[cfg(test)]
+            wait_for_concurrent_terminals: false,
         }
     }
 
@@ -1117,6 +1358,10 @@ impl Downloader {
             install_manifest: None,
             #[cfg(test)]
             runtime_source: None,
+            #[cfg(test)]
+            acquisition_workers: None,
+            #[cfg(test)]
+            wait_for_concurrent_terminals: false,
         }
     }
 
@@ -1135,6 +1380,8 @@ impl Downloader {
             asset_object_base_url: Arc::from(ASSET_OBJECT_BASE_URL),
             install_manifest: Some(manifest),
             runtime_source: None,
+            acquisition_workers: None,
+            wait_for_concurrent_terminals: false,
         }
     }
 
@@ -1150,6 +1397,18 @@ impl Downloader {
     #[cfg(test)]
     pub(crate) fn with_test_asset_object_base_url(mut self, base_url: impl Into<Arc<str>>) -> Self {
         self.asset_object_base_url = base_url.into();
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_test_acquisition_workers(mut self, workers: ManagedBlockingWorkers) -> Self {
+        self.acquisition_workers = Some(workers);
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_test_concurrent_terminal_wait(mut self) -> Self {
+        self.wait_for_concurrent_terminals = true;
         self
     }
 
@@ -1356,6 +1615,19 @@ impl Downloader {
         version_manifest_entry: ManifestEntry,
         context: &ManagedReconstructionContext,
     ) -> Result<RetainedKnownGoodReconstruction, DownloadError> {
+        let attempt = context.blocking_attempt().await;
+        let result = self
+            .reconstruct_version_inner_unsettled(version_id, version_manifest_entry, context)
+            .await;
+        context.settle_blocking_attempt(attempt, result).await
+    }
+
+    async fn reconstruct_version_inner_unsettled(
+        &self,
+        version_id: &str,
+        version_manifest_entry: ManifestEntry,
+        context: &ManagedReconstructionContext,
+    ) -> Result<RetainedKnownGoodReconstruction, DownloadError> {
         let (authority, library_sources) = self
             .reconstruct_vanilla_authority(version_id, &version_manifest_entry, context)
             .await?;
@@ -1393,6 +1665,18 @@ impl Downloader {
         version_id: &str,
         context: &ManagedReconstructionContext,
     ) -> Result<ReconstructedVanillaClientAuthority, DownloadError> {
+        let attempt = context.blocking_attempt().await;
+        let result = self
+            .reconstruct_version_with_client_source_unsettled(version_id, context)
+            .await;
+        context.settle_blocking_attempt(attempt, result).await
+    }
+
+    async fn reconstruct_version_with_client_source_unsettled(
+        &self,
+        version_id: &str,
+        context: &ManagedReconstructionContext,
+    ) -> Result<ReconstructedVanillaClientAuthority, DownloadError> {
         let (authority, library_sources, client_source, version_bundle_sources) = self
             .reconstruct_version_with_client_authority(version_id, context)
             .await?;
@@ -1413,6 +1697,18 @@ impl Downloader {
     }
 
     pub(crate) async fn reconstruct_version_for_processor(
+        &self,
+        version_id: &str,
+        context: &ManagedReconstructionContext,
+    ) -> Result<ReconstructedVanillaProcessorAuthority, DownloadError> {
+        let attempt = context.blocking_attempt().await;
+        let result = self
+            .reconstruct_version_for_processor_unsettled(version_id, context)
+            .await;
+        context.settle_blocking_attempt(attempt, result).await
+    }
+
+    async fn reconstruct_version_for_processor_unsettled(
         &self,
         version_id: &str,
         context: &ManagedReconstructionContext,
@@ -1800,7 +2096,67 @@ impl Downloader {
             .map(|_| plan.reserve_contribution());
         let runtime_contribution = runtime_source.as_ref().map(|_| plan.reserve_contribution());
 
-        let library_cache_admission = ExactLibraryCacheAdmission::bind(self.managed_root()).await?;
+        let client = version.downloads.client.as_ref().ok_or_else(|| {
+            DownloadError::ResolveManifest(
+                "authenticated version has no exact client artifact".to_string(),
+            )
+        })?;
+        let client_source_spec = SelectedSourceTaskSpec {
+            kind: SelectedDownloadArtifactKind::ClientJar,
+            url: client.url.clone(),
+            logical_identity: version_id.to_string(),
+            expected: ExpectedIntegrity::from_mojang(client.size, &client.sha1),
+            max_bytes: exact_version_bundle_source_limit(client.size, "client")?,
+            target: selected_download_source_label(
+                SelectedDownloadArtifactKind::ClientJar,
+                version_id,
+            ),
+            fact_tx: fact_tx.cloned(),
+            label: "client",
+        };
+        let log_config_source_spec = version
+            .logging
+            .as_ref()
+            .and_then(|logging| logging.client.as_ref())
+            .map(|logging| {
+                Ok::<_, DownloadError>(SelectedSourceTaskSpec {
+                    kind: SelectedDownloadArtifactKind::LogConfig,
+                    url: logging.file.url.clone(),
+                    logical_identity: logging.file.id.clone(),
+                    expected: ExpectedIntegrity::from_mojang(logging.file.size, &logging.file.sha1),
+                    max_bytes: exact_version_bundle_source_limit(logging.file.size, "log config")?,
+                    target: selected_download_source_label(
+                        SelectedDownloadArtifactKind::LogConfig,
+                        &logging.file.id,
+                    ),
+                    fact_tx: fact_tx.cloned(),
+                    label: "log config",
+                })
+            })
+            .transpose()?;
+        #[cfg(not(test))]
+        let acquisition_workers = ManagedBlockingWorkers::new();
+        #[cfg(test)]
+        let acquisition_workers = self
+            .acquisition_workers
+            .clone()
+            .unwrap_or_else(ManagedBlockingWorkers::new);
+        let _acquisition_cancellation_guard = acquisition_workers.cancellation_guard();
+        let library_cache_admission = ExactLibraryCacheAdmission::bind_with_workers(
+            self.managed_root(),
+            acquisition_workers.clone(),
+        )
+        .await?;
+        let library_source_pool = LibrarySourcePool::new_with_workers(acquisition_workers.clone())?;
+        let prepared_asset_pipeline = if asset_index_source.is_some() {
+            Some(
+                prepare_asset_download_pipeline(self.managed_root(), acquisition_workers.clone())
+                    .await?,
+            )
+        } else {
+            None
+        };
+
         if asset_index_source.is_some() {
             plan.add_done(asset_index_bytes);
             send(progress(
@@ -1810,23 +2166,63 @@ impl Downloader {
                 Some(format!("{}.json", version.asset_index.id)),
             ));
         }
+
+        send(progress(
+            "client_jar",
+            0,
+            1,
+            Some(format!("{version_id}.jar")),
+        ));
+        if let Some(logging) = version
+            .logging
+            .as_ref()
+            .and_then(|logging| logging.client.as_ref())
+        {
+            send(progress("log_config", 0, 1, Some(logging.file.id.clone())));
+        }
+        send(progress("libraries", 0, library_jobs.len() as i32, None));
+        if runtime_source.is_some() {
+            send(progress(
+                "java_runtime",
+                0,
+                0,
+                Some(format!(
+                    "Preparing {} (Java {})",
+                    if version.java_version.component.trim().is_empty() {
+                        "managed runtime".to_string()
+                    } else {
+                        version.java_version.component.clone()
+                    },
+                    version.java_version.major_version
+                )),
+            ));
+        }
+
+        let mut client_pipeline = client_source_spec.spawn(self.client.clone());
+        let mut log_config_pipeline =
+            log_config_source_spec.map(|spec| spec.spawn(self.client.clone()));
+        let mut asset_pipeline = match (
+            prepared_asset_pipeline,
+            asset_index_source,
+            asset_contribution,
+        ) {
+            (Some(prepared), Some(source), Some(contribution)) => {
+                Some(spawn_asset_download_pipeline(
+                    prepared,
+                    self.client.clone(),
+                    Arc::clone(&self.asset_object_base_url),
+                    version.asset_index.id.clone(),
+                    source,
+                    fact_tx.cloned(),
+                    plan.clone(),
+                    contribution,
+                ))
+            }
+            (None, None, None) => None,
+            _ => unreachable!("prepared asset source and transfer contribution must stay paired"),
+        };
         let mut runtime_pipeline = match (runtime_source, runtime_contribution) {
             (Some(runtime_source), Some(contribution)) => {
-                send(progress(
-                    "java_runtime",
-                    0,
-                    0,
-                    Some(format!(
-                        "Preparing {} (Java {})",
-                        if version.java_version.component.trim().is_empty() {
-                            "managed runtime".to_string()
-                        } else {
-                            version.java_version.component.clone()
-                        },
-                        version.java_version.major_version
-                    )),
-                ));
-
                 let java_version = version.java_version.clone();
                 Some(self.spawn_runtime_pipeline(
                     java_version,
@@ -1839,230 +2235,287 @@ impl Downloader {
             _ => unreachable!("runtime source and transfer contribution must stay paired"),
         };
 
-        let artifact_result = async {
-            send(progress(
-                "client_jar",
-                0,
-                1,
-                Some(format!("{version_id}.jar")),
-            ));
-            let client = version.downloads.client.as_ref().ok_or_else(|| {
-                DownloadError::ResolveManifest(
-                    "authenticated version has no exact client artifact".to_string(),
-                )
-            })?;
-            let http_client = self.client.clone();
-            let url = client.url.clone();
-            let expected = ExpectedIntegrity::from_mojang(client.size, &client.sha1);
-            let max_bytes = exact_version_bundle_source_limit(client.size, "client")?;
-            let logical_identity = version_id.to_string();
-            let target = selected_download_source_label(
-                SelectedDownloadArtifactKind::ClientJar,
-                version_id,
-            );
-            let client_fact_tx = fact_tx.cloned();
-            let client_jar_task = tokio::spawn(async move {
-                acquire_authenticated_selected_artifact_source(SelectedArtifactSourceRequest {
-                    client: &http_client,
-                    kind: SelectedDownloadArtifactKind::ClientJar,
-                    url: &url,
-                    logical_identity: &logical_identity,
-                    expected: &expected,
-                    max_bytes,
-                    target: &target,
-                    fact_tx: client_fact_tx.as_ref(),
-                })
-                .await
-            });
-            let log_config_task = if let Some(logging) = version
-                .logging
-                .as_ref()
-                .and_then(|logging| logging.client.as_ref())
-            {
-                send(progress("log_config", 0, 1, Some(logging.file.id.clone())));
-                let http_client = self.client.clone();
-                let file = logging.file.clone();
-                let expected = ExpectedIntegrity::from_mojang(file.size, &file.sha1);
-                let max_bytes = exact_version_bundle_source_limit(file.size, "log config")?;
-                let target = selected_download_source_label(
-                    SelectedDownloadArtifactKind::LogConfig,
-                    &file.id,
-                );
-                let log_fact_tx = fact_tx.cloned();
-                Some(tokio::spawn(async move {
-                    acquire_authenticated_selected_artifact_source(
-                        SelectedArtifactSourceRequest {
-                            client: &http_client,
-                            kind: SelectedDownloadArtifactKind::LogConfig,
-                            url: &file.url,
-                            logical_identity: &file.id,
-                            expected: &expected,
-                            max_bytes,
-                            target: &target,
-                            fact_tx: log_fact_tx.as_ref(),
-                        },
-                    )
-                    .await
-                }))
-            } else {
-                None
-            };
-            let mut asset_pipeline = match (asset_index_source, asset_contribution) {
-                (Some(source), Some(contribution)) => Some(spawn_asset_download_pipeline(
-                    self.managed_root().to_path_buf(),
-                    self.client.clone(),
-                    Arc::clone(&self.asset_object_base_url),
-                    version.asset_index.id.clone(),
-                    source,
-                    fact_tx.cloned(),
-                    plan.clone(),
-                    contribution,
-                )),
-                (None, None) => None,
-                _ => unreachable!("asset source and transfer contribution must stay paired"),
-            };
+        let total_library_jobs = library_jobs.len() as i32;
+        let mut completed_library_jobs = 0;
+        let mut library_proofs = Vec::with_capacity(total_library_jobs as usize);
+        let mut library_sources = Vec::with_capacity(total_library_jobs as usize);
+        let mut library_downloads =
+            futures_util::stream::iter(library_jobs.into_iter().zip(library_contributions).map(
+                |(classified, contribution)| {
+                    let client = self.client.clone();
+                    let fact_tx = fact_tx.cloned();
+                    let source_pool = library_source_pool.clone();
+                    let cache_admission = library_cache_admission.clone();
+                    async move {
+                        let acquisition = acquire_retained_classified_library(
+                            &client,
+                            classified,
+                            &cache_admission,
+                            &source_pool,
+                            fact_tx.as_ref(),
+                        )
+                        .await?;
+                        Ok::<_, DownloadError>((acquisition, contribution))
+                    }
+                },
+            ))
+            .buffer_unordered(library_download_concurrency());
 
-            send(progress("libraries", 0, library_jobs.len() as i32, None));
-            let client = self.client.clone();
-            let source_pool = LibrarySourcePool::new()?;
-            let total_library_jobs = library_jobs.len() as i32;
-            let mut completed_library_jobs = 0;
-            let library_result = async {
-                let mut proofs = Vec::with_capacity(total_library_jobs as usize);
-                let mut sources = Vec::with_capacity(total_library_jobs as usize);
-                let mut library_downloads =
-                    futures_util::stream::iter(library_jobs.into_iter().zip(library_contributions).map(
-                        |(classified, contribution)| {
-                            let client = client.clone();
-                            let fact_tx = fact_tx.cloned();
-                            let source_pool = source_pool.clone();
-                            let cache_admission = library_cache_admission.clone();
-                            async move {
-                                let acquisition = acquire_retained_classified_library(
-                                    &client,
-                                    classified,
-                                    &cache_admission,
-                                    &source_pool,
-                                    fact_tx.as_ref(),
+        enum LaneEvent {
+            Client(Result<AuthenticatedSelectedArtifactSource, DownloadError>),
+            LogConfig(Result<AuthenticatedSelectedArtifactSource, DownloadError>),
+            Library(
+                Option<
+                    Result<
+                        (
+                            RetainedClassifiedLibraryAcquisition,
+                            Option<TransferPlanContribution>,
+                        ),
+                        DownloadError,
+                    >,
+                >,
+            ),
+            Asset(AssetDownloadPipelineEvent),
+            Runtime(RuntimeEnsurePipelineEvent),
+        }
+
+        let mut client_source = None;
+        let mut log_config_source = None;
+        let mut client_complete = false;
+        let mut log_config_complete = log_config_pipeline.is_none();
+        let mut libraries_complete = false;
+        let mut asset_complete = asset_pipeline.is_none();
+        let mut runtime_complete = runtime_pipeline.is_none();
+        let mut asset_result = None;
+        let mut runtime_receipt = None;
+        let mut pending_library_acquisition = None;
+
+        #[cfg(test)]
+        if self.wait_for_concurrent_terminals {
+            while !(client_pipeline.is_finished()
+                && asset_pipeline
+                    .as_ref()
+                    .is_some_and(AssetDownloadPipeline::is_finished))
+            {
+                tokio::task::yield_now().await;
+            }
+        }
+
+        let primary_error = 'coordinator: loop {
+            let event = if !client_complete && client_pipeline.is_finished() {
+                LaneEvent::Client(client_pipeline.complete().await)
+            } else if !log_config_complete
+                && log_config_pipeline
+                    .as_ref()
+                    .is_some_and(SelectedSourcePipeline::is_finished)
+            {
+                LaneEvent::LogConfig(
+                    log_config_pipeline
+                        .as_mut()
+                        .expect("live log-config pipeline")
+                        .complete()
+                        .await,
+                )
+            } else {
+                if !libraries_complete && pending_library_acquisition.is_none() {
+                    match library_downloads.next().now_or_never() {
+                        Some(Some(Ok(acquisition))) => {
+                            pending_library_acquisition = Some(acquisition);
+                        }
+                        Some(Some(Err(error))) => break 'coordinator Some(error),
+                        Some(None) => libraries_complete = true,
+                        None => {}
+                    }
+                }
+
+                let asset_terminal = !asset_complete
+                    && asset_pipeline
+                        .as_ref()
+                        .is_some_and(|pipeline| pipeline.is_finished());
+                let runtime_terminal = !runtime_complete
+                    && runtime_pipeline
+                        .as_ref()
+                        .is_some_and(|pipeline| pipeline.is_finished());
+                match ready_concurrent_lane(
+                    asset_terminal,
+                    runtime_terminal,
+                    pending_library_acquisition.is_some(),
+                ) {
+                    Some(ReadyConcurrentLane::AssetTerminal) => LaneEvent::Asset(
+                        next_asset_download_pipeline_event(
+                            asset_pipeline.as_mut().expect("live asset pipeline"),
+                        )
+                        .await,
+                    ),
+                    Some(ReadyConcurrentLane::RuntimeTerminal) => LaneEvent::Runtime(
+                        next_runtime_pipeline_event(
+                            runtime_pipeline.as_mut().expect("live runtime pipeline"),
+                        )
+                        .await,
+                    ),
+                    Some(ReadyConcurrentLane::BufferedLibrarySuccess) => {
+                        LaneEvent::Library(Some(Ok(pending_library_acquisition
+                            .take()
+                            .expect("selected buffered library lane retains its acquisition"))))
+                    }
+                    None => {
+                        if client_complete
+                            && log_config_complete
+                            && libraries_complete
+                            && asset_complete
+                            && runtime_complete
+                        {
+                            break None;
+                        }
+                        tokio::select! {
+                            biased;
+                            result = client_pipeline.complete(), if !client_complete => LaneEvent::Client(result),
+                            result = async {
+                                log_config_pipeline
+                                    .as_mut()
+                                    .expect("live log-config pipeline")
+                                    .complete()
+                                    .await
+                            }, if !log_config_complete => LaneEvent::LogConfig(result),
+                            result = library_downloads.next(), if !libraries_complete => LaneEvent::Library(result),
+                            event = async {
+                                next_asset_download_pipeline_event(
+                                    asset_pipeline.as_mut().expect("live asset pipeline"),
                                 )
-                                .await?;
-                                Ok::<_, DownloadError>((acquisition, contribution))
-                            }
-                        },
-                    ))
-                    .buffer_unordered(library_download_concurrency());
-                let mut asset_progress_open = asset_pipeline.is_some();
-                let mut runtime_progress_open = runtime_pipeline.is_some();
-                loop {
-                    tokio::select! {
-                        progress = recv_asset_progress(&mut asset_pipeline), if asset_progress_open => {
-                            if let Some(progress) = progress {
-                                send(progress);
-                            } else {
-                                asset_progress_open = false;
-                            }
-                        }
-                        progress = recv_runtime_progress(&mut runtime_pipeline), if runtime_progress_open => {
-                            if let Some(progress) = progress {
-                                send(progress);
-                            } else {
-                                runtime_progress_open = false;
-                            }
-                        }
-                        result = library_downloads.next() => {
-                            let Some(result) = result else {
-                                break;
-                            };
-                            let (acquisition, contribution) = result?;
-                            let RetainedClassifiedLibraryAcquisition {
-                                relative_path: _,
-                                name,
-                                observed_size,
-                                proof,
-                                source,
-                            } = acquisition;
-                            if let Some(contribution) = contribution {
-                                contribution.resolve(observed_size);
-                            }
-                            if let Some(proof) = proof {
-                                proofs.push(proof);
-                            }
-                            if let Some(source) = source {
-                                sources.push(source);
-                            }
-                            plan.add_done(observed_size);
-                            completed_library_jobs += 1;
-                            send(progress(
-                                "libraries",
-                                completed_library_jobs,
-                                total_library_jobs,
-                                Some(name),
-                            ));
+                                .await
+                            }, if !asset_complete => LaneEvent::Asset(event),
+                            event = async {
+                                next_runtime_pipeline_event(
+                                    runtime_pipeline.as_mut().expect("live runtime pipeline"),
+                                )
+                                .await
+                            }, if !runtime_complete => LaneEvent::Runtime(event),
                         }
                     }
                 }
-                Ok::<_, DownloadError>((proofs, sources))
-            }
-            .await;
-            let client_jar_result = await_selected_source_task(client_jar_task, "client").await;
-            let log_config_result = match log_config_task {
-                Some(task) => Some(await_selected_source_task(task, "log config").await),
-                None => None,
             };
-            if client_jar_result.is_ok() {
-                plan.add_done(client_jar_bytes);
-                send(progress(
-                    "client_jar",
-                    1,
-                    1,
-                    Some(format!("{version_id}.jar")),
-                ));
+            match event {
+                LaneEvent::Client(Ok(source)) => {
+                    client_complete = true;
+                    client_source = Some(source);
+                    plan.add_done(client_jar_bytes);
+                    send(progress(
+                        "client_jar",
+                        1,
+                        1,
+                        Some(format!("{version_id}.jar")),
+                    ));
+                }
+                LaneEvent::Client(Err(error)) => break 'coordinator Some(error),
+                LaneEvent::LogConfig(Ok(source)) => {
+                    log_config_complete = true;
+                    log_config_source = Some(source);
+                    plan.add_done(log_config_bytes);
+                    let logging = version
+                        .logging
+                        .as_ref()
+                        .and_then(|logging| logging.client.as_ref())
+                        .expect("completed log-config pipeline has a declaration");
+                    send(progress("log_config", 1, 1, Some(logging.file.id.clone())));
+                }
+                LaneEvent::LogConfig(Err(error)) => break 'coordinator Some(error),
+                LaneEvent::Library(Some(Ok((acquisition, contribution)))) => {
+                    let RetainedClassifiedLibraryAcquisition {
+                        relative_path: _,
+                        name,
+                        observed_size,
+                        proof,
+                        source,
+                    } = acquisition;
+                    if let Some(contribution) = contribution {
+                        contribution.resolve(observed_size);
+                    }
+                    if let Some(proof) = proof {
+                        library_proofs.push(proof);
+                    }
+                    if let Some(source) = source {
+                        library_sources.push(source);
+                    }
+                    plan.add_done(observed_size);
+                    completed_library_jobs += 1;
+                    send(progress(
+                        "libraries",
+                        completed_library_jobs,
+                        total_library_jobs,
+                        Some(name),
+                    ));
+                }
+                LaneEvent::Library(Some(Err(error))) => break 'coordinator Some(error),
+                LaneEvent::Library(None) => libraries_complete = true,
+                LaneEvent::Asset(AssetDownloadPipelineEvent::Progress(progress)) => send(progress),
+                LaneEvent::Asset(AssetDownloadPipelineEvent::Complete {
+                    result,
+                    final_progress,
+                }) => match result {
+                    Ok(result) => {
+                        for progress in final_progress {
+                            send(progress);
+                        }
+                        asset_complete = true;
+                        asset_pipeline.take();
+                        asset_result = Some(result);
+                    }
+                    Err(error) => {
+                        asset_pipeline.take();
+                        break 'coordinator Some(error);
+                    }
+                },
+                LaneEvent::Runtime(RuntimeEnsurePipelineEvent::Progress(progress)) => {
+                    send(progress)
+                }
+                LaneEvent::Runtime(RuntimeEnsurePipelineEvent::Complete {
+                    result,
+                    final_progress,
+                }) => match result {
+                    Ok(receipt) => {
+                        for progress in final_progress {
+                            send(progress);
+                        }
+                        runtime_complete = true;
+                        runtime_pipeline.take();
+                        runtime_receipt = Some(receipt);
+                    }
+                    Err(error) => {
+                        runtime_pipeline.take();
+                        break 'coordinator Some(error);
+                    }
+                },
             }
-            if log_config_result.as_ref().is_some_and(Result::is_ok)
-                && let Some(logging) = version
-                    .logging
-                    .as_ref()
-                    .and_then(|logging| logging.client.as_ref())
-            {
-                plan.add_done(log_config_bytes);
-                send(progress("log_config", 1, 1, Some(logging.file.id.clone())));
+        };
+
+        if let Some(error) = primary_error {
+            acquisition_workers.cancel();
+            drop(library_downloads);
+            client_pipeline.abort();
+            if let Some(pipeline) = &log_config_pipeline {
+                pipeline.abort();
             }
-            let asset_result = if client_jar_result.is_err()
-                || log_config_result.as_ref().is_some_and(Result::is_err)
-                || library_result.is_err()
-            {
-                abort_asset_download_pipeline(asset_pipeline).await;
-                None
-            } else {
-                await_asset_download_pipeline(asset_pipeline, send).await?
-            };
-            let client_source = client_jar_result?;
-            let log_config_source = log_config_result.transpose()?;
-            let (library_proofs, library_sources) = library_result?;
-            Ok::<_, DownloadError>((
-                pending_library_declarations,
-                library_proofs,
-                library_sources,
-                client_source,
-                log_config_source,
-                asset_result,
-            ))
+            abort_asset_download_pipeline(&mut asset_pipeline).await;
+            acquisition_workers.drain().await;
+            client_pipeline.drain().await;
+            if let Some(pipeline) = log_config_pipeline.as_mut() {
+                pipeline.drain().await;
+            }
+            drop(pending_library_acquisition);
+            drop(client_source);
+            drop(log_config_source);
+            drop(library_proofs);
+            drop(library_sources);
+            drop(asset_result);
+            drop(runtime_receipt);
+            return Err(
+                settle_runtime_pipeline_after_failure(runtime_pipeline.take(), error).await,
+            );
         }
-        .await;
+        drop(library_downloads);
+        acquisition_workers.drain().await;
 
-        let (
-            runtime_receipt,
-            (
-                pending_library_declarations,
-                library_proofs,
-                library_sources,
-                client_source,
-                log_config_source,
-                asset_result,
-            ),
-        ) = finish_runtime_pipeline_after_artifacts(runtime_pipeline, artifact_result, send)
-            .await?;
-
+        let client_source = client_source.expect("successful client lane returned its source");
         let library_declarations = pending_library_declarations
             .seal_streamed(library_proofs)
             .map_err(|error| {
@@ -2285,6 +2738,15 @@ pub(crate) async fn reconstruct_profile_library_declarations(
     declarations: PendingExactLibraryDeclarations,
     context: &ManagedReconstructionContext,
 ) -> Result<(SealedExactLibraryDeclarations, RetainedLibrarySourceSet), DownloadError> {
+    let attempt = context.blocking_attempt().await;
+    let result = reconstruct_profile_library_declarations_unsettled(declarations, context).await;
+    context.settle_blocking_attempt(attempt, result).await
+}
+
+async fn reconstruct_profile_library_declarations_unsettled(
+    declarations: PendingExactLibraryDeclarations,
+    context: &ManagedReconstructionContext,
+) -> Result<(SealedExactLibraryDeclarations, RetainedLibrarySourceSet), DownloadError> {
     let jobs = {
         let (libraries, environment) = declarations.profile_plan_inputs().ok_or_else(|| {
             DownloadError::ResolveManifest(
@@ -2371,6 +2833,23 @@ pub(crate) async fn reconstruct_installer_processor_sources(
 }
 
 async fn reconstruct_installer_library_declarations_inner(
+    sources: crate::loaders::PendingForgeReconstructionSources,
+    workspace: Option<&crate::loaders::workspace::cleanup::ProcessorWorkspace>,
+    context: &ManagedReconstructionContext,
+) -> Result<
+    (
+        crate::loaders::BoundForgeInstallExecution,
+        RetainedLibrarySourceSet,
+    ),
+    DownloadError,
+> {
+    let attempt = context.blocking_attempt().await;
+    let result =
+        reconstruct_installer_library_declarations_unsettled(sources, workspace, context).await;
+    context.settle_blocking_attempt(attempt, result).await
+}
+
+async fn reconstruct_installer_library_declarations_unsettled(
     sources: crate::loaders::PendingForgeReconstructionSources,
     workspace: Option<&crate::loaders::workspace::cleanup::ProcessorWorkspace>,
     context: &ManagedReconstructionContext,
@@ -3453,14 +3932,6 @@ fn version_bundle_install_error(message: impl Into<String>) -> DownloadError {
     DownloadError::ResolveManifest(message.into())
 }
 
-async fn await_selected_source_task(
-    task: tokio::task::JoinHandle<Result<AuthenticatedSelectedArtifactSource, DownloadError>>,
-    label: &'static str,
-) -> Result<AuthenticatedSelectedArtifactSource, DownloadError> {
-    task.await
-        .map_err(|error| selected_source_task_error(error, label))?
-}
-
 fn selected_source_task_error(error: tokio::task::JoinError, label: &str) -> DownloadError {
     let reason = if error.is_cancelled() {
         "cancelled"
@@ -3486,6 +3957,34 @@ fn managed_install_owner_error(error: tokio::task::JoinError) -> DownloadError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct BlockingWorkerGate {
+        state: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+    }
+
+    impl BlockingWorkerGate {
+        fn new() -> Self {
+            Self {
+                state: Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new())),
+            }
+        }
+
+        fn shared(&self) -> Arc<(std::sync::Mutex<bool>, std::sync::Condvar)> {
+            Arc::clone(&self.state)
+        }
+
+        fn release(&self) {
+            let (lock, condition) = &*self.state;
+            *lock.lock().expect("worker release lock") = true;
+            condition.notify_all();
+        }
+    }
+
+    impl Drop for BlockingWorkerGate {
+        fn drop(&mut self) {
+            self.release();
+        }
+    }
 
     fn exact_contract_version() -> serde_json::Value {
         serde_json::json!({
@@ -3667,5 +4166,183 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn terminal_lanes_precede_buffered_library_success() {
+        let cases = [
+            ((false, false, false), None),
+            (
+                (false, false, true),
+                Some(ReadyConcurrentLane::BufferedLibrarySuccess),
+            ),
+            (
+                (false, true, false),
+                Some(ReadyConcurrentLane::RuntimeTerminal),
+            ),
+            (
+                (false, true, true),
+                Some(ReadyConcurrentLane::RuntimeTerminal),
+            ),
+            (
+                (true, false, false),
+                Some(ReadyConcurrentLane::AssetTerminal),
+            ),
+            (
+                (true, false, true),
+                Some(ReadyConcurrentLane::AssetTerminal),
+            ),
+            (
+                (true, true, false),
+                Some(ReadyConcurrentLane::AssetTerminal),
+            ),
+            ((true, true, true), Some(ReadyConcurrentLane::AssetTerminal)),
+        ];
+
+        for ((asset, runtime, library), expected) in cases {
+            assert_eq!(ready_concurrent_lane(asset, runtime, library), expected);
+        }
+    }
+
+    #[test]
+    fn asset_cache_mapping_preserves_cancellation_and_task_failure() {
+        assert!(matches!(
+            asset_cache_error(
+                crate::managed_component_cache::ManagedComponentExactCacheError::Admission
+            ),
+            DownloadError::Integrity(_)
+        ));
+        assert!(matches!(
+            asset_cache_error(
+                crate::managed_component_cache::ManagedComponentExactCacheError::Cancelled
+            ),
+            DownloadError::FileOperation(error)
+                if error.kind() == std::io::ErrorKind::Interrupted
+        ));
+        assert!(matches!(
+            asset_cache_error(
+                crate::managed_component_cache::ManagedComponentExactCacheError::TaskStopped
+            ),
+            DownloadError::FileOperation(error) if error.kind() == std::io::ErrorKind::Other
+        ));
+    }
+
+    #[tokio::test]
+    async fn dropped_reconstruction_attempt_holds_serialization_until_workers_drain() {
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let entered_tx = Arc::new(std::sync::Mutex::new(Some(entered_tx)));
+        let release = BlockingWorkerGate::new();
+        let hook_release = release.shared();
+        let workers =
+            ManagedBlockingWorkers::new_with_checkpoint_hook(Arc::new(move |checkpoint| {
+                if checkpoint != crate::managed_blocking::ManagedBlockingCheckpoint::SourceSpool {
+                    return;
+                }
+                let Some(entered) = entered_tx
+                    .lock()
+                    .expect("reconstruction checkpoint lock")
+                    .take()
+                else {
+                    return;
+                };
+                let _ = entered.send(());
+                let (lock, condition) = &*hook_release;
+                let released = lock.lock().expect("reconstruction release lock");
+                drop(
+                    condition
+                        .wait_while(released, |released| !*released)
+                        .expect("reconstruction release wait"),
+                );
+            }));
+        let setup_attempt = workers.attempt_guard();
+        let temporary = tempfile::tempdir().expect("reconstruction root");
+        let managed_root = ManagedDir::open_root(temporary.path()).expect("managed root");
+        let context = ManagedReconstructionContext {
+            mode: ManagedReconstructionMode::Libraries(ManagedLibrariesReconstructionContext {
+                source_pool: LibrarySourcePool::new_with_workers(workers.clone())
+                    .expect("library source pool"),
+                cache_admission: ExactLibraryCacheAdmission::bind_guarded_with_workers(
+                    managed_root,
+                    workers.clone(),
+                )
+                .await
+                .expect("library cache admission"),
+                cache_proofs: Arc::new(std::sync::Mutex::new(
+                    AuthenticatedLibraryCacheProofSet::default(),
+                )),
+            }),
+            workers: workers.clone(),
+            blocking_operation: Arc::new(tokio::sync::Mutex::new(())),
+        };
+        workers.drain().await;
+        setup_attempt.disarm();
+
+        let bytes = b"gated reconstruction source".to_vec();
+        let source = AuthenticatedLocalLibraryBytes::new(
+            crate::artifact_path::ArtifactRelativePath::new("org/example/gated/1/gated-1.jar")
+                .expect("library source path"),
+            LibraryComponentSourceKind::Library,
+            bytes.clone(),
+            bytes.len() as u64,
+            Sha1::digest(&bytes).into(),
+        )
+        .expect("authenticated local source");
+        let first_context = context.clone();
+        let first =
+            tokio::spawn(async move { first_context.retain_local_sources(vec![source]).await });
+        tokio::time::timeout(std::time::Duration::from_secs(1), entered_rx)
+            .await
+            .expect("source worker must reach checkpoint")
+            .expect("source worker entered checkpoint");
+
+        first.abort();
+        let first_error = match first.await {
+            Err(error) => error,
+            Ok(_) => panic!("first attempt must be aborted"),
+        };
+        assert!(first_error.is_cancelled());
+        assert!(workers.is_cancelled());
+
+        let second_context = context.clone();
+        let mut second =
+            tokio::spawn(async move { second_context.retain_local_sources(Vec::new()).await });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(25), &mut second)
+                .await
+                .is_err(),
+            "the drain monitor must retain reconstruction serialization"
+        );
+
+        release.release();
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            workers.drain().await;
+            second
+                .await
+                .expect("second reconstruction task")
+                .expect("second reconstruction attempt");
+        })
+        .await
+        .expect("drain monitor must release reconstruction serialization");
+
+        let later_source = AuthenticatedLocalLibraryBytes::new(
+            crate::artifact_path::ArtifactRelativePath::new(
+                "org/example/gated/1/gated-later-1.jar",
+            )
+            .expect("later library source path"),
+            LibraryComponentSourceKind::Library,
+            bytes.clone(),
+            bytes.len() as u64,
+            Sha1::digest(&bytes).into(),
+        )
+        .expect("later authenticated local source");
+        let later_error = match context.retain_local_sources(vec![later_source]).await {
+            Err(error) => error,
+            Ok(_) => panic!("cancelled reconstruction context must reject later work"),
+        };
+        assert!(matches!(
+            later_error,
+            DownloadError::FileOperation(error)
+                if error.kind() == std::io::ErrorKind::Interrupted
+        ));
     }
 }

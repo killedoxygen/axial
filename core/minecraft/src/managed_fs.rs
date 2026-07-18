@@ -1321,6 +1321,17 @@ impl ManagedDir {
         guard: &ManagedFileGuard,
         max_size: u64,
     ) -> Result<[u8; 20], LoaderError> {
+        self.sha1_guarded_file_bytes_with_check(name, guard, max_size, || Ok(()))
+    }
+
+    pub(crate) fn sha1_guarded_file_bytes_with_check(
+        &self,
+        name: &str,
+        guard: &ManagedFileGuard,
+        max_size: u64,
+        mut check: impl FnMut() -> Result<(), LoaderError>,
+    ) -> Result<[u8; 20], LoaderError> {
+        check()?;
         validate_segment(name)?;
         if guard.size > max_size || !self.file_guard_matches(name, guard)? {
             return Err(LoaderError::Verify(
@@ -1339,6 +1350,7 @@ impl ManagedDir {
         let mut hasher = Sha1::new();
         let mut chunk = [0_u8; 64 * 1024];
         loop {
+            check()?;
             let read = file.read(&mut chunk)?;
             if read == 0 {
                 break;
@@ -1353,6 +1365,7 @@ impl ManagedDir {
             }
             hasher.update(&chunk[..read]);
         }
+        check()?;
         if observed != guard.size || !self.file_guard_matches(name, guard)? {
             return Err(LoaderError::Verify(
                 "managed guarded hash source changed during hashing".to_string(),
@@ -3809,6 +3822,35 @@ mod platform {
 mod tests {
     use super::*;
     use std::fs;
+
+    #[cfg(unix)]
+    #[test]
+    fn cancellable_guarded_hash_rejects_same_size_namespace_replacement() {
+        let root = test_root("guarded-hash-replacement");
+        fs::create_dir_all(&root).expect("root");
+        fs::write(root.join("artifact"), b"before").expect("artifact");
+        let directory = ManagedDir::open_root(&root).expect("managed root");
+        let guard = directory
+            .inspect_regular_file("artifact")
+            .expect("inspect artifact")
+            .expect("artifact guard");
+        let mut checks = 0;
+
+        let error = directory
+            .sha1_guarded_file_bytes_with_check("artifact", &guard, 6, || {
+                checks += 1;
+                if checks == 3 {
+                    fs::rename(root.join("artifact"), root.join("saved"))
+                        .expect("park admitted artifact");
+                    fs::write(root.join("artifact"), b"replac").expect("same-size replacement");
+                }
+                Ok(())
+            })
+            .expect_err("namespace replacement must invalidate guarded hash");
+
+        assert!(matches!(error, LoaderError::Verify(_)));
+        let _ = fs::remove_dir_all(root);
+    }
 
     #[cfg(target_os = "linux")]
     #[test]

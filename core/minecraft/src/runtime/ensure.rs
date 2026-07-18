@@ -1,12 +1,20 @@
+use super::cancellation::{
+    RuntimeCancellation, RuntimeCancellationSender, runtime_cancellation_channel,
+};
+#[cfg(test)]
+use super::cancellation::{
+    RuntimeTestGate, RuntimeTestHookPoint, arm_runtime_test_hook, wait_for_runtime_test_hook,
+};
 use super::discovery::{
     is_known_runtime_component, parse_runtime_override, preferred_runtime_component,
     resolve_axial_cached_runtime, resolve_component_runtime, resolve_managed_runtime,
     resolve_override_runtime, runtime_requirement,
 };
 use super::install::{
-    ManagedRuntimeCommitReceipt, ManagedRuntimeRebuildError, install_ephemeral_processor_runtime,
-    publish_staged_managed_runtime, publish_staged_managed_runtime_and_finalize,
-    stage_managed_runtime,
+    ManagedRuntimeCommitReceipt, ManagedRuntimeRebuildError, discard_staged_managed_runtime,
+    install_ephemeral_processor_runtime, publish_staged_managed_runtime,
+    publish_staged_managed_runtime_and_finalize, stage_managed_runtime,
+    stage_managed_runtime_until_cancelled,
 };
 use super::layout::{ManagedRuntimeCache, runtime_os_arch};
 use super::manifest::{RuntimeSourceReceipt, acquire_runtime_source};
@@ -18,6 +26,132 @@ use super::model::{
 use super::probe::{JavaRuntimeProbeReceipt, probe_java_runtime_receipt};
 use crate::launch::JavaVersion;
 use std::path::{Path, PathBuf};
+use std::sync::{
+    Arc,
+    atomic::{AtomicU8, Ordering},
+};
+
+const RUNTIME_MATERIALIZATION_OPEN: u8 = 0;
+const RUNTIME_MATERIALIZATION_CANCELLED: u8 = 1;
+const RUNTIME_MATERIALIZATION_SETTLING: u8 = 2;
+const RUNTIME_MATERIALIZATION_COMPLETE: u8 = 3;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RuntimeMaterializationCancellation {
+    Cancelled,
+    SettlementRequired,
+}
+
+pub(crate) struct RuntimeMaterializationCancelHandle {
+    phase: Arc<AtomicU8>,
+    cancellation: RuntimeCancellationSender,
+}
+
+pub(crate) struct RuntimeMaterializationTaskControl {
+    phase: Arc<AtomicU8>,
+    cancellation: RuntimeCancellation,
+}
+
+pub(crate) fn runtime_materialization_control() -> (
+    RuntimeMaterializationCancelHandle,
+    RuntimeMaterializationTaskControl,
+) {
+    let phase = Arc::new(AtomicU8::new(RUNTIME_MATERIALIZATION_OPEN));
+    let (cancellation, cancellation_rx) = runtime_cancellation_channel();
+    (
+        RuntimeMaterializationCancelHandle {
+            phase: Arc::clone(&phase),
+            cancellation,
+        },
+        RuntimeMaterializationTaskControl {
+            phase,
+            cancellation: cancellation_rx,
+        },
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn block_runtime_before_publication_claim_for_test(
+    install_root: &Path,
+) -> RuntimeTestGate {
+    arm_runtime_test_hook(RuntimeTestHookPoint::BeforePublicationClaim, install_root)
+}
+
+impl RuntimeMaterializationCancelHandle {
+    pub(crate) fn cancel_before_publication(&self) -> RuntimeMaterializationCancellation {
+        match self.phase.compare_exchange(
+            RUNTIME_MATERIALIZATION_OPEN,
+            RUNTIME_MATERIALIZATION_CANCELLED,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) | Err(RUNTIME_MATERIALIZATION_CANCELLED) => {
+                self.cancellation.cancel();
+                RuntimeMaterializationCancellation::Cancelled
+            }
+            Err(RUNTIME_MATERIALIZATION_SETTLING | RUNTIME_MATERIALIZATION_COMPLETE) => {
+                RuntimeMaterializationCancellation::SettlementRequired
+            }
+            Err(phase) => panic!("invalid runtime materialization phase {phase}"),
+        }
+    }
+}
+
+impl RuntimeMaterializationTaskControl {
+    #[cfg(test)]
+    pub(crate) async fn cancelled(&mut self) {
+        self.cancellation.cancelled().await;
+    }
+
+    fn cancellation(&mut self) -> &mut RuntimeCancellation {
+        &mut self.cancellation
+    }
+
+    pub(crate) fn claim_publication_settlement(&self) -> bool {
+        match self.phase.compare_exchange(
+            RUNTIME_MATERIALIZATION_OPEN,
+            RUNTIME_MATERIALIZATION_SETTLING,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) | Err(RUNTIME_MATERIALIZATION_SETTLING) => true,
+            Err(RUNTIME_MATERIALIZATION_CANCELLED) => false,
+            Err(RUNTIME_MATERIALIZATION_COMPLETE) => {
+                panic!("completed runtime materialization cannot claim publication")
+            }
+            Err(phase) => panic!("invalid runtime materialization phase {phase}"),
+        }
+    }
+
+    pub(crate) fn finish(&self) -> bool {
+        loop {
+            match self.phase.load(Ordering::Acquire) {
+                RUNTIME_MATERIALIZATION_OPEN => {
+                    if self
+                        .phase
+                        .compare_exchange(
+                            RUNTIME_MATERIALIZATION_OPEN,
+                            RUNTIME_MATERIALIZATION_COMPLETE,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        )
+                        .is_ok()
+                    {
+                        return true;
+                    }
+                }
+                RUNTIME_MATERIALIZATION_SETTLING => {
+                    self.phase
+                        .store(RUNTIME_MATERIALIZATION_COMPLETE, Ordering::Release);
+                    return true;
+                }
+                RUNTIME_MATERIALIZATION_CANCELLED => return false,
+                RUNTIME_MATERIALIZATION_COMPLETE => return true,
+                phase => panic!("invalid runtime materialization phase {phase}"),
+            }
+        }
+    }
+}
 
 pub(crate) struct ProcessorRuntime {
     probe_receipt: JavaRuntimeProbeReceipt,
@@ -265,7 +399,8 @@ pub(crate) async fn materialize_preferred_runtime_source<F>(
     java_version: &JavaVersion,
     source_receipt: RuntimeSourceReceipt,
     observer: &mut F,
-) -> Result<RuntimeSourceReceipt, JavaRuntimeLookupError>
+    control: &mut RuntimeMaterializationTaskControl,
+) -> Result<Option<RuntimeSourceReceipt>, JavaRuntimeLookupError>
 where
     F: FnMut(RuntimeEnsureEvent),
 {
@@ -277,7 +412,18 @@ where
     }
     let current = resolve_axial_cached_runtime(cache, &component, java_version.major_version).ok();
     let matches_source = match current.as_ref() {
-        Some(runtime) => runtime_record_matches_source(runtime, &source_receipt).await,
+        Some(runtime) => {
+            let matches = runtime_record_matches_source_until_cancelled(
+                runtime,
+                &source_receipt,
+                control.cancellation(),
+            )
+            .await;
+            if control.cancellation().is_cancelled() {
+                return Ok(None);
+            }
+            matches
+        }
         None => false,
     };
     let source_receipt = if matches_source {
@@ -286,13 +432,45 @@ where
         observer(RuntimeEnsureEvent::DownloadingManagedRuntime {
             component: component.as_str().to_string(),
         });
-        install_managed_runtime_component_from_source(cache, &component, source_receipt, observer)
+        let staged = stage_managed_runtime_until_cancelled(
+            cache,
+            &component,
+            source_receipt,
+            observer,
+            control.cancellation(),
+        )
+        .await?;
+        let Some(staged) = staged else {
+            return Ok(None);
+        };
+        #[cfg(test)]
+        wait_for_runtime_test_hook(
+            RuntimeTestHookPoint::BeforePublicationClaim,
+            &cache
+                .component_root(component.as_str())
+                .expect("staged runtime has a managed cache root"),
+        )
+        .await;
+        if !control.claim_publication_settlement() {
+            discard_staged_managed_runtime(staged).await?;
+            return Ok(None);
+        }
+        publish_staged_managed_runtime_and_finalize(staged)
             .await
             .map_err(ManagedRuntimeRebuildError::into_lookup_error)?
             .into_source_receipt()
     };
     let runtime = resolve_axial_cached_runtime(cache, &component, java_version.major_version)?;
-    if !runtime_record_matches_source(&runtime, &source_receipt).await {
+    let matches_source = runtime_record_matches_source_until_cancelled(
+        &runtime,
+        &source_receipt,
+        control.cancellation(),
+    )
+    .await;
+    if control.cancellation().is_cancelled() {
+        return Ok(None);
+    }
+    if !matches_source {
         return Err(JavaRuntimeLookupError::Install(
             "installed runtime does not match its authenticated source".to_string(),
         ));
@@ -300,7 +478,7 @@ where
     observer(RuntimeEnsureEvent::ManagedRuntimeReady {
         component: component.as_str().to_string(),
     });
-    Ok(source_receipt)
+    Ok(Some(source_receipt))
 }
 
 pub async fn ensure_runtime_with_events<F, Admit, Permit>(
@@ -587,6 +765,22 @@ async fn runtime_record_matches_source(
         return false;
     }
     super::install::runtime_tree_matches_source(Path::new(&runtime.root_dir), source).await
+}
+
+async fn runtime_record_matches_source_until_cancelled(
+    runtime: &RuntimeRecord,
+    source: &RuntimeSourceReceipt,
+    cancellation: &RuntimeCancellation,
+) -> bool {
+    if runtime.source != RuntimeSource::Managed || &runtime.id != source.component() {
+        return false;
+    }
+    super::install::runtime_tree_matches_source_until_cancelled(
+        Path::new(&runtime.root_dir),
+        source,
+        cancellation,
+    )
+    .await
 }
 
 #[cfg(test)]

@@ -1780,7 +1780,9 @@ pub(crate) async fn managed_whole_instance_reconstruction_fixture_for_test(
             DownloadError::Integrity("whole-instance Library source is invalid".to_string())
         })?,
     )?;
-    let asset_pool = AssetSourcePool::new()?;
+    let asset_workers = crate::managed_blocking::ManagedBlockingWorkers::new();
+    let asset_attempt = asset_workers.attempt_guard();
+    let asset_pool = AssetSourcePool::new_with_workers(asset_workers.clone())?;
     let mut asset_sources = RetainedAssetSourceSet::new();
     for (path, kind, bytes) in [
         (
@@ -1808,6 +1810,8 @@ pub(crate) async fn managed_whole_instance_reconstruction_fixture_for_test(
                 .await?,
         )?;
     }
+    asset_workers.drain().await;
+    asset_attempt.disarm();
     let root_lease = ManagedRootPublicationLease::acquire(managed_root)
         .await
         .map_err(|_| {
@@ -2025,7 +2029,9 @@ pub(crate) async fn managed_assets_reconstruction_fixture_for_test(
         },
         environment: crate::rules::default_environment(),
     };
-    let source_pool = AssetSourcePool::new()?;
+    let asset_workers = crate::managed_blocking::ManagedBlockingWorkers::new();
+    let asset_attempt = asset_workers.attempt_guard();
+    let source_pool = AssetSourcePool::new_with_workers(asset_workers.clone())?;
     let mut sources = RetainedAssetSourceSet::new();
     for (path, kind, bytes) in [
         (
@@ -2053,6 +2059,8 @@ pub(crate) async fn managed_assets_reconstruction_fixture_for_test(
                 .await?,
         )?;
     }
+    asset_workers.drain().await;
+    asset_attempt.disarm();
     RetainedKnownGoodReconstruction::new(
         KnownGoodReconstructionReceipt { authenticated },
         RetainedLibrarySourceSet::new(),

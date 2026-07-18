@@ -21,6 +21,7 @@ use super::transfer::{
 use crate::artifact_path::ArtifactRelativePath;
 use crate::asset_index::AssetIndexFlags;
 use crate::known_good::{MAX_TIER2_AGGREGATE_BYTES, MAX_TIER2_ARTIFACT_BYTES, MAX_TIER2_ENTRIES};
+use crate::managed_blocking::ManagedBlockingWorkers;
 use crate::managed_component_cache::{ManagedComponentExactCache, ManagedComponentExactCacheError};
 use crate::managed_component_table::ManagedComponentKind;
 use crate::paths::assets_dir;
@@ -38,6 +39,15 @@ pub(crate) const ASSET_OBJECT_BASE_URL: &str = "https://resources.download.minec
 pub(super) struct AssetDownloadPipeline {
     task: Option<tokio::task::JoinHandle<Result<RetainedAssetsAcquisition, DownloadError>>>,
     progress_rx: mpsc::UnboundedReceiver<DownloadProgress>,
+    progress_open: bool,
+}
+
+impl AssetDownloadPipeline {
+    pub(super) fn is_finished(&self) -> bool {
+        self.task
+            .as_ref()
+            .is_some_and(tokio::task::JoinHandle::is_finished)
+    }
 }
 
 impl Drop for AssetDownloadPipeline {
@@ -52,6 +62,19 @@ pub(super) struct RetainedAssetsAcquisition {
     pub(super) asset_index_source: AuthenticatedSelectedArtifactSource,
     pub(super) sources: RetainedAssetSourceSet,
     pub(super) cache_proofs: AuthenticatedAssetCacheProofSet,
+}
+
+pub(super) struct PreparedAssetDownloadPipeline {
+    source_pool: AssetSourcePool,
+    cache: ManagedComponentExactCache,
+}
+
+pub(super) enum AssetDownloadPipelineEvent {
+    Progress(DownloadProgress),
+    Complete {
+        result: Result<RetainedAssetsAcquisition, DownloadError>,
+        final_progress: Vec<DownloadProgress>,
+    },
 }
 
 pub(super) struct AssetSourceAcquisitionRequest<'a, F> {
@@ -120,8 +143,23 @@ pub(crate) struct AssetObject {
     pub(crate) size: i64,
 }
 
+pub(super) async fn prepare_asset_download_pipeline(
+    mc_dir: &Path,
+    workers: ManagedBlockingWorkers,
+) -> Result<PreparedAssetDownloadPipeline, DownloadError> {
+    let source_pool = AssetSourcePool::new_with_workers(workers.clone())?;
+    let cache = ManagedComponentExactCache::bind_with_workers(
+        mc_dir,
+        ManagedComponentKind::Assets,
+        workers,
+    )
+    .await
+    .map_err(asset_cache_error)?;
+    Ok(PreparedAssetDownloadPipeline { source_pool, cache })
+}
+
 pub(super) fn spawn_asset_download_pipeline(
-    mc_dir: PathBuf,
+    prepared: PreparedAssetDownloadPipeline,
     client: reqwest::Client,
     asset_object_base_url: Arc<str>,
     asset_index_id: String,
@@ -130,10 +168,10 @@ pub(super) fn spawn_asset_download_pipeline(
     plan: Arc<TransferPlan>,
     contribution: TransferPlanContribution,
 ) -> AssetDownloadPipeline {
+    let PreparedAssetDownloadPipeline { source_pool, cache } = prepared;
     let (progress_tx, progress_rx) = mpsc::unbounded_channel();
     let task = tokio::spawn(async move {
-        acquire_asset_sources_with_client(
-            &mc_dir,
+        acquire_asset_sources_with_cache(
             AssetSourceAcquisitionRequest::new(
                 client,
                 asset_object_base_url,
@@ -145,7 +183,8 @@ pub(super) fn spawn_asset_download_pipeline(
                 |progress| {
                     let _ = progress_tx.send(progress);
                 },
-            ),
+            )
+            .bind(source_pool, cache),
         )
         .await
     });
@@ -153,20 +192,13 @@ pub(super) fn spawn_asset_download_pipeline(
     AssetDownloadPipeline {
         task: Some(task),
         progress_rx,
+        progress_open: true,
     }
 }
 
-pub(super) async fn await_asset_download_pipeline<F>(
-    pipeline: Option<AssetDownloadPipeline>,
-    send: &mut F,
-) -> Result<Option<RetainedAssetsAcquisition>, DownloadError>
-where
-    F: FnMut(DownloadProgress),
-{
-    let Some(mut pipeline) = pipeline else {
-        return Ok(None);
-    };
-
+pub(super) async fn next_asset_download_pipeline_event(
+    pipeline: &mut AssetDownloadPipeline,
+) -> AssetDownloadPipelineEvent {
     loop {
         enum PipelineEvent {
             Progress(Option<DownloadProgress>),
@@ -174,57 +206,64 @@ where
                 Result<Result<RetainedAssetsAcquisition, DownloadError>, tokio::task::JoinError>,
             ),
         }
-        let event = {
+        let event = if pipeline.progress_open {
             let task = pipeline
                 .task
                 .as_mut()
                 .expect("live asset pipeline owns its task");
             tokio::select! {
-                progress = pipeline.progress_rx.recv() => PipelineEvent::Progress(progress),
+                biased;
                 result = task => PipelineEvent::Complete(result),
+                progress = pipeline.progress_rx.recv() => PipelineEvent::Progress(progress),
             }
+        } else {
+            let result = pipeline
+                .task
+                .as_mut()
+                .expect("live asset pipeline owns its task")
+                .await;
+            PipelineEvent::Complete(result)
         };
         match event {
-            PipelineEvent::Progress(progress) => {
-                if let Some(progress) = progress {
-                    send(progress);
-                }
+            PipelineEvent::Progress(Some(progress)) => {
+                return AssetDownloadPipelineEvent::Progress(progress);
+            }
+            PipelineEvent::Progress(None) => {
+                pipeline.progress_open = false;
             }
             PipelineEvent::Complete(result) => {
                 pipeline.task.take();
-                while let Ok(progress) = pipeline.progress_rx.try_recv() {
-                    send(progress);
-                }
-                return result
+                let result = result
                     .map_err(|error| {
                         DownloadError::ResolveManifest(format!("asset download task {error}"))
-                    })?
-                    .map(Some);
+                    })
+                    .and_then(|result| result);
+                let final_progress = if result.is_ok() {
+                    std::iter::from_fn(|| pipeline.progress_rx.try_recv().ok()).collect()
+                } else {
+                    Vec::new()
+                };
+                return AssetDownloadPipelineEvent::Complete {
+                    result,
+                    final_progress,
+                };
             }
         }
     }
 }
 
-pub(super) async fn abort_asset_download_pipeline(pipeline: Option<AssetDownloadPipeline>) {
-    if let Some(mut pipeline) = pipeline
-        && let Some(task) = pipeline.task.take()
-    {
+pub(super) async fn abort_asset_download_pipeline(pipeline: &mut Option<AssetDownloadPipeline>) {
+    let Some(pipeline) = pipeline.as_mut() else {
+        return;
+    };
+    if let Some(task) = pipeline.task.as_mut() {
         task.abort();
+    }
+    if let Some(task) = pipeline.task.take() {
         let _ = task.await;
     }
-}
-
-async fn acquire_asset_sources_with_client<F>(
-    mc_dir: &Path,
-    request: AssetSourceAcquisitionRequest<'_, F>,
-) -> Result<RetainedAssetsAcquisition, DownloadError>
-where
-    F: FnMut(DownloadProgress),
-{
-    let cache = ManagedComponentExactCache::bind(mc_dir, ManagedComponentKind::Assets)
-        .await
-        .map_err(asset_cache_error)?;
-    acquire_asset_sources_with_cache(request.bind(AssetSourcePool::new()?, cache)).await
+    pipeline.progress_rx.close();
+    pipeline.progress_open = false;
 }
 
 pub(super) async fn acquire_asset_sources_with_cache<F>(
@@ -248,6 +287,7 @@ where
         source_pool,
         cache,
     } = request;
+    source_pool.ensure_active()?;
     if asset_index_source.kind() != SelectedDownloadArtifactKind::AssetIndex
         || asset_index_source.logical_identity() != asset_index_id
     {
@@ -286,6 +326,7 @@ where
         let cache = cache.clone();
         let asset_object_base_url = Arc::clone(&asset_object_base_url);
         async move {
+            source_pool.ensure_active()?;
             if cache
                 .full_sha1(&job.relative_path, job.expected_size)
                 .await
@@ -387,12 +428,6 @@ pub(crate) fn parse_asset_index(bytes: &[u8]) -> Result<AssetIndex, serde_json::
     serde_json::from_slice(bytes)
 }
 
-pub(super) async fn recv_asset_progress(
-    pipeline: &mut Option<AssetDownloadPipeline>,
-) -> Option<DownloadProgress> {
-    pipeline.as_mut()?.progress_rx.recv().await
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct AssetObjectDownloadJob {
     pub(super) hash: String,
@@ -483,11 +518,15 @@ pub(super) fn asset_object_hash_prefix(hash: &str) -> Result<&str, DownloadError
     Ok(&hash[..2])
 }
 
-fn asset_cache_error(error: ManagedComponentExactCacheError) -> DownloadError {
+pub(super) fn asset_cache_error(error: ManagedComponentExactCacheError) -> DownloadError {
     match error {
         ManagedComponentExactCacheError::Admission => {
             DownloadError::Integrity("asset cache admission failed".to_string())
         }
+        ManagedComponentExactCacheError::Cancelled => DownloadError::FileOperation(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "asset cache admission was cancelled",
+        )),
         ManagedComponentExactCacheError::TaskStopped => DownloadError::FileOperation(
             io::Error::other("asset cache admission task stopped unexpectedly"),
         ),

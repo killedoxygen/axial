@@ -10,7 +10,8 @@ use super::libraries::{library_jobs_for, library_verification_plans_for};
 use super::path_safety::{safe_download_target_label, windows_verbatim_path_string};
 use super::promotion::sweep_stale_promotion_backups;
 use super::runtime::{
-    RuntimeEnsurePipeline, finish_runtime_pipeline_after_artifacts, runtime_ensure_progress,
+    runtime_ensure_progress, runtime_pipeline_for_test, settle_runtime_pipeline,
+    settle_runtime_pipeline_after_failure,
 };
 use super::transfer::{
     acquire_authenticated_selected_artifact_source_with_retry_delays_for_test,
@@ -22,6 +23,7 @@ use crate::known_good::{
     MAX_TIER2_ARTIFACT_BYTES,
 };
 use crate::launch::{JavaVersion, Library, LibraryArtifact, LibraryDownload, maven_to_path};
+use crate::managed_blocking::{ManagedBlockingCheckpoint, ManagedBlockingWorkers};
 use crate::managed_fs::ManagedDir;
 use crate::managed_publication::ManagedRootPublicationLease;
 use crate::manifest::VersionManifest;
@@ -29,15 +31,14 @@ use crate::paths::{assets_dir, versions_dir};
 use crate::rules::Environment;
 use crate::runtime::{
     RuntimeEnsureEvent, RuntimeId, RuntimeSourceReceipt, TestRuntimeSourceDescriptor,
+    authenticated_test_runtime_source,
 };
 use sha1::{Digest as _, Sha1};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
-};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex as StdMutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{Mutex, mpsc, oneshot};
@@ -189,6 +190,192 @@ async fn install_version_starts_asset_index_before_library_download_finishes() {
         .expect("install task should join")
         .expect("install should succeed");
 
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn client_failure_cancels_a_blocked_library_lane() {
+    assert_required_lane_failure_cancels_blocked_sibling("/client.jar", "/library.jar").await;
+}
+
+#[tokio::test]
+async fn library_failure_aborts_and_drains_a_blocked_client_lane() {
+    assert_required_lane_failure_cancels_blocked_sibling("/library.jar", "/client.jar").await;
+}
+
+#[tokio::test]
+async fn sibling_failure_drains_blocked_nonruntime_workers_before_install_returns() {
+    for checkpoint in [
+        ManagedBlockingCheckpoint::LibraryValidation,
+        ManagedBlockingCheckpoint::CacheHash,
+        ManagedBlockingCheckpoint::SourceSpool,
+    ] {
+        assert_sibling_failure_drains_blocked_worker(checkpoint).await;
+    }
+}
+
+#[tokio::test]
+async fn simultaneous_client_and_asset_terminals_preserve_scheduler_precedence() {
+    let version_id = "simultaneous-terminal-precedence";
+    let root = temp_dir(version_id);
+    let fixture = spawn_blocked_worker_install_server(version_id, true).await;
+    fixture
+        .release_client_failure
+        .send(())
+        .expect("release client terminal");
+    let downloader = test_manifest_downloader(
+        &root,
+        version_id,
+        &fixture.version_url,
+        &fixture.version_sha1,
+    )
+    .with_test_asset_object_base_url(fixture.object_base_url.clone())
+    .with_test_concurrent_terminal_wait();
+
+    let error = timeout(
+        Duration::from_secs(5),
+        downloader.install_version(version_id, |_| {}),
+    )
+    .await
+    .expect("simultaneous terminal coordinator must settle")
+    .expect_err("client and asset terminals must fail");
+
+    assert!(error.to_string().contains("/client.jar"));
+    fixture.server.abort();
+    let _ = fixture.server.await;
+    let _ = fs::remove_dir_all(root);
+}
+
+async fn assert_sibling_failure_drains_blocked_worker(checkpoint: ManagedBlockingCheckpoint) {
+    let version_id = format!("worker-drain-{checkpoint:?}").to_ascii_lowercase();
+    let root = temp_dir(&version_id);
+    let fixture = spawn_blocked_worker_install_server(&version_id, false).await;
+    if checkpoint == ManagedBlockingCheckpoint::CacheHash {
+        let cached_object = asset_object_path(&root, &fixture.object_hash);
+        fs::create_dir_all(cached_object.parent().expect("cached object parent"))
+            .expect("create cached object parent");
+        fs::write(cached_object, &fixture.object_body).expect("seed exact cached asset object");
+    }
+    let (entered_tx, entered_rx) = oneshot::channel();
+    let entered_tx = Arc::new(StdMutex::new(Some(entered_tx)));
+    let release = Arc::new((StdMutex::new(false), Condvar::new()));
+    let exited = Arc::new(AtomicUsize::new(0));
+    let hook_release = Arc::clone(&release);
+    let hook_exited = Arc::clone(&exited);
+    let workers = ManagedBlockingWorkers::new_with_checkpoint_hook(Arc::new(move |observed| {
+        if observed != checkpoint {
+            return;
+        }
+        let Some(entered) = entered_tx.lock().expect("worker entered lock").take() else {
+            return;
+        };
+        let _ = entered.send(());
+        let (lock, condition) = &*hook_release;
+        let released = lock.lock().expect("worker gate lock");
+        drop(
+            condition
+                .wait_while(released, |released| !*released)
+                .expect("worker gate wait"),
+        );
+        hook_exited.fetch_add(1, Ordering::Release);
+    }));
+    let downloader = test_manifest_downloader(
+        &root,
+        &version_id,
+        &fixture.version_url,
+        &fixture.version_sha1,
+    )
+    .with_test_asset_object_base_url(fixture.object_base_url.clone())
+    .with_test_acquisition_workers(workers.clone());
+    let install_version_id = version_id.clone();
+    let mut install = tokio::spawn(async move {
+        downloader
+            .install_version(&install_version_id, |_| {})
+            .await
+    });
+
+    timeout(Duration::from_secs(5), entered_rx)
+        .await
+        .expect("selected blocking worker must enter")
+        .expect("blocking worker entered signal");
+    fixture
+        .release_client_failure
+        .send(())
+        .expect("release client failure");
+    timeout(Duration::from_secs(2), async {
+        while !workers.is_cancelled() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("client failure must signal sibling cancellation");
+    assert!(
+        timeout(Duration::from_millis(25), &mut install)
+            .await
+            .is_err(),
+        "install must remain in worker drain"
+    );
+    assert_eq!(exited.load(Ordering::Acquire), 0);
+
+    let (lock, condition) = &*release;
+    *lock.lock().expect("worker release lock") = true;
+    condition.notify_one();
+    let error = timeout(Duration::from_secs(5), install)
+        .await
+        .expect("drained install must return")
+        .expect("install task")
+        .expect_err("client failure must remain primary");
+    assert!(!error.to_string().contains("cancelled"));
+    assert_eq!(exited.load(Ordering::Acquire), 1);
+    tokio::time::sleep(Duration::from_millis(25)).await;
+    assert_eq!(exited.load(Ordering::Acquire), 1);
+    assert!(!versions_dir(&root).join(&version_id).exists());
+
+    fixture.server.abort();
+    let _ = fixture.server.await;
+    let _ = fs::remove_dir_all(root);
+}
+
+async fn assert_required_lane_failure_cancels_blocked_sibling(
+    failing_path: &'static str,
+    blocked_path: &'static str,
+) {
+    let version_id = if failing_path == "/client.jar" {
+        "fail-fast-client"
+    } else {
+        "fail-fast-library"
+    };
+    let root = temp_dir(version_id);
+    let fixture = spawn_fail_fast_install_server(version_id, failing_path, blocked_path).await;
+    let downloader = test_manifest_downloader(
+        &root,
+        version_id,
+        &fixture.version_url,
+        &fixture.version_sha1,
+    );
+    let install = tokio::spawn(async move { downloader.install_version(version_id, |_| {}).await });
+
+    timeout(Duration::from_secs(2), fixture.blocked_started)
+        .await
+        .expect("the sibling lane must start before the primary failure")
+        .expect("blocked sibling start signal");
+    let error = timeout(Duration::from_secs(2), install)
+        .await
+        .expect("the primary lane failure must not wait for its blocked sibling")
+        .expect("install task")
+        .expect_err("the selected required lane must fail");
+    assert!(matches!(
+        error,
+        DownloadError::Request(_) | DownloadError::ResolveManifest(_) | DownloadError::Integrity(_)
+    ));
+    timeout(Duration::from_secs(2), fixture.blocked_closed)
+        .await
+        .expect("the blocked sibling connection must close during failure drain")
+        .expect("blocked sibling close signal");
+    assert!(!versions_dir(&root).join(version_id).exists());
+
+    fixture.server.abort();
+    let _ = fixture.server.await;
     let _ = fs::remove_dir_all(root);
 }
 
@@ -1318,61 +1505,55 @@ async fn normal_install_retries_local_version_bundle_settlement() {
 }
 
 #[tokio::test]
-async fn runtime_task_is_aborted_when_artifact_install_fails() {
-    struct RuntimeGuard(Arc<AtomicBool>);
-
-    impl Drop for RuntimeGuard {
-        fn drop(&mut self) {
-            self.0.store(true, Ordering::SeqCst);
-        }
-    }
-
-    let cancelled = Arc::new(AtomicBool::new(false));
-    let cancelled_in_task = Arc::clone(&cancelled);
+async fn runtime_effect_settles_before_artifact_failure_returns() {
     let (started_tx, started_rx) = oneshot::channel();
+    let (release_tx, release_rx) = oneshot::channel();
+    let source_receipt = authenticated_test_runtime_source(&JavaVersion {
+        component: "java-runtime-delta".to_string(),
+        major_version: 21,
+    })
+    .expect("authenticated runtime test source");
     let task = tokio::spawn(async move {
-        let _guard = RuntimeGuard(cancelled_in_task);
         let _ = started_tx.send(());
-        std::future::pending::<
-            Result<Option<RuntimeSourceReceipt>, crate::runtime::JavaRuntimeLookupError>,
-        >()
-        .await
+        let _ = release_rx.await;
+        Ok::<RuntimeSourceReceipt, crate::runtime::JavaRuntimeLookupError>(source_receipt)
     });
     started_rx.await.expect("runtime task should start");
     let artifact_error = DownloadError::ResolveManifest("artifact failed".to_string());
+    let mut settlement = tokio::spawn(async move {
+        settle_runtime_pipeline_after_failure(
+            Some(runtime_pipeline_for_test(task, true)),
+            artifact_error,
+        )
+        .await
+    });
 
-    let result = timeout(
-        Duration::from_millis(100),
-        finish_runtime_pipeline_after_artifacts(
-            Some(runtime_pipeline(task)),
-            Err::<(), _>(artifact_error),
-            &mut |_| {},
-        ),
-    )
-    .await
-    .expect("runtime cancellation should settle promptly");
+    assert!(
+        timeout(Duration::from_millis(25), &mut settlement)
+            .await
+            .is_err()
+    );
+    release_tx.send(()).expect("release runtime effect");
+    let result = timeout(Duration::from_secs(1), settlement)
+        .await
+        .expect("settled runtime should release the primary error")
+        .expect("runtime settlement task");
 
     assert!(matches!(
         result,
-        Err(DownloadError::ResolveManifest(message)) if message == "artifact failed"
+        DownloadError::ResolveManifest(message) if message == "artifact failed"
     ));
-    assert!(
-        cancelled.load(Ordering::SeqCst),
-        "runtime task guard must be dropped before return"
-    );
 }
 
 #[tokio::test]
-async fn runtime_error_is_reported_when_artifact_install_succeeds() {
+async fn runtime_error_is_reported_when_runtime_settles() {
     let task = tokio::spawn(async {
-        Err::<Option<RuntimeSourceReceipt>, _>(crate::runtime::JavaRuntimeLookupError::Install(
+        Err::<RuntimeSourceReceipt, _>(crate::runtime::JavaRuntimeLookupError::Install(
             "runtime failed".to_string(),
         ))
     });
 
-    let result =
-        finish_runtime_pipeline_after_artifacts(Some(runtime_pipeline(task)), Ok(()), &mut |_| {})
-            .await;
+    let result = settle_runtime_pipeline(Some(runtime_pipeline_for_test(task, false))).await;
 
     assert!(matches!(
         result,
@@ -1384,32 +1565,22 @@ async fn runtime_error_is_reported_when_artifact_install_succeeds() {
 #[tokio::test]
 async fn artifact_error_is_preserved_when_runtime_also_fails() {
     let task = tokio::spawn(async {
-        Err::<Option<RuntimeSourceReceipt>, _>(crate::runtime::JavaRuntimeLookupError::Install(
+        Err::<RuntimeSourceReceipt, _>(crate::runtime::JavaRuntimeLookupError::Install(
             "runtime failed".to_string(),
         ))
     });
     let artifact_error = DownloadError::ResolveManifest("artifact failed".to_string());
 
-    let result = finish_runtime_pipeline_after_artifacts(
-        Some(runtime_pipeline(task)),
-        Err::<(), _>(artifact_error),
-        &mut |_| {},
+    let result = settle_runtime_pipeline_after_failure(
+        Some(runtime_pipeline_for_test(task, false)),
+        artifact_error,
     )
     .await;
 
     assert!(matches!(
         result,
-        Err(DownloadError::ResolveManifest(message)) if message == "artifact failed"
+        DownloadError::ResolveManifest(message) if message == "artifact failed"
     ));
-}
-
-fn runtime_pipeline(
-    task: tokio::task::JoinHandle<
-        Result<Option<RuntimeSourceReceipt>, crate::runtime::JavaRuntimeLookupError>,
-    >,
-) -> RuntimeEnsurePipeline {
-    let (_progress_tx, progress_rx) = mpsc::unbounded_channel();
-    RuntimeEnsurePipeline { task, progress_rx }
 }
 
 #[test]
@@ -2798,6 +2969,226 @@ async fn spawn_overlapped_install_server() -> (
         request_rx,
         release_library_tx,
     )
+}
+
+struct FailFastInstallServer {
+    version_url: String,
+    version_sha1: String,
+    blocked_started: oneshot::Receiver<()>,
+    blocked_closed: oneshot::Receiver<()>,
+    server: tokio::task::JoinHandle<()>,
+}
+
+struct BlockedWorkerInstallServer {
+    version_url: String,
+    version_sha1: String,
+    object_base_url: String,
+    object_body: Vec<u8>,
+    object_hash: String,
+    release_client_failure: oneshot::Sender<()>,
+    server: tokio::task::JoinHandle<()>,
+}
+
+async fn spawn_blocked_worker_install_server(
+    version_id: &str,
+    fail_object: bool,
+) -> BlockedWorkerInstallServer {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind blocked-worker install server");
+    let base_url = format!("http://{}", listener.local_addr().expect("local addr"));
+    let client_body = b"blocked-worker client".to_vec();
+    let library_body = test_jar(
+        "org/example/worker/WorkerLibrary.class",
+        b"blocked-worker library",
+    );
+    let object_body = b"blocked-worker asset".to_vec();
+    let object_hash = sha1_hex(&object_body);
+    let asset_index = serde_json::to_vec(&serde_json::json!({
+        "objects": {
+            "worker/asset.bin": {
+                "hash": object_hash,
+                "size": object_body.len()
+            }
+        }
+    }))
+    .expect("serialize blocked-worker asset index");
+    let version_body = serde_json::to_vec(&serde_json::json!({
+        "id": version_id,
+        "assetIndex": {
+            "id": format!("{version_id}-assets"),
+            "url": format!("{base_url}/asset-index.json"),
+            "sha1": sha1_hex(&asset_index),
+            "size": asset_index.len(),
+            "totalSize": object_body.len()
+        },
+        "downloads": {
+            "client": {
+                "url": format!("{base_url}/client.jar"),
+                "sha1": sha1_hex(&client_body),
+                "size": client_body.len()
+            }
+        },
+        "libraries": [{
+            "name": "org.example:worker:1.0.0",
+            "downloads": {
+                "artifact": {
+                    "path": "org/example/worker/1.0.0/worker-1.0.0.jar",
+                    "url": format!("{base_url}/library.jar"),
+                    "sha1": sha1_hex(&library_body),
+                    "size": library_body.len()
+                }
+            }
+        }]
+    }))
+    .expect("serialize blocked-worker version");
+    let version_sha1 = sha1_hex(&version_body);
+    let object_path = format!("/{}/{}", &object_hash[..2], object_hash);
+    let returned_object_body = object_body.clone();
+    let (release_client_failure, release_client_failure_rx) = oneshot::channel();
+    let release_client_failure_rx = Arc::new(Mutex::new(Some(release_client_failure_rx)));
+
+    let server = tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            let version_body = version_body.clone();
+            let asset_index = asset_index.clone();
+            let library_body = library_body.clone();
+            let object_body = object_body.clone();
+            let object_path = object_path.clone();
+            let release_client_failure_rx = Arc::clone(&release_client_failure_rx);
+            tokio::spawn(async move {
+                let Some(path) = read_request_path(&mut socket).await else {
+                    return;
+                };
+                match path.as_str() {
+                    "/version.json" => {
+                        write_raw_response(&mut socket, "200 OK", &version_body).await
+                    }
+                    "/asset-index.json" => {
+                        write_raw_response(&mut socket, "200 OK", &asset_index).await
+                    }
+                    "/library.jar" => {
+                        write_raw_response(&mut socket, "200 OK", &library_body).await
+                    }
+                    "/client.jar" => {
+                        let release = release_client_failure_rx.lock().await.take();
+                        if let Some(release) = release {
+                            let _ = release.await;
+                        }
+                        write_raw_response(&mut socket, "404 Not Found", b"missing").await;
+                    }
+                    path if path == object_path => {
+                        if fail_object {
+                            write_raw_response(&mut socket, "404 Not Found", b"missing").await
+                        } else {
+                            write_raw_response(&mut socket, "200 OK", &object_body).await
+                        }
+                    }
+                    _ => write_raw_response(&mut socket, "404 Not Found", b"missing").await,
+                }
+            });
+        }
+    });
+
+    BlockedWorkerInstallServer {
+        version_url: format!("{base_url}/version.json"),
+        version_sha1,
+        object_base_url: base_url,
+        object_body: returned_object_body,
+        object_hash,
+        release_client_failure,
+        server,
+    }
+}
+
+async fn spawn_fail_fast_install_server(
+    version_id: &str,
+    failing_path: &'static str,
+    blocked_path: &'static str,
+) -> FailFastInstallServer {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind fail-fast install server");
+    let base_url = format!("http://{}", listener.local_addr().expect("local addr"));
+    let client_body = b"fail-fast client".to_vec();
+    let library_body = test_jar(
+        "org/example/failfast/FailFastLibrary.class",
+        b"fail-fast library",
+    );
+    let version_body = serde_json::to_vec(&serde_json::json!({
+        "id": version_id,
+        "downloads": {
+            "client": {
+                "url": format!("{base_url}/client.jar"),
+                "sha1": sha1_hex(&client_body),
+                "size": client_body.len()
+            }
+        },
+        "libraries": [{
+            "name": "org.example:failfast:1.0.0",
+            "downloads": {
+                "artifact": {
+                    "path": "org/example/failfast/1.0.0/failfast-1.0.0.jar",
+                    "url": format!("{base_url}/library.jar"),
+                    "sha1": sha1_hex(&library_body),
+                    "size": library_body.len()
+                }
+            }
+        }]
+    }))
+    .expect("serialize fail-fast version");
+    let version_sha1 = sha1_hex(&version_body);
+    let (blocked_started_tx, blocked_started) = oneshot::channel();
+    let (blocked_closed_tx, blocked_closed) = oneshot::channel();
+    let blocked_started_tx = Arc::new(Mutex::new(Some(blocked_started_tx)));
+    let blocked_closed_tx = Arc::new(Mutex::new(Some(blocked_closed_tx)));
+    let blocked_ready = Arc::new(tokio::sync::Notify::new());
+
+    let server = tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            let version_body = version_body.clone();
+            let blocked_started_tx = Arc::clone(&blocked_started_tx);
+            let blocked_closed_tx = Arc::clone(&blocked_closed_tx);
+            let blocked_ready = Arc::clone(&blocked_ready);
+            tokio::spawn(async move {
+                let Some(path) = read_request_path(&mut socket).await else {
+                    return;
+                };
+                if path == "/version.json" {
+                    write_raw_response(&mut socket, "200 OK", &version_body).await;
+                } else if path == blocked_path {
+                    if let Some(started) = blocked_started_tx.lock().await.take() {
+                        let _ = started.send(());
+                    }
+                    blocked_ready.notify_one();
+                    let mut probe = [0_u8; 1];
+                    let _ = socket.read(&mut probe).await;
+                    if let Some(closed) = blocked_closed_tx.lock().await.take() {
+                        let _ = closed.send(());
+                    }
+                } else if path == failing_path {
+                    blocked_ready.notified().await;
+                    write_raw_response(&mut socket, "404 Not Found", b"missing").await;
+                } else {
+                    write_raw_response(&mut socket, "404 Not Found", b"missing").await;
+                }
+            });
+        }
+    });
+
+    FailFastInstallServer {
+        version_url: format!("{base_url}/version.json"),
+        version_sha1,
+        blocked_started,
+        blocked_closed,
+        server,
+    }
 }
 
 struct NonemptyAssetInstallServer {

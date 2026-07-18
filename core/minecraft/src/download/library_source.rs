@@ -13,6 +13,12 @@ use crate::known_good::{
     ManagedKnownGoodComponent,
 };
 use crate::loaders::types::LoaderError;
+#[cfg(test)]
+use crate::managed_blocking::ManagedBlockingAttemptGuard;
+use crate::managed_blocking::{
+    ManagedBlockingCheckpoint, ManagedBlockingTaskError, ManagedBlockingWorkers,
+    ManagedCancellation,
+};
 use crate::managed_component_lifecycle::{
     ComponentPublicationSourceIdentity, RetainedComponentPublicationSource,
 };
@@ -55,27 +61,34 @@ const ZIP_MAX_COMMENT_BYTES: usize = u16::MAX as usize;
 pub(super) struct LibrarySourcePool {
     acquisition_permits: Arc<Semaphore>,
     spool: Arc<RetainedComponentSourceSpool>,
+    workers: ManagedBlockingWorkers,
 }
 
 impl LibrarySourcePool {
-    #[cfg(test)]
-    pub(super) fn with_retained_limit_for_test(retained_bytes: u64) -> Result<Self, DownloadError> {
-        Self::with_retained_limit(retained_bytes)
+    pub(super) fn new_with_workers(workers: ManagedBlockingWorkers) -> Result<Self, DownloadError> {
+        Self::with_retained_limit(MAX_TIER2_AGGREGATE_BYTES, workers)
     }
 
-    pub(super) fn new() -> Result<Self, DownloadError> {
-        Self::with_retained_limit(MAX_TIER2_AGGREGATE_BYTES)
-    }
-
-    fn with_retained_limit(retained_bytes: u64) -> Result<Self, DownloadError> {
+    pub(super) fn with_retained_limit(
+        retained_bytes: u64,
+        workers: ManagedBlockingWorkers,
+    ) -> Result<Self, DownloadError> {
         Ok(Self {
             acquisition_permits: Arc::new(Semaphore::new(LIBRARY_SOURCE_BUDGET_UNITS as usize)),
             spool: RetainedComponentSourceSpool::new(retained_bytes)
                 .map_err(retained_spool_download_error)?,
+            workers,
         })
     }
 
+    pub(super) fn ensure_active(&self) -> Result<(), DownloadError> {
+        self.workers
+            .ensure_active()
+            .map_err(managed_blocking_download_error)
+    }
+
     async fn reserve(&self, hard_limit: u64) -> Result<OwnedSemaphorePermit, DownloadError> {
+        self.ensure_active()?;
         if hard_limit == 0 || hard_limit > LIBRARY_SOURCE_MAX_BYTES {
             return Err(source_integrity_error("exceeds the bounded scratch limit"));
         }
@@ -94,19 +107,21 @@ impl LibrarySourcePool {
         acquisition_permit: OwnedSemaphorePermit,
     ) -> Result<RetainedComponentSourceAllocation, DownloadError> {
         let spool = Arc::clone(&self.spool);
-        let result = tokio::task::spawn_blocking(move || {
-            let allocation = spool.append_authenticated(file, observed_size, observed_sha1);
-            drop(acquisition_permit);
-            allocation
-        })
-        .await
-        .map_err(|error| {
-            DownloadError::FileOperation(io::Error::other(format!(
-                "retained source spool task stopped unexpectedly: {error}"
-            )))
-        })?;
+        let result = self
+            .workers
+            .run(move |cancellation| {
+                let allocation =
+                    spool.append_authenticated(file, observed_size, observed_sha1, &cancellation);
+                drop(acquisition_permit);
+                allocation
+            })
+            .await
+            .map_err(managed_blocking_download_error)?;
         match result {
             Ok(allocation) => Ok(allocation),
+            Err(RetainedComponentSourceAppendError::Cancelled) => Err(
+                managed_blocking_download_error(ManagedBlockingTaskError::Cancelled),
+            ),
             Err(RetainedComponentSourceAppendError::SourceRejected) => Err(source_integrity_error(
                 "validated JAR changed during retained source admission",
             )),
@@ -127,27 +142,37 @@ impl LibrarySourcePool {
     {
         let permit = self.reserve(observed_size).await?;
         let spool = Arc::clone(&self.spool);
-        tokio::task::spawn_blocking(move || {
-            let allocation = if validate_and_rewind_bounded_jar(&mut reader).is_err() {
-                Ok(None)
-            } else {
-                match spool.append_authenticated(reader, observed_size, observed_sha1) {
-                    Ok(allocation) => Ok(Some(allocation)),
-                    Err(RetainedComponentSourceAppendError::SourceRejected) => Ok(None),
-                    Err(RetainedComponentSourceAppendError::Spool(error)) => {
-                        Err(retained_spool_download_error(error))
+        self.workers
+            .run(move |cancellation| {
+                let validation = validate_and_rewind_bounded_jar(&mut reader, &cancellation);
+                let allocation = if validation.is_err() && cancellation.is_cancelled() {
+                    Err(managed_blocking_download_error(
+                        ManagedBlockingTaskError::Cancelled,
+                    ))
+                } else if validation.is_err() {
+                    Ok(None)
+                } else {
+                    match spool.append_authenticated(
+                        reader,
+                        observed_size,
+                        observed_sha1,
+                        &cancellation,
+                    ) {
+                        Ok(allocation) => Ok(Some(allocation)),
+                        Err(RetainedComponentSourceAppendError::Cancelled) => Err(
+                            managed_blocking_download_error(ManagedBlockingTaskError::Cancelled),
+                        ),
+                        Err(RetainedComponentSourceAppendError::SourceRejected) => Ok(None),
+                        Err(RetainedComponentSourceAppendError::Spool(error)) => {
+                            Err(retained_spool_download_error(error))
+                        }
                     }
-                }
-            };
-            drop(permit);
-            allocation
-        })
-        .await
-        .map_err(|error| {
-            DownloadError::FileOperation(io::Error::other(format!(
-                "retained cache spool task stopped unexpectedly: {error}"
-            )))
-        })?
+                };
+                drop(permit);
+                allocation
+            })
+            .await
+            .map_err(managed_blocking_download_error)?
     }
 
     pub(super) async fn retain_authenticated_local_source(
@@ -157,26 +182,31 @@ impl LibrarySourcePool {
         let (relative_path, kind, bytes, observed_size, observed_sha1) = source.into_parts();
         let permit = self.reserve(observed_size).await?;
         let spool = Arc::clone(&self.spool);
-        let allocation = tokio::task::spawn_blocking(move || {
-            let allocation =
-                spool.append_authenticated(Cursor::new(bytes), observed_size, observed_sha1);
-            drop(permit);
-            allocation
-        })
-        .await
-        .map_err(|error| {
-            DownloadError::FileOperation(io::Error::other(format!(
-                "retained local source spool task stopped unexpectedly: {error}"
-            )))
-        })?
-        .map_err(|error| match error {
-            RetainedComponentSourceAppendError::SourceRejected => {
-                source_integrity_error("changed during retained local source admission")
-            }
-            RetainedComponentSourceAppendError::Spool(error) => {
-                retained_spool_download_error(error)
-            }
-        })?;
+        let allocation = self
+            .workers
+            .run(move |cancellation| {
+                let allocation = spool.append_authenticated(
+                    Cursor::new(bytes),
+                    observed_size,
+                    observed_sha1,
+                    &cancellation,
+                );
+                drop(permit);
+                allocation
+            })
+            .await
+            .map_err(managed_blocking_download_error)?
+            .map_err(|error| match error {
+                RetainedComponentSourceAppendError::Cancelled => {
+                    managed_blocking_download_error(ManagedBlockingTaskError::Cancelled)
+                }
+                RetainedComponentSourceAppendError::SourceRejected => {
+                    source_integrity_error("changed during retained local source admission")
+                }
+                RetainedComponentSourceAppendError::Spool(error) => {
+                    retained_spool_download_error(error)
+                }
+            })?;
         Ok(
             RetainedLibraryComponentSource::from_authenticated_local_allocation(
                 allocation,
@@ -885,6 +915,7 @@ async fn acquire_library_source_with_retry_delays(
 ) -> Result<AcquiredLibrarySource, DownloadError> {
     let mut next_delay = 0;
     loop {
+        request.pool.ensure_active()?;
         match acquire_library_source_attempt(&request).await {
             Ok(source) => return Ok(source),
             Err(error) if error.retryable && next_delay < retry_delays.len() => {
@@ -942,6 +973,7 @@ async fn acquire_library_source_attempt_inner(
     request: &LibrarySourceRequest<'_>,
     validation_hook: Option<BlockingValidationHook>,
 ) -> Result<AcquiredLibrarySource, LibrarySourceAttemptError> {
+    request.pool.ensure_active().map_err(nonretryable)?;
     if request
         .expected
         .sha1
@@ -1116,31 +1148,39 @@ async fn acquire_library_source_attempt_inner(
     }
 
     let mut file = output.into_std().await;
-    let verified = tokio::task::spawn_blocking(move || {
-        if let Some(hook) = validation_hook {
-            hook();
-        }
-        let verified_sha1 = hash_open_file(&mut file, observed_size)?;
-        validate_and_rewind_bounded_jar(&mut file)?;
-        Ok::<_, std::io::Error>((file, verified_sha1, permit))
-    })
-    .await
-    .map_err(|error| {
-        emit_source_fact(
-            request,
-            ExecutionDownloadFactKind::TempWriteFailed,
-            no_download_fact_fields(),
-        );
-        nonretryable(std::io::Error::other(error.to_string()).into())
-    })?
-    .map_err(|error| {
-        emit_source_fact(
-            request,
-            ExecutionDownloadFactKind::ChecksumMismatch,
-            vec![("algorithm", "sha1")],
-        );
-        nonretryable(error.into())
-    })?;
+    let verified = request
+        .pool
+        .workers
+        .run(move |cancellation| {
+            if let Some(hook) = validation_hook {
+                hook();
+            }
+            cancellation.checkpoint(ManagedBlockingCheckpoint::LibraryValidation);
+            cancellation.check_io()?;
+            let verified_sha1 = hash_open_file(&mut file, observed_size, &cancellation)?;
+            validate_and_rewind_bounded_jar(&mut file, &cancellation)?;
+            Ok::<_, std::io::Error>((file, verified_sha1, permit))
+        })
+        .await
+        .map_err(|error| {
+            emit_source_fact(
+                request,
+                ExecutionDownloadFactKind::TempWriteFailed,
+                no_download_fact_fields(),
+            );
+            nonretryable(managed_blocking_download_error(error))
+        })?
+        .map_err(|error| {
+            if error.kind() == io::ErrorKind::Interrupted {
+                return nonretryable(error.into());
+            }
+            emit_source_fact(
+                request,
+                ExecutionDownloadFactKind::ChecksumMismatch,
+                vec![("algorithm", "sha1")],
+            );
+            nonretryable(error.into())
+        })?;
     let (file, verified_sha1, permit) = verified;
     if verified_sha1 != observed_sha1 {
         emit_source_fact(
@@ -1169,7 +1209,12 @@ async fn acquire_library_source_attempt_inner(
     })
 }
 
-fn hash_open_file(file: &mut File, expected_size: u64) -> std::io::Result<[u8; 20]> {
+fn hash_open_file(
+    file: &mut File,
+    expected_size: u64,
+    cancellation: &ManagedCancellation,
+) -> std::io::Result<[u8; 20]> {
+    cancellation.check_io()?;
     if file.metadata()?.len() != expected_size {
         return Err(std::io::Error::other(
             "retained library source size changed",
@@ -1180,6 +1225,7 @@ fn hash_open_file(file: &mut File, expected_size: u64) -> std::io::Result<[u8; 2
     let mut observed = 0_u64;
     let mut buffer = [0_u8; 64 * 1024];
     loop {
+        cancellation.check_io()?;
         let read = file.read(&mut buffer)?;
         if read == 0 {
             break;
@@ -1196,8 +1242,12 @@ fn hash_open_file(file: &mut File, expected_size: u64) -> std::io::Result<[u8; 2
     Ok(hasher.finalize().into())
 }
 
-fn validate_bounded_jar<R: Read + Seek>(file: &mut R) -> std::io::Result<()> {
-    preflight_zip_central_directory(file)?;
+fn validate_bounded_jar<R: Read + Seek>(
+    file: &mut R,
+    cancellation: &ManagedCancellation,
+) -> std::io::Result<()> {
+    cancellation.check_io()?;
+    preflight_zip_central_directory(file, cancellation)?;
     file.seek(SeekFrom::Start(0))?;
     let mut archive = zip::ZipArchive::new(file)?;
     if archive.is_empty() || archive.len() > usize::from(MAX_JAR_ENTRIES) {
@@ -1209,6 +1259,7 @@ fn validate_bounded_jar<R: Read + Seek>(file: &mut R) -> std::io::Result<()> {
     let mut total_uncompressed_bytes = 0_u64;
     let mut has_file = false;
     for index in 0..archive.len() {
+        cancellation.check_io()?;
         let entry = archive.by_index(index)?;
         let name_bytes = entry.name_raw().len();
         if name_bytes > MAX_JAR_ENTRY_NAME_BYTES {
@@ -1245,13 +1296,21 @@ fn validate_bounded_jar<R: Read + Seek>(file: &mut R) -> std::io::Result<()> {
     Ok(())
 }
 
-fn validate_and_rewind_bounded_jar<R: Read + Seek>(file: &mut R) -> std::io::Result<()> {
-    validate_bounded_jar(file)?;
+fn validate_and_rewind_bounded_jar<R: Read + Seek>(
+    file: &mut R,
+    cancellation: &ManagedCancellation,
+) -> std::io::Result<()> {
+    validate_bounded_jar(file, cancellation)?;
+    cancellation.check_io()?;
     file.seek(SeekFrom::Start(0))?;
     Ok(())
 }
 
-fn preflight_zip_central_directory<R: Read + Seek>(file: &mut R) -> std::io::Result<()> {
+fn preflight_zip_central_directory<R: Read + Seek>(
+    file: &mut R,
+    cancellation: &ManagedCancellation,
+) -> std::io::Result<()> {
+    cancellation.check_io()?;
     let length = file.seek(SeekFrom::End(0))?;
     let tail_len =
         length.min((ZIP_END_OF_CENTRAL_DIRECTORY_BYTES + ZIP_MAX_COMMENT_BYTES) as u64) as usize;
@@ -1311,6 +1370,7 @@ fn preflight_zip_central_directory<R: Read + Seek>(file: &mut R) -> std::io::Res
     let mut total_uncompressed_bytes = 0_u64;
     let mut header = [0_u8; 46];
     for _ in 0..entries {
+        cancellation.check_io()?;
         file.read_exact(&mut header)?;
         consumed = consumed
             .checked_add(header.len() as u64)
@@ -1414,6 +1474,20 @@ fn source_integrity_error(message: &str) -> DownloadError {
     DownloadError::Integrity(format!("library source {message}"))
 }
 
+fn managed_blocking_download_error(error: ManagedBlockingTaskError) -> DownloadError {
+    let (kind, message) = match error {
+        ManagedBlockingTaskError::Cancelled => (
+            io::ErrorKind::Interrupted,
+            "retained library source work was cancelled",
+        ),
+        ManagedBlockingTaskError::TaskStopped => (
+            io::ErrorKind::Other,
+            "retained library source task stopped unexpectedly",
+        ),
+    };
+    DownloadError::FileOperation(io::Error::new(kind, message))
+}
+
 fn retained_spool_download_error(error: RetainedComponentSourceSpoolError) -> DownloadError {
     if error.is_capacity_exceeded() {
         source_integrity_error("exceeds the aggregate retained-source limit")
@@ -1441,6 +1515,32 @@ mod tests {
     use zip::write::SimpleFileOptions;
 
     const PUBLICATION_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(5);
+
+    fn uncancelled() -> ManagedCancellation {
+        ManagedBlockingWorkers::new().cancellation()
+    }
+
+    fn source_pool_for_test() -> (
+        LibrarySourcePool,
+        ManagedBlockingWorkers,
+        ManagedBlockingAttemptGuard,
+    ) {
+        source_pool_with_retained_limit_for_test(MAX_TIER2_AGGREGATE_BYTES)
+    }
+
+    fn source_pool_with_retained_limit_for_test(
+        retained_bytes: u64,
+    ) -> (
+        LibrarySourcePool,
+        ManagedBlockingWorkers,
+        ManagedBlockingAttemptGuard,
+    ) {
+        let workers = ManagedBlockingWorkers::new();
+        let attempt = workers.attempt_guard();
+        let pool = LibrarySourcePool::with_retained_limit(retained_bytes, workers.clone())
+            .expect("test component source pool");
+        (pool, workers, attempt)
+    }
 
     struct ScriptedResponse {
         status: &'static str,
@@ -1746,7 +1846,7 @@ mod tests {
             sha1: Some(sha1_hex(&body)),
         };
         let (url, _) = spawn_server(vec![ScriptedResponse::full(body.clone())]).await;
-        let pool = LibrarySourcePool::new().expect("test component source pool");
+        let (pool, _workers, _attempt) = source_pool_for_test();
         let absent_destination = std::env::temp_dir().join(format!(
             "axial-library-source-no-destination-{}",
             std::process::id()
@@ -1769,7 +1869,7 @@ mod tests {
             sha1: None,
         };
         let (url, _) = spawn_server(vec![ScriptedResponse::full(body.clone())]).await;
-        let pool = LibrarySourcePool::new().expect("test component source pool");
+        let (pool, _workers, _attempt) = source_pool_for_test();
 
         let source = acquire(&url, &expected, body.len() as u64, "library:size", &pool)
             .await
@@ -1783,7 +1883,7 @@ mod tests {
         let body = jar_bytes(b"observed-only");
         let expected = ExpectedIntegrity::default();
         let (url, _) = spawn_server(vec![ScriptedResponse::full(body.clone())]).await;
-        let pool = LibrarySourcePool::new().expect("test component source pool");
+        let (pool, _workers, _attempt) = source_pool_for_test();
 
         let source = acquire(
             &url,
@@ -1802,7 +1902,7 @@ mod tests {
     async fn invalid_sha_metadata_fails_before_network_or_budget_effects() {
         let body = jar_bytes(b"invalid-sha-metadata");
         let (url, requests) = spawn_server(vec![ScriptedResponse::full(body)]).await;
-        let pool = LibrarySourcePool::new().expect("test component source pool");
+        let (pool, _workers, _attempt) = source_pool_for_test();
         let expected = ExpectedIntegrity {
             size: None,
             sha1: Some("not-a-sha1".to_string()),
@@ -1833,7 +1933,7 @@ mod tests {
             sha1: None,
         };
         let (url, _) = spawn_server(vec![ScriptedResponse::without_length(body)]).await;
-        let pool = LibrarySourcePool::new().expect("test component source pool");
+        let (pool, _workers, _attempt) = source_pool_for_test();
 
         let error = rejected(
             acquire(
@@ -1856,7 +1956,7 @@ mod tests {
         const REQUEST_CAP: u64 = 17 << 20;
         let body = jar_bytes(b"small-source-large-contract");
         let (url, _) = spawn_server(vec![ScriptedResponse::full(body.clone())]).await;
-        let pool = LibrarySourcePool::new().expect("test component source pool");
+        let (pool, _workers, _attempt) = source_pool_for_test();
 
         let source = acquire(
             &url,
@@ -1944,8 +2044,7 @@ mod tests {
         let bytes = b"authenticated local reconstruction output".to_vec();
         let size = bytes.len() as u64;
         let sha1 = sha1_bytes(&bytes);
-        let pool = LibrarySourcePool::with_retained_limit_for_test(size)
-            .expect("bounded component source pool");
+        let (pool, _workers, _attempt) = source_pool_with_retained_limit_for_test(size);
         let candidate = AuthenticatedLocalLibraryBytes::new(
             path,
             LibraryComponentSourceKind::Library,
@@ -2150,8 +2249,8 @@ mod tests {
             ScriptedResponse::full(body.clone()),
         ])
         .await;
-        let pool = LibrarySourcePool::with_retained_limit_for_test(body.len() as u64)
-            .expect("bounded component source pool");
+        let (pool, _workers, _attempt) =
+            source_pool_with_retained_limit_for_test(body.len() as u64);
         let first = acquire_component(
             &url,
             &ExpectedIntegrity::default(),
@@ -2201,7 +2300,7 @@ mod tests {
             ScriptedResponse::full(body.clone()),
         ])
         .await;
-        let pool = LibrarySourcePool::new().expect("component source pool");
+        let (pool, _workers, _attempt) = source_pool_for_test();
         let source = acquire_component(
             &url,
             &ExpectedIntegrity::default(),
@@ -2288,7 +2387,7 @@ mod tests {
     async fn retained_library_replay_then_final_consume_does_not_charge_budget_twice() {
         let body = jar_bytes(b"replay then final consume");
         let (url, _) = spawn_server(vec![ScriptedResponse::full(body.clone())]).await;
-        let pool = LibrarySourcePool::new().expect("component source pool");
+        let (pool, _workers, _attempt) = source_pool_for_test();
         let source = acquire_component(
             &url,
             &ExpectedIntegrity::default(),
@@ -2335,8 +2434,8 @@ mod tests {
     async fn cancelled_library_staging_keeps_retained_source_alive_until_copy_finishes() {
         let body = jar_bytes(b"cancelled-component-staging");
         let (url, _) = spawn_server(vec![ScriptedResponse::full(body.clone())]).await;
-        let pool = LibrarySourcePool::with_retained_limit_for_test(body.len() as u64)
-            .expect("bounded component source pool");
+        let (pool, _workers, _attempt) =
+            source_pool_with_retained_limit_for_test(body.len() as u64);
         let source = acquire_component(
             &url,
             &ExpectedIntegrity::default(),
@@ -2426,6 +2525,7 @@ mod tests {
             sha1: Some("0000000000000000000000000000000000000000".to_string()),
         };
         let (url, _) = spawn_server(vec![ScriptedResponse::full(body.clone())]).await;
+        let (pool, _workers, _attempt) = source_pool_for_test();
 
         let error = rejected(
             acquire(
@@ -2433,7 +2533,7 @@ mod tests {
                 &expected,
                 body.len() as u64,
                 "library:sha-mismatch",
-                &LibrarySourcePool::new().expect("test component source pool"),
+                &pool,
             )
             .await,
             "expected mismatched SHA rejection",
@@ -2450,6 +2550,7 @@ mod tests {
             sha1: None,
         };
         let (url, _) = spawn_server(vec![ScriptedResponse::full(body.clone())]).await;
+        let (pool, _workers, _attempt) = source_pool_for_test();
 
         let error = rejected(
             acquire(
@@ -2457,7 +2558,7 @@ mod tests {
                 &expected,
                 body.len() as u64 + 1,
                 "library:size-mismatch",
-                &LibrarySourcePool::new().expect("test component source pool"),
+                &pool,
             )
             .await,
             "expected mismatched size rejection",
@@ -2470,6 +2571,7 @@ mod tests {
     async fn rejects_declared_content_length_over_request_cap() {
         let response = ScriptedResponse::partial(65, Vec::new());
         let (url, _) = spawn_server(vec![response]).await;
+        let (pool, _workers, _attempt) = source_pool_for_test();
 
         let error = rejected(
             acquire(
@@ -2477,7 +2579,7 @@ mod tests {
                 &ExpectedIntegrity::default(),
                 64,
                 "library:declared-oversize",
-                &LibrarySourcePool::new().expect("test component source pool"),
+                &pool,
             )
             .await,
             "expected declared oversize rejection",
@@ -2491,6 +2593,7 @@ mod tests {
         let body = jar_bytes(b"stream-over-cap");
         let cap = body.len() as u64 - 1;
         let (url, _) = spawn_server(vec![ScriptedResponse::without_length(body)]).await;
+        let (pool, _workers, _attempt) = source_pool_for_test();
 
         let error = rejected(
             acquire(
@@ -2498,7 +2601,7 @@ mod tests {
                 &ExpectedIntegrity::default(),
                 cap,
                 "library:stream-oversize",
-                &LibrarySourcePool::new().expect("test component source pool"),
+                &pool,
             )
             .await,
             "expected streamed oversize rejection",
@@ -2521,7 +2624,7 @@ mod tests {
             size: Some(body.len() as u64),
             sha1: Some(sha1_hex(&body)),
         };
-        let pool = LibrarySourcePool::new().expect("test component source pool");
+        let (pool, _workers, _attempt) = source_pool_for_test();
 
         let client = reqwest::Client::new();
         let relative_path = fixture_relative_path();
@@ -2556,7 +2659,7 @@ mod tests {
         let client = reqwest::Client::new();
         let expected = ExpectedIntegrity::default();
         let relative_path = fixture_relative_path();
-        let pool = LibrarySourcePool::new().expect("test component source pool");
+        let (pool, _workers, _attempt) = source_pool_for_test();
 
         let error = acquire_library_source_with_retry_delays(
             LibrarySourceRequest {
@@ -2590,7 +2693,7 @@ mod tests {
         let client = reqwest::Client::new();
         let expected = ExpectedIntegrity::default();
         let relative_path = fixture_relative_path();
-        let pool = LibrarySourcePool::new().expect("test component source pool");
+        let (pool, _workers, _attempt) = source_pool_for_test();
 
         let source = acquire_library_source_with_retry_delays(
             LibrarySourceRequest {
@@ -2615,7 +2718,7 @@ mod tests {
     #[tokio::test]
     async fn rejects_zero_length_library_contract_before_network_or_retention() {
         let (url, requests) = spawn_server(vec![ScriptedResponse::full(Vec::new())]).await;
-        let pool = LibrarySourcePool::new().expect("test component source pool");
+        let (pool, _workers, _attempt) = source_pool_for_test();
 
         let error = rejected(
             acquire(
@@ -2642,7 +2745,7 @@ mod tests {
     async fn fresh_invalid_jar_restores_scratch_without_retained_charge() {
         let body = b"not-a-jar".to_vec();
         let (url, requests) = spawn_server(vec![ScriptedResponse::full(body.clone())]).await;
-        let pool = LibrarySourcePool::new().expect("test component source pool");
+        let (pool, _workers, _attempt) = source_pool_for_test();
 
         let error = rejected(
             acquire(
@@ -2666,7 +2769,7 @@ mod tests {
     async fn cache_jar_reader_failures_restore_scratch_without_retained_charge() {
         let body = jar_bytes(b"cache reader failure");
         let sha1 = sha1_bytes(&body);
-        let pool = LibrarySourcePool::new().expect("test component source pool");
+        let (pool, _workers, _attempt) = source_pool_for_test();
 
         assert!(
             pool.try_retain_authenticated_jar_reader(
@@ -2710,10 +2813,10 @@ mod tests {
     #[test]
     fn preflight_rejects_oversized_entry_count_and_central_directory() {
         let mut too_many_entries = eocd(MAX_JAR_ENTRIES + 1, 1);
-        assert!(preflight_zip_central_directory(&mut too_many_entries).is_err());
+        assert!(preflight_zip_central_directory(&mut too_many_entries, &uncancelled()).is_err());
 
         let mut oversized_directory = eocd(1, MAX_JAR_CENTRAL_DIRECTORY_BYTES + 1);
-        assert!(preflight_zip_central_directory(&mut oversized_directory).is_err());
+        assert!(preflight_zip_central_directory(&mut oversized_directory, &uncancelled()).is_err());
     }
 
     #[test]
@@ -2724,7 +2827,7 @@ mod tests {
         trailing_file
             .write_all(&trailing)
             .expect("write trailing fixture");
-        assert!(preflight_zip_central_directory(&mut trailing_file).is_err());
+        assert!(preflight_zip_central_directory(&mut trailing_file, &uncancelled()).is_err());
 
         let mut fake_terminal = jar_bytes(b"fake terminal");
         fake_terminal.extend_from_slice(&[
@@ -2734,7 +2837,7 @@ mod tests {
         fake_file
             .write_all(&fake_terminal)
             .expect("write fake EOCD fixture");
-        assert!(preflight_zip_central_directory(&mut fake_file).is_err());
+        assert!(preflight_zip_central_directory(&mut fake_file, &uncancelled()).is_err());
     }
 
     #[test]
@@ -2750,7 +2853,8 @@ mod tests {
         file.write_all(&bytes).expect("write JAR fixture");
         file.seek(SeekFrom::Start(0)).expect("rewind JAR fixture");
 
-        let error = validate_bounded_jar(&mut file).expect_err("reject oversized name");
+        let error =
+            validate_bounded_jar(&mut file, &uncancelled()).expect_err("reject oversized name");
 
         assert!(error.to_string().contains("entry name is too large"));
     }
@@ -2763,7 +2867,8 @@ mod tests {
         file.write_all(&bytes).expect("write JAR fixture");
         file.seek(SeekFrom::Start(0)).expect("rewind JAR fixture");
 
-        let error = validate_bounded_jar(&mut file).expect_err("reject per-entry ZIP bomb");
+        let error =
+            validate_bounded_jar(&mut file, &uncancelled()).expect_err("reject per-entry ZIP bomb");
 
         assert!(error.to_string().contains("entry expands beyond"));
     }
@@ -2777,7 +2882,8 @@ mod tests {
         file.write_all(&bytes).expect("write JAR fixture");
         file.seek(SeekFrom::Start(0)).expect("rewind JAR fixture");
 
-        let error = validate_bounded_jar(&mut file).expect_err("reject aggregate ZIP bomb");
+        let error =
+            validate_bounded_jar(&mut file, &uncancelled()).expect_err("reject aggregate ZIP bomb");
 
         assert!(error.to_string().contains("JAR expands beyond"));
     }
@@ -2789,7 +2895,7 @@ mod tests {
         let (gate_tx, gate_rx) = oneshot::channel();
         let response = ScriptedResponse::gated(body.clone(), started_tx, gate_rx);
         let (url, _) = spawn_server(vec![response]).await;
-        let pool = LibrarySourcePool::new().expect("test component source pool");
+        let (pool, _workers, _attempt) = source_pool_for_test();
         let pool_for_task = pool.clone();
         let task = tokio::spawn(async move {
             acquire(
@@ -2812,14 +2918,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cancellation_during_blocking_validation_keeps_budget_reserved() {
+    async fn cancellation_drain_joins_blocked_validation_and_restores_budget() {
         let body = jar_bytes(b"cancel-validation");
         let (url, _) = spawn_server(vec![ScriptedResponse::full(body.clone())]).await;
-        let pool = LibrarySourcePool::new().expect("test component source pool");
+        let workers = ManagedBlockingWorkers::new();
+        let pool = LibrarySourcePool::new_with_workers(workers.clone())
+            .expect("test component source pool");
         let pool_for_task = pool.clone();
         let (entered_tx, entered_rx) = oneshot::channel();
         let release = Arc::new((Mutex::new(false), Condvar::new()));
         let release_for_hook = Arc::clone(&release);
+        let hook_exited = Arc::new(AtomicUsize::new(0));
+        let hook_exited_for_task = Arc::clone(&hook_exited);
         let task = tokio::spawn(async move {
             let client = reqwest::Client::new();
             let expected = ExpectedIntegrity::default();
@@ -2845,6 +2955,7 @@ mod tests {
                             .wait_while(released, |released| !*released)
                             .expect("validation gate wait"),
                     );
+                    hook_exited_for_task.store(1, Ordering::Release);
                 })),
             )
             .await
@@ -2852,20 +2963,27 @@ mod tests {
         entered_rx.await.expect("blocking validation entered");
         assert_eq!(pool.available_bytes(), 0);
 
+        workers.cancel();
         task.abort();
         let _ = task.await;
         assert_eq!(pool.available_bytes(), 0);
+        let mut drain = Box::pin(workers.drain());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), &mut drain)
+                .await
+                .is_err()
+        );
+        assert_eq!(hook_exited.load(Ordering::Acquire), 0);
 
         let (lock, condition) = &*release;
         *lock.lock().expect("validation release lock") = true;
         condition.notify_one();
-        for _ in 0..100 {
-            if pool.available_bytes() == LIBRARY_SOURCE_MAX_BYTES {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
+        tokio::time::timeout(Duration::from_secs(1), drain)
+            .await
+            .expect("validation worker must acknowledge cancellation");
+        assert_eq!(hook_exited.load(Ordering::Acquire), 1);
         assert_eq!(pool.available_bytes(), LIBRARY_SOURCE_MAX_BYTES);
+        assert_eq!(pool.retained_available_bytes(), MAX_TIER2_AGGREGATE_BYTES);
     }
 
     #[tokio::test]
@@ -2876,7 +2994,7 @@ mod tests {
         let mut responses = vec![ScriptedResponse::gated(body.clone(), started_tx, gate_rx)];
         responses.extend((1..16).map(|_| ScriptedResponse::full(body.clone())));
         let (url, requests) = spawn_server(responses).await;
-        let pool = LibrarySourcePool::new().expect("test component source pool");
+        let (pool, _workers, _attempt) = source_pool_for_test();
 
         let first_url = url.clone();
         let first_pool = pool.clone();
@@ -2944,7 +3062,7 @@ mod tests {
             });
         }
         let (url, requests) = spawn_server(responses).await;
-        let pool = LibrarySourcePool::new().expect("test component source pool");
+        let (pool, _workers, _attempt) = source_pool_for_test();
         let mut tasks = Vec::new();
         for index in 0..16 {
             let task_url = url.clone();
