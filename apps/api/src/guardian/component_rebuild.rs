@@ -326,7 +326,13 @@ impl ManagedVersionBundleComponentRebuildEffect {
         Arc::ptr_eq(&self.identity, expected)
     }
 
-    pub(crate) fn core_request(&self) -> (&std::path::Path, &str) {
+    pub(crate) fn core_request(
+        &self,
+    ) -> (
+        &std::path::Path,
+        &str,
+        &Arc<axial_minecraft::known_good::KnownGoodInventory>,
+    ) {
         self.request.core_request()
     }
 
@@ -2628,7 +2634,18 @@ mod tests {
                     .iter()
                     .all(|step| step.step_id != COMPONENT_QUARANTINE_STEP)
             );
-            assert_eq!(effect.core_request(), (expected_root.as_path(), "1.21.1"));
+            let (request_root, request_version_id, inventory) = effect.core_request();
+            assert_eq!(request_root, expected_root.as_path());
+            assert_eq!(request_version_id, "1.21.1");
+            assert_eq!(
+                inventory
+                    .managed_component_projection(
+                        axial_minecraft::known_good::ManagedKnownGoodComponent::VersionBundle,
+                    )
+                    .expect("admitted VersionBundle projection")
+                    .entry_count(),
+                3
+            );
             async move {
                 assert!(
                     !state.instance_lifecycle_is_held(INSTANCE_ID).await,
@@ -2720,7 +2737,18 @@ mod tests {
                     .get(&operation_id)
                     .expect("VersionBundle rollback plan is visible before Core mutation");
                 assert_eq!(plan.status, OperationStatus::Planned);
-                assert_eq!(effect.core_request(), (root.as_path(), VERSION_ID));
+                let (request_root, request_version_id, inventory) = effect.core_request();
+                assert_eq!(request_root, root.as_path());
+                assert_eq!(request_version_id, VERSION_ID);
+                assert_eq!(
+                    inventory
+                        .managed_component_projection(
+                            axial_minecraft::known_good::ManagedKnownGoodComponent::VersionBundle,
+                        )
+                        .expect("admitted VersionBundle projection")
+                        .entry_count(),
+                    3
+                );
                 let rollback_receipt =
                     match axial_minecraft::rebuild_managed_version_bundle_rollback_fixture_for_test(
                         root, VERSION_ID,

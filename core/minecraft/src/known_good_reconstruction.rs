@@ -1,7 +1,7 @@
 use crate::download::{
     Downloader, ManagedProjectionSequenceEffect, ManagedProjectionSequenceError,
     ManagedProjectionSequenceOutcome, ManagedReconstructionContext,
-    publish_managed_projection_sequence,
+    RegisteredVersionBundleSourceError, publish_managed_projection_sequence,
 };
 #[cfg(test)]
 use crate::download::{
@@ -11,6 +11,7 @@ use crate::known_good::{
     KnownGoodInventory, KnownGoodReconstructionReceipt, ManagedAssetsReconstruction,
     ManagedKnownGoodComponent, ManagedLibrariesReconstruction, ManagedVersionBundleReconstruction,
     ManagedWholeInstanceReconstruction, RetainedKnownGoodReconstruction,
+    VersionBundleProjectionAuthority,
 };
 use crate::managed_component_lifecycle::{
     ManagedComponentCommittedReceipt, ManagedComponentLifecycleOutcome,
@@ -42,6 +43,7 @@ use crate::version_bundle_publication::{
 #[cfg(feature = "test-support")]
 use sha1::{Digest as _, Sha1};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 #[cfg(feature = "test-support")]
 use std::{collections::HashMap, io};
 
@@ -118,7 +120,7 @@ enum WholeInstanceRuntimeTerminal {
 }
 
 struct SettledVersionBundleRebuildAuthority {
-    projection: KnownGoodReconstructionReceipt,
+    projection: VersionBundleProjectionAuthority,
     lease: ManagedRootPublicationLease,
 }
 
@@ -178,6 +180,9 @@ pub enum ManagedAssetsRebuildError {
 
 pub enum ManagedVersionBundleRebuildError {
     Reconstruction(KnownGoodReconstructionError),
+    Source,
+    Authority,
+    LocalPreparation,
     Preparation,
     RolledBack(ManagedVersionBundleRollbackReceipt),
 }
@@ -261,6 +266,9 @@ impl std::fmt::Debug for ManagedVersionBundleRebuildError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(match self {
             Self::Reconstruction(_) => "ManagedVersionBundleRebuildError::Reconstruction(..)",
+            Self::Source => "ManagedVersionBundleRebuildError::Source",
+            Self::Authority => "ManagedVersionBundleRebuildError::Authority",
+            Self::LocalPreparation => "ManagedVersionBundleRebuildError::LocalPreparation",
             Self::Preparation => "ManagedVersionBundleRebuildError::Preparation",
             Self::RolledBack(_) => "ManagedVersionBundleRebuildError::RolledBack(..)",
         })
@@ -306,6 +314,9 @@ impl std::fmt::Display for ManagedVersionBundleRebuildError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(match self {
             Self::Reconstruction(_) => "managed VersionBundle reconstruction failed",
+            Self::Source => "managed VersionBundle source acquisition failed",
+            Self::Authority => "managed VersionBundle authority was rejected",
+            Self::LocalPreparation => "managed VersionBundle local preparation failed",
             Self::Preparation => "managed VersionBundle rebuild failed before its canonical effect",
             Self::RolledBack(_) => "managed VersionBundle rebuild rolled back",
         })
@@ -431,15 +442,13 @@ impl ManagedVersionBundleCommitReceipt {
     }
 
     pub fn matches_known_good_inventory(&self, expected: &KnownGoodInventory) -> bool {
-        version_bundle_projections_match(&self.authority.projection, expected)
+        self.authority
+            .projection
+            .matches_known_good_inventory(expected)
     }
 
     pub async fn revalidate(&self) -> bool {
-        let Ok(projection) = self
-            .authority
-            .projection
-            .component_projection(ManagedKnownGoodComponent::VersionBundle)
-        else {
+        let Ok(projection) = self.authority.projection.component_projection() else {
             return false;
         };
         revalidate_settled_version_bundle(&self.authority.lease, projection).await
@@ -456,7 +465,9 @@ impl ManagedVersionBundleRollbackReceipt {
     }
 
     pub fn matches_known_good_inventory(&self, expected: &KnownGoodInventory) -> bool {
-        version_bundle_projections_match(&self.authority.projection, expected)
+        self.authority
+            .projection
+            .matches_known_good_inventory(expected)
     }
 
     pub fn effect(&self) -> ManagedVersionBundleRollbackEffect {
@@ -622,31 +633,6 @@ fn whole_rollback_effect(
     }
 }
 
-fn version_bundle_projections_match(
-    reconstructed: &KnownGoodReconstructionReceipt,
-    expected: &KnownGoodInventory,
-) -> bool {
-    let Ok(reconstructed) =
-        reconstructed.component_projection(ManagedKnownGoodComponent::VersionBundle)
-    else {
-        return false;
-    };
-    let Ok(expected) =
-        expected.managed_component_projection(ManagedKnownGoodComponent::VersionBundle)
-    else {
-        return false;
-    };
-    reconstructed.entry_count() == expected.entry_count()
-        && reconstructed
-            .entries()
-            .iter()
-            .zip(expected.entries())
-            .all(|(left, right)| {
-                left.inventory_ordinal() == right.inventory_ordinal()
-                    && left.entry() == right.entry()
-            })
-}
-
 pub async fn rebuild_managed_libraries(
     managed_root: impl Into<PathBuf>,
     version_id: &str,
@@ -684,19 +670,51 @@ pub async fn rebuild_managed_assets(
 pub async fn rebuild_managed_version_bundle(
     managed_root: impl Into<PathBuf>,
     version_id: &str,
+    expected: Arc<KnownGoodInventory>,
 ) -> Result<ManagedVersionBundleCommitReceipt, ManagedVersionBundleRebuildError> {
     let managed_root = managed_root.into();
     let version_id = version_id.to_string();
     let owner = tokio::spawn(async move {
-        let reconstruction =
-            prepare_managed_version_bundle_reconstruction(managed_root, &version_id)
-                .await
-                .map_err(ManagedVersionBundleRebuildError::Reconstruction)?;
+        let reconstruction = match reconstruction_kind(&version_id) {
+            ReconstructionKind::Vanilla => {
+                prepare_registered_managed_version_bundle_reconstruction(
+                    managed_root,
+                    &version_id,
+                    expected,
+                )
+                .await?
+            }
+            ReconstructionKind::Loader => {
+                let reconstruction =
+                    prepare_loader_managed_version_bundle_reconstruction(managed_root, &version_id)
+                        .await
+                        .map_err(|error| match error {
+                            KnownGoodReconstructionError::ManagedRoot => {
+                                ManagedVersionBundleRebuildError::LocalPreparation
+                            }
+                            KnownGoodReconstructionError::Vanilla
+                            | KnownGoodReconstructionError::Loader => {
+                                ManagedVersionBundleRebuildError::Reconstruction(error)
+                            }
+                        })?;
+                require_loader_version_bundle_projection(reconstruction, &expected)?
+            }
+        };
         publish_managed_version_bundle_reconstruction(reconstruction).await
     });
     owner
         .await
         .map_err(|_| ManagedVersionBundleRebuildError::Preparation)?
+}
+
+fn require_loader_version_bundle_projection(
+    reconstruction: ManagedVersionBundleReconstruction,
+    expected: &KnownGoodInventory,
+) -> Result<ManagedVersionBundleReconstruction, ManagedVersionBundleRebuildError> {
+    if !reconstruction.matches_known_good_inventory(expected) {
+        return Err(ManagedVersionBundleRebuildError::Authority);
+    }
+    Ok(reconstruction)
 }
 
 pub async fn rematerialize_managed_instance(
@@ -1205,7 +1223,7 @@ async fn publish_managed_version_bundle_reconstruction(
         .map_err(|_| ManagedVersionBundleRebuildError::Preparation)?;
     let publication = {
         let version_bundle = projection
-            .component_projection(ManagedKnownGoodComponent::VersionBundle)
+            .component_projection()
             .map_err(|_| ManagedVersionBundleRebuildError::Preparation)?;
         publish_version_bundle(lease, source, version_bundle).await
     };
@@ -1278,11 +1296,37 @@ async fn prepare_managed_assets_reconstruction(
         .map_err(|_| reconstruction_error_for(kind))
 }
 
-async fn prepare_managed_version_bundle_reconstruction(
+async fn prepare_registered_managed_version_bundle_reconstruction(
+    managed_root: impl Into<PathBuf>,
+    version_id: &str,
+    expected: Arc<KnownGoodInventory>,
+) -> Result<ManagedVersionBundleReconstruction, ManagedVersionBundleRebuildError> {
+    let managed_root = managed_root.into();
+    let guarded_root = run_publication_blocking(move || ManagedDir::open_root(&managed_root))
+        .await
+        .map_err(|_| ManagedVersionBundleRebuildError::LocalPreparation)?
+        .map_err(|_| ManagedVersionBundleRebuildError::LocalPreparation)?;
+    let source = Downloader::source_only()
+        .reconstruct_registered_version_bundle_source(guarded_root.clone(), version_id, &expected)
+        .await
+        .map_err(|error| match error {
+            RegisteredVersionBundleSourceError::Source => ManagedVersionBundleRebuildError::Source,
+            RegisteredVersionBundleSourceError::Authority => {
+                ManagedVersionBundleRebuildError::Authority
+            }
+            RegisteredVersionBundleSourceError::LocalPreparation => {
+                ManagedVersionBundleRebuildError::LocalPreparation
+            }
+        })?;
+    ManagedVersionBundleReconstruction::from_registered(guarded_root, version_id, expected, source)
+        .map_err(|_| ManagedVersionBundleRebuildError::Authority)
+}
+
+async fn prepare_loader_managed_version_bundle_reconstruction(
     managed_root: impl Into<PathBuf>,
     version_id: &str,
 ) -> Result<ManagedVersionBundleReconstruction, KnownGoodReconstructionError> {
-    let kind = reconstruction_kind(version_id);
+    let kind = ReconstructionKind::Loader;
     let managed_root = managed_root.into();
     let guarded_root = run_publication_blocking(move || ManagedDir::open_root(&managed_root))
         .await
@@ -1407,6 +1451,7 @@ mod tests {
     use sha1::{Digest as _, Sha1};
     use std::collections::HashMap;
     use std::fs;
+    use std::sync::Arc;
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
     #[test]
@@ -1424,6 +1469,230 @@ mod tests {
             reconstruction_kind("loader-v2-invalid"),
             ReconstructionKind::Loader
         );
+    }
+
+    #[tokio::test]
+    async fn registered_vanilla_version_bundle_all_exact_requires_no_provider() {
+        const VERSION_ID: &str = "registered-bundle-all-exact";
+        const CLIENT_BYTES: &[u8] = b"expected-client";
+        const LOG_ID: &str = "registered-log.xml";
+        const LOG_BYTES: &[u8] = b"<Configuration/>";
+        let managed = tempfile::tempdir().expect("managed root");
+        let version_json = registered_version_bundle_metadata(
+            VERSION_ID,
+            "http://127.0.0.1:9/client",
+            CLIENT_BYTES,
+            LOG_ID,
+            "http://127.0.0.1:9/log",
+            LOG_BYTES,
+            None,
+        );
+        seed_registered_version_bundle(
+            managed.path(),
+            VERSION_ID,
+            &version_json,
+            CLIENT_BYTES,
+            LOG_ID,
+            LOG_BYTES,
+        );
+        let inventory = Arc::new(
+            crate::known_good::KnownGoodInventory::version_bundle_for_test(
+                VERSION_ID,
+                &version_json,
+                CLIENT_BYTES,
+                Some((LOG_ID, LOG_BYTES)),
+            ),
+        );
+
+        let receipt =
+            super::rebuild_managed_version_bundle(managed.path(), VERSION_ID, inventory.clone())
+                .await
+                .expect("exact local VersionBundle rebuild");
+
+        assert_eq!(receipt.version_id(), VERSION_ID);
+        assert!(receipt.matches_root(managed.path()).await);
+        assert!(receipt.matches_known_good_inventory(&inventory));
+        assert!(receipt.revalidate().await);
+    }
+
+    #[tokio::test]
+    async fn registered_vanilla_version_bundle_fetches_only_corrupt_member() {
+        const VERSION_ID: &str = "registered-bundle-corrupt-client";
+        const CLIENT_BYTES: &[u8] = b"expected-client";
+        const CORRUPT_CLIENT_BYTES: &[u8] = b"tampered-client";
+        const LOG_ID: &str = "registered-log.xml";
+        const LOG_BYTES: &[u8] = b"<Configuration/>";
+        let managed = tempfile::tempdir().expect("managed root");
+        let (client_url, requested_path) = serve_single_version_bundle_member(CLIENT_BYTES).await;
+        let version_json = registered_version_bundle_metadata(
+            VERSION_ID,
+            &client_url,
+            CLIENT_BYTES,
+            LOG_ID,
+            "http://127.0.0.1:9/log",
+            LOG_BYTES,
+            None,
+        );
+        seed_registered_version_bundle(
+            managed.path(),
+            VERSION_ID,
+            &version_json,
+            CORRUPT_CLIENT_BYTES,
+            LOG_ID,
+            LOG_BYTES,
+        );
+        let inventory = Arc::new(
+            crate::known_good::KnownGoodInventory::version_bundle_for_test(
+                VERSION_ID,
+                &version_json,
+                CLIENT_BYTES,
+                Some((LOG_ID, LOG_BYTES)),
+            ),
+        );
+
+        let receipt =
+            super::rebuild_managed_version_bundle(managed.path(), VERSION_ID, inventory.clone())
+                .await
+                .expect("corrupt client-only VersionBundle rebuild");
+
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(2), requested_path)
+                .await
+                .expect("selected client request")
+                .expect("selected client request path"),
+            "/member"
+        );
+        assert_eq!(
+            fs::read(
+                managed
+                    .path()
+                    .join(format!("versions/{VERSION_ID}/{VERSION_ID}.jar")),
+            )
+            .expect("repaired client"),
+            CLIENT_BYTES
+        );
+        assert!(receipt.matches_known_good_inventory(&inventory));
+        assert!(receipt.revalidate().await);
+    }
+
+    #[tokio::test]
+    async fn registered_vanilla_version_bundle_rejects_metadata_contract_drift_before_effect() {
+        const VERSION_ID: &str = "registered-bundle-contract-drift";
+        const CLIENT_BYTES: &[u8] = b"expected-client";
+        const OTHER_CLIENT_BYTES: &[u8] = b"different-client";
+        const LOG_ID: &str = "registered-log.xml";
+        const LOG_BYTES: &[u8] = b"<Configuration/>";
+        let managed = tempfile::tempdir().expect("managed root");
+        let drifted_client_sha1 = format!("{:x}", Sha1::digest(OTHER_CLIENT_BYTES));
+        let version_json = registered_version_bundle_metadata(
+            VERSION_ID,
+            "http://127.0.0.1:9/client",
+            CLIENT_BYTES,
+            LOG_ID,
+            "http://127.0.0.1:9/log",
+            LOG_BYTES,
+            Some(&drifted_client_sha1),
+        );
+        seed_registered_version_bundle(
+            managed.path(),
+            VERSION_ID,
+            &version_json,
+            CLIENT_BYTES,
+            LOG_ID,
+            LOG_BYTES,
+        );
+        let inventory = Arc::new(
+            crate::known_good::KnownGoodInventory::version_bundle_for_test(
+                VERSION_ID,
+                &version_json,
+                CLIENT_BYTES,
+                Some((LOG_ID, LOG_BYTES)),
+            ),
+        );
+
+        let error = super::rebuild_managed_version_bundle(managed.path(), VERSION_ID, inventory)
+            .await
+            .expect_err("metadata contract drift must be rejected");
+
+        assert!(matches!(
+            error,
+            super::ManagedVersionBundleRebuildError::Authority
+        ));
+        assert_eq!(
+            fs::read(
+                managed
+                    .path()
+                    .join(format!("versions/{VERSION_ID}/{VERSION_ID}.jar")),
+            )
+            .expect("unmodified client"),
+            CLIENT_BYTES
+        );
+    }
+
+    #[tokio::test]
+    async fn loader_version_bundle_projection_gate_publishes_only_exact_pinned_authority() {
+        const CLIENT_BYTES: &[u8] = b"axial managed VersionBundle client fixture";
+        const LOG_ID: &str = "guardian-version-bundle.xml";
+        const LOG_BYTES: &[u8] = b"<Configuration/>";
+        let version_id = crate::loaders::installed_version_id_for(
+            crate::loaders::LoaderComponentId::Fabric,
+            "1.21.5",
+            "0.16.14",
+        )
+        .expect("canonical loader version id");
+        assert_eq!(
+            super::reconstruction_kind(&version_id),
+            super::ReconstructionKind::Loader
+        );
+        let version_json = serde_json::to_vec(&serde_json::json!({
+            "id": version_id.as_str(),
+            "type": "release",
+            "mainClass": "org.axial.GuardianFixture"
+        }))
+        .expect("loader projection metadata");
+        let expected = crate::known_good::KnownGoodInventory::version_bundle_for_test(
+            &version_id,
+            &version_json,
+            CLIENT_BYTES,
+            Some((LOG_ID, LOG_BYTES)),
+        );
+
+        let matching_root = tempfile::tempdir().expect("matching loader root");
+        let matching_guard = crate::managed_fs::ManagedDir::open_root(matching_root.path())
+            .expect("matching loader root guard");
+        let matching = crate::known_good::managed_version_bundle_reconstruction_fixture_for_test(
+            matching_guard,
+            &version_id,
+        )
+        .expect("matching loader reconstruction");
+        let matching = super::require_loader_version_bundle_projection(matching, &expected)
+            .expect("matching pinned loader projection");
+        let receipt = super::publish_managed_version_bundle_reconstruction(matching)
+            .await
+            .expect("matching loader projection publication");
+        assert!(receipt.matches_known_good_inventory(&expected));
+        assert!(receipt.revalidate().await);
+
+        let mismatched_root = tempfile::tempdir().expect("mismatched loader root");
+        let mismatched_guard = crate::managed_fs::ManagedDir::open_root(mismatched_root.path())
+            .expect("mismatched loader root guard");
+        let mismatched = crate::known_good::managed_version_bundle_reconstruction_fixture_for_test(
+            mismatched_guard,
+            &version_id,
+        )
+        .expect("mismatched loader reconstruction");
+        let mismatch = crate::known_good::KnownGoodInventory::version_bundle_for_test(
+            &version_id,
+            &version_json,
+            b"different pinned client",
+            Some((LOG_ID, LOG_BYTES)),
+        );
+        assert!(matches!(
+            super::require_loader_version_bundle_projection(mismatched, &mismatch),
+            Err(super::ManagedVersionBundleRebuildError::Authority)
+        ));
+        assert!(!mismatched_root.path().join("versions").exists());
+        assert!(!mismatched_root.path().join("assets").exists());
     }
 
     #[tokio::test]
@@ -1803,6 +2072,111 @@ mod tests {
         assert_user_owned_sentinels(&user_sentinels);
     }
 
+    fn registered_version_bundle_metadata(
+        version_id: &str,
+        client_url: &str,
+        client_bytes: &[u8],
+        log_id: &str,
+        log_url: &str,
+        log_bytes: &[u8],
+        client_sha1_override: Option<&str>,
+    ) -> Vec<u8> {
+        let client_sha1 = client_sha1_override
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("{:x}", Sha1::digest(client_bytes)));
+        serde_json::to_vec(&serde_json::json!({
+            "id": version_id,
+            "type": "release",
+            "mainClass": "org.axial.RegisteredBundleFixture",
+            "assetIndex": {
+                "id": "unrequested-assets",
+                "sha1": format!("{:x}", Sha1::digest(b"unrequested-assets")),
+                "size": 18,
+                "totalSize": 18,
+                "url": "http://127.0.0.1:9/asset-index"
+            },
+            "downloads": {
+                "client": {
+                    "sha1": client_sha1,
+                    "size": client_bytes.len(),
+                    "url": client_url
+                }
+            },
+            "javaVersion": {
+                "component": "unrequested-runtime",
+                "majorVersion": 21
+            },
+            "logging": {
+                "client": {
+                    "argument": "-Dlog4j.configurationFile=${path}",
+                    "file": {
+                        "id": log_id,
+                        "sha1": format!("{:x}", Sha1::digest(log_bytes)),
+                        "size": log_bytes.len(),
+                        "url": log_url
+                    },
+                    "type": "log4j2-xml"
+                }
+            }
+        }))
+        .expect("registered VersionBundle metadata")
+    }
+
+    fn seed_registered_version_bundle(
+        managed_root: &std::path::Path,
+        version_id: &str,
+        version_json: &[u8],
+        client_jar: &[u8],
+        log_id: &str,
+        log_config: &[u8],
+    ) {
+        let version_root = managed_root.join("versions").join(version_id);
+        let log_root = managed_root.join("assets/log_configs");
+        fs::create_dir_all(&version_root).expect("registered version root");
+        fs::create_dir_all(&log_root).expect("registered log root");
+        fs::write(
+            version_root.join(format!("{version_id}.json")),
+            version_json,
+        )
+        .expect("registered metadata");
+        fs::write(version_root.join(format!("{version_id}.jar")), client_jar)
+            .expect("registered client");
+        fs::write(log_root.join(log_id), log_config).expect("registered log config");
+    }
+
+    async fn serve_single_version_bundle_member(
+        bytes: &'static [u8],
+    ) -> (String, tokio::sync::oneshot::Receiver<String>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("VersionBundle byte server");
+        let address = listener.local_addr().expect("VersionBundle byte address");
+        let (request_tx, request_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            let mut request = [0_u8; 1024];
+            let read = socket.read(&mut request).await.unwrap_or_default();
+            let request = String::from_utf8_lossy(&request[..read]);
+            let path = request
+                .lines()
+                .next()
+                .and_then(|line| line.split_ascii_whitespace().nth(1))
+                .unwrap_or_default()
+                .to_string();
+            let _ = request_tx.send(path);
+            let headers = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                bytes.len()
+            );
+            if socket.write_all(headers.as_bytes()).await.is_ok() {
+                let _ = socket.write_all(bytes).await;
+            }
+        });
+        (format!("http://{address}/member"), request_rx)
+    }
+
     async fn whole_instance_fixture(
         managed_root: &std::path::Path,
         version_id: &str,
@@ -2114,6 +2488,9 @@ mod tests {
             assert!(!error.to_string().contains('/'));
         }
         for error in [
+            super::ManagedVersionBundleRebuildError::Source,
+            super::ManagedVersionBundleRebuildError::Authority,
+            super::ManagedVersionBundleRebuildError::LocalPreparation,
             super::ManagedVersionBundleRebuildError::Preparation,
             super::ManagedVersionBundleRebuildError::Reconstruction(
                 KnownGoodReconstructionError::Loader,

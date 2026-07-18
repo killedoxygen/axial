@@ -38,6 +38,7 @@ use sha1::{Digest as _, Sha1};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
 
 pub const MAX_KNOWN_GOOD_RELATIVE_PATH_BYTES: usize = MAX_ARTIFACT_RELATIVE_PATH_BYTES;
 pub const MAX_KNOWN_GOOD_PATH_SEGMENT_BYTES: usize = MAX_ARTIFACT_PATH_SEGMENT_BYTES;
@@ -1229,9 +1230,17 @@ pub(crate) struct RetainedKnownGoodReconstruction {
 }
 
 pub(crate) struct ManagedVersionBundleReconstruction {
-    projection: KnownGoodReconstructionReceipt,
+    projection: VersionBundleProjectionAuthority,
     managed_root: ManagedDir,
     source: AuthenticatedVersionBundleSource,
+}
+
+pub(crate) enum VersionBundleProjectionAuthority {
+    Reconstructed(KnownGoodReconstructionReceipt),
+    Registered {
+        version_id: KnownGoodId,
+        inventory: Arc<KnownGoodInventory>,
+    },
 }
 
 pub(crate) struct ManagedLibrariesReconstruction {
@@ -1338,7 +1347,7 @@ impl RetainedKnownGoodReconstruction {
             sources,
         )?;
         Ok(ManagedVersionBundleReconstruction {
-            projection: receipt,
+            projection: VersionBundleProjectionAuthority::Reconstructed(receipt),
             managed_root,
             source,
         })
@@ -1464,14 +1473,91 @@ impl RetainedKnownGoodReconstruction {
 }
 
 impl ManagedVersionBundleReconstruction {
+    pub(crate) fn from_registered(
+        managed_root: ManagedDir,
+        version_id: &str,
+        inventory: Arc<KnownGoodInventory>,
+        source: AuthenticatedVersionBundleSource,
+    ) -> Result<Self, DownloadError> {
+        let version_id = KnownGoodId::new(version_id).map_err(|_| {
+            DownloadError::Integrity("registered VersionBundle identity is invalid".to_string())
+        })?;
+        let projection = inventory
+            .managed_component_projection(ManagedKnownGoodComponent::VersionBundle)
+            .map_err(|_| {
+                DownloadError::Integrity(
+                    "registered VersionBundle projection is invalid".to_string(),
+                )
+            })?;
+        if !source.matches_projection(&projection) || source.version_id() != version_id.as_str() {
+            return Err(DownloadError::Integrity(
+                "registered VersionBundle source does not match its projection".to_string(),
+            ));
+        }
+        Ok(Self {
+            projection: VersionBundleProjectionAuthority::Registered {
+                version_id,
+                inventory,
+            },
+            managed_root,
+            source,
+        })
+    }
+
+    pub(crate) fn matches_known_good_inventory(&self, expected: &KnownGoodInventory) -> bool {
+        self.projection.matches_known_good_inventory(expected)
+    }
+
     pub(crate) fn into_effect_parts(
         self,
     ) -> (
         ManagedDir,
-        KnownGoodReconstructionReceipt,
+        VersionBundleProjectionAuthority,
         AuthenticatedVersionBundleSource,
     ) {
         (self.managed_root, self.projection, self.source)
+    }
+}
+
+impl VersionBundleProjectionAuthority {
+    pub(crate) fn version_id(&self) -> &str {
+        match self {
+            Self::Reconstructed(receipt) => receipt.version_id(),
+            Self::Registered { version_id, .. } => version_id.as_str(),
+        }
+    }
+
+    pub(crate) fn component_projection(
+        &self,
+    ) -> Result<ManagedComponentProjection<'_>, ManagedComponentProjectionError> {
+        match self {
+            Self::Reconstructed(receipt) => {
+                receipt.component_projection(ManagedKnownGoodComponent::VersionBundle)
+            }
+            Self::Registered { inventory, .. } => {
+                inventory.managed_component_projection(ManagedKnownGoodComponent::VersionBundle)
+            }
+        }
+    }
+
+    pub(crate) fn matches_known_good_inventory(&self, expected: &KnownGoodInventory) -> bool {
+        let Ok(ours) = self.component_projection() else {
+            return false;
+        };
+        let Ok(expected) =
+            expected.managed_component_projection(ManagedKnownGoodComponent::VersionBundle)
+        else {
+            return false;
+        };
+        ours.entry_count() == expected.entry_count()
+            && ours
+                .entries()
+                .iter()
+                .zip(expected.entries())
+                .all(|(left, right)| {
+                    left.inventory_ordinal() == right.inventory_ordinal()
+                        && left.entry() == right.entry()
+                })
     }
 }
 

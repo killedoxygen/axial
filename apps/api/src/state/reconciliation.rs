@@ -345,6 +345,7 @@ enum RegisteredComponentRebuildState {
 pub(crate) struct RegisteredVersionBundleComponentRebuildEffect {
     library_root: PathBuf,
     version_id: String,
+    inventory: std::sync::Arc<axial_minecraft::known_good::KnownGoodInventory>,
 }
 
 pub(crate) struct RegisteredLibrariesComponentRebuildEffect {
@@ -360,6 +361,7 @@ pub(crate) struct RegisteredAssetsComponentRebuildEffect {
 struct ManagedArtifactCoreRequest {
     library_root: PathBuf,
     version_id: String,
+    inventory: std::sync::Arc<axial_minecraft::known_good::KnownGoodInventory>,
 }
 
 pub(crate) enum RegisteredManagedArtifactComponentEffectAdmission<Request> {
@@ -1077,8 +1079,14 @@ async fn settle_reconciliation_pending_with_backoff(
 }
 
 impl RegisteredVersionBundleComponentRebuildEffect {
-    pub(crate) fn core_request(&self) -> (&Path, &str) {
-        (&self.library_root, &self.version_id)
+    pub(crate) fn core_request(
+        &self,
+    ) -> (
+        &Path,
+        &str,
+        &std::sync::Arc<axial_minecraft::known_good::KnownGoodInventory>,
+    ) {
+        (&self.library_root, &self.version_id, &self.inventory)
     }
 }
 
@@ -1727,6 +1735,7 @@ impl RegisteredComponentRebuildAdmission {
                     request: RegisteredVersionBundleComponentRebuildEffect {
                         library_root: request.library_root,
                         version_id: request.version_id,
+                        inventory: request.inventory,
                     },
                     completion: Box::new(completion),
                 }
@@ -1791,6 +1800,7 @@ impl RegisteredComponentRebuildAdmission {
         let request = ManagedArtifactCoreRequest {
             library_root: self.known_good.library_root.clone(),
             version_id: self.known_good.version_id.clone(),
+            inventory: self.known_good.inventory.clone(),
         };
         let RegisteredComponentRebuildAdmission {
             authority,

@@ -58,8 +58,14 @@ use crate::managed_component_lifecycle::{
 use crate::managed_component_publication::ComponentRollbackEffect;
 use crate::managed_component_table::ManagedComponentKind;
 use crate::managed_fs::ManagedDir;
-use crate::managed_publication::{ManagedRootPublicationLease, run_publication_blocking};
-use crate::manifest::{ManifestEntry, VersionManifest, fetch_fresh_install_version_manifest};
+use crate::managed_publication::{
+    ManagedRootPublicationLease, open_managed_target_parent, run_publication_blocking,
+    validate_existing_managed_target_path,
+};
+use crate::manifest::{
+    ManifestEntry, VersionManifest, fetch_fresh_install_version_manifest,
+    fetch_registered_repair_version_manifest,
+};
 use crate::rules::{Environment, default_environment};
 use crate::runtime::{ManagedRuntimeCache, RuntimeSourceReceipt, acquire_preferred_runtime_source};
 #[cfg(test)]
@@ -107,6 +113,37 @@ pub(crate) struct RetainedVersionBundleReconstructionSources {
     log_config: Option<Arc<[u8]>>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RegisteredVersionBundleSourceError {
+    Source,
+    Authority,
+    LocalPreparation,
+}
+
+#[derive(Clone)]
+struct VersionBundleMemberContract {
+    kind: KnownGoodArtifactKind,
+    root_name: &'static str,
+    relative_path: String,
+    logical_identity: String,
+    digest: String,
+    size: u64,
+}
+
+#[derive(Clone)]
+struct VersionBundleContract {
+    version_json: VersionBundleMemberContract,
+    client_jar: VersionBundleMemberContract,
+    log_config: Option<VersionBundleMemberContract>,
+}
+
+#[derive(Default)]
+struct ExactLocalVersionBundleSources {
+    version_json: Option<AuthenticatedVersionBundleMemberSource>,
+    client_jar: Option<AuthenticatedVersionBundleMemberSource>,
+    log_config: Option<AuthenticatedVersionBundleMemberSource>,
+}
+
 pub(crate) struct AuthenticatedVersionBundleMemberSource {
     kind: KnownGoodArtifactKind,
     logical_identity: String,
@@ -126,6 +163,23 @@ impl AuthenticatedVersionBundleSource {
 
     pub(crate) fn into_sources(self) -> Vec<AuthenticatedVersionBundleMemberSource> {
         self.members
+    }
+
+    fn from_members(
+        version_id: String,
+        projection: &ManagedComponentProjection<'_>,
+        members: Vec<AuthenticatedVersionBundleMemberSource>,
+    ) -> Result<Self, DownloadError> {
+        let source = Self {
+            version_id,
+            members,
+        };
+        if !source.matches_projection(projection) {
+            return Err(version_bundle_install_error(
+                "VersionBundle sources do not match the admitted projection",
+            ));
+        }
+        Ok(source)
     }
 
     fn from_selected_sources(
@@ -1145,6 +1199,155 @@ impl Downloader {
         let version_manifest_entry = self.resolve_manifest_entry(version_id).await?;
         self.reconstruct_version_inner(version_id, version_manifest_entry, context)
             .await
+    }
+
+    pub(crate) async fn reconstruct_registered_version_bundle_source(
+        &self,
+        managed_root: ManagedDir,
+        version_id: &str,
+        inventory: &crate::known_good::KnownGoodInventory,
+    ) -> Result<AuthenticatedVersionBundleSource, RegisteredVersionBundleSourceError> {
+        validate_install_version_id(version_id)
+            .map_err(|_| RegisteredVersionBundleSourceError::Authority)?;
+        let projection = inventory
+            .managed_component_projection(ManagedKnownGoodComponent::VersionBundle)
+            .map_err(|_| RegisteredVersionBundleSourceError::Authority)?;
+        let contract = version_bundle_contract(version_id, &projection)
+            .map_err(|_| RegisteredVersionBundleSourceError::Authority)?;
+        let local = retain_exact_local_version_bundle_sources(managed_root.clone(), &contract)
+            .await
+            .map_err(|_| RegisteredVersionBundleSourceError::LocalPreparation)?;
+
+        let (version, version_json_source) = match local.version_json {
+            Some(source) => {
+                let version = parse_vanilla_version_source(source.bytes(), version_id)
+                    .and_then(|version| {
+                        validate_vanilla_version_bundle_contracts(&version)?;
+                        Ok(version)
+                    })
+                    .map_err(|_| RegisteredVersionBundleSourceError::Authority)?;
+                (version, source)
+            }
+            None => {
+                let manifest = fetch_registered_repair_version_manifest(
+                    version_id,
+                    &contract.version_json.digest,
+                )
+                .await
+                .map_err(|_| RegisteredVersionBundleSourceError::Source)?;
+                let entry = registered_version_metadata_manifest_entry(
+                    manifest,
+                    version_id,
+                    &contract.version_json,
+                )?;
+                let expected = expected_integrity(&contract.version_json);
+                let target = selected_download_source_label(
+                    SelectedDownloadArtifactKind::VersionJson,
+                    version_id,
+                );
+                let selected =
+                    acquire_authenticated_selected_artifact_source(SelectedArtifactSourceRequest {
+                        client: &self.client,
+                        kind: SelectedDownloadArtifactKind::VersionJson,
+                        url: &entry.url,
+                        logical_identity: version_id,
+                        expected: &expected,
+                        max_bytes: usize::try_from(contract.version_json.size)
+                            .map_err(|_| RegisteredVersionBundleSourceError::Authority)?,
+                        target: &target,
+                        fact_tx: None,
+                    })
+                    .await
+                    .map_err(|_| RegisteredVersionBundleSourceError::Source)?;
+                let version = parse_vanilla_version_source(selected.bytes(), version_id)
+                    .and_then(|version| {
+                        validate_vanilla_version_bundle_contracts(&version)?;
+                        Ok(version)
+                    })
+                    .map_err(|_| RegisteredVersionBundleSourceError::Authority)?;
+                let source = AuthenticatedVersionBundleMemberSource::from_selected(selected)
+                    .map_err(|_| RegisteredVersionBundleSourceError::Authority)?;
+                (version, source)
+            }
+        };
+
+        validate_version_bundle_contract_against_metadata(&contract, &version)
+            .map_err(|_| RegisteredVersionBundleSourceError::Authority)?;
+        let client_jar_source = match local.client_jar {
+            Some(source) => source,
+            None => {
+                let client = version
+                    .downloads
+                    .client
+                    .as_ref()
+                    .ok_or(RegisteredVersionBundleSourceError::Authority)?;
+                let expected = expected_integrity(&contract.client_jar);
+                let target = selected_download_source_label(
+                    SelectedDownloadArtifactKind::ClientJar,
+                    version_id,
+                );
+                let selected =
+                    acquire_authenticated_selected_artifact_source(SelectedArtifactSourceRequest {
+                        client: &self.client,
+                        kind: SelectedDownloadArtifactKind::ClientJar,
+                        url: &client.url,
+                        logical_identity: version_id,
+                        expected: &expected,
+                        max_bytes: usize::try_from(contract.client_jar.size)
+                            .map_err(|_| RegisteredVersionBundleSourceError::Authority)?,
+                        target: &target,
+                        fact_tx: None,
+                    })
+                    .await
+                    .map_err(|_| RegisteredVersionBundleSourceError::Source)?;
+                AuthenticatedVersionBundleMemberSource::from_selected(selected)
+                    .map_err(|_| RegisteredVersionBundleSourceError::Authority)?
+            }
+        };
+
+        let log_config_source = match (&contract.log_config, local.log_config) {
+            (None, None) => None,
+            (Some(_), Some(source)) => Some(source),
+            (Some(contract), None) => {
+                let file = &version
+                    .logging
+                    .as_ref()
+                    .and_then(|logging| logging.client.as_ref())
+                    .ok_or(RegisteredVersionBundleSourceError::Authority)?
+                    .file;
+                let expected = expected_integrity(contract);
+                let target = selected_download_source_label(
+                    SelectedDownloadArtifactKind::LogConfig,
+                    &contract.logical_identity,
+                );
+                let selected =
+                    acquire_authenticated_selected_artifact_source(SelectedArtifactSourceRequest {
+                        client: &self.client,
+                        kind: SelectedDownloadArtifactKind::LogConfig,
+                        url: &file.url,
+                        logical_identity: &contract.logical_identity,
+                        expected: &expected,
+                        max_bytes: usize::try_from(contract.size)
+                            .map_err(|_| RegisteredVersionBundleSourceError::Authority)?,
+                        target: &target,
+                        fact_tx: None,
+                    })
+                    .await
+                    .map_err(|_| RegisteredVersionBundleSourceError::Source)?;
+                Some(
+                    AuthenticatedVersionBundleMemberSource::from_selected(selected)
+                        .map_err(|_| RegisteredVersionBundleSourceError::Authority)?,
+                )
+            }
+            (None, Some(_)) => return Err(RegisteredVersionBundleSourceError::Authority),
+        };
+
+        let mut members = Vec::with_capacity(2 + usize::from(log_config_source.is_some()));
+        members.push(version_json_source);
+        members.push(client_jar_source);
+        members.extend(log_config_source);
+        AuthenticatedVersionBundleSource::from_members(version_id.to_string(), &projection, members)
+            .map_err(|_| RegisteredVersionBundleSourceError::Authority)
     }
 
     async fn reconstruct_version_inner(
@@ -2298,6 +2501,253 @@ fn reconstruction_download_proof(
     })
 }
 
+fn version_bundle_contract(
+    version_id: &str,
+    projection: &ManagedComponentProjection<'_>,
+) -> Result<VersionBundleContract, DownloadError> {
+    if projection.component() != ManagedKnownGoodComponent::VersionBundle
+        || !(2..=3).contains(&projection.entry_count())
+    {
+        return Err(version_bundle_install_error(
+            "registered VersionBundle projection shape is invalid",
+        ));
+    }
+    let version_json = version_bundle_member_contract(
+        version_id,
+        projection,
+        KnownGoodArtifactKind::VersionMetadata,
+    )?;
+    let client_jar =
+        version_bundle_member_contract(version_id, projection, KnownGoodArtifactKind::ClientJar)?;
+    let log_config = projection
+        .entries()
+        .iter()
+        .any(|projected| projected.entry().kind() == KnownGoodArtifactKind::LogConfig)
+        .then(|| {
+            version_bundle_member_contract(version_id, projection, KnownGoodArtifactKind::LogConfig)
+        })
+        .transpose()?;
+    if projection.entry_count() != 2 + usize::from(log_config.is_some())
+        || version_json.size > MAX_KNOWN_GOOD_VERSION_JSON_BYTES as u64
+    {
+        return Err(version_bundle_install_error(
+            "registered VersionBundle projection members are invalid",
+        ));
+    }
+    Ok(VersionBundleContract {
+        version_json,
+        client_jar,
+        log_config,
+    })
+}
+
+fn version_bundle_member_contract(
+    version_id: &str,
+    projection: &ManagedComponentProjection<'_>,
+    kind: KnownGoodArtifactKind,
+) -> Result<VersionBundleMemberContract, DownloadError> {
+    let mut matches = projection
+        .entries()
+        .iter()
+        .filter(|projected| projected.entry().kind() == kind);
+    let projected = matches.next().ok_or_else(|| {
+        version_bundle_install_error("registered VersionBundle projection member is missing")
+    })?;
+    if matches.next().is_some() {
+        return Err(version_bundle_install_error(
+            "registered VersionBundle projection member is duplicated",
+        ));
+    }
+    let entry = projected.entry();
+    let (root_name, logical_identity) = match kind {
+        KnownGoodArtifactKind::VersionMetadata => (
+            "versions",
+            projected_member_identity(version_id, projection, kind)?,
+        ),
+        KnownGoodArtifactKind::ClientJar => (
+            "versions",
+            projected_member_identity(version_id, projection, kind)?,
+        ),
+        KnownGoodArtifactKind::LogConfig => (
+            "assets",
+            projected_optional_log_identity(projection)?.ok_or_else(|| {
+                version_bundle_install_error("registered VersionBundle log projection is missing")
+            })?,
+        ),
+        _ => {
+            return Err(version_bundle_install_error(
+                "registered VersionBundle projection member kind is invalid",
+            ));
+        }
+    };
+    let expected_root = match kind {
+        KnownGoodArtifactKind::VersionMetadata | KnownGoodArtifactKind::ClientJar => {
+            KnownGoodRoot::Versions
+        }
+        KnownGoodArtifactKind::LogConfig => KnownGoodRoot::Assets,
+        _ => unreachable!(),
+    };
+    if entry.root() != &expected_root {
+        return Err(version_bundle_install_error(
+            "registered VersionBundle projection root is invalid",
+        ));
+    }
+    let (digest, size) = match entry.integrity() {
+        KnownGoodIntegrity::Sha1 { digest, size }
+        | KnownGoodIntegrity::ExactBytes { digest, size }
+            if *size > 0 && *size <= MAX_TIER2_ARTIFACT_BYTES =>
+        {
+            (digest.as_str().to_string(), *size)
+        }
+        _ => {
+            return Err(version_bundle_install_error(
+                "registered VersionBundle projection integrity is invalid",
+            ));
+        }
+    };
+    Ok(VersionBundleMemberContract {
+        kind,
+        root_name,
+        relative_path: entry.path().as_str().to_string(),
+        logical_identity,
+        digest,
+        size,
+    })
+}
+
+async fn retain_exact_local_version_bundle_sources(
+    managed_root: ManagedDir,
+    contract: &VersionBundleContract,
+) -> Result<ExactLocalVersionBundleSources, DownloadError> {
+    let contract = contract.clone();
+    run_publication_blocking(move || {
+        Ok(ExactLocalVersionBundleSources {
+            version_json: read_exact_local_version_bundle_member(
+                &managed_root,
+                &contract.version_json,
+            )?,
+            client_jar: read_exact_local_version_bundle_member(
+                &managed_root,
+                &contract.client_jar,
+            )?,
+            log_config: contract
+                .log_config
+                .as_ref()
+                .map(|member| read_exact_local_version_bundle_member(&managed_root, member))
+                .transpose()?
+                .flatten(),
+        })
+    })
+    .await
+    .map_err(|_| {
+        DownloadError::FileOperation(io::Error::other(
+            "registered VersionBundle local source task stopped",
+        ))
+    })?
+}
+
+fn read_exact_local_version_bundle_member(
+    managed_root: &ManagedDir,
+    contract: &VersionBundleMemberContract,
+) -> Result<Option<AuthenticatedVersionBundleMemberSource>, DownloadError> {
+    validate_existing_managed_target_path(
+        managed_root,
+        contract.root_name,
+        &contract.relative_path,
+    )
+    .map_err(|_| {
+        DownloadError::FileOperation(io::Error::other(
+            "registered VersionBundle local source path is ambiguous",
+        ))
+    })?;
+    let Some((parent, name)) =
+        open_managed_target_parent(managed_root, contract.root_name, &contract.relative_path)
+            .map_err(|_| {
+                DownloadError::FileOperation(io::Error::other(
+                    "registered VersionBundle local source parent is unavailable",
+                ))
+            })?
+    else {
+        return Ok(None);
+    };
+    let Some(guard) = parent.inspect_regular_file(&name).map_err(|_| {
+        DownloadError::FileOperation(io::Error::other(
+            "registered VersionBundle local source is not a stable regular file",
+        ))
+    })?
+    else {
+        return Ok(None);
+    };
+    if guard.size() != contract.size {
+        return Ok(None);
+    }
+    let bytes = parent
+        .read_guarded_file_bounded(&name, &guard, contract.size)
+        .map_err(|_| {
+            DownloadError::FileOperation(io::Error::other(
+                "registered VersionBundle local source read failed",
+            ))
+        })?;
+    let source = AuthenticatedVersionBundleMemberSource::from_local(
+        contract.kind,
+        contract.logical_identity.clone(),
+        bytes,
+    )?;
+    if source.observed_size() != contract.size
+        || !source
+            .observed_sha1()
+            .eq_ignore_ascii_case(&contract.digest)
+    {
+        return Ok(None);
+    }
+    Ok(Some(source))
+}
+
+fn expected_integrity(contract: &VersionBundleMemberContract) -> ExpectedIntegrity {
+    ExpectedIntegrity {
+        size: Some(contract.size),
+        sha1: Some(contract.digest.clone()),
+    }
+}
+
+fn validate_version_bundle_contract_against_metadata(
+    contract: &VersionBundleContract,
+    version: &VersionJson,
+) -> Result<(), DownloadError> {
+    let client = version.downloads.client.as_ref().ok_or_else(|| {
+        version_bundle_install_error("authenticated VersionBundle client contract is missing")
+    })?;
+    if client.url.trim().is_empty()
+        || u64::try_from(client.size).ok() != Some(contract.client_jar.size)
+        || !client
+            .sha1
+            .eq_ignore_ascii_case(&contract.client_jar.digest)
+    {
+        return Err(version_bundle_install_error(
+            "authenticated VersionBundle client contract does not match the projection",
+        ));
+    }
+    let metadata_log = version
+        .logging
+        .as_ref()
+        .and_then(|logging| logging.client.as_ref())
+        .map(|logging| &logging.file);
+    match (&contract.log_config, metadata_log) {
+        (None, None) => Ok(()),
+        (Some(contract), Some(file))
+            if file.id == contract.logical_identity
+                && !file.url.trim().is_empty()
+                && u64::try_from(file.size).ok() == Some(contract.size)
+                && file.sha1.eq_ignore_ascii_case(&contract.digest) =>
+        {
+            Ok(())
+        }
+        _ => Err(version_bundle_install_error(
+            "authenticated VersionBundle log contract does not match the projection",
+        )),
+    }
+}
+
 fn exact_version_bundle_source_limit(size: i64, label: &str) -> Result<usize, DownloadError> {
     u64::try_from(size)
         .ok()
@@ -2543,6 +2993,26 @@ fn validate_version_manifest_entry(entry: ManifestEntry) -> Result<ManifestEntry
         return Err(DownloadError::ResolveManifest(
             "version manifest entry has invalid source metadata".to_string(),
         ));
+    }
+    Ok(entry)
+}
+
+fn registered_version_metadata_manifest_entry(
+    manifest: VersionManifest,
+    version_id: &str,
+    contract: &VersionBundleMemberContract,
+) -> Result<ManifestEntry, RegisteredVersionBundleSourceError> {
+    let entry = manifest
+        .versions
+        .into_iter()
+        .find(|entry| entry.id == version_id)
+        .ok_or(RegisteredVersionBundleSourceError::Authority)
+        .and_then(|entry| {
+            validate_version_manifest_entry(entry)
+                .map_err(|_| RegisteredVersionBundleSourceError::Authority)
+        })?;
+    if !entry.sha1.eq_ignore_ascii_case(&contract.digest) {
+        return Err(RegisteredVersionBundleSourceError::Authority);
     }
     Ok(entry)
 }
@@ -3088,6 +3558,52 @@ mod tests {
         };
 
         assert!(validate_version_manifest_entry(entry).is_err());
+    }
+
+    #[test]
+    fn registered_metadata_discovery_requires_the_pinned_projection_digest() {
+        const VERSION_ID: &str = "registered-metadata";
+        const PINNED_SHA1: &str = "1111111111111111111111111111111111111111";
+        let contract = VersionBundleMemberContract {
+            kind: KnownGoodArtifactKind::VersionMetadata,
+            root_name: "versions",
+            relative_path: format!("{VERSION_ID}/{VERSION_ID}.json"),
+            logical_identity: VERSION_ID.to_string(),
+            digest: PINNED_SHA1.to_string(),
+            size: 7,
+        };
+        let manifest = |sha1: &str| {
+            serde_json::from_value::<VersionManifest>(serde_json::json!({
+                "latest": { "release": VERSION_ID, "snapshot": VERSION_ID },
+                "versions": [{
+                    "id": VERSION_ID,
+                    "type": "release",
+                    "url": "https://example.invalid/version.json",
+                    "sha1": sha1
+                }]
+            }))
+            .expect("version manifest")
+        };
+
+        assert_eq!(
+            registered_version_metadata_manifest_entry(
+                manifest("2222222222222222222222222222222222222222"),
+                VERSION_ID,
+                &contract,
+            )
+            .expect_err("manifest drift must fail"),
+            RegisteredVersionBundleSourceError::Authority
+        );
+        assert_eq!(
+            registered_version_metadata_manifest_entry(
+                manifest(PINNED_SHA1),
+                VERSION_ID,
+                &contract,
+            )
+            .expect("pinned manifest entry")
+            .sha1,
+            PINNED_SHA1
+        );
     }
 
     #[test]

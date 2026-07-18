@@ -31,8 +31,9 @@ pub(crate) use install::{
     AuthenticatedVersionBundleSource, ManagedProjectionSequenceEffect,
     ManagedProjectionSequenceError, ManagedProjectionSequenceOutcome, ManagedReconstructionContext,
     PreparedManagedInstall, ReconstructedVanillaAuthority, ReconstructedVanillaAuthorityParts,
-    RetainedVersionBundleReconstructionSources, prepare_local_managed_install,
-    publish_managed_projection_sequence, publish_prepared_managed_install,
+    RegisteredVersionBundleSourceError, RetainedVersionBundleReconstructionSources,
+    prepare_local_managed_install, publish_managed_projection_sequence,
+    publish_prepared_managed_install,
 };
 #[cfg(test)]
 pub(crate) use install::{

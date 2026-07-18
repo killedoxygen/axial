@@ -186,12 +186,18 @@ pub(super) async fn execute_registered_artifact_recovery_sequence(
             execute_managed_version_bundle_component_rebuild(
                 component_admission,
                 move |effect| async move {
-                    let (root, version_id) = effect.core_request();
+                    let (root, version_id, inventory) = effect.core_request();
                     let root = root.to_path_buf();
                     let version_id = version_id.to_string();
+                    let inventory = inventory.clone();
                     let rebuilt = match rebuild_source {
                         RegisteredArtifactComponentRebuildSource::Production => {
-                            axial_minecraft::rebuild_managed_version_bundle(root, &version_id).await
+                            axial_minecraft::rebuild_managed_version_bundle(
+                                root,
+                                &version_id,
+                                inventory,
+                            )
+                            .await
                         }
                         #[cfg(test)]
                         RegisteredArtifactComponentRebuildSource::Fixture => {
@@ -205,10 +211,26 @@ pub(super) async fn execute_registered_artifact_recovery_sequence(
                     match rebuilt {
                         Ok(receipt) => effect.committed(receipt, Vec::new()),
                         Err(
-                            axial_minecraft::ManagedVersionBundleRebuildError::Reconstruction(_)
+                            axial_minecraft::ManagedVersionBundleRebuildError::Reconstruction(
+                                axial_minecraft::KnownGoodReconstructionError::Vanilla
+                                | axial_minecraft::KnownGoodReconstructionError::Loader,
+                            )
+                            | axial_minecraft::ManagedVersionBundleRebuildError::Source,
+                        ) => effect.failed_before_effect([
+                            "version_bundle_component_source_failed".into(),
+                        ]),
+                        Err(axial_minecraft::ManagedVersionBundleRebuildError::Authority) => effect
+                            .failed_before_effect([
+                                "version_bundle_component_authority_rejected".into()
+                            ]),
+                        Err(
+                            axial_minecraft::ManagedVersionBundleRebuildError::Reconstruction(
+                                axial_minecraft::KnownGoodReconstructionError::ManagedRoot,
+                            )
+                            | axial_minecraft::ManagedVersionBundleRebuildError::LocalPreparation
                             | axial_minecraft::ManagedVersionBundleRebuildError::Preparation,
                         ) => effect.failed_before_effect([
-                            "version_bundle_component_preparation_failed".into(),
+                            "version_bundle_component_local_preparation_failed".into(),
                         ]),
                         Err(axial_minecraft::ManagedVersionBundleRebuildError::RolledBack(
                             receipt,
