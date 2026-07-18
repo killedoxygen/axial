@@ -97,8 +97,8 @@ pub use runtime::{
     list_java_runtimes, managed_runtime_contents_verified_without_probe, parse_runtime_override,
     preferred_runtime_component, probe_java_runtime_receipt, rebuild_managed_runtime_component,
     resolve_java_runtime_probe, runtime_component_executable_present_without_probe,
-    runtime_component_ready_without_probe, runtime_component_structurally_ready_without_probe,
-    runtime_executable_ready_without_probe, runtime_requirement, snapshot_java_runtime,
+    runtime_component_structurally_ready_without_probe, runtime_executable_ready_without_probe,
+    runtime_requirement, snapshot_java_runtime,
 };
 #[cfg(feature = "test-support")]
 pub use runtime::{

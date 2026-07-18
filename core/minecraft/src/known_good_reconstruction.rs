@@ -774,9 +774,7 @@ async fn publish_managed_whole_instance_reconstruction_inner(
             ));
         }
     };
-    if !runtime.revalidate(&runtime_cache, &runtime_component).await
-        || !runtime.matches_known_good_inventory(projection.inventory())
-    {
+    if !runtime.matches_known_good_inventory(projection.inventory()) {
         let ManagedRuntimeRebuildError::Effect(runtime) =
             runtime.into_failure(crate::runtime::JavaRuntimeLookupError::Install(
                 "whole-instance Runtime failed its exact postcheck".to_string(),
@@ -841,7 +839,6 @@ async fn publish_managed_whole_instance_reconstruction_inner(
         }
     };
     if !revalidate_whole_projection(&root_lease, &projection).await
-        || !runtime.revalidate(&runtime_cache, &runtime_component).await
         || !runtime.matches_known_good_inventory(projection.inventory())
     {
         return Err(whole_rollback(
@@ -1372,7 +1369,9 @@ mod tests {
     use crate::runtime::{
         ComponentManifest, ComponentManifestDownload, ComponentManifestDownloads,
         ComponentManifestFile, ManagedRuntimeCache, RuntimeId,
-        authenticated_runtime_source_from_manifest_for_test, runtime_java_relative_path,
+        authenticated_runtime_source_from_manifest_for_test,
+        register_runtime_tree_verification_counts_for_test, runtime_java_relative_path,
+        take_runtime_tree_verification_counts_for_test,
     };
     use sha1::{Digest as _, Sha1};
     use std::collections::HashMap;
@@ -1681,6 +1680,38 @@ mod tests {
         assert_user_owned_sentinels(&user_sentinels);
         drop(receipt);
         waiter.await.expect("waiting task").expect("waiting lease");
+    }
+
+    #[tokio::test]
+    async fn whole_instance_runtime_verification_scan_budget_is_five() {
+        const VERSION_ID: &str = "whole-instance-runtime-scan-budget";
+        let managed = tempfile::tempdir().expect("managed root");
+        let runtime_cache = ManagedRuntimeCache::isolated_for_test().expect("runtime cache");
+        let runtime_component = RuntimeId::from("jre-legacy");
+        let runtime_root = runtime_cache
+            .component_root(runtime_component.as_str())
+            .expect("runtime root");
+        let runtime_url = serve_runtime_bytes(b"scan-budget java", 2).await;
+        let reconstruction = whole_instance_fixture(
+            managed.path(),
+            VERSION_ID,
+            &runtime_component,
+            &runtime_url,
+            b"scan-budget java",
+        )
+        .await;
+        register_runtime_tree_verification_counts_for_test(&runtime_root);
+
+        let receipt = super::publish_managed_whole_instance_reconstruction(
+            reconstruction,
+            runtime_cache.clone(),
+        )
+        .await
+        .expect("whole-instance commit");
+        let counts = take_runtime_tree_verification_counts_for_test(&runtime_root);
+        assert_eq!(counts.reason_vector(), [1, 1, 0, 1, 0, 0, 1, 1]);
+        assert_eq!(counts.total(), 5);
+        drop(receipt);
     }
 
     #[tokio::test]

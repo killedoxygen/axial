@@ -61,7 +61,6 @@ pub struct ManagedRuntimeVerificationRequest<'a> {
     pub target: TargetDescriptor,
     pub runtime_root: &'a Path,
     pub java_executable: &'a Path,
-    pub require_ready_marker: bool,
 }
 
 impl std::fmt::Debug for ManagedRuntimeVerificationRequest<'_> {
@@ -70,7 +69,6 @@ impl std::fmt::Debug for ManagedRuntimeVerificationRequest<'_> {
             .debug_struct("ManagedRuntimeVerificationRequest")
             .field("operation_id", &self.operation_id)
             .field("target", &self.target)
-            .field("require_ready_marker", &self.require_ready_marker)
             .finish_non_exhaustive()
     }
 }
@@ -86,13 +84,7 @@ impl<'a> ManagedRuntimeVerificationRequest<'a> {
             target,
             runtime_root,
             java_executable,
-            require_ready_marker: true,
         }
-    }
-
-    pub fn without_ready_marker_requirement(mut self) -> Self {
-        self.require_ready_marker = false;
-        self
     }
 }
 
@@ -500,7 +492,7 @@ pub fn verify_managed_runtime(
     validate_managed_runtime_target(&request.target, request.operation_id.as_ref(), &mut facts)?;
 
     let ready_marker = request.runtime_root.join(".axial-ready");
-    if request.require_ready_marker && !ready_marker.is_file() {
+    if !ready_marker.is_file() {
         let kind = if ready_marker.exists() {
             RuntimeCapabilityErrorKind::RuntimeCorrupt
         } else {
@@ -631,7 +623,6 @@ pub(crate) fn repair_managed_runtime(
         target: request.target.clone(),
         runtime_root: request.runtime_root.path(),
         java_executable: request.runtime_root.java_executable(),
-        require_ready_marker: true,
     }) {
         Ok(verification) => {
             report.facts.extend(verification.facts);

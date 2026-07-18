@@ -62,10 +62,6 @@ pub fn list_java_runtimes(cache: &ManagedRuntimeCache) -> Vec<JavaRuntimeResult>
         .collect()
 }
 
-pub fn runtime_component_ready_without_probe(cache: &ManagedRuntimeCache, component: &str) -> bool {
-    component_runtime_ready_without_probe(cache.root(), component)
-}
-
 pub fn runtime_component_executable_present_without_probe(
     cache: &ManagedRuntimeCache,
     component: &str,
@@ -191,14 +187,6 @@ pub(super) fn resolve_component_runtime(
     required_major: i32,
 ) -> Result<RuntimeRecord, JavaRuntimeLookupError> {
     resolve_axial_cached_runtime(cache, component, required_major)
-}
-
-pub(super) fn component_runtime_ready_without_probe(base_dir: &Path, component: &str) -> bool {
-    if !runtime_filesystem_path(base_dir).as_ref().exists() {
-        return false;
-    }
-
-    detect_runtime_state(&base_dir.join(component)) == RuntimeInstallState::Ready
 }
 
 fn component_runtime_structurally_ready(base_dir: &Path, component: &str) -> bool {

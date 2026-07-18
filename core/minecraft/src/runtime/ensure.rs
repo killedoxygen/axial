@@ -7,14 +7,15 @@ use super::cancellation::{
 };
 use super::discovery::{
     is_known_runtime_component, parse_runtime_override, preferred_runtime_component,
-    resolve_axial_cached_runtime, resolve_component_runtime, resolve_managed_runtime,
-    resolve_override_runtime, runtime_requirement,
+    resolve_component_runtime, resolve_managed_runtime, resolve_override_runtime,
+    runtime_requirement,
 };
 use super::install::{
-    ManagedRuntimeCommitReceipt, ManagedRuntimeRebuildError, discard_staged_managed_runtime,
+    CachedManagedRuntimeVerification, ManagedRuntimeCommitReceipt, ManagedRuntimeRebuildError,
+    RuntimeTreeVerificationReason, discard_staged_managed_runtime,
     install_ephemeral_processor_runtime, publish_staged_managed_runtime,
     publish_staged_managed_runtime_and_finalize, stage_managed_runtime,
-    stage_managed_runtime_until_cancelled,
+    stage_managed_runtime_until_cancelled, verify_cached_managed_runtime_until_cancelled,
 };
 use super::layout::{ManagedRuntimeCache, runtime_os_arch};
 use super::manifest::{RuntimeSourceReceipt, acquire_runtime_source};
@@ -197,11 +198,6 @@ where
         &mut observer,
     )
     .await?;
-    if !receipt.revalidate(cache, &component).await {
-        return Err(receipt.into_failure(JavaRuntimeLookupError::Install(
-            "rebuilt runtime failed exact commit receipt verification".to_string(),
-        )));
-    }
     observer(RuntimeEnsureEvent::ManagedRuntimeReady {
         component: component.as_str().to_string(),
     });
@@ -280,9 +276,7 @@ exit 0
     let receipt =
         rebuild_managed_runtime_component_from_source(cache, &component, source, &mut observer)
             .await?;
-    if !receipt.revalidate(cache, &component).await
-        || !receipt.matches_known_good_inventory(&inventory)
-    {
+    if !receipt.matches_known_good_inventory(&inventory) {
         return Err(receipt.into_failure(JavaRuntimeLookupError::Install(
             "runtime rebuild fixture failed sealed postcondition verification".to_string(),
         )));
@@ -410,71 +404,57 @@ where
             "runtime source does not match the preferred managed component".to_string(),
         ));
     }
-    let current = resolve_axial_cached_runtime(cache, &component, java_version.major_version).ok();
-    let matches_source = match current.as_ref() {
-        Some(runtime) => {
-            let matches = runtime_record_matches_source_until_cancelled(
-                runtime,
-                &source_receipt,
-                control.cancellation(),
-            )
-            .await;
-            if control.cancellation().is_cancelled() {
-                return Ok(None);
-            }
-            matches
-        }
-        None => false,
-    };
-    let source_receipt = if matches_source {
-        source_receipt
-    } else {
-        observer(RuntimeEnsureEvent::DownloadingManagedRuntime {
-            component: component.as_str().to_string(),
-        });
-        let staged = stage_managed_runtime_until_cancelled(
-            cache,
-            &component,
-            source_receipt,
-            observer,
-            control.cancellation(),
-        )
-        .await?;
-        let Some(staged) = staged else {
-            return Ok(None);
-        };
-        #[cfg(test)]
-        wait_for_runtime_test_hook(
-            RuntimeTestHookPoint::BeforePublicationClaim,
-            &cache
-                .component_root(component.as_str())
-                .expect("staged runtime has a managed cache root"),
-        )
-        .await;
-        if !control.claim_publication_settlement() {
-            discard_staged_managed_runtime(staged).await?;
-            return Ok(None);
-        }
-        publish_staged_managed_runtime_and_finalize(staged)
-            .await
-            .map_err(ManagedRuntimeRebuildError::into_lookup_error)?
-            .into_source_receipt()
-    };
-    let runtime = resolve_axial_cached_runtime(cache, &component, java_version.major_version)?;
-    let matches_source = runtime_record_matches_source_until_cancelled(
-        &runtime,
-        &source_receipt,
+    let source_receipt = match verify_cached_managed_runtime_until_cancelled(
+        cache,
+        &component,
+        java_version.major_version,
+        source_receipt,
         control.cancellation(),
     )
+    .await?
+    {
+        CachedManagedRuntimeVerification::Matched(verified) => {
+            let (_runtime, source) = verified.into_parts();
+            observer(RuntimeEnsureEvent::ManagedRuntimeReady {
+                component: component.as_str().to_string(),
+            });
+            return Ok(Some(source));
+        }
+        CachedManagedRuntimeVerification::Mismatched(source) => source,
+        CachedManagedRuntimeVerification::Cancelled => return Ok(None),
+    };
+    observer(RuntimeEnsureEvent::DownloadingManagedRuntime {
+        component: component.as_str().to_string(),
+    });
+    let staged = stage_managed_runtime_until_cancelled(
+        cache,
+        &component,
+        source_receipt,
+        observer,
+        control.cancellation(),
+    )
+    .await?;
+    let Some(staged) = staged else {
+        return Ok(None);
+    };
+    #[cfg(test)]
+    wait_for_runtime_test_hook(
+        RuntimeTestHookPoint::BeforePublicationClaim,
+        &cache
+            .component_root(component.as_str())
+            .expect("staged runtime has a managed cache root"),
+    )
     .await;
-    if control.cancellation().is_cancelled() {
+    if !control.claim_publication_settlement() {
+        discard_staged_managed_runtime(staged).await?;
         return Ok(None);
     }
-    if !matches_source {
-        return Err(JavaRuntimeLookupError::Install(
-            "installed runtime does not match its authenticated source".to_string(),
-        ));
-    }
+    let verified = publish_staged_managed_runtime_and_finalize(staged)
+        .await
+        .map_err(ManagedRuntimeRebuildError::into_lookup_error)?
+        .into_verified_runtime(cache, &component, java_version.major_version)
+        .map_err(ManagedRuntimeRebuildError::into_lookup_error)?;
+    let (_runtime, source_receipt) = verified.into_parts();
     observer(RuntimeEnsureEvent::ManagedRuntimeReady {
         component: component.as_str().to_string(),
     });
@@ -668,18 +648,13 @@ where
     observer(RuntimeEnsureEvent::DownloadingManagedRuntime {
         component: preferred.as_str().to_string(),
     });
-    let source_receipt =
+    let verified =
         install_managed_runtime_component_from_source(cache, preferred, source_receipt, observer)
             .await
             .map_err(ManagedRuntimeRebuildError::into_lookup_error)?
-            .into_source_receipt();
-    let runtime =
-        resolve_component_runtime(cache, preferred, requirement.required_java.major_version)?;
-    if !runtime_record_matches_source(&runtime, &source_receipt).await {
-        return Err(JavaRuntimeLookupError::Install(
-            "installed runtime does not match its authenticated source".to_string(),
-        ));
-    }
+            .into_verified_runtime(cache, preferred, requirement.required_java.major_version)
+            .map_err(ManagedRuntimeRebuildError::into_lookup_error)?;
+    let (runtime, _source_receipt) = verified.into_parts();
     observer(RuntimeEnsureEvent::ManagedRuntimeReady {
         component: preferred.as_str().to_string(),
     });
@@ -764,21 +739,10 @@ async fn runtime_record_matches_source(
     if runtime.source != RuntimeSource::Managed || &runtime.id != source.component() {
         return false;
     }
-    super::install::runtime_tree_matches_source(Path::new(&runtime.root_dir), source).await
-}
-
-async fn runtime_record_matches_source_until_cancelled(
-    runtime: &RuntimeRecord,
-    source: &RuntimeSourceReceipt,
-    cancellation: &RuntimeCancellation,
-) -> bool {
-    if runtime.source != RuntimeSource::Managed || &runtime.id != source.component() {
-        return false;
-    }
-    super::install::runtime_tree_matches_source_until_cancelled(
+    super::install::runtime_tree_matches_source(
         Path::new(&runtime.root_dir),
         source,
-        cancellation,
+        RuntimeTreeVerificationReason::EnsureSourceMatch,
     )
     .await
 }

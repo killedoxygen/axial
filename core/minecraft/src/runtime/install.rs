@@ -20,7 +20,7 @@ use super::manifest::{
     component_manifest_proof_bytes,
 };
 use super::model::{
-    JavaRuntimeLookupError, RuntimeEnsureEvent, RuntimeId, RuntimeSourceFailure,
+    JavaRuntimeLookupError, RuntimeEnsureEvent, RuntimeId, RuntimeRecord, RuntimeSourceFailure,
     RuntimeSourceFailureKind,
 };
 use crate::known_good::{
@@ -64,6 +64,90 @@ pub(crate) struct StagedManagedRuntime {
 struct ManagedRuntimePublicationLease {
     _component_lock: tokio::sync::OwnedMutexGuard<()>,
     _file_lock: RuntimeInstallFileLock,
+}
+
+pub(super) struct VerifiedManagedRuntime {
+    runtime: RuntimeRecord,
+    source: RuntimeSourceReceipt,
+    _publication_lease: ManagedRuntimePublicationLease,
+}
+
+pub(super) enum CachedManagedRuntimeVerification {
+    Matched(VerifiedManagedRuntime),
+    Mismatched(RuntimeSourceReceipt),
+    Cancelled,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) enum RuntimeTreeVerificationReason {
+    StagePostMaterialization,
+    PublicationPrePromotion,
+    CanonicalReuse,
+    PublicationPostPromotion,
+    CachedSourceMatch,
+    EnsureSourceMatch,
+    ReceiptRevalidation,
+    FinalizationPrecheck,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct RuntimeTreeVerificationCounts {
+    pub(crate) stage_post_materialization: usize,
+    pub(crate) publication_pre_promotion: usize,
+    pub(crate) canonical_reuse: usize,
+    pub(crate) publication_post_promotion: usize,
+    pub(crate) cached_source_match: usize,
+    pub(crate) ensure_source_match: usize,
+    pub(crate) receipt_revalidation: usize,
+    pub(crate) finalization_precheck: usize,
+}
+
+#[cfg(test)]
+impl RuntimeTreeVerificationCounts {
+    pub(crate) fn total(self) -> usize {
+        self.stage_post_materialization
+            + self.publication_pre_promotion
+            + self.canonical_reuse
+            + self.publication_post_promotion
+            + self.cached_source_match
+            + self.ensure_source_match
+            + self.receipt_revalidation
+            + self.finalization_precheck
+    }
+
+    pub(crate) fn reason_vector(self) -> [usize; 8] {
+        [
+            self.stage_post_materialization,
+            self.publication_pre_promotion,
+            self.canonical_reuse,
+            self.publication_post_promotion,
+            self.cached_source_match,
+            self.ensure_source_match,
+            self.receipt_revalidation,
+            self.finalization_precheck,
+        ]
+    }
+
+    fn record(&mut self, reason: RuntimeTreeVerificationReason) {
+        let count = match reason {
+            RuntimeTreeVerificationReason::StagePostMaterialization => {
+                &mut self.stage_post_materialization
+            }
+            RuntimeTreeVerificationReason::PublicationPrePromotion => {
+                &mut self.publication_pre_promotion
+            }
+            RuntimeTreeVerificationReason::CanonicalReuse => &mut self.canonical_reuse,
+            RuntimeTreeVerificationReason::PublicationPostPromotion => {
+                &mut self.publication_post_promotion
+            }
+            RuntimeTreeVerificationReason::CachedSourceMatch => &mut self.cached_source_match,
+            RuntimeTreeVerificationReason::EnsureSourceMatch => &mut self.ensure_source_match,
+            RuntimeTreeVerificationReason::ReceiptRevalidation => &mut self.receipt_revalidation,
+            RuntimeTreeVerificationReason::FinalizationPrecheck => &mut self.finalization_precheck,
+        };
+        *count += 1;
+    }
 }
 
 /// Sealed evidence that Core published and revalidated a managed runtime tree.
@@ -170,7 +254,8 @@ impl ManagedRuntimeFailureReceipt {
         })
     }
 
-    pub async fn revalidate(
+    #[cfg(test)]
+    pub(crate) async fn revalidate(
         &self,
         cache: &ManagedRuntimeCache,
         expected_component: &RuntimeId,
@@ -185,7 +270,12 @@ impl ManagedRuntimeFailureReceipt {
             return false;
         };
         source.component() == expected_component
-            && runtime_tree_matches_source(&install_root, source.as_ref()).await
+            && runtime_tree_matches_source(
+                &install_root,
+                source.as_ref(),
+                RuntimeTreeVerificationReason::ReceiptRevalidation,
+            )
+            .await
             && self
                 .quarantine
                 .as_ref()
@@ -244,21 +334,53 @@ impl ManagedRuntimeCommitReceipt {
         let Some(source) = self.source.as_ref() else {
             return false;
         };
-        runtime_tree_matches_source(&install_root, source).await
+        runtime_tree_matches_source(
+            &install_root,
+            source,
+            RuntimeTreeVerificationReason::ReceiptRevalidation,
+        )
+        .await
             && self
                 .quarantine
                 .as_ref()
                 .is_none_or(|obligation| obligation.path_observation().is_present())
     }
 
-    pub(crate) fn into_source_receipt(self) -> RuntimeSourceReceipt {
+    pub(super) fn into_verified_runtime(
+        self,
+        cache: &ManagedRuntimeCache,
+        expected_component: &RuntimeId,
+        required_major: i32,
+    ) -> Result<VerifiedManagedRuntime, ManagedRuntimeRebuildError> {
+        if !self.matches_cache(cache)
+            || &self.component != expected_component
+            || self
+                .source
+                .as_ref()
+                .is_none_or(|source| source.component() != expected_component)
+        {
+            return Err(self.into_failure(JavaRuntimeLookupError::Install(
+                "managed runtime commit cannot settle outside its verified authority".to_string(),
+            )));
+        }
+        let runtime = match super::discovery::resolve_component_runtime(
+            cache,
+            expected_component,
+            required_major,
+        ) {
+            Ok(runtime) => runtime,
+            Err(error) => return Err(self.into_failure(error)),
+        };
         let Self {
             source,
-            _publication_lease: publication_lease,
+            _publication_lease,
             ..
         } = self;
-        drop(publication_lease);
-        source.expect("managed runtime commit receipt always retains its source")
+        Ok(VerifiedManagedRuntime {
+            runtime,
+            source: source.expect("managed runtime commit receipt always retains its source"),
+            _publication_lease,
+        })
     }
 
     pub(crate) fn into_failure(self, cause: JavaRuntimeLookupError) -> ManagedRuntimeRebuildError {
@@ -270,6 +392,18 @@ impl ManagedRuntimeCommitReceipt {
             quarantine: self.quarantine,
             _publication_lease: self._publication_lease,
         })
+    }
+}
+
+impl VerifiedManagedRuntime {
+    pub(super) fn into_parts(self) -> (RuntimeRecord, RuntimeSourceReceipt) {
+        let Self {
+            runtime,
+            source,
+            _publication_lease,
+        } = self;
+        drop(_publication_lease);
+        (runtime, source)
     }
 }
 
@@ -298,7 +432,25 @@ async fn finalize_managed_runtime_commit_inner(
     mut receipt: ManagedRuntimeCommitReceipt,
     failure_mode: PublishFailureMode,
 ) -> Result<ManagedRuntimeCommitReceipt, ManagedRuntimeFailureReceipt> {
-    if !receipt.revalidate(&receipt.cache, &receipt.component).await {
+    let install_root = receipt
+        .cache
+        .component_root(receipt.component.as_str())
+        .expect("managed runtime receipt component retains a cache root");
+    let source = receipt
+        .source
+        .as_ref()
+        .expect("managed runtime commit receipt always retains its source");
+    if !runtime_tree_matches_source(
+        &install_root,
+        source,
+        RuntimeTreeVerificationReason::FinalizationPrecheck,
+    )
+    .await
+        || receipt
+            .quarantine
+            .as_ref()
+            .is_some_and(|obligation| !obligation.path_observation().is_present())
+    {
         return Err(managed_runtime_finalization_failure(
             receipt,
             "managed runtime changed before whole-instance settlement",
@@ -394,6 +546,90 @@ impl OwnedRuntimeStage {
     }
 }
 
+async fn acquire_managed_runtime_publication_lease_until_cancelled(
+    cache: &ManagedRuntimeCache,
+    component: &RuntimeId,
+    install_root: &Path,
+    cancellation: &mut RuntimeCancellation,
+) -> Result<Option<ManagedRuntimePublicationLease>, JavaRuntimeLookupError> {
+    let component_lock = match cancellation
+        .wait(cache.install_lock(component.as_str()).lock_owned())
+        .await
+    {
+        Some(lock) => lock,
+        None => return Ok(None),
+    };
+    let file_lock = match acquire_runtime_install_file_lock_until_cancelled(
+        install_root,
+        cancellation,
+    )
+    .await?
+    {
+        Some(lock) => lock,
+        None => return Ok(None),
+    };
+    Ok(Some(ManagedRuntimePublicationLease {
+        _component_lock: component_lock,
+        _file_lock: file_lock,
+    }))
+}
+
+pub(super) async fn verify_cached_managed_runtime_until_cancelled(
+    cache: &ManagedRuntimeCache,
+    component: &RuntimeId,
+    required_major: i32,
+    source: RuntimeSourceReceipt,
+    cancellation: &mut RuntimeCancellation,
+) -> Result<CachedManagedRuntimeVerification, JavaRuntimeLookupError> {
+    if source.component() != component {
+        return Err(JavaRuntimeLookupError::Install(
+            "runtime source component mismatch".to_string(),
+        ));
+    }
+    if super::discovery::resolve_component_runtime(cache, component, required_major).is_err() {
+        return Ok(CachedManagedRuntimeVerification::Mismatched(source));
+    }
+    let install_root = cache.component_root(component.as_str()).ok_or_else(|| {
+        JavaRuntimeLookupError::Install(
+            "runtime component is outside the managed cache vocabulary".to_string(),
+        )
+    })?;
+    let Some(publication_lease) = acquire_managed_runtime_publication_lease_until_cancelled(
+        cache,
+        component,
+        &install_root,
+        cancellation,
+    )
+    .await?
+    else {
+        return Ok(CachedManagedRuntimeVerification::Cancelled);
+    };
+    let Ok(runtime) = super::discovery::resolve_component_runtime(cache, component, required_major)
+    else {
+        return Ok(CachedManagedRuntimeVerification::Mismatched(source));
+    };
+    let matches_source = runtime_tree_matches_source_until_cancelled(
+        &install_root,
+        &source,
+        RuntimeTreeVerificationReason::CachedSourceMatch,
+        cancellation,
+    )
+    .await;
+    if cancellation.is_cancelled() {
+        return Ok(CachedManagedRuntimeVerification::Cancelled);
+    }
+    if !matches_source {
+        return Ok(CachedManagedRuntimeVerification::Mismatched(source));
+    }
+    Ok(CachedManagedRuntimeVerification::Matched(
+        VerifiedManagedRuntime {
+            runtime,
+            source,
+            _publication_lease: publication_lease,
+        },
+    ))
+}
+
 pub(crate) async fn stage_managed_runtime(
     cache: &ManagedRuntimeCache,
     component: &RuntimeId,
@@ -429,19 +665,16 @@ pub(super) async fn stage_managed_runtime_until_cancelled(
             "runtime component is outside the managed cache vocabulary".to_string(),
         )
     })?;
-    let component_lock = match cancellation
-        .wait(cache.install_lock(component.as_str()).lock_owned())
-        .await
-    {
-        Some(lock) => lock,
-        None => return Ok(None),
+    let Some(publication_lease) = acquire_managed_runtime_publication_lease_until_cancelled(
+        cache,
+        component,
+        &install_root,
+        cancellation,
+    )
+    .await?
+    else {
+        return Ok(None);
     };
-    let file_lock =
-        match acquire_runtime_install_file_lock_until_cancelled(&install_root, cancellation).await?
-        {
-            Some(lock) => lock,
-            None => return Ok(None),
-        };
     let staging_root = runtime_sidecar_path(&install_root, "staging");
     if cancellation.is_cancelled() {
         return Ok(None);
@@ -480,8 +713,13 @@ pub(super) async fn stage_managed_runtime_until_cancelled(
         let _ = stage.cleanup().await;
         return Err(error);
     }
-    let tree_matches =
-        runtime_tree_matches_source_until_cancelled(&staged_root, &source, cancellation).await;
+    let tree_matches = runtime_tree_matches_source_until_cancelled(
+        &staged_root,
+        &source,
+        RuntimeTreeVerificationReason::StagePostMaterialization,
+        cancellation,
+    )
+    .await;
     if cancellation.is_cancelled() {
         stage
             .cleanup()
@@ -501,10 +739,7 @@ pub(super) async fn stage_managed_runtime_until_cancelled(
         install_root,
         stage,
         source: Some(source),
-        publication_lease: Some(ManagedRuntimePublicationLease {
-            _component_lock: component_lock,
-            _file_lock: file_lock,
-        }),
+        publication_lease: Some(publication_lease),
     }))
 }
 
@@ -653,7 +888,12 @@ async fn publish_staged_managed_runtime_inner(
     #[cfg(test)]
     wait_for_runtime_test_hook(RuntimeTestHookPoint::Publication, &staged.install_root).await;
     if source.component() != &staged.component
-        || !runtime_tree_matches_source(staged.stage.root(), &source).await
+        || !runtime_tree_matches_source(
+            staged.stage.root(),
+            &source,
+            RuntimeTreeVerificationReason::PublicationPrePromotion,
+        )
+        .await
     {
         let _ = staged.stage.cleanup().await;
         return Err(JavaRuntimeLookupError::Install(
@@ -667,7 +907,14 @@ async fn publish_staged_managed_runtime_inner(
     let mut quarantine_exists = runtime_path_exists_async(&quarantine_root).await?;
     let mut publication_effect_started = false;
 
-    if canonical_exists && runtime_tree_matches_source(&staged.install_root, &source).await {
+    if canonical_exists
+        && runtime_tree_matches_source(
+            &staged.install_root,
+            &source,
+            RuntimeTreeVerificationReason::CanonicalReuse,
+        )
+        .await
+    {
         staged
             .stage
             .cleanup()
@@ -799,7 +1046,13 @@ async fn publish_staged_managed_runtime_inner(
     }
     publication_effect_started = true;
 
-    if !runtime_tree_matches_source(&staged.install_root, &source).await {
+    if !runtime_tree_matches_source(
+        &staged.install_root,
+        &source,
+        RuntimeTreeVerificationReason::PublicationPostPromotion,
+    )
+    .await
+    {
         let failed_tree_result = async_fs::rename(
             runtime_filesystem_path(&staged.install_root).as_ref(),
             runtime_filesystem_path(staged.stage.root()).as_ref(),
@@ -934,27 +1187,89 @@ fn managed_runtime_commit_receipt(
     }
 }
 
+#[cfg(test)]
+static RUNTIME_TREE_VERIFICATION_COUNTS: std::sync::OnceLock<
+    std::sync::Mutex<HashMap<PathBuf, RuntimeTreeVerificationCounts>>,
+> = std::sync::OnceLock::new();
+
+fn record_runtime_tree_verification(
+    root: &Path,
+    source: &RuntimeSourceReceipt,
+    reason: RuntimeTreeVerificationReason,
+) {
+    #[cfg(test)]
+    {
+        let scope_root = if matches!(
+            reason,
+            RuntimeTreeVerificationReason::StagePostMaterialization
+                | RuntimeTreeVerificationReason::PublicationPrePromotion
+        ) {
+            root.parent()
+                .map(|parent| parent.join(source.component().as_str()))
+                .unwrap_or_else(|| root.to_path_buf())
+        } else {
+            root.to_path_buf()
+        };
+        let mut counts = RUNTIME_TREE_VERIFICATION_COUNTS
+            .get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+            .lock()
+            .expect("runtime tree verification counter registry");
+        if let Some(counts) = counts.get_mut(&scope_root) {
+            counts.record(reason);
+        }
+    }
+    #[cfg(not(test))]
+    let _ = (root, source, reason);
+}
+
+#[cfg(test)]
+pub(crate) fn register_runtime_tree_verification_counts_for_test(root: &Path) {
+    RUNTIME_TREE_VERIFICATION_COUNTS
+        .get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+        .lock()
+        .expect("runtime tree verification counter registry")
+        .insert(root.to_path_buf(), RuntimeTreeVerificationCounts::default());
+}
+
+#[cfg(test)]
+pub(crate) fn take_runtime_tree_verification_counts_for_test(
+    root: &Path,
+) -> RuntimeTreeVerificationCounts {
+    RUNTIME_TREE_VERIFICATION_COUNTS
+        .get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+        .lock()
+        .expect("runtime tree verification counter registry")
+        .remove(root)
+        .unwrap_or_default()
+}
+
 pub(super) async fn runtime_tree_matches_source(
     root: &Path,
     source: &RuntimeSourceReceipt,
+    reason: RuntimeTreeVerificationReason,
 ) -> bool {
     let (_cancellation_sender, cancellation) = runtime_cancellation_channel();
-    runtime_tree_matches_source_inner(root, source, cancellation.thread_cancellation()).await
+    runtime_tree_matches_source_inner(root, source, reason, cancellation.thread_cancellation())
+        .await
 }
 
 pub(super) async fn runtime_tree_matches_source_until_cancelled(
     root: &Path,
     source: &RuntimeSourceReceipt,
+    reason: RuntimeTreeVerificationReason,
     cancellation: &RuntimeCancellation,
 ) -> bool {
-    runtime_tree_matches_source_inner(root, source, cancellation.thread_cancellation()).await
+    runtime_tree_matches_source_inner(root, source, reason, cancellation.thread_cancellation())
+        .await
 }
 
 async fn runtime_tree_matches_source_inner(
     root: &Path,
     source: &RuntimeSourceReceipt,
+    reason: RuntimeTreeVerificationReason,
     cancellation: RuntimeThreadCancellation,
 ) -> bool {
+    record_runtime_tree_verification(root, source, reason);
     if cancellation.is_cancelled() {
         return false;
     }
@@ -1616,30 +1931,44 @@ pub(crate) fn block_runtime_publication_for_test(install_root: &Path) -> Runtime
 }
 
 #[cfg(test)]
+pub(crate) fn runtime_publication_lock_availability_for_test(
+    cache: &ManagedRuntimeCache,
+    component: &RuntimeId,
+) -> (bool, bool) {
+    let component_available = cache
+        .install_lock(component.as_str())
+        .try_lock_owned()
+        .is_ok();
+    let file_available = cache
+        .component_root(component.as_str())
+        .and_then(|install_root| {
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(
+                    runtime_filesystem_path(&runtime_install_lock_file_path(&install_root))
+                        .as_ref(),
+                )
+                .ok()
+        })
+        .is_some_and(|file| {
+            if file.try_lock().is_err() {
+                return false;
+            }
+            let _ = file.unlock();
+            true
+        });
+    (component_available, file_available)
+}
+
+#[cfg(test)]
 pub(crate) fn runtime_publication_locks_available_for_test(
     cache: &ManagedRuntimeCache,
     component: &RuntimeId,
 ) -> bool {
-    let Ok(_component_guard) = cache.install_lock(component.as_str()).try_lock_owned() else {
-        return false;
-    };
-    let Some(install_root) = cache.component_root(component.as_str()) else {
-        return false;
-    };
-    let Ok(file) = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(runtime_filesystem_path(&runtime_install_lock_file_path(&install_root)).as_ref())
-    else {
-        return false;
-    };
-    if file.try_lock().is_err() {
-        return false;
-    }
-    let _ = file.unlock();
-    true
+    runtime_publication_lock_availability_for_test(cache, component) == (true, true)
 }
 
 #[cfg(test)]

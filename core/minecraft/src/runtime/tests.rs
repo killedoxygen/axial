@@ -14,18 +14,22 @@ use super::{
     finalize_managed_runtime_commit_with_removed_quarantine_failure_for_test,
     install_runtime_manifest_file, install_runtime_manifest_files, java_executable,
     java_executable_for_os, managed_runtime_contents_verified_without_probe,
-    parse_mach_o_arm64_compatibility, plan_runtime_manifest_files, publish_staged_managed_runtime,
+    materialize_preferred_runtime_source, parse_mach_o_arm64_compatibility,
+    plan_runtime_manifest_files, publish_staged_managed_runtime,
     publish_staged_managed_runtime_and_finalize,
     publish_staged_managed_runtime_with_displacement_failure_for_test,
     publish_staged_managed_runtime_with_finalization_failure_for_test,
     publish_staged_managed_runtime_with_promotion_failure_for_test,
     publish_staged_managed_runtime_with_restoration_failure_for_test,
     publish_staged_managed_runtime_with_rotation_failure_for_test,
-    rosetta_requirement_for_managed_runtime, runtime_cancellation_channel, runtime_download_client,
-    runtime_file_download_concurrency_for, runtime_install_lock_file_path, runtime_os_arch_for,
-    runtime_record_matches_source_for_test, runtime_source_url_is_secure_for_test,
-    runtime_windows_verbatim_path_string, select_runtime_manifest, stage_managed_runtime,
-    stage_managed_runtime_until_cancelled, validate_ephemeral_processor_manifest_for_test,
+    rebuild_managed_runtime_component_from_source,
+    register_runtime_tree_verification_counts_for_test, rosetta_requirement_for_managed_runtime,
+    runtime_cancellation_channel, runtime_download_client, runtime_file_download_concurrency_for,
+    runtime_install_lock_file_path, runtime_materialization_control, runtime_os_arch_for,
+    runtime_publication_lock_availability_for_test, runtime_record_matches_source_for_test,
+    runtime_source_url_is_secure_for_test, runtime_windows_verbatim_path_string,
+    select_runtime_manifest, stage_managed_runtime, stage_managed_runtime_until_cancelled,
+    take_runtime_tree_verification_counts_for_test, validate_ephemeral_processor_manifest_for_test,
     validate_runtime_file_source_urls_for_test, verify_runtime_download,
 };
 #[cfg(feature = "test-support")]
@@ -734,10 +738,12 @@ async fn ready_managed_runtime_matches_the_full_authenticated_source() {
     let staged = stage_managed_runtime(&cache, &component, source, &mut |_| {})
         .await
         .expect("managed runtime stage");
-    let source = publish_staged_managed_runtime(staged)
+    let verified = publish_staged_managed_runtime(staged)
         .await
         .expect("managed runtime publish")
-        .into_source_receipt();
+        .into_verified_runtime(&cache, &component, 8)
+        .expect("verified managed runtime");
+    let (_resolved, source) = verified.into_parts();
     let runtime = RuntimeRecord {
         id: component,
         java_path: java_executable(&root).to_string_lossy().into_owned(),
@@ -757,6 +763,210 @@ async fn ready_managed_runtime_matches_the_full_authenticated_source() {
     fs::write(java_executable(&root), b"tampered java").expect("tamper runtime file");
     make_executable(&java_executable(&root));
     assert!(!runtime_record_matches_source_for_test(&runtime, &source).await);
+}
+
+#[tokio::test]
+async fn managed_runtime_materialization_scan_budgets_are_one_cached_and_three_fresh() {
+    let cached = ManagedRuntimeCache::isolated_for_test().expect("cached runtime cache");
+    let component = RuntimeId::from("jre-legacy");
+    let cached_root = cached
+        .component_root(component.as_str())
+        .expect("cached runtime root");
+    let cached_source =
+        runtime_source_receipt_fixture(&component, &cached_root, b"cached java").await;
+    let cached_stage = stage_managed_runtime(&cached, &component, cached_source, &mut |_| {})
+        .await
+        .expect("cached runtime stage");
+    let cached_verified = publish_staged_managed_runtime_and_finalize(cached_stage)
+        .await
+        .expect("cached runtime publish")
+        .into_verified_runtime(&cached, &component, 8)
+        .expect("cached verified runtime");
+    let (_runtime, cached_source) = cached_verified.into_parts();
+    register_runtime_tree_verification_counts_for_test(&cached_root);
+
+    let (_cached_cancel, mut cached_control) = runtime_materialization_control();
+    let cached_result = materialize_preferred_runtime_source(
+        &cached,
+        &JavaVersion {
+            component: component.as_str().to_string(),
+            major_version: 8,
+        },
+        cached_source,
+        &mut |_| {},
+        &mut cached_control,
+    )
+    .await
+    .expect("cached runtime materialization");
+    assert!(cached_result.is_some());
+    let cached_counts = take_runtime_tree_verification_counts_for_test(&cached_root);
+    assert_eq!(cached_counts.reason_vector(), [0, 0, 0, 0, 1, 0, 0, 0]);
+    assert_eq!(cached_counts.total(), 1);
+
+    let fresh = ManagedRuntimeCache::isolated_for_test().expect("fresh runtime cache");
+    let fresh_root = fresh
+        .component_root(component.as_str())
+        .expect("fresh runtime root");
+    let fresh_source = runtime_source_receipt_fixture(&component, &fresh_root, b"fresh java").await;
+    register_runtime_tree_verification_counts_for_test(&fresh_root);
+    let (_fresh_cancel, mut fresh_control) = runtime_materialization_control();
+    let fresh_result = materialize_preferred_runtime_source(
+        &fresh,
+        &JavaVersion {
+            component: component.as_str().to_string(),
+            major_version: 8,
+        },
+        fresh_source,
+        &mut |_| {},
+        &mut fresh_control,
+    )
+    .await
+    .expect("fresh runtime materialization");
+    assert!(fresh_result.is_some());
+    let fresh_counts = take_runtime_tree_verification_counts_for_test(&fresh_root);
+    assert_eq!(fresh_counts.reason_vector(), [1, 1, 0, 1, 0, 0, 0, 0]);
+    assert_eq!(fresh_counts.total(), 3);
+}
+
+#[tokio::test]
+async fn managed_runtime_publication_scan_budgets_cover_reuse_and_replacement() {
+    let component = RuntimeId::from("jre-legacy");
+
+    let reuse_cache = ManagedRuntimeCache::isolated_for_test().expect("reuse runtime cache");
+    let reuse_root = reuse_cache
+        .component_root(component.as_str())
+        .expect("reuse runtime root");
+    let reuse_source = runtime_source_receipt_fixture_with_download_count(
+        &component,
+        &reuse_root,
+        b"reused java",
+        2,
+    )
+    .await;
+    let reuse_stage = stage_managed_runtime(&reuse_cache, &component, reuse_source, &mut |_| {})
+        .await
+        .expect("initial reuse stage");
+    let reuse_source = publish_staged_managed_runtime_and_finalize(reuse_stage)
+        .await
+        .expect("initial reuse publish")
+        .into_verified_runtime(&reuse_cache, &component, 8)
+        .expect("initial verified reuse runtime")
+        .into_parts()
+        .1;
+    register_runtime_tree_verification_counts_for_test(&reuse_root);
+    let reuse_stage = stage_managed_runtime(&reuse_cache, &component, reuse_source, &mut |_| {})
+        .await
+        .expect("exact reuse stage");
+    let reuse_receipt = publish_staged_managed_runtime_and_finalize(reuse_stage)
+        .await
+        .expect("exact canonical reuse");
+    let reuse_counts = take_runtime_tree_verification_counts_for_test(&reuse_root);
+    assert_eq!(reuse_counts.reason_vector(), [1, 1, 1, 0, 0, 0, 0, 0]);
+    assert_eq!(reuse_counts.total(), 3);
+    drop(reuse_receipt);
+
+    let replacement_cache =
+        ManagedRuntimeCache::isolated_for_test().expect("replacement runtime cache");
+    let replacement_root = replacement_cache
+        .component_root(component.as_str())
+        .expect("replacement runtime root");
+    let original_source =
+        runtime_source_receipt_fixture(&component, &replacement_root, b"original replacement java")
+            .await;
+    let original_stage =
+        stage_managed_runtime(&replacement_cache, &component, original_source, &mut |_| {})
+            .await
+            .expect("original replacement stage");
+    let original_receipt = publish_staged_managed_runtime_and_finalize(original_stage)
+        .await
+        .expect("original replacement publish");
+    drop(original_receipt);
+    let replacement_source =
+        runtime_source_receipt_fixture(&component, &replacement_root, b"new replacement java")
+            .await;
+    register_runtime_tree_verification_counts_for_test(&replacement_root);
+    let replacement_stage = stage_managed_runtime(
+        &replacement_cache,
+        &component,
+        replacement_source,
+        &mut |_| {},
+    )
+    .await
+    .expect("mismatching replacement stage");
+    let replacement_receipt = publish_staged_managed_runtime_and_finalize(replacement_stage)
+        .await
+        .expect("mismatching canonical replacement");
+    let replacement_counts = take_runtime_tree_verification_counts_for_test(&replacement_root);
+    assert_eq!(replacement_counts.reason_vector(), [1, 1, 1, 1, 0, 0, 0, 0]);
+    assert_eq!(replacement_counts.total(), 4);
+    drop(replacement_receipt);
+}
+
+#[tokio::test]
+async fn guardian_runtime_rebuild_scan_budget_is_five_with_two_simulated_state_boundaries() {
+    let cache = ManagedRuntimeCache::isolated_for_test().expect("runtime cache");
+    let component = RuntimeId::from("jre-legacy");
+    let root = cache
+        .component_root(component.as_str())
+        .expect("runtime root");
+    let source = runtime_source_receipt_fixture(&component, &root, b"guardian java").await;
+    register_runtime_tree_verification_counts_for_test(&root);
+
+    let receipt =
+        rebuild_managed_runtime_component_from_source(&cache, &component, source, &mut |_| {})
+            .await
+            .expect("Guardian runtime rebuild");
+    assert!(receipt.revalidate(&cache, &component).await);
+    assert!(receipt.revalidate(&cache, &component).await);
+
+    let counts = take_runtime_tree_verification_counts_for_test(&root);
+    assert_eq!(counts.reason_vector(), [1, 1, 0, 1, 0, 0, 2, 0]);
+    assert_eq!(counts.total(), 5);
+}
+
+#[tokio::test]
+async fn cached_runtime_verification_holds_exact_publication_locks_until_consumed() {
+    let cache = ManagedRuntimeCache::isolated_for_test().expect("runtime cache");
+    let component = RuntimeId::from("jre-legacy");
+    let root = cache
+        .component_root(component.as_str())
+        .expect("runtime root");
+    let source = runtime_source_receipt_fixture(&component, &root, b"cached java").await;
+    let staged = stage_managed_runtime(&cache, &component, source, &mut |_| {})
+        .await
+        .expect("managed runtime stage");
+    let source = publish_staged_managed_runtime_and_finalize(staged)
+        .await
+        .expect("managed runtime publish")
+        .into_verified_runtime(&cache, &component, 8)
+        .expect("verified managed runtime")
+        .into_parts()
+        .1;
+    let (_cancellation_sender, mut cancellation) = runtime_cancellation_channel();
+    let verified = match super::install::verify_cached_managed_runtime_until_cancelled(
+        &cache,
+        &component,
+        8,
+        source,
+        &mut cancellation,
+    )
+    .await
+    .expect("cached runtime verification")
+    {
+        super::install::CachedManagedRuntimeVerification::Matched(verified) => verified,
+        _ => panic!("cached runtime should match its authenticated source"),
+    };
+    assert_eq!(
+        runtime_publication_lock_availability_for_test(&cache, &component),
+        (false, false),
+        "cached verification result must retain both exact publication locks"
+    );
+    let (_runtime, _source) = verified.into_parts();
+    assert_eq!(
+        runtime_publication_lock_availability_for_test(&cache, &component),
+        (true, true),
+        "verified result consumption must release both exact publication locks"
+    );
 }
 
 #[tokio::test]
@@ -1817,6 +2027,7 @@ async fn late_finalization_failure_reports_observed_quarantine_and_retains_autho
             !remove_before_error
         );
         assert!(failure.matches_cache(&cache));
+        assert_eq!(failure.component(), &component);
         assert!(failure.matches_known_good_inventory(&inventory));
         assert!(failure.revalidate(&cache, &component).await);
 
@@ -2353,7 +2564,22 @@ async fn runtime_source_receipt_fixture(
     runtime_root: &Path,
     java_bytes: &[u8],
 ) -> RuntimeSourceReceipt {
-    let java_url = serve_runtime_download(java_bytes.to_vec()).await;
+    runtime_source_receipt_fixture_with_download_count(component, runtime_root, java_bytes, 1).await
+}
+
+async fn runtime_source_receipt_fixture_with_download_count(
+    component: &RuntimeId,
+    runtime_root: &Path,
+    java_bytes: &[u8],
+    download_count: usize,
+) -> RuntimeSourceReceipt {
+    let java_url = if download_count == 1 {
+        serve_runtime_download(java_bytes.to_vec()).await
+    } else {
+        serve_runtime_retry_responses(vec![(200, java_bytes.to_vec()); download_count])
+            .await
+            .0
+    };
     let java_relative_path = java_executable(runtime_root)
         .strip_prefix(runtime_root)
         .expect("java path under runtime root")

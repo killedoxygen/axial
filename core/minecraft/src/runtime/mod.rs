@@ -19,8 +19,8 @@ pub use discovery::{
     is_known_runtime_component, list_java_runtimes,
     managed_runtime_contents_verified_without_probe, parse_runtime_override,
     preferred_runtime_component, runtime_component_executable_present_without_probe,
-    runtime_component_ready_without_probe, runtime_component_structurally_ready_without_probe,
-    runtime_executable_ready_without_probe, runtime_requirement,
+    runtime_component_structurally_ready_without_probe, runtime_executable_ready_without_probe,
+    runtime_requirement,
 };
 pub(crate) use ensure::{
     ProcessorRuntime, RuntimeMaterializationCancelHandle, materialize_ephemeral_processor_runtime,
@@ -47,10 +47,16 @@ pub use install::{
 };
 #[cfg(test)]
 pub(crate) use install::{
-    block_runtime_publication_for_test, runtime_publication_locks_available_for_test,
+    block_runtime_publication_for_test, runtime_publication_lock_availability_for_test,
+    runtime_publication_locks_available_for_test,
 };
 pub(crate) use install::{
     finalize_managed_runtime_commit, runtime_source_matches_known_good_inventory,
+};
+#[cfg(test)]
+pub(crate) use install::{
+    register_runtime_tree_verification_counts_for_test,
+    take_runtime_tree_verification_counts_for_test,
 };
 pub use layout::ManagedRuntimeCache;
 pub(crate) use layout::runtime_java_relative_path;
