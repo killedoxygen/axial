@@ -587,7 +587,7 @@ impl PerformanceManager {
         }
         // Provider and network work is completed while ownership remains entirely
         // in anonymous staging handles. No rollback or managed state effect exists yet.
-        let staged = stage_managed_graph(client, selection.pins, instance.path())
+        let staged = stage_managed_graph(client, selection.pins, instance)
             .await
             .map_err(ManagedMutationError::definite)
             .map_err(|error| ManagedInstallExecutionError::from_mutation(error, false))?;
@@ -624,13 +624,13 @@ impl PerformanceManager {
             }
         })?;
 
-        let mods_dir = instance_mods_dir.to_path_buf();
+        let mods_for_commit = mods.clone();
         let previous_for_commit = previous_state.clone();
         let state = state_from_plan(plan, installed_graph_from_plan(plan));
         let state_for_commit = state.clone();
         let commit = tokio::task::spawn_blocking(move || {
             commit_staged_graph(
-                &mods_dir,
+                &mods_for_commit,
                 previous_for_commit.as_ref(),
                 &state_for_commit,
                 staged,
@@ -721,11 +721,12 @@ impl PerformanceManager {
 }
 
 pub(super) fn commit_staged_graph<Stage: ManagedArtifactStage>(
-    instance_mods_dir: &Path,
+    instance_mods: &AnchoredDirectory,
     previous_state: Option<&CompositionState>,
     state: &CompositionState,
     staged: Vec<Stage>,
 ) -> Result<(), InstallError> {
+    let instance_mods_dir = instance_mods.path();
     let desired_by_filename = state
         .installed_mods
         .iter()
@@ -780,8 +781,8 @@ pub(super) fn commit_staged_graph<Stage: ManagedArtifactStage>(
             drop(artifact);
             continue;
         }
-        let obligation = prepare_managed_artifact_addition(instance_mods_dir, &installed)?;
-        artifact.publish_create_new(&obligation)?;
+        let obligation = prepare_managed_artifact_addition(instance_mods, &installed)?;
+        artifact.publish_create_new(obligation.parent(), obligation.filename())?;
         publish_managed_artifact_addition(instance_mods_dir, &installed, &obligation)?;
     }
 

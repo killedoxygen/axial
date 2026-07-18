@@ -1,5 +1,6 @@
 use crate::MANAGED_ARTIFACT_MAX_BYTES;
 use crate::types::{CompositionState, CompositionTier, InstalledMod, OwnershipClass};
+use axial_minecraft::managed_path::AnchoredDirectory;
 use chrono::Utc;
 use rand::{RngCore, rngs::OsRng};
 use serde::{Deserialize, Serialize};
@@ -1588,54 +1589,78 @@ fn managed_artifact_addition_path(
 }
 
 pub(crate) fn prepare_managed_artifact_addition(
-    instance_mods_dir: &Path,
+    instance_mods_dir: &AnchoredDirectory,
     installed: &InstalledMod,
-) -> Result<PathBuf, StateError> {
-    let obligation = managed_artifact_addition_path(
-        instance_mods_dir,
+) -> Result<ManagedArtifactAdditionObligation, StateError> {
+    managed_artifact_addition_path(
+        instance_mods_dir.path(),
         &installed.filename,
         &installed.integrity.sha512,
     )?;
-    let digest_root = obligation.parent().ok_or_else(|| {
-        StateError::InvalidState("managed addition obligation path is invalid".to_string())
-    })?;
-    for path in [
-        instance_mods_dir.join(STATE_DIR_NAME),
-        instance_mods_dir
-            .join(STATE_DIR_NAME)
-            .join(MUTATION_DIR_NAME),
-        instance_mods_dir
-            .join(STATE_DIR_NAME)
-            .join(MUTATION_DIR_NAME)
-            .join(ADDITION_DIR_NAME),
-        digest_root.to_path_buf(),
-    ] {
-        ensure_managed_directory(&path)?;
-    }
-    if path_exists(&obligation)? {
+    let state_root = instance_mods_dir.open_or_create_child(STATE_DIR_NAME)?;
+    let mutation_root = state_root.open_or_create_child(MUTATION_DIR_NAME)?;
+    let addition_root = mutation_root.open_or_create_child(ADDITION_DIR_NAME)?;
+    let digest = installed.integrity.sha512.to_ascii_lowercase();
+    let parent = addition_root.open_or_create_child(&digest)?;
+    let path = parent.path().join(&installed.filename);
+    if path_exists(&path)? {
         return Err(StateError::InvalidState(
             "managed addition obligation already exists".to_string(),
         ));
     }
-    Ok(obligation)
+    Ok(ManagedArtifactAdditionObligation {
+        root_relative_path: PathBuf::from(STATE_DIR_NAME)
+            .join(MUTATION_DIR_NAME)
+            .join(ADDITION_DIR_NAME)
+            .join(digest)
+            .join(&installed.filename),
+        path,
+        parent,
+        filename: installed.filename.clone(),
+    })
+}
+
+pub(crate) struct ManagedArtifactAdditionObligation {
+    root_relative_path: PathBuf,
+    path: PathBuf,
+    parent: AnchoredDirectory,
+    filename: String,
+}
+
+impl ManagedArtifactAdditionObligation {
+    pub(crate) fn parent(&self) -> &AnchoredDirectory {
+        &self.parent
+    }
+
+    pub(crate) fn filename(&self) -> &str {
+        &self.filename
+    }
 }
 
 pub(crate) fn publish_managed_artifact_addition(
     instance_mods_dir: &Path,
     installed: &InstalledMod,
-    obligation: &Path,
+    obligation: &ManagedArtifactAdditionObligation,
 ) -> Result<(), StateError> {
-    let expected = managed_artifact_addition_path(
+    managed_artifact_addition_path(
         instance_mods_dir,
         &installed.filename,
         &installed.integrity.sha512,
     )?;
-    if obligation != expected {
+    let expected_relative = PathBuf::from(STATE_DIR_NAME)
+        .join(MUTATION_DIR_NAME)
+        .join(ADDITION_DIR_NAME)
+        .join(installed.integrity.sha512.to_ascii_lowercase())
+        .join(&installed.filename);
+    if obligation.filename != installed.filename
+        || obligation.root_relative_path != expected_relative
+        || obligation.path != obligation.parent.path().join(&obligation.filename)
+    {
         return Err(StateError::InvalidState(
             "managed addition obligation path does not match its artifact".to_string(),
         ));
     }
-    let (identity, len) = admit_file_identity(obligation).map_err(|error| {
+    let (identity, len) = admit_file_identity(&obligation.path).map_err(|error| {
         identity_admission_error(
             error,
             StateError::InvalidIntegrity {
@@ -1644,14 +1669,15 @@ pub(crate) fn publish_managed_artifact_addition(
             },
         )
     })?;
-    if len != installed.size || !path_matches_sha512(obligation, &installed.integrity.sha512)? {
+    if len != installed.size || !path_matches_sha512(&obligation.path, &installed.integrity.sha512)?
+    {
         return Err(StateError::InvalidIntegrity {
             filename: installed.filename.clone(),
             reason: "managed addition bytes do not match sealed metadata".to_string(),
         });
     }
     let final_path = managed_artifact_path(instance_mods_dir, &installed.filename)?;
-    fs::hard_link(obligation, &final_path)?;
+    fs::hard_link(&obligation.path, &final_path)?;
     let final_metadata = fs::symlink_metadata(&final_path)?;
     if !final_metadata.file_type().is_file()
         || final_metadata.len() != installed.size

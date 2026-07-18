@@ -9,6 +9,7 @@ use crate::types::{
     ManagedArtifactProvider, ManagedArtifactSource, ManagedMod, ModCondition, OwnershipClass,
     PerformanceMode, VersionFamily,
 };
+use axial_minecraft::managed_path::AnchoredDirectory;
 use sha2::{Digest, Sha512};
 use std::fs;
 use std::io::Write;
@@ -27,7 +28,11 @@ impl ManagedArtifactStage for FakeOwnedStage {
         &self.installed
     }
 
-    fn publish_create_new(self, destination: &Path) -> Result<(), InstallError> {
+    fn publish_create_new(
+        self,
+        destination: &AnchoredDirectory,
+        filename: &str,
+    ) -> Result<(), InstallError> {
         if self.fail_publication {
             return Err(InstallError::Io(std::io::Error::other(
                 "injected managed publication failure",
@@ -36,7 +41,7 @@ impl ManagedArtifactStage for FakeOwnedStage {
         let mut file = fs::OpenOptions::new()
             .write(true)
             .create_new(true)
-            .open(destination)?;
+            .open(destination.path().join(filename))?;
         file.write_all(&self.bytes)?;
         file.sync_all()?;
         Ok(())
@@ -125,7 +130,7 @@ fn changed_graph_requests_provider_only_for_the_changed_pin() {
         .into_iter()
         .filter(|stage| stage.installed.filename == "root.jar")
         .collect();
-    commit_staged_graph(&root, Some(&previous), &next, changed_stage)
+    commit_staged_graph(&anchor(&root), Some(&previous), &next, changed_stage)
         .expect("commit changed pin with retained dependency");
     assert_graph_files(&root, b"replacement-root", b"dependency");
     let _ = fs::remove_dir_all(root);
@@ -148,7 +153,7 @@ fn changed_graph_revalidates_retained_pin_before_commit_effects() {
     fs::write(root.join("dependency.jar"), b"changed-after-selection")
         .expect("replace retained dependency");
 
-    commit_staged_graph(&root, Some(&previous), &next, changed_stage)
+    commit_staged_graph(&anchor(&root), Some(&previous), &next, changed_stage)
         .expect_err("changed retained pin must abort before commit");
 
     assert_eq!(fs::read(root.join("root.jar")).expect("old root"), b"root");
@@ -171,7 +176,8 @@ fn dependency_complete_graph_commits_and_rolls_back_to_absence() {
     let state = state_from_plan(&plan, installed_from_plan(&plan));
     crate::state::save_absent_rollback_snapshot(&root).expect("snapshot absence");
 
-    commit_staged_graph(&root, None, &state, fake_stages(&plan, false)).expect("commit full graph");
+    commit_staged_graph(&anchor(&root), None, &state, fake_stages(&plan, false))
+        .expect("commit full graph");
 
     assert_graph_files(&root, b"root", b"dependency");
     assert_eq!(
@@ -439,7 +445,7 @@ fn mid_commit_failure_restores_exact_prior_graph() {
     let replacement = state_from_plan(&replacement_plan, installed_from_plan(&replacement_plan));
     let mut stages = fake_stages(&replacement_plan, false);
     stages[1].fail_publication = true;
-    commit_staged_graph(&root, Some(&previous), &replacement, stages)
+    commit_staged_graph(&anchor(&root), Some(&previous), &replacement, stages)
         .expect_err("injected mid-commit failure");
     let snapshot = crate::state::load_rollback_snapshot(&root)
         .expect("load rollback")
@@ -467,7 +473,7 @@ fn commit_collision_never_claims_or_removes_user_owned_destination() {
     let state = state_from_plan(&plan, installed_from_plan(&plan));
     fs::write(root.join("root.jar"), b"user-owned").expect("write user file");
 
-    commit_staged_graph(&root, None, &state, fake_stages(&plan, false))
+    commit_staged_graph(&anchor(&root), None, &state, fake_stages(&plan, false))
         .expect_err("untracked destination must block publication");
     crate::state::reconcile_managed_addition_obligations(&root, None)
         .expect("discard untracked managed obligations");
@@ -490,7 +496,8 @@ fn full_graph_remove_and_rollback_preserve_dependencies() {
     let root = test_root("remove-rollback");
     let plan = graph_plan(b"root", b"dependency");
     let state = state_from_plan(&plan, installed_from_plan(&plan));
-    commit_staged_graph(&root, None, &state, fake_stages(&plan, false)).expect("install graph");
+    commit_staged_graph(&anchor(&root), None, &state, fake_stages(&plan, false))
+        .expect("install graph");
 
     remove_managed_transaction(&root).expect("remove graph");
     assert!(!root.join("root.jar").exists());
@@ -644,6 +651,10 @@ fn assert_graph_files(root: &Path, root_bytes: &[u8], dependency_bytes: &[u8]) {
         fs::read(root.join("dependency.jar")).expect("dependency"),
         dependency_bytes
     );
+}
+
+fn anchor(root: &Path) -> AnchoredDirectory {
+    AnchoredDirectory::open(root).expect("anchor managed mods directory")
 }
 
 fn test_root(name: &str) -> PathBuf {

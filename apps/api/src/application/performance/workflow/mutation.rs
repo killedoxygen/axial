@@ -1035,12 +1035,20 @@ pub(super) fn performance_install_error(
                 "error": "invalid performance artifact integrity metadata"
             })),
         ),
-        InstallError::Download(_) => (
-            StatusCode::BAD_GATEWAY,
-            Json(serde_json::json!({
-                "error": "Could not download managed performance files. Check the connection and try again."
-            })),
-        ),
+        InstallError::Download(error) => {
+            tracing::warn!(
+                failure_kind = ?error.kind,
+                io_error_kind = ?error.io_error_kind(),
+                fact_count = error.facts.len(),
+                "managed performance artifact staging failed"
+            );
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({
+                    "error": "Could not download managed performance files. Check the connection and try again."
+                })),
+            )
+        }
         error => internal_install_error(error),
     }
 }

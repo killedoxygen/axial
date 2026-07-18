@@ -276,6 +276,13 @@ impl std::fmt::Display for ExecutionDownloadError {
 impl std::error::Error for ExecutionDownloadError {}
 
 impl ExecutionDownloadError {
+    pub fn io_error_kind(&self) -> Option<io::ErrorKind> {
+        match &self.error {
+            DownloadError::FileOperation(error) => Some(error.kind()),
+            _ => None,
+        }
+    }
+
     pub fn into_download_error(self) -> DownloadError {
         let Self { kind, facts, error } = self;
         let _fact_report = (kind, facts);

@@ -94,6 +94,20 @@ impl AnchoredDirectory {
         }
     }
 
+    pub(crate) fn managed_directory(&self) -> ManagedDir {
+        self.directory.clone()
+    }
+
+    pub(crate) fn validate_child_name(&self, name: &str) -> io::Result<()> {
+        validate_segment(name).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "anchored directory child name is invalid",
+            )
+        })?;
+        self.directory.revalidate().map_err(anchor_error)
+    }
+
     fn admit(directory: ManagedDir, parent: Option<Arc<AnchoredDirectory>>) -> io::Result<Self> {
         let rename_blockers = directory.acquire_rename_blockers().map_err(anchor_error)?;
         let stable_path = directory.anchored_path().map_err(anchor_error)?;
@@ -186,15 +200,15 @@ pub(crate) enum ManagedDirectoryMoveFailure {
         cause: LoaderError,
     },
     IdentityMismatchRestored {
-        #[cfg(test)]
+        #[cfg(all(test, unix))]
         expected_identity: ManagedDirectoryIdentity,
-        #[cfg(test)]
+        #[cfg(all(test, unix))]
         cause: LoaderError,
     },
     IdentityMismatchParked {
-        #[cfg(test)]
+        #[cfg(all(test, unix))]
         expected_identity: ManagedDirectoryIdentity,
-        #[cfg(test)]
+        #[cfg(all(test, unix))]
         cause: LoaderError,
     },
 }
@@ -215,12 +229,12 @@ impl ManagedDirectoryMoveFailure {
         expected_identity: ManagedDirectoryIdentity,
         cause: LoaderError,
     ) -> Self {
-        #[cfg(not(test))]
+        #[cfg(not(all(test, unix)))]
         let _ = (expected_identity, cause);
         Self::IdentityMismatchRestored {
-            #[cfg(test)]
+            #[cfg(all(test, unix))]
             expected_identity,
-            #[cfg(test)]
+            #[cfg(all(test, unix))]
             cause,
         }
     }
@@ -229,12 +243,12 @@ impl ManagedDirectoryMoveFailure {
         expected_identity: ManagedDirectoryIdentity,
         cause: LoaderError,
     ) -> Self {
-        #[cfg(not(test))]
+        #[cfg(not(all(test, unix)))]
         let _ = (expected_identity, cause);
         Self::IdentityMismatchParked {
-            #[cfg(test)]
+            #[cfg(all(test, unix))]
             expected_identity,
-            #[cfg(test)]
+            #[cfg(all(test, unix))]
             cause,
         }
     }
@@ -890,7 +904,7 @@ impl ManagedDir {
         self.create_child_new_inner(name, |_| {})
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     fn create_child_new_with_hook(
         &self,
         name: &str,
@@ -1196,7 +1210,7 @@ impl ManagedDir {
         self.link_guarded_file_no_replace_inner(guard, name, || {})
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "linux"))]
     fn link_guarded_file_no_replace_with_hook(
         &self,
         guard: &ManagedFileGuard,
@@ -1530,7 +1544,7 @@ impl ManagedDir {
         )
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     fn move_child_guarded_no_replace_with_before_move_hook(
         &self,
         name: &str,
@@ -1549,7 +1563,7 @@ impl ManagedDir {
         )
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     fn move_child_guarded_no_replace_with_hooks(
         &self,
         name: &str,
@@ -2925,7 +2939,7 @@ impl ManagedDir {
         self.remove_empty_child_guarded_inner(name, park_name, child, || {})
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     fn remove_empty_child_guarded_with_hook(
         &self,
         name: &str,

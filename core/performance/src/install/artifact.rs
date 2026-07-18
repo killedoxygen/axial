@@ -7,9 +7,9 @@ use crate::types::{
 use axial_minecraft::download::{
     VerifiedContentIntegrity, VerifiedStagedContent, download_owned_verified_content_to_staging,
 };
+use axial_minecraft::managed_path::AnchoredDirectory;
 use chrono::Utc;
 use futures_util::{StreamExt, stream};
-use std::path::Path;
 
 const MANAGED_GRAPH_STAGE_CONCURRENCY: usize = 4;
 
@@ -20,7 +20,11 @@ pub(super) struct StagedManagedArtifact {
 
 pub(super) trait ManagedArtifactStage {
     fn installed(&self) -> &InstalledMod;
-    fn publish_create_new(self, destination: &Path) -> Result<(), InstallError>;
+    fn publish_create_new(
+        self,
+        destination: &AnchoredDirectory,
+        filename: &str,
+    ) -> Result<(), InstallError>;
 }
 
 impl ManagedArtifactStage for StagedManagedArtifact {
@@ -28,9 +32,13 @@ impl ManagedArtifactStage for StagedManagedArtifact {
         &self.installed
     }
 
-    fn publish_create_new(self, destination: &Path) -> Result<(), InstallError> {
+    fn publish_create_new(
+        self,
+        destination: &AnchoredDirectory,
+        filename: &str,
+    ) -> Result<(), InstallError> {
         self.staged
-            .publish_create_new(destination)
+            .publish_create_new(destination, filename)
             .map(|_| ())
             .map_err(|error| InstallError::Io(std::io::Error::other(error)))
     }
@@ -39,7 +47,7 @@ impl ManagedArtifactStage for StagedManagedArtifact {
 pub(super) async fn stage_managed_graph(
     client: &reqwest::Client,
     pins: Vec<ManagedArtifactPin>,
-    staging_root: &Path,
+    staging_root: &AnchoredDirectory,
 ) -> Result<Vec<StagedManagedArtifact>, InstallError> {
     let concurrency = pins.len().clamp(1, MANAGED_GRAPH_STAGE_CONCURRENCY);
     let staged_capacity = pins.len();
@@ -50,11 +58,11 @@ pub(super) async fn stage_managed_graph(
             sha1: None,
             sha512: Some(pin.sha512().to_string()),
         };
-        let staging_label = staging_root.join(pin.filename());
         let staged = download_owned_verified_content_to_staging(
             client,
             pin.download_url(),
-            &staging_label,
+            staging_root,
+            pin.filename(),
             &expected,
         )
         .await

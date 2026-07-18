@@ -9,7 +9,7 @@ use super::path_safety::{
     bounded_download_file_label, filesystem_path, safe_download_target_label,
 };
 use crate::loaders::types::LoaderError;
-use crate::managed_fs::{ManagedDir, ManagedFileGuard};
+use crate::managed_fs::{AnchoredDirectory, ManagedDir, ManagedFileGuard};
 use futures_util::StreamExt;
 use sha1::{Digest as _, Sha1};
 use sha2::Sha512;
@@ -24,9 +24,25 @@ pub const MAX_VERIFIED_CONTENT_STAGING_BYTES: u64 = 1 << 30;
 const CONTENT_DOWNLOAD_RETRY_DELAY_MILLIS: [u64; 3] = [500, 1_500, 4_000];
 
 #[derive(Clone, Copy)]
-enum StagingMode {
-    Legacy,
-    Owned,
+enum StagingDestination<'a> {
+    Legacy(&'a Path),
+    Owned {
+        directory: &'a AnchoredDirectory,
+        filename: &'a str,
+    },
+}
+
+impl<'a> StagingDestination<'a> {
+    fn label_path(self) -> &'a Path {
+        match self {
+            Self::Legacy(path) => path,
+            Self::Owned { filename, .. } => Path::new(filename),
+        }
+    }
+
+    fn is_owned(self) -> bool {
+        matches!(self, Self::Owned { .. })
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -75,10 +91,11 @@ impl VerifiedStagedContent {
     /// syscall succeeded but post-effect verification or directory sync failed.
     pub fn publish_create_new(
         mut self,
-        published_path: &Path,
+        published_directory: &AnchoredDirectory,
+        filename: &str,
     ) -> Result<ExecutionDownloadReport, VerifiedStagedContentError> {
         self.staged
-            .publish_create_new(published_path, &self.sha512)?;
+            .publish_create_new(published_directory, filename, &self.sha512)?;
         Ok(self.report)
     }
 
@@ -111,28 +128,36 @@ impl std::fmt::Debug for OwnedStagingFile {
 }
 
 impl OwnedStagingFile {
-    fn create(path: &Path, mode: StagingMode) -> Result<(Self, std::fs::File), io::Error> {
-        let parent = path
-            .parent()
-            .filter(|value| !value.as_os_str().is_empty())
-            .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "content staging destination has no explicit parent",
-                )
-            })?;
-        let name = path
-            .file_name()
-            .and_then(|value| value.to_str())
-            .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "content staging filename is invalid",
-                )
-            })?
-            .to_string();
-        let directory = ManagedDir::open_root(parent).map_err(managed_staging_io_error)?;
-        let anonymous = matches!(mode, StagingMode::Owned);
+    fn create(destination: StagingDestination<'_>) -> Result<(Self, std::fs::File), io::Error> {
+        let (directory, name, anonymous) = match destination {
+            StagingDestination::Legacy(path) => {
+                let parent = path
+                    .parent()
+                    .filter(|value| !value.as_os_str().is_empty())
+                    .ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "content staging destination has no explicit parent",
+                        )
+                    })?;
+                let name = path
+                    .file_name()
+                    .and_then(|value| value.to_str())
+                    .ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "content staging filename is invalid",
+                        )
+                    })?
+                    .to_string();
+                let directory = ManagedDir::open_root(parent).map_err(managed_staging_io_error)?;
+                (directory, name, false)
+            }
+            StagingDestination::Owned {
+                directory,
+                filename,
+            } => (directory.managed_directory(), filename.to_string(), true),
+        };
         let guard = if anonymous {
             directory
                 .create_anonymous_guarded_file()
@@ -182,26 +207,22 @@ impl OwnedStagingFile {
                 "content staging file identity changed before settlement",
             ));
         }
-        self.directory.sync().map_err(managed_staging_io_error)
+        Ok(())
     }
 
     fn publish_create_new(
         &mut self,
-        published_path: &Path,
+        published_directory: &AnchoredDirectory,
+        name: &str,
         expected_sha512: &str,
     ) -> Result<(), VerifiedStagedContentError> {
         if !self.anonymous {
             return Err(VerifiedStagedContentError::InvalidPublication);
         }
-        let parent = published_path
-            .parent()
-            .filter(|value| !value.as_os_str().is_empty())
-            .ok_or(VerifiedStagedContentError::InvalidPublication)?;
-        let name = published_path
-            .file_name()
-            .and_then(|value| value.to_str())
-            .ok_or(VerifiedStagedContentError::InvalidPublication)?;
-        let destination = ManagedDir::open_root(parent).map_err(publication_error)?;
+        published_directory
+            .validate_child_name(name)
+            .map_err(VerifiedStagedContentError::Io)?;
+        let destination = published_directory.managed_directory();
         destination
             .link_guarded_file_no_replace(self.guard(), name)
             .map_err(publication_error)?;
@@ -287,19 +308,26 @@ pub async fn download_verified_content_to_staging(
 pub async fn download_owned_verified_content_to_staging(
     client: &reqwest::Client,
     url: &str,
-    staging_destination: &Path,
+    staging_directory: &AnchoredDirectory,
+    filename: &str,
     expected: &VerifiedContentIntegrity,
 ) -> Result<VerifiedStagedContent, ExecutionDownloadError> {
+    let staging_destination = Path::new(filename);
     let target = safe_download_target_label(staging_destination);
     validate_owned_content_integrity(expected, staging_destination, &target)?;
+    staging_directory
+        .validate_child_name(filename)
+        .map_err(|error| staging_io_error(&target, error))?;
     let retry_delays = CONTENT_DOWNLOAD_RETRY_DELAY_MILLIS.map(Duration::from_millis);
     let completed = download_verified_content_to_staging_owned_with_retry_delays(
         client,
         url,
-        staging_destination,
+        StagingDestination::Owned {
+            directory: staging_directory,
+            filename,
+        },
         expected,
         &retry_delays,
-        StagingMode::Owned,
     )
     .await?;
     Ok(VerifiedStagedContent {
@@ -321,10 +349,9 @@ async fn download_verified_content_to_staging_with_retry_delays(
     let mut completed = download_verified_content_to_staging_owned_with_retry_delays(
         client,
         url,
-        staging_destination,
+        StagingDestination::Legacy(staging_destination),
         expected,
         retry_delays,
-        StagingMode::Legacy,
     )
     .await?;
     completed.staged.release_to_legacy_caller();
@@ -334,26 +361,19 @@ async fn download_verified_content_to_staging_with_retry_delays(
 async fn download_verified_content_to_staging_owned_with_retry_delays(
     client: &reqwest::Client,
     url: &str,
-    staging_destination: &Path,
+    staging_destination: StagingDestination<'_>,
     expected: &VerifiedContentIntegrity,
     retry_delays: &[Duration],
-    mode: StagingMode,
 ) -> Result<CompletedStaging, ExecutionDownloadError> {
-    let target = safe_download_target_label(staging_destination);
-    validate_content_integrity(expected, staging_destination, &target)?;
+    let label_path = staging_destination.label_path();
+    let target = safe_download_target_label(label_path);
+    validate_content_integrity(expected, label_path, &target)?;
 
     let mut prior_facts = Vec::new();
     let mut next_delay = 0_usize;
     loop {
-        match download_verified_content_attempt(
-            client,
-            url,
-            staging_destination,
-            expected,
-            &target,
-            mode,
-        )
-        .await
+        match download_verified_content_attempt(client, url, staging_destination, expected, &target)
+            .await
         {
             Ok(mut report) => {
                 prior_facts.append(&mut report.report.facts);
@@ -553,14 +573,14 @@ async fn validate_legacy_staging_destination(
 async fn download_verified_content_attempt(
     client: &reqwest::Client,
     url: &str,
-    staging_destination: &Path,
+    staging_destination: StagingDestination<'_>,
     expected: &VerifiedContentIntegrity,
     target: &str,
-    mode: StagingMode,
 ) -> Result<CompletedStaging, ExecutionDownloadError> {
+    let label_path = staging_destination.label_path();
     let mut facts = Vec::new();
-    if matches!(mode, StagingMode::Legacy) {
-        validate_legacy_staging_destination(staging_destination, target).await?;
+    if let StagingDestination::Legacy(path) = staging_destination {
+        validate_legacy_staging_destination(path, target).await?;
     }
     let response = match client.get(url).send().await {
         Ok(response) => response,
@@ -600,11 +620,11 @@ async fn download_verified_content_attempt(
         return Err(execution_download_error(
             ExecutionDownloadFactKind::SizeMismatch,
             facts,
-            download_size_mismatch(staging_destination, byte_limit, content_length),
+            download_size_mismatch(label_path, byte_limit, content_length),
         ));
     }
 
-    let (mut staged, output) = OwnedStagingFile::create(staging_destination, mode)
+    let (mut staged, output) = OwnedStagingFile::create(staging_destination)
         .map_err(|error| staging_io_error(target, error))?;
     let mut output = tokio::fs::File::from_std(output);
 
@@ -643,7 +663,7 @@ async fn download_verified_content_attempt(
             return Err(execution_download_error(
                 ExecutionDownloadFactKind::SizeMismatch,
                 facts,
-                download_size_mismatch(staging_destination, byte_limit, next_written),
+                download_size_mismatch(label_path, byte_limit, next_written),
             ));
         }
         if let Some(hasher) = sha1.as_mut() {
@@ -695,12 +715,12 @@ async fn download_verified_content_attempt(
             facts,
             DownloadError::Integrity(format!(
                 "{} download ended before its declared size",
-                bounded_download_file_label(staging_destination)
+                bounded_download_file_label(label_path)
             )),
         ));
     }
     let sync_result = match output.flush().await {
-        Ok(()) if matches!(mode, StagingMode::Owned) => output.sync_all().await,
+        Ok(()) if staging_destination.is_owned() => output.sync_all().await,
         Ok(()) => Ok(()),
         Err(error) => Err(error),
     };
@@ -726,7 +746,7 @@ async fn download_verified_content_attempt(
     drop(output);
     let actual_sha1 = sha1.map(|hasher| format!("{:x}", hasher.finalize()));
     let actual_sha512 = streamed_sha512.map(|hasher| format!("{:x}", hasher.finalize()));
-    if matches!(mode, StagingMode::Owned) {
+    if staging_destination.is_owned() {
         let settled = tokio::task::spawn_blocking(move || {
             let result = staged.settle(written);
             (staged, result)
@@ -783,7 +803,7 @@ async fn download_verified_content_attempt(
             return Err(execution_download_error(
                 ExecutionDownloadFactKind::ChecksumMismatch,
                 facts,
-                content_integrity_error(staging_destination, "failed sha1 verification"),
+                content_integrity_error(label_path, "failed sha1 verification"),
             ));
         }
     }
@@ -799,7 +819,7 @@ async fn download_verified_content_attempt(
             return Err(execution_download_error(
                 ExecutionDownloadFactKind::ChecksumMismatch,
                 facts,
-                content_integrity_error(staging_destination, "failed sha512 verification"),
+                content_integrity_error(label_path, "failed sha512 verification"),
             ));
         }
         Some(actual)
@@ -1101,17 +1121,19 @@ mod tests {
         assert_eq!(attempts.load(Ordering::SeqCst), 0);
     }
 
+    #[cfg(any(target_os = "linux", windows))]
     #[tokio::test]
     async fn owned_staging_requires_positive_size_and_canonical_sha512_before_network() {
         let root = TempDir::new().expect("staging root");
-        let destination = root.path().join("content.jar");
+        let directory = AnchoredDirectory::open(root.path()).expect("anchor staging root");
         let body = b"owned content";
         let mut missing_size = integrity(body);
         missing_size.size = None;
         let missing_size_error = download_owned_verified_content_to_staging(
             &reqwest::Client::new(),
             "http://127.0.0.1:9/unreachable",
-            &destination,
+            &directory,
+            "content.jar",
             &missing_size,
         )
         .await
@@ -1126,7 +1148,8 @@ mod tests {
         let uppercase_error = download_owned_verified_content_to_staging(
             &reqwest::Client::new(),
             "http://127.0.0.1:9/unreachable",
-            &destination,
+            &directory,
+            "content.jar",
             &uppercase_sha512,
         )
         .await
@@ -1135,7 +1158,24 @@ mod tests {
             uppercase_error.kind,
             ExecutionDownloadFactKind::MetadataInvalid
         );
-        assert!(!destination.exists());
+        let invalid_name = download_owned_verified_content_to_staging(
+            &reqwest::Client::new(),
+            "http://127.0.0.1:9/unreachable",
+            &directory,
+            "../content.jar",
+            &integrity(body),
+        )
+        .await
+        .expect_err("owned staging filename must be one validated segment");
+        assert_eq!(
+            invalid_name.kind,
+            ExecutionDownloadFactKind::TempWriteFailed
+        );
+        assert_eq!(
+            invalid_name.io_error_kind(),
+            Some(io::ErrorKind::InvalidInput)
+        );
+        assert!(!root.path().join("content.jar").exists());
     }
 
     #[cfg(any(target_os = "linux", windows))]
@@ -1143,7 +1183,8 @@ mod tests {
     async fn owned_staging_evidence_needs_no_crash_recovery_namespace() {
         let body = b"owned content".to_vec();
         let root = TempDir::new().expect("staging root");
-        let staged = owned_stage(&root, "content.jar", &body).await;
+        let directory = AnchoredDirectory::open(root.path()).expect("anchor staging root");
+        let staged = owned_stage(&directory, "content.jar", &body).await;
 
         assert_eq!(staged.file_name(), "content.jar");
         assert_eq!(staged.size(), body.len() as u64);
@@ -1173,7 +1214,7 @@ mod tests {
     async fn owned_staging_hash_and_size_mismatches_clean_exact_stage() {
         let body = b"provider bytes".to_vec();
         let root = TempDir::new().expect("staging root");
-        let size_destination = root.path().join("size.jar");
+        let directory = AnchoredDirectory::open(root.path()).expect("anchor staging root");
         let attempts = Arc::new(AtomicUsize::new(0));
         let url = serve_responses(vec![(200, body.clone())], Arc::clone(&attempts)).await;
         let mut wrong_size = integrity(&body);
@@ -1181,28 +1222,29 @@ mod tests {
         let size_error = download_owned_verified_content_to_staging(
             &reqwest::Client::new(),
             &url,
-            &size_destination,
+            &directory,
+            "size.jar",
             &wrong_size,
         )
         .await
         .expect_err("size mismatch");
         assert_eq!(size_error.kind, ExecutionDownloadFactKind::SizeMismatch);
-        assert!(!size_destination.exists());
+        assert!(!root.path().join("size.jar").exists());
 
-        let hash_destination = root.path().join("hash.jar");
         let attempts = Arc::new(AtomicUsize::new(0));
         let url = serve_responses(vec![(200, body.clone())], Arc::clone(&attempts)).await;
         let wrong_hash = integrity(b"different byte");
         let hash_error = download_owned_verified_content_to_staging(
             &reqwest::Client::new(),
             &url,
-            &hash_destination,
+            &directory,
+            "hash.jar",
             &wrong_hash,
         )
         .await
         .expect_err("sha512 mismatch");
         assert_eq!(hash_error.kind, ExecutionDownloadFactKind::ChecksumMismatch);
-        assert!(!hash_destination.exists());
+        assert!(!root.path().join("hash.jar").exists());
         assert!(
             root.path()
                 .read_dir()
@@ -1217,11 +1259,15 @@ mod tests {
     async fn owned_staging_publishes_the_exact_handle_create_new() {
         let body = b"published content".to_vec();
         let root = TempDir::new().expect("staging root");
-        let staged = owned_stage(&root, "content.stage", &body).await;
-        let published = root.path().join("content.jar");
+        let source = AnchoredDirectory::open(root.path()).expect("anchor staging root");
+        let destination = source
+            .open_or_create_child("nested")
+            .expect("anchor nested publication root");
+        let staged = owned_stage(&source, "content.stage", &body).await;
+        let published = root.path().join("nested/content.jar");
 
         let report = staged
-            .publish_create_new(&published)
+            .publish_create_new(&destination, "content.jar")
             .expect("exact create-only publication");
 
         assert_eq!(report.bytes_written, body.len() as u64);
@@ -1233,12 +1279,13 @@ mod tests {
     async fn owned_staging_final_window_collision_preserves_replacement() {
         let body = b"owned content".to_vec();
         let root = TempDir::new().expect("staging root");
-        let staged = owned_stage(&root, "content.stage", &body).await;
+        let directory = AnchoredDirectory::open(root.path()).expect("anchor staging root");
+        let staged = owned_stage(&directory, "content.stage", &body).await;
         let published = root.path().join("content.jar");
         std::fs::write(&published, b"replacement").expect("destination replacement");
 
         staged
-            .publish_create_new(&published)
+            .publish_create_new(&directory, "content.jar")
             .expect_err("create-only publication collision");
 
         assert_eq!(
@@ -1253,12 +1300,13 @@ mod tests {
     async fn owned_staging_rejects_portable_alias_without_publication() {
         let body = b"owned content".to_vec();
         let root = TempDir::new().expect("staging root");
-        let staged = owned_stage(&root, "content.stage", &body).await;
+        let directory = AnchoredDirectory::open(root.path()).expect("anchor staging root");
+        let staged = owned_stage(&directory, "content.stage", &body).await;
         let alias = root.path().join("Content.JAR");
         std::fs::write(&alias, b"alias").expect("portable alias");
 
         staged
-            .publish_create_new(&root.path().join("content.jar"))
+            .publish_create_new(&directory, "content.jar")
             .expect_err("portable alias must fail closed");
 
         assert_eq!(std::fs::read(alias).expect("alias preserved"), b"alias");
@@ -1270,12 +1318,13 @@ mod tests {
     async fn owned_staging_refuses_symlink_publication() {
         let body = b"owned content".to_vec();
         let root = TempDir::new().expect("staging root");
-        let staged = owned_stage(&root, "content.stage", &body).await;
+        let directory = AnchoredDirectory::open(root.path()).expect("anchor staging root");
+        let staged = owned_stage(&directory, "content.stage", &body).await;
         let published = root.path().join("content.jar");
         std::os::unix::fs::symlink("target.jar", &published).expect("publication symlink");
 
         staged
-            .publish_create_new(&published)
+            .publish_create_new(&directory, "content.jar")
             .expect_err("symlink cannot receive publication");
         assert!(published.is_symlink());
         assert_eq!(root.path().read_dir().expect("root entries").count(), 1);
@@ -1286,10 +1335,12 @@ mod tests {
     async fn owned_staging_fails_closed_without_anonymous_inode_support() {
         let body = b"owned content";
         let root = TempDir::new().expect("staging root");
+        let directory = AnchoredDirectory::open(root.path()).expect("anchor staging root");
         let error = download_owned_verified_content_to_staging(
             &reqwest::Client::new(),
             "http://127.0.0.1:9/unreachable",
-            &root.path().join("content.jar"),
+            &directory,
+            "content.jar",
             &integrity(body),
         )
         .await
@@ -1306,13 +1357,18 @@ mod tests {
     }
 
     #[cfg(any(target_os = "linux", windows))]
-    async fn owned_stage(root: &TempDir, name: &str, body: &[u8]) -> VerifiedStagedContent {
+    async fn owned_stage(
+        directory: &AnchoredDirectory,
+        name: &str,
+        body: &[u8],
+    ) -> VerifiedStagedContent {
         let attempts = Arc::new(AtomicUsize::new(0));
         let url = serve_responses(vec![(200, body.to_vec())], Arc::clone(&attempts)).await;
         let staged = download_owned_verified_content_to_staging(
             &reqwest::Client::new(),
             &url,
-            &root.path().join(name),
+            directory,
+            name,
             &integrity(body),
         )
         .await
