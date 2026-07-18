@@ -5405,6 +5405,8 @@ mod platform {
         let path = parent_path.join(format!(".axial-owned-{}", uuid::Uuid::new_v4().simple()));
         let mut options = fs::OpenOptions::new();
         options
+            .read(true)
+            .write(true)
             .access_mode(
                 windows_sys::Win32::Foundation::GENERIC_READ
                     | windows_sys::Win32::Foundation::GENERIC_WRITE
