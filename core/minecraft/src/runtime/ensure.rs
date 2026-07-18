@@ -413,19 +413,14 @@ where
     };
 
     if let Some(requested_runtime) = requested.clone() {
-        let requested_record = requested_runtime.clone();
-        let refreshed = refresh_ready_managed_runtime(
-            cache,
-            requested_runtime,
-            java_version.major_version,
-            source,
-            &mut mutation_admission,
-            &mut observer,
-        )
-        .await?;
+        if requested_runtime.source == RuntimeSource::Managed {
+            observer(RuntimeEnsureEvent::ManagedRuntimeReady {
+                component: requested_runtime.id.as_str().to_string(),
+            });
+        }
         return Ok(RuntimeEnsureResult {
-            requested: Some(requested_record),
-            effective: refreshed.effective,
+            requested: Some(requested_runtime.clone()),
+            effective: requested_runtime,
             probe_usage,
         });
     }
@@ -463,23 +458,10 @@ where
     let preferred = &requirement.preferred_component;
     match resolve_managed_runtime(cache, preferred) {
         Ok(runtime) => {
-            let refreshed = refresh_ready_managed_runtime(
-                cache,
-                runtime,
-                requirement.required_java.major_version,
-                source,
-                mutation_admission,
-                observer,
-            )
-            .await?;
-            if !refreshed.install_performed {
-                observer(RuntimeEnsureEvent::ManagedRuntimeReady {
-                    component: preferred.as_str().to_string(),
-                });
-            }
-            return Ok(ManagedEnsure {
-                effective: refreshed.effective,
+            observer(RuntimeEnsureEvent::ManagedRuntimeReady {
+                component: preferred.as_str().to_string(),
             });
+            return Ok(ManagedEnsure { effective: runtime });
         }
         // reinstalling produces the same x86_64 build, so a missing-Rosetta
         // failure can never be repaired by falling through to install
@@ -525,66 +507,6 @@ where
     });
     drop(mutation_permit);
     Ok(ManagedEnsure { effective: runtime })
-}
-
-struct RefreshedRuntime {
-    effective: RuntimeRecord,
-    install_performed: bool,
-}
-
-async fn refresh_ready_managed_runtime<F, Admit, Permit>(
-    cache: &ManagedRuntimeCache,
-    runtime: RuntimeRecord,
-    required_major: i32,
-    source: RuntimeEnsureSource,
-    mutation_admission: &mut Option<Admit>,
-    observer: &mut F,
-) -> Result<RefreshedRuntime, JavaRuntimeLookupError>
-where
-    F: FnMut(RuntimeEnsureEvent),
-    Admit: FnOnce() -> Result<Permit, ManagedRuntimeMutationRefused>,
-{
-    if runtime.source != RuntimeSource::Managed {
-        return Ok(RefreshedRuntime {
-            effective: runtime,
-            install_performed: false,
-        });
-    }
-
-    let source_receipt = acquire_runtime_source_for_ensure(cache, &runtime.id, source).await?;
-    let component = runtime.id.clone();
-    if let Ok(current) = resolve_component_runtime(cache, &component, required_major)
-        && runtime_record_matches_source(&current, &source_receipt).await
-    {
-        return Ok(RefreshedRuntime {
-            effective: current,
-            install_performed: false,
-        });
-    }
-
-    let mutation_permit = admit_managed_runtime_mutation(mutation_admission)?;
-    observer(RuntimeEnsureEvent::DownloadingManagedRuntime {
-        component: component.as_str().to_string(),
-    });
-    let source_receipt =
-        install_managed_runtime_component_from_source(cache, &component, source_receipt, observer)
-            .await
-            .map_err(ManagedRuntimeRebuildError::into_lookup_error)?
-            .into_source_receipt();
-    let effective = resolve_component_runtime(cache, &component, required_major)?;
-    if !runtime_record_matches_source(&effective, &source_receipt).await {
-        return Err(JavaRuntimeLookupError::Install(
-            "installed runtime does not match its authenticated source".to_string(),
-        ));
-    }
-    observer(RuntimeEnsureEvent::ManagedRuntimeReady {
-        component: component.as_str().to_string(),
-    });
-    drop(mutation_permit);
-    Ok(RefreshedRuntime {
-        effective,
-        install_performed: true,
-    })
 }
 
 fn admit_managed_runtime_mutation<Admit, Permit>(

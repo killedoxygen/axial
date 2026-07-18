@@ -1,16 +1,13 @@
-#[cfg(feature = "test-support")]
-use super::ensure_runtime_with_persisted_manifest_for_test;
 use super::file_download::component_manifest_link_target_path;
 use super::{
     ComponentManifest, ComponentManifestDownload, ComponentManifestDownloads,
     ComponentManifestFile, JavaRuntimeInfo, JavaRuntimeLookupError, MachOArm64Compatibility,
-    ManagedRuntimeCache, ManagedRuntimeMutationRefused, ManagedRuntimeRebuildError,
-    RosettaRuntimeDecision, RuntimeDownloadActual, RuntimeDownloadEvidence,
-    RuntimeDownloadIntegrityError, RuntimeDownloadManifest, RuntimeEnsureEvent, RuntimeId,
-    RuntimeInstallState, RuntimeManifest, RuntimeRecord, RuntimeSource, RuntimeSourceFailure,
-    RuntimeSourceFailureKind, RuntimeSourceReceipt, acquire_runtime_source_for_test,
-    authenticated_runtime_source_from_manifest_for_test, component_manifest_destination,
-    component_manifest_proof_bytes, detect_distribution, detect_runtime_state,
+    ManagedRuntimeCache, ManagedRuntimeRebuildError, RosettaRuntimeDecision, RuntimeDownloadActual,
+    RuntimeDownloadEvidence, RuntimeDownloadIntegrityError, RuntimeDownloadManifest,
+    RuntimeEnsureEvent, RuntimeId, RuntimeInstallState, RuntimeManifest, RuntimeRecord,
+    RuntimeSource, RuntimeSourceFailure, RuntimeSourceFailureKind, RuntimeSourceReceipt,
+    acquire_runtime_source_for_test, authenticated_runtime_source_from_manifest_for_test,
+    component_manifest_destination, detect_distribution, detect_runtime_state,
     ensure_runtime_with_events, fetch_runtime_file, fetch_runtime_manifest_bytes_for_test,
     finalize_managed_runtime_commit_with_failure_for_test,
     finalize_managed_runtime_commit_with_removed_quarantine_failure_for_test,
@@ -29,6 +26,11 @@ use super::{
     runtime_windows_verbatim_path_string, select_runtime_manifest, stage_managed_runtime,
     validate_ephemeral_processor_manifest_for_test, validate_runtime_file_source_urls_for_test,
     verify_runtime_download,
+};
+#[cfg(feature = "test-support")]
+use super::{
+    ManagedRuntimeMutationRefused, component_manifest_proof_bytes,
+    ensure_runtime_with_persisted_manifest_for_test,
 };
 use crate::JavaVersion;
 use serde::Deserialize;
@@ -2607,7 +2609,7 @@ async fn runtime_file_download_rejects_stream_past_expected_size_and_removes_tem
 
 #[cfg(feature = "test-support")]
 #[tokio::test]
-async fn ready_managed_runtime_does_not_request_mutation_admission() {
+async fn ready_managed_runtime_paths_reuse_structural_install_without_source_refresh() {
     let cache = ManagedRuntimeCache::isolated_for_test().expect("runtime cache");
     let component = test_runtime_component();
     let root = cache
@@ -2621,35 +2623,42 @@ async fn ready_managed_runtime_does_not_request_mutation_admission() {
     fs::write(&java, java_bytes).expect("java fixture");
     make_executable(&java);
     fs::write(root.join(".axial-ready"), b"ready").expect("ready marker");
-    let admissions = AtomicUsize::new(0);
-    let mut events = Vec::new();
-
-    let ensured = ensure_runtime_with_persisted_manifest_for_test(
-        &cache,
-        &JavaVersion {
-            component: component.as_str().to_string(),
-            major_version: 21,
-        },
-        "",
-        false,
-        None,
-        || {
-            admissions.fetch_add(1, Ordering::SeqCst);
-            Ok::<(), ManagedRuntimeMutationRefused>(())
-        },
-        |event| events.push(event),
+    fs::write(
+        root.join(".axial-runtime-manifest.json"),
+        b"provider refresh must not run",
     )
-    .await
-    .expect("ready runtime ensure");
+    .expect("replace persisted source proof after structural admission");
+    let admissions = AtomicUsize::new(0);
 
-    assert_eq!(admissions.load(Ordering::SeqCst), 0);
-    assert_eq!(ensured.effective.install_state, RuntimeInstallState::Ready);
-    assert_eq!(
-        events,
-        vec![RuntimeEnsureEvent::ManagedRuntimeReady {
-            component: component.as_str().to_string(),
-        }]
-    );
+    for requested_override in ["", component.as_str()] {
+        let mut events = Vec::new();
+        let ensured = ensure_runtime_with_persisted_manifest_for_test(
+            &cache,
+            &JavaVersion {
+                component: component.as_str().to_string(),
+                major_version: 21,
+            },
+            requested_override,
+            false,
+            None,
+            || {
+                admissions.fetch_add(1, Ordering::SeqCst);
+                Ok::<(), ManagedRuntimeMutationRefused>(())
+            },
+            |event| events.push(event),
+        )
+        .await
+        .expect("ready runtime ensure");
+
+        assert_eq!(admissions.load(Ordering::SeqCst), 0);
+        assert_eq!(ensured.effective.install_state, RuntimeInstallState::Ready);
+        assert_eq!(
+            events,
+            vec![RuntimeEnsureEvent::ManagedRuntimeReady {
+                component: component.as_str().to_string(),
+            }]
+        );
+    }
 }
 
 #[cfg(feature = "test-support")]
