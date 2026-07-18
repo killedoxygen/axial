@@ -53,9 +53,32 @@ struct FabricLauncherMeta {
 }
 
 #[derive(Deserialize, Eq, PartialEq)]
+#[serde(from = "FabricMainClassSource")]
 struct FabricMainClass {
+    client: String,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum FabricMainClassSource {
+    Environment(FabricEnvironmentMainClasses),
+    Universal(String),
+}
+
+#[derive(Deserialize)]
+struct FabricEnvironmentMainClasses {
     #[serde(default)]
     client: String,
+}
+
+impl From<FabricMainClassSource> for FabricMainClass {
+    fn from(source: FabricMainClassSource) -> Self {
+        let client = match source {
+            FabricMainClassSource::Environment(main_classes) => main_classes.client,
+            FabricMainClassSource::Universal(main_class) => main_class,
+        };
+        Self { client }
+    }
 }
 
 pub async fn fetch_game_versions()
@@ -109,14 +132,16 @@ fn profile_install_proof_from_entry(
     url: &str,
     entry: FabricInstallEntry,
 ) -> Result<ProfileInstallProof, crate::loaders::types::LoaderError> {
-    if entry.loader.version != record.loader_version
-        || !install_entry_matches_target(&entry, &record.minecraft_version)
-    {
+    let client_main_class = (entry.loader.version == record.loader_version)
+        .then(|| compatible_client_main_class(&entry, &record.minecraft_version))
+        .flatten()
+        .map(str::to_owned);
+    let Some(client_main_class) = client_main_class else {
         return Err(crate::loaders::types::LoaderError::ProviderDataInvalid {
             kind: crate::loaders::types::LoaderProviderFailureKind::SchemaInvalid,
             status: None,
         });
-    }
+    };
     Ok(ProfileInstallProof {
         provider_url: url.to_string(),
         canonical_profile_id: format!(
@@ -124,7 +149,7 @@ fn profile_install_proof_from_entry(
             record.loader_version, record.minecraft_version
         ),
         inherits_from: record.minecraft_version.clone(),
-        client_main_class: entry.launcher_meta.main_class.client,
+        client_main_class,
         required_libraries: vec![
             ProfileLibraryProof {
                 coordinate: entry.loader.maven,
@@ -160,7 +185,7 @@ fn build_index_from_entries(
 
     for entry in raw
         .into_iter()
-        .filter(|entry| install_entry_matches_target(entry, minecraft_version))
+        .filter(|entry| compatible_client_main_class(entry, minecraft_version).is_some())
     {
         let version_id =
             provider_installed_version_id(component_id, minecraft_version, &entry.loader.version)?;
@@ -210,16 +235,24 @@ fn build_index_from_entries(
     })
 }
 
-fn install_entry_matches_target(entry: &FabricInstallEntry, minecraft_version: &str) -> bool {
-    entry.loader.maven == format!("net.fabricmc:fabric-loader:{}", entry.loader.version)
-        && entry.intermediary.version == minecraft_version
-        && entry.intermediary.maven == format!("net.fabricmc:intermediary:{minecraft_version}")
-        && !entry.launcher_meta.main_class.client.trim().is_empty()
+fn compatible_client_main_class<'a>(
+    entry: &'a FabricInstallEntry,
+    minecraft_version: &str,
+) -> Option<&'a str> {
+    if entry.loader.maven != format!("net.fabricmc:fabric-loader:{}", entry.loader.version)
+        || entry.intermediary.version != minecraft_version
+        || entry.intermediary.maven != format!("net.fabricmc:intermediary:{minecraft_version}")
+    {
+        return None;
+    }
+
+    let client_main_class = entry.launcher_meta.main_class.client.trim();
+    (!client_main_class.is_empty()).then_some(client_main_class)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{FabricInstallEntry, build_index_from_entries};
+    use super::{FabricInstallEntry, build_index_from_entries, profile_install_proof_from_entry};
     use crate::loaders::types::{LoaderError, LoaderProviderFailureKind};
 
     #[test]
@@ -227,16 +260,16 @@ mod tests {
         let raw = serde_json::from_value::<Vec<FabricInstallEntry>>(serde_json::json!([
             {
                 "loader": {
-                    "version": "0.19.3",
+                    "version": "0.2.0.71",
                     "stable": true,
-                    "maven": "net.fabricmc:fabric-loader:0.19.3"
+                    "maven": "net.fabricmc:fabric-loader:0.2.0.71"
                 },
                 "intermediary": {
                     "version": "0.0.0",
                     "maven": "net.fabricmc:intermediary:0.0.0"
                 },
                 "launcherMeta": {
-                    "mainClass": { "client": "net.fabricmc.loader.impl.launch.knot.KnotClient" }
+                    "mainClass": "net.minecraft.launchwrapper.Launch"
                 }
             },
             {
@@ -266,6 +299,20 @@ mod tests {
                 "launcherMeta": {
                     "mainClass": {}
                 }
+            },
+            {
+                "loader": {
+                    "version": "0.2.0.70",
+                    "stable": false,
+                    "maven": "net.fabricmc:fabric-loader:0.2.0.70"
+                },
+                "intermediary": {
+                    "version": "26.2",
+                    "maven": "net.fabricmc:intermediary:26.2"
+                },
+                "launcherMeta": {
+                    "mainClass": "   "
+                }
             }
         ]))
         .expect("Fabric loader catalog fixture");
@@ -273,6 +320,43 @@ mod tests {
         let index = build_index_from_entries("26.2", raw).expect("normalized Fabric index");
 
         assert!(index.builds.is_empty());
+    }
+
+    #[test]
+    fn build_catalog_and_exact_proof_accept_universal_main_class_shape() {
+        let fixture = serde_json::json!({
+            "loader": {
+                "version": "0.2.0.71",
+                "stable": true,
+                "maven": "net.fabricmc:fabric-loader:0.2.0.71"
+            },
+            "intermediary": {
+                "version": "1.14",
+                "maven": "net.fabricmc:intermediary:1.14"
+            },
+            "launcherMeta": {
+                "mainClass": "  net.minecraft.launchwrapper.Launch  "
+            }
+        });
+        let catalog_entry = serde_json::from_value::<FabricInstallEntry>(fixture.clone())
+            .expect("historical Fabric loader catalog fixture");
+        let index = build_index_from_entries("1.14", vec![catalog_entry])
+            .expect("normalized historical Fabric index");
+
+        assert_eq!(index.builds.len(), 1);
+        let proof_entry = serde_json::from_value::<FabricInstallEntry>(fixture)
+            .expect("historical Fabric profile fixture");
+        let proof = profile_install_proof_from_entry(
+            &index.builds[0],
+            "https://meta.fabricmc.net/v2/versions/loader/1.14/0.2.0.71/profile/json",
+            proof_entry,
+        )
+        .expect("historical Fabric exact proof");
+
+        assert_eq!(
+            proof.client_main_class,
+            "net.minecraft.launchwrapper.Launch"
+        );
     }
 
     #[test]
