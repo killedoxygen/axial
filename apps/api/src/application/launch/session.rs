@@ -558,7 +558,7 @@ pub async fn prepare_launch_preflight(
         .await
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(super) struct LaunchPreflightMemoryProfile {
     pub(super) host_total_memory_mb: Option<u64>,
@@ -567,7 +567,7 @@ pub(super) struct LaunchPreflightMemoryProfile {
     pub(super) launcher_process_memory_mb: Option<u64>,
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 impl LaunchPreflightMemoryProfile {
     fn into_evidence(self) -> LaunchMemoryEvidence {
         LaunchMemoryEvidence {
@@ -579,7 +579,7 @@ impl LaunchPreflightMemoryProfile {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(super) async fn prepare_launch_preflight_with_memory_profile_for_test(
     state: &AppState,
     instance_id: String,

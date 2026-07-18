@@ -340,9 +340,9 @@ impl PersistedStateLoadEvidence {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        PersistedStateLoadEvidence, PersistedStateRejectedRecord, persisted_state_record_target,
-    };
+    #[cfg(unix)]
+    use super::persisted_state_record_target;
+    use super::{PersistedStateLoadEvidence, PersistedStateRejectedRecord};
     use static_assertions::assert_not_impl_any;
     use std::path::Path;
 

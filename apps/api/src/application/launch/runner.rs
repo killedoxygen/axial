@@ -174,7 +174,7 @@ pub(crate) async fn launch_session(
     launch_session_with_control(state, task, producer, LaunchLoopControl::default()).await
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) async fn launch_session_with_persisted_runtime_manifest_for_test(
     state: AppState,
     task: super::session::LaunchSessionTask,
@@ -654,7 +654,7 @@ fn trace_unconfirmed_launch_failure_termination(error_class: LaunchFailureTermin
     );
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 async fn launch_session_inner(
     state: AppState,
     task: LaunchSessionRunTask,
@@ -2137,21 +2137,24 @@ pub fn trace_launch_event(session_id: &str, message: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use crate::guardian::GuardianDomain;
     use crate::guardian::{
         GuardianActionKind, GuardianArtifactRepairSettlement, GuardianComponentRebuildStatus,
-        GuardianDomain, GuardianMode, GuardianSummaryDecision,
-        GuardianWholeInstanceRematerializationDisposition,
+        GuardianMode, GuardianSummaryDecision, GuardianWholeInstanceRematerializationDisposition,
         GuardianWholeInstanceRematerializationStatus, assess_whole_instance_rematerialization,
         execute_managed_version_bundle_component_rebuild,
         execute_registered_guardian_artifact_repair, execute_whole_instance_rematerialization_with,
         guardian_summary_for_test, guardian_user_outcome_for_test,
     };
     use crate::observability::telemetry::{DEFAULT_POSTHOG_HOST, TelemetryHub};
+    #[cfg(unix)]
+    use crate::state::contracts::TargetKind;
     use crate::state::contracts::{
         OperationId, OperationPhase, OperationStatus, OwnershipClass, ReconciliationComponent,
         ReconciliationRung, ReconciliationTerminalOutcome, StabilizationSystem, TargetDescriptor,
-        TargetKind,
     };
+    #[cfg(unix)]
     use crate::state::failure_memory::{FailureMemorySnapshot, failure_memory_path};
     use crate::state::{
         AppStateInit, GuardianFailureMemoryStore, InstallStore, LaunchEvent, OperationJournalStore,
@@ -2185,9 +2188,12 @@ mod tests {
     const MANAGED_LIBRARY_FIXTURE_PATH: &str =
         "libraries/org/axial/fixture/1.0.0/fixture-1.0.0.jar";
     const MANAGED_LIBRARY_FIXTURE_BYTES: &[u8] = b"axial managed Libraries fixture";
+    #[cfg(unix)]
     const CRASH_E2E_INSTANCE_ID: &str = "0123456789abcdef";
+    #[cfg(unix)]
     const CRASH_E2E_FABRIC_VERSION_ID: &str =
         "loader-v2-YXhpYWwtaW5zdGFsbGVkLWxvYWRlcgABAAYxLjIxLjEABzAuMTYuMTA";
+    #[cfg(unix)]
     const CRASH_E2E_FABRIC_LIBRARIES: [(&str, &str); 2] = [
         (
             "net.fabricmc:fabric-loader:0.16.10",
@@ -5370,6 +5376,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     fn retarget_test_launch_task(
         task: &mut super::super::session::LaunchSessionTask,
         instance_id: &str,
@@ -6097,6 +6104,7 @@ exit 0
         )
     }
 
+    #[cfg(unix)]
     fn test_app_state_with_library(root: &Path) -> AppState {
         let paths = test_paths(root);
         let config_store = ConfigStore::from_config(
@@ -6538,6 +6546,7 @@ exit 1
         java_path.to_string_lossy().to_string()
     }
 
+    #[cfg(unix)]
     fn assert_out_of_memory_observation(
         entry: &crate::state::failure_memory::GuardianFailureMemoryEntry,
         expected_instance_id: &str,
@@ -6558,6 +6567,7 @@ exit 1
         assert_eq!(entry.user_intent_hash, None);
     }
 
+    #[cfg(unix)]
     fn assert_oom_preflight_guidance(
         preflight: &super::super::session::LaunchPreflightResponse,
         fact: &crate::guardian::GuardianFact,
@@ -6594,6 +6604,7 @@ exit 1
         );
     }
 
+    #[cfg(unix)]
     fn guardian_fact_field<'a>(
         fact: &'a crate::guardian::GuardianFact,
         key: &str,
@@ -6604,6 +6615,7 @@ exit 1
             .map(|field| field.value.as_str())
     }
 
+    #[cfg(unix)]
     fn assert_no_out_of_memory_sensitive_decoys(payload: &str) {
         for fragment in [
             "/home/alice",

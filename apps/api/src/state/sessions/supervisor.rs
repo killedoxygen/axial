@@ -12,7 +12,7 @@ use std::future::Future;
 use std::io;
 use std::process::ExitStatus;
 use std::sync::Arc;
-#[cfg(test)]
+#[cfg(all(test, unix))]
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
@@ -88,9 +88,9 @@ pub(super) struct ProcessControlHandle {
     commands: mpsc::UnboundedSender<ProcessControl>,
     reaped: watch::Receiver<Option<ProcessReap>>,
     terminal_settled: watch::Receiver<bool>,
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     reject_next_start_kill: Arc<AtomicBool>,
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     completed: watch::Receiver<bool>,
 }
 
@@ -99,7 +99,7 @@ pub(super) struct ProcessTerminationRequest {
     acceptance: Option<ProcessTerminationAcceptance>,
     reaped: watch::Receiver<Option<ProcessReap>>,
     terminal_settled: watch::Receiver<bool>,
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     completed: watch::Receiver<bool>,
 }
 
@@ -116,7 +116,7 @@ impl ProcessControlHandle {
             acceptance: None,
             reaped: self.reaped.clone(),
             terminal_settled: self.terminal_settled.clone(),
-            #[cfg(test)]
+            #[cfg(all(test, unix))]
             completed: self.completed.clone(),
         }
     }
@@ -143,12 +143,12 @@ impl ProcessControlHandle {
         })
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(super) fn completion_receiver(&self) -> watch::Receiver<bool> {
         self.completed.clone()
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(super) async fn wait_until_reaped(&self) {
         let mut reaped = self.reaped.clone();
         if reaped.borrow().is_none() {
@@ -156,7 +156,7 @@ impl ProcessControlHandle {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(super) fn reject_next_start_kill(&self) {
         self.reject_next_start_kill.store(true, Ordering::SeqCst);
     }
@@ -231,7 +231,7 @@ impl ProcessTerminationRequest {
         Ok(acceptance)
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(super) async fn completed(&mut self) -> io::Result<ProcessTerminationAcceptance> {
         let acceptance = self.settled().await?;
         if !*self.completed.borrow() {
@@ -287,9 +287,9 @@ pub(super) struct PreparedProcessOwner {
     commands: mpsc::UnboundedReceiver<ProcessControl>,
     reaped: watch::Sender<Option<ProcessReap>>,
     terminal_settled: watch::Sender<bool>,
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     reject_next_start_kill: Arc<AtomicBool>,
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     completed: watch::Sender<bool>,
     #[cfg(test)]
     control_closed_probe: Option<oneshot::Sender<()>>,
@@ -301,18 +301,18 @@ pub(super) fn prepare_process_owner(child: Child) -> (ProcessControlHandle, Prep
     let (commands, commands_rx) = mpsc::unbounded_channel();
     let (reaped, reaped_rx) = watch::channel(None);
     let (terminal_settled, terminal_settled_rx) = watch::channel(false);
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     let (completed, completed_rx) = watch::channel(false);
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     let reject_next_start_kill = Arc::new(AtomicBool::new(false));
     (
         ProcessControlHandle {
             commands,
             reaped: reaped_rx,
             terminal_settled: terminal_settled_rx,
-            #[cfg(test)]
+            #[cfg(all(test, unix))]
             reject_next_start_kill: reject_next_start_kill.clone(),
-            #[cfg(test)]
+            #[cfg(all(test, unix))]
             completed: completed_rx,
         },
         PreparedProcessOwner {
@@ -320,9 +320,9 @@ pub(super) fn prepare_process_owner(child: Child) -> (ProcessControlHandle, Prep
             commands: commands_rx,
             reaped,
             terminal_settled,
-            #[cfg(test)]
+            #[cfg(all(test, unix))]
             reject_next_start_kill,
-            #[cfg(test)]
+            #[cfg(all(test, unix))]
             completed,
             #[cfg(test)]
             control_closed_probe: None,
@@ -340,13 +340,17 @@ pub(super) fn rejected_process_control_handle() -> ProcessControlHandle {
     drop(reaped);
     let (terminal_settled, terminal_settled_rx) = watch::channel(false);
     drop(terminal_settled);
+    #[cfg(unix)]
     let (completed, completed_rx) = watch::channel(false);
+    #[cfg(unix)]
     drop(completed);
     ProcessControlHandle {
         commands,
         reaped: reaped_rx,
         terminal_settled: terminal_settled_rx,
+        #[cfg(unix)]
         reject_next_start_kill: Arc::new(AtomicBool::new(false)),
+        #[cfg(unix)]
         completed: completed_rx,
     }
 }
@@ -358,6 +362,7 @@ pub(super) struct GatedTerminationControl {
     pending_acceptance: Option<oneshot::Sender<io::Result<ProcessTerminationAcceptance>>>,
     reaped: watch::Sender<Option<ProcessReap>>,
     terminal_settled: watch::Sender<bool>,
+    #[cfg(unix)]
     completed: watch::Sender<bool>,
 }
 
@@ -399,6 +404,7 @@ impl GatedTerminationControl {
                 .map_err(ProcessOwnerError::from_io),
         }));
         self.terminal_settled.send_replace(true);
+        #[cfg(unix)]
         self.completed.send_replace(true);
     }
 }
@@ -408,19 +414,23 @@ pub(super) fn gated_termination_control() -> GatedTerminationControl {
     let (commands, command_rx) = mpsc::unbounded_channel();
     let (reaped, reaped_rx) = watch::channel(None);
     let (terminal_settled, terminal_settled_rx) = watch::channel(false);
+    #[cfg(unix)]
     let (completed, completed_rx) = watch::channel(false);
     GatedTerminationControl {
         handle: ProcessControlHandle {
             commands,
             reaped: reaped_rx,
             terminal_settled: terminal_settled_rx,
+            #[cfg(unix)]
             reject_next_start_kill: Arc::new(AtomicBool::new(false)),
+            #[cfg(unix)]
             completed: completed_rx,
         },
         commands: command_rx,
         pending_acceptance: None,
         reaped,
         terminal_settled,
+        #[cfg(unix)]
         completed,
     }
 }
@@ -437,7 +447,7 @@ pub(super) struct OutputPumpTasks {
     processor: JoinHandle<()>,
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(super) fn output_pump_tasks_with_processor(processor: JoinHandle<()>) -> OutputPumpTasks {
     OutputPumpTasks {
         stdout: None,
@@ -538,12 +548,12 @@ where
 }
 
 impl PreparedProcessOwner {
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     fn set_control_closed_probe(&mut self, probe: oneshot::Sender<()>) {
         self.control_closed_probe = Some(probe);
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(super) fn set_reap_gate(
         &mut self,
         reached: oneshot::Sender<()>,
@@ -583,7 +593,7 @@ impl PreparedProcessOwner {
                             &mut self.child,
                             &mut requested_cause,
                             control,
-                            #[cfg(test)]
+                            #[cfg(all(test, unix))]
                             &self.reject_next_start_kill,
                         ) {
                             break status;
@@ -635,7 +645,7 @@ impl PreparedProcessOwner {
                 self.terminal_settled.send_replace(true);
             }
             store.process_owner_completed(attempt.id).await;
-            #[cfg(test)]
+            #[cfg(all(test, unix))]
             self.completed.send_replace(true);
         });
     }
@@ -645,7 +655,7 @@ fn handle_process_control(
     child: &mut Child,
     requested_cause: &mut Option<ProcessTerminalCause>,
     control: ProcessControl,
-    #[cfg(test)] reject_next_start_kill: &AtomicBool,
+    #[cfg(all(test, unix))] reject_next_start_kill: &AtomicBool,
 ) -> Option<io::Result<ExitStatus>> {
     match control {
         ProcessControl::Terminate { cause, accepted } => {
@@ -659,7 +669,7 @@ fn handle_process_control(
                     Some(Ok(status))
                 }
                 Ok(None) => {
-                    #[cfg(test)]
+                    #[cfg(all(test, unix))]
                     if reject_next_start_kill.swap(false, Ordering::SeqCst) {
                         let _ = accepted.send(Err(io::Error::new(
                             io::ErrorKind::PermissionDenied,
@@ -992,12 +1002,16 @@ where
 mod tests {
     use super::super::test_record;
     use super::*;
+    use axial_launcher::LaunchFailureClass;
+    #[cfg(unix)]
     use axial_launcher::{
-        LaunchEvent, LaunchFailure, LaunchFailureClass, LaunchSessionOutcome,
-        LaunchSessionOutcomeKind,
+        LaunchEvent, LaunchFailure, LaunchSessionOutcome, LaunchSessionOutcomeKind,
     };
+    #[cfg(unix)]
     use std::process::Stdio;
+    #[cfg(unix)]
     use tokio::io::AsyncWriteExt;
+    #[cfg(unix)]
     use tokio::process::Command;
     use tokio::sync::Notify;
 
@@ -1298,12 +1312,14 @@ mod tests {
         let (accepted, accepted_rx) = oneshot::channel();
         let (reaped, reaped_rx) = watch::channel(None);
         let (terminal_settled, terminal_settled_rx) = watch::channel(false);
+        #[cfg(unix)]
         let (completed, completed_rx) = watch::channel(false);
         let request = ProcessTerminationRequest {
             accepted: Some(accepted_rx),
             acceptance: None,
             reaped: reaped_rx,
             terminal_settled: terminal_settled_rx,
+            #[cfg(unix)]
             completed: completed_rx,
         };
         let settled = tokio::spawn(async move {
@@ -1331,6 +1347,7 @@ mod tests {
             .expect_err("reap error");
         assert_eq!(error.kind(), io::ErrorKind::Other);
         assert_eq!(error.to_string(), "synthetic reap failure");
+        #[cfg(unix)]
         drop(completed);
     }
 

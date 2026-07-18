@@ -1830,14 +1830,16 @@ mod tests {
     use crate::state::failure_memory::GuardianFailureMemoryStore;
     use crate::state::{
         AppState, AppStateInit, InstallStore, MAX_OPERATION_JOURNAL_STEP_FACTS,
-        OperationJournalStore, ProducerLease, RegisteredComponentRebuildAdmission,
-        RegisteredManagedArtifactCommitPostcheck,
-        RegisteredManagedArtifactComponentEffectAdmission, SessionStore,
+        OperationJournalStore, ProducerLease, RegisteredComponentRebuildAdmission, SessionStore,
         commit_reconciliation_memory, component_rebuild_journal, new_instance,
         reconciliation_attempt_key, reconciliation_instance_target, reconciliation_journal_attempt,
         reconciliation_memory_entry, record_reconciliation_journal_failure,
         registered_artifact_target_for_test, reserve_reconciliation_attempt,
-        settle_reconciliation_memory,
+    };
+    #[cfg(unix)]
+    use crate::state::{
+        RegisteredManagedArtifactCommitPostcheck,
+        RegisteredManagedArtifactComponentEffectAdmission, settle_reconciliation_memory,
     };
     use axial_config::{AppPaths, InstanceRegistrySnapshot};
     use axial_minecraft::known_good::{

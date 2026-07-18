@@ -1455,7 +1455,7 @@ impl SessionStore {
             .unwrap_or_default()
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) async fn reject_next_process_start_kill(&self, session_id: &str) -> bool {
         let process = self
             .sessions
@@ -5672,6 +5672,7 @@ mod tests {
         stored
     }
 
+    #[cfg(unix)]
     async fn emit_test_boot_reply(
         store: &SessionStore,
         session_id: &str,
@@ -5775,6 +5776,7 @@ mod tests {
         stale_attempt
     }
 
+    #[cfg(unix)]
     struct AttachedTestProcess {
         pid: u32,
         control: supervisor::ProcessControlHandle,
@@ -5787,6 +5789,7 @@ mod tests {
         release_reap: tokio::sync::oneshot::Sender<()>,
     }
 
+    #[cfg(unix)]
     async fn attach_test_child(
         store: &Arc<SessionStore>,
         session_id: &str,

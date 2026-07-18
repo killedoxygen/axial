@@ -1122,6 +1122,7 @@ async fn damaged_runtime_rebuilds_minimal_component_and_launches_once() {
         (path, contents.to_vec())
     })
     .collect::<Vec<_>>();
+    #[cfg(unix)]
     let game_dir = fixture.state.instances().game_dir(&instance_id);
     let producer = fixture
         .state

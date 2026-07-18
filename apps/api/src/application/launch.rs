@@ -39,7 +39,7 @@ pub(crate) use reports::{
     stop_launch_session,
 };
 pub(crate) use runner::launch_session;
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) use runner::launch_session_with_persisted_runtime_manifest_for_test;
 pub use runner::{
     LaunchRequestError, LaunchSuccess, sanitize_live_launch_failure_message, trace_launch_event,
@@ -50,7 +50,7 @@ pub fn snapshot_status(
 ) -> axial_launcher::LaunchStatusEvent {
     crate::guardian::launch_status_snapshot(record)
 }
-#[cfg(test)]
+#[cfg(all(test, unix))]
 use session::prepare_launch_session;
 #[cfg(test)]
 pub(crate) use session::readiness_guardian_facts_for_coverage;

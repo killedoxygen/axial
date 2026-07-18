@@ -282,7 +282,7 @@ impl AnchoredRecordIdentity {
         self.revalidate().is_ok()
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn same_file(&self, other: &Self) -> bool {
         self.file.same_identity(&other.file)
     }
@@ -420,7 +420,7 @@ impl AnchoredRegularFile {
         self.0.revalidate()
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     fn same_identity(&self, other: &Self) -> bool {
         self.0.same_identity(&other.0)
     }
@@ -2153,11 +2153,6 @@ mod platform {
             self.matches(&basic, &standard, &id)
         }
 
-        #[cfg(test)]
-        pub(super) fn same_identity(&self, other: &Self) -> bool {
-            self.volume == other.volume && self.id == other.id
-        }
-
         fn matches(
             &self,
             basic: &FILE_BASIC_INFO,
@@ -3524,11 +3519,6 @@ mod platform {
         }
 
         pub(super) fn revalidate(&self) -> bool {
-            false
-        }
-
-        #[cfg(test)]
-        pub(super) fn same_identity(&self, _other: &Self) -> bool {
             false
         }
     }
