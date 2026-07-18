@@ -6818,9 +6818,14 @@ mod tests {
             .expect("component admitted while sweep is current");
 
         reservation.cancellation().cancel();
-        let outcome = execute_failed_managed_assets_component_rebuild_for_test(component)
-            .await
-            .expect("admitted component settles while sweep remains active");
+        let outcome = execute_failed_managed_assets_component_rebuild_for_test(
+            state
+                .try_claim_producer()
+                .expect("claim cancelled sweep component owner"),
+            component,
+        )
+        .await
+        .expect("admitted component settles while sweep remains active");
         assert_eq!(
             outcome.status,
             crate::guardian::GuardianComponentRebuildStatus::Failed
@@ -6855,9 +6860,14 @@ mod tests {
 
         reservation.cancellation().cancel();
         reservation.settle(IdleSweepTerminal::Cancelled);
-        let outcome = execute_failed_managed_assets_component_rebuild_for_test(component)
-            .await
-            .expect("settled sweep component is durably failed");
+        let outcome = execute_failed_managed_assets_component_rebuild_for_test(
+            state
+                .try_claim_producer()
+                .expect("claim settled sweep component owner"),
+            component,
+        )
+        .await
+        .expect("settled sweep component is durably failed");
         assert_eq!(
             outcome.status,
             crate::guardian::GuardianComponentRebuildStatus::Failed
@@ -7085,9 +7095,14 @@ mod tests {
                 .admit_managed_artifact_mutation()
                 .expect("intervening managed artifact writer"),
         );
-        let outcome = execute_managed_assets_component_rebuild_fixture_for_test(component)
-            .await
-            .expect("stale R2 settlement");
+        let outcome = execute_managed_assets_component_rebuild_fixture_for_test(
+            state
+                .try_claim_producer()
+                .expect("claim stale R2 settlement owner"),
+            component,
+        )
+        .await
+        .expect("stale R2 settlement");
 
         assert_eq!(
             outcome.status,

@@ -6,7 +6,7 @@ use crate::state::contracts::{
     OperationPhase, OwnershipClass, StabilizationSystem, TargetDescriptor,
 };
 use crate::state::{
-    RegisteredUserConfigRestoreEligibility, RegisteredWholeInstanceDurableOutcome,
+    ProducerLease, RegisteredUserConfigRestoreEligibility, RegisteredWholeInstanceDurableOutcome,
     RegisteredWholeInstancePreparation, RegisteredWholeInstanceRematerializationAdmission,
     RegisteredWholeInstanceRematerializationAuthorization,
     RegisteredWholeInstanceRematerializationEligibility,
@@ -193,6 +193,7 @@ impl GuardianWholeInstanceRematerializationError {
 }
 
 async fn await_whole_instance_owner<Owner>(
+    producer: ProducerLease,
     owner: Owner,
 ) -> Result<
     GuardianWholeInstanceRematerializationOutcome,
@@ -207,20 +208,22 @@ where
         > + Send
         + 'static,
 {
-    tokio::spawn(owner)
-        .await
-        .map_err(|_| GuardianWholeInstanceRematerializationError {
+    producer.spawn_joinable(owner).await.map_err(|_| {
+        GuardianWholeInstanceRematerializationError {
             class: "invalid_guardian_outcome",
-        })?
+        }
+    })?
 }
 
 pub(crate) async fn execute_whole_instance_rematerialization(
+    producer: ProducerLease,
     admission: RegisteredWholeInstanceRematerializationAdmission,
 ) -> Result<
     GuardianWholeInstanceRematerializationOutcome,
     GuardianWholeInstanceRematerializationError,
 > {
     execute_whole_instance_rematerialization_with(
+        producer,
         admission,
         |root, runtime_cache, version_id| async move {
             axial_minecraft::rematerialize_managed_instance(root, &runtime_cache, &version_id).await
@@ -230,6 +233,7 @@ pub(crate) async fn execute_whole_instance_rematerialization(
 }
 
 pub(crate) async fn execute_whole_instance_rematerialization_with<Driver, DriverFuture>(
+    producer: ProducerLease,
     admission: RegisteredWholeInstanceRematerializationAdmission,
     driver: Driver,
 ) -> Result<
@@ -244,7 +248,7 @@ where
         + Send
         + 'static,
 {
-    await_whole_instance_owner(async move {
+    await_whole_instance_owner(producer, async move {
         let preparation = admission.into_effect().await.map_err(|error| {
             GuardianWholeInstanceRematerializationError {
                 class: error.class(),
@@ -274,7 +278,6 @@ where
             }
             Err(
                 ManagedWholeInstanceRebuildError::Reconstruction(_)
-                | ManagedWholeInstanceRebuildError::Preparation
                 | ManagedWholeInstanceRebuildError::RuntimePreparation,
             ) => completion.into_failed_settlement(),
         };

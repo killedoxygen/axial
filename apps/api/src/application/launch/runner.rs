@@ -1475,10 +1475,12 @@ async fn launch_session_inner_with_control(
                         let recovery_state = state.clone();
                         let component_rebuild_source =
                             control.registered_artifact_component_rebuild_source();
+                        let recovery_producer = producer.claim_child();
                         let repair_task = producer.claim_child().spawn_joinable(async move {
                             let client = reqwest::Client::new();
                             let outcome = execute_registered_artifact_recovery_sequence(
                                 &recovery_state,
+                                recovery_producer,
                                 RegisteredArtifactRecoveryEntry::Fresh(Box::new(admission)),
                                 &client,
                                 component_rebuild_source,
@@ -2552,6 +2554,9 @@ mod tests {
 
         let recovery = execute_registered_artifact_recovery_sequence(
             &state,
+            state
+                .try_claim_producer()
+                .expect("claim Libraries recovery owner"),
             RegisteredArtifactRecoveryEntry::Fresh(Box::new(admission)),
             &reqwest::Client::new(),
             RegisteredArtifactComponentRebuildSource::Fixture,
@@ -3114,12 +3119,17 @@ mod tests {
             r2_admission.attempt().component(),
             ReconciliationComponent::VersionBundle
         );
-        let r2_outcome =
-            execute_managed_version_bundle_component_rebuild(r2_admission, |effect| async move {
+        let r2_outcome = execute_managed_version_bundle_component_rebuild(
+            state
+                .try_claim_producer()
+                .expect("claim mass-tamper rebuild owner"),
+            r2_admission,
+            |effect| async move {
                 effect.failed_before_effect(["mass_tamper_component_fixture_failed".to_string()])
-            })
-            .await
-            .expect("settle failed mass-tamper R2 fixture");
+            },
+        )
+        .await
+        .expect("settle failed mass-tamper R2 fixture");
         assert_eq!(r2_outcome.status, GuardianComponentRebuildStatus::Failed);
 
         let eligibility = state
@@ -3144,8 +3154,9 @@ mod tests {
             offer,
             r3_operation_id.clone(),
             chrono::Duration::minutes(30),
-            move |admission| {
+            move |producer, admission| {
                 execute_whole_instance_rematerialization_with(
+                    producer,
                     admission,
                     move |_, runtime_cache, _| async move {
                         observed_core_calls.fetch_add(1, Ordering::SeqCst);

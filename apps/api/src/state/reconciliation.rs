@@ -4691,7 +4691,7 @@ mod tests {
     };
     use crate::state::contracts::{JournalId, OperationPhase, OperationStepResult, RollbackState};
     use crate::state::failure_memory::FailureMemorySnapshot;
-    use crate::state::{AppStateInit, InstallStore, SessionStore, new_instance};
+    use crate::state::{AppStateInit, InstallStore, ProducerLease, SessionStore, new_instance};
     use axial_config::{AppPaths, InstanceRegistrySnapshot};
     use axial_minecraft::known_good::{
         KnownGoodArtifactKind, KnownGoodInventory, TestKnownGoodEntry, TestKnownGoodIntegrity,
@@ -4705,6 +4705,12 @@ mod tests {
 
     const INSTANCE_ID: &str = "0000000000000001";
     const DIAGNOSIS_ID: DiagnosisId = DiagnosisId::LauncherManagedArtifactCorrupt;
+
+    fn test_reconciliation_owner(state: &AppState) -> ProducerLease {
+        state
+            .try_claim_producer()
+            .expect("claim reconciliation test owner")
+    }
 
     #[derive(Default)]
     struct ControlledWriteBackend {
@@ -6207,6 +6213,27 @@ mod tests {
         .expect("prepare sealed Core whole-instance fixture")
     }
 
+    async fn prepare_blocked_core_whole_instance_fixture(
+        fixture: &Fixture,
+        runtime_bytes: &'static [u8],
+    ) -> (
+        axial_minecraft::ManagedWholeInstanceFixtureForTest,
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (runtime_url, reached, release) = serve_blocked_runtime_bytes(runtime_bytes).await;
+        let core_fixture = axial_minecraft::prepare_managed_whole_instance_fixture_for_test(
+            PathBuf::from(fixture.state.library_dir().expect("fixture library root")),
+            "1.21.1",
+            RuntimeId::from("java-runtime-delta"),
+            &runtime_url,
+            runtime_bytes,
+        )
+        .await
+        .expect("prepare blocked sealed Core whole-instance fixture");
+        (core_fixture, reached, release)
+    }
+
     async fn serve_runtime_bytes(bytes: &'static [u8]) -> String {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -6231,6 +6258,40 @@ mod tests {
             }
         });
         format!("http://{address}/java")
+    }
+
+    async fn serve_blocked_runtime_bytes(
+        bytes: &'static [u8],
+    ) -> (
+        String,
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("blocked whole-instance Runtime fixture server");
+        let address = listener
+            .local_addr()
+            .expect("blocked whole-instance Runtime fixture address");
+        let (reached_tx, reached_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            let mut request = [0_u8; 1024];
+            let _ = socket.read(&mut request).await;
+            let _ = reached_tx.send(());
+            let _ = release_rx.await;
+            let headers = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                bytes.len()
+            );
+            if socket.write_all(headers.as_bytes()).await.is_ok() {
+                let _ = socket.write_all(bytes).await;
+            }
+        });
+        (format!("http://{address}/java"), reached_rx, release_tx)
     }
 
     #[tokio::test]
@@ -7596,12 +7657,18 @@ mod tests {
         backend.fail_attempt(gated_attempt);
         let calls = Arc::new(AtomicUsize::new(0));
         let driver_calls = calls.clone();
+        let owner = test_reconciliation_owner(&fixture.state);
         let execution = tokio::spawn(async move {
             crate::guardian::execute_whole_instance_rematerialization_with(
+                owner,
                 admission,
                 move |_, _, _| async move {
                     driver_calls.fetch_add(1, Ordering::SeqCst);
-                    Err(axial_minecraft::ManagedWholeInstanceRebuildError::Preparation)
+                    Err(
+                        axial_minecraft::ManagedWholeInstanceRebuildError::Reconstruction(
+                            axial_minecraft::KnownGoodReconstructionError::ManagedRoot,
+                        ),
+                    )
                 },
             )
             .await
@@ -7652,6 +7719,7 @@ mod tests {
         let driver_snapshot_path = snapshot_path.clone();
 
         let outcome = crate::guardian::execute_whole_instance_rematerialization_with(
+            test_reconciliation_owner(&fixture.state),
             admission,
             move |_, _, _| async move {
                 let snapshot = serde_json::from_slice::<serde_json::Value>(
@@ -7664,7 +7732,11 @@ mod tests {
                         .is_some_and(|snapshots| snapshots.len() == 1),
                     Ordering::SeqCst,
                 );
-                Err(axial_minecraft::ManagedWholeInstanceRebuildError::Preparation)
+                Err(
+                    axial_minecraft::ManagedWholeInstanceRebuildError::Reconstruction(
+                        axial_minecraft::KnownGoodReconstructionError::ManagedRoot,
+                    ),
+                )
             },
         )
         .await
@@ -7709,10 +7781,15 @@ mod tests {
         let capture_calls = Arc::new(AtomicUsize::new(0));
         let called = capture_calls.clone();
         let capture_outcome = crate::guardian::execute_whole_instance_rematerialization_with(
+            test_reconciliation_owner(&capture_fixture.state),
             capture_admission,
             move |_, _, _| async move {
                 called.fetch_add(1, Ordering::SeqCst);
-                Err(axial_minecraft::ManagedWholeInstanceRebuildError::Preparation)
+                Err(
+                    axial_minecraft::ManagedWholeInstanceRebuildError::Reconstruction(
+                        axial_minecraft::KnownGoodReconstructionError::ManagedRoot,
+                    ),
+                )
             },
         )
         .await
@@ -7739,10 +7816,15 @@ mod tests {
         let persist_outcome = tokio::time::timeout(
             Duration::from_secs(2),
             crate::guardian::execute_whole_instance_rematerialization_with(
+                test_reconciliation_owner(&persist_fixture.state),
                 persist_admission,
                 move |_, _, _| async move {
                     called.fetch_add(1, Ordering::SeqCst);
-                    Err(axial_minecraft::ManagedWholeInstanceRebuildError::Preparation)
+                    Err(
+                        axial_minecraft::ManagedWholeInstanceRebuildError::Reconstruction(
+                            axial_minecraft::KnownGoodReconstructionError::ManagedRoot,
+                        ),
+                    )
                 },
             ),
         )
@@ -7836,14 +7918,20 @@ mod tests {
         let driver_calls = calls.clone();
         let (driver_entered_tx, driver_entered_rx) = tokio::sync::oneshot::channel();
         let (driver_release_tx, driver_release_rx) = tokio::sync::oneshot::channel();
+        let owner = test_reconciliation_owner(&fixture.state);
         let execution = tokio::spawn(async move {
             crate::guardian::execute_whole_instance_rematerialization_with(
+                owner,
                 admission,
                 move |_, _, _| async move {
                     driver_calls.fetch_add(1, Ordering::SeqCst);
                     let _ = driver_entered_tx.send(());
                     let _ = driver_release_rx.await;
-                    Err(axial_minecraft::ManagedWholeInstanceRebuildError::Preparation)
+                    Err(
+                        axial_minecraft::ManagedWholeInstanceRebuildError::Reconstruction(
+                            axial_minecraft::KnownGoodReconstructionError::ManagedRoot,
+                        ),
+                    )
                 },
             )
             .await
@@ -7916,14 +8004,20 @@ mod tests {
         let driver_calls = calls.clone();
         let (driver_entered_tx, driver_entered_rx) = tokio::sync::oneshot::channel();
         let (driver_release_tx, driver_release_rx) = tokio::sync::oneshot::channel();
+        let owner = test_reconciliation_owner(&fixture.state);
         let execution = tokio::spawn(async move {
             crate::guardian::execute_whole_instance_rematerialization_with(
+                owner,
                 admission,
                 move |_, _, _| async move {
                     driver_calls.fetch_add(1, Ordering::SeqCst);
                     let _ = driver_entered_tx.send(());
                     let _ = driver_release_rx.await;
-                    Err(axial_minecraft::ManagedWholeInstanceRebuildError::Preparation)
+                    Err(
+                        axial_minecraft::ManagedWholeInstanceRebuildError::Reconstruction(
+                            axial_minecraft::KnownGoodReconstructionError::ManagedRoot,
+                        ),
+                    )
                 },
             )
             .await
@@ -8022,10 +8116,15 @@ mod tests {
             let driver_calls = calls.clone();
 
             let outcome = crate::guardian::execute_whole_instance_rematerialization_with(
+                test_reconciliation_owner(&fixture.state),
                 admission,
                 move |_, _, _| async move {
                     driver_calls.fetch_add(1, Ordering::SeqCst);
-                    Err(axial_minecraft::ManagedWholeInstanceRebuildError::Preparation)
+                    Err(
+                        axial_minecraft::ManagedWholeInstanceRebuildError::Reconstruction(
+                            axial_minecraft::KnownGoodReconstructionError::ManagedRoot,
+                        ),
+                    )
                 },
             )
             .await
@@ -8079,6 +8178,7 @@ mod tests {
         let key = reconciliation_attempt_key(admission.attempt());
 
         let outcome = crate::guardian::execute_whole_instance_rematerialization_with(
+            test_reconciliation_owner(&fixture.state),
             admission,
             move |_, runtime_cache, _| async move {
                 axial_minecraft::publish_managed_whole_instance_rollback_fixture_for_test(
@@ -8145,6 +8245,7 @@ mod tests {
             let admission = whole_instance_admission(&fixture, label, mode).await;
 
             let outcome = crate::guardian::execute_whole_instance_rematerialization_with(
+                test_reconciliation_owner(&fixture.state),
                 admission,
                 move |_, runtime_cache, _| async move {
                     axial_minecraft::publish_managed_whole_instance_fixture_for_test(
@@ -8209,6 +8310,7 @@ mod tests {
         let state = fixture.state.clone();
 
         let outcome = crate::guardian::execute_whole_instance_rematerialization_with(
+            test_reconciliation_owner(&fixture.state),
             admission,
             move |_, runtime_cache, _| async move {
                 let receipt = axial_minecraft::publish_managed_whole_instance_fixture_for_test(
@@ -8254,6 +8356,7 @@ mod tests {
         let state = fixture.state.clone();
 
         let outcome = crate::guardian::execute_whole_instance_rematerialization_with(
+            test_reconciliation_owner(&fixture.state),
             admission,
             move |_, runtime_cache, _| async move {
                 let receipt = axial_minecraft::publish_managed_whole_instance_fixture_for_test(
@@ -8316,13 +8419,18 @@ mod tests {
             offer,
             operation_id.clone(),
             chrono::Duration::minutes(30),
-            move |admission| {
+            move |producer, admission| {
                 executed.fetch_add(1, Ordering::SeqCst);
                 crate::guardian::execute_whole_instance_rematerialization_with(
+                    producer,
                     admission,
                     move |_, _, _| async move {
                         driven.fetch_add(1, Ordering::SeqCst);
-                        Err(axial_minecraft::ManagedWholeInstanceRebuildError::Preparation)
+                        Err(
+                            axial_minecraft::ManagedWholeInstanceRebuildError::Reconstruction(
+                                axial_minecraft::KnownGoodReconstructionError::ManagedRoot,
+                            ),
+                        )
                     },
                 )
             },
@@ -8340,7 +8448,14 @@ mod tests {
 
     #[tokio::test]
     async fn application_whole_instance_owner_survives_waiter_cancellation_and_blocks_shutdown() {
+        const RUNTIME_BYTES: &[u8] = b"Application-owned whole-instance Runtime";
         let fixture = fixture("application-whole-owner-cancellation");
+        let (core_fixture, core_reached, core_release) =
+            prepare_blocked_core_whole_instance_fixture(&fixture, RUNTIME_BYTES).await;
+        fixture.state.activate_known_good_inventory_for_test(
+            INSTANCE_ID,
+            core_fixture.known_good_inventory(),
+        );
         persist_runtime_component_ladder(
             &fixture,
             "application-whole-owner-cancellation",
@@ -8368,32 +8483,31 @@ mod tests {
         .await
         .expect("request drain begins");
 
-        let calls = Arc::new(AtomicUsize::new(0));
-        let driver_calls = calls.clone();
-        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
-        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
         let result = crate::application::spawn_explicit_whole_instance_rematerialization_with(
             fixture.state.clone(),
             handoff,
             offer,
             operation_id.clone(),
             chrono::Duration::minutes(30),
-            move |admission| {
+            move |producer, admission| {
                 crate::guardian::execute_whole_instance_rematerialization_with(
+                    producer,
                     admission,
-                    move |_, _, _| async move {
-                        driver_calls.fetch_add(1, Ordering::SeqCst);
-                        let _ = entered_tx.send(());
-                        let _ = release_rx.await;
-                        Err(axial_minecraft::ManagedWholeInstanceRebuildError::Preparation)
+                    move |_, runtime_cache, _| async move {
+                        axial_minecraft::publish_managed_whole_instance_fixture_for_test(
+                            core_fixture,
+                            &runtime_cache,
+                        )
+                        .await
                     },
                 )
             },
         )
         .expect("DrainingRequests handoff claims a producer");
         drop(request);
-        entered_rx.await.expect("Core driver blocks after plan");
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        core_reached
+            .await
+            .expect("direct Core publication blocks after plan");
         assert_eq!(
             fixture
                 .journals
@@ -8439,7 +8553,7 @@ mod tests {
                 .managed_artifact_mutation_epoch_is_capturable_for_test()
         );
 
-        let _ = release_tx.send(());
+        let _ = core_release.send(());
         quiesce
             .await
             .expect("quiesce task")
@@ -8495,13 +8609,18 @@ mod tests {
             offer,
             operation_id.clone(),
             chrono::Duration::minutes(30),
-            move |admission| {
+            move |producer, admission| {
                 crate::guardian::execute_whole_instance_rematerialization_with(
+                    producer,
                     admission,
                     move |_, _, _| async move {
                         let _ = entered_tx.send(());
                         let _ = release_rx.await;
-                        Err(axial_minecraft::ManagedWholeInstanceRebuildError::Preparation)
+                        Err(
+                            axial_minecraft::ManagedWholeInstanceRebuildError::Reconstruction(
+                                axial_minecraft::KnownGoodReconstructionError::ManagedRoot,
+                            ),
+                        )
                     },
                 )
             },

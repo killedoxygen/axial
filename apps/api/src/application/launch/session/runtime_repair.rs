@@ -480,9 +480,12 @@ async fn execute_owned_runtime_component_rebuild(
 ) -> Result<(GuardianComponentRebuildOutcome, IntegrityForegroundLease), OperationJournalStoreError>
 {
     let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+    let rebuild_owner = producer.claim_child();
     producer.spawn_child(async move {
-        let result =
-            execute_managed_runtime_component_rebuild(admission, move |effect| async move {
+        let result = execute_managed_runtime_component_rebuild(
+            rebuild_owner,
+            admission,
+            move |effect| async move {
                 let (runtime_cache, component) = effect.core_request();
                 let mut progress = RuntimeComponentRebuildProgress::default();
                 let rebuild = match rebuild_source {
@@ -513,8 +516,9 @@ async fn execute_owned_runtime_component_rebuild(
                         progress.failed_fact_ids("runtime_component_rebuild_effect_failed"),
                     ),
                 }
-            })
-            .await;
+            },
+        )
+        .await;
         let _ = result_tx.send((result, foreground));
     });
     let (result, foreground) = result_rx.await.map_err(|_| {

@@ -10,7 +10,7 @@ use crate::guardian::{
 };
 use crate::state::contracts::{OperationId, ReconciliationComponent};
 use crate::state::{
-    AppState, OperationJournalStoreError, RegisteredArtifactFailedRepair,
+    AppState, OperationJournalStoreError, ProducerLease, RegisteredArtifactFailedRepair,
     RegisteredArtifactFindings,
     RegisteredArtifactRecoveryEntry as StateRegisteredArtifactRecoveryEntry,
     RegisteredArtifactRepairAdmission,
@@ -57,6 +57,7 @@ pub(super) struct Tier2RegisteredArtifactRecovery {
 
 struct Tier2RegisteredArtifactRecoveryExecution {
     state: AppState,
+    producer: ProducerLease,
     entry: StateRegisteredArtifactRecoveryEntry,
     client: reqwest::Client,
     rebuild_source: RegisteredArtifactComponentRebuildSource,
@@ -64,6 +65,7 @@ struct Tier2RegisteredArtifactRecoveryExecution {
 
 pub(super) fn prepare_tier2_registered_artifact_recovery(
     state: AppState,
+    producer: ProducerLease,
     sweep_operation_id: &OperationId,
     report: &IntegrityTier2Report,
     findings: RegisteredArtifactFindings,
@@ -104,6 +106,7 @@ pub(super) fn prepare_tier2_registered_artifact_recovery(
     Tier2RegisteredArtifactRecovery {
         execution: Some(Box::new(Tier2RegisteredArtifactRecoveryExecution {
             state,
+            producer,
             entry,
             client,
             rebuild_source,
@@ -120,6 +123,7 @@ impl Tier2RegisteredArtifactRecovery {
         };
         let Tier2RegisteredArtifactRecoveryExecution {
             state,
+            producer,
             entry,
             client,
             rebuild_source,
@@ -142,14 +146,21 @@ impl Tier2RegisteredArtifactRecovery {
                 RegisteredArtifactRecoveryEntry::Resume(Box::new(continuation))
             }
         };
-        execute_registered_artifact_recovery_sequence(&state, entry, &client, rebuild_source)
-            .await
-            .map(Some)
+        execute_registered_artifact_recovery_sequence(
+            &state,
+            producer,
+            entry,
+            &client,
+            rebuild_source,
+        )
+        .await
+        .map(Some)
     }
 }
 
 pub(super) async fn execute_registered_artifact_recovery_sequence(
     state: &AppState,
+    producer: ProducerLease,
     entry: RegisteredArtifactRecoveryEntry,
     client: &reqwest::Client,
     rebuild_source: RegisteredArtifactComponentRebuildSource,
@@ -184,6 +195,7 @@ pub(super) async fn execute_registered_artifact_recovery_sequence(
     let rebuild = match component {
         ReconciliationComponent::VersionBundle => {
             execute_managed_version_bundle_component_rebuild(
+                producer,
                 component_admission,
                 move |effect| async move {
                     let (root, version_id, inventory) = effect.core_request();
@@ -245,6 +257,7 @@ pub(super) async fn execute_registered_artifact_recovery_sequence(
         }
         ReconciliationComponent::Libraries => {
             execute_managed_libraries_component_rebuild(
+                producer,
                 component_admission,
                 move |effect| async move {
                     let (root, version_id) = effect.core_request();
@@ -284,12 +297,15 @@ pub(super) async fn execute_registered_artifact_recovery_sequence(
         }
         ReconciliationComponent::Assets => match rebuild_source {
             RegisteredArtifactComponentRebuildSource::Production => {
-                execute_managed_assets_component_rebuild(component_admission).await?
+                execute_managed_assets_component_rebuild(producer, component_admission).await?
             }
             #[cfg(test)]
             RegisteredArtifactComponentRebuildSource::Fixture => {
-                execute_managed_assets_component_rebuild_fixture_for_test(component_admission)
-                    .await?
+                execute_managed_assets_component_rebuild_fixture_for_test(
+                    producer,
+                    component_admission,
+                )
+                .await?
             }
         },
         _ => {

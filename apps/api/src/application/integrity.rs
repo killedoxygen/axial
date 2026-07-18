@@ -176,9 +176,11 @@ impl PlannedIntegritySweep {
             instance_id,
             journal,
         } = self;
+        let recovery_producer = producer.claim_child();
         IntegritySweepExecution {
             completion: producer.spawn_joinable(execute_reserved_owned(
                 state,
+                recovery_producer,
                 instance_id,
                 journal,
                 settlement,
@@ -202,9 +204,11 @@ impl PlannedIntegritySweep {
             instance_id,
             journal,
         } = self;
+        let recovery_producer = producer.claim_child();
         IntegritySweepExecution {
             completion: producer.spawn_joinable(execute_reserved_owned(
                 state,
+                recovery_producer,
                 instance_id,
                 journal,
                 settlement,
@@ -229,9 +233,11 @@ impl PlannedIntegritySweep {
             instance_id,
             journal,
         } = self;
+        let recovery_producer = producer.claim_child();
         IntegritySweepExecution {
             completion: producer.spawn_joinable(execute_reserved_owned_with_source(
                 state,
+                recovery_producer,
                 instance_id,
                 journal,
                 settlement,
@@ -255,9 +261,11 @@ impl PlannedIntegritySweep {
             instance_id,
             journal,
         } = self;
+        let recovery_producer = producer.claim_child();
         IntegritySweepExecution {
             completion: producer.spawn_joinable(execute_reserved_owned_with_source(
                 state,
+                recovery_producer,
                 instance_id,
                 journal,
                 settlement,
@@ -278,6 +286,7 @@ impl PlannedIntegritySweep {
 
 async fn execute_reserved_owned<AfterSpawn>(
     state: AppState,
+    recovery_producer: ProducerLease,
     instance_id: String,
     journal: OperationJournalEntry,
     settlement: IdleSweepSettlementOwner,
@@ -288,6 +297,7 @@ where
 {
     execute_reserved_owned_with_source(
         state,
+        recovery_producer,
         instance_id,
         journal,
         settlement,
@@ -301,6 +311,7 @@ where
 
 async fn execute_reserved_owned_with_source<AfterSpawn>(
     state: AppState,
+    recovery_producer: ProducerLease,
     instance_id: String,
     journal: OperationJournalEntry,
     settlement: IdleSweepSettlementOwner,
@@ -382,6 +393,7 @@ where
                     let client = reqwest::Client::new();
                     let recovery = prepare_tier2_registered_artifact_recovery(
                         recovery_state,
+                        recovery_producer,
                         &recovery_operation_id,
                         report,
                         findings,

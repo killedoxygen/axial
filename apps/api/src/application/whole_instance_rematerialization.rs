@@ -4,7 +4,8 @@ use crate::guardian::{
 };
 use crate::state::contracts::OperationId;
 use crate::state::{
-    AppState, RegisteredWholeInstanceRematerializationAdmission, RequestProducerHandoff,
+    AppState, ProducerLease, RegisteredWholeInstanceRematerializationAdmission,
+    RequestProducerHandoff,
 };
 use std::future::Future;
 
@@ -85,7 +86,7 @@ pub(crate) fn spawn_explicit_whole_instance_rematerialization_with<Executor, Exe
     ExplicitWholeInstanceRematerializationError,
 >
 where
-    Executor: FnOnce(RegisteredWholeInstanceRematerializationAdmission) -> ExecutorFuture
+    Executor: FnOnce(ProducerLease, RegisteredWholeInstanceRematerializationAdmission) -> ExecutorFuture
         + Send
         + 'static,
     ExecutorFuture: Future<
@@ -99,6 +100,7 @@ where
     let producer = state
         .try_claim_request_producer(&handoff)
         .map_err(|_| application_error("shutdown"))?;
+    let rematerialization_owner = producer.claim_child();
     let (result_tx, result_rx) = tokio::sync::oneshot::channel();
     producer.spawn(async move {
         let result = async {
@@ -111,7 +113,7 @@ where
                 )
                 .await
                 .map_err(|error| application_error(error.class()))?;
-            executor(admission)
+            executor(rematerialization_owner, admission)
                 .await
                 .map_err(|error| application_error(error.class()))
         }
