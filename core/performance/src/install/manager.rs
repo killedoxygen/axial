@@ -1,11 +1,11 @@
 use super::model::{ActiveRules, InstallError};
 use super::rules_refresh::{configured_remote_rules_url, normalize_remote_rules_url, rules_client};
-use crate::modrinth::ModrinthClient;
 use crate::resolve::{builtin_manifest, detect_hardware, resolve_plan};
 use crate::rules_cache::{RulesCacheStatus, load_active_rules_cache};
 use crate::signature::{RemoteRulesVerifier, configured_remote_rules_verifier};
 use crate::status::{RuleChannel, RuleSource, RulesValidation};
 use crate::types::{CompositionPlan, ResolutionRequest};
+use axial_minecraft::managed_path::AnchoredDirectory;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
@@ -15,7 +15,6 @@ pub(super) const ACTIVE_RULES_LOCK_INVARIANT: &str = "active performance rules l
 #[derive(Debug)]
 pub struct PerformanceManager {
     pub(super) active: Arc<RwLock<ActiveRules>>,
-    pub(super) modrinth: ModrinthClient,
     pub(super) rules_client: reqwest::Client,
     pub(super) remote_rules_url: Option<String>,
     pub(super) remote_rules_verifier: RemoteRulesVerifier,
@@ -34,6 +33,7 @@ pub struct PerformanceRulesAuthority {
 pub struct ManagedCompositionAuthority {
     pub(super) manager: Arc<PerformanceManager>,
     instances_root: Arc<PathBuf>,
+    instances_root_anchor: Arc<AnchoredDirectory>,
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -64,6 +64,10 @@ impl ManagedCompositionAuthority {
 
     pub(super) fn instances_root(&self) -> &Path {
         &self.instances_root
+    }
+
+    pub(super) fn instances_root_anchor(&self) -> &AnchoredDirectory {
+        &self.instances_root_anchor
     }
 }
 
@@ -97,7 +101,6 @@ impl PerformanceManager {
                 last_refresh_at: None,
                 validation: RulesValidation::Valid,
             })),
-            modrinth: ModrinthClient::new(),
             rules_client: rules_client(),
             remote_rules_url: None,
             remote_rules_verifier: RemoteRulesVerifier::disabled(),
@@ -151,7 +154,6 @@ impl PerformanceManager {
                 last_refresh_at: loaded.last_refresh_at,
                 validation: loaded.validation,
             })),
-            modrinth: ModrinthClient::new(),
             rules_client: rules_client(),
             remote_rules_url,
             remote_rules_verifier,
@@ -160,13 +162,6 @@ impl PerformanceManager {
             rules_authority_claimed: AtomicBool::new(false),
             managed_authority_claimed: AtomicBool::new(false),
         })
-    }
-
-    #[cfg(test)]
-    pub(super) fn new_with_modrinth_base_url(base_url: String) -> Result<Self, InstallError> {
-        let mut manager = Self::new()?;
-        manager.modrinth = ModrinthClient::new_with_base_url(base_url);
-        Ok(manager)
     }
 
     pub fn get_plan(&self, request: ResolutionRequest) -> CompositionPlan {
@@ -236,9 +231,12 @@ impl PerformanceManager {
                 ));
             }
             Ok(_) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                std::fs::create_dir(instances_root)?;
+            }
             Err(error) => return Err(error),
         }
+        let instances_root_anchor = AnchoredDirectory::open(instances_root)?;
         self.managed_authority_claimed
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .map_err(|_| {
@@ -250,6 +248,7 @@ impl PerformanceManager {
         Ok(ManagedCompositionAuthority {
             manager: self.clone(),
             instances_root: Arc::new(instances_root.to_path_buf()),
+            instances_root_anchor: Arc::new(instances_root_anchor),
         })
     }
 }

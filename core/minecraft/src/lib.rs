@@ -17,6 +17,10 @@ mod managed_component_source_spool;
 mod managed_component_spool;
 mod managed_component_table;
 mod managed_fs;
+
+pub mod managed_path {
+    pub use crate::managed_fs::AnchoredDirectory;
+}
 mod managed_publication;
 pub mod manifest;
 pub mod paths;

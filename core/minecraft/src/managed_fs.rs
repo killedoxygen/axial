@@ -28,6 +28,70 @@ pub(crate) struct ManagedDir {
     inner: Arc<ManagedDirInner>,
 }
 
+#[derive(Clone)]
+pub struct AnchoredDirectory {
+    directory: ManagedDir,
+    stable_path: Arc<PathBuf>,
+    _rename_blockers: Arc<Vec<platform::DirectoryRenameBlocker>>,
+    _parent: Option<Arc<AnchoredDirectory>>,
+}
+
+impl std::fmt::Debug for AnchoredDirectory {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AnchoredDirectory")
+            .finish_non_exhaustive()
+    }
+}
+
+impl AnchoredDirectory {
+    pub fn open(path: &Path) -> io::Result<Self> {
+        Self::admit(ManagedDir::open_root(path).map_err(anchor_error)?, None)
+    }
+
+    pub fn open_child(&self, name: &str) -> io::Result<Option<Self>> {
+        match self.directory.open_child_anchored(name) {
+            Ok(child) => Self::admit(child, Some(Arc::new(self.clone()))).map(Some),
+            Err(LoaderError::Io(error)) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(anchor_error(error)),
+        }
+    }
+
+    pub fn open_or_create_child(&self, name: &str) -> io::Result<Self> {
+        Self::admit(
+            self.directory
+                .open_or_create_child_anchored(name)
+                .map_err(anchor_error)?,
+            Some(Arc::new(self.clone())),
+        )
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.stable_path
+    }
+
+    fn admit(directory: ManagedDir, parent: Option<Arc<AnchoredDirectory>>) -> io::Result<Self> {
+        let rename_blockers = directory.acquire_rename_blockers().map_err(anchor_error)?;
+        let stable_path = directory.anchored_path().map_err(anchor_error)?;
+        Ok(Self {
+            directory,
+            stable_path: Arc::new(stable_path),
+            _rename_blockers: Arc::new(rename_blockers),
+            _parent: parent,
+        })
+    }
+}
+
+fn anchor_error(error: LoaderError) -> io::Error {
+    match error {
+        LoaderError::Io(error) => error,
+        _ => io::Error::new(
+            io::ErrorKind::InvalidData,
+            "managed directory capability could not be admitted",
+        ),
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct ManagedDirectoryIdentity(platform::DirectoryIdentity);
 
@@ -713,6 +777,57 @@ impl ManagedDir {
 
     pub(crate) fn path(&self) -> &Path {
         &self.inner.path
+    }
+
+    pub(super) fn anchored_path(&self) -> Result<PathBuf, LoaderError> {
+        platform::anchored_directory_path(&self.inner.handle, &self.inner.path, self.inner.identity)
+            .map_err(LoaderError::Io)
+    }
+
+    pub(super) fn acquire_rename_blockers(
+        &self,
+    ) -> Result<Vec<platform::DirectoryRenameBlocker>, LoaderError> {
+        let (blockers, identity) =
+            platform::acquire_directory_rename_blockers(&self.inner.handle, &self.inner.path)?;
+        if identity != self.inner.identity {
+            return Err(LoaderError::Verify(
+                "anchored directory identity changed during admission".to_string(),
+            ));
+        }
+        Ok(blockers)
+    }
+
+    pub(super) fn open_child_anchored(&self, name: &str) -> Result<Self, LoaderError> {
+        validate_segment(name)?;
+        let (handle, identity) =
+            platform::open_child_directory(&self.inner.handle, &self.inner.path, OsStr::new(name))?;
+        Ok(self.child_unvalidated(name, handle, identity))
+    }
+
+    pub(super) fn open_or_create_child_anchored(&self, name: &str) -> Result<Self, LoaderError> {
+        validate_segment(name)?;
+        match platform::open_child_directory(&self.inner.handle, &self.inner.path, OsStr::new(name))
+        {
+            Ok((handle, identity)) => Ok(self.child_unvalidated(name, handle, identity)),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                match platform::create_child_directory(
+                    &self.inner.handle,
+                    &self.inner.path,
+                    OsStr::new(name),
+                ) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+                    Err(error) => return Err(LoaderError::Io(error)),
+                }
+                let (handle, identity) = platform::open_child_directory(
+                    &self.inner.handle,
+                    &self.inner.path,
+                    OsStr::new(name),
+                )?;
+                Ok(self.child_unvalidated(name, handle, identity))
+            }
+            Err(error) => Err(LoaderError::Io(error)),
+        }
     }
 
     pub(crate) fn identity(&self) -> Result<ManagedDirectoryIdentity, LoaderError> {
@@ -1606,7 +1721,18 @@ impl ManagedDir {
         handle: platform::DirectoryHandle,
         identity: platform::DirectoryIdentity,
     ) -> Result<Self, LoaderError> {
-        let child = Self {
+        let child = self.child_unvalidated(name, handle, identity);
+        child.revalidate()?;
+        Ok(child)
+    }
+
+    fn child_unvalidated(
+        &self,
+        name: &str,
+        handle: platform::DirectoryHandle,
+        identity: platform::DirectoryIdentity,
+    ) -> Self {
+        Self {
             inner: Arc::new(ManagedDirInner {
                 path: self.inner.path.join(name),
                 identity,
@@ -1616,9 +1742,7 @@ impl ManagedDir {
                     name: OsString::from(name),
                 },
             }),
-        };
-        child.revalidate()?;
-        Ok(child)
+        }
     }
 
     pub(crate) fn open_or_create_relative_parent(
@@ -3296,11 +3420,12 @@ mod platform {
     use std::ffi::{CStr, OsStr, OsString};
     use std::fs;
     use std::io;
-    use std::os::fd::OwnedFd;
+    use std::os::fd::{AsRawFd, OwnedFd};
     use std::os::unix::ffi::OsStrExt;
     use std::path::Path;
 
     pub(super) type DirectoryHandle = OwnedFd;
+    pub(super) type DirectoryRenameBlocker = ();
     pub(super) type FileIdentity = DirectoryIdentity;
 
     #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -3323,6 +3448,42 @@ mod platform {
         let handle = rfs::open(path, directory_flags(), Mode::empty())?;
         let identity = identity_from_stat(rfs::fstat(&handle)?);
         Ok((handle, identity))
+    }
+
+    pub(super) fn acquire_directory_rename_blockers(
+        handle: &DirectoryHandle,
+        _path: &Path,
+    ) -> io::Result<(Vec<DirectoryRenameBlocker>, DirectoryIdentity)> {
+        Ok((vec![()], identity_from_stat(rfs::fstat(handle)?)))
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(super) fn anchored_directory_path(
+        handle: &DirectoryHandle,
+        _raw_path: &Path,
+        expected: DirectoryIdentity,
+    ) -> io::Result<std::path::PathBuf> {
+        let path = std::path::PathBuf::from(format!("/proc/self/fd/{}/.", handle.as_raw_fd()));
+        let observed = identity_from_stat(rfs::stat(&path)?);
+        if observed != expected {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "managed directory descriptor path changed identity",
+            ));
+        }
+        Ok(path)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub(super) fn anchored_directory_path(
+        _handle: &DirectoryHandle,
+        _raw_path: &Path,
+        _expected: DirectoryIdentity,
+    ) -> io::Result<std::path::PathBuf> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "managed directory capabilities are unsupported on this Unix platform",
+        ))
     }
 
     pub(super) fn open_child_directory(
@@ -3675,6 +3836,45 @@ mod tests {
             b"file"
         );
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn anchored_directory_keeps_descendants_bound_to_the_admitted_tree() {
+        let root = test_root("anchored-directory-substitution");
+        let moved = root.with_extension("moved");
+        fs::create_dir_all(root.join("child")).expect("create anchored child");
+        fs::write(root.join("child/value"), b"admitted").expect("write admitted value");
+        let anchor = AnchoredDirectory::open(&root).expect("anchor root");
+        let child = anchor
+            .open_child("child")
+            .expect("open child")
+            .expect("anchored child");
+
+        #[cfg(target_os = "linux")]
+        {
+            fs::rename(&root, &moved).expect("rename raw root");
+            fs::create_dir_all(root.join("child")).expect("create replacement tree");
+            fs::write(root.join("child/value"), b"replacement").expect("write replacement value");
+            assert_eq!(
+                fs::read(child.path().join("value")).expect("read anchored value"),
+                b"admitted"
+            );
+            let _ = fs::remove_dir_all(&root);
+        }
+
+        #[cfg(windows)]
+        {
+            fs::rename(&root, &moved).expect_err("anchor blocks root substitution");
+            assert_eq!(
+                fs::read(child.path().join("value")).expect("read anchored value"),
+                b"admitted"
+            );
+        }
+
+        drop(child);
+        drop(anchor);
+        let _ = fs::remove_dir_all(&moved);
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[cfg(unix)]
@@ -5016,6 +5216,7 @@ mod platform {
     const DELETE_ACCESS: u32 = 0x0001_0000;
 
     pub(super) type DirectoryHandle = fs::File;
+    pub(super) type DirectoryRenameBlocker = fs::File;
     pub(super) type FileIdentity = DirectoryIdentity;
 
     #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -5036,7 +5237,22 @@ mod platform {
     pub(super) fn open_exact_directory(
         path: &Path,
     ) -> io::Result<(DirectoryHandle, DirectoryIdentity)> {
-        let file = open_no_follow(path, FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES, true)?;
+        open_exact_directory_with_share(
+            path,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        )
+    }
+
+    fn open_exact_directory_with_share(
+        path: &Path,
+        share_mode: u32,
+    ) -> io::Result<(DirectoryHandle, DirectoryIdentity)> {
+        let file = open_no_follow_with_share(
+            path,
+            FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES,
+            true,
+            share_mode,
+        )?;
         let basic: FILE_BASIC_INFO = query(&file, FileBasicInfo)?;
         let standard: FILE_STANDARD_INFO = query(&file, FileStandardInfo)?;
         if basic.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
@@ -5050,6 +5266,39 @@ mod platform {
         }
         let identity = directory_identity(&file)?;
         Ok((file, identity))
+    }
+
+    pub(super) fn acquire_directory_rename_blockers(
+        _handle: &DirectoryHandle,
+        path: &Path,
+    ) -> io::Result<(Vec<DirectoryRenameBlocker>, DirectoryIdentity)> {
+        let mut ancestors = path.ancestors().collect::<Vec<_>>();
+        ancestors.reverse();
+        let mut blockers = Vec::with_capacity(ancestors.len());
+        let mut final_identity = None;
+        for ancestor in ancestors {
+            let (blocker, identity) =
+                open_exact_directory_with_share(ancestor, FILE_SHARE_READ | FILE_SHARE_WRITE)?;
+            blockers.push(blocker);
+            final_identity = Some(identity);
+        }
+        let identity = final_identity.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "managed directory capability path has no ancestors",
+            )
+        })?;
+        Ok((blockers, identity))
+    }
+
+    pub(super) fn anchored_directory_path(
+        _handle: &DirectoryHandle,
+        raw_path: &Path,
+        _expected: DirectoryIdentity,
+    ) -> io::Result<std::path::PathBuf> {
+        // The retained no-delete-sharing handles prevent substitution of every
+        // admitted ancestor while consumers operate through this path.
+        Ok(raw_path.to_path_buf())
     }
 
     pub(super) fn open_child_directory(
@@ -5384,11 +5633,25 @@ mod platform {
     }
 
     fn open_no_follow(path: &Path, access: u32, include_directories: bool) -> io::Result<fs::File> {
+        open_no_follow_with_share(
+            path,
+            access,
+            include_directories,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        )
+    }
+
+    fn open_no_follow_with_share(
+        path: &Path,
+        access: u32,
+        include_directories: bool,
+        share_mode: u32,
+    ) -> io::Result<fs::File> {
         let mut options = fs::OpenOptions::new();
         options
             .read(true)
             .access_mode(access)
-            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .share_mode(share_mode)
             .custom_flags(
                 FILE_FLAG_OPEN_REPARSE_POINT
                     | if include_directories {

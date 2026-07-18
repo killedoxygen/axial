@@ -6,10 +6,12 @@ license.workspace = true
 authors.workspace = true
 
 [dependencies]
+axial-minecraft = { path = "../minecraft" }
 chrono.workspace = true
 ed25519-dalek.workspace = true
 futures-util.workspace = true
 hex.workspace = true
+rand.workspace = true
 reqwest.workspace = true
 regex.workspace = true
 serde.workspace = true

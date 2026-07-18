@@ -19,7 +19,6 @@ pub fn resolve_plan(manifest: Option<&Manifest>, request: ResolutionRequest) -> 
             tier: CompositionTier::VanillaEnhanced,
             mods: Vec::new(),
             jvm_preset: String::new(),
-            fallback_chain: Vec::new(),
             warnings: Vec::new(),
             fallback_reason: String::new(),
         };
@@ -92,7 +91,6 @@ pub fn resolve_plan(manifest: Option<&Manifest>, request: ResolutionRequest) -> 
                     tier: definition.tier,
                     mods: active_mods,
                     jvm_preset: definition.jvm_preset.clone(),
-                    fallback_chain: fallback_chain(manifest, &definition.id),
                     warnings,
                     fallback_reason: fallback_reason.clone(),
                 };
@@ -178,7 +176,6 @@ fn vanilla_enhanced_plan(
         tier: CompositionTier::VanillaEnhanced,
         mods: Vec::new(),
         jvm_preset: String::new(),
-        fallback_chain: Vec::new(),
         warnings: Vec::new(),
         fallback_reason: String::new(),
     }
@@ -290,29 +287,6 @@ fn push_unique_warning(warnings: &mut Vec<String>, warning: String) {
     if !warnings.iter().any(|existing| existing == &warning) {
         warnings.push(warning);
     }
-}
-
-fn fallback_chain(manifest: &Manifest, start_id: &str) -> Vec<String> {
-    let mut chain = Vec::new();
-    let mut seen = std::collections::HashSet::new();
-    let mut current = start_id.to_string();
-
-    while !current.is_empty() && seen.insert(current.clone()) {
-        let Some(definition) = manifest
-            .compositions
-            .iter()
-            .find(|definition| definition.id == current)
-        else {
-            break;
-        };
-        if definition.fallback_to.is_empty() {
-            break;
-        }
-        chain.push(definition.fallback_to.clone());
-        current = definition.fallback_to.clone();
-    }
-
-    chain
 }
 
 fn should_include_mod(

@@ -2,7 +2,6 @@ pub mod effective;
 mod file_identity;
 mod health;
 pub mod install;
-pub mod modrinth;
 pub mod resolve;
 pub mod rules;
 pub mod rules_cache;
@@ -49,6 +48,7 @@ pub use status::{
 };
 pub use types::{
     CompositionPlan, CompositionState, CompositionTier, HardwareProfile, InstalledMod,
-    ManagedArtifactIntegrity, ManagedArtifactProvider, ManagedArtifactSource, Manifest,
-    ModCondition, OwnershipClass, PerformanceMode, ResolutionRequest,
+    ManagedArtifactIntegrity, ManagedArtifactProvider, ManagedArtifactSource,
+    ManagedDependencyStateEdge, Manifest, ModCondition, OwnershipClass, PerformanceMode,
+    ResolutionRequest,
 };

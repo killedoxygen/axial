@@ -1,6 +1,7 @@
 use crate::MANAGED_ARTIFACT_MAX_BYTES;
 use crate::types::{CompositionState, CompositionTier, InstalledMod, OwnershipClass};
 use chrono::Utc;
+use rand::{RngCore, rngs::OsRng};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha512};
 use std::collections::{HashMap, HashSet};
@@ -14,29 +15,30 @@ const LOCK_STAGED_FILE_NAME: &str = ".axial-lock.json.new.tmp";
 const LOCK_BACKUP_FILE_NAME: &str = ".axial-lock.json.previous.tmp";
 const LOCK_DELETE_FILE_NAME: &str = ".axial-lock.json.delete.tmp";
 const LOCK_DELETE_MARKER: &[u8] = b"axial-performance-state-delete-v1\n";
-const STATE_SCHEMA_VERSION: i32 = 1;
+const STATE_SCHEMA_VERSION: i32 = 2;
 const STATE_MAX_BYTES: u64 = 1024 * 1024;
 const STATE_MAX_INSTALLED_MODS: usize = 256;
 const STATE_TOKEN_MAX_CHARS: usize = 256;
 const STATE_TIMESTAMP_MAX_CHARS: usize = 64;
-const STATE_FAILURE_MAX_CHARS: usize = 512;
 const STATE_FILENAME_MAX_BYTES: usize = 255;
 pub(crate) const STATE_DIR_NAME: &str = ".axial-performance";
 const MUTATION_DIR_NAME: &str = "mutations";
 const REMOVAL_DIR_NAME: &str = "removals";
 const ADDITION_DIR_NAME: &str = "additions";
+const QUARANTINE_DIR_NAME: &str = "quarantine";
 const ROLLBACK_DIR_NAME: &str = "rollback";
 const ROLLBACK_FILE_NAME: &str = "latest.json";
 const ROLLBACK_FILES_DIR_NAME: &str = "files";
 const ROLLBACK_HISTORY_DIR_NAME: &str = "history";
 const ROLLBACK_TMP_DIR_NAME: &str = "tmp";
-const ROLLBACK_SCHEMA_VERSION: i32 = 2;
+const ROLLBACK_SCHEMA_VERSION: i32 = 3;
 const ROLLBACK_HISTORY_LIMIT: usize = 5;
 const ROLLBACK_METADATA_MAX_BYTES: u64 = 1024 * 1024;
 const ROLLBACK_RETAINED_MAX_BYTES: u64 = MANAGED_ARTIFACT_MAX_BYTES * 2;
 const ROLLBACK_TRANSIENT_MAX_BYTES: u64 =
     ROLLBACK_RETAINED_MAX_BYTES + MANAGED_ARTIFACT_MAX_BYTES + (ROLLBACK_METADATA_MAX_BYTES * 3);
 pub(crate) const RECOVERY_ENTRY_LIMIT: usize = 1024;
+const CLEANUP_QUARANTINE_MAX_BYTES: u64 = MANAGED_ARTIFACT_MAX_BYTES * 4;
 
 #[derive(Debug, Error)]
 pub enum StateError {
@@ -153,7 +155,6 @@ pub(crate) struct RollbackArtifact {
     pub version_id: String,
     pub ownership_class: OwnershipClass,
     pub sha512: String,
-    pub sha512_verified: bool,
 }
 
 impl RollbackSnapshot {
@@ -180,10 +181,11 @@ pub(crate) fn load_state(instance_mods_dir: &Path) -> Result<Option<CompositionS
 }
 
 pub(crate) fn reconcile_managed_storage(instance_mods_dir: &Path) -> Result<(), StateError> {
+    reconcile_cleanup_quarantine(instance_mods_dir)?;
     reconcile_state_publication(instance_mods_dir)?;
     let state = load_state_admitted(instance_mods_dir)?;
-    reconcile_managed_removal_obligations(instance_mods_dir, state.as_ref())?;
     reconcile_managed_addition_obligations(instance_mods_dir, state.as_ref())?;
+    reconcile_managed_removal_obligations(instance_mods_dir, state.as_ref())?;
     reconcile_rollback_metadata(instance_mods_dir)
 }
 
@@ -242,8 +244,10 @@ pub(crate) fn load_state_admitted(
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct ManagedInspectionReconciliation {
     state_publication: bool,
+    managed_addition: bool,
     managed_removal: bool,
     rollback_publication: bool,
+    cleanup_quarantine: bool,
 }
 
 impl ManagedInspectionReconciliation {
@@ -252,7 +256,10 @@ impl ManagedInspectionReconciliation {
     }
 
     pub(crate) const fn admitted_state_reconciliation_required(self) -> bool {
-        self.managed_removal || self.rollback_publication
+        self.managed_addition
+            || self.managed_removal
+            || self.rollback_publication
+            || self.cleanup_quarantine
     }
 }
 
@@ -261,8 +268,10 @@ pub(crate) fn preflight_managed_inspection_reconciliation(
 ) -> Result<ManagedInspectionReconciliation, StateError> {
     Ok(ManagedInspectionReconciliation {
         state_publication: state_publication_reconciliation_required(instance_mods_dir)?,
+        managed_addition: managed_addition_reconciliation_required(instance_mods_dir)?,
         managed_removal: managed_removal_reconciliation_required(instance_mods_dir)?,
         rollback_publication: rollback_publication_reconciliation_required(instance_mods_dir)?,
+        cleanup_quarantine: cleanup_quarantine_reconciliation_required(instance_mods_dir)?,
     })
 }
 
@@ -270,6 +279,9 @@ pub(crate) fn reconcile_managed_inspection_publication(
     instance_mods_dir: &Path,
     preflight: ManagedInspectionReconciliation,
 ) -> Result<(), StateError> {
+    if preflight.cleanup_quarantine {
+        reconcile_cleanup_quarantine(instance_mods_dir)?;
+    }
     if preflight.state_publication {
         reconcile_state_publication(instance_mods_dir)?;
     }
@@ -281,6 +293,9 @@ pub(crate) fn reconcile_managed_inspection_obligations(
     preflight: ManagedInspectionReconciliation,
     state: Option<&CompositionState>,
 ) -> Result<(), StateError> {
+    if preflight.managed_addition {
+        reconcile_managed_addition_obligations(instance_mods_dir, state)?;
+    }
     if preflight.managed_removal {
         reconcile_managed_removal_obligations(instance_mods_dir, state)?;
     }
@@ -288,6 +303,21 @@ pub(crate) fn reconcile_managed_inspection_obligations(
         reconcile_rollback_metadata(instance_mods_dir)?;
     }
     Ok(())
+}
+
+fn managed_addition_reconciliation_required(instance_mods_dir: &Path) -> Result<bool, StateError> {
+    let state_root = instance_mods_dir.join(STATE_DIR_NAME);
+    let mutation_root = state_root.join(MUTATION_DIR_NAME);
+    let root = mutation_root.join(ADDITION_DIR_NAME);
+    for path in [&state_root, &mutation_root, &root] {
+        validate_managed_recovery_directory(path)?;
+    }
+    let mut entries = match fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(StateError::Read(error)),
+    };
+    Ok(entries.next().transpose()?.is_some())
 }
 
 pub(crate) fn save_state(
@@ -646,7 +676,7 @@ fn read_bounded_regular_file_if_present(
 }
 
 fn remove_publication_file(path: &Path, phase: StatePublicationPhase) -> Result<(), StateError> {
-    remove_admitted_regular_file(path).map_err(|source| publication(phase, source))
+    remove_owned_file(path).map_err(|error| cleanup_publication_error(phase, error))
 }
 
 fn reserve_backup_exclusive(
@@ -676,8 +706,20 @@ fn reserve_backup_exclusive(
             "performance state destination changed during backup".to_string(),
         ));
     }
-    remove_admitted_regular_file(source).map_err(|source| publication(phase, source))?;
+    let source_sha512 = match expected_sha512 {
+        Some(expected) => expected.to_string(),
+        None => hex::encode(bounded_file_sha512(source, source_len)?),
+    };
+    remove_identity_bound_file(source, source_identity, source_len, &source_sha512)
+        .map_err(|error| cleanup_publication_error(phase, error))?;
     Ok(())
+}
+
+fn cleanup_publication_error(phase: StatePublicationPhase, error: StateError) -> StateError {
+    match error {
+        StateError::Read(source) => publication(phase, source),
+        error => error,
+    }
 }
 
 pub(crate) fn save_rollback_snapshot(
@@ -871,7 +913,6 @@ fn planned_rollback_artifact(
             version_id: installed.version_id.clone(),
             ownership_class: installed.ownership_class,
             sha512: installed.integrity.sha512.clone(),
-            sha512_verified: installed.integrity.sha512_verified,
         },
     })
 }
@@ -1352,21 +1393,6 @@ pub(crate) fn restore_rollback_snapshot_classified(
     })
 }
 
-pub(crate) async fn restore_rollback_snapshot_async(
-    instance_mods_dir: &Path,
-    snapshot: &RollbackSnapshot,
-) -> Result<ManagedRollbackOutcome, StateError> {
-    let instance_mods_dir = instance_mods_dir.to_path_buf();
-    let snapshot = snapshot.clone();
-    tokio::task::spawn_blocking(move || restore_rollback_snapshot(&instance_mods_dir, &snapshot))
-        .await
-        .map_err(|_| {
-            StateError::Read(std::io::Error::other(
-                "rollback restore task stopped before reporting its result",
-            ))
-        })?
-}
-
 pub(crate) async fn restore_rollback_snapshot_classified_async(
     instance_mods_dir: &Path,
     snapshot: &RollbackSnapshot,
@@ -1396,18 +1422,16 @@ pub(crate) fn managed_artifact_matches(
     instance_mods_dir: &Path,
     installed: &InstalledMod,
 ) -> Result<bool, StateError> {
-    path_matches_sha512(
-        &managed_artifact_path(instance_mods_dir, &installed.filename)?,
-        &installed.integrity.sha512,
-    )
-}
-
-pub(crate) fn remove_managed_artifact(
-    instance_mods_dir: &Path,
-    installed: &InstalledMod,
-) -> Result<(), StateError> {
-    let backup = stage_managed_artifact_removal(instance_mods_dir, installed)?;
-    remove_owned_file(&backup)
+    let path = managed_artifact_path(instance_mods_dir, &installed.filename)?;
+    let metadata = match fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(StateError::Read(error)),
+    };
+    if !metadata.file_type().is_file() || metadata.len() != installed.size {
+        return Ok(false);
+    }
+    path_matches_sha512(&path, &installed.integrity.sha512)
 }
 
 pub(crate) fn stage_managed_artifact_removal(
@@ -1563,6 +1587,85 @@ fn managed_artifact_addition_path(
         .join(filename))
 }
 
+pub(crate) fn prepare_managed_artifact_addition(
+    instance_mods_dir: &Path,
+    installed: &InstalledMod,
+) -> Result<PathBuf, StateError> {
+    let obligation = managed_artifact_addition_path(
+        instance_mods_dir,
+        &installed.filename,
+        &installed.integrity.sha512,
+    )?;
+    let digest_root = obligation.parent().ok_or_else(|| {
+        StateError::InvalidState("managed addition obligation path is invalid".to_string())
+    })?;
+    for path in [
+        instance_mods_dir.join(STATE_DIR_NAME),
+        instance_mods_dir
+            .join(STATE_DIR_NAME)
+            .join(MUTATION_DIR_NAME),
+        instance_mods_dir
+            .join(STATE_DIR_NAME)
+            .join(MUTATION_DIR_NAME)
+            .join(ADDITION_DIR_NAME),
+        digest_root.to_path_buf(),
+    ] {
+        ensure_managed_directory(&path)?;
+    }
+    if path_exists(&obligation)? {
+        return Err(StateError::InvalidState(
+            "managed addition obligation already exists".to_string(),
+        ));
+    }
+    Ok(obligation)
+}
+
+pub(crate) fn publish_managed_artifact_addition(
+    instance_mods_dir: &Path,
+    installed: &InstalledMod,
+    obligation: &Path,
+) -> Result<(), StateError> {
+    let expected = managed_artifact_addition_path(
+        instance_mods_dir,
+        &installed.filename,
+        &installed.integrity.sha512,
+    )?;
+    if obligation != expected {
+        return Err(StateError::InvalidState(
+            "managed addition obligation path does not match its artifact".to_string(),
+        ));
+    }
+    let (identity, len) = admit_file_identity(obligation).map_err(|error| {
+        identity_admission_error(
+            error,
+            StateError::InvalidIntegrity {
+                filename: installed.filename.clone(),
+                reason: "managed addition ownership cannot be admitted".to_string(),
+            },
+        )
+    })?;
+    if len != installed.size || !path_matches_sha512(obligation, &installed.integrity.sha512)? {
+        return Err(StateError::InvalidIntegrity {
+            filename: installed.filename.clone(),
+            reason: "managed addition bytes do not match sealed metadata".to_string(),
+        });
+    }
+    let final_path = managed_artifact_path(instance_mods_dir, &installed.filename)?;
+    fs::hard_link(obligation, &final_path)?;
+    let final_metadata = fs::symlink_metadata(&final_path)?;
+    if !final_metadata.file_type().is_file()
+        || final_metadata.len() != installed.size
+        || crate::file_identity::revalidate(&final_path, identity, len).is_err()
+        || !path_matches_sha512(&final_path, &installed.integrity.sha512)?
+    {
+        return Err(StateError::InvalidIntegrity {
+            filename: installed.filename.clone(),
+            reason: "managed addition publication could not be proven".to_string(),
+        });
+    }
+    Ok(())
+}
+
 struct AdmittedManagedAddition {
     path: PathBuf,
     identity: crate::file_identity::FileIdentity,
@@ -1653,26 +1756,28 @@ pub(crate) fn reconcile_managed_addition_obligations(
                 })
             });
             let final_path = managed_artifact_path(instance_mods_dir, &filename)?;
-            match fs::symlink_metadata(&final_path) {
-                Ok(final_metadata) => {
-                    if !final_metadata.file_type().is_file()
-                        || crate::file_identity::revalidate(
-                            &final_path,
-                            obligation_identity.0,
-                            obligation_identity.1,
-                        )
-                        .is_err()
-                        || !path_matches_sha512(&final_path, &digest)?
-                    {
-                        return Err(StateError::InvalidIntegrity {
-                            filename,
-                            reason: "managed addition destination ownership cannot be proven"
-                                .to_string(),
-                        });
+            if tracked {
+                match fs::symlink_metadata(&final_path) {
+                    Ok(final_metadata) => {
+                        if !final_metadata.file_type().is_file()
+                            || crate::file_identity::revalidate(
+                                &final_path,
+                                obligation_identity.0,
+                                obligation_identity.1,
+                            )
+                            .is_err()
+                            || !path_matches_sha512(&final_path, &digest)?
+                        {
+                            return Err(StateError::InvalidIntegrity {
+                                filename,
+                                reason: "managed addition destination ownership cannot be proven"
+                                    .to_string(),
+                            });
+                        }
                     }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(StateError::Read(error)),
                 }
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => return Err(StateError::Read(error)),
             }
             admitted.push(AdmittedManagedAddition {
                 path: entry.path(),
@@ -1740,21 +1845,21 @@ pub(crate) fn reconcile_managed_addition_obligations(
         let final_path = managed_artifact_path(instance_mods_dir, &obligation.filename)?;
         match fs::symlink_metadata(&final_path) {
             Ok(final_metadata) => {
-                if !final_metadata.file_type().is_file()
-                    || crate::file_identity::revalidate(
+                let exact_alias = final_metadata.file_type().is_file()
+                    && crate::file_identity::revalidate(
                         &final_path,
                         obligation.identity,
                         obligation.len,
                     )
-                    .is_err()
-                    || !path_matches_sha512(&final_path, &obligation.digest)?
-                {
+                    .is_ok()
+                    && path_matches_sha512(&final_path, &obligation.digest)?;
+                if obligation.tracked && !exact_alias {
                     return Err(StateError::InvalidIntegrity {
                         filename: obligation.filename.clone(),
                         reason: "managed addition destination changed after admission".to_string(),
                     });
                 }
-                if !obligation.tracked {
+                if !obligation.tracked && exact_alias {
                     remove_identity_bound_file(
                         &final_path,
                         obligation.identity,
@@ -1799,86 +1904,6 @@ pub(crate) fn reconcile_managed_addition_obligations(
     }
     fs::remove_dir(root)?;
     Ok(())
-}
-
-pub(crate) fn settle_abandoned_managed_artifact_addition(
-    instance_mods_dir: &Path,
-    installed: &InstalledMod,
-) -> Result<(), StateError> {
-    let obligation = managed_artifact_addition_path(
-        instance_mods_dir,
-        &installed.filename,
-        &installed.integrity.sha512,
-    )?;
-    let digest_root = obligation
-        .parent()
-        .expect("managed addition obligation always has a digest parent");
-    let addition_root = digest_root
-        .parent()
-        .expect("managed addition digest always has an addition parent");
-    let mutation_root = addition_root
-        .parent()
-        .expect("managed addition root always has a mutation parent");
-    let state_root = mutation_root
-        .parent()
-        .expect("managed mutation root always has a state parent");
-    for path in [state_root, mutation_root, addition_root, digest_root] {
-        validate_managed_recovery_directory(path)?;
-    }
-    let (identity, len) = match admit_file_identity(&obligation) {
-        Ok(admitted) => admitted,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::InvalidData => {
-            return Err(StateError::InvalidState(
-                "abandoned managed addition obligation is not a regular file".to_string(),
-            ));
-        }
-        Err(error) => return Err(StateError::Read(error)),
-    };
-    if path_exists(&managed_artifact_path(
-        instance_mods_dir,
-        &installed.filename,
-    )?)? {
-        return Err(StateError::InvalidState(
-            "abandoned managed addition target still exists".to_string(),
-        ));
-    }
-    let mut count = 0_usize;
-    let mut aliases = Vec::new();
-    for entry in fs::read_dir(instance_mods_dir)? {
-        let entry = entry?;
-        admit_recovery_entry(&mut count, "abandoned managed addition scan")?;
-        let is_alias = entry
-            .file_name()
-            .to_str()
-            .and_then(parse_managed_download_temp_name)
-            .is_some_and(|(filename, _)| filename == installed.filename);
-        if !is_alias {
-            continue;
-        }
-        let alias_identity = admit_file_identity(&entry.path()).map_err(|error| {
-            identity_admission_error(
-                error,
-                StateError::InvalidIntegrity {
-                    filename: installed.filename.clone(),
-                    reason: "abandoned managed addition temp alias is conflicting".to_string(),
-                },
-            )
-        })?;
-        if identity != alias_identity.0
-            || !path_matches_sha512(&entry.path(), &installed.integrity.sha512)?
-        {
-            return Err(StateError::InvalidIntegrity {
-                filename: installed.filename.clone(),
-                reason: "abandoned managed addition temp alias is conflicting".to_string(),
-            });
-        }
-        aliases.push((entry.path(), alias_identity.0));
-    }
-    for (path, alias_identity) in aliases {
-        remove_identity_bound_file(&path, alias_identity, len, &installed.integrity.sha512)?;
-    }
-    remove_identity_bound_file(&obligation, identity, len, &installed.integrity.sha512)
 }
 
 pub(crate) fn settle_managed_artifact_removal(
@@ -2223,7 +2248,6 @@ fn validate_rollback_snapshot(snapshot: &RollbackSnapshot) -> Result<(), StateEr
         if artifact.project_id != installed.project_id
             || artifact.version_id != installed.version_id
             || artifact.sha512 != installed.integrity.sha512
-            || artifact.sha512_verified != installed.integrity.sha512_verified
         {
             return Err(StateError::InvalidRollback(format!(
                 "artifact {} metadata does not match rollback state",
@@ -2796,7 +2820,26 @@ fn copy_regular_file_exclusive(source_path: &Path, target_path: &Path) -> Result
 }
 
 fn remove_owned_file(path: &Path) -> Result<(), StateError> {
-    remove_admitted_regular_file(path).map_err(StateError::Read)
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_file() => metadata,
+        Ok(_) => {
+            return Err(StateError::InvalidState(
+                "managed cleanup target is not a regular file".to_string(),
+            ));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(StateError::Read(error)),
+    };
+    let (digest, admitted) = admit_bounded_file_sha512(path, metadata.len())?;
+    if digest.is_empty() {
+        return Err(StateError::InvalidState(
+            "managed cleanup target digest could not be admitted".to_string(),
+        ));
+    }
+    let admitted = admitted.ok_or_else(|| {
+        StateError::InvalidState("managed cleanup target identity was not admitted".to_string())
+    })?;
+    quarantine_remove_admitted_file(path, admitted, metadata.len(), &hex::encode(digest), |_| {})
 }
 
 fn remove_file_matching_sha512(
@@ -2828,7 +2871,7 @@ fn remove_file_matching_sha512(
             "managed cleanup target identity changed after digest admission".to_string(),
         ));
     }
-    fs::remove_file(path).map_err(StateError::Read)
+    quarantine_remove_admitted_file(path, admitted, metadata.len(), expected_sha512, |_| {})
 }
 
 fn remove_identity_bound_file(
@@ -2845,7 +2888,7 @@ fn remove_identity_bound_file(
             "managed cleanup target identity or digest changed after admission".to_string(),
         ));
     }
-    fs::remove_file(path).map_err(StateError::Read)
+    quarantine_remove_admitted_file(path, admitted, admitted_len, expected_sha512, |_| {})
 }
 
 fn admit_file_identity(
@@ -2863,25 +2906,204 @@ fn identity_admission_error(error: std::io::Error, invalid: StateError) -> State
     }
 }
 
-fn remove_admitted_regular_file(path: &Path) -> Result<(), std::io::Error> {
-    let admitted = match crate::file_identity::admit(path) {
-        Ok(admitted) => admitted,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(error),
-    };
-    if crate::file_identity::revalidate(path, admitted.identity(), admitted.metadata().len())
-        .is_err()
-    {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "managed cleanup target identity changed during admission",
+#[cfg(test)]
+fn quarantine_remove_file_with_hook(
+    path: &Path,
+    expected_sha512: &str,
+    max_bytes: u64,
+    after_park: impl FnOnce(&Path),
+) -> Result<(), StateError> {
+    let metadata = fs::symlink_metadata(path)?;
+    if !metadata.file_type().is_file() || metadata.len() > max_bytes {
+        return Err(StateError::InvalidState(
+            "managed cleanup target is not a bounded regular file".to_string(),
         ));
     }
-    drop(admitted);
-    match fs::remove_file(path) {
+    let (identity, len) = admit_file_identity(path)?;
+    if !path_matches_sha512(path, expected_sha512)? {
+        return Err(StateError::InvalidState(
+            "managed cleanup target digest changed after admission".to_string(),
+        ));
+    }
+    quarantine_remove_admitted_file(path, identity, len, expected_sha512, after_park)
+}
+
+fn quarantine_remove_admitted_file(
+    path: &Path,
+    admitted: crate::file_identity::FileIdentity,
+    admitted_len: u64,
+    expected_sha512: &str,
+    after_park: impl FnOnce(&Path),
+) -> Result<(), StateError> {
+    if !is_valid_sha512(expected_sha512) {
+        return Err(StateError::InvalidState(
+            "managed cleanup digest is invalid".to_string(),
+        ));
+    }
+    let instance_mods_dir = managed_cleanup_root(path)?;
+    reconcile_cleanup_quarantine(&instance_mods_dir)?;
+    let quarantine = cleanup_quarantine_path(&instance_mods_dir);
+    ensure_cleanup_quarantine(&instance_mods_dir)?;
+    let mut nonce = [0_u8; 16];
+    OsRng.try_fill_bytes(&mut nonce).map_err(|_| {
+        StateError::Read(std::io::Error::other(
+            "managed cleanup quarantine nonce generation failed",
+        ))
+    })?;
+    let parked = quarantine.join(format!(
+        "{}.{}.park",
+        expected_sha512.to_ascii_lowercase(),
+        hex::encode(nonce)
+    ));
+    fs::rename(path, &parked)?;
+    after_park(&parked);
+    let parked_matches = crate::file_identity::revalidate(&parked, admitted, admitted_len).is_ok()
+        && path_matches_sha512(&parked, expected_sha512)?;
+    if !parked_matches {
+        if !path_exists(path)? {
+            fs::hard_link(&parked, path)?;
+        }
+        return Err(StateError::InvalidState(
+            "managed cleanup parked identity changed after admission".to_string(),
+        ));
+    }
+    remove_quarantined_exact_file(&parked, expected_sha512, admitted_len)?;
+    cleanup_empty_quarantine_roots(&instance_mods_dir)
+}
+
+fn managed_cleanup_root(path: &Path) -> Result<PathBuf, StateError> {
+    let parent = path.parent().ok_or_else(|| {
+        StateError::InvalidState("managed cleanup target has no parent".to_string())
+    })?;
+    for ancestor in parent.ancestors() {
+        if ancestor
+            .file_name()
+            .is_some_and(|name| name == STATE_DIR_NAME)
+        {
+            return ancestor.parent().map(Path::to_path_buf).ok_or_else(|| {
+                StateError::InvalidState("managed cleanup root is invalid".to_string())
+            });
+        }
+    }
+    Ok(parent.to_path_buf())
+}
+
+fn cleanup_quarantine_path(instance_mods_dir: &Path) -> PathBuf {
+    instance_mods_dir
+        .join(STATE_DIR_NAME)
+        .join(MUTATION_DIR_NAME)
+        .join(QUARANTINE_DIR_NAME)
+}
+
+fn ensure_cleanup_quarantine(instance_mods_dir: &Path) -> Result<(), StateError> {
+    for path in [
+        instance_mods_dir.join(STATE_DIR_NAME),
+        instance_mods_dir
+            .join(STATE_DIR_NAME)
+            .join(MUTATION_DIR_NAME),
+        cleanup_quarantine_path(instance_mods_dir),
+    ] {
+        ensure_recovery_directory(&path)?;
+    }
+    Ok(())
+}
+
+fn cleanup_quarantine_reconciliation_required(
+    instance_mods_dir: &Path,
+) -> Result<bool, StateError> {
+    let root = cleanup_quarantine_path(instance_mods_dir);
+    match fs::symlink_metadata(&root) {
+        Ok(metadata) if metadata.file_type().is_dir() => Ok(true),
+        Ok(_) => Err(StateError::InvalidState(
+            "managed cleanup quarantine is not a regular directory".to_string(),
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => Err(StateError::Read(error)),
+    }
+}
+
+fn reconcile_cleanup_quarantine(instance_mods_dir: &Path) -> Result<(), StateError> {
+    let root = cleanup_quarantine_path(instance_mods_dir);
+    validate_managed_recovery_directory(&root)?;
+    let entries = match fs::read_dir(&root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(StateError::Read(error)),
+    };
+    let mut count = 0_usize;
+    let mut total_bytes = 0_u64;
+    for entry in entries {
+        let entry = entry?;
+        admit_recovery_entry(&mut count, "managed cleanup quarantine")?;
+        let metadata = entry.metadata()?;
+        if !metadata.file_type().is_file() || metadata.len() > MANAGED_ARTIFACT_MAX_BYTES {
+            return Err(StateError::InvalidState(
+                "managed cleanup quarantine contains an invalid entry".to_string(),
+            ));
+        }
+        total_bytes = total_bytes.checked_add(metadata.len()).ok_or_else(|| {
+            StateError::InvalidState("managed cleanup quarantine size overflowed".to_string())
+        })?;
+        if total_bytes > CLEANUP_QUARANTINE_MAX_BYTES {
+            return Err(StateError::InvalidState(
+                "managed cleanup quarantine exceeds its byte budget".to_string(),
+            ));
+        }
+        let name = entry.file_name();
+        let name = name.to_str().ok_or_else(|| {
+            StateError::InvalidState("managed cleanup quarantine name is invalid".to_string())
+        })?;
+        let (digest, suffix) = name.split_once('.').ok_or_else(|| {
+            StateError::InvalidState("managed cleanup quarantine name is invalid".to_string())
+        })?;
+        let nonce = suffix.strip_suffix(".park").ok_or_else(|| {
+            StateError::InvalidState("managed cleanup quarantine name is invalid".to_string())
+        })?;
+        if !is_valid_sha512(digest)
+            || nonce.len() != 32
+            || !nonce.bytes().all(|byte| byte.is_ascii_hexdigit())
+            || !path_matches_sha512(&entry.path(), digest)?
+        {
+            return Err(StateError::InvalidState(
+                "managed cleanup quarantine ownership cannot be proven".to_string(),
+            ));
+        }
+        remove_quarantined_exact_file(&entry.path(), digest, metadata.len())?;
+    }
+    cleanup_empty_quarantine_roots(instance_mods_dir)
+}
+
+fn remove_quarantined_exact_file(
+    path: &Path,
+    expected_sha512: &str,
+    expected_len: u64,
+) -> Result<(), StateError> {
+    let (identity, len) = admit_file_identity(path)?;
+    if len != expected_len
+        || !path_matches_sha512(path, expected_sha512)?
+        || crate::file_identity::revalidate(path, identity, len).is_err()
+    {
+        return Err(StateError::InvalidState(
+            "managed cleanup quarantine identity changed".to_string(),
+        ));
+    }
+    fs::remove_file(path)?;
+    Ok(())
+}
+
+fn cleanup_empty_quarantine_roots(instance_mods_dir: &Path) -> Result<(), StateError> {
+    let quarantine = cleanup_quarantine_path(instance_mods_dir);
+    match fs::remove_dir(&quarantine) {
         Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error),
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::DirectoryNotEmpty
+            ) =>
+        {
+            Ok(())
+        }
+        Err(error) => Err(StateError::Read(error)),
     }
 }
 
@@ -2893,23 +3115,14 @@ fn cleanup_rollback_restore_targets(targets: &[RollbackRestoreTarget]) -> Result
 }
 
 fn validate_state(state: &CompositionState) -> Result<(), StateError> {
-    validate_state_token("composition id", &state.composition_id)?;
+    crate::install::plan::validate_state_graph(state)
+        .map_err(|error| StateError::InvalidState(error.to_string()))?;
     if state.installed_at.trim() != state.installed_at
         || state.installed_at.is_empty()
         || state.installed_at.chars().count() > STATE_TIMESTAMP_MAX_CHARS
     {
         return Err(StateError::InvalidState(
             "performance state timestamp is invalid".to_string(),
-        ));
-    }
-    if state.failure_count < 0 {
-        return Err(StateError::InvalidState(
-            "performance state failure count is invalid".to_string(),
-        ));
-    }
-    if state.last_failure.chars().count() > STATE_FAILURE_MAX_CHARS {
-        return Err(StateError::InvalidState(
-            "performance state failure evidence exceeds the limit".to_string(),
         ));
     }
     if state.installed_mods.len() > STATE_MAX_INSTALLED_MODS {
@@ -2943,13 +3156,6 @@ fn validate_state(state: &CompositionState) -> Result<(), StateError> {
             });
         }
         validate_sha512_integrity(&installed.filename, &installed.integrity.sha512)?;
-        if installed.integrity.sha512.is_empty() {
-            return Err(StateError::InvalidIntegrity {
-                filename: installed.filename.clone(),
-                reason: "managed artifacts require a locally computed SHA-512 ownership digest"
-                    .to_string(),
-            });
-        }
     }
     Ok(())
 }
@@ -3802,7 +4008,8 @@ fn rollback_snapshot_record_bytes(
 mod tests {
     use super::*;
     use crate::types::{
-        InstalledMod, ManagedArtifactIntegrity, ManagedArtifactProvider, ManagedArtifactSource,
+        InstalledMod, ManagedArtifactIntegrity, ManagedArtifactProvider, ManagedArtifactRole,
+        ManagedArtifactSource, VersionFamily,
     };
 
     fn restored_composition(outcome: ManagedRollbackOutcome) -> CompositionState {
@@ -4068,14 +4275,21 @@ mod tests {
         fs::remove_file(source).expect("consume source");
         fs::write(root.join(filename), b"same-bytes").expect("write replacement inode");
 
-        let error = recover_managed_storage(&root).expect_err("replacement must block recovery");
+        let recovered = recover_managed_storage(&root).expect("discard owned obligation");
 
-        assert!(matches!(error, StateError::InvalidIntegrity { .. }));
+        assert!(recovered.is_none());
         assert_eq!(
             fs::read(root.join(filename)).expect("read replacement"),
             b"same-bytes"
         );
-        assert!(obligation.exists());
+        assert!(!obligation.exists());
+        assert!(
+            !root
+                .join(STATE_DIR_NAME)
+                .join(MUTATION_DIR_NAME)
+                .join(ADDITION_DIR_NAME)
+                .exists()
+        );
         let _ = fs::remove_dir_all(root);
     }
 
@@ -4346,14 +4560,16 @@ mod tests {
         assert_eq!(snapshot.artifacts.len(), 1);
         let artifact = &snapshot.artifacts[0];
         assert_eq!(artifact.filename, "managed-a.jar");
-        assert_eq!(artifact.project_id, "sodium");
-        assert_eq!(artifact.version_id, "version");
+        assert_eq!(
+            artifact.project_id,
+            test_mod("sodium", "managed-a.jar").project_id
+        );
+        assert_eq!(artifact.version_id, "NFkjnzWE");
         assert_eq!(artifact.ownership_class, OwnershipClass::CompositionManaged);
         assert_eq!(
             artifact.sha512,
             test_mod("sodium", "managed-a.jar").integrity.sha512
         );
-        assert!(!artifact.sha512_verified);
         assert_eq!(
             fs::read(rollback_files_dir_path(&root).join(&artifact.stored_filename))
                 .expect("read stored artifact"),
@@ -4673,26 +4889,9 @@ mod tests {
         )
         .expect("save snapshot");
         fs::write(root.join("managed-a.jar"), b"user-replacement").expect("replace target");
-        fs::write(
-            lock_file_path(&root),
-            serde_json::to_vec(&state_fixture(serde_json::json!({
-                "composition_id": "core-current",
-                "tier": "core",
-                "installed_mods": [{
-                    "project_id": "sodium",
-                    "version_id": "version",
-                    "filename": "managed-a.jar",
-                    "ownership_class": "user_managed",
-                    "source": { "provider": "modrinth" },
-                    "integrity": { "sha512": "", "sha512_verified": false }
-                }],
-                "installed_at": "2026-05-30T00:00:00Z",
-                "failure_count": 0,
-                "last_failure": ""
-            })))
-            .expect("serialize current state"),
-        )
-        .expect("write corrupt current state");
+        let mut corrupt = test_state("core-current", vec![test_mod("sodium", "managed-a.jar")]);
+        corrupt.installed_mods[0].ownership_class = OwnershipClass::UserManaged;
+        write_unvalidated_state(&root, corrupt);
 
         let error = restore_rollback_snapshot(&root, &snapshot)
             .expect_err("corrupt current ownership must block rollback");
@@ -4797,7 +4996,7 @@ mod tests {
         fs::write(root.join("user.jar"), b"user-v2").expect("mutate user");
 
         let restored = restored_composition(
-            restore_rollback_snapshot_async(&root, &snapshot)
+            restore_rollback_snapshot_classified_async(&root, &snapshot)
                 .await
                 .expect("restore async"),
         );
@@ -4827,11 +5026,14 @@ mod tests {
         .expect("save snapshot");
         fs::write(root.join("managed-a.jar"), b"user-replacement").expect("replace target");
 
-        let error = restore_rollback_snapshot_async(&root, &snapshot)
+        let error = restore_rollback_snapshot_classified_async(&root, &snapshot)
             .await
             .expect_err("async rollback must not overwrite untracked target");
 
-        assert!(matches!(error, StateError::InvalidRollback(_)));
+        assert!(matches!(
+            error,
+            RollbackRestoreError::Definite(StateError::InvalidRollback(_))
+        ));
         assert_eq!(
             fs::read(root.join("managed-a.jar")).expect("read target"),
             b"user-replacement"
@@ -4905,11 +5107,9 @@ mod tests {
                     "version_id": "version",
                     "filename": "sodium.jar",
                     "source": { "provider": "modrinth" },
-                    "integrity": { "sha512": "", "sha512_verified": false }
+                    "integrity": { "sha512": "" }
                 }],
-                "installed_at": "2026-05-30T00:00:00Z",
-                "failure_count": 0,
-                "last_failure": ""
+                "installed_at": "2026-05-30T00:00:00Z"
             })))
             .expect("serialize state"),
         )
@@ -4930,11 +5130,9 @@ mod tests {
                     "filename": "sodium.jar",
                     "ownership_class": "plugin_managed",
                     "source": { "provider": "modrinth" },
-                    "integrity": { "sha512": "", "sha512_verified": false }
+                    "integrity": { "sha512": "" }
                 }],
-                "installed_at": "2026-05-30T00:00:00Z",
-                "failure_count": 0,
-                "last_failure": ""
+                "installed_at": "2026-05-30T00:00:00Z"
             })))
             .expect("serialize state"),
         )
@@ -4961,9 +5159,7 @@ mod tests {
                     "filename": "sodium.jar",
                     "ownership_class": "composition_managed"
                 }],
-                "installed_at": "2026-05-30T00:00:00Z",
-                "failure_count": 0,
-                "last_failure": ""
+                "installed_at": "2026-05-30T00:00:00Z"
             })))
             .expect("serialize state"),
         )
@@ -4984,11 +5180,9 @@ mod tests {
                     "filename": "sodium.jar",
                     "ownership_class": "composition_managed",
                     "source": { "provider": "unknown" },
-                    "integrity": { "sha512": "", "sha512_verified": false }
+                    "integrity": { "sha512": "" }
                 }],
-                "installed_at": "2026-05-30T00:00:00Z",
-                "failure_count": 0,
-                "last_failure": ""
+                "installed_at": "2026-05-30T00:00:00Z"
             })))
             .expect("serialize state"),
         )
@@ -5009,11 +5203,9 @@ mod tests {
                     "filename": "sodium.jar",
                     "ownership_class": "composition_managed",
                     "source": { "provider": "modrinth" },
-                    "integrity": { "sha512": "", "sha512_verified": false, "path": "/tmp/sodium.jar" }
+                    "integrity": { "sha512": "", "path": "/tmp/sodium.jar" }
                 }],
-                "installed_at": "2026-05-30T00:00:00Z",
-                "failure_count": 0,
-                "last_failure": ""
+                "installed_at": "2026-05-30T00:00:00Z"
             })))
             .expect("serialize state"),
         )
@@ -5027,8 +5219,8 @@ mod tests {
     }
 
     #[test]
-    fn load_state_rejects_missing_failure_metadata() {
-        let root = test_root("missing-failure-metadata");
+    fn load_state_rejects_missing_graph_metadata() {
+        let root = test_root("missing-graph-metadata");
         fs::write(
             lock_file_path(&root),
             serde_json::to_vec(&state_fixture(serde_json::json!({
@@ -5039,10 +5231,10 @@ mod tests {
             })))
             .expect("serialize state"),
         )
-        .expect("write state without failure metadata");
+        .expect("write state without graph metadata");
 
         assert!(matches!(
-            load_state(&root).expect_err("missing failure metadata should be invalid"),
+            load_state(&root).expect_err("missing graph metadata should be invalid"),
             StateError::Parse(_)
         ));
 
@@ -5059,8 +5251,6 @@ mod tests {
                 "tier": "core",
                 "installed_mods": [],
                 "installed_at": "2026-05-30T00:00:00Z",
-                "failure_count": 0,
-                "last_failure": "",
                 "unexpected_state": true
             })))
             .expect("serialize state"),
@@ -5130,88 +5320,81 @@ mod tests {
     }
 
     #[test]
-    fn load_state_rejects_verified_integrity_without_sha512() {
+    fn cleanup_quarantine_preserves_a_final_window_replacement() {
+        let root = test_root("cleanup-final-window-replacement");
+        let target = root.join("managed.jar");
+        fs::write(&target, b"owned").expect("write owned target");
+        let digest = hex::encode(Sha512::digest(b"owned"));
+
+        quarantine_remove_file_with_hook(&target, &digest, 64, |_| {
+            fs::write(&target, b"replacement").expect("write replacement");
+        })
+        .expect("remove parked owned target");
+
+        assert_eq!(
+            fs::read(&target).expect("replacement preserved"),
+            b"replacement"
+        );
+        assert!(!cleanup_quarantine_path(&root).exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cleanup_quarantine_retains_identity_mismatch_for_fail_closed_recovery() {
+        let root = test_root("cleanup-parked-mismatch");
+        let target = root.join("managed.jar");
+        fs::write(&target, b"owned").expect("write owned target");
+        let digest = hex::encode(Sha512::digest(b"owned"));
+
+        let error = quarantine_remove_file_with_hook(&target, &digest, 64, |parked| {
+            fs::rename(parked, parked.with_extension("displaced"))
+                .expect("retain displaced admitted bytes");
+            fs::write(parked, b"replacement").expect("replace parked pathname");
+        })
+        .expect_err("parked replacement must fail closed");
+
+        assert!(matches!(error, StateError::InvalidState(_)));
+        assert_eq!(
+            fs::read(&target).expect("replacement restored"),
+            b"replacement"
+        );
+        assert!(cleanup_quarantine_path(&root).is_dir());
+        assert!(reconcile_cleanup_quarantine(&root).is_err());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn load_state_rejects_empty_sha512() {
         let root = test_root("invalid-integrity");
-        fs::write(
-            lock_file_path(&root),
-            serde_json::to_vec(&state_fixture(serde_json::json!({
-                "composition_id": "core",
-                "tier": "core",
-                "installed_mods": [{
-                    "project_id": "sodium",
-                    "version_id": "version",
-                    "filename": "sodium.jar",
-                    "ownership_class": "composition_managed",
-                    "source": { "provider": "modrinth" },
-                    "integrity": { "sha512": "", "sha512_verified": true }
-                }],
-                "installed_at": "2026-05-30T00:00:00Z",
-                "failure_count": 0,
-                "last_failure": ""
-            })))
-            .expect("serialize state"),
-        )
-        .expect("write invalid integrity state");
+        let mut state = test_state("core", vec![test_mod("sodium", "sodium.jar")]);
+        state.installed_mods[0].integrity.sha512.clear();
+        write_unvalidated_state(&root, state);
 
         let error = load_state(&root).expect_err("empty verified SHA-512 should be invalid");
 
-        assert!(matches!(error, StateError::InvalidIntegrity { .. }));
+        assert!(matches!(error, StateError::InvalidState(_)));
         let _ = fs::remove_dir_all(root);
     }
 
     #[test]
     fn load_state_rejects_malformed_sha512_metadata() {
         let root = test_root("malformed-sha512");
-        fs::write(
-            lock_file_path(&root),
-            serde_json::to_vec(&state_fixture(serde_json::json!({
-                "composition_id": "core",
-                "tier": "core",
-                "installed_mods": [{
-                    "project_id": "sodium",
-                    "version_id": "version",
-                    "filename": "sodium.jar",
-                    "ownership_class": "composition_managed",
-                    "source": { "provider": "modrinth" },
-                    "integrity": { "sha512": "abc123", "sha512_verified": true }
-                }],
-                "installed_at": "2026-05-30T00:00:00Z",
-                "failure_count": 0,
-                "last_failure": ""
-            })))
-            .expect("serialize state"),
-        )
-        .expect("write malformed integrity state");
+        let mut state = test_state("core", vec![test_mod("sodium", "sodium.jar")]);
+        state.installed_mods[0].integrity.sha512 = "abc123".to_string();
+        write_unvalidated_state(&root, state);
 
         let error = load_state(&root).expect_err("short SHA-512 should be invalid");
 
-        assert!(matches!(error, StateError::InvalidIntegrity { .. }));
+        assert!(matches!(error, StateError::InvalidState(_)));
         let _ = fs::remove_dir_all(root);
     }
 
     #[test]
     fn load_state_rejects_user_managed_artifacts_as_tracked_state() {
         let root = test_root("user-managed-state");
-        fs::write(
-            lock_file_path(&root),
-            serde_json::to_vec(&state_fixture(serde_json::json!({
-                "composition_id": "core",
-                "tier": "core",
-                "installed_mods": [{
-                    "project_id": "sodium",
-                    "version_id": "version",
-                    "filename": "user.jar",
-                    "ownership_class": "user_managed",
-                    "source": { "provider": "modrinth" },
-                    "integrity": { "sha512": "", "sha512_verified": false }
-                }],
-                "installed_at": "2026-05-30T00:00:00Z",
-                "failure_count": 0,
-                "last_failure": ""
-            })))
-            .expect("serialize state"),
-        )
-        .expect("write user-managed state");
+        let mut state = test_state("core", vec![test_mod("sodium", "user.jar")]);
+        state.installed_mods[0].ownership_class = OwnershipClass::UserManaged;
+        write_unvalidated_state(&root, state);
 
         let error = load_state(&root).expect_err("user-managed tracked state should fail");
 
@@ -5242,8 +5425,11 @@ mod tests {
         first.integrity.sha512 = hex::encode(Sha512::digest(b"first"));
         second.integrity.sha512 = hex::encode(Sha512::digest(b"second"));
 
+        let mut state = test_state("core", vec![first]);
+        state.installed_mods.push(second);
+        state.graph_sha512.clear();
         assert!(matches!(
-            save_state(&root, &test_state("core", vec![first, second])),
+            save_state(&root, &state),
             Err(StateError::InvalidState(_))
         ));
         assert!(!lock_file_path(&root).exists());
@@ -5331,14 +5517,23 @@ mod tests {
     }
 
     fn test_state(composition_id: &str, installed_mods: Vec<InstalledMod>) -> CompositionState {
-        CompositionState {
+        let mut state = CompositionState {
             composition_id: composition_id.to_string(),
+            family: VersionFamily::F,
             tier: CompositionTier::Core,
+            game_version: "1.21.11".to_string(),
+            loader: "fabric".to_string(),
+            graph_sha512: String::new(),
+            dependency_edges: Vec::new(),
             installed_mods,
             installed_at: "2026-05-30T00:00:00Z".to_string(),
-            failure_count: 0,
-            last_failure: String::new(),
-        }
+        };
+        state
+            .installed_mods
+            .sort_by(|left, right| left.project_id.cmp(&right.project_id));
+        state.graph_sha512 = crate::install::plan::canonical_state_graph_digest(&state)
+            .expect("canonical test graph");
+        state
     }
 
     fn state_fixture(state: serde_json::Value) -> serde_json::Value {
@@ -5348,23 +5543,48 @@ mod tests {
         })
     }
 
+    fn write_unvalidated_state(root: &Path, state: CompositionState) {
+        fs::write(
+            lock_file_path(root),
+            serde_json::to_vec(&PersistedCompositionState {
+                schema_version: STATE_SCHEMA_VERSION,
+                state,
+            })
+            .expect("serialize invalid state"),
+        )
+        .expect("write invalid state");
+    }
+
     fn test_mod(project_id: &str, filename: &str) -> InstalledMod {
         let bytes = filename
             .strip_suffix(".jar")
             .unwrap_or("managed")
             .as_bytes();
         InstalledMod {
-            project_id: project_id.to_string(),
-            version_id: "version".to_string(),
+            project_id: test_project_id(project_id),
+            version_id: "NFkjnzWE".to_string(),
             filename: filename.to_string(),
+            role: ManagedArtifactRole::Root,
+            size: bytes.len() as u64,
             ownership_class: OwnershipClass::CompositionManaged,
             source: ManagedArtifactSource {
                 provider: ManagedArtifactProvider::Modrinth,
             },
             integrity: ManagedArtifactIntegrity {
                 sha512: hex::encode(Sha512::digest(bytes)),
-                sha512_verified: false,
             },
+        }
+    }
+
+    fn test_project_id(label: &str) -> String {
+        match label {
+            "sodium" => "AANobbMI".to_string(),
+            "lithium" => "gvQqBUqZ".to_string(),
+            "ferrite" => "uXXizFIs".to_string(),
+            value if value.len() == 8 && value.bytes().all(|byte| byte.is_ascii_alphanumeric()) => {
+                value.to_string()
+            }
+            value => hex::encode(Sha512::digest(value.as_bytes()))[..8].to_string(),
         }
     }
 

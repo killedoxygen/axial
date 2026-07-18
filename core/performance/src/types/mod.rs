@@ -32,6 +32,13 @@ pub enum CompositionTier {
     VanillaEnhanced,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ManagedArtifactRole {
+    Root,
+    RequiredDependency,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ModCondition {
@@ -103,7 +110,6 @@ pub struct ManagedArtifactDefinition {
 #[serde(deny_unknown_fields)]
 pub struct ManagedArtifactIntegrity {
     pub sha512: String,
-    pub sha512_verified: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -149,8 +155,6 @@ pub struct CompositionPlan {
     #[serde(default)]
     pub jvm_preset: String,
     #[serde(default)]
-    pub fallback_chain: Vec<String>,
-    #[serde(default)]
     pub warnings: Vec<String>,
     #[serde(default)]
     pub fallback_reason: String,
@@ -189,8 +193,6 @@ pub struct CompositionDef {
     #[serde(default)]
     pub mods: Vec<ManagedMod>,
     #[serde(default)]
-    pub fallback_to: String,
-    #[serde(default)]
     pub jvm_preset: String,
 }
 
@@ -223,18 +225,31 @@ pub struct InstalledMod {
     pub project_id: String,
     pub version_id: String,
     pub filename: String,
+    pub role: ManagedArtifactRole,
+    pub size: u64,
     pub ownership_class: OwnershipClass,
     pub source: ManagedArtifactSource,
     pub integrity: ManagedArtifactIntegrity,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManagedDependencyStateEdge {
+    pub parent_project_id: String,
+    pub child_project_id: String,
+    pub child_version_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CompositionState {
     pub composition_id: String,
+    pub family: VersionFamily,
     pub tier: CompositionTier,
+    pub game_version: String,
+    pub loader: String,
+    pub graph_sha512: String,
+    pub dependency_edges: Vec<ManagedDependencyStateEdge>,
     pub installed_mods: Vec<InstalledMod>,
     pub installed_at: String,
-    pub failure_count: i32,
-    pub last_failure: String,
 }

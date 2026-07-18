@@ -33,38 +33,12 @@ impl AdmittedFile {
     }
 }
 
-pub(crate) fn from_file(file: &fs::File) -> io::Result<FileIdentity> {
-    let metadata = file.metadata()?;
-    if !metadata.is_file() {
-        return Err(invalid_identity("managed identity is not a regular file"));
-    }
-    platform_file_identity(file, &metadata)
-}
-
 pub(crate) fn admit(path: &Path) -> io::Result<AdmittedFile> {
     platform_admit(path)
 }
 
-pub(crate) async fn admit_async(path: &Path) -> io::Result<AdmittedFile> {
-    let path = path.to_path_buf();
-    tokio::task::spawn_blocking(move || admit(&path))
-        .await
-        .map_err(|_| io::Error::other("managed identity task stopped"))?
-}
-
 pub(crate) fn revalidate(path: &Path, expected: FileIdentity, expected_len: u64) -> io::Result<()> {
     platform_revalidate(path, expected, expected_len)
-}
-
-pub(crate) async fn revalidate_async(
-    path: &Path,
-    expected: FileIdentity,
-    expected_len: u64,
-) -> io::Result<()> {
-    let path = path.to_path_buf();
-    tokio::task::spawn_blocking(move || revalidate(&path, expected, expected_len))
-        .await
-        .map_err(|_| io::Error::other("managed identity task stopped"))?
 }
 
 #[cfg(unix)]

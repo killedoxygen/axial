@@ -1,5 +1,5 @@
 {
-  "schema_version": 2,
+  "schema_version": 3,
   "generated_at": "2026-07-18T00:00:00Z",
   "minimum_app_version": "0.4.0-dev.1",
   "rule_channel": "bundled",
@@ -74,7 +74,6 @@
       "families": ["E"],
       "loaders": ["fabric"],
       "tier": "extended",
-      "fallback_to": "family-e-fabric-core",
       "mods": [
         {"artifact_id": "sodium", "project_id": "AANobbMI", "slug": "sodium", "name": "Sodium", "condition": "always"},
         {"artifact_id": "lithium", "project_id": "gvQqBUqZ", "slug": "lithium", "name": "Lithium", "condition": "always"},
@@ -102,7 +101,6 @@
       "families": ["E"],
       "loaders": ["fabric"],
       "tier": "core",
-      "fallback_to": "family-e-vanilla-enhanced",
       "mods": [
         {"artifact_id": "sodium", "project_id": "AANobbMI", "slug": "sodium", "name": "Sodium", "condition": "always"},
         {"artifact_id": "lithium", "project_id": "gvQqBUqZ", "slug": "lithium", "name": "Lithium", "condition": "always"},
@@ -128,7 +126,6 @@
       "families": ["E"],
       "loaders": ["forge", "neoforge"],
       "tier": "extended",
-      "fallback_to": "family-e-forge-core",
       "mods": [
         {"artifact_id": "embeddium", "project_id": "sk9rgfiA", "slug": "embeddium", "name": "Embeddium", "condition": "always"},
         {"artifact_id": "ferrite-core", "project_id": "uXXizFIs", "slug": "ferrite-core", "name": "FerriteCore", "condition": "always"},
@@ -144,7 +141,6 @@
       "families": ["E"],
       "loaders": ["forge", "neoforge"],
       "tier": "core",
-      "fallback_to": "family-e-vanilla-enhanced",
       "mods": [
         {"artifact_id": "embeddium", "project_id": "sk9rgfiA", "slug": "embeddium", "name": "Embeddium", "condition": "always"},
         {"artifact_id": "ferrite-core", "project_id": "uXXizFIs", "slug": "ferrite-core", "name": "FerriteCore", "condition": "always"}
@@ -157,7 +153,6 @@
       "families": ["F"],
       "loaders": ["fabric"],
       "tier": "extended",
-      "fallback_to": "family-f-fabric-core",
       "mods": [
         {"artifact_id": "sodium", "project_id": "AANobbMI", "slug": "sodium", "name": "Sodium", "condition": "always"},
         {"artifact_id": "lithium", "project_id": "gvQqBUqZ", "slug": "lithium", "name": "Lithium", "condition": "always"},
@@ -186,7 +181,6 @@
       "families": ["F"],
       "loaders": ["fabric"],
       "tier": "core",
-      "fallback_to": "family-f-vanilla-enhanced",
       "mods": [
         {"artifact_id": "sodium", "project_id": "AANobbMI", "slug": "sodium", "name": "Sodium", "condition": "always"},
         {"artifact_id": "lithium", "project_id": "gvQqBUqZ", "slug": "lithium", "name": "Lithium", "condition": "always"},
@@ -216,7 +210,6 @@
       "families": ["F"],
       "loaders": ["forge", "neoforge"],
       "tier": "extended",
-      "fallback_to": "family-f-forge-core",
       "mods": [
         {"artifact_id": "embeddium", "project_id": "sk9rgfiA", "slug": "embeddium", "name": "Embeddium", "condition": "always"},
         {"artifact_id": "ferrite-core", "project_id": "uXXizFIs", "slug": "ferrite-core", "name": "FerriteCore", "condition": "always"},
@@ -232,7 +225,6 @@
       "families": ["F"],
       "loaders": ["forge", "neoforge"],
       "tier": "core",
-      "fallback_to": "family-f-vanilla-enhanced",
       "mods": [
         {"artifact_id": "embeddium", "project_id": "sk9rgfiA", "slug": "embeddium", "name": "Embeddium", "condition": "always"},
         {"artifact_id": "ferrite-core", "project_id": "uXXizFIs", "slug": "ferrite-core", "name": "FerriteCore", "condition": "always"}
@@ -245,7 +237,6 @@
       "families": ["C"],
       "loaders": ["forge"],
       "tier": "core",
-      "fallback_to": "family-c-vanilla-enhanced",
       "mods": [
         {"artifact_id": "foamfix", "project_id": "jupr7Bf5", "slug": "foamfix", "name": "FoamFix", "condition": "version_range", "version_range": "1.12.2"},
         {"artifact_id": "ai-improvements", "project_id": "DSVgwcji", "slug": "ai-improvements", "name": "AI Improvements", "condition": "version_range", "version_range": "1.12.2"},

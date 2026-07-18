@@ -1,4 +1,3 @@
-use crate::modrinth::ModrinthError;
 use crate::rules_cache::RulesCacheStatus;
 use crate::signature::{RulesSignatureError, RulesSignatureMetadata};
 use crate::state::StateError;
@@ -13,16 +12,12 @@ pub enum InstallError {
     Manifest(#[from] crate::resolve::ResolveError),
     #[error("failed to access performance state: {0}")]
     State(#[from] StateError),
-    #[error("modrinth error: {0}")]
-    Modrinth(#[from] ModrinthError),
     #[error("filesystem error: {0}")]
     Io(#[from] std::io::Error),
+    #[error("managed artifact staging failed")]
+    Download(#[from] axial_minecraft::download::ExecutionDownloadError),
     #[error("composition plan is required")]
     MissingPlan,
-    #[error("no compatible versions found for {0}")]
-    NoCompatibleVersion(String),
-    #[error("no downloadable file for {0}")]
-    NoPrimaryFile(String),
     #[error("mod filename is invalid: {0}")]
     InvalidFilename(String),
     #[error("managed artifact target already exists: {0}")]

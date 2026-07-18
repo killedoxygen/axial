@@ -17,7 +17,7 @@ const MAX_EXACT_GAME_VERSION_CHARS: usize = 64;
 const MAX_HARDWARE_VALUE: i32 = 1_048_576;
 const MODRINTH_PROJECT_ID_CHARS: usize = 8;
 
-pub const PERFORMANCE_MANIFEST_SCHEMA_VERSION: i32 = 2;
+pub const PERFORMANCE_MANIFEST_SCHEMA_VERSION: i32 = 3;
 
 pub fn builtin_manifest() -> Result<Manifest, ResolveError> {
     let manifest = serde_json::from_str::<Manifest>(BUILTIN_CATALOG)?;
@@ -67,11 +67,6 @@ pub fn validate_manifest(manifest: &Manifest) -> Result<(), ResolveError> {
             "composition description",
         )?;
         validate_optional_text(
-            &composition.fallback_to,
-            MAX_ID_CHARS,
-            "composition fallback",
-        )?;
-        validate_optional_text(
             &composition.jvm_preset,
             MAX_NAME_CHARS,
             "composition jvm preset",
@@ -104,11 +99,6 @@ pub fn validate_manifest(manifest: &Manifest) -> Result<(), ResolveError> {
     }
 
     for composition in &manifest.compositions {
-        if !composition.fallback_to.is_empty() && !ids.contains(&composition.fallback_to) {
-            return Err(ResolveError::UnknownFallback(
-                composition.fallback_to.clone(),
-            ));
-        }
         for managed_mod in &composition.mods {
             validate_managed_mod_artifact(managed_mod, &artifacts)?;
         }

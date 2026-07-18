@@ -79,8 +79,6 @@ pub enum ResolveError {
     MissingCompositionId,
     #[error("duplicate composition id: {0}")]
     DuplicateCompositionId(String),
-    #[error("fallback_to references unknown composition: {0}")]
-    UnknownFallback(String),
     #[error("emergency disable id is required")]
     MissingEmergencyDisableId,
     #[error("emergency disable target_id is required")]

@@ -94,10 +94,8 @@ pub enum EffectiveInstrumentationMode {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EffectiveFallbackPlan {
     pub selected: bool,
-    pub chain: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
-    pub launchable: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -154,13 +152,7 @@ pub fn effective_performance_plan(plan: &CompositionPlan) -> EffectivePerformanc
         },
         fallback: EffectiveFallbackPlan {
             selected: raw_fallback_selected,
-            chain: plan
-                .fallback_chain
-                .iter()
-                .filter_map(|value| public_optional_token(value))
-                .collect(),
             reason: fallback_reason.clone(),
-            launchable: true,
         },
         health_requirements: EffectivePerformanceHealthRequirements {
             expected_health: BundleHealth::Healthy,
@@ -387,7 +379,6 @@ mod tests {
             tier: CompositionTier::Extended,
             mods: vec![managed_mod("sodium", "Sodium")],
             jvm_preset: "performance".to_string(),
-            fallback_chain: vec!["family-f-fabric-core".to_string()],
             warnings: Vec::new(),
             fallback_reason: "A faster performance bundle is temporarily unavailable, so Axial chose the safest available option.".to_string(),
         };
@@ -415,7 +406,6 @@ mod tests {
             effective.launch_smoothing.policy,
             EffectiveLaunchSmoothingPolicy::Managed
         );
-        assert_eq!(effective.fallback.chain, vec!["family-f-fabric-core"]);
         assert!(effective.fallback.selected);
         assert_eq!(
             effective.health_requirements.required_ownership,
@@ -451,7 +441,6 @@ mod tests {
                 tier: CompositionTier::VanillaEnhanced,
                 mods: Vec::new(),
                 jvm_preset: String::new(),
-                fallback_chain: Vec::new(),
                 warnings: Vec::new(),
                 fallback_reason: String::new(),
             };
@@ -483,7 +472,6 @@ mod tests {
             tier: CompositionTier::Extended,
             mods: vec![managed_mod("bad id with spaces / path", &long_text)],
             jvm_preset: "performance with spaces".to_string(),
-            fallback_chain: vec!["family f fallback with spaces".to_string()],
             warnings: vec![long_text.clone()],
             fallback_reason: long_text,
         };
@@ -507,7 +495,6 @@ mod tests {
             effective.jvm_contribution.preset.as_deref(),
             Some("performancewithspaces")
         );
-        assert_eq!(effective.fallback.chain, vec!["familyffallbackwithspaces"]);
     }
 
     #[test]
@@ -520,7 +507,6 @@ mod tests {
             tier: CompositionTier::Extended,
             mods: vec![managed_mod("sodium", "/home/alice/.minecraft --token secret")],
             jvm_preset: "performance".to_string(),
-            fallback_chain: Vec::new(),
             warnings: Vec::new(),
             fallback_reason:
                 r#"C:\Users\Alice\AppData\Roaming\.minecraft --accessToken secret {"provider":"payload"}"#

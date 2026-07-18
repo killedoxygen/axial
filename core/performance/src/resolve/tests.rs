@@ -76,10 +76,6 @@ fn family_c_forge_1_12_2_resolves_conservative_core_with_vanilla_fallback() {
     assert_eq!(plan.family, VersionFamily::C);
     assert_eq!(plan.loader, "forge");
     assert_eq!(plan.tier, CompositionTier::Core);
-    assert_eq!(
-        plan.fallback_chain,
-        vec!["family-c-vanilla-enhanced".to_string()]
-    );
     assert_eq!(count_mods_with_slug(&plan.mods, "foamfix"), 1);
     assert_eq!(count_mods_with_slug(&plan.mods, "ai-improvements"), 1);
     assert_eq!(count_mods_with_slug(&plan.mods, "clumps"), 1);
@@ -435,7 +431,7 @@ fn forge_family_e_and_f_resolve_extended_then_core_when_extended_disabled() {
         expected_family,
         extended_composition_id,
         core_composition_id,
-        vanilla_composition_id,
+        _vanilla_composition_id,
     ) in [
         (
             "1.20.1",
@@ -469,13 +465,6 @@ fn forge_family_e_and_f_resolve_extended_then_core_when_extended_disabled() {
             assert_eq!(plan.family, expected_family);
             assert_eq!(plan.loader, loader);
             assert_eq!(plan.tier, CompositionTier::Extended);
-            assert_eq!(
-                plan.fallback_chain,
-                vec![
-                    core_composition_id.to_string(),
-                    vanilla_composition_id.to_string()
-                ]
-            );
             assert_eq!(count_mods_with_slug(&plan.mods, "embeddium"), 1);
             assert_eq!(count_mods_with_slug(&plan.mods, "ferrite-core"), 1);
 
@@ -502,10 +491,6 @@ fn forge_family_e_and_f_resolve_extended_then_core_when_extended_disabled() {
             assert_eq!(fallback_plan.family, expected_family);
             assert_eq!(fallback_plan.loader, loader);
             assert_eq!(fallback_plan.tier, CompositionTier::Core);
-            assert_eq!(
-                fallback_plan.fallback_chain,
-                vec![vanilla_composition_id.to_string()]
-            );
             assert_eq!(count_mods_with_slug(&fallback_plan.mods, "embeddium"), 1);
             assert_eq!(count_mods_with_slug(&fallback_plan.mods, "ferrite-core"), 1);
             assert_eq!(
@@ -858,7 +843,7 @@ fn nvidium_is_skipped_when_iris_is_installed() {
 #[test]
 fn manifest_without_emergency_disables_is_not_current_schema() {
     let error = serde_json::from_value::<Manifest>(serde_json::json!({
-        "schema_version": 2,
+        "schema_version": 3,
         "generated_at": "2026-04-02T00:00:00Z",
         "minimum_app_version": "0.4.0-alpha",
         "rule_channel": "bundled",
@@ -873,7 +858,7 @@ fn manifest_without_emergency_disables_is_not_current_schema() {
 #[test]
 fn manifest_without_artifacts_is_not_current_schema() {
     let error = serde_json::from_value::<Manifest>(serde_json::json!({
-        "schema_version": 2,
+        "schema_version": 3,
         "generated_at": "2026-04-02T00:00:00Z",
         "minimum_app_version": "0.4.0-alpha",
         "rule_channel": "bundled",
@@ -888,7 +873,7 @@ fn manifest_without_artifacts_is_not_current_schema() {
 #[test]
 fn manifest_without_minimum_app_version_is_not_current_schema() {
     let error = serde_json::from_value::<Manifest>(serde_json::json!({
-        "schema_version": 2,
+        "schema_version": 3,
         "generated_at": "2026-04-02T00:00:00Z",
         "rule_channel": "bundled",
         "artifacts": [],
@@ -903,7 +888,7 @@ fn manifest_without_minimum_app_version_is_not_current_schema() {
 #[test]
 fn manifest_without_rule_channel_is_not_current_schema() {
     let error = serde_json::from_value::<Manifest>(serde_json::json!({
-        "schema_version": 2,
+        "schema_version": 3,
         "generated_at": "2026-04-02T00:00:00Z",
         "minimum_app_version": "0.4.0-alpha",
         "artifacts": [],
@@ -1061,7 +1046,7 @@ fn validation_rejects_noncanonical_artifact_provider_identities() {
 #[test]
 fn manifest_rejects_unverifiable_artifact_publisher_signature_fields() {
     let error = serde_json::from_value::<Manifest>(serde_json::json!({
-        "schema_version": 2,
+        "schema_version": 3,
         "generated_at": "2026-04-02T00:00:00Z",
         "minimum_app_version": "0.4.0-alpha",
         "rule_channel": "bundled",

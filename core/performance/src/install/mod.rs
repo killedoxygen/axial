@@ -1,10 +1,8 @@
 mod artifact;
-mod fallback;
 mod manager;
 mod model;
 mod mutation;
-mod plan;
-mod promotion;
+pub(crate) mod plan;
 mod rules_refresh;
 
 #[cfg(test)]

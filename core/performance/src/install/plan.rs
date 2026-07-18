@@ -1,5 +1,8 @@
 use crate::MANAGED_ARTIFACT_MAX_BYTES;
-use crate::types::{CompositionPlan, CompositionTier, PerformanceMode, VersionFamily};
+use crate::types::{
+    CompositionPlan, CompositionState, CompositionTier, ManagedDependencyStateEdge,
+    PerformanceMode, VersionFamily,
+};
 use reqwest::Url;
 use sha2::{Digest, Sha512};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -14,12 +17,6 @@ const MAX_DOWNLOAD_URL_BYTES: usize = 8192;
 const MODRINTH_ID_BYTES: usize = 8;
 const SHA512_HEX_BYTES: usize = 128;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub enum ManagedArtifactRole {
-    Root,
-    RequiredDependency,
-}
-
 impl ManagedArtifactRole {
     fn canonical_name(self) -> &'static str {
         match self {
@@ -28,6 +25,8 @@ impl ManagedArtifactRole {
         }
     }
 }
+
+pub use crate::types::ManagedArtifactRole;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ManagedArtifactPin {
@@ -284,8 +283,8 @@ impl ManagedCompositionInstallPlan {
             &game_version,
             &loader,
             aggregate_bytes,
-            &pins,
-            &edges,
+            pins.iter().map(CanonicalGraphNode::from_pin),
+            edges.iter().map(CanonicalGraphEdge::from_plan),
         );
 
         Ok(Self {
@@ -386,6 +385,8 @@ pub enum ManagedInstallPlanError {
     DependencyVersionMismatch,
     #[error("managed composition contains an unreachable required dependency")]
     UnreachableDependency,
+    #[error("managed composition graph digest is invalid")]
+    InvalidGraphDigest,
 }
 
 fn validate_modrinth_id(value: &str) -> Result<(), ()> {
@@ -499,15 +500,74 @@ fn validate_sha512(sha512: &str) -> Result<(), ManagedInstallPlanError> {
     }
 }
 
-fn graph_digest(
+#[derive(Clone, Copy)]
+struct CanonicalGraphNode<'a> {
+    project_id: &'a str,
+    version_id: &'a str,
+    filename: &'a str,
+    role: ManagedArtifactRole,
+    size: u64,
+    sha512: &'a str,
+}
+
+impl<'a> CanonicalGraphNode<'a> {
+    fn from_pin(pin: &'a ManagedArtifactPin) -> Self {
+        Self {
+            project_id: &pin.project_id,
+            version_id: &pin.version_id,
+            filename: &pin.filename,
+            role: pin.role,
+            size: pin.size,
+            sha512: &pin.sha512,
+        }
+    }
+
+    fn from_installed(installed: &'a crate::types::InstalledMod) -> Self {
+        Self {
+            project_id: &installed.project_id,
+            version_id: &installed.version_id,
+            filename: &installed.filename,
+            role: installed.role,
+            size: installed.size,
+            sha512: &installed.integrity.sha512,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct CanonicalGraphEdge<'a> {
+    parent_project_id: &'a str,
+    child_project_id: &'a str,
+    child_version_id: &'a str,
+}
+
+impl<'a> CanonicalGraphEdge<'a> {
+    fn from_plan(edge: &'a ManagedDependencyEdge) -> Self {
+        Self {
+            parent_project_id: &edge.parent_project_id,
+            child_project_id: &edge.child_project_id,
+            child_version_id: &edge.child_version_id,
+        }
+    }
+
+    fn from_state(edge: &'a ManagedDependencyStateEdge) -> Self {
+        Self {
+            parent_project_id: &edge.parent_project_id,
+            child_project_id: &edge.child_project_id,
+            child_version_id: &edge.child_version_id,
+        }
+    }
+}
+
+fn graph_digest<'a>(
     composition_id: &str,
     family: VersionFamily,
     tier: CompositionTier,
     game_version: &str,
     loader: &str,
     aggregate_bytes: u64,
-    pins: &[ManagedArtifactPin],
-    edges: &[ManagedDependencyEdge],
+    pins: impl ExactSizeIterator<Item = CanonicalGraphNode<'a>>,
+    edges: impl ExactSizeIterator<Item = CanonicalGraphEdge<'a>>,
 ) -> String {
     let mut hasher = Sha512::new();
     hash_field(
@@ -525,11 +585,8 @@ fn graph_digest(
         b"aggregate_bytes",
         &aggregate_bytes.to_be_bytes(),
     );
-    hash_field(
-        &mut hasher,
-        b"pin_count",
-        &(pins.len() as u64).to_be_bytes(),
-    );
+    let pin_count = pins.len();
+    hash_field(&mut hasher, b"pin_count", &(pin_count as u64).to_be_bytes());
     for pin in pins {
         hash_field(&mut hasher, b"pin_project", pin.project_id.as_bytes());
         hash_field(&mut hasher, b"pin_version", pin.version_id.as_bytes());
@@ -542,10 +599,11 @@ fn graph_digest(
         hash_field(&mut hasher, b"pin_size", &pin.size.to_be_bytes());
         hash_field(&mut hasher, b"pin_sha512", pin.sha512.as_bytes());
     }
+    let edge_count = edges.len();
     hash_field(
         &mut hasher,
         b"edge_count",
-        &(edges.len() as u64).to_be_bytes(),
+        &(edge_count as u64).to_be_bytes(),
     );
     for edge in edges {
         hash_field(
@@ -561,6 +619,140 @@ fn graph_digest(
         );
     }
     hex::encode(hasher.finalize())
+}
+
+pub(crate) fn validate_state_graph(
+    state: &CompositionState,
+) -> Result<(), ManagedInstallPlanError> {
+    let digest = canonical_state_graph_digest(state)?;
+    if digest != state.graph_sha512 {
+        return Err(ManagedInstallPlanError::InvalidGraphDigest);
+    }
+    Ok(())
+}
+
+pub(crate) fn canonical_state_graph_digest(
+    state: &CompositionState,
+) -> Result<String, ManagedInstallPlanError> {
+    if state.installed_mods.len() > MAX_MANAGED_PLAN_NODES {
+        return Err(ManagedInstallPlanError::TooManyArtifacts);
+    }
+    if state.dependency_edges.len() > MAX_MANAGED_PLAN_EDGES {
+        return Err(ManagedInstallPlanError::TooManyEdges);
+    }
+    validate_required_text(
+        &state.composition_id,
+        MAX_COMPOSITION_ID_BYTES,
+        ManagedInstallPlanError::InvalidCompositionId,
+    )?;
+    validate_target_value(&state.game_version)?;
+    validate_target_value(&state.loader)?;
+
+    let mut projects = BTreeMap::new();
+    let mut filenames = BTreeSet::new();
+    let mut aggregate_bytes = 0_u64;
+    let mut roots = BTreeSet::new();
+    let mut previous_project = None;
+    for (index, installed) in state.installed_mods.iter().enumerate() {
+        validate_modrinth_id(&installed.project_id)
+            .map_err(|_| ManagedInstallPlanError::InvalidProjectId)?;
+        validate_modrinth_id(&installed.version_id)
+            .map_err(|_| ManagedInstallPlanError::InvalidVersionId)?;
+        validate_portable_jar_filename(&installed.filename)?;
+        if installed.size == 0 || installed.size > MANAGED_ARTIFACT_MAX_BYTES {
+            return Err(ManagedInstallPlanError::InvalidArtifactSize);
+        }
+        validate_sha512(&installed.integrity.sha512)?;
+        if previous_project.is_some_and(|previous: &str| previous >= installed.project_id.as_str())
+        {
+            return Err(ManagedInstallPlanError::DuplicateArtifact);
+        }
+        previous_project = Some(&installed.project_id);
+        if projects
+            .insert(installed.project_id.clone(), index)
+            .is_some()
+        {
+            return Err(ManagedInstallPlanError::DuplicateArtifact);
+        }
+        if !filenames.insert(installed.filename.to_ascii_lowercase()) {
+            return Err(ManagedInstallPlanError::DuplicateFilename);
+        }
+        if installed.role == ManagedArtifactRole::Root {
+            roots.insert(installed.project_id.clone());
+        }
+        aggregate_bytes = aggregate_bytes
+            .checked_add(installed.size)
+            .filter(|bytes| *bytes <= MANAGED_ARTIFACT_MAX_BYTES)
+            .ok_or(ManagedInstallPlanError::ArtifactBytesExceeded)?;
+    }
+
+    let mut unique_edges = BTreeSet::new();
+    let mut adjacency = BTreeMap::<String, Vec<String>>::new();
+    let mut previous_edge = None;
+    for edge in &state.dependency_edges {
+        if previous_edge.is_some_and(|previous: &ManagedDependencyStateEdge| previous >= edge) {
+            return Err(ManagedInstallPlanError::DuplicateEdge);
+        }
+        previous_edge = Some(edge);
+        validate_modrinth_id(&edge.parent_project_id)
+            .map_err(|_| ManagedInstallPlanError::InvalidProjectId)?;
+        validate_modrinth_id(&edge.child_project_id)
+            .map_err(|_| ManagedInstallPlanError::InvalidProjectId)?;
+        validate_modrinth_id(&edge.child_version_id)
+            .map_err(|_| ManagedInstallPlanError::InvalidVersionId)?;
+        if !unique_edges.insert(edge.clone()) {
+            return Err(ManagedInstallPlanError::DuplicateEdge);
+        }
+        let Some(&child_index) = projects.get(&edge.child_project_id) else {
+            return Err(ManagedInstallPlanError::UnknownEdgeEndpoint);
+        };
+        if !projects.contains_key(&edge.parent_project_id) {
+            return Err(ManagedInstallPlanError::UnknownEdgeEndpoint);
+        }
+        if state.installed_mods[child_index].version_id != edge.child_version_id {
+            return Err(ManagedInstallPlanError::DependencyVersionMismatch);
+        }
+        adjacency
+            .entry(edge.parent_project_id.clone())
+            .or_default()
+            .push(edge.child_project_id.clone());
+    }
+
+    let mut reachable = roots.clone();
+    let mut queue = roots.into_iter().collect::<VecDeque<_>>();
+    while let Some(project_id) = queue.pop_front() {
+        if let Some(children) = adjacency.get(&project_id) {
+            for child in children {
+                if reachable.insert(child.clone()) {
+                    queue.push_back(child.clone());
+                }
+            }
+        }
+    }
+    if state.installed_mods.iter().any(|installed| {
+        installed.role == ManagedArtifactRole::RequiredDependency
+            && !reachable.contains(&installed.project_id)
+    }) {
+        return Err(ManagedInstallPlanError::UnreachableDependency);
+    }
+
+    let digest = graph_digest(
+        &state.composition_id,
+        state.family,
+        state.tier,
+        &state.game_version,
+        &state.loader,
+        aggregate_bytes,
+        state
+            .installed_mods
+            .iter()
+            .map(CanonicalGraphNode::from_installed),
+        state
+            .dependency_edges
+            .iter()
+            .map(CanonicalGraphEdge::from_state),
+    );
+    Ok(digest)
 }
 
 fn hash_field(hasher: &mut Sha512, label: &[u8], value: &[u8]) {
@@ -625,7 +817,6 @@ mod tests {
             tier: CompositionTier::Extended,
             mods: roots.iter().map(|root| managed_mod(root)).collect(),
             jvm_preset: String::new(),
-            fallback_chain: Vec::new(),
             warnings: Vec::new(),
             fallback_reason: String::new(),
         }
