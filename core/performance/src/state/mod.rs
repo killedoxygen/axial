@@ -2998,6 +2998,7 @@ fn quarantine_remove_admitted_file_inner(
     before_settlement(&parked);
     match settlement.settle_exact(&parked)? {
         crate::file_identity::ExactFileSettlement::Settled => Ok(()),
+        #[cfg(unix)]
         crate::file_identity::ExactFileSettlement::PathChanged => Err(StateError::InvalidState(
             "managed cleanup quarantine identity changed before settlement".to_string(),
         )),

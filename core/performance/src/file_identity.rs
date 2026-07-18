@@ -23,6 +23,7 @@ pub(crate) struct AdmittedFile {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ExactFileSettlement {
     Settled,
+    #[cfg(unix)]
     PathChanged,
 }
 
