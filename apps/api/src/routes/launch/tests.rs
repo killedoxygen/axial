@@ -21,6 +21,7 @@ use axum::{
     http::Request,
 };
 use serde_json::json;
+use sha2::Digest as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -3962,9 +3963,15 @@ fn write_family_c_proof_record(
 fn write_family_c_managed_state(fixture: &RouteTestFixture, instance_id: &str) {
     let mods_dir = fixture.state.instances().game_dir(instance_id).join("mods");
     std::fs::create_dir_all(&mods_dir).expect("create mods dir");
+    let state = family_c_managed_state();
+    for installed in &state.installed_mods {
+        let bytes = family_c_artifact_bytes(&installed.project_id);
+        std::fs::write(mods_dir.join(&installed.filename), bytes)
+            .expect("write family c managed artifact");
+    }
     std::fs::write(
         mods_dir.join(".axial-lock.json"),
-        managed_state_fixture_bytes(&family_c_managed_state()),
+        managed_state_fixture_bytes(&state),
     )
     .expect("write family c managed state");
 }
@@ -4055,20 +4062,25 @@ fn family_c_managed_state() -> axial_performance::CompositionState {
 }
 
 fn family_c_installed_mod(project_id: &str, filename: &str) -> axial_performance::InstalledMod {
+    let bytes = family_c_artifact_bytes(project_id);
     axial_performance::InstalledMod {
         project_id: project_id.to_string(),
         version_id: project_id.to_string(),
         filename: filename.to_string(),
         role: axial_performance::ManagedArtifactRole::Root,
-        size: 1,
+        size: bytes.len() as u64,
         ownership_class: axial_performance::OwnershipClass::CompositionManaged,
         source: axial_performance::ManagedArtifactSource {
             provider: axial_performance::ManagedArtifactProvider::Modrinth,
         },
         integrity: axial_performance::ManagedArtifactIntegrity {
-            sha512: "a".repeat(128),
+            sha512: hex::encode(sha2::Sha512::digest(bytes)),
         },
     }
+}
+
+fn family_c_artifact_bytes(project_id: &str) -> Vec<u8> {
+    format!("family-c-managed-artifact:{project_id}").into_bytes()
 }
 
 fn family_c_comparison() -> crate::state::launch_reports::LaunchProofComparison {

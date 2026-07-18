@@ -2891,10 +2891,11 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
-    #[test]
-    fn launch_report_persists_json_and_lists_recent_records() {
+    #[tokio::test]
+    async fn launch_report_persists_json_and_lists_recent_records() {
         let root = test_root("persist-list");
         let paths = test_paths(&root);
+        let store = LaunchReportStore::load_from_paths_for_test(&paths);
         let mut first = test_record("first");
         first.state = LaunchState::Exited;
         first.pid = Some(11);
@@ -2911,10 +2912,18 @@ mod tests {
             b"Description: Mod loading error\njava.lang.IllegalStateException: failed\nSuspected Mods: Example Machines (examplemachines) version 3.2.1\nJVM Flags: -Duser.home=/home/alice -Dtoken=raw-secret-token",
         );
 
-        let first_proof =
-            persist_test_report(&paths, &first, Some("2026-01-02T03:04:05.000Z"), "failed")
-                .expect("persist first report");
-        let second = persist_test_report(&paths, &test_record("second"), None, "running")
+        let first_proof = store
+            .persist(
+                first.clone(),
+                Some("2026-01-02T03:04:05.000Z".to_string()),
+                "failed".to_string(),
+                None,
+            )
+            .await
+            .expect("persist first report");
+        let second = store
+            .persist(test_record("second"), None, "running".to_string(), None)
+            .await
             .expect("persist second report");
 
         assert!(
@@ -2981,7 +2990,8 @@ mod tests {
                 .any(|report| report.session_id == second.session_id)
         );
 
-        let _ = fs::remove_dir_all(root);
+        drop(store);
+        fs::remove_dir_all(root).expect("remove launch report fixture");
     }
 
     #[test]
