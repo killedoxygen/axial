@@ -41,6 +41,27 @@ const ROLLBACK_TRANSIENT_MAX_BYTES: u64 =
 pub(crate) const RECOVERY_ENTRY_LIMIT: usize = 1024;
 const CLEANUP_QUARANTINE_MAX_BYTES: u64 = MANAGED_ARTIFACT_MAX_BYTES * 4;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RollbackDurabilityPoint {
+    DirectoryCreated,
+    ArtifactPublished,
+    ArtifactCopiesPublished,
+    ArtifactCopiesCleaned,
+    HistoryStaged,
+    HistoryCandidateCleaned,
+    HistoryPublished,
+    LatestStaged,
+    LatestBackedUp,
+    LatestPublished,
+    LatestRestored,
+}
+
+#[cfg(test)]
+thread_local! {
+    static ROLLBACK_DURABILITY_FAILURE: std::cell::Cell<Option<RollbackDurabilityPoint>> =
+        const { std::cell::Cell::new(None) };
+}
+
 #[derive(Debug, Error)]
 pub enum StateError {
     #[error("failed to read state: {0}")]
@@ -813,6 +834,7 @@ struct PlannedRollbackSnapshot {
 
 struct PlannedRollbackArtifact {
     source_path: PathBuf,
+    staged_path: PathBuf,
     stored_path: PathBuf,
     expected_bytes: u64,
     metadata: RollbackArtifact,
@@ -902,9 +924,12 @@ fn planned_rollback_artifact(
     expected_bytes: u64,
 ) -> Result<PlannedRollbackArtifact, StateError> {
     let stored_filename = format!("{snapshot_id}-{index}.bin");
+    let staged_filename = format!("{stored_filename}.new.tmp");
     validate_managed_filename(&stored_filename)?;
+    validate_managed_filename(&staged_filename)?;
     Ok(PlannedRollbackArtifact {
         source_path,
+        staged_path: rollback_files_dir_path(instance_mods_dir).join(staged_filename),
         stored_path: rollback_files_dir_path(instance_mods_dir).join(&stored_filename),
         expected_bytes,
         metadata: RollbackArtifact {
@@ -1012,96 +1037,156 @@ fn total_directory_files(
     Ok(())
 }
 
+enum RollbackMetadataPublicationFailure {
+    PrePublish(StateError),
+    Indeterminate(StateError),
+}
+
 fn commit_rollback_snapshot(
     instance_mods_dir: &Path,
     planned: &PlannedRollbackSnapshot,
     snapshot: &RollbackSnapshot,
 ) -> Result<(), StateError> {
     ensure_rollback_internal_roots(instance_mods_dir)?;
-    let mut copied_paths = Vec::new();
-    for artifact in &planned.artifacts {
-        if let Err(error) = copy_rollback_artifact(artifact) {
-            cleanup_created_rollback_artifacts(&copied_paths)?;
-            return Err(error);
-        }
-        copied_paths.push(artifact.stored_path.as_path());
-    }
     let history_path = rollback_history_file_path(instance_mods_dir, &snapshot.id);
-    let history_temp = match stage_new_rollback_snapshot(&history_path, snapshot) {
-        Ok(temp_path) => temp_path,
-        Err(error) => {
-            cleanup_created_rollback_artifacts(&copied_paths)?;
-            return Err(error);
-        }
-    };
-    if let Err(error) = write_rollback_snapshot(&rollback_file_path(instance_mods_dir), snapshot) {
-        let history_cleanup = remove_owned_file(&history_temp);
-        let artifact_cleanup = cleanup_created_rollback_artifacts(&copied_paths);
-        match (artifact_cleanup, history_cleanup) {
-            (Err(cleanup), _) | (Ok(()), Err(cleanup)) => return Err(cleanup),
-            (Ok(()), Ok(())) => {}
-        }
+    let history_temp = stage_new_rollback_snapshot(&history_path, snapshot)?;
+    if let Err(error) = sync_rollback_directory(
+        &rollback_history_dir_path(instance_mods_dir),
+        RollbackDurabilityPoint::HistoryStaged,
+    ) {
+        cleanup_unpublished_rollback_candidate(instance_mods_dir, &history_temp, snapshot)?;
         return Err(error);
     }
-    if let Err(error) = fs::hard_link(&history_temp, history_path) {
-        return Err(StateError::Read(error));
+    for artifact in &planned.artifacts {
+        if let Err(failure) = copy_rollback_artifact(artifact) {
+            if !failure.published {
+                cleanup_unpublished_rollback_candidate(instance_mods_dir, &history_temp, snapshot)?;
+            }
+            return Err(failure.error);
+        }
     }
-    remove_owned_file(&history_temp)?;
-    Ok(())
+    if let Err(error) = sync_rollback_directory(
+        &rollback_files_dir_path(instance_mods_dir),
+        RollbackDurabilityPoint::ArtifactCopiesPublished,
+    ) {
+        cleanup_unpublished_rollback_candidate(instance_mods_dir, &history_temp, snapshot)?;
+        return Err(error);
+    }
+    if let Err(failure) = durable_rollback_rename(
+        &history_temp,
+        &history_path,
+        RollbackDurabilityPoint::HistoryPublished,
+    ) {
+        if !failure.renamed {
+            cleanup_unpublished_rollback_candidate(instance_mods_dir, &history_temp, snapshot)?;
+        }
+        return Err(failure.error);
+    }
+    write_rollback_snapshot(&rollback_file_path(instance_mods_dir), snapshot).map_err(|failure| {
+        match failure {
+            RollbackMetadataPublicationFailure::PrePublish(error)
+            | RollbackMetadataPublicationFailure::Indeterminate(error) => error,
+        }
+    })
 }
 
-fn copy_rollback_artifact(artifact: &PlannedRollbackArtifact) -> Result<(), StateError> {
-    let source_metadata = fs::symlink_metadata(&artifact.source_path)?;
-    if !source_metadata.file_type().is_file() || source_metadata.len() != artifact.expected_bytes {
+struct RollbackArtifactCopyFailure {
+    error: StateError,
+    published: bool,
+}
+
+fn copy_rollback_artifact(
+    artifact: &PlannedRollbackArtifact,
+) -> Result<(), RollbackArtifactCopyFailure> {
+    stage_rollback_artifact_copy(artifact).map_err(|error| RollbackArtifactCopyFailure {
+        error,
+        published: false,
+    })?;
+    match durable_rollback_rename(
+        &artifact.staged_path,
+        &artifact.stored_path,
+        RollbackDurabilityPoint::ArtifactPublished,
+    ) {
+        Ok(()) => Ok(()),
+        Err(failure) if failure.renamed => Err(RollbackArtifactCopyFailure {
+            error: failure.error,
+            published: true,
+        }),
+        Err(failure) => {
+            remove_owned_file(&artifact.staged_path).map_err(|error| {
+                RollbackArtifactCopyFailure {
+                    error,
+                    published: false,
+                }
+            })?;
+            Err(RollbackArtifactCopyFailure {
+                error: failure.error,
+                published: false,
+            })
+        }
+    }
+}
+
+fn stage_rollback_artifact_copy(artifact: &PlannedRollbackArtifact) -> Result<(), StateError> {
+    let admitted_source = crate::file_identity::admit(&artifact.source_path).map_err(|error| {
+        identity_admission_error(
+            error,
+            StateError::InvalidRollback(format!(
+                "managed rollback source {} changed before copy",
+                artifact.metadata.filename
+            )),
+        )
+    })?;
+    if admitted_source.metadata().len() != artifact.expected_bytes {
         return Err(StateError::InvalidRollback(format!(
             "managed rollback source {} changed before copy",
             artifact.metadata.filename
         )));
     }
-    let source = fs::File::open(&artifact.source_path)?;
-    let opened_metadata = source.metadata()?;
-    if !opened_metadata.is_file() || opened_metadata.len() != artifact.expected_bytes {
-        return Err(StateError::InvalidRollback(format!(
-            "managed rollback source {} changed before copy",
-            artifact.metadata.filename
-        )));
-    }
+    let source_identity = admitted_source.identity();
+    let source = admitted_source.into_file();
     let mut destination = fs::OpenOptions::new()
         .write(true)
         .create_new(true)
-        .open(&artifact.stored_path)?;
+        .open(&artifact.staged_path)?;
     let result = (|| {
         let copied = std::io::copy(
             &mut source.take(artifact.expected_bytes.saturating_add(1)),
             &mut destination,
         )?;
-        destination.flush()?;
+        destination.sync_all()?;
         Ok::<u64, std::io::Error>(copied)
     })();
     let copied = match result {
         Ok(copied) => copied,
         Err(error) => {
             drop(destination);
-            remove_owned_file(&artifact.stored_path)?;
+            remove_owned_file(&artifact.staged_path)?;
             return Err(StateError::Read(error));
         }
     };
     if copied != artifact.expected_bytes {
         drop(destination);
-        remove_owned_file(&artifact.stored_path)?;
+        remove_owned_file(&artifact.staged_path)?;
         return Err(StateError::InvalidRollback(format!(
             "managed rollback source {} changed during copy",
             artifact.metadata.filename
         )));
     }
-    let source_digest = bounded_file_sha512(&artifact.source_path, artifact.expected_bytes)?;
-    let stored_digest = bounded_file_sha512(&artifact.stored_path, artifact.expected_bytes)?;
+    drop(destination);
+    let (source_digest, revalidated_source_identity) =
+        admit_bounded_file_sha512(&artifact.source_path, artifact.expected_bytes)?;
+    let (stored_digest, stored_identity) =
+        admit_bounded_file_sha512(&artifact.staged_path, artifact.expected_bytes)?;
     let expected_digest = &artifact.metadata.sha512;
-    if source_digest.is_empty()
+    if revalidated_source_identity != Some(source_identity)
+        || stored_identity.is_none()
+        || stored_identity == Some(source_identity)
+        || source_digest.is_empty()
         || stored_digest != source_digest
         || !hex::encode(stored_digest).eq_ignore_ascii_case(expected_digest)
     {
-        remove_owned_file(&artifact.stored_path)?;
+        remove_owned_file(&artifact.staged_path)?;
         return Err(StateError::InvalidIntegrity {
             filename: artifact.metadata.filename.clone(),
             reason: "rollback copy does not match the recorded ownership digest".to_string(),
@@ -1119,11 +1204,36 @@ fn cleanup_created_rollback_artifacts(paths: &[&Path]) -> Result<(), StateError>
             first_error = Some(error);
         }
     }
-    if let Some(error) = first_error {
-        Err(error)
-    } else {
-        Ok(())
+    first_error.map_or(Ok(()), Err)
+}
+
+fn cleanup_unpublished_rollback_candidate(
+    instance_mods_dir: &Path,
+    history_temp: &Path,
+    snapshot: &RollbackSnapshot,
+) -> Result<(), StateError> {
+    if read_rollback_snapshot_file(history_temp)? != *snapshot {
+        return Err(StateError::InvalidRollback(
+            "rollback candidate manifest changed before cleanup".to_string(),
+        ));
     }
+    cleanup_abandoned_snapshot_artifacts(instance_mods_dir, snapshot)?;
+    sync_rollback_directory(
+        &rollback_files_dir_path(instance_mods_dir),
+        RollbackDurabilityPoint::ArtifactCopiesCleaned,
+    )?;
+    remove_rollback_history_candidate(instance_mods_dir, history_temp)
+}
+
+fn remove_rollback_history_candidate(
+    instance_mods_dir: &Path,
+    history_temp: &Path,
+) -> Result<(), StateError> {
+    remove_owned_file(history_temp)?;
+    sync_rollback_directory(
+        &rollback_history_dir_path(instance_mods_dir),
+        RollbackDurabilityPoint::HistoryCandidateCleaned,
+    )
 }
 
 fn finish_rollback_retention(instance_mods_dir: &Path) -> Result<(), StateError> {
@@ -2200,6 +2310,9 @@ fn ensure_managed_directory(path: &Path) -> Result<(), StateError> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             fs::create_dir(path)?;
             if validate_existing_directory(path)? {
+                if let Some(parent) = path.parent() {
+                    sync_rollback_directory(parent, RollbackDurabilityPoint::DirectoryCreated)?;
+                }
                 Ok(())
             } else {
                 Err(StateError::InvalidRollback(
@@ -2209,6 +2322,93 @@ fn ensure_managed_directory(path: &Path) -> Result<(), StateError> {
         }
         Err(error) => Err(StateError::Read(error)),
     }
+}
+
+#[derive(Debug)]
+struct RollbackRenameFailure {
+    error: StateError,
+    renamed: bool,
+}
+
+fn inject_rollback_durability_failure(_point: RollbackDurabilityPoint) -> Result<(), StateError> {
+    #[cfg(test)]
+    if ROLLBACK_DURABILITY_FAILURE.with(|failure| {
+        if failure.get() == Some(_point) {
+            failure.set(None);
+            true
+        } else {
+            false
+        }
+    }) {
+        return Err(StateError::Read(std::io::Error::other(format!(
+            "injected rollback durability failure at {_point:?}"
+        ))));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn sync_rollback_directory(path: &Path, point: RollbackDurabilityPoint) -> Result<(), StateError> {
+    inject_rollback_durability_failure(point)?;
+    fs::File::open(path)?.sync_all()?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn sync_rollback_directory(_path: &Path, point: RollbackDurabilityPoint) -> Result<(), StateError> {
+    inject_rollback_durability_failure(point)
+}
+
+fn durable_rollback_rename(
+    source: &Path,
+    destination: &Path,
+    point: RollbackDurabilityPoint,
+) -> Result<(), RollbackRenameFailure> {
+    let source_parent = source.parent().ok_or_else(|| RollbackRenameFailure {
+        error: StateError::InvalidRollback("rollback source parent is invalid".to_string()),
+        renamed: false,
+    })?;
+    let destination_parent = destination.parent().ok_or_else(|| RollbackRenameFailure {
+        error: StateError::InvalidRollback("rollback destination parent is invalid".to_string()),
+        renamed: false,
+    })?;
+    let source_name = source
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| RollbackRenameFailure {
+            error: StateError::InvalidRollback("rollback source name is invalid".to_string()),
+            renamed: false,
+        })?;
+    let destination_name = destination
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| RollbackRenameFailure {
+            error: StateError::InvalidRollback("rollback destination name is invalid".to_string()),
+            renamed: false,
+        })?;
+    let source_anchor =
+        AnchoredDirectory::open(source_parent).map_err(|error| RollbackRenameFailure {
+            error: StateError::Read(error),
+            renamed: false,
+        })?;
+    let destination_anchor =
+        AnchoredDirectory::open(destination_parent).map_err(|error| RollbackRenameFailure {
+            error: StateError::Read(error),
+            renamed: false,
+        })?;
+    if let Err(error) =
+        source_anchor.rename_file_no_replace(source_name, &destination_anchor, destination_name)
+    {
+        let renamed = !source.exists() && destination.exists();
+        return Err(RollbackRenameFailure {
+            error: StateError::Read(error),
+            renamed,
+        });
+    }
+    inject_rollback_durability_failure(point).map_err(|error| RollbackRenameFailure {
+        error,
+        renamed: true,
+    })
 }
 
 fn validate_rollback_snapshot(snapshot: &RollbackSnapshot) -> Result<(), StateError> {
@@ -3342,7 +3542,12 @@ fn ensure_recovery_directory(path: &Path) -> Result<(), StateError> {
                 Err(error) => return Err(StateError::Read(error)),
             }
             match fs::symlink_metadata(path) {
-                Ok(metadata) if metadata.file_type().is_dir() => Ok(()),
+                Ok(metadata) if metadata.file_type().is_dir() => {
+                    if let Some(parent) = path.parent() {
+                        sync_rollback_directory(parent, RollbackDurabilityPoint::DirectoryCreated)?;
+                    }
+                    Ok(())
+                }
                 Ok(_) => Err(StateError::InvalidState(
                     "managed recovery directory was not created safely".to_string(),
                 )),
@@ -3406,7 +3611,7 @@ fn cleanup_proven_history_temps(instance_mods_dir: &Path) -> Result<(), StateErr
         }
         match fs::symlink_metadata(&final_path) {
             Ok(_) if temp == read_bounded_regular_metadata_file(&final_path)? => {
-                remove_owned_file(&temp_path)?;
+                remove_rollback_history_candidate(instance_mods_dir, &temp_path)?;
                 continue;
             }
             Ok(_) => {
@@ -3425,11 +3630,16 @@ fn cleanup_proven_history_temps(instance_mods_dir: &Path) -> Result<(), StateErr
             Err(error) => return Err(StateError::Read(error)),
         };
         if matches_latest {
-            fs::hard_link(&temp_path, &final_path)?;
-        } else {
-            cleanup_abandoned_snapshot_artifacts(instance_mods_dir, &snapshot)?;
+            return Err(StateError::InvalidRollback(
+                "latest rollback metadata has no canonical history record".to_string(),
+            ));
         }
-        remove_owned_file(&temp_path)?;
+        cleanup_abandoned_snapshot_artifacts(instance_mods_dir, &snapshot)?;
+        sync_rollback_directory(
+            &rollback_files_dir_path(instance_mods_dir),
+            RollbackDurabilityPoint::ArtifactCopiesCleaned,
+        )?;
+        remove_rollback_history_candidate(instance_mods_dir, &temp_path)?;
     }
     Ok(())
 }
@@ -3684,6 +3894,8 @@ fn cleanup_abandoned_snapshot_artifacts(
             ));
         }
         let path = rollback_files_dir_path(instance_mods_dir).join(&artifact.stored_filename);
+        let staged = rollback_files_dir_path(instance_mods_dir)
+            .join(format!("{}.new.tmp", artifact.stored_filename));
         if path_exists(&path)? {
             if !path_matches_sha512(&path, &artifact.sha512)? {
                 return Err(StateError::InvalidRollback(
@@ -3691,6 +3903,15 @@ fn cleanup_abandoned_snapshot_artifacts(
                 ));
             }
             remove_file_matching_sha512(&path, &artifact.sha512, MANAGED_ARTIFACT_MAX_BYTES)?;
+        }
+        if path_exists(&staged)? {
+            let metadata = fs::symlink_metadata(&staged)?;
+            if !metadata.file_type().is_file() || metadata.len() > MANAGED_ARTIFACT_MAX_BYTES {
+                return Err(StateError::InvalidRollback(
+                    "abandoned rollback staging ownership cannot be proven".to_string(),
+                ));
+            }
+            remove_owned_file(&staged)?;
         }
     }
     Ok(())
@@ -3712,12 +3933,18 @@ fn cleanup_proven_latest_temp(instance_mods_dir: &Path) -> Result<(), StateError
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
         Err(error) => return Err(StateError::Read(error)),
     };
+    let history_path = rollback_history_file_path(instance_mods_dir, &temp_snapshot.id);
+    let matches_history = match fs::symlink_metadata(&history_path) {
+        Ok(_) => temp_data == read_bounded_regular_metadata_file(&history_path)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => return Err(StateError::Read(error)),
+    };
     let candidate_artifacts_absent = temp_snapshot.artifacts.iter().all(|artifact| {
         !rollback_files_dir_path(instance_mods_dir)
             .join(&artifact.stored_filename)
             .exists()
     });
-    if !matches_latest && !candidate_artifacts_absent {
+    if !matches_latest && !matches_history && !candidate_artifacts_absent {
         return Err(StateError::InvalidRollback(
             "latest rollback temp ownership cannot be proven".to_string(),
         ));
@@ -3763,25 +3990,44 @@ fn read_rollback_snapshot_file(path: &Path) -> Result<RollbackSnapshot, StateErr
     Ok(snapshot)
 }
 
-fn write_rollback_snapshot(path: &Path, snapshot: &RollbackSnapshot) -> Result<(), StateError> {
-    let data = serde_json::to_vec_pretty(snapshot)?;
+fn write_rollback_snapshot(
+    path: &Path,
+    snapshot: &RollbackSnapshot,
+) -> Result<(), RollbackMetadataPublicationFailure> {
+    let data = serde_json::to_vec_pretty(snapshot)
+        .map_err(StateError::from)
+        .map_err(RollbackMetadataPublicationFailure::PrePublish)?;
     if data.len() as u64 > ROLLBACK_METADATA_MAX_BYTES {
-        return Err(StateError::InvalidRollback(
-            "rollback metadata exceeds the byte budget".to_string(),
+        return Err(RollbackMetadataPublicationFailure::PrePublish(
+            StateError::InvalidRollback("rollback metadata exceeds the byte budget".to_string()),
         ));
     }
-    reconcile_rollback_metadata_publication_for_write(path)?;
+    reconcile_rollback_metadata_publication_for_write(path)
+        .map_err(RollbackMetadataPublicationFailure::PrePublish)?;
     let temp_path = path.with_extension("json.tmp");
     let mut temp = fs::OpenOptions::new()
         .write(true)
         .create_new(true)
-        .open(&temp_path)?;
+        .open(&temp_path)
+        .map_err(StateError::Read)
+        .map_err(RollbackMetadataPublicationFailure::PrePublish)?;
     if let Err(error) = temp.write_all(&data).and_then(|()| temp.sync_all()) {
         drop(temp);
-        remove_owned_file(&temp_path)?;
-        return Err(StateError::Read(error));
+        remove_owned_file(&temp_path).map_err(RollbackMetadataPublicationFailure::PrePublish)?;
+        return Err(RollbackMetadataPublicationFailure::PrePublish(
+            StateError::Read(error),
+        ));
     }
     drop(temp);
+    let parent = path.parent().ok_or_else(|| {
+        RollbackMetadataPublicationFailure::PrePublish(StateError::InvalidRollback(
+            "rollback metadata parent is invalid".to_string(),
+        ))
+    })?;
+    if let Err(error) = sync_rollback_directory(parent, RollbackDurabilityPoint::LatestStaged) {
+        remove_owned_file(&temp_path).map_err(RollbackMetadataPublicationFailure::PrePublish)?;
+        return Err(RollbackMetadataPublicationFailure::PrePublish(error));
+    }
     publish_rollback_metadata(&temp_path, path)
 }
 
@@ -3828,7 +4074,8 @@ fn reconcile_rollback_metadata_publication(path: &Path) -> Result<(), StateError
         Some(_) => {
             remove_file_matching_sha512(&backup, &previous_sha512, ROLLBACK_METADATA_MAX_BYTES)
         }
-        None => fs::rename(backup, path).map_err(StateError::Read),
+        None => durable_rollback_rename(&backup, path, RollbackDurabilityPoint::LatestRestored)
+            .map_err(|failure| failure.error),
     }
 }
 
@@ -3846,35 +4093,79 @@ pub(crate) fn reconcile_rollback_metadata(instance_mods_dir: &Path) -> Result<()
     reconcile_rollback_metadata_publication(&rollback_file_path(instance_mods_dir))
 }
 
-fn publish_rollback_metadata(temp_path: &Path, path: &Path) -> Result<(), StateError> {
+fn publish_rollback_metadata(
+    temp_path: &Path,
+    path: &Path,
+) -> Result<(), RollbackMetadataPublicationFailure> {
     let backup = rollback_metadata_backup_path(path);
     let backup_sha512 = match fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_file() => {
-            let admitted_sha512 = admitted_rollback_file_sha512(path)?;
-            reserve_backup_exclusive(
-                path,
-                &backup,
-                StatePublicationPhase::Backup,
-                Some(&admitted_sha512),
-            )?;
+            let admitted_sha512 = admitted_rollback_file_sha512(path)
+                .map_err(RollbackMetadataPublicationFailure::PrePublish)?;
+            let admitted_identity = admit_file_identity(path)
+                .map_err(StateError::Read)
+                .map_err(RollbackMetadataPublicationFailure::PrePublish)?;
+            durable_rollback_rename(path, &backup, RollbackDurabilityPoint::LatestBackedUp)
+                .map_err(|failure| RollbackMetadataPublicationFailure::PrePublish(failure.error))?;
+            let backup_matches =
+                crate::file_identity::revalidate(&backup, admitted_identity.0, admitted_identity.1)
+                    .is_ok()
+                    && admitted_rollback_file_sha512(&backup)
+                        .is_ok_and(|digest| digest == admitted_sha512);
+            if !backup_matches {
+                if path_exists(&backup).map_err(RollbackMetadataPublicationFailure::PrePublish)?
+                    && !path_exists(path).map_err(RollbackMetadataPublicationFailure::PrePublish)?
+                {
+                    durable_rollback_rename(&backup, path, RollbackDurabilityPoint::LatestRestored)
+                        .map_err(|restore| {
+                            RollbackMetadataPublicationFailure::PrePublish(restore.error)
+                        })?;
+                }
+                return Err(RollbackMetadataPublicationFailure::PrePublish(
+                    StateError::InvalidRollback(
+                        "rollback metadata backup ownership cannot be proven".to_string(),
+                    ),
+                ));
+            }
             Some(admitted_sha512)
         }
         Ok(_) => {
-            return Err(StateError::InvalidRollback(
-                "rollback metadata destination is not a regular file".to_string(),
+            return Err(RollbackMetadataPublicationFailure::PrePublish(
+                StateError::InvalidRollback(
+                    "rollback metadata destination is not a regular file".to_string(),
+                ),
             ));
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-        Err(error) => return Err(StateError::Read(error)),
-    };
-    if let Err(error) = fs::rename(temp_path, path) {
-        if path_exists(&backup)? && !path_exists(path)? {
-            fs::rename(&backup, path)?;
+        Err(error) => {
+            return Err(RollbackMetadataPublicationFailure::PrePublish(
+                StateError::Read(error),
+            ));
         }
-        return Err(StateError::Read(error));
+    };
+    if let Err(failure) =
+        durable_rollback_rename(temp_path, path, RollbackDurabilityPoint::LatestPublished)
+    {
+        if failure.renamed {
+            return Err(RollbackMetadataPublicationFailure::Indeterminate(
+                failure.error,
+            ));
+        }
+        let backup_exists =
+            path_exists(&backup).map_err(RollbackMetadataPublicationFailure::PrePublish)?;
+        let latest_exists =
+            path_exists(path).map_err(RollbackMetadataPublicationFailure::PrePublish)?;
+        if backup_exists && !latest_exists {
+            durable_rollback_rename(&backup, path, RollbackDurabilityPoint::LatestRestored)
+                .map_err(|restore| RollbackMetadataPublicationFailure::PrePublish(restore.error))?;
+        }
+        return Err(RollbackMetadataPublicationFailure::PrePublish(
+            failure.error,
+        ));
     }
     if let Some(backup_sha512) = backup_sha512 {
-        remove_file_matching_sha512(&backup, &backup_sha512, ROLLBACK_METADATA_MAX_BYTES)?;
+        remove_file_matching_sha512(&backup, &backup_sha512, ROLLBACK_METADATA_MAX_BYTES)
+            .map_err(RollbackMetadataPublicationFailure::Indeterminate)?;
     }
     Ok(())
 }
@@ -3896,7 +4187,10 @@ fn stage_new_rollback_snapshot(
         .write(true)
         .create_new(true)
         .open(&temp_path)?;
-    if let Err(error) = file.write_all(data.as_bytes()).and_then(|()| file.flush()) {
+    if let Err(error) = file
+        .write_all(data.as_bytes())
+        .and_then(|()| file.sync_all())
+    {
         drop(file);
         remove_owned_file(&temp_path)?;
         return Err(StateError::Read(error));
@@ -4116,6 +4410,20 @@ mod tests {
                 panic!("expected rollback to restore a managed composition")
             }
         }
+    }
+
+    fn with_rollback_durability_failure<T>(
+        point: RollbackDurabilityPoint,
+        operation: impl FnOnce() -> T,
+    ) -> T {
+        ROLLBACK_DURABILITY_FAILURE.with(|failure| {
+            assert_eq!(failure.replace(Some(point)), None);
+        });
+        let result = operation();
+        ROLLBACK_DURABILITY_FAILURE.with(|failure| {
+            assert_eq!(failure.replace(None), None, "fault point was not reached");
+        });
+        result
     }
 
     #[test]
@@ -4754,6 +5062,421 @@ mod tests {
     }
 
     #[test]
+    fn rollback_snapshot_is_independent_from_live_in_place_corruption() {
+        let root = test_root("snapshot-independent-copy");
+        let live_path = root.join("managed-a.jar");
+        fs::write(&live_path, b"managed-a").expect("write managed artifact");
+        let live = crate::file_identity::admit(&live_path).expect("admit live artifact");
+        let live_identity = live.identity();
+        let live_len = live.metadata().len();
+        drop(live);
+
+        let snapshot = save_rollback_snapshot(
+            &root,
+            &test_state("core-a", vec![test_mod("sodium", "managed-a.jar")]),
+        )
+        .expect("save rollback snapshot");
+        let stored_path =
+            rollback_files_dir_path(&root).join(&snapshot.artifacts[0].stored_filename);
+        let stored = crate::file_identity::admit(&stored_path).expect("admit stored artifact");
+        assert_ne!(stored.identity(), live_identity);
+        drop(stored);
+
+        let mut live = fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&live_path)
+            .expect("open live artifact in place");
+        live.write_all(b"corrupt-a")
+            .and_then(|()| live.sync_all())
+            .expect("corrupt live artifact in place");
+        drop(live);
+        crate::file_identity::revalidate(&live_path, live_identity, live_len)
+            .expect("live corruption retained physical identity");
+
+        assert_eq!(
+            fs::read(&stored_path).expect("read independent stored artifact"),
+            b"managed-a"
+        );
+        assert!(
+            path_matches_sha512(&stored_path, &snapshot.artifacts[0].sha512)
+                .expect("verify retained rollback artifact")
+        );
+
+        fs::remove_file(&live_path).expect("remove corrupt live artifact");
+        let restored = restored_composition(
+            restore_rollback_snapshot(&root, &snapshot).expect("restore independent snapshot"),
+        );
+        assert_eq!(restored.composition_id, "core-a");
+        assert_eq!(
+            fs::read(live_path).expect("read restored artifact"),
+            b"managed-a"
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn rollback_snapshot_cleans_artifacts_when_files_directory_sync_fails() {
+        let root = test_root("snapshot-files-sync-failure");
+        fs::write(root.join("managed-a.jar"), b"managed-a").expect("write managed artifact");
+        let state = test_state("core-a", vec![test_mod("sodium", "managed-a.jar")]);
+
+        let error = with_rollback_durability_failure(
+            RollbackDurabilityPoint::ArtifactCopiesPublished,
+            || save_rollback_snapshot(&root, &state),
+        )
+        .expect_err("files directory sync failure must reject snapshot");
+
+        assert!(matches!(error, StateError::Read(_)));
+        assert_eq!(
+            fs::read_dir(rollback_files_dir_path(&root))
+                .expect("read rollback files")
+                .count(),
+            0
+        );
+        assert_eq!(
+            fs::read_dir(rollback_history_dir_path(&root))
+                .expect("read rollback history")
+                .count(),
+            0
+        );
+        assert!(!rollback_file_path(&root).exists());
+        save_rollback_snapshot(&root, &state).expect("retry snapshot after settled cleanup");
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn rollback_snapshot_cleans_candidate_when_history_directory_sync_fails() {
+        let root = test_root("snapshot-history-sync-failure");
+        fs::write(root.join("managed-a.jar"), b"managed-a").expect("write managed artifact");
+        let state = test_state("core-a", vec![test_mod("sodium", "managed-a.jar")]);
+
+        let error =
+            with_rollback_durability_failure(RollbackDurabilityPoint::HistoryStaged, || {
+                save_rollback_snapshot(&root, &state)
+            })
+            .expect_err("history directory sync failure must reject snapshot");
+
+        assert!(matches!(error, StateError::Read(_)));
+        assert_eq!(
+            fs::read_dir(rollback_files_dir_path(&root))
+                .expect("read rollback files")
+                .count(),
+            0
+        );
+        assert_eq!(
+            fs::read_dir(rollback_history_dir_path(&root))
+                .expect("read rollback history")
+                .count(),
+            0
+        );
+        assert!(!rollback_file_path(&root).exists());
+        save_rollback_snapshot(&root, &state).expect("retry snapshot after settled cleanup");
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn rollback_snapshot_preserves_canonical_history_after_latest_sync_failure() {
+        let root = test_root("snapshot-latest-sync-failure");
+        fs::write(root.join("managed-a.jar"), b"managed-a").expect("write managed artifact");
+        let state = test_state("core-a", vec![test_mod("sodium", "managed-a.jar")]);
+
+        let error =
+            with_rollback_durability_failure(RollbackDurabilityPoint::LatestPublished, || {
+                save_rollback_snapshot(&root, &state)
+            })
+            .expect_err("latest sync failure must report an indeterminate publication");
+
+        assert!(matches!(error, StateError::Read(_)));
+        let latest = load_rollback_snapshot(&root)
+            .expect("load latest after reported sync failure")
+            .expect("latest remains readable");
+        let history = rollback_history_file_path(&root, &latest.id);
+        assert_eq!(
+            read_bounded_regular_metadata_file(&history).expect("read canonical history"),
+            read_bounded_regular_metadata_file(&rollback_file_path(&root)).expect("read latest")
+        );
+        assert!(
+            rollback_files_dir_path(&root)
+                .join(&latest.artifacts[0].stored_filename)
+                .exists(),
+            "indeterminate latest publication must retain backing artifacts"
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn rollback_snapshot_preserves_history_when_latest_backup_sync_fails() {
+        let root = test_root("snapshot-backup-sync-failure");
+        fs::write(root.join("managed-a.jar"), b"managed-a").expect("write managed artifact");
+        let retained = save_rollback_snapshot(
+            &root,
+            &test_state("core-a", vec![test_mod("sodium", "managed-a.jar")]),
+        )
+        .expect("save retained snapshot");
+        let successor_state = test_state("core-b", vec![test_mod("sodium", "managed-a.jar")]);
+
+        let error =
+            with_rollback_durability_failure(RollbackDurabilityPoint::LatestBackedUp, || {
+                save_rollback_snapshot(&root, &successor_state)
+            })
+            .expect_err("latest backup sync failure must reject publication");
+
+        assert!(matches!(error, StateError::Read(_)));
+        assert!(!rollback_file_path(&root).exists());
+        assert!(rollback_metadata_backup_path(&rollback_file_path(&root)).exists());
+        reconcile_rollback_metadata(&root).expect("restore retained latest from backup");
+        assert_eq!(
+            load_rollback_snapshot_admitted(&root)
+                .expect("load reconciled latest")
+                .expect("reconciled latest exists")
+                .id,
+            retained.id
+        );
+        let records = load_retained_rollback_snapshots(&root).expect("load retained history");
+        assert_eq!(records.len(), 2);
+        assert!(records.iter().all(|record| {
+            record.snapshot.artifacts.iter().all(|artifact| {
+                rollback_files_dir_path(&root)
+                    .join(&artifact.stored_filename)
+                    .exists()
+            })
+        }));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn rollback_backup_reconciliation_survives_restore_sync_failure() {
+        let root = test_root("snapshot-backup-reconcile-sync-failure");
+        fs::write(root.join("managed-a.jar"), b"managed-a").expect("write managed artifact");
+        let retained = save_rollback_snapshot(
+            &root,
+            &test_state("core-a", vec![test_mod("sodium", "managed-a.jar")]),
+        )
+        .expect("save retained snapshot");
+        let latest = rollback_file_path(&root);
+        let backup = rollback_metadata_backup_path(&latest);
+        fs::rename(&latest, &backup).expect("stage backup reconciliation obligation");
+
+        let error =
+            with_rollback_durability_failure(RollbackDurabilityPoint::LatestRestored, || {
+                reconcile_rollback_metadata(&root)
+            })
+            .expect_err("restored latest sync failure must remain recoverable");
+
+        assert!(matches!(error, StateError::Read(_)));
+        assert!(latest.exists());
+        assert!(!backup.exists());
+        reconcile_rollback_metadata(&root).expect("reconcile already-restored latest");
+        assert_eq!(
+            load_rollback_snapshot_admitted(&root)
+                .expect("load latest")
+                .expect("latest exists")
+                .id,
+            retained.id
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn rollback_history_publication_preserves_preexisting_canonical_collision() {
+        let root = test_root("snapshot-history-collision");
+        fs::write(root.join("managed-a.jar"), b"managed-a").expect("write managed artifact");
+        let state = test_state("core-a", vec![test_mod("sodium", "managed-a.jar")]);
+        let (planned, snapshot) = test_snapshot_candidate(&root, &state, "rb-history-collision");
+        ensure_rollback_internal_roots(&root).expect("create rollback roots");
+        let collision = rollback_history_file_path(&root, &snapshot.id);
+        fs::write(&collision, b"user-collision").expect("write canonical collision");
+
+        commit_rollback_snapshot(&root, &planned, &snapshot)
+            .expect_err("canonical history collision must reject publication");
+
+        assert_eq!(
+            fs::read(&collision).expect("read preserved canonical collision"),
+            b"user-collision"
+        );
+        assert_eq!(
+            fs::read_dir(rollback_files_dir_path(&root))
+                .expect("read rollback files")
+                .count(),
+            0
+        );
+        assert!(!rollback_file_path(&root).exists());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn rollback_latest_backup_reservation_preserves_preexisting_collision() {
+        let root = test_root("snapshot-backup-collision");
+        fs::write(root.join("managed-a.jar"), b"managed-a").expect("write managed artifact");
+        save_rollback_snapshot(
+            &root,
+            &test_state("core-a", vec![test_mod("sodium", "managed-a.jar")]),
+        )
+        .expect("save retained snapshot");
+        let latest = rollback_file_path(&root);
+        let latest_before = fs::read(&latest).expect("read retained latest");
+        let backup = rollback_metadata_backup_path(&latest);
+        fs::write(&backup, b"user-backup-collision").expect("write backup collision");
+        let successor = RollbackSnapshot {
+            id: "rb-backup-collision-successor".to_string(),
+            schema_version: ROLLBACK_SCHEMA_VERSION,
+            created_at: "2026-05-30T00:00:01Z".to_string(),
+            target: RollbackSnapshotState::ManagedStateAbsent,
+            artifacts: Vec::new(),
+        };
+        let temp = latest.with_extension("json.tmp");
+        let mut temp_file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp)
+            .expect("create latest candidate");
+        temp_file
+            .write_all(&serde_json::to_vec_pretty(&successor).expect("serialize successor"))
+            .and_then(|()| temp_file.sync_all())
+            .expect("sync latest candidate");
+        drop(temp_file);
+
+        publish_rollback_metadata(&temp, &latest)
+            .expect_err("backup collision must reject publication");
+
+        assert_eq!(
+            fs::read(&latest).expect("read preserved latest"),
+            latest_before
+        );
+        assert_eq!(
+            fs::read(&backup).expect("read preserved backup collision"),
+            b"user-backup-collision"
+        );
+        assert!(temp.exists());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn rollback_artifact_publication_preserves_preexisting_final_collision() {
+        let root = test_root("snapshot-artifact-collision");
+        fs::write(root.join("managed-a.jar"), b"managed-a").expect("write managed artifact");
+        let state = test_state("core-a", vec![test_mod("sodium", "managed-a.jar")]);
+        let (planned, snapshot) = test_snapshot_candidate(&root, &state, "rb-artifact-collision");
+        ensure_rollback_internal_roots(&root).expect("create rollback roots");
+        let final_path = planned.artifacts[0].stored_path.clone();
+        let staged_path = planned.artifacts[0].staged_path.clone();
+        fs::write(&final_path, b"user-collision").expect("write artifact collision");
+
+        commit_rollback_snapshot(&root, &planned, &snapshot)
+            .expect_err("artifact collision must reject publication");
+
+        assert_eq!(
+            fs::read(final_path).expect("read preserved artifact collision"),
+            b"user-collision"
+        );
+        assert!(!staged_path.exists());
+        assert!(!rollback_history_file_path(&root, &snapshot.id).exists());
+        assert!(
+            rollback_history_file_path(&root, &snapshot.id)
+                .with_extension("json.new.tmp")
+                .exists(),
+            "cleanup failure must retain the candidate ownership manifest"
+        );
+        assert!(!rollback_file_path(&root).exists());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn rollback_recovery_cleans_manifest_bound_partial_artifact_publication() {
+        let root = test_root("snapshot-partial-artifact-recovery");
+        fs::write(root.join("managed-a.jar"), b"managed-a").expect("write managed a");
+        fs::write(root.join("managed-b.jar"), b"managed-b").expect("write managed b");
+        let state = test_state(
+            "core-a",
+            vec![
+                test_mod("sodium", "managed-a.jar"),
+                test_mod("lithium", "managed-b.jar"),
+            ],
+        );
+        let (planned, snapshot) =
+            test_snapshot_candidate(&root, &state, "rb-partial-artifact-recovery");
+        ensure_rollback_internal_roots(&root).expect("create rollback roots");
+        let history = rollback_history_file_path(&root, &snapshot.id);
+        let history_temp = stage_new_rollback_snapshot(&history, &snapshot)
+            .expect("stage candidate ownership manifest");
+        sync_rollback_directory(
+            &rollback_history_dir_path(&root),
+            RollbackDurabilityPoint::HistoryStaged,
+        )
+        .expect("sync candidate ownership manifest");
+        stage_rollback_artifact_copy(&planned.artifacts[0]).expect("stage first artifact");
+        durable_rollback_rename(
+            &planned.artifacts[0].staged_path,
+            &planned.artifacts[0].stored_path,
+            RollbackDurabilityPoint::ArtifactPublished,
+        )
+        .expect("publish first artifact");
+        let mut partial = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&planned.artifacts[1].staged_path)
+            .expect("create partial second artifact");
+        partial
+            .write_all(b"partial")
+            .and_then(|()| partial.sync_all())
+            .expect("sync partial second artifact");
+        drop(partial);
+
+        recover_managed_storage(&root).expect("recover partial candidate");
+
+        assert!(!history_temp.exists());
+        assert!(!planned.artifacts[0].stored_path.exists());
+        assert!(!planned.artifacts[1].staged_path.exists());
+        assert!(!history.exists());
+        assert!(!rollback_file_path(&root).exists());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn rollback_recovery_retains_manifest_until_artifact_cleanup_is_synced() {
+        let root = test_root("snapshot-cleanup-ordering");
+        fs::write(root.join("managed-a.jar"), b"managed-a").expect("write managed artifact");
+        let state = test_state("core-a", vec![test_mod("sodium", "managed-a.jar")]);
+        let (planned, snapshot) = test_snapshot_candidate(&root, &state, "rb-cleanup-ordering");
+        ensure_rollback_internal_roots(&root).expect("create rollback roots");
+        let history = rollback_history_file_path(&root, &snapshot.id);
+        let history_temp = stage_new_rollback_snapshot(&history, &snapshot)
+            .expect("stage candidate ownership manifest");
+        stage_rollback_artifact_copy(&planned.artifacts[0]).expect("stage artifact");
+        durable_rollback_rename(
+            &planned.artifacts[0].staged_path,
+            &planned.artifacts[0].stored_path,
+            RollbackDurabilityPoint::ArtifactPublished,
+        )
+        .expect("publish artifact");
+
+        with_rollback_durability_failure(RollbackDurabilityPoint::ArtifactCopiesCleaned, || {
+            recover_managed_storage(&root)
+        })
+        .expect_err("unsynced artifact cleanup must retain its ownership manifest");
+
+        assert!(history_temp.exists());
+        assert!(!history.exists());
+        recover_managed_storage(&root).expect("retry manifest-bound cleanup");
+        assert!(!history_temp.exists());
+        assert!(!planned.artifacts[0].stored_path.exists());
+        assert!(!rollback_file_path(&root).exists());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn rollback_snapshot_rejects_oversized_artifact_before_copy() {
         let root = test_root("snapshot-artifact-byte-budget");
         let source_path = root.join("managed-a.jar");
@@ -4910,7 +5633,7 @@ mod tests {
     }
 
     #[test]
-    fn rollback_snapshot_cleans_candidate_when_latest_metadata_cannot_publish() {
+    fn rollback_snapshot_does_not_start_candidate_when_latest_temp_is_invalid() {
         let root = test_root("snapshot-metadata-failure-cleanup");
         fs::write(root.join("managed-a.jar"), b"managed-a").expect("write managed a");
         let retained = save_rollback_snapshot(
@@ -4927,6 +5650,8 @@ mod tests {
             &test_state("core-b", vec![test_mod("lithium", "managed-b.jar")]),
         )
         .expect_err("blocked latest metadata should reject candidate");
+        fs::remove_dir(rollback_file_path(&root).with_extension("json.tmp"))
+            .expect("remove latest temp blocker");
 
         let latest = load_rollback_snapshot(&root)
             .expect("load retained latest")
@@ -4937,14 +5662,14 @@ mod tests {
                 .expect("read rollback files")
                 .count(),
             1,
-            "failed candidate artifact should be removed"
+            "preflight failure must not create a candidate artifact"
         );
         assert_eq!(
             fs::read_dir(rollback_history_dir_path(&root))
                 .expect("read rollback history")
                 .count(),
             1,
-            "failed candidate history should be removed"
+            "preflight failure must not create candidate history"
         );
         let _ = fs::remove_dir_all(root);
     }
@@ -5062,6 +5787,10 @@ mod tests {
         let mut corrupt = test_state("core-current", vec![test_mod("sodium", "managed-a.jar")]);
         corrupt.installed_mods[0].ownership_class = OwnershipClass::UserManaged;
         write_unvalidated_state(&root, corrupt);
+        let artifact_path =
+            rollback_files_dir_path(&root).join(&snapshot.artifacts[0].stored_filename);
+        let artifact_before = fs::read(&artifact_path).expect("read snapshot artifact before");
+        let state_before = fs::read(lock_file_path(&root)).expect("read corrupt state before");
 
         let error = restore_rollback_snapshot(&root, &snapshot)
             .expect_err("corrupt current ownership must block rollback");
@@ -5070,6 +5799,14 @@ mod tests {
         assert_eq!(
             fs::read(root.join("managed-a.jar")).expect("read target"),
             b"user-replacement"
+        );
+        assert_eq!(
+            fs::read(artifact_path).expect("read snapshot artifact after"),
+            artifact_before
+        );
+        assert_eq!(
+            fs::read(lock_file_path(&root)).expect("read corrupt state after"),
+            state_before
         );
 
         let _ = fs::remove_dir_all(root);
@@ -5880,6 +6617,28 @@ mod tests {
         state.graph_sha512 = crate::install::plan::canonical_state_graph_digest(&state)
             .expect("canonical test graph");
         state
+    }
+
+    fn test_snapshot_candidate(
+        root: &Path,
+        state: &CompositionState,
+        snapshot_id: &str,
+    ) -> (PlannedRollbackSnapshot, RollbackSnapshot) {
+        let planned = plan_rollback_artifacts(root, state, snapshot_id).expect("plan snapshot");
+        let snapshot = RollbackSnapshot {
+            id: snapshot_id.to_string(),
+            schema_version: ROLLBACK_SCHEMA_VERSION,
+            created_at: "2026-05-30T00:00:00Z".to_string(),
+            target: RollbackSnapshotState::ManagedComposition {
+                state: state.clone(),
+            },
+            artifacts: planned
+                .artifacts
+                .iter()
+                .map(|artifact| artifact.metadata.clone())
+                .collect(),
+        };
+        (planned, snapshot)
     }
 
     fn state_fixture(state: serde_json::Value) -> serde_json::Value {

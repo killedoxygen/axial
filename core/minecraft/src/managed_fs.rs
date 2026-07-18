@@ -94,6 +94,56 @@ impl AnchoredDirectory {
         }
     }
 
+    pub fn rename_file_no_replace(
+        &self,
+        source_name: &str,
+        destination: &Self,
+        destination_name: &str,
+    ) -> io::Result<()> {
+        validate_segment(source_name).map_err(anchor_error)?;
+        validate_segment(destination_name).map_err(anchor_error)?;
+        if destination
+            .directory
+            .portable_child_name_state(destination_name)
+            .map_err(anchor_error)?
+            .0
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "managed rename destination already exists",
+            ));
+        }
+        let guard = self
+            .directory
+            .inspect_regular_file(source_name)
+            .map_err(anchor_error)?
+            .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))?;
+        self.directory
+            .rename_guarded_file_no_replace(
+                source_name,
+                &guard,
+                &destination.directory,
+                destination_name,
+            )
+            .map_err(anchor_error)?;
+        if !destination
+            .directory
+            .has_portably_exact_child_name(destination_name)
+            .map_err(anchor_error)?
+            || self
+                .directory
+                .has_portably_exact_child_name(source_name)
+                .map_err(anchor_error)?
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "managed rename namespace changed during publication",
+            ));
+        }
+        destination.directory.sync().map_err(anchor_error)?;
+        self.directory.sync().map_err(anchor_error)
+    }
+
     pub(crate) fn managed_directory(&self) -> ManagedDir {
         self.directory.clone()
     }
@@ -3957,6 +4007,44 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
+    #[test]
+    fn anchored_file_rename_no_replace_preserves_collisions() {
+        let root = test_root("anchored-file-rename-no-replace");
+        let source_path = root.join("source");
+        let destination_path = root.join("destination");
+        fs::create_dir_all(&source_path).expect("create source directory");
+        fs::create_dir_all(&destination_path).expect("create destination directory");
+        fs::write(source_path.join("candidate"), b"candidate").expect("write candidate");
+        fs::write(destination_path.join("published"), b"collision").expect("write collision");
+        let source = AnchoredDirectory::open(&source_path).expect("anchor source");
+        let destination = AnchoredDirectory::open(&destination_path).expect("anchor destination");
+
+        source
+            .rename_file_no_replace("candidate", &destination, "published")
+            .expect_err("create-only rename must preserve a collision");
+        assert_eq!(
+            fs::read(source_path.join("candidate")).expect("read retained candidate"),
+            b"candidate"
+        );
+        assert_eq!(
+            fs::read(destination_path.join("published")).expect("read collision"),
+            b"collision"
+        );
+
+        fs::remove_file(destination_path.join("published")).expect("remove collision");
+        source
+            .rename_file_no_replace("candidate", &destination, "published")
+            .expect("publish candidate create-only");
+        assert!(!source_path.join("candidate").exists());
+        assert_eq!(
+            fs::read(destination_path.join("published")).expect("read published candidate"),
+            b"candidate"
+        );
+
+        drop((source, destination));
+        let _ = fs::remove_dir_all(root);
+    }
+
     #[cfg(unix)]
     #[test]
     fn create_child_new_rejects_a_portable_name_alias() {
@@ -5290,7 +5378,7 @@ mod platform {
         FILE_ID_INFO, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE,
         FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_STANDARD_INFO, FileBasicInfo,
         FileDispositionInfoEx, FileIdInfo, FileStandardInfo, GetFileInformationByHandleEx,
-        MoveFileExW, SetFileInformationByHandle,
+        MOVEFILE_WRITE_THROUGH, MoveFileExW, SetFileInformationByHandle,
     };
 
     const DELETE_ACCESS: u32 = 0x0001_0000;
@@ -5603,7 +5691,13 @@ mod platform {
     ) -> io::Result<()> {
         let source = wide_path(&from_path.join(from));
         let destination = wide_path(&to_path.join(to));
-        let result = unsafe { MoveFileExW(source.as_ptr(), destination.as_ptr(), 0) };
+        let result = unsafe {
+            MoveFileExW(
+                source.as_ptr(),
+                destination.as_ptr(),
+                MOVEFILE_WRITE_THROUGH,
+            )
+        };
         if result == 0 {
             Err(io::Error::last_os_error())
         } else {
