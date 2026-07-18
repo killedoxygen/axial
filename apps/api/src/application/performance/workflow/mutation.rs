@@ -978,6 +978,10 @@ fn removed_install_response() -> PerformanceInstallResponse {
 }
 
 fn internal_install_error(_error: impl std::fmt::Display) -> (StatusCode, Json<serde_json::Value>) {
+    tracing::warn!(
+        error_class = "performance_internal",
+        "managed performance request failed"
+    );
     (
         StatusCode::INTERNAL_SERVER_ERROR,
         Json(serde_json::json!({ "error": PERFORMANCE_INSTALL_INTERNAL_ERROR })),
@@ -1121,10 +1125,17 @@ fn managed_mutation_error(
         axial_performance::ManagedMutationError::Definite(error) => {
             performance_install_error(error)
         }
-        axial_performance::ManagedMutationError::Indeterminate(_) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": PERFORMANCE_INSTALL_INTERNAL_ERROR })),
-        ),
+        axial_performance::ManagedMutationError::Indeterminate(error) => {
+            tracing::warn!(
+                error_class = "performance_indeterminate",
+                operation = error.operation(),
+                "managed performance mutation outcome was indeterminate"
+            );
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": PERFORMANCE_INSTALL_INTERNAL_ERROR })),
+            )
+        }
     }
 }
 

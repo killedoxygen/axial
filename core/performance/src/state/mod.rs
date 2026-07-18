@@ -6883,6 +6883,33 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn rollback_snapshot_directories_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = test_root("rollback-owner-only");
+        let installed = test_mod("sodium", "managed.jar");
+        fs::write(root.join(&installed.filename), b"managed").expect("write managed artifact");
+        save_rollback_snapshot(&root, &test_state("core", vec![installed]))
+            .expect("save rollback snapshot");
+
+        for path in [
+            root.join(STATE_DIR_NAME),
+            rollback_dir_path(&root),
+            rollback_files_dir_path(&root),
+            rollback_history_dir_path(&root),
+            rollback_tmp_dir_path(&root),
+        ] {
+            let mode = fs::symlink_metadata(path)
+                .expect("reserved directory metadata")
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o077, 0);
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
     #[test]
     fn load_state_rejects_empty_sha512() {
         let root = test_root("invalid-integrity");

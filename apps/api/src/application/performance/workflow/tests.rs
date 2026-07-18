@@ -56,6 +56,34 @@ struct RollbackFixture {
     id: String,
 }
 
+fn create_private_fixture_directory(root: &FsPath, path: &FsPath) {
+    assert!(
+        path.starts_with(root),
+        "private fixture path must stay below its root"
+    );
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(path)
+            .expect("create private fixture directory");
+        for directory in path.ancestors().take_while(|directory| *directory != root) {
+            let mode = fs::symlink_metadata(directory)
+                .expect("read private fixture directory metadata")
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o077, 0, "fixture directory must be owner-only");
+        }
+    }
+
+    #[cfg(not(unix))]
+    fs::create_dir_all(path).expect("create private fixture directory");
+}
+
 fn write_rollback_fixture(
     mods_dir: &FsPath,
     id: &str,
@@ -66,9 +94,9 @@ fn write_rollback_fixture(
     let rollback_dir = mods_dir.join(".axial-performance").join("rollback");
     let files_dir = rollback_dir.join("files");
     let history_dir = rollback_dir.join("history");
-    fs::create_dir_all(&files_dir).expect("create rollback artifact fixture directory");
-    fs::create_dir_all(&history_dir).expect("create rollback history fixture directory");
-    fs::create_dir_all(rollback_dir.join("tmp")).expect("create rollback temp fixture directory");
+    create_private_fixture_directory(mods_dir, &files_dir);
+    create_private_fixture_directory(mods_dir, &history_dir);
+    create_private_fixture_directory(mods_dir, &rollback_dir.join("tmp"));
 
     let artifacts = state
         .installed_mods
