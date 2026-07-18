@@ -6,6 +6,7 @@ pub mod modrinth;
 pub mod pack;
 pub mod provider;
 pub mod registry;
+pub mod resolver;
 mod transaction;
 
 pub use error::{ContentError, ContentResult};
@@ -29,3 +30,9 @@ pub use pack::{
 };
 pub use provider::{ContentProvider, ContentQuery, LoaderGameFilter, Page, SortOrder};
 pub use registry::ContentRegistry;
+pub use resolver::{
+    ContentResolution, ResolutionConflict, ResolutionConflictKind, ResolutionConflictReason,
+    ResolutionError, ResolutionReason, ResolutionSelection, ResolutionTarget, ResolvedContentItem,
+    canonicalize_version_only_dependencies, has_unresolved_version_only_incompatibility,
+    newer_version, pick_version, resolve_content, version_conflicts_with_installed,
+};

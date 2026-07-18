@@ -5,10 +5,11 @@
 
 use super::{ContentApiError, json_error};
 use crate::state::AppState;
-use axial_content::{ContentKind, LoaderGameFilter};
 use axum::http::StatusCode;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+
+pub use axial_content::ResolutionTarget as ResolveTarget;
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -23,14 +24,6 @@ pub enum TargetRef {
         loader: Option<String>,
         game_version: String,
     },
-}
-
-pub struct ResolveTarget {
-    /// `None` for a draft: there is nowhere to read a manifest from or write to.
-    pub game_dir: Option<PathBuf>,
-    pub loader: String,
-    pub game_version: String,
-    pub supports_mods: bool,
 }
 
 fn target_from_stored_metadata(
@@ -49,18 +42,6 @@ fn target_from_stored_metadata(
         game_version: game_version.to_string(),
         supports_mods: !loader.is_empty() && loader != "vanilla",
     })
-}
-
-impl ResolveTarget {
-    /// The version filter for a given kind. Only mods and modpacks are tagged
-    /// with the instance's loader upstream, so narrowing a resource pack or a
-    /// shader by it would match nothing.
-    pub fn filter_for(&self, kind: ContentKind) -> LoaderGameFilter {
-        LoaderGameFilter {
-            loader: (kind.filters_by_loader() && self.supports_mods).then(|| self.loader.clone()),
-            game_version: Some(self.game_version.clone()).filter(|value| !value.is_empty()),
-        }
-    }
 }
 
 pub async fn resolve_target(
@@ -131,6 +112,7 @@ pub fn require_instance_game_dir(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axial_content::ContentKind;
 
     fn target(loader: &str, supports_mods: bool) -> ResolveTarget {
         ResolveTarget {

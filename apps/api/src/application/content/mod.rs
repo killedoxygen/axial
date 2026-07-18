@@ -24,8 +24,10 @@ use crate::state::{
 };
 use axial_content::{
     CanonicalContent, CanonicalId, ContentDetail, ContentError, ContentKind, ContentManifest,
-    ContentQuery, ContentVersion, ManifestEntry, Page, ProviderId, SortOrder, entry_file_present,
-    install_and_record, uninstall_many,
+    ContentQuery, ContentVersion, ManifestEntry, Page, ProviderId, SortOrder,
+    canonicalize_version_only_dependencies, entry_file_present,
+    has_unresolved_version_only_incompatibility, install_and_record, newer_version, uninstall_many,
+    version_conflicts_with_installed,
 };
 use axial_minecraft::{DownloadProgress, download::ExecutionDownloadFact};
 use axum::{Json, http::StatusCode};
@@ -45,10 +47,7 @@ pub use resolve::{ConflictKind, PlanConflict, PlanItem, PlanReason, ResolutionPl
 pub use target::TargetRef;
 
 use futures_util::{StreamExt, stream};
-use resolve::{
-    canonicalize_version_only_dependencies, has_unresolved_version_only_incompatibility,
-    newer_version, resolve, resolve_for_execution, version_conflicts_with_installed,
-};
+use resolve::{into_plan, resolve, resolve_for_execution};
 use target::{require_instance_game_dir, resolve_target};
 
 pub type ContentApiError = (StatusCode, Json<serde_json::Value>);
@@ -86,6 +85,7 @@ const DEFAULT_SEARCH_LIMIT: u32 = 40;
 const MAX_SEARCH_LIMIT: u32 = 100;
 const MAX_COMPAT_ITEMS: usize = 40;
 const COMPAT_DETAIL_CONCURRENCY: usize = 6;
+const MAX_CONFLICT_ERROR_CHARS: usize = 1024;
 
 #[derive(Debug, Deserialize)]
 pub struct ContentSearchParams {
@@ -309,7 +309,7 @@ pub async fn content_plan(
         TargetRef::Instance { instance_id } => Some(instance_id.clone()),
         TargetRef::Draft { .. } => None,
     };
-    Ok(resolution.into_plan(instance_id, &target))
+    Ok(into_plan(resolution, instance_id, &target))
 }
 
 pub(crate) async fn queue_content_install(
@@ -415,9 +415,15 @@ where
     let has_unavailable = resolution
         .conflicts
         .iter()
-        .any(|conflict| conflict.kind == ConflictKind::Unavailable);
+        .any(|conflict| conflict.kind() == axial_content::ResolutionConflictKind::Unavailable);
     if has_unavailable || (!request.allow_incompatible && !resolution.conflicts.is_empty()) {
-        return Err(conflicts_error(&resolution.conflicts).into());
+        let conflicts = resolution
+            .conflicts
+            .iter()
+            .cloned()
+            .map(PlanConflict::from)
+            .collect::<Vec<_>>();
+        return Err(conflicts_error(&conflicts).into());
     }
 
     let planned = resolution.to_install();
@@ -810,6 +816,12 @@ fn conflicts_error(conflicts: &[PlanConflict]) -> ContentApiError {
         .map(|conflict| conflict.detail.clone())
         .collect::<Vec<_>>()
         .join("; ");
+    let detail = if detail.chars().count() > MAX_CONFLICT_ERROR_CHARS {
+        let retained = MAX_CONFLICT_ERROR_CHARS.saturating_sub(3);
+        format!("{}...", detail.chars().take(retained).collect::<String>())
+    } else {
+        detail
+    };
     (
         StatusCode::CONFLICT,
         Json(serde_json::json!({ "error": detail, "conflicts": conflicts })),
@@ -938,5 +950,26 @@ mod tests {
         assert_eq!(entries[0].canonical_id.as_str(), "modrinth:live");
         assert_eq!(manifest, before, "projection must not rewrite provenance");
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn conflict_error_summary_is_bounded_without_dropping_structured_conflicts() {
+        let conflicts = (0..200)
+            .map(|_| PlanConflict {
+                canonical_id: None,
+                kind: ConflictKind::Unavailable,
+                detail: "A".repeat(200),
+            })
+            .collect::<Vec<_>>();
+
+        let (_, body) = conflicts_error(&conflicts);
+        let summary = body.0["error"].as_str().expect("conflict summary");
+
+        assert_eq!(summary.chars().count(), MAX_CONFLICT_ERROR_CHARS);
+        assert!(summary.ends_with("..."));
+        assert_eq!(
+            body.0["conflicts"].as_array().map(Vec::len),
+            Some(conflicts.len())
+        );
     }
 }

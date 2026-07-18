@@ -6,7 +6,7 @@
 //! ask the provider what they are in one batch and record real provenance for
 //! every mod, rather than leaving a pack-shaped hole in the manifest.
 
-use super::resolve::{pick_version, resolve_for_execution};
+use super::resolve::resolve_for_execution;
 use super::target::{ResolveTarget, instance_target};
 use super::{
     ContentApiError, ContentExecutionError, ContentSelection, content_error_response,
@@ -18,9 +18,9 @@ use crate::application::{
 };
 use crate::state::{AppState, ProducerLease, RequestProducerHandoff, UpdateOperationLease};
 use axial_content::{
-    CanonicalId, ContentKind, ContentManifest, FileRef, ManagedRemoval, ManifestEntry, PackIndex,
-    PackInstallOptions, ProviderId, VersionIdentity, install_pack_files_with_finalize,
-    read_pack_index, verified_removable_variants,
+    CanonicalId, ContentKind, ContentManifest, ContentResolution, FileRef, ManagedRemoval,
+    ManifestEntry, PackIndex, PackInstallOptions, ProviderId, VersionIdentity,
+    install_pack_files_with_finalize, pick_version, read_pack_index, verified_removable_variants,
 };
 use axum::http::StatusCode;
 use serde::{Deserialize, Serialize};
@@ -895,7 +895,7 @@ async fn validate_cherry_pick_dependencies(
 }
 
 fn cherry_pick_resolution_is_complete(
-    resolution: &super::resolve::Resolution,
+    resolution: &ContentResolution,
     selected_versions: &HashSet<(CanonicalId, String)>,
 ) -> bool {
     resolution.conflicts.is_empty()
@@ -1657,8 +1657,8 @@ mod tests {
 
     #[test]
     fn cherry_pick_resolution_requires_the_complete_dependency_closure() {
-        let item = |project: &str, reason: super::super::resolve::PlanReason, installed: bool| {
-            super::super::resolve::ResolvedItem {
+        let item = |project: &str, reason: axial_content::ResolutionReason, installed: bool| {
+            axial_content::ResolvedContentItem {
                 canonical_id: CanonicalId::for_project(ProviderId::Modrinth, project),
                 provider: ProviderId::Modrinth,
                 project_id: project.to_string(),
@@ -1683,16 +1683,12 @@ mod tests {
         let selected_id = CanonicalId::for_project(ProviderId::Modrinth, "selected");
         let dependency_id = CanonicalId::for_project(ProviderId::Modrinth, "dependency");
         let mut selected = HashSet::from([(selected_id, "selected-version".to_string())]);
-        let resolution = super::super::resolve::Resolution {
+        let resolution = ContentResolution {
             items: vec![
-                item(
-                    "selected",
-                    super::super::resolve::PlanReason::Selected,
-                    false,
-                ),
+                item("selected", axial_content::ResolutionReason::Selected, false),
                 item(
                     "dependency",
-                    super::super::resolve::PlanReason::Dependency,
+                    axial_content::ResolutionReason::Dependency,
                     false,
                 ),
             ],
