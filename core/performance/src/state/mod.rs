@@ -1673,7 +1673,6 @@ struct AdmittedManagedAddition {
     digest: String,
     filename: String,
     tracked: bool,
-    temp_aliases: Vec<(PathBuf, crate::file_identity::FileIdentity)>,
 }
 
 pub(crate) fn reconcile_managed_addition_obligations(
@@ -1786,7 +1785,6 @@ pub(crate) fn reconcile_managed_addition_obligations(
                 digest: digest.clone(),
                 filename,
                 tracked,
-                temp_aliases: Vec::new(),
             });
         }
         digest_dirs_to_remove.push(digest_dir.path());
@@ -1798,47 +1796,6 @@ pub(crate) fn reconcile_managed_addition_obligations(
         }
         fs::remove_dir(root)?;
         return Ok(());
-    }
-
-    let by_filename = admitted
-        .iter()
-        .enumerate()
-        .map(|(index, obligation)| (obligation.filename.clone(), index))
-        .collect::<HashMap<_, _>>();
-    for entry in fs::read_dir(instance_mods_dir)? {
-        let entry = entry?;
-        admit_recovery_entry(&mut count, "managed addition recovery scan")?;
-        let entry_name = entry.file_name();
-        let Some((filename, _)) = entry_name
-            .to_str()
-            .and_then(parse_managed_download_temp_name)
-        else {
-            continue;
-        };
-        let Some(index) = by_filename.get(filename).copied() else {
-            continue;
-        };
-        let identity = admit_file_identity(&entry.path()).map_err(|error| {
-            identity_admission_error(
-                error,
-                StateError::InvalidIntegrity {
-                    filename: filename.to_string(),
-                    reason: "managed addition temp alias ownership cannot be proven".to_string(),
-                },
-            )
-        })?;
-        let obligation = &admitted[index];
-        if identity.0 != obligation.identity
-            || !path_matches_sha512(&entry.path(), &obligation.digest)?
-        {
-            return Err(StateError::InvalidIntegrity {
-                filename: filename.to_string(),
-                reason: "managed addition temp alias ownership cannot be proven".to_string(),
-            });
-        }
-        admitted[index]
-            .temp_aliases
-            .push((entry.path(), identity.0));
     }
 
     for obligation in &admitted {
@@ -1889,9 +1846,6 @@ pub(crate) fn reconcile_managed_addition_obligations(
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(StateError::Read(error)),
         }
-        for (alias, identity) in &obligation.temp_aliases {
-            remove_identity_bound_file(alias, *identity, obligation.len, &obligation.digest)?;
-        }
         remove_identity_bound_file(
             &obligation.path,
             obligation.identity,
@@ -1924,7 +1878,30 @@ pub(crate) fn settle_managed_artifact_removal(
             MANAGED_ARTIFACT_MAX_BYTES,
         )?;
     }
+    let digest_dir = backup.parent().ok_or_else(|| {
+        StateError::InvalidState("managed removal backup has no digest directory".to_string())
+    })?;
+    settle_empty_removal_digest_directory(digest_dir)?;
     Ok(())
+}
+
+fn settle_empty_removal_digest_directory(digest_dir: &Path) -> Result<(), StateError> {
+    let root = digest_dir.parent().ok_or_else(|| {
+        StateError::InvalidState("managed removal digest has no parent".to_string())
+    })?;
+    let digest = digest_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| is_valid_sha512(name))
+        .ok_or_else(|| StateError::InvalidState("managed removal digest is invalid".to_string()))?;
+    match axial_minecraft::managed_path::AnchoredDirectory::open(root) {
+        Ok(root) => {
+            root.remove_empty_child(digest)?;
+            Ok(())
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(StateError::Read(error)),
+    }
 }
 
 fn removal_backup_path(instance_mods_dir: &Path, installed: &InstalledMod) -> PathBuf {
@@ -1985,6 +1962,7 @@ fn managed_removal_reconciliation_required(instance_mods_dir: &Path) -> Result<b
                 StateError::InvalidState("managed removal digest is invalid".to_string())
             })?
             .to_string();
+        required = true;
         for entry in fs::read_dir(digest_dir.path())? {
             let entry = entry?;
             admit_recovery_entry(&mut count, "managed removal obligations")?;
@@ -2000,7 +1978,6 @@ fn managed_removal_reconciliation_required(instance_mods_dir: &Path) -> Result<b
                     reason: "managed removal obligation ownership cannot be proven".to_string(),
                 });
             }
-            required = true;
         }
     }
     Ok(required)
@@ -2022,6 +1999,7 @@ pub(crate) fn reconcile_managed_removal_obligations(
         Err(error) => return Err(StateError::Read(error)),
     };
     let mut count = 0_usize;
+    let mut admitted_digest_dirs = Vec::new();
     for digest_dir in digest_dirs {
         let digest_dir = digest_dir?;
         admit_recovery_entry(&mut count, "managed removal obligations")?;
@@ -2040,7 +2018,8 @@ pub(crate) fn reconcile_managed_removal_obligations(
                 StateError::InvalidState("managed removal digest is invalid".to_string())
             })?
             .to_string();
-        for entry in fs::read_dir(digest_dir.path())? {
+        let digest_path = digest_dir.path();
+        for entry in fs::read_dir(&digest_path)? {
             let entry = entry?;
             admit_recovery_entry(&mut count, "managed removal obligations")?;
             let filename = entry
@@ -2053,6 +2032,25 @@ pub(crate) fn reconcile_managed_removal_obligations(
                 return Err(StateError::InvalidIntegrity {
                     filename,
                     reason: "managed removal obligation ownership cannot be proven".to_string(),
+                });
+            }
+        }
+        admitted_digest_dirs.push((digest_path, digest));
+    }
+
+    for (digest_path, digest) in admitted_digest_dirs {
+        for entry in fs::read_dir(&digest_path)? {
+            let entry = entry?;
+            let filename = entry
+                .file_name()
+                .to_str()
+                .ok_or_else(|| StateError::InvalidFilename("managed removal".to_string()))?
+                .to_string();
+            validate_managed_filename(&filename)?;
+            if !entry.file_type()?.is_file() || !path_matches_sha512(&entry.path(), &digest)? {
+                return Err(StateError::InvalidIntegrity {
+                    filename,
+                    reason: "managed removal obligation changed after admission".to_string(),
                 });
             }
             let tracked = current_state.is_some_and(|state| {
@@ -2082,6 +2080,7 @@ pub(crate) fn reconcile_managed_removal_obligations(
                 remove_file_matching_sha512(&entry.path(), &digest, MANAGED_ARTIFACT_MAX_BYTES)?;
             }
         }
+        settle_empty_removal_digest_directory(&digest_path)?;
     }
     Ok(())
 }
@@ -2830,16 +2829,8 @@ fn remove_owned_file(path: &Path) -> Result<(), StateError> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(StateError::Read(error)),
     };
-    let (digest, admitted) = admit_bounded_file_sha512(path, metadata.len())?;
-    if digest.is_empty() {
-        return Err(StateError::InvalidState(
-            "managed cleanup target digest could not be admitted".to_string(),
-        ));
-    }
-    let admitted = admitted.ok_or_else(|| {
-        StateError::InvalidState("managed cleanup target identity was not admitted".to_string())
-    })?;
-    quarantine_remove_admitted_file(path, admitted, metadata.len(), &hex::encode(digest), |_| {})
+    let (admitted, digest) = admit_live_cleanup_file(path, metadata.len())?;
+    quarantine_remove_admitted_file(path, admitted, &digest, |_| {})
 }
 
 fn remove_file_matching_sha512(
@@ -2857,21 +2848,13 @@ fn remove_file_matching_sha512(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(StateError::Read(error)),
     };
-    let (digest, admitted) = admit_bounded_file_sha512(path, metadata.len())?;
-    if digest.is_empty() || !hex::encode(digest).eq_ignore_ascii_case(expected_sha512) {
+    let (admitted, digest) = admit_live_cleanup_file(path, metadata.len())?;
+    if !digest.eq_ignore_ascii_case(expected_sha512) {
         return Err(StateError::InvalidState(
             "managed cleanup target bytes changed after admission".to_string(),
         ));
     }
-    let admitted = admitted.ok_or_else(|| {
-        StateError::InvalidState("managed cleanup target identity was not admitted".to_string())
-    })?;
-    if crate::file_identity::revalidate(path, admitted, metadata.len()).is_err() {
-        return Err(StateError::InvalidState(
-            "managed cleanup target identity changed after digest admission".to_string(),
-        ));
-    }
-    quarantine_remove_admitted_file(path, admitted, metadata.len(), expected_sha512, |_| {})
+    quarantine_remove_admitted_file(path, admitted, expected_sha512, |_| {})
 }
 
 fn remove_identity_bound_file(
@@ -2880,15 +2863,13 @@ fn remove_identity_bound_file(
     admitted_len: u64,
     expected_sha512: &str,
 ) -> Result<(), StateError> {
-    if crate::file_identity::revalidate(path, admitted, admitted_len).is_err()
-        || !path_matches_sha512(path, expected_sha512)?
-        || crate::file_identity::revalidate(path, admitted, admitted_len).is_err()
-    {
+    let (settlement, digest) = admit_live_cleanup_file(path, admitted_len)?;
+    if settlement.identity() != admitted || !digest.eq_ignore_ascii_case(expected_sha512) {
         return Err(StateError::InvalidState(
             "managed cleanup target identity or digest changed after admission".to_string(),
         ));
     }
-    quarantine_remove_admitted_file(path, admitted, admitted_len, expected_sha512, |_| {})
+    quarantine_remove_admitted_file(path, settlement, expected_sha512, |_| {})
 }
 
 fn admit_file_identity(
@@ -2919,29 +2900,76 @@ fn quarantine_remove_file_with_hook(
             "managed cleanup target is not a bounded regular file".to_string(),
         ));
     }
-    let (identity, len) = admit_file_identity(path)?;
-    if !path_matches_sha512(path, expected_sha512)? {
+    let (admitted, digest) = admit_live_cleanup_file(path, metadata.len())?;
+    if !digest.eq_ignore_ascii_case(expected_sha512) {
         return Err(StateError::InvalidState(
             "managed cleanup target digest changed after admission".to_string(),
         ));
     }
-    quarantine_remove_admitted_file(path, identity, len, expected_sha512, after_park)
+    quarantine_remove_admitted_file_inner(path, admitted, expected_sha512, after_park, |_| {})
 }
 
 fn quarantine_remove_admitted_file(
     path: &Path,
-    admitted: crate::file_identity::FileIdentity,
-    admitted_len: u64,
+    admitted: crate::file_identity::AdmittedFile,
     expected_sha512: &str,
     after_park: impl FnOnce(&Path),
+) -> Result<(), StateError> {
+    quarantine_remove_admitted_file_inner(path, admitted, expected_sha512, after_park, |_| {})
+}
+
+#[cfg(test)]
+fn quarantine_remove_file_with_settlement_hook(
+    path: &Path,
+    expected_sha512: &str,
+    max_bytes: u64,
+    before_settlement: impl FnOnce(&Path),
+) -> Result<(), StateError> {
+    let metadata = fs::symlink_metadata(path)?;
+    if !metadata.file_type().is_file() || metadata.len() > max_bytes {
+        return Err(StateError::InvalidState(
+            "managed cleanup target is not a bounded regular file".to_string(),
+        ));
+    }
+    let (admitted, digest) = admit_live_cleanup_file(path, metadata.len())?;
+    if !digest.eq_ignore_ascii_case(expected_sha512) {
+        return Err(StateError::InvalidState(
+            "managed cleanup target digest changed after admission".to_string(),
+        ));
+    }
+    quarantine_remove_admitted_file_inner(
+        path,
+        admitted,
+        expected_sha512,
+        |_| {},
+        before_settlement,
+    )
+}
+
+fn quarantine_remove_admitted_file_inner(
+    path: &Path,
+    settlement: crate::file_identity::AdmittedFile,
+    expected_sha512: &str,
+    after_park: impl FnOnce(&Path),
+    before_settlement: impl FnOnce(&Path),
 ) -> Result<(), StateError> {
     if !is_valid_sha512(expected_sha512) {
         return Err(StateError::InvalidState(
             "managed cleanup digest is invalid".to_string(),
         ));
     }
+    let admitted = settlement.identity();
+    let admitted_len = settlement.metadata().len();
     let instance_mods_dir = managed_cleanup_root(path)?;
-    reconcile_cleanup_quarantine(&instance_mods_dir)?;
+    let usage = inspect_cleanup_quarantine(&instance_mods_dir)?
+        .map(|inspection| inspection.usage)
+        .unwrap_or_default();
+    ensure_cleanup_quarantine_capacity(usage, admitted_len)?;
+    crate::file_identity::revalidate(path, admitted, admitted_len).map_err(|_| {
+        StateError::InvalidState(
+            "managed cleanup target identity changed before parking".to_string(),
+        )
+    })?;
     let quarantine = cleanup_quarantine_path(&instance_mods_dir);
     ensure_cleanup_quarantine(&instance_mods_dir)?;
     let mut nonce = [0_u8; 16];
@@ -2967,8 +2995,13 @@ fn quarantine_remove_admitted_file(
             "managed cleanup parked identity changed after admission".to_string(),
         ));
     }
-    remove_quarantined_exact_file(&parked, expected_sha512, admitted_len)?;
-    cleanup_empty_quarantine_roots(&instance_mods_dir)
+    before_settlement(&parked);
+    match settlement.settle_exact(&parked)? {
+        crate::file_identity::ExactFileSettlement::Settled => Ok(()),
+        crate::file_identity::ExactFileSettlement::PathChanged => Err(StateError::InvalidState(
+            "managed cleanup quarantine identity changed before settlement".to_string(),
+        )),
+    }
 }
 
 fn managed_cleanup_root(path: &Path) -> Result<PathBuf, StateError> {
@@ -3011,40 +3044,59 @@ fn ensure_cleanup_quarantine(instance_mods_dir: &Path) -> Result<(), StateError>
 fn cleanup_quarantine_reconciliation_required(
     instance_mods_dir: &Path,
 ) -> Result<bool, StateError> {
-    let root = cleanup_quarantine_path(instance_mods_dir);
-    match fs::symlink_metadata(&root) {
-        Ok(metadata) if metadata.file_type().is_dir() => Ok(true),
-        Ok(_) => Err(StateError::InvalidState(
-            "managed cleanup quarantine is not a regular directory".to_string(),
-        )),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-        Err(error) => Err(StateError::Read(error)),
-    }
+    inspect_cleanup_quarantine(instance_mods_dir)?;
+    Ok(false)
 }
 
 fn reconcile_cleanup_quarantine(instance_mods_dir: &Path) -> Result<(), StateError> {
+    inspect_cleanup_quarantine(instance_mods_dir)?;
+    Ok(())
+}
+
+#[derive(Clone, Copy, Default)]
+struct CleanupQuarantineUsage {
+    count: usize,
+    bytes: u64,
+}
+
+struct CleanupQuarantineInspection {
+    usage: CleanupQuarantineUsage,
+}
+
+fn inspect_cleanup_quarantine(
+    instance_mods_dir: &Path,
+) -> Result<Option<CleanupQuarantineInspection>, StateError> {
     let root = cleanup_quarantine_path(instance_mods_dir);
-    validate_managed_recovery_directory(&root)?;
+    match fs::symlink_metadata(&root) {
+        Ok(metadata) if metadata.file_type().is_dir() => {}
+        Ok(_) => {
+            return Err(StateError::InvalidState(
+                "managed cleanup quarantine is not a regular directory".to_string(),
+            ));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(StateError::Read(error)),
+    }
     let entries = match fs::read_dir(&root) {
         Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(StateError::Read(error)),
     };
-    let mut count = 0_usize;
-    let mut total_bytes = 0_u64;
+    let mut usage = CleanupQuarantineUsage::default();
     for entry in entries {
         let entry = entry?;
-        admit_recovery_entry(&mut count, "managed cleanup quarantine")?;
-        let metadata = entry.metadata()?;
+        admit_recovery_entry(&mut usage.count, "managed cleanup quarantine")?;
+        let path = entry.path();
+        let metadata = fs::symlink_metadata(&path)?;
         if !metadata.file_type().is_file() || metadata.len() > MANAGED_ARTIFACT_MAX_BYTES {
             return Err(StateError::InvalidState(
                 "managed cleanup quarantine contains an invalid entry".to_string(),
             ));
         }
-        total_bytes = total_bytes.checked_add(metadata.len()).ok_or_else(|| {
+        usage.bytes = usage.bytes.checked_add(metadata.len()).ok_or_else(|| {
             StateError::InvalidState("managed cleanup quarantine size overflowed".to_string())
         })?;
-        if total_bytes > CLEANUP_QUARANTINE_MAX_BYTES {
+        if usage.bytes > CLEANUP_QUARANTINE_MAX_BYTES {
             return Err(StateError::InvalidState(
                 "managed cleanup quarantine exceeds its byte budget".to_string(),
             ));
@@ -3059,52 +3111,82 @@ fn reconcile_cleanup_quarantine(instance_mods_dir: &Path) -> Result<(), StateErr
         let nonce = suffix.strip_suffix(".park").ok_or_else(|| {
             StateError::InvalidState("managed cleanup quarantine name is invalid".to_string())
         })?;
-        if !is_valid_sha512(digest)
+        if digest.len() != 128
+            || !digest
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
             || nonce.len() != 32
-            || !nonce.bytes().all(|byte| byte.is_ascii_hexdigit())
-            || !path_matches_sha512(&entry.path(), digest)?
+            || !nonce
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
         {
             return Err(StateError::InvalidState(
-                "managed cleanup quarantine ownership cannot be proven".to_string(),
+                "managed cleanup quarantine name is not canonical".to_string(),
             ));
         }
-        remove_quarantined_exact_file(&entry.path(), digest, metadata.len())?;
+        let admitted_entry = crate::file_identity::admit(&path)?;
+        if admitted_entry.metadata().len() != metadata.len()
+            || crate::file_identity::revalidate(&path, admitted_entry.identity(), metadata.len())
+                .is_err()
+        {
+            return Err(StateError::InvalidState(
+                "managed cleanup quarantine entry changed during inspection".to_string(),
+            ));
+        }
     }
-    cleanup_empty_quarantine_roots(instance_mods_dir)
+    Ok(Some(CleanupQuarantineInspection { usage }))
 }
 
-fn remove_quarantined_exact_file(
-    path: &Path,
-    expected_sha512: &str,
-    expected_len: u64,
+fn ensure_cleanup_quarantine_capacity(
+    usage: CleanupQuarantineUsage,
+    additional_bytes: u64,
 ) -> Result<(), StateError> {
-    let (identity, len) = admit_file_identity(path)?;
-    if len != expected_len
-        || !path_matches_sha512(path, expected_sha512)?
-        || crate::file_identity::revalidate(path, identity, len).is_err()
-    {
+    let bytes = usage.bytes.checked_add(additional_bytes).ok_or_else(|| {
+        StateError::InvalidState("managed cleanup quarantine size overflowed".to_string())
+    })?;
+    if usage.count >= RECOVERY_ENTRY_LIMIT || bytes > CLEANUP_QUARANTINE_MAX_BYTES {
         return Err(StateError::InvalidState(
-            "managed cleanup quarantine identity changed".to_string(),
+            "managed cleanup quarantine has no remaining capacity".to_string(),
         ));
     }
-    fs::remove_file(path)?;
     Ok(())
 }
 
-fn cleanup_empty_quarantine_roots(instance_mods_dir: &Path) -> Result<(), StateError> {
-    let quarantine = cleanup_quarantine_path(instance_mods_dir);
-    match fs::remove_dir(&quarantine) {
-        Ok(()) => Ok(()),
-        Err(error)
-            if matches!(
-                error.kind(),
-                std::io::ErrorKind::NotFound | std::io::ErrorKind::DirectoryNotEmpty
-            ) =>
-        {
-            Ok(())
-        }
-        Err(error) => Err(StateError::Read(error)),
+fn admit_live_cleanup_file(
+    path: &Path,
+    expected_len: u64,
+) -> Result<(crate::file_identity::AdmittedFile, String), StateError> {
+    let admitted = crate::file_identity::admit_for_settlement(path)?;
+    if admitted.metadata().len() != expected_len || expected_len > MANAGED_ARTIFACT_MAX_BYTES {
+        return Err(StateError::InvalidState(
+            "managed cleanup target size changed".to_string(),
+        ));
     }
+    let mut file = admitted.try_clone_file()?;
+    let mut hasher = Sha512::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    let mut total = 0_u64;
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        total = total.saturating_add(read as u64);
+        if total > expected_len || total > MANAGED_ARTIFACT_MAX_BYTES {
+            return Err(StateError::InvalidState(
+                "managed cleanup target size changed".to_string(),
+            ));
+        }
+        hasher.update(&buffer[..read]);
+    }
+    if total != expected_len
+        || crate::file_identity::revalidate(path, admitted.identity(), expected_len).is_err()
+    {
+        return Err(StateError::InvalidState(
+            "managed cleanup target identity changed during digest admission".to_string(),
+        ));
+    }
+    Ok((admitted, hex::encode(hasher.finalize())))
 }
 
 fn cleanup_rollback_restore_targets(targets: &[RollbackRestoreTarget]) -> Result<(), StateError> {
@@ -3207,17 +3289,6 @@ fn validate_sha512_integrity(filename: &str, sha512: &str) -> Result<(), StateEr
 
 fn is_valid_sha512(value: &str) -> bool {
     value.len() == 128 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
-}
-
-fn parse_managed_download_temp_name(name: &str) -> Option<(&str, &str)> {
-    let (filename, suffix) = name.strip_suffix(".tmp")?.rsplit_once('.')?;
-    (!filename.is_empty()
-        && !suffix.is_empty()
-        && suffix.len() <= 48
-        && suffix
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_')))
-    .then_some((filename, suffix))
 }
 
 fn admit_recovery_entry(count: &mut usize, label: &str) -> Result<(), StateError> {
@@ -3373,9 +3444,11 @@ fn prove_managed_internal_roots(instance_mods_dir: &Path) -> Result<(), StateErr
         let name = name.to_str().ok_or_else(|| {
             StateError::InvalidState("managed mutation root name is invalid".to_string())
         })?;
-        if !matches!(name, REMOVAL_DIR_NAME | ADDITION_DIR_NAME | "replacements")
-            || !entry.file_type()?.is_dir()
-        {
+        let known = matches!(
+            name,
+            REMOVAL_DIR_NAME | ADDITION_DIR_NAME | QUARANTINE_DIR_NAME
+        );
+        if !known || !entry.file_type()?.is_dir() {
             return Err(StateError::InvalidState(
                 "managed mutation root contains an unknown entry".to_string(),
             ));
@@ -3386,6 +3459,7 @@ fn prove_managed_internal_roots(instance_mods_dir: &Path) -> Result<(), StateErr
             "managed addition obligation root remains after recovery".to_string(),
         ));
     }
+    inspect_cleanup_quarantine(instance_mods_dir)?;
     Ok(())
 }
 
@@ -3414,13 +3488,9 @@ fn prove_removal_obligations_settled(instance_mods_dir: &Path) -> Result<(), Sta
                 "managed removal root contains an invalid entry".to_string(),
             ));
         }
-        if let Some(entry) = fs::read_dir(digest_dir.path())?.next() {
-            entry?;
-            admit_recovery_entry(&mut count, "managed removal proof entries")?;
-            return Err(StateError::InvalidState(
-                "managed removal obligation remains after recovery".to_string(),
-            ));
-        }
+        return Err(StateError::InvalidState(
+            "managed removal obligation directory remains after recovery".to_string(),
+        ));
     }
     Ok(())
 }
@@ -4162,7 +4232,7 @@ mod tests {
     }
 
     #[test]
-    fn addition_recovery_removes_uncommitted_publication_and_temp_alias() {
+    fn addition_recovery_does_not_claim_legacy_filename_derived_temp_alias() {
         let root = test_root("recover-uncommitted-addition");
         let filename = "new.jar";
         let digest = hex::encode(Sha512::digest(b"new-managed"));
@@ -4180,8 +4250,33 @@ mod tests {
         );
 
         assert!(!final_path.exists());
-        assert!(!temp.exists());
+        assert_eq!(
+            fs::read(&temp).expect("legacy temp remains user-owned"),
+            b"new-managed"
+        );
         assert!(!obligation.exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn obsolete_replacement_namespace_is_rejected_and_preserved() {
+        let root = test_root("obsolete-replacement-namespace");
+        let replacements = root
+            .join(STATE_DIR_NAME)
+            .join(MUTATION_DIR_NAME)
+            .join("replacements");
+        fs::create_dir_all(&replacements).expect("create obsolete namespace");
+        let unknown = replacements.join("unknown-owned-entry");
+        fs::write(&unknown, b"unknown").expect("write unknown entry");
+
+        let error = prove_managed_storage_recovered(&root, None)
+            .expect_err("obsolete namespace must fail closed");
+
+        assert!(matches!(error, StateError::InvalidState(_)));
+        assert_eq!(
+            fs::read(unknown).expect("unknown entry preserved"),
+            b"unknown"
+        );
         let _ = fs::remove_dir_all(root);
     }
 
@@ -4338,6 +4433,54 @@ mod tests {
             fs::read_dir(removals).expect("read removal root").count(),
             RECOVERY_ENTRY_LIMIT + 1
         );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn removal_recovery_settles_exact_empty_digest_directories() {
+        let root = test_root("recover-empty-removal-digests");
+        let removals = root
+            .join(STATE_DIR_NAME)
+            .join(MUTATION_DIR_NAME)
+            .join(REMOVAL_DIR_NAME);
+        fs::create_dir_all(&removals).expect("create removal root");
+        for index in 0..8 {
+            fs::create_dir(removals.join(format!("{index:0128x}")))
+                .expect("create empty digest directory");
+        }
+
+        recover_managed_storage(&root).expect("recover empty removal digests");
+
+        assert_eq!(
+            fs::read_dir(&removals).expect("read removal root").count(),
+            0
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn repeated_removal_settlement_does_not_accumulate_digest_directories() {
+        let root = test_root("bounded-removal-settlement");
+        let installed = test_mod("sodium", "managed-a.jar");
+        let removals = root
+            .join(STATE_DIR_NAME)
+            .join(MUTATION_DIR_NAME)
+            .join(REMOVAL_DIR_NAME);
+
+        for _ in 0..8 {
+            fs::write(root.join(&installed.filename), b"managed-a")
+                .expect("write managed artifact");
+            let backup = stage_managed_artifact_removal(&root, &installed)
+                .expect("stage managed artifact removal");
+            settle_managed_artifact_removal(&root, &installed)
+                .expect("settle managed artifact removal");
+
+            assert!(!backup.exists());
+            assert_eq!(
+                fs::read_dir(&removals).expect("read removal root").count(),
+                0
+            );
+        }
         let _ = fs::remove_dir_all(root);
     }
 
@@ -5320,7 +5463,7 @@ mod tests {
     }
 
     #[test]
-    fn cleanup_quarantine_preserves_a_final_window_replacement() {
+    fn cleanup_quarantine_preserves_live_namespace_replacement() {
         let root = test_root("cleanup-final-window-replacement");
         let target = root.join("managed.jar");
         fs::write(&target, b"owned").expect("write owned target");
@@ -5335,7 +5478,183 @@ mod tests {
             fs::read(&target).expect("replacement preserved"),
             b"replacement"
         );
-        assert!(!cleanup_quarantine_path(&root).exists());
+        #[cfg(unix)]
+        assert_eq!(
+            inspect_cleanup_quarantine(&root)
+                .expect("inspect retained quarantine")
+                .expect("retained quarantine")
+                .usage
+                .count,
+            1
+        );
+        #[cfg(windows)]
+        assert_eq!(
+            fs::read_dir(cleanup_quarantine_path(&root))
+                .expect("read permanent quarantine")
+                .count(),
+            0
+        );
+        prove_managed_storage_recovered(&root, None).expect("prove permanent quarantine");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cleanup_quarantine_restart_retains_self_consistent_unowned_entry() {
+        let root = test_root("cleanup-restart-unowned-entry");
+        let quarantine = cleanup_quarantine_path(&root);
+        fs::create_dir_all(&quarantine).expect("create quarantine");
+        let bytes = b"self-consistent-but-unowned";
+        let digest = hex::encode(Sha512::digest(bytes));
+        let injected = quarantine.join(format!("{digest}.{:032x}.park", 1));
+        fs::write(&injected, bytes).expect("write injected entry");
+
+        reconcile_cleanup_quarantine(&root).expect("first restart reconciliation");
+        reconcile_cleanup_quarantine(&root).expect("second restart reconciliation");
+
+        assert_eq!(fs::read(&injected).expect("injected entry retained"), bytes);
+        let preflight =
+            preflight_managed_inspection_reconciliation(&root).expect("preflight retained entry");
+        assert!(!preflight.cleanup_quarantine);
+        prove_managed_storage_recovered(&root, None).expect("prove bounded retained entry");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cleanup_quarantine_retains_validated_bytes_outside_live_namespace() {
+        let root = test_root("cleanup-linux-retention");
+        let target = root.join("managed.jar");
+        fs::write(&target, b"owned").expect("write owned target");
+        let digest = hex::encode(Sha512::digest(b"owned"));
+
+        quarantine_remove_file_with_hook(&target, &digest, 64, |_| {})
+            .expect("park validated target");
+
+        assert!(!target.exists());
+        let inspection = inspect_cleanup_quarantine(&root)
+            .expect("inspect quarantine")
+            .expect("retained quarantine");
+        assert_eq!(inspection.usage.count, 1);
+        assert_eq!(inspection.usage.bytes, 5);
+        let retained = fs::read_dir(cleanup_quarantine_path(&root))
+            .expect("read quarantine")
+            .next()
+            .expect("one retained entry")
+            .expect("retained entry")
+            .path();
+        assert_eq!(fs::read(retained).expect("read retained bytes"), b"owned");
+        prove_managed_storage_recovered(&root, None).expect("prove bounded retained quarantine");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cleanup_quarantine_restart_reconciliation_is_idempotent() {
+        let root = test_root("cleanup-linux-restart");
+        let target = root.join("managed.jar");
+        fs::write(&target, b"owned").expect("write owned target");
+        let digest = hex::encode(Sha512::digest(b"owned"));
+        quarantine_remove_file_with_hook(&target, &digest, 64, |_| {})
+            .expect("park validated target");
+        inspect_cleanup_quarantine(&root)
+            .expect("inspect quarantine")
+            .expect("retained quarantine");
+        let retained = fs::read_dir(cleanup_quarantine_path(&root))
+            .expect("read quarantine")
+            .next()
+            .expect("one retained entry")
+            .expect("retained entry")
+            .path();
+
+        reconcile_cleanup_quarantine(&root).expect("first restart reconciliation");
+        reconcile_cleanup_quarantine(&root).expect("second restart reconciliation");
+
+        assert_eq!(fs::read(&retained).expect("retained bytes"), b"owned");
+        let preflight = preflight_managed_inspection_reconciliation(&root)
+            .expect("preflight retained quarantine");
+        assert!(!preflight.cleanup_quarantine);
+        prove_managed_storage_recovered(&root, None).expect("prove restart state");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cleanup_quarantine_capacity_blocks_before_live_target_move() {
+        let root = test_root("cleanup-linux-capacity");
+        let quarantine = cleanup_quarantine_path(&root);
+        fs::create_dir_all(&quarantine).expect("create quarantine");
+        let digest = hex::encode(Sha512::digest(b""));
+        for index in 0..RECOVERY_ENTRY_LIMIT {
+            fs::write(quarantine.join(format!("{digest}.{index:032x}.park")), b"")
+                .expect("write retained entry");
+        }
+        let target = root.join("managed.jar");
+        fs::write(&target, b"owned").expect("write owned target");
+        let target_digest = hex::encode(Sha512::digest(b"owned"));
+
+        let error = quarantine_remove_file_with_hook(&target, &target_digest, 64, |_| {})
+            .expect_err("full quarantine must block before parking");
+
+        assert!(matches!(error, StateError::InvalidState(_)));
+        assert_eq!(fs::read(&target).expect("live target remains"), b"owned");
+        assert_eq!(
+            fs::read_dir(&quarantine).expect("read quarantine").count(),
+            RECOVERY_ENTRY_LIMIT
+        );
+        assert!(
+            ensure_cleanup_quarantine_capacity(
+                CleanupQuarantineUsage {
+                    count: 0,
+                    bytes: CLEANUP_QUARANTINE_MAX_BYTES,
+                },
+                1,
+            )
+            .is_err()
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cleanup_quarantine_retained_handle_ignores_same_bytes_path_substitution() {
+        let root = test_root("cleanup-same-bytes-window-replacement");
+        let target = root.join("managed.jar");
+        fs::write(&target, b"owned").expect("write owned target");
+        let digest = hex::encode(Sha512::digest(b"owned"));
+        let observed = std::cell::RefCell::new(None);
+
+        let result = quarantine_remove_file_with_settlement_hook(&target, &digest, 64, |parked| {
+            let displaced = parked.with_extension("displaced");
+            fs::rename(parked, &displaced).expect("displace admitted entry");
+            fs::write(parked, b"owned").expect("write same-bytes replacement");
+            *observed.borrow_mut() = Some((parked.to_path_buf(), displaced));
+        });
+        let (parked, displaced) = observed.into_inner().expect("settlement paths");
+
+        #[cfg(unix)]
+        {
+            assert!(matches!(result, Err(StateError::InvalidState(_))));
+            assert_eq!(
+                fs::read(displaced).expect("admitted bytes retained"),
+                b"owned"
+            );
+        }
+        #[cfg(windows)]
+        {
+            result.expect("retained handle settlement");
+            assert!(!displaced.exists());
+        }
+        assert_eq!(
+            fs::read(&parked).expect("unknown replacement preserved"),
+            b"owned"
+        );
+        #[cfg(unix)]
+        assert!(reconcile_cleanup_quarantine(&root).is_err());
+        #[cfg(windows)]
+        reconcile_cleanup_quarantine(&root).expect("retain structural restart entry");
+        assert_eq!(
+            fs::read(parked).expect("unknown replacement still preserved"),
+            b"owned"
+        );
         let _ = fs::remove_dir_all(root);
     }
 

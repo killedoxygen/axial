@@ -17,6 +17,13 @@ pub(crate) struct AdmittedFile {
     file: fs::File,
     metadata: fs::Metadata,
     identity: FileIdentity,
+    settlement_capable: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ExactFileSettlement {
+    Settled,
+    PathChanged,
 }
 
 impl AdmittedFile {
@@ -28,13 +35,31 @@ impl AdmittedFile {
         self.identity
     }
 
+    pub(crate) fn try_clone_file(&self) -> io::Result<fs::File> {
+        self.file.try_clone()
+    }
+
+    pub(crate) fn settle_exact(self, path: &Path) -> io::Result<ExactFileSettlement> {
+        if !self.settlement_capable {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "managed file was not admitted for exact settlement",
+            ));
+        }
+        platform_settle_exact(self, path)
+    }
+
     pub(crate) fn into_file(self) -> fs::File {
         self.file
     }
 }
 
 pub(crate) fn admit(path: &Path) -> io::Result<AdmittedFile> {
-    platform_admit(path)
+    platform_admit(path, false)
+}
+
+pub(crate) fn admit_for_settlement(path: &Path) -> io::Result<AdmittedFile> {
+    platform_admit(path, true)
 }
 
 pub(crate) fn revalidate(path: &Path, expected: FileIdentity, expected_len: u64) -> io::Result<()> {
@@ -42,7 +67,7 @@ pub(crate) fn revalidate(path: &Path, expected: FileIdentity, expected_len: u64)
 }
 
 #[cfg(unix)]
-fn platform_admit(path: &Path) -> io::Result<AdmittedFile> {
+fn platform_admit(path: &Path, settlement_capable: bool) -> io::Result<AdmittedFile> {
     use std::os::unix::fs::MetadataExt;
 
     let before = fs::symlink_metadata(path)?;
@@ -68,12 +93,17 @@ fn platform_admit(path: &Path) -> io::Result<AdmittedFile> {
         file,
         metadata,
         identity,
+        settlement_capable,
     })
 }
 
 #[cfg(windows)]
-fn platform_admit(path: &Path) -> io::Result<AdmittedFile> {
-    let file = open_regular_no_follow(path)?;
+fn platform_admit(path: &Path, settlement_capable: bool) -> io::Result<AdmittedFile> {
+    let file = if settlement_capable {
+        open_regular_no_follow_for_settlement(path)?
+    } else {
+        open_regular_no_follow(path)?
+    };
     let metadata = file.metadata()?;
     if !metadata.is_file() {
         return Err(invalid_identity("managed identity is not a regular file"));
@@ -84,11 +114,64 @@ fn platform_admit(path: &Path) -> io::Result<AdmittedFile> {
         file,
         metadata,
         identity,
+        settlement_capable,
     })
 }
 
 #[cfg(not(any(unix, windows)))]
-fn platform_admit(_path: &Path) -> io::Result<AdmittedFile> {
+fn platform_admit(_path: &Path, _settlement_capable: bool) -> io::Result<AdmittedFile> {
+    Err(unsupported_identity())
+}
+
+#[cfg(unix)]
+fn platform_settle_exact(admitted: AdmittedFile, path: &Path) -> io::Result<ExactFileSettlement> {
+    // POSIX cannot condition unlink on inode identity. Retain the proven inode instead of
+    // pathname-unlinking a possible last-window replacement.
+    match platform_revalidate(path, admitted.identity, admitted.metadata.len()) {
+        Ok(()) => Ok(ExactFileSettlement::Settled),
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::InvalidData
+            ) =>
+        {
+            Ok(ExactFileSettlement::PathChanged)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(windows)]
+fn platform_settle_exact(admitted: AdmittedFile, _path: &Path) -> io::Result<ExactFileSettlement> {
+    use std::mem::size_of;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_DISPOSITION_FLAG_DELETE, FILE_DISPOSITION_FLAG_POSIX_SEMANTICS,
+        FILE_DISPOSITION_INFO_EX, FileDispositionInfoEx, SetFileInformationByHandle,
+    };
+
+    let disposition = FILE_DISPOSITION_INFO_EX {
+        Flags: FILE_DISPOSITION_FLAG_DELETE | FILE_DISPOSITION_FLAG_POSIX_SEMANTICS,
+    };
+    // SAFETY: the admitted file owns a live delete-capable handle and `disposition` is a
+    // correctly sized immutable input buffer for `FileDispositionInfoEx`.
+    let removed = unsafe {
+        SetFileInformationByHandle(
+            admitted.file.as_raw_handle(),
+            FileDispositionInfoEx,
+            (&raw const disposition).cast(),
+            u32::try_from(size_of::<FILE_DISPOSITION_INFO_EX>()).unwrap_or(u32::MAX),
+        )
+    };
+    if removed == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(ExactFileSettlement::Settled)
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn platform_settle_exact(_admitted: AdmittedFile, _path: &Path) -> io::Result<ExactFileSettlement> {
     Err(unsupported_identity())
 }
 
@@ -191,6 +274,21 @@ fn open_regular_no_follow(path: &Path) -> io::Result<fs::File> {
     fs::OpenOptions::new()
         .read(true)
         .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+}
+
+#[cfg(windows)]
+fn open_regular_no_follow_for_settlement(path: &Path) -> io::Result<fs::File> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Foundation::GENERIC_READ;
+    use windows_sys::Win32::Storage::FileSystem::{
+        DELETE, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE, FILE_SHARE_READ,
+    };
+
+    fs::OpenOptions::new()
+        .access_mode(GENERIC_READ | DELETE)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_DELETE)
         .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
         .open(path)
 }

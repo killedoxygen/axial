@@ -16,12 +16,6 @@ pub enum InstallError {
     Io(#[from] std::io::Error),
     #[error("managed artifact staging failed")]
     Download(#[from] axial_minecraft::download::ExecutionDownloadError),
-    #[error("composition plan is required")]
-    MissingPlan,
-    #[error("mod filename is invalid: {0}")]
-    InvalidFilename(String),
-    #[error("managed artifact target already exists: {0}")]
-    ManagedArtifactTargetExists(String),
     #[error("no performance rollback snapshot available")]
     NoRollbackSnapshot,
     #[error("performance rollback snapshot not found")]

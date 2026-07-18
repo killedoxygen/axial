@@ -70,6 +70,30 @@ impl AnchoredDirectory {
         &self.stable_path
     }
 
+    pub fn remove_empty_child(&self, name: &str) -> io::Result<bool> {
+        validate_segment(name).map_err(anchor_error)?;
+        let child = match self.directory.open_child(name) {
+            Ok(child) => child,
+            Err(LoaderError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
+                return Ok(false);
+            }
+            Err(error) => return Err(anchor_error(error)),
+        };
+        let park_name = format!(".axial-empty-{}", uuid::Uuid::new_v4().simple());
+        match self
+            .directory
+            .remove_empty_child_guarded(name, &park_name, child)
+            .map_err(anchor_error)?
+        {
+            ManagedEmptyChildRemoval::Removed => Ok(true),
+            ManagedEmptyChildRemoval::IdentityMismatchRestored
+            | ManagedEmptyChildRemoval::IdentityMismatchParked => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "managed empty directory settlement changed identity",
+            )),
+        }
+    }
+
     fn admit(directory: ManagedDir, parent: Option<Arc<AnchoredDirectory>>) -> io::Result<Self> {
         let rename_blockers = directory.acquire_rename_blockers().map_err(anchor_error)?;
         let stable_path = directory.anchored_path().map_err(anchor_error)?;
