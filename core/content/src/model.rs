@@ -182,11 +182,16 @@ pub struct ContentVersion {
 }
 
 impl ContentVersion {
+    /// Return the sole install authority for this version. Multiple primaries,
+    /// or multiple files without a primary, are ambiguous and fail closed.
     pub fn primary_file(&self) -> Option<&FileRef> {
-        self.files
-            .iter()
-            .find(|file| file.primary)
-            .or_else(|| self.files.first())
+        let mut primaries = self.files.iter().filter(|file| file.primary);
+        let first_primary = primaries.next();
+        match (first_primary, primaries.next(), self.files.as_slice()) {
+            (Some(file), None, _) => Some(file),
+            (None, None, [file]) => Some(file),
+            _ => None,
+        }
     }
 }
 

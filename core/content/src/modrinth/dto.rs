@@ -1,4 +1,6 @@
-use serde::Deserialize;
+use serde::de::{MapAccess, Visitor};
+use serde::{Deserialize, Deserializer};
+use std::fmt;
 
 #[derive(Debug, Deserialize)]
 pub(super) struct SearchResponse {
@@ -103,8 +105,16 @@ pub(super) struct Dependency {
     pub version_id: Option<String>,
     #[serde(default)]
     pub project_id: Option<String>,
-    #[serde(default)]
-    pub dependency_type: String,
+    pub dependency_type: DependencyType,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum DependencyType {
+    Required,
+    Optional,
+    Incompatible,
+    Embedded,
 }
 
 #[derive(Debug, Deserialize)]
@@ -124,4 +134,36 @@ pub(super) struct Hashes {
     pub sha1: Option<String>,
     #[serde(default)]
     pub sha512: Option<String>,
+}
+
+pub(super) struct VersionFilesResponse(pub Vec<(String, Version)>);
+
+impl<'de> Deserialize<'de> for VersionFilesResponse {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct VersionFilesVisitor;
+
+        impl<'de> Visitor<'de> for VersionFilesVisitor {
+            type Value = VersionFilesResponse;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a map from requested file hashes to content versions")
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+            where
+                A: MapAccess<'de>,
+            {
+                let mut entries = Vec::with_capacity(map.size_hint().unwrap_or(0));
+                while let Some(entry) = map.next_entry()? {
+                    entries.push(entry);
+                }
+                Ok(VersionFilesResponse(entries))
+            }
+        }
+
+        deserializer.deserialize_map(VersionFilesVisitor)
+    }
 }

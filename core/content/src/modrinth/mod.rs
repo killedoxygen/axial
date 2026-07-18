@@ -1,16 +1,22 @@
 mod dto;
 
 use crate::error::{ContentError, ContentResult};
+use crate::limits::{
+    MAX_DETAIL_BODY_BYTES, MAX_PROVIDER_DETAIL_BYTES, MAX_PROVIDER_METADATA_BYTES,
+};
 use crate::model::{
     CanonicalContent, CanonicalId, ContentDependency, ContentDetail, ContentKind, ContentVersion,
     DependencyKind, FileRef, GalleryImage, ProjectMetadata, ProviderId, ProviderRef,
     ReleaseChannel, VersionIdentity,
 };
 use crate::provider::{ContentProvider, ContentQuery, LoaderGameFilter, Page, SortOrder};
-use std::collections::HashMap;
+use futures_util::StreamExt;
+use std::collections::{HashMap, HashSet};
 
 const DEFAULT_BASE_URL: &str = "https://api.modrinth.com/v2";
 const MAX_BULK_IDS: usize = 100;
+const MAX_PROVIDER_BATCH_ITEMS: usize = 4096;
+const MAX_PROVIDER_ID_BYTES: usize = 256;
 const USER_AGENT: &str = concat!(
     "mateoltd/axial/",
     env!("CARGO_PKG_VERSION"),
@@ -46,6 +52,7 @@ impl ModrinthProvider {
         &self,
         url: &str,
         query: &[(&str, String)],
+        max_bytes: usize,
     ) -> ContentResult<T> {
         let response = self
             .client
@@ -55,7 +62,50 @@ impl ModrinthProvider {
             .query(query)
             .send()
             .await?;
-        parse_response(response, url).await
+        parse_response(response, url, max_bytes).await
+    }
+
+    async fn get_json_counted<T: serde::de::DeserializeOwned>(
+        &self,
+        url: &str,
+        query: &[(&str, String)],
+        max_bytes: usize,
+    ) -> ContentResult<(T, usize)> {
+        let response = self
+            .client
+            .get(url)
+            .header(reqwest::header::USER_AGENT, USER_AGENT)
+            .header(reqwest::header::ACCEPT, "application/json")
+            .query(query)
+            .send()
+            .await?;
+        parse_response_counted(response, url, max_bytes).await
+    }
+}
+
+#[derive(Debug)]
+struct ProviderBatchBudget {
+    remaining_bytes: usize,
+}
+
+impl ProviderBatchBudget {
+    fn new() -> Self {
+        Self {
+            remaining_bytes: MAX_PROVIDER_METADATA_BYTES,
+        }
+    }
+
+    fn remaining(&self) -> usize {
+        self.remaining_bytes
+    }
+
+    fn admit(&mut self, bytes: usize) -> ContentResult<()> {
+        self.remaining_bytes = self.remaining_bytes.checked_sub(bytes).ok_or_else(|| {
+            ContentError::ProviderMetadataInvalid(
+                "content provider batch responses exceeded their aggregate size bound".to_string(),
+            )
+        })?;
+        Ok(())
     }
 }
 
@@ -76,8 +126,13 @@ impl ContentProvider for ModrinthProvider {
             params.push(("query", search.clone()));
         }
 
-        let response: dto::SearchResponse =
-            self.get_json(&self.endpoint("/search"), &params).await?;
+        let response: dto::SearchResponse = self
+            .get_json(
+                &self.endpoint("/search"),
+                &params,
+                MAX_PROVIDER_METADATA_BYTES,
+            )
+            .await?;
         let items = response
             .hits
             .into_iter()
@@ -94,15 +149,20 @@ impl ContentProvider for ModrinthProvider {
     async fn detail(&self, id: &CanonicalId) -> ContentResult<ContentDetail> {
         let project_id = project_id_of(id)?;
         let project: dto::Project = self
-            .get_json(&self.endpoint(&format!("/project/{project_id}")), &[])
+            .get_json(
+                &self.endpoint(&format!("/project/{project_id}")),
+                &[],
+                MAX_PROVIDER_DETAIL_BYTES,
+            )
             .await?;
         let versions: Vec<dto::Version> = self
             .get_json(
                 &self.endpoint(&format!("/project/{project_id}/version")),
                 &[],
+                MAX_PROVIDER_METADATA_BYTES,
             )
             .await?;
-        Ok(map_project_detail(project, versions))
+        map_project_detail(&project_id, project, versions)
     }
 
     async fn versions(
@@ -129,9 +189,10 @@ impl ContentProvider for ModrinthProvider {
             .get_json(
                 &self.endpoint(&format!("/project/{project_id}/version")),
                 &params,
+                MAX_PROVIDER_METADATA_BYTES,
             )
             .await?;
-        Ok(versions.into_iter().map(map_version).collect())
+        map_project_versions(&project_id, versions)
     }
 
     async fn metadata(
@@ -141,28 +202,49 @@ impl ContentProvider for ModrinthProvider {
         if ids.is_empty() {
             return Ok(HashMap::new());
         }
-        let project_ids: Vec<String> = ids.iter().filter_map(|id| project_id_of(id).ok()).collect();
-        if project_ids.is_empty() {
-            return Ok(HashMap::new());
+        validate_batch_item_count(ids.len())?;
+        let mut requested = HashSet::with_capacity(ids.len());
+        let mut project_ids = Vec::with_capacity(ids.len());
+        for id in ids {
+            let project_id = project_id_of(id)?;
+            if !requested.insert(project_id.clone()) {
+                return Err(duplicate_batch_input("project"));
+            }
+            project_ids.push(project_id);
         }
         let mut metadata = HashMap::new();
+        let mut seen_results = HashSet::new();
+        let mut response_budget = ProviderBatchBudget::new();
         for chunk in project_ids.chunks(MAX_BULK_IDS) {
-            let projects: Vec<dto::Project> = self
-                .get_json(
+            let requested_chunk = chunk.iter().map(String::as_str).collect::<HashSet<_>>();
+            let (projects, response_bytes): (Vec<dto::Project>, usize) = self
+                .get_json_counted(
                     &self.endpoint("/projects"),
                     &[("ids", json_string_array(chunk))],
+                    response_budget.remaining(),
                 )
                 .await?;
-            metadata.extend(projects.into_iter().filter_map(|project| {
-                let kind = kind_from_project_type(&project.project_type)?;
-                Some((
+            response_budget.admit(response_bytes)?;
+            for project in projects {
+                validate_batch_result_identity(
+                    "project",
+                    &project.id,
+                    &requested_chunk,
+                    &mut seen_results,
+                )?;
+                let kind = kind_from_project_type(&project.project_type).ok_or_else(|| {
+                    ContentError::ProviderMetadataInvalid(
+                        "content provider returned an unknown project type".to_string(),
+                    )
+                })?;
+                metadata.insert(
                     CanonicalId::for_project(ProviderId::Modrinth, &project.id),
                     ProjectMetadata {
                         kind,
                         title: project.title,
                     },
-                ))
-            }));
+                );
+            }
         }
         Ok(metadata)
     }
@@ -174,9 +256,14 @@ impl ContentProvider for ModrinthProvider {
         if sha512_hashes.is_empty() {
             return Ok(HashMap::new());
         }
+        validate_batch_item_count(sha512_hashes.len())?;
+        validate_unique_hash_inputs(sha512_hashes)?;
         let url = self.endpoint("/version_files");
         let mut identities = HashMap::new();
+        let mut seen_results = HashSet::new();
+        let mut response_budget = ProviderBatchBudget::new();
         for chunk in sha512_hashes.chunks(MAX_BULK_IDS) {
+            let requested_chunk = chunk.iter().map(String::as_str).collect::<HashSet<_>>();
             let body = serde_json::json!({
                 "hashes": chunk,
                 "algorithm": "sha512",
@@ -189,10 +276,13 @@ impl ContentProvider for ModrinthProvider {
                 .json(&body)
                 .send()
                 .await?;
-            let resolved: HashMap<String, dto::Version> = parse_response(response, &url).await?;
-            identities.extend(resolved.into_iter().filter_map(|(hash, version)| {
-                map_identity(version).map(|identity| (hash, identity))
-            }));
+            let (resolved, response_bytes): (dto::VersionFilesResponse, usize) =
+                parse_response_counted(response, &url, response_budget.remaining()).await?;
+            response_budget.admit(response_bytes)?;
+            for (hash, version) in resolved.0 {
+                validate_batch_result_identity("hash", &hash, &requested_chunk, &mut seen_results)?;
+                identities.insert(hash, map_identity(version)?);
+            }
         }
         Ok(identities)
     }
@@ -201,18 +291,34 @@ impl ContentProvider for ModrinthProvider {
         &self,
         version_ids: &[String],
     ) -> ContentResult<HashMap<String, VersionIdentity>> {
+        if version_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        validate_batch_item_count(version_ids.len())?;
+        validate_unique_identity_inputs("version", version_ids)?;
         let mut identities = HashMap::new();
+        let mut seen_results = HashSet::new();
+        let mut response_budget = ProviderBatchBudget::new();
         for chunk in version_ids.chunks(MAX_BULK_IDS) {
-            let versions: Vec<dto::Version> = self
-                .get_json(
+            let requested_chunk = chunk.iter().map(String::as_str).collect::<HashSet<_>>();
+            let (versions, response_bytes): (Vec<dto::Version>, usize) = self
+                .get_json_counted(
                     &self.endpoint("/versions"),
                     &[("ids", json_string_array(chunk))],
+                    response_budget.remaining(),
                 )
                 .await?;
-            identities.extend(versions.into_iter().filter_map(|version| {
+            response_budget.admit(response_bytes)?;
+            for version in versions {
+                validate_batch_result_identity(
+                    "version",
+                    &version.id,
+                    &requested_chunk,
+                    &mut seen_results,
+                )?;
                 let identity = map_identity(version)?;
-                Some((identity.version_id.clone(), identity))
-            }));
+                identities.insert(identity.version_id.clone(), identity);
+            }
         }
         Ok(identities)
     }
@@ -221,7 +327,18 @@ impl ContentProvider for ModrinthProvider {
 async fn parse_response<T: serde::de::DeserializeOwned>(
     response: reqwest::Response,
     context: &str,
+    max_bytes: usize,
 ) -> ContentResult<T> {
+    parse_response_counted(response, context, max_bytes)
+        .await
+        .map(|(value, _)| value)
+}
+
+async fn parse_response_counted<T: serde::de::DeserializeOwned>(
+    response: reqwest::Response,
+    context: &str,
+    max_bytes: usize,
+) -> ContentResult<(T, usize)> {
     let status = response.status();
     if !status.is_success() {
         return Err(ContentError::Status {
@@ -229,8 +346,56 @@ async fn parse_response<T: serde::de::DeserializeOwned>(
             context: context.to_string(),
         });
     }
-    let bytes = response.bytes().await?;
-    parse_provider_json(&bytes, context)
+    let bytes = bounded_response_body(response, max_bytes).await?;
+    let value = parse_provider_json(&bytes, context)?;
+    Ok((value, bytes.len()))
+}
+
+async fn bounded_response_body(
+    response: reqwest::Response,
+    max_bytes: usize,
+) -> ContentResult<Vec<u8>> {
+    validate_declared_body_length(response.content_length(), max_bytes)?;
+    let initial_capacity = response
+        .content_length()
+        .and_then(|length| usize::try_from(length).ok())
+        .unwrap_or(0)
+        .min(max_bytes);
+    let mut body = Vec::with_capacity(initial_capacity);
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        append_bounded_body_chunk(&mut body, &chunk?, max_bytes)?;
+    }
+    Ok(body)
+}
+
+fn validate_declared_body_length(length: Option<u64>, max_bytes: usize) -> ContentResult<()> {
+    if length.is_some_and(|length| length > max_bytes as u64) {
+        return Err(oversized_provider_response());
+    }
+    Ok(())
+}
+
+fn append_bounded_body_chunk(
+    body: &mut Vec<u8>,
+    chunk: &[u8],
+    max_bytes: usize,
+) -> ContentResult<()> {
+    let retained = max_bytes
+        .saturating_add(1)
+        .saturating_sub(body.len())
+        .min(chunk.len());
+    body.extend_from_slice(&chunk[..retained]);
+    if body.len() > max_bytes {
+        return Err(oversized_provider_response());
+    }
+    Ok(())
+}
+
+fn oversized_provider_response() -> ContentError {
+    ContentError::ProviderMetadataInvalid(
+        "content provider response exceeded its size bound".to_string(),
+    )
 }
 
 fn parse_provider_json<T: serde::de::DeserializeOwned>(
@@ -302,11 +467,80 @@ fn json_string_array(values: &[String]) -> String {
     serde_json::to_string(values).unwrap_or_else(|_| "[]".to_string())
 }
 
+fn validate_batch_item_count(count: usize) -> ContentResult<()> {
+    if count > MAX_PROVIDER_BATCH_ITEMS {
+        return Err(ContentError::Invalid(
+            "content provider batch input exceeds its item bound".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_unique_identity_inputs(label: &str, values: &[String]) -> ContentResult<()> {
+    let mut seen = HashSet::with_capacity(values.len());
+    for value in values {
+        if !valid_provider_identity(value) {
+            return Err(ContentError::Invalid(format!(
+                "content provider {label} input is invalid"
+            )));
+        }
+        if !seen.insert(value.as_str()) {
+            return Err(duplicate_batch_input(label));
+        }
+    }
+    Ok(())
+}
+
+fn validate_unique_hash_inputs(values: &[String]) -> ContentResult<()> {
+    let mut seen = HashSet::with_capacity(values.len());
+    for value in values {
+        if !valid_sha512(value) {
+            return Err(ContentError::Invalid(
+                "content provider hash input is invalid".to_string(),
+            ));
+        }
+        if !seen.insert(value.as_str()) {
+            return Err(duplicate_batch_input("hash"));
+        }
+    }
+    Ok(())
+}
+
+fn duplicate_batch_input(label: &str) -> ContentError {
+    ContentError::Invalid(format!(
+        "content provider batch contains a duplicate {label} input"
+    ))
+}
+
+fn validate_batch_result_identity(
+    label: &str,
+    value: &str,
+    requested: &HashSet<&str>,
+    seen: &mut HashSet<String>,
+) -> ContentResult<()> {
+    let identity_valid = if label == "hash" {
+        valid_sha512(value)
+    } else {
+        valid_provider_identity(value)
+    };
+    if !identity_valid || !requested.contains(value) {
+        return Err(ContentError::ProviderMetadataInvalid(format!(
+            "content provider returned an unexpected {label} identity"
+        )));
+    }
+    if !seen.insert(value.to_string()) {
+        return Err(ContentError::ProviderMetadataInvalid(format!(
+            "content provider returned a duplicate {label} identity"
+        )));
+    }
+    Ok(())
+}
+
 fn project_id_of(id: &CanonicalId) -> ContentResult<String> {
     let raw = id.as_str();
     let project = raw
         .strip_prefix("modrinth:")
-        .filter(|rest| !rest.is_empty())
+        .filter(|rest| valid_provider_identity(rest))
         .ok_or_else(|| ContentError::Invalid(format!("not a modrinth id: {raw}")))?;
     Ok(project.to_string())
 }
@@ -342,7 +576,21 @@ fn map_search_hit(hit: dto::SearchHit) -> Option<CanonicalContent> {
     })
 }
 
-fn map_project_detail(project: dto::Project, versions: Vec<dto::Version>) -> ContentDetail {
+fn map_project_detail(
+    requested_project_id: &str,
+    project: dto::Project,
+    versions: Vec<dto::Version>,
+) -> ContentResult<ContentDetail> {
+    if project.id != requested_project_id {
+        return Err(ContentError::ProviderMetadataInvalid(
+            "content provider returned detail for a different project".to_string(),
+        ));
+    }
+    if project.body.len() > MAX_DETAIL_BODY_BYTES {
+        return Err(ContentError::ProviderMetadataInvalid(
+            "content detail body exceeded its size bound".to_string(),
+        ));
+    }
     let kind = kind_from_project_type(&project.project_type).unwrap_or(ContentKind::Mod);
     let mut categories = project.categories;
     categories.extend(project.additional_categories);
@@ -368,7 +616,7 @@ fn map_project_detail(project: dto::Project, versions: Vec<dto::Version>) -> Con
             slug: project.slug,
         }],
     };
-    ContentDetail {
+    Ok(ContentDetail {
         content,
         body: project.body,
         gallery: project
@@ -379,27 +627,52 @@ fn map_project_detail(project: dto::Project, versions: Vec<dto::Version>) -> Con
                 title: entry.title,
             })
             .collect(),
-        versions: versions.into_iter().map(map_version).collect(),
-    }
+        versions: map_project_versions(requested_project_id, versions)?,
+    })
 }
 
-fn map_version(version: dto::Version) -> ContentVersion {
-    ContentVersion {
+fn map_project_versions(
+    requested_project_id: &str,
+    versions: Vec<dto::Version>,
+) -> ContentResult<Vec<ContentVersion>> {
+    let mut seen = HashSet::with_capacity(versions.len());
+    versions
+        .into_iter()
+        .map(|version| {
+            if version.project_id != requested_project_id {
+                return Err(ContentError::ProviderMetadataInvalid(
+                    "content provider returned a version for a different project".to_string(),
+                ));
+            }
+            if !seen.insert(version.id.clone()) {
+                return Err(ContentError::ProviderMetadataInvalid(
+                    "content provider returned a duplicate version identity".to_string(),
+                ));
+            }
+            map_version(version)
+        })
+        .collect()
+}
+
+fn map_version(version: dto::Version) -> ContentResult<ContentVersion> {
+    validate_provider_identity("version", &version.id)?;
+    validate_provider_identity("project", &version.project_id)?;
+    Ok(ContentVersion {
         id: version.id,
         name: version.name,
         version_number: version.version_number,
         game_versions: version.game_versions,
         loaders: version.loaders,
-        channel: release_channel(&version.version_type),
+        channel: release_channel(&version.version_type)?,
         published: version.date_published,
         downloads: version.downloads,
         files: version.files.into_iter().map(map_file).collect(),
         dependencies: version
             .dependencies
             .into_iter()
-            .filter_map(map_dependency)
-            .collect(),
-    }
+            .map(map_dependency)
+            .collect::<ContentResult<Vec<_>>>()?,
+    })
 }
 
 fn map_file(file: dto::VersionFile) -> FileRef {
@@ -413,33 +686,42 @@ fn map_file(file: dto::VersionFile) -> FileRef {
     }
 }
 
-fn map_dependency(dependency: dto::Dependency) -> Option<ContentDependency> {
-    let kind = match dependency.dependency_type.as_str() {
-        "required" => DependencyKind::Required,
-        "optional" => DependencyKind::Optional,
-        "incompatible" => DependencyKind::Incompatible,
-        "embedded" => DependencyKind::Embedded,
-        _ => return None,
+fn map_dependency(dependency: dto::Dependency) -> ContentResult<ContentDependency> {
+    let kind = match dependency.dependency_type {
+        dto::DependencyType::Required => DependencyKind::Required,
+        dto::DependencyType::Optional => DependencyKind::Optional,
+        dto::DependencyType::Incompatible => DependencyKind::Incompatible,
+        dto::DependencyType::Embedded => DependencyKind::Embedded,
     };
-    if dependency.project_id.is_none() && dependency.version_id.is_none() {
-        return None;
+    if let Some(project_id) = dependency.project_id.as_deref() {
+        validate_provider_identity("dependency project", project_id)?;
     }
-    Some(ContentDependency {
+    if let Some(version_id) = dependency.version_id.as_deref() {
+        validate_provider_identity("dependency version", version_id)?;
+    }
+    if dependency.project_id.is_none() && dependency.version_id.is_none() {
+        return Err(ContentError::ProviderMetadataInvalid(
+            "content dependency has no project or version identity".to_string(),
+        ));
+    }
+    Ok(ContentDependency {
         project_id: dependency.project_id,
         version_id: dependency.version_id,
         kind,
     })
 }
 
-fn map_identity(version: dto::Version) -> Option<VersionIdentity> {
+fn map_identity(version: dto::Version) -> ContentResult<VersionIdentity> {
+    validate_provider_identity("version", &version.id)?;
+    validate_provider_identity("project", &version.project_id)?;
     let game_versions = version.game_versions;
     let loaders = version.loaders;
     let dependencies = version
         .dependencies
         .into_iter()
-        .filter_map(map_dependency)
-        .collect();
-    Some(VersionIdentity {
+        .map(map_dependency)
+        .collect::<ContentResult<Vec<_>>>()?;
+    Ok(VersionIdentity {
         provider: ProviderId::Modrinth,
         project_id: version.project_id,
         version_id: version.id,
@@ -450,17 +732,203 @@ fn map_identity(version: dto::Version) -> Option<VersionIdentity> {
     })
 }
 
-fn release_channel(version_type: &str) -> ReleaseChannel {
+fn release_channel(version_type: &str) -> ContentResult<ReleaseChannel> {
     match version_type {
-        "beta" => ReleaseChannel::Beta,
-        "alpha" => ReleaseChannel::Alpha,
-        _ => ReleaseChannel::Release,
+        "release" => Ok(ReleaseChannel::Release),
+        "beta" => Ok(ReleaseChannel::Beta),
+        "alpha" => Ok(ReleaseChannel::Alpha),
+        _ => Err(ContentError::ProviderMetadataInvalid(
+            "content version has an unknown release channel".to_string(),
+        )),
     }
+}
+
+fn validate_provider_identity(label: &str, value: &str) -> ContentResult<()> {
+    if !valid_provider_identity(value) {
+        return Err(ContentError::ProviderMetadataInvalid(format!(
+            "content {label} identity is invalid"
+        )));
+    }
+    Ok(())
+}
+
+fn valid_provider_identity(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= MAX_PROVIDER_ID_BYTES
+        && value.trim() == value
+        && !value.chars().any(char::is_control)
+}
+
+fn valid_sha512(value: &str) -> bool {
+    value.len() == 128
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn provider_body_limits_admit_exact_and_reject_one_over() {
+        validate_declared_body_length(
+            Some(MAX_PROVIDER_METADATA_BYTES as u64),
+            MAX_PROVIDER_METADATA_BYTES,
+        )
+        .expect("exact declared metadata limit");
+        assert!(
+            validate_declared_body_length(
+                Some((MAX_PROVIDER_METADATA_BYTES + 1) as u64),
+                MAX_PROVIDER_METADATA_BYTES,
+            )
+            .is_err()
+        );
+        validate_declared_body_length(
+            Some(MAX_PROVIDER_DETAIL_BYTES as u64),
+            MAX_PROVIDER_DETAIL_BYTES,
+        )
+        .expect("exact declared detail limit");
+        assert!(
+            validate_declared_body_length(
+                Some((MAX_PROVIDER_DETAIL_BYTES + 1) as u64),
+                MAX_PROVIDER_DETAIL_BYTES,
+            )
+            .is_err()
+        );
+
+        let mut body = Vec::new();
+        append_bounded_body_chunk(
+            &mut body,
+            &vec![0; MAX_PROVIDER_METADATA_BYTES],
+            MAX_PROVIDER_METADATA_BYTES,
+        )
+        .expect("exact streamed metadata limit");
+        assert!(append_bounded_body_chunk(&mut body, &[0], MAX_PROVIDER_METADATA_BYTES).is_err());
+    }
+
+    #[test]
+    fn detail_body_limit_admits_exact_and_rejects_one_over() {
+        let project = |body: String| {
+            serde_json::from_value::<dto::Project>(serde_json::json!({
+                "id": "project",
+                "title": "Project",
+                "project_type": "mod",
+                "body": body
+            }))
+            .expect("detail project")
+        };
+
+        map_project_detail(
+            "project",
+            project("x".repeat(MAX_DETAIL_BODY_BYTES)),
+            Vec::new(),
+        )
+        .expect("exact detail body limit");
+        assert!(
+            map_project_detail(
+                "project",
+                project("x".repeat(MAX_DETAIL_BODY_BYTES + 1)),
+                Vec::new(),
+            )
+            .is_err()
+        );
+    }
+
+    fn provider_version(id: &str, project_id: &str) -> dto::Version {
+        serde_json::from_value(serde_json::json!({
+            "id": id,
+            "project_id": project_id,
+            "name": "Version",
+            "version_number": "1.0.0",
+            "version_type": "release"
+        }))
+        .expect("provider version")
+    }
+
+    #[test]
+    fn project_version_mapping_rejects_wrong_and_duplicate_identities() {
+        assert!(map_project_versions("requested", vec![provider_version("v1", "other")]).is_err());
+        assert!(
+            map_project_versions(
+                "requested",
+                vec![
+                    provider_version("v1", "requested"),
+                    provider_version("v1", "requested"),
+                ],
+            )
+            .is_err()
+        );
+
+        let wrong_project: dto::Project = serde_json::from_value(serde_json::json!({
+            "id": "other",
+            "title": "Other",
+            "project_type": "mod"
+        }))
+        .expect("project detail");
+        assert!(map_project_detail("requested", wrong_project, Vec::new()).is_err());
+    }
+
+    #[test]
+    fn batch_inputs_and_aggregate_responses_are_bounded() {
+        validate_batch_item_count(MAX_PROVIDER_BATCH_ITEMS).expect("exact batch item limit");
+        assert!(validate_batch_item_count(MAX_PROVIDER_BATCH_ITEMS + 1).is_err());
+        assert!(
+            validate_unique_identity_inputs("version", &["same".to_string(), "same".to_string()])
+                .is_err()
+        );
+        assert!(validate_unique_hash_inputs(&["a".repeat(128), "a".repeat(128)]).is_err());
+
+        let mut budget = ProviderBatchBudget::new();
+        budget
+            .admit(MAX_PROVIDER_METADATA_BYTES)
+            .expect("exact aggregate response limit");
+        assert_eq!(budget.remaining(), 0);
+        assert!(budget.admit(1).is_err());
+    }
+
+    #[test]
+    fn batch_results_reject_unexpected_and_duplicate_identities() {
+        let requested = HashSet::from(["requested"]);
+        let mut seen = HashSet::new();
+        assert!(
+            validate_batch_result_identity("version", "unexpected", &requested, &mut seen).is_err()
+        );
+        validate_batch_result_identity("version", "requested", &requested, &mut seen)
+            .expect("first requested result");
+        assert!(
+            validate_batch_result_identity("version", "requested", &requested, &mut seen).is_err()
+        );
+
+        let hash = "a".repeat(128);
+        let other_hash = "b".repeat(128);
+        let requested_hashes = HashSet::from([hash.as_str()]);
+        assert!(
+            validate_batch_result_identity(
+                "hash",
+                &other_hash,
+                &requested_hashes,
+                &mut HashSet::new(),
+            )
+            .is_err()
+        );
+        let payload = format!(
+            r#"{{"{hash}":{{"id":"v1","project_id":"p1","name":"V1","version_number":"1"}},"{hash}":{{"id":"v2","project_id":"p2","name":"V2","version_number":"2"}}}}"#
+        );
+        let duplicate_hashes =
+            parse_provider_json::<dto::VersionFilesResponse>(payload.as_bytes(), "hash fixture")
+                .expect("preserve duplicate JSON keys");
+        assert_eq!(duplicate_hashes.0.len(), 2);
+        let mut seen_hashes = HashSet::new();
+        for (hash, _) in duplicate_hashes.0 {
+            if validate_batch_result_identity("hash", &hash, &requested_hashes, &mut seen_hashes)
+                .is_err()
+            {
+                return;
+            }
+        }
+        panic!("duplicate hash result must be rejected");
+    }
 
     #[test]
     fn invalid_provider_json_is_typed_as_metadata_invalid() {
@@ -508,5 +976,44 @@ mod tests {
             Some("version-c")
         );
         assert_eq!(identity.dependencies[1].kind, DependencyKind::Required);
+    }
+
+    #[test]
+    fn dependency_mapping_rejects_unknown_and_identityless_records() {
+        let unknown = serde_json::from_value::<dto::Version>(serde_json::json!({
+            "id": "version-a",
+            "project_id": "project-a",
+            "name": "Project A",
+            "version_number": "1.0.0",
+            "dependencies": [{ "project_id": "dependency", "dependency_type": "suggested" }]
+        }));
+        assert!(
+            unknown.is_err(),
+            "unknown dependency types must fail decoding"
+        );
+
+        let identityless: dto::Version = serde_json::from_value(serde_json::json!({
+            "id": "version-a",
+            "project_id": "project-a",
+            "name": "Project A",
+            "version_number": "1.0.0",
+            "dependencies": [{ "dependency_type": "required" }]
+        }))
+        .expect("structurally decoded identityless dependency");
+        assert!(map_identity(identityless).is_err());
+    }
+
+    #[test]
+    fn version_mapping_rejects_unknown_release_channels() {
+        let version: dto::Version = serde_json::from_value(serde_json::json!({
+            "id": "version-a",
+            "project_id": "project-a",
+            "name": "Project A",
+            "version_number": "1.0.0",
+            "version_type": "candidate"
+        }))
+        .expect("version payload");
+
+        assert!(map_version(version).is_err());
     }
 }

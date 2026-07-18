@@ -1,4 +1,8 @@
 use crate::error::{ContentError, ContentResult};
+use crate::limits::{
+    MAX_CONTENT_ARTIFACT_BYTES, MAX_CONTENT_GRAPH_BYTES, MAX_DEPENDENCIES_PER_NODE,
+    MAX_RESOLUTION_EDGES, MAX_RESOLUTION_NODES,
+};
 use crate::manifest::{ContentManifest, ManifestEntry, entry_file_present, entry_path_matches};
 use crate::model::{CanonicalId, ContentDependency, ContentKind, FileRef, ProviderId};
 use crate::transaction::{FileTransaction, StagingGuard, contained_path};
@@ -10,6 +14,7 @@ use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::fs;
 use std::path::Path;
+use url::Url;
 
 /// A single resolved file the pipeline should download and record. Callers build
 /// these from a resolution plan (selected content plus its dependencies).
@@ -40,6 +45,7 @@ where
     F: FnMut(DownloadProgress),
     G: FnMut(ExecutionDownloadFact),
 {
+    validate_install_plan(files)?;
     let mut manifest = ContentManifest::load(game_dir)?;
     let total = files.len() as i32;
     let mut prospective_manifest = manifest.clone();
@@ -143,6 +149,97 @@ where
     transaction.commit();
     on_progress(done(total));
     Ok(manifest)
+}
+
+/// Revalidate a resolved plan immediately before any staging or filesystem
+/// mutation. Resolution is the primary admission boundary, while this guard
+/// prevents another in-process caller from constructing a weaker plan.
+fn validate_install_plan(files: &[PlannedFile]) -> ContentResult<()> {
+    if files.len() > MAX_RESOLUTION_NODES {
+        return Err(ContentError::ProviderMetadataInvalid(
+            "the content plan exceeds its item bound".to_string(),
+        ));
+    }
+    let mut edge_count = 0_usize;
+    let mut total_bytes = 0_u64;
+    for planned in files {
+        if planned.dependencies.len() > MAX_DEPENDENCIES_PER_NODE {
+            return Err(ContentError::ProviderMetadataInvalid(
+                "the content plan exceeds its per-item dependency bound".to_string(),
+            ));
+        }
+        edge_count = edge_count
+            .checked_add(planned.dependencies.len())
+            .filter(|count| *count <= MAX_RESOLUTION_EDGES)
+            .ok_or_else(|| {
+                ContentError::ProviderMetadataInvalid(
+                    "the content plan exceeds its dependency bound".to_string(),
+                )
+            })?;
+        let artifact_bytes = validate_planned_artifact(planned.kind, &planned.file)?;
+        total_bytes = total_bytes
+            .checked_add(artifact_bytes)
+            .filter(|bytes| *bytes <= MAX_CONTENT_GRAPH_BYTES)
+            .ok_or_else(|| {
+                ContentError::ProviderMetadataInvalid(
+                    "the content plan exceeds its aggregate download bound".to_string(),
+                )
+            })?;
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_planned_artifact(kind: ContentKind, file: &FileRef) -> ContentResult<u64> {
+    if kind == ContentKind::Modpack {
+        return Err(ContentError::ProviderMetadataInvalid(
+            "a modpack is not installable as a single content artifact".to_string(),
+        ));
+    }
+    if !valid_provider_filename(&file.filename)
+        || (kind == ContentKind::Mod && !file.filename.to_ascii_lowercase().ends_with(".jar"))
+    {
+        return Err(ContentError::ProviderMetadataInvalid(
+            "the provider returned an invalid content filename".to_string(),
+        ));
+    }
+    let url = Url::parse(&file.url).map_err(|_| {
+        ContentError::ProviderMetadataInvalid(
+            "the provider returned an invalid content download URL".to_string(),
+        )
+    })?;
+    if url.scheme() != "https"
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(ContentError::ProviderMetadataInvalid(
+            "content downloads require an HTTPS provider URL".to_string(),
+        ));
+    }
+    if !file.sha512.as_deref().is_some_and(valid_sha512) {
+        return Err(ContentError::ProviderMetadataInvalid(
+            "the provider returned content without an exact SHA-512 digest".to_string(),
+        ));
+    }
+    let size = file.size.filter(|size| *size > 0).ok_or_else(|| {
+        ContentError::ProviderMetadataInvalid(
+            "the provider returned content without a positive size".to_string(),
+        )
+    })?;
+    if size > MAX_CONTENT_ARTIFACT_BYTES {
+        return Err(ContentError::ProviderMetadataInvalid(
+            "the provider returned an oversized content artifact".to_string(),
+        ));
+    }
+    Ok(size)
+}
+
+fn valid_sha512(value: &str) -> bool {
+    value.len() == 128
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 #[derive(Debug)]
@@ -846,6 +943,7 @@ fn done(total: i32) -> DownloadProgress {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::DependencyKind;
 
     fn planned(project: &str, filename: &str) -> PlannedFile {
         PlannedFile {
@@ -858,8 +956,8 @@ mod tests {
                 url: format!("https://example.invalid/{filename}"),
                 filename: filename.to_string(),
                 sha1: None,
-                sha512: None,
-                size: None,
+                sha512: Some("a".repeat(128)),
+                size: Some(1),
                 primary: true,
             },
             dependencies: Vec::new(),
@@ -867,15 +965,89 @@ mod tests {
         }
     }
 
+    fn dependency(index: usize) -> ContentDependency {
+        ContentDependency {
+            project_id: Some(format!("dependency-{index}")),
+            version_id: None,
+            kind: DependencyKind::Required,
+        }
+    }
+
+    #[test]
+    fn artifact_admission_is_exact_and_closed() {
+        let mut candidate = planned("project", "project.jar");
+        candidate.file.size = Some(MAX_CONTENT_ARTIFACT_BYTES);
+        assert_eq!(
+            validate_planned_artifact(candidate.kind, &candidate.file)
+                .expect("exact artifact limit"),
+            MAX_CONTENT_ARTIFACT_BYTES
+        );
+
+        let mut invalid = candidate.clone();
+        invalid.file.filename = "project.zip".to_string();
+        assert!(validate_planned_artifact(invalid.kind, &invalid.file).is_err());
+        invalid = candidate.clone();
+        invalid.file.url = "http://example.invalid/project.jar".to_string();
+        assert!(validate_planned_artifact(invalid.kind, &invalid.file).is_err());
+        invalid = candidate.clone();
+        invalid.file.sha512 = Some("A".repeat(128));
+        assert!(validate_planned_artifact(invalid.kind, &invalid.file).is_err());
+        invalid = candidate.clone();
+        invalid.file.size = Some(0);
+        assert!(validate_planned_artifact(invalid.kind, &invalid.file).is_err());
+        invalid.file.size = Some(MAX_CONTENT_ARTIFACT_BYTES + 1);
+        assert!(validate_planned_artifact(invalid.kind, &invalid.file).is_err());
+    }
+
+    #[test]
+    fn install_plan_limits_admit_exact_and_reject_one_over() {
+        let exact_nodes = (0..MAX_RESOLUTION_NODES)
+            .map(|index| planned(&format!("project-{index}"), &format!("project-{index}.jar")))
+            .collect::<Vec<_>>();
+        validate_install_plan(&exact_nodes).expect("exact node limit");
+        let mut too_many_nodes = exact_nodes;
+        too_many_nodes.push(planned("overflow", "overflow.jar"));
+        assert!(validate_install_plan(&too_many_nodes).is_err());
+
+        let mut exact_edges = (0..(MAX_RESOLUTION_EDGES / MAX_DEPENDENCIES_PER_NODE))
+            .map(|index| planned(&format!("root-{index}"), &format!("root-{index}.jar")))
+            .collect::<Vec<_>>();
+        for item in &mut exact_edges {
+            item.dependencies = (0..MAX_DEPENDENCIES_PER_NODE).map(dependency).collect();
+        }
+        validate_install_plan(&exact_edges).expect("exact edge limit");
+        let mut per_node_over = exact_edges.clone();
+        per_node_over[0]
+            .dependencies
+            .push(dependency(MAX_DEPENDENCIES_PER_NODE));
+        assert!(validate_install_plan(&per_node_over).is_err());
+        let mut edge_over = exact_edges;
+        let mut overflow_edge = planned("edge-over", "edge-over.jar");
+        overflow_edge.dependencies.push(dependency(0));
+        edge_over.push(overflow_edge);
+        assert!(validate_install_plan(&edge_over).is_err());
+
+        let mut exact_graph = planned("large", "large.jar");
+        exact_graph.file.size = Some(MAX_CONTENT_GRAPH_BYTES);
+        validate_install_plan(std::slice::from_ref(&exact_graph)).expect("exact graph byte limit");
+        let mut graph_over = exact_graph;
+        graph_over.file.filename = "first.jar".to_string();
+        let second = planned("second", "second.jar");
+        assert!(validate_install_plan(&[graph_over, second]).is_err());
+    }
+
     fn recorded(project: &str, filename: &str) -> ManifestEntry {
         let planned = planned(project, filename);
+        let mut recorded_file = planned.file;
+        recorded_file.sha512 = None;
+        recorded_file.size = None;
         ManifestEntry::managed(
             planned.canonical_id,
             planned.provider,
             planned.project_id,
             planned.version_id,
             planned.kind,
-            &planned.file,
+            &recorded_file,
             Vec::new(),
             planned.title,
         )

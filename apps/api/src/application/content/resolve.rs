@@ -12,7 +12,7 @@ use crate::state::AppState;
 use axial_content::{
     CanonicalId, ContentDependency, ContentKind, ContentManifest, ContentResolution,
     ResolutionConflict, ResolutionConflictKind, ResolutionConflictReason, ResolutionError,
-    ResolutionReason, ResolutionSelection, resolve_content,
+    ResolutionLimitKind, ResolutionReason, ResolutionSelection, resolve_content,
 };
 use axum::http::StatusCode;
 use serde::Serialize;
@@ -102,9 +102,6 @@ fn public_conflict_detail(conflict: &ResolutionConflict) -> String {
     match &conflict.reason {
         ResolutionConflictReason::NoCompatibleVersion => {
             format!("{subject} has no compatible version for this loader and Minecraft version")
-        }
-        ResolutionConflictReason::DependencyGraphTooLarge => {
-            format!("{subject} could not be resolved because the dependency graph is too large")
         }
         ResolutionConflictReason::RequiredDependencyUnidentified => {
             format!("{subject} has a required dependency that could not be identified")
@@ -241,6 +238,10 @@ fn resolution_error_response(error: ResolutionError) -> ContentApiError {
             StatusCode::BAD_REQUEST,
             "the selected content type changed; refresh it and try again",
         ),
+        ResolutionError::DuplicateSelection => json_error(
+            StatusCode::BAD_REQUEST,
+            "the same content cannot be selected more than once",
+        ),
         ResolutionError::ModpackRequiresInstance => json_error(
             StatusCode::BAD_REQUEST,
             "a modpack is installed as its own instance, not added to one",
@@ -253,6 +254,23 @@ fn resolution_error_response(error: ResolutionError) -> ContentApiError {
             StatusCode::CONFLICT,
             "an installed exact dependency could not be identified",
         ),
+        ResolutionError::LimitExceeded(limit) => match limit.kind {
+            ResolutionLimitKind::Selections => json_error(
+                StatusCode::BAD_REQUEST,
+                "too many content items were selected at once",
+            ),
+            ResolutionLimitKind::Nodes
+            | ResolutionLimitKind::Depth
+            | ResolutionLimitKind::DependenciesPerNode
+            | ResolutionLimitKind::Edges
+            | ResolutionLimitKind::Queue
+            | ResolutionLimitKind::Conflicts
+            | ResolutionLimitKind::GraphBytes
+            | ResolutionLimitKind::StructuredOutput => json_error(
+                StatusCode::CONFLICT,
+                "the content dependency graph exceeds its safety limits",
+            ),
+        },
         ResolutionError::Provider(error) => content_error_response(error),
     }
 }
@@ -352,11 +370,6 @@ mod tests {
                 "Sodium has no compatible version for this loader and Minecraft version",
             ),
             (
-                conflict(None, ResolutionConflictReason::DependencyGraphTooLarge),
-                ConflictKind::Unavailable,
-                "This content could not be resolved because the dependency graph is too large",
-            ),
-            (
                 conflict(
                     None,
                     ResolutionConflictReason::RequiredDependencyUnidentified,
@@ -445,6 +458,25 @@ mod tests {
         );
         assert!(!bounded.detail.contains(&oversized));
         assert!(bounded.detail.chars().count() < 180);
+    }
+
+    #[test]
+    fn limit_projection_uses_fixed_copy_without_structured_fact_values() {
+        let (status, body) = resolution_error_response(ResolutionError::LimitExceeded(
+            axial_content::ResolutionLimitExceeded {
+                kind: ResolutionLimitKind::Edges,
+                maximum: 4096,
+                observed: 987_654,
+            },
+        ));
+        let body = body.0;
+
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(
+            body.get("error").and_then(serde_json::Value::as_str),
+            Some("the content dependency graph exceeds its safety limits")
+        );
+        assert!(!body.to_string().contains("987654"));
     }
 
     #[test]

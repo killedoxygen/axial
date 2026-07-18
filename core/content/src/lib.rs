@@ -1,5 +1,6 @@
 pub mod error;
 pub mod install;
+mod limits;
 pub mod manifest;
 pub mod model;
 pub mod modrinth;
@@ -32,7 +33,9 @@ pub use provider::{ContentProvider, ContentQuery, LoaderGameFilter, Page, SortOr
 pub use registry::ContentRegistry;
 pub use resolver::{
     ContentResolution, ResolutionConflict, ResolutionConflictKind, ResolutionConflictReason,
-    ResolutionError, ResolutionReason, ResolutionSelection, ResolutionTarget, ResolvedContentItem,
+    ResolutionError, ResolutionLimitExceeded, ResolutionLimitKind, ResolutionReason,
+    ResolutionSelection, ResolutionTarget, ResolvedContentItem,
     canonicalize_version_only_dependencies, has_unresolved_version_only_incompatibility,
     newer_version, pick_version, resolve_content, version_conflicts_with_installed,
+    version_matches_filter,
 };

@@ -3,32 +3,40 @@
 //! installed-content conflicts and version choice; callers adapt the domain
 //! result to their transport and execution surfaces.
 
+use crate::install::validate_planned_artifact;
+use crate::limits::{
+    MAX_CONTENT_GRAPH_BYTES, MAX_DEPENDENCIES_PER_NODE, MAX_RESOLUTION_CONFLICTS,
+    MAX_RESOLUTION_DEPTH, MAX_RESOLUTION_EDGES, MAX_RESOLUTION_NODES, MAX_RESOLUTION_OUTPUT_BYTES,
+    MAX_RESOLUTION_QUEUE, MAX_RESOLUTION_SELECTIONS,
+};
 use crate::{
     CanonicalId, ContentDependency, ContentError, ContentKind, ContentManifest, ContentRegistry,
     ContentVersion, DependencyKind, FileRef, LoaderGameFilter, ManifestEntry, PlannedFile,
     ProjectMetadata, ProviderId, ReleaseChannel, VersionIdentity, entry_file_present,
 };
+use serde::Serialize;
+use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 
-const MAX_RESOLVE_ITEMS: usize = 200;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ResolutionReason {
     Selected,
     Dependency,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ResolutionConflictKind {
     Unavailable,
     Incompatible,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ResolutionConflictReason {
     NoCompatibleVersion,
-    DependencyGraphTooLarge,
     RequiredDependencyUnidentified,
     StabilizationFailed,
     ExactVersionConflict {
@@ -51,7 +59,6 @@ impl ResolutionConflictReason {
                 ResolutionConflictKind::Incompatible
             }
             Self::NoCompatibleVersion
-            | Self::DependencyGraphTooLarge
             | Self::RequiredDependencyUnidentified
             | Self::StabilizationFailed
             | Self::ExactVersionConflict { .. } => ResolutionConflictKind::Unavailable,
@@ -59,7 +66,7 @@ impl ResolutionConflictReason {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ResolutionConflict {
     pub canonical_id: Option<CanonicalId>,
     /// Raw provider-authored title for an Application adapter to bound and
@@ -107,17 +114,47 @@ pub enum ResolutionError {
     NoSelection,
     #[error("the selected content type changed")]
     SelectedKindChanged,
+    #[error("the same content was selected more than once")]
+    DuplicateSelection,
     #[error("a modpack cannot be added to an instance")]
     ModpackRequiresInstance,
     #[error("the target does not support mods")]
     ModLoaderRequired,
     #[error("an installed exact dependency could not be identified")]
     InstalledDependencyUnidentified,
+    #[error("content resolution exceeded the {0} limit")]
+    LimitExceeded(ResolutionLimitExceeded),
     #[error(transparent)]
     Provider(#[from] ContentError),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResolutionLimitKind {
+    Selections,
+    Nodes,
+    Depth,
+    DependenciesPerNode,
+    Edges,
+    Queue,
+    Conflicts,
+    GraphBytes,
+    StructuredOutput,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResolutionLimitExceeded {
+    pub kind: ResolutionLimitKind,
+    pub maximum: u64,
+    pub observed: u64,
+}
+
+impl std::fmt::Display for ResolutionLimitExceeded {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{:?}", self.kind)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ResolvedContentItem {
     pub canonical_id: CanonicalId,
     pub provider: ProviderId,
@@ -148,7 +185,7 @@ impl ResolvedContentItem {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ContentResolution {
     pub items: Vec<ResolvedContentItem>,
     pub conflicts: Vec<ResolutionConflict>,
@@ -163,6 +200,160 @@ impl ContentResolution {
             .filter(|item| !item.already_installed || item.update)
             .map(ResolvedContentItem::to_planned)
             .collect()
+    }
+}
+
+#[derive(Debug, Default)]
+struct ResolutionBudget {
+    nodes: usize,
+    edges: usize,
+    graph_bytes: u64,
+    structured_bytes: usize,
+}
+
+impl ResolutionBudget {
+    fn admit_node(&mut self, depth: usize) -> Result<(), ResolutionError> {
+        ensure_within_limit(
+            ResolutionLimitKind::Depth,
+            depth as u64,
+            MAX_RESOLUTION_DEPTH as u64,
+        )?;
+        self.nodes = self.nodes.saturating_add(1);
+        ensure_within_limit(
+            ResolutionLimitKind::Nodes,
+            self.nodes as u64,
+            MAX_RESOLUTION_NODES as u64,
+        )
+    }
+
+    fn admit_dependencies(&mut self, count: usize) -> Result<(), ResolutionError> {
+        ensure_within_limit(
+            ResolutionLimitKind::DependenciesPerNode,
+            count as u64,
+            MAX_DEPENDENCIES_PER_NODE as u64,
+        )?;
+        self.edges = self.edges.saturating_add(count);
+        ensure_within_limit(
+            ResolutionLimitKind::Edges,
+            self.edges as u64,
+            MAX_RESOLUTION_EDGES as u64,
+        )
+    }
+
+    fn admit_artifact(&mut self, size: u64) -> Result<(), ResolutionError> {
+        self.graph_bytes = self.graph_bytes.saturating_add(size);
+        ensure_within_limit(
+            ResolutionLimitKind::GraphBytes,
+            self.graph_bytes,
+            MAX_CONTENT_GRAPH_BYTES,
+        )
+    }
+
+    fn admit_output<T: Serialize>(&mut self, value: &T) -> Result<usize, ResolutionError> {
+        let remaining = MAX_RESOLUTION_OUTPUT_BYTES.saturating_sub(self.structured_bytes);
+        let encoded_len = bounded_serialized_len(value, remaining)?;
+        self.admit_output_len(encoded_len)?;
+        Ok(encoded_len)
+    }
+
+    fn admit_output_len(&mut self, encoded_len: usize) -> Result<(), ResolutionError> {
+        self.structured_bytes = self.structured_bytes.saturating_add(encoded_len);
+        validate_structured_output_length(self.structured_bytes)
+    }
+
+    fn admit_provider_text(&mut self, value: &str) -> Result<usize, ResolutionError> {
+        self.admit_output_len(value.len())?;
+        Ok(value.len())
+    }
+}
+
+fn ensure_within_limit(
+    kind: ResolutionLimitKind,
+    observed: u64,
+    maximum: u64,
+) -> Result<(), ResolutionError> {
+    if observed > maximum {
+        return Err(ResolutionError::LimitExceeded(ResolutionLimitExceeded {
+            kind,
+            maximum,
+            observed,
+        }));
+    }
+    Ok(())
+}
+
+fn push_conflict(
+    conflicts: &mut Vec<ResolutionConflict>,
+    conflict: ResolutionConflict,
+) -> Result<(), ResolutionError> {
+    ensure_within_limit(
+        ResolutionLimitKind::Conflicts,
+        conflicts.len().saturating_add(1) as u64,
+        MAX_RESOLUTION_CONFLICTS as u64,
+    )?;
+    conflicts.push(conflict);
+    Ok(())
+}
+
+fn validate_resolution_output(resolution: &ContentResolution) -> Result<(), ResolutionError> {
+    bounded_serialized_len(resolution, MAX_RESOLUTION_OUTPUT_BYTES).map(|_| ())
+}
+
+fn validate_structured_output_length(encoded_len: usize) -> Result<(), ResolutionError> {
+    ensure_within_limit(
+        ResolutionLimitKind::StructuredOutput,
+        encoded_len as u64,
+        MAX_RESOLUTION_OUTPUT_BYTES as u64,
+    )
+}
+
+struct BoundedCountingWriter {
+    written: usize,
+    maximum: usize,
+    overflowed: bool,
+}
+
+impl std::io::Write for BoundedCountingWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let remaining = self.maximum.saturating_sub(self.written);
+        if bytes.len() > remaining {
+            self.overflowed = true;
+            return Err(std::io::Error::other(
+                "structured output exceeded its bound",
+            ));
+        }
+        self.written += bytes.len();
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn bounded_serialized_len<T: Serialize>(
+    value: &T,
+    maximum: usize,
+) -> Result<usize, ResolutionError> {
+    let mut writer = BoundedCountingWriter {
+        written: 0,
+        maximum,
+        overflowed: false,
+    };
+    match serde_json::to_writer(&mut writer, value) {
+        Ok(()) => Ok(writer.written),
+        Err(_) if writer.overflowed => {
+            Err(ResolutionError::LimitExceeded(ResolutionLimitExceeded {
+                kind: ResolutionLimitKind::StructuredOutput,
+                maximum: MAX_RESOLUTION_OUTPUT_BYTES as u64,
+                observed: MAX_RESOLUTION_OUTPUT_BYTES as u64 + 1,
+            }))
+        }
+        Err(_) => Err(ResolutionError::Provider(
+            ContentError::ProviderMetadataInvalid(
+                "content resolution could not be represented".to_string(),
+            ),
+        )),
     }
 }
 
@@ -203,7 +394,7 @@ fn validate_selected_kinds(
 
 struct ResolvePass {
     resolution: ContentResolution,
-    retry_with_exact: Option<(CanonicalId, String)>,
+    retry_with_exact: Vec<(CanonicalId, String)>,
 }
 
 pub async fn resolve_content(
@@ -215,21 +406,37 @@ pub async fn resolve_content(
     if selections.is_empty() {
         return Err(ResolutionError::NoSelection);
     }
+    ensure_within_limit(
+        ResolutionLimitKind::Selections,
+        selections.len() as u64,
+        MAX_RESOLUTION_SELECTIONS as u64,
+    )?;
+    let mut selected_once = HashSet::with_capacity(selections.len());
+    if selections
+        .iter()
+        .any(|selection| !selected_once.insert(selection.canonical_id.as_str()))
+    {
+        return Err(ResolutionError::DuplicateSelection);
+    }
     let mut exact_requirements = HashMap::new();
+    let mut work_budget = ResolutionBudget::default();
     let replacing: HashSet<CanonicalId> = selections
         .iter()
         .map(|selection| CanonicalId(selection.canonical_id.clone()))
         .collect();
     for (canonical_id, version_id) in
-        installed_exact_requirements(registry, target, manifest, &replacing).await?
+        installed_exact_requirements(registry, target, manifest, &replacing, &mut work_budget)
+            .await?
     {
         if let Some(conflict) =
             insert_exact_requirement(&mut exact_requirements, canonical_id, version_id)
         {
-            return Ok(ContentResolution {
+            let resolution = ContentResolution {
                 items: Vec::new(),
                 conflicts: vec![conflict],
-            });
+            };
+            validate_resolution_output(&resolution)?;
+            return Ok(resolution);
         }
     }
     for selection in selections {
@@ -240,30 +447,44 @@ pub async fn resolve_content(
         if let Some(conflict) =
             insert_exact_requirement(&mut exact_requirements, canonical_id, version_id.clone())
         {
-            return Ok(ContentResolution {
+            let resolution = ContentResolution {
                 items: Vec::new(),
                 conflicts: vec![conflict],
-            });
+            };
+            validate_resolution_output(&resolution)?;
+            return Ok(resolution);
         }
     }
 
-    for _ in 0..MAX_RESOLVE_ITEMS {
-        let pass =
-            resolve_pass(registry, target, selections, manifest, &exact_requirements).await?;
-        let Some((canonical_id, required_version)) = pass.retry_with_exact else {
+    for _ in 0..=(MAX_RESOLUTION_DEPTH + 1) {
+        let pass = resolve_pass(
+            registry,
+            target,
+            selections,
+            manifest,
+            &exact_requirements,
+            &mut work_budget,
+        )
+        .await?;
+        if pass.retry_with_exact.is_empty() {
+            validate_resolution_output(&pass.resolution)?;
             return Ok(pass.resolution);
-        };
-        exact_requirements.insert(canonical_id, required_version);
+        }
+        for (canonical_id, required_version) in pass.retry_with_exact {
+            exact_requirements.insert(canonical_id, required_version);
+        }
     }
 
-    Ok(ContentResolution {
+    let resolution = ContentResolution {
         items: Vec::new(),
         conflicts: vec![ResolutionConflict {
             canonical_id: None,
             subject_title: None,
             reason: ResolutionConflictReason::StabilizationFailed,
         }],
-    })
+    };
+    validate_resolution_output(&resolution)?;
+    Ok(resolution)
 }
 
 fn insert_exact_requirement(
@@ -281,6 +502,7 @@ async fn installed_exact_requirements(
     target: &ResolutionTarget,
     manifest: &ContentManifest,
     replacing: &HashSet<CanonicalId>,
+    work_budget: &mut ResolutionBudget,
 ) -> Result<Vec<(CanonicalId, String)>, ResolutionError> {
     let live_entries: Vec<&ManifestEntry> = manifest
         .entries
@@ -288,6 +510,17 @@ async fn installed_exact_requirements(
         .filter(|entry| !replacing.contains(&entry.canonical_id))
         .filter(|entry| installed_entry_present(entry, target.game_dir.as_deref()))
         .collect();
+    let installed_edges = live_entries.iter().fold(0_usize, |total, entry| {
+        total.saturating_add(entry.dependencies.len())
+    });
+    for entry in &live_entries {
+        work_budget.admit_dependencies(entry.dependencies.len())?;
+    }
+    ensure_within_limit(
+        ResolutionLimitKind::Edges,
+        installed_edges as u64,
+        MAX_RESOLUTION_EDGES as u64,
+    )?;
     let installed_versions: HashMap<&str, &ManifestEntry> = live_entries
         .iter()
         .map(|entry| (entry.version_id.as_str(), *entry))
@@ -343,6 +576,7 @@ async fn resolve_pass(
     selections: &[ResolutionSelection],
     manifest: &ContentManifest,
     exact_requirements: &HashMap<CanonicalId, String>,
+    work_budget: &mut ResolutionBudget,
 ) -> Result<ResolvePass, ResolutionError> {
     let selected_ids: Vec<CanonicalId> = selections
         .iter()
@@ -352,13 +586,17 @@ async fn resolve_pass(
     validate_selected_kinds(selections, &metadata, target)?;
     let mut metadata_requested: HashSet<CanonicalId> = selected_ids.into_iter().collect();
     let mut resolved_versions: HashMap<CanonicalId, String> = HashMap::new();
+    let mut visited: HashSet<CanonicalId> = HashSet::new();
     let mut items: Vec<ResolvedContentItem> = Vec::new();
     let mut conflicts: Vec<ResolutionConflict> = Vec::new();
     let mut incompatibilities: HashSet<(CanonicalId, CanonicalId)> = HashSet::new();
     let mut dependency_versions: HashMap<String, VersionIdentity> = HashMap::new();
     let mut dependency_versions_requested: HashSet<String> = HashSet::new();
+    let mut budget = ResolutionBudget::default();
+    let mut retry_with_exact = HashMap::<CanonicalId, String>::new();
+    let mut retry_pin_conflict = false;
 
-    let mut queue: VecDeque<(CanonicalId, Option<String>, ResolutionReason)> = selections
+    let mut queue: VecDeque<(CanonicalId, Option<String>, ResolutionReason, usize)> = selections
         .iter()
         .map(|selection| {
             let canonical_id = CanonicalId(selection.canonical_id.clone());
@@ -366,21 +604,20 @@ async fn resolve_pass(
                 .version_id
                 .clone()
                 .or_else(|| exact_requirements.get(&canonical_id).cloned());
-            (canonical_id, version_id, ResolutionReason::Selected)
+            (canonical_id, version_id, ResolutionReason::Selected, 0)
         })
         .collect();
 
-    while let Some((canonical_id, forced_version, reason)) = queue.pop_front() {
+    while let Some((canonical_id, forced_version, reason, depth)) = queue.pop_front() {
         let pinned_version = exact_requirements.get(&canonical_id);
         if let (Some(forced_version), Some(pinned_version)) =
             (forced_version.as_deref(), pinned_version)
             && forced_version != pinned_version
         {
-            conflicts.push(exact_dependency_conflict(
-                &canonical_id,
-                forced_version,
-                pinned_version,
-            ));
+            push_conflict(
+                &mut conflicts,
+                exact_dependency_conflict(&canonical_id, forced_version, pinned_version),
+            )?;
             continue;
         }
         let forced_version = forced_version.or_else(|| pinned_version.cloned());
@@ -389,27 +626,28 @@ async fn resolve_pass(
                 && required_version != chosen_version
             {
                 if exact_requirement_needs_retry(exact_requirements, &canonical_id) {
-                    return Ok(ResolvePass {
-                        resolution: ContentResolution { items, conflicts },
-                        retry_with_exact: Some((canonical_id, required_version.to_string())),
-                    });
+                    if let Some(conflict) = insert_exact_requirement(
+                        &mut retry_with_exact,
+                        canonical_id.clone(),
+                        required_version.to_string(),
+                    ) {
+                        push_conflict(&mut conflicts, conflict)?;
+                        retry_pin_conflict = true;
+                    }
+                    continue;
                 }
-                conflicts.push(exact_dependency_conflict(
-                    &canonical_id,
-                    chosen_version,
-                    required_version,
-                ));
+                push_conflict(
+                    &mut conflicts,
+                    exact_dependency_conflict(&canonical_id, chosen_version, required_version),
+                )?;
             }
             continue;
         }
-        if items.len() >= MAX_RESOLVE_ITEMS {
-            conflicts.push(ResolutionConflict {
-                canonical_id: Some(canonical_id),
-                subject_title: None,
-                reason: ResolutionConflictReason::DependencyGraphTooLarge,
-            });
-            break;
+        if !visited.insert(canonical_id.clone()) {
+            continue;
         }
+        budget.admit_node(depth)?;
+        work_budget.admit_node(depth)?;
 
         if !metadata_requested.contains(&canonical_id) {
             let mut missing_ids = HashSet::new();
@@ -417,8 +655,8 @@ async fn resolve_pass(
             missing_ids.extend(
                 queue
                     .iter()
-                    .filter(|(queued_id, _, _)| !metadata_requested.contains(queued_id))
-                    .map(|(queued_id, _, _)| queued_id.clone()),
+                    .filter(|(queued_id, _, _, _)| !metadata_requested.contains(queued_id))
+                    .map(|(queued_id, _, _, _)| queued_id.clone()),
             );
             let missing_ids: Vec<CanonicalId> = missing_ids.into_iter().collect();
             let fetched = registry.metadata(&missing_ids).await?;
@@ -426,7 +664,7 @@ async fn resolve_pass(
             metadata_requested.extend(missing_ids);
         }
         let Some(project) = metadata.get(&canonical_id).cloned() else {
-            conflicts.push(unavailable_conflict(&canonical_id));
+            push_conflict(&mut conflicts, unavailable_conflict(&canonical_id))?;
             continue;
         };
         let kind = project.kind;
@@ -436,20 +674,24 @@ async fn resolve_pass(
         let versions = match registry.versions(&canonical_id, &filter).await {
             Ok(versions) => versions,
             Err(ContentError::Status { status, .. }) if status.as_u16() == 404 => {
-                conflicts.push(unavailable_conflict(&canonical_id));
+                push_conflict(&mut conflicts, unavailable_conflict(&canonical_id))?;
                 continue;
             }
             Err(error) => return Err(ResolutionError::Provider(error)),
         };
 
-        let Some(version) = pick_version(&versions, forced_version.as_deref()) else {
-            conflicts.push(unavailable_conflict(&canonical_id));
+        let Some(version) =
+            pick_compatible_version(&versions, forced_version.as_deref(), target, kind)
+        else {
+            push_conflict(&mut conflicts, unavailable_conflict(&canonical_id))?;
             continue;
         };
-        let Some(file) = version.primary_file().cloned() else {
-            conflicts.push(unavailable_conflict(&canonical_id));
-            continue;
-        };
+        let file = unambiguous_install_artifact(version)?.clone();
+        let artifact_bytes = validate_planned_artifact(kind, &file)?;
+        budget.admit_artifact(artifact_bytes)?;
+        work_budget.admit_artifact(artifact_bytes)?;
+        budget.admit_dependencies(version.dependencies.len())?;
+        work_budget.admit_dependencies(version.dependencies.len())?;
         resolved_versions.insert(canonical_id.clone(), version.id.clone());
 
         let missing_dependency_versions: Vec<String> = version
@@ -466,24 +708,34 @@ async fn resolve_pass(
                     .await?,
             );
         }
-        let dependencies =
+        let mut dependencies =
             canonicalize_version_only_dependencies(&version.dependencies, &dependency_versions);
+        dependencies.sort_by(compare_dependencies);
 
         for dependency in &dependencies {
             match dependency.kind {
                 DependencyKind::Required => {
                     if let Some(project_id) = &dependency.project_id {
+                        ensure_within_limit(
+                            ResolutionLimitKind::Queue,
+                            queue.len().saturating_add(1) as u64,
+                            MAX_RESOLUTION_QUEUE as u64,
+                        )?;
                         queue.push_back((
                             CanonicalId::for_project(ProviderId::Modrinth, project_id),
                             dependency.version_id.clone(),
                             ResolutionReason::Dependency,
+                            depth.saturating_add(1),
                         ));
                     } else {
-                        conflicts.push(ResolutionConflict {
-                            canonical_id: Some(canonical_id.clone()),
-                            subject_title: None,
-                            reason: ResolutionConflictReason::RequiredDependencyUnidentified,
-                        });
+                        push_conflict(
+                            &mut conflicts,
+                            ResolutionConflict {
+                                canonical_id: Some(canonical_id.clone()),
+                                subject_title: None,
+                                reason: ResolutionConflictReason::RequiredDependencyUnidentified,
+                            },
+                        )?;
                     }
                 }
                 DependencyKind::Incompatible => {
@@ -500,7 +752,10 @@ async fn resolve_pass(
                             && incompatibilities
                                 .insert((canonical_id.clone(), entry.canonical_id.clone()))
                         {
-                            conflicts.push(incompatible_conflict(&canonical_id, entry));
+                            push_conflict(
+                                &mut conflicts,
+                                incompatible_conflict(&canonical_id, entry),
+                            )?;
                         }
                     }
                 }
@@ -515,7 +770,7 @@ async fn resolve_pass(
             target.game_dir.as_deref(),
         ) {
             if incompatibilities.insert((canonical_id.clone(), entry.canonical_id.clone())) {
-                conflicts.push(incompatible_conflict(&canonical_id, entry));
+                push_conflict(&mut conflicts, incompatible_conflict(&canonical_id, entry))?;
             }
         }
 
@@ -524,7 +779,7 @@ async fn resolve_pass(
             resolved_install_state(existing, target.game_dir.as_deref(), &version.id);
         let project_id = canonical_id.project_id().to_string();
 
-        items.push(ResolvedContentItem {
+        let item = ResolvedContentItem {
             canonical_id,
             provider: ProviderId::Modrinth,
             project_id,
@@ -541,15 +796,25 @@ async fn resolve_pass(
             reason,
             already_installed,
             update,
-        });
+        };
+        let encoded_len = budget.admit_output(&item)?;
+        work_budget.admit_output_len(encoded_len)?;
+        items.push(item);
     }
 
-    conflicts.extend(selected_incompatibility_conflicts(&items));
+    append_selected_incompatibility_conflicts(&items, &mut conflicts)?;
 
-    apply_metadata_titles(&metadata, &mut conflicts);
+    apply_metadata_titles(&metadata, &mut conflicts, &mut budget, work_budget)?;
+    let retry_with_exact = if retry_pin_conflict {
+        Vec::new()
+    } else {
+        let mut retries = retry_with_exact.into_iter().collect::<Vec<_>>();
+        retries.sort_by(|left, right| left.0.as_str().cmp(right.0.as_str()));
+        retries
+    };
     Ok(ResolvePass {
         resolution: ContentResolution { items, conflicts },
-        retry_with_exact: None,
+        retry_with_exact,
     })
 }
 
@@ -572,6 +837,22 @@ pub fn canonicalize_version_only_dependencies(
             dependency
         })
         .collect()
+}
+
+fn compare_dependencies(left: &ContentDependency, right: &ContentDependency) -> Ordering {
+    dependency_kind_rank(left.kind)
+        .cmp(&dependency_kind_rank(right.kind))
+        .then_with(|| left.project_id.cmp(&right.project_id))
+        .then_with(|| left.version_id.cmp(&right.version_id))
+}
+
+fn dependency_kind_rank(kind: DependencyKind) -> u8 {
+    match kind {
+        DependencyKind::Required => 0,
+        DependencyKind::Incompatible => 1,
+        DependencyKind::Optional => 2,
+        DependencyKind::Embedded => 3,
+    }
 }
 
 pub fn has_unresolved_version_only_incompatibility(dependencies: &[ContentDependency]) -> bool {
@@ -624,58 +905,69 @@ fn installed_entry_present(entry: &ManifestEntry, game_dir: Option<&Path>) -> bo
     game_dir.is_none_or(|root| entry_file_present(root, entry))
 }
 
-fn selected_incompatibility_conflicts(items: &[ResolvedContentItem]) -> Vec<ResolutionConflict> {
-    let resolved_projects: HashSet<String> =
-        items.iter().map(|item| item.project_id.clone()).collect();
+fn append_selected_incompatibility_conflicts(
+    items: &[ResolvedContentItem],
+    conflicts: &mut Vec<ResolutionConflict>,
+) -> Result<(), ResolutionError> {
+    let resolved_projects: HashMap<&str, &ResolvedContentItem> = items
+        .iter()
+        .map(|item| (item.project_id.as_str(), item))
+        .collect();
     let mut selected_incompatibilities = HashSet::new();
-    let mut conflicts = Vec::new();
     for item in items {
         for dependency in &item.dependencies {
             let Some(project_id) = dependency.project_id.as_deref() else {
                 continue;
             };
-            if !resolved_projects.contains(project_id) {
+            let Some(candidate) = resolved_projects.get(project_id) else {
                 continue;
-            }
-            if !items.iter().any(|candidate| {
-                incompatible_dependency_matches(
-                    dependency,
-                    &candidate.project_id,
-                    &candidate.version_id,
-                )
-            }) {
+            };
+            if !incompatible_dependency_matches(
+                dependency,
+                &candidate.project_id,
+                &candidate.version_id,
+            ) {
                 continue;
             }
             let key = (item.project_id.clone(), project_id.to_string());
             if selected_incompatibilities.insert(key) {
-                conflicts.push(ResolutionConflict {
-                    canonical_id: Some(item.canonical_id.clone()),
-                    subject_title: None,
-                    reason: ResolutionConflictReason::SelectedIncompatibility {
-                        other_project_id: project_id.to_string(),
+                push_conflict(
+                    conflicts,
+                    ResolutionConflict {
+                        canonical_id: Some(item.canonical_id.clone()),
+                        subject_title: None,
+                        reason: ResolutionConflictReason::SelectedIncompatibility {
+                            other_project_id: project_id.to_string(),
+                        },
                     },
-                });
+                )?;
             }
         }
     }
-    conflicts
+    Ok(())
 }
 
 fn apply_metadata_titles(
     metadata: &HashMap<CanonicalId, ProjectMetadata>,
     conflicts: &mut [ResolutionConflict],
-) {
+    budget: &mut ResolutionBudget,
+    work_budget: &mut ResolutionBudget,
+) -> Result<(), ResolutionError> {
     for conflict in conflicts {
         if let Some(id) = &conflict.canonical_id {
-            conflict.subject_title = metadata.get(id).map(|project| project.title.clone());
+            if let Some(project) = metadata.get(id) {
+                let encoded_len = budget.admit_provider_text(&project.title)?;
+                work_budget.admit_output_len(encoded_len)?;
+                conflict.subject_title = Some(project.title.clone());
+            }
         }
     }
+    Ok(())
 }
 
-/// The version an installed entry should move to, if any. Versions arrive
-/// newest-first from the provider, so "newer" is "earlier in the list"; an
-/// installed version that no longer appears (a loader or Minecraft change
-/// filtered it out) always yields to the best compatible pick.
+/// The version an installed entry should move to, if any. Ranking is local and
+/// deterministic: stable releases outrank prereleases, then publication time
+/// and provider version id break ties. Provider response order has no authority.
 pub fn newer_version<'a>(
     versions: &'a [ContentVersion],
     current_version_id: &str,
@@ -684,14 +976,13 @@ pub fn newer_version<'a>(
     if picked.id == current_version_id {
         return None;
     }
-    let picked_index = versions
-        .iter()
-        .position(|version| version.id == picked.id)?;
     match versions
         .iter()
-        .position(|version| version.id == current_version_id)
+        .find(|version| version.id == current_version_id)
     {
-        Some(current_index) => (picked_index < current_index).then_some(picked),
+        Some(current) => {
+            (compare_version_rank(picked, current) == Ordering::Greater).then_some(picked)
+        }
         None => Some(picked),
     }
 }
@@ -737,18 +1028,75 @@ pub fn pick_version<'a>(
     forced: Option<&str>,
 ) -> Option<&'a ContentVersion> {
     if let Some(forced) = forced {
-        return versions.iter().find(|version| version.id == forced);
+        return versions
+            .iter()
+            .find(|version| version.id == forced && version.primary_file().is_some());
     }
     versions
         .iter()
-        .find(|version| {
-            matches!(version.channel, ReleaseChannel::Release) && version.primary_file().is_some()
-        })
-        .or_else(|| {
-            versions
-                .iter()
-                .find(|version| version.primary_file().is_some())
-        })
+        .filter(|version| version.primary_file().is_some())
+        .max_by(|left, right| compare_version_rank(left, right))
+}
+
+fn pick_compatible_version<'a>(
+    versions: &'a [ContentVersion],
+    forced: Option<&str>,
+    target: &ResolutionTarget,
+    kind: ContentKind,
+) -> Option<&'a ContentVersion> {
+    if let Some(forced) = forced {
+        return versions
+            .iter()
+            .find(|version| version.id == forced && version_matches_target(version, target, kind));
+    }
+    versions
+        .iter()
+        .filter(|version| version_matches_target(version, target, kind))
+        .filter(|version| version.primary_file().is_some())
+        .max_by(|left, right| compare_version_rank(left, right))
+}
+
+pub fn version_matches_filter(version: &ContentVersion, filter: &LoaderGameFilter) -> bool {
+    filter.game_version.as_ref().is_none_or(|game_version| {
+        version
+            .game_versions
+            .iter()
+            .any(|candidate| candidate == game_version)
+    }) && filter
+        .loader
+        .as_ref()
+        .is_none_or(|loader| version.loaders.iter().any(|candidate| candidate == loader))
+}
+
+fn version_matches_target(
+    version: &ContentVersion,
+    target: &ResolutionTarget,
+    kind: ContentKind,
+) -> bool {
+    version_matches_filter(version, &target.filter_for(kind))
+}
+
+fn compare_version_rank(left: &ContentVersion, right: &ContentVersion) -> Ordering {
+    release_channel_rank(left.channel)
+        .cmp(&release_channel_rank(right.channel))
+        .then_with(|| left.published.cmp(&right.published))
+        .then_with(|| left.id.cmp(&right.id))
+}
+
+fn release_channel_rank(channel: ReleaseChannel) -> u8 {
+    match channel {
+        ReleaseChannel::Release => 2,
+        ReleaseChannel::Beta => 1,
+        ReleaseChannel::Alpha => 0,
+    }
+}
+
+fn unambiguous_install_artifact(version: &ContentVersion) -> Result<&FileRef, ResolutionError> {
+    version.primary_file().ok_or_else(|| {
+        ResolutionError::Provider(ContentError::ProviderMetadataInvalid(
+            "content version does not identify one unambiguous artifact".to_string(),
+        ))
+    })
 }
 
 fn unavailable_conflict(canonical_id: &CanonicalId) -> ResolutionConflict {
@@ -878,7 +1226,16 @@ mod tests {
 
                         let path = target.split('?').next().unwrap_or(&target);
                         let response = if path == "/v2/projects" {
-                            ProviderResponse::Json(Value::Array(projects))
+                            let requested_projects = projects
+                                .into_iter()
+                                .filter(|project| {
+                                    project.get("id").and_then(Value::as_str).is_some_and(|id| {
+                                        target.contains(&format!("%22{id}%22"))
+                                            || target.contains(&format!("\"{id}\""))
+                                    })
+                                })
+                                .collect();
+                            ProviderResponse::Json(Value::Array(requested_projects))
                         } else if let Some(project_id) = path
                             .strip_prefix("/v2/project/")
                             .and_then(|path| path.strip_suffix("/version"))
@@ -979,7 +1336,9 @@ mod tests {
             "loaders": ["fabric"],
             "dependencies": dependencies,
             "files": [{
-                "hashes": { "sha1": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" },
+                "hashes": {
+                    "sha512": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                },
                 "url": format!("https://example.invalid/{project_id}.jar"),
                 "filename": format!("{project_id}.jar"),
                 "primary": true,
@@ -1047,6 +1406,113 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn resolve_content_terminates_required_dependency_cycles_once() {
+        let fixture = ProviderFixture::new(
+            vec![
+                provider_project("first", "First"),
+                provider_project("second", "Second"),
+            ],
+            HashMap::from([
+                (
+                    "first".to_string(),
+                    provider_versions(vec![provider_version(
+                        "first-v1",
+                        "first",
+                        vec![provider_dependency("second", None, "required")],
+                    )]),
+                ),
+                (
+                    "second".to_string(),
+                    provider_versions(vec![provider_version(
+                        "second-v1",
+                        "second",
+                        vec![provider_dependency("first", None, "required")],
+                    )]),
+                ),
+            ]),
+        )
+        .await;
+
+        let resolution = resolve_content(
+            &fixture.registry,
+            &resolver_target(),
+            &[selection("modrinth:first", ContentKind::Mod)],
+            &ContentManifest::default(),
+        )
+        .await
+        .expect("resolve dependency cycle");
+
+        assert!(resolution.conflicts.is_empty());
+        assert_eq!(
+            resolution
+                .items
+                .iter()
+                .map(|item| item.project_id.as_str())
+                .collect::<Vec<_>>(),
+            ["first", "second"]
+        );
+        assert_eq!(fixture.request_count("/v2/project/first/version"), 1);
+        assert_eq!(fixture.request_count("/v2/project/second/version"), 1);
+    }
+
+    #[tokio::test]
+    async fn duplicate_selections_fail_before_provider_work() {
+        let registry = ContentRegistry::new(reqwest::Client::new());
+        let duplicate = selection("modrinth:duplicate", ContentKind::Mod);
+        let error = resolve_content(
+            &registry,
+            &resolver_target(),
+            &[duplicate.clone(), duplicate],
+            &ContentManifest::default(),
+        )
+        .await
+        .expect_err("duplicate selections must fail locally");
+
+        assert!(matches!(error, ResolutionError::DuplicateSelection));
+    }
+
+    #[tokio::test]
+    async fn installed_dependency_inputs_obey_the_per_node_bound() {
+        let mut manifest = ContentManifest::default();
+        let dependencies = (0..=MAX_DEPENDENCIES_PER_NODE)
+            .map(|index| ContentDependency {
+                project_id: Some(format!("dependency-{index}")),
+                version_id: Some(format!("version-{index}")),
+                kind: DependencyKind::Required,
+            })
+            .collect();
+        manifest.upsert(ManifestEntry::managed(
+            CanonicalId::for_project(ProviderId::Modrinth, "installed"),
+            ProviderId::Modrinth,
+            "installed".to_string(),
+            "installed-v1".to_string(),
+            ContentKind::Mod,
+            &file("installed.jar", Some(1)),
+            dependencies,
+            None,
+        ));
+
+        let mut work_budget = ResolutionBudget::default();
+        let error = installed_exact_requirements(
+            &ContentRegistry::new(reqwest::Client::new()),
+            &resolver_target(),
+            &manifest,
+            &HashSet::new(),
+            &mut work_budget,
+        )
+        .await
+        .expect_err("oversized installed dependency row must fail locally");
+
+        assert!(matches!(
+            error,
+            ResolutionError::LimitExceeded(ResolutionLimitExceeded {
+                kind: ResolutionLimitKind::DependenciesPerNode,
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test]
     async fn resolve_content_retries_until_a_late_exact_requirement_stabilizes() {
         let fixture = ProviderFixture::new(
             vec![
@@ -1110,6 +1576,99 @@ mod tests {
             2,
             "the late exact requirement must trigger one complete retry"
         );
+    }
+
+    #[tokio::test]
+    async fn cascading_exact_pins_stabilize_under_one_operation_budget() {
+        let fixture = ProviderFixture::new(
+            vec![
+                provider_project("root", "Root"),
+                provider_project("pin-a", "Pin A"),
+                provider_project("a", "A"),
+                provider_project("b", "B"),
+                provider_project("z-pin-b", "Pin B"),
+            ],
+            HashMap::from([
+                (
+                    "root".to_string(),
+                    provider_versions(vec![provider_version(
+                        "root-v1",
+                        "root",
+                        vec![provider_dependency("a", None, "required")],
+                    )]),
+                ),
+                (
+                    "pin-a".to_string(),
+                    provider_versions(vec![provider_version(
+                        "pin-a-v1",
+                        "pin-a",
+                        vec![provider_dependency("a", Some("a-v1"), "required")],
+                    )]),
+                ),
+                (
+                    "a".to_string(),
+                    provider_versions(vec![
+                        provider_version("a-v2", "a", Vec::new()),
+                        provider_version(
+                            "a-v1",
+                            "a",
+                            vec![
+                                provider_dependency("b", None, "required"),
+                                provider_dependency("z-pin-b", None, "required"),
+                            ],
+                        ),
+                    ]),
+                ),
+                (
+                    "b".to_string(),
+                    provider_versions(vec![
+                        provider_version("b-v2", "b", Vec::new()),
+                        provider_version("b-v1", "b", Vec::new()),
+                    ]),
+                ),
+                (
+                    "z-pin-b".to_string(),
+                    provider_versions(vec![provider_version(
+                        "pin-b-v1",
+                        "z-pin-b",
+                        vec![provider_dependency("b", Some("b-v1"), "required")],
+                    )]),
+                ),
+            ]),
+        )
+        .await;
+
+        let resolution = resolve_content(
+            &fixture.registry,
+            &resolver_target(),
+            &[
+                selection("modrinth:root", ContentKind::Mod),
+                selection("modrinth:pin-a", ContentKind::Mod),
+            ],
+            &ContentManifest::default(),
+        )
+        .await
+        .expect("stabilize cascading exact pins");
+
+        assert!(resolution.conflicts.is_empty());
+        assert_eq!(
+            resolution
+                .items
+                .iter()
+                .find(|item| item.project_id == "a")
+                .map(|item| item.version_id.as_str()),
+            Some("a-v1")
+        );
+        assert_eq!(
+            resolution
+                .items
+                .iter()
+                .find(|item| item.project_id == "b")
+                .map(|item| item.version_id.as_str()),
+            Some("b-v1")
+        );
+        assert_eq!(fixture.request_count("/v2/project/a/version"), 3);
+        assert_eq!(fixture.request_count("/v2/project/b/version"), 2);
     }
 
     #[tokio::test]
@@ -1332,6 +1891,13 @@ mod tests {
         }
     }
 
+    fn selected_conflicts(items: &[ResolvedContentItem]) -> Vec<ResolutionConflict> {
+        let mut conflicts = Vec::new();
+        append_selected_incompatibility_conflicts(items, &mut conflicts)
+            .expect("bounded selected conflicts");
+        conflicts
+    }
+
     fn target(supports_mods: bool) -> ResolutionTarget {
         ResolutionTarget {
             game_dir: None,
@@ -1339,6 +1905,99 @@ mod tests {
             game_version: "1.21.6".to_string(),
             supports_mods,
         }
+    }
+
+    #[test]
+    fn resolution_limits_admit_exact_and_reject_one_over() {
+        ensure_within_limit(
+            ResolutionLimitKind::Selections,
+            MAX_RESOLUTION_SELECTIONS as u64,
+            MAX_RESOLUTION_SELECTIONS as u64,
+        )
+        .expect("exact selection limit");
+        assert!(
+            ensure_within_limit(
+                ResolutionLimitKind::Selections,
+                (MAX_RESOLUTION_SELECTIONS + 1) as u64,
+                MAX_RESOLUTION_SELECTIONS as u64,
+            )
+            .is_err()
+        );
+
+        let mut nodes = ResolutionBudget::default();
+        for _ in 0..MAX_RESOLUTION_NODES {
+            nodes.admit_node(0).expect("exact node budget");
+        }
+        assert!(nodes.admit_node(0).is_err());
+        ResolutionBudget::default()
+            .admit_node(MAX_RESOLUTION_DEPTH)
+            .expect("exact depth limit");
+        assert!(
+            ResolutionBudget::default()
+                .admit_node(MAX_RESOLUTION_DEPTH + 1)
+                .is_err()
+        );
+
+        let mut edges = ResolutionBudget::default();
+        for _ in 0..(MAX_RESOLUTION_EDGES / MAX_DEPENDENCIES_PER_NODE) {
+            edges
+                .admit_dependencies(MAX_DEPENDENCIES_PER_NODE)
+                .expect("exact edge budget");
+        }
+        assert!(edges.admit_dependencies(1).is_err());
+        assert!(
+            ResolutionBudget::default()
+                .admit_dependencies(MAX_DEPENDENCIES_PER_NODE + 1)
+                .is_err()
+        );
+
+        ensure_within_limit(
+            ResolutionLimitKind::Queue,
+            MAX_RESOLUTION_QUEUE as u64,
+            MAX_RESOLUTION_QUEUE as u64,
+        )
+        .expect("exact queue limit");
+        assert!(
+            ensure_within_limit(
+                ResolutionLimitKind::Queue,
+                (MAX_RESOLUTION_QUEUE + 1) as u64,
+                MAX_RESOLUTION_QUEUE as u64,
+            )
+            .is_err()
+        );
+
+        let mut conflicts = Vec::new();
+        for index in 0..MAX_RESOLUTION_CONFLICTS {
+            push_conflict(
+                &mut conflicts,
+                unavailable_conflict(&CanonicalId::for_project(
+                    ProviderId::Modrinth,
+                    &format!("project-{index}"),
+                )),
+            )
+            .expect("exact conflict budget");
+        }
+        assert!(
+            push_conflict(
+                &mut conflicts,
+                unavailable_conflict(&CanonicalId::for_project(ProviderId::Modrinth, "overflow",)),
+            )
+            .is_err()
+        );
+
+        let mut bytes = ResolutionBudget::default();
+        bytes
+            .admit_artifact(MAX_CONTENT_GRAPH_BYTES)
+            .expect("exact graph byte budget");
+        assert!(bytes.admit_artifact(1).is_err());
+        validate_structured_output_length(MAX_RESOLUTION_OUTPUT_BYTES)
+            .expect("exact structured output limit");
+        assert!(validate_structured_output_length(MAX_RESOLUTION_OUTPUT_BYTES + 1).is_err());
+        assert_eq!(
+            bounded_serialized_len(&"abc", 5).expect("exact counting writer limit"),
+            5
+        );
+        assert!(bounded_serialized_len(&"abc", 4).is_err());
     }
 
     #[test]
@@ -1381,6 +2040,82 @@ mod tests {
     }
 
     #[test]
+    fn version_ranking_is_independent_of_provider_order() {
+        let mut older = version(
+            "release-a",
+            ReleaseChannel::Release,
+            vec![file("a.jar", None)],
+        );
+        older.published = Some("2026-01-01T00:00:00Z".to_string());
+        let mut newer = version(
+            "release-b",
+            ReleaseChannel::Release,
+            vec![file("b.jar", None)],
+        );
+        newer.published = Some("2026-02-01T00:00:00Z".to_string());
+
+        assert_eq!(
+            pick_version(&[older.clone(), newer.clone()], None)
+                .expect("rank forward")
+                .id,
+            "release-b"
+        );
+        assert_eq!(
+            pick_version(&[newer, older], None)
+                .expect("rank reverse")
+                .id,
+            "release-b"
+        );
+    }
+
+    #[test]
+    fn local_target_validation_rejects_provider_filter_drift() {
+        let target = target(true);
+        let mut wrong_game = version(
+            "wrong-game",
+            ReleaseChannel::Release,
+            vec![file("wrong.jar", None)],
+        );
+        wrong_game.game_versions = vec!["1.20.1".to_string()];
+        let mut wrong_loader = version(
+            "wrong-loader",
+            ReleaseChannel::Release,
+            vec![file("wrong-loader.jar", None)],
+        );
+        wrong_loader.loaders = vec!["forge".to_string()];
+
+        assert!(pick_compatible_version(&[wrong_game], None, &target, ContentKind::Mod).is_none());
+        assert!(
+            pick_compatible_version(&[wrong_loader], None, &target, ContentKind::Mod).is_none()
+        );
+    }
+
+    #[test]
+    fn artifact_selection_requires_one_unambiguous_file() {
+        let none = version("none", ReleaseChannel::Release, Vec::new());
+        assert!(unambiguous_install_artifact(&none).is_err());
+
+        let mut first = file("first.jar", Some(1));
+        first.primary = false;
+        let mut second = file("second.jar", Some(1));
+        second.primary = false;
+        let ambiguous = version("ambiguous", ReleaseChannel::Release, vec![first, second]);
+        assert!(unambiguous_install_artifact(&ambiguous).is_err());
+
+        let single = version(
+            "single",
+            ReleaseChannel::Release,
+            vec![file("single.jar", Some(1))],
+        );
+        assert_eq!(
+            unambiguous_install_artifact(&single)
+                .expect("single primary")
+                .filename,
+            "single.jar"
+        );
+    }
+
+    #[test]
     fn newer_version_flags_only_strictly_newer_picks() {
         let versions = vec![
             version(
@@ -1399,7 +2134,7 @@ mod tests {
     }
 
     #[test]
-    fn newer_version_leaves_a_beta_ahead_of_the_latest_release_alone() {
+    fn newer_version_prefers_a_stable_release_over_a_prerelease() {
         let versions = vec![
             version(
                 "beta-2",
@@ -1412,7 +2147,12 @@ mod tests {
                 vec![file("rel1.jar", None)],
             ),
         ];
-        assert!(newer_version(&versions, "beta-2").is_none());
+        assert_eq!(
+            newer_version(&versions, "beta-2")
+                .expect("stable replacement")
+                .id,
+            "rel-1"
+        );
     }
 
     #[test]
@@ -1855,7 +2595,7 @@ mod tests {
             resolved_item("second", None),
         ];
 
-        let conflicts = selected_incompatibility_conflicts(&items);
+        let conflicts = selected_conflicts(&items);
 
         assert_eq!(conflicts.len(), 1);
         assert_eq!(conflicts[0].kind(), ResolutionConflictKind::Incompatible);
@@ -1875,15 +2615,12 @@ mod tests {
     fn selected_incompatibilities_honor_exact_version_ids() {
         let mut nonmatching = resolved_item("first", Some("second"));
         nonmatching.dependencies[0].version_id = Some("different-version".to_string());
-        assert!(
-            selected_incompatibility_conflicts(&[nonmatching, resolved_item("second", None),])
-                .is_empty()
-        );
+        assert!(selected_conflicts(&[nonmatching, resolved_item("second", None),]).is_empty());
 
         let mut matching = resolved_item("first", Some("second"));
         matching.dependencies[0].version_id = Some("v1".to_string());
         assert_eq!(
-            selected_incompatibility_conflicts(&[matching, resolved_item("second", None)]).len(),
+            selected_conflicts(&[matching, resolved_item("second", None)]).len(),
             1
         );
     }

@@ -27,7 +27,7 @@ use axial_content::{
     ContentQuery, ContentVersion, ManifestEntry, Page, ProviderId, SortOrder,
     canonicalize_version_only_dependencies, entry_file_present,
     has_unresolved_version_only_incompatibility, install_and_record, newer_version, uninstall_many,
-    version_conflicts_with_installed,
+    version_conflicts_with_installed, version_matches_filter,
 };
 use axial_minecraft::{DownloadProgress, download::ExecutionDownloadFact};
 use axum::{Json, http::StatusCode};
@@ -660,6 +660,10 @@ pub async fn instance_content_updates(
                         .versions(&entry.canonical_id, &filter)
                         .await
                         .ok()?;
+                    let versions = versions
+                        .into_iter()
+                        .filter(|version| version_matches_filter(version, &filter))
+                        .collect::<Vec<_>>();
                     let latest = newer_version(&versions, &entry.version_id)?.clone();
                     Some((entry, latest))
                 }
