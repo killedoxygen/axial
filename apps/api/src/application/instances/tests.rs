@@ -3023,6 +3023,24 @@ fn loader_create_selection_rejects_stale_uninstalled_exact_build() {
 }
 
 #[test]
+fn loader_create_selection_rejects_provider_filtered_fabric_build() {
+    let component_id = axial_minecraft::LoaderComponentId::Fabric;
+    let build_id = axial_minecraft::build_id_for(component_id, "26.2", "0.19.3");
+
+    let (status, Json(body)) = resolve_loader_create_selection_from_build_catalog(
+        component_id,
+        &build_id,
+        Vec::new(),
+        &loader_catalog_state(true, false),
+        &[],
+    )
+    .expect_err("provider-filtered build should not create an instance");
+
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_bounded_error_body(&body, "Selected loader build is not available.");
+}
+
+#[test]
 fn loader_create_selection_allows_stale_exact_build_when_already_installed() {
     let component_id = axial_minecraft::LoaderComponentId::Fabric;
     let build = fabric_build_record(component_id, "1.21.1", "0.16.14", 900);

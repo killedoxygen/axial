@@ -255,7 +255,7 @@ pub struct CachedCatalog<T> {
     pub value: T,
 }
 
-pub const LOADER_CATALOG_SCHEMA_VERSION: u32 = 9;
+pub const LOADER_CATALOG_SCHEMA_VERSION: u32 = 10;
 
 impl<T> CachedCatalog<T> {
     pub fn new(value: T) -> Self {

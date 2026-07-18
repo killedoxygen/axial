@@ -259,6 +259,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn install_resolution_rejects_build_absent_from_live_compatibility_catalog() {
+        let component_id = LoaderComponentId::Fabric;
+        let build_id = build_id_for(component_id, "26.2", "0.19.3");
+
+        let error = resolve_build_record_for_install_with(
+            component_id,
+            &build_id,
+            move |minecraft_version| {
+                assert_eq!(minecraft_version, "26.2");
+                std::future::ready(Ok(LoaderVersionIndex {
+                    component_id,
+                    builds: Vec::new(),
+                }))
+            },
+        )
+        .await
+        .expect_err("provider-filtered build");
+
+        assert!(matches!(error, LoaderError::BuildNotFound(_)));
+    }
+
+    #[tokio::test]
     async fn install_resolution_rejects_unsafe_version_before_provider_fetch() {
         let calls = Arc::new(AtomicUsize::new(0));
         let fetch_calls = Arc::clone(&calls);

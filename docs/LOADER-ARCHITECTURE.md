@@ -55,7 +55,16 @@ Important fields:
 - `build_meta`
 - `strategy`
 - `artifact_kind`
+- `installability`
 - `install_source`
+
+A normalized build record exists only when the provider has supplied a complete installable
+combination. Fabric build rows require the exact provider-authored intermediary version and Maven
+coordinate for the requested Minecraft target, an exact loader Maven coordinate, and a non-empty
+client main class. Placeholder or mismatched compatibility rows are omitted, so neither create nor
+direct install admission can queue them. Exact duplicate rows collapse in provider order;
+conflicting rows for one build identity invalidate the catalog. Install resolution repeats the live
+catalog lookup before accepting work.
 
 `build_id` is Axial-owned. It is the stable opaque selection key for install work. Current build
 ids use the canonical `loader-build-v1-<base64url>` encoding: a domain/version marker, explicit

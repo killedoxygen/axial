@@ -276,6 +276,14 @@ mod tests {
     }
 
     #[test]
+    fn select_preferred_loader_build_reports_provider_filtered_catalog_as_unavailable() {
+        let error = select_preferred_loader_build(LoaderComponentId::Fabric, Vec::new())
+            .expect_err("empty provider-compatible catalog should fail");
+
+        assert_eq!(error, LoaderBuildSelectionError::NoBuildAvailable);
+    }
+
+    #[test]
     fn preferred_loader_build_skips_incompatible_quilt_java25_and_uses_compatible_beta() {
         let component_id = LoaderComponentId::Quilt;
         let incompatible = loader_build(component_id, "26.1.2", "0.29.2", 700);

@@ -260,12 +260,12 @@ mod tests {
     }
 
     #[test]
-    fn read_cache_rejects_schema_version_eight() {
+    fn read_cache_rejects_immediately_previous_schema_version() {
         let root = temp_dir("previous-cache-schema");
         fs::create_dir_all(&root).expect("create root");
         let cache_path = root.join("catalog.json");
         let cached = CachedCatalog {
-            schema_version: 8,
+            schema_version: LOADER_CATALOG_SCHEMA_VERSION - 1,
             fetched_at_ms: 1,
             value: vec!["old".to_string()],
         };
