@@ -628,12 +628,47 @@ impl ShutdownAttempt {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::state::{AppStateInit, InstallStore, SessionStore};
+    use crate::state::auth_persistence::{
+        AuthPersistenceError, AuthSnapshotPersistence, PersistedAuthSnapshot,
+    };
+    use crate::state::{AppStateInit, AuthLoginStore, InstallStore, SessionStore};
     use axial_config::{AppPaths, ConfigStore, InstanceRegistrySnapshot, InstanceStore};
     use axial_performance::PerformanceManager;
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    #[derive(Default)]
+    struct UnavailableAuthSnapshotPersistence {
+        saves: AtomicU64,
+        deletes: AtomicU64,
+        flushes: AtomicU64,
+    }
+
+    impl AuthSnapshotPersistence for UnavailableAuthSnapshotPersistence {
+        fn load_snapshot(&self) -> Result<Option<PersistedAuthSnapshot>, AuthPersistenceError> {
+            Err(AuthPersistenceError::Unavailable)
+        }
+
+        fn save_snapshot(
+            &self,
+            _snapshot: &PersistedAuthSnapshot,
+        ) -> Result<(), AuthPersistenceError> {
+            self.saves.fetch_add(1, Ordering::Relaxed);
+            Err(AuthPersistenceError::Ambiguous)
+        }
+
+        fn delete_snapshot(&self) -> Result<(), AuthPersistenceError> {
+            self.deletes.fetch_add(1, Ordering::Relaxed);
+            Err(AuthPersistenceError::Ambiguous)
+        }
+
+        fn flush(&self) -> Result<(), AuthPersistenceError> {
+            self.flushes.fetch_add(1, Ordering::Relaxed);
+            Err(AuthPersistenceError::CleanupPending)
+        }
+    }
 
     #[tokio::test]
     async fn cancelled_and_concurrent_callers_share_the_owned_attempt() {
@@ -680,6 +715,29 @@ mod tests {
 
         assert_eq!(fixture.state.shutdown().await, Ok(()));
         assert!(fixture.state.try_claim_producer().is_err());
+    }
+
+    #[tokio::test]
+    async fn startup_rejected_secure_auth_does_not_block_app_shutdown() {
+        let mut fixture = TestFixture::new("startup-rejected-secure-auth");
+        let persistence = Arc::new(UnavailableAuthSnapshotPersistence::default());
+        fixture.state.auth_logins =
+            Arc::new(AuthLoginStore::with_persistence(persistence.clone()).await);
+        assert_eq!(fixture.state.auth_logins.load_issue_count(), 1);
+
+        fixture
+            .state
+            .shutdown()
+            .await
+            .expect("startup-rejected secure auth relinquishes ownership");
+        fixture
+            .state
+            .shutdown()
+            .await
+            .expect("application shutdown remains idempotent");
+        assert_eq!(persistence.saves.load(Ordering::Relaxed), 0);
+        assert_eq!(persistence.deletes.load(Ordering::Relaxed), 0);
+        assert_eq!(persistence.flushes.load(Ordering::Relaxed), 0);
     }
 
     #[tokio::test]

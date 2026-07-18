@@ -12,6 +12,7 @@ pub struct StatusResponse {
     pub app_name: String,
     pub version: String,
     pub dev_mode: bool,
+    pub secure_auth_persistence: &'static str,
 }
 
 pub fn launcher_status(state: &AppState) -> StatusResponse {
@@ -33,6 +34,7 @@ pub fn launcher_status(state: &AppState) -> StatusResponse {
         app_name: state.app_name().to_string(),
         version: state.version().to_string(),
         dev_mode: cfg!(debug_assertions),
+        secure_auth_persistence: state.auth_logins().secure_auth_persistence_mode(),
     }
 }
 
@@ -47,8 +49,8 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
 
-    #[test]
-    fn status_includes_startup_warnings_and_remains_ok() {
+    #[tokio::test]
+    async fn status_includes_startup_warnings_and_remains_ok() {
         let root = test_root("status-startup-warnings");
         let paths = test_paths(&root);
         let config = Arc::new(ConfigStore::load_from(paths.clone()).expect("load config"));
@@ -75,6 +77,15 @@ mod tests {
 
         assert_eq!(response.status, "ok");
         assert_eq!(response.warnings, vec!["startup warning".to_string()]);
+        assert_eq!(response.secure_auth_persistence, "os_keyring");
+
+        let state = state.with_auth_logins(Arc::new(
+            crate::state::AuthLoginStore::isolated_volatile_for_test().await,
+        ));
+        assert_eq!(
+            launcher_status(&state).secure_auth_persistence,
+            "isolated_volatile"
+        );
 
         let _ = fs::remove_dir_all(root);
     }

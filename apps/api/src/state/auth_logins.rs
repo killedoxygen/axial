@@ -6,11 +6,10 @@ use std::sync::{Arc, Mutex as SyncMutex, RwLock as SyncRwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::{Mutex as AsyncMutex, MutexGuard, OwnedMutexGuard};
 
-#[cfg(not(test))]
 use super::auth_persistence::SecureAuthSnapshotPersistence;
 use super::auth_persistence::{
     AuthPersistenceError, AuthSnapshotPersistence, AuthSnapshotRejection, PersistedAuthSnapshot,
-    PersistedAuthState,
+    PersistedAuthState, SecureAuthPersistenceMode,
 };
 
 #[derive(Clone, Eq, PartialEq)]
@@ -194,6 +193,12 @@ enum AuthLoginStoreLifecycle {
     Closed,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AuthLoginStartupState {
+    Ready,
+    Rejected,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum AuthLoginStoreError {
     #[error("secure auth persistence failed")]
@@ -217,11 +222,13 @@ pub struct AuthLoginStore {
     mutation_gate: Arc<AsyncMutex<()>>,
     pending_commit: Arc<SyncMutex<Option<PendingAuthCommit>>>,
     lifecycle: Arc<SyncMutex<AuthLoginStoreLifecycle>>,
+    startup_state: AuthLoginStartupState,
     mutation_latched: Arc<AtomicBool>,
     load_issue_count: usize,
     active_auth_refresh: AsyncMutex<()>,
     active_auth_generation: Arc<AtomicU64>,
     persistence: Option<Arc<dyn AuthSnapshotPersistence>>,
+    persistence_mode: SecureAuthPersistenceMode,
     next_id: AtomicU64,
 }
 
@@ -233,38 +240,63 @@ impl AuthLoginStore {
             mutation_gate: Arc::new(AsyncMutex::new(())),
             pending_commit: Arc::new(SyncMutex::new(None)),
             lifecycle: Arc::new(SyncMutex::new(AuthLoginStoreLifecycle::Open)),
+            startup_state: AuthLoginStartupState::Ready,
             mutation_latched: Arc::new(AtomicBool::new(false)),
             load_issue_count: 0,
             active_auth_refresh: AsyncMutex::new(()),
             active_auth_generation: Arc::new(AtomicU64::new(0)),
             persistence: None,
+            persistence_mode: SecureAuthPersistenceMode::OsKeyring,
             next_id: AtomicU64::new(1),
         }
     }
 
-    pub async fn load_from_secure_store() -> Self {
+    pub async fn load_from_secure_store() -> std::io::Result<Self> {
         #[cfg(test)]
         {
-            Self::new()
+            Ok(Self::new())
         }
 
         #[cfg(not(test))]
         {
-            Self::with_persistence(Arc::new(SecureAuthSnapshotPersistence::new())).await
+            let persistence =
+                tokio::task::spawn_blocking(SecureAuthSnapshotPersistence::for_app_startup)
+                    .await
+                    .map_err(|_| {
+                        std::io::Error::other("secure auth persistence startup task stopped")
+                    })??;
+            Ok(Self::with_persistence(Arc::new(persistence)).await)
         }
     }
 
     pub(crate) async fn with_persistence(persistence: Arc<dyn AuthSnapshotPersistence>) -> Self {
+        let persistence_mode = persistence.mode();
         let load_persistence = persistence.clone();
         let loaded = tokio::task::spawn_blocking(move || load_persistence.load_snapshot()).await;
-        let (state, load_issue_count, mutation_latched) = match loaded {
+        let (state, load_issue_count, startup_state) = match loaded {
             Ok(Ok(Some(snapshot))) => match snapshot.into_state(Utc::now()) {
-                Ok(state) => (state, 0, false),
-                Err(AuthSnapshotRejection::Expired) => (empty_persisted_auth_state(), 1, false),
-                Err(AuthSnapshotRejection::Malformed) => (empty_persisted_auth_state(), 1, true),
+                Ok(state) => (state, 0, AuthLoginStartupState::Ready),
+                Err(AuthSnapshotRejection::Expired) => (
+                    empty_persisted_auth_state(),
+                    1,
+                    AuthLoginStartupState::Ready,
+                ),
+                Err(AuthSnapshotRejection::Malformed) => (
+                    empty_persisted_auth_state(),
+                    1,
+                    AuthLoginStartupState::Rejected,
+                ),
             },
-            Ok(Ok(None)) => (empty_persisted_auth_state(), 0, false),
-            Ok(Err(_)) | Err(_) => (empty_persisted_auth_state(), 1, true),
+            Ok(Ok(None)) => (
+                empty_persisted_auth_state(),
+                0,
+                AuthLoginStartupState::Ready,
+            ),
+            Ok(Err(_)) | Err(_) => (
+                empty_persisted_auth_state(),
+                1,
+                AuthLoginStartupState::Rejected,
+            ),
         };
         Self {
             committed: Arc::new(SyncRwLock::new(AuthLoginCommittedState {
@@ -283,11 +315,13 @@ impl AuthLoginStore {
             mutation_gate: Arc::new(AsyncMutex::new(())),
             pending_commit: Arc::new(SyncMutex::new(None)),
             lifecycle: Arc::new(SyncMutex::new(AuthLoginStoreLifecycle::Open)),
-            mutation_latched: Arc::new(AtomicBool::new(mutation_latched)),
+            startup_state,
+            mutation_latched: Arc::new(AtomicBool::new(false)),
             load_issue_count,
             active_auth_refresh: AsyncMutex::new(()),
             active_auth_generation: Arc::new(AtomicU64::new(0)),
             persistence: Some(persistence),
+            persistence_mode,
             next_id: AtomicU64::new(1),
         }
     }
@@ -296,10 +330,35 @@ impl AuthLoginStore {
         self.load_issue_count
     }
 
+    pub(crate) fn secure_auth_persistence_mode(&self) -> &'static str {
+        self.persistence_mode.as_str()
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn isolated_volatile_for_test() -> Self {
+        Self::with_persistence(Arc::new(
+            SecureAuthSnapshotPersistence::isolated_volatile_for_test(),
+        ))
+        .await
+    }
+
     async fn begin_mutation(
         &self,
     ) -> Result<(OwnedMutexGuard<()>, AuthLoginCommittedState), AuthLoginStoreError> {
-        let mut mutation = self.mutation_gate.clone().lock_owned().await;
+        let mutation = self.mutation_gate.clone().lock_owned().await;
+        let mutation = self.prepare_mutation_gate(mutation).await?;
+        let state = self
+            .committed
+            .read()
+            .expect(AUTH_STORE_LOCK_INVARIANT)
+            .clone();
+        Ok((mutation, state))
+    }
+
+    async fn prepare_mutation_gate(
+        &self,
+        mut mutation: OwnedMutexGuard<()>,
+    ) -> Result<OwnedMutexGuard<()>, AuthLoginStoreError> {
         self.ensure_mutation_allowed()?;
         let pending = self
             .pending_commit
@@ -311,12 +370,7 @@ impl AuthLoginStore {
                 .commit_candidate_holding_gate(pending.candidate, pending.bump_generation, mutation)
                 .await?;
         }
-        let state = self
-            .committed
-            .read()
-            .expect(AUTH_STORE_LOCK_INVARIANT)
-            .clone();
-        Ok((mutation, state))
+        Ok(mutation)
     }
 
     async fn commit_candidate(
@@ -390,13 +444,15 @@ impl AuthLoginStore {
     }
 
     fn ensure_mutation_allowed(&self) -> Result<(), AuthLoginStoreError> {
-        if self.mutation_latched.load(Ordering::Acquire) {
-            return Err(AuthLoginStoreError::MutationLatched);
-        }
         if *self.lifecycle.lock().expect(AUTH_STORE_LOCK_INVARIANT)
             == AuthLoginStoreLifecycle::Closed
         {
             return Err(AuthLoginStoreError::Closed);
+        }
+        if self.startup_state == AuthLoginStartupState::Rejected
+            || self.mutation_latched.load(Ordering::Acquire)
+        {
+            return Err(AuthLoginStoreError::MutationLatched);
         }
         Ok(())
     }
@@ -930,12 +986,18 @@ impl AuthLoginStore {
     }
 
     pub(crate) async fn close(&self) -> Result<(), AuthLoginStoreError> {
+        let mutation = self.mutation_gate.clone().lock_owned().await;
         if *self.lifecycle.lock().expect(AUTH_STORE_LOCK_INVARIANT)
             == AuthLoginStoreLifecycle::Closed
         {
             return Ok(());
         }
-        let (mutation, _) = self.begin_mutation().await?;
+        if self.startup_state == AuthLoginStartupState::Rejected {
+            *self.lifecycle.lock().expect(AUTH_STORE_LOCK_INVARIANT) =
+                AuthLoginStoreLifecycle::Closed;
+            return Ok(());
+        }
+        let mutation = self.prepare_mutation_gate(mutation).await?;
         let mutation = self.flush_persistence_holding_gate(mutation).await?;
         *self.lifecycle.lock().expect(AUTH_STORE_LOCK_INVARIANT) = AuthLoginStoreLifecycle::Closed;
         drop(mutation);
@@ -1078,7 +1140,9 @@ mod tests {
         saves: AtomicU64,
         deletes: AtomicU64,
         flushes: AtomicU64,
+        fail_loads: AtomicBool,
         fail_saves: AtomicBool,
+        ambiguous_saves: AtomicBool,
         fail_deletes: AtomicBool,
         fail_flushes: AtomicBool,
         block_saves: AtomicBool,
@@ -1090,35 +1154,28 @@ mod tests {
         fn with_snapshot(snapshot: PersistedAuthSnapshot) -> Self {
             Self {
                 snapshot: Mutex::new(Some(snapshot)),
-                saves: AtomicU64::new(0),
-                deletes: AtomicU64::new(0),
-                flushes: AtomicU64::new(0),
-                fail_saves: AtomicBool::new(false),
-                fail_deletes: AtomicBool::new(false),
-                fail_flushes: AtomicBool::new(false),
-                block_saves: AtomicBool::new(false),
-                save_started: AtomicBool::new(false),
-                release_saves: AtomicBool::new(false),
+                ..Self::default()
             }
         }
 
         fn with_failing_deletes(snapshot: PersistedAuthSnapshot) -> Self {
-            Self {
-                snapshot: Mutex::new(Some(snapshot)),
-                saves: AtomicU64::new(0),
-                deletes: AtomicU64::new(0),
-                flushes: AtomicU64::new(0),
-                fail_saves: AtomicBool::new(false),
-                fail_deletes: AtomicBool::new(true),
-                fail_flushes: AtomicBool::new(false),
-                block_saves: AtomicBool::new(false),
-                save_started: AtomicBool::new(false),
-                release_saves: AtomicBool::new(false),
-            }
+            let persistence = Self::with_snapshot(snapshot);
+            persistence.fail_deletes.store(true, Ordering::Relaxed);
+            persistence
+        }
+
+        fn with_unavailable_load() -> Self {
+            let persistence = Self::default();
+            persistence.fail_loads.store(true, Ordering::Relaxed);
+            persistence
         }
 
         fn fail_saves(&self) {
             self.fail_saves.store(true, Ordering::Relaxed);
+        }
+
+        fn fail_saves_ambiguously(&self) {
+            self.ambiguous_saves.store(true, Ordering::Relaxed);
         }
 
         fn allow_saves(&self) {
@@ -1162,6 +1219,9 @@ mod tests {
 
     impl AuthSnapshotPersistence for MockAuthSnapshotPersistence {
         fn load_snapshot(&self) -> Result<Option<PersistedAuthSnapshot>, AuthPersistenceError> {
+            if self.fail_loads.load(Ordering::Relaxed) {
+                return Err(AuthPersistenceError::Unavailable);
+            }
             Ok(self.snapshot())
         }
 
@@ -1174,6 +1234,9 @@ mod tests {
                 && !self.release_saves.load(Ordering::Acquire)
             {
                 std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            if self.ambiguous_saves.load(Ordering::Relaxed) {
+                return Err(AuthPersistenceError::Ambiguous);
             }
             if self.fail_saves.load(Ordering::Relaxed) {
                 return Err(AuthPersistenceError::Unavailable);
@@ -1510,7 +1573,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn auth_login_store_latches_wrong_schema_without_rewrite() {
+    async fn auth_login_store_closes_malformed_startup_rejection_without_rewrite() {
         let now = Utc::now();
         let token = AuthLoginMsaToken {
             login_id: "msa-wrong-schema".to_string(),
@@ -1523,19 +1586,91 @@ mod tests {
             authenticated_at: now,
             expires_at: now + chrono::Duration::seconds(3600),
         };
-        let persistence = Arc::new(MockAuthSnapshotPersistence::with_snapshot(
-            test_persisted_snapshot_with_version(&token, None, 1),
-        ));
+        let snapshot = test_persisted_snapshot_with_version(&token, None, 1);
+        let persistence = Arc::new(MockAuthSnapshotPersistence::with_snapshot(snapshot.clone()));
 
         let store = AuthLoginStore::with_persistence(persistence.clone()).await;
 
         assert_eq!(store.active_msa_token().await, None);
-        assert!(persistence.snapshot().is_some());
-        assert_eq!(persistence.deletes(), 0);
+        assert_eq!(persistence.snapshot(), Some(snapshot.clone()));
         assert_eq!(store.load_issue_count(), 1);
         assert!(matches!(
             store
                 .replace_with_msa_token(new_msa_token("blocked", None, 3600))
+                .await,
+            Err(AuthLoginStoreError::MutationLatched)
+        ));
+        store
+            .close()
+            .await
+            .expect("close rejected secure auth store");
+        store.close().await.expect("close remains idempotent");
+        assert_eq!(persistence.snapshot(), Some(snapshot));
+        assert_eq!(persistence.saves(), 0);
+        assert_eq!(persistence.deletes(), 0);
+        assert_eq!(persistence.flushes(), 0);
+        assert!(matches!(
+            store
+                .replace_with_msa_token(new_msa_token("closed", None, 3600))
+                .await,
+            Err(AuthLoginStoreError::Closed)
+        ));
+    }
+
+    #[tokio::test]
+    async fn auth_login_store_closes_unavailable_startup_rejection_without_persistence_access() {
+        let persistence = Arc::new(MockAuthSnapshotPersistence::with_unavailable_load());
+        let store = AuthLoginStore::with_persistence(persistence.clone()).await;
+
+        assert_eq!(store.load_issue_count(), 1);
+        assert!(matches!(
+            store
+                .replace_with_msa_token(new_msa_token("blocked", None, 3600))
+                .await,
+            Err(AuthLoginStoreError::MutationLatched)
+        ));
+        store
+            .close()
+            .await
+            .expect("close rejected secure auth store");
+        store.close().await.expect("close remains idempotent");
+        assert_eq!(persistence.snapshot(), None);
+        assert_eq!(persistence.saves(), 0);
+        assert_eq!(persistence.deletes(), 0);
+        assert_eq!(persistence.flushes(), 0);
+        assert!(matches!(
+            store
+                .replace_with_msa_token(new_msa_token("closed", None, 3600))
+                .await,
+            Err(AuthLoginStoreError::Closed)
+        ));
+    }
+
+    #[tokio::test]
+    async fn auth_login_store_post_start_ambiguous_mutation_still_blocks_close() {
+        let persistence = Arc::new(MockAuthSnapshotPersistence::default());
+        let store = AuthLoginStore::with_persistence(persistence.clone()).await;
+        persistence.fail_saves_ambiguously();
+
+        assert!(matches!(
+            store
+                .replace_with_msa_token(new_msa_token("ambiguous", None, 3600))
+                .await,
+            Err(AuthLoginStoreError::Persistence(
+                AuthPersistenceError::Ambiguous
+            ))
+        ));
+        assert!(matches!(
+            store.close().await,
+            Err(AuthLoginStoreError::MutationLatched)
+        ));
+        assert_eq!(persistence.snapshot(), None);
+        assert_eq!(persistence.saves(), 0);
+        assert_eq!(persistence.deletes(), 0);
+        assert_eq!(persistence.flushes(), 0);
+        assert!(matches!(
+            store
+                .replace_with_msa_token(new_msa_token("still-blocked", None, 3600))
                 .await,
             Err(AuthLoginStoreError::MutationLatched)
         ));

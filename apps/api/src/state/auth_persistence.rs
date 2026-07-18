@@ -4,7 +4,10 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
+#[cfg(any(debug_assertions, test))]
+use std::ffi::OsString;
 use std::fmt;
+use std::io;
 use std::sync::{Arc, Mutex};
 
 const AUTH_SNAPSHOT_SCHEMA_VERSION: u8 = 2;
@@ -20,8 +23,33 @@ const AUTH_SNAPSHOT_HEAD_VERSION: u8 = 1;
 const AUTH_SNAPSHOT_CHUNK_SLOT_COUNT: usize = 2;
 const AUTH_PERSISTENCE_LOCK_INVARIANT: &str =
     "secure auth cleanup lock poisoned; persisted credential cleanup ownership may diverge";
+#[cfg(all(debug_assertions, not(test)))]
+const SECURE_AUTH_VOLATILE_ENV: &str = "AXIAL_SECURE_AUTH_VOLATILE";
+#[cfg(any(debug_assertions, test))]
+const SECURE_AUTH_VOLATILE_ENV_ERROR: &str = "secure auth volatile mode is invalid";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SecureAuthPersistenceMode {
+    OsKeyring,
+    #[cfg(any(debug_assertions, test))]
+    IsolatedVolatile,
+}
+
+impl SecureAuthPersistenceMode {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::OsKeyring => "os_keyring",
+            #[cfg(any(debug_assertions, test))]
+            Self::IsolatedVolatile => "isolated_volatile",
+        }
+    }
+}
 
 pub(crate) trait AuthSnapshotPersistence: Send + Sync {
+    fn mode(&self) -> SecureAuthPersistenceMode {
+        SecureAuthPersistenceMode::OsKeyring
+    }
+
     fn load_snapshot(&self) -> Result<Option<PersistedAuthSnapshot>, AuthPersistenceError>;
     fn save_snapshot(&self, snapshot: &PersistedAuthSnapshot) -> Result<(), AuthPersistenceError>;
     fn delete_snapshot(&self) -> Result<(), AuthPersistenceError>;
@@ -426,22 +454,112 @@ impl CredentialEntryBackend for KeyringCredentialEntryBackend {
     }
 }
 
+#[cfg(any(debug_assertions, test))]
+#[derive(Debug, Eq, PartialEq)]
+enum SecureAuthBackendSelection {
+    OsKeyring,
+    IsolatedVolatile,
+}
+
+#[cfg(any(debug_assertions, test))]
+fn select_secure_auth_backend(
+    configured_mode: Option<OsString>,
+) -> io::Result<SecureAuthBackendSelection> {
+    match configured_mode {
+        None => Ok(SecureAuthBackendSelection::OsKeyring),
+        Some(value) if value == "1" => Ok(SecureAuthBackendSelection::IsolatedVolatile),
+        Some(_) => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            SECURE_AUTH_VOLATILE_ENV_ERROR,
+        )),
+    }
+}
+
+#[cfg(any(debug_assertions, test))]
+#[derive(Default)]
+struct VolatileCredentialEntryBackend {
+    entries: Mutex<std::collections::HashMap<String, String>>,
+}
+
+#[cfg(any(debug_assertions, test))]
+impl CredentialEntryBackend for VolatileCredentialEntryBackend {
+    fn get(&self, user: &str) -> Result<Option<String>, AuthPersistenceError> {
+        Ok(self
+            .entries
+            .lock()
+            .map_err(|_| AuthPersistenceError::Unavailable)?
+            .get(user)
+            .cloned())
+    }
+
+    fn set(&self, user: &str, value: &str) -> Result<(), AuthPersistenceError> {
+        self.entries
+            .lock()
+            .map_err(|_| AuthPersistenceError::Unavailable)?
+            .insert(user.to_string(), value.to_string());
+        Ok(())
+    }
+
+    fn delete(&self, user: &str) -> Result<(), AuthPersistenceError> {
+        self.entries
+            .lock()
+            .map_err(|_| AuthPersistenceError::Unavailable)?
+            .remove(user);
+        Ok(())
+    }
+}
+
 pub(crate) struct SecureAuthSnapshotPersistence {
     backend: Arc<dyn CredentialEntryBackend>,
+    mode: SecureAuthPersistenceMode,
     cleanup: Mutex<HashSet<String>>,
 }
 
 impl SecureAuthSnapshotPersistence {
     #[cfg(not(test))]
-    pub(crate) fn new() -> Self {
-        Self::with_backend(Arc::new(KeyringCredentialEntryBackend))
+    pub(crate) fn for_app_startup() -> io::Result<Self> {
+        #[cfg(debug_assertions)]
+        {
+            return match select_secure_auth_backend(std::env::var_os(SECURE_AUTH_VOLATILE_ENV))? {
+                SecureAuthBackendSelection::OsKeyring => {
+                    Ok(Self::with_backend(Arc::new(KeyringCredentialEntryBackend)))
+                }
+                SecureAuthBackendSelection::IsolatedVolatile => Ok(Self::with_backend_and_mode(
+                    Arc::new(VolatileCredentialEntryBackend::default()),
+                    SecureAuthPersistenceMode::IsolatedVolatile,
+                )),
+            };
+        }
+
+        #[cfg(not(debug_assertions))]
+        Ok(Self::with_backend(Arc::new(KeyringCredentialEntryBackend)))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn isolated_volatile_for_test() -> Self {
+        Self::with_backend_and_mode(
+            Arc::new(VolatileCredentialEntryBackend::default()),
+            SecureAuthPersistenceMode::IsolatedVolatile,
+        )
     }
 
     fn with_backend(backend: Arc<dyn CredentialEntryBackend>) -> Self {
+        Self::with_backend_and_mode(backend, SecureAuthPersistenceMode::OsKeyring)
+    }
+
+    fn with_backend_and_mode(
+        backend: Arc<dyn CredentialEntryBackend>,
+        mode: SecureAuthPersistenceMode,
+    ) -> Self {
         Self {
             backend,
+            mode,
             cleanup: Mutex::new(HashSet::new()),
         }
+    }
+
+    pub(crate) fn mode(&self) -> SecureAuthPersistenceMode {
+        self.mode
     }
 
     fn chunk_user(slot: usize, chunk: usize) -> String {
@@ -533,6 +651,10 @@ impl SecureAuthSnapshotPersistence {
 }
 
 impl AuthSnapshotPersistence for SecureAuthSnapshotPersistence {
+    fn mode(&self) -> SecureAuthPersistenceMode {
+        SecureAuthSnapshotPersistence::mode(self)
+    }
+
     fn load_snapshot(&self) -> Result<Option<PersistedAuthSnapshot>, AuthPersistenceError> {
         let Some((head, _)) = self.read_head()? else {
             return Ok(None);
@@ -744,6 +866,7 @@ pub(crate) fn test_persisted_snapshot_with_version(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::state::{AuthLoginStore, NewAuthLoginMsaToken};
     use std::collections::HashMap;
 
     #[derive(Clone)]
@@ -849,6 +972,89 @@ mod tests {
             expires_at: now + chrono::Duration::seconds(3600),
         };
         PersistedAuthSnapshot::from_state(Some("login-test"), &[token], &[])
+    }
+
+    #[test]
+    fn isolated_volatile_secure_auth_selector_is_exact() {
+        assert_eq!(
+            select_secure_auth_backend(None).expect("unset hook"),
+            SecureAuthBackendSelection::OsKeyring
+        );
+        assert_eq!(
+            select_secure_auth_backend(Some(OsString::from("1"))).expect("volatile hook"),
+            SecureAuthBackendSelection::IsolatedVolatile
+        );
+
+        let invalid_values = [
+            OsString::new(),
+            OsString::from("0"),
+            OsString::from("true"),
+            non_unicode_os_string(),
+        ];
+        for invalid in invalid_values {
+            let error =
+                select_secure_auth_backend(Some(invalid)).expect_err("invalid hook must fail");
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+            assert_eq!(error.to_string(), SECURE_AUTH_VOLATILE_ENV_ERROR);
+        }
+    }
+
+    #[cfg(unix)]
+    fn non_unicode_os_string() -> OsString {
+        use std::os::unix::ffi::OsStringExt;
+        OsString::from_vec(vec![0xff])
+    }
+
+    #[cfg(windows)]
+    fn non_unicode_os_string() -> OsString {
+        use std::os::windows::ffi::OsStringExt;
+        OsString::from_wide(&[0xd800])
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    fn non_unicode_os_string() -> OsString {
+        OsString::from("non-unicode-unavailable")
+    }
+
+    #[tokio::test]
+    async fn isolated_volatile_secure_auth_save_load_delete_and_close_round_trip() {
+        let persistence = Arc::new(SecureAuthSnapshotPersistence::isolated_volatile_for_test());
+        assert_eq!(
+            persistence.mode(),
+            SecureAuthPersistenceMode::IsolatedVolatile
+        );
+        let store = AuthLoginStore::with_persistence(persistence.clone()).await;
+        let token = store
+            .replace_with_msa_token(NewAuthLoginMsaToken {
+                access_token: "volatile-access-token".to_string(),
+                refresh_token: Some("volatile-refresh-token".to_string()),
+                id_token: Some("volatile-id-token".to_string()),
+                token_type: "Bearer".to_string(),
+                expires_in: 3600,
+                scope: Some("XboxLive.signin offline_access".to_string()),
+            })
+            .await
+            .expect("persist volatile auth");
+        store.close().await.expect("close volatile auth");
+        drop(store);
+
+        let restored = AuthLoginStore::with_persistence(persistence.clone()).await;
+        assert_eq!(restored.secure_auth_persistence_mode(), "isolated_volatile");
+        let mut expected_token = token;
+        expected_token.authenticated_at =
+            DateTime::from_timestamp_millis(expected_token.authenticated_at.timestamp_millis())
+                .expect("persisted authentication timestamp");
+        expected_token.expires_at =
+            DateTime::from_timestamp_millis(expected_token.expires_at.timestamp_millis())
+                .expect("persisted expiry timestamp");
+        assert_eq!(restored.active_msa_token().await, Some(expected_token));
+        assert!(restored.clear_all().await.expect("delete volatile auth"));
+        restored.close().await.expect("close deleted volatile auth");
+        drop(restored);
+
+        let empty = AuthLoginStore::with_persistence(persistence).await;
+        assert_eq!(empty.active_msa_token().await, None);
+        empty.close().await.expect("close empty volatile auth");
     }
 
     #[test]

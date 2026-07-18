@@ -454,6 +454,7 @@ impl AppState {
             AuthLoginStore::load_from_secure_store(),
             RemoteFlagStore::load_from_config_dir(remote_flags_config_dir),
         );
+        let auth_logins = auth_logins?;
         #[cfg(not(test))]
         let managed_runtime_cache = ManagedRuntimeCache::canonical()?;
         #[cfg(test)]
@@ -540,6 +541,12 @@ impl AppState {
     #[cfg(test)]
     pub(crate) fn with_accounts(mut self, accounts: Arc<LauncherAccountStore>) -> Self {
         self.accounts = accounts;
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_auth_logins(mut self, auth_logins: Arc<AuthLoginStore>) -> Self {
+        self.auth_logins = auth_logins;
         self
     }
 
