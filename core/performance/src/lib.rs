@@ -22,8 +22,9 @@ pub use effective::{
 };
 pub use health::BundleHealth;
 pub use install::{
-    InstallError, ManagedArtifactWitnessProof, ManagedCompositionAuthority,
-    ManagedCompositionInspection, ManagedIdentityError, ManagedIndeterminate,
+    InstallError, ManagedArtifactPin, ManagedArtifactRole, ManagedArtifactWitnessProof,
+    ManagedCompositionAuthority, ManagedCompositionInspection, ManagedCompositionInstallPlan,
+    ManagedDependencyEdge, ManagedIdentityError, ManagedIndeterminate, ManagedInstallPlanError,
     ManagedInstanceIdentity, ManagedMutationError, ManagedResolvedInspection,
     PERFORMANCE_RULES_URL_ENV, PerformanceManager, PerformanceRulesAuthority, RulesRefreshError,
     VerifiedRemoteRules, remote_rules_refresh_warning,

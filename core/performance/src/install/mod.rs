@@ -3,6 +3,7 @@ mod fallback;
 mod manager;
 mod model;
 mod mutation;
+mod plan;
 mod promotion;
 mod rules_refresh;
 
@@ -17,5 +18,9 @@ pub use model::{InstallError, PERFORMANCE_RULES_URL_ENV, RulesRefreshError, Veri
 pub use mutation::{
     ManagedArtifactWitnessProof, ManagedCompositionInspection, ManagedIndeterminate,
     ManagedMutationError, ManagedResolvedInspection,
+};
+pub use plan::{
+    ManagedArtifactPin, ManagedArtifactRole, ManagedCompositionInstallPlan, ManagedDependencyEdge,
+    ManagedInstallPlanError,
 };
 pub use rules_refresh::remote_rules_refresh_warning;
