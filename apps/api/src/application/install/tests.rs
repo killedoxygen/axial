@@ -607,6 +607,56 @@ fn loader_operation_progress_advances_after_the_complete_denominator_resolves() 
 }
 
 #[test]
+fn loader_presenter_clamps_progress_when_the_raw_denominator_grows() {
+    let mut first = install_progress("assets", 8, 10);
+    first.bytes_done = Some(800);
+    first.bytes_total = Some(1_000);
+    let mut expanded = install_progress("assets", 8, 20);
+    expanded.bytes_done = Some(800);
+    expanded.bytes_total = Some(2_000);
+    let mut advanced = install_progress("assets", 18, 20);
+    advanced.bytes_done = Some(1_800);
+    advanced.bytes_total = Some(2_000);
+
+    assert_eq!(
+        loader_install_progress_view_model(&expanded).progress_pct,
+        37,
+        "the raw ratio demonstrates the denominator-growth regression"
+    );
+    assert_eq!(
+        loader_presented_percentages(vec![first, expanded, advanced]),
+        vec![66, 66, 73]
+    );
+}
+
+#[test]
+fn loader_observed_base_revalidation_does_not_regress_public_progress() {
+    let observed_base = completed_base_progress();
+    let revalidation = install_progress("version_json", 0, 1);
+    let mut revalidation_transfer = install_progress("assets", 1, 10);
+    revalidation_transfer.bytes_done = Some(100);
+    revalidation_transfer.bytes_total = Some(1_000);
+
+    assert_eq!(
+        loader_install_progress_view_model(&revalidation).progress_pct,
+        8,
+        "base revalidation restarts at the raw loader transfer floor"
+    );
+    assert_eq!(
+        loader_presented_percentages(vec![
+            observed_base,
+            revalidation,
+            revalidation_transfer,
+            install_progress("loader_libraries", 0, 8),
+            install_progress("loader_libraries", 8, 8),
+            install_progress("loader_publish", 1, 1),
+            install_progress("done", 1, 1),
+        ]),
+        vec![80, 80, 80, 82, 90, 99, 100]
+    );
+}
+
+#[test]
 fn pending_denominator_cannot_latch_a_late_phase_percentage() {
     let mut presenter = InstallProgressPresenter::default();
     let pending = presenter.record(install_progress("assets", 10, 10));
