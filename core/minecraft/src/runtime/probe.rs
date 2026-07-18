@@ -518,13 +518,18 @@ pub(super) fn detect_distribution(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::parse_java_version;
+    #[cfg(unix)]
     use super::{
-        command_output_with_timeout, parse_java_version, probe_java_runtime_receipt,
-        resolve_java_runtime_probe, snapshot_java_runtime,
+        command_output_with_timeout, probe_java_runtime_receipt, resolve_java_runtime_probe,
+        snapshot_java_runtime,
     };
+    #[cfg(unix)]
     use crate::runtime::RuntimeProbeSource;
     use std::fs;
+    #[cfg(unix)]
     use std::process::Command;
+    #[cfg(unix)]
     use std::time::{Duration, Instant};
 
     #[test]

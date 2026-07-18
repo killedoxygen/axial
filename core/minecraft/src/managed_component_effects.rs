@@ -1970,6 +1970,7 @@ mod tests {
         lane.into_intent_candidate(lease, manifest).unwrap()
     }
 
+    #[cfg(target_os = "linux")]
     async fn two_shard_empty_file_candidate(
         temporary: &tempfile::TempDir,
     ) -> (

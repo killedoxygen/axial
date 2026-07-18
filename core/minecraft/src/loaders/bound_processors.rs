@@ -1747,8 +1747,10 @@ mod tests {
     use super::{
         AuthenticatedBytes, BoundProcessorError, PipeEvent, StagedAuthority, drain_pipe,
         manifest_attributes, processor_main_class, reauthenticate_step_dependencies,
-        spawn_contained_child, valid_main_class, wait_for_contained_child,
+        valid_main_class,
     };
+    #[cfg(unix)]
+    use super::{spawn_contained_child, wait_for_contained_child};
     use crate::artifact_path::ArtifactRelativePath;
     use crate::loaders::forge_installer::{
         BoundProcessorArgument, BoundProcessorArgumentPart, BoundProcessorArtifact,
@@ -1761,10 +1763,14 @@ mod tests {
     use std::fs;
     use std::io::{Cursor, Write};
     use std::sync::{Arc, atomic::AtomicUsize};
+    #[cfg(unix)]
     use std::time::Duration;
     use tokio::io::AsyncWriteExt;
+    #[cfg(unix)]
     use tokio::process::Command;
-    use tokio::sync::{mpsc, oneshot};
+    use tokio::sync::mpsc;
+    #[cfg(unix)]
+    use tokio::sync::oneshot;
     use zip::{ZipWriter, write::SimpleFileOptions};
 
     #[cfg(target_os = "linux")]

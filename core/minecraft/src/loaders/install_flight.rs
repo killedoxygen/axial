@@ -93,7 +93,9 @@ impl InstallFlightRegistry {
 
 #[cfg(test)]
 mod tests {
-    use super::{InstallFlightKey, InstallFlightRegistry, acquire, acquire_with_wait_observer};
+    #[cfg(unix)]
+    use super::acquire_with_wait_observer;
+    use super::{InstallFlightKey, InstallFlightRegistry, acquire};
     use crate::loaders::types::LoaderError;
     use std::fs;
     use std::path::Path;
