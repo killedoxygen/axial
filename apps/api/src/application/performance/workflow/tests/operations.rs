@@ -3061,6 +3061,215 @@ async fn provider_resolution_failure_terminalizes_before_effect_started() {
 }
 
 #[tokio::test]
+async fn provider_resolution_failure_after_remove_retains_snapshot_rollback_proof() {
+    let fixture = TestFixture::new("provider-resolution-after-remove");
+    let version_id = fabric_version_id("1.20.4");
+    let instance_id = fixture.add_instance("Managed", &version_id);
+    fixture.write_fabric_version(&version_id, "1.20.4");
+    let mods_dir = fixture
+        .state
+        .instances()
+        .game_dir(&instance_id)
+        .join("mods");
+    let managed_lock = seed_managed_lock(
+        &fixture.state,
+        &instance_id,
+        "provider-resolution-after-remove",
+    );
+    let sentinel = mods_dir.join("user-owned.jar");
+    fs::write(&sentinel, b"unchanged").expect("write post-remove provider failure sentinel");
+
+    let Json(removed) = handle_install(
+        State(fixture.state.clone()),
+        Json(InstallRequest {
+            instance_id: Some(instance_id.clone()),
+            game_version: Some("1.20.4".to_string()),
+            loader: Some("fabric".to_string()),
+            mode: Some("managed".to_string()),
+            action: Some("remove".to_string()),
+            rollback_id: None,
+            queued: None,
+        }),
+    )
+    .await
+    .expect("remove managed composition before provider failure");
+    assert_eq!(removed.status, "removed");
+    assert!(!managed_lock.exists());
+    assert_eq!(
+        fs::read(&sentinel).expect("read preserved post-remove sentinel"),
+        b"unchanged"
+    );
+
+    let rollback_before = performance_rollback_list(
+        &fixture.state,
+        RollbackQuery {
+            instance_id: Some(instance_id.clone()),
+        },
+    )
+    .await
+    .expect("post-remove rollback list")
+    .snapshots;
+    assert_eq!(rollback_before.len(), 1);
+    assert!(rollback_before[0].latest);
+    assert!(rollback_before[0].rollback_available);
+    let Json(health_before) = handle_health(
+        State(fixture.state.clone()),
+        Query(HealthQuery {
+            instance_id: Some(instance_id.clone()),
+        }),
+    )
+    .await
+    .expect("post-remove health");
+    assert_eq!(health_before.health, BundleHealth::Disabled);
+    assert_eq!(health_before.proof.rollback, RollbackState::Available);
+
+    let mut operation = PerformanceOperation {
+        instance_id: instance_id.clone(),
+        game_version: Some("1.20.4".to_string()),
+        loader: Some("fabric".to_string()),
+        mode: Some("managed".to_string()),
+        action: PerformanceInstallAction::Install,
+        rollback_id: None,
+        status_operation_id: None,
+        persistence_failure: None,
+        installed_versions: None,
+    };
+    let foreground = fixture
+        .state
+        .register_integrity_foreground()
+        .expect("register post-remove provider failure foreground")
+        .wait_for_settlement()
+        .await;
+    let identity = performance_operation_journal_identity(&fixture.state, &operation, &foreground)
+        .await
+        .expect("resolve post-remove queued journal identity");
+    assert_eq!(identity.rollback, RollbackState::Available);
+    let status = fixture
+        .state
+        .performance_operations()
+        .start_with_identity(
+            instance_id.clone(),
+            "install".to_string(),
+            PerformanceOperationPayload {
+                game_version: operation.game_version.clone(),
+                loader: operation.loader.clone(),
+                mode: operation.mode.clone(),
+                rollback_id: None,
+            },
+            crate::state::performance_operations::PerformanceOperationJournalIdentity::new(
+                "install",
+                identity.target_id,
+                identity.rollback,
+            ),
+        )
+        .await
+        .expect("start post-remove provider failure status");
+    assert_eq!(
+        status
+            .journal_identity
+            .as_ref()
+            .expect("post-remove journal identity")
+            .rollback,
+        RollbackState::Available
+    );
+    operation.status_operation_id = Some(status.id.clone());
+    fixture.state.installs().insert(status.id.clone()).await;
+
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        run_queued_performance_operation_with_resolver(
+            fixture.state.clone(),
+            operation,
+            fixture.state.installs().clone(),
+            status.id.clone(),
+            foreground,
+            |_, _, _, _| async { Err(ManagedPlanResolutionError::ResolutionFailed) },
+        ),
+    )
+    .await
+    .expect("post-remove provider failure terminalizes");
+    let events = collect_install_events(&fixture.state, &status.id).await;
+    assert_eq!(events.last().expect("terminal event").phase, "error");
+
+    let operation_id = crate::state::contracts::OperationId::new(status.id.clone());
+    let journal = fixture
+        .state
+        .journals()
+        .get(&operation_id)
+        .expect("post-remove provider failure journal");
+    assert_eq!(
+        journal.status,
+        crate::state::contracts::OperationStatus::Failed
+    );
+    assert_eq!(journal.rollback, RollbackState::Available);
+    assert!(
+        journal
+            .planned_steps
+            .iter()
+            .all(|step| step.rollback == RollbackState::Available)
+    );
+    assert!(!journal.completed_steps.iter().any(|step| {
+        matches!(
+            step.step_id.as_str(),
+            "performance_plan_resolved" | "performance_effect_started"
+        )
+    }));
+    assert!(
+        journal
+            .completed_steps
+            .iter()
+            .all(|step| step.changed_target.is_none())
+    );
+    let failure = journal
+        .completed_steps
+        .iter()
+        .find(|step| step.step_id == "apply_performance_plan")
+        .expect("post-remove terminal provider failure step");
+    assert_eq!(failure.rollback, RollbackState::Available);
+
+    let public = performance_operation_status(&fixture.state, &status.id)
+        .await
+        .expect("public post-remove provider failure status");
+    let proof = public
+        .proof
+        .expect("post-remove terminal provider failure proof");
+    assert_eq!(proof.rollback, RollbackState::Available);
+    assert!(
+        proof
+            .fields
+            .iter()
+            .all(|field| field.key != "latest_changed_target")
+    );
+    assert_eq!(
+        performance_rollback_list(
+            &fixture.state,
+            RollbackQuery {
+                instance_id: Some(instance_id.clone()),
+            },
+        )
+        .await
+        .expect("preserved post-remove rollback list")
+        .snapshots,
+        rollback_before
+    );
+    let Json(health_after) = handle_health(
+        State(fixture.state.clone()),
+        Query(HealthQuery {
+            instance_id: Some(instance_id),
+        }),
+    )
+    .await
+    .expect("preserved post-remove health");
+    assert_eq!(health_after.health, BundleHealth::Disabled);
+    assert_eq!(health_after.proof.rollback, RollbackState::Available);
+    assert!(!managed_lock.exists());
+    assert_eq!(
+        fs::read(&sentinel).expect("read sentinel after provider failure"),
+        b"unchanged"
+    );
+}
+
+#[tokio::test]
 async fn fresh_download_failure_has_no_effect_marker_or_rollback_proof() {
     let fixture = TestFixture::new("fresh-download-pre-effect-failure");
     let instance_id = fixture.add_instance("Managed", "1.20.4-fabric");

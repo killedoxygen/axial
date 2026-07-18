@@ -24,9 +24,10 @@ use crate::observability::{RedactionAudience, sanitize_evidence_token};
 use crate::state::contracts::{OperationId, OperationPhase, RollbackState};
 use crate::state::{AppManagedCompositionAdmission, AppState, IntegrityForegroundLease};
 use axial_performance::{
-    BundleHealth, CompositionPlan, CompositionState, InstallError, ManagedCompositionInstallPlan,
-    ManagedInstallExecutionError, ManagedRollbackOutcome, PerformanceMode, ResolutionRequest,
-    RollbackSnapshotSummary as CoreRollbackSnapshotSummary, RollbackSnapshotTarget, StateError,
+    BundleHealth, CompositionPlan, CompositionState, InstallError, ManagedCompositionInspection,
+    ManagedCompositionInstallPlan, ManagedInstallExecutionError, ManagedRollbackOutcome,
+    PerformanceMode, ResolutionRequest, RollbackSnapshotSummary as CoreRollbackSnapshotSummary,
+    RollbackSnapshotTarget, StateError,
 };
 use axum::{Json, http::StatusCode};
 use serde::Serialize;
@@ -256,20 +257,20 @@ pub(super) async fn performance_operation_journal_identity(
         operation.game_version.as_deref(),
         operation.loader.as_deref(),
     )?;
+    let inspection = admitted.inspect(None).await;
     let plan = state.performance().get_plan(ResolutionRequest {
         game_version,
         loader,
         mode,
         hardware: state.performance().hardware(),
-        installed_mods: admitted
-            .inspect(None)
-            .await
-            .map(|inspection| inspection.installed_mod_evidence)
+        installed_mods: inspection
+            .as_ref()
+            .map(|inspection| inspection.installed_mod_evidence.clone())
             .unwrap_or_default(),
     });
-    let rollback = preflight_current_performance_state(&admitted)
-        .await
-        .map(|state| rollback_state_for_current_state(state.as_ref()))
+    let rollback = inspection
+        .as_ref()
+        .map(install_rollback_state_for_inspection)
         .unwrap_or(RollbackState::Unavailable);
     Ok(PerformanceJournalIdentity {
         action: PerformanceInstallAction::Install,
@@ -619,20 +620,19 @@ where
     Progress: FnOnce(PerformanceInstallAction) -> ProgressFuture,
     ProgressFuture: std::future::Future<Output = ()>,
 {
+    let current_inspection = admitted.inspect(None).await.map_err(managed_mutation_error);
     let plan = state.performance().get_plan(ResolutionRequest {
         game_version: game_version.clone(),
         loader: loader.clone(),
         mode,
         hardware: state.performance().hardware(),
-        installed_mods: admitted
-            .inspect(None)
-            .await
-            .map(|inspection| inspection.installed_mod_evidence)
+        installed_mods: current_inspection
+            .as_ref()
+            .map(|inspection| inspection.installed_mod_evidence.clone())
             .unwrap_or_default(),
     });
-    let current_state = preflight_current_performance_state(admitted).await;
-    let pre_effect_rollback_state = match &current_state {
-        Ok(state) => rollback_state_for_current_state(state.as_ref()),
+    let pre_effect_rollback_state = match &current_inspection {
+        Ok(inspection) => install_rollback_state_for_inspection(inspection),
         Err(_) => RollbackState::Unavailable,
     };
     let rollback_state = pre_effect_rollback_state;
@@ -699,7 +699,7 @@ where
                 ),
             )
         })?;
-    if let Err(error) = current_state {
+    if let Err(error) = current_inspection {
         let result = Err(error);
         record_performance_operation_result(
             state,
@@ -931,6 +931,21 @@ async fn rollback_preflight(
 
 fn rollback_state_for_current_state(state: Option<&CompositionState>) -> RollbackState {
     if state.is_some() {
+        RollbackState::Available
+    } else {
+        RollbackState::Unavailable
+    }
+}
+
+fn install_rollback_state_for_inspection(
+    inspection: &ManagedCompositionInspection,
+) -> RollbackState {
+    if inspection.state.is_some()
+        || inspection
+            .rollback_snapshots
+            .iter()
+            .any(|snapshot| snapshot.rollback_available)
+    {
         RollbackState::Available
     } else {
         RollbackState::Unavailable
