@@ -4751,7 +4751,7 @@ mod tests {
 
     #[test]
     fn copy_rule_table_is_unique_complete_and_bounded() {
-        assert_eq!(GUARDIAN_COPY_RULES.len(), 27);
+        assert_eq!(GUARDIAN_COPY_RULES.len(), 26);
         for (index, rule) in GUARDIAN_COPY_RULES.iter().enumerate() {
             assert!(
                 GUARDIAN_COPY_RULES[index + 1..]

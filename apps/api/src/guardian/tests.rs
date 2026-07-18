@@ -492,7 +492,7 @@ fn declarative_rules_have_unique_ids_and_keep_conditions_out_of_evidence() {
         GuardianFactId::RegisteredArtifactRepairAvailable,
     ];
 
-    assert_eq!(DIAGNOSIS_RULES.len(), 60);
+    assert_eq!(DIAGNOSIS_RULES.len(), 59);
     for rule in DIAGNOSIS_RULES {
         assert!(diagnosis_ids.insert(rule.id), "duplicate rule {}", rule.id);
         assert!(!rule.trigger_fact_ids.is_empty(), "{}", rule.id);
@@ -513,7 +513,7 @@ fn declarative_rules_have_unique_ids_and_keep_conditions_out_of_evidence() {
 }
 
 #[test]
-fn nine_multi_fact_rule_families_emit_once_with_declared_support_order() {
+fn eight_multi_fact_rule_families_emit_once_with_declared_support_order() {
     let families: &[(DiagnosisId, &[GuardianFactId])] = &[
         (
             DiagnosisId::JavaOverrideUnavailable,
@@ -568,10 +568,6 @@ fn nine_multi_fact_rule_families_emit_once_with_declared_support_order() {
                 GuardianFactId::OwnershipUnknown,
                 GuardianFactId::PrimitiveRefused,
             ],
-        ),
-        (
-            DiagnosisId::PerformanceFallbackSelected,
-            &[GuardianFactId::PerformanceFallbackSelected],
         ),
         (
             DiagnosisId::ProcessLifecycleObserved,
