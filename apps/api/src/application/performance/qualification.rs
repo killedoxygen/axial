@@ -20,11 +20,7 @@ pub(crate) const FAMILY_C_MANAGED_COMPOSITION_ID: &str = "family-c-forge-core";
 
 const FAMILY_C_COMPARISON_STAGE_METRIC_NAME: &str = "total_completed_stage_duration_ms";
 const FAMILY_C_COMPARISON_BOOT_METRIC_NAME: &str = "boot_duration_ms";
-const FAMILY_C_MANAGED_EXPECTED_ARTIFACTS: [(&str, &str, &str); 3] = [
-    ("foamfix", "jupr7Bf5", "foamfix"),
-    ("ai-improvements", "DSVgwcji", "ai-improvements"),
-    ("clumps", "clumps", "clumps"),
-];
+const FAMILY_C_MANAGED_EXPECTED_PROJECT_IDS: [&str; 3] = ["jupr7Bf5", "DSVgwcji", "Wnxd13zP"];
 const BENCHMARK_SUITE_STORAGE_ERROR_MESSAGE: &str =
     "Could not load benchmark suite data. Check app data permissions and try again.";
 
@@ -792,15 +788,13 @@ fn unobserved_managed_install_evidence(
 fn family_c_managed_expected_artifacts_present(
     composition_state: &axial_performance::CompositionState,
 ) -> bool {
-    FAMILY_C_MANAGED_EXPECTED_ARTIFACTS
+    FAMILY_C_MANAGED_EXPECTED_PROJECT_IDS
         .iter()
-        .all(|(artifact_id, project_id, slug)| {
-            composition_state.installed_mods.iter().any(|installed| {
-                let installed_project_id = installed.project_id.trim();
-                installed_project_id == *artifact_id
-                    || installed_project_id == *project_id
-                    || installed_project_id == *slug
-            })
+        .all(|project_id| {
+            composition_state
+                .installed_mods
+                .iter()
+                .any(|installed| installed.project_id == *project_id)
         })
 }
 
@@ -1082,4 +1076,54 @@ struct FamilyCManagedComparisonEvidence {
     metric_valid: bool,
     samples_present: bool,
     values_present: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::family_c_managed_expected_artifacts_present;
+    use axial_performance::{
+        CompositionState, CompositionTier, InstalledMod, ManagedArtifactIntegrity,
+        ManagedArtifactProvider, ManagedArtifactSource, OwnershipClass,
+    };
+
+    #[test]
+    fn managed_install_evidence_requires_exact_canonical_project_ids() {
+        let canonical = composition_state(["jupr7Bf5", "DSVgwcji", "Wnxd13zP"]);
+        assert!(family_c_managed_expected_artifacts_present(&canonical));
+
+        for (index, alias) in ["foamfix", "ai-improvements", "clumps"]
+            .into_iter()
+            .enumerate()
+        {
+            let mut aliased = canonical.clone();
+            aliased.installed_mods[index].project_id = alias.to_string();
+            assert!(!family_c_managed_expected_artifacts_present(&aliased));
+        }
+    }
+
+    fn composition_state<const N: usize>(project_ids: [&str; N]) -> CompositionState {
+        CompositionState {
+            composition_id: "family-c-forge-core".to_string(),
+            tier: CompositionTier::Core,
+            installed_mods: project_ids
+                .into_iter()
+                .map(|project_id| InstalledMod {
+                    project_id: project_id.to_string(),
+                    version_id: "version".to_string(),
+                    filename: format!("{project_id}.jar"),
+                    ownership_class: OwnershipClass::CompositionManaged,
+                    source: ManagedArtifactSource {
+                        provider: ManagedArtifactProvider::Modrinth,
+                    },
+                    integrity: ManagedArtifactIntegrity {
+                        sha512: "0".repeat(128),
+                        sha512_verified: true,
+                    },
+                })
+                .collect(),
+            installed_at: "2026-07-18T00:00:00Z".to_string(),
+            failure_count: 0,
+            last_failure: String::new(),
+        }
+    }
 }

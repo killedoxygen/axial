@@ -40,6 +40,8 @@ pub enum ModrinthError {
     Http { status: u16, body: String },
     #[error("modrinth response too large")]
     ResponseTooLarge,
+    #[error("modrinth version project identity mismatch")]
+    ProjectMismatch,
     #[error("hash mismatch: expected {expected} got {actual}")]
     HashMismatch { expected: String, actual: String },
     #[error("download size exceeded: expected {expected} bytes got at least {actual} bytes")]
@@ -108,6 +110,12 @@ impl ModrinthClient {
         let versions = serde_json::from_slice::<Vec<Version>>(
             &bounded_version_response_body(response).await?,
         )?;
+        if versions
+            .iter()
+            .any(|version| version.project_id != project_id)
+        {
+            return Err(ModrinthError::ProjectMismatch);
+        }
         let mut compatible: Vec<Version> = versions
             .into_iter()
             .filter(|version| matches_any(&version.game_versions, game_versions))
@@ -395,6 +403,7 @@ impl Default for ModrinthClient {
 #[derive(Debug, Clone, Deserialize)]
 pub struct Version {
     pub id: String,
+    pub project_id: String,
     #[serde(default)]
     pub game_versions: Vec<String>,
     #[serde(default)]
@@ -520,6 +529,46 @@ mod tests {
             }
             other => panic!("expected rate-limit error, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn list_versions_rejects_exact_project_identity_mismatch() {
+        let body = br#"[{"id":"version-a","project_id":"lithiumx","game_versions":["1.21.1"],"loaders":["fabric"],"files":[]}]"#.to_vec();
+        let base_url = spawn_response_server(
+            "200 OK",
+            vec![("content-type".to_string(), "application/json".to_string())],
+            body,
+        )
+        .await;
+        let client = ModrinthClient::new_with_base_url(base_url);
+
+        let error = client
+            .list_versions("sodiumxx", &["1.21.1".to_string()], &["fabric".to_string()])
+            .await
+            .expect_err("shape-valid slug-like identities must still match exactly");
+
+        assert!(matches!(error, ModrinthError::ProjectMismatch));
+    }
+
+    #[tokio::test]
+    async fn list_versions_requires_response_project_identity() {
+        let body =
+            br#"[{"id":"version-a","game_versions":["1.21.1"],"loaders":["fabric"],"files":[]}]"#
+                .to_vec();
+        let base_url = spawn_response_server(
+            "200 OK",
+            vec![("content-type".to_string(), "application/json".to_string())],
+            body,
+        )
+        .await;
+        let client = ModrinthClient::new_with_base_url(base_url);
+
+        let error = client
+            .list_versions("sodiumxx", &["1.21.1".to_string()], &["fabric".to_string()])
+            .await
+            .expect_err("project identity is required on every version row");
+
+        assert!(matches!(error, ModrinthError::Parse(_)));
     }
 
     #[tokio::test]

@@ -280,8 +280,52 @@ fn modernfix_uses_exact_supported_roots_once_without_parent_fallback() {
 }
 
 #[test]
-fn builtin_manifest_binds_managed_aliases_to_immutable_provider_identities() {
+fn builtin_manifest_binds_all_managed_artifacts_to_immutable_provider_identities() {
     let manifest = builtin_manifest().expect("manifest");
+    let expected_project_ids = [
+        ("sodium", "AANobbMI"),
+        ("lithium", "gvQqBUqZ"),
+        ("ferrite-core", "uXXizFIs"),
+        ("immediatelyfast", "5ZwdcRci"),
+        ("dynamic-fps", "LQ3K71Q1"),
+        ("modernfix", "nmDcB62a"),
+        ("entityculling", "NNAgCjsB"),
+        ("c2me-fabric", "VSNURh3q"),
+        ("moreculling", "51shyZVL"),
+        ("krypton", "fQEb0iXm"),
+        ("enhancedblockentities", "OVuFYfre"),
+        ("memoryleakfix", "NRjRiSSD"),
+        ("clumps", "Wnxd13zP"),
+        ("foamfix", "jupr7Bf5"),
+        ("ai-improvements", "DSVgwcji"),
+        ("lazydfu", "hvFnDODi"),
+        ("smooth-boot-reloaded", "z53V2L4P"),
+        ("starlight", "H8CaAYZC"),
+        ("nvidium", "SfMw2IZN"),
+        ("embeddium", "sk9rgfiA"),
+        ("scalablelux", "Ps1zyz6x"),
+        ("particle-core", "RSeLon5O"),
+        ("threadtweak", "vSEH1ERy"),
+        ("badoptimizations", "g96Z4WVZ"),
+    ];
+    assert_eq!(manifest.artifacts.len(), expected_project_ids.len());
+    for (artifact_id, project_id) in expected_project_ids {
+        let artifact = manifest
+            .artifacts
+            .iter()
+            .find(|artifact| artifact.id == artifact_id)
+            .expect("audited artifact authority");
+        assert_eq!(artifact.source.project_id, project_id, "{artifact_id}");
+        assert!(
+            manifest
+                .compositions
+                .iter()
+                .flat_map(|composition| &composition.mods)
+                .filter(|managed_mod| managed_mod.artifact_id == artifact_id)
+                .all(|managed_mod| managed_mod.project_id == project_id),
+            "{artifact_id}"
+        );
+    }
     let ebe_artifact = manifest
         .artifacts
         .iter()
@@ -356,13 +400,13 @@ fn builtin_manifest_binds_managed_aliases_to_immutable_provider_identities() {
         .flat_map(|composition| composition.mods.iter_mut())
         .find(|managed_mod| managed_mod.artifact_id == "enhancedblockentities")
         .expect("EBE composition declaration");
-    declaration.project_id = "enhancedblockentities".to_string();
+    declaration.project_id = "AANobbMI".to_string();
     assert_error_kind(
         validate_manifest(&stale_ebe),
         ResolveError::ManagedModProjectMismatch {
             artifact_id: "enhancedblockentities".to_string(),
             expected: "OVuFYfre".to_string(),
-            actual: "enhancedblockentities".to_string(),
+            actual: "AANobbMI".to_string(),
         },
     );
 
@@ -373,13 +417,13 @@ fn builtin_manifest_binds_managed_aliases_to_immutable_provider_identities() {
         .flat_map(|composition| composition.mods.iter_mut())
         .find(|managed_mod| managed_mod.artifact_id == "memoryleakfix")
         .expect("MemoryLeakFix composition declaration");
-    declaration.project_id = "memoryleakfix".to_string();
+    declaration.project_id = "AANobbMI".to_string();
     assert_error_kind(
         validate_manifest(&stale_memory_leak_fix),
         ResolveError::ManagedModProjectMismatch {
             artifact_id: "memoryleakfix".to_string(),
             expected: "NRjRiSSD".to_string(),
-            actual: "memoryleakfix".to_string(),
+            actual: "AANobbMI".to_string(),
         },
     );
 }
@@ -994,16 +1038,13 @@ fn validation_rejects_invalid_artifact_definitions() {
 }
 
 #[test]
-fn validation_rejects_padded_artifact_provider_identities() {
-    for (value, expected_field) in [
-        (" sodium", "artifact project id padding"),
-        ("sodium ", "artifact project id padding"),
-    ] {
+fn validation_rejects_noncanonical_artifact_provider_identities() {
+    for value in ["AANobbM", "AANobbMI9", "AANobbM-", " AANobbM"] {
         let mut manifest = builtin_manifest().expect("manifest");
         manifest.artifacts[0].source.project_id = value.to_string();
         assert!(matches!(
             validate_manifest(&manifest),
-            Err(ResolveError::ManifestBound(field)) if field == expected_field
+            Err(ResolveError::ManifestBound("artifact Modrinth project id"))
         ));
     }
 
@@ -1064,13 +1105,13 @@ fn validation_rejects_invalid_managed_mod_artifact_references() {
     );
 
     let mut project_mismatch = builtin_manifest().expect("manifest");
-    first_managed_mod_mut(&mut project_mismatch).project_id = "other-project".to_string();
+    first_managed_mod_mut(&mut project_mismatch).project_id = "gvQqBUqZ".to_string();
     assert_error_kind(
         validate_manifest(&project_mismatch),
         ResolveError::ManagedModProjectMismatch {
             artifact_id: "sodium".to_string(),
-            expected: "sodium".to_string(),
-            actual: "other-project".to_string(),
+            expected: "AANobbMI".to_string(),
+            actual: "gvQqBUqZ".to_string(),
         },
     );
 
@@ -1087,14 +1128,14 @@ fn validation_rejects_invalid_managed_mod_artifact_references() {
 }
 
 #[test]
-fn validation_rejects_padded_managed_mod_provider_identities() {
-    for value in [" sodium", "sodium "] {
+fn validation_rejects_noncanonical_managed_mod_provider_identities() {
+    for value in ["AANobbM", "AANobbMI9", "AANobbM-", " AANobbM"] {
         let mut manifest = builtin_manifest().expect("manifest");
         first_managed_mod_mut(&mut manifest).project_id = value.to_string();
         assert!(matches!(
             validate_manifest(&manifest),
             Err(ResolveError::ManifestBound(
-                "managed mod project id padding"
+                "managed mod Modrinth project id"
             ))
         ));
     }
@@ -1502,7 +1543,7 @@ fn depleted_higher_bundle_falls_back_with_compatibility_reason() {
     extended.mods = vec![
         ManagedMod {
             artifact_id: "nvidium".to_string(),
-            project_id: "nvidium".to_string(),
+            project_id: "SfMw2IZN".to_string(),
             slug: "nvidium".to_string(),
             name: "Nvidium".to_string(),
             condition: ModCondition::Hardware,
@@ -1518,7 +1559,7 @@ fn depleted_higher_bundle_falls_back_with_compatibility_reason() {
         },
         ManagedMod {
             artifact_id: "sodium".to_string(),
-            project_id: "sodium".to_string(),
+            project_id: "AANobbMI".to_string(),
             slug: "sodium".to_string(),
             name: "Sodium".to_string(),
             condition: ModCondition::Recommend,
@@ -1583,7 +1624,7 @@ fn artifact_disable_drops_matching_managed_mod_with_warning() {
 }
 
 #[test]
-fn artifact_disable_targets_declared_artifact_aliases() {
+fn artifact_disable_targets_declared_immutable_project_id() {
     let mut manifest = builtin_manifest().expect("manifest");
     manifest.artifacts[0].id = "sodium-artifact".to_string();
     for composition in &mut manifest.compositions {
@@ -1595,8 +1636,8 @@ fn artifact_disable_targets_declared_artifact_aliases() {
     }
     manifest
         .emergency_disables
-        .push(test_artifact_disable("hold-sodium-alias", "sodium"));
-    validate_manifest(&manifest).expect("declared source alias should validate");
+        .push(test_artifact_disable("hold-sodium-project", "AANobbMI"));
+    validate_manifest(&manifest).expect("declared project identity should validate");
 
     let plan = resolve_plan(
         Some(&manifest),
@@ -1615,8 +1656,29 @@ fn artifact_disable_targets_declared_artifact_aliases() {
             .all(|managed_mod| managed_mod.slug != "sodium")
     );
     assert!(plan.warnings.iter().any(|warning| {
-        warning.contains("sodium skipped by emergency disable hold-sodium-alias")
+        warning.contains("sodium skipped by emergency disable hold-sodium-project")
     }));
+}
+
+#[test]
+fn validation_rejects_emergency_disable_slug_alias() {
+    let mut manifest = builtin_manifest().expect("manifest");
+    manifest.artifacts[0].id = "sodium-artifact".to_string();
+    for composition in &mut manifest.compositions {
+        for managed_mod in &mut composition.mods {
+            if managed_mod.artifact_id == "sodium" {
+                managed_mod.artifact_id = "sodium-artifact".to_string();
+            }
+        }
+    }
+    manifest
+        .emergency_disables
+        .push(test_artifact_disable("hold-sodium-slug", "sodium"));
+
+    assert_error_kind(
+        validate_manifest(&manifest),
+        ResolveError::UnknownEmergencyDisableArtifact("sodium".to_string()),
+    );
 }
 
 fn test_composition_disable(id: &str, target_id: &str) -> EmergencyDisable {

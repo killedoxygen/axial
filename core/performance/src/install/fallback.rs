@@ -179,9 +179,6 @@ fn artifact_target_matches(
         || disable
             .target_id
             .eq_ignore_ascii_case(&artifact.source.project_id)
-        || disable
-            .target_id
-            .eq_ignore_ascii_case(&artifact.source.slug)
 }
 
 fn disable_applies(

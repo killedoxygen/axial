@@ -473,12 +473,7 @@ async fn representative_modern_fabric_plans_install_without_composition_fallback
 
     let requests = requests.lock().expect("request log").clone();
     for project in [
-        "sodium",
-        "lithium",
-        "ferrite-core",
-        "immediatelyfast",
-        "dynamic-fps",
-        "nmDcB62a",
+        "AANobbMI", "gvQqBUqZ", "uXXizFIs", "5ZwdcRci", "LQ3K71Q1", "nmDcB62a",
     ] {
         assert!(
             request_log_contains(&requests, &format!("/v2/project/{project}/version")),
@@ -492,6 +487,10 @@ async fn representative_modern_fabric_plans_install_without_composition_fallback
     assert!(!request_log_contains(
         &requests,
         "/v2/project/modernfix/version"
+    ));
+    assert!(!request_log_contains(
+        &requests,
+        "/v2/project/sodium/version"
     ));
 }
 
@@ -566,7 +565,7 @@ async fn family_c_forge_core_installs_with_mocked_modrinth_artifacts() {
     }
 
     let requests = requests.lock().expect("request log").clone();
-    for project_ref in ["jupr7Bf5", "DSVgwcji", "clumps"] {
+    for project_ref in ["jupr7Bf5", "DSVgwcji", "Wnxd13zP"] {
         assert!(
             request_log_contains(&requests, &format!("/v2/project/{project_ref}/version")),
             "{project_ref}"
@@ -2483,7 +2482,7 @@ fn version_response_body_for_game_version(
 ) -> Vec<u8> {
     let file_url = format!("http://{addr}/files/{project_ref}.jar");
     format!(
-        r#"[{{"id":"{project_ref}-version","game_versions":["{game_version}"],"loaders":["fabric"],"featured":true,"date_published":"2026-05-30T00:00:00Z","files":[{{"url":"{file_url}","filename":"{project_ref}.jar","primary":true,"hashes":{{}}}}]}}]"#
+        r#"[{{"id":"{project_ref}-version","project_id":"{project_ref}","game_versions":["{game_version}"],"loaders":["fabric"],"featured":true,"date_published":"2026-05-30T00:00:00Z","files":[{{"url":"{file_url}","filename":"{project_ref}.jar","primary":true,"hashes":{{}}}}]}}]"#
     )
     .into_bytes()
 }
@@ -2605,14 +2604,20 @@ fn representative_project_from_version_request(first_line: &str) -> Option<&str>
     let start = first_line.find("/v2/project/")? + "/v2/project/".len();
     let rest = &first_line[start..];
     let end = rest.find("/version")?;
-    Some(&rest[..end])
+    let project_id = &rest[..end];
+    is_canonical_modrinth_project_id(project_id).then_some(project_id)
 }
 
 fn representative_project_from_file_request(first_line: &str) -> Option<&str> {
     let start = first_line.find("/files/")? + "/files/".len();
     let rest = &first_line[start..];
     let end = rest.find(".jar")?;
-    Some(&rest[..end])
+    let project_id = &rest[..end];
+    is_canonical_modrinth_project_id(project_id).then_some(project_id)
+}
+
+fn is_canonical_modrinth_project_id(project_id: &str) -> bool {
+    project_id.len() == 8 && project_id.bytes().all(|byte| byte.is_ascii_alphanumeric())
 }
 
 fn representative_version_response_body(
@@ -2627,7 +2632,7 @@ fn representative_version_response_body(
         serde_json::to_string(game_versions).expect("serialize representative game versions");
     let loaders = serde_json::to_string(loaders).expect("serialize representative loaders");
     format!(
-        r#"[{{"id":"{project_ref}-representative-version","game_versions":{game_versions},"loaders":{loaders},"featured":true,"date_published":"2026-05-30T00:00:00Z","files":[{{"url":"{file_url}","filename":"{project_ref}.jar","primary":true,"hashes":{{"sha512":"{sha512}"}}}}]}}]"#
+        r#"[{{"id":"{project_ref}-representative-version","project_id":"{project_ref}","game_versions":{game_versions},"loaders":{loaders},"featured":true,"date_published":"2026-05-30T00:00:00Z","files":[{{"url":"{file_url}","filename":"{project_ref}.jar","primary":true,"hashes":{{"sha512":"{sha512}"}}}}]}}]"#
     )
     .into_bytes()
 }
@@ -2754,7 +2759,7 @@ async fn spawn_leaky_download_failure_server() -> (String, Vec<String>) {
                     .contains("/v2/project/sodium/version")
                 {
                     let body = format!(
-                        r#"[{{"id":"version-a","game_versions":["1.20.4"],"loaders":["fabric"],"featured":true,"date_published":"2026-05-30T00:00:00Z","files":[{{"url":"{provider_url}","filename":"sodium-secret.jar","primary":true,"hashes":{{}}}}]}}]"#
+                        r#"[{{"id":"version-a","project_id":"sodium","game_versions":["1.20.4"],"loaders":["fabric"],"featured":true,"date_published":"2026-05-30T00:00:00Z","files":[{{"url":"{provider_url}","filename":"sodium-secret.jar","primary":true,"hashes":{{}}}}]}}]"#
                     );
                     ("200 OK", "application/json", body.into_bytes())
                 } else if first_line.contains("/private-provider/sodium-secret.jar") {
@@ -2884,7 +2889,7 @@ async fn spawn_modrinth_server_with_sha512_size_and_requests(
                     .contains("/v2/project/sodium/version")
                 {
                     let body = format!(
-                        r#"[{{"id":"version-a","game_versions":["1.20.4"],"loaders":["fabric"],"featured":true,"date_published":"2026-05-30T00:00:00Z","files":[{{"url":"{file_url}","filename":"sodium.jar","primary":true,"hashes":{{{hashes}}}{size}}}]}}]"#
+                        r#"[{{"id":"version-a","project_id":"sodium","game_versions":["1.20.4"],"loaders":["fabric"],"featured":true,"date_published":"2026-05-30T00:00:00Z","files":[{{"url":"{file_url}","filename":"sodium.jar","primary":true,"hashes":{{{hashes}}}{size}}}]}}]"#
                     );
                     ("200 OK", "application/json", body.into_bytes())
                 } else if first_line.contains("/files/sodium.jar") {

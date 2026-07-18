@@ -4,30 +4,30 @@
   "minimum_app_version": "0.4.0-dev.1",
   "rule_channel": "bundled",
   "artifacts": [
-    {"id": "sodium", "type": "mod", "source": {"provider": "modrinth", "project_id": "sodium", "slug": "sodium"}, "checksum_policy": "provider_sha512", "ownership_class": "composition_managed"},
-    {"id": "lithium", "type": "mod", "source": {"provider": "modrinth", "project_id": "lithium", "slug": "lithium"}, "checksum_policy": "provider_sha512", "ownership_class": "composition_managed"},
-    {"id": "ferrite-core", "type": "mod", "source": {"provider": "modrinth", "project_id": "ferrite-core", "slug": "ferrite-core"}, "checksum_policy": "provider_sha512", "ownership_class": "composition_managed"},
-    {"id": "immediatelyfast", "type": "mod", "source": {"provider": "modrinth", "project_id": "immediatelyfast", "slug": "immediatelyfast"}, "checksum_policy": "provider_sha512", "ownership_class": "composition_managed"},
-    {"id": "dynamic-fps", "type": "mod", "source": {"provider": "modrinth", "project_id": "dynamic-fps", "slug": "dynamic-fps"}, "checksum_policy": "provider_sha512", "ownership_class": "composition_managed"},
+    {"id": "sodium", "type": "mod", "source": {"provider": "modrinth", "project_id": "AANobbMI", "slug": "sodium"}, "checksum_policy": "provider_sha512", "ownership_class": "composition_managed"},
+    {"id": "lithium", "type": "mod", "source": {"provider": "modrinth", "project_id": "gvQqBUqZ", "slug": "lithium"}, "checksum_policy": "provider_sha512", "ownership_class": "composition_managed"},
+    {"id": "ferrite-core", "type": "mod", "source": {"provider": "modrinth", "project_id": "uXXizFIs", "slug": "ferrite-core"}, "checksum_policy": "provider_sha512", "ownership_class": "composition_managed"},
+    {"id": "immediatelyfast", "type": "mod", "source": {"provider": "modrinth", "project_id": "5ZwdcRci", "slug": "immediatelyfast"}, "checksum_policy": "provider_sha512", "ownership_class": "composition_managed"},
+    {"id": "dynamic-fps", "type": "mod", "source": {"provider": "modrinth", "project_id": "LQ3K71Q1", "slug": "dynamic-fps"}, "checksum_policy": "provider_sha512", "ownership_class": "composition_managed"},
     {"id": "modernfix", "type": "mod", "source": {"provider": "modrinth", "project_id": "nmDcB62a", "slug": "modernfix"}, "checksum_policy": "provider_sha512", "ownership_class": "composition_managed"},
-    {"id": "entityculling", "type": "mod", "source": {"provider": "modrinth", "project_id": "entityculling", "slug": "entityculling"}, "checksum_policy": "provider_sha512", "ownership_class": "composition_managed"},
-    {"id": "c2me-fabric", "type": "mod", "source": {"provider": "modrinth", "project_id": "c2me-fabric", "slug": "c2me-fabric"}, "checksum_policy": "provider_sha512", "ownership_class": "composition_managed"},
-    {"id": "moreculling", "type": "mod", "source": {"provider": "modrinth", "project_id": "moreculling", "slug": "moreculling"}, "checksum_policy": "provider_sha512", "ownership_class": "composition_managed"},
-    {"id": "krypton", "type": "mod", "source": {"provider": "modrinth", "project_id": "krypton", "slug": "krypton"}, "checksum_policy": "provider_sha512", "ownership_class": "composition_managed"},
+    {"id": "entityculling", "type": "mod", "source": {"provider": "modrinth", "project_id": "NNAgCjsB", "slug": "entityculling"}, "checksum_policy": "provider_sha512", "ownership_class": "composition_managed"},
+    {"id": "c2me-fabric", "type": "mod", "source": {"provider": "modrinth", "project_id": "VSNURh3q", "slug": "c2me-fabric"}, "checksum_policy": "provider_sha512", "ownership_class": "composition_managed"},
+    {"id": "moreculling", "type": "mod", "source": {"provider": "modrinth", "project_id": "51shyZVL", "slug": "moreculling"}, "checksum_policy": "provider_sha512", "ownership_class": "composition_managed"},
+    {"id": "krypton", "type": "mod", "source": {"provider": "modrinth", "project_id": "fQEb0iXm", "slug": "krypton"}, "checksum_policy": "provider_sha512", "ownership_class": "composition_managed"},
     {"id": "enhancedblockentities", "type": "mod", "source": {"provider": "modrinth", "project_id": "OVuFYfre", "slug": "ebe"}, "checksum_policy": "provider_sha512", "ownership_class": "composition_managed"},
     {"id": "memoryleakfix", "type": "mod", "source": {"provider": "modrinth", "project_id": "NRjRiSSD", "slug": "memoryleakfix"}, "checksum_policy": "provider_sha512", "ownership_class": "composition_managed"},
-    {"id": "clumps", "type": "mod", "source": {"provider": "modrinth", "project_id": "clumps", "slug": "clumps"}, "checksum_policy": "provider_sha512", "ownership_class": "composition_managed"},
+    {"id": "clumps", "type": "mod", "source": {"provider": "modrinth", "project_id": "Wnxd13zP", "slug": "clumps"}, "checksum_policy": "provider_sha512", "ownership_class": "composition_managed"},
     {"id": "foamfix", "type": "mod", "source": {"provider": "modrinth", "project_id": "jupr7Bf5", "slug": "foamfix"}, "checksum_policy": "provider_sha512", "ownership_class": "composition_managed"},
     {"id": "ai-improvements", "type": "mod", "source": {"provider": "modrinth", "project_id": "DSVgwcji", "slug": "ai-improvements"}, "checksum_policy": "provider_sha512", "ownership_class": "composition_managed"},
-    {"id": "lazydfu", "type": "mod", "source": {"provider": "modrinth", "project_id": "lazydfu", "slug": "lazydfu"}, "checksum_policy": "provider_sha512", "ownership_class": "composition_managed"},
-    {"id": "smooth-boot-reloaded", "type": "mod", "source": {"provider": "modrinth", "project_id": "smooth-boot-reloaded", "slug": "smooth-boot-reloaded"}, "checksum_policy": "provider_sha512", "ownership_class": "composition_managed"},
-    {"id": "starlight", "type": "mod", "source": {"provider": "modrinth", "project_id": "starlight", "slug": "starlight"}, "checksum_policy": "provider_sha512", "ownership_class": "composition_managed"},
-    {"id": "nvidium", "type": "mod", "source": {"provider": "modrinth", "project_id": "nvidium", "slug": "nvidium"}, "checksum_policy": "provider_sha512", "ownership_class": "composition_managed"},
-    {"id": "embeddium", "type": "mod", "source": {"provider": "modrinth", "project_id": "embeddium", "slug": "embeddium"}, "checksum_policy": "provider_sha512", "ownership_class": "composition_managed"},
-    {"id": "scalablelux", "type": "mod", "source": {"provider": "modrinth", "project_id": "scalablelux", "slug": "scalablelux"}, "checksum_policy": "provider_sha512", "ownership_class": "composition_managed"},
-    {"id": "particle-core", "type": "mod", "source": {"provider": "modrinth", "project_id": "particle-core", "slug": "particle-core"}, "checksum_policy": "provider_sha512", "ownership_class": "composition_managed"},
-    {"id": "threadtweak", "type": "mod", "source": {"provider": "modrinth", "project_id": "threadtweak", "slug": "threadtweak"}, "checksum_policy": "provider_sha512", "ownership_class": "composition_managed"},
-    {"id": "badoptimizations", "type": "mod", "source": {"provider": "modrinth", "project_id": "badoptimizations", "slug": "badoptimizations"}, "checksum_policy": "provider_sha512", "ownership_class": "composition_managed"}
+    {"id": "lazydfu", "type": "mod", "source": {"provider": "modrinth", "project_id": "hvFnDODi", "slug": "lazydfu"}, "checksum_policy": "provider_sha512", "ownership_class": "composition_managed"},
+    {"id": "smooth-boot-reloaded", "type": "mod", "source": {"provider": "modrinth", "project_id": "z53V2L4P", "slug": "smooth-boot-reloaded"}, "checksum_policy": "provider_sha512", "ownership_class": "composition_managed"},
+    {"id": "starlight", "type": "mod", "source": {"provider": "modrinth", "project_id": "H8CaAYZC", "slug": "starlight"}, "checksum_policy": "provider_sha512", "ownership_class": "composition_managed"},
+    {"id": "nvidium", "type": "mod", "source": {"provider": "modrinth", "project_id": "SfMw2IZN", "slug": "nvidium"}, "checksum_policy": "provider_sha512", "ownership_class": "composition_managed"},
+    {"id": "embeddium", "type": "mod", "source": {"provider": "modrinth", "project_id": "sk9rgfiA", "slug": "embeddium"}, "checksum_policy": "provider_sha512", "ownership_class": "composition_managed"},
+    {"id": "scalablelux", "type": "mod", "source": {"provider": "modrinth", "project_id": "Ps1zyz6x", "slug": "scalablelux"}, "checksum_policy": "provider_sha512", "ownership_class": "composition_managed"},
+    {"id": "particle-core", "type": "mod", "source": {"provider": "modrinth", "project_id": "RSeLon5O", "slug": "particle-core"}, "checksum_policy": "provider_sha512", "ownership_class": "composition_managed"},
+    {"id": "threadtweak", "type": "mod", "source": {"provider": "modrinth", "project_id": "vSEH1ERy", "slug": "threadtweak"}, "checksum_policy": "provider_sha512", "ownership_class": "composition_managed"},
+    {"id": "badoptimizations", "type": "mod", "source": {"provider": "modrinth", "project_id": "g96Z4WVZ", "slug": "badoptimizations"}, "checksum_policy": "provider_sha512", "ownership_class": "composition_managed"}
   ],
   "emergency_disables": [],
   "compositions": [
@@ -76,23 +76,23 @@
       "tier": "extended",
       "fallback_to": "family-e-fabric-core",
       "mods": [
-        {"artifact_id": "sodium", "project_id": "sodium", "slug": "sodium", "name": "Sodium", "condition": "always"},
-        {"artifact_id": "lithium", "project_id": "lithium", "slug": "lithium", "name": "Lithium", "condition": "always"},
-        {"artifact_id": "ferrite-core", "project_id": "ferrite-core", "slug": "ferrite-core", "name": "FerriteCore", "condition": "always"},
-        {"artifact_id": "immediatelyfast", "project_id": "immediatelyfast", "slug": "immediatelyfast", "name": "ImmediatelyFast", "condition": "always"},
-        {"artifact_id": "dynamic-fps", "project_id": "dynamic-fps", "slug": "dynamic-fps", "name": "Dynamic FPS", "condition": "always"},
+        {"artifact_id": "sodium", "project_id": "AANobbMI", "slug": "sodium", "name": "Sodium", "condition": "always"},
+        {"artifact_id": "lithium", "project_id": "gvQqBUqZ", "slug": "lithium", "name": "Lithium", "condition": "always"},
+        {"artifact_id": "ferrite-core", "project_id": "uXXizFIs", "slug": "ferrite-core", "name": "FerriteCore", "condition": "always"},
+        {"artifact_id": "immediatelyfast", "project_id": "5ZwdcRci", "slug": "immediatelyfast", "name": "ImmediatelyFast", "condition": "always"},
+        {"artifact_id": "dynamic-fps", "project_id": "LQ3K71Q1", "slug": "dynamic-fps", "name": "Dynamic FPS", "condition": "always"},
         {"artifact_id": "modernfix", "project_id": "nmDcB62a", "slug": "modernfix", "name": "ModernFix", "condition": "always", "exact_game_versions": ["1.16.4", "1.16.5", "1.18.2", "1.19.2", "1.19.4", "1.20", "1.20.1", "1.20.2", "1.20.3", "1.20.4", "1.20.5", "1.20.6", "1.21", "1.21.1", "1.21.4", "26.1", "26.1.2"]},
-        {"artifact_id": "entityculling", "project_id": "entityculling", "slug": "entityculling", "name": "EntityCulling", "condition": "always"},
-        {"artifact_id": "c2me-fabric", "project_id": "c2me-fabric", "slug": "c2me-fabric", "name": "C2ME", "condition": "always"},
-        {"artifact_id": "moreculling", "project_id": "moreculling", "slug": "moreculling", "name": "MoreCulling", "condition": "always"},
-        {"artifact_id": "krypton", "project_id": "krypton", "slug": "krypton", "name": "Krypton", "condition": "always"},
+        {"artifact_id": "entityculling", "project_id": "NNAgCjsB", "slug": "entityculling", "name": "EntityCulling", "condition": "always"},
+        {"artifact_id": "c2me-fabric", "project_id": "VSNURh3q", "slug": "c2me-fabric", "name": "C2ME", "condition": "always"},
+        {"artifact_id": "moreculling", "project_id": "51shyZVL", "slug": "moreculling", "name": "MoreCulling", "condition": "always"},
+        {"artifact_id": "krypton", "project_id": "fQEb0iXm", "slug": "krypton", "name": "Krypton", "condition": "always"},
         {"artifact_id": "enhancedblockentities", "project_id": "OVuFYfre", "slug": "ebe", "name": "Enhanced Block Entities", "condition": "version_range", "version_range": ">=1.16.2 <=1.21.4"},
         {"artifact_id": "memoryleakfix", "project_id": "NRjRiSSD", "slug": "memoryleakfix", "name": "MemoryLeakFix", "condition": "version_range", "version_range": "<=1.20.4"},
-        {"artifact_id": "clumps", "project_id": "clumps", "slug": "clumps", "name": "Clumps", "condition": "always"},
-        {"artifact_id": "lazydfu", "project_id": "lazydfu", "slug": "lazydfu", "name": "LazyDFU", "condition": "version_range", "version_range": ">=1.16 <1.19.4"},
-        {"artifact_id": "smooth-boot-reloaded", "project_id": "smooth-boot-reloaded", "slug": "smooth-boot-reloaded", "name": "Smooth Boot Reloaded", "condition": "version_range", "version_range": ">=1.16 <1.19.4"},
-        {"artifact_id": "starlight", "project_id": "starlight", "slug": "starlight", "name": "Starlight", "condition": "version_range", "version_range": ">=1.16 <1.19.4"},
-        {"artifact_id": "nvidium", "project_id": "nvidium", "slug": "nvidium", "name": "Nvidium", "condition": "hardware", "version_range": ">=1.20.1", "hardware_req": {"gpu_vendor": "nvidia", "gpu_arch_min": 2}, "mutual_exclusions": ["iris"]}
+        {"artifact_id": "clumps", "project_id": "Wnxd13zP", "slug": "clumps", "name": "Clumps", "condition": "always"},
+        {"artifact_id": "lazydfu", "project_id": "hvFnDODi", "slug": "lazydfu", "name": "LazyDFU", "condition": "version_range", "version_range": ">=1.16 <1.19.4"},
+        {"artifact_id": "smooth-boot-reloaded", "project_id": "z53V2L4P", "slug": "smooth-boot-reloaded", "name": "Smooth Boot Reloaded", "condition": "version_range", "version_range": ">=1.16 <1.19.4"},
+        {"artifact_id": "starlight", "project_id": "H8CaAYZC", "slug": "starlight", "name": "Starlight", "condition": "version_range", "version_range": ">=1.16 <1.19.4"},
+        {"artifact_id": "nvidium", "project_id": "SfMw2IZN", "slug": "nvidium", "name": "Nvidium", "condition": "hardware", "version_range": ">=1.20.1", "hardware_req": {"gpu_vendor": "nvidia", "gpu_arch_min": 2}, "mutual_exclusions": ["iris"]}
       ]
     },
     {
@@ -104,11 +104,11 @@
       "tier": "core",
       "fallback_to": "family-e-vanilla-enhanced",
       "mods": [
-        {"artifact_id": "sodium", "project_id": "sodium", "slug": "sodium", "name": "Sodium", "condition": "always"},
-        {"artifact_id": "lithium", "project_id": "lithium", "slug": "lithium", "name": "Lithium", "condition": "always"},
-        {"artifact_id": "ferrite-core", "project_id": "ferrite-core", "slug": "ferrite-core", "name": "FerriteCore", "condition": "always"},
-        {"artifact_id": "immediatelyfast", "project_id": "immediatelyfast", "slug": "immediatelyfast", "name": "ImmediatelyFast", "condition": "always"},
-        {"artifact_id": "dynamic-fps", "project_id": "dynamic-fps", "slug": "dynamic-fps", "name": "Dynamic FPS", "condition": "always"},
+        {"artifact_id": "sodium", "project_id": "AANobbMI", "slug": "sodium", "name": "Sodium", "condition": "always"},
+        {"artifact_id": "lithium", "project_id": "gvQqBUqZ", "slug": "lithium", "name": "Lithium", "condition": "always"},
+        {"artifact_id": "ferrite-core", "project_id": "uXXizFIs", "slug": "ferrite-core", "name": "FerriteCore", "condition": "always"},
+        {"artifact_id": "immediatelyfast", "project_id": "5ZwdcRci", "slug": "immediatelyfast", "name": "ImmediatelyFast", "condition": "always"},
+        {"artifact_id": "dynamic-fps", "project_id": "LQ3K71Q1", "slug": "dynamic-fps", "name": "Dynamic FPS", "condition": "always"},
         {"artifact_id": "modernfix", "project_id": "nmDcB62a", "slug": "modernfix", "name": "ModernFix", "condition": "always", "exact_game_versions": ["1.16.4", "1.16.5", "1.18.2", "1.19.2", "1.19.4", "1.20", "1.20.1", "1.20.2", "1.20.3", "1.20.4", "1.20.5", "1.20.6", "1.21", "1.21.1", "1.21.4", "26.1", "26.1.2"]}
       ]
     },
@@ -130,11 +130,11 @@
       "tier": "extended",
       "fallback_to": "family-e-forge-core",
       "mods": [
-        {"artifact_id": "embeddium", "project_id": "embeddium", "slug": "embeddium", "name": "Embeddium", "condition": "always"},
-        {"artifact_id": "ferrite-core", "project_id": "ferrite-core", "slug": "ferrite-core", "name": "FerriteCore", "condition": "always"},
-        {"artifact_id": "entityculling", "project_id": "entityculling", "slug": "entityculling", "name": "EntityCulling", "condition": "always"},
+        {"artifact_id": "embeddium", "project_id": "sk9rgfiA", "slug": "embeddium", "name": "Embeddium", "condition": "always"},
+        {"artifact_id": "ferrite-core", "project_id": "uXXizFIs", "slug": "ferrite-core", "name": "FerriteCore", "condition": "always"},
+        {"artifact_id": "entityculling", "project_id": "NNAgCjsB", "slug": "entityculling", "name": "EntityCulling", "condition": "always"},
         {"artifact_id": "memoryleakfix", "project_id": "NRjRiSSD", "slug": "memoryleakfix", "name": "MemoryLeakFix", "condition": "version_range", "version_range": "<=1.20.4"},
-        {"artifact_id": "clumps", "project_id": "clumps", "slug": "clumps", "name": "Clumps", "condition": "always"}
+        {"artifact_id": "clumps", "project_id": "Wnxd13zP", "slug": "clumps", "name": "Clumps", "condition": "always"}
       ]
     },
     {
@@ -146,8 +146,8 @@
       "tier": "core",
       "fallback_to": "family-e-vanilla-enhanced",
       "mods": [
-        {"artifact_id": "embeddium", "project_id": "embeddium", "slug": "embeddium", "name": "Embeddium", "condition": "always"},
-        {"artifact_id": "ferrite-core", "project_id": "ferrite-core", "slug": "ferrite-core", "name": "FerriteCore", "condition": "always"}
+        {"artifact_id": "embeddium", "project_id": "sk9rgfiA", "slug": "embeddium", "name": "Embeddium", "condition": "always"},
+        {"artifact_id": "ferrite-core", "project_id": "uXXizFIs", "slug": "ferrite-core", "name": "FerriteCore", "condition": "always"}
       ]
     },
     {
@@ -159,24 +159,24 @@
       "tier": "extended",
       "fallback_to": "family-f-fabric-core",
       "mods": [
-        {"artifact_id": "sodium", "project_id": "sodium", "slug": "sodium", "name": "Sodium", "condition": "always"},
-        {"artifact_id": "lithium", "project_id": "lithium", "slug": "lithium", "name": "Lithium", "condition": "always"},
-        {"artifact_id": "ferrite-core", "project_id": "ferrite-core", "slug": "ferrite-core", "name": "FerriteCore", "condition": "always"},
-        {"artifact_id": "immediatelyfast", "project_id": "immediatelyfast", "slug": "immediatelyfast", "name": "ImmediatelyFast", "condition": "always"},
-        {"artifact_id": "dynamic-fps", "project_id": "dynamic-fps", "slug": "dynamic-fps", "name": "Dynamic FPS", "condition": "always"},
+        {"artifact_id": "sodium", "project_id": "AANobbMI", "slug": "sodium", "name": "Sodium", "condition": "always"},
+        {"artifact_id": "lithium", "project_id": "gvQqBUqZ", "slug": "lithium", "name": "Lithium", "condition": "always"},
+        {"artifact_id": "ferrite-core", "project_id": "uXXizFIs", "slug": "ferrite-core", "name": "FerriteCore", "condition": "always"},
+        {"artifact_id": "immediatelyfast", "project_id": "5ZwdcRci", "slug": "immediatelyfast", "name": "ImmediatelyFast", "condition": "always"},
+        {"artifact_id": "dynamic-fps", "project_id": "LQ3K71Q1", "slug": "dynamic-fps", "name": "Dynamic FPS", "condition": "always"},
         {"artifact_id": "modernfix", "project_id": "nmDcB62a", "slug": "modernfix", "name": "ModernFix", "condition": "always", "exact_game_versions": ["1.16.4", "1.16.5", "1.18.2", "1.19.2", "1.19.4", "1.20", "1.20.1", "1.20.2", "1.20.3", "1.20.4", "1.20.5", "1.20.6", "1.21", "1.21.1", "1.21.4", "26.1", "26.1.2"]},
-        {"artifact_id": "entityculling", "project_id": "entityculling", "slug": "entityculling", "name": "EntityCulling", "condition": "always"},
-        {"artifact_id": "c2me-fabric", "project_id": "c2me-fabric", "slug": "c2me-fabric", "name": "C2ME", "condition": "always"},
-        {"artifact_id": "moreculling", "project_id": "moreculling", "slug": "moreculling", "name": "MoreCulling", "condition": "always"},
-        {"artifact_id": "krypton", "project_id": "krypton", "slug": "krypton", "name": "Krypton", "condition": "always"},
+        {"artifact_id": "entityculling", "project_id": "NNAgCjsB", "slug": "entityculling", "name": "EntityCulling", "condition": "always"},
+        {"artifact_id": "c2me-fabric", "project_id": "VSNURh3q", "slug": "c2me-fabric", "name": "C2ME", "condition": "always"},
+        {"artifact_id": "moreculling", "project_id": "51shyZVL", "slug": "moreculling", "name": "MoreCulling", "condition": "always"},
+        {"artifact_id": "krypton", "project_id": "fQEb0iXm", "slug": "krypton", "name": "Krypton", "condition": "always"},
         {"artifact_id": "enhancedblockentities", "project_id": "OVuFYfre", "slug": "ebe", "name": "Enhanced Block Entities", "condition": "version_range", "version_range": ">=1.16.2 <=1.21.4"},
         {"artifact_id": "memoryleakfix", "project_id": "NRjRiSSD", "slug": "memoryleakfix", "name": "MemoryLeakFix", "condition": "version_range", "version_range": "<=1.20.4"},
-        {"artifact_id": "clumps", "project_id": "clumps", "slug": "clumps", "name": "Clumps", "condition": "always"},
-        {"artifact_id": "scalablelux", "project_id": "scalablelux", "slug": "scalablelux", "name": "ScalableLux", "condition": "always"},
-        {"artifact_id": "particle-core", "project_id": "particle-core", "slug": "particle-core", "name": "Particle Core", "condition": "always"},
-        {"artifact_id": "threadtweak", "project_id": "threadtweak", "slug": "threadtweak", "name": "ThreadTweak", "condition": "always"},
-        {"artifact_id": "badoptimizations", "project_id": "badoptimizations", "slug": "badoptimizations", "name": "BadOptimizations", "condition": "always"},
-        {"artifact_id": "nvidium", "project_id": "nvidium", "slug": "nvidium", "name": "Nvidium", "condition": "hardware", "version_range": ">=1.20.1", "hardware_req": {"gpu_vendor": "nvidia", "gpu_arch_min": 2}, "mutual_exclusions": ["iris"]}
+        {"artifact_id": "clumps", "project_id": "Wnxd13zP", "slug": "clumps", "name": "Clumps", "condition": "always"},
+        {"artifact_id": "scalablelux", "project_id": "Ps1zyz6x", "slug": "scalablelux", "name": "ScalableLux", "condition": "always"},
+        {"artifact_id": "particle-core", "project_id": "RSeLon5O", "slug": "particle-core", "name": "Particle Core", "condition": "always"},
+        {"artifact_id": "threadtweak", "project_id": "vSEH1ERy", "slug": "threadtweak", "name": "ThreadTweak", "condition": "always"},
+        {"artifact_id": "badoptimizations", "project_id": "g96Z4WVZ", "slug": "badoptimizations", "name": "BadOptimizations", "condition": "always"},
+        {"artifact_id": "nvidium", "project_id": "SfMw2IZN", "slug": "nvidium", "name": "Nvidium", "condition": "hardware", "version_range": ">=1.20.1", "hardware_req": {"gpu_vendor": "nvidia", "gpu_arch_min": 2}, "mutual_exclusions": ["iris"]}
       ]
     },
     {
@@ -188,16 +188,16 @@
       "tier": "core",
       "fallback_to": "family-f-vanilla-enhanced",
       "mods": [
-        {"artifact_id": "sodium", "project_id": "sodium", "slug": "sodium", "name": "Sodium", "condition": "always"},
-        {"artifact_id": "lithium", "project_id": "lithium", "slug": "lithium", "name": "Lithium", "condition": "always"},
-        {"artifact_id": "ferrite-core", "project_id": "ferrite-core", "slug": "ferrite-core", "name": "FerriteCore", "condition": "always"},
-        {"artifact_id": "immediatelyfast", "project_id": "immediatelyfast", "slug": "immediatelyfast", "name": "ImmediatelyFast", "condition": "always"},
-        {"artifact_id": "dynamic-fps", "project_id": "dynamic-fps", "slug": "dynamic-fps", "name": "Dynamic FPS", "condition": "always"},
+        {"artifact_id": "sodium", "project_id": "AANobbMI", "slug": "sodium", "name": "Sodium", "condition": "always"},
+        {"artifact_id": "lithium", "project_id": "gvQqBUqZ", "slug": "lithium", "name": "Lithium", "condition": "always"},
+        {"artifact_id": "ferrite-core", "project_id": "uXXizFIs", "slug": "ferrite-core", "name": "FerriteCore", "condition": "always"},
+        {"artifact_id": "immediatelyfast", "project_id": "5ZwdcRci", "slug": "immediatelyfast", "name": "ImmediatelyFast", "condition": "always"},
+        {"artifact_id": "dynamic-fps", "project_id": "LQ3K71Q1", "slug": "dynamic-fps", "name": "Dynamic FPS", "condition": "always"},
         {"artifact_id": "modernfix", "project_id": "nmDcB62a", "slug": "modernfix", "name": "ModernFix", "condition": "always", "exact_game_versions": ["1.16.4", "1.16.5", "1.18.2", "1.19.2", "1.19.4", "1.20", "1.20.1", "1.20.2", "1.20.3", "1.20.4", "1.20.5", "1.20.6", "1.21", "1.21.1", "1.21.4", "26.1", "26.1.2"]},
-        {"artifact_id": "scalablelux", "project_id": "scalablelux", "slug": "scalablelux", "name": "ScalableLux", "condition": "always"},
-        {"artifact_id": "particle-core", "project_id": "particle-core", "slug": "particle-core", "name": "Particle Core", "condition": "always"},
-        {"artifact_id": "threadtweak", "project_id": "threadtweak", "slug": "threadtweak", "name": "ThreadTweak", "condition": "always"},
-        {"artifact_id": "badoptimizations", "project_id": "badoptimizations", "slug": "badoptimizations", "name": "BadOptimizations", "condition": "always"}
+        {"artifact_id": "scalablelux", "project_id": "Ps1zyz6x", "slug": "scalablelux", "name": "ScalableLux", "condition": "always"},
+        {"artifact_id": "particle-core", "project_id": "RSeLon5O", "slug": "particle-core", "name": "Particle Core", "condition": "always"},
+        {"artifact_id": "threadtweak", "project_id": "vSEH1ERy", "slug": "threadtweak", "name": "ThreadTweak", "condition": "always"},
+        {"artifact_id": "badoptimizations", "project_id": "g96Z4WVZ", "slug": "badoptimizations", "name": "BadOptimizations", "condition": "always"}
       ]
     },
     {
@@ -218,11 +218,11 @@
       "tier": "extended",
       "fallback_to": "family-f-forge-core",
       "mods": [
-        {"artifact_id": "embeddium", "project_id": "embeddium", "slug": "embeddium", "name": "Embeddium", "condition": "always"},
-        {"artifact_id": "ferrite-core", "project_id": "ferrite-core", "slug": "ferrite-core", "name": "FerriteCore", "condition": "always"},
-        {"artifact_id": "entityculling", "project_id": "entityculling", "slug": "entityculling", "name": "EntityCulling", "condition": "always"},
+        {"artifact_id": "embeddium", "project_id": "sk9rgfiA", "slug": "embeddium", "name": "Embeddium", "condition": "always"},
+        {"artifact_id": "ferrite-core", "project_id": "uXXizFIs", "slug": "ferrite-core", "name": "FerriteCore", "condition": "always"},
+        {"artifact_id": "entityculling", "project_id": "NNAgCjsB", "slug": "entityculling", "name": "EntityCulling", "condition": "always"},
         {"artifact_id": "memoryleakfix", "project_id": "NRjRiSSD", "slug": "memoryleakfix", "name": "MemoryLeakFix", "condition": "version_range", "version_range": "<=1.20.4"},
-        {"artifact_id": "clumps", "project_id": "clumps", "slug": "clumps", "name": "Clumps", "condition": "always"}
+        {"artifact_id": "clumps", "project_id": "Wnxd13zP", "slug": "clumps", "name": "Clumps", "condition": "always"}
       ]
     },
     {
@@ -234,8 +234,8 @@
       "tier": "core",
       "fallback_to": "family-f-vanilla-enhanced",
       "mods": [
-        {"artifact_id": "embeddium", "project_id": "embeddium", "slug": "embeddium", "name": "Embeddium", "condition": "always"},
-        {"artifact_id": "ferrite-core", "project_id": "ferrite-core", "slug": "ferrite-core", "name": "FerriteCore", "condition": "always"}
+        {"artifact_id": "embeddium", "project_id": "sk9rgfiA", "slug": "embeddium", "name": "Embeddium", "condition": "always"},
+        {"artifact_id": "ferrite-core", "project_id": "uXXizFIs", "slug": "ferrite-core", "name": "FerriteCore", "condition": "always"}
       ]
     },
     {
@@ -249,7 +249,7 @@
       "mods": [
         {"artifact_id": "foamfix", "project_id": "jupr7Bf5", "slug": "foamfix", "name": "FoamFix", "condition": "version_range", "version_range": "1.12.2"},
         {"artifact_id": "ai-improvements", "project_id": "DSVgwcji", "slug": "ai-improvements", "name": "AI Improvements", "condition": "version_range", "version_range": "1.12.2"},
-        {"artifact_id": "clumps", "project_id": "clumps", "slug": "clumps", "name": "Clumps", "condition": "version_range", "version_range": "1.12.2"}
+        {"artifact_id": "clumps", "project_id": "Wnxd13zP", "slug": "clumps", "name": "Clumps", "condition": "version_range", "version_range": "1.12.2"}
       ]
     }
   ]

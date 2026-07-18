@@ -15,6 +15,7 @@ const MAX_DESCRIPTION_CHARS: usize = 1024;
 const MAX_VERSION_RANGE_CHARS: usize = 256;
 const MAX_EXACT_GAME_VERSION_CHARS: usize = 64;
 const MAX_HARDWARE_VALUE: i32 = 1_048_576;
+const MODRINTH_PROJECT_ID_CHARS: usize = 8;
 
 pub const PERFORMANCE_MANIFEST_SCHEMA_VERSION: i32 = 2;
 
@@ -201,11 +202,9 @@ fn validate_artifacts(
         if artifact.source.project_id.trim().is_empty() {
             return Err(ResolveError::MissingArtifactProjectId(artifact.id.clone()));
         }
+        validate_modrinth_project_id(&artifact.source.project_id, "artifact Modrinth project id")?;
         if artifact.source.slug.trim().is_empty() {
             return Err(ResolveError::MissingArtifactSlug(artifact.id.clone()));
-        }
-        if artifact.source.project_id.trim() != artifact.source.project_id {
-            return Err(ResolveError::ManifestBound("artifact project id padding"));
         }
         if artifact.source.slug.trim() != artifact.source.slug {
             return Err(ResolveError::ManifestBound("artifact slug padding"));
@@ -252,11 +251,7 @@ fn validate_managed_mod_artifact(
             managed_mod.artifact_id.clone(),
         ));
     };
-    if managed_mod.project_id.trim() != managed_mod.project_id {
-        return Err(ResolveError::ManifestBound(
-            "managed mod project id padding",
-        ));
-    }
+    validate_modrinth_project_id(&managed_mod.project_id, "managed mod Modrinth project id")?;
     if managed_mod.slug.trim() != managed_mod.slug {
         return Err(ResolveError::ManifestBound("managed mod slug padding"));
     }
@@ -398,6 +393,15 @@ fn validate_text(value: &str, max: usize, field: &'static str) -> Result<(), Res
     Ok(())
 }
 
+fn validate_modrinth_project_id(project_id: &str, field: &'static str) -> Result<(), ResolveError> {
+    if project_id.len() != MODRINTH_PROJECT_ID_CHARS
+        || !project_id.bytes().all(|byte| byte.is_ascii_alphanumeric())
+    {
+        return Err(ResolveError::ManifestBound(field));
+    }
+    Ok(())
+}
+
 fn validate_optional_text(
     value: &str,
     max: usize,
@@ -427,7 +431,6 @@ fn declared_artifact_targets(
     for artifact in artifacts {
         targets.insert(artifact.id.to_lowercase());
         targets.insert(artifact.source.project_id.to_lowercase());
-        targets.insert(artifact.source.slug.to_lowercase());
     }
     targets
 }

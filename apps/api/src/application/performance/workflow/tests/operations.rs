@@ -195,6 +195,20 @@ async fn queued_remove_returns_install_id_and_complete_progress() {
     assert_eq!(status.action, "remove");
     assert_eq!(status.state, "complete");
     assert_eq!(status.error, None);
+    assert_eq!(
+        status
+            .journal_identity
+            .as_ref()
+            .expect("remove journal identity")
+            .rollback,
+        RollbackState::Unavailable
+    );
+    let journal = fixture
+        .state
+        .journals()
+        .get(&crate::state::contracts::OperationId::new(install_id))
+        .expect("remove journal");
+    assert_eq!(journal.rollback, RollbackState::Unavailable);
 }
 
 #[tokio::test]
