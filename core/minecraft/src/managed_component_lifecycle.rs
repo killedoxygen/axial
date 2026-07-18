@@ -1046,6 +1046,7 @@ mod tests {
     use super::*;
     use crate::managed_component_publication::COMPONENT_INTENT_FILE;
     use crate::managed_component_table::decode_component_table_shard;
+    use crate::managed_fs::{register_sha1_full_read_counts, take_sha1_full_read_counts};
     use sha1::{Digest as _, Sha1};
     use std::fs;
     use std::sync::Arc;
@@ -1988,6 +1989,69 @@ mod tests {
             assert!(shard.rows[2].prior.is_none());
             drop(candidate);
         }
+    }
+
+    #[tokio::test]
+    async fn mixed_component_publication_has_measured_target_hash_budget() {
+        let temporary = tempfile::tempdir().expect("test root");
+        let inherited = test_source(
+            "org/example/inherited.jar",
+            ManagedComponentArtifactKind::Library,
+            b"inherited-exact-component".to_vec(),
+        );
+        let fresh = test_source(
+            "org/example/fresh.jar",
+            ManagedComponentArtifactKind::NativeLibrary,
+            b"fresh-component-with-distinct-content".to_vec(),
+        );
+        let inherited_identity = inherited.identity.clone();
+        let fresh_identity = fresh.identity.clone();
+        let canonical = inherited
+            .identity
+            .relative_path
+            .join_under(&temporary.path().join("libraries"));
+        fs::create_dir_all(canonical.parent().expect("canonical parent")).unwrap();
+        fs::write(&canonical, &inherited.bytes).unwrap();
+        let authority = test_authority(
+            ManagedComponentKind::Libraries,
+            &[inherited.clone(), fresh.clone()],
+        );
+        let projection = authority
+            .component_projection(ManagedKnownGoodComponent::Libraries)
+            .expect("mixed component projection");
+        let lease = test_lease(&temporary).await;
+        register_sha1_full_read_counts(temporary.path());
+
+        let outcome = publish_managed_component_effect(
+            lease,
+            projection,
+            ManagedComponentKind::Libraries,
+            vec![fresh],
+        )
+        .await
+        .expect("mixed component publication");
+
+        assert!(matches!(
+            outcome,
+            ManagedComponentLifecycleOutcome::Committed(_)
+        ));
+        assert_eq!(fs::read(canonical).unwrap(), inherited.bytes);
+        assert_eq!(
+            fs::read(
+                fresh_identity
+                    .relative_path
+                    .join_under(&temporary.path().join("libraries"))
+            )
+            .unwrap(),
+            b"fresh-component-with-distinct-content"
+        );
+        assert_component_lane_settled(&temporary, ManagedComponentKind::Libraries);
+        let counts = take_sha1_full_read_counts(temporary.path());
+        assert_eq!(
+            counts.count(inherited_identity.size, inherited_identity.sha1),
+            9
+        );
+        assert_eq!(counts.count(fresh_identity.size, fresh_identity.sha1), 10);
     }
 
     #[tokio::test]

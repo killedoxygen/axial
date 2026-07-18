@@ -24,6 +24,57 @@ const MAX_EXACT_FILE_NAME_BYTES: usize = 255;
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_TEMPS: OnceLock<Mutex<HashSet<ActiveTempKey>>> = OnceLock::new();
 
+#[cfg(test)]
+static SHA1_FULL_READ_COUNTS: OnceLock<Mutex<HashMap<PathBuf, HashMap<(u64, [u8; 20]), usize>>>> =
+    OnceLock::new();
+
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct ManagedSha1FullReadCounts {
+    counts: HashMap<(u64, [u8; 20]), usize>,
+}
+
+#[cfg(test)]
+impl ManagedSha1FullReadCounts {
+    pub(crate) fn count(&self, size: u64, sha1: [u8; 20]) -> usize {
+        self.counts.get(&(size, sha1)).copied().unwrap_or_default()
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn register_sha1_full_read_counts(root: &Path) {
+    let replaced = SHA1_FULL_READ_COUNTS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .expect("managed SHA-1 full-read counter registry")
+        .insert(root.to_path_buf(), HashMap::new());
+    assert!(replaced.is_none(), "managed SHA-1 full-read scope reused");
+}
+
+#[cfg(test)]
+pub(crate) fn take_sha1_full_read_counts(root: &Path) -> ManagedSha1FullReadCounts {
+    let counts = SHA1_FULL_READ_COUNTS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .expect("managed SHA-1 full-read counter registry")
+        .remove(root)
+        .expect("managed SHA-1 full-read scope was not registered");
+    ManagedSha1FullReadCounts { counts }
+}
+
+#[cfg(test)]
+fn record_sha1_full_read(directory: &Path, size: u64, sha1: [u8; 20]) {
+    let mut scopes = SHA1_FULL_READ_COUNTS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .expect("managed SHA-1 full-read counter registry");
+    for (root, counts) in scopes.iter_mut() {
+        if directory.starts_with(root) {
+            *counts.entry((size, sha1)).or_default() += 1;
+        }
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct ManagedDir {
     inner: Arc<ManagedDirInner>,
@@ -1865,7 +1916,10 @@ impl ManagedDir {
                 "managed guarded hash source changed during hashing".to_string(),
             ));
         }
-        Ok(hasher.finalize().into())
+        let sha1 = hasher.finalize().into();
+        #[cfg(test)]
+        record_sha1_full_read(&self.inner.path, guard.size, sha1);
+        Ok(sha1)
     }
 
     pub(crate) fn sha512_guarded_file(
@@ -3337,10 +3391,10 @@ impl ManagedDir {
             ));
         }
         budget.remaining_bytes -= size;
-        Ok(ManagedFileFact {
-            size,
-            sha1: hasher.finalize().into(),
-        })
+        let sha1 = hasher.finalize().into();
+        #[cfg(test)]
+        record_sha1_full_read(&self.inner.path, size, sha1);
+        Ok(ManagedFileFact { size, sha1 })
     }
 
     fn read_bounded(
