@@ -19,7 +19,10 @@ async fn status_reports_bundled_rules_without_remote_refresh() {
     assert!(status.rules_cache.updated_at.is_none());
     assert!(status.rules_cache.loaded_at.is_none());
     assert!(status.rules_cache.warning.is_none());
-    assert_eq!(status.schema_version, 1);
+    assert_eq!(
+        status.schema_version,
+        axial_performance::PERFORMANCE_MANIFEST_SCHEMA_VERSION
+    );
     assert!(!status.generated_at.is_empty());
     assert!(status.composition_count > 0);
     assert!(!status.remote_refresh);

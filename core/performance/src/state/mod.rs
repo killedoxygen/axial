@@ -30,7 +30,7 @@ const ROLLBACK_FILE_NAME: &str = "latest.json";
 const ROLLBACK_FILES_DIR_NAME: &str = "files";
 const ROLLBACK_HISTORY_DIR_NAME: &str = "history";
 const ROLLBACK_TMP_DIR_NAME: &str = "tmp";
-const ROLLBACK_SCHEMA_VERSION: i32 = 1;
+const ROLLBACK_SCHEMA_VERSION: i32 = 2;
 const ROLLBACK_HISTORY_LIMIT: usize = 5;
 const ROLLBACK_METADATA_MAX_BYTES: u64 = 1024 * 1024;
 const ROLLBACK_RETAINED_MAX_BYTES: u64 = MANAGED_ARTIFACT_MAX_BYTES * 2;
@@ -106,16 +106,37 @@ pub(crate) struct RollbackSnapshot {
     pub id: String,
     pub schema_version: i32,
     pub created_at: String,
-    pub state: CompositionState,
+    pub target: RollbackSnapshotState,
     pub artifacts: Vec<RollbackArtifact>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub(crate) enum RollbackSnapshotState {
+    ManagedStateAbsent,
+    ManagedComposition { state: CompositionState },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RollbackSnapshotTarget {
+    ManagedStateAbsent,
+    ManagedComposition,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ManagedRollbackOutcome {
+    ManagedStateAbsent,
+    ManagedComposition(CompositionState),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RollbackSnapshotSummary {
     pub id: String,
     pub created_at: String,
-    pub composition_id: String,
-    pub tier: CompositionTier,
+    pub target: RollbackSnapshotTarget,
+    pub composition_id: Option<String>,
+    pub tier: Option<CompositionTier>,
     pub installed_count: usize,
     pub artifact_count: usize,
     pub ownership_class: OwnershipClass,
@@ -133,6 +154,24 @@ pub(crate) struct RollbackArtifact {
     pub ownership_class: OwnershipClass,
     pub sha512: String,
     pub sha512_verified: bool,
+}
+
+impl RollbackSnapshot {
+    fn state(&self) -> Option<&CompositionState> {
+        match &self.target {
+            RollbackSnapshotState::ManagedStateAbsent => None,
+            RollbackSnapshotState::ManagedComposition { state } => Some(state),
+        }
+    }
+
+    fn target_kind(&self) -> RollbackSnapshotTarget {
+        match &self.target {
+            RollbackSnapshotState::ManagedStateAbsent => RollbackSnapshotTarget::ManagedStateAbsent,
+            RollbackSnapshotState::ManagedComposition { .. } => {
+                RollbackSnapshotTarget::ManagedComposition
+            }
+        }
+    }
 }
 
 pub(crate) fn load_state(instance_mods_dir: &Path) -> Result<Option<CompositionState>, StateError> {
@@ -646,15 +685,41 @@ pub(crate) fn save_rollback_snapshot(
     state: &CompositionState,
 ) -> Result<RollbackSnapshot, StateError> {
     validate_state(state)?;
+    save_rollback_snapshot_target(
+        instance_mods_dir,
+        RollbackSnapshotState::ManagedComposition {
+            state: state.clone(),
+        },
+    )
+}
+
+pub(crate) fn save_absent_rollback_snapshot(
+    instance_mods_dir: &Path,
+) -> Result<RollbackSnapshot, StateError> {
+    save_rollback_snapshot_target(instance_mods_dir, RollbackSnapshotState::ManagedStateAbsent)
+}
+
+fn save_rollback_snapshot_target(
+    instance_mods_dir: &Path,
+    target: RollbackSnapshotState,
+) -> Result<RollbackSnapshot, StateError> {
     let snapshot_id = new_rollback_snapshot_id();
-    let planned = plan_rollback_artifacts(instance_mods_dir, state, &snapshot_id)?;
+    let planned = match &target {
+        RollbackSnapshotState::ManagedStateAbsent => PlannedRollbackSnapshot {
+            artifacts: Vec::new(),
+            total_bytes: 0,
+        },
+        RollbackSnapshotState::ManagedComposition { state } => {
+            plan_rollback_artifacts(instance_mods_dir, state, &snapshot_id)?
+        }
+    };
     finish_rollback_retention(instance_mods_dir)?;
 
     let snapshot = RollbackSnapshot {
         id: snapshot_id.clone(),
         schema_version: ROLLBACK_SCHEMA_VERSION,
         created_at: Utc::now().to_rfc3339(),
-        state: state.clone(),
+        target,
         artifacts: planned
             .artifacts
             .iter()
@@ -681,6 +746,19 @@ pub(crate) async fn save_rollback_snapshot_async(
         .map_err(|_| {
             StateError::Read(std::io::Error::other(
                 "rollback snapshot task stopped before reporting its result",
+            ))
+        })?
+}
+
+pub(crate) async fn save_absent_rollback_snapshot_async(
+    instance_mods_dir: &Path,
+) -> Result<RollbackSnapshot, StateError> {
+    let instance_mods_dir = instance_mods_dir.to_path_buf();
+    tokio::task::spawn_blocking(move || save_absent_rollback_snapshot(&instance_mods_dir))
+        .await
+        .map_err(|_| {
+            StateError::Read(std::io::Error::other(
+                "absent rollback snapshot task stopped before reporting its result",
             ))
         })?
 }
@@ -1153,16 +1231,21 @@ pub(crate) fn list_rollback_snapshots_admitted(
     let snapshots = load_retained_rollback_snapshots(instance_mods_dir)?;
     Ok(snapshots
         .into_iter()
-        .map(|record| RollbackSnapshotSummary {
-            id: record.snapshot.id,
-            created_at: record.snapshot.created_at,
-            composition_id: record.snapshot.state.composition_id,
-            tier: record.snapshot.state.tier,
-            installed_count: record.snapshot.state.installed_mods.len(),
-            artifact_count: record.snapshot.artifacts.len(),
-            ownership_class: OwnershipClass::CompositionManaged,
-            rollback_available: true,
-            latest: record.latest,
+        .map(|record| {
+            let target = record.snapshot.target_kind();
+            let state = record.snapshot.state();
+            RollbackSnapshotSummary {
+                id: record.snapshot.id.clone(),
+                created_at: record.snapshot.created_at.clone(),
+                target,
+                composition_id: state.map(|state| state.composition_id.clone()),
+                tier: state.map(|state| state.tier),
+                installed_count: state.map_or(0, |state| state.installed_mods.len()),
+                artifact_count: record.snapshot.artifacts.len(),
+                ownership_class: OwnershipClass::CompositionManaged,
+                rollback_available: true,
+                latest: record.latest,
+            }
         })
         .collect())
 }
@@ -1170,7 +1253,7 @@ pub(crate) fn list_rollback_snapshots_admitted(
 pub(crate) fn restore_rollback_snapshot(
     instance_mods_dir: &Path,
     snapshot: &RollbackSnapshot,
-) -> Result<CompositionState, StateError> {
+) -> Result<ManagedRollbackOutcome, StateError> {
     restore_rollback_snapshot_classified(instance_mods_dir, snapshot)
         .map_err(RollbackRestoreError::into_state_error)
 }
@@ -1192,13 +1275,13 @@ impl RollbackRestoreError {
 pub(crate) fn restore_rollback_snapshot_classified(
     instance_mods_dir: &Path,
     snapshot: &RollbackSnapshot,
-) -> Result<CompositionState, RollbackRestoreError> {
+) -> Result<ManagedRollbackOutcome, RollbackRestoreError> {
     validate_rollback_snapshot(snapshot).map_err(RollbackRestoreError::Definite)?;
 
     let snapshot_filenames: HashSet<String> = snapshot
-        .state
-        .installed_mods
-        .iter()
+        .state()
+        .into_iter()
+        .flat_map(|state| state.installed_mods.iter())
         .map(|installed| installed.filename.clone())
         .collect();
     reconcile_state_publication(instance_mods_dir).map_err(RollbackRestoreError::Indeterminate)?;
@@ -1239,7 +1322,10 @@ pub(crate) fn restore_rollback_snapshot_classified(
         for target in &restore_targets {
             publish_rollback_restore_target(target)?;
         }
-        save_state(instance_mods_dir, &snapshot.state)?;
+        match snapshot.state() {
+            Some(state) => save_state(instance_mods_dir, state)?,
+            None => remove_state(instance_mods_dir)?,
+        }
         Ok::<(), StateError>(())
     })();
     if let Err(error) = publication {
@@ -1250,7 +1336,7 @@ pub(crate) fn restore_rollback_snapshot_classified(
             .map_err(RollbackRestoreError::Indeterminate)?;
         return Err(RollbackRestoreError::Indeterminate(error));
     }
-    reconcile_managed_addition_obligations(instance_mods_dir, Some(&snapshot.state))
+    reconcile_managed_addition_obligations(instance_mods_dir, snapshot.state())
         .map_err(RollbackRestoreError::Indeterminate)?;
     cleanup_rollback_restore_backups(&restore_targets)
         .map_err(RollbackRestoreError::Indeterminate)?;
@@ -1260,13 +1346,16 @@ pub(crate) fn restore_rollback_snapshot_classified(
         settle_managed_artifact_removal(instance_mods_dir, installed)
             .map_err(RollbackRestoreError::Indeterminate)?;
     }
-    Ok(snapshot.state.clone())
+    Ok(match snapshot.state() {
+        Some(state) => ManagedRollbackOutcome::ManagedComposition(state.clone()),
+        None => ManagedRollbackOutcome::ManagedStateAbsent,
+    })
 }
 
 pub(crate) async fn restore_rollback_snapshot_async(
     instance_mods_dir: &Path,
     snapshot: &RollbackSnapshot,
-) -> Result<CompositionState, StateError> {
+) -> Result<ManagedRollbackOutcome, StateError> {
     let instance_mods_dir = instance_mods_dir.to_path_buf();
     let snapshot = snapshot.clone();
     tokio::task::spawn_blocking(move || restore_rollback_snapshot(&instance_mods_dir, &snapshot))
@@ -1281,7 +1370,7 @@ pub(crate) async fn restore_rollback_snapshot_async(
 pub(crate) async fn restore_rollback_snapshot_classified_async(
     instance_mods_dir: &Path,
     snapshot: &RollbackSnapshot,
-) -> Result<CompositionState, RollbackRestoreError> {
+) -> Result<ManagedRollbackOutcome, RollbackRestoreError> {
     let instance_mods_dir = instance_mods_dir.to_path_buf();
     let snapshot = snapshot.clone();
     tokio::task::spawn_blocking(move || {
@@ -2088,7 +2177,9 @@ fn validate_rollback_snapshot(snapshot: &RollbackSnapshot) -> Result<(), StateEr
             "rollback timestamp is invalid".to_string(),
         ));
     }
-    validate_state(&snapshot.state)?;
+    if let Some(state) = snapshot.state() {
+        validate_state(state)?;
+    }
     if snapshot.artifacts.len() > STATE_MAX_INSTALLED_MODS {
         return Err(StateError::InvalidRollback(
             "rollback artifact count exceeds the limit".to_string(),
@@ -2111,9 +2202,9 @@ fn validate_rollback_snapshot(snapshot: &RollbackSnapshot) -> Result<(), StateEr
             ));
         }
         let Some(installed) = snapshot
-            .state
-            .installed_mods
-            .iter()
+            .state()
+            .into_iter()
+            .flat_map(|state| state.installed_mods.iter())
             .find(|installed| installed.filename == artifact.filename)
         else {
             return Err(StateError::InvalidRollback(format!(
@@ -2142,7 +2233,10 @@ fn validate_rollback_snapshot(snapshot: &RollbackSnapshot) -> Result<(), StateEr
         validate_sha512_integrity(&artifact.filename, &artifact.sha512)?;
     }
 
-    if artifact_filenames.len() != snapshot.state.installed_mods.len() {
+    let installed_count = snapshot
+        .state()
+        .map_or(0, |state| state.installed_mods.len());
+    if artifact_filenames.len() != installed_count {
         return Err(StateError::InvalidRollback(
             "rollback artifacts do not cover the complete managed state".to_string(),
         ));
@@ -3711,6 +3805,15 @@ mod tests {
         InstalledMod, ManagedArtifactIntegrity, ManagedArtifactProvider, ManagedArtifactSource,
     };
 
+    fn restored_composition(outcome: ManagedRollbackOutcome) -> CompositionState {
+        match outcome {
+            ManagedRollbackOutcome::ManagedComposition(state) => state,
+            ManagedRollbackOutcome::ManagedStateAbsent => {
+                panic!("expected rollback to restore a managed composition")
+            }
+        }
+    }
+
     #[test]
     fn admitted_state_read_does_not_reconcile_staged_publication() {
         let root = test_root("admitted-state-read");
@@ -4153,6 +4256,44 @@ mod tests {
     }
 
     #[test]
+    fn absent_rollback_removes_partially_promoted_addition_and_preserves_user_files() {
+        let root = test_root("absent-rollback-partial-addition");
+        fs::write(root.join("user.jar"), b"user-v1").expect("write user file");
+        let snapshot = save_absent_rollback_snapshot(&root).expect("save absent snapshot");
+        let source = root.join("managed.jar.project.tmp");
+        fs::write(&source, b"managed-partial").expect("write managed source");
+        let digest = hex::encode(Sha512::digest(b"managed-partial"));
+        let obligation = stage_managed_artifact_addition(&root, "managed.jar", &digest, &source)
+            .expect("stage managed addition");
+        fs::hard_link(&obligation, root.join("managed.jar"))
+            .expect("publish partial managed addition");
+        fs::remove_file(source).expect("settle managed download temp");
+
+        let recovered = recover_managed_storage(&root)
+            .expect("recover partial promotion after indeterminate install");
+
+        assert!(recovered.is_none());
+        assert!(!root.join("managed.jar").exists());
+        assert!(!lock_file_path(&root).exists());
+        assert_eq!(
+            fs::read(root.join("user.jar")).expect("read user file"),
+            b"user-v1"
+        );
+        assert!(
+            !root
+                .join(STATE_DIR_NAME)
+                .join(MUTATION_DIR_NAME)
+                .join(ADDITION_DIR_NAME)
+                .exists()
+        );
+        let outcome = restore_rollback_snapshot(&root, &snapshot)
+            .expect("restore retained absence after recovery");
+        assert_eq!(outcome, ManagedRollbackOutcome::ManagedStateAbsent);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn rollback_snapshot_rejects_missing_artifact_metadata() {
         let root = test_root("missing-rollback-artifact-metadata");
         fs::create_dir_all(rollback_files_dir_path(&root)).expect("create rollback files dir");
@@ -4167,7 +4308,10 @@ mod tests {
                 "id": "rb-missing-metadata",
                 "schema_version": ROLLBACK_SCHEMA_VERSION,
                 "created_at": "2026-05-30T00:00:00Z",
-                "state": test_state("core-a", vec![test_mod("sodium", "managed-a.jar")]),
+                "target": {
+                    "kind": "managed_composition",
+                    "state": test_state("core-a", vec![test_mod("sodium", "managed-a.jar")]),
+                },
                 "artifacts": [{
                     "filename": "managed-a.jar",
                     "stored_filename": "missing-metadata.bin"
@@ -4448,7 +4592,9 @@ mod tests {
         let snapshot = load_rollback_snapshot_by_id(&root, &older_id)
             .expect("load older snapshot")
             .expect("older snapshot exists");
-        let restored = restore_rollback_snapshot(&root, &snapshot).expect("restore older");
+        let restored = restored_composition(
+            restore_rollback_snapshot(&root, &snapshot).expect("restore older"),
+        );
 
         assert_eq!(restored.composition_id, "core-a");
         assert_eq!(
@@ -4612,8 +4758,9 @@ mod tests {
         let user_temp_path = root.join("managed-a.rollback.tmp");
         fs::write(&user_temp_path, b"user-temp").expect("write user temp");
 
-        let restored =
-            restore_rollback_snapshot(&root, &snapshot).expect("restore should use managed temp");
+        let restored = restored_composition(
+            restore_rollback_snapshot(&root, &snapshot).expect("restore should use managed temp"),
+        );
 
         assert_eq!(restored.composition_id, "core-a");
         assert_eq!(
@@ -4649,9 +4796,11 @@ mod tests {
         .expect("save current state");
         fs::write(root.join("user.jar"), b"user-v2").expect("mutate user");
 
-        let restored = restore_rollback_snapshot_async(&root, &snapshot)
-            .await
-            .expect("restore async");
+        let restored = restored_composition(
+            restore_rollback_snapshot_async(&root, &snapshot)
+                .await
+                .expect("restore async"),
+        );
 
         assert_eq!(restored.composition_id, "core-a");
         assert_eq!(
@@ -4937,7 +5086,10 @@ mod tests {
                 "id": "rb-missing-artifacts",
                 "schema_version": ROLLBACK_SCHEMA_VERSION,
                 "created_at": "2026-05-30T00:00:00Z",
-                "state": test_state("core", Vec::new())
+                "target": {
+                    "kind": "managed_composition",
+                    "state": test_state("core", Vec::new()),
+                }
             }))
             .expect("serialize rollback snapshot"),
         )
@@ -4946,6 +5098,32 @@ mod tests {
         assert!(matches!(
             load_rollback_snapshot(&root).expect_err("missing artifacts should be invalid"),
             StateError::Parse(_)
+        ));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn rollback_snapshot_rejects_previous_schema_without_compatibility_parsing() {
+        let root = test_root("previous-rollback-schema");
+        let rollback_dir = rollback_dir_path(&root);
+        fs::create_dir_all(&rollback_dir).expect("create rollback dir");
+        fs::write(
+            rollback_file_path(&root),
+            serde_json::to_vec(&serde_json::json!({
+                "id": "rb-previous-schema",
+                "schema_version": ROLLBACK_SCHEMA_VERSION - 1,
+                "created_at": "2026-05-30T00:00:00Z",
+                "state": test_state("core", Vec::new()),
+                "artifacts": [],
+            }))
+            .expect("serialize previous rollback schema"),
+        )
+        .expect("write previous rollback schema");
+
+        assert!(matches!(
+            load_rollback_snapshot(&root).expect_err("previous schema should be invalid"),
+            StateError::Parse(_) | StateError::InvalidRollback(_)
         ));
 
         let _ = fs::remove_dir_all(root);

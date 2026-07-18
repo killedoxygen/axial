@@ -554,6 +554,7 @@ mod tests {
             name: name.to_string(),
             condition: ModCondition::Always,
             version_range: String::new(),
+            exact_game_versions: Vec::new(),
             hardware_req: Some(HardwareRequirement::default()),
             mutual_exclusions: Vec::new(),
         }

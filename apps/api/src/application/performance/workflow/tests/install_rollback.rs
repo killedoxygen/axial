@@ -532,6 +532,149 @@ async fn rollback_list_route_returns_snapshot_metadata() {
 }
 
 #[tokio::test]
+async fn first_install_absence_rollback_lists_after_restart_and_preserves_user_files() {
+    let mut fixture = TestFixture::new("first-install-absence-rollback");
+    let version_id = "1.5.2";
+    let instance_id = fixture
+        .add_persisted_instance("First managed install", version_id)
+        .await;
+    fixture.write_vanilla_version(version_id);
+    let mods_dir = fixture
+        .state
+        .instances()
+        .game_dir(&instance_id)
+        .join("mods");
+    fs::create_dir_all(&mods_dir).expect("create mods directory");
+    fs::write(mods_dir.join("user.jar"), b"user-v1").expect("write user file");
+
+    let Json(installed) = handle_install(
+        State(fixture.state.clone()),
+        Json(InstallRequest {
+            instance_id: Some(instance_id.clone()),
+            game_version: Some(version_id.to_string()),
+            loader: Some("vanilla".to_string()),
+            mode: Some("managed".to_string()),
+            action: None,
+            rollback_id: None,
+            queued: None,
+        }),
+    )
+    .await
+    .expect("first managed install");
+
+    assert!(installed.active);
+    assert_eq!(installed.status, "complete");
+    assert_eq!(installed.composition_id, "family-a-vanilla-enhanced");
+    assert!(mods_dir.join(".axial-lock.json").is_file());
+
+    let root = fixture.preserve_root_for_restart();
+    fixture
+        .state
+        .performance_operations()
+        .close()
+        .await
+        .expect("close performance operation store before restart");
+    fixture
+        .state
+        .journals()
+        .close()
+        .await
+        .expect("close operation journal store before restart");
+    drop(fixture);
+
+    let restarted = build_test_state(&root, None, None);
+    let response = router()
+        .with_state(restarted.clone())
+        .oneshot(
+            Request::builder()
+                .uri(format!(
+                    "/api/v1/performance/rollback?instance_id={instance_id}"
+                ))
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("rollback list after restart");
+    let status = response.status();
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("read rollback list");
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "rollback list after restart failed: {}",
+        String::from_utf8_lossy(&body)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&body).expect("rollback list json");
+    let snapshots = value["snapshots"].as_array().expect("snapshots array");
+    assert_eq!(snapshots.len(), 1);
+    let snapshot = &snapshots[0];
+    assert_eq!(snapshot["target"], "managed_state_absent");
+    assert!(snapshot["composition_id"].is_null());
+    assert!(snapshot["tier"].is_null());
+    assert_eq!(snapshot["installed_count"], 0);
+    assert_eq!(snapshot["artifact_count"], 0);
+    assert_eq!(snapshot["rollback_available"], true);
+    assert_eq!(snapshot["latest"], true);
+
+    let Json(rolled_back) = handle_install(
+        State(restarted.clone()),
+        Json(InstallRequest {
+            instance_id: Some(instance_id.clone()),
+            game_version: None,
+            loader: None,
+            mode: None,
+            action: Some("rollback".to_string()),
+            rollback_id: snapshot["id"].as_str().map(str::to_string),
+            queued: None,
+        }),
+    )
+    .await
+    .expect("rollback first install to absence after restart");
+
+    assert!(!rolled_back.active);
+    assert_eq!(rolled_back.status, "rolled_back");
+    assert_eq!(rolled_back.health, BundleHealth::Disabled);
+    assert!(rolled_back.composition_id.is_empty());
+    assert!(rolled_back.tier.is_empty());
+    assert_eq!(rolled_back.installed_count, 0);
+    assert!(rolled_back.managed_artifacts.is_empty());
+    assert!(!mods_dir.join(".axial-lock.json").exists());
+    assert_eq!(
+        fs::read(mods_dir.join("user.jar")).expect("read user file"),
+        b"user-v1"
+    );
+
+    let retained = performance_rollback_list(
+        &restarted,
+        RollbackQuery {
+            instance_id: Some(instance_id),
+        },
+    )
+    .await
+    .expect("list retained absence rollback");
+    assert_eq!(retained.snapshots.len(), 1);
+    assert_eq!(
+        retained.snapshots[0].target,
+        axial_performance::RollbackSnapshotTarget::ManagedStateAbsent
+    );
+    assert!(retained.snapshots[0].rollback_available);
+
+    restarted
+        .performance_operations()
+        .close()
+        .await
+        .expect("close restarted performance operation store");
+    restarted
+        .journals()
+        .close()
+        .await
+        .expect("close restarted operation journal store");
+    drop(restarted);
+    fs::remove_dir_all(root).expect("remove preserved restart root");
+}
+
+#[tokio::test]
 async fn rollback_list_route_bounds_public_snapshot_descriptors() {
     let fixture = TestFixture::new("rollback-list-redaction");
     let instance_id = fixture.add_instance("Managed", "1.20.4-fabric");

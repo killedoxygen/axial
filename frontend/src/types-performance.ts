@@ -245,6 +245,7 @@ export interface ManagedPerformanceMod {
   name: string;
   condition: ModCondition;
   version_range?: string;
+  exact_game_versions?: string[];
   hardware_req?: PerformanceHardwareRequirement | null;
   mutual_exclusions?: string[];
 }
@@ -444,8 +445,9 @@ export interface PerformanceModeDisplay {
 export interface PerformanceRollbackSnapshotSummary {
   id: string;
   created_at: string;
-  composition_id: string;
-  tier: CompositionTier;
+  target: 'managed_state_absent' | 'managed_composition';
+  composition_id: string | null;
+  tier: CompositionTier | null;
   installed_count: number;
   artifact_count: number;
   ownership_class: PerformanceOwnershipClass;

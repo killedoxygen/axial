@@ -3,12 +3,12 @@ use super::manager::{ManagedCompositionAuthority, ManagedInstanceIdentity, Perfo
 use super::model::InstallError;
 use super::promotion::{reconcile_managed_replace_backups, settle_managed_replace_backup};
 use crate::state::{
-    RollbackRestoreError, RollbackSnapshotSummary, load_rollback_snapshot,
+    ManagedRollbackOutcome, RollbackRestoreError, RollbackSnapshotSummary, load_rollback_snapshot,
     load_rollback_snapshot_async, load_rollback_snapshot_by_id_async, load_state,
     remove_managed_artifact, remove_state, restore_rollback_snapshot,
     restore_rollback_snapshot_async, restore_rollback_snapshot_classified_async,
-    save_rollback_snapshot, save_rollback_snapshot_async, save_state,
-    settle_managed_artifact_removal, stage_managed_artifact_removal,
+    save_absent_rollback_snapshot_async, save_rollback_snapshot, save_rollback_snapshot_async,
+    save_state, settle_managed_artifact_removal, stage_managed_artifact_removal,
 };
 use crate::types::{
     CompositionPlan, CompositionState, InstalledMod, PerformanceMode, ResolutionRequest,
@@ -172,7 +172,7 @@ impl ManagedCompositionAuthority {
     pub async fn rollback_managed(
         &self,
         identity: &ManagedInstanceIdentity,
-    ) -> Result<CompositionState, ManagedMutationError> {
+    ) -> Result<ManagedRollbackOutcome, ManagedMutationError> {
         self.validate_identity(identity).await?;
         self.manager
             .rollback_managed_async(identity.mods_dir())
@@ -183,7 +183,7 @@ impl ManagedCompositionAuthority {
         &self,
         identity: &ManagedInstanceIdentity,
         snapshot_id: &str,
-    ) -> Result<CompositionState, ManagedMutationError> {
+    ) -> Result<ManagedRollbackOutcome, ManagedMutationError> {
         self.validate_identity(identity).await?;
         self.manager
             .rollback_managed_snapshot_async(identity.mods_dir(), snapshot_id)
@@ -440,11 +440,14 @@ impl PerformanceManager {
         fs::create_dir_all(instance_mods_dir).map_err(ManagedMutationError::definite)?;
         let previous_state = load_state(instance_mods_dir)
             .map_err(|error| ManagedMutationError::indeterminate("install_preflight", error))?;
-        if let Some(previous_state) = previous_state.as_ref() {
-            save_rollback_snapshot_async(instance_mods_dir, previous_state)
+        match previous_state.as_ref() {
+            Some(previous_state) => save_rollback_snapshot_async(instance_mods_dir, previous_state)
                 .await
-                .map_err(|error| ManagedMutationError::indeterminate("install_snapshot", error))?;
-        }
+                .map_err(|error| ManagedMutationError::indeterminate("install_snapshot", error))?,
+            None => save_absent_rollback_snapshot_async(instance_mods_dir)
+                .await
+                .map_err(|error| ManagedMutationError::indeterminate("install_snapshot", error))?,
+        };
 
         let attempt_plans = self.install_attempt_plans(plan);
         let mut abandoned_states = Vec::new();
@@ -536,7 +539,7 @@ impl PerformanceManager {
     pub(super) async fn rollback_managed_async(
         &self,
         instance_mods_dir: &Path,
-    ) -> Result<CompositionState, ManagedMutationError> {
+    ) -> Result<ManagedRollbackOutcome, ManagedMutationError> {
         let snapshot = load_rollback_snapshot_async(instance_mods_dir)
             .await
             .map_err(|error| ManagedMutationError::indeterminate("rollback_preflight", error))?
@@ -550,7 +553,7 @@ impl PerformanceManager {
         &self,
         instance_mods_dir: &Path,
         snapshot_id: &str,
-    ) -> Result<CompositionState, ManagedMutationError> {
+    ) -> Result<ManagedRollbackOutcome, ManagedMutationError> {
         crate::state::validate_rollback_snapshot_id(snapshot_id)
             .map_err(ManagedMutationError::definite)?;
         let snapshot = load_rollback_snapshot_by_id_async(instance_mods_dir, snapshot_id)
@@ -682,15 +685,13 @@ impl PerformanceManager {
             Err(error) => {
                 self.reconcile_replaced_managed(instance_mods_dir, previous_state)
                     .await?;
-                if previous_state.is_some() {
-                    let snapshot = load_rollback_snapshot_async(instance_mods_dir)
-                        .await?
-                        .ok_or(InstallError::NoRollbackSnapshot)?;
-                    if let Err(rollback_error) =
-                        restore_rollback_snapshot_async(instance_mods_dir, &snapshot).await
-                    {
-                        return Err(InstallError::State(rollback_error));
-                    }
+                let snapshot = load_rollback_snapshot_async(instance_mods_dir)
+                    .await?
+                    .ok_or(InstallError::NoRollbackSnapshot)?;
+                if let Err(rollback_error) =
+                    restore_rollback_snapshot_async(instance_mods_dir, &snapshot).await
+                {
+                    return Err(InstallError::State(rollback_error));
                 }
                 Err(error)
             }
@@ -800,7 +801,7 @@ fn remove_managed_transaction(instance_mods_dir: &Path) -> Result<(), InstallErr
 
 fn rollback_managed_transaction(
     instance_mods_dir: &Path,
-) -> Result<CompositionState, InstallError> {
+) -> Result<ManagedRollbackOutcome, InstallError> {
     let snapshot =
         load_rollback_snapshot(instance_mods_dir)?.ok_or(InstallError::NoRollbackSnapshot)?;
     Ok(restore_rollback_snapshot(instance_mods_dir, &snapshot)?)

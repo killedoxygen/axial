@@ -12,7 +12,7 @@ use crate::modrinth::{ModrinthClient, ModrinthError};
 use crate::resolve::builtin_manifest;
 use crate::rules_cache::{remote_rules_snapshot, rules_cache_path};
 use crate::signature::RulesSignatureMetadata;
-use crate::state::StateError;
+use crate::state::{ManagedRollbackOutcome, StateError};
 use crate::state::{load_state, save_state};
 use crate::status::{RuleChannel, RuleSource, RulesValidation};
 use crate::types::{
@@ -61,6 +61,15 @@ fn managed_install_error(error: &ManagedMutationError) -> Option<&InstallError> 
     }
 }
 
+fn restored_composition(outcome: ManagedRollbackOutcome) -> CompositionState {
+    match outcome {
+        ManagedRollbackOutcome::ManagedComposition(state) => state,
+        ManagedRollbackOutcome::ManagedStateAbsent => {
+            panic!("expected rollback to restore a managed composition")
+        }
+    }
+}
+
 #[test]
 fn managed_artifact_install_concurrency_is_bounded() {
     assert_eq!(managed_artifact_install_concurrency(0), 1);
@@ -78,6 +87,7 @@ fn managed_artifact_temp_path_uses_safe_project_suffix() {
         name: "Managed Mod".to_string(),
         condition: ModCondition::Always,
         version_range: String::new(),
+        exact_game_versions: Vec::new(),
         hardware_req: None,
         mutual_exclusions: Vec::new(),
     };
@@ -109,6 +119,7 @@ async fn ensure_installed_writes_composition_managed_ownership() {
             name: "Sodium".to_string(),
             condition: ModCondition::Always,
             version_range: String::new(),
+            exact_game_versions: Vec::new(),
             hardware_req: None,
             mutual_exclusions: Vec::new(),
         }],
@@ -176,6 +187,7 @@ async fn ensure_installed_records_verified_modrinth_sha512_when_available() {
             name: "Sodium".to_string(),
             condition: ModCondition::Always,
             version_range: String::new(),
+            exact_game_versions: Vec::new(),
             hardware_req: None,
             mutual_exclusions: Vec::new(),
         }],
@@ -261,6 +273,95 @@ async fn managed_install_falls_back_to_slug_after_project_id_404_or_no_compatibl
             "/v2/project/declared-slug/version"
         ));
     }
+}
+
+#[tokio::test]
+async fn managed_install_does_not_repeat_an_identical_project_and_slug_lookup() {
+    let (base_url, requests) = spawn_modrinth_identity_server(ProjectLookupResponse::Empty).await;
+    let manager =
+        PerformanceManager::new_with_modrinth_base_url(base_url).expect("performance manager");
+    let managed_mod = managed_mod("declared-project", "declared-project");
+    let loaders = vec!["fabric".to_string()];
+
+    let versions = manager
+        .resolve_managed_mod_versions(&managed_mod, "1.20.4", &loaders)
+        .await
+        .expect("empty exact lookup should remain empty");
+
+    assert!(versions.is_empty());
+    let requests = requests.lock().expect("request log").clone();
+    assert_eq!(
+        request_log_count(&requests, "/v2/project/declared-project/version"),
+        1
+    );
+}
+
+#[tokio::test]
+async fn managed_install_treats_case_distinct_project_and_slug_as_separate_aliases() {
+    let (base_url, requests) = spawn_modrinth_identity_server(ProjectLookupResponse::Empty).await;
+    let manager =
+        PerformanceManager::new_with_modrinth_base_url(base_url).expect("performance manager");
+    let managed_mod = managed_mod("declared-project", "DECLARED-PROJECT");
+    let loaders = vec!["fabric".to_string()];
+
+    let error = manager
+        .resolve_managed_mod_versions(&managed_mod, "1.20.4", &loaders)
+        .await
+        .expect_err("a case-distinct slug should receive its own fallback lookup");
+
+    assert!(matches!(
+        error,
+        InstallError::Modrinth(ModrinthError::Http { status: 404, .. })
+    ));
+    let requests = requests.lock().expect("request log").clone();
+    assert!(request_log_contains(
+        &requests,
+        "/v2/project/declared-project/version"
+    ));
+    assert!(request_log_contains(
+        &requests,
+        "/v2/project/DECLARED-PROJECT/version"
+    ));
+}
+
+#[tokio::test]
+async fn managed_install_refuses_parent_minor_versions_without_downloading() {
+    let root = test_root("managed-install-exact-game-version");
+    let (base_url, requests) =
+        spawn_modrinth_identity_server(ProjectLookupResponse::ParentVersion).await;
+    let manager =
+        PerformanceManager::new_with_modrinth_base_url(base_url).expect("performance manager");
+    let plan = CompositionPlan {
+        composition_id: "exact-game-version".to_string(),
+        family: VersionFamily::F,
+        loader: "fabric".to_string(),
+        mode: PerformanceMode::Managed,
+        tier: CompositionTier::Core,
+        mods: vec![managed_mod("declared-project", "declared-project")],
+        jvm_preset: String::new(),
+        fallback_chain: Vec::new(),
+        warnings: Vec::new(),
+        fallback_reason: String::new(),
+    };
+
+    let state = manager
+        .attempt_install_plan(&plan, "1.20.4", &root, None)
+        .await
+        .expect("an exact provider miss has a definite install outcome");
+
+    assert!(state.installed_mods.is_empty());
+    assert_eq!(state.failure_count, 1);
+    let requests = requests.lock().expect("request log").clone();
+    assert_eq!(
+        request_log_count(&requests, "/v2/project/declared-project/version"),
+        1
+    );
+    assert!(!request_log_contains(
+        &requests,
+        "/files/declared-project.jar"
+    ));
+
+    let _ = fs::remove_dir_all(root);
 }
 
 #[tokio::test]
@@ -413,7 +514,7 @@ async fn representative_modern_fabric_plans_install_without_composition_fallback
         "ferrite-core",
         "immediatelyfast",
         "dynamic-fps",
-        "modernfix",
+        "nmDcB62a",
     ] {
         assert!(
             request_log_contains(&requests, &format!("/v2/project/{project}/version")),
@@ -424,6 +525,10 @@ async fn representative_modern_fabric_plans_install_without_composition_fallback
             "{project}"
         );
     }
+    assert!(!request_log_contains(
+        &requests,
+        "/v2/project/modernfix/version"
+    ));
 }
 
 #[tokio::test]
@@ -540,6 +645,7 @@ async fn ensure_installed_does_not_claim_matching_untracked_final_file() {
             name: "Sodium".to_string(),
             condition: ModCondition::Always,
             version_range: String::new(),
+            exact_game_versions: Vec::new(),
             hardware_req: None,
             mutual_exclusions: Vec::new(),
         }],
@@ -596,6 +702,7 @@ async fn ensure_installed_rejects_existing_final_file_with_wrong_size() {
             name: "Sodium".to_string(),
             condition: ModCondition::Always,
             version_range: String::new(),
+            exact_game_versions: Vec::new(),
             hardware_req: None,
             mutual_exclusions: Vec::new(),
         }],
@@ -662,6 +769,7 @@ async fn ensure_installed_does_not_overwrite_existing_mismatched_final_file() {
             name: "Sodium".to_string(),
             condition: ModCondition::Always,
             version_range: String::new(),
+            exact_game_versions: Vec::new(),
             hardware_req: None,
             mutual_exclusions: Vec::new(),
         }],
@@ -762,6 +870,7 @@ async fn ensure_installed_replaces_previously_tracked_mismatched_final_file() {
             name: "Sodium".to_string(),
             condition: ModCondition::Always,
             version_range: String::new(),
+            exact_game_versions: Vec::new(),
             hardware_req: None,
             mutual_exclusions: Vec::new(),
         }],
@@ -837,6 +946,7 @@ async fn ensure_installed_removes_temp_and_leaves_no_final_on_sha512_mismatch() 
             name: "Sodium".to_string(),
             condition: ModCondition::Always,
             version_range: String::new(),
+            exact_game_versions: Vec::new(),
             hardware_req: None,
             mutual_exclusions: Vec::new(),
         }],
@@ -879,6 +989,7 @@ async fn ensure_installed_passes_modrinth_file_size_to_download() {
             name: "Sodium".to_string(),
             condition: ModCondition::Always,
             version_range: String::new(),
+            exact_game_versions: Vec::new(),
             hardware_req: None,
             mutual_exclusions: Vec::new(),
         }],
@@ -905,7 +1016,7 @@ async fn ensure_installed_passes_modrinth_file_size_to_download() {
 async fn severe_extended_failure_installs_and_saves_core_fallback() {
     let root = test_root("install-severe-fallback-core");
     let manager = PerformanceManager::new_with_modrinth_base_url(
-        spawn_selective_modrinth_server(&["sodium", "lithium"]).await,
+        spawn_retrying_selective_modrinth_server(&["sodium", "lithium"]).await,
     )
     .expect("performance manager");
     set_test_compositions(
@@ -926,6 +1037,8 @@ async fn severe_extended_failure_installs_and_saves_core_fallback() {
         mode: PerformanceMode::Managed,
         tier: CompositionTier::Extended,
         mods: vec![
+            managed_mod("sodium", "sodium"),
+            managed_mod("lithium", "lithium"),
             managed_mod("entityculling", "entityculling"),
             managed_mod("c2me-fabric", "c2me-fabric"),
             managed_mod("moreculling", "moreculling"),
@@ -963,10 +1076,106 @@ async fn severe_extended_failure_installs_and_saves_core_fallback() {
 }
 
 #[tokio::test]
+async fn severe_fallback_cannot_reintroduce_an_exact_version_exclusion() {
+    let root = test_root("install-fallback-preserves-exact-exclusion");
+    let manager = PerformanceManager::new_with_modrinth_base_url(
+        spawn_selective_modrinth_server(&["excluded"]).await,
+    )
+    .expect("performance manager");
+    let mut excluded = managed_mod("excluded", "excluded");
+    excluded.exact_game_versions = vec!["1.21.4".to_string()];
+    set_test_compositions(
+        &manager,
+        vec![composition_def(
+            "test-core",
+            CompositionTier::Core,
+            vec![excluded],
+        )],
+    );
+    let plan = CompositionPlan {
+        composition_id: "test-extended".to_string(),
+        family: VersionFamily::F,
+        loader: "fabric".to_string(),
+        mode: PerformanceMode::Managed,
+        tier: CompositionTier::Extended,
+        mods: vec![
+            managed_mod("unavailable-a", "unavailable-a"),
+            managed_mod("unavailable-b", "unavailable-b"),
+        ],
+        jvm_preset: String::new(),
+        fallback_chain: vec!["test-core".to_string()],
+        warnings: Vec::new(),
+        fallback_reason: String::new(),
+    };
+
+    let state = manager
+        .ensure_installed(&plan, "1.20.4", &root)
+        .await
+        .expect("install filtered core fallback");
+
+    assert_eq!(state.composition_id, "test-core");
+    assert!(state.installed_mods.is_empty());
+    assert!(!root.join("excluded.jar").exists());
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn fallback_attempt_skips_emergency_disabled_composition() {
+    let manager = PerformanceManager::new_with_modrinth_base_url("http://127.0.0.1:1".to_string())
+        .expect("performance manager");
+    set_test_compositions(
+        &manager,
+        vec![
+            composition_def(
+                "test-core",
+                CompositionTier::Core,
+                vec![managed_mod("sodium", "sodium")],
+            ),
+            composition_def(
+                "test-vanilla-enhanced",
+                CompositionTier::VanillaEnhanced,
+                Vec::new(),
+            ),
+        ],
+    );
+    set_test_emergency_disables(
+        &manager,
+        vec![composition_disable(
+            "disable-core",
+            "test-core",
+            CompositionTier::Core,
+        )],
+    );
+    let plan = CompositionPlan {
+        composition_id: "test-extended".to_string(),
+        family: VersionFamily::F,
+        loader: "fabric".to_string(),
+        mode: PerformanceMode::Managed,
+        tier: CompositionTier::Extended,
+        mods: vec![managed_mod("sodium", "sodium")],
+        jvm_preset: String::new(),
+        fallback_chain: vec!["test-core".to_string(), "test-vanilla-enhanced".to_string()],
+        warnings: Vec::new(),
+        fallback_reason: String::new(),
+    };
+
+    let attempts = manager.install_attempt_plans(&plan);
+
+    assert_eq!(
+        attempts
+            .iter()
+            .map(|attempt| attempt.composition_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["test-extended", "test-vanilla-enhanced"]
+    );
+}
+
+#[tokio::test]
 async fn fallback_attempt_skips_emergency_disabled_artifact() {
     let root = test_root("install-fallback-skips-disabled-artifact");
     let manager = PerformanceManager::new_with_modrinth_base_url(
-        spawn_selective_modrinth_server(&["sodium", "lithium"]).await,
+        spawn_retrying_selective_modrinth_server(&["sodium", "lithium"]).await,
     )
     .expect("performance manager");
     set_test_compositions(
@@ -995,6 +1204,8 @@ async fn fallback_attempt_skips_emergency_disabled_artifact() {
         mode: PerformanceMode::Managed,
         tier: CompositionTier::Extended,
         mods: vec![
+            managed_mod("sodium", "sodium"),
+            managed_mod("lithium", "lithium"),
             managed_mod("entityculling", "entityculling"),
             managed_mod("c2me-fabric", "c2me-fabric"),
         ],
@@ -1150,10 +1361,12 @@ async fn rollback_restores_previous_managed_files_without_touching_user_files() 
         .expect("remove managed bundle");
     fs::write(root.join("user.jar"), b"user-v2").expect("mutate user file");
 
-    let restored = manager
-        .rollback_managed_async(&root)
-        .await
-        .expect("rollback should restore latest snapshot");
+    let restored = restored_composition(
+        manager
+            .rollback_managed_async(&root)
+            .await
+            .expect("rollback should restore latest snapshot"),
+    );
 
     assert_eq!(restored.composition_id, "core");
     assert_eq!(
@@ -1174,6 +1387,93 @@ async fn rollback_restores_previous_managed_files_without_touching_user_files() 
     );
 
     let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn first_install_rollback_to_absence_survives_restart_and_preserves_user_files() {
+    let instances_root = test_root("first-install-rollback-absence");
+    let instance_id = "0123456789abcdef";
+    let mods_dir = instances_root.join(instance_id).join("mods");
+    fs::create_dir_all(&mods_dir).expect("create mods directory");
+    fs::write(mods_dir.join("user.jar"), b"user-v1").expect("write user file");
+    let manager = Arc::new(
+        PerformanceManager::new_with_modrinth_base_url(spawn_modrinth_server(true).await)
+            .expect("performance manager"),
+    );
+    let authority = manager
+        .claim_managed_authority(&instances_root)
+        .expect("claim managed authority");
+    let identity = authority.identify(instance_id).expect("identify instance");
+    let plan = CompositionPlan {
+        composition_id: "test-first-install".to_string(),
+        family: VersionFamily::F,
+        loader: "fabric".to_string(),
+        mode: PerformanceMode::Managed,
+        tier: CompositionTier::Core,
+        mods: vec![managed_mod("sodium", "sodium")],
+        jvm_preset: String::new(),
+        fallback_chain: Vec::new(),
+        warnings: Vec::new(),
+        fallback_reason: String::new(),
+    };
+
+    authority
+        .ensure_installed(&identity, &plan, "1.20.4")
+        .await
+        .expect("install first managed composition");
+    assert!(mods_dir.join("sodium.jar").is_file());
+    assert!(crate::state::lock_file_path(&mods_dir).is_file());
+    let before_restart = authority
+        .inspect(&identity, None, || Ok(()))
+        .await
+        .expect("inspect first install");
+    assert_eq!(before_restart.rollback_snapshots.len(), 1);
+    assert_eq!(
+        before_restart.rollback_snapshots[0].target,
+        crate::state::RollbackSnapshotTarget::ManagedStateAbsent
+    );
+    assert!(before_restart.rollback_snapshots[0].rollback_available);
+    assert!(before_restart.rollback_snapshots[0].latest);
+    drop(authority);
+    drop(manager);
+
+    let reloaded_manager = Arc::new(PerformanceManager::new().expect("reloaded manager"));
+    let reloaded = reloaded_manager
+        .claim_managed_authority(&instances_root)
+        .expect("claim reloaded managed authority");
+    let reloaded_identity = reloaded
+        .identify(instance_id)
+        .expect("identify reloaded instance");
+    let reloaded_inspection = reloaded
+        .inspect(&reloaded_identity, None, || Ok(()))
+        .await
+        .expect("list persisted rollback snapshot");
+    assert_eq!(reloaded_inspection.rollback_snapshots.len(), 1);
+    assert_eq!(
+        reloaded_inspection.rollback_snapshots[0].target,
+        crate::state::RollbackSnapshotTarget::ManagedStateAbsent
+    );
+
+    let outcome = reloaded
+        .rollback_managed(&reloaded_identity)
+        .await
+        .expect("rollback first install to absence");
+
+    assert_eq!(outcome, ManagedRollbackOutcome::ManagedStateAbsent);
+    assert!(!mods_dir.join("sodium.jar").exists());
+    assert!(!crate::state::lock_file_path(&mods_dir).exists());
+    assert_eq!(
+        fs::read(mods_dir.join("user.jar")).expect("read user file"),
+        b"user-v1"
+    );
+    let restored_inspection = reloaded
+        .inspect(&reloaded_identity, None, || Ok(()))
+        .await
+        .expect("inspect restored absence");
+    assert!(restored_inspection.state.is_none());
+    assert_eq!(restored_inspection.rollback_snapshots.len(), 1);
+
+    let _ = fs::remove_dir_all(instances_root);
 }
 
 #[tokio::test]
@@ -1669,9 +1969,12 @@ async fn rollback_rejects_path_traversal_metadata() {
         rollback_dir.join("latest.json"),
         serde_json::to_vec(&serde_json::json!({
             "id": "rb-path-traversal",
-            "schema_version": 1,
+            "schema_version": 2,
             "created_at": "2026-05-30T00:00:00Z",
-            "state": test_state("core", vec![test_mod("sodium", "../outside.jar")]),
+            "target": {
+                "kind": "managed_composition",
+                "state": test_state("core", vec![test_mod("sodium", "../outside.jar")]),
+            },
             "artifacts": []
         }))
         .expect("serialize snapshot"),
@@ -1894,6 +2197,7 @@ fn managed_mod(project_id: &str, slug: &str) -> ManagedMod {
         name: "Declared Artifact".to_string(),
         condition: ModCondition::Always,
         version_range: String::new(),
+        exact_game_versions: Vec::new(),
         hardware_req: None,
         mutual_exclusions: Vec::new(),
     }
@@ -1944,6 +2248,18 @@ fn artifact_disable(id: &str, target_id: &str, tier: CompositionTier) -> Emergen
     }
 }
 
+fn composition_disable(id: &str, target_id: &str, tier: CompositionTier) -> EmergencyDisable {
+    EmergencyDisable {
+        id: id.to_string(),
+        target: EmergencyDisableTarget::Composition,
+        target_id: target_id.to_string(),
+        reason: "test disable".to_string(),
+        families: vec![VersionFamily::F],
+        loaders: vec!["fabric".to_string()],
+        tiers: vec![tier],
+    }
+}
+
 fn signed_metadata(manifest: &crate::types::Manifest) -> (String, RulesSignatureMetadata) {
     let signing_key = SigningKey::from_bytes(&[11_u8; 32]);
     let payload = crate::signature::canonical_manifest_payload(manifest).expect("payload");
@@ -1982,6 +2298,7 @@ enum ProjectLookupResponse {
     Version,
     NotFound,
     Empty,
+    ParentVersion,
     RateLimited,
 }
 
@@ -2044,6 +2361,22 @@ async fn spawn_modrinth_identity_server(
                             ProjectLookupResponse::Empty => {
                                 ("200 OK", "application/json", String::new(), b"[]".to_vec())
                             }
+                            ProjectLookupResponse::ParentVersion => {
+                                if first_line.contains("game_versions=%5B%221.20%22%5D") {
+                                    (
+                                        "200 OK",
+                                        "application/json",
+                                        String::new(),
+                                        version_response_body_for_game_version(
+                                            &addr,
+                                            "declared-project",
+                                            "1.20",
+                                        ),
+                                    )
+                                } else {
+                                    ("200 OK", "application/json", String::new(), b"[]".to_vec())
+                                }
+                            }
                             ProjectLookupResponse::RateLimited => (
                                 "429 Too Many Requests",
                                 "text/plain",
@@ -2081,15 +2414,30 @@ async fn spawn_modrinth_identity_server(
 }
 
 fn version_response_body(addr: &std::net::SocketAddr, project_ref: &str) -> Vec<u8> {
+    version_response_body_for_game_version(addr, project_ref, "1.20.4")
+}
+
+fn version_response_body_for_game_version(
+    addr: &std::net::SocketAddr,
+    project_ref: &str,
+    game_version: &str,
+) -> Vec<u8> {
     let file_url = format!("http://{addr}/files/{project_ref}.jar");
     format!(
-        r#"[{{"id":"{project_ref}-version","game_versions":["1.20.4"],"loaders":["fabric"],"featured":true,"date_published":"2026-05-30T00:00:00Z","files":[{{"url":"{file_url}","filename":"{project_ref}.jar","primary":true,"hashes":{{}}}}]}}]"#
+        r#"[{{"id":"{project_ref}-version","game_versions":["{game_version}"],"loaders":["fabric"],"featured":true,"date_published":"2026-05-30T00:00:00Z","files":[{{"url":"{file_url}","filename":"{project_ref}.jar","primary":true,"hashes":{{}}}}]}}]"#
     )
     .into_bytes()
 }
 
 fn request_log_contains(requests: &[String], needle: &str) -> bool {
     requests.iter().any(|request| request.contains(needle))
+}
+
+fn request_log_count(requests: &[String], needle: &str) -> usize {
+    requests
+        .iter()
+        .filter(|request| request.contains(needle))
+        .count()
 }
 
 fn sorted_projects(mut projects: Vec<String>) -> Vec<String> {
@@ -2230,6 +2578,17 @@ fn representative_file_body(project_ref: &str) -> Vec<u8> {
 }
 
 async fn spawn_selective_modrinth_server(success_projects: &[&str]) -> String {
+    spawn_selective_modrinth_server_after_failures(success_projects, 0).await
+}
+
+async fn spawn_retrying_selective_modrinth_server(success_projects: &[&str]) -> String {
+    spawn_selective_modrinth_server_after_failures(success_projects, 1).await
+}
+
+async fn spawn_selective_modrinth_server_after_failures(
+    success_projects: &[&str],
+    failures_before_success: usize,
+) -> String {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind selective modrinth test server");
@@ -2238,12 +2597,14 @@ async fn spawn_selective_modrinth_server(success_projects: &[&str]) -> String {
         .iter()
         .map(|project| project.to_string())
         .collect::<std::collections::HashSet<_>>();
+    let version_requests = Arc::new(Mutex::new(std::collections::HashMap::new()));
     tokio::spawn(async move {
         loop {
             let Ok((mut stream, _)) = listener.accept().await else {
                 break;
             };
             let success_projects = success_projects.clone();
+            let version_requests = Arc::clone(&version_requests);
             tokio::spawn(async move {
                 let mut request = Vec::new();
                 let mut buf = [0_u8; 1024];
@@ -2265,8 +2626,13 @@ async fn spawn_selective_modrinth_server(success_projects: &[&str]) -> String {
 
                 let request = String::from_utf8_lossy(&request);
                 let first_line = request.lines().next().unwrap_or_default();
-                let (status, content_type, body) =
-                    selective_modrinth_response(&addr, &success_projects, first_line);
+                let (status, content_type, body) = selective_modrinth_response(
+                    &addr,
+                    &success_projects,
+                    &version_requests,
+                    failures_before_success,
+                    first_line,
+                );
                 let headers = format!(
                     "HTTP/1.1 {status}\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
                     body.len()
@@ -2358,10 +2724,20 @@ async fn spawn_leaky_download_failure_server() -> (String, Vec<String>) {
 fn selective_modrinth_response(
     addr: &std::net::SocketAddr,
     success_projects: &std::collections::HashSet<String>,
+    version_requests: &Mutex<std::collections::HashMap<String, usize>>,
+    failures_before_success: usize,
     first_line: &str,
 ) -> (&'static str, &'static str, Vec<u8>) {
     for project in success_projects {
         if first_line.contains(&format!("/v2/project/{project}/version")) {
+            let mut version_requests = version_requests
+                .lock()
+                .expect("selective version request lock");
+            let request_count = version_requests.entry(project.clone()).or_default();
+            if *request_count < failures_before_success {
+                *request_count += 1;
+                return ("404 Not Found", "text/plain", b"not found".to_vec());
+            }
             return (
                 "200 OK",
                 "application/json",

@@ -95,9 +95,12 @@ fn write_rollback_fixture(
         .collect::<Vec<_>>();
     let snapshot = serde_json::json!({
         "id": id,
-        "schema_version": 1,
+        "schema_version": 2,
         "created_at": created_at,
-        "state": state,
+        "target": {
+            "kind": "managed_composition",
+            "state": state,
+        },
         "artifacts": artifacts,
     });
     let metadata = serde_json::to_vec_pretty(&snapshot).expect("serialize rollback fixture");
@@ -287,6 +290,7 @@ fn assert_omits_raw_fragments(body: &str, fragments: &[&str]) {
 struct TestFixture {
     state: AppState,
     root: PathBuf,
+    cleanup_root: bool,
 }
 
 #[derive(Default)]
@@ -384,7 +388,11 @@ impl TestFixture {
         let root = test_root(name);
         let state = build_test_state(&root, remote_rules_url, remote_rules_public_key);
 
-        Self { state, root }
+        Self {
+            state,
+            root,
+            cleanup_root: true,
+        }
     }
 
     fn add_instance(&self, name: &str, version_id: &str) -> String {
@@ -392,6 +400,27 @@ impl TestFixture {
             .instances()
             .insert_for_test(name.to_string(), version_id.to_string())
             .expect("add instance")
+            .id
+    }
+
+    async fn add_persisted_instance(&self, name: &str, version_id: &str) -> String {
+        let instance = crate::state::new_instance(
+            axial_config::generate_instance_id(),
+            name.to_string(),
+            version_id.to_string(),
+            String::new(),
+            String::new(),
+        );
+        let foreground = self
+            .state
+            .register_integrity_foreground()
+            .expect("register persisted fixture foreground")
+            .wait_for_settlement()
+            .await;
+        self.state
+            .create_instance(&foreground, instance, None)
+            .await
+            .expect("persist fixture instance")
             .id
     }
 
@@ -415,6 +444,31 @@ impl TestFixture {
         .expect("write version json");
         fs::write(version_dir.join(format!("{version_id}.jar")), b"client jar")
             .expect("write version jar");
+    }
+
+    fn write_vanilla_version(&self, version_id: &str) {
+        let version_dir = self.root.join("library").join("versions").join(version_id);
+        fs::create_dir_all(&version_dir).expect("create vanilla version dir");
+        fs::write(
+            version_dir.join(format!("{version_id}.json")),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "id": version_id,
+                "type": "release",
+                "mainClass": "net.minecraft.client.main.Main",
+                "assetIndex": {},
+                "javaVersion": { "component": "jre-legacy", "majorVersion": 8 },
+                "libraries": []
+            }))
+            .expect("serialize vanilla version"),
+        )
+        .expect("write vanilla version json");
+        fs::write(version_dir.join(format!("{version_id}.jar")), b"client jar")
+            .expect("write vanilla version jar");
+    }
+
+    fn preserve_root_for_restart(&mut self) -> PathBuf {
+        self.cleanup_root = false;
+        self.root.clone()
     }
 }
 
@@ -475,7 +529,9 @@ async fn spawn_delayed_rules_server(
 
 impl Drop for TestFixture {
     fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.root);
+        if self.cleanup_root {
+            let _ = fs::remove_dir_all(&self.root);
+        }
     }
 }
 

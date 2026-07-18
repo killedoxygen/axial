@@ -458,6 +458,33 @@ mod tests {
     }
 
     #[test]
+    fn previous_manifest_schema_cache_is_not_accepted() {
+        let root = test_root("previous-manifest-schema");
+        let builtin = builtin_manifest().expect("builtin manifest");
+        let mut remote = builtin.clone();
+        remote.schema_version = crate::PERFORMANCE_MANIFEST_SCHEMA_VERSION - 1;
+        remote.generated_at = "2026-05-30T10:00:00Z".to_string();
+        let (public_key, signature) = signed_metadata(&remote);
+        let verifier = RemoteRulesVerifier::from_public_key_hex(Some(public_key));
+        let snapshot = remote_rules_snapshot(&remote, signature);
+        let path = rules_cache_path(&root);
+        fs::create_dir_all(path.parent().expect("cache parent")).expect("create cache dir");
+        fs::write(
+            &path,
+            snapshot.encode().expect("encode previous schema cache"),
+        )
+        .expect("write previous schema cache");
+
+        let loaded = load_active_rules_cache(&root, &builtin, true, &verifier);
+
+        assert_eq!(loaded.rule_source, RuleSource::BuiltIn);
+        assert_eq!(loaded.status.state, RulesCacheState::Invalid);
+        assert!(!loaded.status.recorded);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn remote_cache_with_null_signature_falls_back_to_builtin_with_warning() {
         let root = test_root("null-signature-remote");
         let builtin = builtin_manifest().expect("builtin manifest");

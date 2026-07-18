@@ -56,20 +56,34 @@ impl PerformanceManager {
                 continue;
             }
 
+            if active_composition_disable(manifest, definition, plan.family, &plan.loader).is_some()
+            {
+                warn!(
+                    "performance fallback composition {} is emergency disabled",
+                    fallback_id
+                );
+                continue;
+            }
+
             let mods = definition
                 .mods
                 .iter()
-                .filter(|managed_mod| {
+                .filter_map(|managed_mod| {
+                    let admitted_mod = plan.mods.iter().find(|admitted_mod| {
+                        admitted_mod
+                            .artifact_id
+                            .eq_ignore_ascii_case(&managed_mod.artifact_id)
+                    })?;
                     active_artifact_disable(
                         manifest,
-                        managed_mod,
+                        admitted_mod,
                         plan.family,
                         &plan.loader,
                         definition.tier,
                     )
                     .is_none()
+                    .then(|| admitted_mod.clone())
                 })
-                .cloned()
                 .collect();
 
             plans.push(CompositionPlan {
@@ -113,6 +127,19 @@ pub(super) fn severe_install_failure(plan: &CompositionPlan, state: &Composition
     !plan.mods.is_empty()
         && state.failure_count > 0
         && state.installed_mods.len() < MIN_USEFUL_MANAGED_INSTALLS
+}
+
+fn active_composition_disable<'a>(
+    manifest: &'a Manifest,
+    definition: &crate::types::CompositionDef,
+    family: VersionFamily,
+    loader: &str,
+) -> Option<&'a EmergencyDisable> {
+    manifest.emergency_disables.iter().find(|disable| {
+        disable.target == EmergencyDisableTarget::Composition
+            && disable.target_id == definition.id
+            && disable_applies(disable, family, loader, definition.tier)
+    })
 }
 
 pub(super) fn active_artifact_disable<'a>(

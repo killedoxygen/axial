@@ -22,8 +22,9 @@ use crate::observability::{RedactionAudience, sanitize_evidence_token};
 use crate::state::contracts::{OperationId, OperationPhase, RollbackState};
 use crate::state::{AppManagedCompositionAdmission, AppState, IntegrityForegroundLease};
 use axial_performance::{
-    BundleHealth, CompositionState, InstallError, PerformanceMode, ResolutionRequest,
-    RollbackSnapshotSummary as CoreRollbackSnapshotSummary, StateError,
+    BundleHealth, CompositionState, InstallError, ManagedRollbackOutcome, PerformanceMode,
+    ResolutionRequest, RollbackSnapshotSummary as CoreRollbackSnapshotSummary,
+    RollbackSnapshotTarget, StateError,
 };
 use axum::{Json, http::StatusCode};
 use serde::Serialize;
@@ -47,8 +48,9 @@ pub struct PerformanceRollbackListResponse {
 pub struct PerformanceRollbackSnapshotSummary {
     pub id: String,
     pub created_at: String,
-    pub composition_id: String,
-    pub tier: axial_performance::CompositionTier,
+    pub target: RollbackSnapshotTarget,
+    pub composition_id: Option<String>,
+    pub tier: Option<axial_performance::CompositionTier>,
     pub installed_count: usize,
     pub artifact_count: usize,
     pub ownership_class: axial_performance::OwnershipClass,
@@ -82,10 +84,10 @@ fn performance_rollback_snapshot_summary(
     PerformanceRollbackSnapshotSummary {
         id: super::super::public_performance_descriptor(&snapshot.id, "rollback_snapshot"),
         created_at: public_performance_timestamp(&snapshot.created_at),
-        composition_id: super::super::public_performance_descriptor(
-            &snapshot.composition_id,
-            "composition",
-        ),
+        target: snapshot.target,
+        composition_id: snapshot.composition_id.as_deref().map(|composition_id| {
+            super::super::public_performance_descriptor(composition_id, "composition")
+        }),
         tier: snapshot.tier,
         installed_count: snapshot.installed_count,
         artifact_count: snapshot.artifact_count,
@@ -337,7 +339,7 @@ async fn execute_performance_rollback(
 
     let result = async {
         let rollback_id = optional_value(operation.rollback_id.as_deref());
-        let restored_state = admitted
+        let restored = admitted
             .rollback_managed(rollback_id.as_deref())
             .await
             .map_err(managed_mutation_error)?;
@@ -348,19 +350,34 @@ async fn execute_performance_rollback(
         let health = inspection.health;
         let warnings = inspection.warnings;
 
-        Ok(PerformanceInstallResponse {
-            active: true,
-            status: "rolled_back".to_string(),
-            install_id: None,
-            health,
-            composition_id: super::super::public_performance_descriptor(
-                &restored_state.composition_id,
-                "composition",
-            ),
-            tier: tier_name(restored_state.tier).to_string(),
-            installed_count: restored_state.installed_mods.len(),
-            managed_artifacts: managed_artifact_summary(Some(&restored_state)),
-            warnings,
+        Ok(match restored {
+            ManagedRollbackOutcome::ManagedStateAbsent => PerformanceInstallResponse {
+                active: false,
+                status: "rolled_back".to_string(),
+                install_id: None,
+                health,
+                composition_id: String::new(),
+                tier: String::new(),
+                installed_count: 0,
+                managed_artifacts: Vec::new(),
+                warnings,
+            },
+            ManagedRollbackOutcome::ManagedComposition(restored_state) => {
+                PerformanceInstallResponse {
+                    active: true,
+                    status: "rolled_back".to_string(),
+                    install_id: None,
+                    health,
+                    composition_id: super::super::public_performance_descriptor(
+                        &restored_state.composition_id,
+                        "composition",
+                    ),
+                    tier: tier_name(restored_state.tier).to_string(),
+                    installed_count: restored_state.installed_mods.len(),
+                    managed_artifacts: managed_artifact_summary(Some(&restored_state)),
+                    warnings,
+                }
+            }
         })
     }
     .await;
@@ -763,7 +780,13 @@ async fn rollback_preflight(
     );
 
     Ok(match snapshot {
-        Some(snapshot) => (snapshot.composition_id.clone(), RollbackState::Available),
+        Some(snapshot) => (
+            snapshot
+                .composition_id
+                .clone()
+                .unwrap_or_else(|| "performance_managed_state_absent".to_string()),
+            RollbackState::Available,
+        ),
         None => (
             "performance_rollback_snapshot".to_string(),
             RollbackState::Unavailable,

@@ -324,6 +324,15 @@ fn should_include_mod(
     hardware: &HardwareProfile,
     installed: &std::collections::HashSet<String>,
 ) -> (bool, String) {
+    if !managed_mod.exact_game_versions.is_empty()
+        && !managed_mod
+            .exact_game_versions
+            .iter()
+            .any(|candidate| candidate == game_version)
+    {
+        return (false, String::new());
+    }
+
     if !managed_mod.version_range.trim().is_empty() {
         let Ok(version) = parse_version(game_version) else {
             return (false, String::new());

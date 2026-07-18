@@ -130,6 +130,8 @@ pub struct ManagedMod {
     #[serde(default)]
     pub version_range: String,
     #[serde(default)]
+    pub exact_game_versions: Vec<String>,
+    #[serde(default)]
     pub hardware_req: Option<HardwareRequirement>,
     #[serde(default)]
     pub mutual_exclusions: Vec<String>,

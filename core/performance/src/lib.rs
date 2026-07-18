@@ -28,7 +28,10 @@ pub use install::{
     PERFORMANCE_RULES_URL_ENV, PerformanceManager, PerformanceRulesAuthority, RulesRefreshError,
     VerifiedRemoteRules, remote_rules_refresh_warning,
 };
-pub use resolve::{ResolveError, builtin_manifest, detect_hardware, parse_mode, resolve_plan};
+pub use resolve::{
+    PERFORMANCE_MANIFEST_SCHEMA_VERSION, ResolveError, builtin_manifest, detect_hardware,
+    parse_mode, resolve_plan,
+};
 pub use rules_cache::{
     RULES_CACHE_MAX_BYTES, RulesCacheSnapshot, RulesCacheState, RulesCacheStatus, rules_cache_path,
 };
@@ -36,7 +39,9 @@ pub use signature::{
     PERFORMANCE_RULES_PUBLIC_KEY_ENV, RULES_KEY_ID_HEADER, RULES_SIGNATURE_HEADER,
     RemoteRulesVerifier, RulesSignatureError, RulesSignatureMetadata, canonical_manifest_payload,
 };
-pub use state::{RollbackSnapshotSummary, StateError};
+pub use state::{
+    ManagedRollbackOutcome, RollbackSnapshotSummary, RollbackSnapshotTarget, StateError,
+};
 pub use status::{
     FamilyCoverage, PerformanceRulesStatus, RuleChannel, RuleSource, RulesValidation, rules_status,
     rules_status_for,

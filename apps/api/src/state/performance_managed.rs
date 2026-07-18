@@ -1,6 +1,7 @@
 use axial_performance::{
     CompositionPlan, CompositionState, ManagedCompositionAuthority, ManagedCompositionInspection,
-    ManagedInstanceIdentity, ManagedMutationError, ManagedResolvedInspection, ResolutionRequest,
+    ManagedInstanceIdentity, ManagedMutationError, ManagedResolvedInspection,
+    ManagedRollbackOutcome, ResolutionRequest,
 };
 use std::collections::HashMap;
 use std::io;
@@ -480,7 +481,7 @@ impl ManagedCompositionAdmission {
     pub(crate) async fn rollback_managed(
         &self,
         snapshot_id: Option<&str>,
-    ) -> Result<CompositionState, ManagedMutationError> {
+    ) -> Result<ManagedRollbackOutcome, ManagedMutationError> {
         let _mutation = self.managed_mutation_admission()?;
         let result = match snapshot_id {
             Some(snapshot_id) => {

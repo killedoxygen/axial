@@ -221,45 +221,32 @@ impl PerformanceManager {
         game_version: &str,
         loaders: &[String],
     ) -> Result<Vec<Version>, InstallError> {
+        let game_versions = [game_version.to_string()];
         let project_result = self
-            .list_versions_with_game_fallback(&managed_mod.project_id, game_version, loaders)
+            .modrinth
+            .list_versions(&managed_mod.project_id, &game_versions, loaders)
             .await;
+        let distinct_slug =
+            !managed_mod.slug.is_empty() && managed_mod.project_id != managed_mod.slug;
 
         match project_result {
             Ok(versions) if !versions.is_empty() => Ok(versions),
+            Ok(versions) if !distinct_slug => Ok(versions),
             Ok(_) => self
-                .list_versions_with_game_fallback(&managed_mod.slug, game_version, loaders)
+                .modrinth
+                .list_versions(&managed_mod.slug, &game_versions, loaders)
                 .await
                 .map_err(InstallError::Modrinth),
+            Err(error @ ModrinthError::Http { status: 404, .. }) if !distinct_slug => {
+                Err(InstallError::Modrinth(error))
+            }
             Err(ModrinthError::Http { status: 404, .. }) => self
-                .list_versions_with_game_fallback(&managed_mod.slug, game_version, loaders)
+                .modrinth
+                .list_versions(&managed_mod.slug, &game_versions, loaders)
                 .await
                 .map_err(InstallError::Modrinth),
             Err(error) => Err(InstallError::Modrinth(error)),
         }
-    }
-
-    async fn list_versions_with_game_fallback(
-        &self,
-        project_ref: &str,
-        game_version: &str,
-        loaders: &[String],
-    ) -> Result<Vec<Version>, ModrinthError> {
-        let game_versions = vec![game_version.to_string()];
-        let mut versions = self
-            .modrinth
-            .list_versions(project_ref, &game_versions, loaders)
-            .await?;
-        if versions.is_empty()
-            && let Some(parent_minor) = parent_minor_version(game_version)
-            && parent_minor != game_version
-        {
-            versions = self
-                .modrinth
-                .list_versions(project_ref, &[parent_minor], loaders)
-                .await?;
-        }
-        Ok(versions)
     }
 }
 
@@ -535,13 +522,6 @@ async fn bounded_regular_file_sha512(path: &Path) -> Result<(String, u64), std::
     }
     crate::file_identity::revalidate_async(path, identity, opened_len).await?;
     Ok((hex::encode(hasher.finalize()), actual_size))
-}
-
-fn parent_minor_version(game_version: &str) -> Option<String> {
-    let mut parts = game_version.split('.');
-    let major = parts.next()?;
-    let minor = parts.next()?;
-    Some(format!("{major}.{minor}"))
 }
 
 fn sanitize_mod_filename(name: &str) -> Result<String, InstallError> {

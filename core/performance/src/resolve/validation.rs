@@ -13,7 +13,10 @@ const MAX_ID_CHARS: usize = 128;
 const MAX_NAME_CHARS: usize = 256;
 const MAX_DESCRIPTION_CHARS: usize = 1024;
 const MAX_VERSION_RANGE_CHARS: usize = 256;
+const MAX_EXACT_GAME_VERSION_CHARS: usize = 64;
 const MAX_HARDWARE_VALUE: i32 = 1_048_576;
+
+pub const PERFORMANCE_MANIFEST_SCHEMA_VERSION: i32 = 2;
 
 pub fn builtin_manifest() -> Result<Manifest, ResolveError> {
     let manifest = serde_json::from_str::<Manifest>(BUILTIN_CATALOG)?;
@@ -22,7 +25,7 @@ pub fn builtin_manifest() -> Result<Manifest, ResolveError> {
 }
 
 pub fn validate_manifest(manifest: &Manifest) -> Result<(), ResolveError> {
-    if manifest.schema_version != 1 {
+    if manifest.schema_version != PERFORMANCE_MANIFEST_SCHEMA_VERSION {
         return Err(ResolveError::UnsupportedSchema);
     }
     validate_text(&manifest.generated_at, 64, "generated_at")?;
@@ -201,6 +204,12 @@ fn validate_artifacts(
         if artifact.source.slug.trim().is_empty() {
             return Err(ResolveError::MissingArtifactSlug(artifact.id.clone()));
         }
+        if artifact.source.project_id.trim() != artifact.source.project_id {
+            return Err(ResolveError::ManifestBound("artifact project id padding"));
+        }
+        if artifact.source.slug.trim() != artifact.source.slug {
+            return Err(ResolveError::ManifestBound("artifact slug padding"));
+        }
         if artifact.ownership_class != OwnershipClass::CompositionManaged {
             return Err(ResolveError::InvalidArtifactOwnership(artifact.id.clone()));
         }
@@ -230,6 +239,11 @@ fn validate_managed_mod_artifact(
         MAX_VERSION_RANGE_CHARS,
         "managed mod version range",
     )?;
+    validate_count(
+        managed_mod.exact_game_versions.len(),
+        MAX_FILTER_ITEMS,
+        "managed mod exact game version count",
+    )?;
     if managed_mod.artifact_id.trim().is_empty() {
         return Err(ResolveError::MissingManagedModArtifactId);
     }
@@ -238,6 +252,14 @@ fn validate_managed_mod_artifact(
             managed_mod.artifact_id.clone(),
         ));
     };
+    if managed_mod.project_id.trim() != managed_mod.project_id {
+        return Err(ResolveError::ManifestBound(
+            "managed mod project id padding",
+        ));
+    }
+    if managed_mod.slug.trim() != managed_mod.slug {
+        return Err(ResolveError::ManifestBound("managed mod slug padding"));
+    }
     if managed_mod.project_id != artifact.source.project_id {
         return Err(ResolveError::ManagedModProjectMismatch {
             artifact_id: managed_mod.artifact_id.clone(),
@@ -253,6 +275,7 @@ fn validate_managed_mod_artifact(
         });
     }
     validate_managed_mod_version_range(managed_mod)?;
+    validate_managed_mod_exact_game_versions(managed_mod)?;
     validate_managed_mod_hardware_req(managed_mod)?;
     validate_managed_mod_mutual_exclusions(managed_mod)?;
     Ok(())
@@ -269,6 +292,39 @@ fn validate_managed_mod_version_range(managed_mod: &ManagedMod) -> Result<(), Re
             return Err(ResolveError::InvalidManagedModVersionRange {
                 artifact_id: managed_mod.artifact_id.clone(),
                 version_range: trimmed.to_string(),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn validate_managed_mod_exact_game_versions(managed_mod: &ManagedMod) -> Result<(), ResolveError> {
+    if !managed_mod.version_range.trim().is_empty() && !managed_mod.exact_game_versions.is_empty() {
+        return Err(ResolveError::ConflictingManagedModVersionSelectors {
+            artifact_id: managed_mod.artifact_id.clone(),
+        });
+    }
+
+    let mut seen = std::collections::HashSet::new();
+    for game_version in &managed_mod.exact_game_versions {
+        validate_text(
+            game_version,
+            MAX_EXACT_GAME_VERSION_CHARS,
+            "managed mod exact game version",
+        )?;
+        if game_version.is_empty()
+            || game_version.trim() != game_version
+            || parse_version(game_version).is_err()
+        {
+            return Err(ResolveError::InvalidManagedModExactGameVersion {
+                artifact_id: managed_mod.artifact_id.clone(),
+                game_version: game_version.clone(),
+            });
+        }
+        if !seen.insert(game_version) {
+            return Err(ResolveError::DuplicateManagedModExactGameVersion {
+                artifact_id: managed_mod.artifact_id.clone(),
+                game_version: game_version.clone(),
             });
         }
     }
