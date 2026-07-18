@@ -1,6 +1,7 @@
 use crate::artifact_path::{ArtifactRelativePath, validate_artifact_path_segment};
 use crate::loaders::types::LoaderError;
 use sha1::{Digest as _, Sha1};
+use sha2::Sha512;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
 use std::io::{self, Read, Seek, SeekFrom, Write};
@@ -184,6 +185,37 @@ impl ManagedFileGuard {
 
     pub(crate) fn identity(&self) -> ManagedFileIdentity {
         ManagedFileIdentity(self.identity)
+    }
+
+    pub(crate) fn try_clone_file(&self) -> Result<std::fs::File, LoaderError> {
+        if platform::file_identity(&self.file)? != self.identity {
+            return Err(LoaderError::Verify(
+                "managed file handle identity changed".to_string(),
+            ));
+        }
+        Ok(self.file.try_clone()?)
+    }
+
+    pub(crate) fn capture_size(&mut self) -> Result<u64, LoaderError> {
+        if platform::file_identity(&self.file)? != self.identity {
+            return Err(LoaderError::Verify(
+                "managed file handle identity changed before settlement".to_string(),
+            ));
+        }
+        self.size = self.file.metadata()?.len();
+        Ok(self.size)
+    }
+
+    pub(crate) fn settle_anonymous_publication(&self) -> Result<(), LoaderError> {
+        if platform::file_identity(&self.file)? != self.identity
+            || self.file.metadata()?.len() != self.size
+        {
+            return Err(LoaderError::Verify(
+                "managed anonymous publication handle changed".to_string(),
+            ));
+        }
+        platform::settle_anonymous_publication(&self.file)?;
+        Ok(())
     }
 
     pub(crate) fn into_bounded_reader(
@@ -961,6 +993,111 @@ impl ManagedDir {
         }
     }
 
+    pub(crate) fn create_new_guarded_file(
+        &self,
+        name: &str,
+    ) -> Result<ManagedFileGuard, LoaderError> {
+        validate_segment(name)?;
+        self.revalidate()?;
+        if self.has_portably_exact_child_name(name)? {
+            return Err(LoaderError::Io(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "managed create-only file already exists",
+            )));
+        }
+        let file =
+            platform::create_new_file(&self.inner.handle, &self.inner.path, OsStr::new(name))?;
+        let guard = ManagedFileGuard {
+            identity: platform::file_identity(&file)?,
+            size: 0,
+            file,
+        };
+        let admitted = match self.has_portably_exact_child_name(name) {
+            Ok(true) => self.file_guard_matches(name, &guard),
+            Ok(false) => Ok(false),
+            Err(error) => Err(error),
+        };
+        match admitted {
+            Ok(true) => Ok(guard),
+            Ok(false) => {
+                let _ = self.remove_guarded_file(name, &guard);
+                Err(LoaderError::Verify(
+                    "managed create-only file identity changed".to_string(),
+                ))
+            }
+            Err(error) => {
+                let _ = self.remove_guarded_file(name, &guard);
+                Err(error)
+            }
+        }
+    }
+
+    pub(crate) fn create_anonymous_guarded_file(&self) -> Result<ManagedFileGuard, LoaderError> {
+        self.revalidate()?;
+        let file = platform::create_anonymous_file(&self.inner.handle, &self.inner.path)?;
+        let guard = ManagedFileGuard {
+            identity: platform::file_identity(&file)?,
+            size: 0,
+            file,
+        };
+        if platform::file_identity(&guard.file)? != guard.identity {
+            return Err(LoaderError::Verify(
+                "managed anonymous file identity changed during admission".to_string(),
+            ));
+        }
+        self.revalidate()?;
+        Ok(guard)
+    }
+
+    pub(crate) fn link_guarded_file_no_replace(
+        &self,
+        guard: &ManagedFileGuard,
+        name: &str,
+    ) -> Result<(), LoaderError> {
+        self.link_guarded_file_no_replace_inner(guard, name, || {})
+    }
+
+    #[cfg(test)]
+    fn link_guarded_file_no_replace_with_hook(
+        &self,
+        guard: &ManagedFileGuard,
+        name: &str,
+        before_link: impl FnOnce(),
+    ) -> Result<(), LoaderError> {
+        self.link_guarded_file_no_replace_inner(guard, name, before_link)
+    }
+
+    fn link_guarded_file_no_replace_inner(
+        &self,
+        guard: &ManagedFileGuard,
+        name: &str,
+        before_link: impl FnOnce(),
+    ) -> Result<(), LoaderError> {
+        validate_segment(name)?;
+        self.revalidate()?;
+        if self.has_portably_exact_child_name(name)? {
+            return Err(LoaderError::Io(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "managed publication destination already exists",
+            )));
+        }
+        if platform::file_identity(&guard.file)? != guard.identity
+            || guard.file.metadata()?.len() != guard.size
+        {
+            return Err(LoaderError::Verify(
+                "managed anonymous publication source identity changed".to_string(),
+            ));
+        }
+        before_link();
+        platform::link_file_no_replace(
+            &guard.file,
+            &self.inner.handle,
+            &self.inner.path,
+            OsStr::new(name),
+        )?;
+        Ok(())
+    }
+
     pub(crate) fn file_guard_matches(
         &self,
         name: &str,
@@ -1083,6 +1220,52 @@ impl ManagedDir {
             ));
         }
         Ok(hasher.finalize().into())
+    }
+
+    pub(crate) fn sha512_guarded_file(
+        &self,
+        name: &str,
+        guard: &ManagedFileGuard,
+        max_size: u64,
+    ) -> Result<String, LoaderError> {
+        validate_segment(name)?;
+        if guard.size > max_size || !self.file_guard_matches(name, guard)? {
+            return Err(LoaderError::Verify(
+                "managed guarded hash source is invalid or exceeds its bound".to_string(),
+            ));
+        }
+        let mut file = guard.file.try_clone()?;
+        if platform::file_identity(&file)? != guard.identity || file.metadata()?.len() != guard.size
+        {
+            return Err(LoaderError::Verify(
+                "managed guarded hash source identity changed".to_string(),
+            ));
+        }
+        file.seek(SeekFrom::Start(0))?;
+        let mut observed = 0_u64;
+        let mut hasher = Sha512::new();
+        let mut chunk = [0_u8; 64 * 1024];
+        loop {
+            let read = file.read(&mut chunk)?;
+            if read == 0 {
+                break;
+            }
+            observed = observed.checked_add(read as u64).ok_or_else(|| {
+                LoaderError::Verify("managed guarded hash size overflowed".to_string())
+            })?;
+            if observed > guard.size {
+                return Err(LoaderError::Verify(
+                    "managed guarded hash source exceeded its admitted size".to_string(),
+                ));
+            }
+            hasher.update(&chunk[..read]);
+        }
+        if observed != guard.size || !self.file_guard_matches(name, guard)? {
+            return Err(LoaderError::Verify(
+                "managed guarded hash source changed during hashing".to_string(),
+            ));
+        }
+        Ok(format!("{:x}", hasher.finalize()))
     }
 
     pub(crate) fn read_guarded_file_bounded(
@@ -3174,6 +3357,72 @@ mod platform {
         Ok(fs::File::from(fd))
     }
 
+    #[cfg(target_os = "linux")]
+    pub(super) fn create_anonymous_file(
+        parent: &DirectoryHandle,
+        _parent_path: &Path,
+    ) -> io::Result<fs::File> {
+        let fd = rfs::openat(
+            parent,
+            ".",
+            OFlags::RDWR | OFlags::TMPFILE | OFlags::CLOEXEC,
+            Mode::from_bits_truncate(0o600),
+        )?;
+        Ok(fs::File::from(fd))
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub(super) fn create_anonymous_file(
+        _parent: &DirectoryHandle,
+        _parent_path: &Path,
+    ) -> io::Result<fs::File> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "anonymous managed staging is unsupported on this Unix platform",
+        ))
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(super) fn link_file_no_replace(
+        file: &fs::File,
+        parent: &DirectoryHandle,
+        _parent_path: &Path,
+        name: &OsStr,
+    ) -> io::Result<()> {
+        match rfs::linkat(file, "", parent, name, AtFlags::EMPTY_PATH) {
+            Ok(()) => Ok(()),
+            Err(error) if error == rustix::io::Errno::PERM => {
+                use std::os::fd::AsRawFd;
+                let proc_path = format!("/proc/self/fd/{}", file.as_raw_fd());
+                Ok(rfs::linkat(
+                    rfs::CWD,
+                    proc_path,
+                    parent,
+                    name,
+                    AtFlags::SYMLINK_FOLLOW,
+                )?)
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub(super) fn link_file_no_replace(
+        _file: &fs::File,
+        _parent: &DirectoryHandle,
+        _parent_path: &Path,
+        _name: &OsStr,
+    ) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "anonymous managed publication is unsupported on this Unix platform",
+        ))
+    }
+
+    pub(super) fn settle_anonymous_publication(_file: &fs::File) -> io::Result<()> {
+        Ok(())
+    }
+
     pub(super) fn open_file_read(
         parent: &DirectoryHandle,
         _parent_path: &Path,
@@ -3375,6 +3624,38 @@ mod platform {
 mod tests {
     use super::*;
     use std::fs;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn anonymous_handle_publication_preserves_a_final_window_replacement() {
+        let root = test_root("anonymous-link-race");
+        fs::create_dir_all(&root).expect("root");
+        let directory = ManagedDir::open_root(&root).expect("managed root");
+        let mut guard = directory
+            .create_anonymous_guarded_file()
+            .expect("anonymous file");
+        let mut writer = guard.try_clone_file().expect("writer");
+        writer.write_all(b"owned").expect("write owned bytes");
+        writer.sync_all().expect("sync owned bytes");
+        drop(writer);
+        guard.capture_size().expect("capture size");
+
+        let error = directory
+            .link_guarded_file_no_replace_with_hook(&guard, "published", || {
+                fs::write(root.join("published"), b"replacement")
+                    .expect("final-window replacement");
+            })
+            .expect_err("kernel link is create-only");
+
+        assert!(matches!(error, LoaderError::Io(_)));
+        assert_eq!(
+            fs::read(root.join("published")).expect("replacement preserved"),
+            b"replacement"
+        );
+        drop(guard);
+        assert_eq!(root.read_dir().expect("root entries").count(), 1);
+        let _ = fs::remove_dir_all(root);
+    }
 
     #[test]
     fn create_child_new_is_create_only_and_returns_an_exact_child() {
@@ -4722,9 +5003,10 @@ mod platform {
     use std::os::windows::io::AsRawHandle;
     use std::path::Path;
     use windows_sys::Win32::Storage::FileSystem::{
-        FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_BASIC_INFO,
-        FILE_DISPOSITION_FLAG_DELETE, FILE_DISPOSITION_FLAG_POSIX_SEMANTICS,
-        FILE_DISPOSITION_INFO_EX, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+        FILE_ADD_FILE, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_BASIC_INFO,
+        FILE_DISPOSITION_FLAG_DELETE, FILE_DISPOSITION_FLAG_ON_CLOSE,
+        FILE_DISPOSITION_FLAG_POSIX_SEMANTICS, FILE_DISPOSITION_INFO_EX,
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_DELETE_ON_CLOSE, FILE_FLAG_OPEN_REPARSE_POINT,
         FILE_ID_INFO, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE,
         FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_STANDARD_INFO, FileBasicInfo,
         FileDispositionInfoEx, FileIdInfo, FileStandardInfo, GetFileInformationByHandleEx,
@@ -4799,6 +5081,123 @@ mod platform {
             .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
             .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
         options.open(parent_path.join(name))
+    }
+
+    pub(super) fn create_anonymous_file(
+        _parent: &DirectoryHandle,
+        parent_path: &Path,
+    ) -> io::Result<fs::File> {
+        let path = parent_path.join(format!(".axial-owned-{}", uuid::Uuid::new_v4().simple()));
+        let mut options = fs::OpenOptions::new();
+        options
+            .access_mode(
+                windows_sys::Win32::Foundation::GENERIC_READ
+                    | windows_sys::Win32::Foundation::GENERIC_WRITE
+                    | DELETE_ACCESS,
+            )
+            .create_new(true)
+            .share_mode(FILE_SHARE_READ)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_DELETE_ON_CLOSE);
+        let file = options.open(path)?;
+        set_file_disposition(
+            &file,
+            FILE_DISPOSITION_FLAG_DELETE
+                | FILE_DISPOSITION_FLAG_ON_CLOSE
+                | FILE_DISPOSITION_FLAG_POSIX_SEMANTICS,
+        )?;
+        Ok(file)
+    }
+
+    pub(super) fn link_file_no_replace(
+        file: &fs::File,
+        parent: &DirectoryHandle,
+        parent_path: &Path,
+        name: &OsStr,
+    ) -> io::Result<()> {
+        use ntapi::ntioapi::{
+            FILE_LINK_INFORMATION, FileLinkInformation, IO_STATUS_BLOCK, NtSetInformationFile,
+        };
+        use ntapi::winapi::shared::ntdef::HANDLE;
+        let link_parent = open_no_follow(
+            parent_path,
+            FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES | FILE_ADD_FILE,
+            true,
+        )?;
+        if directory_identity(&link_parent)? != directory_identity(parent)? {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "managed publication directory identity changed",
+            ));
+        }
+        let encoded = name.encode_wide().collect::<Vec<_>>();
+        let filename_bytes = encoded
+            .len()
+            .checked_mul(size_of::<u16>())
+            .and_then(|value| u32::try_from(value).ok())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "filename is too long"))?;
+        let buffer_bytes = size_of::<FILE_LINK_INFORMATION>()
+            .checked_add(filename_bytes as usize)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "filename is too long"))?;
+        let words = buffer_bytes.div_ceil(size_of::<usize>());
+        let mut storage = vec![0_usize; words];
+        let information = storage.as_mut_ptr().cast::<FILE_LINK_INFORMATION>();
+        unsafe {
+            (*information).ReplaceIfExists = 0;
+            (*information).RootDirectory = link_parent.as_raw_handle() as HANDLE;
+            (*information).FileNameLength = filename_bytes;
+            std::ptr::copy_nonoverlapping(
+                encoded.as_ptr(),
+                std::ptr::addr_of_mut!((*information).FileName).cast::<u16>(),
+                encoded.len(),
+            );
+        }
+        let mut status_block = unsafe { std::mem::zeroed::<IO_STATUS_BLOCK>() };
+        let status = unsafe {
+            NtSetInformationFile(
+                file.as_raw_handle() as HANDLE,
+                &mut status_block,
+                information.cast(),
+                u32::try_from(buffer_bytes)
+                    .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "link is too long"))?,
+                FileLinkInformation,
+            )
+        };
+        if status >= 0 {
+            Ok(())
+        } else if status as u32 == 0xc000_0035 {
+            Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "managed publication destination already exists",
+            ))
+        } else {
+            Err(io::Error::other(format!(
+                "managed handle link failed with NTSTATUS {status:#x}"
+            )))
+        }
+    }
+
+    pub(super) fn settle_anonymous_publication(file: &fs::File) -> io::Result<()> {
+        set_file_disposition(
+            file,
+            FILE_DISPOSITION_FLAG_DELETE | FILE_DISPOSITION_FLAG_POSIX_SEMANTICS,
+        )
+    }
+
+    fn set_file_disposition(file: &fs::File, flags: u32) -> io::Result<()> {
+        let disposition = FILE_DISPOSITION_INFO_EX { Flags: flags };
+        let result = unsafe {
+            SetFileInformationByHandle(
+                file.as_raw_handle(),
+                FileDispositionInfoEx,
+                (&raw const disposition).cast(),
+                u32::try_from(size_of::<FILE_DISPOSITION_INFO_EX>()).unwrap_or(u32::MAX),
+            )
+        };
+        if result == 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
     }
 
     pub(super) fn open_file_read(

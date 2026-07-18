@@ -23,7 +23,8 @@ pub(crate) use asset_source::{
 pub use assets::repair_virtual_assets_from_index;
 pub(crate) use assets::{ASSET_OBJECT_BASE_URL, parse_asset_index};
 pub use content_transfer::{
-    MAX_VERIFIED_CONTENT_STAGING_BYTES, download_verified_content_to_staging,
+    MAX_VERIFIED_CONTENT_STAGING_BYTES, VerifiedStagedContent, VerifiedStagedContentError,
+    download_owned_verified_content_to_staging, download_verified_content_to_staging,
 };
 pub use install::Downloader;
 pub(crate) use install::{
