@@ -343,7 +343,7 @@ pub(crate) async fn launch_benchmark(
                 .await
                 .map_err(super::launch_request_error_response)?;
 
-            let mut response = super::launch_success_response_payload(&launched);
+            let mut response = benchmark_launch_response(&state, &launched).await?;
             response["benchmark"] = benchmark_response;
             Ok(response)
         }
@@ -862,7 +862,13 @@ async fn own_benchmark_suite_launch(
         }
     };
 
-    let mut response = super::launch_success_response_payload(&launched);
+    let mut response = match benchmark_launch_response(&state, &launched).await {
+        Ok(response) => response,
+        Err(error) => {
+            let _ = result_tx.send(Err(error));
+            return;
+        }
+    };
     response["benchmark"] = benchmark_response;
     response["suite"] = suite_response;
     let _ = result_tx.send(Ok(BenchmarkSuiteOwnedLaunch {
@@ -870,6 +876,30 @@ async fn own_benchmark_suite_launch(
         run_index,
     }));
     own_benchmark_suite_terminal_outcome(state, session_id, terminal_events).await;
+}
+
+async fn benchmark_launch_response(
+    state: &AppState,
+    launched: &super::LaunchSuccess,
+) -> Result<serde_json::Value, LaunchApplicationError> {
+    let status = state
+        .sessions()
+        .status_snapshot(&launched.session_id)
+        .await
+        .ok_or_else(|| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({
+                    "error": "Could not read the launch status. Try again from the launcher."
+                })),
+            )
+        })?;
+    let mut response = json!(super::public_launch_status(&status));
+    response["instance_id"] = json!(&launched.instance_id);
+    response["launched_at"] = json!(&launched.launched_at);
+    response["max_memory_mb"] = json!(launched.max_memory_mb);
+    response["min_memory_mb"] = json!(launched.min_memory_mb);
+    Ok(response)
 }
 
 async fn finish_benchmark_suite_reservation_failure(
@@ -953,6 +983,7 @@ async fn own_benchmark_suite_terminal_outcome(
                 return;
             }
             Ok(LaunchEvent::Log(_)) => {}
+            Ok(LaunchEvent::ProcessSettled { .. }) => {}
             Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
                 let Some(record) = state.sessions().get(&session_id).await else {
                     tracing::warn!(

@@ -24,12 +24,12 @@ import { LogLines } from '../components/log-line';
 export function LogsPane({
   inst,
   resources,
-  running,
+  processLive,
   onRefresh,
 }: {
   inst: EnrichedInstance;
   resources: ResourceLoadState;
-  running: boolean;
+  processLive: boolean;
   onRefresh: () => void;
 }): JSX.Element {
   const logs = resources.data?.logs ?? [];
@@ -42,7 +42,7 @@ export function LogsPane({
   }>({ status: 'idle' });
   const sortedLogs = useMemo(() => sortLogs(logs), [logs]);
   const selectedEntry = sortedLogs.find((log) => log.name === selected);
-  const isLive = running && isCurrentLog(selected);
+  const isLive = processLive && isCurrentLog(selected);
   const selectedIsCompressedArchive = isCompressedLogArchive(selected);
 
   useEffect(() => {
@@ -74,12 +74,12 @@ export function LogsPane({
         });
     };
     load(true);
-    const timer = running ? window.setInterval(() => load(false), LOG_TAIL_POLL_MS) : 0;
+    const timer = processLive ? window.setInterval(() => load(false), LOG_TAIL_POLL_MS) : 0;
     return () => {
       alive = false;
       if (timer) window.clearInterval(timer);
     };
-  }, [inst.id, running, selected, selectedIsCompressedArchive]);
+  }, [inst.id, processLive, selected, selectedIsCompressedArchive]);
 
   return (
     <div class="cp-instance-body cp-logs-pane">

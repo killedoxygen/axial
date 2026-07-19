@@ -84,31 +84,28 @@ pub use install::{
     InstallQueueContentSelection, InstallQueueRequest, InstallQueueStateResponse,
     InstallStartResponse, InstallStatusResponse, InstallVersionStaging, InstallVersionStartRequest,
     LoaderBuildsRequest, LoaderInstallStartRequest, begin_install_operation_journal,
-    install_events_stream, install_operation_id, install_status, loader_builds, loader_components,
-    loader_game_versions, loader_install_events_stream, loader_pre_operation_error_response,
-    public_loader_install_progress_record_json, public_vanilla_install_progress_record_json,
-    record_install_operation_interrupted, record_install_operation_progress,
-    sanitize_install_progress, stage_install_version_command,
+    install_operation_id, install_status, loader_builds, loader_components, loader_game_versions,
+    loader_pre_operation_error_response, public_loader_install_progress_record_json,
+    public_vanilla_install_progress_record_json, record_install_operation_interrupted,
+    record_install_operation_progress, sanitize_install_progress, stage_install_version_command,
 };
 pub(crate) use install::{
-    enqueue_install_from_continuation, enqueue_install_owned, install_queue_status_owned,
-    remove_queued_install_owned, retry_install_owned,
-    settle_startup_install_guardian_failure_memory,
+    enqueue_install_from_continuation, enqueue_install_owned, install_events_stream,
+    install_queue_status_owned, loader_install_events_stream, remove_queued_install_owned,
+    retry_install_owned, settle_startup_install_guardian_failure_memory,
 };
 pub(crate) use integrity_scheduler::spawn_idle_integrity_scheduler;
 pub use java::{JavaRuntimesResponse, java_runtimes};
 pub(crate) use known_good::{
     rebuild_registered_known_good, registered_known_good_is_live, spawn_startup_known_good_rebuilds,
 };
+pub(crate) use launch::launch_preflight_stage_evidence;
 pub use launch::{
     LaunchInstanceStaging, LaunchPreflightMemory, LaunchPreflightOverride,
     LaunchPreflightOverrides, LaunchPreflightResourceBudget, LaunchPreflightResponse,
-    LaunchRequest, LaunchRequestError, LaunchSuccess, launch_application_stage_evidence,
-    launch_request_error_response_payload, launch_success_response_payload,
-    prepare_launch_preflight, sanitize_live_launch_failure_message, stage_launch_instance_command,
-    trace_launch_event,
+    LaunchRequest, launch_application_stage_evidence, prepare_launch_preflight,
+    stage_launch_instance_command,
 };
-pub(crate) use launch::{launch_notice_from_values, launch_preflight_stage_evidence};
 pub use music::{
     MusicStatusResponse, MusicTrackBytes, MusicTrackError, MusicTrackRequest, music_status,
     music_track,

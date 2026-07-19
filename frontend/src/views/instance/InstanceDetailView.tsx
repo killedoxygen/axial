@@ -4,7 +4,7 @@ import { Icon } from '../../ui/Icons';
 import { Button, IconButton, Pill } from '../../ui/Atoms';
 import { InstanceTile, guardedInstanceHue } from '../../ui/InstanceVisual';
 import { openContextMenu } from '../../ui/ContextMenu';
-import { instances, launchNotices, launchState, runningSessions, versionById } from '../../store';
+import { instances, launchNotices, launchSessions, launchState, versionById } from '../../store';
 import { navigate, resetViewScroll } from '../../ui-state';
 import { selectInstance } from '../../actions';
 import { launchGame, killGame } from '../../launch';
@@ -12,6 +12,12 @@ import { handleInstallClick, retryFailedInstall } from '../../machines/downloads
 import { errMessage } from '../../utils';
 import { formatDate, fmtRelative } from '../../format';
 import { instanceInstallStatus } from '../../instance-install-status';
+import {
+  launchSessionActivityLabel,
+  launchSessionCanStop,
+  launchSessionHasLiveProcess,
+  launchSessionIsPlaying,
+} from '../../launch-presenters';
 import type { EnrichedInstance } from '../../types-instance';
 import { fetchInstanceResources, type ResourceLoadState } from './resources';
 import { LOG_RESOURCE_POLL_MS } from './logs';
@@ -58,8 +64,12 @@ export function InstanceDetailView({ id }: { id: string }): JSX.Element {
   const selectedTabForCurrentInstance = selectedTab?.instanceId === id ? selectedTab.tab : null;
   const [resources, setResources] = useState<ResourceLoadState>({ status: 'loading', data: null });
   const [now, setNow] = useState(() => Date.now());
-  const running = inst ? !!runningSessions.value[inst.id] : false;
-  const session = inst ? runningSessions.value[inst.id] : undefined;
+  const session = inst ? launchSessions.value[inst.id] : undefined;
+  const sessionActive = Boolean(session);
+  const playing = launchSessionIsPlaying(session);
+  const processLive = launchSessionHasLiveProcess(session);
+  const canStop = launchSessionCanStop(session);
+  const sessionLabel = launchSessionActivityLabel(session);
   const launch = launchState.value;
   const preparing = inst && launch.status === 'preparing' && launch.instanceId === inst.id ? launch : null;
   const selectTab = (next: Tab): void => {
@@ -98,7 +108,7 @@ export function InstanceDetailView({ id }: { id: string }): JSX.Element {
   }, [inst?.id]);
 
   useEffect(() => {
-    if (!inst || !running) return;
+    if (!inst || !processLive) return;
     let alive = true;
     const refreshQuietly = (): void => {
       void fetchInstanceResources(inst.id)
@@ -121,14 +131,14 @@ export function InstanceDetailView({ id }: { id: string }): JSX.Element {
       alive = false;
       window.clearInterval(timer);
     };
-  }, [inst?.id, running]);
+  }, [inst?.id, processLive]);
 
   useEffect(() => {
-    if (!running) return;
+    if (!playing) return;
     setNow(Date.now());
     const timer = window.setInterval(() => setNow(Date.now()), 1000);
     return () => window.clearInterval(timer);
-  }, [running]);
+  }, [playing]);
 
   if (!inst) {
     return (
@@ -199,7 +209,7 @@ export function InstanceDetailView({ id }: { id: string }): JSX.Element {
   const launchNotice = launchNotices.value[inst.id];
 
   return (
-    <div class="cp-instance-view" data-running={running} style={{ ['--cp-aurora-h' as any]: auroraHue }}>
+    <div class="cp-instance-view" data-running={playing} style={{ ['--cp-aurora-h' as any]: auroraHue }}>
       <div class="cp-instance-stage" aria-hidden="true">
         <div class="cp-instance-aurora-sheet">
           <div class="cp-instance-aurora cp-instance-aurora--b1" />
@@ -224,8 +234,8 @@ export function InstanceDetailView({ id }: { id: string }): JSX.Element {
             </div>
             <h1 class="cp-instance-hero-title">{inst.name}</h1>
             <div class="cp-instance-hero-meta">
-              <span class="cp-instance-status" data-running={running}>
-                {running ? 'Playing now' : 'Ready'}
+              <span class="cp-instance-status" data-running={playing}>
+                {session ? sessionLabel : 'Ready'}
               </span>
               <span>
                 Last played <b>{fmtRelative(inst.last_played_at)}</b>
@@ -237,15 +247,17 @@ export function InstanceDetailView({ id }: { id: string }): JSX.Element {
           </div>
           <div class="cp-instance-hero-actions">
             <div class="cp-instance-launch">
-              {running ? (
+              {sessionActive ? (
                 <div class="cp-session">
                   <span class="cp-session-time">
-                    <span>{fmtElapsed(session?.launchedAt, now)}</span>
+                    <span>{playing ? `${sessionLabel} - ${fmtElapsed(session?.launchedAt, now)}` : sessionLabel}</span>
                   </span>
-                  <button class="cp-session-stop" type="button" onClick={onStop}>
-                    <Icon name="stop" size={13} />
-                    Stop
-                  </button>
+                  {canStop && (
+                    <button class="cp-session-stop" type="button" onClick={onStop}>
+                      <Icon name="stop" size={13} />
+                      Stop
+                    </button>
+                  )}
                 </div>
               ) : (
                 <LaunchSplitButton
@@ -341,7 +353,7 @@ export function InstanceDetailView({ id }: { id: string }): JSX.Element {
           <ScreenshotsPane inst={inst} resources={resources} onRefresh={reloadResources} />
         )}
         {!installLocked && activeTab === 'logs' && (
-          <LogsPane inst={inst} resources={resources} running={running} onRefresh={reloadResources} />
+          <LogsPane inst={inst} resources={resources} processLive={processLive} onRefresh={reloadResources} />
         )}
         {!installLocked && activeTab === 'settings' && <SettingsPane inst={inst} />}
       </div>

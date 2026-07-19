@@ -1,17 +1,21 @@
 use axial_api::app::{ApiServerShutdownError, ServerHandle};
 use axial_config::AppPaths;
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use tokio::sync::watch;
 
 const TERMINAL_STATE_LOCK_INVARIANT: &str =
     "desktop terminal-state lock poisoned; action ownership may be inconsistent";
+const LAUNCH_EVENT_TASK_LOCK_INVARIANT: &str =
+    "desktop launch-event task lock poisoned; stream ownership may be inconsistent";
 
 #[derive(Clone)]
 pub struct DesktopState {
     version: String,
     paths: AppPaths,
     terminal: TerminalActionCoordinator,
+    launch_events: LaunchEventTaskCoordinator,
 }
 
 impl DesktopState {
@@ -20,6 +24,7 @@ impl DesktopState {
             version,
             paths,
             terminal: TerminalActionCoordinator::new(),
+            launch_events: LaunchEventTaskCoordinator::new(),
         }
     }
 
@@ -33,6 +38,141 @@ impl DesktopState {
 
     pub fn terminal(&self) -> &TerminalActionCoordinator {
         &self.terminal
+    }
+
+    pub fn launch_events(&self) -> &LaunchEventTaskCoordinator {
+        &self.launch_events
+    }
+}
+
+#[derive(Clone)]
+pub struct LaunchEventTaskCoordinator {
+    shared: Arc<Mutex<LaunchEventTaskState>>,
+}
+
+struct LaunchEventTaskState {
+    next_owner_id: u64,
+    active: HashMap<String, LaunchEventTaskEntry>,
+}
+
+struct LaunchEventTaskEntry {
+    owner_id: u64,
+    cancel: watch::Sender<bool>,
+    emission_gate: Arc<Mutex<()>>,
+}
+
+pub struct LaunchEventTaskOwner {
+    coordinator: LaunchEventTaskCoordinator,
+    session_id: String,
+    owner_id: u64,
+    cancel: watch::Receiver<bool>,
+    emission_gate: Arc<Mutex<()>>,
+}
+
+impl LaunchEventTaskCoordinator {
+    fn new() -> Self {
+        Self {
+            shared: Arc::new(Mutex::new(LaunchEventTaskState {
+                next_owner_id: 0,
+                active: HashMap::new(),
+            })),
+        }
+    }
+
+    pub fn replace(&self, session_id: String) -> LaunchEventTaskOwner {
+        let (cancel, cancel_receiver) = watch::channel(false);
+        let (owner_id, emission_gate, previous_cancel) = {
+            let mut state = self.shared.lock().expect(LAUNCH_EVENT_TASK_LOCK_INVARIANT);
+            state.next_owner_id = state
+                .next_owner_id
+                .checked_add(1)
+                .expect("desktop launch-event owner id overflowed");
+            let owner_id = state.next_owner_id;
+            let previous = state.active.remove(&session_id);
+            let emission_gate = previous
+                .as_ref()
+                .map(|entry| entry.emission_gate.clone())
+                .unwrap_or_else(|| Arc::new(Mutex::new(())));
+            let previous_cancel = previous.map(|entry| entry.cancel);
+            state.active.insert(
+                session_id.clone(),
+                LaunchEventTaskEntry {
+                    owner_id,
+                    cancel,
+                    emission_gate: emission_gate.clone(),
+                },
+            );
+            (owner_id, emission_gate, previous_cancel)
+        };
+
+        if let Some(previous_cancel) = previous_cancel {
+            previous_cancel.send_replace(true);
+        }
+        {
+            let _emission = emission_gate
+                .lock()
+                .expect(LAUNCH_EVENT_TASK_LOCK_INVARIANT);
+        }
+
+        LaunchEventTaskOwner {
+            coordinator: self.clone(),
+            session_id,
+            owner_id,
+            cancel: cancel_receiver,
+            emission_gate,
+        }
+    }
+
+    fn is_current(&self, session_id: &str, owner_id: u64) -> bool {
+        self.shared
+            .lock()
+            .expect(LAUNCH_EVENT_TASK_LOCK_INVARIANT)
+            .active
+            .get(session_id)
+            .is_some_and(|entry| entry.owner_id == owner_id)
+    }
+
+    fn retire(&self, session_id: &str, owner_id: u64) {
+        let mut state = self.shared.lock().expect(LAUNCH_EVENT_TASK_LOCK_INVARIANT);
+        if state
+            .active
+            .get(session_id)
+            .is_some_and(|entry| entry.owner_id == owner_id)
+        {
+            state.active.remove(session_id);
+        }
+    }
+}
+
+impl LaunchEventTaskOwner {
+    pub async fn cancelled(&mut self) {
+        if *self.cancel.borrow() {
+            return;
+        }
+        let _ = self.cancel.changed().await;
+    }
+
+    pub fn emit_if_current<E>(&self, emit: impl FnOnce() -> Result<(), E>) -> Result<bool, E> {
+        let _emission = self
+            .emission_gate
+            .lock()
+            .expect(LAUNCH_EVENT_TASK_LOCK_INVARIANT);
+        if !self.coordinator.is_current(&self.session_id, self.owner_id) {
+            return Ok(false);
+        }
+        match emit() {
+            Ok(()) => Ok(true),
+            Err(error) => {
+                self.coordinator.retire(&self.session_id, self.owner_id);
+                Err(error)
+            }
+        }
+    }
+}
+
+impl Drop for LaunchEventTaskOwner {
+    fn drop(&mut self) {
+        self.coordinator.retire(&self.session_id, self.owner_id);
     }
 }
 
@@ -236,7 +376,134 @@ impl Drop for TerminalAttemptOwner {
 
 #[cfg(test)]
 mod tests {
-    use super::{TerminalActionCoordinator, TerminalFailure, TerminalIntent};
+    use super::{
+        LaunchEventTaskCoordinator, TerminalActionCoordinator, TerminalFailure, TerminalIntent,
+    };
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn replacing_launch_event_owner_cancels_the_previous_owner() {
+        let coordinator = LaunchEventTaskCoordinator::new();
+        let mut first = coordinator.replace("session".to_string());
+        let second = coordinator.replace("session".to_string());
+
+        first.cancelled().await;
+        assert!(coordinator.is_current("session", second.owner_id));
+        assert!(!coordinator.is_current("session", first.owner_id));
+    }
+
+    #[test]
+    fn stale_launch_event_owner_cannot_emit_or_retire_replacement() {
+        let coordinator = LaunchEventTaskCoordinator::new();
+        let first = coordinator.replace("session".to_string());
+        let second = coordinator.replace("session".to_string());
+        let emitted = AtomicUsize::new(0);
+
+        assert_eq!(
+            first.emit_if_current(|| {
+                emitted.fetch_add(1, Ordering::SeqCst);
+                Ok::<(), ()>(())
+            }),
+            Ok(false)
+        );
+        drop(first);
+        assert!(coordinator.is_current("session", second.owner_id));
+        assert_eq!(
+            second.emit_if_current(|| {
+                emitted.fetch_add(1, Ordering::SeqCst);
+                Ok::<(), ()>(())
+            }),
+            Ok(true)
+        );
+        assert_eq!(emitted.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn replacing_launch_event_owner_waits_for_in_flight_emission() {
+        let coordinator = LaunchEventTaskCoordinator::new();
+        let first = coordinator.replace("session".to_string());
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let emitter = std::thread::spawn(move || {
+            first
+                .emit_if_current(|| {
+                    entered_tx.send(()).expect("signal active emission");
+                    release_rx.recv().expect("release active emission");
+                    Ok::<(), ()>(())
+                })
+                .expect("active emission")
+        });
+        entered_rx.recv().expect("emission entered");
+
+        let replacement_coordinator = coordinator.clone();
+        let (replacement_tx, replacement_rx) = mpsc::channel();
+        let replacement = std::thread::spawn(move || {
+            let owner = replacement_coordinator.replace("session".to_string());
+            assert!(replacement_tx.send(owner).is_ok(), "return replacement");
+        });
+        assert!(
+            replacement_rx
+                .recv_timeout(Duration::from_millis(100))
+                .is_err()
+        );
+
+        release_tx.send(()).expect("release emission");
+        assert!(emitter.join().expect("join emitter"));
+        let second = replacement_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("replacement after emission");
+        replacement.join().expect("join replacement");
+        assert!(coordinator.is_current("session", second.owner_id));
+    }
+
+    #[test]
+    fn launch_event_emit_failure_retires_exact_owner() {
+        let coordinator = LaunchEventTaskCoordinator::new();
+        let owner = coordinator.replace("session".to_string());
+
+        assert_eq!(
+            owner.emit_if_current(|| Err::<(), _>("emit failed")),
+            Err("emit failed")
+        );
+        assert!(!coordinator.is_current("session", owner.owner_id));
+    }
+
+    #[test]
+    fn launch_event_emission_gates_are_independent_per_session() {
+        let coordinator = LaunchEventTaskCoordinator::new();
+        let first = coordinator.replace("first".to_string());
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let emitter = std::thread::spawn(move || {
+            first
+                .emit_if_current(|| {
+                    entered_tx.send(()).expect("signal first emission");
+                    release_rx.recv().expect("release first emission");
+                    Ok::<(), ()>(())
+                })
+                .expect("first emission")
+        });
+        entered_rx.recv().expect("first emission entered");
+
+        let other = coordinator.replace("other".to_string());
+        assert!(coordinator.is_current("other", other.owner_id));
+
+        release_tx.send(()).expect("release first emission");
+        assert!(emitter.join().expect("join first emitter"));
+    }
+
+    #[test]
+    fn dropping_current_launch_event_owner_retires_it() {
+        let coordinator = LaunchEventTaskCoordinator::new();
+        let owner = coordinator.replace("session".to_string());
+        let owner_id = owner.owner_id;
+
+        drop(owner);
+
+        assert!(!coordinator.is_current("session", owner_id));
+    }
 
     #[tokio::test]
     async fn same_intent_joins_one_active_attempt() {

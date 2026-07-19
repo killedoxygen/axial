@@ -6,7 +6,7 @@ use crate::observability::{
     RedactionAudience, sanitize_evidence_token, sanitize_public_diagnostic_text,
 };
 use crate::state::launch_reports::LaunchProofContext;
-use crate::state::{AppState, LaunchStatusEvent};
+use crate::state::{AppState, LaunchFailureTerminalizationLease, LaunchStatusEvent};
 use axial_launcher::{LaunchFailureClass, LaunchSessionOutcome, failure_class_name};
 
 const LIVE_LAUNCH_FAILURE_MAX_CHARS: usize = 180;
@@ -64,6 +64,7 @@ pub(super) async fn fail_launch(
 pub(super) async fn fail_launch_for_journal(
     state: &AppState,
     producer: &crate::state::ProducerLease,
+    terminalization: &mut LaunchFailureTerminalizationLease,
     session_id: &str,
     message: &str,
     healing: Option<axial_launcher::LaunchHealingSummary>,
@@ -83,6 +84,7 @@ pub(super) async fn fail_launch_for_journal(
         },
     )
     .await;
+    terminalization.release_lifecycle_guard();
     persist_launch_proof_with_context(state, producer, session_id, None, "failed", None).await;
     LaunchRequestError {
         message: public_message,
@@ -91,7 +93,9 @@ pub(super) async fn fail_launch_for_journal(
     }
 }
 
-pub fn sanitize_live_launch_failure_message(message: &str) -> String {
+pub(in crate::application::launch) fn sanitize_live_launch_failure_message(
+    message: &str,
+) -> String {
     // the Rosetta hint's `--` flags trip the sensitive-text heuristic, so
     // rebuild a trusted message instead of losing the guidance
     if let Some(public_message) = rosetta_required_launch_failure_message(message) {
@@ -264,7 +268,7 @@ mod tests {
         let failure_detail = match status_event {
             LaunchEvent::Status(status) => {
                 assert_eq!(status.state, "exited");
-                status.failure_detail.expect("failure detail")
+                status.status.failure_detail.expect("failure detail")
             }
             other => panic!("expected status event, got {other:?}"),
         };

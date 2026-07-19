@@ -1,5 +1,25 @@
-import type { LaunchActionState, LaunchNotice, LaunchNoticeTone } from './types-launch';
+import type { LaunchActionState, LaunchNotice, LaunchNoticeTone, LaunchSession } from './types-launch';
 import type { LaunchState } from './store';
+
+type LaunchSessionPresentationInput = Pick<LaunchSession, 'viewModel'>;
+
+export function launchSessionIsPlaying(session: LaunchSessionPresentationInput | undefined): boolean {
+  return session?.viewModel?.playing === true;
+}
+
+export function launchSessionCanStop(session: LaunchSessionPresentationInput | undefined): boolean {
+  return session?.viewModel?.can_stop === true;
+}
+
+export function launchSessionHasLiveProcess(session: LaunchSessionPresentationInput | undefined): boolean {
+  return session?.viewModel?.process_live === true;
+}
+
+export function launchSessionActivityLabel(session: LaunchSessionPresentationInput | undefined): string {
+  const backendLabel = session?.viewModel?.label.trim();
+  if (backendLabel) return backendLabel;
+  return 'Preparing launch';
+}
 
 function launchNoticeIcon(tone: LaunchNoticeTone): string {
   if (tone === 'success') return 'check-circle';

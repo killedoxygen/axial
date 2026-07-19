@@ -4,6 +4,7 @@ use super::contracts::{
     StabilizationSystem, TargetDescriptor, TargetKind,
 };
 use super::failure_memory::FailureMemoryStoreError;
+use super::sessions::{RecoveringSessionMutationScope, SharedComponentMutationLease};
 use super::{
     AppState, KnownGoodVerificationLease, KnownGoodVerificationUnavailable,
     OperationJournalStoreError, ReconciliationAttemptReservation, ReconciliationEvidenceRejection,
@@ -226,7 +227,8 @@ pub(crate) struct RegisteredArtifactRepairAdmission {
     inventory: Arc<axial_minecraft::known_good::KnownGoodInventory>,
     mutation: RegisteredArtifactMutationCapability,
     plan: RegisteredArtifactRepairPlan,
-    _component_mutation: super::sessions::SharedComponentMutationLease,
+    recovery_scope: Option<RecoveringSessionMutationScope>,
+    _component_mutation: SharedComponentMutationLease,
     _config_mutation: tokio::sync::OwnedMutexGuard<()>,
     #[cfg(test)]
     lifetime: Arc<()>,
@@ -651,8 +653,9 @@ impl RegisteredArtifactRepairAdmission {
         if !receipt.matches_failed_attempt(&self.attempt) {
             return Err(ReconciliationEvidenceRejection::JournalMismatch);
         }
+        let recovery_scope = self.recovery_scope;
         self.authority
-            .into_registered_artifact_failed_repair(&self.attempt)
+            .into_registered_artifact_failed_repair(&self.attempt, recovery_scope)
     }
 }
 
@@ -749,6 +752,38 @@ impl AppState {
         operation_id: OperationId,
         suppression_for: chrono::Duration,
     ) -> Result<RegisteredArtifactRepairAdmission, ReconciliationEvidenceRejection> {
+        self.admit_registered_artifact_repair_with_recovery_scope(
+            authorization,
+            operation_id,
+            suppression_for,
+            None,
+        )
+        .await
+    }
+
+    pub(crate) async fn admit_launch_registered_artifact_repair(
+        &self,
+        authorization: RegisteredArtifactRepairAuthorization,
+        operation_id: OperationId,
+        suppression_for: chrono::Duration,
+        recovery_scope: RecoveringSessionMutationScope,
+    ) -> Result<RegisteredArtifactRepairAdmission, ReconciliationEvidenceRejection> {
+        self.admit_registered_artifact_repair_with_recovery_scope(
+            authorization,
+            operation_id,
+            suppression_for,
+            Some(recovery_scope),
+        )
+        .await
+    }
+
+    async fn admit_registered_artifact_repair_with_recovery_scope(
+        &self,
+        authorization: RegisteredArtifactRepairAuthorization,
+        operation_id: OperationId,
+        suppression_for: chrono::Duration,
+        recovery_scope: Option<RecoveringSessionMutationScope>,
+    ) -> Result<RegisteredArtifactRepairAdmission, ReconciliationEvidenceRejection> {
         let (findings, observation, diagnosis_id, action, target) = authorization.into_parts();
         if action != GuardianActionKind::Repair
             || findings.target_for(observation) != Some(&target)
@@ -766,11 +801,15 @@ impl AppState {
             .acquire_mutation()
             .await
             .map_err(|_| ReconciliationEvidenceRejection::RootAuthorityUnavailable)?;
-        let component_mutation = self
-            .sessions
-            .acquire_shared_component_mutation()
-            .await
-            .ok_or(ReconciliationEvidenceRejection::ActiveSession)?;
+        let component_mutation = match recovery_scope.as_ref() {
+            Some(scope) => {
+                self.sessions
+                    .acquire_recovering_component_mutation(scope)
+                    .await
+            }
+            None => self.sessions.acquire_shared_component_mutation().await,
+        }
+        .ok_or(ReconciliationEvidenceRejection::ActiveSession)?;
 
         if !self.registered_artifact_findings_can_admit(&findings)
             || !Arc::ptr_eq(&inventory, &findings.authority.inventory)
@@ -860,6 +899,7 @@ impl AppState {
             inventory,
             mutation,
             plan,
+            recovery_scope,
             _component_mutation: component_mutation,
             _config_mutation: config_mutation,
             #[cfg(test)]

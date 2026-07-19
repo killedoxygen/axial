@@ -24,7 +24,7 @@ mod reports;
 mod runner;
 mod session;
 
-pub(crate) use crate::guardian::{launch_notice, launch_notice_from_values};
+pub(crate) use crate::guardian::launch_notice;
 
 pub(crate) use super::performance::BenchmarkMatrix;
 pub(crate) use benchmark::*;
@@ -33,23 +33,17 @@ pub(crate) use reports::{
     LAUNCH_COMMAND_REDACTED_VALUE, LAUNCH_KILL_INTERNAL_ERROR_MESSAGE,
     LAUNCH_KILL_NO_PROCESS_MESSAGE, launch_kill_error_response, sanitize_launch_command,
 };
-pub use reports::{LaunchStatusViewModel, public_launch_status_json};
+pub use reports::{LaunchStatusViewModel, PublicLaunchStatus, public_launch_status};
 pub(crate) use reports::{
-    launch_command_payload, launch_report_payload, launch_reports_payload, launch_status_payload,
+    launch_command_payload, launch_report_payload, launch_reports_payload, launch_status,
     stop_launch_session,
 };
+pub(crate) use runner::LaunchRequestError;
 pub(crate) use runner::launch_session;
 #[cfg(all(test, unix))]
 pub(crate) use runner::launch_session_with_persisted_runtime_manifest_for_test;
-pub use runner::{
-    LaunchRequestError, LaunchSuccess, sanitize_live_launch_failure_message, trace_launch_event,
-};
+use runner::{LaunchSuccess, sanitize_live_launch_failure_message, trace_launch_event};
 
-pub fn snapshot_status(
-    record: &axial_launcher::LaunchSessionRecord,
-) -> axial_launcher::LaunchStatusEvent {
-    crate::guardian::launch_status_snapshot(record)
-}
 #[cfg(all(test, unix))]
 use session::prepare_launch_session;
 #[cfg(test)]
@@ -163,49 +157,19 @@ pub(crate) fn launch_benchmark_status_payload(
     payload
 }
 
-pub fn launch_success_response_payload(launched: &LaunchSuccess) -> Value {
-    let view_model = LaunchStatusViewModel::for_state("queued");
-    json!({
-        "status": "launching",
-        "state": "queued",
-        "session_id": &launched.session_id,
-        "instance_id": &launched.instance_id,
-        "pid": launched.pid,
-        "launched_at": &launched.launched_at,
-        "max_memory_mb": launched.max_memory_mb,
-        "min_memory_mb": launched.min_memory_mb,
-        "healing": &launched.healing,
-        "guardian": &launched.guardian,
-        "notice": launch_notice(
-            launched.guardian.as_ref(),
-            launched.healing.as_ref(),
-            None,
-            None,
-            None,
-        ),
-        "view_model": view_model,
-    })
+pub(crate) fn launch_prepared_response_payload(
+    task: &LaunchSessionTask,
+    status: &PublicLaunchStatus,
+) -> Value {
+    let mut response = json!(status);
+    response["instance_id"] = json!(&task.intent.instance_id);
+    response["launched_at"] = json!(&task.launched_at);
+    response["max_memory_mb"] = json!(task.intent.max_memory_mb);
+    response["min_memory_mb"] = json!(task.intent.min_memory_mb);
+    response
 }
 
-pub(crate) fn launch_prepared_response_payload(task: &LaunchSessionTask) -> Value {
-    let view_model = LaunchStatusViewModel::for_state("queued");
-    json!({
-        "status": "launching",
-        "state": "queued",
-        "session_id": &task.intent.session_id,
-        "instance_id": &task.intent.instance_id,
-        "pid": null,
-        "launched_at": &task.launched_at,
-        "max_memory_mb": task.intent.max_memory_mb,
-        "min_memory_mb": task.intent.min_memory_mb,
-        "healing": null,
-        "guardian": &task.guardian,
-        "notice": launch_notice(Some(&task.guardian), None, None, None, None),
-        "view_model": view_model,
-    })
-}
-
-pub fn launch_request_error_response_payload(error: &LaunchRequestError) -> Value {
+fn launch_request_error_response_payload(error: &LaunchRequestError) -> Value {
     let public_message = sanitize_live_launch_failure_message(&error.message);
     let notice = launch_notice(
         error.guardian.as_ref(),
@@ -222,12 +186,12 @@ pub fn launch_request_error_response_payload(error: &LaunchRequestError) -> Valu
     })
 }
 
-pub fn launch_request_error_response(error: LaunchRequestError) -> LaunchApplicationError {
+pub(crate) fn launch_request_error_response(error: LaunchRequestError) -> LaunchApplicationError {
     let status = launch_request_error_status(&error);
     (status, Json(launch_request_error_response_payload(&error)))
 }
 
-pub fn launch_request_error_status(error: &LaunchRequestError) -> StatusCode {
+pub(crate) fn launch_request_error_status(error: &LaunchRequestError) -> StatusCode {
     if error
         .guardian
         .as_ref()

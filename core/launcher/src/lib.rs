@@ -36,7 +36,7 @@ pub use jvm::{
 pub use process::{
     LaunchEvent, LaunchLogEvent, LaunchNotice, LaunchNoticeTone, LaunchPriorityEvidence,
     LaunchSessionExitReason, LaunchSessionOutcome, LaunchSessionOutcomeKind, LaunchSessionRecord,
-    LaunchStageEvidence, LaunchStageRecord, LaunchStatusEvent,
+    LaunchStageEvidence, LaunchStageRecord, LaunchStatusEvent, RevisionedLaunchStatus,
 };
 pub use readiness::{
     LaunchReadiness, LaunchReadinessReason, LaunchReadinessReasonId, LaunchReadinessRequest,

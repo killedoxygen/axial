@@ -2,7 +2,6 @@ use axial_config::{AppConfig, Instance};
 use axial_launcher::{GuardianMode, LAUNCH_MEMORY_HEADROOM_MB, OverrideOrigin, SessionId};
 use axial_minecraft::{VersionEntry, compare_version_like};
 use std::cmp::Ordering;
-use std::time::SystemTime;
 
 const BUILT_IN_MAX_MEMORY_MB: i32 = 4096;
 const BUILT_IN_MIN_MEMORY_MB: i32 = 512;
@@ -243,17 +242,29 @@ pub(super) fn raw_jvm_args_origin(instance: &Instance) -> Option<OverrideOrigin>
 }
 
 pub(super) fn generate_session_id() -> SessionId {
-    let nanos = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map(|value| value.as_nanos())
-        .unwrap_or_default();
-    SessionId(format!("{:032x}", nanos))
+    SessionId(uuid::Uuid::new_v4().to_string())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use axial_minecraft::build_id_for;
+    use std::collections::HashSet;
+    use uuid::Version;
+
+    #[test]
+    fn generated_session_ids_are_unique_uuid_v4_values() {
+        let ids = (0..1_024)
+            .map(|_| generate_session_id().0)
+            .collect::<HashSet<_>>();
+
+        assert_eq!(ids.len(), 1_024);
+        for id in ids {
+            let parsed = uuid::Uuid::parse_str(&id).expect("parse generated session UUID");
+            assert_eq!(parsed.get_version(), Some(Version::Random));
+            assert_eq!(parsed.to_string(), id);
+        }
+    }
 
     #[test]
     fn explicit_instance_memory_takes_precedence_over_request_and_derived_defaults() {

@@ -87,7 +87,9 @@ async fn handle_launch(
         .try_claim()
         .map_err(launch_app::launch_shutdown_error_response)?;
     let prepared = launch_app::prepare_launch_session_owned(&state, payload, &producer).await?;
-    let response = launch_app::launch_prepared_response_payload(&prepared.task);
+    let initial_status =
+        launch_app::launch_status(&state, &prepared.task.intent.session_id).await?;
+    let response = launch_app::launch_prepared_response_payload(&prepared.task, &initial_status);
     spawn_launch_session(state, prepared.task, producer);
 
     Ok(Json(response))
@@ -240,6 +242,7 @@ async fn handle_launch_report(
 
 async fn handle_launch_events(
     State(state): State<AppState>,
+    Extension(handoff): Extension<RequestProducerHandoff>,
     Path(id): Path<String>,
 ) -> Result<
     axum::response::sse::Sse<
@@ -247,7 +250,10 @@ async fn handle_launch_events(
     >,
     (StatusCode, Json<serde_json::Value>),
 > {
-    stream::launch_events_sse(state, id).await
+    let producer = handoff
+        .try_claim()
+        .map_err(super::producer_claim_error_response)?;
+    stream::launch_events_sse(state, id, producer).await
 }
 
 async fn handle_launch_command(
@@ -262,10 +268,8 @@ async fn handle_launch_command(
 async fn handle_launch_status(
     State(state): State<AppState>,
     Path(id): Path<String>,
-) -> Result<Json<serde_json::Value>, launch_app::LaunchApplicationError> {
-    launch_app::launch_status_payload(&state, &id)
-        .await
-        .map(Json)
+) -> Result<Json<launch_app::PublicLaunchStatus>, launch_app::LaunchApplicationError> {
+    launch_app::launch_status(&state, &id).await.map(Json)
 }
 
 async fn handle_launch_kill(

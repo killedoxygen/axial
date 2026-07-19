@@ -23,6 +23,21 @@ use std::{
     sync::Arc,
 };
 
+#[test]
+fn duplicate_session_admission_maps_to_bounded_internal_error() {
+    let (status, body) = launch_session_admission_error_response(
+        crate::state::SessionAdmissionError::DuplicateSessionId,
+    );
+
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(
+        body.0,
+        serde_json::json!({
+            "error": "Could not reserve a unique launch session. Try again."
+        })
+    );
+}
+
 mod errors;
 mod overrides;
 mod prepare;

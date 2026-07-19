@@ -211,6 +211,7 @@ impl ProcessTerminationRequest {
         reap_acceptance(&reaped)
     }
 
+    #[cfg(test)]
     pub(super) async fn reaped(&mut self) -> io::Result<ProcessTerminationAcceptance> {
         let acceptance = self.accepted().await?;
         if self.reaped.borrow().is_none() {
@@ -770,11 +771,7 @@ async fn settle_process_exit(
 ) {
     if matches!(
         requested_cause,
-        Some(
-            ProcessTerminalCause::LaunchFailure
-                | ProcessTerminalCause::Replacement
-                | ProcessTerminalCause::Shutdown
-        )
+        Some(ProcessTerminalCause::LaunchFailure | ProcessTerminalCause::Replacement)
     ) {
         return;
     }
@@ -862,7 +859,10 @@ async fn settle_process_exit(
         exit_code,
         crash_evidence.as_ref(),
     );
-    let failure_class = if requested_cause == Some(ProcessTerminalCause::UserStop) {
+    let failure_class = if matches!(
+        requested_cause,
+        Some(ProcessTerminalCause::UserStop | ProcessTerminalCause::Shutdown)
+    ) {
         None
     } else if force_unknown {
         Some(LaunchFailureClass::Unknown)
@@ -870,29 +870,38 @@ async fn settle_process_exit(
         fused_failure
     }
     .map(|failure| failure.as_str().to_string());
-    store
-        .emit_status_for_attempt(
-            session_id,
-            attempt,
-            LaunchStatusEvent {
-                state: "exited".to_string(),
-                benchmark: None,
-                pid: None,
-                exit_code,
-                failure_class,
-                failure_detail,
-                crash_evidence,
-                healing: exit_context.record.healing.clone(),
-                guardian: exit_context.record.guardian.clone(),
-                outcome: (requested_cause == Some(ProcessTerminalCause::UserStop)).then(|| {
-                    LaunchSessionOutcome::from_reason(LaunchSessionExitReason::LauncherStopped)
-                }),
-                notice: None,
-                evidence,
-                stages: Vec::new(),
-            },
-        )
-        .await;
+    let settlement = LaunchStatusEvent {
+        state: "exited".to_string(),
+        benchmark: None,
+        pid: None,
+        exit_code,
+        failure_class,
+        failure_detail,
+        crash_evidence,
+        healing: exit_context.record.healing.clone(),
+        guardian: exit_context.record.guardian.clone(),
+        outcome: (requested_cause == Some(ProcessTerminalCause::UserStop))
+            .then(|| LaunchSessionOutcome::from_reason(LaunchSessionExitReason::LauncherStopped)),
+        notice: None,
+        evidence,
+        stages: Vec::new(),
+    };
+    if requested_cause == Some(ProcessTerminalCause::UserStop) {
+        store
+            .record_user_stop_intent_for_attempt(session_id, attempt)
+            .await;
+        store
+            .emit_process_settlement_for_attempt(session_id, attempt, settlement)
+            .await;
+    } else if requested_cause == Some(ProcessTerminalCause::Shutdown) {
+        store
+            .settle_shutdown_process_exit_for_attempt(session_id, attempt, settlement)
+            .await;
+    } else {
+        store
+            .settle_natural_process_exit_for_attempt(session_id, attempt, settlement)
+            .await;
+    }
 }
 
 fn should_collect_crash_artifact(
@@ -916,13 +925,13 @@ async fn settle_watchdog_exit(
         return;
     };
     store
-        .emit_status_for_attempt(
+        .emit_process_settlement_for_attempt(
             session_id,
             attempt,
             LaunchStatusEvent {
-                state: "exited".to_string(),
+                state: "recovering".to_string(),
                 benchmark: None,
-                pid: exit_context.record.pid,
+                pid: None,
                 exit_code: Some(-1),
                 failure_class: Some("startup_stalled".to_string()),
                 failure_detail: Some("no startup activity observed".to_string()),
@@ -1448,9 +1457,9 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn watchdog_settles_terminal_status_before_output_drain_under_log_lock() {
+    async fn watchdog_settles_recovery_status_before_output_drain_under_log_lock() {
         let store = Arc::new(SessionStore::new());
-        let session_id = "watchdog-terminal-before-drain";
+        let session_id = "watchdog-recovery-before-drain";
         let mut record = test_record(session_id);
         record.state = LaunchState::Starting;
         store.insert(record).await.expect("insert session");
@@ -1492,11 +1501,8 @@ mod tests {
         let super::super::LaunchEvent::Status(status) = event else {
             panic!("expected watchdog status");
         };
-        assert_eq!(status.state, "exited");
-        assert_eq!(
-            status.outcome.as_ref().expect("watchdog outcome").reason,
-            LaunchSessionExitReason::WatchdogKilled
-        );
+        assert_eq!(status.state, "recovering");
+        assert_eq!(status.outcome, None);
         assert!(!*control.completed.borrow());
 
         drop(log_transition);
@@ -1782,6 +1788,10 @@ mod tests {
     async fn shutdown_awaits_successful_owners_and_preserves_sessions_after_any_rejection() {
         let store = Arc::new(SessionStore::new());
         let session_id = "shutdown-mixed-owner-results";
+        store
+            .insert(test_record(session_id))
+            .await
+            .expect("insert shutdown session");
         let mut command = Command::new("sh");
         command.arg("-c").arg("exec sleep 30");
         let launched = store
@@ -1818,6 +1828,10 @@ mod tests {
     async fn cancelled_shutdown_caller_does_not_cancel_the_owned_coordinator() {
         let store = Arc::new(SessionStore::new());
         let session_id = "shutdown-caller-cancelled";
+        store
+            .insert(test_record(session_id))
+            .await
+            .expect("insert shutdown session");
         let mut command = Command::new("sh");
         command.arg("-c").arg("exec sleep 30");
         store
@@ -1845,13 +1859,18 @@ mod tests {
         assert!(!sessions.is_empty());
         drop(sessions);
 
-        let lifecycle = store.lifecycle_transition.clone().lock_owned();
-        let lifecycle = tokio::time::timeout(Duration::from_secs(2), lifecycle)
-            .await
-            .expect("detached coordinator completion");
-        assert!(store.active_processes.lock().await.is_empty());
-        assert!(store.sessions.read().await.is_empty());
-        drop(lifecycle);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if store.active_processes.lock().await.is_empty()
+                    && store.sessions.read().await.is_empty()
+                {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("detached coordinator completion");
     }
 
     #[cfg(unix)]

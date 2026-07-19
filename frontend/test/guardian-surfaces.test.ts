@@ -1,7 +1,14 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { clearLaunchNotice, confirmLaunch, setLaunchNotice, updateRunningSessionState } from '../src/actions';
+import {
+  clearLaunchNotice,
+  confirmLaunch,
+  convergeLaunchStatus,
+  endSessionIfCurrent,
+  setLaunchNotice,
+  updateLaunchSessionState,
+} from '../src/actions';
 import {
   createNoticePresentation,
   createResultToastMessage,
@@ -21,16 +28,23 @@ import {
   unresolvedFailureViewModel,
 } from '../src/machines/download-view-models';
 import { backendLaunchNotice, createBackendLaunchNoticeTracker } from '../src/launch-notice-tracker';
-import { launchActionPresentation, launchNoticePresentation } from '../src/launch-presenters';
+import { establishNativeLaunchTransport, type LaunchLiveHandle } from '../src/launch-live-transport';
+import {
+  launchActionPresentation,
+  launchNoticePresentation,
+  launchSessionActivityLabel,
+  launchSessionCanStop,
+  launchSessionHasLiveProcess,
+  launchSessionIsPlaying,
+} from '../src/launch-presenters';
 import { launchProofGuardianEvidence } from '../src/launch-proof-presenters';
-import { launchSessionOutcome, launchStatusViewModel } from '../src/launch-response-adapters';
+import { launchSessionOutcome, launchStatusUpdate, launchStatusViewModel } from '../src/launch-response-adapters';
 import { performanceHealthNotice } from '../src/performance-presenters';
 import { GUARDIAN_OPTIONS, guardianModeFrom } from '../src/guardian-settings';
-import { launchNotices, runningSessions } from '../src/store';
+import { launchNotices, launchSessions } from '../src/store';
 import { startupWarningMessages } from '../src/startup-warnings';
-import type { GuardianSummary } from '../src/types-guardian';
 import type { InstallFailureViewModel, InstallItem, InstallQueueNoticeViewModel } from '../src/types-install';
-import type { LaunchHealingSummary, LaunchNotice, RunningSession } from '../src/types-launch';
+import type { LaunchNotice, LaunchSession, LaunchStatusViewModel } from '../src/types-launch';
 
 const sensitiveFragments = [
   '/home/alice/.axial',
@@ -43,6 +57,39 @@ const sensitiveFragments = [
 
 type LaunchProofFixture = Parameters<typeof launchProofGuardianEvidence>[0] & Record<string, unknown>;
 type PerformanceHealthFixture = NonNullable<Parameters<typeof performanceHealthNotice>[0]> & Record<string, unknown>;
+
+function launchViewModel(
+  stateId: string,
+  label: string,
+  overrides: Partial<LaunchStatusViewModel> = {},
+): LaunchStatusViewModel {
+  return {
+    state_id: stateId,
+    label,
+    progress_pct: 88,
+    terminal: false,
+    playing: false,
+    process_live: false,
+    can_stop: false,
+    ...overrides,
+  };
+}
+
+function launchWireStatus(
+  sessionId: string,
+  revision: number,
+  viewModel: unknown,
+  outcome: unknown = null,
+  notice: unknown = null,
+): Record<string, unknown> {
+  return {
+    session_id: sessionId,
+    revision,
+    view_model: viewModel,
+    notice,
+    outcome,
+  };
+}
 
 function assertExcludesSensitive(value: unknown): void {
   const serialized = JSON.stringify(value);
@@ -303,35 +350,19 @@ test('launch action presentation follows backend launch, install, blocked, queue
   assert.equal(progress.disabled, true);
 });
 
-test('Guardian and Healing session evidence survives status patches while notices dismiss independently', () => {
-  runningSessions.value = {};
+test('launch session patches and notice dismissal remain independently scoped', () => {
+  launchSessions.value = {};
   launchNotices.value = {};
-  const guardian: GuardianSummary = {
-    mode: 'managed',
-    decision: 'intervened',
-    message: 'Guardian adjusted the launch.',
-    details: ['Backend Guardian detail.'],
-  };
-  const healing: LaunchHealingSummary = {
-    fallback_applied: 'safe_runtime',
-    warnings: ['Backend Healing detail.'],
-    retry_count: 1,
-  };
-  const session: RunningSession = {
+  const session: LaunchSession = {
     sessionId: 'session-a',
-    versionId: '1.21.6',
-    pid: 0,
-    state: 'queued',
     launchedAt: '2026-07-17T00:00:00.000Z',
-    allocatedMB: 4096,
-    guardian,
-    healing,
+    viewModel: launchViewModel('queued', 'Preparing launch', { progress_pct: 8 }),
+    statusRevision: 0,
   };
 
   confirmLaunch('instance-a', session);
-  updateRunningSessionState('instance-a', { state: 'running', pid: 1234 });
-  assert.equal(runningSessions.value['instance-a']?.guardian, guardian);
-  assert.equal(runningSessions.value['instance-a']?.healing, healing);
+  updateLaunchSessionState('instance-a', { stopping: true });
+  assert.equal(launchSessions.value['instance-a']?.viewModel?.label, 'Preparing launch');
 
   const first: LaunchNotice = { message: 'First backend notice', tone: 'warned' };
   const second: LaunchNotice = { message: 'Second backend notice', tone: 'intervened' };
@@ -341,7 +372,7 @@ test('Guardian and Healing session evidence survives status patches while notice
   assert.equal(launchNotices.value['instance-a'], undefined);
   assert.equal(launchNotices.value['instance-b'], second);
 
-  runningSessions.value = {};
+  launchSessions.value = {};
   launchNotices.value = {};
 });
 
@@ -352,9 +383,20 @@ test('launch status and outcome adapters accept only bounded typed display field
       label: 'Backend preparation copy',
       progress_pct: 140,
       terminal: false,
+      playing: false,
+      process_live: true,
+      can_stop: true,
       raw_error: sensitiveFragments.join(' '),
     }),
-    { state_id: 'preparing_launch', label: 'Backend preparation copy', progress_pct: 100, terminal: false },
+    {
+      state_id: 'preparing_launch',
+      label: 'Backend preparation copy',
+      progress_pct: 100,
+      terminal: false,
+      playing: false,
+      process_live: true,
+      can_stop: true,
+    },
   );
   const outcome = launchSessionOutcome({
     reason: 'startup_failed',
@@ -366,6 +408,184 @@ test('launch status and outcome adapters accept only bounded typed display field
   assertExcludesSensitive(outcome);
   assert.equal(launchSessionOutcome({ reason: 'startup_failed', kind: 'fatal', summary: 'No' }), undefined);
   assert.equal(launchSessionOutcome({ reason: 'made_up_reason', kind: 'failed', summary: 'No' }), undefined);
+});
+
+test('launch status parsing is atomic and terminality remains backend-authored', () => {
+  const recovery = launchStatusUpdate(
+    launchWireStatus('terminal-session', 2, launchViewModel('recovering', 'Recovering startup')),
+    'terminal-session',
+  );
+  assert.equal(recovery?.viewModel.terminal, false);
+
+  const rawTerminal = launchWireStatus(
+    'terminal-session',
+    3,
+    launchViewModel('failed', 'Guardian is still settling', { progress_pct: 100 }),
+  );
+  rawTerminal.state = 'failed';
+  assert.equal(launchStatusUpdate(rawTerminal, 'terminal-session')?.viewModel.terminal, false);
+
+  const terminal = launchStatusUpdate(
+    launchWireStatus(
+      'terminal-session',
+      4,
+      launchViewModel('failed', 'Launch failed', { progress_pct: 100, terminal: true }),
+      { reason: 'startup_failed', kind: 'failed', summary: 'Backend terminal summary.' },
+    ),
+    'terminal-session',
+  );
+  assert.equal(terminal?.viewModel.terminal, true);
+  assert.equal(terminal?.outcome?.summary, 'Backend terminal summary.');
+
+  const malformedHigherRevision = launchWireStatus('terminal-session', 5, {
+    ...launchViewModel('exited', 'Exited', { terminal: true }),
+    can_stop: undefined,
+  });
+  assert.equal(launchStatusUpdate(malformedHigherRevision, 'terminal-session'), null);
+  assert.equal(launchStatusUpdate(launchWireStatus('other-session', 6, terminal!.viewModel), 'terminal-session'), null);
+
+  const session: LaunchSession = {
+    sessionId: 'terminal-session',
+    launchedAt: '2026-07-17T00:00:00.000Z',
+    viewModel: terminal!.viewModel,
+    statusRevision: 1,
+  };
+  launchSessions.value = { 'instance-a': session };
+  assert.equal(endSessionIfCurrent('instance-a', 'terminal-session'), true);
+  assert.equal(endSessionIfCurrent('instance-a', 'terminal-session'), false);
+  assert.equal(launchSessions.value['instance-a'], undefined);
+});
+
+test('launch session presentation distinguishes active recovery from a live process', () => {
+  const session = (state: string, viewModel: LaunchStatusViewModel): LaunchSession => ({
+    sessionId: `session-${state}`,
+    launchedAt: '2026-07-17T00:00:00.000Z',
+    viewModel,
+    statusRevision: 0,
+  });
+
+  const recovering = session('recovering', launchViewModel('recovering', 'Guardian is repairing startup'));
+  assert.equal(launchSessionIsPlaying(recovering), false);
+  assert.equal(launchSessionCanStop(recovering), false);
+  assert.equal(launchSessionHasLiveProcess(recovering), false);
+  assert.equal(launchSessionActivityLabel(recovering), 'Guardian is repairing startup');
+
+  for (const state of ['queued', 'planning', 'preparing', 'settling']) {
+    const label = state === 'settling' ? 'Finalizing session' : 'Preparing launch';
+    const current = session(state, launchViewModel(state, label));
+    assert.equal(launchSessionIsPlaying(current), false, state);
+    assert.equal(launchSessionCanStop(current), false, state);
+    assert.equal(launchSessionHasLiveProcess(current), false, state);
+  }
+  for (const state of ['starting', 'monitoring']) {
+    const current = session(
+      state,
+      launchViewModel(state, 'Starting Minecraft', { process_live: true, can_stop: true }),
+    );
+    assert.equal(launchSessionIsPlaying(current), false, state);
+    assert.equal(launchSessionCanStop(current), true, state);
+    assert.equal(launchSessionHasLiveProcess(current), true, state);
+  }
+  for (const state of ['running', 'degraded']) {
+    const label = state === 'degraded' ? 'Running with warnings' : 'Playing';
+    const current = session(
+      state,
+      launchViewModel(state, label, { playing: true, process_live: true, can_stop: true }),
+    );
+    assert.equal(launchSessionIsPlaying(current), true, state);
+    assert.equal(launchSessionCanStop(current), true, state);
+    assert.equal(launchSessionHasLiveProcess(current), true, state);
+    assert.equal(launchSessionActivityLabel(current), label);
+  }
+});
+
+test('launch session convergence rejects stale, malformed, and replacement-session updates atomically', () => {
+  const session: LaunchSession = {
+    sessionId: 'ordered-session',
+    launchedAt: '2026-07-17T00:00:00.000Z',
+    viewModel: launchViewModel('monitoring', 'Monitoring startup', { process_live: true, can_stop: true }),
+    statusRevision: 7,
+  };
+  launchSessions.value = { 'instance-a': session };
+
+  assert.equal(
+    convergeLaunchStatus(
+      'instance-a',
+      'ordered-session',
+      launchWireStatus(
+        'ordered-session',
+        7,
+        launchViewModel('exited', 'Exited', { progress_pct: 100, terminal: true }),
+        { reason: 'clean_exit', kind: 'clean', summary: 'Minecraft closed normally.' },
+      ),
+    ),
+    null,
+  );
+  assert.equal(
+    convergeLaunchStatus(
+      'instance-a',
+      'ordered-session',
+      launchWireStatus('ordered-session', 8, {
+        ...launchViewModel('recovering', 'Recovering startup'),
+        can_stop: undefined,
+      }),
+    ),
+    null,
+  );
+  assert.equal(launchSessions.value['instance-a']?.statusRevision, 7);
+  const recovery = convergeLaunchStatus(
+    'instance-a',
+    'ordered-session',
+    launchWireStatus('ordered-session', 8, launchViewModel('recovering', 'Recovering startup')),
+  );
+  assert.equal(recovery?.revision, 8);
+  assert.equal(launchSessions.value['instance-a']?.viewModel.state_id, 'recovering');
+  assert.equal(launchSessions.value['instance-a']?.statusRevision, 8);
+  assert.equal(
+    convergeLaunchStatus(
+      'instance-a',
+      'ordered-session',
+      launchWireStatus(
+        'other-session',
+        9,
+        launchViewModel('running', 'Running', { playing: true, process_live: true, can_stop: true }),
+      ),
+    ),
+    null,
+  );
+  const running = convergeLaunchStatus(
+    'instance-a',
+    'ordered-session',
+    launchWireStatus(
+      'ordered-session',
+      9,
+      launchViewModel('running', 'Running', { playing: true, process_live: true, can_stop: true }),
+      null,
+      { message: 'Guardian completed recovery.', tone: 'success' },
+    ),
+  );
+  assert.equal(running?.notice?.message, 'Guardian completed recovery.');
+  assert.equal(launchSessions.value['instance-a']?.viewModel.playing, true);
+  launchSessions.value = {};
+});
+
+test('native launch bridge failure closes native listeners but preserves polling convergence', async () => {
+  const closed: string[] = [];
+  const handle = (name: string): LaunchLiveHandle => ({
+    close(): void {
+      closed.push(name);
+    },
+  });
+  const transport = await establishNativeLaunchTransport({
+    startPoll: () => handle('poll'),
+    subscribeStatus: async () => handle('status'),
+    subscribeLog: async () => handle('log'),
+    startBridge: async () => false,
+  });
+
+  assert.deepEqual(closed, ['status', 'log']);
+  transport.close();
+  assert.deepEqual(closed, ['status', 'log', 'poll']);
 });
 
 test('install failure adapters cover every backend state and action without reading raw fields', () => {

@@ -491,14 +491,22 @@ fn launch_journal_error_response(
 }
 
 fn launch_session_admission_error_response(
-    _error: crate::state::SessionAdmissionError,
+    error: crate::state::SessionAdmissionError,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    (
-        StatusCode::SERVICE_UNAVAILABLE,
-        Json(json!({
-            "error": "Launches are unavailable while the application is shutting down."
-        })),
-    )
+    match error {
+        crate::state::SessionAdmissionError::ShuttingDown => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "error": "Launches are unavailable while the application is shutting down."
+            })),
+        ),
+        crate::state::SessionAdmissionError::DuplicateSessionId => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({
+                "error": "Could not reserve a unique launch session. Try again."
+            })),
+        ),
+    }
 }
 
 fn launch_integrity_admission_error_response(

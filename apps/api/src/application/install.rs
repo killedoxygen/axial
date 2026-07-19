@@ -594,7 +594,7 @@ pub use operation::{
 };
 #[cfg(test)]
 use operation::{loader_install_progress_view_model, typed_runtime_failure_evidence};
-pub use stream::{install_events_stream, loader_install_events_stream};
+pub(crate) use stream::{install_events_stream, loader_install_events_stream};
 
 async fn start_install_version_with_foreground(
     state: &AppState,

@@ -252,6 +252,20 @@ html[data-desktop-chrome='mac-overlay'] .cp-rail-brand {
   background: var(--accent-fill);
   box-shadow: 0 0 0 2px var(--bg-deep);
 }
+.cp-rail-tile-session {
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  width: 17px;
+  height: 17px;
+  border-radius: 999px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-secondary);
+  background: var(--bg-raised);
+  box-shadow: 0 0 0 2px var(--bg-deep);
+}
 .cp-rail-tile-dot {
   position: absolute;
   right: 1px;

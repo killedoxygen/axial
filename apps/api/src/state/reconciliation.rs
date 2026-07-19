@@ -19,7 +19,7 @@ use super::registered_artifact_findings::{
     recorded_artifact_provenance_matches, registered_artifact_target,
     resolve_recorded_artifact_provenance,
 };
-use super::sessions::SharedComponentMutationLease;
+use super::sessions::{RecoveringSessionMutationScope, SharedComponentMutationLease};
 use super::{
     AppState, InstanceLifecycleLease, KnownGoodVerificationLease, KnownGoodVerificationOwner,
     OperationJournalStore, OperationJournalStoreError,
@@ -76,6 +76,7 @@ pub(crate) struct RecordedRuntimeArtifactRepairFailure {
 pub(crate) struct RegisteredArtifactFailedRepair {
     evidence: RecordedReconciliationFailure,
     verification: KnownGoodVerificationLease,
+    recovery_scope: Option<RecoveringSessionMutationScope>,
 }
 
 #[must_use]
@@ -2263,6 +2264,7 @@ impl RegisteredReconciliationAuthority {
     pub(super) fn into_registered_artifact_failed_repair(
         self,
         attempt: &ReconciliationAttempt,
+        recovery_scope: Option<RecoveringSessionMutationScope>,
     ) -> Result<RegisteredArtifactFailedRepair, ReconciliationEvidenceRejection> {
         let Self {
             state,
@@ -2311,6 +2313,7 @@ impl RegisteredReconciliationAuthority {
         Ok(RegisteredArtifactFailedRepair {
             evidence,
             verification,
+            recovery_scope,
         })
     }
 
@@ -3064,7 +3067,7 @@ impl AppState {
         attempt: &ReconciliationAttempt,
     ) -> Result<RegisteredArtifactFailedRepair, ReconciliationEvidenceRejection> {
         self.registered_reconciliation_authority_for_verification(&verification)?
-            .into_registered_artifact_failed_repair(attempt)
+            .into_registered_artifact_failed_repair(attempt, None)
     }
 
     pub(crate) fn registered_artifact_recovery_entry(
@@ -3206,7 +3209,8 @@ impl AppState {
             return Err(ReconciliationEvidenceRejection::IncarnationMismatch);
         }
         let authority = self.registered_reconciliation_authority_for_verification(verification)?;
-        let continuation = authority.into_registered_artifact_failed_repair(terminal.attempt())?;
+        let continuation =
+            authority.into_registered_artifact_failed_repair(terminal.attempt(), None)?;
         if continuation.evidence.artifact_provenance != Some(provenance) {
             return Err(ReconciliationEvidenceRejection::ScopeMismatch);
         }
@@ -3416,6 +3420,7 @@ impl AppState {
         self.admit_component_rebuild_with_config_observer(
             evidence,
             None,
+            None,
             operation_id,
             suppression_for,
             || {},
@@ -3432,10 +3437,12 @@ impl AppState {
         let RegisteredArtifactFailedRepair {
             evidence,
             verification,
+            recovery_scope,
         } = continuation;
         self.admit_component_rebuild_with_config_observer(
             RecordedRuntimeArtifactRepairFailure { evidence },
             Some(verification),
+            recovery_scope.as_ref(),
             operation_id,
             suppression_for,
             || {},
@@ -3447,6 +3454,7 @@ impl AppState {
         &self,
         evidence: RecordedRuntimeArtifactRepairFailure,
         verification: Option<KnownGoodVerificationLease>,
+        recovery_scope: Option<&RecoveringSessionMutationScope>,
         operation_id: OperationId,
         suppression_for: chrono::Duration,
         after_config: AfterConfig,
@@ -3506,11 +3514,15 @@ impl AppState {
         {
             return Err(ReconciliationEvidenceRejection::IncarnationMismatch);
         }
-        let component_mutation = self
-            .sessions
-            .acquire_shared_component_mutation()
-            .await
-            .ok_or(ReconciliationEvidenceRejection::ActiveSession)?;
+        let component_mutation = match recovery_scope {
+            Some(scope) => {
+                self.sessions
+                    .acquire_recovering_component_mutation(scope)
+                    .await
+            }
+            None => self.sessions.acquire_shared_component_mutation().await,
+        }
+        .ok_or(ReconciliationEvidenceRejection::ActiveSession)?;
         let predecessor = self.recorded_reconciliation_failure_at(
             &predecessor_before_wait.lifecycle,
             predecessor_before_wait.terminal.operation_id(),
@@ -6691,7 +6703,7 @@ mod tests {
 
         assert_eq!(
             drifted_authority
-                .into_registered_artifact_failed_repair(&attempt)
+                .into_registered_artifact_failed_repair(&attempt, None)
                 .err(),
             Some(ReconciliationEvidenceRejection::MemoryNotFailed)
         );
@@ -6727,6 +6739,7 @@ mod tests {
             state
                 .admit_component_rebuild_with_config_observer(
                     evidence,
+                    None,
                     None,
                     OperationId::new("component-admission-root-drift-rebuild"),
                     chrono::Duration::minutes(30),
@@ -6792,6 +6805,7 @@ mod tests {
             state
                 .admit_component_rebuild_with_config_observer(
                     evidence,
+                    None,
                     None,
                     OperationId::new("component-admission-inventory-rebuild"),
                     chrono::Duration::minutes(30),

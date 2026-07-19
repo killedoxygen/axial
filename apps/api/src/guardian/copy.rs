@@ -18,8 +18,7 @@ use crate::state::failure_memory::FailureMemoryKey;
 use axial_launcher::{
     CrashEvidence, GuardianMode as LauncherGuardianMode, HealingEventKind, LaunchFailureClass,
     LaunchHealingSummary, LaunchNotice, LaunchNoticeTone, LaunchSessionExitReason,
-    LaunchSessionOutcome, LaunchSessionOutcomeKind, LaunchSessionRecord, LaunchStageEvidence,
-    LaunchStatusEvent,
+    LaunchSessionOutcome, LaunchSessionOutcomeKind, LaunchStageEvidence,
 };
 use chrono::{DateTime, Timelike, Utc};
 use serde::{Deserialize, Serialize};
@@ -662,18 +661,6 @@ pub(crate) fn launch_notice(
         details,
         tone: launch_notice_tone(guardian, healing, outcome),
     })
-}
-
-pub(crate) fn launch_status_snapshot(record: &LaunchSessionRecord) -> LaunchStatusEvent {
-    let mut status = axial_launcher::snapshot_status(record);
-    status.notice = launch_notice_from_values(
-        status.guardian.as_ref(),
-        status.healing.as_ref(),
-        status.outcome.as_ref(),
-        status.failure_detail.as_deref(),
-        None,
-    );
-    status
 }
 
 pub(crate) fn launch_session_outcome(reason: LaunchSessionExitReason) -> LaunchSessionOutcome {
@@ -4292,7 +4279,7 @@ mod tests {
     use crate::state::contracts::OperationPhase;
     use axial_launcher::{
         GuardianMode, LaunchHealingSummary, LaunchNoticeTone, LaunchSessionExitReason,
-        LaunchSessionOutcome, LaunchSessionRecord, LaunchState, SessionId,
+        LaunchSessionOutcome,
     };
 
     fn warning_summary() -> GuardianSummary {
@@ -4489,50 +4476,12 @@ mod tests {
     }
 
     #[test]
-    fn watchdog_outcome_and_snapshot_notice_are_application_authored() {
+    fn watchdog_outcome_is_application_authored() {
         let watchdog = super::launch_session_outcome(LaunchSessionExitReason::WatchdogKilled);
         assert_eq!(watchdog.summary, "Guardian stopped a stalled startup.");
         assert_ne!(
             watchdog,
             LaunchSessionOutcome::from_reason(LaunchSessionExitReason::WatchdogKilled)
-        );
-
-        let guardian = warning_summary();
-        let record = LaunchSessionRecord {
-            session_id: SessionId("notice-parity".to_string()),
-            instance_id: "instance".to_string(),
-            version_id: "1.21.5".to_string(),
-            launched_at: None,
-            benchmark: None,
-            state: LaunchState::Exited,
-            pid: None,
-            process_started_at_ms: None,
-            boot_completed_at_ms: None,
-            boot_duration_ms: None,
-            priority: None,
-            exit_code: Some(-1),
-            command: Vec::new(),
-            java_path: None,
-            natives_dir: None,
-            failure: None,
-            crash_evidence: None,
-            healing: None,
-            guardian: Some(serde_json::to_value(&guardian).expect("Guardian JSON")),
-            outcome: Some(watchdog),
-            stages: Vec::new(),
-        };
-        let factual = axial_launcher::snapshot_status(&record);
-        assert!(factual.notice.is_none());
-        let enriched = super::launch_status_snapshot(&record);
-        assert_eq!(
-            enriched.notice,
-            super::launch_notice_from_values(
-                record.guardian.as_ref(),
-                record.healing.as_ref(),
-                record.outcome.as_ref(),
-                None,
-                None,
-            )
         );
     }
 

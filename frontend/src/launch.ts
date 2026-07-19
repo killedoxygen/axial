@@ -9,36 +9,31 @@ import {
   onNativeEvent,
   startNativeLaunchEvents,
 } from './native';
-import { config, launchState, runningSessions, selectedInstance, instanceLaunchDrafts } from './store';
+import { config, launchSessions, launchState, selectedInstance, instanceLaunchDrafts } from './store';
 import {
   clearLaunchNotice,
   confirmLaunch,
+  convergeLaunchStatus,
   endLaunchPrep,
   endSession,
+  endSessionIfCurrent,
   setLaunchNotice,
   startLaunch,
   updateInstanceInList,
   updateLaunchPrep,
   updateLaunchPrepView,
-  updateRunningSessionState,
+  updateLaunchSessionState,
 } from './actions';
-import type { LaunchNotice } from './types-launch';
-import type { Instance } from './types-instance';
-import type { Config } from './types-settings';
+import type { LaunchNotice, LaunchSessionOutcome } from './types-launch';
 import { createBackendLaunchNoticeTracker, type BackendLaunchNoticeTracker } from './launch-notice-tracker';
-import { launchSessionOutcome, launchStatusViewModel } from './launch-response-adapters';
-
-const LIVE_LAUNCH_UPDATES_UNAVAILABLE = 'Live launch updates are unavailable.';
+import { launchStatusUpdate } from './launch-response-adapters';
+import { establishNativeLaunchTransport } from './launch-live-transport';
 
 function rollbackLaunch(instanceId: string): void {
   endSession(instanceId);
-  if (Object.keys(runningSessions.value).length === 0) Music.unsuppress();
+  if (Object.keys(launchSessions.value).length === 0) Music.unsuppress();
 
   endLaunchPrep();
-}
-
-function updateRunningSession(instanceId: string, patch: Partial<import('./types-launch').RunningSession>): void {
-  updateRunningSessionState(instanceId, patch);
 }
 
 function surfaceBackendLaunchNotice(
@@ -56,17 +51,10 @@ function surfaceBackendLaunchNotice(
   return true;
 }
 
-function selectedLaunchMaxMemoryMB(response: any, inst: Instance, cfg: Config | null): number {
-  if (typeof response?.max_memory_mb === 'number' && response.max_memory_mb > 0) return response.max_memory_mb;
-  if (typeof inst.max_memory_mb === 'number' && inst.max_memory_mb > 0) return inst.max_memory_mb;
-  if (typeof cfg?.max_memory_mb === 'number' && cfg.max_memory_mb > 0) return cfg.max_memory_mb;
-  return 4096;
-}
-
 export async function launchGame(): Promise<void> {
   const inst = selectedInstance.value;
   if (!inst?.launch_action?.launchable) return;
-  if (runningSessions.value[inst.id]) return;
+  if (launchSessions.value[inst.id]) return;
   if (launchState.value.status === 'preparing') return;
 
   const cfg = config.value;
@@ -129,25 +117,19 @@ export async function launchGame(): Promise<void> {
       rollbackLaunch(inst.id);
       return;
     }
-    const initialViewModel = launchStatusViewModel(res.view_model) ?? undefined;
-    if (initialViewModel) updateLaunchPrepView(inst.id, initialViewModel);
+    const initialStatus = launchStatusUpdate(res, res.session_id);
+    if (!initialStatus) throw new Error('Launch response did not match the status contract.');
+    updateLaunchPrepView(inst.id, initialStatus.viewModel);
 
     const launchedAt = res.launched_at || new Date().toISOString();
-    const allocatedMB = selectedLaunchMaxMemoryMB(res, launchInst, cfg);
     confirmLaunch(inst.id, {
       sessionId: res.session_id,
-      versionId: launchInst.version_id,
-      pid: typeof res.pid === 'number' ? res.pid : 0,
-      state: typeof res.state === 'string' ? res.state : 'queued',
       launchedAt,
-      allocatedMB,
-      viewModel: initialViewModel,
-      benchmark: res.benchmark,
-      healing: res.healing,
-      guardian: res.guardian,
+      viewModel: initialStatus.viewModel,
+      statusRevision: initialStatus.revision,
     });
     launchCommitted = true;
-    surfaceBackendLaunchNotice(res.notice, inst.id, inst.name, noticeTracker);
+    surfaceBackendLaunchNotice(initialStatus.notice, inst.id, inst.name, noticeTracker);
 
     Music.suppress();
     let launchStarted = false;
@@ -198,6 +180,7 @@ function makeLaunchStatusPoller(
 ): { close(): void } {
   let stopped = false;
   let timerId = 0;
+  let inFlight = false;
 
   const handle = {
     close(): void {
@@ -208,15 +191,19 @@ function makeLaunchStatusPoller(
 
   const poll = async (): Promise<void> => {
     if (stopped) return;
-    if (runningSessions.value[instanceId]?.sessionId !== sessionId) {
+    if (inFlight) return;
+    if (launchSessions.value[instanceId]?.sessionId !== sessionId) {
       handle.close();
       return;
     }
+    inFlight = true;
     try {
       const data = await api('GET', `/launch/${sessionId}/status`);
       if (!stopped && !data?.error) onStatus(data, handle);
     } catch {
       // Native events remain primary. Polling is only a convergence fallback.
+    } finally {
+      inFlight = false;
     }
   };
 
@@ -235,67 +222,35 @@ async function connectLaunchEvents(
   onStarted?: () => void,
 ): Promise<void> {
   const onStatus = (data: any, handle: { close(): void }): void => {
-    const session = runningSessions.value[instanceId];
-    const prep = launchState.value;
-    const matchingPrep = prep.status === 'preparing' && prep.instanceId === instanceId;
-    if (session?.sessionId !== sessionId && !matchingPrep) return;
-    surfaceBackendLaunchNotice(data.notice, instanceId, instanceName, noticeTracker);
-    const outcome = launchSessionOutcome(data.outcome);
-    const viewModel = launchStatusViewModel(data.view_model);
-    if (viewModel) updateLaunchPrepView(instanceId, viewModel);
-    if (session && (typeof data.pid === 'number' || data.healing || typeof data.state === 'string' || outcome)) {
-      updateRunningSession(instanceId, {
-        pid: typeof data.pid === 'number' ? data.pid : session.pid || 0,
-        state: typeof data.state === 'string' ? data.state : session.state,
-        viewModel: viewModel || session.viewModel,
-        benchmark: data.benchmark || session.benchmark,
-        healing: data.healing || session.healing,
-        guardian: data.guardian || session.guardian,
-        outcome: outcome || session.outcome,
-      });
+    const session = launchSessions.value[instanceId];
+    if (session?.sessionId !== sessionId) return;
+    const update = convergeLaunchStatus(instanceId, sessionId, data);
+    if (!update) return;
+    surfaceBackendLaunchNotice(update.notice, instanceId, instanceName, noticeTracker);
+    if (update.viewModel.playing) onStarted?.();
+    if (update.viewModel.terminal) {
+      onSessionTerminal(update.outcome, instanceId, instanceName, sessionId, handle);
     }
-    if (data.state === 'running') onStarted?.();
-    if (data.state === 'exited') onGameExited(data, instanceId, instanceName, sessionId, handle);
   };
 
   const onLog = (data: any): void => {
-    if (runningSessions.value[instanceId]?.sessionId !== sessionId) return;
+    if (launchSessions.value[instanceId]?.sessionId !== sessionId) return;
     appendLog(data.source, data.text, instanceId, instanceName);
   };
 
   if (hasNativeDesktopRuntime()) {
-    let statusSubscription: { close(): void } | null = null;
-    let logSubscription: { close(): void } | null = null;
-    let pollSubscription: { close(): void } | null = null;
-    const streamHandle = {
-      close(): void {
-        statusSubscription?.close();
-        logSubscription?.close();
-        pollSubscription?.close();
-      },
-    };
-    statusSubscription = await onNativeEvent(nativeLaunchStatusEventName(sessionId), (data) => {
-      onStatus(data, streamHandle);
+    await establishNativeLaunchTransport({
+      startPoll: (handle) =>
+        makeLaunchStatusPoller(sessionId, instanceId, (data) => {
+          onStatus(data, handle);
+        }),
+      subscribeStatus: (handle) =>
+        onNativeEvent(nativeLaunchStatusEventName(sessionId), (data) => {
+          onStatus(data, handle);
+        }),
+      subscribeLog: () => onNativeEvent(nativeLaunchLogEventName(sessionId), onLog),
+      startBridge: () => startNativeLaunchEvents(sessionId),
     });
-    logSubscription = await onNativeEvent(nativeLaunchLogEventName(sessionId), onLog);
-    if (!statusSubscription || !logSubscription) {
-      streamHandle.close();
-      throw new Error(LIVE_LAUNCH_UPDATES_UNAVAILABLE);
-    }
-    pollSubscription = makeLaunchStatusPoller(sessionId, instanceId, (data) => {
-      onStatus(data, streamHandle);
-    });
-    let started = false;
-    try {
-      started = await startNativeLaunchEvents(sessionId);
-    } catch (err: unknown) {
-      streamHandle.close();
-      throw err;
-    }
-    if (!started) {
-      streamHandle.close();
-      throw new Error(LIVE_LAUNCH_UPDATES_UNAVAILABLE);
-    }
     return;
   }
 
@@ -326,7 +281,7 @@ async function connectLaunchEvents(
 
   es.onerror = () => {
     if (es.readyState !== EventSource.CLOSED) return;
-    if (runningSessions.value[instanceId]?.sessionId !== sessionId) return;
+    if (launchSessions.value[instanceId]?.sessionId !== sessionId) return;
     appendLog(
       'system',
       `Lost live updates for ${instanceName || instanceId}. The game may still be running.`,
@@ -340,41 +295,41 @@ async function connectLaunchEvents(
   });
 }
 
-function onGameExited(
-  data: any,
+function onSessionTerminal(
+  outcome: LaunchSessionOutcome | null,
   instanceId: string,
   instanceName: string,
   sessionId: string,
   eventSource: { close(): void },
 ): void {
-  const session = runningSessions.value[instanceId];
+  const session = launchSessions.value[instanceId];
   if (!session || session.sessionId !== sessionId) return;
-  const outcome = launchSessionOutcome(data.outcome) || session.outcome;
 
+  if (!endSessionIfCurrent(instanceId, sessionId)) return;
   eventSource.close();
-  endSession(instanceId);
 
-  if (Object.keys(runningSessions.value).length === 0) Music.unsuppress();
+  if (Object.keys(launchSessions.value).length === 0) Music.unsuppress();
   appendLog('system', outcome?.summary || `${instanceName || instanceId} session ended.`, instanceId, instanceName);
 }
 
 export async function killGame(): Promise<void> {
   const inst = selectedInstance.value;
   if (!inst) return;
-  const session = runningSessions.value[inst.id];
+  const session = launchSessions.value[inst.id];
   if (!session) return;
   if (session.stopping) return;
+  if (!session.viewModel.can_stop) return;
 
   try {
-    updateRunningSessionState(inst.id, { stopping: true });
+    updateLaunchSessionState(inst.id, { stopping: true });
     const res = await api('POST', `/launch/${session.sessionId}/kill`);
     if (res?.error) {
-      updateRunningSessionState(inst.id, { stopping: false });
+      updateLaunchSessionState(inst.id, { stopping: false });
       showError(`Could not stop the game: ${res.error}`);
       return;
     }
   } catch (err: unknown) {
-    updateRunningSessionState(inst.id, { stopping: false });
+    updateLaunchSessionState(inst.id, { stopping: false });
     showError(`Could not stop the game: ${errMessage(err)}`);
   }
 }

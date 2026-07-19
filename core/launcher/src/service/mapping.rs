@@ -13,8 +13,10 @@ pub fn launch_state_name(state: LaunchState) -> &'static str {
         LaunchState::Prewarming => "prewarming",
         LaunchState::Starting => "starting",
         LaunchState::Monitoring => "monitoring",
+        LaunchState::Recovering => "recovering",
         LaunchState::Running => "running",
         LaunchState::Degraded => "degraded",
+        LaunchState::Settling => "settling",
         LaunchState::Failed => "failed",
         LaunchState::Exited => "exited",
     }
@@ -32,8 +34,10 @@ pub fn launch_stage_label(stage: &str) -> &'static str {
         "prewarming" => "Prewarming game data",
         "starting" => "Starting process",
         "monitoring" => "Monitoring startup",
+        "recovering" => "Recovering startup",
         "running" => "Running",
         "degraded" => "Degraded",
+        "settling" => "Finalizing session",
         "failed" => "Failed",
         "exited" => "Exited",
         _ => "Launch stage",
@@ -46,6 +50,36 @@ pub fn is_terminal_status(status: &LaunchStatusEvent) -> bool {
 
 pub fn is_terminal_state(state: LaunchState) -> bool {
     matches!(state, LaunchState::Failed | LaunchState::Exited)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{is_terminal_state, is_terminal_status, launch_stage_label, launch_state_name};
+    use crate::{LaunchState, LaunchStatusEvent};
+
+    #[test]
+    fn recovering_is_a_named_nonterminal_launch_state() {
+        let status = LaunchStatusEvent {
+            state: "recovering".to_string(),
+            benchmark: None,
+            pid: None,
+            exit_code: Some(1),
+            failure_class: Some("unknown".to_string()),
+            failure_detail: None,
+            crash_evidence: None,
+            healing: None,
+            guardian: None,
+            outcome: None,
+            notice: None,
+            evidence: Vec::new(),
+            stages: Vec::new(),
+        };
+
+        assert_eq!(launch_state_name(LaunchState::Recovering), "recovering");
+        assert_eq!(launch_stage_label("recovering"), "Recovering startup");
+        assert!(!is_terminal_state(LaunchState::Recovering));
+        assert!(!is_terminal_status(&status));
+    }
 }
 
 pub fn failure_class_name(class: LaunchFailureClass) -> &'static str {

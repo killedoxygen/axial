@@ -37,8 +37,10 @@ pub enum LaunchState {
     Prewarming,
     Starting,
     Monitoring,
+    Recovering,
     Running,
     Degraded,
+    Settling,
     Failed,
     Exited,
 }

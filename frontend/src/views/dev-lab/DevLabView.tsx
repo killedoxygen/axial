@@ -10,7 +10,7 @@ import {
   featureFlags,
   featureFlagsLoadState,
   launchState,
-  runningSessions,
+  launchSessions,
   systemInfo,
   updateInfo,
 } from '../../store';
@@ -132,7 +132,7 @@ function InspectorPanel(): JSX.Element {
     { key: 'activeDownload', title: 'activeDownload', value: activeDownload.value },
     { key: 'downloadQueue', title: 'downloadQueue', value: downloadQueue.value },
     { key: 'launchState', title: 'launchState', value: launchState.value },
-    { key: 'runningSessions', title: 'runningSessions', value: runningSessions.value },
+    { key: 'launchSessions', title: 'launchSessions', value: launchSessions.value },
     { key: 'updateInfo', title: 'updateInfo', value: updateInfo.value },
     { key: 'route', title: 'route', value: route.value, open: true },
   ];

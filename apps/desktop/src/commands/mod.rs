@@ -3,12 +3,11 @@ use crate::state::{
     ApiRuntimeState, DesktopState, TerminalAttemptOwner, TerminalFailure, TerminalIntent,
     TerminalResult,
 };
-use axial_api::application::launch::{public_launch_status_json, snapshot_status};
+use axial_api::application::launch::public_launch_status;
 use axial_api::application::{
     public_loader_install_progress_record_json, public_vanilla_install_progress_record_json,
 };
 use axial_api::state::{AppState, LaunchEvent};
-use axial_launcher::is_terminal_state;
 use serde::Serialize;
 use std::fs;
 use std::future::Future;
@@ -797,43 +796,88 @@ pub async fn start_loader_install_events(
 pub async fn start_launch_events(
     app: AppHandle,
     state: State<'_, AppState>,
+    desktop: State<'_, DesktopState>,
     session_id: String,
 ) -> Result<(), String> {
-    let snapshot = state
+    let mut owner = desktop.launch_events().replace(session_id.clone());
+    let mut subscription = state
         .sessions()
-        .get(&session_id)
-        .await
-        .ok_or_else(|| "session not found".to_string())?;
-    let mut receiver = state
-        .sessions()
-        .subscribe(&session_id)
+        .subscribe_events(&session_id)
         .await
         .ok_or_else(|| "session not found".to_string())?;
     let status_event_name = events::launch_status(&session_id);
     let log_event_name = events::launch_log(&session_id);
 
     tauri::async_runtime::spawn(async move {
-        let snapshot_status = snapshot_status(&snapshot);
-        let _ = app.emit(
-            &status_event_name,
-            public_launch_status_json(&snapshot_status),
-        );
-        if is_terminal_state(snapshot.state) {
+        let status = public_launch_status(subscription.retained_status());
+        let mut last_revision = status.revision;
+        let terminal = status.view_model.terminal;
+        if owner
+            .emit_if_current(|| app.emit(&status_event_name, status))
+            .ok()
+            != Some(true)
+        {
+            return;
+        }
+        if terminal {
             return;
         }
         loop {
-            match receiver.recv().await {
+            let event = tokio::select! {
+                biased;
+                _ = owner.cancelled() => return,
+                event = subscription.recv() => event,
+            };
+            match event {
                 Ok(LaunchEvent::Status(status)) => {
-                    let terminal = matches!(status.state.as_str(), "failed" | "exited");
-                    let _ = app.emit(&status_event_name, public_launch_status_json(&status));
+                    if status.revision <= last_revision {
+                        continue;
+                    }
+                    let status = public_launch_status(&status);
+                    last_revision = status.revision;
+                    let terminal = status.view_model.terminal;
+                    if owner
+                        .emit_if_current(|| app.emit(&status_event_name, status))
+                        .ok()
+                        != Some(true)
+                    {
+                        return;
+                    }
                     if terminal {
                         return;
                     }
                 }
                 Ok(LaunchEvent::Log(log)) => {
-                    let _ = app.emit(&log_event_name, log);
+                    if owner
+                        .emit_if_current(|| app.emit(&log_event_name, log))
+                        .ok()
+                        != Some(true)
+                    {
+                        return;
+                    }
                 }
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Ok(LaunchEvent::ProcessSettled { .. }) => {}
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                    let Some(status) = subscription.rebase().await else {
+                        return;
+                    };
+                    if status.revision <= last_revision {
+                        continue;
+                    }
+                    let status = public_launch_status(&status);
+                    last_revision = status.revision;
+                    let terminal = status.view_model.terminal;
+                    if owner
+                        .emit_if_current(|| app.emit(&status_event_name, status))
+                        .ok()
+                        != Some(true)
+                    {
+                        return;
+                    }
+                    if terminal {
+                        return;
+                    }
+                }
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
             }
         }

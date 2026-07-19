@@ -1,7 +1,6 @@
 use crate::application::launch as launch_app;
 use crate::observability::{RedactionAudience, sanitize_evidence_token, sanitize_public_log_line};
-use crate::state::{AppState, LaunchEvent, LaunchLogEvent, LaunchStatusEvent};
-use axial_launcher::{is_terminal_state, is_terminal_status};
+use crate::state::{AppState, LaunchEvent, LaunchLogEvent, ProducerLease};
 use axum::{
     Json,
     http::StatusCode,
@@ -12,33 +11,46 @@ use std::convert::Infallible;
 pub(super) async fn launch_events_sse(
     state: AppState,
     id: String,
+    producer: ProducerLease,
 ) -> Result<
     Sse<impl futures_util::Stream<Item = Result<Event, Infallible>>>,
     (StatusCode, Json<serde_json::Value>),
 > {
-    let snapshot = state.sessions().get(&id).await.ok_or_else(|| {
-        (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({ "error": "session not found" })),
-        )
-    })?;
-    let mut receiver = state.sessions().subscribe(&id).await.ok_or_else(|| {
-        (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({ "error": "session not found" })),
-        )
-    })?;
-
+    let mut subscription = state
+        .sessions()
+        .subscribe_events(&id)
+        .await
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "error": "session not found" })),
+            )
+        })?;
     let stream = async_stream::stream! {
-        yield Ok(status_event(&launch_app::snapshot_status(&snapshot)));
-        if is_terminal_state(snapshot.state) {
+        let request_drain = producer.wait_for_request_drain_start();
+        tokio::pin!(request_drain);
+        let status = launch_app::public_launch_status(subscription.retained_status());
+        let mut last_revision = status.revision;
+        let terminal = status.view_model.terminal;
+        yield Ok(status_event(&status));
+        if terminal {
             return;
         }
 
         loop {
-            match receiver.recv().await {
+            let event = tokio::select! {
+                biased;
+                _ = &mut request_drain => return,
+                event = subscription.recv() => event,
+            };
+            match event {
                 Ok(LaunchEvent::Status(status)) => {
-                    let terminal = is_terminal_status(&status);
+                    if status.revision <= last_revision {
+                        continue;
+                    }
+                    let status = launch_app::public_launch_status(&status);
+                    last_revision = status.revision;
+                    let terminal = status.view_model.terminal;
                     yield Ok(status_event(&status));
                     if terminal {
                         return;
@@ -47,7 +59,22 @@ pub(super) async fn launch_events_sse(
                 Ok(LaunchEvent::Log(log)) => {
                     yield Ok(log_event(&log));
                 }
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Ok(LaunchEvent::ProcessSettled { .. }) => {}
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                    let Some(status) = subscription.rebase().await else {
+                        return;
+                    };
+                    if status.revision <= last_revision {
+                        continue;
+                    }
+                    let status = launch_app::public_launch_status(&status);
+                    last_revision = status.revision;
+                    let terminal = status.view_model.terminal;
+                    yield Ok(status_event(&status));
+                    if terminal {
+                        return;
+                    }
+                }
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
             }
         }
@@ -56,11 +83,10 @@ pub(super) async fn launch_events_sse(
     Ok(Sse::new(stream))
 }
 
-fn status_event(status: &LaunchStatusEvent) -> Event {
-    Event::default().event("status").data(
-        serde_json::to_string(&launch_app::public_launch_status_json(status))
-            .unwrap_or_else(|_| "{}".to_string()),
-    )
+fn status_event(status: &launch_app::PublicLaunchStatus) -> Event {
+    Event::default()
+        .event("status")
+        .data(serde_json::to_string(status).unwrap_or_else(|_| "{}".to_string()))
 }
 
 fn log_event(log: &LaunchLogEvent) -> Event {

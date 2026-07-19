@@ -1512,14 +1512,13 @@ exit 0
         .await
         .unwrap_or_else(|(_, payload)| panic!("prepare repaired component launch: {payload:?}"));
         let session_id = prepared.task.intent.session_id.clone();
-        let launched = tokio::time::timeout(
+        tokio::time::timeout(
             Duration::from_secs(10),
             crate::application::launch::launch_session(state.clone(), prepared.task, producer),
         )
         .await
         .expect("repaired component launch deadline")
         .unwrap_or_else(|error| panic!("repaired component launch: {}", error.message));
-        assert_eq!(launched.instance_id, instance_id);
         let game_dir = state.instances().game_dir(instance_id);
         assert_eq!(
             fs::read_to_string(game_dir.join("guardian-component-process-count"))
@@ -1531,6 +1530,7 @@ exit 0
             .get(&session_id)
             .await
             .expect("repaired component running session");
+        assert_eq!(running.instance_id, instance_id);
         assert_eq!(running.state, axial_launcher::LaunchState::Running);
         assert!(running.boot_completed_at_ms.is_some());
         let _ = state.sessions().kill(&session_id).await;

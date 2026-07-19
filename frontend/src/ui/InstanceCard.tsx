@@ -5,8 +5,9 @@ import { Icon } from './Icons';
 import { SelectionCheckbox } from './SelectionActionTray';
 import { selectionToggleLabel } from './selection';
 import { navigate } from '../ui-state';
-import { runningSessions, versionById } from '../store';
+import { launchSessions, versionById } from '../store';
 import { instanceInstallStatus } from '../instance-install-status';
+import { launchSessionActivityLabel, launchSessionIsPlaying } from '../launch-presenters';
 import type { EnrichedInstance } from '../types-instance';
 
 export function InstanceCard({
@@ -21,7 +22,9 @@ export function InstanceCard({
   onToggleSelect?: (e: MouseEvent) => void;
 }): JSX.Element {
   const theme = useTheme();
-  const running = !!runningSessions.value[inst.id];
+  const session = launchSessions.value[inst.id];
+  const playing = launchSessionIsPlaying(session);
+  const sessionLabel = launchSessionActivityLabel(session);
   const version = versionById(inst.version_id);
   const install = instanceInstallStatus(inst, version);
   const installing = install.installing;
@@ -47,7 +50,8 @@ export function InstanceCard({
       role="button"
       tabIndex={0}
       aria-label={installing ? `Open ${inst.name}. ${installBadge}` : `Open ${inst.name}`}
-      data-running={running}
+      data-running={playing}
+      data-session-active={Boolean(session)}
       data-installing={installing}
       data-selected={selected === true}
       onClick={open}
@@ -67,9 +71,10 @@ export function InstanceCard({
             }}
           />
         )}
-        {running && (
-          <span class="cp-icard-live" aria-label="Running">
-            <span /> Live
+        {session && (
+          <span class="cp-icard-live" aria-label={sessionLabel}>
+            <span class="cp-icard-live-dot" />
+            <span class="cp-icard-live-label">{sessionLabel}</span>
           </span>
         )}
         {installing && (

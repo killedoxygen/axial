@@ -189,7 +189,11 @@ impl AppShutdownCoordinator {
                 .await
                 .map_err(|_| AppShutdownError::at(AppShutdownStep::ProducerDrain))
         };
+        let producers_drained = producer_result.is_ok();
         let mut first_error = self.finish_producer_drain(settlement_error, producer_result)?;
+        if producers_drained && self.completed(AppShutdownStep::SessionSettlement) {
+            state.sessions.clear_after_producer_drain().await;
+        }
 
         retain_first_error(
             &mut first_error,
@@ -242,7 +246,7 @@ impl AppShutdownCoordinator {
             }
             state
                 .sessions
-                .terminate_all()
+                .settle_all_for_shutdown()
                 .await
                 .map_err(|_| AppShutdownError::at(AppShutdownStep::SessionSettlement))
         };
@@ -631,8 +635,13 @@ mod tests {
     use crate::state::auth_persistence::{
         AuthPersistenceError, AuthSnapshotPersistence, PersistedAuthSnapshot,
     };
-    use crate::state::{AppStateInit, AuthLoginStore, InstallStore, SessionStore};
+    use crate::state::sessions::test_record;
+    use crate::state::{
+        AppStateInit, AuthLoginStore, InstallStore, LaunchFailureTermination,
+        RunningHandoffOutcome, SessionStore,
+    };
     use axial_config::{AppPaths, ConfigStore, InstanceRegistrySnapshot, InstanceStore};
+    use axial_launcher::{LaunchSessionExitReason, LaunchState, LaunchStatusEvent};
     use axial_performance::PerformanceManager;
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
@@ -773,6 +782,240 @@ mod tests {
                 .is_err()
         );
         assert!(fixture.state.try_claim_producer().is_err());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shutdown_retains_available_process_settlement_until_observer_producer_finishes() {
+        let fixture = TestFixture::new("shutdown-process-settlement-handoff");
+        let session_id = "shutdown-process-settlement-handoff";
+        fixture
+            .state
+            .sessions()
+            .insert(test_record(session_id))
+            .await
+            .expect("insert shutdown session");
+        let mut command = tokio::process::Command::new("sh");
+        command.arg("-c").arg("exec sleep 30");
+        let started = fixture
+            .state
+            .sessions()
+            .start_process(test_record(session_id), command)
+            .await
+            .expect("start shutdown process");
+        let mut running = LaunchStatusEvent {
+            state: "monitoring".to_string(),
+            benchmark: None,
+            pid: started.pid,
+            exit_code: None,
+            failure_class: None,
+            failure_detail: None,
+            crash_evidence: None,
+            healing: None,
+            guardian: None,
+            outcome: None,
+            notice: None,
+            evidence: Vec::new(),
+            stages: Vec::new(),
+        };
+        fixture
+            .state
+            .sessions()
+            .emit_status(session_id, running.clone())
+            .await;
+        running.state = "running".to_string();
+        assert!(matches!(
+            fixture
+                .state
+                .sessions()
+                .publish_running_and_complete_startup_recovery(&started, running)
+                .await,
+            RunningHandoffOutcome::Published
+        ));
+        let (generation, _events) = fixture
+            .state
+            .sessions()
+            .subscribe_terminal_observation(session_id)
+            .await
+            .expect("subscribe terminal observer");
+        let subscription = fixture
+            .state
+            .sessions()
+            .clone()
+            .subscribe_events(session_id)
+            .await
+            .expect("subscribe public session events");
+        let producer = fixture
+            .state
+            .try_claim_producer()
+            .expect("claim observer producer");
+
+        let shutdown_state = fixture.state.clone();
+        let mut shutdown = tokio::spawn(async move { shutdown_state.shutdown().await });
+        let mut lease = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some(lease) = fixture
+                    .state
+                    .sessions()
+                    .claim_process_settlement(session_id, generation, None)
+                    .await
+                {
+                    break lease;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("process settlement becomes available after shutdown termination");
+
+        assert!(!shutdown.is_finished());
+        assert!(fixture.state.sessions().get(session_id).await.is_some());
+        let event = lease.event().clone();
+        assert_eq!(event.failure_class, None);
+        assert_eq!(event.crash_evidence, None);
+        assert_eq!(
+            event.outcome.as_ref().map(|outcome| outcome.reason),
+            Some(LaunchSessionExitReason::LauncherStopped)
+        );
+        let finalized = lease
+            .finalize(event)
+            .await
+            .expect("observer finalizes exact process settlement");
+        assert_eq!(
+            finalized.outcome.as_ref().map(|outcome| outcome.reason),
+            Some(LaunchSessionExitReason::LauncherStopped)
+        );
+        lease.release().await;
+        assert!(fixture.state.sessions().get(session_id).await.is_some());
+
+        drop(producer);
+        tokio::time::timeout(Duration::from_secs(5), &mut shutdown)
+            .await
+            .expect("shutdown completes after observer producer")
+            .expect("shutdown task")
+            .expect("application shutdown");
+        assert!(fixture.state.sessions().get(session_id).await.is_none());
+        subscription.release().await;
+    }
+
+    #[tokio::test]
+    async fn shutdown_retains_launch_failure_proof_session_until_producer_finishes() {
+        let fixture = TestFixture::new("shutdown-launch-failure-proof");
+        let session_id = "shutdown-launch-failure-proof";
+        fixture
+            .state
+            .sessions()
+            .insert(test_record(session_id))
+            .await
+            .expect("insert launch-failure session");
+        let producer = fixture
+            .state
+            .try_claim_producer()
+            .expect("claim failure producer");
+        let mut lease = match fixture
+            .state
+            .sessions()
+            .terminate_for_launch_failure(session_id)
+            .await
+        {
+            LaunchFailureTermination::Ready(lease) => lease,
+            _ => panic!("launch failure must own exact terminalization"),
+        };
+        fixture
+            .state
+            .sessions()
+            .emit_status(
+                session_id,
+                LaunchStatusEvent {
+                    state: "exited".to_string(),
+                    benchmark: None,
+                    pid: None,
+                    exit_code: Some(1),
+                    failure_class: Some("unknown".to_string()),
+                    failure_detail: None,
+                    crash_evidence: None,
+                    healing: None,
+                    guardian: None,
+                    outcome: None,
+                    notice: None,
+                    evidence: Vec::new(),
+                    stages: Vec::new(),
+                },
+            )
+            .await;
+        lease.release_lifecycle_guard();
+
+        let shutdown_state = fixture.state.clone();
+        let mut shutdown = tokio::spawn(async move { shutdown_state.shutdown().await });
+        wait_for_phase(
+            &fixture.state,
+            crate::state::AppLifecyclePhase::QuiescingProducers,
+        )
+        .await;
+        assert!(!shutdown.is_finished());
+        assert!(fixture.state.sessions().get(session_id).await.is_some());
+
+        lease.release().await;
+        assert!(fixture.state.sessions().get(session_id).await.is_some());
+        drop(producer);
+        tokio::time::timeout(Duration::from_secs(5), &mut shutdown)
+            .await
+            .expect("shutdown completes after failure proof producer")
+            .expect("shutdown task")
+            .expect("application shutdown");
+        assert!(fixture.state.sessions().get(session_id).await.is_none());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shutdown_retains_user_stop_proof_session_until_producer_finishes() {
+        let fixture = TestFixture::new("shutdown-user-stop-proof");
+        let session_id = "shutdown-user-stop-proof";
+        fixture
+            .state
+            .sessions()
+            .insert(test_record(session_id))
+            .await
+            .expect("insert user-stop session");
+        let mut command = tokio::process::Command::new("sh");
+        command.arg("-c").arg("exec sleep 30");
+        fixture
+            .state
+            .sessions()
+            .start_process(test_record(session_id), command)
+            .await
+            .expect("start user-stop process");
+        let producer = fixture
+            .state
+            .try_claim_producer()
+            .expect("claim stop producer");
+        let lease = fixture
+            .state
+            .sessions()
+            .begin_user_stop(session_id)
+            .await
+            .expect("own user-stop proof scope");
+        assert_eq!(lease.record().state, LaunchState::Exited);
+
+        let shutdown_state = fixture.state.clone();
+        let mut shutdown = tokio::spawn(async move { shutdown_state.shutdown().await });
+        wait_for_phase(
+            &fixture.state,
+            crate::state::AppLifecyclePhase::QuiescingProducers,
+        )
+        .await;
+        assert!(!shutdown.is_finished());
+        assert!(fixture.state.sessions().get(session_id).await.is_some());
+
+        lease.release().await;
+        assert!(fixture.state.sessions().get(session_id).await.is_some());
+        drop(producer);
+        tokio::time::timeout(Duration::from_secs(5), &mut shutdown)
+            .await
+            .expect("shutdown completes after stop proof producer")
+            .expect("shutdown task")
+            .expect("application shutdown");
+        assert!(fixture.state.sessions().get(session_id).await.is_none());
     }
 
     #[test]

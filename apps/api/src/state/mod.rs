@@ -45,7 +45,9 @@ use axial_config::{
     is_canonical_instance_id,
 };
 use axial_content::ContentRegistry;
-pub use axial_launcher::{LaunchEvent, LaunchLogEvent, LaunchSessionRecord, LaunchStatusEvent};
+pub use axial_launcher::{
+    LaunchEvent, LaunchLogEvent, LaunchSessionRecord, LaunchStatusEvent, RevisionedLaunchStatus,
+};
 use axial_minecraft::ManagedRuntimeCache;
 pub use axial_minecraft::download::DownloadProgress;
 use axial_performance::PerformanceManager;
@@ -169,8 +171,12 @@ pub(crate) use registered_artifact_findings::{
 pub(crate) use remote_flags::{
     RemoteFlagRefreshOutcome, RemoteFlagStore, ResolvedFlagSource, resolve_flag,
 };
-pub(crate) use sessions::{LaunchFailureTermination, LaunchFailureTerminationErrorClass};
-pub use sessions::{SessionAdmissionError, SessionStopError, SessionStore, StartupOutcome};
+pub(crate) use sessions::{
+    LaunchFailureTerminalizationLease, LaunchFailureTermination,
+    LaunchFailureTerminationErrorClass, ProcessSettlementLease, RunningHandoffOutcome,
+    SessionAdmissionError, StalledStartupTermination,
+};
+pub use sessions::{SessionEventSubscription, SessionStopError, SessionStore, StartupOutcome};
 pub(crate) use setup_plans::{SETUP_PLAN_TTL, SetupPlanInsertError, SetupPlanTake};
 use shutdown::AppShutdownCoordinator;
 pub use shutdown::{AppShutdownError, AppShutdownStep};

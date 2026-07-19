@@ -9,19 +9,20 @@ import {
   selectedInstanceId,
   lastInstanceId,
   launchState,
-  runningSessions,
+  launchSessions,
   launchNotices,
   currentPage,
   searchQuery,
   sidebarFilter,
   logLines,
 } from './store';
-import type { RunningSession, LaunchNotice } from './types-launch';
+import type { LaunchSession, LaunchNotice, LaunchStatusUpdate } from './types-launch';
 import type { Version, Catalog } from './types-version';
 import type { Instance } from './types-instance';
 import type { Config, SystemInfo } from './types-settings';
 import type { Page } from './types-ui';
 import type { LaunchStatusViewModel } from './types-launch';
+import { launchStatusUpdate } from './launch-response-adapters';
 
 export function selectInstance(id: string | null): void {
   selectedInstanceId.value = id;
@@ -61,10 +62,10 @@ export function updateLaunchPrepView(instanceId: string, viewModel: LaunchStatus
   };
 }
 
-export function confirmLaunch(instanceId: string, session: RunningSession): void {
+export function confirmLaunch(instanceId: string, session: LaunchSession): void {
   batch(() => {
     launchState.value = { status: 'idle' };
-    runningSessions.value = { ...runningSessions.value, [instanceId]: session };
+    launchSessions.value = { ...launchSessions.value, [instanceId]: session };
   });
 }
 
@@ -73,18 +74,44 @@ export function endLaunchPrep(): void {
 }
 
 export function endSession(instanceId: string): void {
-  const next = { ...runningSessions.value };
+  const next = { ...launchSessions.value };
   delete next[instanceId];
-  runningSessions.value = next;
+  launchSessions.value = next;
 }
 
-export function updateRunningSessionState(instanceId: string, patch: Partial<RunningSession>): void {
-  const current = runningSessions.value[instanceId];
+export function endSessionIfCurrent(instanceId: string, sessionId: string): boolean {
+  if (launchSessions.value[instanceId]?.sessionId !== sessionId) return false;
+  endSession(instanceId);
+  return true;
+}
+
+export function updateLaunchSessionState(instanceId: string, patch: Partial<LaunchSession>): void {
+  const current = launchSessions.value[instanceId];
   if (!current) return;
-  runningSessions.value = {
-    ...runningSessions.value,
+  launchSessions.value = {
+    ...launchSessions.value,
     [instanceId]: { ...current, ...patch },
   };
+}
+
+function applyLaunchStatusUpdate(instanceId: string, sessionId: string, update: LaunchStatusUpdate): boolean {
+  const current = launchSessions.value[instanceId];
+  if (!current || current.sessionId !== sessionId || update.revision <= current.statusRevision) return false;
+  launchSessions.value = {
+    ...launchSessions.value,
+    [instanceId]: {
+      ...current,
+      viewModel: update.viewModel,
+      statusRevision: update.revision,
+    },
+  };
+  return true;
+}
+
+export function convergeLaunchStatus(instanceId: string, sessionId: string, value: unknown): LaunchStatusUpdate | null {
+  const update = launchStatusUpdate(value, sessionId);
+  if (!update || !applyLaunchStatusUpdate(instanceId, sessionId, update)) return null;
+  return update;
 }
 
 export function setLaunchNotice(instanceId: string, notice: LaunchNotice): void {

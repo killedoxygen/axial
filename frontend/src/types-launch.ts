@@ -12,27 +12,12 @@ export interface LaunchActionState {
   disabled_reason?: string;
 }
 
-export interface LaunchBenchmarkMetadata {
-  id?: string;
-  profile?: string;
-  run_type?: string;
-  mode?: string;
-}
-
-export interface RunningSession {
+export interface LaunchSession {
   sessionId: string;
-  versionId: string;
-  pid: number;
-  state?: string;
   stopping?: boolean;
   launchedAt: string;
-  allocatedMB: number;
-  viewModel?: LaunchStatusViewModel;
-  benchmark?: LaunchBenchmarkMetadata;
-  healing?: LaunchHealingSummary;
-  guardian?: GuardianSummary;
-  outcome?: LaunchSessionOutcome;
-  eventSource?: EventSource;
+  viewModel: LaunchStatusViewModel;
+  statusRevision: number;
 }
 
 export type LaunchOverrideOrigin = 'global' | 'instance';
@@ -142,6 +127,9 @@ export interface LaunchStatusViewModel {
   label: string;
   progress_pct: number;
   terminal: boolean;
+  playing: boolean;
+  process_live: boolean;
+  can_stop: boolean;
 }
 
 export type LaunchSessionOutcomeKind = 'clean' | 'stopped' | 'failed' | 'unknown';
@@ -162,6 +150,13 @@ export interface LaunchSessionOutcome {
   reason: LaunchSessionExitReason;
   kind: LaunchSessionOutcomeKind;
   summary: string;
+}
+
+export interface LaunchStatusUpdate {
+  revision: number;
+  viewModel: LaunchStatusViewModel;
+  notice: LaunchNotice | null;
+  outcome: LaunchSessionOutcome | null;
 }
 
 export interface LaunchProofScenario {

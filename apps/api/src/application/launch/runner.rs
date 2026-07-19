@@ -36,7 +36,8 @@ use crate::observability::telemetry::{
 use crate::state::launch_reports::LaunchProofContext;
 use crate::state::{
     AppState, LaunchEvent, LaunchFailureTermination, LaunchFailureTerminationErrorClass,
-    LaunchStatusEvent, OperationJournalStoreError, RegisteredArtifactFindings, StartupOutcome,
+    OperationJournalStoreError, ProcessSettlementLease, RegisteredArtifactFindings,
+    RunningHandoffOutcome, StalledStartupTermination, StartupOutcome,
 };
 use axial_launcher::{
     LaunchFailureClass, LaunchIntent, LaunchPreparationEvent, LaunchSessionExitReason,
@@ -58,10 +59,12 @@ use recovery::{
 use spawn::{
     launch_command_target, launch_spawn_failed_stage_evidence, launch_spawn_stage_evidence,
 };
-use status::{emit_status, launch_state_for_preparation_event, serialize_guardian};
+use status::{
+    emit_status, launch_state_for_preparation_event, launch_status_event, serialize_guardian,
+};
 use tokio::process::Command;
 
-pub use failure::sanitize_live_launch_failure_message;
+pub(super) use failure::sanitize_live_launch_failure_message;
 pub(in crate::application::launch) use proof::persist_launch_proof_owned;
 
 pub(super) async fn persist_launch_proof_for_reservation_failure(
@@ -86,22 +89,20 @@ const STARTUP_OBSERVATION_TIMEOUT: std::time::Duration = std::time::Duration::fr
 const SESSION_TERMINAL_REATTACH_DELAY: std::time::Duration = std::time::Duration::from_millis(25);
 const MAX_RECOVERY_ATTEMPTS: u8 = 3;
 
-pub struct LaunchSuccess {
-    pub session_id: String,
-    pub instance_id: String,
-    pub pid: u32,
-    pub launched_at: String,
-    pub max_memory_mb: i32,
-    pub min_memory_mb: i32,
-    pub healing: Option<axial_launcher::LaunchHealingSummary>,
-    pub guardian: Option<GuardianSummary>,
+pub(crate) struct LaunchSuccess {
+    pub(super) session_id: String,
+    pub(super) instance_id: String,
+    pub(super) launched_at: String,
+    pub(super) max_memory_mb: i32,
+    pub(super) min_memory_mb: i32,
+    pub(super) guardian: Option<GuardianSummary>,
 }
 
 #[derive(Clone)]
-pub struct LaunchRequestError {
-    pub message: String,
-    pub healing: Option<axial_launcher::LaunchHealingSummary>,
-    pub guardian: Option<GuardianSummary>,
+pub(crate) struct LaunchRequestError {
+    pub(crate) message: String,
+    pub(crate) healing: Option<axial_launcher::LaunchHealingSummary>,
+    pub(crate) guardian: Option<GuardianSummary>,
 }
 
 enum LaunchTerminalizationDisposition {
@@ -207,11 +208,15 @@ async fn launch_session_with_control(
         .with_benchmark(task.benchmark.clone())
         .with_resource_budget(task.resource_budget.clone());
     let sessions = state.sessions().clone();
-    let observer_handoff = if let Some(events) = sessions.subscribe(&session_id).await {
+    let (observer_handoff, observer_generation) = if let Some((generation, events)) =
+        sessions.subscribe_terminal_observation(&session_id).await
+    {
         let (handoff_tx, handoff_rx) = tokio::sync::oneshot::channel();
         let observer_state = state.clone();
         let observer_session_id = session_id.clone();
         let observer_update_admission = task.update_admission.clone();
+        let observer_initial_guardian = initial_guardian.clone();
+        let settlement_producer = producer.claim_child();
         producer.spawn_child(async move {
             let _update_admission = observer_update_admission;
             own_terminal_observation(
@@ -221,14 +226,17 @@ async fn launch_session_with_control(
                 guardian_mode,
                 launched_at,
                 proof_context,
+                generation,
+                observer_initial_guardian,
+                settlement_producer,
                 events,
                 handoff_rx,
             )
             .await;
         });
-        Some(handoff_tx)
+        (Some(handoff_tx), Some(generation))
     } else {
-        None
+        (None, None)
     };
     let (integrity_foreground, update_admission, task) = LaunchSessionRunTask::from_prepared(task);
     let mut integrity_foreground = Some(integrity_foreground);
@@ -274,7 +282,13 @@ async fn launch_session_with_control(
     match disposition {
         LaunchTerminalizationDisposition::Complete(result) => {
             if !observer_owns_hold {
-                sessions.release_terminal_retention_hold(&session_id).await;
+                if let Some(generation) = observer_generation {
+                    sessions
+                        .release_terminal_observation_hold(&session_id, generation)
+                        .await;
+                } else {
+                    sessions.release_terminal_retention_hold(&session_id).await;
+                }
             }
             result
         }
@@ -291,91 +305,171 @@ async fn own_terminal_observation(
     guardian_mode: crate::guardian::GuardianMode,
     launched_at: String,
     proof_context: LaunchProofContext,
+    generation: u64,
+    initial_guardian: GuardianSummary,
+    settlement_producer: crate::state::ProducerLease,
     mut events: tokio::sync::broadcast::Receiver<LaunchEvent>,
     handoff: tokio::sync::oneshot::Receiver<TerminalObservationHandoff>,
 ) {
-    let guardian = match handoff.await {
-        Ok(TerminalObservationHandoff::Observe { guardian }) => guardian,
+    let (guardian, handoff_dropped) = match handoff.await {
+        Ok(TerminalObservationHandoff::Observe { guardian }) => (guardian, false),
         Ok(TerminalObservationHandoff::Preserve) => return,
         Err(_) => {
-            state
+            if !state
                 .sessions()
-                .release_terminal_retention_hold(&session_id)
-                .await;
-            return;
+                .terminal_observation_is_pending(&session_id, generation)
+                .await
+            {
+                state
+                    .sessions()
+                    .release_terminal_observation_hold(&session_id, generation)
+                    .await;
+                return;
+            }
+            (initial_guardian, true)
         }
     };
 
-    let terminal = loop {
-        match events.recv().await {
-            Ok(LaunchEvent::Status(status))
-                if matches!(status.state.as_str(), "failed" | "exited") =>
-            {
-                let record = state.sessions().get(&session_id).await;
-                if record.as_ref().is_some_and(|record| {
-                    matches!(record.state, LaunchState::Failed | LaunchState::Exited)
-                }) {
-                    break record;
+    let settlement = loop {
+        if let Some(lease) = state
+            .sessions()
+            .claim_process_settlement(&session_id, generation, None)
+            .await
+        {
+            break Some(lease);
+        }
+
+        let record = state.sessions().get(&session_id).await;
+        if record
+            .as_ref()
+            .is_some_and(|record| matches!(record.state, LaunchState::Failed | LaunchState::Exited))
+        {
+            if let Some(record) = record {
+                persist_terminal_proof(
+                    &state,
+                    &session_id,
+                    &launched_at,
+                    proof_context.clone(),
+                    record,
+                )
+                .await;
+            }
+            break None;
+        }
+
+        if handoff_dropped
+            && !state
+                .sessions()
+                .terminal_observation_is_pending(&session_id, generation)
+                .await
+        {
+            break None;
+        }
+
+        let next_event = if handoff_dropped {
+            match tokio::time::timeout(SESSION_TERMINAL_REATTACH_DELAY, events.recv()).await {
+                Ok(event) => event,
+                Err(_) => continue,
+            }
+        } else {
+            events.recv().await
+        };
+        match next_event {
+            Ok(LaunchEvent::ProcessSettled {
+                generation: signal_generation,
+                attempt_id,
+            }) if signal_generation == generation => {
+                if let Some(lease) = state
+                    .sessions()
+                    .claim_process_settlement(&session_id, generation, Some(attempt_id))
+                    .await
+                {
+                    break Some(lease);
                 }
             }
             Ok(_) => {}
-            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                let record = state.sessions().get(&session_id).await;
-                if record.as_ref().is_some_and(|record| {
-                    matches!(record.state, LaunchState::Failed | LaunchState::Exited)
-                }) {
-                    break record;
-                }
-            }
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
             Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                break state.sessions().get(&session_id).await;
+                break None;
             }
         }
     };
 
-    if let Some(record) = terminal {
-        let accepted_failure_class = record
-            .failure
-            .as_ref()
-            .map(|failure| failure.class)
-            .filter(|failure_class| is_guardian_launch_crash_class(*failure_class));
-        let observed_phase = match (
-            record.boot_completed_at_ms,
-            record.outcome.as_ref().map(|outcome| outcome.reason),
-        ) {
-            (None, Some(LaunchSessionExitReason::StartupFailed)) => {
-                Some(GuardianObservedLaunchFailurePhase::BeforeBoot)
-            }
-            (Some(_), Some(LaunchSessionExitReason::CrashedAfterBoot)) => {
-                Some(GuardianObservedLaunchFailurePhase::AfterBoot)
-            }
-            _ => None,
-        };
-        if let (Some(failure_class), Some(observed_phase)) =
-            (accepted_failure_class, observed_phase)
-        {
-            settle_observed_launch_failure(
-                &state,
+    if let Some(lease) = settlement {
+        let completion_state = state.clone();
+        let completion = settlement_producer.spawn_joinable(async move {
+            settle_observed_process_exit(
+                &completion_state,
                 &session_id,
                 &instance_id,
                 guardian_mode,
-                failure_class,
-                observed_phase,
                 &launched_at,
                 proof_context,
-                record,
                 guardian,
+                lease,
             )
             .await;
-        } else {
-            persist_terminal_proof(&state, &session_id, &launched_at, proof_context, record).await;
-        }
+        });
+        let _ = completion.await;
+        return;
     }
 
     state
         .sessions()
-        .release_terminal_retention_hold(&session_id)
+        .release_terminal_observation_hold(&session_id, generation)
         .await;
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn settle_observed_process_exit(
+    state: &AppState,
+    session_id: &str,
+    instance_id: &str,
+    guardian_mode: crate::guardian::GuardianMode,
+    launched_at: &str,
+    proof_context: LaunchProofContext,
+    mut guardian: GuardianSummary,
+    mut lease: ProcessSettlementLease,
+) {
+    let mut event = lease.event().clone();
+    let failure_class = event
+        .failure_class
+        .as_deref()
+        .and_then(LaunchFailureClass::from_name)
+        .filter(|failure_class| is_guardian_launch_crash_class(*failure_class));
+    if let Some(failure_class) = failure_class {
+        if let Some(user_outcome) =
+            author_guardian_copy(GuardianCopyRequest::observed_launch_failure(
+                failure_class,
+                event.crash_evidence.as_ref(),
+                GuardianObservedLaunchFailurePhase::AfterBoot,
+            ))
+        {
+            guardian = guardian_summary_with_observed_outcome(&guardian, &user_outcome);
+            event.failure_detail = Some(user_outcome.summary().to_string());
+            event.guardian = serialize_guardian(Some(guardian));
+        }
+
+        let observed_at = timestamp_utc();
+        if let Err(error) = record_launch_failure_observation(
+            state.failure_memory(),
+            instance_id,
+            guardian_mode,
+            failure_class,
+            &observed_at,
+        ) {
+            tracing::warn!(
+                error_kind = error.class(),
+                failure_class = failure_class.as_str(),
+                "failed to record observed launch failure"
+            );
+        }
+    }
+
+    let proof_record = lease.preview(event.clone());
+    persist_terminal_proof(state, session_id, launched_at, proof_context, proof_record).await;
+    let _ = lease.finalize(event).await;
+    lease.release().await;
 }
 
 async fn persist_terminal_proof(
@@ -404,96 +498,6 @@ async fn persist_terminal_proof(
         .is_err()
     {
         tracing::warn!(session_id, "failed to persist terminal launch proof");
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn settle_observed_launch_failure(
-    state: &AppState,
-    session_id: &str,
-    instance_id: &str,
-    guardian_mode: crate::guardian::GuardianMode,
-    failure_class: LaunchFailureClass,
-    observed_phase: GuardianObservedLaunchFailurePhase,
-    launched_at: &str,
-    proof_context: LaunchProofContext,
-    record: crate::state::LaunchSessionRecord,
-    mut guardian: GuardianSummary,
-) {
-    let Some(user_outcome) = author_guardian_copy(GuardianCopyRequest::observed_launch_failure(
-        failure_class,
-        record.crash_evidence.as_ref(),
-        observed_phase,
-    )) else {
-        persist_terminal_proof(state, session_id, launched_at, proof_context, record).await;
-        return;
-    };
-    let terminal_state = match observed_phase {
-        GuardianObservedLaunchFailurePhase::BeforeBoot => {
-            guardian = guardian_summary_with_observed_outcome(&guardian, &user_outcome);
-            "failed"
-        }
-        GuardianObservedLaunchFailurePhase::AfterBoot => {
-            guardian = guardian_summary_with_observed_outcome(&guardian, &user_outcome);
-            "exited"
-        }
-    };
-
-    state
-        .sessions()
-        .emit_status(
-            session_id,
-            LaunchStatusEvent {
-                state: terminal_state.to_string(),
-                benchmark: None,
-                pid: None,
-                exit_code: record.exit_code,
-                failure_class: Some(failure_class.as_str().to_string()),
-                failure_detail: Some(user_outcome.summary().to_string()),
-                crash_evidence: record.crash_evidence.clone(),
-                healing: record.healing.clone(),
-                guardian: serialize_guardian(Some(guardian)),
-                outcome: record.outcome.clone(),
-                notice: None,
-                evidence: Vec::new(),
-                stages: Vec::new(),
-            },
-        )
-        .await;
-
-    let observed_at = timestamp_utc();
-    if let Err(error) = record_launch_failure_observation(
-        state.failure_memory(),
-        instance_id,
-        guardian_mode,
-        failure_class,
-        &observed_at,
-    ) {
-        tracing::warn!(
-            error_kind = error.class(),
-            failure_class = failure_class.as_str(),
-            "failed to record observed launch failure"
-        );
-    }
-
-    let Some(updated) = state.sessions().get(session_id).await else {
-        return;
-    };
-    if state
-        .launch_reports()
-        .persist(
-            updated,
-            Some(launched_at.to_string()),
-            "failed".to_string(),
-            Some(proof_context),
-        )
-        .await
-        .is_err()
-    {
-        tracing::warn!(
-            failure_class = failure_class.as_str(),
-            "failed to persist observed launch failure proof"
-        );
     }
 }
 
@@ -528,9 +532,10 @@ async fn terminalize_unhandled_launch_error(
         .terminate_for_launch_failure(session_id)
         .await
     {
-        LaunchFailureTermination::Ready(lease) => {
+        LaunchFailureTermination::Ready(mut lease) => {
             let terminal_error =
-                finalize_unhandled_launch_error(state, producer, session_id, error).await;
+                finalize_unhandled_launch_error(state, producer, &mut lease, session_id, error)
+                    .await;
             lease.release().await;
             LaunchTerminalizationDisposition::Settled(Err(terminal_error))
         }
@@ -548,10 +553,11 @@ async fn terminalize_unhandled_launch_error(
                 .expect("pending preboot terminalization must retain update admission");
             producer.spawn_child(async move {
                 match pending.wait_for_settlement().await {
-                    Ok(lease) => {
+                    Ok(mut lease) => {
                         let _ = finalize_unhandled_launch_error(
                             &deferred_state,
                             &deferred_producer,
+                            &mut lease,
                             &deferred_session_id,
                             deferred_error,
                         )
@@ -613,7 +619,7 @@ async fn retain_launch_authority_until_session_terminal(
             .get(&session_id)
             .await
             .is_none_or(|record| matches!(record.state, LaunchState::Failed | LaunchState::Exited));
-        if terminal {
+        if terminal || state.sessions().shutdown_processes_are_settled() {
             return;
         }
 
@@ -630,6 +636,7 @@ async fn retain_launch_authority_until_session_terminal(
 async fn finalize_unhandled_launch_error(
     state: &AppState,
     producer: &crate::state::ProducerLease,
+    terminalization: &mut crate::state::LaunchFailureTerminalizationLease,
     session_id: &str,
     error: LaunchRequestError,
 ) -> LaunchRequestError {
@@ -639,6 +646,7 @@ async fn finalize_unhandled_launch_error(
     fail_launch_for_journal(
         state,
         producer,
+        terminalization,
         session_id,
         &error.message,
         error.healing,
@@ -1182,80 +1190,131 @@ async fn launch_session_inner_with_control(
             .sessions()
             .wait_for_startup(&session_id, STARTUP_OBSERVATION_TIMEOUT)
             .await;
+        let mut outcome = if outcome == StartupOutcome::Stalled {
+            match state
+                .sessions()
+                .terminate_stalled_startup_attempt(&session_id)
+                .await
+            {
+                Ok(StalledStartupTermination::Settled) => StartupOutcome::Stalled,
+                Ok(StalledStartupTermination::StartupCompleted) => StartupOutcome::Stable,
+                Err(error) => {
+                    trace_launch_event(
+                        &session_id,
+                        &format!("stalled startup termination failed: {error}"),
+                    );
+                    return Err(finish_launch_failure(
+                        &state,
+                        producer,
+                        &session_id,
+                        &mut launch_completion_pending,
+                        LaunchFailure {
+                            proof_context: Some(&proof_context),
+                            class: LaunchFailureClass::StartupStalled,
+                            message: "startup process could not be stopped safely",
+                            healing: prepared.healing.clone(),
+                            guardian: Some(guardian.clone()),
+                            outcome: None,
+                        },
+                    )
+                    .await);
+                }
+            }
+        } else {
+            outcome
+        };
+        control.wait_before_running_handoff().await;
+        if matches!(outcome, StartupOutcome::Stable | StartupOutcome::TimedOut) {
+            let running = launch_status_event(
+                LaunchState::Running,
+                launched.pid,
+                None,
+                prepared.healing.clone(),
+                Some(guardian.clone()),
+            );
+            outcome = match state
+                .sessions()
+                .publish_running_and_complete_startup_recovery(&launched, running)
+                .await
+            {
+                RunningHandoffOutcome::Published => outcome,
+                RunningHandoffOutcome::Settling => StartupOutcome::Settling,
+                RunningHandoffOutcome::Stopped => StartupOutcome::Stopped,
+                RunningHandoffOutcome::Rejected => StartupOutcome::Exited,
+            };
+        }
 
         match outcome {
-            StartupOutcome::Stable | StartupOutcome::TimedOut => {
-                record_successful_self_healing_if_any(
-                    &state,
-                    &session_id,
-                    last_recovery_plan.as_ref(),
-                )
-                .await
-                .map_err(guardian_journal_error)?;
+            StartupOutcome::Stable | StartupOutcome::TimedOut | StartupOutcome::Settling => {
+                let settlement_pending = outcome == StartupOutcome::Settling;
+                if !settlement_pending {
+                    record_successful_self_healing_if_any(
+                        &state,
+                        &session_id,
+                        last_recovery_plan.as_ref(),
+                    )
+                    .await
+                    .map_err(guardian_journal_error)?;
+                }
                 emit_launch_completed(
                     &state,
                     &mut launch_completion_pending,
                     TelemetryLaunchOutcome::Success,
                 );
-                emit_status(
-                    &state,
-                    &session_id,
-                    LaunchState::Running,
-                    launched.pid,
-                    None,
-                    prepared.healing.clone(),
-                    Some(guardian.clone()),
-                )
-                .await;
-                persist_launch_proof_with_context(
-                    &state,
-                    producer,
-                    &session_id,
-                    Some(launched_at.as_str()),
-                    "running",
-                    Some(&proof_context),
-                )
-                .await;
-                if let Err(stage) = persist_launch_metadata(
-                    &state,
-                    integrity_foreground
-                        .as_ref()
-                        .expect("successful launch must retain foreground through metadata"),
-                    &instance.id,
-                    &intent.username,
-                    intent.max_memory_mb,
-                    intent.min_memory_mb,
-                    &launched_at,
-                )
-                .await
-                {
-                    tracing::warn!(?stage, "launch metadata persistence failed");
+                if !settlement_pending {
+                    persist_launch_proof_with_context(
+                        &state,
+                        producer,
+                        &session_id,
+                        Some(launched_at.as_str()),
+                        "running",
+                        Some(&proof_context),
+                    )
+                    .await;
+                    if let Err(stage) = persist_launch_metadata(
+                        &state,
+                        integrity_foreground
+                            .as_ref()
+                            .expect("successful launch must retain foreground through metadata"),
+                        &instance.id,
+                        &intent.username,
+                        intent.max_memory_mb,
+                        intent.min_memory_mb,
+                        &launched_at,
+                    )
+                    .await
+                    {
+                        tracing::warn!(?stage, "launch metadata persistence failed");
+                    }
+                    drop(spawn_successful_user_mod_witness_publication(
+                        &state,
+                        producer,
+                        integrity_foreground.as_ref().expect(
+                            "successful launch must retain foreground through witness publication",
+                        ),
+                        &intent.instance_id,
+                    ));
                 }
-                drop(spawn_successful_user_mod_witness_publication(
-                    &state,
-                    producer,
-                    integrity_foreground.as_ref().expect(
-                        "successful launch must retain foreground through witness publication",
-                    ),
-                    &intent.instance_id,
-                ));
                 return Ok(LaunchSuccess {
                     session_id: session_id.clone(),
                     instance_id: intent.instance_id.clone(),
-                    pid: launched.pid.unwrap_or_default(),
                     launched_at: launched_at.clone(),
                     max_memory_mb: intent.max_memory_mb,
                     min_memory_mb: intent.min_memory_mb,
+                    guardian: Some(guardian.clone()),
+                });
+            }
+            StartupOutcome::Stopped => {
+                trace_launch_event(&session_id, "launch stopped by user during startup");
+                emit_pending_launch_failure(&state, &mut launch_completion_pending);
+                return Err(LaunchRequestError {
+                    message: "Launch stopped by user.".to_string(),
                     healing: prepared.healing.clone(),
                     guardian: Some(guardian.clone()),
                 });
             }
             StartupOutcome::Exited | StartupOutcome::Stalled => {
                 let stalled = matches!(outcome, StartupOutcome::Stalled);
-                if stalled {
-                    let _ = state.sessions().kill(&session_id).await;
-                }
-
                 let terminal_record = if stalled {
                     None
                 } else {
@@ -1438,13 +1497,37 @@ async fn launch_session_inner_with_control(
                             .operation_id()
                             .cloned()
                             .unwrap_or_else(new_registered_artifact_repair_operation_id);
+                        let Some(recovery_scope) = state
+                            .sessions()
+                            .recovering_component_mutation_scope(&session_id)
+                            .await
+                        else {
+                            trace_launch_event(
+                                &session_id,
+                                "registered artifact recovery session was no longer current",
+                            );
+                            return Err(finish_registered_artifact_repair_failure(
+                                &state,
+                                producer,
+                                &session_id,
+                                &mut launch_completion_pending,
+                                &proof_context,
+                                failure_class,
+                                healing,
+                                guardian,
+                                DiagnosisId::LauncherManagedArtifactCorrupt,
+                                GuardianArtifactRepairStatus::Blocked,
+                            )
+                            .await);
+                        };
                         let admission = match state
-                            .admit_registered_artifact_repair(
+                            .admit_launch_registered_artifact_repair(
                                 authorization,
                                 operation_id.clone(),
                                 chrono::Duration::minutes(
                                     REGISTERED_ARTIFACT_REPAIR_SUPPRESSION_MINUTES,
                                 ),
+                                recovery_scope,
                             )
                             .await
                         {
@@ -1553,6 +1636,27 @@ async fn launch_session_inner_with_control(
                             .await;
                         match recovery_outcome.effective_status {
                             GuardianArtifactRepairStatus::Repaired => {
+                                if !state
+                                    .sessions()
+                                    .begin_startup_recovery_retry(&session_id)
+                                    .await
+                                {
+                                    return Err(finish_launch_failure(
+                                        &state,
+                                        producer,
+                                        &session_id,
+                                        &mut launch_completion_pending,
+                                        LaunchFailure {
+                                            proof_context: Some(&proof_context),
+                                            class: failure_class,
+                                            message: "launch recovery session was no longer current",
+                                            healing,
+                                            guardian: Some(guardian.clone()),
+                                            outcome: None,
+                                        },
+                                    )
+                                    .await);
+                                }
                                 registered_recovery_process_retry_used = true;
                                 continue;
                             }
@@ -1601,7 +1705,11 @@ async fn launch_session_inner_with_control(
                                     &mut guardian,
                                     &mut attempt,
                                     &recovery_plan,
-                                ) {
+                                ) && state
+                                    .sessions()
+                                    .begin_startup_recovery_retry(&session_id)
+                                    .await
+                                {
                                     last_recovery_plan = Some(recovery_plan);
                                     continue;
                                 } else {
@@ -1742,6 +1850,44 @@ struct LaunchLoopControl {
     runtime_prepare_source: Option<LaunchRuntimePrepareSource>,
     #[cfg(test)]
     refuse_runtime_mutation_admission: bool,
+    #[cfg(test)]
+    before_running_handoff: Option<std::sync::Arc<LaunchLoopBarrier>>,
+}
+
+#[cfg(test)]
+struct LaunchLoopBarrier {
+    reached: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    release: std::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+}
+
+#[cfg(test)]
+impl LaunchLoopBarrier {
+    fn new() -> (
+        std::sync::Arc<Self>,
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (reached, reached_rx) = tokio::sync::oneshot::channel();
+        let (release, release_rx) = tokio::sync::oneshot::channel();
+        (
+            std::sync::Arc::new(Self {
+                reached: std::sync::Mutex::new(Some(reached)),
+                release: std::sync::Mutex::new(Some(release_rx)),
+            }),
+            reached_rx,
+            release,
+        )
+    }
+
+    async fn wait(&self) {
+        if let Some(reached) = self.reached.lock().expect("barrier reached lock").take() {
+            let _ = reached.send(());
+        }
+        let release = self.release.lock().expect("barrier release lock").take();
+        if let Some(release) = release {
+            let _ = release.await;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1752,6 +1898,13 @@ enum LaunchRuntimePrepareSource {
 }
 
 impl LaunchLoopControl {
+    async fn wait_before_running_handoff(&self) {
+        #[cfg(test)]
+        if let Some(barrier) = self.before_running_handoff.as_ref() {
+            barrier.wait().await;
+        }
+    }
+
     #[cfg(test)]
     fn runtime_prepare_source(&self) -> LaunchRuntimePrepareSource {
         self.runtime_prepare_source
@@ -2130,7 +2283,7 @@ async fn sense_startup_failure_integrity(
         .unwrap_or_default()
 }
 
-pub fn trace_launch_event(session_id: &str, message: &str) {
+pub(super) fn trace_launch_event(session_id: &str, message: &str) {
     append_trace("launch", session_id, message);
 }
 
@@ -2165,7 +2318,7 @@ mod tests {
         AppConfig, AppPaths, ConfigStore, Instance, InstanceRegistrySnapshot, InstanceStore,
     };
     use axial_launcher::{
-        CrashEvidence, LaunchAuthContext, LaunchGuardianContext, LaunchIntent, LaunchSessionRecord,
+        LaunchAuthContext, LaunchGuardianContext, LaunchIntent, LaunchSessionRecord,
         OverrideOrigin, SessionId,
     };
     use axial_minecraft::known_good::{
@@ -2846,6 +2999,11 @@ mod tests {
             .insert(session)
             .await
             .expect("insert wrong-content client launch session");
+        let mut launch_events = state
+            .sessions()
+            .subscribe(session_id)
+            .await
+            .expect("subscribe wrong-content launch events");
         let producer = state
             .try_claim_producer()
             .expect("claim wrong-content client launch producer");
@@ -2907,6 +3065,61 @@ mod tests {
                 .expect("observed startup integrity")
                 .contains(&crate::guardian::GuardianFactId::ArtifactHashMismatch),
             "process-triggered Tier1 must observe the same-size client hash mismatch"
+        );
+        let mut statuses = Vec::new();
+        loop {
+            match launch_events.try_recv() {
+                Ok(LaunchEvent::Status(status)) => statuses.push(*status),
+                Ok(LaunchEvent::Log(_)) => {}
+                Ok(LaunchEvent::ProcessSettled { .. }) => {}
+                Err(tokio::sync::broadcast::error::TryRecvError::Empty) => break,
+                Err(tokio::sync::broadcast::error::TryRecvError::Closed) => break,
+                Err(tokio::sync::broadcast::error::TryRecvError::Lagged(count)) => {
+                    panic!("wrong-content launch event proof lagged by {count}")
+                }
+            }
+        }
+        let states = statuses
+            .iter()
+            .map(|status| status.state.as_str())
+            .collect::<Vec<_>>();
+        assert!(states.contains(&"recovering"));
+        assert!(states.contains(&"running"));
+        assert!(
+            !states
+                .iter()
+                .any(|state| matches!(*state, "failed" | "exited")),
+            "recoverable attempt published a logical terminal: {states:?}"
+        );
+        let running_status = statuses
+            .iter()
+            .rev()
+            .find(|status| status.state == "running")
+            .expect("repaired running status");
+        assert_eq!(
+            running_status
+                .guardian
+                .as_ref()
+                .and_then(|guardian| guardian["decision"].as_str()),
+            Some("intervened")
+        );
+        assert!(running_status.notice.is_some());
+        let running_record = state
+            .sessions()
+            .get(session_id)
+            .await
+            .expect("running recovery session");
+        let stages = &running_record.stages;
+        assert!(
+            stages
+                .iter()
+                .any(|stage| stage.stage == "monitoring"
+                    && stage.result.as_deref() == Some("failed"))
+        );
+        assert!(
+            stages
+                .iter()
+                .any(|stage| stage.stage == "recovering" && stage.result.as_deref() == Some("ok"))
         );
 
         let reconciliation = state
@@ -3775,9 +3988,11 @@ mod tests {
         );
         assert!(crash_evidence.names_out_of_memory);
 
-        let status_payload = super::super::reports::launch_status_payload(&state, session_id)
-            .await
-            .expect("OOM status payload");
+        let status_payload = serde_json::json!(
+            super::super::reports::launch_status(&state, session_id)
+                .await
+                .expect("OOM status payload")
+        );
         assert_eq!(status_payload["failure_class"], "out_of_memory");
         assert_eq!(
             status_payload["failure_detail"],
@@ -3932,11 +4147,13 @@ mod tests {
         while let Ok(event) = events.try_recv() {
             match event {
                 LaunchEvent::Status(status) => event_payloads.push_str(
-                    &super::super::reports::public_launch_status_json(&status).to_string(),
+                    &serde_json::to_string(&super::super::reports::public_launch_status(&status))
+                        .expect("serialize public OOM status event"),
                 ),
                 LaunchEvent::Log(log) => event_payloads.push_str(
                     &serde_json::to_string(&log).expect("serialize public OOM log event"),
                 ),
+                LaunchEvent::ProcessSettled { .. } => {}
             }
         }
         let status_json = status_payload.to_string();
@@ -4031,6 +4248,15 @@ mod tests {
                 .crash_evidence
                 .as_ref()
                 .is_some_and(|evidence| evidence.names_out_of_memory)
+        );
+        assert!(
+            state.launch_reports().load(session_id).is_some(),
+            "proof must be durable before the terminal event is visible"
+        );
+        assert_eq!(
+            state.failure_memory().list().len(),
+            1,
+            "failure memory must be updated before the terminal event is visible"
         );
 
         tokio::time::timeout(Duration::from_secs(2), async {
@@ -4128,6 +4354,230 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn process_settlement_winning_boot_to_running_handoff_finishes_once() {
+        let root = unique_test_dir("launch-boot-running-settlement-race");
+        let state = test_app_state(&root);
+        let session_id = "launch-boot-running-settlement-race";
+        state
+            .sessions()
+            .insert(test_record(session_id))
+            .await
+            .expect("insert handoff race session");
+        let mut events = state
+            .sessions()
+            .subscribe(session_id)
+            .await
+            .expect("subscribe handoff race session");
+        let java_path = write_post_boot_out_of_memory_launch_fixture(&root);
+        let producer = state
+            .try_claim_producer()
+            .expect("claim handoff race producer");
+        let mut task = test_recovery_launch_task(&state, session_id, &root).await;
+        task.instance.java_path = java_path.clone();
+        task.intent.requested_java = java_path;
+        task.intent.game_dir = Some(root.join("instance"));
+        task.launched_at = "2026-01-01T00:00:00.000Z".to_string();
+        let (barrier, reached, release) = LaunchLoopBarrier::new();
+        let launch = tokio::spawn(launch_session_with_control(
+            state.clone(),
+            task,
+            producer,
+            LaunchLoopControl {
+                before_running_handoff: Some(barrier),
+                ..LaunchLoopControl::default()
+            },
+        ));
+
+        tokio::time::timeout(Duration::from_secs(5), reached)
+            .await
+            .expect("running handoff barrier deadline")
+            .expect("running handoff barrier reached");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if state
+                    .sessions()
+                    .get(session_id)
+                    .await
+                    .is_some_and(|record| record.state == LaunchState::Settling)
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("process settlement wins running handoff");
+        release.send(()).expect("release running handoff");
+
+        let launched = tokio::time::timeout(Duration::from_secs(5), launch)
+            .await
+            .expect("handoff race launch deadline")
+            .expect("handoff race launch owner")
+            .unwrap_or_else(|error| {
+                panic!("settling handoff must remain successful: {}", error.message)
+            });
+        assert_eq!(launched.session_id, session_id);
+
+        let mut running_statuses = 0;
+        let mut settling_statuses = 0;
+        let mut terminal_statuses = 0;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let LaunchEvent::Status(status) =
+                    events.recv().await.expect("handoff race event")
+                {
+                    running_statuses += usize::from(status.state == "running");
+                    settling_statuses += usize::from(status.state == "settling");
+                    terminal_statuses +=
+                        usize::from(matches!(status.state.as_str(), "failed" | "exited"));
+                    if terminal_statuses == 1 {
+                        break;
+                    }
+                }
+            }
+        })
+        .await
+        .expect("handoff race terminal deadline");
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if state.sessions().retention_hold_count(session_id).await == Some(0) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("handoff race observer settlement");
+        while let Ok(event) = events.try_recv() {
+            if let LaunchEvent::Status(status) = event {
+                running_statuses += usize::from(status.state == "running");
+                settling_statuses += usize::from(status.state == "settling");
+                terminal_statuses +=
+                    usize::from(matches!(status.state.as_str(), "failed" | "exited"));
+            }
+        }
+        assert_eq!(
+            running_statuses, 1,
+            "only the boot running state may publish"
+        );
+        assert_eq!(settling_statuses, 1, "settling must publish once");
+        assert_eq!(terminal_statuses, 1, "settlement must publish once");
+        let record = state
+            .sessions()
+            .get(session_id)
+            .await
+            .expect("handoff race record");
+        assert_eq!(record.state, LaunchState::Exited);
+        assert_eq!(
+            record.outcome.as_ref().map(|outcome| outcome.reason),
+            Some(LaunchSessionExitReason::CrashedAfterBoot)
+        );
+        assert!(state.launch_reports().load(session_id).is_some());
+        assert_eq!(state.failure_memory().list().len(), 1);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn user_stop_during_running_handoff_short_circuits_guardian_failure_handling() {
+        let root = unique_test_dir("launch-startup-user-stop-race");
+        let state = test_app_state(&root);
+        let session_id = "launch-startup-user-stop-race";
+        state
+            .sessions()
+            .insert(test_record(session_id))
+            .await
+            .expect("insert startup stop session");
+        let mut events = state
+            .sessions()
+            .subscribe(session_id)
+            .await
+            .expect("subscribe startup stop session");
+        let java_path = write_delayed_boot_launch_fixture(&root);
+        let launch_producer = state
+            .try_claim_producer()
+            .expect("claim startup stop launch producer");
+        let stop_producer = state
+            .try_claim_producer()
+            .expect("claim startup stop command producer");
+        let mut task = test_recovery_launch_task(&state, session_id, &root).await;
+        task.instance.java_path = java_path.clone();
+        task.intent.requested_java = java_path;
+        task.intent.game_dir = Some(root.join("instance"));
+        task.launched_at = "2026-01-01T00:00:00.000Z".to_string();
+        let (barrier, reached, release) = LaunchLoopBarrier::new();
+        let launch = tokio::spawn(launch_session_with_control(
+            state.clone(),
+            task,
+            launch_producer,
+            LaunchLoopControl {
+                before_running_handoff: Some(barrier),
+                ..LaunchLoopControl::default()
+            },
+        ));
+
+        tokio::time::timeout(Duration::from_secs(5), reached)
+            .await
+            .expect("running handoff stop barrier deadline")
+            .expect("running handoff stop barrier reached");
+        super::super::reports::stop_launch_session(&state, session_id, &stop_producer)
+            .await
+            .expect("stop startup process");
+        release.send(()).expect("release running handoff stop");
+
+        let result = tokio::time::timeout(Duration::from_secs(5), launch)
+            .await
+            .expect("startup stop launch deadline")
+            .expect("startup stop launch owner");
+        let error = match result {
+            Ok(_) => panic!("startup stop must not report launch success"),
+            Err(error) => error,
+        };
+        assert_eq!(error.message, "Launch stopped by user.");
+
+        let record = state
+            .sessions()
+            .get(session_id)
+            .await
+            .expect("startup stop record");
+        assert_eq!(record.state, LaunchState::Exited);
+        assert_eq!(
+            record.outcome.as_ref().map(|outcome| outcome.reason),
+            Some(LaunchSessionExitReason::LauncherStopped)
+        );
+        assert!(record.failure.is_none());
+        assert!(state.failure_memory().list().is_empty());
+        assert_eq!(
+            state
+                .launch_reports()
+                .load(session_id)
+                .expect("startup stop proof")
+                .outcome,
+            "stopped"
+        );
+        assert_eq!(
+            state.sessions().retention_hold_count(session_id).await,
+            Some(0)
+        );
+
+        let mut terminal_statuses = 0;
+        let mut guardian_failures = 0;
+        while let Ok(event) = events.try_recv() {
+            if let LaunchEvent::Status(status) = event {
+                terminal_statuses +=
+                    usize::from(matches!(status.state.as_str(), "failed" | "exited"));
+                guardian_failures += usize::from(status.failure_class.is_some());
+            }
+        }
+        assert_eq!(terminal_statuses, 1, "user stop must publish once");
+        assert_eq!(guardian_failures, 0, "user stop is not a Guardian failure");
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn post_boot_mod_crash_settles_guardian_copy_proof_and_failure_memory() {
         let root = unique_test_dir("launch-post-boot-mod-crash-e2e");
         let paths = test_paths(&root);
@@ -4172,7 +4622,10 @@ mod tests {
                 match events.recv().await.expect("mod crash event") {
                     LaunchEvent::Status(status) => {
                         event_payloads.push_str(
-                            &super::super::reports::public_launch_status_json(&status).to_string(),
+                            &serde_json::to_string(&super::super::reports::public_launch_status(
+                                &status,
+                            ))
+                            .expect("serialize public mod crash status event"),
                         );
                         if status.state == "exited" {
                             break (status, event_payloads);
@@ -4181,6 +4634,7 @@ mod tests {
                     LaunchEvent::Log(log) => event_payloads.push_str(
                         &serde_json::to_string(&log).expect("serialize public mod crash log event"),
                     ),
+                    LaunchEvent::ProcessSettled { .. } => {}
                 }
             }
         })
@@ -4236,9 +4690,11 @@ mod tests {
                 .as_deref()
                 .is_some_and(|detail| detail.contains("Example Machines"))
         );
-        let status_payload = super::super::reports::launch_status_payload(&state, session_id)
-            .await
-            .expect("settled mod crash status payload");
+        let status_payload = serde_json::json!(
+            super::super::reports::launch_status(&state, session_id)
+                .await
+                .expect("settled mod crash status payload")
+        );
         assert_eq!(
             status_payload["crash_evidence"]["suspected_mods"][0]["name"],
             "Example Machines"
@@ -4380,9 +4836,9 @@ mod tests {
             .insert(test_record(session_id))
             .await
             .expect("insert observer handoff session");
-        let events = state
+        let (generation, events) = state
             .sessions()
-            .subscribe(session_id)
+            .subscribe_terminal_observation(session_id)
             .await
             .expect("subscribe observer handoff");
         let (handoff_tx, handoff_rx) = tokio::sync::oneshot::channel();
@@ -4393,7 +4849,6 @@ mod tests {
         let task = test_recovery_launch_task(&state, session_id, &root).await;
         let proof_context = LaunchProofContext::from_intent(&task.intent);
         drop(task);
-        drop(producer);
 
         own_terminal_observation(
             state.clone(),
@@ -4402,6 +4857,9 @@ mod tests {
             GuardianMode::Managed,
             "2026-01-01T00:00:00.000Z".to_string(),
             proof_context,
+            generation,
+            empty_guardian_summary(axial_launcher::GuardianMode::Managed),
+            producer,
             events,
             handoff_rx,
         )
@@ -4416,28 +4874,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn terminal_observer_ignores_queued_terminal_event_after_retry_started() {
-        let root = unique_test_dir("stale-terminal-observer-event");
+    async fn terminal_observer_ignores_queued_recovery_event_after_retry_started() {
+        let root = unique_test_dir("stale-recovery-observer-event");
         let state = test_app_state(&root);
-        let session_id = "stale-terminal-observer-event";
+        let session_id = "stale-recovery-observer-event";
         state
             .sessions()
             .insert(test_record(session_id))
             .await
-            .expect("insert stale-event session");
-        let events = state
+            .expect("insert recovery-event session");
+        let (generation, events) = state
             .sessions()
-            .subscribe(session_id)
+            .subscribe_terminal_observation(session_id)
             .await
-            .expect("subscribe stale-event observer");
+            .expect("subscribe recovery-event observer");
         let (handoff_tx, handoff_rx) = tokio::sync::oneshot::channel();
         let producer = state
             .try_claim_producer()
-            .expect("claim stale-event producer");
+            .expect("claim recovery-event producer");
         let task = test_recovery_launch_task(&state, session_id, &root).await;
         let proof_context = LaunchProofContext::from_intent(&task.intent);
         drop(task);
-        drop(producer);
         let observer_state = state.clone();
         let mut observer = tokio::spawn(own_terminal_observation(
             observer_state,
@@ -4446,6 +4903,9 @@ mod tests {
             GuardianMode::Managed,
             "2026-01-01T00:00:00.000Z".to_string(),
             proof_context,
+            generation,
+            empty_guardian_summary(axial_launcher::GuardianMode::Managed),
+            producer,
             events,
             handoff_rx,
         ));
@@ -4453,13 +4913,20 @@ mod tests {
         emit_status(
             &state,
             session_id,
-            LaunchState::Exited,
+            LaunchState::Recovering,
             None,
             None,
             None,
             None,
         )
         .await;
+        assert!(
+            state
+                .sessions()
+                .begin_startup_recovery_retry(session_id)
+                .await,
+            "begin same-session startup retry"
+        );
         emit_status(
             &state,
             session_id,
@@ -4483,7 +4950,7 @@ mod tests {
             tokio::time::timeout(Duration::from_millis(50), &mut observer)
                 .await
                 .is_err(),
-            "queued attempt-1 terminal event must not settle the retry session"
+            "queued attempt-1 recovery event must not settle the retry session"
         );
 
         emit_status(
@@ -4510,135 +4977,6 @@ mod tests {
                 .state,
             LaunchState::Exited
         );
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[tokio::test]
-    async fn accepted_startup_failure_settles_copy_memory_proof_and_hold() {
-        let root = unique_test_dir("accepted-startup-failure-terminal-observer");
-        let state = test_app_state(&root);
-        let session_id = "accepted-startup-failure-terminal-observer";
-        state
-            .sessions()
-            .insert(test_record(session_id))
-            .await
-            .expect("insert observed startup failure session");
-        let events = state
-            .sessions()
-            .subscribe(session_id)
-            .await
-            .expect("subscribe observed startup failure");
-        let (handoff_tx, handoff_rx) = tokio::sync::oneshot::channel();
-        let producer = state
-            .try_claim_producer()
-            .expect("claim observed failure task producer");
-        let task = test_recovery_launch_task(&state, session_id, &root).await;
-        let proof_context = LaunchProofContext::from_intent(&task.intent);
-        drop(task);
-        drop(producer);
-        let observer_state = state.clone();
-        let observer = tokio::spawn(own_terminal_observation(
-            observer_state,
-            session_id.to_string(),
-            "instance".to_string(),
-            GuardianMode::Managed,
-            "2026-01-01T00:00:00.000Z".to_string(),
-            proof_context,
-            events,
-            handoff_rx,
-        ));
-        assert!(
-            handoff_tx
-                .send(TerminalObservationHandoff::Observe {
-                    guardian: empty_guardian_summary(axial_launcher::GuardianMode::Managed),
-                })
-                .is_ok(),
-            "handoff observed startup failure"
-        );
-        let crash_evidence: CrashEvidence = serde_json::from_value(serde_json::json!({
-            "source": "minecraft_crash_report",
-            "truncated": false,
-            "exception_class": "net.minecraftforge.fml.common.MissingModsException",
-            "suspected_mods": [],
-            "names_out_of_memory": false
-        }))
-        .expect("typed missing dependency evidence");
-        state
-            .sessions()
-            .emit_status(
-                session_id,
-                LaunchStatusEvent {
-                    state: "exited".to_string(),
-                    benchmark: None,
-                    pid: None,
-                    exit_code: Some(1),
-                    failure_class: Some(LaunchFailureClass::MissingDependency.as_str().to_string()),
-                    failure_detail: Some("Minecraft failed during startup.".to_string()),
-                    crash_evidence: Some(crash_evidence),
-                    healing: None,
-                    guardian: None,
-                    outcome: Some(LaunchSessionOutcome::from_reason(
-                        LaunchSessionExitReason::StartupFailed,
-                    )),
-                    notice: None,
-                    evidence: Vec::new(),
-                    stages: Vec::new(),
-                },
-            )
-            .await;
-
-        tokio::time::timeout(Duration::from_secs(2), observer)
-            .await
-            .expect("observed startup failure settlement deadline")
-            .expect("observed startup failure task");
-
-        let record = state
-            .sessions()
-            .get(session_id)
-            .await
-            .expect("settled startup failure session");
-        assert_eq!(record.state, LaunchState::Failed);
-        assert!(record.boot_completed_at_ms.is_none());
-        assert_eq!(
-            record.failure.as_ref().map(|failure| failure.class),
-            Some(LaunchFailureClass::MissingDependency)
-        );
-        let guardian = record.guardian.as_ref().expect("startup failure guardian");
-        assert_eq!(guardian["decision"], "blocked");
-        assert_eq!(guardian["message"], "Guardian blocked launch startup.");
-        let guardian_details = guardian["details"].as_array().expect("Guardian details");
-        let guardian_guidance = guardian["guidance"].as_array().expect("Guardian guidance");
-        assert!(!guardian_guidance.is_empty());
-        for guidance in guardian_guidance {
-            assert!(guardian_details.contains(guidance));
-        }
-        assert_eq!(
-            record
-                .failure
-                .as_ref()
-                .and_then(|failure| failure.detail.as_deref()),
-            Some("Guardian blocked launch startup.")
-        );
-        let memory = state.failure_memory().list();
-        assert_eq!(memory.len(), 1);
-        assert_eq!(memory[0].diagnosis_id.as_str(), "missing_dependency");
-        assert_eq!(memory[0].target.id, "instance");
-        assert_eq!(memory[0].occurrence_count, 1);
-        let proof = state
-            .launch_reports()
-            .load(session_id)
-            .expect("observed startup failure proof");
-        assert_eq!(proof.outcome, "failed");
-        assert_eq!(proof.failure_class.as_deref(), Some("missing_dependency"));
-        assert_eq!(
-            proof.failure_detail.as_deref(),
-            Some("Guardian blocked launch startup.")
-        );
-        assert_eq!(
-            state.sessions().retention_hold_count(session_id).await,
-            Some(0)
-        );
-
         let _ = fs::remove_dir_all(root);
     }
 

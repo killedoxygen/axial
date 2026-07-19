@@ -2,7 +2,6 @@ mod classify;
 mod priority;
 mod supervisor;
 
-use crate::application::launch_notice_from_values;
 use crate::execution::process::{
     ProcessKillReason, ProcessKillRequest, ProcessObservation, ProcessObservationRequest,
     ProcessStopIntent, ProcessStopRequest, observe_process, process_killed, process_session_target,
@@ -11,8 +10,8 @@ use crate::execution::process::{
 use axial_launcher::{
     LaunchEvent, LaunchFailure, LaunchFailureClass, LaunchLogEvent, LaunchNotice,
     LaunchPriorityEvidence, LaunchSessionOutcomeKind, LaunchSessionRecord, LaunchStageEvidence,
-    LaunchStageRecord, LaunchState, LaunchStatusEvent, classify_startup_failure_text,
-    launch_stage_label, launch_state_name,
+    LaunchStageRecord, LaunchState, LaunchStatusEvent, RevisionedLaunchStatus,
+    classify_startup_failure_text, launch_stage_label, launch_state_name,
 };
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
@@ -53,16 +52,33 @@ impl ProcessAttemptScope {
 }
 
 struct SessionEntry {
+    generation: u64,
     attempt: Arc<ProcessAttemptScope>,
     process: Option<supervisor::ProcessControlHandle>,
     record: LaunchSessionRecord,
     events: broadcast::Sender<LaunchEvent>,
+    last_status: RevisionedLaunchStatus,
     observed_failures: ObservedFailureSignals,
     crash_artifact_game_dir: Option<PathBuf>,
     log_count: usize,
     stop_requested: bool,
+    startup_recovery_owned: bool,
+    pending_process_settlement: Option<PendingProcessSettlement>,
     retention_holds: usize,
+    event_subscription_holds: usize,
+    retained_terminal_sequence: Option<u64>,
     terminal_sequence: Option<u64>,
+}
+
+struct PendingProcessSettlement {
+    generation: u64,
+    attempt: Arc<ProcessAttemptScope>,
+    state: PendingProcessSettlementState,
+}
+
+enum PendingProcessSettlementState {
+    Available(LaunchStatusEvent),
+    Claimed,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -143,16 +159,21 @@ fn attempt_scopes_match(
 }
 
 fn process_state_regresses(previous: LaunchState, next: LaunchState) -> bool {
-    (classify::is_terminal_state(previous)
-        && matches!(
-            next,
-            LaunchState::Starting
-                | LaunchState::Monitoring
-                | LaunchState::Running
-                | LaunchState::Degraded
-        ))
+    classify::is_terminal_state(previous)
         || (matches!(previous, LaunchState::Running | LaunchState::Degraded)
-            && matches!(next, LaunchState::Starting | LaunchState::Monitoring))
+            && matches!(
+                next,
+                LaunchState::Starting | LaunchState::Monitoring | LaunchState::Recovering
+            ))
+        || (previous == LaunchState::Recovering
+            && matches!(
+                next,
+                LaunchState::Starting
+                    | LaunchState::Monitoring
+                    | LaunchState::Running
+                    | LaunchState::Degraded
+            ))
+        || (previous == LaunchState::Settling && !classify::is_terminal_state(next))
         || (previous == LaunchState::Monitoring && next == LaunchState::Starting)
 }
 
@@ -191,19 +212,85 @@ pub struct SessionStore {
     process_owner_changes: Notify,
     lifecycle_transition: Arc<Mutex<()>>,
     shutdown_started: AtomicBool,
+    shutdown_processes_settled: AtomicBool,
     changes: broadcast::Sender<()>,
+    next_session_generation: AtomicU64,
     next_attempt_id: AtomicU64,
     next_terminal_sequence: AtomicU64,
     crash_collection_permits: Arc<Semaphore>,
+    #[cfg(test)]
+    stalled_termination_before_log_lock: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+}
+
+pub struct SessionEventSubscription {
+    store: Arc<SessionStore>,
+    session_id: String,
+    generation: u64,
+    retained_status: RevisionedLaunchStatus,
+    receiver: broadcast::Receiver<LaunchEvent>,
+    retention_active: bool,
+}
+
+impl SessionEventSubscription {
+    pub fn retained_status(&self) -> &RevisionedLaunchStatus {
+        &self.retained_status
+    }
+
+    pub async fn recv(&mut self) -> Result<LaunchEvent, broadcast::error::RecvError> {
+        self.receiver.recv().await
+    }
+
+    pub async fn rebase(&mut self) -> Option<RevisionedLaunchStatus> {
+        let (status, receiver) = self
+            .store
+            .rebase_event_subscription(&self.session_id, self.generation)
+            .await?;
+        self.retained_status = status.clone();
+        self.receiver = receiver;
+        Some(status)
+    }
+
+    pub async fn release(mut self) {
+        if self.retention_active {
+            self.store
+                .release_event_subscription_retention(&self.session_id, self.generation)
+                .await;
+            self.retention_active = false;
+        }
+    }
+}
+
+impl Drop for SessionEventSubscription {
+    fn drop(&mut self) {
+        if !self.retention_active {
+            return;
+        }
+        self.retention_active = false;
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let store = self.store.clone();
+        let session_id = self.session_id.clone();
+        let generation = self.generation;
+        runtime.spawn(async move {
+            store
+                .release_event_subscription_retention(&session_id, generation)
+                .await;
+        });
+    }
 }
 
 pub(super) struct SharedComponentMutationLease {
     _guard: OwnedRwLockWriteGuard<()>,
 }
 
-#[derive(Debug, thiserror::Error)]
-#[error("launch session store is shutting down")]
-pub struct SessionAdmissionError;
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub(crate) enum SessionAdmissionError {
+    #[error("launch session store is shutting down")]
+    ShuttingDown,
+    #[error("launch session id is already registered")]
+    DuplicateSessionId,
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum SessionStopError {
@@ -219,14 +306,59 @@ pub enum SessionStopError {
 pub enum StartupOutcome {
     Stable,
     Exited,
+    Settling,
+    Stopped,
     TimedOut,
     Stalled,
 }
 
+pub(crate) enum RunningHandoffOutcome {
+    Published,
+    Settling,
+    Stopped,
+    Rejected,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StalledStartupTermination {
+    Settled,
+    StartupCompleted,
+}
+
+pub(crate) struct RecoveringSessionMutationScope {
+    session_id: String,
+    attempt_id: u64,
+}
+
+pub(crate) struct StartedLaunchProcess {
+    record: LaunchSessionRecord,
+    attempt: Arc<ProcessAttemptScope>,
+}
+
+impl std::fmt::Debug for StartedLaunchProcess {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("StartedLaunchProcess")
+            .field("session_id", &self.record.session_id.0)
+            .field("attempt_id", &self.attempt.id)
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::ops::Deref for StartedLaunchProcess {
+    type Target = LaunchSessionRecord;
+
+    fn deref(&self) -> &Self::Target {
+        &self.record
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum LaunchFailureTerminationErrorClass {
+    AlreadyTerminal,
     MissingProcess,
     OwnerUnavailable,
+    SettlementClaimed,
     SettlementUnavailable,
     StaleAttempt,
     TerminationRejected,
@@ -235,8 +367,10 @@ pub(crate) enum LaunchFailureTerminationErrorClass {
 impl LaunchFailureTerminationErrorClass {
     pub(crate) fn as_str(self) -> &'static str {
         match self {
+            Self::AlreadyTerminal => "already_terminal",
             Self::MissingProcess => "missing_process",
             Self::OwnerUnavailable => "owner_unavailable",
+            Self::SettlementClaimed => "settlement_claimed",
             Self::SettlementUnavailable => "settlement_unavailable",
             Self::StaleAttempt => "stale_attempt",
             Self::TerminationRejected => "termination_rejected",
@@ -264,6 +398,18 @@ pub(crate) struct LaunchFailureTerminalizationLease {
     lifecycle_guard: Option<OwnedMutexGuard<()>>,
 }
 
+#[must_use]
+pub(crate) struct ProcessSettlementLease {
+    store: Arc<SessionStore>,
+    session_id: String,
+    generation: u64,
+    attempt: Arc<ProcessAttemptScope>,
+    record: LaunchSessionRecord,
+    stop_requested: bool,
+    event: Option<LaunchStatusEvent>,
+    retention_hold_active: bool,
+}
+
 impl PendingLaunchFailureTermination {
     pub(crate) fn error_class(&self) -> LaunchFailureTerminationErrorClass {
         LaunchFailureTerminationErrorClass::TerminationRejected
@@ -284,6 +430,10 @@ impl PendingLaunchFailureTermination {
 }
 
 impl LaunchFailureTerminalizationLease {
+    pub(crate) fn release_lifecycle_guard(&mut self) {
+        drop(self.lifecycle_guard.take());
+    }
+
     pub(crate) async fn release(mut self) {
         self.store
             .release_terminal_retention_hold_for_attempt(&self.session_id, &self.attempt)
@@ -292,14 +442,113 @@ impl LaunchFailureTerminalizationLease {
     }
 }
 
+impl ProcessSettlementLease {
+    pub(crate) fn event(&self) -> &LaunchStatusEvent {
+        self.event
+            .as_ref()
+            .expect("process settlement lease was already finalized")
+    }
+
+    pub(crate) fn preview(&self, mut event: LaunchStatusEvent) -> LaunchSessionRecord {
+        let mut record = self.record.clone();
+        apply_status_update_to_record(&mut record, self.stop_requested, &mut event);
+        record
+    }
+
+    pub(crate) async fn finalize(
+        &mut self,
+        event: LaunchStatusEvent,
+    ) -> Option<LaunchSessionRecord> {
+        let record = self
+            .store
+            .finalize_process_settlement_for_attempt(
+                &self.session_id,
+                self.generation,
+                &self.attempt,
+                event,
+            )
+            .await;
+        if record.is_some() {
+            self.event = None;
+        }
+        record
+    }
+
+    pub(crate) async fn release(mut self) {
+        if let Some(event) = self.event.take() {
+            let _ = self
+                .store
+                .finalize_process_settlement_for_attempt(
+                    &self.session_id,
+                    self.generation,
+                    &self.attempt,
+                    event,
+                )
+                .await;
+        }
+        self.release_hold().await;
+    }
+
+    async fn release_hold(&mut self) {
+        if !self.retention_hold_active {
+            return;
+        }
+        self.store
+            .release_terminal_retention_hold_for_generation_attempt(
+                &self.session_id,
+                self.generation,
+                &self.attempt,
+            )
+            .await;
+        self.retention_hold_active = false;
+    }
+}
+
+impl Drop for ProcessSettlementLease {
+    fn drop(&mut self) {
+        let event = self.event.take();
+        if event.is_none() && !self.retention_hold_active {
+            return;
+        }
+        self.retention_hold_active = false;
+        let store = self.store.clone();
+        let session_id = self.session_id.clone();
+        let generation = self.generation;
+        let attempt = self.attempt.clone();
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        runtime.spawn(async move {
+            if let Some(event) = event {
+                let _ = store
+                    .finalize_process_settlement_for_attempt(
+                        &session_id,
+                        generation,
+                        &attempt,
+                        event,
+                    )
+                    .await;
+            }
+            store
+                .release_terminal_retention_hold_for_generation_attempt(
+                    &session_id,
+                    generation,
+                    &attempt,
+                )
+                .await;
+        });
+    }
+}
+
 #[must_use]
 pub(crate) struct UserStopLease {
     store: Arc<SessionStore>,
-    lifecycle_guard: Option<OwnedMutexGuard<()>>,
     attempt: Arc<ProcessAttemptScope>,
     session_id: String,
     record: LaunchSessionRecord,
     retention_hold_active: bool,
+    #[cfg(test)]
+    drop_release_probe: Option<tokio::sync::oneshot::Sender<()>>,
 }
 
 struct PendingUserStop {
@@ -336,11 +585,20 @@ impl PendingUserStop {
             .await
     }
 
+    #[cfg(test)]
     async fn reaped(&mut self) -> std::io::Result<supervisor::ProcessTerminationAcceptance> {
         self.request
             .as_mut()
             .expect("pending user stop request was already settled")
             .reaped()
+            .await
+    }
+
+    async fn settled(&mut self) -> std::io::Result<supervisor::ProcessTerminationAcceptance> {
+        self.request
+            .as_mut()
+            .expect("pending user stop request was already settled")
+            .settled()
             .await
     }
 
@@ -379,13 +637,15 @@ impl PendingUserStop {
     fn into_lease(mut self, record: LaunchSessionRecord) -> UserStopLease {
         self.disarm_request();
         self.prior_terminal_sequence.take();
+        self.release_lifecycle_guard();
         UserStopLease {
             store: self.store.clone(),
-            lifecycle_guard: self.lifecycle_guard.take(),
             attempt: self.attempt.clone(),
             session_id: self.session_id.clone(),
             record,
             retention_hold_active: true,
+            #[cfg(test)]
+            drop_release_probe: None,
         }
     }
 }
@@ -422,7 +682,7 @@ impl Drop for PendingUserStop {
                             .record_user_stop_intent_for_attempt(&session_id, &attempt)
                             .await;
                     }
-                    let _ = request.reaped().await;
+                    let _ = request.settled().await;
                     if prior_terminal_sequence.is_some() {
                         store
                             .release_terminal_retention_hold_for_attempt(&session_id, &attempt)
@@ -452,27 +712,19 @@ impl UserStopLease {
         &self.record
     }
 
-    pub(crate) async fn emit_log(&self, source: &'static str, text: impl Into<String>) {
-        self.store
-            .emit_log_for_attempt(
-                &self.session_id,
-                &self.attempt,
-                source,
-                text.into(),
-                now_ms(),
-            )
-            .await;
-    }
-
-    pub(crate) async fn emit_status(&self, event: LaunchStatusEvent) {
-        self.store
-            .emit_status_for_attempt(&self.session_id, &self.attempt, event)
-            .await;
+    #[cfg(test)]
+    fn arm_drop_release_probe(&mut self) -> tokio::sync::oneshot::Receiver<()> {
+        assert!(
+            self.drop_release_probe.is_none(),
+            "user-stop drop release probe was already armed"
+        );
+        let (probe, receiver) = tokio::sync::oneshot::channel();
+        self.drop_release_probe = Some(probe);
+        receiver
     }
 
     pub(crate) async fn release(mut self) {
         self.release_hold().await;
-        drop(self.lifecycle_guard.take());
     }
 
     async fn release_hold(&mut self) {
@@ -488,22 +740,23 @@ impl UserStopLease {
 
 impl Drop for UserStopLease {
     fn drop(&mut self) {
-        let Some(lifecycle_guard) = self.lifecycle_guard.take() else {
-            return;
-        };
         if !self.retention_hold_active {
-            drop(lifecycle_guard);
             return;
         }
         self.retention_hold_active = false;
         let store = self.store.clone();
         let session_id = self.session_id.clone();
         let attempt = self.attempt.clone();
+        #[cfg(test)]
+        let drop_release_probe = self.drop_release_probe.take();
         tokio::spawn(async move {
             store
                 .release_terminal_retention_hold_for_attempt(&session_id, &attempt)
                 .await;
-            drop(lifecycle_guard);
+            #[cfg(test)]
+            if let Some(probe) = drop_release_probe {
+                let _ = probe.send(());
+            }
         });
     }
 }
@@ -518,10 +771,14 @@ impl SessionStore {
             process_owner_changes: Notify::new(),
             lifecycle_transition: Arc::new(Mutex::new(())),
             shutdown_started: AtomicBool::new(false),
+            shutdown_processes_settled: AtomicBool::new(false),
             changes,
+            next_session_generation: AtomicU64::new(0),
             next_attempt_id: AtomicU64::new(0),
             next_terminal_sequence: AtomicU64::new(0),
             crash_collection_permits: Arc::new(Semaphore::new(MAX_CONCURRENT_CRASH_COLLECTIONS)),
+            #[cfg(test)]
+            stalled_termination_before_log_lock: Mutex::new(None),
         }
     }
 
@@ -536,12 +793,32 @@ impl SessionStore {
             .expect("process attempt id overflowed")
     }
 
+    fn next_session_generation(&self) -> u64 {
+        self.next_session_generation
+            .fetch_add(1, Ordering::Relaxed)
+            .checked_add(1)
+            .expect("session generation overflowed")
+    }
+
     async fn current_process_attempt(&self, session_id: &str) -> Option<Arc<ProcessAttemptScope>> {
         self.sessions
             .read()
             .await
             .get(session_id)
             .map(|entry| entry.attempt.clone())
+    }
+
+    async fn record_for_attempt(
+        &self,
+        session_id: &str,
+        attempt: &Arc<ProcessAttemptScope>,
+    ) -> Option<LaunchSessionRecord> {
+        self.sessions
+            .read()
+            .await
+            .get(session_id)
+            .filter(|entry| attempt_scopes_match(&entry.attempt, attempt))
+            .map(|entry| entry.record.clone())
     }
 
     async fn acquire_launch_failure_terminalization_lease(
@@ -554,13 +831,23 @@ impl SessionStore {
             Some(lifecycle_guard) => lifecycle_guard,
             None => self.lifecycle_transition.clone().lock_owned().await,
         };
-        let current_attempt = self.current_process_attempt(session_id).await;
-        if !current_attempt
-            .as_ref()
-            .is_some_and(|current| attempt_scopes_match(current, &attempt))
-        {
+        let mut sessions = self.sessions.write().await;
+        let Some(entry) = sessions
+            .get_mut(session_id)
+            .filter(|entry| attempt_scopes_match(&entry.attempt, &attempt))
+        else {
             return Err(LaunchFailureTerminationErrorClass::StaleAttempt);
+        };
+        if classify::is_terminal_state(entry.record.state) {
+            return Err(LaunchFailureTerminationErrorClass::AlreadyTerminal);
         }
+        if let Some(pending) = entry.pending_process_settlement.as_ref()
+            && matches!(pending.state, PendingProcessSettlementState::Claimed)
+        {
+            return Err(LaunchFailureTerminationErrorClass::SettlementClaimed);
+        }
+        entry.pending_process_settlement = None;
+        drop(sessions);
         Ok(LaunchFailureTerminalizationLease {
             store: self.clone(),
             session_id: session_id.to_string(),
@@ -569,43 +856,51 @@ impl SessionStore {
         })
     }
 
-    pub async fn insert(
+    pub(crate) async fn insert(
         &self,
         mut record: LaunchSessionRecord,
     ) -> Result<(), SessionAdmissionError> {
         let _component_admission = self.shared_component_mutation.read().await;
         let _lifecycle_transition = self.lifecycle_transition.lock().await;
         if self.shutdown_started.load(Ordering::Acquire) {
-            return Err(SessionAdmissionError);
+            return Err(SessionAdmissionError::ShuttingDown);
+        }
+        let session_id = record.session_id.0.clone();
+        let mut sessions = self.sessions.write().await;
+        if sessions.contains_key(&session_id) {
+            return Err(SessionAdmissionError::DuplicateSessionId);
         }
         let (events, _) = broadcast::channel(256);
         ensure_stage_started(&mut record, now_ms());
-        let previous_process = self
-            .sessions
-            .read()
-            .await
-            .get(&record.session_id.0)
-            .and_then(|entry| entry.process.clone());
-        let mut sessions = self.sessions.write().await;
+        enforce_record_outcome_invariant(&mut record);
+        let generation = self.next_session_generation();
+        let last_status = RevisionedLaunchStatus::new(
+            session_id.clone(),
+            0,
+            axial_launcher::snapshot_status(&record),
+        );
         sessions.insert(
-            record.session_id.0.clone(),
+            session_id,
             SessionEntry {
+                generation,
                 attempt: ProcessAttemptScope::new(self.next_attempt_id()),
                 process: None,
                 record,
                 events,
+                last_status,
                 observed_failures: ObservedFailureSignals::default(),
                 crash_artifact_game_dir: None,
                 log_count: 0,
                 stop_requested: false,
+                startup_recovery_owned: true,
+                pending_process_settlement: None,
                 retention_holds: 1,
+                event_subscription_holds: 0,
+                retained_terminal_sequence: None,
                 terminal_sequence: None,
             },
         );
         drop(sessions);
-        if let Some(previous_process) = previous_process {
-            let _ = previous_process.terminate(supervisor::ProcessTerminalCause::Replacement);
-        }
         self.notify_changed();
         Ok(())
     }
@@ -618,6 +913,64 @@ impl SessionStore {
             return None;
         }
         Some(SharedComponentMutationLease { _guard: guard })
+    }
+
+    pub(super) async fn acquire_recovering_component_mutation(
+        self: &Arc<Self>,
+        scope: &RecoveringSessionMutationScope,
+    ) -> Option<SharedComponentMutationLease> {
+        let guard = self.shared_component_mutation.clone().write_owned().await;
+        loop {
+            let owner_changed = self.process_owner_changes.notified();
+            tokio::pin!(owner_changed);
+            owner_changed.as_mut().enable();
+
+            let scope_is_exclusive = {
+                let sessions = self.sessions.read().await;
+                sessions.iter().all(|(session_id, entry)| {
+                    classify::is_terminal_state(entry.record.state)
+                        || (session_id == &scope.session_id
+                            && entry.attempt.id == scope.attempt_id
+                            && entry.record.state == LaunchState::Recovering)
+                }) && sessions.get(&scope.session_id).is_some_and(|entry| {
+                    entry.attempt.id == scope.attempt_id
+                        && entry.record.state == LaunchState::Recovering
+                })
+            };
+            if !scope_is_exclusive {
+                return None;
+            }
+            let active_processes = self.active_processes.lock().await;
+            if active_processes
+                .keys()
+                .any(|attempt_id| *attempt_id != scope.attempt_id)
+            {
+                return None;
+            }
+            if active_processes.is_empty() {
+                return Some(SharedComponentMutationLease { _guard: guard });
+            }
+            drop(active_processes);
+            owner_changed.await;
+        }
+    }
+
+    pub(crate) async fn recovering_component_mutation_scope(
+        &self,
+        session_id: &str,
+    ) -> Option<RecoveringSessionMutationScope> {
+        self.sessions
+            .read()
+            .await
+            .get(session_id)
+            .and_then(|entry| {
+                (entry.record.state == LaunchState::Recovering).then(|| {
+                    RecoveringSessionMutationScope {
+                        session_id: session_id.to_string(),
+                        attempt_id: entry.attempt.id,
+                    }
+                })
+            })
     }
 
     pub async fn get(&self, session_id: &str) -> Option<LaunchSessionRecord> {
@@ -679,6 +1032,7 @@ impl SessionStore {
         let mut sessions = self.sessions.write().await;
         let entry = sessions.get_mut(session_id)?;
         entry.record.benchmark = Some(benchmark);
+        publish_refreshed_status(entry);
         let record = entry.record.clone();
         drop(sessions);
         self.notify_changed();
@@ -693,25 +1047,166 @@ impl SessionStore {
             .map(|entry| entry.events.subscribe())
     }
 
-    pub fn subscribe_changes(&self) -> broadcast::Receiver<()> {
-        self.changes.subscribe()
-    }
-
-    pub async fn acquire_terminal_retention_hold(
+    pub(crate) async fn subscribe_terminal_observation(
         &self,
         session_id: &str,
-    ) -> Option<LaunchSessionRecord> {
+    ) -> Option<(u64, broadcast::Receiver<LaunchEvent>)> {
+        self.sessions
+            .read()
+            .await
+            .get(session_id)
+            .map(|entry| (entry.generation, entry.events.subscribe()))
+    }
+
+    pub(crate) async fn terminal_observation_is_pending(
+        &self,
+        session_id: &str,
+        generation: u64,
+    ) -> bool {
+        let Some((attempt_id, pending)) = self
+            .sessions
+            .read()
+            .await
+            .get(session_id)
+            .filter(|entry| {
+                entry.generation == generation && !classify::is_terminal_state(entry.record.state)
+            })
+            .map(|entry| (entry.attempt.id, entry.pending_process_settlement.is_some()))
+        else {
+            return false;
+        };
+        pending || self.active_processes.lock().await.contains_key(&attempt_id)
+    }
+
+    pub(crate) async fn claim_process_settlement(
+        self: &Arc<Self>,
+        session_id: &str,
+        generation: u64,
+        attempt_id: Option<u64>,
+    ) -> Option<ProcessSettlementLease> {
+        let lifecycle_guard = self.lifecycle_transition.clone().lock_owned().await;
+        let mut sessions = self.sessions.write().await;
+        let entry = sessions.get_mut(session_id).filter(|entry| {
+            entry.generation == generation && !classify::is_terminal_state(entry.record.state)
+        })?;
+        let pending = entry.pending_process_settlement.as_ref()?;
+        if pending.generation != generation
+            || !attempt_scopes_match(&entry.attempt, &pending.attempt)
+            || attempt_id.is_some_and(|attempt_id| attempt_id != pending.attempt.id)
+        {
+            return None;
+        }
+        let event = match std::mem::replace(
+            &mut entry
+                .pending_process_settlement
+                .as_mut()
+                .expect("checked pending process settlement")
+                .state,
+            PendingProcessSettlementState::Claimed,
+        ) {
+            PendingProcessSettlementState::Available(event) => event,
+            PendingProcessSettlementState::Claimed => return None,
+        };
+        let record = entry.record.clone();
+        let stop_requested = entry.stop_requested;
+        let attempt = entry
+            .pending_process_settlement
+            .as_ref()
+            .expect("claimed process settlement tombstone")
+            .attempt
+            .clone();
+        drop(sessions);
+        drop(lifecycle_guard);
+        Some(ProcessSettlementLease {
+            store: self.clone(),
+            session_id: session_id.to_string(),
+            generation,
+            attempt,
+            record,
+            stop_requested,
+            event: Some(event),
+            retention_hold_active: true,
+        })
+    }
+
+    pub async fn status_snapshot(&self, session_id: &str) -> Option<RevisionedLaunchStatus> {
+        self.sessions
+            .read()
+            .await
+            .get(session_id)
+            .map(|entry| entry.last_status.clone())
+    }
+
+    pub async fn subscribe_events(
+        self: &Arc<Self>,
+        session_id: &str,
+    ) -> Option<SessionEventSubscription> {
         let mut sessions = self.sessions.write().await;
         let entry = sessions.get_mut(session_id)?;
+        if entry.event_subscription_holds == 0 && entry.retained_terminal_sequence.is_none() {
+            entry.retained_terminal_sequence = entry.terminal_sequence.take();
+        }
+        entry.event_subscription_holds = entry
+            .event_subscription_holds
+            .checked_add(1)
+            .expect("session event subscription hold count overflowed");
         entry.retention_holds = entry
             .retention_holds
             .checked_add(1)
             .expect("session retention hold count overflowed");
         entry.terminal_sequence = None;
-        Some(entry.record.clone())
+        Some(SessionEventSubscription {
+            store: self.clone(),
+            session_id: session_id.to_string(),
+            generation: entry.generation,
+            retained_status: entry.last_status.clone(),
+            receiver: entry.events.subscribe(),
+            retention_active: true,
+        })
     }
 
-    pub async fn release_terminal_retention_hold(&self, session_id: &str) {
+    async fn rebase_event_subscription(
+        &self,
+        session_id: &str,
+        generation: u64,
+    ) -> Option<(RevisionedLaunchStatus, broadcast::Receiver<LaunchEvent>)> {
+        self.sessions
+            .read()
+            .await
+            .get(session_id)
+            .filter(|entry| entry.generation == generation)
+            .map(|entry| (entry.last_status.clone(), entry.events.subscribe()))
+    }
+
+    async fn release_event_subscription_retention(&self, session_id: &str, generation: u64) {
+        let mut sessions = self.sessions.write().await;
+        let Some(entry) = sessions
+            .get_mut(session_id)
+            .filter(|entry| entry.generation == generation)
+        else {
+            return;
+        };
+        entry.retention_holds = entry
+            .retention_holds
+            .checked_sub(1)
+            .expect("released a session event subscription that was not retained");
+        entry.event_subscription_holds = entry
+            .event_subscription_holds
+            .checked_sub(1)
+            .expect("released a session event subscription cohort hold that was not acquired");
+        restore_terminal_sequence_after_final_release(entry, &self.next_terminal_sequence);
+        let evicted = evict_oldest_terminal_sessions(&mut sessions);
+        drop(sessions);
+        if evicted {
+            self.notify_changed();
+        }
+    }
+
+    pub fn subscribe_changes(&self) -> broadcast::Receiver<()> {
+        self.changes.subscribe()
+    }
+
+    pub(crate) async fn release_terminal_retention_hold(&self, session_id: &str) {
         let mut sessions = self.sessions.write().await;
         let Some(entry) = sessions.get_mut(session_id) else {
             return;
@@ -720,13 +1215,31 @@ impl SessionStore {
             .retention_holds
             .checked_sub(1)
             .expect("released a session retention hold that was not acquired");
-        if entry.retention_holds == 0
-            && classify::is_terminal_state(entry.record.state)
-            && entry.terminal_sequence.is_none()
-        {
-            entry.terminal_sequence =
-                Some(self.next_terminal_sequence.fetch_add(1, Ordering::Relaxed));
+        restore_terminal_sequence_after_final_release(entry, &self.next_terminal_sequence);
+        let evicted = evict_oldest_terminal_sessions(&mut sessions);
+        drop(sessions);
+        if evicted {
+            self.notify_changed();
         }
+    }
+
+    pub(crate) async fn release_terminal_observation_hold(
+        &self,
+        session_id: &str,
+        generation: u64,
+    ) {
+        let mut sessions = self.sessions.write().await;
+        let Some(entry) = sessions
+            .get_mut(session_id)
+            .filter(|entry| entry.generation == generation)
+        else {
+            return;
+        };
+        entry.retention_holds = entry
+            .retention_holds
+            .checked_sub(1)
+            .expect("released a terminal observer hold that was not acquired");
+        restore_terminal_sequence_after_final_release(entry, &self.next_terminal_sequence);
         let evicted = evict_oldest_terminal_sessions(&mut sessions);
         drop(sessions);
         if evicted {
@@ -750,13 +1263,31 @@ impl SessionStore {
             .retention_holds
             .checked_sub(1)
             .expect("released a session retention hold that was not acquired");
-        if entry.retention_holds == 0
-            && classify::is_terminal_state(entry.record.state)
-            && entry.terminal_sequence.is_none()
-        {
-            entry.terminal_sequence =
-                Some(self.next_terminal_sequence.fetch_add(1, Ordering::Relaxed));
+        restore_terminal_sequence_after_final_release(entry, &self.next_terminal_sequence);
+        let evicted = evict_oldest_terminal_sessions(&mut sessions);
+        drop(sessions);
+        if evicted {
+            self.notify_changed();
         }
+    }
+
+    async fn release_terminal_retention_hold_for_generation_attempt(
+        &self,
+        session_id: &str,
+        generation: u64,
+        attempt: &Arc<ProcessAttemptScope>,
+    ) {
+        let mut sessions = self.sessions.write().await;
+        let Some(entry) = sessions.get_mut(session_id).filter(|entry| {
+            entry.generation == generation && attempt_scopes_match(&entry.attempt, attempt)
+        }) else {
+            return;
+        };
+        entry.retention_holds = entry
+            .retention_holds
+            .checked_sub(1)
+            .expect("released a process-settlement hold that was not acquired");
+        restore_terminal_sequence_after_final_release(entry, &self.next_terminal_sequence);
         let evicted = evict_oldest_terminal_sessions(&mut sessions);
         drop(sessions);
         if evicted {
@@ -784,6 +1315,7 @@ impl SessionStore {
         if entry.terminal_sequence.is_none() {
             entry.terminal_sequence = prior_terminal_sequence;
         }
+        restore_terminal_sequence_after_final_release(entry, &self.next_terminal_sequence);
     }
 
     async fn record_user_stop_intent_for_attempt(
@@ -795,8 +1327,16 @@ impl SessionStore {
         let entry = sessions
             .get_mut(session_id)
             .filter(|entry| attempt_scopes_match(&entry.attempt, attempt))?;
-        record_user_stop_intent(entry, session_id);
-        Some(entry.record.clone())
+        let changed = record_user_stop_intent(entry, session_id);
+        if changed {
+            publish_refreshed_status(entry);
+        }
+        let record = entry.record.clone();
+        drop(sessions);
+        if changed {
+            self.notify_changed();
+        }
+        Some(record)
     }
 
     pub async fn emit_log(
@@ -1036,7 +1576,7 @@ impl SessionStore {
             stages: Vec::new(),
         };
         apply_status_update(entry, &mut status);
-        let _ = entry.events.send(LaunchEvent::Status(Box::new(status)));
+        publish_status(entry, status);
         publish_prepared_log(entry, prepared);
         true
     }
@@ -1053,27 +1593,182 @@ impl SessionStore {
         &self,
         session_id: &str,
         attempt: &Arc<ProcessAttemptScope>,
+        event: LaunchStatusEvent,
+    ) {
+        self.emit_status_for_attempt_inner(session_id, attempt, event, false)
+            .await;
+    }
+
+    pub(super) async fn emit_process_settlement_for_attempt(
+        &self,
+        session_id: &str,
+        attempt: &Arc<ProcessAttemptScope>,
+        event: LaunchStatusEvent,
+    ) {
+        self.emit_status_for_attempt_inner(session_id, attempt, event, true)
+            .await;
+    }
+
+    pub(super) async fn settle_natural_process_exit_for_attempt(
+        &self,
+        session_id: &str,
+        attempt: &Arc<ProcessAttemptScope>,
+        event: LaunchStatusEvent,
+    ) {
+        self.stage_process_exit_for_attempt(session_id, attempt, event, false)
+            .await;
+    }
+
+    pub(super) async fn settle_shutdown_process_exit_for_attempt(
+        &self,
+        session_id: &str,
+        attempt: &Arc<ProcessAttemptScope>,
+        event: LaunchStatusEvent,
+    ) {
+        self.stage_process_exit_for_attempt(session_id, attempt, event, true)
+            .await;
+    }
+
+    async fn stage_process_exit_for_attempt(
+        &self,
+        session_id: &str,
+        attempt: &Arc<ProcessAttemptScope>,
         mut event: LaunchStatusEvent,
+        stop_requested: bool,
+    ) {
+        let mut sessions = self.sessions.write().await;
+        let Some(entry) = sessions
+            .get_mut(session_id)
+            .filter(|entry| attempt_scopes_match(&entry.attempt, attempt))
+            .filter(|entry| !classify::is_terminal_state(entry.record.state))
+        else {
+            return;
+        };
+        if !stop_requested
+            && entry.record.boot_completed_at_ms.is_none()
+            && entry.startup_recovery_owned
+        {
+            event.state = "recovering".to_string();
+            event.outcome = None;
+            apply_status_update(entry, &mut event);
+            publish_status(entry, event);
+            drop(sessions);
+            self.notify_changed();
+            return;
+        }
+        if entry.pending_process_settlement.is_some() {
+            return;
+        }
+        event.state = "exited".to_string();
+        event.outcome = classify::classify_session_outcome(classify::SessionOutcomeInput {
+            previous_state: entry.record.state,
+            next_state: LaunchState::Exited,
+            boot_completed: true,
+            stop_requested,
+            exit_code: event.exit_code,
+            failure_class: event
+                .failure_class
+                .as_deref()
+                .map(classify::parse_failure_class),
+        });
+        let generation = entry.generation;
+        entry.pending_process_settlement = Some(PendingProcessSettlement {
+            generation,
+            attempt: attempt.clone(),
+            state: PendingProcessSettlementState::Available(event),
+        });
+        let mut settling = LaunchStatusEvent {
+            state: "settling".to_string(),
+            benchmark: None,
+            pid: None,
+            exit_code: None,
+            failure_class: None,
+            failure_detail: None,
+            crash_evidence: None,
+            healing: entry.record.healing.clone(),
+            guardian: entry.record.guardian.clone(),
+            outcome: None,
+            notice: None,
+            evidence: Vec::new(),
+            stages: Vec::new(),
+        };
+        apply_status_update(entry, &mut settling);
+        publish_status(entry, settling);
+        let _ = entry.events.send(LaunchEvent::ProcessSettled {
+            generation,
+            attempt_id: attempt.id,
+        });
+        drop(sessions);
+        self.notify_changed();
+    }
+
+    async fn finalize_process_settlement_for_attempt(
+        &self,
+        session_id: &str,
+        generation: u64,
+        attempt: &Arc<ProcessAttemptScope>,
+        mut event: LaunchStatusEvent,
+    ) -> Option<LaunchSessionRecord> {
+        let next_state = classify::parse_launch_state(&event.state);
+        if !classify::is_terminal_state(next_state) {
+            return None;
+        }
+        let mut sessions = self.sessions.write().await;
+        let entry = sessions.get_mut(session_id).filter(|entry| {
+            entry.generation == generation
+                && attempt_scopes_match(&entry.attempt, attempt)
+                && !classify::is_terminal_state(entry.record.state)
+        })?;
+        let pending = entry
+            .pending_process_settlement
+            .as_ref()
+            .filter(|pending| {
+                pending.generation == generation
+                    && attempt_scopes_match(&pending.attempt, attempt)
+                    && matches!(pending.state, PendingProcessSettlementState::Claimed)
+            })?;
+        debug_assert_eq!(pending.attempt.id, attempt.id);
+        entry.pending_process_settlement = None;
+        apply_status_update(entry, &mut event);
+        update_terminal_sequence_for_publication(entry, &self.next_terminal_sequence);
+        let record = entry.record.clone();
+        publish_status(entry, event);
+        evict_oldest_terminal_sessions(&mut sessions);
+        drop(sessions);
+        self.notify_changed();
+        Some(record)
+    }
+
+    async fn emit_status_for_attempt_inner(
+        &self,
+        session_id: &str,
+        attempt: &Arc<ProcessAttemptScope>,
+        mut event: LaunchStatusEvent,
+        process_settlement: bool,
     ) {
         let mut sessions = self.sessions.write().await;
         if let Some(entry) = sessions
             .get_mut(session_id)
             .filter(|entry| attempt_scopes_match(&entry.attempt, attempt))
         {
+            if process_settlement && event.state == "recovering" {
+                if entry.startup_recovery_owned && entry.record.boot_completed_at_ms.is_none() {
+                    event.outcome = None;
+                } else {
+                    event.state = "exited".to_string();
+                }
+            }
             let next_state = classify::parse_launch_state(&event.state);
             if process_state_regresses(entry.record.state, next_state) {
                 return;
             }
-            apply_status_update(entry, &mut event);
-            if entry.retention_holds == 0 && classify::is_terminal_state(entry.record.state) {
-                if entry.terminal_sequence.is_none() {
-                    entry.terminal_sequence =
-                        Some(self.next_terminal_sequence.fetch_add(1, Ordering::Relaxed));
-                }
-            } else {
-                entry.terminal_sequence = None;
+            if classify::is_terminal_state(next_state) && entry.pending_process_settlement.is_some()
+            {
+                return;
             }
-            let _ = entry.events.send(LaunchEvent::Status(Box::new(event)));
+            apply_status_update(entry, &mut event);
+            update_terminal_sequence_for_publication(entry, &self.next_terminal_sequence);
+            publish_status(entry, event);
             evict_oldest_terminal_sessions(&mut sessions);
             drop(sessions);
             self.notify_changed();
@@ -1090,22 +1785,147 @@ impl SessionStore {
         ensure_stage_started(&mut entry.record, now_ms());
         let evidence = sanitize_stage_evidence(evidence);
         apply_stage_evidence(entry.record.stages.last_mut(), &evidence);
+        publish_refreshed_status(entry);
         let record = entry.record.clone();
         drop(sessions);
         self.notify_changed();
         Some(record)
     }
 
-    pub async fn start_process(
+    pub(crate) async fn publish_running_and_complete_startup_recovery(
+        &self,
+        started: &StartedLaunchProcess,
+        mut event: LaunchStatusEvent,
+    ) -> RunningHandoffOutcome {
+        if event.state != "running" || event.pid != started.record.pid {
+            return RunningHandoffOutcome::Rejected;
+        }
+
+        let _lifecycle_transition = self.lifecycle_transition.lock().await;
+        let mut sessions = self.sessions.write().await;
+        let Some(entry) = sessions
+            .get_mut(&started.record.session_id.0)
+            .filter(|entry| attempt_scopes_match(&entry.attempt, &started.attempt))
+        else {
+            return RunningHandoffOutcome::Rejected;
+        };
+        if entry.record.state == LaunchState::Settling
+            && entry
+                .pending_process_settlement
+                .as_ref()
+                .is_some_and(|pending| attempt_scopes_match(&pending.attempt, &started.attempt))
+        {
+            return RunningHandoffOutcome::Settling;
+        }
+        if classify::is_terminal_state(entry.record.state)
+            && entry
+                .record
+                .outcome
+                .as_ref()
+                .is_some_and(|outcome| outcome.kind == LaunchSessionOutcomeKind::Stopped)
+        {
+            return RunningHandoffOutcome::Stopped;
+        }
+        if !(entry.startup_recovery_owned
+            && entry.record.pid == started.record.pid
+            && entry.record.process_started_at_ms == started.record.process_started_at_ms
+            && matches!(
+                entry.record.state,
+                LaunchState::Monitoring | LaunchState::Running
+            ))
+        {
+            return RunningHandoffOutcome::Rejected;
+        }
+        let next_state = classify::parse_launch_state(&event.state);
+        if process_state_regresses(entry.record.state, next_state) {
+            return RunningHandoffOutcome::Rejected;
+        }
+
+        apply_status_update(entry, &mut event);
+        entry.startup_recovery_owned = false;
+        entry.terminal_sequence = None;
+        publish_status(entry, event);
+        drop(sessions);
+        self.notify_changed();
+        RunningHandoffOutcome::Published
+    }
+
+    pub(crate) async fn begin_startup_recovery_retry(&self, session_id: &str) -> bool {
+        let _lifecycle_transition = self.lifecycle_transition.lock().await;
+        let attempt = {
+            let sessions = self.sessions.read().await;
+            let Some(entry) = sessions.get(session_id) else {
+                return false;
+            };
+            if entry.record.state != LaunchState::Recovering || !entry.startup_recovery_owned {
+                return false;
+            }
+            entry.attempt.clone()
+        };
+        self.wait_for_process_owner_removal(attempt.id).await;
+
+        let mut sessions = self.sessions.write().await;
+        let Some(entry) = sessions
+            .get_mut(session_id)
+            .filter(|entry| attempt_scopes_match(&entry.attempt, &attempt))
+            .filter(|entry| {
+                entry.record.state == LaunchState::Recovering && entry.startup_recovery_owned
+            })
+        else {
+            return false;
+        };
+        entry.process = None;
+        entry.crash_artifact_game_dir = None;
+        entry.log_count = 0;
+        entry.observed_failures = ObservedFailureSignals::default();
+        entry.stop_requested = false;
+        entry.record.pid = None;
+        entry.record.process_started_at_ms = None;
+        entry.record.boot_completed_at_ms = None;
+        entry.record.boot_duration_ms = None;
+        entry.record.priority = None;
+        entry.record.exit_code = None;
+        entry.record.command.clear();
+        entry.record.java_path = None;
+        entry.record.natives_dir = None;
+        entry.record.failure = None;
+        entry.record.crash_evidence = None;
+        entry.record.outcome = None;
+        drop(sessions);
+        self.notify_changed();
+        true
+    }
+
+    pub(crate) async fn start_process(
         self: &Arc<Self>,
         mut record: LaunchSessionRecord,
         mut command: Command,
-    ) -> std::io::Result<LaunchSessionRecord> {
+    ) -> std::io::Result<StartedLaunchProcess> {
         let _component_admission = self.shared_component_mutation.read().await;
         let _lifecycle_transition = self.lifecycle_transition.lock().await;
         if self.shutdown_started.load(Ordering::Acquire) {
             return Err(session_shutdown_error());
         }
+        let session_id = record.session_id.0.clone();
+        let previous_process = {
+            let sessions = self.sessions.read().await;
+            let Some(entry) = sessions.get(&session_id) else {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "launch session must be admitted before process start",
+                ));
+            };
+            if classify::is_terminal_state(entry.record.state)
+                || entry.record.state == LaunchState::Settling
+                || entry.pending_process_settlement.is_some()
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "settling or terminal launch session cannot start another process",
+                ));
+            }
+            entry.process.clone()
+        };
         command.stdout(Stdio::piped()).stderr(Stdio::piped());
         command.kill_on_drop(true);
         let crash_artifact_game_dir = command.as_std().get_current_dir().map(PathBuf::from);
@@ -1132,13 +1952,6 @@ impl SessionStore {
             }
         };
         record.priority = Some(priority.clone());
-        let session_id = record.session_id.0.clone();
-        let previous_process = self
-            .sessions
-            .read()
-            .await
-            .get(&session_id)
-            .and_then(|entry| entry.process.clone());
         let process_started_at_ms = now_ms();
         let mut child = match command.spawn() {
             Ok(child) => child,
@@ -1168,21 +1981,22 @@ impl SessionStore {
         // wholly unregistered or synchronously installed in both places before its owner runs.
         let mut active_processes = self.active_processes.lock().await;
         let mut sessions = self.sessions.write().await;
-        let (events, retention_holds) = if let Some(entry) = sessions.get(&session_id) {
-            (entry.events.clone(), entry.retention_holds)
-        } else {
-            let (events, _) = broadcast::channel(256);
-            (events, 1)
-        };
+        let previous = sessions
+            .get(&session_id)
+            .expect("admitted session remains under lifecycle exclusion");
         let mut stored_record = record.clone();
-        if let Some(previous) = sessions.get(&session_id) {
-            stored_record.state = previous.record.state;
-            stored_record.stages = previous.record.stages.clone();
-            if stored_record.benchmark.is_none() {
-                stored_record.benchmark = previous.record.benchmark.clone();
-            }
+        stored_record.state = previous.record.state;
+        stored_record.stages = previous.record.stages.clone();
+        if stored_record.benchmark.is_none() {
+            stored_record.benchmark = previous.record.benchmark.clone();
         }
         ensure_stage_started(&mut stored_record, now_ms());
+        let events = previous.events.clone();
+        let retention_holds = previous.retention_holds;
+        let event_subscription_holds = previous.event_subscription_holds;
+        let retained_terminal_sequence = previous.retained_terminal_sequence;
+        let generation = previous.generation;
+        let last_status = previous.last_status.clone();
         let mut starting_status = LaunchStatusEvent {
             state: "starting".to_string(),
             benchmark: stored_record.benchmark.clone(),
@@ -1199,21 +2013,25 @@ impl SessionStore {
             stages: Vec::new(),
         };
         let mut entry = SessionEntry {
+            generation,
             attempt: attempt.clone(),
             process: Some(process.clone()),
             record: stored_record,
             events,
+            last_status,
             observed_failures: ObservedFailureSignals::default(),
             crash_artifact_game_dir,
             log_count: 0,
             stop_requested: false,
+            startup_recovery_owned: true,
+            pending_process_settlement: None,
             retention_holds,
+            event_subscription_holds,
+            retained_terminal_sequence,
             terminal_sequence: None,
         };
         apply_status_update(&mut entry, &mut starting_status);
-        let _ = entry
-            .events
-            .send(LaunchEvent::Status(Box::new(starting_status)));
+        publish_status(&mut entry, starting_status);
         sessions.insert(session_id.clone(), entry);
         active_processes.insert(attempt.id, process);
         let output_pumps = supervisor::spawn_output_tasks(
@@ -1238,7 +2056,7 @@ impl SessionStore {
 
         supervisor::spawn_startup_watchdog(self.clone(), session_id.clone(), attempt.clone());
 
-        Ok(record)
+        Ok(StartedLaunchProcess { record, attempt })
     }
 
     pub async fn kill(self: &Arc<Self>, session_id: &str) -> Result<(), SessionStopError> {
@@ -1248,6 +2066,9 @@ impl SessionStore {
             let Some(entry) = sessions.get(session_id) else {
                 return Err(SessionStopError::SessionNotFound);
             };
+            if entry.record.state == LaunchState::Settling {
+                return Err(SessionStopError::NoLiveProcess);
+            }
             let Some(process) = entry.process.clone() else {
                 return Err(SessionStopError::NoLiveProcess);
             };
@@ -1271,15 +2092,107 @@ impl SessionStore {
         };
         if !user_stop_was_accepted(acceptance) {
             stop.release_lifecycle_guard();
-            let _ = stop.reaped().await;
+            let _ = stop.settled().await;
             stop.disarm_request();
             return Err(SessionStopError::NoLiveProcess);
         }
         stop.publish_intent(acceptance).await;
         stop.release_lifecycle_guard();
-        let reaped = stop.reaped().await;
+        let reaped = stop.settled().await;
         stop.disarm_request();
         reaped.map(|_| ()).map_err(SessionStopError::Process)
+    }
+
+    pub(crate) async fn terminate_stalled_startup_attempt(
+        self: &Arc<Self>,
+        session_id: &str,
+    ) -> std::io::Result<StalledStartupTermination> {
+        let _lifecycle_guard = self.lifecycle_transition.clone().lock_owned().await;
+        let attempt = self
+            .sessions
+            .read()
+            .await
+            .get(session_id)
+            .map(|entry| entry.attempt.clone())
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "startup attempt is unavailable",
+                )
+            })?;
+        #[cfg(test)]
+        if let Some(reached) = self.stalled_termination_before_log_lock.lock().await.take() {
+            let _ = reached.send(());
+        }
+        let log_transition = attempt.log_transition.lock().await;
+        let process = {
+            let sessions = self.sessions.read().await;
+            let entry = sessions
+                .get(session_id)
+                .filter(|entry| attempt_scopes_match(&entry.attempt, &attempt))
+                .ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        "startup attempt was replaced",
+                    )
+                })?;
+            if entry.record.boot_completed_at_ms.is_some()
+                || matches!(
+                    entry.record.state,
+                    LaunchState::Running | LaunchState::Degraded
+                )
+            {
+                return Ok(StalledStartupTermination::StartupCompleted);
+            }
+            if entry.record.state == LaunchState::Recovering {
+                None
+            } else if matches!(
+                entry.record.state,
+                LaunchState::Starting | LaunchState::Monitoring
+            ) && !entry.stop_requested
+            {
+                Some(entry.process.clone().ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        "startup attempt has no process owner",
+                    )
+                })?)
+            } else {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Interrupted,
+                    "startup attempt is no longer eligible for watchdog settlement",
+                ));
+            }
+        };
+        let (acceptance, mut request) = if let Some(process) = process {
+            let mut request = process.terminate(supervisor::ProcessTerminalCause::StartupWatchdog);
+            let acceptance = request.accepted().await?;
+            (Some(acceptance), Some(request))
+        } else {
+            (None, None)
+        };
+        drop(log_transition);
+        if let Some(request) = request.as_mut() {
+            request.settled().await?;
+        }
+        self.wait_for_process_owner_removal(attempt.id).await;
+        if acceptance.is_none_or(|acceptance| {
+            matches!(
+                acceptance,
+                supervisor::ProcessTerminationAcceptance::Accepted(
+                    supervisor::ProcessTerminalCause::StartupWatchdog
+                ) | supervisor::ProcessTerminationAcceptance::Joined(
+                    supervisor::ProcessTerminalCause::StartupWatchdog
+                ) | supervisor::ProcessTerminationAcceptance::ProcessExited
+            )
+        }) {
+            Ok(StalledStartupTermination::Settled)
+        } else {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "startup attempt termination was owned by another operation",
+            ))
+        }
     }
 
     pub(crate) async fn terminate_for_launch_failure(
@@ -1287,12 +2200,18 @@ impl SessionStore {
         session_id: &str,
     ) -> LaunchFailureTermination {
         let lifecycle_guard = self.lifecycle_transition.clone().lock_owned().await;
-        let Some((attempt, process, pid)) =
+        let Some((attempt, process, pid, settlement_claimed)) =
             self.sessions.read().await.get(session_id).map(|entry| {
                 (
                     entry.attempt.clone(),
                     entry.process.clone(),
                     entry.record.pid,
+                    entry
+                        .pending_process_settlement
+                        .as_ref()
+                        .is_some_and(|pending| {
+                            matches!(pending.state, PendingProcessSettlementState::Claimed)
+                        }),
                 )
             })
         else {
@@ -1300,6 +2219,11 @@ impl SessionStore {
                 LaunchFailureTerminationErrorClass::MissingProcess,
             );
         };
+        if settlement_claimed {
+            return LaunchFailureTermination::Unconfirmed(
+                LaunchFailureTerminationErrorClass::SettlementClaimed,
+            );
+        }
         let Some(process) = process else {
             if pid.is_some() {
                 return LaunchFailureTermination::Unconfirmed(
@@ -1369,7 +2293,6 @@ impl SessionStore {
             );
         }
 
-        drop(lifecycle_guard);
         let settled = request.settled().await;
         if settled.is_err() && !request.terminal_is_settled() {
             return LaunchFailureTermination::Unconfirmed(
@@ -1377,7 +2300,11 @@ impl SessionStore {
             );
         }
         match self
-            .acquire_launch_failure_terminalization_lease(session_id, attempt, None)
+            .acquire_launch_failure_terminalization_lease(
+                session_id,
+                attempt,
+                Some(lifecycle_guard),
+            )
             .await
         {
             Ok(lease) => LaunchFailureTermination::Ready(lease),
@@ -1395,6 +2322,9 @@ impl SessionStore {
             let Some(entry) = sessions.get_mut(session_id) else {
                 return Err(SessionStopError::SessionNotFound);
             };
+            if entry.record.state == LaunchState::Settling {
+                return Err(SessionStopError::NoLiveProcess);
+            }
             let Some(process) = entry.process.clone() else {
                 return Err(SessionStopError::NoLiveProcess);
             };
@@ -1422,19 +2352,25 @@ impl SessionStore {
                 return Err(SessionStopError::Process(error));
             }
         };
-        let Some(record) = stop.publish_intent(acceptance).await else {
+        if stop.publish_intent(acceptance).await.is_none() {
             stop.release_lifecycle_guard();
-            let _ = stop.reaped().await;
+            let _ = stop.settled().await;
             stop.release_retention().await;
             stop.disarm_request();
             return Err(SessionStopError::NoLiveProcess);
         };
-        if let Err(error) = stop.reaped().await {
+        if let Err(error) = stop.settled().await {
             stop.release_retention().await;
             stop.disarm_request();
             stop.release_lifecycle_guard();
             return Err(SessionStopError::Process(error));
         }
+        let Some(record) = self.record_for_attempt(session_id, &stop.attempt).await else {
+            stop.release_retention().await;
+            stop.disarm_request();
+            stop.release_lifecycle_guard();
+            return Err(SessionStopError::NoLiveProcess);
+        };
         Ok(stop.into_lease(record))
     }
 
@@ -1478,12 +2414,25 @@ impl SessionStore {
             .map(|entry| entry.retention_holds)
     }
 
-    pub async fn terminate_all(self: &Arc<Self>) -> std::io::Result<()> {
+    pub(crate) async fn settle_all_for_shutdown(self: &Arc<Self>) -> std::io::Result<()> {
         self.shutdown_started.store(true, Ordering::Release);
         let store = self.clone();
         tokio::spawn(async move {
             let lifecycle_transition = store.lifecycle_transition.clone().lock_owned().await;
             store.coordinate_terminate_all(lifecycle_transition).await
+        })
+        .await
+        .map_err(|_| std::io::Error::other("launch process shutdown coordinator stopped"))?
+    }
+
+    #[cfg(test)]
+    pub async fn terminate_all(self: &Arc<Self>) -> std::io::Result<()> {
+        self.shutdown_started.store(true, Ordering::Release);
+        let store = self.clone();
+        tokio::spawn(async move {
+            store.settle_all_for_shutdown().await?;
+            store.clear_after_producer_drain().await;
+            Ok(())
         })
         .await
         .map_err(|_| std::io::Error::other("launch process shutdown coordinator stopped"))?
@@ -1534,10 +2483,28 @@ impl SessionStore {
                 "launch process shutdown is incomplete",
             ));
         }
-
-        self.sessions.write().await.clear();
+        self.shutdown_processes_settled
+            .store(true, Ordering::Release);
         self.notify_changed();
         Ok(())
+    }
+
+    pub(crate) fn shutdown_processes_are_settled(&self) -> bool {
+        self.shutdown_processes_settled.load(Ordering::Acquire)
+    }
+
+    pub(crate) async fn clear_after_producer_drain(&self) {
+        let _lifecycle_transition = self.lifecycle_transition.lock().await;
+        debug_assert!(
+            self.shutdown_started.load(Ordering::Acquire),
+            "launch sessions can only be cleared after shutdown admission is latched"
+        );
+        debug_assert!(
+            self.active_processes.lock().await.is_empty(),
+            "launch sessions can only be cleared after process owners settle"
+        );
+        self.sessions.write().await.clear();
+        self.notify_changed();
     }
 
     async fn wait_for_process_owner_removal(&self, attempt_id: u64) {
@@ -1624,21 +2591,35 @@ impl SessionStore {
     pub async fn wait_for_startup(&self, session_id: &str, timeout: Duration) -> StartupOutcome {
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
-            let snapshot = self.sessions.read().await.get(session_id).map(|entry| {
-                (
-                    entry.record.state,
-                    entry.record.boot_completed_at_ms.is_some(),
-                    entry.log_count,
-                )
-            });
+            let snapshot =
+                self.sessions.read().await.get(session_id).map(|entry| {
+                    (
+                        entry.record.state,
+                        entry.record.boot_completed_at_ms.is_some(),
+                        entry.log_count,
+                        entry.record.outcome.as_ref().is_some_and(|outcome| {
+                            outcome.kind == LaunchSessionOutcomeKind::Stopped
+                        }),
+                    )
+                });
 
-            let Some((state, boot_completed, log_count)) = snapshot else {
+            let Some((state, boot_completed, log_count, stopped)) = snapshot else {
                 return StartupOutcome::Exited;
             };
+            if classify::is_terminal_state(state) {
+                return if stopped {
+                    StartupOutcome::Stopped
+                } else {
+                    StartupOutcome::Exited
+                };
+            }
+            if state == LaunchState::Settling {
+                return StartupOutcome::Settling;
+            }
             if boot_completed {
                 return StartupOutcome::Stable;
             }
-            if classify::is_terminal_state(state) {
+            if state == LaunchState::Recovering {
                 return StartupOutcome::Exited;
             }
             if tokio::time::Instant::now() >= deadline {
@@ -1662,6 +2643,50 @@ fn session_shutdown_error() -> std::io::Error {
 
 fn bounded_shutdown_error(error: &std::io::Error) -> std::io::Error {
     std::io::Error::new(error.kind(), "launch process shutdown is incomplete")
+}
+
+fn restore_terminal_sequence_after_final_release(
+    entry: &mut SessionEntry,
+    next_terminal_sequence: &AtomicU64,
+) {
+    if entry.retention_holds != 0 {
+        return;
+    }
+    if !classify::is_terminal_state(entry.record.state) {
+        entry.retained_terminal_sequence = None;
+        entry.terminal_sequence = None;
+        return;
+    }
+    if let Some(sequence) = entry.retained_terminal_sequence.take() {
+        entry.terminal_sequence = Some(sequence);
+    } else if entry.terminal_sequence.is_none() {
+        entry.terminal_sequence = Some(next_terminal_sequence.fetch_add(1, Ordering::Relaxed));
+    }
+}
+
+fn update_terminal_sequence_for_publication(
+    entry: &mut SessionEntry,
+    next_terminal_sequence: &AtomicU64,
+) {
+    if !classify::is_terminal_state(entry.record.state) {
+        entry.terminal_sequence = None;
+        return;
+    }
+    if entry.retention_holds == 0 {
+        if entry.terminal_sequence.is_none() {
+            entry.terminal_sequence = entry
+                .retained_terminal_sequence
+                .take()
+                .or_else(|| Some(next_terminal_sequence.fetch_add(1, Ordering::Relaxed)));
+        }
+        return;
+    }
+
+    entry.terminal_sequence = None;
+    if entry.retained_terminal_sequence.is_none() {
+        entry.retained_terminal_sequence =
+            Some(next_terminal_sequence.fetch_add(1, Ordering::Relaxed));
+    }
 }
 
 fn evict_oldest_terminal_sessions(sessions: &mut HashMap<String, SessionEntry>) -> bool {
@@ -1691,8 +2716,16 @@ fn evict_oldest_terminal_sessions(sessions: &mut HashMap<String, SessionEntry>) 
 }
 
 fn apply_status_update(entry: &mut SessionEntry, event: &mut LaunchStatusEvent) {
+    apply_status_update_to_record(&mut entry.record, entry.stop_requested, event);
+}
+
+fn apply_status_update_to_record(
+    record: &mut LaunchSessionRecord,
+    stop_requested: bool,
+    event: &mut LaunchStatusEvent,
+) {
     let now = now_ms();
-    let previous_state = entry.record.state;
+    let previous_state = record.state;
     let next_state = classify::parse_launch_state(&event.state);
     let parsed_failure_class = event
         .failure_class
@@ -1704,66 +2737,106 @@ fn apply_status_update(entry: &mut SessionEntry, event: &mut LaunchStatusEvent) 
         .and_then(|detail| sanitize_public_notice_text(&detail, MAX_NOTICE_DETAIL_CHARS));
     event.guardian = event.guardian.take().and_then(sanitize_public_json_value);
     event.healing = event.healing.take().and_then(sanitize_public_json_value);
-    if event.outcome.is_none() {
-        event.outcome = entry.record.outcome.clone().or_else(|| {
-            classify::classify_session_outcome(classify::SessionOutcomeInput {
-                previous_state,
-                next_state,
-                boot_completed: entry.record.boot_completed_at_ms.is_some(),
-                stop_requested: entry.stop_requested,
-                exit_code: event.exit_code,
-                failure_class: parsed_failure_class,
-            })
-        });
+    if classify::is_terminal_state(next_state) {
+        event.outcome = Some(
+            event
+                .outcome
+                .take()
+                .or_else(|| record.outcome.clone())
+                .or_else(|| {
+                    classify::classify_session_outcome(classify::SessionOutcomeInput {
+                        previous_state,
+                        next_state,
+                        boot_completed: record.boot_completed_at_ms.is_some(),
+                        stop_requested,
+                        exit_code: event.exit_code,
+                        failure_class: parsed_failure_class,
+                    })
+                })
+                .expect("terminal launch status must have a canonical outcome"),
+        );
+    } else {
+        event.outcome = None;
     }
 
-    update_stage_history(&mut entry.record, event, now);
+    update_stage_history(record, event, now);
 
-    entry.record.state = next_state;
-    if event.pid.is_some() {
-        entry.record.pid = event.pid;
+    record.state = next_state;
+    if matches!(next_state, LaunchState::Recovering | LaunchState::Settling) {
+        record.pid = None;
+        event.pid = None;
+    } else if event.pid.is_some() {
+        record.pid = event.pid;
     }
     if event.exit_code.is_some() {
-        entry.record.exit_code = event.exit_code;
+        record.exit_code = event.exit_code;
     }
     if let Some(failure_class) = parsed_failure_class {
-        entry.record.failure = Some(LaunchFailure {
+        record.failure = Some(LaunchFailure {
             class: failure_class,
             detail: event.failure_detail.clone(),
         });
     }
     if event.crash_evidence.is_some() {
-        entry.record.crash_evidence = event.crash_evidence.clone();
+        record.crash_evidence = event.crash_evidence.clone();
     } else {
-        event.crash_evidence = entry.record.crash_evidence.clone();
+        event.crash_evidence = record.crash_evidence.clone();
     }
     if event.healing.is_some() {
-        entry.record.healing = event.healing.clone();
+        record.healing = event.healing.clone();
     }
     if event.guardian.is_some() {
-        entry.record.guardian = event.guardian.clone();
+        record.guardian = event.guardian.clone();
     }
     if event.benchmark.is_some() {
-        entry.record.benchmark = event.benchmark.clone();
+        record.benchmark = event.benchmark.clone();
     } else {
-        event.benchmark = entry.record.benchmark.clone();
+        event.benchmark = record.benchmark.clone();
     }
-    if let Some(outcome) = &event.outcome {
-        entry.record.outcome = Some(outcome.clone());
-    }
-    if event.notice.is_none() {
-        event.notice = launch_notice_from_values(
-            event.guardian.as_ref(),
-            event.healing.as_ref(),
-            event.outcome.as_ref(),
-            event.failure_detail.as_deref(),
-            None,
-        );
-    }
+    record.outcome = event.outcome.clone();
     if let Some(notice) = event.notice.take() {
         event.notice = Some(sanitize_launch_notice(notice));
     }
-    event.stages = entry.record.stages.clone();
+    event.stages = record.stages.clone();
+}
+
+fn enforce_record_outcome_invariant(record: &mut LaunchSessionRecord) {
+    if !classify::is_terminal_state(record.state) {
+        record.outcome = None;
+        return;
+    }
+    if record.outcome.is_none() {
+        record.outcome = classify::classify_session_outcome(classify::SessionOutcomeInput {
+            previous_state: record.state,
+            next_state: record.state,
+            boot_completed: record.boot_completed_at_ms.is_some(),
+            stop_requested: false,
+            exit_code: record.exit_code,
+            failure_class: record.failure.as_ref().map(|failure| failure.class),
+        });
+    }
+    assert!(
+        record.outcome.is_some(),
+        "terminal launch record must have a canonical outcome"
+    );
+}
+
+fn publish_status(entry: &mut SessionEntry, status: LaunchStatusEvent) {
+    let revision = entry
+        .last_status
+        .revision
+        .checked_add(1)
+        .expect("launch status revision overflowed");
+    let status = RevisionedLaunchStatus::new(entry.record.session_id.0.clone(), revision, status);
+    entry.last_status = status.clone();
+    let _ = entry.events.send(LaunchEvent::Status(Box::new(status)));
+}
+
+fn publish_refreshed_status(entry: &mut SessionEntry) {
+    let mut status = entry.last_status.status.clone();
+    status.benchmark = entry.record.benchmark.clone();
+    status.stages = entry.record.stages.clone();
+    publish_status(entry, status);
 }
 
 fn prepare_log_line(
@@ -1880,14 +2953,15 @@ fn process_stop_stage_evidence(
     process_stage_evidence(&report.facts)
 }
 
-fn record_user_stop_intent(entry: &mut SessionEntry, session_id: &str) {
+fn record_user_stop_intent(entry: &mut SessionEntry, session_id: &str) -> bool {
     if entry.stop_requested {
-        return;
+        return false;
     }
     entry.stop_requested = true;
     let evidence = process_stop_stage_evidence(session_id, ProcessStopIntent::UserRequested);
     ensure_stage_started(&mut entry.record, now_ms());
     apply_stage_evidence(entry.record.stages.last_mut(), &evidence);
+    true
 }
 
 fn user_stop_was_accepted(acceptance: supervisor::ProcessTerminationAcceptance) -> bool {
@@ -1944,7 +3018,11 @@ fn update_stage_history(record: &mut LaunchSessionRecord, event: &mut LaunchStat
         return;
     }
 
-    let previous_result = terminal_result.unwrap_or("ok");
+    let previous_result = if next_stage == "recovering" {
+        "failed"
+    } else {
+        terminal_result.unwrap_or("ok")
+    };
     close_open_stage(record.stages.last_mut(), now, previous_result);
     let mut next = start_stage(next_stage, now, Some(warnings), fallback_reason);
     apply_stage_evidence(Some(&mut next), &evidence);
@@ -2207,7 +3285,7 @@ impl Default for SessionStore {
 }
 
 #[cfg(test)]
-fn test_record(session_id: &str) -> LaunchSessionRecord {
+pub(super) fn test_record(session_id: &str) -> LaunchSessionRecord {
     LaunchSessionRecord {
         session_id: axial_launcher::SessionId(session_id.to_string()),
         instance_id: "instance".to_string(),
@@ -2275,7 +3353,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn shared_component_mutation_excludes_direct_process_start() {
+    async fn shared_component_mutation_precedes_missing_session_start_rejection() {
         let store = Arc::new(SessionStore::new());
         let mutation = store
             .acquire_shared_component_mutation()
@@ -2305,12 +3383,337 @@ mod tests {
         assert!(store.get(session_id).await.is_none());
 
         drop(mutation);
-        let record = tokio::time::timeout(Duration::from_secs(1), start)
+        let error = tokio::time::timeout(Duration::from_secs(1), start)
             .await
             .expect("blocked process start resumes after component mutation")
             .expect("process task completes")
-            .expect("process starts");
-        assert_eq!(record.session_id.0, session_id);
+            .expect_err("missing session must reject process start");
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+        assert!(store.get(session_id).await.is_none());
+        assert!(store.active_processes.lock().await.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn missing_session_process_start_is_effect_free() {
+        let store = Arc::new(SessionStore::new());
+        let session_id = "missing-process-start-admission";
+        let sentinel = test_pid_path(session_id);
+        let _ = std::fs::remove_file(&sentinel);
+        let mut command = Command::new("sh");
+        command
+            .arg("-c")
+            .arg(format!("touch '{}'; exec sleep 30", sentinel.display()));
+
+        let error = match store.start_process(test_record(session_id), command).await {
+            Ok(_) => panic!("missing session must reject process start"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+        assert!(!sentinel.exists());
+        assert!(store.get(session_id).await.is_none());
+        assert!(store.active_processes.lock().await.is_empty());
+        let _ = std::fs::remove_file(sentinel);
+    }
+
+    #[tokio::test]
+    async fn shared_component_mutation_waits_for_recovering_process_owner() {
+        let store = Arc::new(SessionStore::new());
+        let session_id = "recovering-component-mutation";
+        let mut record = test_record(session_id);
+        record.state = LaunchState::Recovering;
+        store
+            .insert(record)
+            .await
+            .expect("insert recovering session");
+        let attempt = store
+            .current_process_attempt(session_id)
+            .await
+            .expect("recovering attempt");
+        let recovery_scope = store
+            .recovering_component_mutation_scope(session_id)
+            .await
+            .expect("recovering mutation scope");
+        assert!(
+            store.acquire_shared_component_mutation().await.is_none(),
+            "ordinary component mutation must still reject a recovering session"
+        );
+        let gated = supervisor::gated_termination_control();
+        store
+            .active_processes
+            .lock()
+            .await
+            .insert(attempt.id, gated.handle.clone());
+
+        let acquiring_store = store.clone();
+        let mut acquisition = tokio::spawn(async move {
+            acquiring_store
+                .acquire_recovering_component_mutation(&recovery_scope)
+                .await
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut acquisition)
+                .await
+                .is_err(),
+            "component mutation must wait until the recovering process owner is removed"
+        );
+
+        store.process_owner_completed(attempt.id).await;
+        let mutation = tokio::time::timeout(Duration::from_secs(1), acquisition)
+            .await
+            .expect("recovering component admission deadline")
+            .expect("component admission task")
+            .expect("recovering session admits component mutation after process settlement");
+        drop(mutation);
+    }
+
+    #[tokio::test]
+    async fn recovering_component_mutation_is_bound_to_one_exclusive_attempt() {
+        let store = Arc::new(SessionStore::new());
+        let mut first = test_record("recovering-component-first");
+        first.state = LaunchState::Recovering;
+        store.insert(first).await.expect("insert first recovery");
+        let first_scope = store
+            .recovering_component_mutation_scope("recovering-component-first")
+            .await
+            .expect("first recovery scope");
+
+        let mut second = test_record("recovering-component-second");
+        second.state = LaunchState::Recovering;
+        store.insert(second).await.expect("insert second recovery");
+        assert!(
+            store
+                .acquire_recovering_component_mutation(&first_scope)
+                .await
+                .is_none(),
+            "one recovering launch cannot exempt another active launch"
+        );
+
+        store
+            .emit_status(
+                "recovering-component-second",
+                terminal_status(Some(1), Some("unknown"), None),
+            )
+            .await;
+        let mut preparing = terminal_status(None, None, None);
+        preparing.state = "preparing".to_string();
+        store
+            .emit_status("recovering-component-first", preparing)
+            .await;
+        assert!(
+            store
+                .acquire_recovering_component_mutation(&first_scope)
+                .await
+                .is_none(),
+            "a scope cannot be reused after its launch resumes preparation"
+        );
+    }
+
+    #[tokio::test]
+    async fn process_settlement_is_terminal_after_running_handoff() {
+        let store = Arc::new(SessionStore::new());
+        let session_id = "post-handoff-watchdog-settlement";
+        let mut record = test_record(session_id);
+        record.state = LaunchState::Monitoring;
+        record.pid = Some(42);
+        record.process_started_at_ms = Some(10);
+        store
+            .insert(record)
+            .await
+            .expect("insert monitored session");
+        let attempt = store
+            .current_process_attempt(session_id)
+            .await
+            .expect("monitored attempt");
+        let started = StartedLaunchProcess {
+            record: store.get(session_id).await.expect("monitored session"),
+            attempt: attempt.clone(),
+        };
+        let mut running = terminal_status(None, None, None);
+        running.state = "running".to_string();
+        running.pid = Some(42);
+        let RunningHandoffOutcome::Published = store
+            .publish_running_and_complete_startup_recovery(&started, running)
+            .await
+        else {
+            panic!("running handoff must publish");
+        };
+        let published = store.get(session_id).await.expect("published session");
+        assert_eq!(published.state, LaunchState::Running);
+        let mut watchdog = terminal_status(
+            Some(-1),
+            Some(LaunchFailureClass::StartupStalled.as_str()),
+            None,
+        );
+        watchdog.state = "recovering".to_string();
+        watchdog.outcome = Some(LaunchSessionOutcome::from_reason(
+            LaunchSessionExitReason::WatchdogKilled,
+        ));
+
+        store
+            .emit_process_settlement_for_attempt(session_id, &attempt, watchdog)
+            .await;
+
+        let settled = store.get(session_id).await.expect("settled session");
+        assert_eq!(settled.state, LaunchState::Exited);
+        assert_eq!(
+            settled.outcome.map(|outcome| outcome.reason),
+            Some(LaunchSessionExitReason::WatchdogKilled)
+        );
+    }
+
+    #[tokio::test]
+    async fn process_settlement_winning_running_handoff_cannot_publish_false_success() {
+        let store = Arc::new(SessionStore::new());
+        let session_id = "settlement-before-running-handoff";
+        let mut record = test_record(session_id);
+        record.state = LaunchState::Monitoring;
+        record.pid = Some(42);
+        record.process_started_at_ms = Some(10);
+        store
+            .insert(record)
+            .await
+            .expect("insert monitored session");
+        let attempt = store
+            .current_process_attempt(session_id)
+            .await
+            .expect("monitored attempt");
+        let started = StartedLaunchProcess {
+            record: store.get(session_id).await.expect("monitored session"),
+            attempt: attempt.clone(),
+        };
+        let mut events = store
+            .subscribe(session_id)
+            .await
+            .expect("subscribe handoff");
+        let lifecycle = store.lifecycle_transition.clone().lock_owned().await;
+        let publishing_store = store.clone();
+        let mut running = terminal_status(None, None, None);
+        running.state = "running".to_string();
+        running.pid = Some(42);
+        let publishing = tokio::spawn(async move {
+            publishing_store
+                .publish_running_and_complete_startup_recovery(&started, running)
+                .await
+        });
+        tokio::task::yield_now().await;
+
+        let mut exited = terminal_status(Some(1), Some("unknown"), None);
+        exited.state = "recovering".to_string();
+        store
+            .emit_process_settlement_for_attempt(session_id, &attempt, exited)
+            .await;
+        drop(lifecycle);
+
+        assert!(matches!(
+            publishing.await.expect("running publication task"),
+            RunningHandoffOutcome::Rejected
+        ));
+        let LaunchEvent::Status(status) = events.recv().await.expect("recovery status") else {
+            panic!("expected recovery status");
+        };
+        assert_eq!(status.state, "recovering");
+        assert!(events.try_recv().is_err());
+        let settled = store.get(session_id).await.expect("settled attempt");
+        assert_eq!(settled.state, LaunchState::Recovering);
+        assert_eq!(settled.pid, None);
+    }
+
+    #[tokio::test]
+    async fn terminal_session_rejects_every_nonterminal_retry_status() {
+        let store = Arc::new(SessionStore::new());
+        let session_id = "terminal-retry-regression";
+        store
+            .insert(test_record(session_id))
+            .await
+            .expect("insert session");
+        let mut terminal =
+            terminal_status(Some(1), Some(LaunchFailureClass::Unknown.as_str()), None);
+        terminal.outcome = Some(LaunchSessionOutcome::from_reason(
+            LaunchSessionExitReason::StartupFailed,
+        ));
+        store.emit_status(session_id, terminal).await;
+        let before = store.get(session_id).await.expect("terminal record");
+        let before = format!("{before:?}");
+        let mut receiver = store
+            .subscribe(session_id)
+            .await
+            .expect("terminal receiver");
+
+        for state in [
+            "idle",
+            "queued",
+            "planning",
+            "validating",
+            "ensuring_runtime",
+            "downloading_runtime",
+            "preparing",
+            "prewarming",
+            "starting",
+            "monitoring",
+            "recovering",
+            "running",
+            "degraded",
+        ] {
+            let mut status = terminal_status(None, None, None);
+            status.state = state.to_string();
+            store.emit_status(session_id, status).await;
+        }
+
+        assert_eq!(
+            format!(
+                "{:?}",
+                store.get(session_id).await.expect("preserved terminal")
+            ),
+            before
+        );
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn recovery_retry_clears_failed_attempt_fields_before_preparation() {
+        let store = Arc::new(SessionStore::new());
+        let session_id = "recovery-retry-attempt-fields";
+        let mut record = test_record(session_id);
+        record.state = LaunchState::Recovering;
+        record.pid = Some(42);
+        record.process_started_at_ms = Some(10);
+        record.exit_code = Some(1);
+        record.command = vec!["stale".to_string()];
+        record.java_path = Some("stale-java".to_string());
+        record.natives_dir = Some("stale-natives".to_string());
+        record.failure = Some(LaunchFailure {
+            class: LaunchFailureClass::Unknown,
+            detail: None,
+        });
+        record.crash_evidence = Some(axial_launcher::CrashEvidence {
+            source: axial_launcher::CrashArtifactKind::MinecraftCrashReport,
+            truncated: false,
+            failure_phase: None,
+            exception_class: None,
+            suspected_mods: Vec::new(),
+            problematic_frame: None,
+            names_out_of_memory: false,
+        });
+        record.outcome = Some(LaunchSessionOutcome::from_reason(
+            LaunchSessionExitReason::StartupFailed,
+        ));
+        store.insert(record).await.expect("insert recovery");
+
+        assert!(store.begin_startup_recovery_retry(session_id).await);
+
+        let retry = store.get(session_id).await.expect("retry record");
+        assert_eq!(retry.state, LaunchState::Recovering);
+        assert_eq!(retry.pid, None);
+        assert_eq!(retry.process_started_at_ms, None);
+        assert_eq!(retry.exit_code, None);
+        assert!(retry.command.is_empty());
+        assert_eq!(retry.java_path, None);
+        assert_eq!(retry.natives_dir, None);
+        assert_eq!(retry.failure, None);
+        assert_eq!(retry.crash_evidence, None);
+        assert_eq!(retry.outcome, None);
     }
 
     #[tokio::test]
@@ -2353,7 +3756,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn launch_retained_terminal_session_replays_the_broadcast_status_snapshot() {
+    async fn launch_retained_terminal_session_replays_exact_status_and_projects_notice() {
         let store = SessionStore::new();
         let retained_session_id = format!("terminal-{MAX_RETAINED_TERMINAL_SESSIONS}");
         let mut retained_receiver = None;
@@ -2395,28 +3798,29 @@ mod tests {
         assert!(store.get("terminal-0").await.is_none());
         let emitted = recv_status(&mut retained_receiver.expect("retained receiver")).await;
         let retained = store
-            .get(&retained_session_id)
+            .status_snapshot(&retained_session_id)
             .await
-            .expect("retained terminal record");
-        let replay = crate::application::launch::snapshot_status(&retained);
+            .expect("retained terminal status");
 
-        assert_eq!(replay.state, emitted.state);
-        assert_eq!(replay.exit_code, emitted.exit_code);
-        assert_eq!(replay.outcome, emitted.outcome);
-        assert_eq!(replay.notice, emitted.notice);
-        let notice = replay.notice.as_ref().expect("enriched replay notice");
+        assert_eq!(retained.revision, 1);
+        assert_eq!(retained.state, emitted.state);
+        assert_eq!(retained.exit_code, emitted.exit_code);
+        assert_eq!(retained.outcome, emitted.outcome);
+        assert_eq!(retained.notice, None);
+        assert_eq!(retained.stages, emitted.stages);
+        let public = crate::application::launch::public_launch_status(&retained);
+        let notice = public.notice.as_ref().expect("projected notice");
         assert_eq!(notice.message, "Guardian found launch settings to review.");
         assert_eq!(notice.details, ["Use the managed Java runtime."]);
         assert_eq!(
-            replay.outcome.as_ref().map(|outcome| outcome.kind),
+            public.outcome.as_ref().map(|outcome| outcome.kind),
             Some(axial_launcher::LaunchSessionOutcomeKind::Unknown)
         );
-        assert_eq!(replay.stages, emitted.stages);
         assert!(store.subscribe(&retained_session_id).await.is_some());
     }
 
     #[tokio::test]
-    async fn launch_retry_pending_terminal_survives_pressure_and_resumes_original_stream() {
+    async fn launch_recovery_survives_pressure_and_resumes_original_stream() {
         let store = SessionStore::new();
         let retry_session_id = "retry-pending";
         store
@@ -2427,12 +3831,9 @@ mod tests {
             .subscribe(retry_session_id)
             .await
             .expect("retry receiver");
-        store
-            .emit_status(
-                retry_session_id,
-                terminal_status(Some(1), Some("unknown"), None),
-            )
-            .await;
+        let mut recovering = terminal_status(Some(1), Some("unknown"), None);
+        recovering.state = "recovering".to_string();
+        store.emit_status(retry_session_id, recovering).await;
 
         insert_retention_ready_terminal_burst(&store, "completed").await;
 
@@ -2441,51 +3842,378 @@ mod tests {
         resumed.state = "preparing".to_string();
         store.emit_status(retry_session_id, resumed).await;
 
-        assert_eq!(recv_status(&mut receiver).await.state, "exited");
+        let recovering = recv_status(&mut receiver).await;
+        assert_eq!(recovering.state, "recovering");
+        assert_eq!(recovering.outcome, None);
+        assert_eq!(recovering.notice, None);
         assert_eq!(recv_status(&mut receiver).await.state, "preparing");
+        let entry = store.sessions.read().await;
+        let entry = entry.get(retry_session_id).expect("recovering session");
+        assert_eq!(entry.terminal_sequence, None);
     }
 
     #[tokio::test]
-    async fn launch_nested_retention_holds_require_the_final_release_for_eligibility() {
-        let store = SessionStore::new();
-        let session_id = "nested-holds";
+    async fn event_subscription_cohort_restores_original_terminal_eviction_age() {
+        let store = Arc::new(SessionStore::new());
+        let session_id = "old-terminal-stream-cohort";
+        store
+            .insert(test_record(session_id))
+            .await
+            .expect("insert old terminal session");
+        store.release_terminal_retention_hold(session_id).await;
+        store
+            .emit_status(session_id, terminal_status(Some(0), None, None))
+            .await;
+        let original_sequence = store
+            .sessions
+            .read()
+            .await
+            .get(session_id)
+            .and_then(|entry| entry.terminal_sequence)
+            .expect("old terminal sequence");
+
+        let first = store
+            .subscribe_events(session_id)
+            .await
+            .expect("first event subscription");
+        let second = store
+            .subscribe_events(session_id)
+            .await
+            .expect("nested event subscription");
+        first.release().await;
+        second.release().await;
+        {
+            let sessions = store.sessions.read().await;
+            let entry = sessions
+                .get(session_id)
+                .expect("subscription-released terminal");
+            assert_eq!(entry.retention_holds, 0);
+            assert_eq!(entry.event_subscription_holds, 0);
+            assert_eq!(entry.retained_terminal_sequence, None);
+            assert_eq!(entry.terminal_sequence, Some(original_sequence));
+        }
+
+        for index in 0..MAX_RETAINED_TERMINAL_SESSIONS {
+            let current_id = format!("newer-terminal-{index}");
+            store
+                .insert(test_record(&current_id))
+                .await
+                .expect("insert newer terminal");
+            store.release_terminal_retention_hold(&current_id).await;
+            store
+                .emit_status(&current_id, terminal_status(Some(0), None, None))
+                .await;
+        }
+
+        assert!(store.get(session_id).await.is_none());
+        assert!(
+            store
+                .get(&format!(
+                    "newer-terminal-{}",
+                    MAX_RETAINED_TERMINAL_SESSIONS - 1
+                ))
+                .await
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn event_subscription_active_terminal_restores_first_terminal_eviction_age() {
+        let store = Arc::new(SessionStore::new());
+        let session_id = "active-terminal-stream-cohort";
+        store
+            .insert(test_record(session_id))
+            .await
+            .expect("insert active session");
+        let subscription = store
+            .subscribe_events(session_id)
+            .await
+            .expect("subscribe while active");
+        store.release_terminal_retention_hold(session_id).await;
+        store
+            .emit_status(session_id, terminal_status(Some(0), None, None))
+            .await;
+        {
+            let sessions = store.sessions.read().await;
+            let entry = sessions.get(session_id).expect("held terminal session");
+            assert_eq!(entry.retention_holds, 1);
+            assert!(entry.retained_terminal_sequence.is_some());
+            assert_eq!(entry.terminal_sequence, None);
+        }
+
+        for index in 0..MAX_RETAINED_TERMINAL_SESSIONS {
+            let current_id = format!("active-cohort-newer-terminal-{index}");
+            store
+                .insert(test_record(&current_id))
+                .await
+                .expect("insert newer terminal");
+            store.release_terminal_retention_hold(&current_id).await;
+            store
+                .emit_status(&current_id, terminal_status(Some(0), None, None))
+                .await;
+        }
+
+        subscription.release().await;
+
+        assert!(store.get(session_id).await.is_none());
+        for index in 0..MAX_RETAINED_TERMINAL_SESSIONS {
+            assert!(
+                store
+                    .get(&format!("active-cohort-newer-terminal-{index}"))
+                    .await
+                    .is_some()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn launch_event_subscription_retains_atomic_snapshot_and_monotonic_revisions() {
+        let store = Arc::new(SessionStore::new());
+        let session_id = "revisioned-subscription";
         store
             .insert(test_record(session_id))
             .await
             .expect("insert session");
-        assert!(
-            store
-                .acquire_terminal_retention_hold(session_id)
-                .await
-                .is_some()
+        let mut subscription = store
+            .subscribe_events(session_id)
+            .await
+            .expect("subscribe to launch events");
+
+        assert_eq!(subscription.retained_status().session_id, session_id);
+        assert_eq!(subscription.retained_status().revision, 0);
+        assert_eq!(subscription.retained_status().state, "queued");
+
+        let mut monitoring = terminal_status(None, None, None);
+        monitoring.state = "monitoring".to_string();
+        store.emit_status(session_id, monitoring).await;
+        let mut recovering = terminal_status(Some(1), Some("unknown"), None);
+        recovering.state = "recovering".to_string();
+        store.emit_status(session_id, recovering).await;
+
+        let LaunchEvent::Status(monitoring) = subscription.recv().await.expect("monitoring") else {
+            panic!("expected monitoring status");
+        };
+        let LaunchEvent::Status(recovering) = subscription.recv().await.expect("recovering") else {
+            panic!("expected recovering status");
+        };
+        assert_eq!(
+            (monitoring.revision, monitoring.state.as_str()),
+            (1, "monitoring")
         );
+        assert_eq!(
+            (recovering.revision, recovering.state.as_str()),
+            (2, "recovering")
+        );
+        assert_eq!(recovering.outcome, None);
+        assert_eq!(subscription.rebase().await.expect("rebase").revision, 2);
+    }
+
+    #[tokio::test]
+    async fn launch_event_subscription_rebase_discards_pre_rebase_events() {
+        let store = Arc::new(SessionStore::new());
+        let session_id = "revisioned-subscription-rebase";
+        store
+            .insert(test_record(session_id))
+            .await
+            .expect("insert session");
+        let mut subscription = store
+            .subscribe_events(session_id)
+            .await
+            .expect("subscribe to launch events");
+
+        for index in 0..300 {
+            store
+                .emit_log(session_id, "stdout", &format!("old-log-{index}"))
+                .await;
+            if index % 50 == 0 {
+                let mut status = terminal_status(None, None, None);
+                status.state = "monitoring".to_string();
+                store.emit_status(session_id, status).await;
+            }
+        }
+        assert!(matches!(
+            subscription.recv().await,
+            Err(broadcast::error::RecvError::Lagged(_))
+        ));
+
+        let rebased = subscription.rebase().await.expect("atomic rebase");
+        assert_eq!(rebased.revision, 6);
+        store
+            .emit_log(session_id, "stdout", "new-log-after-rebase")
+            .await;
+        let mut recovering = terminal_status(None, None, None);
+        recovering.state = "recovering".to_string();
+        store.emit_status(session_id, recovering).await;
+
+        let LaunchEvent::Log(log) = subscription.recv().await.expect("new log") else {
+            panic!("pre-rebase event was not discarded");
+        };
+        assert_eq!(log.text, "new-log-after-rebase");
+        let LaunchEvent::Status(status) = subscription.recv().await.expect("new status") else {
+            panic!("expected post-rebase status");
+        };
+        assert_eq!(status.revision, 7);
+        assert_eq!(status.state, "recovering");
+    }
+
+    #[tokio::test]
+    async fn duplicate_session_admission_preserves_original_entry_and_identity_counters() {
+        let store = SessionStore::new();
+        let session_id = "duplicate-session-admission";
+        let mut original = test_record(session_id);
+        original.version_id = "original".to_string();
+        store
+            .insert(original)
+            .await
+            .expect("insert original session");
+        let (generation, attempt_id, next_generation, next_attempt_id) = {
+            let sessions = store.sessions.read().await;
+            let entry = sessions.get(session_id).expect("original session");
+            (
+                entry.generation,
+                entry.attempt.id,
+                store.next_session_generation.load(Ordering::Relaxed),
+                store.next_attempt_id.load(Ordering::Relaxed),
+            )
+        };
+
+        let mut duplicate = test_record(session_id);
+        duplicate.version_id = "replacement".to_string();
+        assert_eq!(
+            store.insert(duplicate).await,
+            Err(SessionAdmissionError::DuplicateSessionId)
+        );
+
+        let sessions = store.sessions.read().await;
+        let entry = sessions.get(session_id).expect("original remains");
+        assert_eq!(entry.generation, generation);
+        assert_eq!(entry.attempt.id, attempt_id);
+        assert_eq!(entry.record.version_id, "original");
+        assert_eq!(entry.last_status.revision, 0);
+        assert_eq!(entry.last_status.session_id, session_id);
+        assert_eq!(entry.retention_holds, 1);
+        assert_eq!(entry.event_subscription_holds, 0);
+        assert_eq!(
+            store.next_session_generation.load(Ordering::Relaxed),
+            next_generation
+        );
+        assert_eq!(
+            store.next_attempt_id.load(Ordering::Relaxed),
+            next_attempt_id
+        );
+    }
+
+    #[tokio::test]
+    async fn launch_event_subscription_retains_terminal_under_eviction_until_drop() {
+        let store = Arc::new(SessionStore::new());
+        let session_id = "stream-retained-terminal";
+        store
+            .insert(test_record(session_id))
+            .await
+            .expect("insert session");
+        let subscription = store
+            .subscribe_events(session_id)
+            .await
+            .expect("subscribe to launch events");
+        store.release_terminal_retention_hold(session_id).await;
         store
             .emit_status(session_id, terminal_status(Some(0), None, None))
             .await;
 
-        store.release_terminal_retention_hold(session_id).await;
+        insert_retention_ready_terminal_burst(&store, "stream-pressure").await;
+
+        assert!(store.get(session_id).await.is_some());
         assert_eq!(
             store
                 .sessions
                 .read()
                 .await
                 .get(session_id)
-                .expect("held session")
-                .terminal_sequence,
-            None
+                .expect("subscription-retained session")
+                .retention_holds,
+            1
         );
+        drop(subscription);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if store.get(session_id).await.is_none() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("old terminal is evicted when subscription retention releases on drop");
+    }
 
-        store.release_terminal_retention_hold(session_id).await;
-        assert!(
-            store
-                .sessions
-                .read()
-                .await
-                .get(session_id)
-                .expect("eligible session")
-                .terminal_sequence
-                .is_some()
-        );
+    #[tokio::test]
+    async fn stale_subscription_drop_cannot_release_reused_session_generation() {
+        let store = Arc::new(SessionStore::new());
+        let session_id = "reused-session-id";
+        store
+            .insert(test_record(session_id))
+            .await
+            .expect("insert first generation");
+        let subscription = store
+            .subscribe_events(session_id)
+            .await
+            .expect("subscribe to first generation");
+        store
+            .sessions
+            .write()
+            .await
+            .remove(session_id)
+            .expect("remove first generation fixture");
+        store
+            .insert(test_record(session_id))
+            .await
+            .expect("replace session generation");
+
+        subscription.release().await;
+
+        let sessions = store.sessions.read().await;
+        let replacement = sessions.get(session_id).expect("replacement session");
+        assert_eq!(replacement.retention_holds, 1);
+        assert_eq!(replacement.last_status.revision, 0);
+    }
+
+    #[tokio::test]
+    async fn stale_terminal_observer_cannot_release_reused_session_generation() {
+        let store = Arc::new(SessionStore::new());
+        let session_id = "reused-terminal-observer-session-id";
+        store
+            .insert(test_record(session_id))
+            .await
+            .expect("insert first observer generation");
+        let (stale_generation, _) = store
+            .subscribe_terminal_observation(session_id)
+            .await
+            .expect("subscribe first observer generation");
+        store
+            .sessions
+            .write()
+            .await
+            .remove(session_id)
+            .expect("remove first observer generation fixture");
+        store
+            .insert(test_record(session_id))
+            .await
+            .expect("replace observer generation");
+        let (current_generation, _) = store
+            .subscribe_terminal_observation(session_id)
+            .await
+            .expect("subscribe replacement observer generation");
+        assert_ne!(stale_generation, current_generation);
+
+        store
+            .release_terminal_observation_hold(session_id, stale_generation)
+            .await;
+        assert_eq!(store.retention_hold_count(session_id).await, Some(1));
+
+        store
+            .release_terminal_observation_hold(session_id, current_generation)
+            .await;
+        assert_eq!(store.retention_hold_count(session_id).await, Some(0));
     }
 
     #[tokio::test]
@@ -2998,6 +4726,10 @@ mod tests {
             .insert(test_record("benchmark-status"))
             .await
             .expect("insert session");
+        let mut receiver = store
+            .subscribe("benchmark-status")
+            .await
+            .expect("subscribe");
         let benchmark = json!({
             "id": "benchmark-status",
             "profile": "dev-default",
@@ -3008,11 +4740,20 @@ mod tests {
             .attach_benchmark("benchmark-status", benchmark.clone())
             .await
             .expect("attached benchmark");
-
-        let mut receiver = store
-            .subscribe("benchmark-status")
+        let LaunchEvent::Status(attached) = receiver.recv().await.expect("benchmark refresh")
+        else {
+            panic!("expected benchmark refresh status");
+        };
+        assert_eq!(attached.revision, 1);
+        assert_eq!(attached.state, "queued");
+        assert_eq!(attached.benchmark, Some(benchmark.clone()));
+        let snapshot = store
+            .status_snapshot("benchmark-status")
             .await
-            .expect("subscribe");
+            .expect("benchmark snapshot");
+        assert_eq!(snapshot.revision, 1);
+        assert_eq!(snapshot.benchmark, Some(benchmark.clone()));
+
         store
             .emit_status(
                 "benchmark-status",
@@ -3038,15 +4779,57 @@ mod tests {
         let LaunchEvent::Status(status) = emitted else {
             panic!("expected status event");
         };
+        assert_eq!(status.revision, 2);
         assert_eq!(status.benchmark, Some(benchmark.clone()));
         let record = store.get("benchmark-status").await.expect("stored record");
         assert_eq!(record.benchmark, Some(benchmark));
     }
 
     #[tokio::test]
+    async fn record_stage_evidence_refreshes_same_state_revision_and_snapshot() {
+        let store = SessionStore::new();
+        let session_id = "recorded-stage-evidence-refresh";
+        store
+            .insert(test_record(session_id))
+            .await
+            .expect("insert stage evidence session");
+        let mut receiver = store.subscribe(session_id).await.expect("subscribe");
+
+        store
+            .record_stage_evidence(
+                session_id,
+                vec![LaunchStageEvidence {
+                    id: "execution_launch_command_prepared".to_string(),
+                    system: "execution".to_string(),
+                    summary: "Execution prepared the launch command.".to_string(),
+                    details: vec!["arg_count:3".to_string()],
+                }],
+            )
+            .await
+            .expect("record stage evidence");
+
+        let LaunchEvent::Status(refreshed) = receiver.recv().await.expect("stage refresh") else {
+            panic!("expected stage refresh status");
+        };
+        assert_eq!(refreshed.revision, 1);
+        assert_eq!(refreshed.state, "queued");
+        assert_eq!(refreshed.stages[0].evidence.len(), 1);
+        let snapshot = store
+            .status_snapshot(session_id)
+            .await
+            .expect("stage evidence snapshot");
+        assert_eq!(snapshot.revision, 1);
+        assert_eq!(snapshot.stages, refreshed.stages);
+    }
+
+    #[tokio::test]
     async fn launch_start_process_records_process_start_time() {
         let store = Arc::new(SessionStore::new());
         let record = test_record("process-start-time");
+        store
+            .insert(record.clone())
+            .await
+            .expect("insert process start session");
         let mut command = Command::new(std::env::current_exe().expect("current test binary"));
         command.arg("--help");
 
@@ -3107,6 +4890,10 @@ mod tests {
     async fn rejected_kill_preserves_live_attempt_watchdog_state() {
         let store = Arc::new(SessionStore::new());
         let session_id = "rejected-user-kill";
+        store
+            .insert(test_record(session_id))
+            .await
+            .expect("insert rejected kill session");
         let mut command = Command::new("sh");
         command.arg("-c").arg("exec sleep 30");
         store
@@ -3196,7 +4983,7 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn start_process_reuse_resets_watchdog_and_attempt_state() {
+    async fn start_process_recovery_resets_watchdog_and_attempt_state() {
         let store = Arc::new(SessionStore::new());
         let session_id = "reused-process-entry";
         store
@@ -3216,9 +5003,7 @@ mod tests {
                 .observe(LaunchFailureClass::JvmUnsupportedOption, now_ms());
             entry.log_count = 7;
             entry.terminal_sequence = Some(11);
-            entry.record.state = LaunchState::Exited;
-            entry.record.boot_completed_at_ms = Some(now_ms());
-            entry.record.boot_duration_ms = Some(10);
+            entry.record.state = LaunchState::Recovering;
         }
         let mut command = Command::new("sh");
         command.arg("-c").arg("exec sleep 30");
@@ -3254,6 +5039,37 @@ mod tests {
                 .is_some()
         );
         store.terminate_all().await.expect("terminate relaunch");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn terminal_session_cannot_spawn_a_replacement_process() {
+        let store = Arc::new(SessionStore::new());
+        let session_id = "terminal-process-replacement";
+        let sentinel = test_pid_path(session_id);
+        let mut record = test_record(session_id);
+        record.state = LaunchState::Exited;
+        store
+            .insert(record.clone())
+            .await
+            .expect("insert terminal session");
+        let mut command = Command::new("sh");
+        command
+            .arg("-c")
+            .arg(format!("touch '{}'; exec sleep 30", sentinel.display()));
+
+        let error = store
+            .start_process(record, command)
+            .await
+            .expect_err("terminal session must reject process replacement");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(!sentinel.exists());
+        assert_eq!(
+            store.get(session_id).await.expect("terminal session").state,
+            LaunchState::Exited
+        );
+        let _ = std::fs::remove_file(sentinel);
     }
 
     #[tokio::test]
@@ -3430,6 +5246,10 @@ mod tests {
     async fn concurrent_replacements_allocate_monotonic_attempts_and_stale_exit_is_ignored() {
         let store = Arc::new(SessionStore::new());
         let session_id = "concurrent-process-replacement";
+        store
+            .insert(test_record(session_id))
+            .await
+            .expect("insert replacement session");
         let mut first_command = Command::new("sh");
         first_command.arg("-c").arg("exec sleep 30");
         store
@@ -3476,46 +5296,6 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn pending_launch_failure_settlement_cannot_claim_a_replacement_attempt() {
-        let store = Arc::new(SessionStore::new());
-        let session_id = "pending-launch-failure-replacement";
-        let mut command = Command::new("sh");
-        command.arg("-c").arg("exec sleep 30");
-        store
-            .start_process(test_record(session_id), command)
-            .await
-            .expect("spawn replacement target");
-        assert!(store.reject_next_process_start_kill(session_id).await);
-        let pending = match store.terminate_for_launch_failure(session_id).await {
-            LaunchFailureTermination::Pending(pending) => pending,
-            _ => panic!("rejected termination must remain pending"),
-        };
-
-        let mut replacement = test_record(session_id);
-        replacement.version_id = "replacement".to_string();
-        store.insert(replacement).await.expect("insert session");
-        let error_class =
-            match tokio::time::timeout(Duration::from_secs(2), pending.wait_for_settlement())
-                .await
-                .expect("stale settlement deadline")
-            {
-                Ok(_) => panic!("stale attempt must not acquire a terminalization lease"),
-                Err(error_class) => error_class,
-            };
-
-        assert_eq!(
-            error_class,
-            LaunchFailureTerminationErrorClass::StaleAttempt
-        );
-        let stored = store.get(session_id).await.expect("replacement session");
-        assert_eq!(stored.version_id, "replacement");
-        assert_eq!(stored.state, LaunchState::Queued);
-        assert!(stored.failure.is_none());
-        assert_eq!(store.retention_hold_count(session_id).await, Some(1));
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
     async fn launch_process_exit_preserves_observed_failure_class_without_raw_detail() {
         let store = Arc::new(SessionStore::new());
         let session_id = "class-only-observed-failure";
@@ -3535,27 +5315,29 @@ mod tests {
             .await
             .expect("spawn failing process");
 
-        let mut terminal_status = None;
+        let mut recovery_status = None;
         for _ in 0..8 {
             let event = tokio::time::timeout(std::time::Duration::from_secs(2), receiver.recv())
                 .await
                 .expect("status event")
                 .expect("broadcast event");
             if let LaunchEvent::Status(status) = event
-                && status.state == "exited"
+                && status.state == "recovering"
             {
-                terminal_status = Some(status);
+                recovery_status = Some(status);
                 break;
             }
         }
 
-        let status = terminal_status.expect("terminal status");
+        let status = recovery_status.expect("recovery status");
         assert_eq!(
             status.failure_class.as_deref(),
             Some(LaunchFailureClass::JvmUnsupportedOption.as_str())
         );
         assert_eq!(status.failure_detail, None);
-        let status_json = serde_json::to_string(&status).expect("terminal status json");
+        assert_eq!(status.outcome, None);
+        assert_eq!(status.notice, None);
+        let status_json = serde_json::to_string(&status).expect("recovery status json");
         assert!(status_json.contains("execution_process_exited"));
         assert!(status_json.contains("execution_process_exit_code"));
         assert_public_session_payload_excludes_sensitive_content(&status_json);
@@ -3568,10 +5350,8 @@ mod tests {
         let failure = stored.failure.expect("stored failure");
         assert_eq!(failure.class, LaunchFailureClass::JvmUnsupportedOption);
         assert_eq!(failure.detail, None);
-        assert_eq!(
-            stored.outcome.expect("stored outcome").reason,
-            LaunchSessionExitReason::StartupFailed
-        );
+        assert_eq!(stored.state, LaunchState::Recovering);
+        assert_eq!(stored.outcome, None);
     }
 
     #[cfg(unix)]
@@ -3593,21 +5373,21 @@ mod tests {
             .await
             .expect("spawn output-heavy failing process");
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-        let terminal = loop {
+        let recovering = loop {
             let record = store.get(session_id).await.expect("session record");
-            if classify::is_terminal_state(record.state) {
+            if record.state == LaunchState::Recovering {
                 break record;
             }
             assert!(
                 tokio::time::Instant::now() < deadline,
-                "process did not reach terminal state"
+                "process did not reach recovery state"
             );
             tokio::time::sleep(Duration::from_millis(10)).await;
         };
 
-        assert_eq!(terminal.state, LaunchState::Exited);
+        assert_eq!(recovering.state, LaunchState::Recovering);
         assert_eq!(
-            terminal.failure.map(|failure| failure.class),
+            recovering.failure.map(|failure| failure.class),
             Some(LaunchFailureClass::JvmUnsupportedOption)
         );
     }
@@ -3795,9 +5575,28 @@ mod tests {
         let pending = store.get(session_id).await;
         let pending_stream_empty = receiver.try_recv().is_err();
         let later_log_pending = !later_log.is_finished();
+        let terminating_store = store.clone();
+        let mut termination = tokio::spawn(async move {
+            terminating_store
+                .terminate_stalled_startup_attempt(session_id)
+                .await
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut termination)
+                .await
+                .is_err(),
+            "stalled termination must serialize behind the in-flight boot transition"
+        );
         release_effect.wait();
         emit.await.expect("boot log task");
         later_log.await.expect("later log task");
+        assert_eq!(
+            termination
+                .await
+                .expect("stalled termination task")
+                .expect("boot-winning termination result"),
+            StalledStartupTermination::StartupCompleted
+        );
 
         assert_eq!(pending_outcome, StartupOutcome::Stalled);
         let pending = pending.expect("pending boot record");
@@ -3832,6 +5631,104 @@ mod tests {
             panic!("expected later log after boot log");
         };
         assert!(later_log.text.contains("later modded game resources"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stalled_termination_process_exited_releases_log_before_output_settlement() {
+        let store = Arc::new(SessionStore::new());
+        let session_id = "stalled-natural-exit-output-drain";
+        let mut record = test_record(session_id);
+        record.state = LaunchState::Starting;
+        store.insert(record).await.expect("insert stalled session");
+        let attempt = store
+            .current_process_attempt(session_id)
+            .await
+            .expect("stalled attempt");
+        let mut events = store
+            .subscribe(session_id)
+            .await
+            .expect("subscribe stalled session");
+        let log_transition = attempt.log_transition.lock().await;
+
+        let mut command = Command::new("sh");
+        command.arg("-c").arg("exit 0").kill_on_drop(true);
+        let child = command.spawn().expect("natural-exit child");
+        let pid = child.id();
+        let (control, owner) = supervisor::prepare_process_owner(child);
+        let (release_processor, release_processor_rx) = tokio::sync::oneshot::channel();
+        let (processor_waiting, processor_waiting_rx) = tokio::sync::oneshot::channel();
+        let processor_store = store.clone();
+        let processor_attempt = attempt.clone();
+        let processor = tokio::spawn(async move {
+            let _ = release_processor_rx.await;
+            let _ = processor_waiting.send(());
+            processor_store
+                .emit_log_for_attempt(
+                    session_id,
+                    &processor_attempt,
+                    "stdout",
+                    "natural exit output".to_string(),
+                    now_ms(),
+                )
+                .await;
+        });
+        {
+            let mut active = store.active_processes.lock().await;
+            let mut sessions = store.sessions.write().await;
+            let entry = sessions.get_mut(session_id).expect("stalled entry");
+            entry.process = Some(control.clone());
+            entry.record.pid = pid;
+            entry.record.process_started_at_ms = Some(now_ms());
+            active.insert(attempt.id, control.clone());
+            owner.spawn(
+                store.clone(),
+                session_id.to_string(),
+                attempt.clone(),
+                supervisor::output_pump_tasks_with_processor(processor),
+            );
+        }
+        control.wait_until_reaped().await;
+
+        let (termination_before_log_lock, termination_before_log_lock_rx) =
+            tokio::sync::oneshot::channel();
+        *store.stalled_termination_before_log_lock.lock().await = Some(termination_before_log_lock);
+        let terminating_store = store.clone();
+        let termination = tokio::spawn(async move {
+            terminating_store
+                .terminate_stalled_startup_attempt(session_id)
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), termination_before_log_lock_rx)
+            .await
+            .expect("stalled termination reaches log transition")
+            .expect("stalled termination log transition signal");
+        release_processor
+            .send(())
+            .expect("release output processor");
+        processor_waiting_rx
+            .await
+            .expect("output processor waits for log transition");
+        drop(log_transition);
+
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), termination)
+                .await
+                .expect("stalled termination deadline")
+                .expect("stalled termination task")
+                .expect("stalled termination result"),
+            StalledStartupTermination::Settled
+        );
+        let first = events.recv().await.expect("drained output event");
+        let LaunchEvent::Log(log) = first else {
+            panic!("output must drain before natural-exit settlement");
+        };
+        assert_eq!(log.text, "natural exit output");
+        let LaunchEvent::Status(status) = events.recv().await.expect("recovery status") else {
+            panic!("expected recovery status after output drain");
+        };
+        assert_eq!(status.state, "recovering");
+        assert!(store.active_processes.lock().await.is_empty());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3995,6 +5892,10 @@ mod tests {
     async fn late_startup_statuses_cannot_resurrect_a_fast_exit() {
         let store = Arc::new(SessionStore::new());
         let session_id = "late-status-after-fast-exit";
+        store
+            .insert(test_record(session_id))
+            .await
+            .expect("insert fast-exit session");
         let mut command = Command::new("sh");
         command.arg("-c").arg("exit 9");
         store
@@ -4008,12 +5909,12 @@ mod tests {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
         loop {
             let state = store.get(session_id).await.expect("stored record").state;
-            if classify::is_terminal_state(state) {
+            if state == LaunchState::Recovering {
                 break;
             }
             assert!(
                 tokio::time::Instant::now() < deadline,
-                "fast-exit process did not reach terminal state"
+                "fast-exit process did not reach recovery state"
             );
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
@@ -4029,7 +5930,7 @@ mod tests {
 
         assert_eq!(
             store.get(session_id).await.expect("stored record").state,
-            LaunchState::Exited
+            LaunchState::Recovering
         );
         assert!(receiver.try_recv().is_err());
     }
@@ -4240,7 +6141,7 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn terminal_failure_fusion_is_log_order_independent_and_clean_exit_has_no_class() {
+    async fn preboot_failure_fusion_is_log_order_independent_and_clean_exit_has_no_class() {
         for (index, script, expected) in [
             (
                 0,
@@ -4274,15 +6175,15 @@ mod tests {
             let status = tokio::time::timeout(Duration::from_secs(2), async {
                 loop {
                     if let LaunchEvent::Status(status) =
-                        events.recv().await.expect("terminal event")
-                        && status.state == "exited"
+                        events.recv().await.expect("recovery event")
+                        && status.state == "recovering"
                     {
                         break status;
                     }
                 }
             })
             .await
-            .expect("terminal deadline");
+            .expect("recovery deadline");
             assert_eq!(
                 status.failure_class.as_deref(),
                 expected.map(LaunchFailureClass::as_str)
@@ -4430,21 +6331,40 @@ mod tests {
             .expect("spawn sleep process");
         store.kill(session_id).await.expect("kill process");
 
+        let mut stop_intent_revisions = Vec::new();
         let mut terminal_status = None;
-        for _ in 0..8 {
+        for _ in 0..10 {
             let event = tokio::time::timeout(std::time::Duration::from_secs(2), receiver.recv())
                 .await
                 .expect("status event")
                 .expect("broadcast event");
-            if let LaunchEvent::Status(status) = event
-                && status.state == "exited"
-            {
-                terminal_status = Some(status);
-                break;
+            if let LaunchEvent::Status(status) = event {
+                if status.state != "exited"
+                    && status
+                        .stages
+                        .iter()
+                        .flat_map(|stage| &stage.evidence)
+                        .any(|evidence| evidence.id.contains("process_stop_requested"))
+                {
+                    stop_intent_revisions.push(status.revision);
+                }
+                if status.state == "exited" {
+                    terminal_status = Some(status);
+                    break;
+                }
             }
         }
 
         let status = terminal_status.expect("terminal status");
+        assert_eq!(
+            stop_intent_revisions.len(),
+            1,
+            "an accepted stop publishes exactly one preterminal evidence revision"
+        );
+        assert!(
+            stop_intent_revisions[0] < status.revision,
+            "stop intent must publish a same-state revision before terminal settlement"
+        );
         assert_eq!(
             status.outcome.as_ref().expect("stop outcome").reason,
             LaunchSessionExitReason::LauncherStopped
@@ -4460,6 +6380,10 @@ mod tests {
     async fn concurrent_kill_requests_join_the_same_owner_reap() {
         let store = Arc::new(SessionStore::new());
         let session_id = "concurrent-owner-kill";
+        store
+            .insert(test_record(session_id))
+            .await
+            .expect("insert concurrent kill session");
         let mut command = Command::new("sh");
         command.arg("-c").arg("exec sleep 30");
         let launched = store
@@ -4489,9 +6413,13 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn user_stop_lease_blocks_replacement_until_proof_scope_is_released() {
+    async fn user_stop_lease_releases_global_lifecycle_before_proof_scope() {
         let store = Arc::new(SessionStore::new());
         let session_id = "user-stop-blocks-replacement";
+        store
+            .insert(test_record(session_id))
+            .await
+            .expect("insert user-stop session");
         let mut command = Command::new("sh");
         command.arg("-c").arg("exec sleep 30");
         store
@@ -4507,7 +6435,7 @@ mod tests {
             .begin_user_stop(session_id)
             .await
             .expect("begin user stop");
-        assert!(store.lifecycle_transition.try_lock().is_err());
+        assert!(store.lifecycle_transition.try_lock().is_ok());
         assert_eq!(
             store
                 .sessions
@@ -4519,36 +6447,32 @@ mod tests {
             2
         );
 
-        let (started, started_rx) = tokio::sync::oneshot::channel();
-        let replacement_store = store.clone();
-        let replacement = tokio::spawn(async move {
-            let _ = started.send(());
-            replacement_store
-                .insert(test_record(session_id))
-                .await
-                .expect("insert session");
-        });
-        started_rx.await.expect("replacement started");
-        tokio::task::yield_now().await;
-        assert!(!replacement.is_finished());
-
+        let duplicate_store = store.clone();
+        let error = tokio::time::timeout(
+            Duration::from_secs(2),
+            duplicate_store.insert(test_record(session_id)),
+        )
+        .await
+        .expect("duplicate admission deadline")
+        .expect_err("duplicate session id must be rejected");
+        assert_eq!(error, SessionAdmissionError::DuplicateSessionId);
         stop.release().await;
-        tokio::time::timeout(Duration::from_secs(2), replacement)
-            .await
-            .expect("replacement deadline")
-            .expect("replacement task");
-        let replacement_attempt = store
+        let retained_attempt = store
             .current_process_attempt(session_id)
             .await
-            .expect("replacement attempt");
-        assert_ne!(replacement_attempt.id, original_attempt.id);
+            .expect("retained attempt");
+        assert_eq!(retained_attempt.id, original_attempt.id);
     }
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn dropped_user_stop_lease_releases_retention_and_lifecycle_guard() {
+    async fn dropped_user_stop_lease_releases_retention() {
         let store = Arc::new(SessionStore::new());
         let session_id = "dropped-user-stop-lease";
+        store
+            .insert(test_record(session_id))
+            .await
+            .expect("insert dropped stop session");
         let mut command = Command::new("sh");
         command.arg("-c").arg("exec sleep 30");
         store
@@ -4556,10 +6480,11 @@ mod tests {
             .await
             .expect("spawn stop target");
 
-        let stop = store
+        let mut stop = store
             .begin_user_stop(session_id)
             .await
             .expect("begin user stop");
+        assert!(store.lifecycle_transition.try_lock().is_ok());
         assert_eq!(
             store
                 .sessions
@@ -4570,14 +6495,13 @@ mod tests {
                 .retention_holds,
             2
         );
+        let drop_release = stop.arm_drop_release_probe();
         drop(stop);
 
-        let lifecycle = tokio::time::timeout(
-            Duration::from_secs(2),
-            store.lifecycle_transition.clone().lock_owned(),
-        )
-        .await
-        .expect("drop cleanup deadline");
+        tokio::time::timeout(Duration::from_secs(2), drop_release)
+            .await
+            .expect("drop cleanup deadline")
+            .expect("drop cleanup completion signal");
         assert_eq!(
             store
                 .sessions
@@ -4588,7 +6512,6 @@ mod tests {
                 .retention_holds,
             1
         );
-        drop(lifecycle);
     }
 
     #[tokio::test]
@@ -4915,9 +6838,13 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn kill_acknowledges_reap_before_inherited_output_pipe_drain_completes() {
+    async fn kill_waits_for_inherited_output_pipe_drain_settlement() {
         let store = Arc::new(SessionStore::new());
         let session_id = "reap-before-inherited-pipe-drain";
+        store
+            .insert(test_record(session_id))
+            .await
+            .expect("insert inherited-pipe session");
         let descendant_pid_path = test_pid_path("inherited-output-pipe");
         let _ = std::fs::remove_file(&descendant_pid_path);
         let mut command = Command::new("sh");
@@ -4939,16 +6866,26 @@ mod tests {
             .and_then(|entry| entry.process.clone())
             .expect("process control");
 
-        tokio::time::timeout(Duration::from_millis(250), store.kill(session_id))
+        let kill_store = store.clone();
+        let mut kill = tokio::spawn(async move { kill_store.kill(session_id).await });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(250), &mut kill)
+                .await
+                .is_err(),
+            "user stop must remain pending until inherited output is drained or bounded"
+        );
+        tokio::time::timeout(Duration::from_secs(2), &mut kill)
             .await
-            .expect("reap acknowledgment before drain timeout")
+            .expect("settled kill deadline")
+            .expect("kill task")
             .expect("kill target");
         let mut completed = control.completion_receiver();
-        assert!(!*completed.borrow());
-        tokio::time::timeout(Duration::from_secs(2), completed.changed())
-            .await
-            .expect("bounded output drain completion")
-            .expect("owner completion");
+        if !*completed.borrow() {
+            tokio::time::timeout(Duration::from_secs(2), completed.changed())
+                .await
+                .expect("bounded output drain completion")
+                .expect("owner completion");
+        }
 
         let _ = std::process::Command::new("kill")
             .args(["-9", &descendant_pid.to_string()])
@@ -4963,6 +6900,10 @@ mod tests {
         let mut pids = Vec::new();
         let mut receivers = Vec::new();
         for session_id in ["shutdown-owner-a", "shutdown-owner-b"] {
+            store
+                .insert(test_record(session_id))
+                .await
+                .expect("insert shutdown session");
             let mut command = Command::new("sh");
             command.arg("-c").arg("exec sleep 30");
             let launched = store
@@ -4984,7 +6925,15 @@ mod tests {
         assert!(store.active_processes.lock().await.is_empty());
         assert!(store.sessions.read().await.is_empty());
         for receiver in &mut receivers {
-            assert!(receiver.try_recv().is_err());
+            let mut saw_settlement = false;
+            while let Ok(event) = receiver.try_recv() {
+                saw_settlement |= matches!(event, LaunchEvent::ProcessSettled { .. });
+            }
+            assert!(saw_settlement, "shutdown must signal terminal observers");
+            assert!(matches!(
+                receiver.try_recv(),
+                Err(broadcast::error::TryRecvError::Closed)
+            ));
         }
     }
 
@@ -5228,27 +7177,25 @@ mod tests {
         }
         trigger.send(()).expect("trigger watchdog");
 
-        let terminal_status = loop {
+        let recovery_status = loop {
             let event = tokio::time::timeout(Duration::from_secs(2), receiver.recv())
                 .await
                 .expect("watchdog event")
                 .expect("watchdog broadcast");
             if let LaunchEvent::Status(status) = event
-                && status.state == "exited"
+                && status.state == "recovering"
             {
                 break Some(status);
             }
         };
 
-        let status = terminal_status.expect("watchdog terminal status");
+        let status = recovery_status.expect("watchdog recovery status");
         assert_eq!(
             status.failure_class.as_deref(),
             Some(LaunchFailureClass::StartupStalled.as_str())
         );
-        assert_eq!(
-            status.outcome.as_ref().expect("watchdog outcome").reason,
-            LaunchSessionExitReason::WatchdogKilled
-        );
+        assert_eq!(status.outcome, None);
+        assert_eq!(status.notice, None);
         let status_json = serde_json::to_string(&status).expect("status json");
         assert!(status_json.contains("execution_process_killed"));
         assert!(status_json.contains("execution_process_watchdog_action"));
@@ -5614,6 +7561,408 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn postboot_clean_exit_stages_settling_then_publishes_one_immutable_terminal() {
+        let store = Arc::new(SessionStore::new());
+        let session_id = "staged-clean-exit";
+        let mut record = terminal_record(session_id, LaunchState::Running, true);
+        record.pid = Some(42);
+        store.insert(record).await.expect("insert running session");
+        let (generation, mut events) = store
+            .subscribe_terminal_observation(session_id)
+            .await
+            .expect("terminal observation subscription");
+        let attempt = store
+            .current_process_attempt(session_id)
+            .await
+            .expect("current attempt");
+
+        store
+            .settle_natural_process_exit_for_attempt(
+                session_id,
+                &attempt,
+                terminal_status(Some(0), None, None),
+            )
+            .await;
+
+        let settling = recv_status(&mut events).await;
+        assert_eq!(settling.state, "settling");
+        assert_eq!(settling.pid, None);
+        assert_eq!(settling.outcome, None);
+        let signal = events.recv().await.expect("internal settlement signal");
+        assert!(matches!(
+            signal,
+            LaunchEvent::ProcessSettled {
+                generation: signal_generation,
+                attempt_id,
+            } if signal_generation == generation && attempt_id == attempt.id
+        ));
+        let staged = store.get(session_id).await.expect("staged record");
+        assert_eq!(staged.state, LaunchState::Settling);
+        assert_eq!(staged.pid, None);
+        assert_eq!(staged.outcome, None);
+
+        let mut lease = store
+            .claim_process_settlement(session_id, generation, Some(attempt.id))
+            .await
+            .expect("claim process settlement");
+        let terminal = lease
+            .finalize(lease.event().clone())
+            .await
+            .expect("finalize clean exit");
+        assert_eq!(terminal.state, LaunchState::Exited);
+        assert_eq!(
+            terminal.outcome.as_ref().expect("clean outcome").reason,
+            LaunchSessionExitReason::ExternalUserClosed
+        );
+        lease.release().await;
+
+        let published_terminal = recv_status(&mut events).await;
+        assert_eq!(published_terminal.state, "exited");
+        let terminal_revision = store
+            .status_snapshot(session_id)
+            .await
+            .expect("published terminal snapshot")
+            .revision;
+        store
+            .emit_status(session_id, terminal_status(Some(1), Some("unknown"), None))
+            .await;
+        store
+            .emit_status(
+                session_id,
+                LaunchStatusEvent {
+                    state: "running".to_string(),
+                    ..terminal_status(None, None, None)
+                },
+            )
+            .await;
+        assert_eq!(
+            store
+                .status_snapshot(session_id)
+                .await
+                .expect("terminal snapshot")
+                .revision,
+            terminal_revision
+        );
+        assert!(events.try_recv().is_err());
+        assert_eq!(store.retention_hold_count(session_id).await, Some(0));
+    }
+
+    #[tokio::test]
+    async fn claimed_settlement_does_not_block_another_sessions_lifecycle_transition() {
+        let store = Arc::new(SessionStore::new());
+        let session_id = "claimed-settlement-session-a";
+        let mut record = terminal_record(session_id, LaunchState::Running, true);
+        record.pid = Some(42);
+        store.insert(record).await.expect("insert session A");
+        let (generation, _) = store
+            .subscribe_terminal_observation(session_id)
+            .await
+            .expect("subscribe session A observer");
+        let attempt = store
+            .current_process_attempt(session_id)
+            .await
+            .expect("session A attempt");
+        store
+            .settle_natural_process_exit_for_attempt(
+                session_id,
+                &attempt,
+                terminal_status(Some(1), Some("unknown"), None),
+            )
+            .await;
+        let mut lease = store
+            .claim_process_settlement(session_id, generation, Some(attempt.id))
+            .await
+            .expect("claim session A settlement");
+        assert!(store.lifecycle_transition.try_lock().is_ok());
+
+        tokio::time::timeout(
+            Duration::from_millis(250),
+            store.insert(test_record("claimed-settlement-session-b")),
+        )
+        .await
+        .expect("session B lifecycle transition must not wait for session A")
+        .expect("insert session B");
+        assert!(store.get("claimed-settlement-session-b").await.is_some());
+        assert_eq!(
+            store
+                .get(session_id)
+                .await
+                .expect("session A remains staged")
+                .state,
+            LaunchState::Settling
+        );
+
+        let event = lease.event().clone();
+        lease
+            .finalize(event)
+            .await
+            .expect("finalize exact session A tombstone");
+        lease.release().await;
+        assert_eq!(
+            store
+                .get(session_id)
+                .await
+                .expect("session A terminal")
+                .state,
+            LaunchState::Exited
+        );
+    }
+
+    #[tokio::test]
+    async fn claimed_settlement_refuses_same_session_competitors_until_exact_finalize() {
+        let store = Arc::new(SessionStore::new());
+        let session_id = "claimed-settlement-competitors";
+        let mut record = terminal_record(session_id, LaunchState::Running, true);
+        record.pid = Some(42);
+        store.insert(record).await.expect("insert running session");
+        let started = StartedLaunchProcess {
+            record: store.get(session_id).await.expect("started record"),
+            attempt: store
+                .current_process_attempt(session_id)
+                .await
+                .expect("started attempt"),
+        };
+        let (generation, mut events) = store
+            .subscribe_terminal_observation(session_id)
+            .await
+            .expect("subscribe terminal observer");
+        store
+            .settle_natural_process_exit_for_attempt(
+                session_id,
+                &started.attempt,
+                terminal_status(Some(1), Some("unknown"), None),
+            )
+            .await;
+        let _ = recv_status(&mut events).await;
+        let _ = events.recv().await.expect("process settlement signal");
+        let mut lease = store
+            .claim_process_settlement(session_id, generation, Some(started.attempt.id))
+            .await
+            .expect("claim process settlement");
+
+        assert!(
+            store
+                .claim_process_settlement(session_id, generation, Some(started.attempt.id))
+                .await
+                .is_none(),
+            "same tombstone cannot be claimed twice"
+        );
+        assert!(matches!(
+            store.terminate_for_launch_failure(session_id).await,
+            LaunchFailureTermination::Unconfirmed(
+                LaunchFailureTerminationErrorClass::SettlementClaimed
+            )
+        ));
+        assert!(matches!(
+            store.begin_user_stop(session_id).await,
+            Err(SessionStopError::NoLiveProcess)
+        ));
+        let mut command = Command::new("sh");
+        command.arg("-c").arg("exit 0");
+        let start_error = match store.start_process(test_record(session_id), command).await {
+            Ok(_) => panic!("claimed settlement must refuse process replacement"),
+            Err(error) => error,
+        };
+        assert_eq!(start_error.kind(), std::io::ErrorKind::InvalidInput);
+        let mut running = terminal_status(None, None, None);
+        running.state = "running".to_string();
+        running.pid = Some(42);
+        assert!(matches!(
+            store
+                .publish_running_and_complete_startup_recovery(&started, running)
+                .await,
+            RunningHandoffOutcome::Settling
+        ));
+        store
+            .emit_status(session_id, terminal_status(Some(-1), Some("unknown"), None))
+            .await;
+        assert_eq!(
+            store
+                .get(session_id)
+                .await
+                .expect("claimed settlement remains staged")
+                .state,
+            LaunchState::Settling
+        );
+        assert!(events.try_recv().is_err());
+
+        let event = lease.event().clone();
+        lease
+            .finalize(event)
+            .await
+            .expect("exact claimed settlement finalizes");
+        lease.release().await;
+        let terminal = recv_status(&mut events).await;
+        assert_eq!(terminal.state, "exited");
+        assert!(events.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn launch_failure_after_process_exit_consumes_pending_settlement() {
+        let store = Arc::new(SessionStore::new());
+        let session_id = "process-exit-before-launch-failure";
+        store
+            .insert(terminal_record(session_id, LaunchState::Running, true))
+            .await
+            .expect("insert running session");
+        let attempt = store
+            .current_process_attempt(session_id)
+            .await
+            .expect("current attempt");
+        store
+            .settle_natural_process_exit_for_attempt(
+                session_id,
+                &attempt,
+                terminal_status(Some(1), Some("unknown"), None),
+            )
+            .await;
+
+        let mut lease = match store.terminate_for_launch_failure(session_id).await {
+            LaunchFailureTermination::Ready(lease) => lease,
+            _ => panic!("launch failure must own pending terminalization"),
+        };
+        assert!(
+            store
+                .sessions
+                .read()
+                .await
+                .get(session_id)
+                .expect("launch failure session")
+                .pending_process_settlement
+                .is_none()
+        );
+        store
+            .emit_status(
+                session_id,
+                LaunchStatusEvent {
+                    state: "failed".to_string(),
+                    ..terminal_status(Some(-1), Some("unknown"), Some("launch failed"))
+                },
+            )
+            .await;
+        assert!(store.lifecycle_transition.try_lock().is_err());
+        lease.release_lifecycle_guard();
+        assert!(store.lifecycle_transition.try_lock().is_ok());
+        lease.release().await;
+
+        let record = store.get(session_id).await.expect("failed record");
+        assert_eq!(record.state, LaunchState::Failed);
+        assert_eq!(
+            record.failure.expect("failure").detail.as_deref(),
+            Some("launch failed")
+        );
+        assert_eq!(store.retention_hold_count(session_id).await, Some(0));
+    }
+
+    #[tokio::test]
+    async fn stale_generation_and_attempt_cannot_claim_replacement_settlement() {
+        let store = Arc::new(SessionStore::new());
+        let session_id = "stale-settlement-retry";
+        store
+            .insert(terminal_record(session_id, LaunchState::Running, true))
+            .await
+            .expect("insert running session");
+        let (stale_generation, _) = store
+            .subscribe_terminal_observation(session_id)
+            .await
+            .expect("stale observation subscription");
+        let stale_attempt = store
+            .current_process_attempt(session_id)
+            .await
+            .expect("stale attempt");
+        store
+            .settle_natural_process_exit_for_attempt(
+                session_id,
+                &stale_attempt,
+                terminal_status(Some(0), None, None),
+            )
+            .await;
+
+        store
+            .sessions
+            .write()
+            .await
+            .remove(session_id)
+            .expect("remove stale settlement fixture");
+        store
+            .insert(test_record(session_id))
+            .await
+            .expect("insert replacement session");
+        let replacement_attempt = store
+            .current_process_attempt(session_id)
+            .await
+            .expect("replacement attempt");
+        assert_ne!(replacement_attempt.id, stale_attempt.id);
+        assert!(
+            store
+                .claim_process_settlement(session_id, stale_generation, Some(stale_attempt.id),)
+                .await
+                .is_none()
+        );
+        let replacement = store.get(session_id).await.expect("replacement record");
+        assert_eq!(replacement.state, LaunchState::Queued);
+        assert_eq!(
+            store
+                .status_snapshot(session_id)
+                .await
+                .expect("replacement snapshot")
+                .revision,
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn dropped_process_settlement_lease_falls_back_once_and_releases_hold() {
+        let store = Arc::new(SessionStore::new());
+        let session_id = "dropped-settlement-lease";
+        store
+            .insert(terminal_record(session_id, LaunchState::Running, true))
+            .await
+            .expect("insert running session");
+        let (generation, mut events) = store
+            .subscribe_terminal_observation(session_id)
+            .await
+            .expect("terminal observation subscription");
+        let attempt = store
+            .current_process_attempt(session_id)
+            .await
+            .expect("current attempt");
+        store
+            .settle_natural_process_exit_for_attempt(
+                session_id,
+                &attempt,
+                terminal_status(Some(1), Some("unknown"), None),
+            )
+            .await;
+        let _ = recv_status(&mut events).await;
+        let _ = events.recv().await.expect("internal settlement signal");
+        let lease = store
+            .claim_process_settlement(session_id, generation, Some(attempt.id))
+            .await
+            .expect("claim process settlement");
+
+        drop(lease);
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let terminal = store
+                    .get(session_id)
+                    .await
+                    .is_some_and(|record| record.state == LaunchState::Exited);
+                if terminal && store.retention_hold_count(session_id).await == Some(0) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("fallback settlement deadline");
+        let terminal = recv_status(&mut events).await;
+        assert_eq!(terminal.state, "exited");
+        assert!(events.try_recv().is_err());
+    }
+
     async fn insert_and_emit_terminal_status(
         store: &SessionStore,
         record: LaunchSessionRecord,
@@ -5632,7 +7981,7 @@ mod tests {
         receiver: &mut tokio::sync::broadcast::Receiver<LaunchEvent>,
     ) -> LaunchStatusEvent {
         match receiver.recv().await.expect("status event") {
-            LaunchEvent::Status(status) => *status,
+            LaunchEvent::Status(status) => status.status,
             other => panic!("expected status event, got {other:?}"),
         }
     }
@@ -5770,6 +8119,12 @@ mod tests {
             .current_process_attempt(session_id)
             .await
             .expect("stale attempt");
+        store
+            .sessions
+            .write()
+            .await
+            .remove(session_id)
+            .expect("remove stale attempt fixture");
         let mut replacement = test_record(session_id);
         replacement.state = LaunchState::Starting;
         store.insert(replacement).await.expect("insert session");

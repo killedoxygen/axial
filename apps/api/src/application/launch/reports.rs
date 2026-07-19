@@ -1,15 +1,19 @@
 use super::runner::persist_launch_proof_owned;
-use super::snapshot_status;
 use super::trace_launch_event;
-use crate::guardian::{GuardianSummary, guardian_proof_evidence};
+use crate::guardian::{GuardianSummary, guardian_proof_evidence, launch_notice_from_values};
 use crate::observability::{
-    RedactionAudience, sanitize_public_diagnostic_text, sanitize_public_json_value,
+    RedactionAudience, sanitize_evidence_token, sanitize_public_diagnostic_text,
+    sanitize_public_json_value,
 };
-use crate::state::{AppState, LaunchStatusEvent, SessionStopError};
-use axial_launcher::{LaunchHealingSummary, LaunchSessionRecord};
+use crate::state::{AppState, LaunchStatusEvent, RevisionedLaunchStatus, SessionStopError};
+use axial_launcher::{
+    CrashEvidence, LaunchHealingSummary, LaunchNotice, LaunchSessionOutcome, LaunchSessionRecord,
+    LaunchStageEvidence, LaunchStageRecord,
+};
 use axum::Json;
 use axum::http::StatusCode;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
+use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 
 pub(crate) const LAUNCH_COMMAND_REDACTED_VALUE: &str = "<redacted>";
@@ -17,24 +21,61 @@ pub(crate) const LAUNCH_KILL_INTERNAL_ERROR_MESSAGE: &str =
     "Could not stop the launch session. Try again from the launcher.";
 pub(crate) const LAUNCH_KILL_NO_PROCESS_MESSAGE: &str = "session has no running process";
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct LaunchStatusViewModel {
     pub state_id: String,
     pub label: String,
     pub progress_pct: u8,
     pub terminal: bool,
+    pub playing: bool,
+    pub process_live: bool,
+    pub can_stop: bool,
 }
 
 impl LaunchStatusViewModel {
-    pub fn for_state(state: &str) -> Self {
+    fn for_state(state: &str) -> Self {
         let (state_id, label, progress_pct, terminal) = launch_status_view_fields(state);
         Self {
             state_id: state_id.to_string(),
             label: label.to_string(),
             progress_pct,
             terminal,
+            playing: matches!(state, "running" | "degraded"),
+            process_live: false,
+            can_stop: false,
         }
     }
+
+    fn for_status(status: &LaunchStatusEvent) -> Self {
+        let mut view_model = Self::for_state(&status.state);
+        view_model.process_live = status.pid.is_some()
+            && !matches!(
+                status.state.as_str(),
+                "recovering" | "settling" | "failed" | "exited"
+            );
+        view_model.can_stop = view_model.process_live;
+        view_model
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct PublicLaunchStatus {
+    pub session_id: String,
+    pub revision: u64,
+    pub state: String,
+    pub benchmark: Option<Value>,
+    pub pid: Option<u32>,
+    pub exit_code: Option<i32>,
+    pub failure_class: Option<String>,
+    pub failure_detail: Option<String>,
+    pub crash_evidence: Option<CrashEvidence>,
+    pub healing: Option<Value>,
+    pub guardian: Option<Value>,
+    pub outcome: Option<LaunchSessionOutcome>,
+    pub notice: Option<LaunchNotice>,
+    pub evidence: Vec<LaunchStageEvidence>,
+    pub stages: Vec<LaunchStageRecord>,
+    pub view_model: LaunchStatusViewModel,
 }
 
 fn launch_status_view_fields(state: &str) -> (&'static str, &'static str, u8, bool) {
@@ -48,8 +89,10 @@ fn launch_status_view_fields(state: &str) -> (&'static str, &'static str, u8, bo
         "prewarming" => ("prewarming", "Prewarming game data", 64, false),
         "starting" => ("starting", "Starting process", 72, false),
         "monitoring" => ("monitoring", "Monitoring startup", 88, false),
+        "recovering" => ("recovering", "Recovering startup", 88, false),
         "running" => ("running", "Running", 100, false),
         "degraded" => ("degraded", "Running with warnings", 100, false),
+        "settling" => ("settling", "Finalizing session", 100, false),
         "failed" => ("failed", "Launch failed", 100, true),
         "exited" => ("exited", "Exited", 100, true),
         _ => ("unknown", "Launch status updated", 0, false),
@@ -461,44 +504,93 @@ pub(crate) fn sanitize_launch_command(command: &[String]) -> SanitizedLaunchComm
     }
 }
 
-pub(crate) async fn launch_status_payload(
+pub(crate) async fn launch_status(
     state: &AppState,
     id: &str,
-) -> Result<serde_json::Value, super::LaunchApplicationError> {
-    let record = state.sessions().get(id).await.ok_or_else(|| {
+) -> Result<PublicLaunchStatus, super::LaunchApplicationError> {
+    let status = state.sessions().status_snapshot(id).await.ok_or_else(|| {
         (
             StatusCode::NOT_FOUND,
             Json(json!({ "error": "session not found" })),
         )
     })?;
 
-    let status = snapshot_status(&record);
-    let mut response = json!({
-        "state": status.state,
-        "pid": status.pid,
-        "exit_code": status.exit_code,
-        "failure_class": status.failure_class,
-        "failure_detail": status.failure_detail,
-        "crash_evidence": status.crash_evidence,
-        "healing": status.healing,
-        "guardian": status.guardian,
-        "outcome": status.outcome,
-        "notice": status.notice,
-        "stages": status.stages,
-        "session_id": record.session_id.0,
-        "view_model": LaunchStatusViewModel::for_state(&status.state),
-    });
-    if let Some(benchmark) = status.benchmark {
-        response["benchmark"] = benchmark;
-    }
-
-    Ok(public_payload(response))
+    Ok(public_launch_status(&status))
 }
 
-pub fn public_launch_status_json(status: &LaunchStatusEvent) -> serde_json::Value {
-    let mut payload = serde_json::to_value(status).unwrap_or_else(|_| json!({}));
-    payload["view_model"] = json!(LaunchStatusViewModel::for_state(&status.state));
-    public_payload(payload)
+pub fn public_launch_status(status: &RevisionedLaunchStatus) -> PublicLaunchStatus {
+    let event = &status.status;
+    let view_model = LaunchStatusViewModel::for_status(event);
+    debug_assert_eq!(view_model.terminal, event.outcome.is_some());
+    let outcome = sanitize_public_typed(event.outcome.as_ref());
+    let notice = event.notice.clone().or_else(|| {
+        (!matches!(event.state.as_str(), "recovering" | "settling"))
+            .then(|| {
+                launch_notice_from_values(
+                    event.guardian.as_ref(),
+                    event.healing.as_ref(),
+                    outcome.as_ref(),
+                    event.failure_detail.as_deref(),
+                    None,
+                )
+            })
+            .flatten()
+    });
+    let projected = PublicLaunchStatus {
+        session_id: status.session_id.clone(),
+        revision: status.revision,
+        state: event.state.clone(),
+        benchmark: sanitize_public_value(event.benchmark.as_ref()),
+        pid: event.pid,
+        exit_code: event.exit_code,
+        failure_class: event
+            .failure_class
+            .as_deref()
+            .and_then(|value| sanitize_evidence_token(value, RedactionAudience::UserVisible, 64)),
+        failure_detail: event.failure_detail.as_deref().and_then(|value| {
+            let value =
+                sanitize_public_diagnostic_text(value, RedactionAudience::UserVisible, 240, "");
+            (!value.is_empty()).then_some(value)
+        }),
+        crash_evidence: sanitize_public_typed(event.crash_evidence.as_ref()),
+        healing: sanitize_public_value(event.healing.as_ref()),
+        guardian: sanitize_public_value(event.guardian.as_ref()),
+        outcome,
+        notice: sanitize_public_typed(notice.as_ref()),
+        evidence: sanitize_public_items(&event.evidence),
+        stages: sanitize_public_items(&event.stages),
+        view_model,
+    };
+    debug_assert_eq!(projected.view_model.terminal, projected.outcome.is_some());
+    projected
+}
+
+fn sanitize_public_value(value: Option<&Value>) -> Option<Value> {
+    value.cloned().and_then(|value| {
+        sanitize_public_json_value(value, RedactionAudience::UserVisible, 240, 64)
+    })
+}
+
+fn sanitize_public_typed<T>(value: Option<&T>) -> Option<T>
+where
+    T: Serialize + DeserializeOwned,
+{
+    value
+        .and_then(|value| serde_json::to_value(value).ok())
+        .and_then(|value| {
+            sanitize_public_json_value(value, RedactionAudience::UserVisible, 240, 64)
+        })
+        .and_then(|value| serde_json::from_value(value).ok())
+}
+
+fn sanitize_public_items<T>(values: &[T]) -> Vec<T>
+where
+    T: Serialize + DeserializeOwned,
+{
+    values
+        .iter()
+        .filter_map(|value| sanitize_public_typed(Some(value)))
+        .collect()
 }
 
 fn public_payload(value: serde_json::Value) -> serde_json::Value {
@@ -519,23 +611,6 @@ pub(crate) async fn stop_launch_session(
     let record = stop.record().clone();
 
     trace_launch_event(id, "kill requested by client");
-    stop.emit_log("system", "Launch stopped by user.").await;
-    stop.emit_status(LaunchStatusEvent {
-        state: "exited".to_string(),
-        benchmark: None,
-        pid: record.pid,
-        exit_code: Some(-9),
-        failure_class: None,
-        failure_detail: Some("stopped by user".to_string()),
-        crash_evidence: None,
-        healing: record.healing.clone(),
-        guardian: record.guardian.clone(),
-        outcome: None,
-        notice: None,
-        evidence: Vec::new(),
-        stages: Vec::new(),
-    })
-    .await;
     persist_launch_proof_owned(
         state,
         producer,
@@ -569,18 +644,27 @@ pub(crate) fn launch_kill_error_response(error: SessionStopError) -> super::Laun
 #[cfg(test)]
 mod tests {
     use super::{
-        LAUNCH_KILL_NO_PROCESS_MESSAGE, LaunchStatusViewModel, public_launch_status_json,
+        LAUNCH_KILL_NO_PROCESS_MESSAGE, LaunchStatusViewModel, launch_status, public_launch_status,
         stop_launch_session,
     };
-    use crate::state::{AppState, AppStateInit, InstallStore, LaunchStatusEvent, SessionStore};
+    use crate::state::{
+        AppState, AppStateInit, InstallStore, LaunchStatusEvent, RevisionedLaunchStatus,
+        SessionStore,
+    };
     use axial_config::{AppPaths, ConfigStore, InstanceRegistrySnapshot, InstanceStore};
-    use axial_launcher::{LaunchSessionRecord, LaunchState, SessionId};
+    use axial_launcher::{
+        CrashEvidence, LaunchEvent, LaunchNotice, LaunchNoticeTone, LaunchSessionExitReason,
+        LaunchSessionOutcome, LaunchSessionRecord, LaunchStageEvidence, LaunchStageRecord,
+        LaunchState, SessionId,
+    };
     use axial_performance::PerformanceManager;
     use axum::http::StatusCode;
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
     use std::time::{SystemTime, UNIX_EPOCH};
+    #[cfg(unix)]
+    use tokio::process::Command;
 
     #[tokio::test]
     async fn stop_launch_session_reports_missing_session() {
@@ -650,6 +734,74 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stop_launch_session_persists_the_single_supervisor_terminal_record() {
+        let root = unique_test_dir("stop-launch-canonical-terminal");
+        let state = test_app_state(&root);
+        let session_id = "stop-canonical-terminal";
+        state
+            .sessions()
+            .insert(test_record(session_id))
+            .await
+            .expect("insert stop session");
+        let mut events = state
+            .sessions()
+            .subscribe(session_id)
+            .await
+            .expect("subscribe stop session");
+        let mut command = Command::new("sh");
+        command.arg("-c").arg("exec sleep 30");
+        state
+            .sessions()
+            .start_process(test_record(session_id), command)
+            .await
+            .expect("start stop target");
+        let producer = state.try_claim_producer().expect("claim stop producer");
+
+        let response = stop_launch_session(&state, session_id, &producer)
+            .await
+            .expect("stop running session");
+        assert_eq!(response, serde_json::json!({ "status": "killed" }));
+
+        let record = state
+            .sessions()
+            .get(session_id)
+            .await
+            .expect("canonical stopped record");
+        assert_eq!(record.state, LaunchState::Exited);
+        assert_eq!(
+            record.outcome.as_ref().expect("stop outcome").reason,
+            LaunchSessionExitReason::LauncherStopped
+        );
+        assert_eq!(
+            record
+                .stages
+                .iter()
+                .flat_map(|stage| &stage.evidence)
+                .filter(|evidence| evidence.id.contains("process_stop_requested"))
+                .count(),
+            1
+        );
+        let proof = state
+            .launch_reports()
+            .load(session_id)
+            .expect("stopped launch proof");
+        assert_eq!(proof.outcome, "stopped");
+        assert_eq!(proof.session_outcome, record.outcome);
+
+        let mut terminal_count = 0;
+        while let Ok(event) = events.try_recv() {
+            if let LaunchEvent::Status(status) = event
+                && matches!(status.state.as_str(), "failed" | "exited")
+            {
+                terminal_count += 1;
+            }
+        }
+        assert_eq!(terminal_count, 1);
+        let _ = fs::remove_dir_all(root);
+    }
+
     #[test]
     fn launch_status_view_model_authors_progress_copy() {
         assert_eq!(
@@ -659,6 +811,9 @@ mod tests {
                 label: "Validating launch".to_string(),
                 progress_pct: 24,
                 terminal: false,
+                playing: false,
+                process_live: false,
+                can_stop: false,
             }
         );
         assert_eq!(
@@ -668,31 +823,203 @@ mod tests {
                 label: "Exited".to_string(),
                 progress_pct: 100,
                 terminal: true,
+                playing: false,
+                process_live: false,
+                can_stop: false,
+            }
+        );
+        assert_eq!(
+            LaunchStatusViewModel::for_status(&LaunchStatusEvent {
+                state: "settling".to_string(),
+                pid: Some(42),
+                ..terminal_status()
+            }),
+            LaunchStatusViewModel {
+                state_id: "settling".to_string(),
+                label: "Finalizing session".to_string(),
+                progress_pct: 100,
+                terminal: false,
+                playing: false,
+                process_live: false,
+                can_stop: false,
             }
         );
     }
 
     #[test]
-    fn public_launch_status_json_includes_backend_view_model() {
-        let payload = public_launch_status_json(&LaunchStatusEvent {
-            state: "monitoring".to_string(),
-            benchmark: None,
-            pid: None,
-            exit_code: None,
-            failure_class: None,
-            failure_detail: None,
-            crash_evidence: None,
-            healing: None,
-            guardian: None,
-            outcome: None,
-            notice: None,
-            evidence: Vec::new(),
-            stages: Vec::new(),
-        });
+    fn serialized_public_launch_status_includes_backend_view_model() {
+        let payload = serde_json::to_value(public_launch_status(&RevisionedLaunchStatus::new(
+            "session",
+            4,
+            LaunchStatusEvent {
+                state: "monitoring".to_string(),
+                benchmark: None,
+                pid: Some(42),
+                exit_code: None,
+                failure_class: None,
+                failure_detail: None,
+                crash_evidence: None,
+                healing: None,
+                guardian: None,
+                outcome: None,
+                notice: None,
+                evidence: Vec::new(),
+                stages: Vec::new(),
+            },
+        )))
+        .expect("serialize public launch status");
 
+        assert_eq!(payload["session_id"], "session");
+        assert_eq!(payload["revision"], 4);
         assert_eq!(payload["view_model"]["state_id"], "monitoring");
         assert_eq!(payload["view_model"]["label"], "Monitoring startup");
         assert_eq!(payload["view_model"]["progress_pct"], 88);
+        assert_eq!(payload["view_model"]["process_live"], true);
+        assert_eq!(payload["view_model"]["can_stop"], true);
+    }
+
+    #[test]
+    fn public_launch_status_preserves_identity_and_safe_fields_during_redaction() {
+        let session_id = "7d444840-9dc0-4a0c-a214-1e5a7a92533d";
+        let crash_evidence: CrashEvidence = serde_json::from_value(serde_json::json!({
+            "source": "minecraft_crash_report",
+            "truncated": false,
+            "failure_phase": "startup",
+            "exception_class": "java.lang.OutOfMemoryError",
+            "suspected_mods": [],
+            "names_out_of_memory": true
+        }))
+        .expect("valid crash evidence");
+        let payload = serde_json::to_value(public_launch_status(&RevisionedLaunchStatus::new(
+            session_id,
+            17,
+            LaunchStatusEvent {
+                state: "failed".to_string(),
+                benchmark: Some(serde_json::json!({
+                    "profile": "managed",
+                    "unsafe_path": "/home/alice/.minecraft"
+                })),
+                pid: Some(42),
+                exit_code: Some(1),
+                failure_class: Some("startup_failed".to_string()),
+                failure_detail: Some("java path C:\\Users\\Alice\\java.exe".to_string()),
+                crash_evidence: Some(crash_evidence),
+                healing: Some(serde_json::json!({
+                    "decision": "retry",
+                    "unsafe_path": "/home/alice/.minecraft"
+                })),
+                guardian: Some(serde_json::json!({
+                    "decision": "blocked",
+                    "message": "Guardian stopped an unsafe launch."
+                })),
+                outcome: Some(LaunchSessionOutcome::from_reason(
+                    LaunchSessionExitReason::StartupFailed,
+                )),
+                notice: Some(LaunchNotice {
+                    message: "Minecraft did not finish startup.".to_string(),
+                    detail: Some("C:\\Users\\Alice\\AppData\\secret.txt".to_string()),
+                    details: vec![
+                        "Guardian retained the failure proof.".to_string(),
+                        "/home/alice/.minecraft/accessToken".to_string(),
+                    ],
+                    tone: LaunchNoticeTone::Error,
+                }),
+                evidence: vec![LaunchStageEvidence {
+                    id: "startup_failure".to_string(),
+                    system: "guardian".to_string(),
+                    summary: "Startup failure was classified.".to_string(),
+                    details: vec![
+                        "The process exited before boot.".to_string(),
+                        "/home/alice/.minecraft/latest.log".to_string(),
+                    ],
+                }],
+                stages: vec![LaunchStageRecord {
+                    stage: "monitoring".to_string(),
+                    label: "Monitoring startup".to_string(),
+                    started_at_ms: 10,
+                    ended_at_ms: Some(20),
+                    duration_ms: Some(10),
+                    result: Some("failed".to_string()),
+                    warnings: vec![
+                        "Startup ended early.".to_string(),
+                        "C:\\Users\\Alice\\latest.log".to_string(),
+                    ],
+                    fallback_reason: None,
+                    evidence: Vec::new(),
+                }],
+            },
+        )))
+        .expect("serialize public launch status");
+
+        assert_eq!(payload["session_id"], session_id);
+        assert_eq!(payload["revision"], 17);
+        assert_eq!(payload["benchmark"]["profile"], "managed");
+        assert!(payload["benchmark"].get("unsafe_path").is_none());
+        assert_eq!(payload["healing"]["decision"], "retry");
+        assert!(payload["healing"].get("unsafe_path").is_none());
+        assert_eq!(payload["guardian"]["decision"], "blocked");
+        assert_eq!(payload["failure_class"], "startup_failed");
+        assert_eq!(payload["failure_detail"], serde_json::Value::Null);
+        assert_eq!(payload["crash_evidence"]["failure_phase"], "startup");
+        assert_eq!(payload["outcome"]["reason"], "startup_failed");
+        assert_eq!(payload["notice"]["detail"], serde_json::Value::Null);
+        assert_eq!(
+            payload["notice"]["details"].as_array().map(Vec::len),
+            Some(1)
+        );
+        assert_eq!(
+            payload["evidence"][0]["details"].as_array().map(Vec::len),
+            Some(1)
+        );
+        assert_eq!(
+            payload["stages"][0]["warnings"].as_array().map(Vec::len),
+            Some(1)
+        );
+        assert_eq!(payload["view_model"]["terminal"], true);
+    }
+
+    #[tokio::test]
+    async fn recovering_status_payload_and_public_projection_have_snapshot_parity() {
+        let root = unique_test_dir("recovering-status-payload");
+        let state = test_app_state(&root);
+        let session_id = "recovering-status";
+        let mut record = test_record(session_id);
+        record.state = LaunchState::Recovering;
+        record.guardian = Some(serde_json::json!({
+            "mode": "managed",
+            "decision": "warned",
+            "message": "Guardian is recovering this startup."
+        }));
+        state
+            .sessions()
+            .insert(record)
+            .await
+            .expect("insert recovering session");
+
+        let payload = serde_json::to_value(
+            launch_status(&state, session_id)
+                .await
+                .expect("recovering launch status payload"),
+        )
+        .expect("serialize recovering payload");
+        assert_eq!(payload["state"], "recovering");
+        assert_eq!(payload["notice"], serde_json::Value::Null);
+        assert_eq!(payload["outcome"], serde_json::Value::Null);
+        assert_eq!(payload["view_model"]["terminal"], false);
+
+        let status = state
+            .sessions()
+            .status_snapshot(session_id)
+            .await
+            .expect("recovering session snapshot");
+        let public = serde_json::to_value(public_launch_status(&status))
+            .expect("serialize public recovering status");
+        assert_eq!(public["state"], payload["state"]);
+        assert_eq!(public["notice"], payload["notice"]);
+        assert_eq!(public["outcome"], payload["outcome"]);
+        assert_eq!(public["view_model"]["terminal"], false);
+
+        let _ = fs::remove_dir_all(root);
     }
 
     fn test_app_state(root: &Path) -> AppState {

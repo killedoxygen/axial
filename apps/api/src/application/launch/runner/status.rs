@@ -28,23 +28,33 @@ pub(super) async fn emit_status(
         .sessions()
         .emit_status(
             session_id,
-            LaunchStatusEvent {
-                state: launch_state_name(launch_state).to_string(),
-                benchmark: None,
-                pid,
-                exit_code: None,
-                failure_class: failure_class.map(failure_class_name).map(str::to_string),
-                failure_detail: None,
-                crash_evidence: None,
-                healing: serialize_healing(healing),
-                guardian: serialize_guardian(guardian),
-                outcome: None,
-                notice: None,
-                evidence: Vec::new(),
-                stages: Vec::new(),
-            },
+            launch_status_event(launch_state, pid, failure_class, healing, guardian),
         )
         .await;
+}
+
+pub(super) fn launch_status_event(
+    launch_state: LaunchState,
+    pid: Option<u32>,
+    failure_class: Option<LaunchFailureClass>,
+    healing: Option<axial_launcher::LaunchHealingSummary>,
+    guardian: Option<GuardianSummary>,
+) -> LaunchStatusEvent {
+    LaunchStatusEvent {
+        state: launch_state_name(launch_state).to_string(),
+        benchmark: None,
+        pid,
+        exit_code: None,
+        failure_class: failure_class.map(failure_class_name).map(str::to_string),
+        failure_detail: None,
+        crash_evidence: None,
+        healing: serialize_healing(healing),
+        guardian: serialize_guardian(guardian),
+        outcome: None,
+        notice: None,
+        evidence: Vec::new(),
+        stages: Vec::new(),
+    }
 }
 
 pub(super) fn serialize_healing(

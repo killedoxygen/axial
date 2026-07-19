@@ -9,23 +9,28 @@ use crate::execution::file::{FileWriteRequest, write_file_atomically};
 use crate::execution::persistence::{AtomicWriteBackend, PersistenceCoordinator};
 use crate::guardian::{GuardianSummaryDecision, guardian_summary_for_test};
 use crate::state::contracts::TargetDescriptor;
-use crate::state::{AppStateInit, InstallStore, SessionStopError, SessionStore};
+use crate::state::{AppStateInit, InstallStore, LaunchStatusEvent, SessionStopError, SessionStore};
 use axial_config::{AppPaths, ConfigStore, Instance, InstanceStore};
 use axial_launcher::{
     GuardianMode, LaunchAuthContext, LaunchGuardianContext, LaunchIntent, LaunchSessionRecord,
-    LaunchStageRecord, LaunchState, SessionId,
+    LaunchStageEvidence, LaunchStageRecord, LaunchState, SessionId,
 };
+use axial_minecraft::DownloadProgress;
 use axial_performance::PerformanceManager;
 use axum::{
     body::{Body, to_bytes},
     http::Request,
+    response::IntoResponse,
 };
+use http_body_util::BodyExt;
 use serde_json::json;
 use sha2::Digest as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
 use tower::ServiceExt;
 
 #[test]
@@ -54,24 +59,6 @@ fn benchmark_launch_request_missing_instance_id_returns_json_error() {
     );
 }
 
-#[test]
-fn launch_success_response_payload_exposes_effective_memory() {
-    let payload = launch_app::launch_success_response_payload(&launch_app::LaunchSuccess {
-        session_id: "session-1".to_string(),
-        instance_id: "instance-1".to_string(),
-        pid: 1234,
-        launched_at: "2026-05-30T00:00:00Z".to_string(),
-        max_memory_mb: 6144,
-        min_memory_mb: 1024,
-        healing: None,
-        guardian: None,
-    });
-
-    assert_eq!(payload["status"], serde_json::json!("launching"));
-    assert_eq!(payload["max_memory_mb"], serde_json::json!(6144));
-    assert_eq!(payload["min_memory_mb"], serde_json::json!(1024));
-}
-
 #[tokio::test]
 async fn launch_prepared_response_payload_exposes_queued_session_metadata() {
     let fixture = RouteTestFixture::new("prepared-response-payload");
@@ -80,10 +67,27 @@ async fn launch_prepared_response_payload_exposes_queued_session_metadata() {
         .try_claim_producer()
         .expect("claim prepared response producer");
     let task = test_launch_session_task(&fixture.state, &producer).await;
-    let payload = launch_app::launch_prepared_response_payload(&task);
+    let mut queued = test_record(&task.intent.session_id);
+    queued.instance_id = task.intent.instance_id.clone();
+    queued.guardian = Some(serde_json::to_value(&task.guardian).expect("serialize guardian"));
+    fixture
+        .state
+        .sessions()
+        .insert(queued)
+        .await
+        .expect("insert prepared session");
+    let initial_status = launch_app::launch_status(&fixture.state, &task.intent.session_id)
+        .await
+        .expect("queued status");
+    let public_status = serde_json::to_value(&initial_status).expect("serialize queued status");
+    let payload = launch_app::launch_prepared_response_payload(&task, &initial_status);
 
-    assert_eq!(payload["status"], serde_json::json!("launching"));
+    for (key, value) in public_status.as_object().expect("public status object") {
+        assert_eq!(&payload[key], value, "POST status key {key}");
+    }
+
     assert_eq!(payload["state"], serde_json::json!("queued"));
+    assert_eq!(payload["revision"], serde_json::json!(0));
     assert_eq!(payload["session_id"], serde_json::json!("session-queued"));
     assert_eq!(payload["instance_id"], serde_json::json!("instance-queued"));
     assert_eq!(payload["pid"], serde_json::Value::Null);
@@ -94,9 +98,461 @@ async fn launch_prepared_response_payload_exposes_queued_session_metadata() {
     assert_eq!(payload["max_memory_mb"], serde_json::json!(6144));
     assert_eq!(payload["min_memory_mb"], serde_json::json!(1024));
     assert_eq!(payload["healing"], serde_json::Value::Null);
+    assert_eq!(payload["outcome"], serde_json::Value::Null);
+    assert_eq!(payload["view_model"]["playing"], false);
+    assert_eq!(payload["view_model"]["process_live"], false);
+    assert_eq!(payload["view_model"]["can_stop"], false);
     assert_eq!(
         payload["guardian"]["decision"],
         serde_json::json!("allowed")
+    );
+}
+
+#[tokio::test]
+async fn launch_http_sse_and_shared_transport_projection_have_key_parity() {
+    let fixture = RouteTestFixture::new("launch-status-transport-parity");
+    let session_id = "transport-parity";
+    fixture
+        .state
+        .sessions()
+        .insert(test_record(session_id))
+        .await
+        .expect("insert launch session");
+    let retained = fixture
+        .state
+        .sessions()
+        .status_snapshot(session_id)
+        .await
+        .expect("retained status");
+    let shared = serde_json::to_value(launch_app::public_launch_status(&retained))
+        .expect("serialize shared status DTO");
+
+    let response = router()
+        .with_state(fixture.state.clone())
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/v1/launch/{session_id}/status"))
+                .body(Body::empty())
+                .expect("status request"),
+        )
+        .await
+        .expect("status response");
+    let http = serde_json::from_slice::<serde_json::Value>(
+        &to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("status body"),
+    )
+    .expect("HTTP status JSON");
+
+    let stream = super::stream::launch_events_sse(
+        fixture.state.clone(),
+        session_id.to_string(),
+        fixture
+            .state
+            .try_claim_producer()
+            .expect("claim launch event producer"),
+    )
+    .await
+    .expect("create launch event stream");
+    let mut body = stream.into_response().into_body();
+    let sse = launch_sse_payload(&next_launch_sse_frame(&mut body).await);
+
+    assert_eq!(http, shared);
+    assert_eq!(sse, shared);
+    for key in [
+        "benchmark",
+        "pid",
+        "exit_code",
+        "failure_class",
+        "failure_detail",
+        "crash_evidence",
+        "healing",
+        "guardian",
+        "outcome",
+        "notice",
+    ] {
+        assert_eq!(
+            shared[key],
+            serde_json::Value::Null,
+            "explicit null key {key}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn launch_status_transport_reads_revisioned_benchmark_and_stage_mutations() {
+    let fixture = RouteTestFixture::new("launch-status-public-mutation-refresh");
+    let session_id = "public-mutation-refresh";
+    fixture
+        .state
+        .sessions()
+        .insert(test_record(session_id))
+        .await
+        .expect("insert launch session");
+    fixture
+        .state
+        .sessions()
+        .attach_benchmark(session_id, json!({ "id": "benchmark-refresh" }))
+        .await
+        .expect("attach benchmark");
+    fixture
+        .state
+        .sessions()
+        .record_stage_evidence(
+            session_id,
+            vec![LaunchStageEvidence {
+                id: "execution_launch_command_prepared".to_string(),
+                system: "execution".to_string(),
+                summary: "Execution prepared the launch command.".to_string(),
+                details: vec!["arg_count:3".to_string()],
+            }],
+        )
+        .await
+        .expect("record stage evidence");
+
+    let response = router()
+        .with_state(fixture.state.clone())
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/v1/launch/{session_id}/status"))
+                .body(Body::empty())
+                .expect("status request"),
+        )
+        .await
+        .expect("status response");
+    let payload = serde_json::from_slice::<serde_json::Value>(
+        &to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("status body"),
+    )
+    .expect("status JSON");
+
+    assert_eq!(payload["revision"], json!(2));
+    assert_eq!(payload["state"], json!("queued"));
+    assert_eq!(payload["benchmark"]["id"], json!("benchmark-refresh"));
+    assert_eq!(
+        payload["stages"][0]["evidence"][0]["id"],
+        json!("execution_launch_command_prepared")
+    );
+}
+
+#[tokio::test]
+async fn launch_events_sse_reconciles_lagged_recovery_without_closing() {
+    let fixture = RouteTestFixture::new("launch-events-lagged-recovery");
+    let session_id = "lagged-recovery";
+    fixture
+        .state
+        .sessions()
+        .insert(test_record(session_id))
+        .await
+        .expect("insert launch session");
+
+    let stream = super::stream::launch_events_sse(
+        fixture.state.clone(),
+        session_id.to_string(),
+        fixture
+            .state
+            .try_claim_producer()
+            .expect("claim launch event producer"),
+    )
+    .await
+    .expect("create launch event stream");
+    for index in 0..=256 {
+        fixture
+            .state
+            .sessions()
+            .emit_log(session_id, "stdout", &format!("stale-log-{index}"))
+            .await;
+    }
+    fixture
+        .state
+        .sessions()
+        .emit_status(session_id, test_launch_status("recovering"))
+        .await;
+
+    let mut body = stream.into_response().into_body();
+    let initial = next_launch_sse_frame(&mut body).await;
+    assert!(initial.contains("\"state\":\"queued\""));
+
+    let reconciled = next_launch_sse_frame(&mut body).await;
+    assert!(reconciled.contains("\"state\":\"recovering\""));
+    assert!(reconciled.contains("\"terminal\":false"));
+    let reconciled_payload = launch_sse_payload(&reconciled);
+    assert_eq!(reconciled_payload["notice"], serde_json::Value::Null);
+    assert_eq!(reconciled_payload["outcome"], serde_json::Value::Null);
+
+    fixture
+        .state
+        .sessions()
+        .emit_log(session_id, "stdout", "post-rebase-log")
+        .await;
+    fixture
+        .state
+        .sessions()
+        .emit_status(session_id, test_launch_status("exited"))
+        .await;
+    let log = launch_sse_payload(&next_launch_sse_frame(&mut body).await);
+    assert_eq!(log["source"], "stdout");
+    assert_eq!(log["text"], "post-rebase-log");
+    let terminal = next_launch_sse_frame(&mut body).await;
+    assert!(terminal.contains("\"state\":\"exited\""));
+    assert!(terminal.contains("\"terminal\":true"));
+    assert!(
+        tokio::time::timeout(Duration::from_secs(1), body.frame())
+            .await
+            .expect("terminal stream closes promptly")
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn launch_events_sse_preserves_buffered_status_order() {
+    let fixture = RouteTestFixture::new("launch-events-buffered-status");
+    let session_id = "buffered-status";
+    fixture
+        .state
+        .sessions()
+        .insert(test_record(session_id))
+        .await
+        .expect("insert launch session");
+
+    let stream = super::stream::launch_events_sse(
+        fixture.state.clone(),
+        session_id.to_string(),
+        fixture
+            .state
+            .try_claim_producer()
+            .expect("claim launch event producer"),
+    )
+    .await
+    .expect("create launch event stream");
+    fixture
+        .state
+        .sessions()
+        .emit_status(session_id, test_launch_status("monitoring"))
+        .await;
+    fixture
+        .state
+        .sessions()
+        .emit_log(session_id, "stdout", "chronological output")
+        .await;
+    fixture
+        .state
+        .sessions()
+        .emit_status(session_id, test_launch_status("recovering"))
+        .await;
+
+    let mut body = stream.into_response().into_body();
+    assert!(
+        next_launch_sse_frame(&mut body)
+            .await
+            .contains("\"state\":\"queued\"")
+    );
+    let monitoring = launch_sse_payload(&next_launch_sse_frame(&mut body).await);
+    let log = launch_sse_payload(&next_launch_sse_frame(&mut body).await);
+    let recovering = launch_sse_payload(&next_launch_sse_frame(&mut body).await);
+    assert_eq!(monitoring["state"], "monitoring");
+    assert_eq!(monitoring["revision"], 1);
+    assert_eq!(log["source"], "stdout");
+    assert_eq!(log["text"], "chronological output");
+    assert_eq!(recovering["state"], "recovering");
+    assert_eq!(recovering["revision"], 2);
+
+    fixture
+        .state
+        .sessions()
+        .emit_status(session_id, test_launch_status("exited"))
+        .await;
+    let terminal = next_launch_sse_frame(&mut body).await;
+    assert!(terminal.contains("\"state\":\"exited\""));
+    assert!(terminal.contains("\"terminal\":true"));
+}
+
+#[tokio::test]
+async fn launch_events_sse_starts_at_atomic_snapshot_without_stale_replay() {
+    let fixture = RouteTestFixture::new("launch-events-atomic-snapshot");
+    let session_id = "atomic-snapshot";
+    fixture
+        .state
+        .sessions()
+        .insert(test_record(session_id))
+        .await
+        .expect("insert launch session");
+    fixture
+        .state
+        .sessions()
+        .emit_status(session_id, test_launch_status("monitoring"))
+        .await;
+    fixture
+        .state
+        .sessions()
+        .emit_status(session_id, test_launch_status("recovering"))
+        .await;
+
+    let stream = super::stream::launch_events_sse(
+        fixture.state.clone(),
+        session_id.to_string(),
+        fixture
+            .state
+            .try_claim_producer()
+            .expect("claim launch event producer"),
+    )
+    .await
+    .expect("create launch event stream");
+    fixture
+        .state
+        .sessions()
+        .emit_status(session_id, test_launch_status("exited"))
+        .await;
+
+    let mut body = stream.into_response().into_body();
+    let initial = launch_sse_payload(&next_launch_sse_frame(&mut body).await);
+    let terminal = launch_sse_payload(&next_launch_sse_frame(&mut body).await);
+    assert_eq!(initial["state"], "recovering");
+    assert_eq!(initial["revision"], 2);
+    assert_eq!(terminal["state"], "exited");
+    assert_eq!(terminal["revision"], 3);
+}
+
+#[tokio::test]
+async fn launch_events_sse_closes_on_terminal_snapshot_after_lag() {
+    let fixture = RouteTestFixture::new("launch-events-lagged-terminal");
+    let session_id = "lagged-terminal";
+    fixture
+        .state
+        .sessions()
+        .insert(test_record(session_id))
+        .await
+        .expect("insert launch session");
+
+    let stream = super::stream::launch_events_sse(
+        fixture.state.clone(),
+        session_id.to_string(),
+        fixture
+            .state
+            .try_claim_producer()
+            .expect("claim launch event producer"),
+    )
+    .await
+    .expect("create launch event stream");
+    for _ in 0..=256 {
+        fixture
+            .state
+            .sessions()
+            .emit_status(session_id, test_launch_status("queued"))
+            .await;
+    }
+    fixture
+        .state
+        .sessions()
+        .emit_status(session_id, test_launch_status("failed"))
+        .await;
+
+    let mut body = stream.into_response().into_body();
+    assert!(
+        next_launch_sse_frame(&mut body)
+            .await
+            .contains("\"state\":\"queued\"")
+    );
+    let terminal = next_launch_sse_frame(&mut body).await;
+    assert!(terminal.contains("\"state\":\"failed\""));
+    assert!(terminal.contains("\"terminal\":true"));
+    assert!(
+        tokio::time::timeout(Duration::from_secs(1), body.frame())
+            .await
+            .expect("terminal reconciliation closes stream promptly")
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn routed_live_sse_streams_end_before_shutdown_request_drain() {
+    let fixture = RouteTestFixture::new("routed-sse-shutdown-drain");
+    let launch_id = "shutdown-launch-sse";
+    let vanilla_id = "shutdown-vanilla-sse";
+    let loader_id = "shutdown-loader-sse";
+    fixture
+        .state
+        .sessions()
+        .insert(test_record(launch_id))
+        .await
+        .expect("insert live launch session");
+    for (install_id, phase) in [(vanilla_id, "libraries"), (loader_id, "loader_profile")] {
+        fixture
+            .state
+            .installs()
+            .insert(install_id.to_string())
+            .await;
+        fixture
+            .state
+            .installs()
+            .emit(
+                install_id,
+                DownloadProgress {
+                    phase: phase.to_string(),
+                    current: 1,
+                    total: 2,
+                    file: None,
+                    error: None,
+                    done: false,
+                    bytes_done: None,
+                    bytes_total: None,
+                },
+            )
+            .await;
+    }
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind routed SSE server");
+    let address = listener.local_addr().expect("routed SSE address");
+    let app = crate::routes::router(fixture.state.clone());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await });
+
+    let (mut launch, launch_initial) =
+        open_sse_connection(address, &format!("/api/v1/launch/{launch_id}/events")).await;
+    let (mut vanilla, vanilla_initial) =
+        open_sse_connection(address, &format!("/api/v1/install/{vanilla_id}/events")).await;
+    let (mut loader, loader_initial) = open_sse_connection(
+        address,
+        &format!("/api/v1/loaders/install/{loader_id}/events"),
+    )
+    .await;
+    assert!(launch_initial.contains("event: status"));
+    assert!(vanilla_initial.contains("event: progress"));
+    assert!(loader_initial.contains("event: progress"));
+
+    let shutdown_state = fixture.state.clone();
+    let shutdown = tokio::spawn(async move { shutdown_state.shutdown().await });
+    let (launch_eof, vanilla_eof, loader_eof, shutdown_result) =
+        tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(
+                read_sse_to_eof(&mut launch),
+                read_sse_to_eof(&mut vanilla),
+                read_sse_to_eof(&mut loader),
+                shutdown,
+            )
+        })
+        .await
+        .expect("SSE EOF and application shutdown deadline");
+    launch_eof.expect("launch SSE EOF");
+    vanilla_eof.expect("vanilla install SSE EOF");
+    loader_eof.expect("loader install SSE EOF");
+    shutdown_result
+        .expect("shutdown task")
+        .expect("shutdown after routed SSE drain");
+
+    assert_eq!(
+        fixture.state.lifecycle_phase(),
+        crate::state::AppLifecyclePhase::Quiesced
+    );
+    assert!(fixture.state.sessions().get(launch_id).await.is_none());
+    server.abort();
+    assert!(
+        server
+            .await
+            .expect_err("stop routed SSE server")
+            .is_cancelled()
     );
 }
 
@@ -4365,6 +4821,93 @@ fn test_record(session_id: &str) -> LaunchSessionRecord {
         outcome: None,
         stages: Vec::new(),
     }
+}
+
+fn test_launch_status(state: &str) -> LaunchStatusEvent {
+    LaunchStatusEvent {
+        state: state.to_string(),
+        benchmark: None,
+        pid: None,
+        exit_code: None,
+        failure_class: None,
+        failure_detail: None,
+        crash_evidence: None,
+        healing: None,
+        guardian: None,
+        outcome: None,
+        notice: None,
+        evidence: Vec::new(),
+        stages: Vec::new(),
+    }
+}
+
+async fn open_sse_connection(address: std::net::SocketAddr, path: &str) -> (TcpStream, String) {
+    let mut stream = TcpStream::connect(address)
+        .await
+        .expect("connect routed SSE client");
+    stream
+        .write_all(
+            format!(
+                "GET {path} HTTP/1.1\r\nHost: {address}\r\nAccept: text/event-stream\r\nConnection: close\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .await
+        .expect("write routed SSE request");
+
+    let mut response = Vec::new();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        let mut chunk = [0_u8; 2048];
+        loop {
+            let read = stream
+                .read(&mut chunk)
+                .await
+                .expect("read routed SSE response");
+            assert_ne!(read, 0, "routed SSE closed before its initial event");
+            response.extend_from_slice(&chunk[..read]);
+            let text = String::from_utf8_lossy(&response);
+            if text.contains("data: ") && text.contains("\n\n") {
+                return;
+            }
+            assert!(
+                response.len() <= 16 * 1024,
+                "initial SSE response is bounded"
+            );
+        }
+    })
+    .await
+    .expect("initial routed SSE response deadline");
+    let response = String::from_utf8(response).expect("routed SSE response is utf-8");
+    assert!(response.starts_with("HTTP/1.1 200"));
+    (stream, response)
+}
+
+async fn read_sse_to_eof(stream: &mut TcpStream) -> std::io::Result<()> {
+    let mut remaining = Vec::new();
+    stream.read_to_end(&mut remaining).await.map(|_| ())
+}
+
+async fn next_launch_sse_frame(body: &mut Body) -> String {
+    let frame = tokio::time::timeout(Duration::from_secs(1), body.frame())
+        .await
+        .expect("launch event arrives promptly")
+        .expect("launch event stream remains open")
+        .expect("launch event frame");
+    String::from_utf8(
+        frame
+            .into_data()
+            .expect("launch event frame contains data")
+            .to_vec(),
+    )
+    .expect("launch event is utf-8")
+}
+
+fn launch_sse_payload(frame: &str) -> serde_json::Value {
+    let data = frame
+        .lines()
+        .find_map(|line| line.strip_prefix("data: "))
+        .expect("launch SSE frame contains data");
+    serde_json::from_str(data).expect("launch SSE data is JSON")
 }
 
 async fn test_launch_session_task(

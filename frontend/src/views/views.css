@@ -436,13 +436,21 @@
   font-weight: 700;
   color: #fff;
   background: rgba(0, 0, 0, 0.62);
+  max-width: calc(100% - 20px);
 }
-.cp-icard-live > span {
+.cp-icard-live-dot {
+  flex: 0 0 auto;
   width: 6px;
   height: 6px;
   border-radius: 999px;
   background: var(--accent);
   box-shadow: 0 0 10px -2px color-mix(in oklab, var(--accent) 80%, transparent);
+}
+.cp-icard-live-label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .cp-icard-install {
   position: absolute;

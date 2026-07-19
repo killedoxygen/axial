@@ -75,7 +75,7 @@ pub(crate) use copy::{
     guardian_summary_from_persisted_export_value, guardian_summary_with_artifact_repair_outcome,
     guardian_summary_with_blocked_outcome, guardian_summary_with_intervention,
     guardian_summary_with_observed_outcome, guardian_summary_with_suppressed_outcome,
-    launch_notice, launch_notice_from_values, launch_session_outcome, launch_status_snapshot,
+    launch_notice, launch_notice_from_values, launch_session_outcome,
 };
 pub use copy::{
     GuardianInstallOutcomeSummary, GuardianJvmPresetNotice, GuardianJvmPresetOption,

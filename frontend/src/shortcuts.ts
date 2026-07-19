@@ -1,6 +1,6 @@
 import { signal } from '@preact/signals';
 import { commandPaletteOpen, navigate, openCreate, route } from './ui-state';
-import { instances, launchState, runningSessions, selectedInstance } from './store';
+import { instances, launchSessions, launchState, selectedInstance } from './store';
 import { selectInstance } from './actions';
 import { launchGame } from './launch';
 import { Sound } from './sound';
@@ -64,7 +64,7 @@ export const SHORTCUTS: ShortcutDef[] = [
         if (inst) selectInstance(inst.id);
       }
       if (!inst) return;
-      if (runningSessions.value[inst.id]) return;
+      if (launchSessions.value[inst.id]) return;
       if (launchState.value.status === 'preparing') return;
       Sound.ui('launchPress');
       void launchGame();

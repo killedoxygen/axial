@@ -1,5 +1,5 @@
 import { signal, computed } from '@preact/signals';
-import type { RunningSession, InstanceLaunchDraft, LaunchNotice } from './types-launch';
+import type { LaunchSession, InstanceLaunchDraft, LaunchNotice } from './types-launch';
 import type { Version, Catalog } from './types-version';
 import type { Instance } from './types-instance';
 import type { Config, SystemInfo } from './types-settings';
@@ -46,7 +46,7 @@ export type LaunchState =
     };
 
 export const launchState = signal<LaunchState>({ status: 'idle' });
-export const runningSessions = signal<Record<string, RunningSession>>({});
+export const launchSessions = signal<Record<string, LaunchSession>>({});
 export const instanceLaunchDrafts = signal<Record<string, InstanceLaunchDraft>>({});
 export const launchNotices = signal<Record<string, LaunchNotice>>({});
 

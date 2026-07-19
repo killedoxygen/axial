@@ -9,8 +9,9 @@ import { openContextMenu } from '../../ui/ContextMenu';
 import { SelectionActionTray, SelectionCheckbox } from '../../ui/SelectionActionTray';
 import { selectionMenuItem, selectionToggleLabel, useSelection } from '../../ui/selection';
 import { useTheme } from '../../hooks/use-theme';
-import { instances, versionById, runningSessions } from '../../store';
+import { instances, versionById, launchSessions } from '../../store';
 import { instanceInstallStatus } from '../../instance-install-status';
+import { launchSessionActivityLabel, launchSessionIsPlaying } from '../../launch-presenters';
 import { navigate, openCreate } from '../../ui-state';
 import { instanceMenuItems } from '../instance/instance-menu';
 import { deleteInstancesFlow } from '../instance/instance-actions';
@@ -32,7 +33,8 @@ function ListRow({
 }): JSX.Element {
   const theme = useTheme();
   const v = versionById(inst.version_id);
-  const running = !!runningSessions.value[inst.id];
+  const session = launchSessions.value[inst.id];
+  const playing = launchSessionIsPlaying(session);
   const install = instanceInstallStatus(inst, v);
   const installing = install.installing;
   const installLabel = install.state === 'queued' ? install.queuedItem?.title || install.label : 'Installing';
@@ -65,9 +67,9 @@ function ListRow({
       <div>
         <div class="cp-table-row-title" style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
           {inst.name}
-          {running && (
-            <Pill tone="accent" icon="play">
-              Live
+          {session && (
+            <Pill tone={playing ? 'accent' : undefined} icon={playing ? 'play' : 'clock'}>
+              {launchSessionActivityLabel(session)}
             </Pill>
           )}
           {installing && <Pill icon={install.state === 'queued' ? 'clock' : 'download'}>{installLabel}</Pill>}

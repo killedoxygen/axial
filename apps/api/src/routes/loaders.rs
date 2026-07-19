@@ -94,9 +94,13 @@ async fn handle_loader_install(
 
 async fn handle_loader_install_events(
     State(state): State<AppState>,
+    Extension(handoff): Extension<RequestProducerHandoff>,
     Path(id): Path<String>,
 ) -> Result<impl axum::response::IntoResponse, (StatusCode, Json<serde_json::Value>)> {
-    loader_install_events_stream(&state, &id).await
+    let producer = handoff
+        .try_claim()
+        .map_err(super::producer_claim_error_response)?;
+    loader_install_events_stream(&state, &id, producer).await
 }
 
 fn parse_component_id(

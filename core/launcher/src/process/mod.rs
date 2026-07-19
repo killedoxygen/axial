@@ -1,6 +1,7 @@
 use crate::crash::CrashEvidence;
 use crate::types::{LaunchFailure, LaunchState, SessionId};
 use serde::{Deserialize, Serialize};
+use std::ops::Deref;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -155,6 +156,32 @@ pub struct LaunchStatusEvent {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct RevisionedLaunchStatus {
+    pub session_id: String,
+    pub revision: u64,
+    #[serde(flatten)]
+    pub status: LaunchStatusEvent,
+}
+
+impl RevisionedLaunchStatus {
+    pub fn new(session_id: impl Into<String>, revision: u64, status: LaunchStatusEvent) -> Self {
+        Self {
+            session_id: session_id.into(),
+            revision,
+            status,
+        }
+    }
+}
+
+impl Deref for RevisionedLaunchStatus {
+    type Target = LaunchStatusEvent;
+
+    fn deref(&self) -> &Self::Target {
+        &self.status
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct LaunchLogEvent {
     pub source: String,
     pub text: String,
@@ -162,17 +189,9 @@ pub struct LaunchLogEvent {
 
 #[derive(Debug, Clone)]
 pub enum LaunchEvent {
-    Status(Box<LaunchStatusEvent>),
+    Status(Box<RevisionedLaunchStatus>),
     Log(LaunchLogEvent),
-}
-
-impl LaunchEvent {
-    pub fn event_type(&self) -> &'static str {
-        match self {
-            Self::Status(_) => "status",
-            Self::Log(_) => "log",
-        }
-    }
+    ProcessSettled { generation: u64, attempt_id: u64 },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

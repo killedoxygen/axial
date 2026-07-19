@@ -846,10 +846,16 @@ async fn install_events_keep_terminal_installs_subscribable_after_stream_ends() 
     state.installs().insert("done-install".to_string()).await;
     state.installs().emit("done-install", done_progress()).await;
 
-    let response = install_events_stream(&state, "done-install")
-        .await
-        .expect("terminal install events should be served")
-        .into_response();
+    let response = install_events_stream(
+        &state,
+        "done-install",
+        state
+            .try_claim_producer()
+            .expect("claim install event producer"),
+    )
+    .await
+    .expect("terminal install events should be served")
+    .into_response();
     let body = to_bytes(response.into_body(), usize::MAX)
         .await
         .expect("sse body should complete");
@@ -888,10 +894,16 @@ async fn install_events_replay_latest_snapshot_not_prior_progress_log() {
         .emit("active-install", base_progress("libraries"))
         .await;
 
-    let response = install_events_stream(&state, "active-install")
-        .await
-        .expect("active install events should be served")
-        .into_response();
+    let response = install_events_stream(
+        &state,
+        "active-install",
+        state
+            .try_claim_producer()
+            .expect("claim install event producer"),
+    )
+    .await
+    .expect("active install events should be served")
+    .into_response();
     let body_task = tokio::spawn(async move {
         let body = to_bytes(response.into_body(), usize::MAX)
             .await
@@ -921,9 +933,15 @@ async fn install_events_return_bounded_not_found_for_unknown_install() {
     let root = temp_root("install-events-unknown");
     let state = build_test_state(&root);
 
-    let error = install_events_stream(&state, "missing-install")
-        .await
-        .expect_err("missing install should be 404");
+    let error = install_events_stream(
+        &state,
+        "missing-install",
+        state
+            .try_claim_producer()
+            .expect("claim install event producer"),
+    )
+    .await
+    .expect_err("missing install should be 404");
 
     assert_eq!(error.0, StatusCode::NOT_FOUND);
     assert_eq!(error.1.0["error"], "install session not found");
@@ -2516,10 +2534,16 @@ async fn install_events_replay_journal_terminal_progress_when_snapshot_is_missin
     .await
     .expect("record install journal");
 
-    let response = install_events_stream(&state, install_id)
-        .await
-        .expect("journal-only install events should be served")
-        .into_response();
+    let response = install_events_stream(
+        &state,
+        install_id,
+        state
+            .try_claim_producer()
+            .expect("claim install event producer"),
+    )
+    .await
+    .expect("journal-only install events should be served")
+    .into_response();
     let body = to_bytes(response.into_body(), usize::MAX)
         .await
         .expect("sse body should complete");
@@ -2555,10 +2579,16 @@ async fn install_events_replay_restart_loaded_journal_when_snapshot_is_missing()
     }
 
     let reloaded = build_test_state(&root);
-    let response = install_events_stream(&reloaded, install_id)
-        .await
-        .expect("restart-loaded journal events should be served")
-        .into_response();
+    let response = install_events_stream(
+        &reloaded,
+        install_id,
+        reloaded
+            .try_claim_producer()
+            .expect("claim install event producer"),
+    )
+    .await
+    .expect("restart-loaded journal events should be served")
+    .into_response();
     let body = to_bytes(response.into_body(), usize::MAX)
         .await
         .expect("sse body should complete");
@@ -3835,10 +3865,16 @@ async fn loader_install_events_keep_terminal_installs_subscribable_after_stream_
     state.installs().insert("done-install".to_string()).await;
     state.installs().emit("done-install", done_progress()).await;
 
-    let response = loader_install_events_stream(&state, "done-install")
-        .await
-        .expect("terminal loader install events should be served")
-        .into_response();
+    let response = loader_install_events_stream(
+        &state,
+        "done-install",
+        state
+            .try_claim_producer()
+            .expect("claim install event producer"),
+    )
+    .await
+    .expect("terminal loader install events should be served")
+    .into_response();
     let body = to_bytes(response.into_body(), usize::MAX)
         .await
         .expect("sse body should complete");
@@ -3891,10 +3927,16 @@ async fn loader_install_events_redact_raw_terminal_progress_snapshot() {
             )
         .await;
 
-    let response = loader_install_events_stream(&state, "raw-loader-install")
-        .await
-        .expect("loader install events should be served")
-        .into_response();
+    let response = loader_install_events_stream(
+        &state,
+        "raw-loader-install",
+        state
+            .try_claim_producer()
+            .expect("claim install event producer"),
+    )
+    .await
+    .expect("loader install events should be served")
+    .into_response();
     let body = to_bytes(response.into_body(), usize::MAX)
         .await
         .expect("sse body should complete");
@@ -3912,9 +3954,15 @@ async fn loader_install_events_return_bounded_not_found_for_unknown_install() {
     let root = temp_root("loader-install-events-unknown");
     let state = build_test_state(&root);
 
-    let error = loader_install_events_stream(&state, "missing-install")
-        .await
-        .expect_err("missing loader install should be 404");
+    let error = loader_install_events_stream(
+        &state,
+        "missing-install",
+        state
+            .try_claim_producer()
+            .expect("claim install event producer"),
+    )
+    .await
+    .expect_err("missing loader install should be 404");
 
     assert_eq!(error.0, StatusCode::NOT_FOUND);
     assert_eq!(error.1.0["error"], "loader install session not found");

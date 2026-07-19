@@ -99,9 +99,13 @@ async fn handle_install_queue_remove(
 
 async fn handle_install_events(
     State(state): State<AppState>,
+    Extension(handoff): Extension<RequestProducerHandoff>,
     Path(id): Path<String>,
 ) -> Result<impl axum::response::IntoResponse, (StatusCode, Json<serde_json::Value>)> {
-    install_events_stream(&state, &id).await
+    let producer = handoff
+        .try_claim()
+        .map_err(super::producer_claim_error_response)?;
+    install_events_stream(&state, &id, producer).await
 }
 
 #[cfg(test)]

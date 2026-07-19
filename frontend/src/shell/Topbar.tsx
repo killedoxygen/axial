@@ -6,11 +6,13 @@ import { WindowControls } from './WindowControls';
 import { MusicWidget } from './MusicWidget';
 import { UpdateWidget } from './UpdateWidget';
 import { goBack, goForward, navigate, route } from '../ui-state';
-import { runningSessions, instances, versionById, launchState } from '../store';
+import { launchSessions, instances, versionById, launchState } from '../store';
 import { activeDownload, downloadFailure, downloadQueue } from '../machines/downloads';
 import { hasVisibleUpdate, updateFlow, updateFlowActive } from '../updater';
 import { minecraftVersionLabel } from '../version-display';
 import { hasCustomDragRegion, windowStartDragging, windowToggleMaximize } from '../native';
+import { launchSessionActivityLabel, launchSessionIsPlaying } from '../launch-presenters';
+import type { LaunchSession } from '../types-launch';
 
 function assertUnreachable(value: never): never {
   throw new Error(`Unhandled route: ${JSON.stringify(value)}`);
@@ -90,9 +92,9 @@ function StatusGlyph({ state }: { state: GlyphState }): JSX.Element {
   );
 }
 
-function sessionGlyph(session: { stopping?: boolean; state?: string }): GlyphState {
+function sessionGlyph(session: Pick<LaunchSession, 'stopping' | 'viewModel'>): GlyphState {
   if (session.stopping) return 'stopping';
-  if (session.state === 'running' || session.state === 'degraded') return 'playing';
+  if (launchSessionIsPlaying(session)) return 'playing';
   return 'monitoring';
 }
 
@@ -121,7 +123,7 @@ function useSettledLabel(label: string | null, holdMs = 600): string | null {
 }
 
 function StatusPill(): JSX.Element {
-  const sessions = runningSessions.value;
+  const sessions = launchSessions.value;
   const install = activeDownload.value;
 
   const runIds = Object.keys(sessions);
@@ -144,20 +146,20 @@ function StatusPill(): JSX.Element {
     inst && session
       ? session.stopping
         ? 'Stopping'
-        : session.viewModel?.label || 'Playing'
+        : launchSessionActivityLabel(session)
       : !install && launch.status === 'preparing'
         ? launch.label
         : null;
   const flowLabel = useSettledLabel(rawFlowLabel);
 
   if (inst && session) {
-    const label = flowLabel || (session.stopping ? 'Stopping' : session.viewModel?.label || 'Playing');
+    const label = flowLabel || (session.stopping ? 'Stopping' : launchSessionActivityLabel(session));
     const tag = versionTag(inst.version_id);
     glyph = sessionGlyph(session);
     mod = ' cp-status-pill--running';
     onClick = () => navigate({ name: 'instance', id: inst.id });
     title = `${label} · ${inst.name}`;
-    ariaLabel = `Open running instance. ${label} · ${inst.name}`;
+    ariaLabel = `Open active instance. ${label} · ${inst.name}`;
     content = (
       <>
         <span class="cp-status-pill-label">{label}</span>
@@ -284,7 +286,7 @@ export function Topbar(): JSX.Element {
   };
 
   const crumbs = crumbsFor();
-  const sessionActive = Object.keys(runningSessions.value).length > 0;
+  const sessionActive = Object.keys(launchSessions.value).length > 0;
   const flow = updateFlow.value;
   const hasUpdate = hasVisibleUpdate() || updateFlowActive();
   const updateBusy = flow.phase === 'downloading' || flow.phase === 'applying';
