@@ -77,14 +77,18 @@ pub(super) enum AssetDownloadPipelineEvent {
     },
 }
 
+pub(super) struct AssetSourceAcquisitionInputs<P> {
+    pub(super) client: reqwest::Client,
+    pub(super) asset_object_base_url: Arc<str>,
+    pub(super) asset_index_id: String,
+    pub(super) asset_index_source: AuthenticatedSelectedArtifactSource,
+    pub(super) fact_tx: Option<mpsc::UnboundedSender<ExecutionDownloadFact>>,
+    pub(super) plan: P,
+    pub(super) contribution: TransferPlanContribution,
+}
+
 pub(super) struct AssetSourceAcquisitionRequest<'a, F> {
-    client: reqwest::Client,
-    asset_object_base_url: Arc<str>,
-    asset_index_id: String,
-    asset_index_source: AuthenticatedSelectedArtifactSource,
-    fact_tx: Option<mpsc::UnboundedSender<ExecutionDownloadFact>>,
-    plan: &'a TransferPlan,
-    contribution: TransferPlanContribution,
+    inputs: AssetSourceAcquisitionInputs<&'a TransferPlan>,
     send: F,
 }
 
@@ -95,26 +99,8 @@ pub(super) struct GuardedAssetSourceAcquisitionRequest<'a, F> {
 }
 
 impl<'a, F> AssetSourceAcquisitionRequest<'a, F> {
-    pub(super) fn new(
-        client: reqwest::Client,
-        asset_object_base_url: Arc<str>,
-        asset_index_id: String,
-        asset_index_source: AuthenticatedSelectedArtifactSource,
-        fact_tx: Option<mpsc::UnboundedSender<ExecutionDownloadFact>>,
-        plan: &'a TransferPlan,
-        contribution: TransferPlanContribution,
-        send: F,
-    ) -> Self {
-        Self {
-            client,
-            asset_object_base_url,
-            asset_index_id,
-            asset_index_source,
-            fact_tx,
-            plan,
-            contribution,
-            send,
-        }
+    pub(super) fn new(inputs: AssetSourceAcquisitionInputs<&'a TransferPlan>, send: F) -> Self {
+        Self { inputs, send }
     }
 
     pub(super) fn bind(
@@ -160,26 +146,31 @@ pub(super) async fn prepare_asset_download_pipeline(
 
 pub(super) fn spawn_asset_download_pipeline(
     prepared: PreparedAssetDownloadPipeline,
-    client: reqwest::Client,
-    asset_object_base_url: Arc<str>,
-    asset_index_id: String,
-    asset_index_source: AuthenticatedSelectedArtifactSource,
-    fact_tx: Option<mpsc::UnboundedSender<ExecutionDownloadFact>>,
-    plan: Arc<TransferPlan>,
-    contribution: TransferPlanContribution,
+    inputs: AssetSourceAcquisitionInputs<Arc<TransferPlan>>,
 ) -> AssetDownloadPipeline {
     let PreparedAssetDownloadPipeline { source_pool, cache } = prepared;
+    let AssetSourceAcquisitionInputs {
+        client,
+        asset_object_base_url,
+        asset_index_id,
+        asset_index_source,
+        fact_tx,
+        plan,
+        contribution,
+    } = inputs;
     let (progress_tx, progress_rx) = mpsc::unbounded_channel();
     let task = tokio::spawn(async move {
         acquire_asset_sources_with_cache(
             AssetSourceAcquisitionRequest::new(
-                client,
-                asset_object_base_url,
-                asset_index_id,
-                asset_index_source,
-                fact_tx,
-                &plan,
-                contribution,
+                AssetSourceAcquisitionInputs {
+                    client,
+                    asset_object_base_url,
+                    asset_index_id,
+                    asset_index_source,
+                    fact_tx,
+                    plan: &plan,
+                    contribution,
+                },
                 |progress| {
                     let _ = progress_tx.send(progress);
                 },
@@ -275,13 +266,16 @@ where
     let GuardedAssetSourceAcquisitionRequest {
         request:
             AssetSourceAcquisitionRequest {
-                client,
-                asset_object_base_url,
-                asset_index_id,
-                asset_index_source,
-                fact_tx,
-                plan,
-                contribution,
+                inputs:
+                    AssetSourceAcquisitionInputs {
+                        client,
+                        asset_object_base_url,
+                        asset_index_id,
+                        asset_index_source,
+                        fact_tx,
+                        plan,
+                        contribution,
+                    },
                 mut send,
             },
         source_pool,

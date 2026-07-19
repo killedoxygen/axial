@@ -3943,13 +3943,13 @@ fn prove_removal_obligations_settled(instance_mods_dir: &Path) -> Result<(), Sta
         .join(MUTATION_DIR_NAME)
         .join(REMOVAL_DIR_NAME);
     validate_managed_recovery_directory(&root)?;
-    let digest_dirs = match fs::read_dir(&root) {
+    let mut digest_dirs = match fs::read_dir(&root) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(StateError::Read(error)),
     };
-    let mut count = 0_usize;
-    for digest_dir in digest_dirs {
+    if let Some(digest_dir) = digest_dirs.next() {
+        let mut count = 0_usize;
         let digest_dir = digest_dir?;
         admit_recovery_entry(&mut count, "managed removal proof entries")?;
         if !digest_dir.file_type()?.is_dir()

@@ -115,8 +115,8 @@ enum WholeInstanceRootAuthority {
 }
 
 enum WholeInstanceRuntimeTerminal {
-    Committed(ManagedRuntimeCommitReceipt),
-    Failed(ManagedRuntimeFailureReceipt),
+    Committed(Box<ManagedRuntimeCommitReceipt>),
+    Failed(Box<ManagedRuntimeFailureReceipt>),
 }
 
 struct SettledVersionBundleRebuildAuthority {
@@ -828,7 +828,7 @@ async fn publish_managed_whole_instance_reconstruction_inner(
             return Err(whole_rollback(
                 projection,
                 WholeInstanceRootAuthority::Lease(lease),
-                WholeInstanceRuntimeTerminal::Committed(runtime),
+                WholeInstanceRuntimeTerminal::Committed(Box::new(runtime)),
                 whole_rollback_effect(effect),
             ));
         }
@@ -844,7 +844,7 @@ async fn publish_managed_whole_instance_reconstruction_inner(
         return Err(whole_rollback(
             projection,
             WholeInstanceRootAuthority::Lease(root_lease),
-            WholeInstanceRuntimeTerminal::Committed(runtime),
+            WholeInstanceRuntimeTerminal::Committed(Box::new(runtime)),
             ManagedWholeInstanceRollbackEffect::ExactPostcheck,
         ));
     }
@@ -860,7 +860,7 @@ async fn publish_managed_whole_instance_reconstruction_inner(
             return Err(whole_rollback(
                 projection,
                 WholeInstanceRootAuthority::Lease(root_lease),
-                WholeInstanceRuntimeTerminal::Failed(runtime),
+                WholeInstanceRuntimeTerminal::Failed(Box::new(runtime)),
                 ManagedWholeInstanceRollbackEffect::RuntimeFinalization,
             ));
         }
@@ -872,7 +872,7 @@ async fn publish_managed_whole_instance_reconstruction_inner(
         return Err(whole_rollback(
             projection,
             WholeInstanceRootAuthority::Lease(root_lease),
-            WholeInstanceRuntimeTerminal::Committed(runtime),
+            WholeInstanceRuntimeTerminal::Committed(Box::new(runtime)),
             ManagedWholeInstanceRollbackEffect::ExactPostcheck,
         ));
     }
@@ -906,7 +906,7 @@ fn whole_sequence_failure(
     whole_rollback(
         projection,
         WholeInstanceRootAuthority::Guard(root_guard),
-        WholeInstanceRuntimeTerminal::Committed(runtime),
+        WholeInstanceRuntimeTerminal::Committed(Box::new(runtime)),
         ManagedWholeInstanceRollbackEffect::ComponentPublication(error.component()),
     )
 }

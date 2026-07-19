@@ -1552,16 +1552,27 @@ pub(super) fn install_failure_evidence_from_download_facts(
         .collect()
 }
 
+pub(crate) struct ContentFailureOutcomeRequest<'a> {
+    pub(crate) operation_id: &'a OperationId,
+    pub(crate) download_facts: &'a [ExecutionDownloadFact],
+    pub(crate) additional_evidence: Option<GuardianInstallArtifactFailureEvidence>,
+    pub(crate) phase: OperationPhase,
+    pub(crate) observed_at: &'a str,
+}
+
 pub(crate) async fn record_content_failure_outcome(
     producer: &ProducerLease,
     journals: Arc<OperationJournalStore>,
     failure_memory: Arc<GuardianFailureMemoryStore>,
-    operation_id: &OperationId,
-    download_facts: &[ExecutionDownloadFact],
-    additional_evidence: Option<GuardianInstallArtifactFailureEvidence>,
-    phase: OperationPhase,
-    observed_at: &str,
+    request: ContentFailureOutcomeRequest<'_>,
 ) -> Result<(), OperationJournalStoreError> {
+    let ContentFailureOutcomeRequest {
+        operation_id,
+        download_facts,
+        additional_evidence,
+        phase,
+        observed_at,
+    } = request;
     let mut evidence = install_failure_evidence_from_download_facts(operation_id, download_facts);
     if let Some(additional_evidence) = additional_evidence {
         evidence.push(additional_evidence);
@@ -1573,11 +1584,13 @@ pub(crate) async fn record_content_failure_outcome(
         producer,
         journals,
         failure_memory,
-        operation_id,
-        CommandKind::ModifyInstanceContent,
-        &evidence,
-        phase,
-        observed_at,
+        OperationGuardianFailureRequest {
+            operation_id,
+            command: CommandKind::ModifyInstanceContent,
+            evidence: &evidence,
+            phase,
+            observed_at,
+        },
     )
     .await
 }
@@ -1817,13 +1830,23 @@ pub(super) async fn record_install_guardian_failure_outcome(
         producer,
         journals,
         failure_memory,
-        operation_id,
-        CommandKind::InstallVersion,
-        evidence,
-        phase,
-        observed_at,
+        OperationGuardianFailureRequest {
+            operation_id,
+            command: CommandKind::InstallVersion,
+            evidence,
+            phase,
+            observed_at,
+        },
     )
     .await
+}
+
+struct OperationGuardianFailureRequest<'a> {
+    operation_id: &'a OperationId,
+    command: CommandKind,
+    evidence: &'a [GuardianInstallArtifactFailureEvidence],
+    phase: OperationPhase,
+    observed_at: &'a str,
 }
 
 fn assess_install_guardian_failure(
@@ -1855,18 +1878,23 @@ async fn record_operation_guardian_failure_outcome(
     producer: &ProducerLease,
     journals: Arc<OperationJournalStore>,
     failure_memory: Arc<GuardianFailureMemoryStore>,
-    operation_id: &OperationId,
-    command: CommandKind,
-    evidence: &[GuardianInstallArtifactFailureEvidence],
-    phase: OperationPhase,
-    observed_at: &str,
+    request: OperationGuardianFailureRequest<'_>,
 ) -> Result<(), OperationJournalStoreError> {
-    record_operation_guardian_evidence(&journals, operation_id, command, evidence, phase).await?;
-    let operation_id = operation_id.clone();
+    record_operation_guardian_evidence(
+        &journals,
+        request.operation_id,
+        request.command,
+        request.evidence,
+        request.phase,
+    )
+    .await?;
+    let operation_id = request.operation_id.clone();
     let logged_operation_id = operation_id.clone();
-    let evidence = evidence.to_vec();
-    let memory_window = ProviderFailureObservationWindow::from_observed_at(observed_at)
+    let evidence = request.evidence.to_vec();
+    let memory_window = ProviderFailureObservationWindow::from_observed_at(request.observed_at)
         .ok_or(OperationJournalStoreError::InvalidGuardianOutcome)?;
+    let command = request.command;
+    let phase = request.phase;
     #[cfg(test)]
     let policy_evaluation_count = crate::guardian::guardian_policy_evaluation_count_scope();
     let settlement = producer.claim_child().spawn_joinable(async move {
@@ -2049,14 +2077,18 @@ async fn settle_operation_guardian_failure(
             PersistedInstallGuardianOutcome::Valid { summary, memory } => {
                 publish_provider_failure_memory_if_needed(
                     failure_memory,
-                    Some(operation_id.clone()),
-                    GuardianMode::Managed,
-                    phase,
-                    evidence,
-                    summary.diagnosis_id(),
-                    summary.decision_is(GuardianActionKind::Retry),
-                    &memory_window.observed_at,
-                    ProviderMemoryPublication::Replay(memory.map(|memory| *memory)),
+                    ProviderFailureMemoryPublicationRequest {
+                        operation_id: Some(operation_id.clone()),
+                        mode: GuardianMode::Managed,
+                        phase,
+                        evidence,
+                        diagnosis_id: summary.diagnosis_id(),
+                        retry: summary.decision_is(GuardianActionKind::Retry),
+                        observed_at: &memory_window.observed_at,
+                        publication: ProviderMemoryPublication::Replay(
+                            memory.map(|memory| *memory),
+                        ),
+                    },
                 )
                 .await?;
                 return Ok(());
@@ -2104,14 +2136,16 @@ async fn settle_operation_guardian_failure(
     if let Some(memory) = memory {
         publish_provider_failure_memory_if_needed(
             failure_memory,
-            Some(operation_id.clone()),
-            GuardianMode::Managed,
-            phase,
-            evidence,
-            outcome.diagnosis_id,
-            true,
-            &memory_window.observed_at,
-            ProviderMemoryPublication::Assessed(memory),
+            ProviderFailureMemoryPublicationRequest {
+                operation_id: Some(operation_id.clone()),
+                mode: GuardianMode::Managed,
+                phase,
+                evidence,
+                diagnosis_id: outcome.diagnosis_id,
+                retry: true,
+                observed_at: &memory_window.observed_at,
+                publication: ProviderMemoryPublication::Assessed(memory),
+            },
         )
         .await?;
     }
@@ -2368,17 +2402,31 @@ enum ProviderMemoryPublication {
     Replay(Option<GuardianInstallOutcomeMemoryPersistence>),
 }
 
-async fn publish_provider_failure_memory_if_needed(
-    failure_memory: Option<&GuardianFailureMemoryStore>,
+struct ProviderFailureMemoryPublicationRequest<'a> {
     operation_id: Option<OperationId>,
     mode: GuardianMode,
     phase: OperationPhase,
-    evidence: &[GuardianInstallArtifactFailureEvidence],
+    evidence: &'a [GuardianInstallArtifactFailureEvidence],
     diagnosis_id: DiagnosisId,
     retry: bool,
-    observed_at: &str,
+    observed_at: &'a str,
     publication: ProviderMemoryPublication,
+}
+
+async fn publish_provider_failure_memory_if_needed(
+    failure_memory: Option<&GuardianFailureMemoryStore>,
+    request: ProviderFailureMemoryPublicationRequest<'_>,
 ) -> Result<(), FailureMemoryStoreError> {
+    let ProviderFailureMemoryPublicationRequest {
+        operation_id,
+        mode,
+        phase,
+        evidence,
+        diagnosis_id,
+        retry,
+        observed_at,
+        publication,
+    } = request;
     if diagnosis_id != DiagnosisId::DownloadUnavailable || !retry {
         return Ok(());
     }

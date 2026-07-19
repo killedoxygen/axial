@@ -52,36 +52,6 @@ pub fn is_terminal_state(state: LaunchState) -> bool {
     matches!(state, LaunchState::Failed | LaunchState::Exited)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::{is_terminal_state, is_terminal_status, launch_stage_label, launch_state_name};
-    use crate::{LaunchState, LaunchStatusEvent};
-
-    #[test]
-    fn recovering_is_a_named_nonterminal_launch_state() {
-        let status = LaunchStatusEvent {
-            state: "recovering".to_string(),
-            benchmark: None,
-            pid: None,
-            exit_code: Some(1),
-            failure_class: Some("unknown".to_string()),
-            failure_detail: None,
-            crash_evidence: None,
-            healing: None,
-            guardian: None,
-            outcome: None,
-            notice: None,
-            evidence: Vec::new(),
-            stages: Vec::new(),
-        };
-
-        assert_eq!(launch_state_name(LaunchState::Recovering), "recovering");
-        assert_eq!(launch_stage_label("recovering"), "Recovering startup");
-        assert!(!is_terminal_state(LaunchState::Recovering));
-        assert!(!is_terminal_status(&status));
-    }
-}
-
 pub fn failure_class_name(class: LaunchFailureClass) -> &'static str {
     class.as_str()
 }
@@ -129,5 +99,35 @@ pub fn snapshot_status(record: &LaunchSessionRecord) -> LaunchStatusEvent {
         notice: None,
         evidence: Vec::new(),
         stages: record.stages.clone(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{is_terminal_state, is_terminal_status, launch_stage_label, launch_state_name};
+    use crate::{LaunchState, LaunchStatusEvent};
+
+    #[test]
+    fn recovering_is_a_named_nonterminal_launch_state() {
+        let status = LaunchStatusEvent {
+            state: "recovering".to_string(),
+            benchmark: None,
+            pid: None,
+            exit_code: Some(1),
+            failure_class: Some("unknown".to_string()),
+            failure_detail: None,
+            crash_evidence: None,
+            healing: None,
+            guardian: None,
+            outcome: None,
+            notice: None,
+            evidence: Vec::new(),
+            stages: Vec::new(),
+        };
+
+        assert_eq!(launch_state_name(LaunchState::Recovering), "recovering");
+        assert_eq!(launch_stage_label("recovering"), "Recovering startup");
+        assert!(!is_terminal_state(LaunchState::Recovering));
+        assert!(!is_terminal_status(&status));
     }
 }

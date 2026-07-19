@@ -1236,7 +1236,7 @@ pub(crate) struct ManagedVersionBundleReconstruction {
 }
 
 pub(crate) enum VersionBundleProjectionAuthority {
-    Reconstructed(KnownGoodReconstructionReceipt),
+    Reconstructed(Box<KnownGoodReconstructionReceipt>),
     Registered {
         version_id: KnownGoodId,
         inventory: Arc<KnownGoodInventory>,
@@ -1347,7 +1347,7 @@ impl RetainedKnownGoodReconstruction {
             sources,
         )?;
         Ok(ManagedVersionBundleReconstruction {
-            projection: VersionBundleProjectionAuthority::Reconstructed(receipt),
+            projection: VersionBundleProjectionAuthority::Reconstructed(Box::new(receipt)),
             managed_root,
             source,
         })

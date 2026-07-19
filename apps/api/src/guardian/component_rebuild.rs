@@ -150,7 +150,7 @@ enum VersionBundleComponentRebuildEffectResultInner {
 enum RuntimeComponentRebuildEffectResultInner {
     Succeeded {
         effect: ManagedRuntimeComponentRebuildEffect,
-        receipt: ManagedRuntimeCommitReceipt,
+        receipt: Box<ManagedRuntimeCommitReceipt>,
         facts: Vec<String>,
     },
     FailedBeforeEffect {
@@ -159,7 +159,7 @@ enum RuntimeComponentRebuildEffectResultInner {
     },
     FailedAfterEffect {
         effect: ManagedRuntimeComponentRebuildEffect,
-        receipt: ManagedRuntimeFailureReceipt,
+        receipt: Box<ManagedRuntimeFailureReceipt>,
         facts: Vec<String>,
     },
 }
@@ -200,7 +200,7 @@ impl ManagedRuntimeComponentRebuildEffect {
         RuntimeComponentRebuildEffectResult {
             inner: RuntimeComponentRebuildEffectResultInner::Succeeded {
                 effect: self,
-                receipt,
+                receipt: Box::new(receipt),
                 facts: bounded_fact_ids(facts),
             },
         }
@@ -220,7 +220,7 @@ impl ManagedRuntimeComponentRebuildEffect {
 
     pub(crate) fn failed_after_effect(
         self,
-        receipt: ManagedRuntimeFailureReceipt,
+        receipt: Box<ManagedRuntimeFailureReceipt>,
         facts: impl IntoIterator<Item = String>,
     ) -> RuntimeComponentRebuildEffectResult {
         RuntimeComponentRebuildEffectResult {
@@ -472,15 +472,19 @@ where
     let exact_proof_lifetime = REGISTERED_ARTIFACT_EXACT_PROOF_LIFETIME
         .try_with(Arc::clone)
         .ok();
+    #[cfg(test)]
     let owner = producer.spawn_joinable(async move {
-        #[cfg(test)]
-        if let Some(exact_proof_lifetime) = exact_proof_lifetime {
-            return REGISTERED_ARTIFACT_EXACT_PROOF_LIFETIME
-                .scope(exact_proof_lifetime, owner)
-                .await;
+        match exact_proof_lifetime {
+            Some(exact_proof_lifetime) => {
+                REGISTERED_ARTIFACT_EXACT_PROOF_LIFETIME
+                    .scope(exact_proof_lifetime, owner)
+                    .await
+            }
+            None => owner.await,
         }
-        owner.await
     });
+    #[cfg(not(test))]
+    let owner = producer.spawn_joinable(owner);
     owner.await.map_err(|_| {
         invalid_component_rebuild_error(
             std::io::ErrorKind::Other,
@@ -1033,7 +1037,7 @@ pub(crate) async fn execute_managed_assets_component_rebuild_fixture_for_test(
 
 enum ComponentRebuildTerminal {
     Succeeded {
-        receipt: ManagedRuntimeCommitReceipt,
+        receipt: Box<ManagedRuntimeCommitReceipt>,
         facts: Vec<String>,
     },
     FailedBeforeEffect {
@@ -1041,7 +1045,7 @@ enum ComponentRebuildTerminal {
         step_id: &'static str,
     },
     FailedAfterEffect {
-        receipt: ManagedRuntimeFailureReceipt,
+        receipt: Box<ManagedRuntimeFailureReceipt>,
         facts: Vec<String>,
     },
 }
@@ -1089,8 +1093,8 @@ enum AssetsComponentRebuildTerminal {
 }
 
 enum ComponentRebuildPublicationLease {
-    RuntimeCommit(ManagedRuntimeCommitReceipt),
-    RuntimeFailure(ManagedRuntimeFailureReceipt),
+    RuntimeCommit(Box<ManagedRuntimeCommitReceipt>),
+    RuntimeFailure(Box<ManagedRuntimeFailureReceipt>),
 }
 
 impl ComponentRebuildPublicationLease {

@@ -556,9 +556,10 @@ struct InstallQueueSelection {
 use loader::start_loader_install_with_foreground;
 #[cfg(test)]
 use loader::{
-    dispatch_loader_install_failure, loader_install_done_progress, loader_install_error_progress,
-    observe_active_vanilla_base_install, publish_known_good_loader_terminal,
-    require_exact_loader_receipt_version, wait_for_observed_vanilla_base_install,
+    LoaderInstallFailureRequest, dispatch_loader_install_failure, loader_install_done_progress,
+    loader_install_error_progress, observe_active_vanilla_base_install,
+    publish_known_good_loader_terminal, require_exact_loader_receipt_version,
+    wait_for_observed_vanilla_base_install,
 };
 pub use loader::{
     loader_builds, loader_components, loader_game_versions, loader_pre_operation_error_response,
@@ -573,8 +574,9 @@ pub use model::{
     InstallVersionStartRequest, LoaderBuildsRequest, LoaderInstallStartRequest,
 };
 use operation::{
-    ContentDownloadFactAccumulator, InstallProgressCoalescer, InstallProgressPresenter,
-    begin_content_operation_journal, install_failure_evidence_from_download_error_or_facts,
+    ContentDownloadFactAccumulator, ContentFailureOutcomeRequest, InstallProgressCoalescer,
+    InstallProgressPresenter, begin_content_operation_journal,
+    install_failure_evidence_from_download_error_or_facts,
     install_failure_evidence_from_download_facts, install_failure_point_from_journal,
     install_journal_is_terminal, install_progress_history_from_journal,
     install_progress_with_terminal_error, interrupted_install_progress,
@@ -2304,11 +2306,13 @@ where
                 &interrupted_guardian_owner,
                 interrupted_journals.clone(),
                 interrupted_state.failure_memory().clone(),
-                &interrupted_operation_id,
-                progress,
-                &journal_facts,
-                &facts,
-                attempted_terminal,
+                ContentWorkerInterruptionRequest {
+                    operation_id: &interrupted_operation_id,
+                    fallback: progress,
+                    journal_facts: &journal_facts,
+                    execution_facts: &facts,
+                    attempted_terminal,
+                },
             )
             .await
         },
@@ -2356,11 +2360,13 @@ async fn commit_and_emit_content_terminal_progress(
             producer,
             journals.clone(),
             failure_memory,
-            terminal.operation_id,
-            terminal.execution_facts,
-            evidence,
-            phase,
-            &chrono::Utc::now().to_rfc3339(),
+            ContentFailureOutcomeRequest {
+                operation_id: terminal.operation_id,
+                download_facts: terminal.execution_facts,
+                additional_evidence: evidence,
+                phase,
+                observed_at: &chrono::Utc::now().to_rfc3339(),
+            },
         )
         .await?;
     }
@@ -2382,19 +2388,30 @@ async fn commit_and_emit_content_terminal_progress(
     Ok(())
 }
 
-async fn settle_content_worker_interruption(
-    producer: &ProducerLease,
-    journals: Arc<OperationJournalStore>,
-    failure_memory: Arc<crate::state::GuardianFailureMemoryStore>,
-    operation_id: &OperationId,
+struct ContentWorkerInterruptionRequest<'a> {
+    operation_id: &'a OperationId,
     fallback: DownloadProgress,
-    journal_facts: &[String],
-    execution_facts: &[axial_minecraft::download::ExecutionDownloadFact],
+    journal_facts: &'a [String],
+    execution_facts: &'a [axial_minecraft::download::ExecutionDownloadFact],
     attempted_terminal: Option<(
         DownloadProgress,
         Option<crate::application::content::ContentExecutionFailureKind>,
     )>,
+}
+
+async fn settle_content_worker_interruption(
+    producer: &ProducerLease,
+    journals: Arc<OperationJournalStore>,
+    failure_memory: Arc<crate::state::GuardianFailureMemoryStore>,
+    request: ContentWorkerInterruptionRequest<'_>,
 ) -> Option<DownloadProgress> {
+    let ContentWorkerInterruptionRequest {
+        operation_id,
+        fallback,
+        journal_facts,
+        execution_facts,
+        attempted_terminal,
+    } = request;
     loop {
         if let Some((attempted_progress, failure_kind)) = attempted_terminal.as_ref()
             && attempted_progress.error.is_some()
@@ -2408,11 +2425,13 @@ async fn settle_content_worker_interruption(
                 producer,
                 journals.clone(),
                 failure_memory.clone(),
-                operation_id,
-                execution_facts,
-                evidence,
-                phase,
-                &chrono::Utc::now().to_rfc3339(),
+                ContentFailureOutcomeRequest {
+                    operation_id,
+                    download_facts: execution_facts,
+                    additional_evidence: evidence,
+                    phase,
+                    observed_at: &chrono::Utc::now().to_rfc3339(),
+                },
             )
             .await
             {

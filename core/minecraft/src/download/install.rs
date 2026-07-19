@@ -5,10 +5,10 @@ use super::asset_source::{
 #[cfg(test)]
 use super::assets::AssetDownloadPipeline;
 use super::assets::{
-    ASSET_OBJECT_BASE_URL, AssetDownloadPipelineEvent, AssetSourceAcquisitionRequest,
-    RetainedAssetsAcquisition, abort_asset_download_pipeline, acquire_asset_sources_with_cache,
-    asset_cache_error, next_asset_download_pipeline_event, prepare_asset_download_pipeline,
-    spawn_asset_download_pipeline,
+    ASSET_OBJECT_BASE_URL, AssetDownloadPipelineEvent, AssetSourceAcquisitionInputs,
+    AssetSourceAcquisitionRequest, RetainedAssetsAcquisition, abort_asset_download_pipeline,
+    acquire_asset_sources_with_cache, asset_cache_error, next_asset_download_pipeline_event,
+    prepare_asset_download_pipeline, spawn_asset_download_pipeline,
 };
 use super::client::{library_download_concurrency, standard_minecraft_download_client};
 use super::facts::selected_download_source_label;
@@ -1861,13 +1861,15 @@ impl Downloader {
                         cache_proofs,
                     } = acquire_asset_sources_with_cache(
                         AssetSourceAcquisitionRequest::new(
-                            self.client.clone(),
-                            Arc::clone(&self.asset_object_base_url),
-                            version.asset_index.id.clone(),
-                            source,
-                            None,
-                            &plan,
-                            contribution,
+                            AssetSourceAcquisitionInputs {
+                                client: self.client.clone(),
+                                asset_object_base_url: Arc::clone(&self.asset_object_base_url),
+                                asset_index_id: version.asset_index.id.clone(),
+                                asset_index_source: source,
+                                fact_tx: None,
+                                plan: &plan,
+                                contribution,
+                            },
                             |_| {},
                         )
                         .bind(source_pool, cache),
@@ -2209,13 +2211,15 @@ impl Downloader {
             (Some(prepared), Some(source), Some(contribution)) => {
                 Some(spawn_asset_download_pipeline(
                     prepared,
-                    self.client.clone(),
-                    Arc::clone(&self.asset_object_base_url),
-                    version.asset_index.id.clone(),
-                    source,
-                    fact_tx.cloned(),
-                    plan.clone(),
-                    contribution,
+                    AssetSourceAcquisitionInputs {
+                        client: self.client.clone(),
+                        asset_object_base_url: Arc::clone(&self.asset_object_base_url),
+                        asset_index_id: version.asset_index.id.clone(),
+                        asset_index_source: source,
+                        fact_tx: fact_tx.cloned(),
+                        plan: plan.clone(),
+                        contribution,
+                    },
                 ))
             }
             (None, None, None) => None,

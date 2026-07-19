@@ -302,11 +302,13 @@ pub(super) async fn start_loader_install_with_foreground(
                         &guardian_owner,
                         worker_journals.clone(),
                         worker_failure_memory.clone(),
-                        &worker_operation_id,
-                        &loader_target_id,
-                        &base_version_id,
-                        error,
-                        &observed_at,
+                        LoaderInstallFailureRequest {
+                            operation_id: &worker_operation_id,
+                            loader_target_id: &loader_target_id,
+                            base_version_id: &base_version_id,
+                            error,
+                            observed_at: &observed_at,
+                        },
                     )
                     .await;
                     let failure_summary = progress
@@ -444,16 +446,27 @@ where
     }
 }
 
+pub(super) struct LoaderInstallFailureRequest<'a> {
+    pub(super) operation_id: &'a crate::state::contracts::OperationId,
+    pub(super) loader_target_id: &'a str,
+    pub(super) base_version_id: &'a str,
+    pub(super) error: LoaderInstallError,
+    pub(super) observed_at: &'a str,
+}
+
 pub(super) async fn dispatch_loader_install_failure(
     producer: &ProducerLease,
     journals: Arc<crate::state::OperationJournalStore>,
     failure_memory: Arc<crate::state::GuardianFailureMemoryStore>,
-    operation_id: &crate::state::contracts::OperationId,
-    loader_target_id: &str,
-    base_version_id: &str,
-    error: LoaderInstallError,
-    observed_at: &str,
+    request: LoaderInstallFailureRequest<'_>,
 ) {
+    let LoaderInstallFailureRequest {
+        operation_id,
+        loader_target_id,
+        base_version_id,
+        error,
+        observed_at,
+    } = request;
     match error {
         LoaderInstallError::BaseInstallFailed(failure) => {
             if failure.facts().is_empty() {

@@ -475,12 +475,14 @@ where
     Admit: FnOnce() -> Result<Permit, ManagedRuntimeMutationRefused>,
 {
     ensure_runtime_with_events_from_source(
-        cache,
-        java_version,
-        override_path,
-        force_managed,
-        probe_receipt,
-        RuntimeEnsureSource::Production,
+        RuntimeEnsureRequest {
+            cache,
+            java_version,
+            override_path,
+            force_managed,
+            probe_receipt,
+            source: RuntimeEnsureSource::Production,
+        },
         admit_managed_mutation,
         observer,
     )
@@ -502,12 +504,14 @@ where
     Admit: FnOnce() -> Result<Permit, ManagedRuntimeMutationRefused>,
 {
     ensure_runtime_with_events_from_source(
-        cache,
-        java_version,
-        override_path,
-        force_managed,
-        probe_receipt,
-        RuntimeEnsureSource::PersistedManifest,
+        RuntimeEnsureRequest {
+            cache,
+            java_version,
+            override_path,
+            force_managed,
+            probe_receipt,
+            source: RuntimeEnsureSource::PersistedManifest,
+        },
         admit_managed_mutation,
         observer,
     )
@@ -521,13 +525,17 @@ enum RuntimeEnsureSource {
     PersistedManifest,
 }
 
-async fn ensure_runtime_with_events_from_source<F, Admit, Permit>(
-    cache: &ManagedRuntimeCache,
-    java_version: &JavaVersion,
-    override_path: &str,
+struct RuntimeEnsureRequest<'a> {
+    cache: &'a ManagedRuntimeCache,
+    java_version: &'a JavaVersion,
+    override_path: &'a str,
     force_managed: bool,
-    probe_receipt: Option<&JavaRuntimeProbeReceipt>,
+    probe_receipt: Option<&'a JavaRuntimeProbeReceipt>,
     source: RuntimeEnsureSource,
+}
+
+async fn ensure_runtime_with_events_from_source<F, Admit, Permit>(
+    request: RuntimeEnsureRequest<'_>,
     admit_managed_mutation: Admit,
     mut observer: F,
 ) -> Result<RuntimeEnsureResult, JavaRuntimeLookupError>
@@ -535,6 +543,14 @@ where
     F: FnMut(RuntimeEnsureEvent),
     Admit: FnOnce() -> Result<Permit, ManagedRuntimeMutationRefused>,
 {
+    let RuntimeEnsureRequest {
+        cache,
+        java_version,
+        override_path,
+        force_managed,
+        probe_receipt,
+        source,
+    } = request;
     let mut mutation_admission = Some(admit_managed_mutation);
     let requirement = runtime_requirement(java_version);
     let requested_override = parse_runtime_override(override_path);

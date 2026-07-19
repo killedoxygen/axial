@@ -1568,7 +1568,7 @@ mod tests {
 
         assert_eq!(
             cache.due_registered_instances(&state, None, verified_at + CLEAN_RECEIPT_MAX_AGE,),
-            [instance_id.clone()]
+            std::slice::from_ref(&instance_id)
         );
         execute_production_receipt_pass(
             &state,
@@ -1645,7 +1645,7 @@ mod tests {
             .expect("replace receipted identity");
         assert_eq!(
             cache.due_registered_instances(&state, None, now),
-            [replaced_id.clone()]
+            std::slice::from_ref(&replaced_id)
         );
         assert!(!cache.receipts.contains_key(&replaced_id));
         state
@@ -1690,7 +1690,7 @@ mod tests {
         populated.record_terminal(&state, &instance_id, SchedulerExecution::nonclean());
         assert_eq!(
             populated.due_registered_instances(&state, None, now),
-            [instance_id.clone()]
+            std::slice::from_ref(&instance_id)
         );
 
         let mut restarted = KnownGoodTier2ReceiptCache::default();

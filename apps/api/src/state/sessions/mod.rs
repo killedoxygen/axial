@@ -73,12 +73,7 @@ struct SessionEntry {
 struct PendingProcessSettlement {
     generation: u64,
     attempt: Arc<ProcessAttemptScope>,
-    state: PendingProcessSettlementState,
-}
-
-enum PendingProcessSettlementState {
-    Available(LaunchStatusEvent),
-    Claimed,
+    event: Option<LaunchStatusEvent>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -842,7 +837,7 @@ impl SessionStore {
             return Err(LaunchFailureTerminationErrorClass::AlreadyTerminal);
         }
         if let Some(pending) = entry.pending_process_settlement.as_ref()
-            && matches!(pending.state, PendingProcessSettlementState::Claimed)
+            && pending.event.is_none()
         {
             return Err(LaunchFailureTerminationErrorClass::SettlementClaimed);
         }
@@ -1096,17 +1091,12 @@ impl SessionStore {
         {
             return None;
         }
-        let event = match std::mem::replace(
-            &mut entry
-                .pending_process_settlement
-                .as_mut()
-                .expect("checked pending process settlement")
-                .state,
-            PendingProcessSettlementState::Claimed,
-        ) {
-            PendingProcessSettlementState::Available(event) => event,
-            PendingProcessSettlementState::Claimed => return None,
-        };
+        let event = entry
+            .pending_process_settlement
+            .as_mut()
+            .expect("checked pending process settlement")
+            .event
+            .take()?;
         let record = entry.record.clone();
         let stop_requested = entry.stop_requested;
         let attempt = entry
@@ -1675,7 +1665,7 @@ impl SessionStore {
         entry.pending_process_settlement = Some(PendingProcessSettlement {
             generation,
             attempt: attempt.clone(),
-            state: PendingProcessSettlementState::Available(event),
+            event: Some(event),
         });
         let mut settling = LaunchStatusEvent {
             state: "settling".to_string(),
@@ -1725,7 +1715,7 @@ impl SessionStore {
             .filter(|pending| {
                 pending.generation == generation
                     && attempt_scopes_match(&pending.attempt, attempt)
-                    && matches!(pending.state, PendingProcessSettlementState::Claimed)
+                    && pending.event.is_none()
             })?;
         debug_assert_eq!(pending.attempt.id, attempt.id);
         entry.pending_process_settlement = None;
@@ -2209,9 +2199,7 @@ impl SessionStore {
                     entry
                         .pending_process_settlement
                         .as_ref()
-                        .is_some_and(|pending| {
-                            matches!(pending.state, PendingProcessSettlementState::Claimed)
-                        }),
+                        .is_some_and(|pending| pending.event.is_none()),
                 )
             })
         else {
@@ -4243,7 +4231,7 @@ mod tests {
         store
             .release_terminal_retention_hold(proof_session_id)
             .await;
-        assert!(store.get(proof_session_id).await.is_some());
+        assert!(store.get(proof_session_id).await.is_none());
         assert_eq!(
             store
                 .sessions
@@ -4436,7 +4424,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn launch_status_public_notice_and_stage_notes_redact_sensitive_details() {
+    async fn launch_status_notice_and_stage_notes_redact_sensitive_details() {
         let store = SessionStore::new();
         store
             .insert(test_record("guardian-stage-redaction"))
@@ -4476,7 +4464,18 @@ mod tests {
                         ]
                     })),
                     outcome: None,
-                    notice: None,
+                    notice: Some(LaunchNotice {
+                        message: "Guardian blocked an unsafe launch setup.".to_string(),
+                        detail: Some("Review the latest game log before retrying.".to_string()),
+                        details: vec![
+                            "Review the latest game log before retrying.".to_string(),
+                            r#"Java failed at C:\Users\Alice\AppData\java.exe -Xmx8192M -Dtoken=raw"#
+                                .to_string(),
+                            "provider_payload={\"token\":\"secret\"} account_id=account-secret username=SecretPlayer"
+                                .to_string(),
+                        ],
+                        tone: axial_launcher::LaunchNoticeTone::Error,
+                    }),
                     evidence: Vec::new(),
                     stages: Vec::new(),
                 },
@@ -4487,7 +4486,7 @@ mod tests {
         let LaunchEvent::Status(status) = emitted else {
             panic!("expected status event");
         };
-        let notice = status.notice.as_ref().expect("public notice");
+        let notice = status.notice.as_ref().expect("sanitized notice");
         assert_eq!(notice.message, "Guardian blocked an unsafe launch setup.");
         assert_eq!(
             notice.details,
@@ -7272,7 +7271,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn launch_terminal_statuses_emit_distinct_backend_outcomes_and_notices() {
+    async fn launch_terminal_statuses_emit_distinct_backend_outcomes_and_stage_results() {
         let store = SessionStore::new();
 
         let (preboot_status, preboot_record) = insert_and_emit_terminal_status(
@@ -7285,17 +7284,7 @@ mod tests {
             preboot_record.outcome.expect("preboot outcome").reason,
             LaunchSessionExitReason::CrashedBeforeBoot
         );
-        assert_eq!(
-            preboot_status
-                .notice
-                .as_ref()
-                .map(|notice| notice.message.as_str()),
-            Some("Minecraft exited before startup completed.")
-        );
-        assert_eq!(
-            preboot_status.notice.as_ref().map(|notice| notice.tone),
-            Some(axial_launcher::LaunchNoticeTone::Error)
-        );
+        assert_eq!(preboot_status.notice, None);
         assert_eq!(
             preboot_status
                 .stages
@@ -7318,20 +7307,7 @@ mod tests {
             stalled_record.outcome.expect("stalled outcome").reason,
             LaunchSessionExitReason::StartupStalled
         );
-        assert_eq!(
-            stalled_status
-                .notice
-                .as_ref()
-                .map(|notice| notice.message.as_str()),
-            Some("Minecraft did not finish startup in time.")
-        );
-        assert_eq!(
-            stalled_status
-                .notice
-                .as_ref()
-                .and_then(|notice| notice.detail.as_deref()),
-            Some("no startup activity observed.")
-        );
+        assert_eq!(stalled_status.notice, None);
 
         let (external_status, external_record) = insert_and_emit_terminal_status(
             &store,
@@ -7394,13 +7370,7 @@ mod tests {
             postboot_record.outcome.expect("postboot outcome").reason,
             LaunchSessionExitReason::CrashedAfterBoot
         );
-        assert_eq!(
-            postboot_status
-                .notice
-                .as_ref()
-                .map(|notice| notice.message.as_str()),
-            Some("Minecraft crashed after startup.")
-        );
+        assert_eq!(postboot_status.notice, None);
         assert_eq!(
             postboot_status
                 .stages
@@ -7419,17 +7389,7 @@ mod tests {
             unknown_record.outcome.expect("unknown outcome").reason,
             LaunchSessionExitReason::UnknownExit
         );
-        assert_eq!(
-            unknown_status
-                .notice
-                .as_ref()
-                .map(|notice| notice.message.as_str()),
-            Some("Minecraft exited and the launcher could not classify the reason.")
-        );
-        assert_eq!(
-            unknown_status.notice.as_ref().map(|notice| notice.tone),
-            Some(axial_launcher::LaunchNoticeTone::Error)
-        );
+        assert_eq!(unknown_status.notice, None);
     }
 
     #[tokio::test]

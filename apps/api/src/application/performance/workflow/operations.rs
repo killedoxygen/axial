@@ -58,6 +58,16 @@ const PERFORMANCE_RETRY_MAX_DELAY_MS: u64 = 1_000;
 
 pub(super) type PerformanceApplicationError = (StatusCode, Json<serde_json::Value>);
 
+pub(super) struct PerformanceOperationResultRequest<'a> {
+    pub(super) operation_id: &'a OperationId,
+    pub(super) action: PerformanceInstallAction,
+    pub(super) fallback_target_id: &'a str,
+    pub(super) terminal_rollback: RollbackState,
+    pub(super) changed_target: bool,
+    pub(super) result: &'a Result<PerformanceInstallResponse, PerformanceApplicationError>,
+    pub(super) failure_signal: Option<&'a PerformancePersistenceFailureSignal>,
+}
+
 fn performance_shutdown_error() -> PerformanceApplicationError {
     (
         StatusCode::SERVICE_UNAVAILABLE,
@@ -3665,14 +3675,17 @@ fn generated_performance_journal_operation_id(action: PerformanceInstallAction) 
 
 pub(super) async fn record_performance_operation_result(
     state: &AppState,
-    operation_id: &OperationId,
-    action: PerformanceInstallAction,
-    fallback_target_id: &str,
-    terminal_rollback: RollbackState,
-    changed_target: bool,
-    result: &Result<PerformanceInstallResponse, PerformanceApplicationError>,
-    failure_signal: Option<&PerformancePersistenceFailureSignal>,
+    request: PerformanceOperationResultRequest<'_>,
 ) -> Result<(), PerformanceOperationExecutionError> {
+    let PerformanceOperationResultRequest {
+        operation_id,
+        action,
+        fallback_target_id,
+        terminal_rollback,
+        changed_target,
+        result,
+        failure_signal,
+    } = request;
     let target_id = match result {
         Ok(response) => {
             let response_target_id = response.composition_id.trim();

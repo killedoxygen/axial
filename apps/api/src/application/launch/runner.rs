@@ -3103,7 +3103,12 @@ mod tests {
                 .and_then(|guardian| guardian["decision"].as_str()),
             Some("intervened")
         );
-        assert!(running_status.notice.is_some());
+        assert_eq!(running_status.notice, None);
+        assert!(
+            super::super::reports::public_launch_status(running_status)
+                .notice
+                .is_some()
+        );
         let running_record = state
             .sessions()
             .get(session_id)

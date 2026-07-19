@@ -728,7 +728,7 @@ fn family_c_qualification_managed_install_state_evidence(
     let has_installed = installed_count > 0;
     let composition_matches = composition_state.composition_id == FAMILY_C_MANAGED_COMPOSITION_ID;
     let expected_artifacts_present =
-        has_installed && family_c_managed_expected_artifacts_present(&composition_state);
+        has_installed && family_c_managed_expected_artifacts_present(composition_state);
     let ownership = has_installed
         && composition_state.installed_mods.iter().all(|installed| {
             installed.ownership_class == axial_performance::OwnershipClass::CompositionManaged

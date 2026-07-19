@@ -520,7 +520,7 @@ impl SecureAuthSnapshotPersistence {
     pub(crate) fn for_app_startup() -> io::Result<Self> {
         #[cfg(debug_assertions)]
         {
-            return match select_secure_auth_backend(std::env::var_os(SECURE_AUTH_VOLATILE_ENV))? {
+            match select_secure_auth_backend(std::env::var_os(SECURE_AUTH_VOLATILE_ENV))? {
                 SecureAuthBackendSelection::OsKeyring => {
                     Ok(Self::with_backend(Arc::new(KeyringCredentialEntryBackend)))
                 }
@@ -528,7 +528,7 @@ impl SecureAuthSnapshotPersistence {
                     Arc::new(VolatileCredentialEntryBackend::default()),
                     SecureAuthPersistenceMode::IsolatedVolatile,
                 )),
-            };
+            }
         }
 
         #[cfg(not(debug_assertions))]

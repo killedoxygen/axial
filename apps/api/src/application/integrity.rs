@@ -81,6 +81,17 @@ pub(super) struct IntegritySweepReservationFailure {
     error: IdleSweepReserveError,
 }
 
+struct ReservedIntegrityExecutionContext {
+    state: AppState,
+    recovery_producer: ProducerLease,
+    instance_id: String,
+    journal: OperationJournalEntry,
+    settlement: IdleSweepSettlementOwner,
+    rebuild_source: RegisteredArtifactComponentRebuildSource,
+    #[cfg(all(test, target_os = "linux"))]
+    progress_observer: Option<IntegrityTier2ProgressObserver>,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub(super) enum Tier2IntegritySweepError {
     #[error("Tier 2 integrity target is not a canonical instance")]
@@ -236,15 +247,17 @@ impl PlannedIntegritySweep {
         let recovery_producer = producer.claim_child();
         IntegritySweepExecution {
             completion: producer.spawn_joinable(execute_reserved_owned_with_source(
-                state,
-                recovery_producer,
-                instance_id,
-                journal,
-                settlement,
+                ReservedIntegrityExecutionContext {
+                    state,
+                    recovery_producer,
+                    instance_id,
+                    journal,
+                    settlement,
+                    rebuild_source,
+                    #[cfg(target_os = "linux")]
+                    progress_observer: None,
+                },
                 after_spawn,
-                rebuild_source,
-                #[cfg(target_os = "linux")]
-                None,
             )),
         }
     }
@@ -264,14 +277,16 @@ impl PlannedIntegritySweep {
         let recovery_producer = producer.claim_child();
         IntegritySweepExecution {
             completion: producer.spawn_joinable(execute_reserved_owned_with_source(
-                state,
-                recovery_producer,
-                instance_id,
-                journal,
-                settlement,
+                ReservedIntegrityExecutionContext {
+                    state,
+                    recovery_producer,
+                    instance_id,
+                    journal,
+                    settlement,
+                    rebuild_source: RegisteredArtifactComponentRebuildSource::Production,
+                    progress_observer: Some(progress_observer),
+                },
                 |_| {},
-                RegisteredArtifactComponentRebuildSource::Production,
-                Some(progress_observer),
             )),
         }
     }
@@ -296,34 +311,38 @@ where
     AfterSpawn: FnOnce(IdleSweepCancellation),
 {
     execute_reserved_owned_with_source(
-        state,
-        recovery_producer,
-        instance_id,
-        journal,
-        settlement,
+        ReservedIntegrityExecutionContext {
+            state,
+            recovery_producer,
+            instance_id,
+            journal,
+            settlement,
+            rebuild_source: RegisteredArtifactComponentRebuildSource::Production,
+            #[cfg(all(test, target_os = "linux"))]
+            progress_observer: None,
+        },
         after_spawn,
-        RegisteredArtifactComponentRebuildSource::Production,
-        #[cfg(all(test, target_os = "linux"))]
-        None,
     )
     .await
 }
 
 async fn execute_reserved_owned_with_source<AfterSpawn>(
-    state: AppState,
-    recovery_producer: ProducerLease,
-    instance_id: String,
-    journal: OperationJournalEntry,
-    settlement: IdleSweepSettlementOwner,
+    context: ReservedIntegrityExecutionContext,
     after_spawn: AfterSpawn,
-    rebuild_source: RegisteredArtifactComponentRebuildSource,
-    #[cfg(all(test, target_os = "linux"))] progress_observer: Option<
-        IntegrityTier2ProgressObserver,
-    >,
 ) -> Result<IdleIntegrityCompletion, Tier2IntegritySweepError>
 where
     AfterSpawn: FnOnce(IdleSweepCancellation),
 {
+    let ReservedIntegrityExecutionContext {
+        state,
+        recovery_producer,
+        instance_id,
+        journal,
+        settlement,
+        rebuild_source,
+        #[cfg(all(test, target_os = "linux"))]
+        progress_observer,
+    } = context;
     let authority = settlement.authority();
     let ticket = match state
         .mint_known_good_tier2_ticket(&authority, &instance_id)

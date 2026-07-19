@@ -277,12 +277,14 @@ impl ManagedCompositionInstallPlan {
         pins.sort_by(|left, right| left.project_id.cmp(&right.project_id));
         edges.sort();
         let graph_digest = graph_digest(
-            &declarative.composition_id,
-            declarative.family,
-            declarative.tier,
-            &game_version,
-            &loader,
-            aggregate_bytes,
+            CanonicalGraphDigestInputs {
+                composition_id: &declarative.composition_id,
+                family: declarative.family,
+                tier: declarative.tier,
+                game_version: &game_version,
+                loader: &loader,
+                aggregate_bytes,
+            },
             pins.iter().map(CanonicalGraphNode::from_pin),
             edges.iter().map(CanonicalGraphEdge::from_plan),
         );
@@ -559,13 +561,17 @@ impl<'a> CanonicalGraphEdge<'a> {
     }
 }
 
-fn graph_digest<'a>(
-    composition_id: &str,
+struct CanonicalGraphDigestInputs<'a> {
+    composition_id: &'a str,
     family: VersionFamily,
     tier: CompositionTier,
-    game_version: &str,
-    loader: &str,
+    game_version: &'a str,
+    loader: &'a str,
     aggregate_bytes: u64,
+}
+
+fn graph_digest<'a>(
+    inputs: CanonicalGraphDigestInputs<'_>,
     pins: impl ExactSizeIterator<Item = CanonicalGraphNode<'a>>,
     edges: impl ExactSizeIterator<Item = CanonicalGraphEdge<'a>>,
 ) -> String {
@@ -575,15 +581,23 @@ fn graph_digest<'a>(
         b"domain",
         b"axial.managed-composition-install-plan.v1",
     );
-    hash_field(&mut hasher, b"composition", composition_id.as_bytes());
-    hash_field(&mut hasher, b"family", family_name(family).as_bytes());
-    hash_field(&mut hasher, b"tier", tier_name(tier).as_bytes());
-    hash_field(&mut hasher, b"game_version", game_version.as_bytes());
-    hash_field(&mut hasher, b"loader", loader.as_bytes());
+    hash_field(
+        &mut hasher,
+        b"composition",
+        inputs.composition_id.as_bytes(),
+    );
+    hash_field(
+        &mut hasher,
+        b"family",
+        family_name(inputs.family).as_bytes(),
+    );
+    hash_field(&mut hasher, b"tier", tier_name(inputs.tier).as_bytes());
+    hash_field(&mut hasher, b"game_version", inputs.game_version.as_bytes());
+    hash_field(&mut hasher, b"loader", inputs.loader.as_bytes());
     hash_field(
         &mut hasher,
         b"aggregate_bytes",
-        &aggregate_bytes.to_be_bytes(),
+        &inputs.aggregate_bytes.to_be_bytes(),
     );
     let pin_count = pins.len();
     hash_field(&mut hasher, b"pin_count", &(pin_count as u64).to_be_bytes());
@@ -737,12 +751,14 @@ pub(crate) fn canonical_state_graph_digest(
     }
 
     let digest = graph_digest(
-        &state.composition_id,
-        state.family,
-        state.tier,
-        &state.game_version,
-        &state.loader,
-        aggregate_bytes,
+        CanonicalGraphDigestInputs {
+            composition_id: &state.composition_id,
+            family: state.family,
+            tier: state.tier,
+            game_version: &state.game_version,
+            loader: &state.loader,
+            aggregate_bytes,
+        },
         state
             .installed_mods
             .iter()

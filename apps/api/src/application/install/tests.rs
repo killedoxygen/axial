@@ -5039,11 +5039,13 @@ async fn content_journal_records_download_failure_guardian_outcome_and_proof() {
         &test_producer(),
         journals.clone(),
         failure_memory.clone(),
-        &operation_id,
-        &facts,
-        None,
-        OperationPhase::Downloading,
-        "2026-07-16T10:00:00+00:00",
+        ContentFailureOutcomeRequest {
+            operation_id: &operation_id,
+            download_facts: &facts,
+            additional_evidence: None,
+            phase: OperationPhase::Downloading,
+            observed_at: "2026-07-16T10:00:00+00:00",
+        },
     )
     .await
     .expect("record content Guardian outcome");
@@ -5104,11 +5106,13 @@ async fn content_journal_records_typed_metadata_failure_without_download_facts()
         &test_producer(),
         journals.clone(),
         failure_memory.clone(),
-        &operation_id,
-        &[],
-        Some(evidence),
-        phase,
-        "2026-07-16T10:00:00+00:00",
+        ContentFailureOutcomeRequest {
+            operation_id: &operation_id,
+            download_facts: &[],
+            additional_evidence: Some(evidence),
+            phase,
+            observed_at: "2026-07-16T10:00:00+00:00",
+        },
     )
     .await
     .expect("record content Guardian outcome");
@@ -5238,14 +5242,16 @@ async fn guardian_persistence_failure_cannot_publish_incomplete_content_terminal
         &test_producer(),
         journals.clone(),
         failure_memory.clone(),
-        &operation_id,
-        content_interrupted_progress(false),
-        &[],
-        &[],
-        Some((
-            terminal,
-            Some(crate::application::content::ContentExecutionFailureKind::MetadataInvalid),
-        )),
+        ContentWorkerInterruptionRequest {
+            operation_id: &operation_id,
+            fallback: content_interrupted_progress(false),
+            journal_facts: &[],
+            execution_facts: &[],
+            attempted_terminal: Some((
+                terminal,
+                Some(crate::application::content::ContentExecutionFailureKind::MetadataInvalid),
+            )),
+        },
     )
     .await
     .expect("interrupt owner settles a durable terminal");
@@ -5294,11 +5300,13 @@ async fn late_terminal_persistence_recovery_returns_original_content_terminal() 
         &test_producer(),
         journals.clone(),
         failure_memory.clone(),
-        &operation_id,
-        &[],
-        Some(evidence),
-        phase,
-        "2026-07-16T10:00:00+00:00",
+        ContentFailureOutcomeRequest {
+            operation_id: &operation_id,
+            download_facts: &[],
+            additional_evidence: Some(evidence),
+            phase,
+            observed_at: "2026-07-16T10:00:00+00:00",
+        },
     )
     .await
     .expect("record Guardian outcome before terminal");
@@ -5329,14 +5337,16 @@ async fn late_terminal_persistence_recovery_returns_original_content_terminal() 
         &test_producer(),
         journals.clone(),
         failure_memory.clone(),
-        &operation_id,
-        content_interrupted_progress(false),
-        &[],
-        &[],
-        Some((
-            terminal.clone(),
-            Some(crate::application::content::ContentExecutionFailureKind::MetadataInvalid),
-        )),
+        ContentWorkerInterruptionRequest {
+            operation_id: &operation_id,
+            fallback: content_interrupted_progress(false),
+            journal_facts: &[],
+            execution_facts: &[],
+            attempted_terminal: Some((
+                terminal.clone(),
+                Some(crate::application::content::ContentExecutionFailureKind::MetadataInvalid),
+            )),
+        },
     )
     .await
     .expect("late terminal candidate remains authoritative");
@@ -5390,11 +5400,13 @@ async fn content_provider_terminal_replay_does_not_reassess_or_refresh_memory() 
             &test_producer(),
             journals.clone(),
             failure_memory.clone(),
-            &operation_id,
-            &facts,
-            None,
-            OperationPhase::Downloading,
-            "2026-07-16T10:00:00+00:00",
+            ContentFailureOutcomeRequest {
+                operation_id: &operation_id,
+                download_facts: &facts,
+                additional_evidence: None,
+                phase: OperationPhase::Downloading,
+                observed_at: "2026-07-16T10:00:00+00:00",
+            },
         ),
     )
     .await;
@@ -5428,11 +5440,13 @@ async fn content_provider_terminal_replay_does_not_reassess_or_refresh_memory() 
             &test_producer(),
             journals.clone(),
             failure_memory.clone(),
-            &operation_id,
-            &[],
-            Some(recovery_evidence),
-            recovery_phase,
-            "2026-07-16T10:01:00+00:00",
+            ContentFailureOutcomeRequest {
+                operation_id: &operation_id,
+                download_facts: &[],
+                additional_evidence: Some(recovery_evidence),
+                phase: recovery_phase,
+                observed_at: "2026-07-16T10:01:00+00:00",
+            },
         ),
     )
     .await;
@@ -7476,11 +7490,13 @@ async fn startup_retry_scan_restores_vanilla_and_external_provider_ownership() {
         &test_producer(),
         journals.clone(),
         Arc::new(GuardianFailureMemoryStore::new()),
-        &external_operation,
-        "loader_fabric_build_startup",
-        "26.2",
-        LoaderInstallError::Active(external_failure),
-        "2026-07-17T10:00:00+00:00",
+        LoaderInstallFailureRequest {
+            operation_id: &external_operation,
+            loader_target_id: "loader_fabric_build_startup",
+            base_version_id: "26.2",
+            error: LoaderInstallError::Active(external_failure),
+            observed_at: "2026-07-17T10:00:00+00:00",
+        },
     )
     .await;
 
@@ -7955,11 +7971,13 @@ async fn delegated_base_provider_fact_uses_download_pipeline_without_dependency_
         &test_producer(),
         journals.clone(),
         failure_memory.clone(),
-        &operation_id,
-        "loader_fabric_build_1_21_5",
-        "1.21.5",
-        error,
-        "2026-06-16T10:00:00+00:00",
+        LoaderInstallFailureRequest {
+            operation_id: &operation_id,
+            loader_target_id: "loader_fabric_build_1_21_5",
+            base_version_id: "1.21.5",
+            error,
+            observed_at: "2026-06-16T10:00:00+00:00",
+        },
     )
     .await;
 
@@ -7991,11 +8009,13 @@ async fn empty_base_install_payload_uses_only_dependency_fallback() {
         &test_producer(),
         journals.clone(),
         failure_memory.clone(),
-        &operation_id,
-        "loader_fabric_build_1_21_5",
-        "1.21.5",
-        error,
-        "2026-06-16T10:00:00+00:00",
+        LoaderInstallFailureRequest {
+            operation_id: &operation_id,
+            loader_target_id: "loader_fabric_build_1_21_5",
+            base_version_id: "1.21.5",
+            error,
+            observed_at: "2026-06-16T10:00:00+00:00",
+        },
     )
     .await;
 

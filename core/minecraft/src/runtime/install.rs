@@ -197,7 +197,7 @@ pub struct ManagedRuntimeFailureReceipt {
 /// Separates failures before a filesystem effect from sealed post-effect evidence.
 pub enum ManagedRuntimeRebuildError {
     Preparation(JavaRuntimeLookupError),
-    Effect(ManagedRuntimeFailureReceipt),
+    Effect(Box<ManagedRuntimeFailureReceipt>),
 }
 
 impl std::fmt::Display for ManagedRuntimeRebuildError {
@@ -384,14 +384,14 @@ impl ManagedRuntimeCommitReceipt {
     }
 
     pub(crate) fn into_failure(self, cause: JavaRuntimeLookupError) -> ManagedRuntimeRebuildError {
-        ManagedRuntimeRebuildError::Effect(ManagedRuntimeFailureReceipt {
+        ManagedRuntimeRebuildError::Effect(Box::new(ManagedRuntimeFailureReceipt {
             cache: self.cache,
             component: self.component,
             source: self.source.map(Box::new),
             cause,
             quarantine: self.quarantine,
             _publication_lease: self._publication_lease,
-        })
+        }))
     }
 }
 
@@ -1149,7 +1149,7 @@ fn classify_managed_runtime_publish_failure(
         return ManagedRuntimeRebuildError::Preparation(cause);
     }
     let quarantine_root = runtime_sidecar_path(&staged.install_root, "quarantine");
-    ManagedRuntimeRebuildError::Effect(ManagedRuntimeFailureReceipt {
+    ManagedRuntimeRebuildError::Effect(Box::new(ManagedRuntimeFailureReceipt {
         cache: staged.cache.clone(),
         component: staged.component.clone(),
         source: Some(Box::new(source)),
@@ -1164,7 +1164,7 @@ fn classify_managed_runtime_publish_failure(
             .publication_lease
             .take()
             .expect("managed runtime publication retains its lease until terminal settlement"),
-    })
+    }))
 }
 
 fn managed_runtime_commit_receipt(

@@ -1066,7 +1066,10 @@ mod tests {
         let mut record = test_record(session_id);
         record.state = LaunchState::Starting;
         store.insert(record.clone()).await.expect("insert session");
-        let mut events = store.subscribe(session_id).await.expect("subscribe");
+        let (generation, mut events) = store
+            .subscribe_terminal_observation(session_id)
+            .await
+            .expect("subscribe terminal observation");
         let mut command = Command::new("sh");
         command
             .current_dir(&root)
@@ -1081,10 +1084,24 @@ mod tests {
 
         let status = tokio::time::timeout(Duration::from_secs(2), async {
             loop {
-                if let LaunchEvent::Status(status) = events.recv().await.expect("session event")
-                    && status.state == "exited"
-                {
-                    break status;
+                match events.recv().await.expect("session event") {
+                    LaunchEvent::Status(status) if status.state == "exited" => break status,
+                    LaunchEvent::ProcessSettled {
+                        generation: signal_generation,
+                        attempt_id,
+                    } if signal_generation == generation => {
+                        let mut lease = store
+                            .claim_process_settlement(session_id, generation, Some(attempt_id))
+                            .await
+                            .expect("claim clean process settlement");
+                        let event = lease.event().clone();
+                        lease
+                            .finalize(event)
+                            .await
+                            .expect("finalize clean process settlement");
+                        lease.release().await;
+                    }
+                    _ => {}
                 }
             }
         })
@@ -1692,10 +1709,15 @@ mod tests {
             );
         }
 
+        let mut replacement_command = Command::new("sh");
+        replacement_command
+            .arg("-c")
+            .arg("exec sleep 30")
+            .kill_on_drop(true);
         store
-            .insert(test_record(session_id))
+            .start_process(test_record(session_id), replacement_command)
             .await
-            .expect("insert session");
+            .expect("start replacement process");
         let current_attempt = store
             .current_process_attempt(session_id)
             .await
@@ -1731,6 +1753,10 @@ mod tests {
                 .id,
             current_attempt.id
         );
+        tokio::time::timeout(Duration::from_secs(2), store.terminate_all())
+            .await
+            .expect("replacement cleanup deadline")
+            .expect("terminate replacement process");
     }
 
     #[cfg(unix)]

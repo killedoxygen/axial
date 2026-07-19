@@ -1,10 +1,10 @@
 use super::managed_plan::{ManagedPlanResolutionError, resolve_managed_install_plan};
 use super::operations::{
     PerformanceApplicationError, PerformanceInstallAction, PerformanceJournalTransition,
-    PerformanceOperationExecutionError, begin_performance_operation_journal,
-    record_performance_effect_started, record_performance_effect_started_status,
-    record_performance_guardian_supervision, record_performance_operation_result,
-    record_performance_plan_resolved,
+    PerformanceOperationExecutionError, PerformanceOperationResultRequest,
+    begin_performance_operation_journal, record_performance_effect_started,
+    record_performance_effect_started_status, record_performance_guardian_supervision,
+    record_performance_operation_result, record_performance_plan_resolved,
 };
 use super::plan_health::{
     PerformanceManagedArtifactSummary, managed_artifact_summary, performance_composition_target,
@@ -43,6 +43,15 @@ pub(super) async fn resolve_performance_install_plan(
 
 pub(super) const PERFORMANCE_INSTALL_INTERNAL_ERROR: &str =
     "Could not update managed performance files. Check instance folder permissions and try again.";
+
+struct PerformanceInstallExecutionRequest<'a> {
+    state: &'a AppState,
+    admitted: &'a AppManagedCompositionAdmission,
+    operation: &'a PerformanceOperation,
+    mode: PerformanceMode,
+    game_version: String,
+    loader: String,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct PerformanceJournalIdentity {
@@ -182,12 +191,14 @@ where
         operation.loader.as_deref(),
     )?;
     execute_performance_install(
-        state,
-        &admitted,
-        operation,
-        mode,
-        game_version,
-        loader,
+        PerformanceInstallExecutionRequest {
+            state,
+            admitted: &admitted,
+            operation,
+            mode,
+            game_version,
+            loader,
+        },
         resolver,
         progress,
     )
@@ -316,13 +327,15 @@ where
         let result = Err(error);
         record_performance_operation_result(
             state,
-            &operation_id,
-            operation.action,
-            &target_id,
-            rollback_state,
-            false,
-            &result,
-            operation.persistence_failure.as_ref(),
+            PerformanceOperationResultRequest {
+                operation_id: &operation_id,
+                action: operation.action,
+                fallback_target_id: &target_id,
+                terminal_rollback: rollback_state,
+                changed_target: false,
+                result: &result,
+                failure_signal: operation.persistence_failure.as_ref(),
+            },
         )
         .await?;
         return result.map_err(Into::into);
@@ -344,13 +357,15 @@ where
             ));
             record_performance_operation_result(
                 state,
-                &operation_id,
-                operation.action,
-                &target_id,
-                rollback_state,
-                false,
-                &result,
-                operation.persistence_failure.as_ref(),
+                PerformanceOperationResultRequest {
+                    operation_id: &operation_id,
+                    action: operation.action,
+                    fallback_target_id: &target_id,
+                    terminal_rollback: rollback_state,
+                    changed_target: false,
+                    result: &result,
+                    failure_signal: operation.persistence_failure.as_ref(),
+                },
             )
             .await?;
             return result.map_err(Into::into);
@@ -443,13 +458,15 @@ where
     .await;
     record_performance_operation_result(
         state,
-        &operation_id,
-        operation.action,
-        &target_id,
-        rollback_state,
-        result.is_ok(),
-        &result,
-        operation.persistence_failure.as_ref(),
+        PerformanceOperationResultRequest {
+            operation_id: &operation_id,
+            action: operation.action,
+            fallback_target_id: &target_id,
+            terminal_rollback: rollback_state,
+            changed_target: result.is_ok(),
+            result: &result,
+            failure_signal: operation.persistence_failure.as_ref(),
+        },
     )
     .await?;
 
@@ -514,13 +531,15 @@ where
             ));
             record_performance_operation_result(
                 state,
-                &operation_id,
-                journal_action,
-                &target_id,
-                rollback_state,
-                false,
-                &result,
-                operation.persistence_failure.as_ref(),
+                PerformanceOperationResultRequest {
+                    operation_id: &operation_id,
+                    action: journal_action,
+                    fallback_target_id: &target_id,
+                    terminal_rollback: rollback_state,
+                    changed_target: false,
+                    result: &result,
+                    failure_signal: operation.persistence_failure.as_ref(),
+                },
             )
             .await?;
             return result.map_err(Into::into);
@@ -544,13 +563,15 @@ where
         let result = Err(error);
         record_performance_operation_result(
             state,
-            &operation_id,
-            journal_action,
-            &target_id,
-            rollback_state,
-            false,
-            &result,
-            operation.persistence_failure.as_ref(),
+            PerformanceOperationResultRequest {
+                operation_id: &operation_id,
+                action: journal_action,
+                fallback_target_id: &target_id,
+                terminal_rollback: rollback_state,
+                changed_target: false,
+                result: &result,
+                failure_signal: operation.persistence_failure.as_ref(),
+            },
         )
         .await?;
         return result.map_err(Into::into);
@@ -589,13 +610,15 @@ where
         .map_err(managed_mutation_error);
     record_performance_operation_result(
         state,
-        &operation_id,
-        journal_action,
-        &target_id,
-        rollback_state,
-        remove_target_present && result.is_ok(),
-        &result,
-        operation.persistence_failure.as_ref(),
+        PerformanceOperationResultRequest {
+            operation_id: &operation_id,
+            action: journal_action,
+            fallback_target_id: &target_id,
+            terminal_rollback: rollback_state,
+            changed_target: remove_target_present && result.is_ok(),
+            result: &result,
+            failure_signal: operation.persistence_failure.as_ref(),
+        },
     )
     .await?;
 
@@ -603,12 +626,7 @@ where
 }
 
 async fn execute_performance_install<Resolver, ResolutionFuture, Progress, ProgressFuture>(
-    state: &AppState,
-    admitted: &AppManagedCompositionAdmission,
-    operation: &PerformanceOperation,
-    mode: PerformanceMode,
-    game_version: String,
-    loader: String,
+    request: PerformanceInstallExecutionRequest<'_>,
     resolver: Resolver,
     progress: Progress,
 ) -> Result<PerformanceInstallResponse, PerformanceOperationExecutionError>
@@ -620,6 +638,14 @@ where
     Progress: FnOnce(PerformanceInstallAction) -> ProgressFuture,
     ProgressFuture: std::future::Future<Output = ()>,
 {
+    let PerformanceInstallExecutionRequest {
+        state,
+        admitted,
+        operation,
+        mode,
+        game_version,
+        loader,
+    } = request;
     let current_inspection = admitted.inspect(None).await.map_err(managed_mutation_error);
     let plan = state.performance().get_plan(ResolutionRequest {
         game_version: game_version.clone(),
@@ -673,13 +699,15 @@ where
             ));
             record_performance_operation_result(
                 state,
-                &operation_id,
-                operation.action,
-                &plan.composition_id,
-                pre_effect_rollback_state,
-                false,
-                &result,
-                operation.persistence_failure.as_ref(),
+                PerformanceOperationResultRequest {
+                    operation_id: &operation_id,
+                    action: operation.action,
+                    fallback_target_id: &plan.composition_id,
+                    terminal_rollback: pre_effect_rollback_state,
+                    changed_target: false,
+                    result: &result,
+                    failure_signal: operation.persistence_failure.as_ref(),
+                },
             )
             .await?;
             return result.map_err(Into::into);
@@ -703,13 +731,15 @@ where
         let result = Err(error);
         record_performance_operation_result(
             state,
-            &operation_id,
-            operation.action,
-            &plan.composition_id,
-            pre_effect_rollback_state,
-            false,
-            &result,
-            operation.persistence_failure.as_ref(),
+            PerformanceOperationResultRequest {
+                operation_id: &operation_id,
+                action: operation.action,
+                fallback_target_id: &plan.composition_id,
+                terminal_rollback: pre_effect_rollback_state,
+                changed_target: false,
+                result: &result,
+                failure_signal: operation.persistence_failure.as_ref(),
+            },
         )
         .await?;
         return result.map_err(Into::into);
@@ -720,13 +750,15 @@ where
             let result = Err(managed_plan_resolution_error(error));
             record_performance_operation_result(
                 state,
-                &operation_id,
-                operation.action,
-                &plan.composition_id,
-                pre_effect_rollback_state,
-                false,
-                &result,
-                operation.persistence_failure.as_ref(),
+                PerformanceOperationResultRequest {
+                    operation_id: &operation_id,
+                    action: operation.action,
+                    fallback_target_id: &plan.composition_id,
+                    terminal_rollback: pre_effect_rollback_state,
+                    changed_target: false,
+                    result: &result,
+                    failure_signal: operation.persistence_failure.as_ref(),
+                },
             )
             .await?;
             return result.map_err(Into::into);
@@ -826,13 +858,15 @@ where
     };
     record_performance_operation_result(
         state,
-        &operation_id,
-        operation.action,
-        &plan.composition_id,
-        terminal_rollback,
-        changed_target,
-        &result,
-        operation.persistence_failure.as_ref(),
+        PerformanceOperationResultRequest {
+            operation_id: &operation_id,
+            action: operation.action,
+            fallback_target_id: &plan.composition_id,
+            terminal_rollback,
+            changed_target,
+            result: &result,
+            failure_signal: operation.persistence_failure.as_ref(),
+        },
     )
     .await?;
 

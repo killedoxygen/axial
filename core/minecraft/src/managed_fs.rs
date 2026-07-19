@@ -25,13 +25,21 @@ static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_TEMPS: OnceLock<Mutex<HashSet<ActiveTempKey>>> = OnceLock::new();
 
 #[cfg(test)]
-static SHA1_FULL_READ_COUNTS: OnceLock<Mutex<HashMap<PathBuf, HashMap<(u64, [u8; 20]), usize>>>> =
-    OnceLock::new();
+type ManagedSha1ReadIdentity = (u64, [u8; 20]);
+
+#[cfg(test)]
+type ManagedSha1ReadCounts = HashMap<ManagedSha1ReadIdentity, usize>;
+
+#[cfg(test)]
+type ManagedSha1ReadScopes = HashMap<PathBuf, ManagedSha1ReadCounts>;
+
+#[cfg(test)]
+static SHA1_FULL_READ_COUNTS: OnceLock<Mutex<ManagedSha1ReadScopes>> = OnceLock::new();
 
 #[cfg(test)]
 #[derive(Default)]
 pub(crate) struct ManagedSha1FullReadCounts {
-    counts: HashMap<(u64, [u8; 20]), usize>,
+    counts: ManagedSha1ReadCounts,
 }
 
 #[cfg(test)]
@@ -86,6 +94,45 @@ pub struct AnchoredDirectory {
     stable_path: Arc<PathBuf>,
     _rename_blockers: Arc<Vec<platform::DirectoryRenameBlocker>>,
     _parent: Option<Arc<AnchoredDirectory>>,
+}
+
+struct AdmittedFileRenameRequest<'a> {
+    source_name: &'a str,
+    destination: &'a AnchoredDirectory,
+    destination_name: &'a str,
+    admitted_file: &'a std::fs::File,
+}
+
+impl<'a> AdmittedFileRenameRequest<'a> {
+    fn new(
+        source_name: &'a str,
+        destination: &'a AnchoredDirectory,
+        destination_name: &'a str,
+        admitted_file: &'a std::fs::File,
+    ) -> Self {
+        Self {
+            source_name,
+            destination,
+            destination_name,
+            admitted_file,
+        }
+    }
+}
+
+struct AdmittedFileRenameHooks<BeforeRename, AfterRename> {
+    before_rename: BeforeRename,
+    after_rename: AfterRename,
+    force_resync: bool,
+}
+
+impl AdmittedFileRenameHooks<fn(), fn()> {
+    fn none() -> Self {
+        Self {
+            before_rename: || {},
+            after_rename: || {},
+            force_resync: false,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -421,48 +468,36 @@ impl AnchoredDirectory {
         admitted_file: &std::fs::File,
     ) -> AnchoredFileMoveOutcome {
         self.rename_admitted_file_no_replace_inner(
-            source_name,
-            destination,
-            destination_name,
-            admitted_file,
-            || {},
-            || {},
-            false,
+            AdmittedFileRenameRequest::new(
+                source_name,
+                destination,
+                destination_name,
+                admitted_file,
+            ),
+            AdmittedFileRenameHooks::none(),
         )
     }
 
-    #[cfg(test)]
-    fn rename_admitted_file_no_replace_with_hooks(
+    fn rename_admitted_file_no_replace_inner<BeforeRename, AfterRename>(
         &self,
-        source_name: &str,
-        destination: &Self,
-        destination_name: &str,
-        admitted_file: &std::fs::File,
-        before_rename: impl FnOnce(),
-        after_rename: impl FnOnce(),
-        force_resync: bool,
-    ) -> AnchoredFileMoveOutcome {
-        self.rename_admitted_file_no_replace_inner(
+        request: AdmittedFileRenameRequest<'_>,
+        hooks: AdmittedFileRenameHooks<BeforeRename, AfterRename>,
+    ) -> AnchoredFileMoveOutcome
+    where
+        BeforeRename: FnOnce(),
+        AfterRename: FnOnce(),
+    {
+        let AdmittedFileRenameRequest {
             source_name,
             destination,
             destination_name,
             admitted_file,
+        } = request;
+        let AdmittedFileRenameHooks {
             before_rename,
             after_rename,
             force_resync,
-        )
-    }
-
-    fn rename_admitted_file_no_replace_inner(
-        &self,
-        source_name: &str,
-        destination: &Self,
-        destination_name: &str,
-        admitted_file: &std::fs::File,
-        before_rename: impl FnOnce(),
-        after_rename: impl FnOnce(),
-        force_resync: bool,
-    ) -> AnchoredFileMoveOutcome {
+        } = hooks;
         let admitted = (|| -> io::Result<(platform::FileIdentity, u64)> {
             validate_exact_file_name(source_name).map_err(anchor_error)?;
             validate_exact_file_name(destination_name).map_err(anchor_error)?;
@@ -4649,19 +4684,18 @@ mod tests {
         let source = AnchoredDirectory::open(&source_path).expect("anchor source");
         let destination = AnchoredDirectory::open(&destination_path).expect("anchor destination");
 
-        let outcome = source.rename_admitted_file_no_replace_with_hooks(
-            "candidate",
-            &destination,
-            "published",
-            &admitted,
-            || {
-                fs::rename(source_path.join("candidate"), source_path.join("original"))
-                    .expect("displace admitted file in residual window");
-                fs::write(source_path.join("candidate"), b"replacement")
-                    .expect("write residual-window replacement");
+        let outcome = source.rename_admitted_file_no_replace_inner(
+            AdmittedFileRenameRequest::new("candidate", &destination, "published", &admitted),
+            AdmittedFileRenameHooks {
+                before_rename: || {
+                    fs::rename(source_path.join("candidate"), source_path.join("original"))
+                        .expect("displace admitted file in residual window");
+                    fs::write(source_path.join("candidate"), b"replacement")
+                        .expect("write residual-window replacement");
+                },
+                after_rename: || {},
+                force_resync: false,
             },
-            || {},
-            false,
         );
         let receipt = match outcome {
             AnchoredFileMoveOutcome::Applied(receipt) => receipt,
@@ -4698,19 +4732,18 @@ mod tests {
         let source = AnchoredDirectory::open(&source_path).expect("anchor source");
         let destination = AnchoredDirectory::open(&destination_path).expect("anchor destination");
 
-        let outcome = source.rename_admitted_file_no_replace_with_hooks(
-            "candidate",
-            &destination,
-            "published",
-            &admitted,
-            || {
-                fs::rename(source_path.join("candidate"), source_path.join("original"))
-                    .expect("displace admitted file in residual window");
-                fs::write(source_path.join("candidate"), b"replacement")
-                    .expect("write residual-window replacement");
+        let outcome = source.rename_admitted_file_no_replace_inner(
+            AdmittedFileRenameRequest::new("candidate", &destination, "published", &admitted),
+            AdmittedFileRenameHooks {
+                before_rename: || {
+                    fs::rename(source_path.join("candidate"), source_path.join("original"))
+                        .expect("displace admitted file in residual window");
+                    fs::write(source_path.join("candidate"), b"replacement")
+                        .expect("write residual-window replacement");
+                },
+                after_rename: || {},
+                force_resync: false,
             },
-            || {},
-            false,
         );
         let receipt = match outcome {
             AnchoredFileMoveOutcome::Applied(receipt) => receipt,
@@ -4747,14 +4780,13 @@ mod tests {
         let source = AnchoredDirectory::open(&source_path).expect("anchor source");
         let destination = AnchoredDirectory::open(&destination_path).expect("anchor destination");
 
-        let outcome = source.rename_admitted_file_no_replace_with_hooks(
-            "candidate",
-            &destination,
-            "published",
-            &admitted,
-            || {},
-            || {},
-            true,
+        let outcome = source.rename_admitted_file_no_replace_inner(
+            AdmittedFileRenameRequest::new("candidate", &destination, "published", &admitted),
+            AdmittedFileRenameHooks {
+                before_rename: || {},
+                after_rename: || {},
+                force_resync: true,
+            },
         );
         let mut receipt = match outcome {
             AnchoredFileMoveOutcome::Applied(receipt) => receipt,
@@ -4786,20 +4818,19 @@ mod tests {
         let source = AnchoredDirectory::open(&source_path).expect("anchor source");
         let destination = AnchoredDirectory::open(&destination_path).expect("anchor destination");
 
-        let outcome = source.rename_admitted_file_no_replace_with_hooks(
-            "candidate",
-            &destination,
-            "published",
-            &admitted,
-            || {},
-            || {
-                fs::rename(
-                    destination_path.join("published"),
-                    destination_path.join("displaced"),
-                )
-                .expect("displace moved file before receipt admission");
+        let outcome = source.rename_admitted_file_no_replace_inner(
+            AdmittedFileRenameRequest::new("candidate", &destination, "published", &admitted),
+            AdmittedFileRenameHooks {
+                before_rename: || {},
+                after_rename: || {
+                    fs::rename(
+                        destination_path.join("published"),
+                        destination_path.join("displaced"),
+                    )
+                    .expect("displace moved file before receipt admission");
+                },
+                force_resync: false,
             },
-            false,
         );
 
         assert!(matches!(outcome, AnchoredFileMoveOutcome::Indeterminate(_)));

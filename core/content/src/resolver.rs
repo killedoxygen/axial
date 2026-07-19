@@ -954,12 +954,14 @@ fn apply_metadata_titles(
     work_budget: &mut ResolutionBudget,
 ) -> Result<(), ResolutionError> {
     for conflict in conflicts {
-        if let Some(id) = &conflict.canonical_id {
-            if let Some(project) = metadata.get(id) {
-                let encoded_len = budget.admit_provider_text(&project.title)?;
-                work_budget.admit_output_len(encoded_len)?;
-                conflict.subject_title = Some(project.title.clone());
-            }
+        if let Some(project) = conflict
+            .canonical_id
+            .as_ref()
+            .and_then(|id| metadata.get(id))
+        {
+            let encoded_len = budget.admit_provider_text(&project.title)?;
+            work_budget.admit_output_len(encoded_len)?;
+            conflict.subject_title = Some(project.title.clone());
         }
     }
     Ok(())

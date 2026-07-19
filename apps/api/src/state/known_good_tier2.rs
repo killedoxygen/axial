@@ -49,6 +49,16 @@ pub(crate) struct KnownGoodTier2CleanReceipt {
     verified_at: tokio::time::Instant,
 }
 
+struct KnownGoodTier2ExactIdentity<'a> {
+    instance_id: &'a str,
+    version_id: &'a str,
+    created_at: &'a str,
+    library_root: &'a Path,
+    managed_runtime_cache: &'a ManagedRuntimeCache,
+    inventory: &'a Arc<KnownGoodInventory>,
+    managed_artifact_epoch: super::ManagedArtifactMutationEpoch,
+}
+
 impl KnownGoodTier2CleanReceipt {
     pub(crate) fn instance_id(&self) -> &str {
         &self.instance_id
@@ -222,15 +232,15 @@ impl AppState {
         seal: KnownGoodTier2CleanSeal,
         verified_at: tokio::time::Instant,
     ) -> Option<KnownGoodTier2CleanReceipt> {
-        if !self.known_good_tier2_exact_identity_is_current(
-            &seal.instance_id,
-            &seal.version_id,
-            &seal.created_at,
-            &seal.library_root,
-            &seal.managed_runtime_cache,
-            &seal.inventory,
-            seal.managed_artifact_epoch,
-        ) {
+        if !self.known_good_tier2_exact_identity_is_current(KnownGoodTier2ExactIdentity {
+            instance_id: &seal.instance_id,
+            version_id: &seal.version_id,
+            created_at: &seal.created_at,
+            library_root: &seal.library_root,
+            managed_runtime_cache: &seal.managed_runtime_cache,
+            inventory: &seal.inventory,
+            managed_artifact_epoch: seal.managed_artifact_epoch,
+        }) {
             return None;
         }
         let inventory = Arc::downgrade(&seal.inventory);
@@ -253,15 +263,15 @@ impl AppState {
         let Some(inventory) = receipt.inventory.upgrade() else {
             return false;
         };
-        self.known_good_tier2_exact_identity_is_current(
-            &receipt.instance_id,
-            &receipt.version_id,
-            &receipt.created_at,
-            &receipt.library_root,
-            &receipt.managed_runtime_cache,
-            &inventory,
-            receipt.managed_artifact_epoch,
-        )
+        self.known_good_tier2_exact_identity_is_current(KnownGoodTier2ExactIdentity {
+            instance_id: &receipt.instance_id,
+            version_id: &receipt.version_id,
+            created_at: &receipt.created_at,
+            library_root: &receipt.library_root,
+            managed_runtime_cache: &receipt.managed_runtime_cache,
+            inventory: &inventory,
+            managed_artifact_epoch: receipt.managed_artifact_epoch,
+        })
     }
 
     pub(crate) async fn seal_tier2_registered_artifact_request(
@@ -329,27 +339,30 @@ impl AppState {
     }
 
     fn known_good_tier2_ticket_identity_is_current(&self, ticket: &KnownGoodTier2Ticket) -> bool {
-        self.known_good_tier2_exact_identity_is_current(
-            &ticket.instance_id,
-            &ticket.version_id,
-            &ticket.created_at,
-            &ticket.library_root,
-            &ticket.managed_runtime_cache,
-            &ticket.inventory,
-            ticket.managed_artifact_epoch,
-        )
+        self.known_good_tier2_exact_identity_is_current(KnownGoodTier2ExactIdentity {
+            instance_id: &ticket.instance_id,
+            version_id: &ticket.version_id,
+            created_at: &ticket.created_at,
+            library_root: &ticket.library_root,
+            managed_runtime_cache: &ticket.managed_runtime_cache,
+            inventory: &ticket.inventory,
+            managed_artifact_epoch: ticket.managed_artifact_epoch,
+        })
     }
 
     fn known_good_tier2_exact_identity_is_current(
         &self,
-        instance_id: &str,
-        version_id: &str,
-        created_at: &str,
-        library_root: &Path,
-        managed_runtime_cache: &ManagedRuntimeCache,
-        inventory: &Arc<KnownGoodInventory>,
-        managed_artifact_epoch: super::ManagedArtifactMutationEpoch,
+        identity: KnownGoodTier2ExactIdentity<'_>,
     ) -> bool {
+        let KnownGoodTier2ExactIdentity {
+            instance_id,
+            version_id,
+            created_at,
+            library_root,
+            managed_runtime_cache,
+            inventory,
+            managed_artifact_epoch,
+        } = identity;
         self.managed_artifact_mutation_epoch()
             .is_ok_and(|epoch| epoch == managed_artifact_epoch)
             && self
