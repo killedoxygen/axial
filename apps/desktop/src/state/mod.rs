@@ -7,15 +7,17 @@ use tokio::sync::watch;
 
 const TERMINAL_STATE_LOCK_INVARIANT: &str =
     "desktop terminal-state lock poisoned; action ownership may be inconsistent";
-const LAUNCH_EVENT_TASK_LOCK_INVARIANT: &str =
-    "desktop launch-event task lock poisoned; stream ownership may be inconsistent";
+const EVENT_TASK_LOCK_INVARIANT: &str =
+    "desktop event task lock poisoned; stream ownership may be inconsistent";
 
 #[derive(Clone)]
 pub struct DesktopState {
     version: String,
     paths: AppPaths,
     terminal: TerminalActionCoordinator,
-    launch_events: LaunchEventTaskCoordinator,
+    install_events: EventTaskCoordinator,
+    loader_install_events: EventTaskCoordinator,
+    launch_events: EventTaskCoordinator,
 }
 
 impl DesktopState {
@@ -24,7 +26,9 @@ impl DesktopState {
             version,
             paths,
             terminal: TerminalActionCoordinator::new(),
-            launch_events: LaunchEventTaskCoordinator::new(),
+            install_events: EventTaskCoordinator::new(),
+            loader_install_events: EventTaskCoordinator::new(),
+            launch_events: EventTaskCoordinator::new(),
         }
     }
 
@@ -40,63 +44,71 @@ impl DesktopState {
         &self.terminal
     }
 
-    pub fn launch_events(&self) -> &LaunchEventTaskCoordinator {
+    pub fn install_events(&self) -> &EventTaskCoordinator {
+        &self.install_events
+    }
+
+    pub fn loader_install_events(&self) -> &EventTaskCoordinator {
+        &self.loader_install_events
+    }
+
+    pub fn launch_events(&self) -> &EventTaskCoordinator {
         &self.launch_events
     }
 }
 
 #[derive(Clone)]
-pub struct LaunchEventTaskCoordinator {
-    shared: Arc<Mutex<LaunchEventTaskState>>,
+pub struct EventTaskCoordinator {
+    shared: Arc<Mutex<EventTaskState>>,
 }
 
-struct LaunchEventTaskState {
+struct EventTaskState {
     next_owner_id: u64,
-    active: HashMap<String, LaunchEventTaskEntry>,
+    active: HashMap<String, EventTaskEntry>,
 }
 
-struct LaunchEventTaskEntry {
+struct EventTaskEntry {
     owner_id: u64,
     cancel: watch::Sender<bool>,
     emission_gate: Arc<Mutex<()>>,
 }
 
-pub struct LaunchEventTaskOwner {
-    coordinator: LaunchEventTaskCoordinator,
-    session_id: String,
+pub struct EventTaskOwner {
+    coordinator: EventTaskCoordinator,
+    stream_id: String,
     owner_id: u64,
     cancel: watch::Receiver<bool>,
     emission_gate: Arc<Mutex<()>>,
 }
 
-impl LaunchEventTaskCoordinator {
+impl EventTaskCoordinator {
     fn new() -> Self {
         Self {
-            shared: Arc::new(Mutex::new(LaunchEventTaskState {
+            shared: Arc::new(Mutex::new(EventTaskState {
                 next_owner_id: 0,
                 active: HashMap::new(),
             })),
         }
     }
 
-    pub fn replace(&self, session_id: String) -> LaunchEventTaskOwner {
+    pub fn replace(&self, stream_id: String) -> EventTaskOwner {
         let (cancel, cancel_receiver) = watch::channel(false);
         let (owner_id, emission_gate, previous_cancel) = {
-            let mut state = self.shared.lock().expect(LAUNCH_EVENT_TASK_LOCK_INVARIANT);
+            let mut state = self.shared.lock().expect(EVENT_TASK_LOCK_INVARIANT);
             state.next_owner_id = state
                 .next_owner_id
                 .checked_add(1)
-                .expect("desktop launch-event owner id overflowed");
+                .expect("desktop event owner id overflowed");
             let owner_id = state.next_owner_id;
-            let previous = state.active.remove(&session_id);
+            let previous = state.active.remove(&stream_id);
             let emission_gate = previous
                 .as_ref()
                 .map(|entry| entry.emission_gate.clone())
                 .unwrap_or_else(|| Arc::new(Mutex::new(())));
             let previous_cancel = previous.map(|entry| entry.cancel);
             state.active.insert(
-                session_id.clone(),
-                LaunchEventTaskEntry {
+                stream_id.clone(),
+                EventTaskEntry {
                     owner_id,
                     cancel,
                     emission_gate: emission_gate.clone(),
@@ -109,42 +121,40 @@ impl LaunchEventTaskCoordinator {
             previous_cancel.send_replace(true);
         }
         {
-            let _emission = emission_gate
-                .lock()
-                .expect(LAUNCH_EVENT_TASK_LOCK_INVARIANT);
+            let _emission = emission_gate.lock().expect(EVENT_TASK_LOCK_INVARIANT);
         }
 
-        LaunchEventTaskOwner {
+        EventTaskOwner {
             coordinator: self.clone(),
-            session_id,
+            stream_id,
             owner_id,
             cancel: cancel_receiver,
             emission_gate,
         }
     }
 
-    fn is_current(&self, session_id: &str, owner_id: u64) -> bool {
+    fn is_current(&self, stream_id: &str, owner_id: u64) -> bool {
         self.shared
             .lock()
-            .expect(LAUNCH_EVENT_TASK_LOCK_INVARIANT)
+            .expect(EVENT_TASK_LOCK_INVARIANT)
             .active
-            .get(session_id)
+            .get(stream_id)
             .is_some_and(|entry| entry.owner_id == owner_id)
     }
 
-    fn retire(&self, session_id: &str, owner_id: u64) {
-        let mut state = self.shared.lock().expect(LAUNCH_EVENT_TASK_LOCK_INVARIANT);
+    fn retire(&self, stream_id: &str, owner_id: u64) {
+        let mut state = self.shared.lock().expect(EVENT_TASK_LOCK_INVARIANT);
         if state
             .active
-            .get(session_id)
+            .get(stream_id)
             .is_some_and(|entry| entry.owner_id == owner_id)
         {
-            state.active.remove(session_id);
+            state.active.remove(stream_id);
         }
     }
 }
 
-impl LaunchEventTaskOwner {
+impl EventTaskOwner {
     pub async fn cancelled(&mut self) {
         if *self.cancel.borrow() {
             return;
@@ -153,26 +163,23 @@ impl LaunchEventTaskOwner {
     }
 
     pub fn emit_if_current<E>(&self, emit: impl FnOnce() -> Result<(), E>) -> Result<bool, E> {
-        let _emission = self
-            .emission_gate
-            .lock()
-            .expect(LAUNCH_EVENT_TASK_LOCK_INVARIANT);
-        if !self.coordinator.is_current(&self.session_id, self.owner_id) {
+        let _emission = self.emission_gate.lock().expect(EVENT_TASK_LOCK_INVARIANT);
+        if !self.coordinator.is_current(&self.stream_id, self.owner_id) {
             return Ok(false);
         }
         match emit() {
             Ok(()) => Ok(true),
             Err(error) => {
-                self.coordinator.retire(&self.session_id, self.owner_id);
+                self.coordinator.retire(&self.stream_id, self.owner_id);
                 Err(error)
             }
         }
     }
 }
 
-impl Drop for LaunchEventTaskOwner {
+impl Drop for EventTaskOwner {
     fn drop(&mut self) {
-        self.coordinator.retire(&self.session_id, self.owner_id);
+        self.coordinator.retire(&self.stream_id, self.owner_id);
     }
 }
 
@@ -376,16 +383,14 @@ impl Drop for TerminalAttemptOwner {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        LaunchEventTaskCoordinator, TerminalActionCoordinator, TerminalFailure, TerminalIntent,
-    };
+    use super::{EventTaskCoordinator, TerminalActionCoordinator, TerminalFailure, TerminalIntent};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::mpsc;
     use std::time::Duration;
 
     #[tokio::test]
-    async fn replacing_launch_event_owner_cancels_the_previous_owner() {
-        let coordinator = LaunchEventTaskCoordinator::new();
+    async fn replacing_event_owner_cancels_the_previous_owner() {
+        let coordinator = EventTaskCoordinator::new();
         let mut first = coordinator.replace("session".to_string());
         let second = coordinator.replace("session".to_string());
 
@@ -395,8 +400,8 @@ mod tests {
     }
 
     #[test]
-    fn stale_launch_event_owner_cannot_emit_or_retire_replacement() {
-        let coordinator = LaunchEventTaskCoordinator::new();
+    fn stale_event_owner_cannot_emit_or_retire_replacement() {
+        let coordinator = EventTaskCoordinator::new();
         let first = coordinator.replace("session".to_string());
         let second = coordinator.replace("session".to_string());
         let emitted = AtomicUsize::new(0);
@@ -421,8 +426,8 @@ mod tests {
     }
 
     #[test]
-    fn replacing_launch_event_owner_waits_for_in_flight_emission() {
-        let coordinator = LaunchEventTaskCoordinator::new();
+    fn replacing_event_owner_waits_for_in_flight_emission() {
+        let coordinator = EventTaskCoordinator::new();
         let first = coordinator.replace("session".to_string());
         let (entered_tx, entered_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
@@ -459,8 +464,8 @@ mod tests {
     }
 
     #[test]
-    fn launch_event_emit_failure_retires_exact_owner() {
-        let coordinator = LaunchEventTaskCoordinator::new();
+    fn event_emit_failure_retires_exact_owner() {
+        let coordinator = EventTaskCoordinator::new();
         let owner = coordinator.replace("session".to_string());
 
         assert_eq!(
@@ -471,8 +476,8 @@ mod tests {
     }
 
     #[test]
-    fn launch_event_emission_gates_are_independent_per_session() {
-        let coordinator = LaunchEventTaskCoordinator::new();
+    fn event_emission_gates_are_independent_per_stream() {
+        let coordinator = EventTaskCoordinator::new();
         let first = coordinator.replace("first".to_string());
         let (entered_tx, entered_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
@@ -495,8 +500,8 @@ mod tests {
     }
 
     #[test]
-    fn dropping_current_launch_event_owner_retires_it() {
-        let coordinator = LaunchEventTaskCoordinator::new();
+    fn dropping_current_event_owner_retires_it() {
+        let coordinator = EventTaskCoordinator::new();
         let owner = coordinator.replace("session".to_string());
         let owner_id = owner.owner_id;
 

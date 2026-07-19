@@ -700,6 +700,7 @@ pub fn window_set_resize_background(app: AppHandle, dark: bool) -> Result<(), St
 pub async fn start_install_events(
     app: AppHandle,
     state: State<'_, AppState>,
+    desktop: State<'_, DesktopState>,
     install_id: String,
 ) -> Result<(), String> {
     let (snapshot, mut receiver) = state
@@ -708,14 +709,23 @@ pub async fn start_install_events(
         .await
         .ok_or_else(|| "install session not found".to_string())?;
     let event_name = events::install_progress(&install_id);
+    let mut owner = desktop.install_events().replace(install_id);
 
     tauri::async_runtime::spawn(async move {
         if let Some(record) = snapshot.latest {
             let terminal = record.progress.done;
-            let _ = app.emit(
-                &event_name,
-                public_vanilla_install_progress_record_json(&record),
-            );
+            if owner
+                .emit_if_current(|| {
+                    app.emit(
+                        &event_name,
+                        public_vanilla_install_progress_record_json(&record),
+                    )
+                })
+                .ok()
+                != Some(true)
+            {
+                return;
+            }
             if terminal {
                 return;
             }
@@ -724,13 +734,26 @@ pub async fn start_install_events(
             return;
         }
         loop {
-            match receiver.recv().await {
+            let event = tokio::select! {
+                biased;
+                _ = owner.cancelled() => return,
+                event = receiver.recv() => event,
+            };
+            match event {
                 Ok(record) => {
                     let terminal = record.progress.done;
-                    let _ = app.emit(
-                        &event_name,
-                        public_vanilla_install_progress_record_json(&record),
-                    );
+                    if owner
+                        .emit_if_current(|| {
+                            app.emit(
+                                &event_name,
+                                public_vanilla_install_progress_record_json(&record),
+                            )
+                        })
+                        .ok()
+                        != Some(true)
+                    {
+                        return;
+                    }
                     if terminal {
                         return;
                     }
@@ -748,6 +771,7 @@ pub async fn start_install_events(
 pub async fn start_loader_install_events(
     app: AppHandle,
     state: State<'_, AppState>,
+    desktop: State<'_, DesktopState>,
     install_id: String,
 ) -> Result<(), String> {
     let (snapshot, mut receiver) = state
@@ -756,14 +780,23 @@ pub async fn start_loader_install_events(
         .await
         .ok_or_else(|| "loader install session not found".to_string())?;
     let event_name = events::loader_install_progress(&install_id);
+    let mut owner = desktop.loader_install_events().replace(install_id);
 
     tauri::async_runtime::spawn(async move {
         if let Some(record) = snapshot.latest {
             let terminal = record.progress.done;
-            let _ = app.emit(
-                &event_name,
-                public_loader_install_progress_record_json(&record),
-            );
+            if owner
+                .emit_if_current(|| {
+                    app.emit(
+                        &event_name,
+                        public_loader_install_progress_record_json(&record),
+                    )
+                })
+                .ok()
+                != Some(true)
+            {
+                return;
+            }
             if terminal {
                 return;
             }
@@ -772,13 +805,26 @@ pub async fn start_loader_install_events(
             return;
         }
         loop {
-            match receiver.recv().await {
+            let event = tokio::select! {
+                biased;
+                _ = owner.cancelled() => return,
+                event = receiver.recv() => event,
+            };
+            match event {
                 Ok(record) => {
                     let terminal = record.progress.done;
-                    let _ = app.emit(
-                        &event_name,
-                        public_loader_install_progress_record_json(&record),
-                    );
+                    if owner
+                        .emit_if_current(|| {
+                            app.emit(
+                                &event_name,
+                                public_loader_install_progress_record_json(&record),
+                            )
+                        })
+                        .ok()
+                        != Some(true)
+                    {
+                        return;
+                    }
                     if terminal {
                         return;
                     }

@@ -109,14 +109,153 @@ type InstallProgressEvent = {
 
 let progressStream: CloseableSource | null = null;
 let connectedInstallId: string | null = null;
+let installOwnershipRevision = 0;
 const INSTALL_STREAM_SILENCE_MS = 15_000;
 const INSTALL_RECONCILE_ATTEMPTS = 4;
 const INSTALL_RECONCILE_DELAY_MS = 160;
-const reconcilingInstallIds = new Set<string>();
+
+export type InstallStatusReconciliation = 'active' | 'resolved' | 'stale' | 'unavailable';
+export type InstallRecoveryStrength = 'silence' | 'replace';
+
+type InstallOperationClaim = {
+  installId: string;
+  operationId: string | null;
+  queueId: string;
+  revision: number;
+  source: CloseableSource | null;
+};
+
+type InstallRecoveryEntry = {
+  generation: number;
+  owner: unknown;
+  strength: InstallRecoveryStrength;
+  completion: Promise<void>;
+};
+
+export function createInstallRecoveryCoordinator(): {
+  run(
+    installId: string,
+    owner: unknown,
+    strength: InstallRecoveryStrength,
+    work: (isCurrent: () => boolean) => Promise<void>,
+  ): Promise<void>;
+} {
+  const active = new Map<string, InstallRecoveryEntry>();
+  let nextGeneration = 0;
+
+  return {
+    run(installId, owner, strength, work): Promise<void> {
+      const existing = active.get(installId);
+      if (existing && existing.owner === owner && (existing.strength === 'replace' || strength === 'silence')) {
+        return existing.completion;
+      }
+
+      nextGeneration += 1;
+      const generation = nextGeneration;
+      const entry: InstallRecoveryEntry = {
+        generation,
+        owner,
+        strength,
+        completion: Promise.resolve(),
+      };
+      active.set(installId, entry);
+      const isCurrent = (): boolean => active.get(installId)?.generation === generation;
+      entry.completion = work(isCurrent).finally(() => {
+        if (isCurrent()) active.delete(installId);
+      });
+      return entry.completion;
+    },
+  };
+}
+
+const installRecoveryCoordinator = createInstallRecoveryCoordinator();
+
+export async function awaitOwnedInstallValue<T>(
+  load: () => Promise<T>,
+  isCurrent: () => boolean,
+): Promise<{ current: true; value: T } | { current: false }> {
+  if (!isCurrent()) return { current: false };
+  const value = await load();
+  if (!isCurrent()) return { current: false };
+  return { current: true, value };
+}
+
+export async function applyInstallStreamRecovery(
+  reconciliation: InstallStatusReconciliation,
+  actions: {
+    preserveActiveSource: boolean;
+    closeSource(): void;
+    restart(): Promise<void>;
+  },
+): Promise<void> {
+  if (
+    reconciliation === 'resolved' ||
+    reconciliation === 'stale' ||
+    (reconciliation === 'active' && actions.preserveActiveSource)
+  )
+    return;
+  actions.closeSource();
+  await actions.restart();
+}
+
+export function terminalInstallReconciliationNeedsRefresh(reconciliation: InstallStatusReconciliation): boolean {
+  return reconciliation === 'active' || reconciliation === 'unavailable';
+}
 
 function setProgressStream(source: CloseableSource | null): void {
   progressStream?.close();
   progressStream = source;
+}
+
+function sameInstallOwnership(first: ActiveDownload | null, second: ActiveDownload | null): boolean {
+  if (!first || !second) return first === second;
+  return (
+    first.queueId === second.queueId &&
+    first.installId === second.installId &&
+    first.operationId === second.operationId &&
+    first.kind === second.kind &&
+    isSameInstallItem(first.item, second.item)
+  );
+}
+
+function setActiveDownload(next: ActiveDownload | null): void {
+  if (!sameInstallOwnership(activeDownload.value, next)) installOwnershipRevision += 1;
+  activeDownload.value = next;
+}
+
+function captureInstallOperation(
+  installId: string,
+  item: InstallItem,
+  source: CloseableSource | null = null,
+): InstallOperationClaim | null {
+  const active = activeDownload.value;
+  if (
+    !active ||
+    active.installId !== installId ||
+    !isSameInstallItem(active.item, item) ||
+    (source !== null && (progressStream !== source || connectedInstallId !== installId))
+  ) {
+    return null;
+  }
+  return {
+    installId,
+    operationId: active.operationId ?? null,
+    queueId: active.queueId,
+    revision: installOwnershipRevision,
+    source,
+  };
+}
+
+function installOperationIsCurrent(claim: InstallOperationClaim, requireSource: boolean): boolean {
+  const active = activeDownload.value;
+  return (
+    installOwnershipRevision === claim.revision &&
+    active?.installId === claim.installId &&
+    active.queueId === claim.queueId &&
+    (active.operationId ?? null) === claim.operationId &&
+    (!requireSource ||
+      (claim.source !== null && progressStream === claim.source && connectedInstallId === claim.installId))
+  );
 }
 
 export function isActiveInstallItem(item: InstallItem): boolean {
@@ -124,8 +263,14 @@ export function isActiveInstallItem(item: InstallItem): boolean {
   return active !== null && isSameInstallItem(active.item, item);
 }
 
-function isActiveInstallSource(item: InstallItem, source: CloseableSource | null): boolean {
-  return isActiveInstallItem(item) && source !== null && progressStream === source;
+function isActiveInstallSource(installId: string, item: InstallItem, source: CloseableSource | null): boolean {
+  return (
+    connectedInstallId === installId &&
+    activeDownload.value?.installId === installId &&
+    isActiveInstallItem(item) &&
+    source !== null &&
+    progressStream === source
+  );
 }
 
 function activeDownloadFromQueue(active: InstallQueueActiveViewModel): ActiveDownload {
@@ -154,10 +299,10 @@ function reconcileDownloadQueue(response: InstallQueueStateResponse): void {
   batch(() => {
     downloadQueue.value = { items: response.items, view_model: response.view_model };
     if (response.active) {
-      activeDownload.value = activeDownloadFromQueue(response.active);
+      setActiveDownload(activeDownloadFromQueue(response.active));
       return;
     }
-    if (activeDownload.value) activeDownload.value = null;
+    if (activeDownload.value) setActiveDownload(null);
   });
   if (closingStream) {
     if (progressStream === closingStream) progressStream = null;
@@ -185,7 +330,7 @@ function updateActiveDownloadProgress(viewModel: InstallProgressViewModel): void
 }
 
 function completeActiveDownload(): void {
-  activeDownload.value = null;
+  setActiveDownload(null);
   setProgressStream(null);
 }
 
@@ -215,29 +360,25 @@ export function clearDownloadFailureForItem(item: InstallItem): void {
 async function installFailureViewModelForStatus(
   installId: string,
   fallback: InstallFailureViewModel,
-): Promise<InstallFailureViewModel> {
+  isCurrent: () => boolean,
+): Promise<InstallFailureViewModel | null> {
   for (let attempt = 0; attempt < 4; attempt += 1) {
+    if (!isCurrent()) return null;
     try {
-      const status = await api<InstallStatusResponse>('GET', `/install/${encodeURIComponent(installId)}/status`);
-      const viewModel = installFailureViewModel(status.failure_view_model);
+      const ownedStatus = await awaitOwnedInstallValue(
+        () => api<InstallStatusResponse>('GET', `/install/${encodeURIComponent(installId)}/status`),
+        isCurrent,
+      );
+      if (!ownedStatus.current) return null;
+      const viewModel = installFailureViewModel(ownedStatus.value.failure_view_model);
       if (viewModel) return viewModel;
     } catch {
-      return fallback;
+      return isCurrent() ? fallback : null;
     }
     await delay(120);
+    if (!isCurrent()) return null;
   }
-  return fallback;
-}
-
-async function recordBackendInstallFailure(
-  item: InstallItem,
-  displayName: string,
-  installId: string,
-  fallback: InstallFailureViewModel,
-): Promise<InstallFailureViewModel> {
-  const viewModel = await installFailureViewModelForStatus(installId, fallback);
-  recordDownloadFailure(item, displayName, viewModel);
-  return viewModel;
+  return isCurrent() ? fallback : null;
 }
 
 function showInstallQueueNotice(notice: InstallQueueNoticeViewModel | null | undefined): void {
@@ -254,6 +395,19 @@ export async function refreshInstallQueue(
   return response;
 }
 
+async function refreshInstallQueueWhileCurrent(
+  isCurrent: () => boolean,
+  options: { connectActive?: boolean } = {},
+): Promise<boolean> {
+  const ownedResponse = await awaitOwnedInstallValue(
+    () => api<InstallQueueStateResponse>('GET', '/install/queue'),
+    isCurrent,
+  );
+  if (!ownedResponse.current) return false;
+  await applyInstallQueueResponse(ownedResponse.value, { connectActive: options.connectActive });
+  return true;
+}
+
 export async function applyInstallQueueResponse(
   response: InstallQueueStateResponse,
   options: { showNotice?: boolean; connectActive?: boolean } = {},
@@ -266,19 +420,37 @@ export async function applyInstallQueueResponse(
     });
   }
   const terminalActive = response.active?.progress.failed || response.active?.progress.terminal;
-  const activeResponse = terminalActive ? { ...response, active: null } : response;
-  reconcileDownloadQueue(activeResponse);
-  if (!activeResponse.active) connectedInstallId = null;
+  reconcileDownloadQueue(response);
+  if (!response.active) connectedInstallId = null;
   if (options.showNotice) showInstallQueueNotice(response.notice);
   if (terminalActive && response.active) {
     const active = response.active;
     if (!active.install_id) {
-      if (options.connectActive) await refreshInstallQueue({ connectActive: true });
+      connectedInstallId = null;
+      completeActiveDownload();
+      const completionRevision = installOwnershipRevision;
+      if (options.connectActive) {
+        await refreshInstallQueueWhileCurrent(() => installOwnershipRevision === completionRevision, {
+          connectActive: true,
+        });
+      }
       return response;
     }
     const item = installItemFromQueueInstallItem(active.install_item);
-    const resolved = await reconcileInstallStatus(active.install_id, item, active.label);
-    if (!resolved) await refreshInstallQueue({ connectActive: options.connectActive });
+    const source = connectedInstallId === active.install_id ? progressStream : null;
+    const claim = captureInstallOperation(active.install_id, item, source);
+    if (!claim) return response;
+    const reconciliation = await reconcileInstallStatus(claim, item, active.label, () =>
+      installOperationIsCurrent(claim, source !== null),
+    );
+    if (
+      terminalInstallReconciliationNeedsRefresh(reconciliation) &&
+      installOperationIsCurrent(claim, source !== null)
+    ) {
+      await refreshInstallQueueWhileCurrent(() => installOperationIsCurrent(claim, source !== null), {
+        connectActive: options.connectActive,
+      });
+    }
   } else if (options.connectActive) {
     await connectBackendActiveInstall(response.active ?? null);
   }
@@ -295,9 +467,15 @@ async function connectBackendActiveInstall(active: InstallQueueActiveViewModel |
   }
   const item = installItemFromQueueInstallItem(active.install_item);
   connectedInstallId = active.install_id;
+  const claim = captureInstallOperation(active.install_id, item);
+  if (!claim) {
+    connectedInstallId = null;
+    return;
+  }
   try {
     await connectInstallEvents(active.kind, active.install_id, item, active.label);
   } catch (err: unknown) {
+    if (!installOperationIsCurrent(claim, false)) return;
     const message = errMessage(err);
     connectedInstallId = null;
     setProgressStream(null);
@@ -313,42 +491,58 @@ function delay(ms: number): Promise<void> {
   return new Promise((resolve) => window.setTimeout(resolve, ms));
 }
 
-async function reconcileInstallStatus(installId: string, item: InstallItem, displayName: string): Promise<boolean> {
+async function reconcileInstallStatus(
+  claim: InstallOperationClaim,
+  item: InstallItem,
+  displayName: string,
+  isCurrent: () => boolean,
+): Promise<InstallStatusReconciliation> {
   for (let attempt = 0; attempt < INSTALL_RECONCILE_ATTEMPTS; attempt += 1) {
+    if (!isCurrent()) return 'stale';
     let status: InstallStatusResponse;
     try {
-      status = await api<InstallStatusResponse>('GET', `/install/${encodeURIComponent(installId)}/status`);
+      const ownedStatus = await awaitOwnedInstallValue(
+        () => api<InstallStatusResponse>('GET', `/install/${encodeURIComponent(claim.installId)}/status`),
+        isCurrent,
+      );
+      if (!ownedStatus.current) return 'stale';
+      status = ownedStatus.value;
     } catch {
+      if (!isCurrent()) return 'stale';
       await delay(INSTALL_RECONCILE_DELAY_MS);
+      if (!isCurrent()) return 'stale';
       continue;
     }
+    if (!isCurrent()) return 'stale';
 
     const viewModel = installProgressViewModel(status.view_model);
     if (!viewModel) {
       await delay(INSTALL_RECONCILE_DELAY_MS);
+      if (!isCurrent()) return 'stale';
       continue;
     }
 
+    if (!isCurrent()) return 'stale';
     updateActiveDownloadProgress(viewModel);
 
     const failureViewModel = installFailureViewModel(status.failure_view_model);
     if (viewModel.failed || failureViewModel) {
+      if (!isCurrent()) return 'stale';
       const failure = failureViewModel ?? unresolvedFailureViewModel(viewModel.label);
       recordDownloadFailure(item, displayName, failure);
       showError(failure.summary);
-      await onInstallDone();
-      return true;
+      return (await onInstallDone(undefined, isCurrent)) ? 'resolved' : 'stale';
     }
 
     if (status.done || viewModel.terminal) {
-      await onInstallDone(item);
-      return true;
+      if (!isCurrent()) return 'stale';
+      return (await onInstallDone(item, isCurrent)) ? 'resolved' : 'stale';
     }
 
-    return false;
+    return 'active';
   }
 
-  return false;
+  return 'unavailable';
 }
 
 async function reconcileInstallStreamIssue(
@@ -359,32 +553,48 @@ async function reconcileInstallStreamIssue(
     source?: CloseableSource | null;
     closeSource?: boolean;
     reconnect?: boolean;
+    preserveActiveSource?: boolean;
     notice?: string;
   } = {},
 ): Promise<void> {
-  if (!isActiveInstallItem(item) || reconcilingInstallIds.has(installId)) return;
-  reconcilingInstallIds.add(installId);
-
-  try {
-    if (options.closeSource && options.source && progressStream === options.source) {
+  const source = options.source ?? null;
+  const claim = captureInstallOperation(installId, item, source);
+  if (!claim) return;
+  const recoveryOwner = source ?? `${claim.revision}:${claim.queueId}:${claim.operationId ?? ''}:${claim.installId}`;
+  const strength: InstallRecoveryStrength = options.preserveActiveSource ? 'silence' : 'replace';
+  await installRecoveryCoordinator.run(installId, recoveryOwner, strength, async (runnerIsCurrent) => {
+    const requireSourceForResult = options.preserveActiveSource === true && source !== null;
+    const closeCurrentSource = (): void => {
+      if (!options.closeSource || !installOperationIsCurrent(claim, true)) return;
       connectedInstallId = null;
       setProgressStream(null);
+    };
+    if (!options.preserveActiveSource) closeCurrentSource();
+
+    const reconciliation = await reconcileInstallStatus(claim, item, displayName, () => {
+      return runnerIsCurrent() && installOperationIsCurrent(claim, requireSourceForResult);
+    });
+    if (!runnerIsCurrent() || !installOperationIsCurrent(claim, requireSourceForResult) || reconciliation === 'stale') {
+      return;
     }
 
-    const resolved = await reconcileInstallStatus(installId, item, displayName);
-    if (resolved || !isActiveInstallItem(item)) return;
-
-    try {
-      await refreshInstallQueue({
-        connectActive: options.reconnect !== false,
-      });
-    } catch (err: unknown) {
-      const prefix = options.notice || 'Install progress refresh failed.';
-      showError(`${prefix} ${errMessage(err)}`);
-    }
-  } finally {
-    reconcilingInstallIds.delete(installId);
-  }
+    await applyInstallStreamRecovery(reconciliation, {
+      preserveActiveSource: options.preserveActiveSource === true,
+      closeSource: closeCurrentSource,
+      restart: async () => {
+        if (!runnerIsCurrent() || !installOperationIsCurrent(claim, false)) return;
+        try {
+          await refreshInstallQueueWhileCurrent(() => runnerIsCurrent() && installOperationIsCurrent(claim, false), {
+            connectActive: options.reconnect !== false,
+          });
+        } catch (err: unknown) {
+          if (!runnerIsCurrent() || !installOperationIsCurrent(claim, false)) return;
+          const prefix = options.notice || 'Install progress refresh failed.';
+          showError(`${prefix} ${errMessage(err)}`);
+        }
+      },
+    });
+  });
 }
 
 type InstallStreamWatchdog = {
@@ -450,6 +660,7 @@ function createPendingInstallEventSource(): PendingInstallEventSource {
 }
 
 async function connectNativeInstallEventSource(
+  installId: string,
   item: InstallItem,
   controller: PendingInstallEventSource,
   eventName: string,
@@ -463,22 +674,22 @@ async function connectNativeInstallEventSource(
   try {
     subscription = await onNativeEvent(eventName, onData);
   } catch (err: unknown) {
-    if (!isActiveInstallSource(item, controller)) return;
+    if (!isActiveInstallSource(installId, item, controller)) return;
     throw err;
   }
 
   if (!subscription) {
-    if (!isActiveInstallSource(item, controller)) return;
+    if (!isActiveInstallSource(installId, item, controller)) return;
     throw new Error(unavailableMessage);
   }
   if (!controller.setSource(subscription)) return;
-  if (!isActiveInstallSource(item, controller)) return;
+  if (!isActiveInstallSource(installId, item, controller)) return;
 
   let started = false;
   try {
     started = await startEvents();
   } catch (err: unknown) {
-    if (!isActiveInstallSource(item, controller)) return;
+    if (!isActiveInstallSource(installId, item, controller)) return;
     controller.close();
     if (progressStream === controller) progressStream = null;
     throw err;
@@ -515,8 +726,9 @@ async function connectInstallEvents(
   item: InstallItem,
   displayName: string,
 ): Promise<void> {
-  if (!isActiveInstallItem(item)) return;
+  if (!captureInstallOperation(installId, item)) return;
   const copy = STREAM_COPY[kind];
+  const nativeDesktop = hasNativeDesktopRuntime();
 
   let source: CloseableSource | null = null;
   let watchdog: InstallStreamWatchdog | null = null;
@@ -529,7 +741,7 @@ async function connectInstallEvents(
   const startWatchdog = (): void => {
     stopWatchdog();
     watchdog = createInstallStreamWatchdog(async () => {
-      if (!isActiveInstallSource(item, source)) {
+      if (!isActiveInstallSource(installId, item, source)) {
         stopWatchdog();
         return;
       }
@@ -537,12 +749,13 @@ async function connectInstallEvents(
         source,
         closeSource: true,
         reconnect: true,
+        preserveActiveSource: nativeDesktop,
       });
     });
   };
 
   const reconcileIssue = (notice: string): void => {
-    if (!isActiveInstallSource(item, source)) return;
+    if (!isActiveInstallSource(installId, item, source)) return;
     stopWatchdog();
     void reconcileInstallStreamIssue(installId, item, displayName, {
       source,
@@ -553,7 +766,8 @@ async function connectInstallEvents(
   };
 
   const onProgress = async (data: InstallProgressEvent): Promise<void> => {
-    if (!isActiveInstallSource(item, source)) return;
+    const claim = captureInstallOperation(installId, item, source);
+    if (!claim) return;
     watchdog?.markProgress();
 
     const viewModel = installProgressViewModel(data.view_model);
@@ -562,33 +776,35 @@ async function connectInstallEvents(
       return;
     }
 
+    if (!installOperationIsCurrent(claim, true)) return;
     updateActiveDownloadProgress(viewModel);
     if (viewModel.failed) {
       stopWatchdog();
-      completeActiveDownload();
-      const failure = await recordBackendInstallFailure(
-        item,
-        displayName,
+      const failure = await installFailureViewModelForStatus(
         installId,
         unresolvedFailureViewModel(viewModel.label),
+        () => installOperationIsCurrent(claim, true),
       );
+      if (!failure || !installOperationIsCurrent(claim, true)) return;
+      recordDownloadFailure(item, displayName, failure);
       showError(failure.summary);
-      await onInstallDone();
+      await onInstallDone(undefined, () => installOperationIsCurrent(claim, true));
       return;
     }
     if (data.done || viewModel.terminal) {
       stopWatchdog();
-      await onInstallDone(item);
+      await onInstallDone(item, () => installOperationIsCurrent(claim, true));
     }
   };
 
-  if (hasNativeDesktopRuntime()) {
+  if (nativeDesktop) {
     const controller = createPendingInstallEventSource();
     source = controller;
     startWatchdog();
 
     try {
       await connectNativeInstallEventSource(
+        installId,
         item,
         controller,
         kind === 'loader' ? nativeLoaderInstallEventName(installId) : nativeInstallEventName(installId),
@@ -708,14 +924,17 @@ function showInstallQueueError(err: unknown): void {
   showError(`Install queue failed: ${errMessage(err)}`);
 }
 
-async function onInstallDone(completedItem?: InstallItem): Promise<void> {
+async function onInstallDone(completedItem: InstallItem | undefined, isCurrent: () => boolean): Promise<boolean> {
+  if (!isCurrent()) return false;
   connectedInstallId = null;
   completeActiveDownload();
+  const completionRevision = installOwnershipRevision;
   if (completedItem) clearDownloadFailureForItem(completedItem);
   if (completedItem?.content) markContentChanged();
 
   try {
     const [versionsRes, instancesRes] = await Promise.all([api('GET', '/versions'), api('GET', '/instances')]);
+    if (installOwnershipRevision !== completionRevision) return true;
     if (versionsRes.error) throw new Error(versionsRes.error);
     if (instancesRes.error) throw new Error(instancesRes.error);
     const nextVersions = versionsRes.versions || [];
@@ -738,12 +957,18 @@ async function onInstallDone(completedItem?: InstallItem): Promise<void> {
       };
     }
   } catch (err: unknown) {
+    if (installOwnershipRevision !== completionRevision) return true;
     showError(`Install completed, but failed to refresh launcher state: ${errMessage(err)}`);
   }
 
+  if (installOwnershipRevision !== completionRevision) return true;
   try {
-    await refreshInstallQueue({ connectActive: true });
+    await refreshInstallQueueWhileCurrent(() => installOwnershipRevision === completionRevision, {
+      connectActive: true,
+    });
   } catch (err: unknown) {
+    if (installOwnershipRevision !== completionRevision) return true;
     showError(`Install queue refresh failed: ${errMessage(err)}`);
   }
+  return true;
 }
