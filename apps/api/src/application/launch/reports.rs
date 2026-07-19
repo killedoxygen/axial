@@ -652,8 +652,10 @@ mod tests {
         SessionStore,
     };
     use axial_config::{AppPaths, ConfigStore, InstanceRegistrySnapshot, InstanceStore};
+    #[cfg(unix)]
+    use axial_launcher::LaunchEvent;
     use axial_launcher::{
-        CrashEvidence, LaunchEvent, LaunchNotice, LaunchNoticeTone, LaunchSessionExitReason,
+        CrashEvidence, LaunchNotice, LaunchNoticeTone, LaunchSessionExitReason,
         LaunchSessionOutcome, LaunchSessionRecord, LaunchStageEvidence, LaunchStageRecord,
         LaunchState, SessionId,
     };

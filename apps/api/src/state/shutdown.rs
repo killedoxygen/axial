@@ -632,16 +632,19 @@ impl ShutdownAttempt {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use crate::state::RunningHandoffOutcome;
     use crate::state::auth_persistence::{
         AuthPersistenceError, AuthSnapshotPersistence, PersistedAuthSnapshot,
     };
     use crate::state::sessions::test_record;
     use crate::state::{
-        AppStateInit, AuthLoginStore, InstallStore, LaunchFailureTermination,
-        RunningHandoffOutcome, SessionStore,
+        AppStateInit, AuthLoginStore, InstallStore, LaunchFailureTermination, SessionStore,
     };
     use axial_config::{AppPaths, ConfigStore, InstanceRegistrySnapshot, InstanceStore};
-    use axial_launcher::{LaunchSessionExitReason, LaunchState, LaunchStatusEvent};
+    use axial_launcher::LaunchStatusEvent;
+    #[cfg(unix)]
+    use axial_launcher::{LaunchSessionExitReason, LaunchState};
     use axial_performance::PerformanceManager;
     use std::path::{Path, PathBuf};
     use std::sync::Arc;

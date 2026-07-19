@@ -20,7 +20,7 @@ impl DiscordRpcClient {
         Ok(client)
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     fn from_stream(stream: super::transport::IpcStream) -> Self {
         Self { stream, nonce: 0 }
     }
@@ -147,14 +147,13 @@ fn rpc_error_message(payload: &Value) -> Option<String> {
     })
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::super::transport::{IpcStream, read_frame, write_frame};
     use super::*;
     use std::thread;
     use std::time::Duration;
 
-    #[cfg(unix)]
     fn ipc_pair() -> (DiscordRpcClient, IpcStream) {
         let (client, server) =
             std::os::unix::net::UnixStream::pair().expect("unix pair should be available");
@@ -176,7 +175,6 @@ mod tests {
         )
     }
 
-    #[cfg(unix)]
     fn assert_handshake(server: &mut IpcStream) {
         let (opcode, payload) = read_frame(server).expect("handshake frame");
         assert_eq!(opcode, OP_HANDSHAKE);
@@ -185,7 +183,6 @@ mod tests {
         write_frame(server, OP_FRAME, &json!({ "evt": "READY" })).expect("ready frame");
     }
 
-    #[cfg(unix)]
     #[test]
     fn handshake_accepts_ready_response() {
         let (mut client, mut server) = ipc_pair();
@@ -197,7 +194,6 @@ mod tests {
         server.join().expect("server should join");
     }
 
-    #[cfg(unix)]
     #[test]
     fn set_activity_and_clear_activity_use_set_activity_command() {
         let (mut client, mut server) = ipc_pair();
@@ -236,7 +232,6 @@ mod tests {
         server.join().expect("server should join");
     }
 
-    #[cfg(unix)]
     #[test]
     fn command_error_response_is_returned_as_protocol_error() {
         let (mut client, mut server) = ipc_pair();

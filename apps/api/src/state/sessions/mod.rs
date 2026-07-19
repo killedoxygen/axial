@@ -707,7 +707,7 @@ impl UserStopLease {
         &self.record
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     fn arm_drop_release_probe(&mut self) -> tokio::sync::oneshot::Receiver<()> {
         assert!(
             self.drop_release_probe.is_none(),

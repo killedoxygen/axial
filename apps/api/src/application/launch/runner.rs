@@ -1862,6 +1862,7 @@ struct LaunchLoopBarrier {
 
 #[cfg(test)]
 impl LaunchLoopBarrier {
+    #[cfg(unix)]
     fn new() -> (
         std::sync::Arc<Self>,
         tokio::sync::oneshot::Receiver<()>,
