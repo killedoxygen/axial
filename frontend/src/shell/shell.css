@@ -1233,55 +1233,46 @@ button.cp-status-pill--content {
 }
 
 .cp-status-glyph[data-state='downloading'] > span::after {
-  animation: cp-glyph-rain 1200ms ease-in-out infinite;
+  animation: cp-glyph-drop 1500ms ease-in-out infinite;
 }
-.cp-status-glyph[data-state='downloading'] > span:nth-child(1) {
-  transform: translate(-3.6px, -5.2px);
+.cp-status-glyph[data-state='downloading'] > span:nth-child(1),
+.cp-status-glyph[data-state='downloading'] > span:nth-child(3),
+.cp-status-glyph[data-state='downloading'] > span:nth-child(4),
+.cp-status-glyph[data-state='downloading'] > span:nth-child(6) {
+  opacity: 0;
+}
+.cp-status-glyph[data-state='downloading'] > span:nth-child(1)::after,
+.cp-status-glyph[data-state='downloading'] > span:nth-child(3)::after,
+.cp-status-glyph[data-state='downloading'] > span:nth-child(4)::after,
+.cp-status-glyph[data-state='downloading'] > span:nth-child(6)::after {
+  animation: none;
 }
 .cp-status-glyph[data-state='downloading'] > span:nth-child(2) {
-  transform: translate(0, -5.2px);
+  transform: translate(0, -6px);
 }
-.cp-status-glyph[data-state='downloading'] > span:nth-child(3) {
-  transform: translate(3.6px, -5.2px);
-}
-.cp-status-glyph[data-state='downloading'] > span:nth-child(4) {
-  transform: translate(-3.6px, 0);
-}
-.cp-status-glyph[data-state='downloading'] > span:nth-child(6) {
-  transform: translate(3.6px, 0);
-}
-.cp-status-glyph[data-state='downloading'] > span:nth-child(7) {
-  transform: translate(-3.6px, 5.2px);
-}
-.cp-status-glyph[data-state='downloading'] > span:nth-child(8) {
-  transform: translate(0, 5.2px);
-}
-.cp-status-glyph[data-state='downloading'] > span:nth-child(9) {
-  transform: translate(3.6px, 5.2px);
-}
-.cp-status-glyph[data-state='downloading'] > span:nth-child(2)::after {
-  animation-delay: 50ms;
-}
-.cp-status-glyph[data-state='downloading'] > span:nth-child(3)::after {
-  animation-delay: 100ms;
-}
-.cp-status-glyph[data-state='downloading'] > span:nth-child(4)::after {
-  animation-delay: 150ms;
+.cp-status-glyph[data-state='downloading'] > span:nth-child(5) {
+  transform: translate(0, -1.5px);
 }
 .cp-status-glyph[data-state='downloading'] > span:nth-child(5)::after {
-  animation-delay: 200ms;
+  animation-delay: 140ms;
 }
-.cp-status-glyph[data-state='downloading'] > span:nth-child(6)::after {
-  animation-delay: 250ms;
+.cp-status-glyph[data-state='downloading'] > span:nth-child(7) {
+  transform: translate(-3.4px, 2px);
 }
 .cp-status-glyph[data-state='downloading'] > span:nth-child(7)::after {
-  animation-delay: 300ms;
+  animation-delay: 280ms;
 }
-.cp-status-glyph[data-state='downloading'] > span:nth-child(8)::after {
-  animation-delay: 350ms;
+.cp-status-glyph[data-state='downloading'] > span:nth-child(9) {
+  transform: translate(3.4px, 2px);
 }
 .cp-status-glyph[data-state='downloading'] > span:nth-child(9)::after {
-  animation-delay: 400ms;
+  animation-delay: 280ms;
+}
+.cp-status-glyph[data-state='downloading'] > span:nth-child(8) {
+  transform: translate(0, 5px);
+}
+.cp-status-glyph[data-state='downloading'] > span:nth-child(8)::after {
+  animation-delay: 420ms;
 }
 
 .cp-status-glyph[data-state='queued'] > span::after {
@@ -1434,19 +1425,19 @@ button.cp-status-pill--content {
     transform: scale(0.75);
   }
 }
-@keyframes cp-glyph-rain {
+@keyframes cp-glyph-drop {
   0%,
   100% {
-    transform: none;
+    opacity: 0.35;
+    transform: scale(0.8);
+  }
+  35% {
     opacity: 1;
+    transform: scale(1.2);
   }
-  38% {
-    transform: translateY(3px);
-    opacity: 0;
-  }
-  62% {
-    transform: translateY(-3px);
-    opacity: 0;
+  70% {
+    opacity: 0.5;
+    transform: scale(0.9);
   }
 }
 @keyframes cp-glyph-flow {
