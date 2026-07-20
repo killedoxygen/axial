@@ -17,7 +17,7 @@ jobs:
   verify-linux:
     runs-on: ubuntu-24.04
     container:
-      image: ghcr.io/mateoltd/axial-linux-ci@sha256:248d6e65bb8fe79a5c2bad58adba23eceec9db893393a258960987c3286a85af
+      image: ghcr.io/mateoltd/axial-linux-ci@sha256:c13788b4e92861ecec09652d88c220e8fe3ae5fd75ebda09820a219ff0c7091a
     steps:
       - name: Verify non-root container contract
         run: |

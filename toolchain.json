@@ -18,8 +18,8 @@
     }
   },
   "linux_ci_image": {
-    "reference": "ghcr.io/mateoltd/axial-linux-ci@sha256:248d6e65bb8fe79a5c2bad58adba23eceec9db893393a258960987c3286a85af",
-    "source_revision": "9267d01bce2652f8dd3be6fec3e686a6c74abeb1"
+    "reference": "ghcr.io/mateoltd/axial-linux-ci@sha256:c13788b4e92861ecec09652d88c220e8fe3ae5fd75ebda09820a219ff0c7091a",
+    "source_revision": "87dfb56eca0907c85983e5c34a30f434e8546e04"
   },
   "ubuntu_base": {
     "reference": "ubuntu:24.04@sha256:4fbb8e6a8395de5a7550b33509421a2bafbc0aab6c06ba2cef9ebffbc7092d90"
