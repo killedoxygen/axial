@@ -8,12 +8,14 @@ const scriptPath = fileURLToPath(import.meta.url);
 const defaultRepositoryRoot = resolve(dirname(scriptPath), "..");
 const exactVersionPattern = /^(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)$/;
 const commitPattern = /^[0-9a-f]{40}$/;
+const sha256Pattern = /^[0-9a-f]{64}$/;
 const maximumManifestBytes = 16 * 1024;
 
 const profileTools = Object.freeze({
   orchestration: ["node", "task"],
   frontend: ["node", "task", "pnpm"],
   rust: ["node", "task", "rustc", "cargo"],
+  dependencies: ["node", "task", "pnpm", "cargo", "cargo_deny"],
   desktop: ["node", "task", "pnpm", "rustc", "cargo", "tauri_cli"],
 });
 
@@ -73,6 +75,7 @@ export function parseToolchainManifest(source) {
       "pnpm",
       "rust",
       "tauri_cli",
+      "cargo_deny",
       "linux_ci_image",
       "ubuntu_base",
       "ubuntu_apt_snapshot",
@@ -82,6 +85,12 @@ export function parseToolchainManifest(source) {
   if (parsed.schema_version !== 1) fail("schema_version must be 1");
 
   requireKeys(parsed.rust, ["release", "rustc_commit", "cargo_commit"], "rust");
+  requireKeys(parsed.cargo_deny, ["release", "linux_archive"], "cargo_deny");
+  requireKeys(
+    parsed.cargo_deny.linux_archive,
+    ["target", "sha256"],
+    "cargo_deny.linux_archive",
+  );
   requireKeys(
     parsed.linux_ci_image,
     ["reference", "source_revision"],
@@ -109,6 +118,24 @@ export function parseToolchainManifest(source) {
       ),
     },
     tauri_cli: requireExactVersion(parsed.tauri_cli, "tauri_cli"),
+    cargo_deny: {
+      release: requireExactVersion(
+        parsed.cargo_deny.release,
+        "cargo_deny.release",
+      ),
+      linux_archive: {
+        target: requireString(
+          parsed.cargo_deny.linux_archive.target,
+          "cargo_deny.linux_archive.target",
+          /^x86_64-unknown-linux-musl$/,
+        ),
+        sha256: requireString(
+          parsed.cargo_deny.linux_archive.sha256,
+          "cargo_deny.linux_archive.sha256",
+          sha256Pattern,
+        ),
+      },
+    },
     linux_ci_image: {
       reference: requireString(
         parsed.linux_ci_image.reference,
@@ -284,6 +311,16 @@ function inspectExecutable(tool, identity, runner) {
       ),
     };
   }
+  if (tool === "cargo_deny") {
+    return {
+      release: exactObservedVersion(
+        "cargo-deny",
+        runner("cargo", ["deny", "--version"]),
+        identity.cargo_deny.release,
+        /^cargo-deny\s+(\d+\.\d+\.\d+)$/,
+      ),
+    };
+  }
   fail(`unsupported executable ${tool}`);
 }
 
@@ -296,10 +333,18 @@ export function verifyToolchain(options = {}) {
     ...new Set(profiles.flatMap((profile) => profileTools[profile])),
   ].sort();
   const mirrors = {};
-  if (profiles.includes("frontend") || profiles.includes("desktop")) {
+  if (
+    profiles.includes("frontend") ||
+    profiles.includes("dependencies") ||
+    profiles.includes("desktop")
+  ) {
     mirrors.frontend_package = parsePackageMirror(repositoryRoot, identity);
   }
-  if (profiles.includes("rust") || profiles.includes("desktop")) {
+  if (
+    profiles.includes("rust") ||
+    profiles.includes("dependencies") ||
+    profiles.includes("desktop")
+  ) {
     mirrors.rust_toolchain = parseRustMirror(repositoryRoot, identity);
   }
 

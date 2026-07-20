@@ -75,6 +75,7 @@ function exactRunner(calls = []) {
       "release: 1.93.1\ncommit-hash: 083ac5135f967fd9dc906ab057a2315861c7a80d",
     ],
     ["cargo tauri --version", "tauri-cli 2.11.2"],
+    ["cargo deny --version", "cargo-deny 0.20.2"],
   ]);
   return (command, args) => {
     const key = `${command} ${args.join(" ")}`;
@@ -123,6 +124,14 @@ test("rejects ranges, aliases, and malformed immutable identities", () => {
     [
       (manifest) => (manifest.tauri_cli = "^2.11.2"),
       /tauri_cli has an invalid/,
+    ],
+    [
+      (manifest) => (manifest.cargo_deny.release = "latest"),
+      /cargo_deny\.release has an invalid/,
+    ],
+    [
+      (manifest) => (manifest.cargo_deny.linux_archive.sha256 = "unverified"),
+      /cargo_deny\.linux_archive\.sha256 has an invalid/,
     ],
     [
       (manifest) =>
@@ -193,6 +202,28 @@ test("desktop profile verifies every exact mirror and executable", () => {
   assert.equal(
     report.executables.cargo.commit,
     validManifest.rust.cargo_commit,
+  );
+});
+
+test("dependency profile verifies the policy tool without widening desktop startup", () => {
+  const calls = [];
+  const report = verifyToolchain({
+    repositoryRoot: temporaryRepository(),
+    identity: readToolchainIdentity({ repositoryRoot }),
+    profiles: ["dependencies"],
+    runExecutable: exactRunner(calls),
+  });
+  assert.deepEqual(calls.sort(), [
+    "cargo --version --verbose",
+    "cargo deny --version",
+    "node --version",
+    "pnpm --version",
+    "task --version",
+  ]);
+  assert.equal(report.executables.cargo_deny.release, "0.20.2");
+  assert.equal(
+    report.identity.cargo_deny.linux_archive.sha256,
+    "9f12ed4c49936e09b48bf862b595cde2fe64fcbd9d74dfacac6131ca824c8d5f",
   );
 });
 

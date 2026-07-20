@@ -39,6 +39,8 @@ tasks:
       - task: toolchain:preflight
       - pnpm --dir frontend install --frozen-lockfile --ignore-scripts
       - cargo fetch --locked
+      - task: ensure:cargo-deny
+      - node scripts/toolchain.mjs verify --profile dependencies
       - task: ensure:tauri-cli
       - node scripts/toolchain.mjs verify --profile desktop
       - cmd: |
@@ -165,7 +167,17 @@ tasks:
   toolchain:verify:
     desc: verify every exact local delivery tool and tracked mirror
     cmds:
+      - task: ensure:cargo-deny
+      - node scripts/toolchain.mjs verify --profile dependencies
       - task: toolchain:desktop
+
+  dependencies:check:
+    desc: enforce the Cargo and pnpm advisory, license, and source policy
+    platforms: [linux]
+    cmds:
+      - task: ensure:cargo-deny
+      - node scripts/toolchain.mjs verify --profile dependencies
+      - node scripts/dependency-policy.mjs check
 
   toolchain:preflight:
     desc: reject delivery tool drift before dependency installation or compilation
@@ -209,6 +221,7 @@ tasks:
     platforms: [linux]
     cmds:
       - task: assets:check
+      - task: dependencies:check
       - task: verify:delivery
 
   verify:native:windows:
@@ -347,6 +360,7 @@ tasks:
           echo "rustfmt  $(cargo fmt --version 2>/dev/null || echo missing)"
           echo "clippy   $(cargo clippy --version 2>/dev/null || echo missing)"
           echo "tauri    $(cargo tauri --version 2>/dev/null || echo 'missing — run: task setup')"
+          echo "deny     $(cargo deny --version 2>/dev/null || echo 'missing — run: task setup')"
           echo "node     $(node --version 2>/dev/null || echo missing)"
           echo "pnpm     $(pnpm --version 2>/dev/null || echo 'missing — run: task setup')"
       - cmd: |
@@ -416,7 +430,7 @@ tasks:
   verify:contracts:
     internal: true
     cmds:
-      - node --test scripts/tests/toolchain.test.mjs scripts/tests/capability.test.mjs scripts/tests/contracts/p00-b01-contract.test.mjs scripts/tests/contracts/p00-b01-contract-cross-owner.test.mjs scripts/tests/contracts/p00-b02-contract.test.mjs scripts/tests/contracts/p00-b03-contract.test.mjs scripts/tests/contracts/p00-b03-contract-cross-owner.test.mjs
+      - node --test scripts/tests/toolchain.test.mjs scripts/tests/capability.test.mjs scripts/tests/dependency-policy.test.mjs scripts/tests/contracts/p00-b01-contract.test.mjs scripts/tests/contracts/p00-b01-contract-cross-owner.test.mjs scripts/tests/contracts/p00-b02-contract.test.mjs scripts/tests/contracts/p00-b03-contract.test.mjs scripts/tests/contracts/p00-b03-contract-cross-owner.test.mjs
       - task: capability:audit
 
   assets:verify:
@@ -472,6 +486,29 @@ tasks:
 
           install_tauri_cli
           test "$(cargo tauri --version)" = "tauri-cli $tauri_cli_version"
+
+  ensure:cargo-deny:
+    internal: true
+    platforms: [linux]
+    cmds:
+      - cmd: |
+          cargo_deny_version="$(node --input-type=module -e "import { readToolchainIdentity } from './scripts/toolchain.mjs'; process.stdout.write(readToolchainIdentity().cargo_deny.release)")"
+          cargo_deny_target="$(node --input-type=module -e "import { readToolchainIdentity } from './scripts/toolchain.mjs'; process.stdout.write(readToolchainIdentity().cargo_deny.linux_archive.target)")"
+          cargo_deny_sha256="$(node --input-type=module -e "import { readToolchainIdentity } from './scripts/toolchain.mjs'; process.stdout.write(readToolchainIdentity().cargo_deny.linux_archive.sha256)")"
+          if [ "$(cargo deny --version 2>/dev/null || true)" = "cargo-deny $cargo_deny_version" ]; then
+            exit 0
+          fi
+
+          archive_root="$(mktemp -d)"
+          trap 'rm -rf "$archive_root"' EXIT
+          archive="$archive_root/cargo-deny.tar.gz"
+          url="https://github.com/EmbarkStudios/cargo-deny/releases/download/$cargo_deny_version/cargo-deny-$cargo_deny_version-$cargo_deny_target.tar.gz"
+          curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location --retry 3 --output "$archive" "$url"
+          printf '%s  %s\n' "$cargo_deny_sha256" "$archive" | sha256sum --check --status
+          mkdir -p "$archive_root/unpacked" "$HOME/.cargo/bin"
+          tar -xzf "$archive" --strip-components=1 -C "$archive_root/unpacked"
+          install -m 0755 "$archive_root/unpacked/cargo-deny" "$HOME/.cargo/bin/cargo-deny"
+          test "$(cargo deny --version)" = "cargo-deny $cargo_deny_version"
 
   ensure:windows-cross:
     internal: true

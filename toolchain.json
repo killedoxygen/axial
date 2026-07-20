@@ -10,6 +10,13 @@
     "cargo_commit": "083ac5135f967fd9dc906ab057a2315861c7a80d"
   },
   "tauri_cli": "2.11.2",
+  "cargo_deny": {
+    "release": "0.20.2",
+    "linux_archive": {
+      "target": "x86_64-unknown-linux-musl",
+      "sha256": "9f12ed4c49936e09b48bf862b595cde2fe64fcbd9d74dfacac6131ca824c8d5f"
+    }
+  },
   "linux_ci_image": {
     "reference": "ghcr.io/mateoltd/axial-linux-ci@sha256:248d6e65bb8fe79a5c2bad58adba23eceec9db893393a258960987c3286a85af",
     "source_revision": "9267d01bce2652f8dd3be6fec3e686a6c74abeb1"
