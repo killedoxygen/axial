@@ -8,6 +8,8 @@ use sha2::{Digest as _, Sha256};
 
 const RESTART_IDENTITY_DOMAIN: &[u8] = b"axial.persisted-state-restart-record-identity.v2\0";
 const RESTART_IDENTITY_EDGE_SAMPLE_BYTES: usize = 4 * 1024;
+#[cfg(any(unix, windows))]
+const MAX_DIRECT_LEAF_UNITS: usize = 255;
 
 #[path = "registered_artifact.rs"]
 pub(crate) mod registered_artifact;
@@ -1338,7 +1340,7 @@ mod platform {
     }
 
     fn require_direct_leaf(name: &OsStr) -> io::Result<()> {
-        if name.as_bytes().is_empty() || name.as_bytes().len() > libc::NAME_MAX as usize {
+        if name.as_bytes().is_empty() || name.as_bytes().len() > super::MAX_DIRECT_LEAF_UNITS {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "anchored record name exceeds the supported direct-leaf bound",
@@ -1362,7 +1364,20 @@ mod platform {
 
     #[cfg(test)]
     mod normalization_tests {
-        use super::{canonical_nanoseconds, canonical_signed, canonical_unsigned};
+        use super::{
+            canonical_nanoseconds, canonical_signed, canonical_unsigned, require_direct_leaf,
+        };
+        use std::ffi::OsStr;
+
+        #[test]
+        fn direct_leaf_bound_counts_unix_bytes() {
+            let multi_byte_at_bound = "x".repeat(253) + "é";
+            let multi_byte_over_bound = "x".repeat(254) + "é";
+            assert!(require_direct_leaf(OsStr::new(&"x".repeat(255))).is_ok());
+            assert!(require_direct_leaf(OsStr::new(&"x".repeat(256))).is_err());
+            assert!(require_direct_leaf(OsStr::new(&multi_byte_at_bound)).is_ok());
+            assert!(require_direct_leaf(OsStr::new(&multi_byte_over_bound)).is_err());
+        }
 
         #[test]
         fn stat_fields_are_checked_before_entering_canonical_identity() {
@@ -2371,7 +2386,10 @@ mod platform {
 
     fn require_direct_leaf(name: &OsStr) -> io::Result<()> {
         let encoded = name.encode_wide().collect::<Vec<_>>();
-        if encoded.is_empty() || encoded.len() > 255 || encoded.contains(&0) {
+        if encoded.is_empty()
+            || encoded.len() > super::MAX_DIRECT_LEAF_UNITS
+            || encoded.contains(&0)
+        {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "anchored record name exceeds the supported direct-leaf bound",
@@ -2556,6 +2574,22 @@ mod platform {
 
     fn identity_changed(message: &'static str) -> io::Error {
         io::Error::new(io::ErrorKind::PermissionDenied, message)
+    }
+
+    #[cfg(test)]
+    mod normalization_tests {
+        use super::require_direct_leaf;
+        use std::ffi::OsStr;
+
+        #[test]
+        fn direct_leaf_bound_counts_windows_utf16_units() {
+            let surrogate_pair_at_bound = "x".repeat(253) + "😀";
+            let surrogate_pair_over_bound = "x".repeat(254) + "😀";
+            assert!(require_direct_leaf(OsStr::new(&"x".repeat(255))).is_ok());
+            assert!(require_direct_leaf(OsStr::new(&"x".repeat(256))).is_err());
+            assert!(require_direct_leaf(OsStr::new(&surrogate_pair_at_bound)).is_ok());
+            assert!(require_direct_leaf(OsStr::new(&surrogate_pair_over_bound)).is_err());
+        }
     }
 }
 

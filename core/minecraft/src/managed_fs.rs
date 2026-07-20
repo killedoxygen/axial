@@ -4095,7 +4095,9 @@ mod platform {
     use std::ffi::{CStr, OsStr, OsString};
     use std::fs;
     use std::io;
-    use std::os::fd::{AsRawFd, OwnedFd};
+    #[cfg(target_os = "linux")]
+    use std::os::fd::AsRawFd;
+    use std::os::fd::OwnedFd;
     use std::os::unix::ffi::OsStrExt;
     use std::path::Path;
 
@@ -4228,7 +4230,6 @@ mod platform {
         match rfs::linkat(file, "", parent, name, AtFlags::EMPTY_PATH) {
             Ok(()) => Ok(()),
             Err(error) if error == rustix::io::Errno::PERM => {
-                use std::os::fd::AsRawFd;
                 let proc_path = format!("/proc/self/fd/{}", file.as_raw_fd());
                 Ok(rfs::linkat(
                     rfs::CWD,

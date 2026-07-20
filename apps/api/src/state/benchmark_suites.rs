@@ -3718,18 +3718,22 @@ mod tests {
     async fn failed_compensation_retains_exact_retry_and_unrelated_suite_progresses() {
         let (root, _, backend, _, store) = persistence_fixture("compensation-retry");
         backend.fail_next(2);
+        let failed_suite_id = test_suite_id("suite-failed");
         let selected = selection(&store, "suite-failed", None).await;
         let error = store
             .reserve(selected, "session-failed", test_timestamp(), false)
             .await
             .expect_err("reservation and compensation fail");
         let handle = accepted_write_handle(error);
-        assert!(
-            store
-                .get(&test_suite_id("suite-failed"))
-                .expect("read")
-                .is_none()
-        );
+        store
+            .persistence
+            .as_ref()
+            .expect("persistent store")
+            .writer(&failed_suite_id)
+            .expect("failed suite writer")
+            .wait_until_idle()
+            .await;
+        assert!(store.get(&failed_suite_id).expect("read").is_none());
 
         let unrelated = selection(&store, "suite-unrelated", None).await;
         store
