@@ -1,0 +1,353 @@
+{
+  "schema_version": 1,
+  "assets": [
+    {
+      "id": "axial-brand",
+      "source": {
+        "kind": "repository-owned",
+        "locator": "repository://assets/brand-mark.json",
+        "revision": "brand-mark-v1"
+      },
+      "rights": {
+        "basis": "repository-owned",
+        "evidence": {
+          "locator": "docs/ICON-ASSETS.md",
+          "sha256": null
+        },
+        "current_policy": null,
+        "reviewed_at": "2026-07-20"
+      },
+      "refresh": "Increment design_revision, then run task assets:generate and task assets:check.",
+      "files": [
+        {
+          "path": "apps/desktop/icons/dev/icon.ico",
+          "mode": "100644",
+          "sha256": "1277ed71cf8017ab5ad0f0ad1cb87da4433564e93bf19b978fe9e8aa5d219254",
+          "generator": "tauri-cli-brand-mark-v1",
+          "locator": null,
+          "upstream_sha256": null
+        },
+        {
+          "path": "apps/desktop/icons/dev/icon.png",
+          "mode": "100644",
+          "sha256": "7be3c0f124ba0b352b53aca7b19fb6f12a6322cc56c1f9f0f1daef708a94954e",
+          "generator": "tauri-cli-brand-mark-v1",
+          "locator": null,
+          "upstream_sha256": null
+        },
+        {
+          "path": "apps/desktop/icons/icon.ico",
+          "mode": "100644",
+          "sha256": "4237c507be79f18cef672f4ed9adde22ff5513cb36ef36b264a9ccdc61f9a864",
+          "generator": "tauri-cli-brand-mark-v1",
+          "locator": null,
+          "upstream_sha256": null
+        },
+        {
+          "path": "apps/desktop/icons/icon.png",
+          "mode": "100644",
+          "sha256": "88c17d7e98353f93809c2e0c68649823945b521f3cec25f46f9950833221ed7f",
+          "generator": "tauri-cli-brand-mark-v1",
+          "locator": null,
+          "upstream_sha256": null
+        },
+        {
+          "path": "assets/brand-mark.json",
+          "mode": "100644",
+          "sha256": "36b39630e3be2d12c2675882653c0187ad2bc55f052309e70f23577c130a7356",
+          "generator": null,
+          "locator": null,
+          "upstream_sha256": null
+        },
+        {
+          "path": "frontend/static/favicon.png",
+          "mode": "100644",
+          "sha256": "94c392eb05af8b5c523611b1d928cf2f7f09746789cba540c6d2c571056c0af1",
+          "generator": "tauri-cli-brand-mark-v1",
+          "locator": null,
+          "upstream_sha256": null
+        }
+      ]
+    },
+    {
+      "id": "approved-macos-icons",
+      "source": {
+        "kind": "repository-owned",
+        "locator": "repository://apps/desktop/icons/macos",
+        "revision": "approved-icns-v1"
+      },
+      "rights": {
+        "basis": "repository-owned",
+        "evidence": {
+          "locator": "docs/ICON-ASSETS.md",
+          "sha256": null
+        },
+        "current_policy": null,
+        "reviewed_at": "2026-07-20"
+      },
+      "refresh": "Replace only after visual approval and native macOS packaging verification.",
+      "files": [
+        {
+          "path": "apps/desktop/icons/dev/macos/icon.icns",
+          "mode": "100644",
+          "sha256": "22b617a8456b2e66cdd86534bfff7e0397e55b99628ff608554b5325036e8ded",
+          "generator": null,
+          "locator": null,
+          "upstream_sha256": null
+        },
+        {
+          "path": "apps/desktop/icons/macos/icon.icns",
+          "mode": "100644",
+          "sha256": "d7ad79218775f390c90d4568c8ad361cf619a0bd39e4e6b8ed0dc309303ab081",
+          "generator": null,
+          "locator": null,
+          "upstream_sha256": null
+        }
+      ]
+    },
+    {
+      "id": "geist-mono",
+      "source": {
+        "kind": "upstream",
+        "locator": "https://github.com/vercel/geist-font/tree/63b548e95d4821c66fb74f9f93c7c8a693d48301",
+        "revision": "63b548e95d4821c66fb74f9f93c7c8a693d48301"
+      },
+      "rights": {
+        "basis": "sil-ofl-1.1",
+        "evidence": {
+          "locator": "frontend/static/fonts/GeistMono-OFL.txt",
+          "sha256": "930853ee1daa68554d9e35c8a9175affb74f699fad9a5da6ee5ebe76379d9137"
+        },
+        "current_policy": null,
+        "reviewed_at": "2026-07-20"
+      },
+      "refresh": "Update the font and byte-exact OFL notice from one reviewed immutable commit.",
+      "files": [
+        {
+          "path": "frontend/static/fonts/GeistMono-OFL.txt",
+          "mode": "100644",
+          "sha256": "930853ee1daa68554d9e35c8a9175affb74f699fad9a5da6ee5ebe76379d9137",
+          "generator": null,
+          "locator": "https://raw.githubusercontent.com/vercel/geist-font/63b548e95d4821c66fb74f9f93c7c8a693d48301/LICENSE.txt",
+          "upstream_sha256": "930853ee1daa68554d9e35c8a9175affb74f699fad9a5da6ee5ebe76379d9137"
+        },
+        {
+          "path": "frontend/static/fonts/GeistMono-Variable.woff2",
+          "mode": "100644",
+          "sha256": "5bc6413e82be410dc057feccee55160495b999d0fe212b7b6c6499b29b8b1e4a",
+          "generator": null,
+          "locator": "https://raw.githubusercontent.com/vercel/geist-font/63b548e95d4821c66fb74f9f93c7c8a693d48301/packages/next/dist/fonts/geist-mono/GeistMono-Variable.woff2",
+          "upstream_sha256": "5bc6413e82be410dc057feccee55160495b999d0fe212b7b6c6499b29b8b1e4a"
+        }
+      ]
+    },
+    {
+      "id": "loader-marks",
+      "source": {
+        "kind": "repository-owned",
+        "locator": "repository://frontend/static/loader-*.svg",
+        "revision": "neutral-loader-marks-v1"
+      },
+      "rights": {
+        "basis": "repository-owned",
+        "evidence": {
+          "locator": "docs/ICON-ASSETS.md",
+          "sha256": null
+        },
+        "current_policy": null,
+        "reviewed_at": "2026-07-20"
+      },
+      "refresh": "Keep five nonblank, mutually distinct neutral glyphs with no external brand geometry.",
+      "files": [
+        {
+          "path": "frontend/static/loader-base.svg",
+          "mode": "100644",
+          "sha256": "71511273ea28dadbd043a20d0e2bf75b0c6e7cdf185790b0a700a5ba892743b5",
+          "generator": null,
+          "locator": null,
+          "upstream_sha256": null
+        },
+        {
+          "path": "frontend/static/loader-cross.svg",
+          "mode": "100644",
+          "sha256": "29415bd131f5cd1e570eba3930ed3a519e46317e8cd5dd78c5bb05057d3bf5f5",
+          "generator": null,
+          "locator": null,
+          "upstream_sha256": null
+        },
+        {
+          "path": "frontend/static/loader-diamonds.svg",
+          "mode": "100644",
+          "sha256": "109ee1a59a2cbe3de9abe2501bd78a59239f9340233907a7cb5e2eb05eb12637",
+          "generator": null,
+          "locator": null,
+          "upstream_sha256": null
+        },
+        {
+          "path": "frontend/static/loader-grid.svg",
+          "mode": "100644",
+          "sha256": "f8648a4f1075df397a1b200ca624a58c56011bb814aaf44700e4c8579f3bfae7",
+          "generator": null,
+          "locator": null,
+          "upstream_sha256": null
+        },
+        {
+          "path": "frontend/static/loader-orbit.svg",
+          "mode": "100644",
+          "sha256": "c47b394e8772847569a981c103e5bbd86a42b37ab3feb0925fdb4f72e362df4f",
+          "generator": null,
+          "locator": null,
+          "upstream_sha256": null
+        }
+      ]
+    },
+    {
+      "id": "manrope",
+      "source": {
+        "kind": "upstream",
+        "locator": "https://github.com/google/fonts/tree/8f9a401dbb3793e0d1264b15d96aa253f05280f5/ofl/manrope",
+        "revision": "8f9a401dbb3793e0d1264b15d96aa253f05280f5"
+      },
+      "rights": {
+        "basis": "sil-ofl-1.1",
+        "evidence": {
+          "locator": "frontend/static/fonts/Manrope-OFL.txt",
+          "sha256": "f612090fb72b6dca3e807e66fa0d2b5def163cef86f1a3209b5c897cba5ee4b7"
+        },
+        "current_policy": null,
+        "reviewed_at": "2026-07-20"
+      },
+      "refresh": "Update every v20 subset together; normalize only trailing whitespace in the pinned OFL notice.",
+      "files": [
+        {
+          "path": "frontend/static/fonts/Manrope-OFL.txt",
+          "mode": "100644",
+          "sha256": "f612090fb72b6dca3e807e66fa0d2b5def163cef86f1a3209b5c897cba5ee4b7",
+          "generator": null,
+          "locator": "https://raw.githubusercontent.com/google/fonts/8f9a401dbb3793e0d1264b15d96aa253f05280f5/ofl/manrope/OFL.txt",
+          "upstream_sha256": "e01b637272e0cbdfb240184dd98ea5cc671556d9894dae2668d92ab2c906787c"
+        },
+        {
+          "path": "frontend/static/fonts/Manrope-cyrillic-ext.woff2",
+          "mode": "100644",
+          "sha256": "de37de877dc17e4577341fa68bb5cb526b53d54cb29721e674208546a3c7849d",
+          "generator": null,
+          "locator": "https://fonts.gstatic.com/s/manrope/v20/xn7gYHE41ni1AdIRggqxSuXd.woff2",
+          "upstream_sha256": "de37de877dc17e4577341fa68bb5cb526b53d54cb29721e674208546a3c7849d"
+        },
+        {
+          "path": "frontend/static/fonts/Manrope-cyrillic.woff2",
+          "mode": "100644",
+          "sha256": "c268b459a9329e59fecf39a17618efd44c71735532048d60b12aab76a8c14914",
+          "generator": null,
+          "locator": "https://fonts.gstatic.com/s/manrope/v20/xn7gYHE41ni1AdIRggOxSuXd.woff2",
+          "upstream_sha256": "c268b459a9329e59fecf39a17618efd44c71735532048d60b12aab76a8c14914"
+        },
+        {
+          "path": "frontend/static/fonts/Manrope-greek.woff2",
+          "mode": "100644",
+          "sha256": "2fb2e8cbfd52ae46179a8b6024eb162f1f9c6de3d22d6e3a30d8f395de7220be",
+          "generator": null,
+          "locator": "https://fonts.gstatic.com/s/manrope/v20/xn7gYHE41ni1AdIRggSxSuXd.woff2",
+          "upstream_sha256": "2fb2e8cbfd52ae46179a8b6024eb162f1f9c6de3d22d6e3a30d8f395de7220be"
+        },
+        {
+          "path": "frontend/static/fonts/Manrope-latin-ext.woff2",
+          "mode": "100644",
+          "sha256": "3911b66d9f2e005a4b989223405d0e5032619c668597ba467cc76a23c8fffcfb",
+          "generator": null,
+          "locator": "https://fonts.gstatic.com/s/manrope/v20/xn7gYHE41ni1AdIRggmxSuXd.woff2",
+          "upstream_sha256": "3911b66d9f2e005a4b989223405d0e5032619c668597ba467cc76a23c8fffcfb"
+        },
+        {
+          "path": "frontend/static/fonts/Manrope-latin.woff2",
+          "mode": "100644",
+          "sha256": "a30ddcd349703aff7464c34bef3fffdff405ee50c113440d7c8693c02d210972",
+          "generator": null,
+          "locator": "https://fonts.gstatic.com/s/manrope/v20/xn7gYHE41ni1AdIRggexSg.woff2",
+          "upstream_sha256": "a30ddcd349703aff7464c34bef3fffdff405ee50c113440d7c8693c02d210972"
+        },
+        {
+          "path": "frontend/static/fonts/Manrope-vietnamese.woff2",
+          "mode": "100644",
+          "sha256": "6bbb044ab420e07edb0a3042d2eb314b85e83a0182e945a15ab3b9092668dfd5",
+          "generator": null,
+          "locator": "https://fonts.gstatic.com/s/manrope/v20/xn7gYHE41ni1AdIRggixSuXd.woff2",
+          "upstream_sha256": "6bbb044ab420e07edb0a3042d2eb314b85e83a0182e945a15ab3b9092668dfd5"
+        }
+      ]
+    },
+    {
+      "id": "microsoft-auth-symbol",
+      "source": {
+        "kind": "upstream",
+        "locator": "https://github.com/MicrosoftDocs/entra-docs/tree/a10b4ac591ce9ac1c31f21a444fcad1da7f5a888/docs/identity-platform",
+        "revision": "a10b4ac591ce9ac1c31f21a444fcad1da7f5a888"
+      },
+      "rights": {
+        "basis": "microsoft-auth-branding-policy",
+        "evidence": {
+          "locator": "https://raw.githubusercontent.com/MicrosoftDocs/entra-docs/a10b4ac591ce9ac1c31f21a444fcad1da7f5a888/docs/identity-platform/howto-add-branding-in-apps.md",
+          "sha256": "06912b055a60241cfcc7cb0e396519d3513737c64703c789eff64dd8904559eb"
+        },
+        "current_policy": "https://learn.microsoft.com/en-us/entra/identity-platform/howto-add-branding-in-apps",
+        "reviewed_at": "2026-07-20"
+      },
+      "refresh": "Use only in Microsoft authentication controls and review the current policy before updating.",
+      "files": [
+        {
+          "path": "frontend/static/microsoft-auth-symbol.svg",
+          "mode": "100644",
+          "sha256": "929f48f88c8ca7f3f5d294be47ec4caf51acc28ac25340c19a903125d7ecd84a",
+          "generator": null,
+          "locator": "https://raw.githubusercontent.com/MicrosoftDocs/entra-docs/a10b4ac591ce9ac1c31f21a444fcad1da7f5a888/docs/identity-platform/media/howto-add-branding-in-apps/ms-symbollockup_mssymbol_19.svg",
+          "upstream_sha256": "929f48f88c8ca7f3f5d294be47ec4caf51acc28ac25340c19a903125d7ecd84a"
+        }
+      ]
+    },
+    {
+      "id": "snd-kit-01",
+      "source": {
+        "kind": "upstream",
+        "locator": "https://github.com/snd-lib/snd-lib/tree/ecd8ada30acf846b3dcd4f3bfd77b756addd84d9",
+        "revision": "ecd8ada30acf846b3dcd4f3bfd77b756addd84d9"
+      },
+      "rights": {
+        "basis": "snd-terms",
+        "evidence": {
+          "locator": "frontend/static/sounds/SND-NOTICE.txt",
+          "sha256": "f702dc40da3e1e0337554a640c12abc04a69a1cfb36705216d77ab5c0a3bae47"
+        },
+        "current_policy": "https://snd.dev/",
+        "reviewed_at": "2026-07-20"
+      },
+      "refresh": "Update manifest, sprite, notice, immutable revision, and current terms review together.",
+      "files": [
+        {
+          "path": "frontend/static/sounds/SND-NOTICE.txt",
+          "mode": "100644",
+          "sha256": "f702dc40da3e1e0337554a640c12abc04a69a1cfb36705216d77ab5c0a3bae47",
+          "generator": null,
+          "locator": "https://raw.githubusercontent.com/snd-lib/snd-lib/ecd8ada30acf846b3dcd4f3bfd77b756addd84d9/README.md",
+          "upstream_sha256": "f702dc40da3e1e0337554a640c12abc04a69a1cfb36705216d77ab5c0a3bae47"
+        },
+        {
+          "path": "frontend/static/sounds/snd01/audioSprite.json",
+          "mode": "100644",
+          "sha256": "dc6f1d69074deb6e383846b3b6dba1c1cdbd2737406e35a1bea317da13a3e4dd",
+          "generator": null,
+          "locator": "https://raw.githubusercontent.com/snd-lib/snd-lib/ecd8ada30acf846b3dcd4f3bfd77b756addd84d9/assets/sounds/sprite/01/audioSprite.json",
+          "upstream_sha256": "dc6f1d69074deb6e383846b3b6dba1c1cdbd2737406e35a1bea317da13a3e4dd"
+        },
+        {
+          "path": "frontend/static/sounds/snd01/audioSprite.mp3",
+          "mode": "100644",
+          "sha256": "2c06b31823b552aabf0e55a6ba861182e6e22c01bdc41c698ec316232abc39a1",
+          "generator": null,
+          "locator": "https://raw.githubusercontent.com/snd-lib/snd-lib/ecd8ada30acf846b3dcd4f3bfd77b756addd84d9/assets/sounds/sprite/01/audioSprite.mp3",
+          "upstream_sha256": "2c06b31823b552aabf0e55a6ba861182e6e22c01bdc41c698ec316232abc39a1"
+        }
+      ]
+    }
+  ]
+}

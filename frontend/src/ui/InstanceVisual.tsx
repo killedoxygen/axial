@@ -5,7 +5,6 @@ import { hashStr } from '../tokens';
 import { useTheme } from '../hooks/use-theme';
 import { loaderKeyFromComponentId, loaderKeyFromVersion, type LoaderKey } from '../views/create/defaults';
 import { loaderLogoSrc } from '../views/create/loader-logos';
-import { Icon } from './Icons';
 import { resolveTileHue } from './look-guardian';
 import type { Theme } from '../tokens';
 import type { Version } from '../types-version';
@@ -50,20 +49,12 @@ function loaderKeyForInstance(inst: VisualInstance, version: Version | undefined
 
 function GlyphMark({ loader, className }: { loader: LoaderKey; className: string }): JSX.Element {
   const src = loaderLogoSrc(loader);
-  if (src) {
-    return (
-      <span
-        aria-hidden="true"
-        class={`${className} ${className}--mask`}
-        data-loader={loader}
-        style={{ ['--cp-loader-src' as any]: `url("${src}")` }}
-      />
-    );
-  }
   return (
-    <span aria-hidden="true" class={className}>
-      <Icon name="stack" stroke={1.5} />
-    </span>
+    <span
+      aria-hidden="true"
+      class={`${className} ${className}--mask`}
+      style={{ ['--cp-loader-src' as any]: `url("${src}")` }}
+    />
   );
 }
 

@@ -212,7 +212,7 @@ test("the CLI accepts closed Task environment inputs and rejects mixed input aut
   );
 });
 
-test("the CLI audit accepts no scenario authority and audits the empty production registry", async () => {
+test("the CLI audit accepts no scenario authority and audits the production registry", async () => {
   const environment = { ...process.env };
   delete environment.SCENARIO;
   delete environment.PLATFORM;
@@ -221,7 +221,7 @@ test("the CLI audit accepts no scenario authority and audits the empty productio
     env: environment,
     encoding: "utf8",
   });
-  assert.equal(audited.stdout, "capability_registry_audited:0\n");
+  assert.equal(audited.stdout, "capability_registry_audited:4\n");
   assert.equal(audited.stderr, "");
 
   await assert.rejects(

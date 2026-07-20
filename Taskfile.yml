@@ -66,10 +66,19 @@ tasks:
           fi
         platforms: [linux]
 
-  icons:
-    desc: regenerate desktop app icons
+  assets:generate:
+    desc: regenerate the selected desktop and frontend brand assets
     cmds:
+      - task: ensure:tauri-cli
       - node scripts/generate-icons.mjs
+      - node scripts/verify-assets.mjs
+
+  assets:check:
+    desc: verify deterministic generated assets and the strict provenance inventory
+    cmds:
+      - task: ensure:tauri-cli
+      - node scripts/generate-icons.mjs --check
+      - node scripts/verify-assets.mjs
 
   dev:
     desc: run the desktop app in dev mode (frontend dev server + Rust hot-restart)
@@ -78,6 +87,7 @@ tasks:
       PORT: "{{.DEV_PORT}}"
     cmds:
       - task: toolchain:preflight
+      - task: assets:verify
       - task: ensure:tauri-cli
       - task: toolchain:desktop
       - cmd: |
@@ -97,6 +107,7 @@ tasks:
       PORT: "{{.DEV_PORT}}"
     cmds:
       - task: toolchain:preflight
+      - task: assets:verify
       - task: ensure:tauri-cli
       - task: toolchain:desktop
       - task: ensure:windows-cross
@@ -107,24 +118,28 @@ tasks:
     aliases: [web]
     cmds:
       - task: toolchain:frontend
+      - task: assets:verify
       - pnpm --dir frontend run dev
 
   dev:web:mock:
     desc: run the frontend-only dev server with a mocked API (no backend needed)
     cmds:
       - task: toolchain:frontend
+      - task: assets:verify
       - pnpm --dir frontend run dev:mock
 
   watch:
     desc: rebuild frontend assets to disk on file changes
     cmds:
       - task: toolchain:frontend
+      - task: assets:verify
       - pnpm --dir frontend run watch
 
   api:
     desc: run the local API server
     cmds:
       - task: toolchain:rust
+      - task: assets:verify
       - cargo run --locked -p axial-api
 
   check:
@@ -169,6 +184,7 @@ tasks:
     desc: typecheck, test, format-check, and build the frontend exactly once
     cmds:
       - task: toolchain:frontend
+      - task: assets:verify
       - pnpm --dir frontend run verify
 
   verify:rust:
@@ -192,6 +208,7 @@ tasks:
     desc: run the canonical Linux delivery inventory
     platforms: [linux]
     cmds:
+      - task: assets:check
       - task: verify:delivery
 
   verify:native:windows:
@@ -200,6 +217,8 @@ tasks:
     cmds:
       - task: toolchain:rust
       - node --test scripts/tests/capability.test.mjs
+      - node --test scripts/tests/contracts/p00-b03-contract.test.mjs scripts/tests/contracts/p00-b03-contract-cross-owner.test.mjs
+      - node scripts/verify-assets.mjs
       - cargo check --workspace --all-targets --all-features --locked
       - cargo test --locked -p axial-minecraft contained_
 
@@ -209,6 +228,8 @@ tasks:
     cmds:
       - task: toolchain:rust
       - node --test scripts/tests/capability.test.mjs
+      - node --test scripts/tests/contracts/p00-b03-contract.test.mjs scripts/tests/contracts/p00-b03-contract-cross-owner.test.mjs
+      - node scripts/verify-assets.mjs
       - cargo check --workspace --all-targets --all-features --locked
       - cargo test --locked -p axial-minecraft contained_
       - cargo test --locked -p axial-api macos_system_low_priority_round_trip_restores_disk_policy
@@ -310,6 +331,7 @@ tasks:
     dir: apps/desktop
     cmds:
       - task: toolchain:preflight
+      - task: assets:verify
       - task: ensure:tauri-cli
       - task: toolchain:desktop
       - cargo tauri build --config '{{.BUNDLE_TAURI_CONFIG}}' -- --locked
@@ -394,12 +416,18 @@ tasks:
   verify:contracts:
     internal: true
     cmds:
-      - node --test scripts/tests/toolchain.test.mjs scripts/tests/capability.test.mjs scripts/tests/contracts/p00-b01-contract.test.mjs scripts/tests/contracts/p00-b01-contract-cross-owner.test.mjs scripts/tests/contracts/p00-b02-contract.test.mjs
+      - node --test scripts/tests/toolchain.test.mjs scripts/tests/capability.test.mjs scripts/tests/contracts/p00-b01-contract.test.mjs scripts/tests/contracts/p00-b01-contract-cross-owner.test.mjs scripts/tests/contracts/p00-b02-contract.test.mjs scripts/tests/contracts/p00-b03-contract.test.mjs scripts/tests/contracts/p00-b03-contract-cross-owner.test.mjs
       - task: capability:audit
+
+  assets:verify:
+    internal: true
+    cmds:
+      - node scripts/verify-assets.mjs
 
   frontend:build:
     internal: true
     cmds:
+      - task: assets:verify
       - pnpm --dir frontend run build
 
   ensure:pnpm:
