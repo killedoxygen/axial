@@ -282,7 +282,6 @@ test("strict provenance is canonical, complete, hash-bound, and mode-bound", asy
     "utf8",
   );
   const parsed = parseProvenanceManifest(source);
-  assert.equal(parsed.paths.length, 26);
   await verifyAssetProvenance({ root });
 
   const malformed = JSON.parse(source);

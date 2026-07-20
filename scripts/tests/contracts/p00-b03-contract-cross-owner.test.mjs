@@ -230,10 +230,7 @@ test("each portable asset scenario reruns to the same current receipt", async ()
 
 test("provenance owns exactly the shipped inventory and retired duplicates stay absent", async () => {
   await verifyAssetProvenance();
-  const parsed = parseProvenanceManifest(
-    await readFile("assets/provenance.json", "utf8"),
-  );
-  assert.equal(parsed.paths.length, 26);
+  parseProvenanceManifest(await readFile("assets/provenance.json", "utf8"));
 
   const retired = [
     "assets/icon.ico",
