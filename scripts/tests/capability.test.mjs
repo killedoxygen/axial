@@ -332,16 +332,19 @@ test("duplicate identities and path escapes invalidate the complete registry", a
   await evidenceAbsent(fixture.root);
 });
 
-test("module validation permits a shared ancestor alias but rejects a leaf symlink", async (t) => {
+test("capability roots permit a shared ancestor alias but reject a module leaf symlink", async (t) => {
   const fixture = await harness(t, PASS_BODY);
   const aliasParent = await mkdtemp(path.join(os.tmpdir(), "axial-capability-alias-"));
   t.after(() => rm(aliasParent, { recursive: true, force: true }));
-  const aliasRoot = path.join(aliasParent, "scenarios");
-  await symlink(fixture.scenarioRoot, aliasRoot, process.platform === "win32" ? "junction" : "dir");
-  const aliasedModule = path.join(aliasRoot, path.basename(fixture.modulePath));
+  const aliasRoot = path.join(aliasParent, "repository");
+  await symlink(fixture.root, aliasRoot, process.platform === "win32" ? "junction" : "dir");
+  const aliasedScenarioRoot = path.join(aliasRoot, "scripts/capabilities/scenarios");
+  const aliasedModule = path.join(aliasedScenarioRoot, path.basename(fixture.modulePath));
   await runCapability(request(), {
     ...fixture.overrides,
-    scenarioRoot: aliasRoot,
+    repositoryRoot: aliasRoot,
+    scenarioRoot: aliasedScenarioRoot,
+    evidenceRoot: path.join(aliasRoot, "evidence/capabilities"),
     registry: [{ ...fixture.record, module_url: pathToFileURL(aliasedModule).href }],
   });
 
@@ -357,6 +360,44 @@ test("module validation permits a shared ancestor alias but rejects a leaf symli
       "invalid_module_url",
     );
   }
+});
+
+test("module and evidence roots reject repository-internal symlink escapes", async (t) => {
+  const moduleFixture = await harness(t, PASS_BODY);
+  const outsideModules = await mkdtemp(path.join(os.tmpdir(), "axial-capability-modules-"));
+  t.after(() => rm(outsideModules, { recursive: true, force: true }));
+  const escapedModule = path.join(outsideModules, "escaped.mjs");
+  await writeFile(escapedModule, scenarioSource(PASS_BODY), "utf8");
+  const linkedModules = path.join(moduleFixture.scenarioRoot, "linked");
+  await symlink(outsideModules, linkedModules, process.platform === "win32" ? "junction" : "dir");
+  await rejectsCode(
+    () =>
+      runCapability(request(), {
+        ...moduleFixture.overrides,
+        registry: [
+          {
+            ...moduleFixture.record,
+            module_url: pathToFileURL(path.join(linkedModules, "escaped.mjs")).href,
+          },
+        ],
+      }),
+    "invalid_module_url",
+  );
+  await evidenceAbsent(moduleFixture.root);
+
+  const evidenceFixture = await harness(t, PASS_BODY);
+  const outsideEvidence = await mkdtemp(path.join(os.tmpdir(), "axial-capability-evidence-"));
+  t.after(() => rm(outsideEvidence, { recursive: true, force: true }));
+  await symlink(
+    outsideEvidence,
+    path.join(evidenceFixture.root, "evidence"),
+    process.platform === "win32" ? "junction" : "dir",
+  );
+  await rejectsCode(
+    () => runCapability(request(), evidenceFixture.overrides),
+    "unsafe_evidence_root",
+  );
+  assert.deepEqual(await readdir(outsideEvidence), []);
 });
 
 test("capability and concrete platform bindings are checked before execution", async (t) => {

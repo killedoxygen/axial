@@ -267,9 +267,9 @@ async function listPosixProcessGroup(groupId) {
     .filter(({ pid, processGroup }) => Number.isSafeInteger(pid) && processGroup === groupId);
 }
 
-async function runTaskkill(pid, force) {
+async function terminateWindowsTree(pid) {
   try {
-    await execFile("taskkill.exe", ["/PID", String(pid), "/T", ...(force ? ["/F"] : [])], {
+    await execFile("taskkill.exe", ["/PID", String(pid), "/T", "/F"], {
       encoding: "utf8",
       timeout: settlementDeadlineMs,
       windowsHide: true,
@@ -284,11 +284,9 @@ async function runTaskkill(pid, force) {
 
 async function settleWorkerTree(child, closeState) {
   if (process.platform === "win32") {
-    const gracefulControlled = await runTaskkill(child.pid, false);
-    await sleep(settlementGraceMs);
-    const forcedControlled = !closeState.closed ? await runTaskkill(child.pid, true) : false;
+    const treeControlled = await terminateWindowsTree(child.pid);
     const leaderGone = await waitForCondition(() => closeState.closed, settlementDeadlineMs);
-    return (gracefulControlled || forcedControlled) && leaderGone;
+    return treeControlled && leaderGone;
   }
 
   // Freeze the group before enumerating it. Descendants settle while the worker
@@ -660,6 +658,25 @@ function concreteEvidenceRecord(record, platform) {
   return Object.freeze({ ...record, evidence_destination: destination });
 }
 
+async function resolveCapabilityRoots(overrides) {
+  const requestedRoot = path.resolve(overrides.repositoryRoot ?? repositoryRoot);
+  const root = await realpath(requestedRoot).catch(() => fail("invalid_repository_root"));
+  const scenarioRoot = path.resolve(
+    overrides.scenarioRoot ?? path.join(requestedRoot, "scripts/capabilities/scenarios"),
+  );
+  const requestedEvidenceRoot = path.resolve(
+    overrides.evidenceRoot ?? path.join(requestedRoot, "evidence/capabilities"),
+  );
+  if (requestedEvidenceRoot !== path.join(requestedRoot, "evidence", "capabilities")) {
+    fail("invalid_evidence_root");
+  }
+  return {
+    root,
+    scenarioRoot,
+    evidenceRoot: path.join(root, "evidence", "capabilities"),
+  };
+}
+
 async function aggregateRegisteredEvidence(record, root, overrides) {
   if (record.allowed_platforms.length < 2) fail("matrix_not_required");
   await cleanStaleEvidence(record);
@@ -711,10 +728,7 @@ async function aggregateRegisteredEvidence(record, root, overrides) {
 
 export async function runCapability(request, overrides = {}) {
   const normalizedRequest = normalizeRequest(request);
-  const root = path.resolve(overrides.repositoryRoot ?? repositoryRoot);
-  const scenarioRoot = path.resolve(overrides.scenarioRoot ?? path.join(root, "scripts/capabilities/scenarios"));
-  const evidenceRoot = path.resolve(overrides.evidenceRoot ?? path.join(root, "evidence/capabilities"));
-  if (evidenceRoot !== path.join(root, "evidence", "capabilities")) fail("invalid_evidence_root");
+  const { root, scenarioRoot, evidenceRoot } = await resolveCapabilityRoots(overrides);
 
   const records = await validateRegistryStructure(overrides.registry ?? capabilityRegistry, {
     scenarioRoot,
@@ -813,6 +827,7 @@ export async function runCapability(request, overrides = {}) {
   } catch (error) {
     await cleanStaleEvidence(concreteEvidenceRecord(record, normalizedRequest.platform));
     if (error instanceof CapabilityError) throw error;
+    if (error instanceof EvidenceError) fail(error.code);
     fail("evidence_write_failed");
   }
   const concreteRecord = concreteEvidenceRecord(record, normalizedRequest.platform);
@@ -821,10 +836,7 @@ export async function runCapability(request, overrides = {}) {
 }
 
 export async function auditCapabilityRegistry(overrides = {}) {
-  const root = path.resolve(overrides.repositoryRoot ?? repositoryRoot);
-  const scenarioRoot = path.resolve(overrides.scenarioRoot ?? path.join(root, "scripts/capabilities/scenarios"));
-  const evidenceRoot = path.resolve(overrides.evidenceRoot ?? path.join(root, "evidence/capabilities"));
-  if (evidenceRoot !== path.join(root, "evidence", "capabilities")) fail("invalid_evidence_root");
+  const { root, scenarioRoot, evidenceRoot } = await resolveCapabilityRoots(overrides);
   const records = await validateRegistryStructure(overrides.registry ?? capabilityRegistry, {
     scenarioRoot,
     evidenceRoot,
