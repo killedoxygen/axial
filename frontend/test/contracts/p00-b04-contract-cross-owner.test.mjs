@@ -48,10 +48,7 @@ test('cross-platform setup verifies the dependency tool only on Linux', async ()
   for (const task of ['setup', 'toolchain:verify']) {
     const body = taskBody(taskfile, task);
     assert.match(body, /task: ensure:cargo-deny/);
-    assert.match(
-      body,
-      /cmd: node scripts\/toolchain\.mjs verify --profile dependencies\n\s+platforms: \[linux\]/,
-    );
+    assert.match(body, /cmd: node scripts\/toolchain\.mjs verify --profile dependencies\n\s+platforms: \[linux\]/);
   }
 });
 
