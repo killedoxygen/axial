@@ -98,24 +98,71 @@ fn terminate_process_group(group: rustix::process::Pid) -> Result<(), BoundProce
 }
 
 #[cfg(target_os = "macos")]
-fn macos_process_group_is_empty(group: rustix::process::Pid) -> Result<bool, BoundProcessorError> {
-    match rustix::process::test_kill_process_group(group) {
-        Err(rustix::io::Errno::SRCH) => Ok(true),
-        Ok(()) => {
-            terminate_process_group(group)?;
-            if !macos_process_group_has_only_zombies(group)? {
-                return Ok(false);
-            }
-            match rustix::process::test_kill_process_group(group) {
-                Err(rustix::io::Errno::SRCH) => Ok(true),
-                Ok(()) => {
-                    terminate_process_group(group)?;
-                    macos_process_group_has_only_zombies(group)
-                }
-                Err(_) => Err(BoundProcessorError::Unreaped),
-            }
+fn inspect_macos_group_after_owned_kill(
+    group: rustix::process::Pid,
+) -> Result<MacosGroupSettlement, BoundProcessorError> {
+    settle_macos_group_probe(
+        rustix::process::test_kill_process_group(group),
+        || terminate_process_group(group),
+        || macos_process_group_has_only_zombies(group),
+    )
+}
+
+#[cfg(any(target_os = "macos", test))]
+#[derive(Debug, Eq, PartialEq)]
+enum MacosGroupSettlement {
+    Empty,
+    OnlyZombies,
+    LiveMembers,
+}
+
+#[cfg(any(target_os = "macos", test))]
+impl MacosGroupSettlement {
+    fn from_zombie_proof(only_zombies: bool) -> Self {
+        if only_zombies {
+            Self::OnlyZombies
+        } else {
+            Self::LiveMembers
         }
+    }
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn settle_macos_group_probe<Terminate, ProveZombies>(
+    probe: Result<(), rustix::io::Errno>,
+    terminate: Terminate,
+    prove_only_zombies: ProveZombies,
+) -> Result<MacosGroupSettlement, BoundProcessorError>
+where
+    Terminate: FnOnce() -> Result<(), BoundProcessorError>,
+    ProveZombies: FnOnce() -> Result<bool, BoundProcessorError>,
+{
+    match probe {
+        Err(rustix::io::Errno::SRCH) => Ok(MacosGroupSettlement::Empty),
+        Ok(()) => {
+            terminate()?;
+            Ok(MacosGroupSettlement::from_zombie_proof(
+                prove_only_zombies()?
+            ))
+        }
+        // After our SIGKILL succeeds, Darwin can report EPERM while only
+        // unsignalable zombies remain. Accept only the bounded exact-group proof.
+        Err(rustix::io::Errno::PERM) => Ok(MacosGroupSettlement::from_zombie_proof(
+            prove_only_zombies()?,
+        )),
         Err(_) => Err(BoundProcessorError::Unreaped),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn macos_process_group_is_empty(group: rustix::process::Pid) -> Result<bool, BoundProcessorError> {
+    match inspect_macos_group_after_owned_kill(group)? {
+        MacosGroupSettlement::Empty => Ok(true),
+        MacosGroupSettlement::LiveMembers => Ok(false),
+        MacosGroupSettlement::OnlyZombies => Ok(!matches!(
+            inspect_macos_group_after_owned_kill(group)?,
+            MacosGroupSettlement::LiveMembers
+        )),
     }
 }
 
@@ -2254,6 +2301,90 @@ mod tests {
             17,
             false,
         ));
+    }
+
+    #[test]
+    fn macos_group_probe_settlement_preserves_fail_closed_branches() {
+        fn settle(
+            probe: Result<(), rustix::io::Errno>,
+            termination: Result<(), BoundProcessorError>,
+            proof: Result<bool, BoundProcessorError>,
+            calls: &std::cell::Cell<(u8, u8)>,
+        ) -> Result<super::MacosGroupSettlement, BoundProcessorError> {
+            super::settle_macos_group_probe(
+                probe,
+                || {
+                    let (_, proofs) = calls.get();
+                    calls.set((1, proofs));
+                    termination
+                },
+                || {
+                    let (terminations, proofs) = calls.get();
+                    calls.set((terminations, proofs + 1));
+                    proof
+                },
+            )
+        }
+
+        let calls = std::cell::Cell::new((0, 0));
+        assert_eq!(
+            settle(Err(rustix::io::Errno::SRCH), Ok(()), Ok(true), &calls).expect("missing group"),
+            super::MacosGroupSettlement::Empty
+        );
+        assert_eq!(calls.get(), (0, 0));
+
+        calls.set((0, 0));
+        assert_eq!(
+            settle(Ok(()), Ok(()), Ok(true), &calls).expect("signalable zombie group"),
+            super::MacosGroupSettlement::OnlyZombies
+        );
+        assert_eq!(calls.get(), (1, 1));
+
+        calls.set((0, 0));
+        assert_eq!(
+            settle(Err(rustix::io::Errno::PERM), Ok(()), Ok(true), &calls).expect("zombie proof"),
+            super::MacosGroupSettlement::OnlyZombies
+        );
+        assert_eq!(calls.get(), (0, 1));
+
+        calls.set((0, 0));
+        assert_eq!(
+            settle(Err(rustix::io::Errno::PERM), Ok(()), Ok(false), &calls,)
+                .expect("live member remains"),
+            super::MacosGroupSettlement::LiveMembers
+        );
+        assert_eq!(calls.get(), (0, 1));
+
+        calls.set((0, 0));
+        assert!(matches!(
+            settle(Err(rustix::io::Errno::INVAL), Ok(()), Ok(true), &calls,),
+            Err(BoundProcessorError::Unreaped)
+        ));
+        assert_eq!(calls.get(), (0, 0));
+
+        calls.set((0, 0));
+        assert!(matches!(
+            settle(
+                Ok(()),
+                Err(BoundProcessorError::Containment),
+                Ok(true),
+                &calls,
+            ),
+            Err(BoundProcessorError::Containment)
+        ));
+        assert_eq!(calls.get(), (1, 0));
+
+        calls.set((0, 0));
+        assert!(matches!(
+            settle(
+                Err(rustix::io::Errno::PERM),
+                Ok(()),
+                Err(BoundProcessorError::Cleanup),
+                &calls,
+            ),
+            Err(BoundProcessorError::Cleanup)
+        ));
+        assert_eq!(calls.get(), (0, 1));
     }
 
     #[tokio::test]
