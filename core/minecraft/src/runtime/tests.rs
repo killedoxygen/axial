@@ -1208,27 +1208,15 @@ async fn cancelling_blocked_decompression_drains_worker_before_stage_cleanup() {
     );
     assert!(staging_root.exists());
     assert_eq!(
+        runtime_publication_lock_availability_for_test(&cache, &component),
+        (false, false),
+        "blocked decompression must retain both publication locks"
+    );
+    assert_eq!(
         fs::read(root.join("sentinel")).expect("canonical sentinel while cancelled"),
         b"canonical"
     );
 
-    let contender_cache = cache.clone();
-    let contender_component = component.clone();
-    let mut contender_task = tokio::spawn(async move {
-        stage_managed_runtime(
-            &contender_cache,
-            &contender_component,
-            contender_source,
-            &mut |_| {},
-        )
-        .await
-    });
-    assert!(
-        tokio::time::timeout(std::time::Duration::from_millis(25), &mut contender_task)
-            .await
-            .is_err(),
-        "contender must wait until the cancelled decompression worker releases ownership"
-    );
     gate.release
         .send(())
         .expect("release runtime decompression worker");
@@ -1243,7 +1231,23 @@ async fn cancelling_blocked_decompression_drains_worker_before_stage_cleanup() {
         fs::read(root.join("sentinel")).expect("canonical sentinel after cancellation"),
         b"canonical"
     );
+    assert_eq!(
+        runtime_publication_lock_availability_for_test(&cache, &component),
+        (true, true),
+        "cancelled stage must clean up before releasing publication locks"
+    );
 
+    let contender_cache = cache.clone();
+    let contender_component = component.clone();
+    let contender_task = tokio::spawn(async move {
+        stage_managed_runtime(
+            &contender_cache,
+            &contender_component,
+            contender_source,
+            &mut |_| {},
+        )
+        .await
+    });
     let contender = tokio::time::timeout(std::time::Duration::from_secs(2), contender_task)
         .await
         .expect("runtime stage contender should acquire released ownership")
