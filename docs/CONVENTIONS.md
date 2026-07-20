@@ -97,6 +97,13 @@ keep this short and real. if the codebase changes, update this file.
 - frontend JS entry output is `frontend/static/app.js`; additional generated chunks may be emitted under `frontend/static/chunks/`
 - frontend mock mode is build-time gated via `__AXIAL_MOCK_API__` and lives at the `api()` seam in `frontend/src/mock/`; run it with `task dev:web:mock`
 - frontend package manager is `pnpm`, pinned through `frontend/package.json`
+- exact Node, pnpm, Rust, Task, Tauri, container, and base-image identities are owned
+  by `toolchain.json`; tracked mirrors and active executables are verified through
+  `scripts/toolchain.mjs`, never widened with version ranges or mutable tags
+- frontend tests are discovered recursively by `frontend/test/run.mjs`; targeted
+  runs select one exact inventory member through `task frontend:test TEST=...`
+- capability proofs run only through the closed registry in `scripts/capabilities/`
+  and only the dispatcher may publish verified evidence under `evidence/capabilities/`
 - frontend formatting uses Prettier from `frontend/`; run `pnpm run format:check` to check and `pnpm run format` to write
 - the Rust workspace root is `Cargo.toml`
 - local dev commands live in `Taskfile.yml` and run through `task` on all OSes; desktop dev and bundling go through `tauri-cli` (`task dev`, `task bundle`)

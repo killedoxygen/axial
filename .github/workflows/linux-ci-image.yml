@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - main
+      - wip-*
     paths:
       - ".github/docker/linux-ci/**"
       - ".github/workflows/linux-ci-image.yml"
@@ -18,7 +19,7 @@ concurrency:
 
 jobs:
   publish:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
       packages: write
@@ -40,13 +41,16 @@ jobs:
         with:
           images: ghcr.io/${{ github.repository_owner }}/axial-linux-ci
           tags: |
-            type=raw,value=latest
-            type=sha
+            type=sha,format=long
 
-      - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+      - id: build
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
         with:
-          context: .
+          context: .github/docker/linux-ci
           file: .github/docker/linux-ci/Dockerfile
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+
+      - name: Record immutable image identity
+        run: printf 'Image digest: `%s`\n' '${{ steps.build.outputs.digest }}' >> "$GITHUB_STEP_SUMMARY"

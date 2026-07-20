@@ -19,7 +19,7 @@ dotenv: [".env.local", ".env"]
 
 vars:
   WINDOWS_TARGET: x86_64-pc-windows-gnu
-  TAURI_CLI_VERSION_REQ: "^2.9"
+  TAURI_CLI_VERSION: "2.11.2"
   # override with `DEV_PORT=3001 task dev` or `task dev DEV_PORT=3001`
   DEV_PORT: '{{.DEV_PORT | default "1420"}}'
   DEV_TAURI_CONFIG: '{"build":{"beforeDevCommand":{"script":"pnpm run dev:desktop","cwd":"{{toSlash .ROOT_DIR}}/frontend"},"devUrl":"http://localhost:{{.DEV_PORT}}"}}'
@@ -34,10 +34,13 @@ tasks:
   setup:
     desc: one-time setup — frontend deps, Rust deps, tauri-cli, and (Linux/WSL) Windows cross-build prerequisites
     cmds:
+      - node scripts/toolchain.mjs verify --profile orchestration
       - task: ensure:pnpm
+      - task: toolchain:preflight
       - pnpm --dir frontend install --frozen-lockfile --ignore-scripts
       - cargo fetch --locked
       - task: ensure:tauri-cli
+      - node scripts/toolchain.mjs verify --profile desktop
       - cmd: |
           if ! rustup target list --installed | grep -Fxq "{{.WINDOWS_TARGET}}"; then
             rustup target add "{{.WINDOWS_TARGET}}"
@@ -70,11 +73,13 @@ tasks:
 
   dev:
     desc: run the desktop app in dev mode (frontend dev server + Rust hot-restart)
-    deps: [ensure:tauri-cli]
     dir: apps/desktop
     env:
       PORT: "{{.DEV_PORT}}"
     cmds:
+      - task: toolchain:preflight
+      - task: ensure:tauri-cli
+      - task: toolchain:desktop
       - cmd: |
           if [ -n "${WSL_DISTRO_NAME:-}" ] && [ -z "${DISPLAY:-}" ] && [ -z "${WAYLAND_DISPLAY:-}" ]; then
             echo "desktop dev needs WSLg or another Linux GUI session." >&2
@@ -87,111 +92,226 @@ tasks:
   dev:windows:
     desc: run the desktop app in dev mode as a Windows app from Linux/WSL
     platforms: [linux]
-    deps: [ensure:tauri-cli, ensure:windows-cross]
     dir: apps/desktop
     env:
       PORT: "{{.DEV_PORT}}"
     cmds:
+      - task: toolchain:preflight
+      - task: ensure:tauri-cli
+      - task: toolchain:desktop
+      - task: ensure:windows-cross
       - cargo tauri dev --target {{.WINDOWS_TARGET}} --config '{{.DEV_TAURI_CONFIG}}' -- --locked
 
   dev:web:
     desc: run the frontend-only dev server (browser mode, works headless)
     aliases: [web]
     cmds:
+      - task: toolchain:frontend
       - pnpm --dir frontend run dev
 
   dev:web:mock:
     desc: run the frontend-only dev server with a mocked API (no backend needed)
     cmds:
+      - task: toolchain:frontend
       - pnpm --dir frontend run dev:mock
 
   watch:
     desc: rebuild frontend assets to disk on file changes
     cmds:
+      - task: toolchain:frontend
       - pnpm --dir frontend run watch
 
   api:
     desc: run the local API server
     cmds:
+      - task: toolchain:rust
       - cargo run --locked -p axial-api
 
   check:
     desc: run all static checks (matches CI)
     cmds:
+      - task: toolchain:preflight
+      - task: frontend:test
       - pnpm --dir frontend run format:check
-      - pnpm --dir frontend run check
-      - pnpm --dir frontend run test
       - cargo fmt --all --check
-      - cargo check --workspace --locked
       - cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 
   test:
     desc: run Rust workspace tests
     cmds:
+      - task: toolchain:rust
       - cargo test --workspace --locked
 
   verify:
     desc: run checks, tests, and a release desktop build (full CI parity)
     cmds:
-      - task: check
-      - task: test
-      - task: build
+      - task: verify:delivery
+
+  toolchain:verify:
+    desc: verify every exact local delivery tool and tracked mirror
+    cmds:
+      - task: toolchain:desktop
+
+  toolchain:preflight:
+    desc: reject delivery tool drift before dependency installation or compilation
+    cmds:
+      - node scripts/toolchain.mjs verify --profile frontend --profile rust
+
+  frontend:test:
+    desc: run the complete frontend test inventory or one exact TEST member
+    env:
+      AXIAL_FRONTEND_TEST: '{{.TEST | default ""}}'
+    cmds:
+      - task: toolchain:frontend
+      - pnpm --dir frontend run test
+
+  verify:frontend:
+    desc: typecheck, test, format-check, and build the frontend exactly once
+    cmds:
+      - task: toolchain:frontend
+      - pnpm --dir frontend run verify
+
+  verify:rust:
+    desc: format-check, lint, and test the Rust workspace
+    cmds:
+      - task: toolchain:rust
+      - cargo fmt --all --check
+      - cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+      - cargo test --workspace --locked
+
+  verify:delivery:
+    internal: true
+    cmds:
+      - task: toolchain:preflight
+      - task: verify:contracts
+      - task: verify:frontend
+      - task: verify:rust
+      - cargo build --locked -p axial-desktop --release
+
+  verify:linux:
+    desc: run the canonical Linux delivery inventory
+    platforms: [linux]
+    cmds:
+      - task: verify:delivery
+
+  verify:native:windows:
+    desc: compile the workspace and run native Windows containment contracts
+    platforms: [windows]
+    cmds:
+      - task: toolchain:rust
+      - node --test scripts/tests/capability.test.mjs
+      - cargo check --workspace --all-targets --all-features --locked
+      - cargo test --locked -p axial-minecraft contained_
+
+  verify:native:macos:
+    desc: compile the workspace and run native macOS process and priority contracts
+    platforms: [darwin]
+    cmds:
+      - task: toolchain:rust
+      - node --test scripts/tests/capability.test.mjs
+      - cargo check --workspace --all-targets --all-features --locked
+      - cargo test --locked -p axial-minecraft contained_
+      - cargo test --locked -p axial-api macos_system_low_priority_round_trip_restores_disk_policy
+      - cargo check --locked -p axial-desktop --target x86_64-apple-darwin
+
+  capability:self-test:
+    desc: verify the fail-closed capability, toolchain, workflow, and frontend contracts
+    cmds:
+      - task: toolchain:frontend
+      - task: verify:contracts
+      - task: frontend:test
+        vars:
+          TEST: test/contracts/runner-contract.test.ts
+
+  capability:audit:
+    desc: audit every registered capability identity and implementation declaration
+    cmds:
+      - task: toolchain:frontend
+      - node scripts/capability.mjs audit
+
+  capability:run:
+    desc: run one registered capability SCENARIO on PLATFORM
+    env:
+      SCENARIO: '{{.SCENARIO | default ""}}'
+      PLATFORM: '{{.PLATFORM | default ""}}'
+    cmds:
+      - node scripts/capability.mjs run
+
+  capability:platform:
+    desc: run one CAPABILITY-bound SCENARIO on PLATFORM
+    env:
+      CAPABILITY: '{{.CAPABILITY | default ""}}'
+      SCENARIO: '{{.SCENARIO | default ""}}'
+      PLATFORM: '{{.PLATFORM | default ""}}'
+    cmds:
+      - node scripts/capability.mjs platform
 
   fmt:
     desc: format Rust and frontend code
     cmds:
+      - task: toolchain:preflight
       - cargo fmt --all
       - pnpm --dir frontend run format
 
   build:
     desc: build the release desktop binary
-    deps: [frontend:build]
     cmds:
+      - task: toolchain:preflight
+      - task: frontend:build
       - cargo build --locked -p axial-desktop --release
       - cmd: echo "artifact → target/release/axial-desktop{{exeExt}}"
         silent: true
 
   build:dev:
     desc: build the debug desktop binary (bundled static assets, no dev server)
-    deps: [frontend:build]
     cmds:
+      - task: toolchain:preflight
+      - task: frontend:build
       - cargo build --locked -p axial-desktop
       - cmd: echo "artifact → target/debug/axial-desktop{{exeExt}}"
         silent: true
 
   build:windows:
     desc: cross-build the release Windows desktop binary from Linux/WSL
-    deps: [ensure:windows-cross, frontend:build]
     cmds:
+      - task: toolchain:preflight
+      - task: ensure:windows-cross
+      - task: frontend:build
       - cargo build --locked -p axial-desktop --release --target {{.WINDOWS_TARGET}}
       - cmd: echo "artifact → target/{{.WINDOWS_TARGET}}/release/axial-desktop.exe"
         silent: true
 
   build:windows:dev:
     desc: cross-build the debug Windows desktop binary from Linux/WSL
-    deps: [ensure:windows-cross, frontend:build]
     cmds:
+      - task: toolchain:preflight
+      - task: ensure:windows-cross
+      - task: frontend:build
       - cargo build --locked -p axial-desktop --target {{.WINDOWS_TARGET}}
       - cmd: echo "artifact → target/{{.WINDOWS_TARGET}}/debug/axial-desktop.exe"
         silent: true
 
   build:api:
     desc: build the debug API binary
-    deps: [frontend:build]
     cmds:
+      - task: toolchain:preflight
+      - task: frontend:build
       - cargo build --locked -p axial-api
 
   build:api:release:
     desc: build the release API binary
-    deps: [frontend:build]
     cmds:
+      - task: toolchain:preflight
+      - task: frontend:build
       - cargo build --locked -p axial-api --release
 
   bundle:
     desc: build native installers/bundles via tauri (.app/.dmg, .msi/.exe, .deb/.rpm)
-    deps: [ensure:tauri-cli]
     dir: apps/desktop
     cmds:
+      - task: toolchain:preflight
+      - task: ensure:tauri-cli
+      - task: toolchain:desktop
       - cargo tauri build --config '{{.BUNDLE_TAURI_CONFIG}}' -- --locked
 
   doctor:
@@ -256,6 +376,27 @@ tasks:
 
   # ── internal helpers ──────────────────────────────────────────────
 
+  toolchain:frontend:
+    internal: true
+    cmds:
+      - node scripts/toolchain.mjs verify --profile frontend
+
+  toolchain:rust:
+    internal: true
+    cmds:
+      - node scripts/toolchain.mjs verify --profile rust
+
+  toolchain:desktop:
+    internal: true
+    cmds:
+      - node scripts/toolchain.mjs verify --profile desktop
+
+  verify:contracts:
+    internal: true
+    cmds:
+      - node --test scripts/tests/toolchain.test.mjs scripts/tests/capability.test.mjs scripts/tests/contracts/p00-b01-contract.test.mjs scripts/tests/contracts/p00-b01-contract-cross-owner.test.mjs scripts/tests/contracts/p00-b02-contract.test.mjs
+      - task: capability:audit
+
   frontend:build:
     internal: true
     cmds:
@@ -268,8 +409,11 @@ tasks:
           if command -v pnpm >/dev/null 2>&1; then
             exit 0
           fi
-          echo "pnpm not found — enabling via corepack…"
-          if command -v corepack >/dev/null 2>&1 && corepack enable pnpm; then
+          pnpm_version="$(node --input-type=module -e "import { readToolchainIdentity } from './scripts/toolchain.mjs'; process.stdout.write(readToolchainIdentity().pnpm)")"
+          echo "pnpm not found — installing exact pnpm $pnpm_version via corepack…"
+          if command -v corepack >/dev/null 2>&1 \
+            && corepack install --global "pnpm@$pnpm_version" \
+            && corepack enable pnpm; then
             exit 0
           fi
           echo "could not enable pnpm automatically." >&2
@@ -280,49 +424,26 @@ tasks:
     internal: true
     cmds:
       - cmd: |
-          tauri_cli_req='{{.TAURI_CLI_VERSION_REQ}}'
+          tauri_cli_version='{{.TAURI_CLI_VERSION}}'
 
           install_tauri_cli() {
             if command -v cargo-binstall >/dev/null 2>&1; then
-              cargo binstall -y --force --locked tauri-cli --version "$tauri_cli_req"
+              cargo binstall -y --force --locked tauri-cli --version "=$tauri_cli_version"
             else
               echo "(tip: cargo-binstall turns this long compile into a ~15s download: https://github.com/cargo-bins/cargo-binstall)"
-              cargo install tauri-cli --version "$tauri_cli_req" --locked --force
+              cargo install tauri-cli --version "=$tauri_cli_version" --locked --force
             fi
           }
 
-          if command -v cargo-tauri >/dev/null 2>&1; then
-            tauri_version_output="$(cargo tauri --version 2>/dev/null || true)"
-            tauri_version="${tauri_version_output#tauri-cli }"
-            required_min="${tauri_cli_req#^}"
-            required_major="${required_min%%.*}"
-            required_minor="${required_min#*.}"
-
-            if [ "$tauri_version" != "$tauri_version_output" ]; then
-              old_ifs="$IFS"
-              IFS=.
-              set -- $tauri_version
-              IFS="$old_ifs"
-
-              if [ "$#" -eq 3 ]; then
-                case "$1$2$3$required_major$required_minor" in
-                  *[!0-9]*)
-                    ;;
-                  *)
-                    if [ "$1" -eq "$required_major" ] && [ "$2" -ge "$required_minor" ]; then
-                      exit 0
-                    fi
-                    ;;
-                esac
-              fi
-            fi
-
-            echo "${tauri_version_output:-cargo-tauri} does not satisfy tauri-cli $tauri_cli_req — installing compatible version…"
-          else
-            echo "tauri-cli not found — installing $tauri_cli_req…"
+          tauri_version_output="$(cargo tauri --version 2>/dev/null || true)"
+          if [ "$tauri_version_output" = "tauri-cli $tauri_cli_version" ]; then
+            exit 0
           fi
 
+          echo "${tauri_version_output:-tauri-cli not found}; installing exact tauri-cli $tauri_cli_version…"
+
           install_tauri_cli
+          test "$(cargo tauri --version)" = "tauri-cli $tauri_cli_version"
 
   ensure:windows-cross:
     internal: true

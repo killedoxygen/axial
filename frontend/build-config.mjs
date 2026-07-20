@@ -1,0 +1,76 @@
+import { createRequire } from 'node:module';
+import { join } from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+
+/** @typedef {{ dependencyRoot?: string, openaiIconSubsetPath?: string }} ResolverOptions */
+/**
+ * @typedef {object} BuildSemanticsOptions
+ * @property {string} [dependencyRoot]
+ * @property {boolean} enableDevLab
+ * @property {boolean} enableMockApi
+ * @property {string} [openaiIconSubsetPath]
+ * @property {string} webApiBase
+ */
+
+const defaultDependencyRoot = fileURLToPath(new URL('.', import.meta.url));
+const defaultOpenaiIconSubsetPath = fileURLToPath(new URL('./src/vendor/openai-icons-subset.js', import.meta.url));
+const reactCompatAliases = new Map([
+  ['react', 'preact/compat'],
+  ['react-dom', 'preact/compat'],
+  ['react/jsx-runtime', 'preact/jsx-runtime'],
+  ['react/jsx-dev-runtime', 'preact/jsx-runtime'],
+]);
+
+/** @param {ResolverOptions} [options] @returns {import('esbuild').Plugin[]} */
+export function createFrontendResolverPlugins({
+  dependencyRoot = defaultDependencyRoot,
+  openaiIconSubsetPath = defaultOpenaiIconSubsetPath,
+} = {}) {
+  const require = createRequire(pathToFileURL(join(dependencyRoot, 'package.json')));
+  return [
+    {
+      name: 'openai-icon-subset',
+      /** @param {import('esbuild').PluginBuild} build */
+      setup(build) {
+        build.onResolve({ filter: /^@openai\/apps-sdk-ui\/components\/Icon$/ }, () => ({
+          path: openaiIconSubsetPath,
+        }));
+      },
+    },
+    {
+      name: 'preact-compat-alias',
+      /** @param {import('esbuild').PluginBuild} build */
+      setup(build) {
+        build.onResolve({ filter: /^react(?:-dom|\/jsx-runtime|\/jsx-dev-runtime)?$/ }, (args) => {
+          const target = reactCompatAliases.get(args.path);
+          if (!target) return;
+          return { path: require.resolve(target) };
+        });
+      },
+    },
+  ];
+}
+
+/**
+ * @param {BuildSemanticsOptions} options
+ * @returns {Pick<import('esbuild').BuildOptions, 'define' | 'jsx' | 'jsxImportSource' | 'plugins' | 'target'>}
+ */
+export function createFrontendBuildSemantics({
+  dependencyRoot,
+  enableDevLab,
+  enableMockApi,
+  openaiIconSubsetPath,
+  webApiBase,
+}) {
+  return {
+    target: ['es2020'],
+    jsx: 'automatic',
+    jsxImportSource: 'preact',
+    define: {
+      __AXIAL_WEB_API_BASE__: JSON.stringify(webApiBase),
+      __AXIAL_ENABLE_DEV_LAB__: JSON.stringify(enableDevLab),
+      __AXIAL_MOCK_API__: JSON.stringify(enableMockApi),
+    },
+    plugins: createFrontendResolverPlugins({ dependencyRoot, openaiIconSubsetPath }),
+  };
+}

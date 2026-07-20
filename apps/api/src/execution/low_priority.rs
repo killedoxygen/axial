@@ -202,12 +202,21 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn macos_disk_policy_constants_match_the_system_abi() {
-        const IOPOL_PASSIVE: std::ffi::c_int = 2;
+    fn macos_system_low_priority_round_trip_restores_disk_policy() {
+        const IOPOL_TYPE_DISK: std::ffi::c_int = 0;
+        const IOPOL_SCOPE_THREAD: std::ffi::c_int = 1;
+        unsafe extern "C" {
+            fn getiopolicy_np(iotype: std::ffi::c_int, scope: std::ffi::c_int) -> std::ffi::c_int;
+        }
 
-        assert_eq!(IOPOL_PASSIVE, 2);
-        assert_eq!(MACOS_IOPOL_THROTTLE, 3);
-        assert_ne!(IOPOL_PASSIVE, MACOS_IOPOL_THROTTLE);
+        let before = unsafe { getiopolicy_np(IOPOL_TYPE_DISK, IOPOL_SCOPE_THREAD) };
+        assert_ne!(before, -1, "read disk I/O policy before scope");
+        let outcome = run_at_low_priority(SystemLowPriorityPlatform, || unsafe {
+            getiopolicy_np(IOPOL_TYPE_DISK, IOPOL_SCOPE_THREAD)
+        });
+        assert_eq!(outcome, LowPriorityOutcome::Complete(MACOS_IOPOL_THROTTLE));
+        let after = unsafe { getiopolicy_np(IOPOL_TYPE_DISK, IOPOL_SCOPE_THREAD) };
+        assert_eq!(after, before, "restore the exact prior disk I/O policy");
     }
 
     #[derive(Clone)]

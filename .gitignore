@@ -5,6 +5,7 @@
 .tools/
 .cache/
 dist/
+/evidence/
 node_modules
 
 # Local environment

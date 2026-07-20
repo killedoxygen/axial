@@ -23,6 +23,7 @@ const acceptedActions = new Map([
   ["docker/login-action", ["c94ce9fb468520275223c153574b00df6fe4bcc9", "v3.7.0"]],
   ["docker/metadata-action", ["c299e40c65443455700f0fdfc63efafe5b349051", "v5.10.0"]],
   ["docker/build-push-action", ["10e90e3645eae34f1e60eeb005ba3a3d33f178e8", "v6.19.2"]],
+  ["go-task/setup-task", ["01a4adf9db2d14c1de7a560f09170b6e0df736aa", "v2.1.0"]],
 ]);
 
 test("repository identity is Axial and obsolete migration residue is absent", async () => {

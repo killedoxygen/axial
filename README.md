@@ -40,9 +40,13 @@ The product logic is split across launcher, Minecraft, performance, configuratio
 
 ### Requirements
 
-- Rust stable with `rustfmt` and `clippy`
-- Node.js 22 or newer
-- [Task](https://taskfile.dev/installation)
+- Rust 1.93.1 with `rustfmt` and `clippy`
+- Node.js 24.13.1
+- [Task](https://taskfile.dev/installation) 3.52.0
+
+`toolchain.json` owns these exact versions together with pnpm, Tauri CLI, and
+the Linux build-image identities. Setup, generated builds, and delivery
+verification reject mismatched tools instead of accepting version ranges.
 
 On Ubuntu 24.04, desktop builds also need:
 
@@ -71,7 +75,7 @@ Run `task --list` to see every available task.
 | `task dev:web:mock` | Run the frontend against the built-in mock API |
 | `task dev:windows` | Run the Windows desktop target from Linux or WSL |
 | `task api` | Run the local API server |
-| `task check` | Run formatting, TypeScript, Rust check, and Clippy checks |
+| `task check` | Run frontend typechecks/tests/formatting and Rust static checks |
 | `task test` | Run the Rust workspace tests |
 | `task verify` | Run checks, tests, and a release desktop build |
 | `task fmt` | Format Rust and frontend sources |

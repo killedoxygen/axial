@@ -2,20 +2,22 @@
   "private": true,
   "type": "module",
   "packageManager": "pnpm@11.1.3",
+  "engines": {
+    "node": "24.13.1"
+  },
   "scripts": {
-    "build": "tsc --noEmit && node esbuild.mjs",
+    "build": "node esbuild.mjs",
     "dev": "node esbuild.mjs serve",
     "dev:desktop": "node esbuild.mjs serve --strict-port",
     "dev:mock": "node esbuild.mjs serve --strict-port --mock",
     "watch": "node esbuild.mjs watch",
-    "test:look-guardian": "node --experimental-strip-types --test test/look-guardian.test.mjs",
-    "test": "tsc --noEmit -p tsconfig.test.json && node test/run.mjs",
-    "check": "tsc --noEmit",
+    "test": "node test/run.mjs",
+    "verify": "pnpm run format:check && pnpm run test && pnpm run build",
     "format": "prettier --write .",
     "format:check": "prettier --check ."
   },
   "devDependencies": {
-    "@types/node": "^26.1.1",
+    "@types/node": "24.13.3",
     "@types/three": "^0.184.1",
     "esbuild": "^0.25.0",
     "prettier": "^3.8.4",

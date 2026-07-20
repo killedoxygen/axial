@@ -1,10 +1,8 @@
 import net from 'node:net';
 import { rm } from 'node:fs/promises';
-import { createRequire } from 'node:module';
-import { fileURLToPath } from 'node:url';
 import { context, build } from 'esbuild';
+import { createFrontendBuildSemantics } from './build-config.mjs';
 
-const require = createRequire(import.meta.url);
 const mode = process.argv[2]; // 'serve', 'watch', or omitted (production build)
 const strictDevPort = process.argv.includes('--strict-port');
 const portOverride = process.env.PORT;
@@ -13,35 +11,7 @@ const webApiBase = process.env.AXIAL_WEB_API_BASE ?? 'http://127.0.0.1:43430';
 const enableDevLab = mode === 'serve' || mode === 'watch';
 const enableMockApi = mode === 'serve' && process.argv.includes('--mock');
 
-const reactCompatAliases = new Map([
-  ['react', 'preact/compat'],
-  ['react-dom', 'preact/compat'],
-  ['react/jsx-runtime', 'preact/jsx-runtime'],
-  ['react/jsx-dev-runtime', 'preact/jsx-runtime'],
-]);
-
-const openaiIconSubsetPath = fileURLToPath(new URL('./src/vendor/openai-icons-subset.js', import.meta.url));
 const generatedOutputs = ['static/app.js', 'static/app.css', 'static/chunks'];
-
-const openaiIconSubsetPlugin = {
-  name: 'openai-icon-subset',
-  setup(b) {
-    b.onResolve({ filter: /^@openai\/apps-sdk-ui\/components\/Icon$/ }, () => ({
-      path: openaiIconSubsetPath,
-    }));
-  },
-};
-
-const preactCompatAliasPlugin = {
-  name: 'preact-compat-alias',
-  setup(b) {
-    b.onResolve({ filter: /^react(?:-dom|\/jsx-runtime|\/jsx-dev-runtime)?$/ }, (args) => {
-      const target = reactCompatAliases.get(args.path);
-      if (!target) return;
-      return { path: require.resolve(target, { paths: [process.cwd()] }) };
-    });
-  },
-};
 
 const shared = {
   entryPoints: { app: 'src/main.tsx' },
@@ -51,15 +21,7 @@ const shared = {
   splitting: true,
   chunkNames: 'chunks/[name]-[hash]',
   external: ['fonts/*'],
-  target: ['es2020'],
-  jsx: 'automatic',
-  jsxImportSource: 'preact',
-  define: {
-    __AXIAL_WEB_API_BASE__: JSON.stringify(webApiBase),
-    __AXIAL_ENABLE_DEV_LAB__: JSON.stringify(enableDevLab),
-    __AXIAL_MOCK_API__: JSON.stringify(enableMockApi),
-  },
-  plugins: [openaiIconSubsetPlugin, preactCompatAliasPlugin],
+  ...createFrontendBuildSemantics({ enableDevLab, enableMockApi, webApiBase }),
 };
 
 const sizeReporter = {

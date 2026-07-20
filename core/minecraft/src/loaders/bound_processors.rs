@@ -1749,7 +1749,6 @@ mod tests {
         manifest_attributes, processor_main_class, reauthenticate_step_dependencies,
         valid_main_class,
     };
-    #[cfg(unix)]
     use super::{spawn_contained_child, wait_for_contained_child};
     use crate::artifact_path::ArtifactRelativePath;
     use crate::loaders::forge_installer::{
@@ -1763,13 +1762,10 @@ mod tests {
     use std::fs;
     use std::io::{Cursor, Write};
     use std::sync::{Arc, atomic::AtomicUsize};
-    #[cfg(unix)]
     use std::time::Duration;
     use tokio::io::AsyncWriteExt;
-    #[cfg(unix)]
     use tokio::process::Command;
     use tokio::sync::mpsc;
-    #[cfg(unix)]
     use tokio::sync::oneshot;
     use zip::{ZipWriter, write::SimpleFileOptions};
 
@@ -2050,11 +2046,42 @@ mod tests {
         task.await.expect("pipe owner");
     }
 
-    #[cfg(unix)]
+    const CONTAINMENT_FIXTURE_ENV: &str = "AXIAL_CONTAINMENT_FIXTURE";
+    const CONTAINMENT_FIXTURE_TEST: &str =
+        "loaders::bound_processors::tests::contained_child_fixture";
+
+    #[test]
+    fn contained_child_fixture() {
+        let Ok(mode) = std::env::var(CONTAINMENT_FIXTURE_ENV) else {
+            return;
+        };
+        match mode.as_str() {
+            "exit-7" => std::process::exit(7),
+            "wait" => std::thread::sleep(Duration::from_secs(30)),
+            "leader-with-descendant" => {
+                let mut descendant = std::process::Command::new(
+                    std::env::current_exe().expect("current test executable"),
+                );
+                descendant
+                    .args(["--exact", CONTAINMENT_FIXTURE_TEST, "--nocapture"])
+                    .env(CONTAINMENT_FIXTURE_ENV, "wait");
+                descendant.spawn().expect("fixture descendant");
+            }
+            other => panic!("unknown containment fixture mode: {other}"),
+        }
+    }
+
+    fn containment_fixture_command(mode: &str) -> Command {
+        let mut command = Command::new(std::env::current_exe().expect("current test executable"));
+        command
+            .args(["--exact", CONTAINMENT_FIXTURE_TEST, "--nocapture"])
+            .env(CONTAINMENT_FIXTURE_ENV, mode);
+        command
+    }
+
     #[tokio::test]
     async fn contained_nonzero_cancel_and_output_limit_are_reaped() {
-        let mut command = Command::new("sh");
-        command.args(["-c", "exit 7"]);
+        let mut command = containment_fixture_command("exit-7");
         let mut nonzero = spawn_contained_child(&mut command)
             .await
             .expect("nonzero child");
@@ -2076,8 +2103,7 @@ mod tests {
         ));
         assert!(nonzero.child.try_wait().expect("nonzero wait").is_some());
 
-        let mut command = Command::new("sh");
-        command.args(["-c", "sleep 30 & wait"]);
+        let mut command = containment_fixture_command("wait");
         let mut cancelled = spawn_contained_child(&mut command)
             .await
             .expect("cancelled child");
@@ -2100,8 +2126,7 @@ mod tests {
         ));
         assert!(cancelled.child.try_wait().expect("cancel wait").is_some());
 
-        let mut command = Command::new("sh");
-        command.args(["-c", "while :; do :; done"]);
+        let mut command = containment_fixture_command("wait");
         let mut flooded = spawn_contained_child(&mut command)
             .await
             .expect("flood child");
@@ -2123,11 +2148,9 @@ mod tests {
         assert!(flooded.child.try_wait().expect("limit wait").is_some());
     }
 
-    #[cfg(unix)]
     #[tokio::test]
-    async fn successful_leader_exit_terminates_surviving_descendants() {
-        let mut command = Command::new("sh");
-        command.args(["-c", "sleep 30 & exit 0"]);
+    async fn contained_successful_leader_exit_terminates_surviving_descendants() {
+        let mut command = containment_fixture_command("leader-with-descendant");
         let mut child = spawn_contained_child(&mut command)
             .await
             .expect("contained child");
@@ -2156,11 +2179,9 @@ mod tests {
         assert!(child.containment.is_empty().expect("empty process group"));
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn contained_tree_timeout_is_reaped() {
-        let mut command = Command::new("sh");
-        command.args(["-c", "sleep 30 & wait"]);
+        let mut command = containment_fixture_command("wait");
         let mut child = spawn_contained_child(&mut command)
             .await
             .expect("timeout child");
