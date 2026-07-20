@@ -35,6 +35,9 @@ const MAX_PROCESS_OUTPUT_TOTAL_BYTES: usize = 2 << 20;
 const MAX_LINUX_PROCESS_STAT_BYTES: u64 = 4096;
 #[cfg(any(target_os = "macos", test))]
 const MAX_MACOS_PROCESS_GROUP_MEMBERS: usize = 4096;
+// XNU searches zombproc for PROC_PIDTBSDINFO only when arg is nonzero.
+#[cfg(any(target_os = "macos", test))]
+const MACOS_PROC_PIDINFO_FIND_ZOMBIES_ARG: u64 = 1;
 const PROCESSOR_TIMEOUT: Duration = Duration::from_secs(120);
 const PIPE_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 const PROCESS_REAP_TIMEOUT: Duration = Duration::from_secs(5);
@@ -142,7 +145,7 @@ fn macos_process_group_has_only_zombies(
             libc::proc_pidinfo(
                 pid,
                 libc::PROC_PIDTBSDINFO,
-                0,
+                MACOS_PROC_PIDINFO_FIND_ZOMBIES_ARG,
                 info.as_mut_ptr().cast(),
                 info_bytes,
             )
@@ -2209,6 +2212,7 @@ mod tests {
 
     #[test]
     fn macos_group_listing_bounds_and_zombie_classification_fail_closed() {
+        assert_ne!(super::MACOS_PROC_PIDINFO_FIND_ZOMBIES_ARG, 0);
         assert_eq!(
             super::checked_macos_process_group_listing_len(
                 super::MAX_MACOS_PROCESS_GROUP_MEMBERS as i32,
