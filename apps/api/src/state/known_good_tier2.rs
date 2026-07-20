@@ -449,7 +449,6 @@ mod tests {
                         .expect("performance"),
                 ),
                 startup_warnings: Vec::new(),
-                frontend_dir: root.join("frontend"),
             });
             state.set_library_dir_for_test(library_root.to_string_lossy().into_owned());
             let instance = state

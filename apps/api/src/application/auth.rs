@@ -1681,7 +1681,6 @@ mod tests {
                         .expect("performance manager"),
                 ),
                 startup_warnings: Vec::new(),
-                frontend_dir: root.join("frontend"),
             });
             let state = if failing_accounts {
                 let coordinator = PersistenceCoordinator::for_test(

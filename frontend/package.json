@@ -7,6 +7,7 @@
   },
   "scripts": {
     "build": "node esbuild.mjs",
+    "clean": "node esbuild.mjs clean",
     "dev": "node esbuild.mjs serve",
     "dev:desktop": "node esbuild.mjs serve --strict-port",
     "dev:mock": "node esbuild.mjs serve --strict-port --mock",

@@ -908,7 +908,7 @@ fn markdown_document_bytes(snapshot: &InvariantCoverage) -> Vec<u8> {
          This document is a deterministic human-readable projection of Guardian's strict invariant coverage artifact. The JSON artifact remains the complete machine-readable inventory, including all kernel cells.\n\n\
          - Schema: `{}`\n\
          - Machine-readable artifact: [guardian-invariant-coverage-v4.json](../apps/api/tests/fixtures/guardian/guardian-invariant-coverage-v4.json)\n\
-         - Regenerate: `AXIAL_REGENERATE_GUARDIAN_INVARIANT_COVERAGE=1 cargo test -p axial-api regenerate_guardian_invariant_coverage_artifacts -- --ignored`\n\n\
+         - Regenerate: `AXIAL_REGENERATE_GUARDIAN_INVARIANT_COVERAGE=1 cargo test --locked -p axial-api --no-default-features regenerate_guardian_invariant_coverage_artifacts -- --ignored`\n\n\
          ## Invariant Status\n",
         snapshot.schema
     );

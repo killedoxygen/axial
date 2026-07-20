@@ -695,7 +695,6 @@ mod tests {
                     .expect("test performance state"),
             ),
             startup_warnings: Vec::new(),
-            frontend_dir: root.join("frontend"),
         });
         Fixture { state, root }
     }

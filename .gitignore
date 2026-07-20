@@ -4,7 +4,7 @@
 .DS_Store
 .tools/
 .cache/
-dist/
+/dist/
 /evidence/
 node_modules
 
@@ -13,10 +13,9 @@ node_modules
 .env.local
 
 # Frontend build artifacts
-frontend/static/app.js
-frontend/static/app.css
-frontend/static/chunks/
-frontend/package.json.md5
+frontend/dist/
+frontend/dist.stage-*/
+frontend/dist.previous-*/
 target/
 
 # Local-only

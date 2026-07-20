@@ -8097,7 +8097,6 @@ fn build_test_state(root: &Path) -> AppState {
             PerformanceManager::load_for_startup(&paths.config_dir).expect("performance manager"),
         ),
         startup_warnings: Vec::new(),
-        frontend_dir: root.join("frontend"),
     })
 }
 
@@ -8121,7 +8120,6 @@ async fn load_persistent_test_state(root: &Path) -> AppState {
                 .expect("load persistent test performance manager"),
         ),
         startup_warnings,
-        frontend_dir: root.join("frontend"),
     })
     .await
     .expect("load persistent test application state");

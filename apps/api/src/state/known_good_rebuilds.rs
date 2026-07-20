@@ -806,7 +806,6 @@ mod tests {
                     .expect("load test performance state"),
             ),
             startup_warnings: Vec::new(),
-            frontend_dir: root.join("frontend"),
         });
         let library_root = root.join("library");
         std::fs::create_dir_all(&library_root).expect("library root");

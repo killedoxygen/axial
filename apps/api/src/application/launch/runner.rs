@@ -5816,7 +5816,6 @@ mod tests {
                     .expect("performance manager"),
             ),
             startup_warnings: Vec::new(),
-            frontend_dir: root.join("frontend"),
         })
     }
 
@@ -5902,7 +5901,6 @@ mod tests {
                     .expect("registered recovery performance manager"),
             ),
             startup_warnings: Vec::new(),
-            frontend_dir: root.join("frontend"),
         })
     }
 
@@ -5974,7 +5972,6 @@ mod tests {
                     .expect("VersionBundle recovery performance manager"),
             ),
             startup_warnings: Vec::new(),
-            frontend_dir: root.join("frontend"),
         });
         state.activate_known_good_inventory_for_test(
             instance_id,
@@ -6289,7 +6286,6 @@ exit 0
                     .expect("performance manager"),
             ),
             startup_warnings: Vec::new(),
-            frontend_dir: root.join("frontend"),
         });
         activate_fabric_crash_known_good(&state, root, &instance.id);
         state
@@ -6442,7 +6438,6 @@ exit 0
                         .expect("performance manager"),
                 ),
                 startup_warnings: Vec::new(),
-                frontend_dir: root.join("frontend"),
             },
             telemetry,
         )
@@ -6476,7 +6471,6 @@ exit 0
                     .expect("performance manager"),
             ),
             startup_warnings: Vec::new(),
-            frontend_dir: root.join("frontend"),
         })
     }
 

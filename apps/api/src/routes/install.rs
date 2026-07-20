@@ -326,7 +326,6 @@ mod tests {
                         .expect("performance manager"),
                 ),
                 startup_warnings: Vec::new(),
-                frontend_dir: root.join("frontend"),
             });
 
             Self { state, root }

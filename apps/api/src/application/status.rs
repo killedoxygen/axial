@@ -70,7 +70,6 @@ mod tests {
                     .expect("performance manager"),
             ),
             startup_warnings: vec!["startup warning".to_string()],
-            frontend_dir: root.join("frontend"),
         });
 
         let response = launcher_status(&state);
@@ -145,7 +144,6 @@ mod tests {
                     .expect("performance manager"),
             ),
             startup_warnings: Vec::new(),
-            frontend_dir: root.join("frontend"),
         });
 
         let response = launcher_status(&state);
@@ -211,7 +209,6 @@ mod tests {
                     .expect("performance manager"),
             ),
             startup_warnings: Vec::new(),
-            frontend_dir: root.join("frontend"),
         });
 
         let response = launcher_status(&state);
@@ -254,7 +251,6 @@ mod tests {
                     .expect("performance manager"),
             ),
             startup_warnings: Vec::new(),
-            frontend_dir: root.join("frontend"),
         });
 
         let response = launcher_status(&state);
@@ -301,7 +297,6 @@ mod tests {
                     .expect("performance manager"),
             ),
             startup_warnings: Vec::new(),
-            frontend_dir: root.join("frontend"),
         });
 
         let response = launcher_status(&state);
@@ -342,7 +337,6 @@ mod tests {
                     .expect("performance manager"),
             ),
             startup_warnings,
-            frontend_dir: root.join("frontend"),
         });
 
         let response = launcher_status(&state);

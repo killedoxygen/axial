@@ -1018,7 +1018,6 @@ mod tests {
             ),
             config,
             startup_warnings: Vec::new(),
-            frontend_dir: paths.config_dir.join("frontend"),
         })
     }
 

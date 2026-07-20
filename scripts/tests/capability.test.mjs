@@ -221,7 +221,7 @@ test("the CLI audit accepts no scenario authority and audits the production regi
     env: environment,
     encoding: "utf8",
   });
-  assert.equal(audited.stdout, "capability_registry_audited:4\n");
+  assert.equal(audited.stdout, "capability_registry_audited:5\n");
   assert.equal(audited.stderr, "");
 
   await assert.rejects(

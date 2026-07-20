@@ -65,7 +65,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         sessions,
         performance,
         startup_warnings,
-        frontend_dir: axial_api::app::default_frontend_dir(),
     })
     .await?;
     if !start_application_background_workflows(&state).await {

@@ -4290,7 +4290,6 @@ mod tests {
                 PerformanceManager::load_for_startup(&paths.config_dir).expect("test performance"),
             ),
             startup_warnings: Vec::new(),
-            frontend_dir: root.join("frontend"),
         });
         (state, root)
     }

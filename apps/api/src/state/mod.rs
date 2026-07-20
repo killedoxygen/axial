@@ -229,7 +229,6 @@ pub struct AppState {
     config_changes: Arc<broadcast::Sender<()>>,
     #[cfg(test)]
     auth_chain_client_override: Arc<RwLock<Option<crate::auth_chain::AuthChainClient>>>,
-    frontend_dir: Arc<PathBuf>,
 }
 
 pub struct AppStateInit {
@@ -241,7 +240,6 @@ pub struct AppStateInit {
     pub sessions: Arc<SessionStore>,
     pub performance: Arc<PerformanceManager>,
     pub startup_warnings: Vec<String>,
-    pub frontend_dir: PathBuf,
 }
 
 #[derive(Clone, Copy)]
@@ -727,7 +725,6 @@ impl AppState {
             config_changes: Arc::new(config_changes),
             #[cfg(test)]
             auth_chain_client_override: Arc::new(RwLock::new(None)),
-            frontend_dir: Arc::new(init.frontend_dir),
         })
     }
 
@@ -2156,10 +2153,6 @@ impl AppState {
         self.config_changes.subscribe()
     }
 
-    pub fn frontend_dir(&self) -> &Path {
-        self.frontend_dir.as_path()
-    }
-
     #[cfg(test)]
     pub(crate) fn set_auth_chain_client_override(
         &self,
@@ -2349,7 +2342,6 @@ mod known_good_identity_tests {
                     .expect("load test performance state"),
             ),
             startup_warnings: Vec::new(),
-            frontend_dir: root.join("frontend"),
         })
     }
 

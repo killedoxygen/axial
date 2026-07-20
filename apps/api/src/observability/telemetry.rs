@@ -997,7 +997,6 @@ fn panic_location_summary(location: &std::panic::Location<'_>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::default_frontend_dir;
     use crate::state::{AppState, AppStateInit, InstallStore, SessionStore};
     use axial_config::{AppPaths, InstanceRegistrySnapshot, InstanceStore};
     use axial_performance::PerformanceManager;
@@ -1567,7 +1566,6 @@ mod tests {
                         .expect("performance manager"),
                 ),
                 startup_warnings: Vec::new(),
-                frontend_dir: default_frontend_dir(),
             },
             telemetry,
         )

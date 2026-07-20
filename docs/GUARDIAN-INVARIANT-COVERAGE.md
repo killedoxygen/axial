@@ -5,7 +5,7 @@ This document is a deterministic human-readable projection of Guardian's strict 
 
 - Schema: `axial.guardian.invariant_coverage.v4`
 - Machine-readable artifact: [guardian-invariant-coverage-v4.json](../apps/api/tests/fixtures/guardian/guardian-invariant-coverage-v4.json)
-- Regenerate: `AXIAL_REGENERATE_GUARDIAN_INVARIANT_COVERAGE=1 cargo test -p axial-api regenerate_guardian_invariant_coverage_artifacts -- --ignored`
+- Regenerate: `AXIAL_REGENERATE_GUARDIAN_INVARIANT_COVERAGE=1 cargo test --locked -p axial-api --no-default-features regenerate_guardian_invariant_coverage_artifacts -- --ignored`
 
 ## Invariant Status
 | Invariant | Status |

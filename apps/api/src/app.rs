@@ -3,23 +3,23 @@ use crate::observability::telemetry::{
 };
 use crate::routes;
 use crate::state::{AppState, RemoteFlagRefreshOutcome};
+use axum::Router;
+#[cfg(feature = "embedded-frontend")]
 use axum::{
-    Router,
     body::Body,
     http::{Response, StatusCode, Uri, header},
     response::IntoResponse,
     routing::get,
 };
+#[cfg(feature = "embedded-frontend")]
 use include_dir::{Dir, include_dir};
 use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
-use std::path::PathBuf;
 use std::time::Duration;
 use thiserror::Error;
 use tokio::net::TcpListener;
 use tokio::sync::watch;
-use tower_http::services::{ServeDir, ServeFile};
 
 pub const DEFAULT_API_PORT: u16 = 43_430;
 pub const PERFORMANCE_RULES_REFRESH_INTERVAL_ENV: &str =
@@ -29,25 +29,18 @@ pub const DEFAULT_PERFORMANCE_RULES_REFRESH_INTERVAL: Duration = Duration::from_
 pub const MAX_PERFORMANCE_RULES_REFRESH_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 pub const REMOTE_FLAGS_REFRESH_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
 const EMBEDDED_API_SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
-static EMBEDDED_FRONTEND: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/../../frontend/static");
-
-pub fn default_frontend_dir() -> PathBuf {
-    std::env::var("AXIAL_FRONTEND_STATIC_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("frontend/static"))
-}
+#[cfg(feature = "embedded-frontend")]
+static EMBEDDED_FRONTEND: Dir<'_> = include_dir!("$OUT_DIR/embedded-frontend");
 
 pub fn build_router(state: AppState) -> Router {
-    let frontend_dir = state.frontend_dir().to_path_buf();
-    let index_path = frontend_dir.join("index.html");
     let api = routes::router(state);
-
-    if frontend_dir.is_dir() && index_path.is_file() {
-        let static_service =
-            ServeDir::new(frontend_dir).not_found_service(ServeFile::new(index_path));
-        api.fallback_service(static_service)
-    } else {
+    #[cfg(feature = "embedded-frontend")]
+    {
         api.fallback(get(serve_embedded_frontend))
+    }
+    #[cfg(not(feature = "embedded-frontend"))]
+    {
+        api
     }
 }
 
@@ -412,6 +405,7 @@ async fn spawn_background_router_with_grace(
     })
 }
 
+#[cfg(feature = "embedded-frontend")]
 async fn serve_embedded_frontend(uri: Uri) -> impl IntoResponse {
     let path = normalized_embedded_path(uri.path());
     let file = EMBEDDED_FRONTEND
@@ -431,6 +425,7 @@ async fn serve_embedded_frontend(uri: Uri) -> impl IntoResponse {
     }
 }
 
+#[cfg(feature = "embedded-frontend")]
 fn normalized_embedded_path(path: &str) -> String {
     let trimmed = path.trim_start_matches('/');
     if trimmed.is_empty() {
@@ -442,14 +437,17 @@ fn normalized_embedded_path(path: &str) -> String {
     "index.html".to_string()
 }
 
+#[cfg(feature = "embedded-frontend")]
 fn content_type_for_path(path: &str) -> &'static str {
     match path.rsplit('.').next().unwrap_or_default() {
         "html" => "text/html; charset=utf-8",
         "js" => "application/javascript; charset=utf-8",
         "css" => "text/css; charset=utf-8",
+        "json" => "application/json; charset=utf-8",
         "png" => "image/png",
         "svg" => "image/svg+xml",
-        "ogg" => "audio/ogg",
+        "woff2" => "font/woff2",
+        "mp3" => "audio/mpeg",
         "txt" => "text/plain; charset=utf-8",
         _ => "application/octet-stream",
     }
@@ -459,10 +457,143 @@ fn content_type_for_path(path: &str) -> &'static str {
 mod tests {
     use super::axial_api_test_support::build_test_state;
     use super::*;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use axum::routing::get;
+    #[cfg(feature = "embedded-frontend")]
+    use http_body_util::BodyExt;
     use std::fs;
+    #[cfg(feature = "embedded-frontend")]
+    use std::path::Path;
     use std::sync::Arc;
     use tokio::io::AsyncWriteExt;
     use tokio::sync::{Notify, mpsc};
+    use tower::ServiceExt;
+
+    #[cfg(feature = "embedded-frontend")]
+    fn collect_embedded_files<'a>(
+        directory: &'a Dir<'a>,
+        files: &mut Vec<&'a include_dir::File<'a>>,
+    ) {
+        files.extend(directory.files());
+        for child in directory.dirs() {
+            collect_embedded_files(child, files);
+        }
+    }
+
+    #[cfg(feature = "embedded-frontend")]
+    #[test]
+    fn embedded_frontend_is_byte_exact_and_manifest_reachable() {
+        let manifest_file = EMBEDDED_FRONTEND
+            .get_file("generation.json")
+            .expect("embedded generation manifest");
+        let manifest: serde_json::Value =
+            serde_json::from_slice(manifest_file.contents()).expect("parse generation manifest");
+        let records = manifest["files"].as_array().expect("generation files");
+        let source_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../frontend/dist");
+        let mut expected = vec!["generation.json".to_string()];
+        for record in records {
+            let relative = record["path"].as_str().expect("generation file path");
+            let embedded = EMBEDDED_FRONTEND
+                .get_file(relative)
+                .expect("manifest-reachable embedded file");
+            let filesystem =
+                fs::read(source_root.join(relative)).expect("filesystem generation file");
+            assert_eq!(
+                embedded.contents(),
+                filesystem,
+                "embedded byte drift for {relative}"
+            );
+            expected.push(relative.to_string());
+        }
+        let mut embedded = Vec::new();
+        collect_embedded_files(&EMBEDDED_FRONTEND, &mut embedded);
+        let mut actual = embedded
+            .into_iter()
+            .map(|file| file.path().to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        actual.sort();
+        expected.sort();
+        assert_eq!(actual, expected);
+        assert_eq!(
+            manifest_file.contents(),
+            fs::read(source_root.join("generation.json")).unwrap()
+        );
+    }
+
+    #[cfg(feature = "embedded-frontend")]
+    #[tokio::test]
+    async fn embedded_frontend_serves_exact_mime_and_index_fallback() {
+        for (request_path, expected_type) in [
+            ("/fonts/GeistMono-Variable.woff2", "font/woff2"),
+            ("/sounds/snd01/audioSprite.mp3", "audio/mpeg"),
+            ("/generation.json", "application/json; charset=utf-8"),
+        ] {
+            let response = serve_embedded_frontend(request_path.parse::<Uri>().unwrap())
+                .await
+                .into_response();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(response.headers()[header::CONTENT_TYPE], expected_type);
+            let expected = EMBEDDED_FRONTEND
+                .get_file(request_path.trim_start_matches('/'))
+                .unwrap()
+                .contents();
+            assert_eq!(
+                response.into_body().collect().await.unwrap().to_bytes(),
+                expected
+            );
+        }
+
+        let response = serve_embedded_frontend(Uri::from_static("/missing/route"))
+            .await
+            .into_response();
+        assert_eq!(
+            response.headers()[header::CONTENT_TYPE],
+            "text/html; charset=utf-8"
+        );
+        assert_eq!(
+            response.into_body().collect().await.unwrap().to_bytes(),
+            EMBEDDED_FRONTEND.get_file("index.html").unwrap().contents()
+        );
+    }
+
+    #[cfg(feature = "embedded-frontend")]
+    #[tokio::test]
+    async fn standalone_router_owns_only_the_embedded_frontend_fallback() {
+        let root = super::axial_api_test_support::test_root("embedded-router");
+        let response = build_router(build_test_state(&root, None))
+            .oneshot(
+                Request::builder()
+                    .uri("/not-an-api-route")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.into_body().collect().await.unwrap().to_bytes(),
+            EMBEDDED_FRONTEND.get_file("index.html").unwrap().contents()
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(not(feature = "embedded-frontend"))]
+    #[tokio::test]
+    async fn desktop_api_router_has_no_frontend_fallback() {
+        let root = super::axial_api_test_support::test_root("no-frontend-router");
+        let response = build_router(build_test_state(&root, None))
+            .oneshot(
+                Request::builder()
+                    .uri("/index.html")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let _ = fs::remove_dir_all(root);
+    }
 
     #[test]
     fn performance_rules_refresh_interval_defaults_and_clamps() {
@@ -758,7 +889,6 @@ mod axial_api_test_support {
                 .expect("performance manager"),
             ),
             startup_warnings: Vec::new(),
-            frontend_dir: root.join("frontend"),
         })
     }
 

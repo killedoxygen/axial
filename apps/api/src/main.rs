@@ -1,6 +1,4 @@
-use axial_api::app::{
-    DEFAULT_API_PORT, build_router, default_frontend_dir, start_application_background_workflows,
-};
+use axial_api::app::{DEFAULT_API_PORT, build_router, start_application_background_workflows};
 use axial_api::observability::telemetry::{
     TelemetryErrorArea, TelemetryErrorKind, TelemetryErrorLevel, TelemetryEvent, TelemetryHub,
 };
@@ -56,7 +54,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         sessions,
         performance,
         startup_warnings,
-        frontend_dir: default_frontend_dir(),
     })
     .await?;
     if !start_application_background_workflows(&state).await {

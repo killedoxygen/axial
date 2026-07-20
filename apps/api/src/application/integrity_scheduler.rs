@@ -1242,7 +1242,6 @@ mod tests {
                     .expect("performance manager"),
             ),
             startup_warnings: Vec::new(),
-            frontend_dir: root.join("frontend"),
         });
         fs::create_dir_all(&paths.library_dir).expect("create library root");
         state.set_library_dir_for_test(paths.library_dir.to_string_lossy().into_owned());

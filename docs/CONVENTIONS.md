@@ -93,8 +93,10 @@ keep this short and real. if the codebase changes, update this file.
 
 ## Build shape
 - frontend entry is `frontend/src/main.tsx`
-- frontend CSS is imported through `frontend/src/styles.ts`; `frontend/static/app.css` is generated
-- frontend JS entry output is `frontend/static/app.js`; additional generated chunks may be emitted under `frontend/static/chunks/`
+- frontend CSS is imported through `frontend/src/styles.ts`; `frontend/static` contains source assets only
+- production and watch builds atomically publish one complete, budget-checked generation under ignored `frontend/dist`; every generated and public file is owned by its deterministic receipt
+- frontend generation mutations hold one OS-released, portable case-folded loopback lease and fail closed on contention
+- standalone API builds serve only the verified embedded generation; desktop API builds have no frontend fallback and Tauri owns `frontend/dist`
 - frontend mock mode is build-time gated via `__AXIAL_MOCK_API__` and lives at the `api()` seam in `frontend/src/mock/`; run it with `task dev:web:mock`
 - frontend package manager is `pnpm`, pinned through `frontend/package.json`
 - exact Node, pnpm, Rust, Task, Tauri, container, and base-image identities are owned

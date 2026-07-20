@@ -57,7 +57,6 @@ fn truncate_chars(value: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::default_frontend_dir;
     use crate::observability::telemetry::{DEFAULT_POSTHOG_HOST, TelemetryHub};
     use crate::state::{AppStateInit, InstallStore, SessionStore};
     use axial_config::{AppConfig, AppPaths, ConfigStore, InstanceRegistrySnapshot, InstanceStore};
@@ -186,7 +185,6 @@ mod tests {
                     ),
                     config,
                     startup_warnings: Vec::new(),
-                    frontend_dir: default_frontend_dir(),
                 },
                 telemetry.clone(),
             );

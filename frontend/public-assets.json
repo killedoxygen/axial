@@ -1,0 +1,26 @@
+{
+  "schema_version": 1,
+  "files": [
+    "favicon.png",
+    "fonts/GeistMono-OFL.txt",
+    "fonts/GeistMono-Variable.woff2",
+    "fonts/Manrope-OFL.txt",
+    "fonts/Manrope-cyrillic-ext.woff2",
+    "fonts/Manrope-cyrillic.woff2",
+    "fonts/Manrope-greek.woff2",
+    "fonts/Manrope-latin-ext.woff2",
+    "fonts/Manrope-latin.woff2",
+    "fonts/Manrope-vietnamese.woff2",
+    "index.html",
+    "licenses/Lucide-ISC.txt",
+    "loader-base.svg",
+    "loader-cross.svg",
+    "loader-diamonds.svg",
+    "loader-grid.svg",
+    "loader-orbit.svg",
+    "microsoft-auth-symbol.svg",
+    "sounds/SND-NOTICE.txt",
+    "sounds/snd01/audioSprite.json",
+    "sounds/snd01/audioSprite.mp3"
+  ]
+}

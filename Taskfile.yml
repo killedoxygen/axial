@@ -24,6 +24,7 @@ vars:
   DEV_PORT: '{{.DEV_PORT | default "1420"}}'
   DEV_TAURI_CONFIG: '{"build":{"beforeDevCommand":{"script":"pnpm run dev:desktop","cwd":"{{toSlash .ROOT_DIR}}/frontend"},"devUrl":"http://localhost:{{.DEV_PORT}}"}}'
   BUNDLE_TAURI_CONFIG: '{"build":{"beforeBuildCommand":{"script":"pnpm run build","cwd":"{{toSlash .ROOT_DIR}}/frontend"}}}'
+  NATIVE_VERIFY_TAURI_CONFIG: '{"build":{"devUrl":"http://localhost:1420"}}'
 
 tasks:
   default:
@@ -142,7 +143,7 @@ tasks:
     desc: run the local API server
     cmds:
       - task: toolchain:rust
-      - task: assets:verify
+      - task: frontend:build
       - cargo run --locked -p axial-api
 
   check:
@@ -151,6 +152,7 @@ tasks:
       - task: toolchain:preflight
       - task: frontend:test
       - pnpm --dir frontend run format:check
+      - task: frontend:build
       - cargo fmt --all --check
       - cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 
@@ -158,6 +160,7 @@ tasks:
     desc: run Rust workspace tests
     cmds:
       - task: toolchain:rust
+      - task: frontend:build
       - cargo test --workspace --locked
 
   verify:
@@ -201,8 +204,20 @@ tasks:
       - task: assets:verify
       - pnpm --dir frontend run verify
 
+  frontend:build-budget:
+    desc: build, verify, and report the canonical frontend payload budgets
+    cmds:
+      - task: frontend:build
+      - node frontend/verify-generation.mjs
+
   verify:rust:
     desc: format-check, lint, and test the Rust workspace
+    cmds:
+      - task: frontend:build
+      - task: verify:rust:ready
+
+  verify:rust:ready:
+    internal: true
     cmds:
       - task: toolchain:rust
       - cargo fmt --all --check
@@ -215,7 +230,7 @@ tasks:
       - task: toolchain:preflight
       - task: verify:contracts
       - task: verify:frontend
-      - task: verify:rust
+      - task: verify:rust:ready
       - cargo build --locked -p axial-desktop --release
 
   verify:linux:
@@ -229,25 +244,29 @@ tasks:
   verify:native:windows:
     desc: compile the workspace and run native Windows containment contracts
     platforms: [windows]
+    env:
+      TAURI_CONFIG: "{{.NATIVE_VERIFY_TAURI_CONFIG}}"
     cmds:
       - task: toolchain:rust
       - node --test scripts/tests/capability.test.mjs
       - node --test scripts/tests/contracts/p00-b03-contract.test.mjs scripts/tests/contracts/p00-b03-contract-cross-owner.test.mjs
       - node scripts/verify-assets.mjs
-      - cargo check --workspace --all-targets --all-features --locked
+      - cargo check --workspace --all-targets --no-default-features --locked
       - cargo test --locked -p axial-minecraft contained_
 
   verify:native:macos:
     desc: compile the workspace and run native macOS process and priority contracts
     platforms: [darwin]
+    env:
+      TAURI_CONFIG: "{{.NATIVE_VERIFY_TAURI_CONFIG}}"
     cmds:
       - task: toolchain:rust
       - node --test scripts/tests/capability.test.mjs
       - node --test scripts/tests/contracts/p00-b03-contract.test.mjs scripts/tests/contracts/p00-b03-contract-cross-owner.test.mjs
       - node scripts/verify-assets.mjs
-      - cargo check --workspace --all-targets --all-features --locked
+      - cargo check --workspace --all-targets --no-default-features --locked
       - cargo test --locked -p axial-minecraft contained_
-      - cargo test --locked -p axial-api macos_system_low_priority_round_trip_restores_disk_policy
+      - cargo test --locked -p axial-api --no-default-features macos_system_low_priority_round_trip_restores_disk_policy
       - cargo check --locked -p axial-desktop --target x86_64-apple-darwin
 
   capability:self-test:
@@ -409,6 +428,7 @@ tasks:
   clean:
     desc: remove build outputs and caches
     cmds:
+      - pnpm --dir frontend run clean
       - cargo clean
       - rm -rf dist
 
@@ -443,6 +463,7 @@ tasks:
   frontend:build:
     internal: true
     cmds:
+      - task: toolchain:frontend
       - task: assets:verify
       - pnpm --dir frontend run build
 

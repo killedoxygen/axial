@@ -512,7 +512,6 @@ mod tests {
                     .expect("create performance manager"),
             ),
             startup_warnings: Vec::new(),
-            frontend_dir: root.join("frontend"),
         });
         let instance = state
             .instances()

@@ -167,12 +167,22 @@ test("font, favicon, Microsoft authentication, and sound consumers resolve retai
   );
 });
 
+const b03ScenarioIds = [
+  "CP-OA-FONTS",
+  "CP-OA-ICONS",
+  "CP-OA-LOADER-MARKS",
+  "CP-OA-PROVENANCE",
+];
+
 test("the production capability registry and Task gates own the four portable asset proofs", async () => {
-  assert.deepEqual(
-    capabilityRegistry.map(({ scenario_id }) => scenario_id).sort(),
-    ["CP-OA-FONTS", "CP-OA-ICONS", "CP-OA-LOADER-MARKS", "CP-OA-PROVENANCE"],
+  const records = capabilityRegistry.filter(({ scenario_id }) =>
+    b03ScenarioIds.includes(scenario_id),
   );
-  for (const record of capabilityRegistry) {
+  assert.deepEqual(
+    records.map(({ scenario_id }) => scenario_id).sort(),
+    b03ScenarioIds,
+  );
+  for (const record of records) {
     assert.deepEqual(record.allowed_platforms, ["linux", "windows", "macos"]);
     assert.equal(record.owner_phase, "P00");
     assert.match(record.proof_id, /^CAP-OA-/);
@@ -197,7 +207,9 @@ test("the production capability registry and Task gates own the four portable as
 });
 
 test("each portable asset scenario reruns to the same current receipt", async () => {
-  for (const record of capabilityRegistry) {
+  for (const record of capabilityRegistry.filter(({ scenario_id }) =>
+    b03ScenarioIds.includes(scenario_id),
+  )) {
     const implementation = await import(record.module_url.href);
     const context = {
       scenario_id: record.scenario_id,

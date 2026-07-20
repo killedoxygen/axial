@@ -5,7 +5,7 @@
   "identifier": "dev.mateoltd.axial",
   "build": {
     "beforeBuildCommand": "cd ../../frontend && pnpm run build",
-    "frontendDist": "../../frontend/static"
+    "frontendDist": "../../frontend/dist"
   },
   "app": {
     "withGlobalTauri": true,

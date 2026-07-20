@@ -1451,7 +1451,6 @@ mod tests {
                     .expect("load fallback performance"),
             ),
             startup_warnings: startup.warnings,
-            frontend_dir: fixture.root.join("frontend"),
         });
         assert!(!state.instances.is_authoritative());
         state

@@ -203,7 +203,6 @@ mod tests {
                         .expect("performance manager"),
                 ),
                 startup_warnings: Vec::new(),
-                frontend_dir: root.join("frontend"),
             });
             let records = root.join("rejected-records");
             fs::create_dir_all(&records).expect("create rejected record directory");

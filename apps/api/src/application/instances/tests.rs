@@ -5351,7 +5351,6 @@ fn test_state(name: &str) -> (AppState, PathBuf) {
             PerformanceManager::load_for_startup(&paths.config_dir).expect("performance manager"),
         ),
         startup_warnings: Vec::new(),
-        frontend_dir: root.join("frontend"),
     });
     (state, root)
 }

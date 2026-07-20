@@ -649,7 +649,6 @@ fn build_test_state(
             .expect("performance manager"),
         ),
         startup_warnings: Vec::new(),
-        frontend_dir: root.join("frontend"),
     })
 }
 

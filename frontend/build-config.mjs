@@ -1,6 +1,4 @@
-import { createRequire } from 'node:module';
-import { join } from 'node:path';
-import { fileURLToPath, pathToFileURL } from 'node:url';
+import { fileURLToPath } from 'node:url';
 
 /** @typedef {{ dependencyRoot?: string }} ResolverOptions */
 /**
@@ -21,16 +19,15 @@ const reactCompatAliases = new Map([
 
 /** @param {ResolverOptions} [options] @returns {import('esbuild').Plugin[]} */
 export function createFrontendResolverPlugins({ dependencyRoot = defaultDependencyRoot } = {}) {
-  const require = createRequire(pathToFileURL(join(dependencyRoot, 'package.json')));
   return [
     {
       name: 'preact-compat-alias',
       /** @param {import('esbuild').PluginBuild} build */
       setup(build) {
-        build.onResolve({ filter: /^react(?:-dom|\/jsx-runtime|\/jsx-dev-runtime)?$/ }, (args) => {
+        build.onResolve({ filter: /^react(?:-dom|\/jsx-runtime|\/jsx-dev-runtime)?$/ }, async (args) => {
           const target = reactCompatAliases.get(args.path);
           if (!target) return;
-          return { path: require.resolve(target) };
+          return build.resolve(target, { kind: args.kind, resolveDir: dependencyRoot });
         });
       },
     },

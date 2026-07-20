@@ -1046,7 +1046,6 @@ mod persistence_contract_tests {
                     .expect("test performance state"),
             ),
             startup_warnings: Vec::new(),
-            frontend_dir: root.join("frontend"),
         })
         .with_reconciliation_stores(journals.clone(), failure_memory.clone());
         state.set_library_dir_for_test(paths.library_dir.to_string_lossy().into_owned());
