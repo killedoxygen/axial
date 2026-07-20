@@ -4105,7 +4105,7 @@ mod platform {
 
     #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
     pub(super) struct DirectoryIdentity {
-        device: u64,
+        device: rfs::Dev,
         inode: u64,
     }
 

@@ -98,11 +98,18 @@ async function main() {
 
 async function reportAndWait(message) {
   if (!process.send) process.exit(1);
-  await new Promise((resolve, reject) => {
-    process.send(message, (error) => (error ? reject(error) : resolve()));
-  });
   // The dispatcher owns process-tree settlement. Keeping this leader alive lets
   // Windows target descendants by parent PID and POSIX target the process group.
+  const keepAlive = setInterval(() => {}, 60_000);
+  keepAlive.ref();
+  try {
+    await new Promise((resolve, reject) => {
+      process.send(message, (error) => (error ? reject(error) : resolve()));
+    });
+  } catch (error) {
+    clearInterval(keepAlive);
+    throw error;
+  }
   await new Promise(() => {});
 }
 

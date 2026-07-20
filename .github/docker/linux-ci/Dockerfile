@@ -21,10 +21,22 @@ RUN dpkg-deb --extract /tmp/ca-certificates.deb /tmp/ca-certificates \
   libgtk-3-dev \
   libwebkit2gtk-4.1-dev \
   make \
+  passwd \
   pkg-config \
   unzip \
   xz-utils \
   zip \
+  && groupadd --gid 1001 axial \
+  && useradd --uid 1001 --gid axial --create-home --shell /bin/bash axial \
+  && install -d --owner axial --group axial /workspace \
   && rm -rf /var/lib/apt/lists/*
 
+ENV HOME=/home/axial
+USER 1001:1001
 WORKDIR /workspace
+
+RUN test "$(id -u)" = 1001 \
+  && test "$(id -g)" = 1001 \
+  && test -w "$HOME" \
+  && test -w /workspace \
+  && pkg-config --exists gtk+-3.0 webkit2gtk-4.1
