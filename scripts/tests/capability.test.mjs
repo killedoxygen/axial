@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile as execFileCallback } from "node:child_process";
-import { mkdtemp, mkdir, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, readdir, rm, stat, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -330,6 +330,33 @@ test("duplicate identities and path escapes invalidate the complete registry", a
     "invalid_module_url",
   );
   await evidenceAbsent(fixture.root);
+});
+
+test("module validation permits a shared ancestor alias but rejects a leaf symlink", async (t) => {
+  const fixture = await harness(t, PASS_BODY);
+  const aliasParent = await mkdtemp(path.join(os.tmpdir(), "axial-capability-alias-"));
+  t.after(() => rm(aliasParent, { recursive: true, force: true }));
+  const aliasRoot = path.join(aliasParent, "scenarios");
+  await symlink(fixture.scenarioRoot, aliasRoot, process.platform === "win32" ? "junction" : "dir");
+  const aliasedModule = path.join(aliasRoot, path.basename(fixture.modulePath));
+  await runCapability(request(), {
+    ...fixture.overrides,
+    scenarioRoot: aliasRoot,
+    registry: [{ ...fixture.record, module_url: pathToFileURL(aliasedModule).href }],
+  });
+
+  if (process.platform !== "win32") {
+    const linkedModule = path.join(fixture.scenarioRoot, "linked.mjs");
+    await symlink(fixture.modulePath, linkedModule, "file");
+    await rejectsCode(
+      () =>
+        runCapability(request(), {
+          ...fixture.overrides,
+          registry: [{ ...fixture.record, module_url: pathToFileURL(linkedModule).href }],
+        }),
+      "invalid_module_url",
+    );
+  }
 });
 
 test("capability and concrete platform bindings are checked before execution", async (t) => {

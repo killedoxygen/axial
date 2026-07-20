@@ -2,8 +2,16 @@ FROM ubuntu:24.04@sha256:4fbb8e6a8395de5a7550b33509421a2bafbc0aab6c06ba2cef9ebff
 
 ENV DEBIAN_FRONTEND=noninteractive
 
-RUN sed -i 's|http://archive.ubuntu.com/ubuntu/|https://snapshot.ubuntu.com/ubuntu/20260719T000000Z/|g; s|http://security.ubuntu.com/ubuntu/|https://snapshot.ubuntu.com/ubuntu/20260719T000000Z/|g' /etc/apt/sources.list.d/ubuntu.sources \
-  && apt-get update \
+ADD --checksum=sha256:6bac2a01979e210d9eac1d4d56747ec709ea60654744d66705dc3c36e7629e50 \
+  https://snapshot.ubuntu.com/ubuntu/20260719T000000Z/pool/main/c/ca-certificates/ca-certificates_20260601~24.04.1_all.deb \
+  /tmp/ca-certificates.deb
+
+RUN dpkg-deb --extract /tmp/ca-certificates.deb /tmp/ca-certificates \
+  && mkdir -p /etc/ssl/certs \
+  && cat /tmp/ca-certificates/usr/share/ca-certificates/mozilla/*.crt > /etc/ssl/certs/ca-certificates.crt \
+  && rm -rf /tmp/ca-certificates /tmp/ca-certificates.deb \
+  && sed -i 's|http://archive.ubuntu.com/ubuntu/|https://snapshot.ubuntu.com/ubuntu/20260719T000000Z/|g; s|http://security.ubuntu.com/ubuntu/|https://snapshot.ubuntu.com/ubuntu/20260719T000000Z/|g' /etc/apt/sources.list.d/ubuntu.sources \
+  && apt-get update --error-on=any \
   && apt-get install -y --no-install-recommends \
   build-essential \
   ca-certificates \

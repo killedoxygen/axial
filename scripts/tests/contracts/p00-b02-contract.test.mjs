@@ -22,6 +22,7 @@ function runSteps(job) {
 }
 
 test("the exact toolchain manifest owns every delivery projection", async () => {
+  assert.equal(await readFile(".gitattributes", "utf8"), "* text=auto eol=lf\n");
   const packageJson = JSON.parse(await readFile("frontend/package.json", "utf8"));
   assert.equal(packageJson.engines.node, identity.node);
   assert.equal(packageJson.packageManager, `pnpm@${identity.pnpm}`);
@@ -57,6 +58,12 @@ test("the exact toolchain manifest owns every delivery projection", async () => 
   const dockerfile = await readFile(".github/docker/linux-ci/Dockerfile", "utf8");
   assert.equal(dockerfile.split(/\r?\n/, 1)[0], `FROM ${identity.ubuntu_base.reference}`);
   assert.match(dockerfile, new RegExp(`/ubuntu/${identity.ubuntu_apt_snapshot}/`, "g"));
+  assert.match(
+    dockerfile,
+    /ADD --checksum=sha256:[0-9a-f]{64} \\\n+\s+https:\/\/snapshot\.ubuntu\.com\/ubuntu\/\d{8}T\d{6}Z\/pool\/main\/c\/ca-certificates\//,
+  );
+  assert.match(dockerfile, /apt-get update --error-on=any/);
+  assert.doesNotMatch(dockerfile, /Verify-Peer|AllowUnauthenticated/);
 
   const imageWorkflow = await readFile(".github/workflows/linux-ci-image.yml", "utf8");
   assert.match(imageWorkflow, /type=sha,format=long/);

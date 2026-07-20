@@ -2051,6 +2051,10 @@ mod tests {
         "loaders::bound_processors::tests::contained_child_fixture";
 
     #[test]
+    #[allow(
+        clippy::zombie_processes,
+        reason = "the fixture intentionally orphans a descendant to verify containment cleanup"
+    )]
     fn contained_child_fixture() {
         let Ok(mode) = std::env::var(CONTAINMENT_FIXTURE_ENV) else {
             return;

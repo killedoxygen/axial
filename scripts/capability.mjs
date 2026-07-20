@@ -114,7 +114,8 @@ async function validateRegistryStructure(registry, options) {
   if (registry.length > 256) fail("invalid_registry");
   if (registry.length === 0) return [];
 
-  const rootReal = await realpath(options.scenarioRoot).catch(() => fail("invalid_scenario_root"));
+  const rootPath = path.resolve(options.scenarioRoot);
+  const rootReal = await realpath(rootPath).catch(() => fail("invalid_scenario_root"));
   const scenarioIds = new Set();
   const proofIds = new Set();
   const evidencePaths = new Set();
@@ -157,13 +158,15 @@ async function validateRegistryStructure(registry, options) {
       fail("invalid_module_url");
     }
     if (moduleUrl.protocol !== "file:" || moduleUrl.search || moduleUrl.hash) fail("invalid_module_url");
-    const modulePath = fileURLToPath(moduleUrl);
-    const moduleReal = await realpath(modulePath).catch(() => fail("implementation_absent"));
-    if (modulePath !== moduleReal || !isInside(rootReal, moduleReal) || path.extname(moduleReal) !== ".mjs") {
+    const modulePath = path.resolve(fileURLToPath(moduleUrl));
+    if (!isInside(rootPath, modulePath) || path.extname(modulePath) !== ".mjs") {
       fail("invalid_module_url");
     }
-    const metadata = await lstat(moduleReal);
-    if (!metadata.isFile() || metadata.isSymbolicLink()) fail("invalid_module_url");
+    const moduleReal = await realpath(modulePath).catch(() => fail("implementation_absent"));
+    const metadata = await lstat(modulePath);
+    if (!metadata.isFile() || metadata.isSymbolicLink() || !isInside(rootReal, moduleReal)) {
+      fail("invalid_module_url");
+    }
 
     records.push(
       Object.freeze({
