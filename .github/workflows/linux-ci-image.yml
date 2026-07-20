@@ -53,4 +53,5 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
 
       - name: Record immutable image identity
-        run: printf 'Image digest: `%s`\n' '${{ steps.build.outputs.digest }}' >> "$GITHUB_STEP_SUMMARY"
+        run: |
+          printf 'Image digest: `%s`\n' '${{ steps.build.outputs.digest }}' >> "$GITHUB_STEP_SUMMARY"
