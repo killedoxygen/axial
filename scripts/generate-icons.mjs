@@ -804,7 +804,7 @@ export async function promoteGeneratedAssets({
         await assertDestinationParent(root, output.destination);
         await copyFile(destination, backup, fsConstants.COPYFILE_EXCL);
         await chmod(backup, baseline.mode);
-        const backupHandle = await open(backup, "r");
+        const backupHandle = await open(backup, "r+");
         try {
           await backupHandle.sync();
         } finally {

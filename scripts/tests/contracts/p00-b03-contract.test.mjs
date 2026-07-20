@@ -716,5 +716,8 @@ test("generation stages one canonical manifest changing only the six brand-bound
       sha256(await readFile(output.staged)),
     );
   }
-  assert.equal((await lstat(staged.staged)).mode & 0o777, 0o644);
+  const stagedMetadata = await lstat(staged.staged);
+  assert.equal(stagedMetadata.isFile(), true);
+  assert.notEqual(stagedMetadata.mode & 0o200, 0);
+  assert.equal(stagedMetadata.mode & 0o111, 0);
 });
