@@ -33,7 +33,7 @@ const MAX_PROCESS_OUTPUT_BYTES: usize = 1 << 20;
 const MAX_PROCESS_OUTPUT_TOTAL_BYTES: usize = 2 << 20;
 #[cfg(target_os = "linux")]
 const MAX_LINUX_PROCESS_STAT_BYTES: u64 = 4096;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", test))]
 const MAX_MACOS_PROCESS_GROUP_MEMBERS: usize = 4096;
 const PROCESSOR_TIMEOUT: Duration = Duration::from_secs(120);
 const PIPE_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
@@ -74,11 +74,6 @@ impl PendingProcessContainment {
 impl ProcessContainment {
     fn terminate(&self) -> Result<(), BoundProcessorError> {
         terminate_process_group(self.group)
-    }
-
-    #[cfg(target_os = "macos")]
-    fn is_empty(&self) -> Result<bool, BoundProcessorError> {
-        macos_process_group_is_empty(self.group)
     }
 
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -126,34 +121,16 @@ fn macos_process_group_has_only_zombies(
     group: rustix::process::Pid,
 ) -> Result<bool, BoundProcessorError> {
     let group = group.as_raw_nonzero().get();
-    let required = unsafe { libc::proc_listpgrppids(group, std::ptr::null_mut(), 0) };
-    if required < 0 {
-        return Err(BoundProcessorError::Unreaped);
-    }
-    let required = usize::try_from(required).map_err(|_| BoundProcessorError::Unreaped)?;
-    if required == 0 {
-        return Ok(false);
-    }
-    if required >= MAX_MACOS_PROCESS_GROUP_MEMBERS {
-        return Err(BoundProcessorError::Unreaped);
-    }
-
-    // One spare slot makes a full buffer an explicit truncation failure if the
-    // process inventory changes between the sizing and listing calls.
-    let mut pids = vec![0 as libc::pid_t; required + 1];
+    // Darwin's null-buffer sizing call reports the system-wide process count,
+    // not the selected group's size. Bound the group inventory directly.
+    let mut pids = vec![0 as libc::pid_t; MAX_MACOS_PROCESS_GROUP_MEMBERS + 1];
     let buffer_bytes = pids
         .len()
         .checked_mul(std::mem::size_of::<libc::pid_t>())
         .and_then(|bytes| i32::try_from(bytes).ok())
         .ok_or(BoundProcessorError::Unreaped)?;
     let listed = unsafe { libc::proc_listpgrppids(group, pids.as_mut_ptr().cast(), buffer_bytes) };
-    if listed < 0 {
-        return Err(BoundProcessorError::Unreaped);
-    }
-    let listed = usize::try_from(listed).map_err(|_| BoundProcessorError::Unreaped)?;
-    if listed >= pids.len() {
-        return Err(BoundProcessorError::Unreaped);
-    }
+    let listed = checked_macos_process_group_listing_len(listed, pids.len())?;
     pids.truncate(listed);
 
     let mut observed_member = false;
@@ -184,15 +161,42 @@ fn macos_process_group_has_only_zombies(
             return Err(BoundProcessorError::Unreaped);
         }
         let info = unsafe { info.assume_init() };
-        if info.pbi_pgid != group as u32 {
-            continue;
-        }
-        observed_member = true;
-        if info.pbi_status != libc::SZOMB {
+        if !record_zombie_group_member(
+            &mut observed_member,
+            group as u32,
+            info.pbi_pgid,
+            info.pbi_status == libc::SZOMB,
+        ) {
             return Ok(false);
         }
     }
     Ok(observed_member)
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn checked_macos_process_group_listing_len(
+    listed: i32,
+    capacity: usize,
+) -> Result<usize, BoundProcessorError> {
+    let listed = usize::try_from(listed).map_err(|_| BoundProcessorError::Unreaped)?;
+    if listed >= capacity {
+        return Err(BoundProcessorError::Unreaped);
+    }
+    Ok(listed)
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn record_zombie_group_member(
+    observed_member: &mut bool,
+    expected_group: u32,
+    member_group: u32,
+    is_zombie: bool,
+) -> bool {
+    if member_group != expected_group {
+        return true;
+    }
+    *observed_member = true;
+    is_zombie
 }
 
 #[cfg(target_os = "linux")]
@@ -1619,15 +1623,7 @@ async fn terminate_and_reap(child: &mut ContainedChild) -> Result<(), BoundProce
         .map_err(|_| BoundProcessorError::Unreaped)?;
     let deadline = tokio::time::Instant::now() + PROCESS_REAP_TIMEOUT;
     loop {
-        #[cfg(target_os = "linux")]
-        let empty = {
-            let group = child.containment.group;
-            tokio::task::spawn_blocking(move || linux_process_group_is_empty(group))
-                .await
-                .map_err(|_| BoundProcessorError::Unreaped)??
-        };
-        #[cfg(not(target_os = "linux"))]
-        let empty = child.containment.is_empty()?;
+        let empty = process_containment_is_empty(&child.containment).await?;
         if empty {
             return Ok(());
         }
@@ -1635,6 +1631,31 @@ async fn terminate_and_reap(child: &mut ContainedChild) -> Result<(), BoundProce
             return Err(BoundProcessorError::Unreaped);
         }
         tokio::time::sleep(PROCESS_REAP_POLL_INTERVAL).await;
+    }
+}
+
+async fn process_containment_is_empty(
+    containment: &ProcessContainment,
+) -> Result<bool, BoundProcessorError> {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        let group = containment.group;
+        tokio::task::spawn_blocking(move || {
+            #[cfg(target_os = "linux")]
+            {
+                linux_process_group_is_empty(group)
+            }
+            #[cfg(target_os = "macos")]
+            {
+                macos_process_group_is_empty(group)
+            }
+        })
+        .await
+        .map_err(|_| BoundProcessorError::Unreaped)?
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        containment.is_empty()
     }
 }
 
@@ -2186,6 +2207,51 @@ mod tests {
         command
     }
 
+    #[test]
+    fn macos_group_listing_bounds_and_zombie_classification_fail_closed() {
+        assert_eq!(
+            super::checked_macos_process_group_listing_len(
+                super::MAX_MACOS_PROCESS_GROUP_MEMBERS as i32,
+                super::MAX_MACOS_PROCESS_GROUP_MEMBERS + 1,
+            )
+            .expect("maximum bounded group"),
+            super::MAX_MACOS_PROCESS_GROUP_MEMBERS
+        );
+        assert!(matches!(
+            super::checked_macos_process_group_listing_len(-1, 1),
+            Err(BoundProcessorError::Unreaped)
+        ));
+        assert!(matches!(
+            super::checked_macos_process_group_listing_len(
+                (super::MAX_MACOS_PROCESS_GROUP_MEMBERS + 1) as i32,
+                super::MAX_MACOS_PROCESS_GROUP_MEMBERS + 1,
+            ),
+            Err(BoundProcessorError::Unreaped)
+        ));
+
+        let mut observed_member = false;
+        assert!(super::record_zombie_group_member(
+            &mut observed_member,
+            17,
+            18,
+            false,
+        ));
+        assert!(!observed_member);
+        assert!(super::record_zombie_group_member(
+            &mut observed_member,
+            17,
+            17,
+            true,
+        ));
+        assert!(observed_member);
+        assert!(!super::record_zombie_group_member(
+            &mut observed_member,
+            17,
+            17,
+            false,
+        ));
+    }
+
     #[tokio::test]
     async fn contained_nonzero_cancel_and_output_limit_are_reaped() {
         let mut command = containment_fixture_command("exit-7");
@@ -2279,13 +2345,11 @@ mod tests {
             .await
             .unwrap_or_else(|error| panic!("contained success attempt {attempt}: {error:?}"));
             assert!(child.child.try_wait().expect("leader wait").is_some());
-            #[cfg(target_os = "linux")]
             assert!(
-                super::linux_process_group_is_empty(child.containment.group)
+                super::process_containment_is_empty(&child.containment)
+                    .await
                     .expect("empty process group")
             );
-            #[cfg(not(target_os = "linux"))]
-            assert!(child.containment.is_empty().expect("empty process group"));
         }
     }
 
