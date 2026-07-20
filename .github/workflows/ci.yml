@@ -18,8 +18,15 @@ jobs:
   verify-linux:
     runs-on: ubuntu-24.04
     container:
-      image: ghcr.io/mateoltd/axial-linux-ci@sha256:2da018dd3e95c288a18a27ba652195fd842c7b793cf193b49ec5829caa020374
+      image: ghcr.io/mateoltd/axial-linux-ci@sha256:248d6e65bb8fe79a5c2bad58adba23eceec9db893393a258960987c3286a85af
     steps:
+      - name: Verify non-root container contract
+        run: |
+          test "$(id -u)" = 1001
+          test "$(id -g)" = 1001
+          test -w "$HOME"
+          test -w "$GITHUB_WORKSPACE"
+
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           persist-credentials: false

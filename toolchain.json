@@ -11,8 +11,8 @@
   },
   "tauri_cli": "2.11.2",
   "linux_ci_image": {
-    "reference": "ghcr.io/mateoltd/axial-linux-ci@sha256:2da018dd3e95c288a18a27ba652195fd842c7b793cf193b49ec5829caa020374",
-    "source_revision": "7d25636382d44eb9232680baecbd4ffb01478004"
+    "reference": "ghcr.io/mateoltd/axial-linux-ci@sha256:248d6e65bb8fe79a5c2bad58adba23eceec9db893393a258960987c3286a85af",
+    "source_revision": "9267d01bce2652f8dd3be6fec3e686a6c74abeb1"
   },
   "ubuntu_base": {
     "reference": "ubuntu:24.04@sha256:4fbb8e6a8395de5a7550b33509421a2bafbc0aab6c06ba2cef9ebffbc7092d90"

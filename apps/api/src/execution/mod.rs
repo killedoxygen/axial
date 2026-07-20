@@ -26,6 +26,32 @@ use serde::{Deserialize, Serialize};
 
 const MAX_STAGE_EVIDENCE_DETAILS: usize = 8;
 
+#[cfg(all(test, unix))]
+pub(crate) fn create_test_fifo(path: &std::path::Path) -> std::io::Result<()> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let path = CString::new(path.as_os_str().as_bytes()).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "FIFO path contains a null byte",
+        )
+    })?;
+    // SAFETY: `path` is a live, null-terminated C string and `mode` contains
+    // only the owner read/write permission bits accepted by `mkfifo`.
+    let result = unsafe {
+        libc::mkfifo(
+            path.as_ptr(),
+            (libc::S_IRUSR | libc::S_IWUSR) as libc::mode_t,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ExecutionFact {
     pub operation_id: Option<OperationId>,

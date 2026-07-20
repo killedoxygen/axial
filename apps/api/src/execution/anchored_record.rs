@@ -3116,12 +3116,7 @@ mod tests {
         let root = test_root("fifo");
         fs::create_dir_all(&root).expect("create anchored root");
         let fifo = root.join("record.json");
-        rustix::fs::mkfifoat(
-            rustix::fs::CWD,
-            &fifo,
-            rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
-        )
-        .expect("create fifo");
+        crate::execution::create_test_fifo(&fifo).expect("create fifo");
         let directory = AnchoredRecordDirectory::open(&root).expect("hold anchored directory");
 
         let started = Instant::now();

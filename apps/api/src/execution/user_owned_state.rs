@@ -654,12 +654,8 @@ mod tests {
         let fifo_root = TestRoot::new("config-fifo");
         let config = fifo_root.0.join("config");
         fs::create_dir(&config).expect("create config");
-        rustix::fs::mkfifoat(
-            rustix::fs::CWD,
-            config.join("special.toml"),
-            rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
-        )
-        .expect("create selected FIFO");
+        crate::execution::create_test_fifo(&config.join("special.toml"))
+            .expect("create selected FIFO");
         assert!(capture_user_config_blocking(&fifo_root.0).is_err());
 
         let non_utf8_root = TestRoot::new("config-non-utf8");

@@ -4,7 +4,6 @@ on:
   push:
     branches:
       - main
-      - wip-*
     paths:
       - ".github/docker/linux-ci/**"
       - ".github/workflows/linux-ci-image.yml"

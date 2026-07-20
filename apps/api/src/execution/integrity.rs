@@ -248,26 +248,36 @@ mod confined_fs {
         parent: Rc<OwnedFd>,
         name: OsString,
         file: Rc<std::fs::File>,
-        device: u64,
-        inode: u64,
-        size: i64,
-        modified_seconds: i64,
-        modified_nanoseconds: u64,
-        changed_seconds: i64,
-        changed_nanoseconds: u64,
+        observed: rustix::fs::Stat,
     }
 
     struct HeldMetadataLeaf {
         parent: Rc<OwnedFd>,
         name: OsString,
-        device: u64,
-        inode: u64,
-        mode: u32,
-        size: i64,
-        modified_seconds: i64,
-        modified_nanoseconds: u64,
-        changed_seconds: i64,
-        changed_nanoseconds: u64,
+        observed: rustix::fs::Stat,
+    }
+
+    fn same_identity(left: &rustix::fs::Stat, right: &rustix::fs::Stat) -> bool {
+        left.st_dev == right.st_dev && left.st_ino == right.st_ino
+    }
+
+    fn same_metadata_observation(left: &rustix::fs::Stat, right: &rustix::fs::Stat) -> bool {
+        same_identity(left, right)
+            && left.st_mode == right.st_mode
+            && left.st_size == right.st_size
+            && left.st_mtime == right.st_mtime
+            && left.st_mtime_nsec == right.st_mtime_nsec
+            && left.st_ctime == right.st_ctime
+            && left.st_ctime_nsec == right.st_ctime_nsec
+    }
+
+    fn same_content_observation(left: &rustix::fs::Stat, right: &rustix::fs::Stat) -> bool {
+        same_identity(left, right)
+            && left.st_size == right.st_size
+            && left.st_mtime == right.st_mtime
+            && left.st_mtime_nsec == right.st_mtime_nsec
+            && left.st_ctime == right.st_ctime
+            && left.st_ctime_nsec == right.st_ctime_nsec
     }
 
     impl Reader {
@@ -362,14 +372,7 @@ mod confined_fs {
             self.metadata_leaves.borrow_mut().push(HeldMetadataLeaf {
                 parent,
                 name: leaf,
-                device: stat.st_dev,
-                inode: stat.st_ino,
-                mode: stat.st_mode,
-                size: stat.st_size,
-                modified_seconds: stat.st_mtime,
-                modified_nanoseconds: stat.st_mtime_nsec,
-                changed_seconds: stat.st_ctime,
-                changed_nanoseconds: stat.st_ctime_nsec,
+                observed: stat,
             });
             let kind = match FileType::from_raw_mode(stat.st_mode) {
                 FileType::RegularFile => MetadataKind::File,
@@ -422,13 +425,7 @@ mod confined_fs {
                     parent,
                     name: leaf,
                     file: file.clone(),
-                    device: before.st_dev,
-                    inode: before.st_ino,
-                    size: before.st_size,
-                    modified_seconds: before.st_mtime,
-                    modified_nanoseconds: before.st_mtime_nsec,
-                    changed_seconds: before.st_ctime,
-                    changed_nanoseconds: before.st_ctime_nsec,
+                    observed: before,
                 });
                 if before_size != expected_size {
                     return Ok(ContentHashObservation::SizeDrift {
@@ -451,13 +448,7 @@ mod confined_fs {
                         observed_size: after_size,
                     });
                 }
-                if before.st_dev != after.st_dev
-                    || before.st_ino != after.st_ino
-                    || before.st_mtime != after.st_mtime
-                    || before.st_mtime_nsec != after.st_mtime_nsec
-                    || before.st_ctime != after.st_ctime
-                    || before.st_ctime_nsec != after.st_ctime_nsec
-                {
+                if !same_content_observation(&before, &after) {
                     return Ok(ContentHashObservation::ChangedDuringRead);
                 }
                 Ok(ContentHashObservation::Hashed { digest })
@@ -511,15 +502,7 @@ mod confined_fs {
                 let current =
                     rustix::fs::statat(leaf.parent.as_ref(), &leaf.name, AtFlags::SYMLINK_NOFOLLOW)
                         .map_err(io::Error::from)?;
-                if current.st_dev != leaf.device
-                    || current.st_ino != leaf.inode
-                    || current.st_mode != leaf.mode
-                    || current.st_size != leaf.size
-                    || current.st_mtime != leaf.modified_seconds
-                    || current.st_mtime_nsec != leaf.modified_nanoseconds
-                    || current.st_ctime != leaf.changed_seconds
-                    || current.st_ctime_nsec != leaf.changed_nanoseconds
-                {
+                if !same_metadata_observation(&current, &leaf.observed) {
                     return Err(io::Error::new(
                         io::ErrorKind::PermissionDenied,
                         "known-good metadata leaf changed after observation",
@@ -529,13 +512,7 @@ mod confined_fs {
             for leaf in self.leaves.borrow().iter() {
                 let held_stat = rustix::fs::fstat(leaf.file.as_ref()).map_err(io::Error::from)?;
                 if FileType::from_raw_mode(held_stat.st_mode) != FileType::RegularFile
-                    || held_stat.st_dev != leaf.device
-                    || held_stat.st_ino != leaf.inode
-                    || held_stat.st_size != leaf.size
-                    || held_stat.st_mtime != leaf.modified_seconds
-                    || held_stat.st_mtime_nsec != leaf.modified_nanoseconds
-                    || held_stat.st_ctime != leaf.changed_seconds
-                    || held_stat.st_ctime_nsec != leaf.changed_nanoseconds
+                    || !same_content_observation(&held_stat, &leaf.observed)
                 {
                     return Err(io::Error::new(
                         io::ErrorKind::PermissionDenied,
@@ -551,8 +528,7 @@ mod confined_fs {
                 .map_err(io::Error::from)?;
                 let current_stat = rustix::fs::fstat(&current).map_err(io::Error::from)?;
                 if FileType::from_raw_mode(current_stat.st_mode) != FileType::RegularFile
-                    || current_stat.st_dev != leaf.device
-                    || current_stat.st_ino != leaf.inode
+                    || !same_identity(&current_stat, &leaf.observed)
                 {
                     return Err(io::Error::new(
                         io::ErrorKind::PermissionDenied,
