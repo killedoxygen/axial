@@ -1,11 +1,16 @@
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
+import { basename, resolve } from 'node:path';
 import test from 'node:test';
 
-const read = (path) => readFile(path, 'utf8');
+const repositoryRoot = basename(process.cwd()) === 'frontend' ? resolve(process.cwd(), '..') : process.cwd();
 
+/** @param {string} path */
+const read = (path) => readFile(resolve(repositoryRoot, path), 'utf8');
+
+/** @param {string} source @param {string} name */
 function taskBody(source, name) {
-  const escaped = name.replaceAll(':', '\\:');
+  const escaped = name.split(':').join('\\:');
   const match = source.match(new RegExp(`^  ${escaped}:\\n([\\s\\S]*?)(?=^  [a-zA-Z0-9:_-]+:|\\Z)`, 'm'));
   assert.ok(match, `missing Task ${name}`);
   return match[1];
@@ -87,7 +92,7 @@ test('safe lock updates remove every actionable advisory without an exception', 
     ['rustls-webpki', '0.103.13'],
     ['rand', '0.8.7'],
   ]) {
-    assert.match(lock, new RegExp(`name = "${name}"\\nversion = "${version.replaceAll('.', '\\.')}"`));
+    assert.match(lock, new RegExp(`name = "${name}"\\nversion = "${version.split('.').join('\\.')}"`));
   }
   assert.deepEqual(policy.advisory_exceptions, []);
 });

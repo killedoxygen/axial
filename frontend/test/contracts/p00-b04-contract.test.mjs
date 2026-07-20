@@ -1,19 +1,16 @@
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
+import { basename, resolve } from 'node:path';
 import test from 'node:test';
+import { pathToFileURL } from 'node:url';
 
-import {
-  enforceAdvisoryPolicy,
-  parseDependencyPolicy,
-  reconcilePnpmLicenseCoverage,
-  verifyCargoPolicyOutput,
-  verifyPnpmLicenses,
-  verifyPnpmLock,
-  verifyPnpmRegistry,
-} from '../../../scripts/dependency-policy.mjs';
-import { parseToolchainManifest, readToolchainIdentity } from '../../../scripts/toolchain.mjs';
-
-const root = new URL('../../../', import.meta.url);
+const repositoryRoot = basename(process.cwd()) === 'frontend' ? resolve(process.cwd(), '..') : process.cwd();
+const dependencyPolicy = /** @type {Promise<typeof import('../../../scripts/dependency-policy.mjs')>} */ (
+  import(pathToFileURL(resolve(repositoryRoot, 'scripts/dependency-policy.mjs')).href)
+);
+const toolchain = /** @type {Promise<typeof import('../../../scripts/toolchain.mjs')>} */ (
+  import(pathToFileURL(resolve(repositoryRoot, 'scripts/toolchain.mjs')).href)
+);
 
 function policy(overrides = {}) {
   return `${JSON.stringify(
@@ -42,7 +39,8 @@ function exception(overrides = {}) {
 }
 
 test('one canonical policy owns exact expiring advisory exceptions', async () => {
-  const source = await readFile(new URL('dependency-policy.json', root), 'utf8');
+  const { parseDependencyPolicy } = await dependencyPolicy;
+  const source = await readFile(resolve(repositoryRoot, 'dependency-policy.json'), 'utf8');
   const parsed = parseDependencyPolicy(source, {
     now: new Date('2026-07-20T12:00:00.000Z'),
   });
@@ -64,7 +62,8 @@ test('one canonical policy owns exact expiring advisory exceptions', async () =>
   }
 });
 
-test('unknown, duplicate, unused, mismatched, and prohibited advisories fail closed', () => {
+test('unknown, duplicate, unused, mismatched, and prohibited advisories fail closed', async () => {
+  const { enforceAdvisoryPolicy, parseDependencyPolicy } = await dependencyPolicy;
   const finding = {
     ecosystem: 'cargo',
     package: 'example-crate',
@@ -97,7 +96,14 @@ test('unknown, duplicate, unused, mismatched, and prohibited advisories fail clo
   );
 });
 
-test('pnpm sources, integrity, and licenses have no advisory bypass', () => {
+test('pnpm sources, integrity, and licenses have no advisory bypass', async () => {
+  const {
+    reconcilePnpmLicenseCoverage,
+    verifyCargoPolicyOutput,
+    verifyPnpmLicenses,
+    verifyPnpmLock,
+    verifyPnpmRegistry,
+  } = await dependencyPolicy;
   const validLock = {
     lockfileVersion: '9.0',
     importers: {
@@ -117,7 +123,9 @@ test('pnpm sources, integrity, and licenses have no advisory bypass', () => {
     package_ids: ['package@1.2.3'],
   });
   const remoteTarball = structuredClone(validLock);
-  remoteTarball.packages['package@1.2.3'].resolution.tarball = 'https://packages.invalid/package.tgz';
+  Object.assign(remoteTarball.packages['package@1.2.3'].resolution, {
+    tarball: 'https://packages.invalid/package.tgz',
+  });
   assert.throws(() => verifyPnpmLock(remoteTarball), /keys must be exactly/);
   for (const reference of [
     'ftp://packages.invalid/package.tgz',
@@ -168,7 +176,8 @@ test('pnpm sources, integrity, and licenses have no advisory bypass', () => {
 });
 
 test('cargo-deny archive identity is exact in the toolchain manifest', async () => {
-  const source = await readFile(new URL('toolchain.json', root), 'utf8');
+  const { parseToolchainManifest, readToolchainIdentity } = await toolchain;
+  const source = await readFile(resolve(repositoryRoot, 'toolchain.json'), 'utf8');
   const parsed = parseToolchainManifest(source);
   assert.deepEqual(parsed.cargo_deny, {
     release: '0.20.2',
@@ -177,5 +186,5 @@ test('cargo-deny archive identity is exact in the toolchain manifest', async () 
       sha256: '9f12ed4c49936e09b48bf862b595cde2fe64fcbd9d74dfacac6131ca824c8d5f',
     },
   });
-  assert.equal(readToolchainIdentity().cargo_deny.release, '0.20.2');
+  assert.equal(readToolchainIdentity({ repositoryRoot }).cargo_deny.release, '0.20.2');
 });
