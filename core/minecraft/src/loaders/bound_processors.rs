@@ -33,6 +33,8 @@ const MAX_PROCESS_OUTPUT_BYTES: usize = 1 << 20;
 const MAX_PROCESS_OUTPUT_TOTAL_BYTES: usize = 2 << 20;
 #[cfg(target_os = "linux")]
 const MAX_LINUX_PROCESS_STAT_BYTES: u64 = 4096;
+#[cfg(target_os = "macos")]
+const MAX_MACOS_PROCESS_GROUP_MEMBERS: usize = 4096;
 const PROCESSOR_TIMEOUT: Duration = Duration::from_secs(120);
 const PIPE_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 const PROCESS_REAP_TIMEOUT: Duration = Duration::from_secs(5);
@@ -74,7 +76,12 @@ impl ProcessContainment {
         terminate_process_group(self.group)
     }
 
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
+    fn is_empty(&self) -> Result<bool, BoundProcessorError> {
+        macos_process_group_is_empty(self.group)
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     fn is_empty(&self) -> Result<bool, BoundProcessorError> {
         match rustix::process::test_kill_process_group(self.group) {
             Ok(()) => Ok(false),
@@ -90,6 +97,102 @@ fn terminate_process_group(group: rustix::process::Pid) -> Result<(), BoundProce
         Ok(()) | Err(rustix::io::Errno::SRCH) => Ok(()),
         Err(_) => Err(BoundProcessorError::Unreaped),
     }
+}
+
+#[cfg(target_os = "macos")]
+fn macos_process_group_is_empty(group: rustix::process::Pid) -> Result<bool, BoundProcessorError> {
+    match rustix::process::test_kill_process_group(group) {
+        Err(rustix::io::Errno::SRCH) => Ok(true),
+        Ok(()) => {
+            terminate_process_group(group)?;
+            if !macos_process_group_has_only_zombies(group)? {
+                return Ok(false);
+            }
+            match rustix::process::test_kill_process_group(group) {
+                Err(rustix::io::Errno::SRCH) => Ok(true),
+                Ok(()) => {
+                    terminate_process_group(group)?;
+                    macos_process_group_has_only_zombies(group)
+                }
+                Err(_) => Err(BoundProcessorError::Unreaped),
+            }
+        }
+        Err(_) => Err(BoundProcessorError::Unreaped),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn macos_process_group_has_only_zombies(
+    group: rustix::process::Pid,
+) -> Result<bool, BoundProcessorError> {
+    let group = group.as_raw_nonzero().get();
+    let required = unsafe { libc::proc_listpgrppids(group, std::ptr::null_mut(), 0) };
+    if required < 0 {
+        return Err(BoundProcessorError::Unreaped);
+    }
+    let required = usize::try_from(required).map_err(|_| BoundProcessorError::Unreaped)?;
+    if required == 0 {
+        return Ok(false);
+    }
+    if required >= MAX_MACOS_PROCESS_GROUP_MEMBERS {
+        return Err(BoundProcessorError::Unreaped);
+    }
+
+    // One spare slot makes a full buffer an explicit truncation failure if the
+    // process inventory changes between the sizing and listing calls.
+    let mut pids = vec![0 as libc::pid_t; required + 1];
+    let buffer_bytes = pids
+        .len()
+        .checked_mul(std::mem::size_of::<libc::pid_t>())
+        .and_then(|bytes| i32::try_from(bytes).ok())
+        .ok_or(BoundProcessorError::Unreaped)?;
+    let listed = unsafe { libc::proc_listpgrppids(group, pids.as_mut_ptr().cast(), buffer_bytes) };
+    if listed < 0 {
+        return Err(BoundProcessorError::Unreaped);
+    }
+    let listed = usize::try_from(listed).map_err(|_| BoundProcessorError::Unreaped)?;
+    if listed >= pids.len() {
+        return Err(BoundProcessorError::Unreaped);
+    }
+    pids.truncate(listed);
+
+    let mut observed_member = false;
+    for pid in pids.into_iter().filter(|pid| *pid > 0) {
+        let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::zeroed();
+        let info_bytes = i32::try_from(std::mem::size_of::<libc::proc_bsdinfo>())
+            .map_err(|_| BoundProcessorError::Unreaped)?;
+        let read = unsafe {
+            libc::proc_pidinfo(
+                pid,
+                libc::PROC_PIDTBSDINFO,
+                0,
+                info.as_mut_ptr().cast(),
+                info_bytes,
+            )
+        };
+        if read == 0 {
+            let Some(pid) = rustix::process::Pid::from_raw(pid) else {
+                continue;
+            };
+            match rustix::process::test_kill_process(pid) {
+                Err(rustix::io::Errno::SRCH) => continue,
+                Ok(()) | Err(rustix::io::Errno::PERM) => return Ok(false),
+                Err(_) => return Err(BoundProcessorError::Unreaped),
+            }
+        }
+        if read != info_bytes {
+            return Err(BoundProcessorError::Unreaped);
+        }
+        let info = unsafe { info.assume_init() };
+        if info.pbi_pgid != group as u32 {
+            continue;
+        }
+        observed_member = true;
+        if info.pbi_status != libc::SZOMB {
+            return Ok(false);
+        }
+    }
+    Ok(observed_member)
 }
 
 #[cfg(target_os = "linux")]
@@ -2154,33 +2257,36 @@ mod tests {
 
     #[tokio::test]
     async fn contained_successful_leader_exit_terminates_surviving_descendants() {
-        let mut command = containment_fixture_command("leader-with-descendant");
-        let mut child = spawn_contained_child(&mut command)
-            .await
-            .expect("contained child");
-        let (_cancel_tx, mut cancel_rx) = oneshot::channel();
-        let (pipe_tx, mut pipe_rx) = mpsc::unbounded_channel();
-        pipe_tx.send(PipeEvent::Finished).unwrap();
-        pipe_tx.send(PipeEvent::Finished).unwrap();
+        let attempts = if cfg!(target_os = "macos") { 4 } else { 1 };
+        for attempt in 0..attempts {
+            let mut command = containment_fixture_command("leader-with-descendant");
+            let mut child = spawn_contained_child(&mut command)
+                .await
+                .expect("contained child");
+            let (_cancel_tx, mut cancel_rx) = oneshot::channel();
+            let (pipe_tx, mut pipe_rx) = mpsc::unbounded_channel();
+            pipe_tx.send(PipeEvent::Finished).unwrap();
+            pipe_tx.send(PipeEvent::Finished).unwrap();
 
-        wait_for_contained_child(
-            &mut child,
-            &mut cancel_rx,
-            &mut pipe_rx,
-            None,
-            Duration::from_secs(2),
-            Duration::from_millis(50),
-        )
-        .await
-        .expect("contained success");
-        assert!(child.child.try_wait().expect("leader wait").is_some());
-        #[cfg(target_os = "linux")]
-        assert!(
-            super::linux_process_group_is_empty(child.containment.group)
-                .expect("empty process group")
-        );
-        #[cfg(not(target_os = "linux"))]
-        assert!(child.containment.is_empty().expect("empty process group"));
+            wait_for_contained_child(
+                &mut child,
+                &mut cancel_rx,
+                &mut pipe_rx,
+                None,
+                Duration::from_secs(2),
+                Duration::from_millis(50),
+            )
+            .await
+            .unwrap_or_else(|error| panic!("contained success attempt {attempt}: {error:?}"));
+            assert!(child.child.try_wait().expect("leader wait").is_some());
+            #[cfg(target_os = "linux")]
+            assert!(
+                super::linux_process_group_is_empty(child.containment.group)
+                    .expect("empty process group")
+            );
+            #[cfg(not(target_os = "linux"))]
+            assert!(child.containment.is_empty().expect("empty process group"));
+        }
     }
 
     #[tokio::test]

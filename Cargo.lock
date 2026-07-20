@@ -387,6 +387,7 @@ dependencies = [
  "base64 0.22.1",
  "chrono",
  "futures-util",
+ "libc",
  "lzma-rs",
  "md5",
  "ntapi",
