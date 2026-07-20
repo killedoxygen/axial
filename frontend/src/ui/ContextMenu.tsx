@@ -1,10 +1,10 @@
 import type { JSX } from 'preact';
 import { signal } from '@preact/signals';
 import { useEffect, useRef } from 'preact/hooks';
-import { Icon } from './Icons';
+import { Icon, type IconName } from './Icons';
 
 export interface ContextMenuItem {
-  icon?: string;
+  icon?: IconName;
   label: string;
   onSelect: () => void;
   danger?: boolean;

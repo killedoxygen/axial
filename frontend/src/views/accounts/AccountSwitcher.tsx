@@ -65,41 +65,39 @@ function activeAccountMenuItems(account: LauncherAccount): ContextMenuItem[] {
   if (account.kind === 'offline') return offlineAccountMenuItems(account);
   const syncAction = activeMicrosoftProfileSyncAction();
   const refreshAction = activeMicrosoftRefreshAction();
-  return [
-    ...(actionEnabled(syncAction)
-      ? [
-          {
-            icon: 'refresh',
-            label: syncAction?.label ?? 'Sync Minecraft profile',
-            onSelect: () => void syncMinecraftProfile(),
-          },
-        ]
-      : []),
-    ...(actionEnabled(refreshAction)
-      ? [
-          {
-            icon: 'refresh',
-            label: refreshAction?.label ?? 'Refresh Microsoft sign-in',
-            onSelect: () => void refreshMicrosoftAuth(),
-          },
-        ]
-      : []),
-    ...(microsoftSignInAvailable()
-      ? [{ icon: 'globe', label: 'Re-verify with Microsoft', onSelect: () => void signInWithMicrosoftAccount() }]
-      : []),
+  const items: ContextMenuItem[] = [];
+  if (actionEnabled(syncAction)) {
+    items.push({
+      icon: 'refresh',
+      label: syncAction?.label ?? 'Sync Minecraft profile',
+      onSelect: () => void syncMinecraftProfile(),
+    });
+  }
+  if (actionEnabled(refreshAction)) {
+    items.push({
+      icon: 'refresh',
+      label: refreshAction?.label ?? 'Refresh Microsoft sign-in',
+      onSelect: () => void refreshMicrosoftAuth(),
+    });
+  }
+  if (microsoftSignInAvailable()) {
+    items.push({ icon: 'globe', label: 'Re-verify with Microsoft', onSelect: () => void signInWithMicrosoftAccount() });
+  }
+  items.push(
     { label: '', onSelect: () => {}, divider: true },
     { icon: 'x', label: 'Sign out', onSelect: () => void removeAccount(account), danger: true },
-  ];
+  );
+  return items;
 }
 
 function idleAccountMenuItems(account: LauncherAccount): ContextMenuItem[] {
   if (account.kind === 'offline') return offlineAccountMenuItems(account);
-  return [
-    ...(microsoftSignInAvailable()
-      ? [{ icon: 'globe', label: 'Re-verify with Microsoft', onSelect: () => void signInWithMicrosoftAccount() }]
-      : []),
-    { icon: 'x', label: 'Remove account', onSelect: () => void removeAccount(account), danger: true },
-  ];
+  const items: ContextMenuItem[] = [];
+  if (microsoftSignInAvailable()) {
+    items.push({ icon: 'globe', label: 'Re-verify with Microsoft', onSelect: () => void signInWithMicrosoftAccount() });
+  }
+  items.push({ icon: 'x', label: 'Remove account', onSelect: () => void removeAccount(account), danger: true });
+  return items;
 }
 
 function SwitchRow({ account, busy }: { account: LauncherAccount; busy: boolean }): JSX.Element {

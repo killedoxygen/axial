@@ -1,6 +1,6 @@
 import type { JSX } from 'preact';
 import { useEffect, useState } from 'preact/hooks';
-import { Icon } from '../../ui/Icons';
+import { Icon, type IconName } from '../../ui/Icons';
 import { Button, IconButton, Pill } from '../../ui/Atoms';
 import { InstanceTile, guardedInstanceHue } from '../../ui/InstanceVisual';
 import { openContextMenu } from '../../ui/ContextMenu';
@@ -35,7 +35,7 @@ export { deleteInstanceFlow, duplicateInstance, openInstanceFolder, renameInstan
 type Tab = 'mods' | 'worlds' | 'screenshots' | 'logs' | 'settings';
 type TabSelection = { instanceId: string; tab: Tab } | null;
 
-const TABS: Array<{ id: Tab; icon: string; label: string }> = [
+const TABS: Array<{ id: Tab; icon: IconName; label: string }> = [
   { id: 'mods', icon: 'puzzle', label: 'Mods' },
   { id: 'worlds', icon: 'globe', label: 'Worlds' },
   { id: 'screenshots', icon: 'image', label: 'Screenshots' },

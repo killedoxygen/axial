@@ -202,6 +202,34 @@
       ]
     },
     {
+      "id": "lucide-icons",
+      "source": {
+        "kind": "upstream",
+        "locator": "https://github.com/lucide-icons/lucide/tree/5136572c10214634858fcf5f726b2a9d26683918",
+        "revision": "5136572c10214634858fcf5f726b2a9d26683918"
+      },
+      "rights": {
+        "basis": "isc-and-mit",
+        "evidence": {
+          "locator": "frontend/static/licenses/Lucide-ISC.txt",
+          "sha256": "b495047bd93a9b06913511076f504daba17d5bbeb3e0650f3bb53a4220329c57"
+        },
+        "current_policy": "https://lucide.dev/license",
+        "reviewed_at": "2026-07-20"
+      },
+      "refresh": "Update the exact package pin, immutable revision, lock integrity, notice, and icon contract together.",
+      "files": [
+        {
+          "path": "frontend/static/licenses/Lucide-ISC.txt",
+          "mode": "100644",
+          "sha256": "b495047bd93a9b06913511076f504daba17d5bbeb3e0650f3bb53a4220329c57",
+          "generator": null,
+          "locator": "https://raw.githubusercontent.com/lucide-icons/lucide/5136572c10214634858fcf5f726b2a9d26683918/LICENSE",
+          "upstream_sha256": "b495047bd93a9b06913511076f504daba17d5bbeb3e0650f3bb53a4220329c57"
+        }
+      ]
+    },
+    {
       "id": "manrope",
       "source": {
         "kind": "upstream",

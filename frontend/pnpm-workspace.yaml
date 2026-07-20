@@ -1,3 +1,7 @@
 allowBuilds:
   esbuild: true
-nodeLinker: hoisted
+autoInstallPeers: false
+strictPeerDependencies: true
+peerDependencyRules:
+  ignoreMissing:
+    - react

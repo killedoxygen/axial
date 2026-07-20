@@ -1,7 +1,7 @@
 import type { JSX, ComponentChildren } from 'preact';
 import { useState } from 'preact/hooks';
 import type { SoundKind } from '../sound';
-import { Icon } from './Icons';
+import { Icon, type IconName } from './Icons';
 
 type Tone = 'neutral' | 'accent' | 'ok' | 'warn' | 'err' | 'info';
 type BtnVariant = 'primary' | 'secondary' | 'soft' | 'ghost' | 'danger';
@@ -25,7 +25,7 @@ export function Button({
   children?: ComponentChildren;
   variant?: BtnVariant;
   size?: BtnSize;
-  icon?: string;
+  icon?: IconName;
   trailing?: ComponentChildren;
   onClick?: (e: MouseEvent) => void;
   style?: JSX.CSSProperties;
@@ -67,7 +67,7 @@ export function IconButton({
   danger,
   variant,
 }: {
-  icon: string;
+  icon: IconName;
   onClick?: (e: MouseEvent) => void;
   size?: number;
   active?: boolean;
@@ -101,7 +101,7 @@ export function Pill({
 }: {
   children?: ComponentChildren;
   tone?: Tone;
-  icon?: string;
+  icon?: IconName;
   style?: JSX.CSSProperties;
 }): JSX.Element {
   const cls = `cp-pill${tone !== 'neutral' ? ` cp-pill--${tone}` : ''}`;
@@ -204,7 +204,7 @@ export function Input({
   value: string;
   onChange: (v: string) => void;
   placeholder?: string;
-  icon?: string;
+  icon?: IconName;
   trailing?: ComponentChildren;
   style?: JSX.CSSProperties;
   type?: string;

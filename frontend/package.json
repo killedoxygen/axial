@@ -18,14 +18,16 @@
   },
   "devDependencies": {
     "@types/node": "24.13.3",
+    "@types/react": "19.2.14",
     "@types/three": "^0.184.1",
     "esbuild": "^0.25.0",
     "prettier": "^3.8.4",
-    "typescript": "^5.7.0"
+    "typescript": "^5.7.0",
+    "yaml": "2.9.0"
   },
   "dependencies": {
-    "@openai/apps-sdk-ui": "^0.2.2",
     "@preact/signals": "^2.0.0",
+    "lucide-preact": "1.25.0",
     "preact": "^10.25.0",
     "react-markdown": "^9.1.0",
     "remark-gfm": "^4.0.1",

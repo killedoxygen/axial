@@ -1,12 +1,12 @@
 import type { JSX } from 'preact';
 import { Button } from './Atoms';
 import { FloatingTray, FloatingTrayDivider, FloatingTrayLabel } from './FloatingTray';
-import { Icon } from './Icons';
+import { Icon, type IconName } from './Icons';
 import type { SelectionState } from './selection';
 
 export interface SelectionAction {
   label: string;
-  icon?: string;
+  icon?: IconName;
   danger?: boolean;
   disabled?: boolean;
   onClick: () => void;

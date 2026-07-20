@@ -1,148 +1,140 @@
-import type { JSX, FunctionComponent } from 'preact';
+import type { JSX } from 'preact';
 import {
+  Activity,
   Archive,
   ArrowLeft,
   ArrowRight,
   ArrowUp,
+  Box,
   Check,
-  CheckCircle,
+  ChevronDown,
   ChevronLeft,
   ChevronRight,
-  ChevronDown,
   ChevronUp,
+  CircleAlert,
+  CircleCheck,
   CircleDashed,
   Clock,
-  ColorTheme,
   Compass,
   Copy,
-  Cube,
-  DotsHorizontal,
   Download,
-  Edit,
-  ExclamationMarkCircle,
-  Expand,
+  Ellipsis,
   Folder,
   Globe,
   Headphones,
-  Home,
-  ImageSquare,
-  InfoCircle,
+  House,
+  Image,
+  Info,
   Keyboard,
+  Layers,
+  Maximize2,
   Minus,
   Music,
-  PlaySm as Play,
-  PluginPuzzle,
+  Palette,
+  Pencil,
+  Play,
   Plus,
-  Pulse,
-  Reload,
+  Puzzle,
+  RefreshCw,
   Search,
   Settings,
-  SettingsSlider,
   ShieldCheck,
-  ShieldPerson,
-  Skip,
-  SoundOffSimpleMute,
-  SoundOffSpeaker,
-  SoundOnReadOutLoudSpeaker,
-  Stack,
-  SquareCheckboxUnchecked,
-  Stop,
+  ShieldUser,
+  SkipForward,
+  SlidersHorizontal,
+  Square,
+  SquareStop,
   Tag,
   Terminal,
-  Trash,
+  Trash2,
   User,
+  Volume2,
+  VolumeOff,
+  VolumeX,
   X,
-} from '@openai/apps-sdk-ui/components/Icon';
+  type LucideIcon,
+} from 'lucide-preact';
 
-type IconComponent = FunctionComponent<{
-  width?: number | string;
-  height?: number | string;
-  color?: string;
-  class?: string;
-  'aria-hidden'?: boolean | 'true' | 'false';
-  focusable?: boolean | 'true' | 'false';
-  style?: JSX.CSSProperties;
-}>;
+const REGISTRY = {
+  activity: Activity,
+  archive: Archive,
+  'arrow-left': ArrowLeft,
+  'arrow-right': ArrowRight,
+  'arrow-up': ArrowUp,
+  check: Check,
+  'check-circle': CircleCheck,
+  'chevron-left': ChevronLeft,
+  'chevron-right': ChevronRight,
+  'chevron-down': ChevronDown,
+  'chevron-up': ChevronUp,
+  'circle-dashed': CircleDashed,
+  clock: Clock,
+  compass: Compass,
+  copy: Copy,
+  cube: Box,
+  dots: Ellipsis,
+  download: Download,
+  edit: Pencil,
+  expand: Maximize2,
+  folder: Folder,
+  globe: Globe,
+  headphones: Headphones,
+  home: House,
+  image: Image,
+  info: Info,
+  alert: CircleAlert,
+  keyboard: Keyboard,
+  minus: Minus,
+  music: Music,
+  'music-off': VolumeOff,
+  palette: Palette,
+  puzzle: Puzzle,
+  play: Play,
+  'player-skip': SkipForward,
+  plus: Plus,
+  rectangle: Square,
+  refresh: RefreshCw,
+  search: Search,
+  settings: Settings,
+  sliders: SlidersHorizontal,
+  'shield-check': ShieldCheck,
+  'shield-person': ShieldUser,
+  stack: Layers,
+  stop: SquareStop,
+  tag: Tag,
+  terminal: Terminal,
+  trash: Trash2,
+  user: User,
+  volume: Volume2,
+  'volume-off': VolumeX,
+  x: X,
+} as const satisfies Record<string, LucideIcon>;
 
-const REGISTRY: Record<string, IconComponent> = {
-  activity: Pulse as IconComponent,
-  archive: Archive as IconComponent,
-  'arrow-left': ArrowLeft as IconComponent,
-  'arrow-right': ArrowRight as IconComponent,
-  'arrow-up': ArrowUp as IconComponent,
-  check: Check as IconComponent,
-  'check-circle': CheckCircle as IconComponent,
-  'chevron-left': ChevronLeft as IconComponent,
-  'chevron-right': ChevronRight as IconComponent,
-  'chevron-down': ChevronDown as IconComponent,
-  'chevron-up': ChevronUp as IconComponent,
-  'circle-dashed': CircleDashed as IconComponent,
-  clock: Clock as IconComponent,
-  compass: Compass as IconComponent,
-  copy: Copy as IconComponent,
-  cube: Cube as IconComponent,
-  dots: DotsHorizontal as IconComponent,
-  download: Download as IconComponent,
-  edit: Edit as IconComponent,
-  expand: Expand as IconComponent,
-  folder: Folder as IconComponent,
-  globe: Globe as IconComponent,
-  headphones: Headphones as IconComponent,
-  home: Home as IconComponent,
-  image: ImageSquare as IconComponent,
-  info: InfoCircle as IconComponent,
-  alert: ExclamationMarkCircle as IconComponent,
-  keyboard: Keyboard as IconComponent,
-  minus: Minus as IconComponent,
-  music: Music as IconComponent,
-  'music-off': SoundOffSimpleMute as IconComponent,
-  palette: ColorTheme as IconComponent,
-  puzzle: PluginPuzzle as IconComponent,
-  play: Play as IconComponent,
-  'player-skip': Skip as IconComponent,
-  plus: Plus as IconComponent,
-  rectangle: SquareCheckboxUnchecked as IconComponent,
-  refresh: Reload as IconComponent,
-  search: Search as IconComponent,
-  settings: Settings as IconComponent,
-  sliders: SettingsSlider as IconComponent,
-  'shield-check': ShieldCheck as IconComponent,
-  'shield-person': ShieldPerson as IconComponent,
-  stack: Stack as IconComponent,
-  stop: Stop as IconComponent,
-  tag: Tag as IconComponent,
-  terminal: Terminal as IconComponent,
-  trash: Trash as IconComponent,
-  user: User as IconComponent,
-  volume: SoundOnReadOutLoudSpeaker as IconComponent,
-  'volume-off': SoundOffSpeaker as IconComponent,
-  x: X as IconComponent,
-};
+export type IconName = keyof typeof REGISTRY;
+
+export const ICON_NAMES: readonly IconName[] = Object.freeze(Object.keys(REGISTRY) as IconName[]);
+
+export function isIconName(value: string): value is IconName {
+  return Object.prototype.hasOwnProperty.call(REGISTRY, value);
+}
 
 export interface IconProps {
-  name: string;
+  name: IconName;
   size?: number;
   stroke?: number;
   color?: string;
   style?: JSX.CSSProperties;
 }
 
-export function Icon({
-  name,
-  size = 18,
-  stroke: _stroke = 2,
-  color = 'currentColor',
-  style,
-}: IconProps): JSX.Element | null {
-  const Cmp = REGISTRY[name];
-  if (!Cmp) return null;
+export function Icon({ name, size = 18, stroke = 2, color = 'currentColor', style }: IconProps): JSX.Element {
+  const Component = REGISTRY[name];
   return (
-    <Cmp
-      width={size}
-      height={size}
+    <Component
+      size={size}
+      strokeWidth={stroke}
       color={color}
       aria-hidden={true}
-      focusable={false}
+      focusable="false"
       style={{ display: 'block', flexShrink: 0, ...style }}
     />
   );

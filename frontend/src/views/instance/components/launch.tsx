@@ -2,7 +2,7 @@ import type { JSX } from 'preact';
 import { Icon } from '../../../ui/Icons';
 import { Button, Meter } from '../../../ui/Atoms';
 import { DownloadFailureNotice } from '../../../ui/DownloadFailureNotice';
-import { openContextMenu } from '../../../ui/ContextMenu';
+import { openContextMenu, type ContextMenuItem } from '../../../ui/ContextMenu';
 import { navigate } from '../../../ui-state';
 import { clearLaunchNotice } from '../../../actions';
 import { toast } from '../../../toast';
@@ -82,7 +82,7 @@ export function LaunchSplitButton({
     preparing,
   });
   const primaryAction = usesInstallAction ? onInstall : onLaunch;
-  const primaryMenuItem = blocked
+  const primaryMenuItem: ContextMenuItem = blocked
     ? {
         icon: 'alert',
         label: launchAction.disabled_reason || launchAction.label,

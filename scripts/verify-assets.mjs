@@ -328,6 +328,7 @@ export function distributableAssetInventory(indexedPaths) {
         assetPath === "assets/brand-mark.json" ||
         assetPath.startsWith("apps/desktop/icons/") ||
         assetPath.startsWith("frontend/static/fonts/") ||
+        assetPath.startsWith("frontend/static/licenses/") ||
         assetPath.startsWith("frontend/static/sounds/") ||
         /^frontend\/static\/.+\.(?:avif|gif|icns|ico|jpe?g|mp3|ogg|otf|png|svg|ttf|webp|woff2?)$/i.test(
           assetPath,

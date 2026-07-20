@@ -125,7 +125,7 @@ export function AccentField({
         <div class="cp-accent-presets">
           <div class="cp-accent-presets-head">
             <div class="cp-accent-presets-label">Presets</div>
-            <Button variant="secondary" size="sm" icon="reload" onClick={resetToDefault}>
+            <Button variant="secondary" size="sm" icon="refresh" onClick={resetToDefault}>
               Reset
             </Button>
           </div>

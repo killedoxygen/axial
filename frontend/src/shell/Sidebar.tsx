@@ -1,7 +1,7 @@
 import type { JSX } from 'preact';
 import { useCallback, useEffect, useRef, useState } from 'preact/hooks';
 import { InstanceTile } from '../ui/InstanceVisual';
-import { Icon } from '../ui/Icons';
+import { Icon, type IconName } from '../ui/Icons';
 import { Logo } from '../ui/Logo';
 import { PlayerHeadPreview } from '../ui/PlayerHeadPreview';
 import { route, navigate, commandPaletteOpen, type Route, openCreate, openAccountSwitcher } from '../ui-state';
@@ -49,7 +49,7 @@ function railTipAttrs(label: string, tooltip: RailTooltipController) {
   };
 }
 
-function RailIcon({ name, size = 20 }: { name: string; size?: number }): JSX.Element {
+function RailIcon({ name, size = 20 }: { name: IconName; size?: number }): JSX.Element {
   if (name === 'stack') {
     return (
       <span class="cp-rail-icon" aria-hidden="true">
@@ -92,7 +92,7 @@ function RailButton({
   accent,
   tooltip,
 }: {
-  icon: string;
+  icon: IconName;
   label: string;
   target: Route;
   accent?: boolean;
@@ -251,7 +251,7 @@ function UserMenu({ onClose }: { onClose: () => void }): JSX.Element {
     hint,
     right,
   }: {
-    icon: string;
+    icon: IconName;
     label: string;
     onSelect: () => void;
     hint?: string;

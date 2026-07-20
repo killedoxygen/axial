@@ -1,6 +1,6 @@
 import type { JSX } from 'preact';
 import { useState } from 'preact/hooks';
-import { Icon } from '../../ui/Icons';
+import { Icon, type IconName } from '../../ui/Icons';
 import { resetViewScroll } from '../../ui-state';
 import { AppearanceSection } from './AppearanceSection';
 import { AudioSection } from './AudioSection';
@@ -12,7 +12,7 @@ import { AboutSettingsSection } from './AboutSettingsSection';
 
 type SectionId = 'appearance' | 'audio' | 'launching' | 'performance' | 'shortcuts' | 'advanced' | 'about';
 
-const SECTIONS: Array<{ id: SectionId; label: string; icon: string }> = [
+const SECTIONS: Array<{ id: SectionId; label: string; icon: IconName }> = [
   { id: 'appearance', label: 'Appearance', icon: 'palette' },
   { id: 'audio', label: 'Audio', icon: 'headphones' },
   { id: 'launching', label: 'Launching', icon: 'play' },

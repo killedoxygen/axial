@@ -1,4 +1,5 @@
 import type { ToastKind } from './types-ui';
+import type { IconName } from './ui/Icons';
 
 export interface CreateNotice {
   state_id: string;
@@ -60,14 +61,14 @@ function noticeTone(value: string): string {
   return 'info';
 }
 
-function noticeIcon(tone: string): string {
+function noticeIcon(tone: string): IconName {
   if (tone === 'success') return 'check-circle';
   if (tone === 'error' || tone === 'warned') return 'alert';
   if (tone === 'intervened') return 'shield-check';
   return 'info';
 }
 
-export function createNoticePresentation(notice: CreateNotice): { tone: string; icon: string } {
+export function createNoticePresentation(notice: CreateNotice): { tone: string; icon: IconName } {
   const tone = noticeTone(notice.tone);
   return { tone, icon: noticeIcon(tone) };
 }

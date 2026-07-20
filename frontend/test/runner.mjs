@@ -388,7 +388,6 @@ async function compileTests({ dependencyRoot, entries, frontendRoot, outputRoot,
     dependencyRoot,
     enableDevLab: false,
     enableMockApi: false,
-    openaiIconSubsetPath: resolve(dependencyRoot, 'src/vendor/openai-icons-subset.js'),
     webApiBase: '',
   });
   const runnerModule = resolve(dependencyRoot, 'test/runner.mjs');

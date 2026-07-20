@@ -1,6 +1,6 @@
 import type { JSX } from 'preact';
 import { useEffect, useMemo, useRef, useState } from 'preact/hooks';
-import { Icon } from './Icons';
+import { Icon, type IconName } from './Icons';
 import { Kbd } from './Atoms';
 import { commandPaletteOpen, navigate, type Route, openCreate, openAccountSwitcher } from '../ui-state';
 import { instances, launchSessions } from '../store';
@@ -18,7 +18,7 @@ type Group = 'jump' | 'instance' | 'action';
 interface Command {
   id: string;
   group: Group;
-  icon: string;
+  icon: IconName;
   label: string;
   hint?: string;
   keywords?: string;

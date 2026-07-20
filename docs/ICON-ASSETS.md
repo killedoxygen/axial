@@ -50,12 +50,26 @@ Forge, NeoForge, Quilt, Mojang, or Microsoft brand geometry. The loader mapping
 is total and each glyph remains distinct in both text rows and icon-only
 instance surfaces.
 
+## Interface icons
+
+The interface icon registry in `frontend/src/ui/Icons.tsx` exposes 52 semantic
+names backed by exact `lucide-preact@1.25.0`. UI component contracts accept the
+closed `IconName` union; backend and domain strings remain untyped until a UI
+presenter maps them to that union. The `stroke` prop maps directly to Lucide's
+`strokeWidth`, preserving intentional per-surface weight adjustments.
+
+The byte-exact upstream ISC/MIT notice ships at
+`frontend/static/licenses/Lucide-ISC.txt`. To refresh Lucide, update the exact
+manifest and lockfile version, immutable provenance revision and hashes, notice,
+52-name contract review, and visual smoke results together.
+
 ## Third-party assets
 
 `assets/provenance.json` is the strict source, rights, revision, mode, refresh,
 generator, and exact-hash inventory for retained delivery assets. It covers the
 tracked desktop icons, frontend font files and notices, SND kit files, neutral
-loader glyphs, favicon, and Microsoft authentication symbol.
+loader glyphs, interface icon notice, favicon, and Microsoft authentication
+symbol.
 
 The Microsoft symbol is the byte-exact asset published with Microsoft identity
 branding guidance. It is used only inside Microsoft authentication controls;

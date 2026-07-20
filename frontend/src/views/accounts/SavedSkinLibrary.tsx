@@ -208,17 +208,16 @@ export function SavedSkinLibrary({
     stageEditReplacementFile: edit.stageEditReplacementFile,
   });
 
-  const profileMenuItems: ContextMenuItem[] = [
-    ...(skinActionsEnabled && profileSkin && op === null
-      ? [{ icon: 'download', label: 'Save locally', onSelect: () => void saveProfileSkinLocally() }]
-      : []),
-    ...(skinActionsEnabled && profileSkin && op === null
-      ? [{ icon: 'x', label: 'Reset profile skin', onSelect: () => void resetProfileSkin() }]
-      : []),
-    ...(skinActionsEnabled && profileCape && op === null
-      ? [{ icon: 'x', label: 'Reset profile cape', onSelect: () => void resetProfileCape() }]
-      : []),
-  ];
+  const profileMenuItems: ContextMenuItem[] = [];
+  if (skinActionsEnabled && profileSkin && op === null) {
+    profileMenuItems.push(
+      { icon: 'download', label: 'Save locally', onSelect: () => void saveProfileSkinLocally() },
+      { icon: 'x', label: 'Reset profile skin', onSelect: () => void resetProfileSkin() },
+    );
+  }
+  if (skinActionsEnabled && profileCape && op === null) {
+    profileMenuItems.push({ icon: 'x', label: 'Reset profile cape', onSelect: () => void resetProfileCape() });
+  }
   const showProfileSkinTile = Boolean(profile && profileSkin && !showProfileSelectedPreview && !currentProfileSavedKey);
 
   const editingSkin = edit.editKey ? (savedSkinByKey.get(edit.editKey) ?? null) : null;

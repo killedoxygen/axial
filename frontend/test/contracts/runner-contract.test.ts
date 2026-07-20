@@ -47,9 +47,6 @@ async function createFixture(): Promise<Fixture> {
           noEmit: true,
           paths: {
             '@/*': ['./src/*'],
-            '@openai/apps-sdk-ui/components/Icon': [
-              join(dependencyRoot, 'node_modules/@openai/apps-sdk-ui/dist/types/components/Icon/index.d.ts'),
-            ],
             react: [join(dependencyRoot, 'node_modules/preact/compat')],
           },
           resolveJsonModule: true,
@@ -73,13 +70,11 @@ import assert from 'node:assert/strict';
 import { writeFile } from 'node:fs/promises';
 import test from 'node:test';
 import { createElement } from 'react';
-import { InfoCircle } from '@openai/apps-sdk-ui/components/Icon';
 import { marker } from '@/alias';
 
 test('nested TypeScript fixture', async () => {
   assert.equal(marker, 'shared-alias');
   assert.equal(typeof createElement, 'function');
-  assert.ok(InfoCircle);
   await writeFile(${JSON.stringify(receipt)}, 'ts', { flag: 'wx' });
 });
 `;

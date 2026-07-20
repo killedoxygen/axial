@@ -222,37 +222,33 @@ export function modMenuItems(
 ): ContextMenuItem[] {
   const entry = provenance?.entry;
   const update = provenance?.update;
-  return [
-    selectionItem,
-    { divider: true, label: '', onSelect: () => undefined },
-    ...(update
-      ? [
-          {
-            icon: 'arrow-up',
-            label: `Update to ${update.latest_version_number}`,
-            onSelect: () => void applyModUpdates(inst, [update], onRefresh),
-          },
-        ]
-      : []),
-    {
-      icon: mod.enabled ? 'stop' : 'play',
-      label: mod.enabled ? 'Disable' : 'Enable',
-      onSelect: () => void setModEnabled(inst, mod, onRefresh),
-    },
-    ...(entry
-      ? [
-          {
-            icon: 'compass',
-            label: 'View in Discover',
-            onSelect: () => navigate({ name: 'content', id: entry.canonical_id, target: inst.id }),
-          },
-        ]
-      : []),
+  const items: ContextMenuItem[] = [selectionItem, { divider: true, label: '', onSelect: () => undefined }];
+  if (update) {
+    items.push({
+      icon: 'arrow-up',
+      label: `Update to ${update.latest_version_number}`,
+      onSelect: () => void applyModUpdates(inst, [update], onRefresh),
+    });
+  }
+  items.push({
+    icon: mod.enabled ? 'stop' : 'play',
+    label: mod.enabled ? 'Disable' : 'Enable',
+    onSelect: () => void setModEnabled(inst, mod, onRefresh),
+  });
+  if (entry) {
+    items.push({
+      icon: 'compass',
+      label: 'View in Discover',
+      onSelect: () => navigate({ name: 'content', id: entry.canonical_id, target: inst.id }),
+    });
+  }
+  items.push(
     { icon: 'folder', label: 'Open mods folder', onSelect: () => void openInstanceFolder(inst.id, 'mods') },
     { icon: 'refresh', label: 'Refresh list', onSelect: onRefresh },
     { divider: true, label: '', onSelect: () => undefined },
     entry
       ? { icon: 'trash', label: 'Remove', onSelect: () => void removeManagedMod(inst, entry, onRefresh), danger: true }
       : { icon: 'trash', label: 'Delete', onSelect: () => void deleteMods(inst, [mod], onRefresh), danger: true },
-  ];
+  );
+  return items;
 }

@@ -1,5 +1,6 @@
 import type { LaunchActionState, LaunchNotice, LaunchNoticeTone, LaunchSession } from './types-launch';
 import type { LaunchState } from './store';
+import type { IconName } from './ui/Icons';
 
 type LaunchSessionPresentationInput = Pick<LaunchSession, 'viewModel'>;
 
@@ -21,7 +22,7 @@ export function launchSessionActivityLabel(session: LaunchSessionPresentationInp
   return 'Preparing launch';
 }
 
-function launchNoticeIcon(tone: LaunchNoticeTone): string {
+function launchNoticeIcon(tone: LaunchNoticeTone): IconName {
   if (tone === 'success') return 'check-circle';
   if (tone === 'error') return 'alert';
   if (tone === 'warned') return 'alert';
@@ -30,7 +31,7 @@ function launchNoticeIcon(tone: LaunchNoticeTone): string {
 }
 
 export function launchNoticePresentation(notice: LaunchNotice): {
-  icon: string;
+  icon: IconName;
   primaryDetail: string;
   listDetails: string[];
 } {
@@ -56,7 +57,7 @@ interface LaunchActionPresentation {
   usesInstallAction: boolean;
   blocked: boolean;
   label: string;
-  icon: string;
+  icon: IconName;
   pct: number;
   disabled: boolean;
 }
@@ -76,7 +77,8 @@ export function launchActionPresentation({
   const usesInstallAction = launchAction.primary_action === 'install';
   const blocked = launchAction.primary_action === 'blocked';
   const label = progress?.label || (installQueued ? installQueuedView?.title || 'Queued' : launchAction.label);
-  const icon = progress || installQueued ? 'clock' : blocked ? 'alert' : usesInstallAction ? 'download' : 'play';
+  const icon: IconName =
+    progress || installQueued ? 'clock' : blocked ? 'alert' : usesInstallAction ? 'download' : 'play';
   const pct = progress?.determinate ? progress.pct : 0;
   const disabled = Boolean(progress) || installQueued || blocked;
   return { progress, usesInstallAction, blocked, label, icon, pct, disabled };
