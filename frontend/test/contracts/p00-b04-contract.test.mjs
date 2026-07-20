@@ -119,6 +119,17 @@ test('pnpm sources, integrity, and licenses have no advisory bypass', () => {
   const remoteTarball = structuredClone(validLock);
   remoteTarball.packages['package@1.2.3'].resolution.tarball = 'https://packages.invalid/package.tgz';
   assert.throws(() => verifyPnpmLock(remoteTarball), /keys must be exactly/);
+  for (const reference of [
+    'ftp://packages.invalid/package.tgz',
+    'unknown:package',
+    'owner/repository',
+    'git@github.com:owner/repository',
+    '../package',
+  ]) {
+    const nonRegistry = structuredClone(validLock);
+    nonRegistry.importers['.'].dependencies.package.specifier = reference;
+    assert.throws(() => verifyPnpmLock(nonRegistry), /non-registry source/);
+  }
   assert.throws(
     () =>
       verifyPnpmLicenses(

@@ -12,8 +12,6 @@ const exactVersionPattern =
   /^(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/;
 const packagePattern = /^(?:@[a-z0-9._-]+\/)?[a-z0-9._-]+$/i;
 const integrityPattern = /^sha512-[A-Za-z0-9+/]+={0,2}$/;
-const sourcePattern =
-  /^(?:git(?:\+[a-z]+)?:|https?:|file:|link:|workspace:|github:)/i;
 const exceptionKeys = Object.freeze([
   "ecosystem",
   "package",
@@ -443,8 +441,7 @@ export function verifyPnpmLicenses(source, allowedLicenses) {
 }
 
 function parseLockPackageId(packageId, location) {
-  if (typeof packageId !== "string" || sourcePattern.test(packageId))
-    fail(`${location} uses a non-registry source`);
+  if (typeof packageId !== "string") fail(`${location} is invalid`);
   const separator = packageId.lastIndexOf("@");
   if (separator <= 0)
     fail(`${location} does not contain an exact package version`);
@@ -460,6 +457,39 @@ function parseLockPackageId(packageId, location) {
       exactVersionPattern,
     ),
   };
+}
+
+function isRegistryImporterSpecifier(value) {
+  if (typeof value !== "string") return false;
+  if (exactVersionPattern.test(value)) return true;
+  return (
+    (value.startsWith("^") || value.startsWith("~")) &&
+    exactVersionPattern.test(value.slice(1))
+  );
+}
+
+function parseRegistryImporterResolution(value) {
+  if (typeof value !== "string") return undefined;
+  const suffixStart = value.indexOf("(");
+  const version = suffixStart === -1 ? value : value.slice(0, suffixStart);
+  if (!exactVersionPattern.test(version)) return undefined;
+
+  let suffixes = suffixStart === -1 ? "" : value.slice(suffixStart);
+  while (suffixes) {
+    if (!suffixes.startsWith("(")) return undefined;
+    const close = suffixes.indexOf(")");
+    if (close <= 1) return undefined;
+    const peer = suffixes.slice(1, close);
+    const separator = peer.lastIndexOf("@");
+    if (
+      separator <= 0 ||
+      !packagePattern.test(peer.slice(0, separator)) ||
+      !exactVersionPattern.test(peer.slice(separator + 1))
+    )
+      return undefined;
+    suffixes = suffixes.slice(close + 1);
+  }
+  return version;
 }
 
 export function verifyPnpmLock(lock) {
@@ -505,19 +535,33 @@ export function verifyPnpmLock(lock) {
           `pnpm importer ${importerName}.${section}`,
         ),
       )) {
+        const dependencyName = requireString(
+          name,
+          `pnpm importer ${importerName}.${section}.${name}.name`,
+          packagePattern,
+        );
         const dependency = requireRecord(
           value,
           `pnpm importer ${importerName}.${section}.${name}`,
         );
-        for (const field of ["specifier", "version"]) {
-          if (
-            typeof dependency[field] !== "string" ||
-            sourcePattern.test(dependency[field])
-          )
-            fail(
-              `pnpm importer ${importerName}.${section}.${name}.${field} uses a non-registry source`,
-            );
-        }
+        requireKeys(
+          dependency,
+          ["specifier", "version"],
+          `pnpm importer ${importerName}.${section}.${name}`,
+        );
+        if (!isRegistryImporterSpecifier(dependency.specifier))
+          fail(
+            `pnpm importer ${importerName}.${section}.${name}.specifier uses a non-registry source`,
+          );
+        const version = parseRegistryImporterResolution(dependency.version);
+        if (version === undefined)
+          fail(
+            `pnpm importer ${importerName}.${section}.${name}.version uses a non-registry source`,
+          );
+        if (!Object.hasOwn(packages, `${dependencyName}@${version}`))
+          fail(
+            `pnpm importer ${importerName}.${section}.${name}.version has no integrity-backed package`,
+          );
       }
     }
   }

@@ -397,6 +397,45 @@ test("structured pnpm lock verification rejects source and integrity drift", () 
     "git+https://example.invalid/package";
   assert.throws(() => verifyPnpmLock(gitSpecifier), /non-registry source/);
 
+  for (const reference of [
+    "ftp://example.invalid/package.tgz",
+    "custom+transport:package",
+    "npm:other-package@1.2.3",
+    "catalog:default",
+    "patch:package@npm%3A1.2.3#patch.diff",
+    "portal:../package",
+    "owner/repository",
+    "git@github.com:owner/repository",
+    ".",
+    "..",
+    "./package",
+    "../package",
+    "/tmp/package",
+    "\\\\server\\package",
+  ]) {
+    for (const field of ["specifier", "version"]) {
+      const nonRegistry = exactLock();
+      nonRegistry.importers["."].dependencies.package[field] = reference;
+      assert.throws(
+        () => verifyPnpmLock(nonRegistry),
+        /non-registry source/,
+        `${field} accepted ${reference}`,
+      );
+    }
+  }
+
+  const peerResolution = exactLock();
+  peerResolution.importers["."].dependencies.package.version =
+    "1.2.3(@types/react@19.2.14)";
+  assert.doesNotThrow(() => verifyPnpmLock(peerResolution));
+
+  const missingPackage = exactLock();
+  missingPackage.importers["."].dependencies.package.version = "1.2.4";
+  assert.throws(
+    () => verifyPnpmLock(missingPackage),
+    /no integrity-backed package/,
+  );
+
   const oldSchema = exactLock();
   oldSchema.lockfileVersion = "8.0";
   assert.throws(() => verifyPnpmLock(oldSchema), /exactly 9\.0/);
