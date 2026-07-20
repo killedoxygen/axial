@@ -1,3 +1,3 @@
-# Claude Code for MC ParaLauncher
+# Claude Code for Axial
 
 Read and follow [docs/CONVENTIONS.md](docs/CONVENTIONS.md) before making changes.

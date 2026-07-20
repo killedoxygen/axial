@@ -6,7 +6,7 @@ on:
       - "v*"
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: release-${{ github.ref }}
@@ -18,17 +18,19 @@ jobs:
     container:
       image: ghcr.io/mateoltd/axial-linux-ci:latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
 
       - name: Trust checkout as a safe git directory
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
 
-      - uses: pnpm/action-setup@v4
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4.3.0
         with:
           version: 11.1.3
           run_install: false
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: 22
           cache: pnpm
@@ -60,11 +62,11 @@ jobs:
             exit 1
           }
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
           components: rustfmt, clippy
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
 
       - name: Install frontend dependencies
         run: pnpm --dir frontend install --frozen-lockfile --ignore-scripts
@@ -97,7 +99,7 @@ jobs:
         run: cargo build --locked -p axial-desktop --release
 
       - name: Upload frontend bundle
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: release-frontend
           path: |
@@ -108,7 +110,7 @@ jobs:
           retention-days: 1
 
       - name: Upload linux release desktop binary
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: release-linux-amd64
           path: target/release/axial-desktop
@@ -120,7 +122,7 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - name: Download linux release desktop binary
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: release-linux-amd64
           path: target/release
@@ -139,28 +141,31 @@ jobs:
             sha256sum "axial-linux-amd64-${VERSION}.tar.gz" > "axial-linux-amd64-${VERSION}.tar.gz.sha256"
           )
 
-      - name: Upload linux release asset
-        uses: softprops/action-gh-release@v2
+      - name: Upload linux release handoff
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          prerelease: ${{ contains(github.ref_name, '-') }}
-          files: |
-            dist/axial-linux-amd64-*
+          name: release-assets-linux-amd64
+          path: dist/axial-linux-amd64-*
+          if-no-files-found: error
+          retention-days: 1
 
   windows-desktop:
     needs: verify
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
 
       - name: Download frontend bundle
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: release-frontend
           path: frontend/static
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
 
       - name: Build release desktop binary
         env:
@@ -182,15 +187,13 @@ jobs:
           $hash = Get-FileHash -Algorithm SHA256 -Path $archive
           "$($hash.Hash.ToLowerInvariant())  $(Split-Path -Leaf $archive)" | Set-Content -Path "$archive.sha256" -NoNewline -Encoding ascii
 
-      - name: Upload windows release asset
-        uses: softprops/action-gh-release@v2
+      - name: Upload windows release handoff
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          prerelease: ${{ contains(github.ref_name, '-') }}
-          files: |
-            dist/axial-windows-amd64-*.exe
-            dist/axial-windows-amd64-*.exe.sha256
-            dist/axial-windows-amd64-*.zip
-            dist/axial-windows-amd64-*.zip.sha256
+          name: release-assets-windows-amd64
+          path: dist/axial-windows-amd64-*
+          if-no-files-found: error
+          retention-days: 1
 
   macos-desktop:
     needs: verify
@@ -203,17 +206,19 @@ jobs:
             arch: arm64
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
 
       - name: Download frontend bundle
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: release-frontend
           path: frontend/static
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
 
       - name: Install Tauri CLI
         run: cargo install tauri-cli --version "^2.9" --locked
@@ -243,20 +248,59 @@ jobs:
             shasum -a 256 "axial-macos-${{ matrix.arch }}-${VERSION}.tar.gz" > "axial-macos-${{ matrix.arch }}-${VERSION}.tar.gz.sha256"
           )
 
-      - name: Upload macOS release asset
-        uses: softprops/action-gh-release@v2
+      - name: Upload macOS release handoff
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          prerelease: ${{ contains(github.ref_name, '-') }}
-          files: |
-            dist/axial-macos-${{ matrix.arch }}-*
+          name: release-assets-macos-${{ matrix.arch }}
+          path: dist/axial-macos-${{ matrix.arch }}-*
+          if-no-files-found: error
+          retention-days: 1
 
-  verify-release:
+  publish-release:
     needs: [linux-desktop, windows-desktop, macos-desktop]
     runs-on: ubuntu-24.04
+    permissions:
+      contents: write
     steps:
-      - uses: actions/checkout@v4
+      - name: Download linux release handoff
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: release-assets-linux-amd64
+          path: dist
 
-      - uses: actions/setup-node@v4
+      - name: Download windows release handoff
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: release-assets-windows-amd64
+          path: dist
+
+      - name: Download macOS amd64 release handoff
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: release-assets-macos-amd64
+          path: dist
+
+      - name: Download macOS arm64 release handoff
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: release-assets-macos-arm64
+          path: dist
+
+      - name: Publish release assets
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
+        with:
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          files: dist/*
+
+  verify-release:
+    needs: publish-release
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: 22
 
