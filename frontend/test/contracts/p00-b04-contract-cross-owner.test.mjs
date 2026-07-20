@@ -43,6 +43,18 @@ test('one Linux dependency gate is inherited by CI and release without native du
   }
 });
 
+test('cross-platform setup verifies the dependency tool only on Linux', async () => {
+  const taskfile = await read('Taskfile.yml');
+  for (const task of ['setup', 'toolchain:verify']) {
+    const body = taskBody(taskfile, task);
+    assert.match(body, /task: ensure:cargo-deny/);
+    assert.match(
+      body,
+      /cmd: node scripts\/toolchain\.mjs verify --profile dependencies\n\s+platforms: \[linux\]/,
+    );
+  }
+});
+
 test('the policy uses the exact structured YAML dependency supplied by the frontend graph', async () => {
   const [packageManifest, implementation] = await Promise.all([
     read('frontend/package.json').then(JSON.parse),

@@ -40,7 +40,8 @@ tasks:
       - pnpm --dir frontend install --frozen-lockfile --ignore-scripts
       - cargo fetch --locked
       - task: ensure:cargo-deny
-      - node scripts/toolchain.mjs verify --profile dependencies
+      - cmd: node scripts/toolchain.mjs verify --profile dependencies
+        platforms: [linux]
       - task: ensure:tauri-cli
       - node scripts/toolchain.mjs verify --profile desktop
       - cmd: |
@@ -168,7 +169,8 @@ tasks:
     desc: verify every exact local delivery tool and tracked mirror
     cmds:
       - task: ensure:cargo-deny
-      - node scripts/toolchain.mjs verify --profile dependencies
+      - cmd: node scripts/toolchain.mjs verify --profile dependencies
+        platforms: [linux]
       - task: toolchain:desktop
 
   dependencies:check:
