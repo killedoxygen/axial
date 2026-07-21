@@ -4024,6 +4024,221 @@ test("P01-B02 owns capability-safe park restore and replacement primitives", asy
   }
 });
 
+test("P01-B02 explicitly acknowledges preserved exact files", async () => {
+  const library = await read("core/fs/src/lib.rs");
+  assertMustUse(library, "struct", "FileParkPreservationError");
+  assertLinear(library, "FileParkPreservationError");
+  const preservationError = itemBlock(
+    library,
+    "struct",
+    "FileParkPreservationError",
+  );
+  assert.match(preservationError, /error:\s*io::Error/);
+  assert.match(preservationError, /parked:\s*ParkedFile/);
+  assert.match(
+    uniqueMethodBlock(library, "FileParkPreservationError", "error"),
+    /pub fn error\s*\(\s*&self\s*\)\s*->\s*&io::Error/,
+  );
+  assert.match(
+    uniqueMethodBlock(library, "FileParkPreservationError", "into_parked"),
+    /pub fn into_parked\s*\(\s*self\s*\)\s*->\s*ParkedFile[\s\S]*\bself\.parked\b/,
+  );
+
+  const acknowledge = uniqueMethodBlock(
+    library,
+    "ParkedFile",
+    "acknowledge_preserved",
+  );
+  assert.match(
+    acknowledge.slice(0, acknowledge.indexOf("{")),
+    /pub fn acknowledge_preserved\s*\(\s*mut self\s*\)\s*->\s*Result\s*<\s*\(\s*\)\s*,\s*FileParkPreservationError\s*>/,
+  );
+  const checkoutCall = callBlocks(
+    acknowledge,
+    /self\s*\.\s*checkout_current\s*\(/,
+  )[0];
+  const checkoutFailure = matchArmBlocks(
+    acknowledge,
+    /Err\s*\(\s*error\s*\)/,
+  )[0];
+  const disarmCall = callBlocks(acknowledge, /guard\s*\.\s*disarm\s*\(/)[0];
+  assert.ok(checkoutCall && checkoutFailure && disarmCall);
+  assert.deepEqual(callArguments(checkoutCall.source), []);
+  assert.match(
+    checkoutFailure.body,
+    /return\s+Err\s*\(\s*FileParkPreservationError\s*\{[\s\S]{0,200}\berror\s*,[\s\S]{0,120}\bparked:\s*self\b/,
+    "every checkout failure must return the still-armed ParkedFile",
+  );
+  assert.doesNotMatch(
+    acknowledge.slice(0, disarmCall.index),
+    /\?|\.armed\s*=\s*false|\.disarm\s*\(/,
+    "acknowledgement cannot implicitly discard or pre-disarm its retained authority",
+  );
+  assert.deepEqual(callArguments(disarmCall.source), [
+    "&mut self.token",
+    "&operation",
+  ]);
+  assert.ok(
+    checkoutCall.index < acknowledge.indexOf(checkoutFailure.body) &&
+      acknowledge.indexOf(checkoutFailure.body) < disarmCall.index,
+    "typed checkout refusal must precede the sole successful disarm",
+  );
+
+  const checkout = uniqueMethodBlock(library, "ParkedFile", "checkout_current");
+  assert.match(
+    checkout.slice(0, checkout.indexOf("{")),
+    /&self[\s\S]*->\s*io::Result\s*<\s*\(\s*CapabilityOperation\s*,\s*FileParkRecordGuard\s*\)\s*>/,
+  );
+  const verified = checkout.indexOf("!self.verified");
+  const enterCall = callBlocks(checkout, /enter_file_park\s*\(/)[0];
+  const takeCall = callBlocks(checkout, /take_file_park\s*\(/)[0];
+  const validateCheckedOutCall = callBlocks(
+    checkout,
+    /self\s*\.\s*validate_checked_out\s*\(/,
+  )[0];
+  assert.ok(
+    verified !== -1 && enterCall && takeCall && validateCheckedOutCall,
+    "current park checkout needs verified receipt, token admission, guard checkout, and exact validation",
+  );
+  assert.deepEqual(callArguments(enterCall.source), ["&self.token"]);
+  assert.deepEqual(callArguments(takeCall.source), [
+    "&operation",
+    "&self.token",
+  ]);
+  assert.deepEqual(callArguments(validateCheckedOutCall.source), [
+    "&operation",
+    "guard.record()",
+  ]);
+  assert.ok(
+    verified < enterCall.index &&
+      enterCall.index < takeCall.index &&
+      takeCall.index < validateCheckedOutCall.index,
+    "current park checkout validations are out of order",
+  );
+  const finalValidation = conditionalBlocks(checkout).find(({ condition }) =>
+    /self\.validate_checked_out\s*\(/.test(condition),
+  );
+  assert.ok(finalValidation, "missing checked-out park refusal");
+  assertOrdered(
+    finalValidation.body,
+    "drop(guard)",
+    "return Err(error)",
+    "failed current validation must reinsert its checked-out record",
+  );
+  assert.doesNotMatch(
+    checkout,
+    /\.disarm\s*\(|\.armed\s*=\s*false/,
+    "current validation cannot settle parked-file ownership",
+  );
+
+  const checkedOutValidation = uniqueMethodBlock(
+    library,
+    "ParkedFile",
+    "validate_checked_out",
+  );
+  assert.match(checkedOutValidation, /FileParkRegistryPhase::Live/);
+  assert.match(
+    checkedOutValidation,
+    /platform::parked_file_receipt_fields\s*\(/,
+  );
+  assert.match(checkedOutValidation, /platform::file_binding_state\s*\(/);
+  assertCountAtLeast(
+    checkedOutValidation,
+    /self\.parent\.validate\s*\(\s*operation\s*\)/,
+    2,
+    "checked-out validation must bracket exact receipt and binding checks",
+  );
+  for (const field of ["identity", "size", "stamp", "name", "original_name"]) {
+    assert.match(
+      checkedOutValidation,
+      new RegExp(`\\brecord\\.${escapeRegExp(field)}\\b`),
+      `checked-out preservation must bind the exact ${field}`,
+    );
+  }
+
+  const guardDisarm = uniqueMethodBlock(
+    library,
+    "FileParkRecordGuard",
+    "disarm",
+  );
+  const ownerRemoval = guardDisarm.match(/park_owners\s*\.\s*remove\s*\(/)?.[0];
+  const effectRelease = guardDisarm.match(/release_effect\s*\(/)?.[0];
+  const tokenDisarm = guardDisarm.match(/token\s*\.\s*armed\s*=\s*false/)?.[0];
+  const acknowledgementFlow = `${acknowledge}\n${checkout}\n${checkedOutValidation}`;
+  assert.doesNotMatch(
+    acknowledgementFlow,
+    /platform::(?:park_file_no_replace|remove_parked_file|restore_parked_file|settle_removed_file|settle_restored_file|rename[a-z_]*|unlink[a-z_]*)\s*\(|std::fs|tokio::fs/,
+    "preservation acknowledgement must not mutate the retained namespace",
+  );
+  assert.ok(
+    ownerRemoval && effectRelease && tokenDisarm,
+    "successful preservation must remove ownership, release its effect, and disarm",
+  );
+  assert.match(
+    guardDisarm,
+    /Some\s*\(\s*ParkRegistryOwner::File\s*\(\s*self\.id\s*\)\s*\)/,
+    "preservation may remove only its exact file-park owner",
+  );
+  assertOrdered(
+    guardDisarm,
+    ownerRemoval,
+    effectRelease,
+    "preservation owner removal before effect release",
+  );
+  assertOrdered(
+    guardDisarm,
+    effectRelease,
+    tokenDisarm,
+    "preservation effect release before token disarm",
+  );
+
+  const successTest = functionBlock(
+    library,
+    "preserved_file_acknowledgement_leaves_the_leaf_and_clears_ownership",
+  );
+  assert.match(successTest, /\.acknowledge_preserved\s*\(\s*\)/);
+  assert.match(successTest, /outstanding_effects\s*,\s*0/);
+  assert.match(successTest, /file_parks\s*\.\s*is_empty\s*\(\s*\)/);
+  assert.match(successTest, /park_owners\s*\.\s*is_empty\s*\(\s*\)/);
+  assert.match(successTest, /record\.bin[^\n]*\.exists\s*\(\s*\)/);
+  assert.match(successTest, /std::fs::read[\s\S]{0,160}record\.preserved/);
+
+  const reinsertionTest = functionBlock(
+    library,
+    "preserved_file_acknowledgement_reinserts_mismatched_park_ownership",
+  );
+  assertOrdered(
+    reinsertionTest,
+    "record.size",
+    ".acknowledge_preserved()",
+    "registered-record mismatch before refused preservation acknowledgement",
+  );
+  assert.match(reinsertionTest, /\.into_parked\s*\(\s*\)/);
+  assert.match(reinsertionTest, /token\.armed/);
+  assert.match(reinsertionTest, /outstanding_effects\s*,\s*1/);
+  assert.match(reinsertionTest, /file_parks_checked_out\s*,\s*0/);
+  assert.match(reinsertionTest, /file_parks\.len\s*\(\s*\)\s*,\s*1/);
+  assert.match(reinsertionTest, /park_owners\.len\s*\(\s*\)\s*,\s*1/);
+
+  const unixFailureTest = functionBlock(
+    library,
+    "preserved_file_acknowledgement_returns_mutated_park_ownership",
+  );
+  assert.match(
+    library,
+    /#\[cfg\(unix\)\]\s*#\[test\]\s*fn preserved_file_acknowledgement_returns_mutated_park_ownership\s*\(/,
+    "live file mutation is a Unix-only check because the Windows cleanup handle denies writes",
+  );
+  assertOrdered(
+    unixFailureTest,
+    "mutated-payload",
+    ".acknowledge_preserved()",
+    "park mutation before refused preservation acknowledgement",
+  );
+  assert.match(unixFailureTest, /\.into_parked\s*\(\s*\)/);
+  assert.match(unixFailureTest, /token\.armed/);
+});
+
 test("P01-B02 bounds every outstanding native effect with one shared permit", async () => {
   const library = await read("core/fs/src/lib.rs");
   const operationState = itemBlock(library, "struct", "OperationState");
@@ -7166,6 +7381,46 @@ terminalTest("P01-B02 leaves one shared physical adapter", async () => {
       /rustix::|windows_sys::|ntapi::|libc::|F_GETPATH/,
     );
   }
+  const quarantineReceipt = itemBlock(
+    anchoredRecord,
+    "struct",
+    "AnchoredRecordQuarantineReceipt",
+  );
+  assert.match(
+    quarantineReceipt,
+    /ParkedFile/,
+    "the adapter quarantine receipt must retain exact parked-file authority",
+  );
+  const acknowledgeQuarantine = uniqueMethodBlock(
+    anchoredRecord,
+    "AnchoredRecordQuarantineReceipt",
+    "acknowledge_preserved",
+  );
+  assert.match(
+    acknowledgeQuarantine.slice(0, acknowledgeQuarantine.indexOf("{")),
+    /\bself\b/,
+    "adapter preservation acknowledgement must consume its receipt",
+  );
+  assert.match(
+    acknowledgeQuarantine,
+    /\.acknowledge_preserved\s*\(\s*\)/,
+    "the adapter must explicitly delegate parked-file preservation settlement",
+  );
+  const validateQuarantine = uniqueMethodBlock(
+    anchoredRecord,
+    "AnchoredRecordQuarantineReceipt",
+    "is_current",
+  );
+  assert.match(
+    validateQuarantine,
+    /\.validate_current\s*\(\s*\)/,
+    "adapter currentness must delegate to the retained parked-file proof",
+  );
+  assert.doesNotMatch(
+    anchoredRecord,
+    /impl\s+Drop\s+for\s+AnchoredRecordQuarantineReceipt\b/,
+    "dropping an adapter receipt must not auto-acknowledge preservation",
+  );
   assert.equal(await exists("core/performance/src/file_identity.rs"), false);
   assert.doesNotMatch(performanceLibrary, /^mod file_identity;$/m);
   assert.doesNotMatch(
