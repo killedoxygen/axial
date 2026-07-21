@@ -98,6 +98,20 @@ const itemBlock = (source, kind, name) => {
   assert.fail(`unterminated ${kind} ${name}`);
 };
 
+const implementationBlock = (source, name) => {
+  const marker = new RegExp(`impl\\s+${name}(?:<[^>{}]+>)?\\s*\\{`);
+  const match = marker.exec(source);
+  assert.ok(match, `missing impl ${name}`);
+  const openingBrace = source.indexOf("{", match.index);
+  let depth = 0;
+  for (let offset = openingBrace; offset < source.length; offset += 1) {
+    if (source[offset] === "{") depth += 1;
+    if (source[offset] === "}") depth -= 1;
+    if (depth === 0) return source.slice(match.index, offset + 1);
+  }
+  assert.fail(`unterminated impl ${name}`);
+};
+
 const assertOrdered = (source, before, after, label) => {
   const beforeIndex = source.indexOf(before);
   const afterIndex = source.indexOf(after);
@@ -230,6 +244,189 @@ test("P01-B02 has one dependency-bottom physical capability owner", async () => 
   }
 });
 
+test("P01-B02 root acquisition retains exact partial-effect obligations", async () => {
+  const [library, platform] = await Promise.all([
+    read("core/fs/src/lib.rs"),
+    read("core/fs/src/platform.rs"),
+  ]);
+
+  assert.equal(
+    /\bcreated_any\b/.test(platform),
+    false,
+    "a boolean cannot retain the exact root bindings created before failure",
+  );
+
+  const outcomeName = library.match(
+    /pub enum (Root[A-Za-z0-9_]*(?:Acquire|Acquisition|Open|Session)[A-Za-z0-9_]*Outcome)\s*\{/,
+  )?.[1];
+  assert.ok(outcomeName, "root admission needs an operation-specific outcome");
+  const outcome = itemBlock(library, "enum", outcomeName);
+  assert.match(outcome, /\bAcquired\b/);
+  assert.match(outcome, /\bNoEffect\b/);
+  const obligationName = outcome.match(
+    /AppliedUnverified(?:\(\s*|\s*\{[\s\S]{0,240}?obligation:\s*)(Root[A-Za-z0-9_]*Obligation)\b/,
+  )?.[1];
+  assert.ok(
+    obligationName,
+    "partial root admission must return a root-specific AppliedUnverified obligation",
+  );
+
+  const obligation = itemBlock(library, "struct", obligationName);
+  assert.match(
+    obligation,
+    /error:\s*(?:(?:io::)?Error|Root[A-Za-z0-9_]*Error)/,
+  );
+  assert.match(
+    obligation,
+    /(?:root|construction|creation|bindings)[a-z_]*:\s*(?:Option<)?platform::Root[A-Za-z0-9_]*(?:Guard|Binding|Construction|Creation|Obligation)/,
+    "the obligation must retain the walked root and its exact created bindings",
+  );
+  assert.match(
+    obligation,
+    /lease[a-z_]*:\s*(?:Option<)?platform::[A-Za-z0-9_]*Lease[A-Za-z0-9_]*(?:Handle|Binding|Acquisition|Obligation)/,
+    "the obligation must retain an exact lease handle or lease acquisition obligation",
+  );
+
+  const createdBindingName = platform.match(
+    /(?:pub\(crate\)\s+)?struct (Root[A-Za-z0-9_]*(?:Created|Creation)[A-Za-z0-9_]*Binding|CreatedRoot[A-Za-z0-9_]*Binding)\s*\{/,
+  )?.[1];
+  assert.ok(
+    createdBindingName,
+    "platform root construction must retain each exact created binding",
+  );
+  const createdBinding = itemBlock(platform, "struct", createdBindingName);
+  assert.match(createdBinding, /parent:\s*(?:Option<)?DirectoryHandle/);
+  assert.match(createdBinding, /name:\s*(?:OsString|LeafName)/);
+  assert.match(createdBinding, /identity:\s*Identity/);
+  assert.match(
+    createdBinding,
+    /(?:child|handle):\s*(?:Option<)?DirectoryHandle/,
+    "created-root cleanup needs the exact retained child handle",
+  );
+  assert.match(
+    `${obligation}\n${platform}`,
+    new RegExp(
+      `(?:Vec<${createdBindingName}>|${createdBindingName}[A-Za-z0-9_]*>)`,
+    ),
+    "root acquisition must retain the complete created-binding chain",
+  );
+
+  const implementation = implementationBlock(library, obligationName);
+  for (const operation of ["reconcile", "cleanup", "release"]) {
+    assert.match(
+      implementation,
+      new RegExp(`pub fn ${operation}\\((?:mut )?self(?:[,)]|\\s*\\))`),
+      `${obligationName}::${operation} must consume the obligation`,
+    );
+  }
+
+  const acquire = functionBlock(library, "acquire");
+  assert.match(acquire.split("{")[0], new RegExp(`\\b${outcomeName}\\b`));
+  assertOrdered(
+    acquire,
+    "open_or_create_root",
+    "try_acquire_lease",
+    "root creation before lease acquisition",
+  );
+  const leaseFailure = acquire.slice(acquire.indexOf("try_acquire_lease"));
+  assert.match(
+    leaseFailure,
+    new RegExp(`${outcomeName}::AppliedUnverified|${obligationName}`),
+    "lease failure after root creation must preserve the root acquisition obligation",
+  );
+});
+
+test("P01-B02 retains physical startup process-image ancestry for reset", async () => {
+  const [library, platform, bootstrap] = await Promise.all([
+    read("core/fs/src/lib.rs"),
+    read("core/fs/src/platform.rs"),
+    read("apps/api/src/bootstrap.rs"),
+  ]);
+  const unix = between(
+    platform,
+    "#[cfg(unix)]\nmod native {",
+    "#[cfg(windows)]\nmod native {",
+  );
+  const windows = platform.slice(
+    platform.indexOf("#[cfg(windows)]\nmod native {"),
+  );
+
+  const authority = itemBlock(library, "struct", "CapabilityAuthority");
+  assert.match(
+    authority,
+    /(?:executable|process_image|image_ancestry)[a-z_]*:\s*platform::[A-Za-z0-9_]*(?:Executable|ProcessImage|ImageAncestry)[A-Za-z0-9_]*/i,
+    "the root authority must retain startup process-image ancestry",
+  );
+  const acquire = functionBlock(library, "acquire");
+  const startupCapture = `${bootstrap}\n${acquire}`;
+  assert.match(startupCapture, /current_exe\(/);
+  assert.match(
+    startupCapture,
+    /(?:capture|open|admit|retain)[a-z_]*(?:executable|process_image|image_ancestry)|(?:executable|process_image|image_ancestry)[a-z_]*(?:capture|open|admit|retain)/i,
+  );
+
+  for (const [platformName, source] of [
+    ["Unix", unix],
+    ["Windows", windows],
+  ]) {
+    const ancestryName = source.match(
+      /(?:pub\(crate\)\s+)?struct ([A-Za-z0-9_]*(?:Executable|ProcessImage|ImageAncestry)[A-Za-z0-9_]*)\s*\{/i,
+    )?.[1];
+    assert.ok(
+      ancestryName,
+      `${platformName} needs a retained process-image guard`,
+    );
+    const ancestry = itemBlock(source, "struct", ancestryName);
+    assert.match(ancestry, /(?:bindings|ancestors):\s*Vec</);
+    assert.match(ancestry, /(?:file|image)[a-z_]*:\s*(?:File|OwnedFd)/);
+    assert.match(ancestry, /identity:\s*Identity/);
+  }
+
+  const unixProcessImage = functionBlocks(unix)
+    .filter(({ name }) => /executable|process_image|image_ancestry/i.test(name))
+    .map(({ source }) => source)
+    .join("\n");
+  assert.match(unixProcessImage, /openat\(/);
+  assert.match(unixProcessImage, /OFlags::NOFOLLOW|directory_flags\(\)/);
+  assert.match(unixProcessImage, /fstat\(|(?:file|directory)_identity\(/);
+  assert.doesNotMatch(
+    unixProcessImage,
+    /st_nlink|\brequire_(?:regular_)?file\(|\bopen_file\(/,
+    "Unix process-image ancestry is binding-specific and must allow hard-linked executables",
+  );
+
+  const windowsProcessImage = functionBlocks(windows)
+    .filter(({ name }) => /executable|process_image|image_ancestry/i.test(name))
+    .map(({ source }) => source)
+    .join("\n");
+  assert.match(windowsProcessImage, /FILE_OPEN_REPARSE_POINT/);
+  assert.match(
+    windowsProcessImage,
+    /OBJ_CASE_INSENSITIVE/,
+    "the Windows process-image path walker must follow AppPaths case semantics",
+  );
+  assert.match(windowsProcessImage, /object_identity\(|directory_identity\(/);
+
+  const beginReset = functionBlock(library, "begin_reset");
+  const imageValidation = beginReset.match(
+    /[a-z_]*(?:executable|process_image|image_ancestry|ancestry)[a-z_]*\s*\(/i,
+  )?.[0];
+  assert.ok(
+    imageValidation,
+    "reset must revalidate and classify the retained process-image ancestry",
+  );
+  const drainingMarker = beginReset.match(
+    /AUTHORITY_DRAINING|\bDraining\b/,
+  )?.[0];
+  assert.ok(drainingMarker, "reset must have a terminal draining transition");
+  assertOrdered(
+    beginReset,
+    imageValidation,
+    drainingMarker,
+    "physical process-image refusal before terminal drain",
+  );
+});
+
 test("P01-B02 native operations stay relative to retained handles", async () => {
   const [library, platform] = await Promise.all([
     read("core/fs/src/lib.rs"),
@@ -282,6 +479,21 @@ test("P01-B02 native operations stay relative to retained handles", async () => 
     /InitializeObjectAttributes\([\s\S]*?OBJ_CASE_INSENSITIVE[\s\S]*?parent\.as_raw_handle\(\)\.cast\(\)/,
   );
   assert.match(windows, /parent\.as_raw_handle\(\)\.cast\(\)/);
+  const rootChainOpen = functionBlock(windows, "open_root_chain_directory");
+  assert.match(rootChainOpen, /OBJ_CASE_INSENSITIVE/);
+  const exactRelativeOpen = functionBlock(windows, "nt_open_relative");
+  assert.match(exactRelativeOpen, /nt_open_relative_with_attributes\(/);
+  assert.match(
+    exactRelativeOpen,
+    /share,\s*0,\s*\)/,
+    "ordinary managed-child opens must retain exact leaf semantics",
+  );
+  for (const operation of ["open_directory", "open_file"]) {
+    const childOpen = functionBlock(windows, operation);
+    assert.match(childOpen, /nt_open_relative\(/);
+    assert.doesNotMatch(childOpen, /OBJ_CASE_INSENSITIVE/);
+    assert.doesNotMatch(childOpen, /nt_open_relative_with_attributes\(/);
+  }
   assert.match(
     windows,
     /RootDirectory = destination_parent\.as_raw_handle\(\)/,
@@ -685,15 +897,16 @@ terminalTest(
     assert.match(bootstrap, /pub fn open_app_root_session\(/);
     assert.match(bootstrap, /Result<AppRootSession/);
     const openSession = functionBlock(bootstrap, "open_app_root_session");
+    const rootAcquire = functionBlock(fsLibrary, "acquire");
     assert.match(
-      openSession,
+      `${openSession}\n${rootAcquire}`,
       /current_exe\(|executable|process_image/,
       "startup must capture executable ancestry as part of root admission",
     );
     assert.match(
-      combinedConfig,
-      /pub struct AppRootSession[\s\S]{0,2400}?(?:executable|process_image)/,
-      "the retained session must own executable ancestry proof",
+      itemBlock(fsLibrary, "struct", "CapabilityAuthority"),
+      /(?:executable|process_image|image_ancestry)/i,
+      "the one retained native authority must own executable ancestry proof",
     );
     assert.match(
       `${combinedConfig}\n${fsLibrary}`,
@@ -845,6 +1058,7 @@ terminalTest(
       /remove_dir_all\(/,
       /contains_resolved/,
       /canonicalize\(/,
+      /current_exe\(/,
     ]);
     assert.match(desktopCommands, /begin_reset\(/);
     assert.match(desktopCommands, /relaunch|restart/i);
@@ -852,8 +1066,8 @@ terminalTest(
     const executableResetProof = functionBlocks(combinedConfig).find(
       ({ name, source }) =>
         /^pub fn/.test(source) &&
-        /reset|executable|process_image/.test(name) &&
-        /executable|process_image|DirectoryIdentity/.test(source),
+        /reset/.test(name) &&
+        /root_session|begin_reset|reset_preflight/.test(source),
     );
     assert.ok(
       executableResetProof,
