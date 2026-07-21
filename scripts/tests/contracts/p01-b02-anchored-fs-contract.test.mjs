@@ -411,6 +411,18 @@ const assertCountAtLeast = (source, expression, count, label) => {
   assert.ok((matches?.length ?? 0) >= count, label);
 };
 
+const assertLiteralListingBound = (source, name, label) => {
+  const declaration = new RegExp(
+    `(?:pub(?:\\([^)]*\\))?\\s+)?const\\s+${escapeRegExp(name)}\\s*:\\s*usize\\s*=\\s*([0-9][0-9_]*)\\s*;`,
+  ).exec(source);
+  assert.ok(declaration, `${label} must resolve to a literal usize constant`);
+  const value = Number(declaration[1].replaceAll("_", ""));
+  assert.ok(
+    Number.isSafeInteger(value) && value >= 1 && value <= 100_000,
+    `${label} must resolve to a literal in 1..=100000`,
+  );
+};
+
 const exactOperationsLock = (source, label) => {
   const header = source.slice(0, source.indexOf("{"));
   const operation = header.match(
@@ -7164,6 +7176,1029 @@ test("P01-B02 keeps directory revisions opaque and identity process-local", asyn
   );
   const manifest = await read("core/fs/Cargo.toml");
   assert.doesNotMatch(manifest, /^serde(?:_json)?\s*=/m);
+});
+
+test("P01-B02 injects one fixed persisted-state directory bundle off runtime", async () => {
+  const [
+    configRoot,
+    state,
+    anchoredRecord,
+    benchmarkDrivers,
+    performanceOperations,
+    journals,
+    failureMemory,
+    persistedLoad,
+  ] = await Promise.all([
+    read("core/config/src/root.rs"),
+    read("apps/api/src/state/mod.rs"),
+    read("apps/api/src/execution/anchored_record.rs"),
+    read("apps/api/src/state/benchmark_suite_drivers.rs"),
+    read("apps/api/src/state/performance_operations.rs"),
+    read("apps/api/src/state/journals.rs"),
+    read("apps/api/src/state/failure_memory.rs"),
+    read("apps/api/src/state/persisted_state_load.rs"),
+  ]);
+
+  const directories = itemBlock(
+    configRoot,
+    "struct",
+    "PersistedStateDirectories",
+  );
+  for (const field of [
+    "operation_journal_parent",
+    "guardian_failure_memory_parent",
+    "performance_operations",
+    "benchmark_suite_drivers",
+  ]) {
+    assert.match(
+      directories,
+      new RegExp(`\\b${escapeRegExp(field)}\\s*:\\s*Directory\\b`),
+      `persisted-state directory bundle is missing ${field}`,
+    );
+  }
+  assert.equal(
+    directories.match(/:\s*Directory\b/g)?.length ?? 0,
+    4,
+    "persisted-state directory bundle must expose only its four fixed capabilities",
+  );
+  assert.doesNotMatch(directories, /\b(?:Path|PathBuf|OsString|String)\b/);
+
+  const prepare = uniqueMethodBlock(
+    configRoot,
+    "AppRootSession",
+    "prepare_persisted_state_directories",
+  );
+  const prepareHeader = prepare.slice(0, prepare.indexOf("{"));
+  assert.match(
+    prepareHeader,
+    /pub fn prepare_persisted_state_directories\s*\(\s*&self\s*\)\s*->\s*io::Result\s*<\s*PersistedStateDirectories\s*>/,
+  );
+  const prepareFlow = uniqueReachableFunctions(configRoot, prepare);
+  for (const fixedPath of [
+    /\[\s*"state"\s*\]/,
+    /\[\s*"guardian"\s*\]/,
+    /\[\s*"performance"\s*,\s*"operations"\s*\]/,
+    /\[\s*"benchmarks"\s*,\s*"suite-drivers"\s*\]/,
+  ]) {
+    assert.match(prepareFlow, fixedPath);
+  }
+  const appRoot = implementationBlock(configRoot, "AppRootSession");
+  const publicPreparers = functionBlocks(appRoot).filter(({ source }) => {
+    const header = source.slice(0, source.indexOf("{"));
+    return /^pub fn prepare/.test(header) && /Directory/.test(header);
+  });
+  assert.ok(publicPreparers.length > 0, "missing fixed root preparers");
+  for (const { name, source } of publicPreparers) {
+    const header = source.slice(0, source.indexOf("{"));
+    assert.doesNotMatch(
+      header,
+      /\b(?:Path|PathBuf|LeafName|Iterator|IntoIterator)\b|&\s*\[/,
+      `${name} must not expose an arbitrary managed directory chain`,
+    );
+  }
+
+  const stateStartup = functionBlock(state, "new_with_telemetry_inner");
+  assert.equal(
+    stateStartup.match(/prepare_persisted_state_directories\s*\(/g)?.length ??
+      0,
+    1,
+    "AppState startup must prepare the fixed persisted-state bundle once",
+  );
+  for (const getter of [
+    "operation_journal_parent",
+    "guardian_failure_memory_parent",
+    "performance_operations",
+    "benchmark_suite_drivers",
+  ]) {
+    assert.match(
+      stateStartup,
+      new RegExp(`\\.${escapeRegExp(getter)}\\s*\\(\\s*\\)`),
+      `AppState startup does not inject ${getter}`,
+    );
+  }
+
+  const adapterConstructor = uniqueMethodBlock(
+    anchoredRecord,
+    "AnchoredRecordDirectory",
+    "from_directory",
+  );
+  assert.match(
+    adapterConstructor.slice(0, adapterConstructor.indexOf("{")),
+    /directory:\s*Directory\b/,
+  );
+  const productionSources = [
+    ["anchored adapter", anchoredRecord],
+    ["benchmark driver loader", benchmarkDrivers],
+    ["performance operation loader", performanceOperations],
+    ["journal loader", journals],
+    ["failure-memory loader", failureMemory],
+    ["persisted-state recovery", persistedLoad],
+  ].map(([label, source]) => [
+    label,
+    source.split(/\n#\[cfg\(test\)\]\s*\nmod tests\s*\{/)[0],
+  ]);
+  for (const [label, source] of productionSources) {
+    assert.doesNotMatch(
+      source,
+      /AnchoredRecordDirectory::open\s*\(|\.admit_absolute_directory\s*\(/,
+      `${label} must not reopen an absolute persisted-state path`,
+    );
+  }
+
+  const load = functionBlock(state, "load");
+  const blockingStartup = callBlocks(
+    load,
+    /tokio::task::spawn_blocking\s*\(/,
+  ).find(({ source }) => /new_with_telemetry_inner\s*\(/.test(source));
+  assert.ok(
+    blockingStartup,
+    "persisted-state bundle preparation and initial reads must stay off Tokio workers",
+  );
+});
+
+test("P01-B02 derives complete bounded v3 restart observations from axial-fs", async () => {
+  const [
+    anchoredRecord,
+    benchmarkDrivers,
+    performanceOperations,
+    userOwnedState,
+  ] = await Promise.all([
+    read("apps/api/src/execution/anchored_record.rs"),
+    read("apps/api/src/state/benchmark_suite_drivers.rs"),
+    read("apps/api/src/state/performance_operations.rs"),
+    read("apps/api/src/execution/user_owned_state.rs"),
+  ]);
+  const productionAdapter = anchoredRecord.split(
+    /\n#\[cfg\(test\)\]\s*\nmod tests\s*\{/,
+  )[0];
+
+  assert.match(
+    productionAdapter,
+    /struct AnchoredRecordDirectory(?:\s*\([^;]*\bDirectory\b[^;]*\)|\s*\{[^}]*\bDirectory\b)/s,
+    "anchored record directories must retain axial-fs Directory",
+  );
+  const identity = itemBlock(
+    productionAdapter,
+    "struct",
+    "AnchoredRecordIdentity",
+  );
+  assert.match(identity, /\bDirectory\b/);
+  assert.match(identity, /\bLeafName\b/);
+  assert.match(identity, /\bFileRevision\b/);
+  assert.doesNotMatch(
+    identity,
+    /\bFileCapability\b/,
+    "restart and user-mod observations must not retain one native handle per file",
+  );
+
+  const names = uniqueMethodBlock(
+    productionAdapter,
+    "AnchoredRecordDirectory",
+    "names_bounded",
+  );
+  const anchoredDirectoryMethods = implementationBlocks(
+    productionAdapter,
+    "AnchoredRecordDirectory",
+  ).flatMap((implementation) => functionBlocks(implementation));
+  assert.ok(
+    !anchoredDirectoryMethods.some(({ name }) => name === "names"),
+    "the unbounded names compatibility method must be deleted",
+  );
+  const entries = callBlocks(names, /\.entries\s*\(/)[0];
+  assert.ok(entries, "bounded names must use axial-fs enumeration");
+  const entriesLimit = callArguments(entries.source)[0] ?? "";
+  const entriesLimitLocal = /^([a-z_][a-z0-9_]*)$/.exec(entriesLimit)?.[1];
+  assert.ok(
+    /max_entries/.test(entriesLimit) ||
+      (entriesLimitLocal &&
+        new RegExp(
+          `\\blet\\s+${escapeRegExp(entriesLimitLocal)}\\s*=\\s*[^;]*\\bmax_entries\\b`,
+        ).test(names)),
+    "enumeration limit must derive from the caller's finite bound",
+  );
+  assert.match(names, /DirectoryListingState::(?:Complete|Truncated)/);
+  assert.match(names, /Ok\s*\(\s*None\s*\)/);
+  assert.match(names, /Ok\s*\(\s*Some\s*\(/);
+  assert.doesNotMatch(names, /read_dir\s*\(/);
+  const adapterListingBound =
+    /\.clamp\s*\([^,]+,\s*(MAX_[A-Z0-9_]*ENTR(?:Y|IES))\s*\)/.exec(names)?.[1];
+  assert.ok(
+    adapterListingBound,
+    "bounded enumeration must clamp to a named finite maximum",
+  );
+  assertLiteralListingBound(
+    productionAdapter,
+    adapterListingBound,
+    `anchored directory ${adapterListingBound}`,
+  );
+
+  for (const [label, source, loaderName] of [
+    ["benchmark driver", benchmarkDrivers, "load_persisted_driver_inner"],
+    [
+      "performance operation",
+      performanceOperations,
+      "load_persisted_operation_inner",
+    ],
+  ]) {
+    const loader = uniqueReachableFunctions(
+      source,
+      functionBlock(source, loaderName),
+    );
+    const boundedListing = callBlocks(loader, /\.names_bounded\s*\(/)[0];
+    assert.ok(boundedListing, `${label} startup must use a bounded listing`);
+    const listingBound = /MAX_[A-Z0-9_]*ENTR(?:Y|IES)/.exec(
+      callArguments(boundedListing.source)[0] ?? "",
+    )?.[0];
+    assert.ok(
+      listingBound,
+      `${label} listing needs a named finite entry bound`,
+    );
+    assertLiteralListingBound(source, listingBound, `${label} ${listingBound}`);
+    assert.doesNotMatch(loader, /\.names\s*\(\s*\)/);
+    const afterListing = loader.slice(
+      boundedListing.index,
+      boundedListing.index + 2_400,
+    );
+    assert.match(
+      afterListing,
+      /\bNone\b[\s\S]*rejected_record_scan_authoritative\s*=\s*false/,
+      `${label} truncation must make the rejection scan non-authoritative`,
+    );
+  }
+  const userOwnedObservation = uniqueReachableFunctions(
+    userOwnedState,
+    functionBlock(userOwnedState, "observe_blocking"),
+  );
+  const userOwnedListings = callBlocks(
+    userOwnedObservation,
+    /\.names_bounded\s*\(/,
+  );
+  assert.ok(
+    userOwnedListings.length > 0,
+    "user-owned observation must list files",
+  );
+  assert.doesNotMatch(
+    userOwnedObservation,
+    /\.names\s*\(\s*\)|\.entries\s*\(/,
+    "user-owned observation must not bypass bounded anchored listing",
+  );
+  for (const listing of userOwnedListings) {
+    const bound = /MAX_[A-Z0-9_]*ENTR(?:Y|IES)/.exec(
+      callArguments(listing.source)[0] ?? "",
+    )?.[0];
+    assert.ok(bound, "user-owned listing needs a named finite entry bound");
+    assertLiteralListingBound(userOwnedState, bound, `user-owned ${bound}`);
+  }
+
+  const observation = uniqueReachableFunctions(
+    productionAdapter,
+    uniqueMethodBlock(productionAdapter, "AnchoredRecordDirectory", "read"),
+  );
+  assertOrdered(observation, "open_file", "revision", "file before revision");
+  assertOrdered(
+    observation,
+    "revision",
+    "read_bounded",
+    "revision before bounded read",
+  );
+  assertOrdered(
+    observation,
+    "read_bounded",
+    "validate_revision",
+    "bounded read before final revision validation",
+  );
+  const digest = uniqueMethodBlock(
+    productionAdapter,
+    "AnchoredRecordDirectory",
+    "digest",
+  );
+  const digestReader = callBlocks(digest, /\.reader\s*\(/)[0];
+  assert.ok(digestReader, "digest must stream through axial-fs FileReader");
+  assert.match(
+    callArguments(digestReader.source)[0] ?? "",
+    /\bmax_bytes\b/,
+    "digest reader must enforce the caller's byte bound",
+  );
+  assert.match(
+    digest,
+    /let\s+mut\s+[a-z_][a-z0-9_]*\s*=\s*\[\s*0(?:_u8)?\s*;\s*[0-9][0-9_]*(?:\s*\*\s*[0-9][0-9_]*)*\s*\]\s*;/,
+    "digest must use a fixed-size stack buffer",
+  );
+  const digestLoop = bracedStatementBlocks(digest, /\bloop\b/)[0]?.source ?? "";
+  assert.match(digestLoop, /\.read\s*\(\s*&mut\s+[a-z_][a-z0-9_]*\s*\)/);
+  assert.match(digestLoop, /if\s+[a-z_][a-z0-9_]*\s*==\s*0\s*\{\s*break\s*;/);
+  const sha256Hasher =
+    /let\s+mut\s+([a-z_][a-z0-9_]*)\s*=\s*Sha256::new\s*\(\s*\)/.exec(
+      digest,
+    )?.[1];
+  const sha512Hasher =
+    /let\s+mut\s+([a-z_][a-z0-9_]*)\s*=\s*Sha512::new\s*\(\s*\)/.exec(
+      digest,
+    )?.[1];
+  assert.ok(
+    sha256Hasher && sha512Hasher,
+    "digest needs both streaming hashers",
+  );
+  for (const [label, hasher] of [
+    ["SHA-256", sha256Hasher],
+    ["SHA-512", sha512Hasher],
+  ]) {
+    assert.match(
+      digestLoop,
+      new RegExp(
+        `\\b${escapeRegExp(hasher)}\\.update\\s*\\(\\s*&[a-z_][a-z0-9_]*\\s*\\[\\s*\\.\\.[a-z_][a-z0-9_]*\\s*\\]\\s*\\)`,
+      ),
+      `digest loop must update ${label} from every bounded chunk`,
+    );
+  }
+  assertOrdered(
+    digest,
+    ".finish(",
+    "validate_revision",
+    "reader completion before final revision validation",
+  );
+  assert.doesNotMatch(
+    digest,
+    /\.read_bounded\s*\(|\.read_to_end\s*\(|\bVec(?:<|::)|\bvec!\s*\[/,
+    "digest cannot allocate a whole-file byte buffer",
+  );
+  const revalidate = uniqueMethodBlock(
+    productionAdapter,
+    "AnchoredRecordIdentity",
+    "revalidate",
+  );
+  const revalidateFlow = uniqueReachableFunctions(
+    productionAdapter,
+    revalidate,
+  );
+  assertOrdered(
+    revalidateFlow,
+    "open_file",
+    "validate_revision",
+    "handle-light identity must reopen before revision validation",
+  );
+  assert.match(revalidateFlow, /\.validate_revision\s*\(/);
+  const quarantine = uniqueMethodBlock(
+    productionAdapter,
+    "AnchoredRecordIdentity",
+    "quarantine",
+  );
+  const quarantineFlow = uniqueReachableFunctions(
+    productionAdapter,
+    quarantine,
+  );
+  assertOrdered(
+    quarantineFlow,
+    "open_file",
+    "validate_revision",
+    "quarantine must reopen before revision validation",
+  );
+  assertOrdered(
+    quarantineFlow,
+    "validate_revision",
+    "park_request",
+    "quarantine must validate the reopened file before minting a park request",
+  );
+  assert.match(quarantineFlow, /ExpectedFileContent::new\s*\(/);
+
+  assert.match(
+    productionAdapter,
+    /axial\.persisted-state-restart-record-identity\.v3/,
+  );
+  assert.doesNotMatch(
+    productionAdapter,
+    /axial\.persisted-state-restart-record-identity\.v2/,
+  );
+  const restartMethod = uniqueMethodBlock(
+    productionAdapter,
+    "AnchoredRecordObservation",
+    "into_restart_identity",
+  );
+  const restartHeader = restartMethod.slice(0, restartMethod.indexOf("{"));
+  assert.match(
+    restartHeader,
+    /context:\s*AnchoredRecordRestartContext\b/,
+    "v3 identity must bind the canonical persisted-state store context",
+  );
+  assert.match(
+    restartHeader,
+    /canonical_original_(?:name|leaf):\s*&\s*LeafName\b/,
+    "v3 identity must consume the canonical original LeafName",
+  );
+  const restartContext = itemBlock(
+    productionAdapter,
+    "enum",
+    "AnchoredRecordRestartContext",
+  );
+  assert.match(restartContext, /\bPerformanceOperation\b/);
+  assert.match(restartContext, /\bBenchmarkSuiteDriver\b/);
+  const restart = uniqueReachableFunctions(productionAdapter, restartMethod);
+  assert.match(restart, /\bbytes\b/);
+  assert.match(restart, /\b(?:Sha256|sha256)\b/);
+  const contextBinding =
+    /let\s+([a-z_][a-z0-9_]*)(?:\s*:[^=;]+)?\s*=\s*match\s+context\s*\{/.exec(
+      restartMethod,
+    )?.[1];
+  assert.ok(contextBinding, "v3 identity must bind the matched store context");
+  assert.match(
+    restartMethod,
+    new RegExp(
+      `hasher\\.update\\s*\\(\\s*${escapeRegExp(contextBinding)}\\s*\\)`,
+    ),
+    "v3 identity must hash the matched store context",
+  );
+  const performanceDomain = /PerformanceOperation\s*=>\s*b"([^"]+)"/.exec(
+    restartMethod,
+  )?.[1];
+  const benchmarkDomain = /BenchmarkSuiteDriver\s*=>\s*b"([^"]+)"/.exec(
+    restartMethod,
+  )?.[1];
+  assert.ok(
+    performanceDomain &&
+      benchmarkDomain &&
+      performanceDomain !== benchmarkDomain,
+    "each persisted-state store needs distinct hashed context bytes",
+  );
+  assert.match(
+    restartMethod,
+    /update_native_name\s*\([^;]*canonical_original_(?:name|leaf)[^;]*\)/,
+    "v3 identity must hash the caller-supplied original leaf",
+  );
+  const restartSize =
+    /let\s+([a-z_][a-z0-9_]*)\s*=\s*identity\.revision\.size\s*\(\s*\)\s*;/.exec(
+      restartMethod,
+    )?.[1];
+  const restartMtime =
+    /let\s+([a-z_][a-z0-9_]*)\s*=\s*identity\.revision\.modified_at_ns\s*\(\s*\)\s*\?\s*;/.exec(
+      restartMethod,
+    )?.[1];
+  assert.ok(restartSize && restartMtime, "v3 must bind native size and mtime");
+  for (const [label, value] of [
+    ["size", restartSize],
+    ["mtime", restartMtime],
+  ]) {
+    assert.match(
+      restartMethod,
+      new RegExp(
+        `hasher\\.update\\s*\\(\\s*${escapeRegExp(value)}\\.to_(?:le|be)_bytes\\s*\\(\\s*\\)\\s*\\)`,
+      ),
+      `v3 identity must hash native ${label}`,
+    );
+  }
+  const nativeNameEncoders = functionBlocks(productionAdapter).filter(
+    ({ name }) => name === "update_native_name",
+  );
+  const unixNameEncoder = nativeNameEncoders.find(({ source }) =>
+    /\.as_bytes\s*\(\s*\)/.test(source),
+  )?.source;
+  const windowsNameEncoder = nativeNameEncoders.find(({ source }) =>
+    /\.encode_wide\s*\(\s*\)/.test(source),
+  )?.source;
+  assert.ok(
+    unixNameEncoder && windowsNameEncoder,
+    "missing native leaf encoders",
+  );
+  for (const [label, encoder] of [
+    ["Unix", unixNameEncoder],
+    ["Windows", windowsNameEncoder],
+  ]) {
+    assert.match(
+      encoder,
+      /hasher\.update\s*\([^;]*\.len\s*\(\s*\)[^;]*\.to_(?:le|be)_bytes\s*\(\s*\)/,
+      `${label} leaf encoding must hash its native length`,
+    );
+    assertCountAtLeast(
+      encoder,
+      /hasher\.update\s*\(/,
+      2,
+      `${label} leaf encoding must hash native contents after length`,
+    );
+  }
+  const unixNameBytes =
+    /let\s+([a-z_][a-z0-9_]*)\s*=\s*name\.as_bytes\s*\(\s*\)\s*;/.exec(
+      unixNameEncoder,
+    )?.[1];
+  assert.ok(unixNameBytes, "Unix leaf encoder must bind raw native bytes");
+  assert.match(
+    unixNameEncoder,
+    new RegExp(
+      `hasher\\.update\\s*\\(\\s*${escapeRegExp(unixNameBytes)}\\s*\\)`,
+    ),
+    "Unix leaf encoder must hash the bound native bytes",
+  );
+  const windowsNameUnits =
+    /let\s+([a-z_][a-z0-9_]*)\s*=\s*name\.encode_wide\s*\(\s*\)[^;]*;/.exec(
+      windowsNameEncoder,
+    )?.[1];
+  assert.ok(windowsNameUnits, "Windows leaf encoder must bind native units");
+  const windowsUnitLoop = bracedStatementBlocks(
+    windowsNameEncoder,
+    new RegExp(
+      `for\\s+[a-z_][a-z0-9_]*\\s+in\\s+${escapeRegExp(windowsNameUnits)}\\b`,
+    ),
+  )[0];
+  assert.ok(
+    windowsUnitLoop,
+    "Windows leaf encoder must consume every native unit",
+  );
+  const windowsUnit = /for\s+([a-z_][a-z0-9_]*)\s+in\b/.exec(
+    windowsUnitLoop.header,
+  )?.[1];
+  assert.ok(windowsUnit);
+  assert.match(
+    windowsUnitLoop.body,
+    new RegExp(
+      `hasher\\.update\\s*\\(\\s*${escapeRegExp(windowsUnit)}\\.to_(?:le|be)_bytes\\s*\\(\\s*\\)\\s*\\)`,
+    ),
+    "Windows leaf encoder must hash each bound native unit",
+  );
+  assertOrdered(
+    restartMethod,
+    "canonical_original_",
+    ".size(",
+    "canonical leaf before native size",
+  );
+  assertOrdered(
+    restartMethod,
+    ".size(",
+    "modified_at_ns",
+    "native size before modification time",
+  );
+  assertOrdered(
+    restartMethod,
+    "modified_at_ns",
+    "hasher.update(bytes)",
+    "modification time before complete bytes",
+  );
+  assert.match(
+    restart,
+    /Oversized[\s\S]{0,320}(?:return\s+Err|=>\s*Err)/,
+    "oversized observations must not mint restart mutation identity",
+  );
+  assert.doesNotMatch(
+    restart,
+    /read_range_bounded|\b(?:sample|head|tail|edge)\b|platform::|\b(?:physical|inode|device|volume|file_id|directory_chain|changed_at|created_at|ctime|destination|quarantine)\b/i,
+    "v3 identity must exclude samples, physical IDs, destination names, and ctime",
+  );
+
+  for (const [source, functionName] of [
+    [benchmarkDrivers, "retain_driver_rejected_records"],
+    [performanceOperations, "retain_performance_rejected_records"],
+  ]) {
+    const retention = functionBlock(source, functionName);
+    assert.match(
+      retention,
+      /rejection\s*==\s*PersistedStateRecordRejection::Oversized[\s\S]{0,240}\bcontinue\b/,
+      `${functionName} must keep oversized records out of repair eligibility`,
+    );
+  }
+});
+
+test("P01-B02 resumes deterministic persisted-state parks as typed receipts off runtime", async () => {
+  const [persistedLoad, persistedRepair, anchoredRecord] = await Promise.all([
+    read("apps/api/src/state/persisted_state_load.rs"),
+    read("apps/api/src/state/persisted_state_repair.rs"),
+    read("apps/api/src/execution/anchored_record.rs"),
+  ]);
+  assert.doesNotMatch(
+    persistedLoad,
+    /fn exact_applied_quarantine_is_present\s*\(/,
+    "restart recovery must return retained park authority instead of a bool",
+  );
+  const admission = functionBlock(
+    persistedLoad,
+    "admit_exact_applied_persisted_state_quarantine",
+  );
+  const admissionHeader = admission.slice(0, admission.indexOf("{"));
+  assert.match(
+    admissionHeader,
+    /directory:\s*&?\s*(?:AnchoredRecord)?Directory\b/,
+  );
+  assert.match(
+    admissionHeader,
+    /io::Result\s*<\s*Option\s*<\s*PersistedStateRejectedRecordQuarantineReceipt\s*>\s*>/,
+  );
+  assert.doesNotMatch(admissionHeader, /\b(?:AppPaths|Path|PathBuf)\b/);
+  const admissionFlow = uniqueReachableFunctions(
+    `${persistedLoad}\n${anchoredRecord}`,
+    admission,
+  );
+  for (const required of [
+    /persisted_state_repair_quarantine_suffix\s*\(/,
+    /anchored_record_quarantine_name\s*\(/,
+    /ExpectedFileContent::new\s*\(/,
+    /\.park_request\s*\(/,
+    /\.admit_existing_file_park\s*\(/,
+  ]) {
+    assert.match(admissionFlow, required);
+  }
+  assert.doesNotMatch(
+    admissionFlow,
+    /AnchoredRecordDirectory::open\s*\(|\b(?:Uuid|OsRng|random_leaf)\b/,
+  );
+  const restartObservation = callBlocks(
+    admissionFlow,
+    /\.into_restart_identity\s*\(/,
+  )[0];
+  const existingPark = callBlocks(
+    admissionFlow,
+    /\.admit_existing_file_park\s*\(/,
+  )[0];
+  const digestComparison = conditionalBlocks(admissionFlow).find(
+    ({ condition }) =>
+      /physical_identity\s*\(/.test(condition) &&
+      /digest|restart_identity/i.test(condition),
+  );
+  assert.ok(
+    restartObservation && existingPark && digestComparison,
+    "restart admission must compare freshly recomputed v3 identity with its durable attempt",
+  );
+  const restartArguments = callArguments(restartObservation.source);
+  assert.equal(
+    restartArguments.length,
+    2,
+    "restart identity must consume only store context and original leaf",
+  );
+  assert.match(
+    restartArguments[0],
+    /restart_context\s*\([^)]*attempt\.store\s*\(\s*\)/,
+    "restart identity must bind the durable attempt's store context",
+  );
+  assert.match(
+    restartArguments[1],
+    /(?:source|original)[a-z0-9_]*(?:leaf|name)|(?:leaf|name)[a-z0-9_]*(?:source|original)/,
+    "restart identity must receive the canonical original leaf",
+  );
+  assert.doesNotMatch(
+    restartArguments[1],
+    /destination|quarantine/i,
+    "restart identity cannot bind the derived destination name",
+  );
+  const digestComparisonIndex = admissionFlow.indexOf(digestComparison.source);
+  assert.ok(
+    restartObservation.index < digestComparisonIndex &&
+      digestComparisonIndex < existingPark.index,
+    "durable restart identity must match before existing-park authority is admitted",
+  );
+  assert.match(
+    digestComparison.body,
+    /return\s+(?:Ok\s*\(\s*None\s*\)|Err\s*\()/,
+    "restart digest disagreement must refuse park admission",
+  );
+
+  const startup = functionBlock(
+    persistedRepair,
+    "reconcile_persisted_state_repair_startup",
+  );
+  const blockingAdmission = callBlocks(
+    startup,
+    /tokio::task::spawn_blocking\s*\(/,
+  ).find(({ source }) =>
+    /admit_exact_applied_persisted_state_quarantine\s*\(/.test(source),
+  );
+  assert.ok(
+    blockingAdmission,
+    "restart park admission must execute on the blocking pool",
+  );
+  assertOrdered(
+    blockingAdmission.source,
+    "admit_exact_applied_persisted_state_quarantine",
+    "is_current",
+    "restart admission before receipt validation",
+  );
+  assertOrdered(
+    blockingAdmission.source,
+    "is_current",
+    "acknowledge_preserved",
+    "restart receipt validation before preservation acknowledgement",
+  );
+  assert.ok(
+    blockingAdmission.index <
+      startup.indexOf("settle_persisted_state_repair_terminal"),
+    "restart receipt must settle before its reconstructed terminal",
+  );
+  const restartEffect = new RegExp(
+    `let\\s*\\(\\s*([a-z_][a-z0-9_]*)\\s*,\\s*([a-z_][a-z0-9_]*)\\s*\\)\\s*:\\s*\\(\\s*PersistedStateRepairTerminalOutcome\\s*,\\s*Option\\s*<\\s*AnchoredRecordQuarantinePreservationError\\s*>\\s*\\)\\s*=\\s*[\\s\\S]{0,320}tokio::task::spawn_blocking`,
+  ).exec(startup);
+  assert.ok(
+    restartEffect,
+    "restart blocking admission must return outcome and typed preservation authority",
+  );
+  const [, restartOutcome, restartPreservation] = restartEffect;
+  const restartAcknowledgement = blockingAdmission.source.slice(
+    blockingAdmission.source.indexOf("acknowledge_preserved"),
+  );
+  const restartAckFailure = matchArmBlocks(
+    restartAcknowledgement,
+    /Err\s*\([^)]*\)/,
+  )[0];
+  assert.ok(
+    restartAckFailure,
+    "restart preservation acknowledgement needs an explicit failure outcome",
+  );
+  assert.match(
+    restartAckFailure.body,
+    /PersistedStateRepairTerminalOutcome::AppliedUnverified/,
+    "restart acknowledgement failure must reconstruct AppliedUnverified",
+  );
+  assert.match(
+    restartAckFailure.body,
+    /Some\s*\(\s*[a-z_][a-z0-9_]*\s*\)/,
+    "restart acknowledgement failure must return its actual typed carrier",
+  );
+  const restartAckError = /Err\s*\(\s*([a-z_][a-z0-9_]*)\s*\)/.exec(
+    restartAckFailure.marker,
+  )?.[1];
+  assert.ok(
+    restartAckError,
+    "restart acknowledgement failure must bind its error",
+  );
+  assert.match(
+    restartAckFailure.body,
+    new RegExp(`Some\\s*\\(\\s*${escapeRegExp(restartAckError)}\\s*\\)`),
+    "restart acknowledgement must retain the exact error returned by axial-fs",
+  );
+  assert.doesNotMatch(
+    restartAckFailure.body,
+    /PersistedStateRepairTerminalOutcome::Quarantined/,
+    "restart acknowledgement failure cannot claim an exact quarantine",
+  );
+  const restartTerminalIndex = startup.indexOf(
+    "settle_persisted_state_repair_terminal",
+  );
+  const restartPreservationReturn = conditionalBlocks(startup).find(
+    ({ condition, body }) =>
+      new RegExp(
+        `let\\s+Some\\s*\\([^)]*\\)\\s*=\\s*${escapeRegExp(restartPreservation)}\\b`,
+      ).test(condition) &&
+      /return\s+Err\s*\(\s*io::Error(?:::(?:other|new))?\s*\(/.test(body),
+  );
+  assert.ok(
+    restartPreservationReturn &&
+      restartPreservationReturn.source.includes(restartPreservation),
+    "restart must return the retained carrier after terminal settlement",
+  );
+  const restartPreservationBinding =
+    /let\s+Some\s*\(\s*([a-z_][a-z0-9_]*)\s*\)/.exec(
+      restartPreservationReturn.condition,
+    )?.[1];
+  assert.ok(restartPreservationBinding);
+  const restartCarrierError = callBlocks(
+    restartPreservationReturn.body,
+    /io::Error::(?:other|new)\s*\(/,
+  )[0];
+  assert.ok(
+    restartCarrierError,
+    "restart refusal must own the typed preservation carrier",
+  );
+  const restartCarrierArguments = callArguments(restartCarrierError.source);
+  assert.equal(
+    restartCarrierArguments.at(-1)?.trim(),
+    restartPreservationBinding,
+    "restart refusal must pass the carrier itself, not flattened text",
+  );
+  const restartPreservationReturnIndex = startup.indexOf(
+    restartPreservationReturn.source,
+  );
+  assert.ok(
+    restartTerminalIndex < restartPreservationReturnIndex,
+    "restart must write AppliedUnverified before returning preservation failure",
+  );
+  const restartTerminalConstruction = callBlocks(
+    startup,
+    /PersistedStateRepairTerminal::from_attempt\s*\(/,
+  )[0];
+  assert.ok(restartTerminalConstruction, "restart must reconstruct a terminal");
+  assert.match(
+    callArguments(restartTerminalConstruction.source)[1] ?? "",
+    new RegExp(`\\b${escapeRegExp(restartOutcome)}\\b`),
+    "restart terminal must consume the blocking acknowledgement outcome",
+  );
+});
+
+test("P01-B02 settles live persisted-state parks after durable plan and off Tokio", async () => {
+  const [persistedRepair, anchoredRecord] = await Promise.all([
+    read("apps/api/src/state/persisted_state_repair.rs"),
+    read("apps/api/src/execution/anchored_record.rs"),
+  ]);
+
+  const authorize = functionBlock(
+    persistedRepair,
+    "authorize_persisted_state_rejected_record_quarantine",
+  );
+  assert.doesNotMatch(
+    authorize,
+    /\.still_current\s*\(/,
+    "Guardian policy authorization must not perform blocking filesystem work",
+  );
+  const admit = uniqueMethodBlock(
+    persistedRepair,
+    "AppState",
+    "admit_persisted_state_repair",
+  );
+  const blockingCurrentness = callBlocks(
+    admit,
+    /tokio::task::spawn_blocking\s*\(/,
+  ).find(({ source }) => /\.still_current\s*\(/.test(source));
+  assert.ok(
+    blockingCurrentness,
+    "State admission must revalidate the move-only record off Tokio",
+  );
+
+  const execute = uniqueMethodBlock(
+    persistedRepair,
+    "AppState",
+    "execute_persisted_state_repair",
+  );
+  const plan = execute.indexOf("create_persisted_state_repair_plan");
+  const blockingEffect = callBlocks(
+    execute,
+    /tokio::task::spawn_blocking\s*\(/,
+  ).find(({ source }) => /authorization\.quarantine\s*\(/.test(source));
+  const terminal = execute.indexOf("settle_persisted_state_repair_terminal");
+  const memory = execute.indexOf("settle_persisted_state_repair_memory");
+  assert.ok(plan !== -1 && blockingEffect && terminal !== -1 && memory !== -1);
+  assert.ok(
+    plan < blockingEffect.index &&
+      blockingEffect.index < terminal &&
+      terminal < memory,
+    "persisted-state repair must order durable plan, blocking effect, terminal, and memory",
+  );
+  const liveEffect = new RegExp(
+    `let\\s*\\(\\s*([a-z_][a-z0-9_]*)\\s*,\\s*([a-z_][a-z0-9_]*)\\s*\\)\\s*:\\s*\\(\\s*PersistedStateRepairTerminalOutcome\\s*,\\s*Option\\s*<\\s*AnchoredRecordQuarantinePreservationError\\s*>\\s*\\)\\s*=\\s*[\\s\\S]{0,320}tokio::task::spawn_blocking`,
+  ).exec(execute);
+  assert.ok(
+    liveEffect,
+    "blocking repair must return outcome and typed preservation authority",
+  );
+  const [, liveOutcome, livePreservation] = liveEffect;
+  assertOrdered(
+    blockingEffect.source,
+    "authorization.quarantine",
+    "receipt.is_current",
+    "park before exact receipt validation",
+  );
+  assertOrdered(
+    blockingEffect.source,
+    "receipt.is_current",
+    "receipt.acknowledge_preserved",
+    "exact validation before consuming preservation acknowledgement",
+  );
+  const staleReceipt = conditionalBlocks(blockingEffect.source).find(
+    ({ condition }) => /!\s*receipt\.is_current\s*\(/.test(condition),
+  );
+  assert.ok(staleReceipt, "live repair must classify a stale park receipt");
+  assert.match(
+    staleReceipt.body,
+    /AppliedUnverified|AnchoredRecordQuarantinePreservationError/,
+  );
+  assert.doesNotMatch(
+    staleReceipt.body,
+    /PersistedStateRepairTerminalOutcome::Quarantined/,
+  );
+  const liveAcknowledgement = blockingEffect.source.slice(
+    blockingEffect.source.indexOf("receipt.acknowledge_preserved"),
+  );
+  const acknowledged = matchArmBlocks(
+    liveAcknowledgement,
+    /Ok\s*\(\s*\(\s*\)\s*\)/,
+  )[0];
+  const acknowledgementFailure = matchArmBlocks(
+    liveAcknowledgement,
+    /Err\s*\([^)]*\)/,
+  )[0];
+  assert.ok(
+    acknowledged && acknowledgementFailure,
+    "live preservation acknowledgement needs explicit success and failure outcomes",
+  );
+  assert.match(
+    acknowledged.body,
+    /PersistedStateRepairTerminalOutcome::Quarantined/,
+    "only successful consuming acknowledgement may claim Quarantined",
+  );
+  assert.match(
+    acknowledged.body,
+    /None\b/,
+    "successful acknowledgement cannot fabricate a preservation failure",
+  );
+  assert.match(
+    acknowledgementFailure.body,
+    /PersistedStateRepairTerminalOutcome::AppliedUnverified/,
+    "failed acknowledgement must settle as applied-unverified",
+  );
+  const liveAckError = /Err\s*\(\s*([a-z_][a-z0-9_]*)\s*\)/.exec(
+    acknowledgementFailure.marker,
+  )?.[1];
+  assert.ok(liveAckError, "live acknowledgement failure must bind its error");
+  assert.match(
+    acknowledgementFailure.body,
+    new RegExp(`Some\\s*\\(\\s*${escapeRegExp(liveAckError)}\\s*\\)`),
+    "blocking repair must return the exact preservation error",
+  );
+  assert.doesNotMatch(
+    acknowledgementFailure.body,
+    /PersistedStateRepairTerminalOutcome::Quarantined/,
+    "acknowledgement failure must remain applied-unverified or retain typed authority",
+  );
+  const outsideBlockingEffect =
+    execute.slice(0, blockingEffect.index) +
+    execute.slice(blockingEffect.index + blockingEffect.source.length);
+  assert.doesNotMatch(
+    outsideBlockingEffect,
+    /authorization\.(?:still_current|quarantine)\s*\(|receipt\.(?:is_current|acknowledge_preserved)\s*\(/,
+    "live filesystem settlement must not leak back onto Tokio workers",
+  );
+  assert.doesNotMatch(execute, /block_in_place\s*\(/);
+
+  const terminalConstruction = callBlocks(
+    execute,
+    /PersistedStateRepairTerminal::from_attempt\s*\(/,
+  )[0];
+  assert.ok(terminalConstruction, "live repair must construct one terminal");
+  assert.match(
+    callArguments(terminalConstruction.source)[1] ?? "",
+    new RegExp(`\\b${escapeRegExp(liveOutcome)}\\b`),
+    "terminal must consume the outcome returned by the blocking effect",
+  );
+  const terminalFailureFlow = execute.slice(terminal, memory);
+  assert.match(
+    terminalFailureFlow,
+    new RegExp(
+      `PersistedStateRepairExecutionError::Terminal\\s*\\{[\\s\\S]*?\\bpreservation(?:_error|_failure)?\\s*:\\s*${escapeRegExp(livePreservation)}\\b[\\s\\S]*?\\}`,
+    ),
+    "terminal settlement failure must retain pending preservation authority",
+  );
+  const acceptedJournalIndex = execute.indexOf(
+    "PersistedStateRepairExecutionError::AcceptedJournalPersistence",
+  );
+  const finalPreservation = conditionalBlocks(execute).find(({ condition }) =>
+    new RegExp(
+      `let\\s+Some\\s*\\(\\s*[a-z_][a-z0-9_]*\\s*\\)\\s*=\\s*${escapeRegExp(livePreservation)}\\b`,
+    ).test(condition),
+  );
+  assert.ok(
+    finalPreservation,
+    "live repair must inspect retained preservation authority after settlement",
+  );
+  const finalPreservationBinding =
+    /let\s+Some\s*\(\s*([a-z_][a-z0-9_]*)\s*\)/.exec(
+      finalPreservation.condition,
+    )?.[1];
+  assert.ok(finalPreservationBinding);
+  assert.match(
+    finalPreservation.body,
+    new RegExp(
+      `return\\s+Err\\s*\\(\\s*PersistedStateRepairExecutionError::Preservation\\s*\\(\\s*${escapeRegExp(finalPreservationBinding)}\\s*\\)\\s*\\)\\s*;`,
+    ),
+    "live repair must return the exact retained preservation authority",
+  );
+  const finalPreservationIndex = execute.indexOf(finalPreservation.source);
+  assert.ok(
+    memory < finalPreservationIndex &&
+      (acceptedJournalIndex === -1 ||
+        finalPreservationIndex < acceptedJournalIndex),
+    "preservation authority must survive memory settlement and take precedence afterward",
+  );
+  const memoryFailureFlow = execute.slice(memory, finalPreservationIndex);
+  assert.match(
+    memoryFailureFlow,
+    new RegExp(
+      `PersistedStateRepairExecutionError::Memory\\s*\\{[\\s\\S]*?\\bpreservation(?:_error|_failure)?\\s*:\\s*${escapeRegExp(livePreservation)}\\b[\\s\\S]*?\\}`,
+    ),
+    "memory settlement failure must retain pending preservation authority",
+  );
+
+  const preservationError = itemBlock(
+    anchoredRecord,
+    "struct",
+    "AnchoredRecordQuarantinePreservationError",
+  );
+  assertMustUse(
+    anchoredRecord,
+    "struct",
+    "AnchoredRecordQuarantinePreservationError",
+  );
+  assert.match(preservationError, /FileParkPreservationError|ParkedFile/);
+  const executionError = itemBlock(
+    persistedRepair,
+    "enum",
+    "PersistedStateRepairExecutionError",
+  );
+  assert.match(
+    executionError,
+    /\bPreservation\s*\(\s*AnchoredRecordQuarantinePreservationError\s*\)/,
+    "final preservation failure must retain its exact live park authority",
+  );
+  assert.match(
+    executionError,
+    /\bTerminal\s*\{(?=[^}]*\bOperationJournalStoreError\b)(?=[^}]*Option\s*<\s*AnchoredRecordQuarantinePreservationError\s*>)[^}]*\}/s,
+    "terminal persistence failure must retain optional preservation authority",
+  );
+  assert.match(
+    executionError,
+    /\bMemory\s*\{(?=[^}]*\bFailureMemoryStoreError\b)(?=[^}]*Option\s*<\s*AnchoredRecordQuarantinePreservationError\s*>)[^}]*\}/s,
+    "memory persistence failure must retain optional preservation authority",
+  );
 });
 
 terminalTest(
