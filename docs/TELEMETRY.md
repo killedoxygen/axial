@@ -1,5 +1,5 @@
 # Telemetry
-Axial has an anonymous, consent-gated telemetry path for broad product health signals and remote feature flags. Local source builds and packaged builds without a valid PostHog key do not upload anything.
+Axial has an anonymous, consent-gated telemetry path for broad product health signals. Local source builds and packaged builds without a valid PostHog key do not upload anything.
 
 ## What is collected
 Telemetry events are defined only in `apps/api/src/observability/telemetry.rs`. The current event vocabulary is:
@@ -35,14 +35,14 @@ Every property value is sanitized through the `TelemetryExport` redaction audien
 For `$exception`, the fingerprint and area are the durable signal. The summary is capped and sanitized; if it looks sensitive, the event is still sent with a redacted summary value.
 
 ## Identity
-The telemetry identity is a random UUID install id stored in `config.json` as `telemetry_install_id`. Remote flag cache snapshots also record the exact install id that obtained their evaluation so values cannot cross identity rotations.
+The telemetry identity is a random UUID install id stored in `config.json` as `telemetry_install_id`.
 
 The id is committed with config only when telemetry consent is enabled and a valid export key is configured, before any event can be queued. It is not derived from hardware, usernames, paths, accounts, or any other local identity. Turning telemetry off clears the persisted install id and the in-memory queue. Turning telemetry on again commits a fresh id before event admission resumes.
 
 ## Consent
 Telemetry is disabled by default in `AppConfig`. Onboarding includes a stats step with "Anonymous stats" and "Nothing sent" choices; that UI initializes to sharing unless the loaded config is explicitly false, but nothing is persisted until onboarding saves the config. Settings > Advanced has the same anonymous usage stats toggle.
 
-When telemetry is off, events are not queued or newly admitted for export. Work admitted with the current identity before consent is revoked may finish, but revocation admits no new telemetry or remote-flag work. Remote flag responses that lose their identity before cache admission are discarded. Every admitted cache snapshot remains bound to its exact identity and is ignored whenever that identity is not current, including when persistence settles after an identity rotation. Cached remote flag values are not applied while consent is off.
+When telemetry is off, events are not queued or newly admitted for export. Work admitted with the current identity before consent is revoked may finish, but revocation admits no new telemetry work.
 
 Error tracking uses the same consent and key gates as every other telemetry event.
 
@@ -53,7 +53,7 @@ Uploads only happen when a valid `AXIAL_POSTHOG_API_KEY` is available at runtime
 
 `AXIAL_POSTHOG_HOST` can redirect the endpoint, including to a local or self-auditing PostHog-compatible endpoint. The host must be an `http` or `https` URL without credentials, query parameters, or fragments.
 
-`AXIAL_POSTHOG_ENVIRONMENT` can override the deployment label attached to events and flag evaluation. Values are lowercased and must contain only ASCII letters, numbers, hyphens, or underscores, up to 32 characters. Invalid values fall back to `dev` for debug builds and `production` otherwise.
+`AXIAL_POSTHOG_ENVIRONMENT` can override the deployment label attached to events. Values are lowercased and must contain only ASCII letters, numbers, hyphens, or underscores, up to 32 characters. Invalid values fall back to `dev` for debug builds and `production` otherwise.
 
 ## Error storm control
 Backend error events are capped per process before they enter the telemetry queue. At most 30 `$exception` events are exported per process, and at most 5 events are exported for the same `$exception_fingerprint`. The counters reset only when the process restarts. Non-error telemetry events are unaffected.
@@ -62,24 +62,3 @@ Backend error events are capped per process before they enter the telemetry queu
 The backend installs a panic hook at startup. The hook records a single fatal `$exception` with kind `panic`, then chains the previous hook so normal stderr output remains.
 
 Because the process may be exiting, panic capture does not rely on the async flush loop. It performs a best-effort single-event PostHog batch send on a fresh blocking thread with a short timeout. If telemetry consent or the PostHog key is absent, the hook is a no-op.
-
-## Remote feature flags
-Remote feature flags use the same consent, key, and exact-identity admission gates as telemetry. They fetch PostHog `/flags?v=2` values with the telemetry install id and the same `environment` property used on events, then keep only registered, non-dev feature flag keys. A response for an identity that is no longer current before cache admission is discarded; an admitted snapshot that finishes later is ineffective unless its bound identity is current.
-
-Feature flag precedence is:
-
-1. user override from `feature_overrides`
-2. remote PostHog value
-3. registry default
-
-Remote values never apply to dev-only registry keys. As of this writing, the registry contains only `dev.state-inspector`, which is dev-only, so the remote flag layer is implemented but has no release-visible flag to steer.
-
-The remote flag cache lives under the config directory at `flags/remote-cache.json`. It stores only:
-
-- `schema`: the current cache schema id
-- `schema_version`: the current cache schema version
-- `distinct_id`: the canonical telemetry install id that obtained the evaluation
-- `fetched_at`: the fetch timestamp
-- `values`: flag keys mapped to booleans
-
-The cache is used only for 24 hours and only while its canonical `distinct_id` exactly matches the current committed telemetry identity. It rejects unknown fields, retired or wrong schema versions, invalid identities, oversized files, or invalid timestamps, and is filtered against the current non-dev registry on load. Cache reads run off the async runtime. A refresh publishes values only after its exact canonical cache snapshot commits atomically; accepted writes survive caller cancellation, failed writes retry before a later refresh or successful shutdown, and rejected cache bytes are never rewritten during startup.

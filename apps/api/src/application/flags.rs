@@ -4,7 +4,7 @@ use crate::{
     observability::telemetry::{
         TelemetryErrorArea, TelemetryErrorKind, TelemetryErrorLevel, TelemetryEvent,
     },
-    state::{AppState, ResolvedFlagSource, resolve_flag},
+    state::AppState,
 };
 use axial_config::{ConfigStoreError, FEATURE_FLAGS, FlagStage, find_flag};
 use axum::{Json, http::StatusCode};
@@ -20,7 +20,6 @@ type ApiError = (StatusCode, Json<serde_json::Value>);
 pub enum FlagSource {
     Default,
     Override,
-    Remote,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -46,23 +45,19 @@ pub struct FlagOverridePatch {
 }
 
 pub fn list_flags(state: &AppState) -> FlagsResponse {
+    list_flags_for_build(state, cfg!(debug_assertions))
+}
+
+fn list_flags_for_build(state: &AppState, development_build: bool) -> FlagsResponse {
     let config = state.config().current();
-    let remote_identity = state.remote_flag_identity_for(&config);
-    let remote_active = remote_identity.is_some();
-    let remote_values = remote_identity
-        .as_deref()
-        .map(|identity| state.remote_flags().values_snapshot(identity))
-        .unwrap_or_default();
     let flags = FEATURE_FLAGS
         .iter()
-        .filter(|flag| cfg!(debug_assertions) || !flag.dev_only)
+        .filter(|flag| visible_in_build(flag, development_build))
         .map(|flag| {
-            let resolution = resolve_flag(
-                flag,
-                &config.feature_overrides,
-                remote_active,
-                &remote_values,
-            );
+            let (enabled, source) = match config.feature_overrides.get(flag.key).copied() {
+                Some(enabled) => (enabled, FlagSource::Override),
+                None => (flag.default_enabled, FlagSource::Default),
+            };
             FlagViewModel {
                 key: flag.key,
                 title: flag.title,
@@ -70,23 +65,13 @@ pub fn list_flags(state: &AppState) -> FlagsResponse {
                 stage: flag.stage,
                 dev_only: flag.dev_only,
                 default_enabled: flag.default_enabled,
-                enabled: resolution.enabled,
-                source: resolution.source.into(),
+                enabled,
+                source,
             }
         })
         .collect();
 
     FlagsResponse { flags }
-}
-
-impl From<ResolvedFlagSource> for FlagSource {
-    fn from(source: ResolvedFlagSource) -> Self {
-        match source {
-            ResolvedFlagSource::Default => Self::Default,
-            ResolvedFlagSource::Override => Self::Override,
-            ResolvedFlagSource::Remote => Self::Remote,
-        }
-    }
 }
 
 pub async fn update_flag(
@@ -118,7 +103,11 @@ pub async fn update_flag(
 }
 
 fn find_visible_flag(key: &str) -> Option<&'static axial_config::FeatureFlagDef> {
-    find_flag(key).filter(|flag| cfg!(debug_assertions) || !flag.dev_only)
+    find_flag(key).filter(|flag| visible_in_build(flag, cfg!(debug_assertions)))
+}
+
+fn visible_in_build(flag: &axial_config::FeatureFlagDef, development_build: bool) -> bool {
+    development_build || !flag.dev_only
 }
 
 fn unknown_flag_response() -> ApiError {
@@ -170,7 +159,7 @@ mod tests {
     };
 
     #[test]
-    fn list_contains_seed_flag_with_default_state() {
+    fn p00_b10_contract_local_registry_uses_default_without_override() {
         let fixture = TestFixture::new("list-default");
         let response = super::list_flags(&fixture.state);
         let flag = response
@@ -184,15 +173,28 @@ mod tests {
     }
 
     #[test]
-    fn remote_source_serializes_as_lowercase_wire_value() {
+    fn p00_b10_contract_release_projection_hides_dev_only_registry() {
+        let fixture = TestFixture::new("release-projection");
+        let response = super::list_flags_for_build(&fixture.state, false);
+
+        assert!(response.flags.iter().all(|flag| !flag.dev_only));
+    }
+
+    #[test]
+    fn p00_b10_contract_wire_source_vocabulary_is_exactly_local() {
+        let sources = [FlagSource::Default, FlagSource::Override];
+        let expected = sources.clone().map(|source| match source {
+            FlagSource::Default => "default",
+            FlagSource::Override => "override",
+        });
         assert_eq!(
-            serde_json::to_value(FlagSource::Remote).expect("serialize source"),
-            serde_json::json!("remote")
+            serde_json::to_value(sources).expect("serialize local flag sources"),
+            serde_json::json!(expected)
         );
     }
 
     #[tokio::test]
-    async fn setting_override_flips_enabled_source_and_persists() {
+    async fn p00_b10_contract_local_override_is_persisted() {
         let fixture = TestFixture::new("set-override");
         let response = super::update_flag(
             &fixture.state,
@@ -232,7 +234,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn null_enabled_clears_override_back_to_default() {
+    async fn p00_b10_contract_local_override_reset_restores_default() {
         let fixture = TestFixture::new("clear-override");
         super::update_flag(
             &fixture.state,

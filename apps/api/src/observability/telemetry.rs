@@ -63,14 +63,14 @@ fn default_posthog_environment() -> &'static str {
     }
 }
 
-pub fn configured_posthog_key() -> Option<String> {
+fn configured_posthog_key() -> Option<String> {
     let raw = std::env::var(POSTHOG_API_KEY_ENV)
         .ok()
         .or_else(|| option_env!("AXIAL_POSTHOG_API_KEY").map(str::to_string))?;
     sanitize_posthog_key(&raw).ok()
 }
 
-pub fn configured_posthog_host() -> String {
+fn configured_posthog_host() -> String {
     let raw = std::env::var(POSTHOG_HOST_ENV)
         .ok()
         .or_else(|| option_env!("AXIAL_POSTHOG_HOST").map(str::to_string));
@@ -79,7 +79,7 @@ pub fn configured_posthog_host() -> String {
         .unwrap_or_else(|| DEFAULT_POSTHOG_HOST.to_string())
 }
 
-pub fn configured_posthog_environment() -> String {
+fn configured_posthog_environment() -> String {
     let raw = std::env::var(POSTHOG_ENVIRONMENT_ENV)
         .ok()
         .or_else(|| option_env!("AXIAL_POSTHOG_ENVIRONMENT").map(str::to_string));
@@ -533,30 +533,6 @@ impl TelemetryHub {
             .expect("telemetry config source lock poisoned") = config;
     }
 
-    pub fn configured_posthog_key(&self) -> Option<String> {
-        self.key.clone()
-    }
-
-    pub fn configured_posthog_host(&self) -> String {
-        self.host.clone()
-    }
-
-    pub fn current_telemetry_install_id(&self) -> Option<String> {
-        let config = self.current_config();
-        if !config.telemetry_enabled {
-            return None;
-        }
-
-        self.canonicalize_existing_telemetry_install_id(config)
-    }
-
-    pub(crate) fn export_identity_for_config(&self, config: &AppConfig) -> Option<String> {
-        if self.key.is_none() || !config.telemetry_enabled {
-            return None;
-        }
-        self.canonicalize_existing_telemetry_install_id(config.clone())
-    }
-
     pub fn clear_queue(&self) {
         let _admission = self.consent_guard();
         self.queue_guard().clear();
@@ -630,7 +606,7 @@ impl TelemetryHub {
         (!batch.is_empty()).then_some((batch, distinct_id))
     }
 
-    pub(crate) fn export_is_admitted(&self, distinct_id: &str) -> bool {
+    fn export_is_admitted(&self, distinct_id: &str) -> bool {
         let _admission = self.consent_guard();
         self.key.is_some() && self.current_identity_matches(distinct_id)
     }
@@ -1159,8 +1135,8 @@ mod tests {
         assert_eq!(hub.queue_len_for_test(), 0);
     }
 
-    #[test]
-    fn consent_off_disables_emit_without_queue_growth() {
+    #[tokio::test]
+    async fn p00_b10_contract_telemetry_off_admits_no_export_work() {
         let fixture = TestConfig::new(
             "consent-off",
             AppConfig {
@@ -1176,6 +1152,7 @@ mod tests {
         ));
 
         assert_eq!(hub.queue_len_for_test(), 0);
+        assert_eq!(hub.flush_once().await, 0);
     }
 
     #[test]
@@ -1398,7 +1375,7 @@ mod tests {
     }
 
     #[test]
-    fn current_telemetry_install_id_canonicalizes_without_mutating_config() {
+    fn event_identity_canonicalizes_without_mutating_config() {
         let fixture = TestConfig::new(
             "canonical-install-id",
             AppConfig {
@@ -1409,10 +1386,6 @@ mod tests {
         );
         let hub = test_hub(fixture.store.clone());
 
-        assert_eq!(
-            hub.current_telemetry_install_id().as_deref(),
-            Some(TEST_INSTALL_ID)
-        );
         assert_eq!(
             fixture.store.current().telemetry_install_id,
             TEST_INSTALL_ID.to_ascii_uppercase()

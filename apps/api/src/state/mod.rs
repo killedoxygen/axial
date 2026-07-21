@@ -29,7 +29,6 @@ mod persisted_state_repair;
 pub mod presence;
 mod reconciliation;
 mod registered_artifact_findings;
-mod remote_flags;
 mod sessions;
 mod setup_plans;
 mod shutdown;
@@ -40,7 +39,7 @@ mod user_mod_witness;
 
 use axial_config::{
     AppConfig, ConfigStore as StartupConfigStore, ConfigStoreError, INSTANCE_REGISTRY_MAX_ENTRIES,
-    InstanceStore as StartupInstanceStore, InstanceStoreError, find_flag, generate_instance_id,
+    InstanceStore as StartupInstanceStore, InstanceStoreError, generate_instance_id,
     is_canonical_instance_id,
 };
 use axial_content::ContentRegistry;
@@ -163,9 +162,6 @@ pub(crate) use registered_artifact_findings::{
 pub(crate) use registered_artifact_findings::{
     RegisteredArtifactRepairAuthorizationRejection, registered_artifact_target_for_test,
 };
-pub(crate) use remote_flags::{
-    RemoteFlagRefreshOutcome, RemoteFlagStore, ResolvedFlagSource, resolve_flag,
-};
 pub(crate) use sessions::{
     LaunchFailureTerminalizationLease, LaunchFailureTermination,
     LaunchFailureTerminationErrorClass, ProcessSettlementLease, RunningHandoffOutcome,
@@ -205,7 +201,6 @@ pub struct AppState {
     performance_operations: Arc<performance_operations::PerformanceOperationStore>,
     performance: Arc<AppPerformanceStore>,
     telemetry: Arc<TelemetryHub>,
-    remote_flags: Arc<RemoteFlagStore>,
     updater: Arc<UpdaterStore>,
     update_admission: update_admission::UpdateAdmissionCoordinator,
     content: Arc<ContentRegistry>,
@@ -420,7 +415,6 @@ impl AppState {
             config,
             telemetry,
             Arc::new(AuthLoginStore::new()),
-            Arc::new(RemoteFlagStore::default()),
             ManagedRuntimeCache::isolated_for_test()
                 .expect("failed to create isolated managed runtime cache"),
             RejectionStreakStartupMode::Discard,
@@ -448,12 +442,7 @@ impl AppState {
                     .to_string(),
             );
         }
-        let remote_flags_config_dir = init.config.paths().config_dir.clone();
-        let (auth_logins, remote_flags) = tokio::join!(
-            AuthLoginStore::load_from_secure_store(),
-            RemoteFlagStore::load_from_config_dir(remote_flags_config_dir),
-        );
-        let auth_logins = auth_logins?;
+        let auth_logins = AuthLoginStore::load_from_secure_store().await?;
         #[cfg(not(test))]
         let managed_runtime_cache = ManagedRuntimeCache::canonical()?;
         #[cfg(test)]
@@ -464,7 +453,6 @@ impl AppState {
                 config,
                 telemetry,
                 Arc::new(auth_logins),
-                Arc::new(remote_flags),
                 managed_runtime_cache,
                 RejectionStreakStartupMode::Progress,
             )
@@ -495,7 +483,6 @@ impl AppState {
             config,
             telemetry,
             Arc::new(AuthLoginStore::new()),
-            Arc::new(RemoteFlagStore::default()),
             ManagedRuntimeCache::isolated_for_test()
                 .expect("failed to create isolated managed runtime cache"),
             RejectionStreakStartupMode::Discard,
@@ -564,7 +551,6 @@ impl AppState {
         config: Arc<AppConfigStore>,
         telemetry: Arc<TelemetryHub>,
         auth_logins: Arc<AuthLoginStore>,
-        remote_flags: Arc<RemoteFlagStore>,
         managed_runtime_cache: ManagedRuntimeCache,
         rejection_streak_startup_mode: RejectionStreakStartupMode,
     ) -> std::io::Result<Self> {
@@ -694,7 +680,6 @@ impl AppState {
             performance_operations,
             performance,
             telemetry,
-            remote_flags,
             updater,
             update_admission: update_admission::UpdateAdmissionCoordinator::new(),
             content,
@@ -1103,10 +1088,6 @@ impl AppState {
         &self.telemetry
     }
 
-    pub(crate) fn remote_flags(&self) -> &Arc<RemoteFlagStore> {
-        &self.remote_flags
-    }
-
     pub fn updater(&self) -> &Arc<UpdaterStore> {
         &self.updater
     }
@@ -1202,10 +1183,6 @@ impl AppState {
     #[cfg(test)]
     pub(crate) fn lifecycle_phase(&self) -> AppLifecyclePhase {
         self.lifecycle.phase()
-    }
-
-    pub(crate) fn remote_flag_identity_for(&self, config: &AppConfig) -> Option<String> {
-        self.telemetry.export_identity_for_config(config)
     }
 
     pub fn startup_warnings(&self) -> Vec<String> {
@@ -2075,31 +2052,6 @@ impl AppState {
                 ConfigStoreError::Persistence(std::io::Error::other(error.to_string()))
             })
         }
-    }
-
-    pub fn flag_enabled(&self, key: &str) -> bool {
-        let Some(flag) = find_flag(key) else {
-            return false;
-        };
-        if flag.dev_only && !cfg!(debug_assertions) {
-            return false;
-        }
-
-        let config = self.config.current();
-        let remote_identity = self.remote_flag_identity_for(&config);
-        let remote_active = remote_identity.is_some();
-        let remote_values = remote_identity
-            .as_deref()
-            .map(|identity| self.remote_flags.values_snapshot(identity))
-            .unwrap_or_default();
-
-        resolve_flag(
-            flag,
-            &config.feature_overrides,
-            remote_active,
-            &remote_values,
-        )
-        .enabled
     }
 
     pub fn subscribe_config_changes(&self) -> broadcast::Receiver<()> {

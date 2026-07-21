@@ -28,7 +28,6 @@ import {
 import { refreshAccountSkin } from './player-skin';
 import { scheduleAutoUpdateCheck } from './updater';
 import { refreshInstallQueue } from './machines/downloads';
-import { refreshFlags } from './flags';
 import { toast } from './toast';
 import { errMessage } from './utils';
 import { restoreRoute, showOnboardingOverlay } from './ui-state';
@@ -58,8 +57,6 @@ async function init(): Promise<void> {
 
     const nativeVersion = await getNativeAppVersion();
     if (nativeVersion) appVersion.value = nativeVersion;
-
-    void refreshFlags().catch(() => undefined);
 
     let [configRes, systemRes, statusRes, musicStatusRes] = await Promise.all([
       api('GET', '/config'),

@@ -1,12 +1,11 @@
 import type { JSX } from 'preact';
 import { useEffect, useRef, useState } from 'preact/hooks';
 import { api } from '../../api';
-import { ensureFlags, refreshFlags, setFlagOverride } from '../../flags';
 import { hasNativeDesktopRuntime, requestNativeAppReset } from '../../native';
 import { Button, Toggle } from '../../ui/Atoms';
 import { SettingRow, SettingsSection } from '../../ui/SettingsSheet';
 import { navigate } from '../../ui-state';
-import { config, devMode, featureFlags, featureFlagsLoadState } from '../../store';
+import { config, devMode } from '../../store';
 import { toast } from '../../toast';
 import { errMessage } from '../../utils';
 
@@ -33,55 +32,6 @@ function PerformanceLabSlot(): JSX.Element | null {
 
   if (!isDev || !Lab) return null;
   return <Lab />;
-}
-
-const FLAG_STAGE_NOTES = {
-  experimental: 'Experimental. May change or break.',
-  beta: 'Beta. May still change.',
-} as const;
-
-export function ExperimentalFlagRows(): JSX.Element | null {
-  const allFlags = featureFlags.value;
-  const loadState = featureFlagsLoadState.value;
-
-  useEffect(() => {
-    if (!featureFlags.value) void ensureFlags().catch(() => undefined);
-  }, []);
-
-  if (!allFlags) {
-    const failed = loadState.status === 'error';
-    return (
-      <SettingRow
-        title="Experimental flags"
-        description={
-          failed ? `Could not load feature flags: ${loadState.error || 'Unknown error'}` : 'Feature flags are loading.'
-        }
-        control={
-          failed ? (
-            <Button variant="secondary" icon="refresh" onClick={() => void refreshFlags().catch(() => undefined)}>
-              Retry
-            </Button>
-          ) : undefined
-        }
-      />
-    );
-  }
-
-  const flags = allFlags.filter((flag) => !flag.dev_only);
-  if (flags.length === 0) return null;
-
-  return (
-    <>
-      {flags.map((flag) => (
-        <SettingRow
-          key={flag.key}
-          title={flag.title}
-          description={`${flag.description} ${FLAG_STAGE_NOTES[flag.stage]}`}
-          control={<Toggle on={flag.enabled} onChange={() => void setFlagOverride(flag.key, !flag.enabled)} />}
-        />
-      ))}
-    </>
-  );
 }
 
 export function AdvancedSettingsSection(): JSX.Element {
@@ -159,7 +109,6 @@ export function AdvancedSettingsSection(): JSX.Element {
           </Button>
         }
       />
-      <ExperimentalFlagRows />
       {__AXIAL_ENABLE_DEV_LAB__ && isDev && (
         <SettingRow
           title="Dev lab"

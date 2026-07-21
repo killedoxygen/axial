@@ -2311,7 +2311,6 @@ mod tests {
             "spawn_benchmark_suite_drivers_resume(state);",
             "spawn_performance_rules_refresh(state);",
             "spawn_telemetry_export(state);",
-            "spawn_remote_flags_refresh(state);",
         ] {
             assert!(repair < app.find(call).expect("aggregated startup call"));
         }

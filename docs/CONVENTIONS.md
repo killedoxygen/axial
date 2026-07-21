@@ -53,8 +53,8 @@ keep this short and real. if the codebase changes, update this file.
 - flags are read and toggled only through `/api/v1/flags`
 - frontend code must read flags through `flagEnabled` and toggle them through `setFlagOverride` in `frontend/src/flags.ts`
 - do not fetch or cache flag state ad hoc
-- remote values apply only to non-dev registry keys
-- flag precedence is user override, then remote value, then registry default
+- flag precedence is user override, then registry default
+- the Dev Lab owns lazy frontend flag loading; do not add flag loading to application startup or Settings
 - dev-only flags never appear in release builds
 
 ## Telemetry

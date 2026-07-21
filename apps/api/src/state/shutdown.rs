@@ -4,7 +4,7 @@ use tokio::sync::watch;
 
 const SHUTDOWN_LOCK_INVARIANT: &str =
     "application shutdown lock poisoned; completion state may be inconsistent";
-const SHUTDOWN_STEP_COUNT: usize = 20;
+const SHUTDOWN_STEP_COUNT: usize = 19;
 type ShutdownAttemptChannel = Arc<watch::Sender<Option<Result<(), AppShutdownError>>>>;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -24,7 +24,6 @@ pub enum AppShutdownStep {
     FailureMemory,
     Accounts,
     SecureAuth,
-    RemoteFlags,
     KnownGoodInventories,
     UserModWitnesses,
     InstanceRegistry,
@@ -49,11 +48,10 @@ impl AppShutdownStep {
             Self::FailureMemory => 12,
             Self::Accounts => 13,
             Self::SecureAuth => 14,
-            Self::RemoteFlags => 15,
-            Self::KnownGoodInventories => 16,
-            Self::UserModWitnesses => 17,
-            Self::InstanceRegistry => 18,
-            Self::Config => 19,
+            Self::KnownGoodInventories => 15,
+            Self::UserModWitnesses => 16,
+            Self::InstanceRegistry => 17,
+            Self::Config => 18,
         }
     }
 
@@ -74,7 +72,6 @@ impl AppShutdownStep {
             Self::FailureMemory => "failure_memory",
             Self::Accounts => "accounts",
             Self::SecureAuth => "secure_auth",
-            Self::RemoteFlags => "remote_flags",
             Self::KnownGoodInventories => "known_good_inventories",
             Self::UserModWitnesses => "user_mod_witnesses",
             Self::InstanceRegistry => "instance_registry",
@@ -204,7 +201,6 @@ impl AppShutdownCoordinator {
             benchmark_result,
             performance_result,
             auth_result,
-            remote_result,
             rules_result,
             instance_result,
             config_result,
@@ -212,7 +208,6 @@ impl AppShutdownCoordinator {
             self.close_benchmark_chain(state),
             self.close_performance_chain(state),
             self.close_auth_chain(state),
-            self.close_remote_flags(state),
             self.close_performance_rules(state),
             self.close_instance_registry(state),
             self.close_config(state),
@@ -222,7 +217,6 @@ impl AppShutdownCoordinator {
         retain_first_error(&mut first_error, benchmark_result);
         retain_first_error(&mut first_error, performance_result);
         retain_first_error(&mut first_error, auth_result);
-        retain_first_error(&mut first_error, remote_result);
         retain_first_error(&mut first_error, rules_result);
         retain_first_error(&mut first_error, known_good_result);
         retain_first_error(&mut first_error, user_mod_witness_result);
@@ -446,19 +440,6 @@ impl AppShutdownCoordinator {
                 .map_err(|_| AppShutdownError::at(AppShutdownStep::SecureAuth))?;
             self.mark_completed(AppShutdownStep::SecureAuth);
         }
-        Ok(())
-    }
-
-    async fn close_remote_flags(&self, state: &AppState) -> Result<(), AppShutdownError> {
-        if self.completed(AppShutdownStep::RemoteFlags) {
-            return Ok(());
-        }
-        state
-            .remote_flags
-            .close()
-            .await
-            .map_err(|_| AppShutdownError::at(AppShutdownStep::RemoteFlags))?;
-        self.mark_completed(AppShutdownStep::RemoteFlags);
         Ok(())
     }
 

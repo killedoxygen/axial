@@ -1,5 +1,5 @@
 export type FlagStage = 'experimental' | 'beta';
-export type FlagSource = 'default' | 'override' | 'remote';
+export type FlagSource = 'default' | 'override';
 
 export interface FeatureFlagViewModel {
   key: string;

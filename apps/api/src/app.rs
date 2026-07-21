@@ -2,7 +2,7 @@ use crate::observability::telemetry::{
     TelemetryEvent, install_panic_capture, run_telemetry_flush_loop,
 };
 use crate::routes;
-use crate::state::{AppState, RemoteFlagRefreshOutcome};
+use crate::state::AppState;
 use axum::Router;
 #[cfg(feature = "embedded-frontend")]
 use axum::{
@@ -27,7 +27,6 @@ pub const PERFORMANCE_RULES_REFRESH_INTERVAL_ENV: &str =
 pub const MIN_PERFORMANCE_RULES_REFRESH_INTERVAL: Duration = Duration::from_secs(15 * 60);
 pub const DEFAULT_PERFORMANCE_RULES_REFRESH_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
 pub const MAX_PERFORMANCE_RULES_REFRESH_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
-pub const REMOTE_FLAGS_REFRESH_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
 const EMBEDDED_API_SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 #[cfg(feature = "embedded-frontend")]
 static EMBEDDED_FRONTEND: Dir<'_> = include_dir!("$OUT_DIR/embedded-frontend");
@@ -58,7 +57,6 @@ pub async fn start_application_background_workflows(state: &AppState) -> bool {
     spawn_benchmark_suite_drivers_resume(state);
     spawn_performance_rules_refresh(state);
     spawn_telemetry_export(state);
-    spawn_remote_flags_refresh(state);
     true
 }
 
@@ -85,34 +83,6 @@ fn spawn_performance_rules_refresh(state: &AppState) -> bool {
             }
         },
         interval,
-        shutdown,
-    ));
-
-    true
-}
-
-fn spawn_remote_flags_refresh(state: &AppState) -> bool {
-    if !state.telemetry().export_configured() {
-        return false;
-    }
-    let Ok(producer) = state.try_claim_producer() else {
-        return false;
-    };
-    let shutdown = state.subscribe_shutdown();
-
-    let state = state.clone();
-    tracing::info!(
-        interval_seconds = REMOTE_FLAGS_REFRESH_INTERVAL.as_secs(),
-        "remote feature flags periodic refresh scheduled"
-    );
-    producer.spawn(run_periodic_refresh_loop(
-        move || {
-            let state = state.clone();
-            async move {
-                refresh_remote_flags_once(&state).await;
-            }
-        },
-        REMOTE_FLAGS_REFRESH_INTERVAL,
         shutdown,
     ));
 
@@ -194,21 +164,6 @@ async fn refresh_performance_rules_once(state: &AppState) {
 
 fn performance_rules_refresh_log_warning(error: &axial_performance::RulesRefreshError) -> String {
     axial_performance::remote_rules_refresh_warning("failed", error)
-}
-
-async fn refresh_remote_flags_once(state: &AppState) {
-    match state.remote_flags().refresh_once(state.telemetry()).await {
-        Ok(RemoteFlagRefreshOutcome::Skipped) => {}
-        Ok(RemoteFlagRefreshOutcome::Refreshed { flag_count }) => {
-            tracing::info!(
-                flag_count,
-                "remote feature flags background refresh finished"
-            );
-        }
-        Err(error) => {
-            tracing::warn!("remote feature flags background refresh failed: {error}");
-        }
-    }
 }
 
 fn configured_performance_rules_refresh_interval() -> Duration {

@@ -1,7 +1,7 @@
 //! Observability and evidence system boundary.
 //!
 //! Observability owns structured events, local evidence, proof records,
-//! redaction scopes, retention, and future telemetry export boundaries.
+//! redaction scopes, retention, and the telemetry-safe export boundary.
 
 pub mod telemetry;
 
