@@ -1655,9 +1655,11 @@ mod tests {
         fn new_inner(name: &str, username: &str, failing_accounts: bool) -> Self {
             let root = test_root(name);
             let paths = test_paths(&root);
+            let root_session = crate::state::test_root_session(&paths);
             let config = Arc::new(
                 ConfigStore::from_config(
                     paths.clone(),
+                    Arc::clone(&root_session),
                     AppConfig {
                         username: username.to_string(),
                         ..AppConfig::default()
@@ -1666,8 +1668,12 @@ mod tests {
                 .expect("set username"),
             );
             let instances = Arc::new(
-                InstanceStore::from_snapshot(paths.clone(), InstanceRegistrySnapshot::default())
-                    .expect("load instances"),
+                InstanceStore::from_snapshot(
+                    paths.clone(),
+                    root_session,
+                    InstanceRegistrySnapshot::default(),
+                )
+                .expect("load instances"),
             );
             let state = AppState::new(AppStateInit {
                 app_name: "Axial".to_string(),

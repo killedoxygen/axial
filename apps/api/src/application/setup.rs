@@ -465,12 +465,22 @@ mod tests {
         fn new(name: &str, config: impl FnOnce(&AppPaths) -> AppConfig) -> Self {
             let root = unique_test_dir(name);
             let paths = test_paths(&root);
+            let root_session = crate::state::test_root_session(&paths);
             let config = Arc::new(
-                ConfigStore::from_config(paths.clone(), config(&paths)).expect("config source"),
+                ConfigStore::from_config(
+                    paths.clone(),
+                    Arc::clone(&root_session),
+                    config(&paths),
+                )
+                .expect("config source"),
             );
             let instances = Arc::new(
-                InstanceStore::from_snapshot(paths.clone(), InstanceRegistrySnapshot::default())
-                    .expect("instance source"),
+                InstanceStore::from_snapshot(
+                    paths.clone(),
+                    root_session,
+                    InstanceRegistrySnapshot::default(),
+                )
+                .expect("instance source"),
             );
             let state = AppState::new(AppStateInit {
                 app_name: "Axial".to_string(),

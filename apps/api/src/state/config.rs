@@ -989,7 +989,9 @@ mod tests {
 
     fn test_store(name: &str, failures: usize) -> (Arc<AppConfigStore>, Arc<RecordingBackend>) {
         let paths = test_paths(name);
-        let source = ConfigStore::from_config(paths, AppConfig::default()).expect("config source");
+        let root_session = crate::state::test_root_session(&paths);
+        let source = ConfigStore::from_config(paths, root_session, AppConfig::default())
+            .expect("config source");
         let backend = RecordingBackend::new(failures);
         let coordinator =
             PersistenceCoordinator::for_test(backend.clone(), Duration::ZERO, Duration::ZERO);
@@ -1000,15 +1002,25 @@ mod tests {
 
     fn test_app_state(name: &str) -> AppState {
         let paths = test_paths(name);
+        let root_session = crate::state::test_root_session(&paths);
         let config = Arc::new(
-            ConfigStore::from_config(paths.clone(), AppConfig::default()).expect("config source"),
+            ConfigStore::from_config(
+                paths.clone(),
+                Arc::clone(&root_session),
+                AppConfig::default(),
+            )
+            .expect("config source"),
         );
         AppState::new(AppStateInit {
             app_name: "Axial".to_string(),
             version: "test".to_string(),
             instances: Arc::new(
-                InstanceStore::from_snapshot(paths.clone(), InstanceRegistrySnapshot::default())
-                    .expect("instance store"),
+                InstanceStore::from_snapshot(
+                    paths.clone(),
+                    root_session,
+                    InstanceRegistrySnapshot::default(),
+                )
+                .expect("instance store"),
             ),
             installs: Arc::new(InstallStore::new()),
             sessions: Arc::new(SessionStore::new()),

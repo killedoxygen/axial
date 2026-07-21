@@ -777,12 +777,15 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         let paths = axial_config::AppPaths::from_root(root.to_path_buf())
             .expect("absolute test app root");
+        let root_session = crate::state::test_root_session(&paths);
         let config = Arc::new(
-            axial_config::ConfigStore::load_from(paths.clone()).expect("load test config"),
+            axial_config::ConfigStore::load_from(paths.clone(), Arc::clone(&root_session))
+                .expect("load test config"),
         );
         let instances = Arc::new(
             axial_config::InstanceStore::from_snapshot(
                 paths.clone(),
+                root_session,
                 axial_config::InstanceRegistrySnapshot::default(),
             )
             .expect("load test instances"),

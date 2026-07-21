@@ -8048,10 +8048,18 @@ fn assert_no_public_raw_fragments(message: &str) {
 
 fn build_test_state(root: &Path) -> AppState {
     let paths = test_app_paths(root);
-    let config = Arc::new(ConfigStore::load_from(paths.clone()).expect("load config"));
+    let root_session = crate::state::test_root_session(&paths);
+    let config = Arc::new(
+        ConfigStore::load_from(paths.clone(), Arc::clone(&root_session))
+            .expect("load config"),
+    );
     let instances = Arc::new(
-        InstanceStore::from_snapshot(paths.clone(), InstanceRegistrySnapshot::default())
-            .expect("load instances"),
+        InstanceStore::from_snapshot(
+            paths.clone(),
+            root_session,
+            InstanceRegistrySnapshot::default(),
+        )
+        .expect("load instances"),
     );
     AppState::new(AppStateInit {
         app_name: "Axial".to_string(),
@@ -8070,9 +8078,11 @@ fn build_test_state(root: &Path) -> AppState {
 
 async fn load_persistent_test_state(root: &Path) -> AppState {
     let paths = test_app_paths(root);
-    let config_startup = ConfigStore::load_for_startup(paths.clone())
+    let root_session = crate::state::test_root_session(&paths);
+    let config_startup = ConfigStore::load_for_startup(paths.clone(), Arc::clone(&root_session))
         .expect("load persistent test config for startup");
-    let instance_startup = InstanceStore::load_for_startup(paths.clone());
+    let instance_startup = InstanceStore::load_for_startup(paths.clone(), root_session)
+        .expect("load persistent test instances for startup");
     let mut startup_warnings = config_startup.warnings;
     startup_warnings.extend(instance_startup.warnings);
 

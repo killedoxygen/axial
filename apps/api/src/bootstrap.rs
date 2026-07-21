@@ -1,4 +1,4 @@
-use axial_config::AppPaths;
+use axial_config::{AppPaths, AppRootSession};
 use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::path::PathBuf;
@@ -97,6 +97,10 @@ pub fn resolve_app_paths(selection: AppRootSelection) -> Result<AppPaths, AppRoo
         AppRootSelection::Explicit { root, .. } => AppPaths::from_root(root)
             .map_err(|_| AppRootError::ExplicitRootInvalid),
     }
+}
+
+pub fn open_app_root_session(paths: &AppPaths) -> Result<AppRootSession, std::io::Error> {
+    paths.open_root_session()
 }
 
 fn parse_app_root_selection(

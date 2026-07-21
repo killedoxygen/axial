@@ -1,11 +1,11 @@
 use crate::paths::AppPaths;
+use crate::AppRootSession;
+use axial_fs::{Directory, LeafName};
 use axial_minecraft::{LoaderComponentId, VersionEntry};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
-use std::fs;
-use std::io::Read;
 use std::ops::Deref;
-use std::path::Path;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use thiserror::Error;
 
@@ -422,6 +422,7 @@ impl InstanceRegistrySnapshot {
 
 pub struct InstanceStore {
     paths: AppPaths,
+    root_session: Arc<AppRootSession>,
     snapshot: InstanceRegistrySnapshot,
     mutation_allowed: bool,
 }
@@ -443,11 +444,23 @@ pub enum InstanceStoreError {
     TooLarge { max_bytes: u64 },
     #[error("failed to persist instance registry: {0}")]
     Persistence(std::io::Error),
+    #[error("failed to open application root: {0}")]
+    Root(std::io::Error),
 }
 
 impl InstanceStore {
-    pub fn load_for_startup(paths: AppPaths) -> InstanceStoreStartup {
-        let (snapshot, warnings, mutation_allowed) = match read_registry(paths.instances_file()) {
+    pub fn load_for_startup(
+        paths: AppPaths,
+        root_session: Arc<AppRootSession>,
+    ) -> Result<InstanceStoreStartup, InstanceStoreError> {
+        root_session
+            .validate_paths(&paths)
+            .map_err(InstanceStoreError::Root)?;
+        let root = root_session
+            .root_directory()
+            .map_err(InstanceStoreError::Root)?;
+        let loaded = read_registry(&root);
+        let (snapshot, warnings, mutation_allowed) = match loaded {
             Ok(data) => match load_snapshot(&data) {
                 Ok(snapshot) => (snapshot, Vec::new(), true),
                 Err(_) => rejected_startup_snapshot(),
@@ -458,23 +471,29 @@ impl InstanceStore {
             Err(_) => rejected_startup_snapshot(),
         };
 
-        InstanceStoreStartup {
+        Ok(InstanceStoreStartup {
             store: Self {
                 paths,
+                root_session,
                 snapshot,
                 mutation_allowed,
             },
             warnings,
-        }
+        })
     }
 
     pub fn from_snapshot(
         paths: AppPaths,
+        root_session: Arc<AppRootSession>,
         snapshot: InstanceRegistrySnapshot,
     ) -> Result<Self, InstanceStoreError> {
+        root_session
+            .validate_paths(&paths)
+            .map_err(InstanceStoreError::Root)?;
         snapshot.validate()?;
         Ok(Self {
             paths,
+            root_session,
             snapshot,
             mutation_allowed: true,
         })
@@ -490,6 +509,10 @@ impl InstanceStore {
 
     pub fn mutation_allowed(&self) -> bool {
         self.mutation_allowed
+    }
+
+    pub fn root_session(&self) -> &Arc<AppRootSession> {
+        &self.root_session
     }
 }
 
@@ -545,24 +568,11 @@ fn load_snapshot(data: &[u8]) -> Result<InstanceRegistrySnapshot, InstanceStoreE
     Ok(snapshot)
 }
 
-fn read_registry(path: &Path) -> Result<Vec<u8>, std::io::Error> {
-    let metadata = fs::symlink_metadata(path)?;
-    if !metadata.file_type().is_file() || metadata.len() > INSTANCE_REGISTRY_MAX_BYTES {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "instance registry is not a bounded regular file",
-        ));
-    }
-    let mut data = Vec::with_capacity(metadata.len() as usize);
-    let mut bounded = fs::File::open(path)?.take(INSTANCE_REGISTRY_MAX_BYTES + 1);
-    bounded.read_to_end(&mut data)?;
-    if data.len() as u64 > INSTANCE_REGISTRY_MAX_BYTES {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "instance registry exceeds the maximum size",
-        ));
-    }
-    Ok(data)
+fn read_registry(root: &Directory) -> Result<Vec<u8>, std::io::Error> {
+    root.open_file(
+        &LeafName::new("instances.json").expect("fixed instance registry leaf is valid"),
+    )?
+    .read_bounded(INSTANCE_REGISTRY_MAX_BYTES)
 }
 
 fn validate_instance(instance: &Instance) -> Result<(), InstanceStoreError> {
@@ -662,19 +672,61 @@ fn is_bounded_token(value: &str, max_chars: usize, allow_empty: bool) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::Path;
+    use std::fs;
+    use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    fn test_paths(name: &str) -> AppPaths {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock after unix epoch")
-            .as_nanos();
-        let root = std::env::temp_dir().join(format!(
-            "axial-instance-registry-{name}-{}-{nonce}",
-            std::process::id()
-        ));
-        AppPaths::from_root(root).expect("absolute test app root")
+    struct TestRoot {
+        root: PathBuf,
+        paths: AppPaths,
+        root_session: Option<Arc<AppRootSession>>,
+    }
+
+    impl TestRoot {
+        fn new(name: &str) -> Self {
+            let nonce = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock after unix epoch")
+                .as_nanos();
+            let root = std::env::temp_dir().join(format!(
+                "axial-instance-registry-{name}-{}-{nonce}",
+                std::process::id()
+            ));
+            let paths = AppPaths::from_root(root.clone()).expect("absolute test app root");
+            let root_session = Arc::new(paths.open_root_session().expect("test root session"));
+            Self {
+                root,
+                paths,
+                root_session: Some(root_session),
+            }
+        }
+
+        fn paths(&self) -> AppPaths {
+            self.paths.clone()
+        }
+
+        fn root_session(&self) -> Arc<AppRootSession> {
+            Arc::clone(
+                self.root_session
+                    .as_ref()
+                    .expect("test root session is retained"),
+            )
+        }
+    }
+
+    impl Drop for TestRoot {
+        fn drop(&mut self) {
+            drop(self.root_session.take());
+            if let Err(error) = fs::remove_dir_all(&self.root)
+                && error.kind() != std::io::ErrorKind::NotFound
+            {
+                if std::thread::panicking() {
+                    eprintln!("failed to clean instance-store test root during panic: {error}");
+                } else {
+                    panic!("failed to clean instance-store test root: {error}");
+                }
+            }
+        }
     }
 
     fn instance(id: &str, name: &str) -> Instance {
@@ -713,10 +765,13 @@ mod tests {
     }
 
     fn assert_rejected_without_rewrite(name: &str, data: &[u8]) {
-        let paths = test_paths(name);
+        let root = TestRoot::new(name);
+        let paths = root.paths();
+        let root_session = root.root_session();
         write_registry(&paths, data);
 
-        let startup = InstanceStore::load_for_startup(paths.clone());
+        let startup = InstanceStore::load_for_startup(paths.clone(), root_session)
+            .expect("load startup registry");
 
         assert_eq!(startup.store.current(), InstanceRegistrySnapshot::default());
         assert!(!startup.store.mutation_allowed());
@@ -725,16 +780,28 @@ mod tests {
             fs::read(paths.instances_file()).expect("read registry"),
             data
         );
-        cleanup(
-            paths
-                .instances_file()
-                .parent()
-                .expect("instance registry has a parent"),
-        );
     }
 
-    fn cleanup(path: &Path) {
-        let _ = fs::remove_dir_all(path);
+    #[test]
+    fn constructors_reject_reconstructed_paths_without_the_acquisition_lineage() {
+        let root = TestRoot::new("root-lineage-mismatch");
+        let paths = AppPaths::from_root(root.root.clone()).expect("reconstruct identical paths");
+        let root_session = root.root_session();
+
+        assert!(matches!(
+            InstanceStore::load_for_startup(paths.clone(), Arc::clone(&root_session)),
+            Err(InstanceStoreError::Root(error))
+                if error.kind() == std::io::ErrorKind::InvalidInput
+        ));
+        assert!(matches!(
+            InstanceStore::from_snapshot(
+                paths.clone(),
+                root_session,
+                InstanceRegistrySnapshot::default(),
+            ),
+            Err(InstanceStoreError::Root(error))
+                if error.kind() == std::io::ErrorKind::InvalidInput
+        ));
     }
 
     #[test]
@@ -771,9 +838,12 @@ mod tests {
 
     #[test]
     fn missing_registry_is_admitted_as_empty() {
-        let paths = test_paths("missing");
+        let root = TestRoot::new("missing");
+        let paths = root.paths();
+        let root_session = root.root_session();
 
-        let startup = InstanceStore::load_for_startup(paths.clone());
+        let startup = InstanceStore::load_for_startup(paths.clone(), root_session)
+            .expect("load missing startup registry");
 
         assert_eq!(startup.store.current(), InstanceRegistrySnapshot::default());
         assert!(startup.store.mutation_allowed());
@@ -816,21 +886,18 @@ mod tests {
 
     #[test]
     fn nonregular_registry_is_rejected_without_replacement() {
-        let paths = test_paths("nonregular");
+        let root = TestRoot::new("nonregular");
+        let paths = root.paths();
+        let root_session = root.root_session();
         fs::create_dir_all(paths.instances_file()).expect("create registry directory");
 
-        let startup = InstanceStore::load_for_startup(paths.clone());
+        let startup = InstanceStore::load_for_startup(paths.clone(), root_session)
+            .expect("load nonregular startup registry");
 
         assert_eq!(startup.store.current(), InstanceRegistrySnapshot::default());
         assert!(!startup.store.mutation_allowed());
         assert_eq!(startup.warnings.len(), 1);
         assert!(paths.instances_file().is_dir());
-        cleanup(
-            paths
-                .instances_file()
-                .parent()
-                .expect("instance registry has a parent"),
-        );
     }
 
     #[test]
@@ -929,7 +996,9 @@ mod tests {
 
     #[test]
     fn from_snapshot_exposes_immutable_fixture_state_and_paths() {
-        let paths = test_paths("fixture");
+        let root = TestRoot::new("fixture");
+        let paths = root.paths();
+        let root_session = root.root_session();
         let snapshot = InstanceRegistrySnapshot::new(
             vec![instance("0000000000000001", "Fixture")],
             "0000000000000001".to_string(),
@@ -937,8 +1006,8 @@ mod tests {
         )
         .expect("valid snapshot");
 
-        let store =
-            InstanceStore::from_snapshot(paths.clone(), snapshot.clone()).expect("fixture store");
+        let store = InstanceStore::from_snapshot(paths.clone(), root_session, snapshot.clone())
+            .expect("fixture store");
 
         assert_eq!(store.current(), snapshot);
         assert_eq!(store.paths().instances_file(), paths.instances_file());

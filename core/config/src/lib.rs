@@ -2,6 +2,7 @@ pub mod flags;
 pub mod instances;
 pub mod models;
 pub mod paths;
+mod root;
 pub mod store;
 
 pub use flags::{FEATURE_FLAGS, FeatureFlagDef, FlagStage, find_flag};
@@ -17,4 +18,7 @@ pub use models::{
     USERNAME_MAX_LEN, USERNAME_MIN_LEN, validate_launch_auth_mode, validate_username,
 };
 pub use paths::{AppPaths, AppPathsError, TerminalResetScope};
+pub use root::{
+    AppRootSession, AppRootSessionReinsertError, AppRootSessionReinsertErrorKind,
+};
 pub use store::{CONFIG_MAX_BYTES, ConfigStartupLoad, ConfigStore, ConfigStoreError};

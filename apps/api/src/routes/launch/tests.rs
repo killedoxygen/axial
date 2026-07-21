@@ -4065,8 +4065,16 @@ impl RouteTestFixture {
     }
 
     fn from_root_paths(root: PathBuf, paths: AppPaths) -> Self {
-        let config = Arc::new(ConfigStore::load_from(paths.clone()).expect("load config"));
-        let instances = Arc::new(InstanceStore::load_for_startup(paths.clone()).store);
+        let root_session = crate::state::test_root_session(&paths);
+        let config = Arc::new(
+            ConfigStore::load_from(paths.clone(), Arc::clone(&root_session))
+                .expect("load config"),
+        );
+        let instances = Arc::new(
+            InstanceStore::load_for_startup(paths.clone(), root_session)
+                .expect("load instances")
+                .store,
+        );
         let state = AppState::new(AppStateInit {
             app_name: "Axial".to_string(),
             version: "test".to_string(),

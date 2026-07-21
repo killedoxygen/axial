@@ -5,7 +5,9 @@ mod smoke;
 mod state;
 
 use axial_api::app::{spawn_background, start_application_background_workflows};
-use axial_api::bootstrap::{desktop_app_root_selection_from_environment, resolve_app_paths};
+use axial_api::bootstrap::{
+    desktop_app_root_selection_from_environment, open_app_root_session, resolve_app_paths,
+};
 use axial_api::observability::telemetry::{
     TelemetryErrorArea, TelemetryErrorKind, TelemetryErrorLevel, TelemetryEvent, TelemetryHub,
 };
@@ -39,19 +41,27 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let paths = resolve_app_paths(desktop_app_root_selection_from_environment(
         context.config().identifier.as_str(),
     )?)?;
+    let root_session = open_app_root_session(&paths)?;
+    let root_session = Arc::new(root_session);
     let config_paths = paths.clone();
-    let config_startup =
-        tokio::task::spawn_blocking(move || ConfigStore::load_for_startup(config_paths)).await??;
+    let config_root_session = Arc::clone(&root_session);
+    let config_startup = tokio::task::spawn_blocking(move || {
+        ConfigStore::load_for_startup(config_paths, config_root_session)
+    })
+    .await??;
     let instance_paths = paths.clone();
-    let instance_startup =
-        tokio::task::spawn_blocking(move || InstanceStore::load_for_startup(instance_paths))
-            .await?;
+    let instance_root_session = Arc::clone(&root_session);
+    let instance_startup = tokio::task::spawn_blocking(move || {
+        InstanceStore::load_for_startup(instance_paths, instance_root_session)
+    })
+    .await??;
     let mut startup_warnings = config_startup.warnings;
     startup_warnings.extend(instance_startup.warnings);
     let config = Arc::new(config_startup.store);
     let instances = Arc::new(instance_startup.store);
     let installs = Arc::new(InstallStore::new());
     let sessions = Arc::new(SessionStore::new());
+    drop(root_session.prepare_performance_directory()?);
     let performance_dir = paths.performance_dir().to_path_buf();
     let performance = Arc::new(
         tokio::task::spawn_blocking(move || {

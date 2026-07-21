@@ -618,9 +618,11 @@ fn build_test_state(
     remote_rules_public_key: Option<String>,
 ) -> AppState {
     let paths = test_paths(root);
+    let root_session = crate::state::test_root_session(&paths);
     let config = Arc::new(
         ConfigStore::from_config(
             paths.clone(),
+            Arc::clone(&root_session),
             AppConfig {
                 library_dir: paths.library_dir().to_string_lossy().to_string(),
                 ..AppConfig::default()
@@ -628,7 +630,11 @@ fn build_test_state(
         )
         .expect("configure library dir"),
     );
-    let instances = Arc::new(InstanceStore::load_for_startup(paths.clone()).store);
+    let instances = Arc::new(
+        InstanceStore::load_for_startup(paths.clone(), root_session)
+            .expect("load instances")
+            .store,
+    );
     AppState::new(AppStateInit {
         app_name: "Axial".to_string(),
         version: "test".to_string(),

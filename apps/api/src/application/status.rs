@@ -49,15 +49,28 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
 
+    fn default_stores(paths: &AppPaths) -> (Arc<ConfigStore>, Arc<InstanceStore>) {
+        let root_session = crate::state::test_root_session(paths);
+        let config = Arc::new(
+            ConfigStore::load_from(paths.clone(), Arc::clone(&root_session))
+                .expect("load config"),
+        );
+        let instances = Arc::new(
+            InstanceStore::from_snapshot(
+                paths.clone(),
+                root_session,
+                InstanceRegistrySnapshot::default(),
+            )
+            .expect("load instances"),
+        );
+        (config, instances)
+    }
+
     #[tokio::test]
     async fn status_includes_startup_warnings_and_remains_ok() {
         let root = test_root("status-startup-warnings");
         let paths = test_paths(&root);
-        let config = Arc::new(ConfigStore::load_from(paths.clone()).expect("load config"));
-        let instances = Arc::new(
-            InstanceStore::from_snapshot(paths.clone(), InstanceRegistrySnapshot::default())
-                .expect("load instances"),
-        );
+        let (config, instances) = default_stores(&paths);
         let state = AppState::new(AppStateInit {
             app_name: "Axial".to_string(),
             version: "test".to_string(),
@@ -126,11 +139,7 @@ mod tests {
             .expect("create suite directory");
         fs::write(suite_path, b"{").expect("write malformed suite");
 
-        let config = Arc::new(ConfigStore::load_from(paths.clone()).expect("load config"));
-        let instances = Arc::new(
-            InstanceStore::from_snapshot(paths.clone(), InstanceRegistrySnapshot::default())
-                .expect("load instances"),
-        );
+        let (config, instances) = default_stores(&paths);
         let state = AppState::new(AppStateInit {
             app_name: "Axial".to_string(),
             version: "test".to_string(),
@@ -187,11 +196,7 @@ mod tests {
             .expect("create suite directory");
         fs::write(&suite_path, b"{not-json").expect("write malformed suite");
 
-        let config = Arc::new(ConfigStore::load_from(paths.clone()).expect("load config"));
-        let instances = Arc::new(
-            InstanceStore::from_snapshot(paths.clone(), InstanceRegistrySnapshot::default())
-                .expect("load instances"),
-        );
+        let (config, instances) = default_stores(&paths);
         let state = AppState::new(AppStateInit {
             app_name: "Axial".to_string(),
             version: "test".to_string(),
@@ -229,11 +234,7 @@ mod tests {
             .expect("create report directory");
         fs::write(&report_path, b"{not-json").expect("write malformed report");
 
-        let config = Arc::new(ConfigStore::load_from(paths.clone()).expect("load config"));
-        let instances = Arc::new(
-            InstanceStore::from_snapshot(paths.clone(), InstanceRegistrySnapshot::default())
-                .expect("load instances"),
-        );
+        let (config, instances) = default_stores(&paths);
         let state = AppState::new(AppStateInit {
             app_name: "Axial".to_string(),
             version: "test".to_string(),
@@ -275,9 +276,12 @@ mod tests {
         .expect("create app root");
         fs::write(paths.instances_file(), "{not valid json").expect("write malformed registry");
 
+        let root_session = crate::state::test_root_session(&paths);
         let config_startup =
-            ConfigStore::load_for_startup(paths.clone()).expect("load config for startup");
-        let instance_startup = InstanceStore::load_for_startup(paths.clone());
+            ConfigStore::load_for_startup(paths.clone(), Arc::clone(&root_session))
+                .expect("load config for startup");
+        let instance_startup = InstanceStore::load_for_startup(paths.clone(), root_session)
+            .expect("load instances for startup");
         let mut startup_warnings = config_startup.warnings;
         startup_warnings.extend(instance_startup.warnings);
         let state = AppState::new(AppStateInit {

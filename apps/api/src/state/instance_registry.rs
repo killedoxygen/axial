@@ -1781,9 +1781,13 @@ mod tests {
     #[tokio::test]
     async fn claim_owns_launcher_managed_registry_target_and_destination() {
         let paths = test_paths("ownership");
-        let source =
-            InstanceStore::from_snapshot(paths.clone(), InstanceRegistrySnapshot::default())
-                .expect("instance source");
+        let root_session = crate::state::test_root_session(&paths);
+        let source = InstanceStore::from_snapshot(
+            paths.clone(),
+            root_session,
+            InstanceRegistrySnapshot::default(),
+        )
+        .expect("instance source");
         let backend = RecordingBackend::new(0);
         let coordinator =
             PersistenceCoordinator::for_test(backend.clone(), Duration::ZERO, Duration::ZERO);
@@ -1823,7 +1827,9 @@ mod tests {
         failures: usize,
     ) -> (Arc<AppInstanceStore>, Arc<RecordingBackend>) {
         let paths = test_paths(name);
-        let source = InstanceStore::from_snapshot(paths, snapshot).expect("instance source");
+        let root_session = crate::state::test_root_session(&paths);
+        let source = InstanceStore::from_snapshot(paths, root_session, snapshot)
+            .expect("instance source");
         let backend = RecordingBackend::new(failures);
         let coordinator =
             PersistenceCoordinator::for_test(backend.clone(), Duration::ZERO, Duration::ZERO);

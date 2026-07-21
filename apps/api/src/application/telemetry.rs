@@ -151,8 +151,10 @@ mod tests {
         fn new(name: &str) -> Self {
             let root = test_root(name);
             let paths = test_paths(&root);
+            let root_session = crate::state::test_root_session(&paths);
             let config = ConfigStore::from_config(
                 paths.clone(),
+                Arc::clone(&root_session),
                 AppConfig {
                     telemetry_enabled: true,
                     telemetry_install_id: TEST_INSTALL_ID.to_string(),
@@ -173,6 +175,7 @@ mod tests {
                     instances: Arc::new(
                         InstanceStore::from_snapshot(
                             paths.clone(),
+                            root_session,
                             InstanceRegistrySnapshot::default(),
                         )
                         .expect("load instances"),

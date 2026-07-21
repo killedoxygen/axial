@@ -5388,10 +5388,18 @@ mod tests {
 
     fn test_app_state(root: &Path) -> AppState {
         let paths = test_paths(root);
-        let config = Arc::new(ConfigStore::load_from(paths.clone()).expect("load config"));
+        let root_session = crate::state::test_root_session(&paths);
+        let config = Arc::new(
+            ConfigStore::load_from(paths.clone(), Arc::clone(&root_session))
+                .expect("load config"),
+        );
         let instances = Arc::new(
-            InstanceStore::from_snapshot(paths.clone(), InstanceRegistrySnapshot::default())
-                .expect("load instances"),
+            InstanceStore::from_snapshot(
+                paths.clone(),
+                root_session,
+                InstanceRegistrySnapshot::default(),
+            )
+            .expect("load instances"),
         );
         AppState::new(AppStateInit {
             app_name: "Axial".to_string(),
@@ -5457,9 +5465,11 @@ mod tests {
         fs::create_dir_all(paths.instances_dir().join(instance_id))
             .expect("registered recovery instance directory");
         fs::create_dir_all(&library_dir).expect("registered recovery managed root");
+        let root_session = crate::state::test_root_session(&paths);
         let config = Arc::new(
             ConfigStore::from_config(
                 paths.clone(),
+                Arc::clone(&root_session),
                 AppConfig {
                     library_dir: library_dir.to_string_lossy().into_owned(),
                     ..AppConfig::default()
@@ -5473,6 +5483,7 @@ mod tests {
         let instances = Arc::new(
             InstanceStore::from_snapshot(
                 paths.clone(),
+                root_session,
                 InstanceRegistrySnapshot::new(vec![instance], instance_id.to_string(), Vec::new())
                     .expect("registered recovery registry snapshot"),
             )
@@ -5531,9 +5542,11 @@ mod tests {
             .expect("VersionBundle log directory");
         fs::write(&log_path, LOG_BYTES).expect("VersionBundle log config");
 
+        let root_session = crate::state::test_root_session(&paths);
         let config = Arc::new(
             ConfigStore::from_config(
                 paths.clone(),
+                Arc::clone(&root_session),
                 AppConfig {
                     library_dir: library_dir.to_string_lossy().into_owned(),
                     ..AppConfig::default()
@@ -5544,6 +5557,7 @@ mod tests {
         let instances = Arc::new(
             InstanceStore::from_snapshot(
                 paths.clone(),
+                root_session,
                 InstanceRegistrySnapshot::new(vec![instance], instance_id.to_string(), Vec::new())
                     .expect("VersionBundle recovery registry snapshot"),
             )
@@ -5661,9 +5675,11 @@ mod tests {
         let paths = test_paths(root);
         fs::create_dir_all(paths.instances_dir().join(&instance.id))
             .expect("registered launch instance directory");
+        let root_session = crate::state::test_root_session(&paths);
         let config = Arc::new(
             ConfigStore::from_config(
                 paths.clone(),
+                Arc::clone(&root_session),
                 AppConfig {
                     library_dir: root.join("library").to_string_lossy().to_string(),
                     ..AppConfig::default()
@@ -5675,7 +5691,7 @@ mod tests {
             InstanceRegistrySnapshot::new(vec![instance.clone()], instance.id.clone(), Vec::new())
                 .expect("registered launch instance snapshot");
         let instances = Arc::new(
-            InstanceStore::from_snapshot(paths.clone(), snapshot)
+            InstanceStore::from_snapshot(paths.clone(), root_session, snapshot)
                 .expect("load registered launch instance"),
         );
         let state = AppState::new(AppStateInit {
@@ -5809,8 +5825,10 @@ mod tests {
 
     fn test_app_state_with_telemetry(root: &Path) -> AppState {
         let paths = test_paths(root);
+        let root_session = crate::state::test_root_session(&paths);
         let config_store = ConfigStore::from_config(
             paths.clone(),
+            Arc::clone(&root_session),
             AppConfig {
                 telemetry_enabled: true,
                 telemetry_install_id: TEST_TELEMETRY_INSTALL_ID.to_string(),
@@ -5820,8 +5838,12 @@ mod tests {
         .expect("seed telemetry config");
         let config = Arc::new(config_store);
         let instances = Arc::new(
-            InstanceStore::from_snapshot(paths.clone(), InstanceRegistrySnapshot::default())
-                .expect("load instances"),
+            InstanceStore::from_snapshot(
+                paths.clone(),
+                root_session,
+                InstanceRegistrySnapshot::default(),
+            )
+            .expect("load instances"),
         );
         let telemetry = Arc::new(TelemetryHub::new(
             config.clone(),
@@ -5850,8 +5872,10 @@ mod tests {
     #[cfg(unix)]
     fn test_app_state_with_library(root: &Path) -> AppState {
         let paths = test_paths(root);
+        let root_session = crate::state::test_root_session(&paths);
         let config_store = ConfigStore::from_config(
             paths.clone(),
+            Arc::clone(&root_session),
             AppConfig {
                 library_dir: paths.library_dir().to_string_lossy().to_string(),
                 ..AppConfig::default()
@@ -5860,8 +5884,12 @@ mod tests {
         .expect("set test library");
         let config = Arc::new(config_store);
         let instances = Arc::new(
-            InstanceStore::from_snapshot(paths.clone(), InstanceRegistrySnapshot::default())
-                .expect("load instances"),
+            InstanceStore::from_snapshot(
+                paths.clone(),
+                root_session,
+                InstanceRegistrySnapshot::default(),
+            )
+            .expect("load instances"),
         );
         AppState::new(AppStateInit {
             app_name: "Axial".to_string(),

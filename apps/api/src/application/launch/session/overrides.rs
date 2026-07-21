@@ -500,10 +500,18 @@ mod tests {
     fn test_state(name: &str) -> (AppState, PathBuf) {
         let root = test_root(name);
         let paths = test_paths(&root);
-        let config = Arc::new(ConfigStore::load_from(paths.clone()).expect("load config"));
+        let root_session = crate::state::test_root_session(&paths);
+        let config = Arc::new(
+            ConfigStore::load_from(paths.clone(), Arc::clone(&root_session))
+                .expect("load config"),
+        );
         let instances = Arc::new(
-            InstanceStore::from_snapshot(paths.clone(), InstanceRegistrySnapshot::default())
-                .expect("load instances"),
+            InstanceStore::from_snapshot(
+                paths.clone(),
+                root_session,
+                InstanceRegistrySnapshot::default(),
+            )
+            .expect("load instances"),
         );
         let state = AppState::new(AppStateInit {
             app_name: "Axial".to_string(),

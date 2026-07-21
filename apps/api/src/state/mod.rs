@@ -38,9 +38,9 @@ pub mod updater;
 mod user_mod_witness;
 
 use axial_config::{
-    AppConfig, ConfigStore as StartupConfigStore, ConfigStoreError, INSTANCE_REGISTRY_MAX_ENTRIES,
-    InstanceStore as StartupInstanceStore, InstanceStoreError, generate_instance_id,
-    is_canonical_instance_id,
+    AppConfig, AppRootSession, ConfigStore as StartupConfigStore, ConfigStoreError,
+    INSTANCE_REGISTRY_MAX_ENTRIES, InstanceStore as StartupInstanceStore, InstanceStoreError,
+    generate_instance_id, is_canonical_instance_id,
 };
 use axial_content::ContentService;
 pub use axial_launcher::{
@@ -61,6 +61,11 @@ use config::ConfigCommitAdmissionContext;
 
 const STARTUP_WARNING_LIMIT: usize = 8;
 const STARTUP_WARNING_MAX_CHARS: usize = 240;
+
+#[cfg(test)]
+pub(crate) fn test_root_session(paths: &axial_config::AppPaths) -> Arc<AppRootSession> {
+    Arc::new(paths.open_root_session().expect("test root session"))
+}
 
 pub use accounts::{
     LauncherAccountKind, LauncherAccountRecord, LauncherAccountStore, microsoft_account_id,
@@ -181,6 +186,7 @@ pub use updater::{UpdateFlowPhase, UpdateFlowSnapshot, UpdaterStore};
 pub struct AppState {
     app_name: String,
     version: String,
+    root_session: Arc<AppRootSession>,
     config: Arc<AppConfigStore>,
     managed_runtime_cache: ManagedRuntimeCache,
     instances: Arc<AppInstanceStore>,
@@ -396,17 +402,42 @@ impl KnownGoodCandidateAdmission {
     }
 }
 
+fn validate_app_state_init_authority(
+    init: &AppStateInit,
+) -> std::io::Result<Arc<AppRootSession>> {
+    let root_session = Arc::clone(init.config.root_session());
+    if !Arc::ptr_eq(&root_session, init.instances.root_session()) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "application stores must share one root capability",
+        ));
+    }
+    if init.config.paths() != init.instances.paths() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "application stores must share one app data root",
+        ));
+    }
+    Ok(root_session)
+}
+
 impl AppState {
     #[cfg(test)]
     pub fn new(init: AppStateInit) -> Self {
+        Self::try_new_for_test(init)
+            .unwrap_or_else(|error| panic!("failed to initialize application persistence: {error}"))
+    }
+
+    #[cfg(test)]
+    fn try_new_for_test(init: AppStateInit) -> std::io::Result<Self> {
+        let root_session = validate_app_state_init_authority(&init)?;
         let config =
             Arc::new(AppConfigStore::claim(&init.config).unwrap_or_else(|error| {
                 panic!("failed to initialize config persistence: {error}")
             }));
         let managed_runtime_cache = ManagedRuntimeCache::from_root(
             config.paths().runtimes_dir().to_path_buf(),
-        )
-        .expect("test app paths must provide an absolute managed runtime root");
+        )?;
         let telemetry = Arc::new(TelemetryHub::from_env(config.clone()));
         assert!(
             !config.current().telemetry_enabled
@@ -416,16 +447,17 @@ impl AppState {
         );
         Self::new_with_telemetry_inner(
             init,
+            root_session,
             config,
             telemetry,
             Arc::new(AuthLoginStore::new()),
             managed_runtime_cache,
             RejectionStreakStartupMode::Discard,
         )
-        .unwrap_or_else(|error| panic!("failed to initialize application persistence: {error}"))
     }
 
     pub async fn load(mut init: AppStateInit) -> std::io::Result<Self> {
+        let root_session = validate_app_state_init_authority(&init)?;
         let config =
             Arc::new(AppConfigStore::claim(&init.config).unwrap_or_else(|error| {
                 panic!("failed to initialize config persistence: {error}")
@@ -451,6 +483,7 @@ impl AppState {
         let state = tokio::task::spawn_blocking(move || {
             Self::new_with_telemetry_inner(
                 init,
+                root_session,
                 config,
                 telemetry,
                 Arc::new(auth_logins),
@@ -474,6 +507,9 @@ impl AppState {
 
     #[cfg(test)]
     pub(crate) fn new_with_telemetry(init: AppStateInit, telemetry: Arc<TelemetryHub>) -> Self {
+        let root_session = validate_app_state_init_authority(&init).unwrap_or_else(|error| {
+            panic!("failed to initialize application root authority: {error}")
+        });
         let config =
             Arc::new(AppConfigStore::claim(&init.config).unwrap_or_else(|error| {
                 panic!("failed to initialize config persistence: {error}")
@@ -485,6 +521,7 @@ impl AppState {
         telemetry.replace_config_source(config.clone());
         Self::new_with_telemetry_inner(
             init,
+            root_session,
             config,
             telemetry,
             Arc::new(AuthLoginStore::new()),
@@ -552,18 +589,13 @@ impl AppState {
 
     fn new_with_telemetry_inner(
         init: AppStateInit,
+        root_session: Arc<AppRootSession>,
         config: Arc<AppConfigStore>,
         telemetry: Arc<TelemetryHub>,
         auth_logins: Arc<AuthLoginStore>,
         managed_runtime_cache: ManagedRuntimeCache,
         rejection_streak_startup_mode: RejectionStreakStartupMode,
     ) -> std::io::Result<Self> {
-        if config.paths() != init.instances.paths() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "application stores must share one app data root",
-            ));
-        }
         let instance_registry_authoritative = init.instances.mutation_allowed();
         let instances = Arc::new(AppInstanceStore::claim(&init.instances).unwrap_or_else(
             |error| panic!("failed to initialize instance registry persistence: {error}"),
@@ -670,6 +702,7 @@ impl AppState {
         Ok(Self {
             app_name: init.app_name,
             version: init.version,
+            root_session,
             config,
             managed_runtime_cache,
             instances,
@@ -715,6 +748,10 @@ impl AppState {
 
     pub fn version(&self) -> &str {
         &self.version
+    }
+
+    pub fn root_session(&self) -> &Arc<AppRootSession> {
+        &self.root_session
     }
 
     pub fn config(&self) -> &Arc<AppConfigStore> {
@@ -2220,6 +2257,100 @@ fn setup_instance_paths_match(game_dir: &Path, expected: &[SetupInstancePathSnap
 }
 
 #[cfg(test)]
+mod root_session_ownership_tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    struct TestRoot(PathBuf);
+
+    impl TestRoot {
+        fn new(name: &str) -> Self {
+            let nonce = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock after unix epoch")
+                .as_nanos();
+            Self(std::env::temp_dir().join(format!(
+                "axial-state-root-ownership-{name}-{}-{nonce}",
+                std::process::id()
+            )))
+        }
+
+        fn paths(&self) -> axial_config::AppPaths {
+            axial_config::AppPaths::from_root(self.0.clone()).expect("absolute test app root")
+        }
+    }
+
+    impl Drop for TestRoot {
+        fn drop(&mut self) {
+            if let Err(error) = std::fs::remove_dir_all(&self.0)
+                && error.kind() != std::io::ErrorKind::NotFound
+            {
+                if std::thread::panicking() {
+                    eprintln!("failed to clean AppState ownership test root during panic: {error}");
+                } else {
+                    panic!("failed to clean AppState ownership test root: {error}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn rejects_stores_owned_by_distinct_root_session_wrappers() {
+        let config_root = TestRoot::new("config");
+        let config_paths = config_root.paths();
+        let instance_root = TestRoot::new("instances");
+        let instance_paths = instance_root.paths();
+        let config_root_session = test_root_session(&config_paths);
+        let instance_root_session = test_root_session(&instance_paths);
+        let config = Arc::new(
+            axial_config::ConfigStore::load_from(config_paths.clone(), config_root_session)
+                .expect("load config"),
+        );
+        let instances = Arc::new(
+            axial_config::InstanceStore::from_snapshot(
+                instance_paths,
+                instance_root_session,
+                axial_config::InstanceRegistrySnapshot::default(),
+            )
+            .expect("load instances"),
+        );
+        let performance = Arc::new(
+            axial_performance::PerformanceManager::load_for_startup(
+                config_paths.performance_dir(),
+            )
+            .expect("load performance state"),
+        );
+        let existing_config_owner =
+            AppConfigStore::claim(&config).expect("claim config persistence before rejection");
+        assert!(
+            !config_paths.config_file().exists(),
+            "claiming config persistence must not write the config snapshot"
+        );
+
+        let error = match AppState::try_new_for_test(AppStateInit {
+            app_name: "Axial".to_string(),
+            version: "test".to_string(),
+            config: Arc::clone(&config),
+            instances,
+            installs: Arc::new(InstallStore::new()),
+            sessions: Arc::new(SessionStore::new()),
+            performance,
+            startup_warnings: Vec::new(),
+        }) {
+            Ok(_) => panic!("distinct root session wrappers must reject"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(
+            !config_paths.config_file().exists(),
+            "authority rejection must precede config persistence"
+        );
+        drop(existing_config_owner);
+    }
+}
+
+#[cfg(test)]
 mod known_good_identity_tests {
     use super::*;
     use std::sync::Mutex;
@@ -2228,12 +2359,18 @@ mod known_good_identity_tests {
     fn known_good_state_fixture(root: &Path) -> AppState {
         let paths = axial_config::AppPaths::from_root(root.to_path_buf())
             .expect("absolute test app root");
+        let root_session = test_root_session(&paths);
         let config = Arc::new(
-            axial_config::ConfigStore::load_from(paths.clone()).expect("load test config"),
+            axial_config::ConfigStore::load_from(
+                paths.clone(),
+                Arc::clone(&root_session),
+            )
+            .expect("load test config"),
         );
         let instances = Arc::new(
             axial_config::InstanceStore::from_snapshot(
                 paths.clone(),
+                root_session,
                 axial_config::InstanceRegistrySnapshot::default(),
             )
             .expect("load test instances"),

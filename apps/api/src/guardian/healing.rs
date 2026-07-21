@@ -1640,12 +1640,15 @@ mod tests {
         let failure_memory = Arc::new(failure_memory);
         let root = test_root("registered-state");
         let paths = test_paths(&root);
+        let root_session = crate::state::test_root_session(&paths);
         let config = Arc::new(
-            axial_config::ConfigStore::load_from(paths.clone()).expect("load test config"),
+            axial_config::ConfigStore::load_from(paths.clone(), Arc::clone(&root_session))
+                .expect("load test config"),
         );
         let instances = Arc::new(
             axial_config::InstanceStore::from_snapshot(
                 paths.clone(),
+                root_session,
                 InstanceRegistrySnapshot::new(
                     vec![new_instance(
                         TEST_INSTANCE_ID.to_string(),

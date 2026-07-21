@@ -1,9 +1,15 @@
 use std::fmt;
 use std::io;
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
 
-#[derive(Clone, Eq, PartialEq)]
+use crate::AppRootSession;
+
+pub(crate) struct AppPathsLineage;
+
+#[derive(Clone)]
 pub struct AppPaths {
+    lineage: Arc<AppPathsLineage>,
     root: PathBuf,
     config_file: PathBuf,
     instances_file: PathBuf,
@@ -32,6 +38,7 @@ impl AppPaths {
         validate_root(&root)?;
 
         Ok(Self {
+            lineage: Arc::new(AppPathsLineage),
             config_file: root.join("config.json"),
             instances_file: root.join("instances.json"),
             instances_dir: root.join("instances"),
@@ -133,6 +140,18 @@ impl AppPaths {
         &self.update_staging_dir
     }
 
+    pub(crate) fn root(&self) -> &Path {
+        &self.root
+    }
+
+    pub(crate) fn lineage(&self) -> &Arc<AppPathsLineage> {
+        &self.lineage
+    }
+
+    pub fn open_root_session(&self) -> std::io::Result<AppRootSession> {
+        AppRootSession::open(self)
+    }
+
     pub fn terminal_reset_scope(&self) -> TerminalResetScope {
         TerminalResetScope {
             target: self.root.clone(),
@@ -145,6 +164,14 @@ impl fmt::Debug for AppPaths {
         formatter.debug_struct("AppPaths").finish_non_exhaustive()
     }
 }
+
+impl PartialEq for AppPaths {
+    fn eq(&self, other: &Self) -> bool {
+        self.root == other.root
+    }
+}
+
+impl Eq for AppPaths {}
 
 #[derive(Clone, Eq, PartialEq)]
 pub struct TerminalResetScope {

@@ -498,9 +498,11 @@ mod tests {
     async fn p00_b08_contract_presence_disabled_snapshot_is_idle() {
         let root = test_root("disabled");
         let paths = test_paths(&root);
+        let root_session = crate::state::test_root_session(&paths);
         let config = Arc::new(
             ConfigStore::from_config(
                 paths.clone(),
+                Arc::clone(&root_session),
                 AppConfig {
                     discord_rpc_enabled: false,
                     ..AppConfig::default()
@@ -509,8 +511,12 @@ mod tests {
             .expect("create config"),
         );
         let instances = Arc::new(
-            InstanceStore::from_snapshot(paths.clone(), InstanceRegistrySnapshot::default())
-                .expect("create instances"),
+            InstanceStore::from_snapshot(
+                paths.clone(),
+                root_session,
+                InstanceRegistrySnapshot::default(),
+            )
+            .expect("create instances"),
         );
         let state = AppState::new(AppStateInit {
             app_name: "Axial".to_string(),
@@ -572,9 +578,11 @@ mod tests {
             b"client",
         )
         .expect("write installed version jar");
+        let root_session = crate::state::test_root_session(&paths);
         let config = Arc::new(
             ConfigStore::from_config(
                 paths.clone(),
+                Arc::clone(&root_session),
                 AppConfig {
                     library_dir: paths.library_dir().to_string_lossy().into_owned(),
                     discord_rpc_enabled: true,
@@ -584,8 +592,12 @@ mod tests {
             .expect("create config"),
         );
         let instances = Arc::new(
-            InstanceStore::from_snapshot(paths.clone(), InstanceRegistrySnapshot::default())
-                .expect("create instances"),
+            InstanceStore::from_snapshot(
+                paths.clone(),
+                root_session,
+                InstanceRegistrySnapshot::default(),
+            )
+            .expect("create instances"),
         );
         let state = AppState::new(AppStateInit {
             app_name: "Axial".to_string(),

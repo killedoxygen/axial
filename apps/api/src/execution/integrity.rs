@@ -4257,9 +4257,11 @@ mod tests {
         let library_dir = library_dir.unwrap_or_else(|| root.join("private-library-root"));
         fs::create_dir_all(&library_dir).expect("library root");
         let paths = test_paths(&root);
+        let root_session = crate::state::test_root_session(&paths);
         let config = Arc::new(
             ConfigStore::from_config(
                 paths.clone(),
+                Arc::clone(&root_session),
                 AppConfig {
                     library_dir: library_dir.to_string_lossy().into_owned(),
                     ..AppConfig::default()
@@ -4268,8 +4270,12 @@ mod tests {
             .expect("test config"),
         );
         let instances = Arc::new(
-            InstanceStore::from_snapshot(paths.clone(), InstanceRegistrySnapshot::default())
-                .expect("test instances"),
+            InstanceStore::from_snapshot(
+                paths.clone(),
+                root_session,
+                InstanceRegistrySnapshot::default(),
+            )
+            .expect("test instances"),
         );
         let state = AppState::new(AppStateInit {
             app_name: "Axial".to_string(),

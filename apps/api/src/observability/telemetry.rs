@@ -1002,7 +1002,9 @@ mod tests {
             ));
             fs::create_dir_all(&root).expect("create telemetry test root");
             let paths = test_paths(&root);
-            let store = ConfigStore::from_config(paths.clone(), config).expect("seed config");
+            let root_session = crate::state::test_root_session(&paths);
+            let store = ConfigStore::from_config(paths.clone(), root_session, config)
+                .expect("seed config");
 
             Self {
                 root,
@@ -1522,6 +1524,7 @@ mod tests {
         let instances = Arc::new(
             InstanceStore::from_snapshot(
                 fixture.paths.clone(),
+                Arc::clone(fixture.store.root_session()),
                 InstanceRegistrySnapshot::default(),
             )
             .expect("load instances"),

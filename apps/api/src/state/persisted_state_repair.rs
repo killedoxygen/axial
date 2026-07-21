@@ -670,11 +670,15 @@ mod tests {
                 .expect("config path has a parent"),
         )
         .expect("app root");
-        let config =
-            Arc::new(axial_config::ConfigStore::load_from(paths.clone()).expect("test config"));
+        let root_session = crate::state::test_root_session(&paths);
+        let config = Arc::new(
+            axial_config::ConfigStore::load_from(paths.clone(), Arc::clone(&root_session))
+                .expect("test config"),
+        );
         let instances = Arc::new(
             axial_config::InstanceStore::from_snapshot(
                 paths.clone(),
+                root_session,
                 InstanceRegistrySnapshot::default(),
             )
             .expect("test instances"),
