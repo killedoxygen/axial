@@ -1,7 +1,6 @@
 mod artifact_path;
 mod asset_index;
 pub mod download;
-pub mod integrity;
 pub mod known_good;
 mod known_good_libraries;
 mod known_good_reconstruction;
@@ -72,17 +71,12 @@ pub use loaders::{
     loader_components, parse_build_id, resolve_build_record_for_install,
     validate_materialized_loader_profile,
 };
-pub use manifest::{
-    ManifestEntry, VersionManifest, fetch_version_manifest, fetch_version_manifest_cached,
-};
+pub use manifest::{ManifestEntry, VersionManifest, fetch_version_manifest_cached};
 pub use paths::{
-    cache_dir, create_minecraft_dir, default_minecraft_dir, libraries_dir, loader_cache_dir,
-    loader_catalog_dir, validate_installation, version_manifest_cache_path, versions_dir,
+    cache_dir, create_minecraft_dir, libraries_dir, loader_cache_dir, loader_catalog_dir,
+    version_manifest_cache_path, versions_dir,
 };
-pub use rules::{
-    Environment, Rule, current_os_arch, current_os_name, default_environment, evaluate_rules,
-    is_native_library, native_classifier_key,
-};
+pub use rules::default_environment;
 pub use runtime::{
     JavaRuntimeInfo, JavaRuntimeLookupError, JavaRuntimeProbeReceipt, JavaRuntimeProbeResolution,
     JavaRuntimeProbeResolutionError, JavaRuntimeProbeSnapshot, JavaRuntimeResult,
@@ -110,7 +104,7 @@ pub use version::{
     scan_versions_snapshot,
 };
 pub use version_meta::{
-    MinecraftVersionMeta, ReleaseReference, analyze_minecraft_version, apply_version_analysis,
-    compare_version_entries, compare_version_like, enrich_loader_game_versions,
-    enrich_version_entries, manifest_release_entries, manifest_release_references,
+    MinecraftVersionMeta, ReleaseReference, analyze_minecraft_version, compare_version_entries,
+    compare_version_like, enrich_loader_game_versions, enrich_version_entries,
+    manifest_release_entries, manifest_release_references,
 };

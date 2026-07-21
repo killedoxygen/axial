@@ -360,7 +360,6 @@ const fn priority_profile(id: DiagnosisId) -> PriorityProfile {
         | DiagnosisId::ClientJarMissing
         | DiagnosisId::LibrariesMissing
         | DiagnosisId::AssetIndexMissing
-        | DiagnosisId::LaunchCommandInvalid
         | DiagnosisId::JvmArgUnsupported
         | DiagnosisId::LauncherManagedArtifactSignatureCorrupt
         | DiagnosisId::InstallArtifactMetadataInvalid
@@ -385,9 +384,9 @@ const fn priority_profile(id: DiagnosisId) -> PriorityProfile {
         DiagnosisId::ManagedRuntimeCorrupt | DiagnosisId::LauncherManagedArtifactCorrupt => {
             PriorityProfile::RepairCorruption
         }
-        DiagnosisId::LaunchCommandPrepared
-        | DiagnosisId::JvmArgsEmpty
-        | DiagnosisId::ProcessLifecycleObserved => PriorityProfile::Record,
+        DiagnosisId::JvmArgsEmpty | DiagnosisId::ProcessLifecycleObserved => {
+            PriorityProfile::Record
+        }
         DiagnosisId::LaunchMemoryMinClamped
         | DiagnosisId::LaunchMemoryAllocationLow
         | DiagnosisId::LaunchResourceMemoryPressure
@@ -666,24 +665,6 @@ pub(super) const DIAGNOSIS_RULES: &[DiagnosisRule] = &[
         RuleConfidence::SupportingFactOr(GuardianConfidence::Confirmed),
         [Block],
         "asset_index_missing"
-    ),
-    rule!(
-        LaunchCommandInvalid,
-        [LaunchCommandInvalid],
-        RuleDomain::Fixed(GuardianDomain::Launch),
-        RuleSeverity::Fixed(GuardianSeverity::Blocking),
-        RuleConfidence::Fixed(GuardianConfidence::Confirmed),
-        [Block],
-        "launch_command_invalid"
-    ),
-    rule!(
-        LaunchCommandPrepared,
-        [LaunchCommandPrepared],
-        RuleDomain::Fixed(GuardianDomain::Launch),
-        RuleSeverity::Fixed(GuardianSeverity::Info),
-        RuleConfidence::Fixed(GuardianConfidence::Confirmed),
-        [RecordOnly],
-        "launch_command_prepared"
     ),
     rule!(
         LaunchMemoryMinClamped,

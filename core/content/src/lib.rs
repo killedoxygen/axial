@@ -3,10 +3,8 @@ pub mod install;
 mod limits;
 pub mod manifest;
 pub mod model;
-pub mod modrinth;
+mod modrinth;
 pub mod pack;
-pub mod provider;
-pub mod registry;
 pub mod resolver;
 mod transaction;
 
@@ -20,17 +18,15 @@ pub use manifest::{
     ContentManifest, ManifestEntry, entry_file_present, entry_path_matches, sha512_file,
 };
 pub use model::{
-    CanonicalContent, CanonicalId, ContentDependency, ContentDetail, ContentKind, ContentVersion,
-    DependencyKind, FileRef, GalleryImage, ProjectMetadata, ProviderId, ProviderRef,
-    ReleaseChannel, VersionIdentity,
+    CanonicalContent, CanonicalId, ContentDependency, ContentDetail, ContentKind, ContentQuery,
+    ContentVersion, DependencyKind, FileRef, GalleryImage, LoaderGameFilter, Page, ProjectMetadata,
+    ProviderId, ReleaseChannel, SortOrder, VersionIdentity,
 };
-pub use modrinth::ModrinthProvider;
+pub use modrinth::ContentService;
 pub use pack::{
     PackFile, PackFinalizeContext, PackIndex, PackInstallOptions, PackInstallReport, PackLoader,
     install_pack_files_with_finalize, read_pack_index,
 };
-pub use provider::{ContentProvider, ContentQuery, LoaderGameFilter, Page, SortOrder};
-pub use registry::ContentRegistry;
 pub use resolver::{
     ContentResolution, ResolutionConflict, ResolutionConflictKind, ResolutionConflictReason,
     ResolutionError, ResolutionLimitExceeded, ResolutionLimitKind, ResolutionReason,

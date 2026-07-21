@@ -59,9 +59,67 @@ impl ProviderId {
     }
 }
 
-/// Stable identity for a piece of content across the app. Currently namespaced by
-/// its primary provider (`modrinth:AABBCC`); a future canonical resolver may merge
-/// several provider projects under one id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SortOrder {
+    #[default]
+    Relevance,
+    Downloads,
+    Follows,
+    Newest,
+    Updated,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContentQuery {
+    pub kind: ContentKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub search: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub loader: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub game_version: Option<String>,
+    #[serde(default)]
+    pub categories: Vec<String>,
+    #[serde(default)]
+    pub sort: SortOrder,
+    #[serde(default)]
+    pub offset: u32,
+    pub limit: u32,
+}
+
+impl ContentQuery {
+    pub fn new(kind: ContentKind) -> Self {
+        Self {
+            kind,
+            search: None,
+            loader: None,
+            game_version: None,
+            categories: Vec::new(),
+            sort: SortOrder::default(),
+            offset: 0,
+            limit: 40,
+        }
+    }
+}
+
+/// Narrows a project's versions to those compatible with a target instance.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LoaderGameFilter {
+    pub loader: Option<String>,
+    pub game_version: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Page<T> {
+    pub items: Vec<T>,
+    pub offset: u32,
+    pub limit: u32,
+    pub total: u64,
+}
+
+/// Stable identity for a piece of content across the app, namespaced by its
+/// authoritative service (`modrinth:AABBCC`).
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct CanonicalId(pub String);
 
@@ -78,16 +136,6 @@ impl CanonicalId {
     pub fn project_id(&self) -> &str {
         self.0.split_once(':').map(|(_, id)| id).unwrap_or(&self.0)
     }
-}
-
-/// One provider's view of a project. Multiple refs on the same canonical record
-/// mean the same content is offered by more than one provider.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ProviderRef {
-    pub provider: ProviderId,
-    pub project_id: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub slug: Option<String>,
 }
 
 /// A downloadable file with the integrity facts needed to verify it.
@@ -223,8 +271,6 @@ pub struct CanonicalContent {
     pub loaders: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub updated: Option<String>,
-    #[serde(default)]
-    pub sources: Vec<ProviderRef>,
 }
 
 /// Provider-authored identity used by trusted workflows that only need a

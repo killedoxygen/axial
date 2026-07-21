@@ -358,65 +358,6 @@ fn execution_java_update_fact_maps_to_update_diagnosis() {
 }
 
 #[test]
-fn execution_launch_command_fact_maps_to_launch_domain() {
-    let target = target(
-        "session-1",
-        TargetKind::Session,
-        OwnershipClass::LauncherManaged,
-    );
-    let execution_fact = ExecutionFact {
-        operation_id: None,
-        kind: ExecutionFactKind::LaunchCommandPrepared,
-        target: Some(target),
-        fields: vec![EvidenceField::new(
-            "program",
-            "launch_program",
-            EvidenceSensitivity::Public,
-        )],
-    };
-
-    let fact = guardian_fact_from_execution(&execution_fact, OperationPhase::Preparing);
-    let diagnoses = diagnose(std::slice::from_ref(&fact), OperationPhase::Preparing);
-
-    assert_eq!(fact.id.as_str(), "launch_command_prepared");
-    assert_eq!(fact.domain, GuardianDomain::Launch);
-    assert_eq!(diagnoses.len(), 1);
-    assert_eq!(diagnoses[0].id().as_str(), "launch_command_prepared");
-    assert_eq!(diagnoses[0].severity(), GuardianSeverity::Info);
-}
-
-#[test]
-fn execution_launch_command_invalid_fact_maps_to_blocking_diagnosis() {
-    let target = target(
-        "session-1",
-        TargetKind::Session,
-        OwnershipClass::LauncherManaged,
-    );
-    let execution_fact = ExecutionFact {
-        operation_id: None,
-        kind: ExecutionFactKind::LaunchCommandInvalid,
-        target: Some(target),
-        fields: vec![EvidenceField::new(
-            "arg_count",
-            "1",
-            EvidenceSensitivity::Public,
-        )],
-    };
-
-    let fact = guardian_fact_from_execution(&execution_fact, OperationPhase::Preparing);
-    let diagnoses = diagnose(&[fact], OperationPhase::Preparing);
-
-    assert_eq!(diagnoses.len(), 1);
-    assert_eq!(diagnoses[0].id().as_str(), "launch_command_invalid");
-    assert_eq!(diagnoses[0].severity(), GuardianSeverity::Blocking);
-    assert!(
-        diagnoses[0]
-            .candidate_actions()
-            .contains(&GuardianActionKind::Block)
-    );
-}
-
-#[test]
 fn launch_readiness_fact_maps_to_blocking_install_diagnosis() {
     let fact = GuardianFact {
         operation_id: None,

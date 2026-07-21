@@ -645,7 +645,7 @@ where
         })
         .cloned()
         .collect();
-    let (mut manifest, identified, stale_entries) = build_pack_manifest(
+    let mut prepared_manifest = prepare_pack_manifest(
         state,
         &game_dir,
         &preview_files,
@@ -655,6 +655,7 @@ where
         selected_paths.is_empty(),
     )
     .await?;
+    let identified = prepared_manifest.entries.len();
     let _mutation = state.admit_managed_artifact_mutation().map_err(|error| {
         content_execution_error(axial_content::ContentError::Io(std::io::Error::other(
             error.to_string(),
@@ -670,15 +671,19 @@ where
         &mut on_progress,
         &mut on_download_fact,
         |report, transaction| {
+            prepared_manifest.materialize(&report.installed)?;
             let protected_paths: Vec<String> = report
                 .installed
                 .iter()
                 .map(|file| file.path.clone())
                 .collect();
-            let stale_files =
-                verified_stale_pack_files(&game_dir, &stale_entries, &protected_paths)?;
+            let stale_files = verified_stale_pack_files(
+                &game_dir,
+                &prepared_manifest.stale_entries,
+                &protected_paths,
+            )?;
             transaction.stage_removals(&stale_files)?;
-            manifest.save(&game_dir)
+            prepared_manifest.manifest.save(&game_dir)
         },
     )
     .await;
@@ -962,10 +967,59 @@ where
     Ok(archive)
 }
 
-/// Ask the provider to name every file the pack just laid down, using the
-/// hashes the index already gave us, and record what it recognizes. Files it
-/// does not recognize stay unmanaged rather than being invented.
-async fn build_pack_manifest(
+struct PreparedPackManifest {
+    manifest: ContentManifest,
+    entries: Vec<ManifestEntry>,
+    stale_entries: Vec<ManifestEntry>,
+}
+
+impl PreparedPackManifest {
+    fn materialize(
+        &mut self,
+        installed: &[axial_content::PackFile],
+    ) -> axial_content::ContentResult<()> {
+        let installed_by_hash: HashMap<&str, &axial_content::PackFile> = installed
+            .iter()
+            .filter_map(|file| file.sha512.as_deref().map(|hash| (hash, file)))
+            .collect();
+
+        for mut entry in self.entries.drain(..) {
+            let expected_sha512 = entry.sha512.as_deref().ok_or_else(|| {
+                axial_content::ContentError::ProviderMetadataInvalid(
+                    "identified modpack content has no exact SHA-512 digest".to_string(),
+                )
+            })?;
+            let file = installed_by_hash.get(expected_sha512).ok_or_else(|| {
+                axial_content::ContentError::ProviderMetadataInvalid(
+                    "identified modpack content changed before manifest finalization".to_string(),
+                )
+            })?;
+            let size = file.size.filter(|size| *size > 0).ok_or_else(|| {
+                axial_content::ContentError::ProviderMetadataInvalid(
+                    "identified modpack content has no positive authenticated size".to_string(),
+                )
+            })?;
+            if entry.kind != file.kind().unwrap_or(ContentKind::Modpack)
+                || entry.filename != file.filename()
+            {
+                return Err(axial_content::ContentError::ProviderMetadataInvalid(
+                    "identified modpack content changed before manifest finalization".to_string(),
+                ));
+            }
+            entry.size = Some(size);
+            self.manifest.validate_provider_entry(&entry)?;
+            if let Some(previous) = self.manifest.upsert(entry) {
+                self.stale_entries.push(previous);
+            }
+        }
+        self.manifest.validate_provider_projection()
+    }
+}
+
+/// Resolve pack-index hashes into provider identities before filesystem mutation.
+/// Exact sizes are materialized from authenticated downloads in the transaction
+/// finalizer; files the provider does not recognize remain unmanaged.
+async fn prepare_pack_manifest(
     state: &AppState,
     game_dir: &Path,
     installed: &[axial_content::PackFile],
@@ -973,9 +1027,10 @@ async fn build_pack_manifest(
     pack_title: &str,
     version: &axial_content::ContentVersion,
     record_pack_root: bool,
-) -> Result<(ContentManifest, usize, Vec<ManifestEntry>), ContentExecutionError> {
+) -> Result<PreparedPackManifest, ContentExecutionError> {
     let mut manifest = ContentManifest::load(game_dir).map_err(content_error_response)?;
     let mut stale_entries = Vec::new();
+    let mut entries = Vec::new();
 
     // The pack itself: what this instance was built from, so an update knows
     // where it came from.
@@ -987,7 +1042,6 @@ async fn build_pack_manifest(
             version_id: version.id.clone(),
             kind: ContentKind::Modpack,
             filename: String::new(),
-            sha1: None,
             sha512: None,
             size: None,
             dependencies: Vec::new(),
@@ -1002,11 +1056,11 @@ async fn build_pack_manifest(
             stale_entries.push(previous);
         }
     }
+    let mut prospective = manifest.clone();
 
     let by_hash = group_pack_files_by_sha512(installed);
     reject_duplicate_pack_hashes(&by_hash)?;
 
-    let mut identified = 0;
     if !by_hash.is_empty() {
         let hashes: Vec<String> = by_hash.keys().cloned().collect();
         let resolved = state
@@ -1031,6 +1085,13 @@ async fn build_pack_manifest(
                 .get(&canonical_id)
                 .cloned()
                 .or(identity.title.clone());
+            if file.size == Some(0) {
+                return Err(content_execution_error(
+                    axial_content::ContentError::ProviderMetadataInvalid(
+                        "identified modpack content has a zero declared size".to_string(),
+                    ),
+                ));
+            }
             let entry = ManifestEntry {
                 canonical_id,
                 provider: identity.provider,
@@ -1038,7 +1099,6 @@ async fn build_pack_manifest(
                 version_id: identity.version_id,
                 kind,
                 filename: file.filename().to_string(),
-                sha1: file.sha1.clone(),
                 sha512: file.sha512.clone(),
                 size: file.size,
                 dependencies: identity.dependencies,
@@ -1046,20 +1106,24 @@ async fn build_pack_manifest(
                 installed_at: chrono::Utc::now().to_rfc3339(),
                 title,
             };
-            manifest
-                .validate_provider_entry(&entry)
+            let mut bounded_entry = entry.clone();
+            bounded_entry.size = Some(u64::MAX);
+            prospective
+                .validate_provider_entry(&bounded_entry)
                 .map_err(content_execution_error)?;
-            if let Some(previous) = manifest.upsert(entry) {
-                stale_entries.push(previous);
-            }
-            identified += 1;
+            let _ = prospective.upsert(bounded_entry);
+            entries.push(entry);
         }
     }
-    manifest
+    prospective
         .validate_provider_projection()
         .map_err(content_execution_error)?;
 
-    Ok((manifest, identified, stale_entries))
+    Ok(PreparedPackManifest {
+        manifest,
+        entries,
+        stale_entries,
+    })
 }
 
 fn group_pack_files_by_sha512(
@@ -1289,6 +1353,72 @@ mod tests {
             failure_kind,
             Some(ContentExecutionFailureKind::MetadataInvalid)
         );
+    }
+
+    fn prepared_pack_entry(hash: &str) -> ManifestEntry {
+        ManifestEntry {
+            canonical_id: CanonicalId::for_project(ProviderId::Modrinth, "project"),
+            provider: ProviderId::Modrinth,
+            project_id: "project".to_string(),
+            version_id: "version".to_string(),
+            kind: ContentKind::Mod,
+            filename: "managed.jar".to_string(),
+            sha512: Some(hash.to_string()),
+            size: None,
+            dependencies: Vec::new(),
+            enabled: true,
+            installed_at: chrono::Utc::now().to_rfc3339(),
+            title: Some("Managed".to_string()),
+        }
+    }
+
+    fn authenticated_pack_file(hash: &str, size: u64) -> axial_content::PackFile {
+        axial_content::PackFile {
+            path: "mods/managed.jar".to_string(),
+            url: "https://example.invalid/managed.jar".to_string(),
+            sha1: None,
+            sha512: Some(hash.to_string()),
+            size: Some(size),
+        }
+    }
+
+    #[test]
+    fn p00_b11_contract_pack_manifest_derives_missing_size_from_authenticated_bytes() {
+        let hash = "a".repeat(128);
+        let mut prepared = PreparedPackManifest {
+            manifest: ContentManifest::default(),
+            entries: vec![prepared_pack_entry(&hash)],
+            stale_entries: Vec::new(),
+        };
+
+        prepared
+            .materialize(&[authenticated_pack_file(&hash, 42)])
+            .expect("authenticated size should materialize ownership");
+
+        let entry = prepared
+            .manifest
+            .find(&CanonicalId::for_project(ProviderId::Modrinth, "project"))
+            .expect("materialized entry");
+        assert_eq!(entry.size, Some(42));
+        assert_eq!(entry.sha512.as_deref(), Some(hash.as_str()));
+    }
+
+    #[test]
+    fn p00_b11_contract_pack_manifest_rejects_zero_or_mismatched_authenticated_evidence() {
+        let hash = "a".repeat(128);
+        for installed in [
+            authenticated_pack_file(&hash, 0),
+            authenticated_pack_file(&"b".repeat(128), 42),
+        ] {
+            let mut prepared = PreparedPackManifest {
+                manifest: ContentManifest::default(),
+                entries: vec![prepared_pack_entry(&hash)],
+                stale_entries: Vec::new(),
+            };
+
+            assert!(prepared.materialize(&[installed]).is_err());
+            assert!(prepared.manifest.entries.is_empty());
+        }
     }
 
     #[test]

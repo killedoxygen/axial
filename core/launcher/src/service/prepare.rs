@@ -273,7 +273,7 @@ where
         extra_jvm_args.extend(gc_preset_args(
             &effective_preset,
             &runtime.effective_info,
-            uses_low_impact_startup(&intent.performance_mode),
+            intent.low_impact_startup,
         ));
     } else if attempt.disable_custom_gc {
         effective_preset.clear();
@@ -284,7 +284,6 @@ where
     let planning_started_at = Instant::now();
     let plan = plan_resolved_launch(
         &VanillaLaunchRequest {
-            session_id: intent.session_id.clone(),
             mc_dir: intent.library_dir.clone(),
             version_id: intent.version_id.clone(),
             target_version_id: target_version_id.to_string(),
@@ -363,10 +362,6 @@ fn launch_target_version_id<'a>(
     intent.version_id.trim()
 }
 
-fn uses_low_impact_startup(performance_mode: &str) -> bool {
-    !matches!(performance_mode.trim(), "custom")
-}
-
 fn launch_auth_mode_for_context(intent: &LaunchIntent) -> &'static str {
     if intent.auth.is_offline() {
         "offline"
@@ -385,7 +380,7 @@ fn runtime_selection_from_ensure(
     }
 }
 
-pub fn sanitize_effective_runtime_major(
+pub(crate) fn sanitize_effective_runtime_major(
     runtime: &mut RuntimeSelection,
     java_version: &JavaVersion,
 ) {
@@ -443,14 +438,11 @@ mod tests {
             fs::create_dir_all(&game_dir).expect("instance dir");
 
             let intent = LaunchIntent {
-                session_id: format!("prepare-gate-{}", target.minecraft_version),
                 library_dir: library_dir.clone(),
-                instance_id: format!("fabric-{}", target.minecraft_version),
                 version_id: version_id.clone(),
                 target_version_id: target.minecraft_version.to_string(),
                 loader: "fabric".to_string(),
                 is_modded: true,
-                username: "Player".to_string(),
                 auth: LaunchAuthContext::offline("Player"),
                 requested_java: fake_java.to_string_lossy().to_string(),
                 requested_preset: String::new(),
@@ -465,7 +457,7 @@ mod tests {
                     mode: GuardianMode::Managed,
                     ..LaunchGuardianContext::default()
                 },
-                performance_mode: "managed".to_string(),
+                low_impact_startup: true,
             };
 
             let prepared = prepare_launch_attempt_with_events(
@@ -544,7 +536,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prepare_launch_attempt_uses_offline_auth_context_from_intent_username() {
+    async fn prepare_launch_attempt_uses_authenticated_offline_player() {
         let root = unique_temp_root("axial-prepare-auth-test");
         let runtime_cache = isolated_runtime_cache();
         let library_dir = root.join("library");
@@ -585,14 +577,11 @@ mod tests {
         );
 
         let intent = LaunchIntent {
-            session_id: "prepare-auth-test".to_string(),
             library_dir: library_dir.clone(),
-            instance_id: "auth-test".to_string(),
             version_id: version_id.to_string(),
             target_version_id: version_id.to_string(),
             loader: "vanilla".to_string(),
             is_modded: false,
-            username: "Player".to_string(),
             auth: LaunchAuthContext::offline("Player"),
             requested_java: fake_java.to_string_lossy().to_string(),
             requested_preset: String::new(),
@@ -607,7 +596,7 @@ mod tests {
                 mode: GuardianMode::Managed,
                 ..LaunchGuardianContext::default()
             },
-            performance_mode: "managed".to_string(),
+            low_impact_startup: true,
         };
 
         let prepared = prepare_launch_attempt_with_events(
@@ -666,14 +655,11 @@ mod tests {
         );
 
         let intent = LaunchIntent {
-            session_id: "prepare-custom-preset-block-test".to_string(),
             library_dir: library_dir.clone(),
-            instance_id: "custom-preset-block-test".to_string(),
             version_id: version_id.to_string(),
             target_version_id: version_id.to_string(),
             loader: "vanilla".to_string(),
             is_modded: false,
-            username: "Player".to_string(),
             auth: LaunchAuthContext::offline("Player"),
             requested_java: fake_java.to_string_lossy().to_string(),
             requested_preset: crate::jvm::PRESET_SMOOTH.to_string(),
@@ -690,7 +676,7 @@ mod tests {
                 preset_override_origin: Some(OverrideOrigin::Instance),
                 raw_jvm_args_origin: None,
             },
-            performance_mode: "managed".to_string(),
+            low_impact_startup: true,
         };
 
         let prepared = prepare_launch_attempt_with_events(
@@ -758,14 +744,11 @@ mod tests {
         );
 
         let intent = LaunchIntent {
-            session_id: "prepare-online-auth-test".to_string(),
             library_dir: library_dir.clone(),
-            instance_id: "online-auth-test".to_string(),
             version_id: version_id.to_string(),
             target_version_id: version_id.to_string(),
             loader: "vanilla".to_string(),
             is_modded: false,
-            username: "OfflineName".to_string(),
             auth: LaunchAuthContext {
                 player_name: "ProfileName".to_string(),
                 uuid: "4f9c7f7d0b1245d9a5c2f03a8c120001".to_string(),
@@ -787,7 +770,7 @@ mod tests {
                 mode: GuardianMode::Managed,
                 ..LaunchGuardianContext::default()
             },
-            performance_mode: "managed".to_string(),
+            low_impact_startup: true,
         };
 
         let prepared = prepare_launch_attempt_with_events(
@@ -850,14 +833,11 @@ mod tests {
         );
 
         let intent = LaunchIntent {
-            session_id: "prepare-runtime-event-test".to_string(),
             library_dir,
-            instance_id: "runtime-event-test".to_string(),
             version_id: version_id.to_string(),
             target_version_id: version_id.to_string(),
             loader: "vanilla".to_string(),
             is_modded: false,
-            username: "Player".to_string(),
             auth: LaunchAuthContext::offline("Player"),
             requested_java: fake_java.to_string_lossy().to_string(),
             requested_preset: String::new(),
@@ -872,7 +852,7 @@ mod tests {
                 mode: GuardianMode::Managed,
                 ..LaunchGuardianContext::default()
             },
-            performance_mode: "managed".to_string(),
+            low_impact_startup: true,
         };
         let mut events = Vec::new();
 
@@ -1259,14 +1239,11 @@ echo 'openjdk version "21.0.3" 2024-04-16' >&2
             }),
         );
         LaunchIntent {
-            session_id: "receipt-test".to_string(),
             library_dir,
-            instance_id: "receipt-test".to_string(),
             version_id: version_id.to_string(),
             target_version_id: version_id.to_string(),
             loader: "vanilla".to_string(),
             is_modded: false,
-            username: "Player".to_string(),
             auth: LaunchAuthContext::offline("Player"),
             requested_java: java_path.to_string_lossy().to_string(),
             requested_preset: String::new(),
@@ -1282,7 +1259,7 @@ echo 'openjdk version "21.0.3" 2024-04-16' >&2
                 java_override_origin: Some(OverrideOrigin::Instance),
                 ..LaunchGuardianContext::default()
             },
-            performance_mode: "managed".to_string(),
+            low_impact_startup: true,
         }
     }
 

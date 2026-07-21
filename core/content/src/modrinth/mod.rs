@@ -5,11 +5,10 @@ use crate::limits::{
     MAX_DETAIL_BODY_BYTES, MAX_PROVIDER_DETAIL_BYTES, MAX_PROVIDER_METADATA_BYTES,
 };
 use crate::model::{
-    CanonicalContent, CanonicalId, ContentDependency, ContentDetail, ContentKind, ContentVersion,
-    DependencyKind, FileRef, GalleryImage, ProjectMetadata, ProviderId, ProviderRef,
-    ReleaseChannel, VersionIdentity,
+    CanonicalContent, CanonicalId, ContentDependency, ContentDetail, ContentKind, ContentQuery,
+    ContentVersion, DependencyKind, FileRef, GalleryImage, LoaderGameFilter, Page, ProjectMetadata,
+    ProviderId, ReleaseChannel, SortOrder, VersionIdentity,
 };
-use crate::provider::{ContentProvider, ContentQuery, LoaderGameFilter, Page, SortOrder};
 use futures_util::StreamExt;
 use std::collections::{HashMap, HashSet};
 
@@ -24,12 +23,12 @@ const USER_AGENT: &str = concat!(
 );
 
 #[derive(Debug, Clone)]
-pub struct ModrinthProvider {
+pub struct ContentService {
     client: reqwest::Client,
     base_url: String,
 }
 
-impl ModrinthProvider {
+impl ContentService {
     pub fn new(client: reqwest::Client) -> Self {
         Self {
             client,
@@ -42,6 +41,11 @@ impl ModrinthProvider {
             client,
             base_url: base_url.into(),
         }
+    }
+
+    /// Shared connection pool for verified content downloads.
+    pub fn client(&self) -> &reqwest::Client {
+        &self.client
     }
 
     fn endpoint(&self, path: &str) -> String {
@@ -81,40 +85,7 @@ impl ModrinthProvider {
             .await?;
         parse_response_counted(response, url, max_bytes).await
     }
-}
-
-#[derive(Debug)]
-struct ProviderBatchBudget {
-    remaining_bytes: usize,
-}
-
-impl ProviderBatchBudget {
-    fn new() -> Self {
-        Self {
-            remaining_bytes: MAX_PROVIDER_METADATA_BYTES,
-        }
-    }
-
-    fn remaining(&self) -> usize {
-        self.remaining_bytes
-    }
-
-    fn admit(&mut self, bytes: usize) -> ContentResult<()> {
-        self.remaining_bytes = self.remaining_bytes.checked_sub(bytes).ok_or_else(|| {
-            ContentError::ProviderMetadataInvalid(
-                "content provider batch responses exceeded their aggregate size bound".to_string(),
-            )
-        })?;
-        Ok(())
-    }
-}
-
-impl ContentProvider for ModrinthProvider {
-    fn id(&self) -> ProviderId {
-        ProviderId::Modrinth
-    }
-
-    async fn search(&self, query: &ContentQuery) -> ContentResult<Page<CanonicalContent>> {
+    pub async fn search(&self, query: &ContentQuery) -> ContentResult<Page<CanonicalContent>> {
         let facets = build_facets(query);
         let mut params: Vec<(&str, String)> = vec![
             ("index", sort_index(query.sort).to_string()),
@@ -146,7 +117,7 @@ impl ContentProvider for ModrinthProvider {
         })
     }
 
-    async fn detail(&self, id: &CanonicalId) -> ContentResult<ContentDetail> {
+    pub async fn detail(&self, id: &CanonicalId) -> ContentResult<ContentDetail> {
         let project_id = project_id_of(id)?;
         let project: dto::Project = self
             .get_json(
@@ -165,7 +136,7 @@ impl ContentProvider for ModrinthProvider {
         map_project_detail(&project_id, project, versions)
     }
 
-    async fn versions(
+    pub async fn versions(
         &self,
         id: &CanonicalId,
         filter: &LoaderGameFilter,
@@ -195,7 +166,7 @@ impl ContentProvider for ModrinthProvider {
         map_project_versions(&project_id, versions)
     }
 
-    async fn metadata(
+    pub async fn metadata(
         &self,
         ids: &[CanonicalId],
     ) -> ContentResult<HashMap<CanonicalId, ProjectMetadata>> {
@@ -249,7 +220,7 @@ impl ContentProvider for ModrinthProvider {
         Ok(metadata)
     }
 
-    async fn identify(
+    pub async fn identify(
         &self,
         sha512_hashes: &[String],
     ) -> ContentResult<HashMap<String, VersionIdentity>> {
@@ -287,7 +258,7 @@ impl ContentProvider for ModrinthProvider {
         Ok(identities)
     }
 
-    async fn version_identities(
+    pub async fn version_identities(
         &self,
         version_ids: &[String],
     ) -> ContentResult<HashMap<String, VersionIdentity>> {
@@ -321,6 +292,42 @@ impl ContentProvider for ModrinthProvider {
             }
         }
         Ok(identities)
+    }
+
+    /// Project titles for a batch of IDs, in one round trip.
+    pub async fn titles(&self, ids: &[CanonicalId]) -> ContentResult<HashMap<CanonicalId, String>> {
+        Ok(self
+            .metadata(ids)
+            .await?
+            .into_iter()
+            .map(|(id, metadata)| (id, metadata.title))
+            .collect())
+    }
+}
+
+#[derive(Debug)]
+struct ProviderBatchBudget {
+    remaining_bytes: usize,
+}
+
+impl ProviderBatchBudget {
+    fn new() -> Self {
+        Self {
+            remaining_bytes: MAX_PROVIDER_METADATA_BYTES,
+        }
+    }
+
+    fn remaining(&self) -> usize {
+        self.remaining_bytes
+    }
+
+    fn admit(&mut self, bytes: usize) -> ContentResult<()> {
+        self.remaining_bytes = self.remaining_bytes.checked_sub(bytes).ok_or_else(|| {
+            ContentError::ProviderMetadataInvalid(
+                "content provider batch responses exceeded their aggregate size bound".to_string(),
+            )
+        })?;
+        Ok(())
     }
 }
 
@@ -568,11 +575,6 @@ fn map_search_hit(hit: dto::SearchHit) -> Option<CanonicalContent> {
         game_versions: hit.versions,
         loaders: Vec::new(),
         updated: hit.date_modified,
-        sources: vec![ProviderRef {
-            provider: ProviderId::Modrinth,
-            project_id: hit.project_id,
-            slug: hit.slug,
-        }],
     })
 }
 
@@ -610,11 +612,6 @@ fn map_project_detail(
         game_versions: project.game_versions,
         loaders: project.loaders,
         updated: project.updated,
-        sources: vec![ProviderRef {
-            provider: ProviderId::Modrinth,
-            project_id: project.id,
-            slug: project.slug,
-        }],
     };
     Ok(ContentDetail {
         content,
@@ -769,6 +766,112 @@ fn valid_sha512(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    #[tokio::test]
+    async fn p00_b11_contract_injected_service_maps_provider_neutral_wire_records() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind content service fixture");
+        let address = listener.local_addr().expect("content service address");
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept search request");
+            let mut request = Vec::new();
+            let mut chunk = [0_u8; 1024];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let read = socket.read(&mut chunk).await.expect("read search request");
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&chunk[..read]);
+            }
+            let body = serde_json::to_vec(&serde_json::json!({
+                "hits": [{
+                    "project_id": "project-a",
+                    "slug": "project-a",
+                    "title": "Project A",
+                    "author": "Author",
+                    "description": "Summary",
+                    "project_type": "mod"
+                }],
+                "offset": 0,
+                "limit": 1,
+                "total_hits": 1
+            }))
+            .expect("encode search response");
+            let headers = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            socket
+                .write_all(headers.as_bytes())
+                .await
+                .expect("write search headers");
+            socket.write_all(&body).await.expect("write search body");
+            String::from_utf8(request).expect("search request is UTF-8")
+        });
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("content service fixture client");
+        let service = ContentService::with_base_url(client, format!("http://{address}/v2"));
+        let mut query = ContentQuery::new(ContentKind::Mod);
+        query.search = Some("project".to_string());
+        query.limit = 1;
+
+        let page = service
+            .search(&query)
+            .await
+            .expect("search through service");
+        let request = server.await.expect("search fixture task");
+        let wire = serde_json::to_value(&page.items[0]).expect("serialize search hit");
+
+        assert!(request.starts_with("GET /v2/search?"));
+        assert_eq!(page.items[0].canonical_id.as_str(), "modrinth:project-a");
+        assert_eq!(wire.get("provider"), Some(&serde_json::json!("modrinth")));
+        assert!(wire.get("sources").is_none());
+    }
+
+    #[tokio::test]
+    async fn p00_b11_contract_foreign_namespaces_fail_before_any_request() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind no-request fixture");
+        let address = listener.local_addr().expect("no-request address");
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("no-request fixture client");
+        let service = ContentService::with_base_url(client, format!("http://{address}/v2"));
+        let foreign = CanonicalId("curseforge:project-a".to_string());
+
+        assert!(matches!(
+            service.detail(&foreign).await,
+            Err(ContentError::Invalid(_))
+        ));
+        assert!(matches!(
+            service
+                .versions(&foreign, &LoaderGameFilter::default())
+                .await,
+            Err(ContentError::Invalid(_))
+        ));
+        assert!(matches!(
+            service
+                .metadata(&[
+                    CanonicalId::for_project(ProviderId::Modrinth, "valid"),
+                    foreign,
+                ])
+                .await,
+            Err(ContentError::Invalid(_))
+        ));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(25), listener.accept())
+                .await
+                .is_err(),
+            "foreign IDs must not reach the configured service"
+        );
+    }
 
     #[test]
     fn provider_body_limits_admit_exact_and_reject_one_over() {

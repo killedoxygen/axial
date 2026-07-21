@@ -20,9 +20,7 @@ macro_rules! id_type {
     };
 }
 
-id_type!(InstanceId);
 id_type!(SessionId);
-id_type!(VersionId);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

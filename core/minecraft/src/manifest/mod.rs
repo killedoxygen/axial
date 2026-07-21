@@ -87,10 +87,6 @@ struct ManifestCache {
 
 static MANIFEST_CACHE: OnceLock<Mutex<ManifestCache>> = OnceLock::new();
 
-pub async fn fetch_version_manifest() -> Result<VersionManifest, String> {
-    fetch_read_only_version_manifest().await
-}
-
 pub(crate) async fn fetch_registered_repair_version_manifest(
     version_id: &str,
     expected_metadata_sha1: &str,
@@ -142,21 +138,6 @@ fn manifest_contains_registered_repair_entry(
         .is_some_and(|entry| {
             !entry.url.trim().is_empty() && entry.sha1.eq_ignore_ascii_case(expected_metadata_sha1)
         })
-}
-
-async fn fetch_read_only_version_manifest() -> Result<VersionManifest, String> {
-    if let Some(value) = fresh_cached_manifest() {
-        return Ok(value);
-    }
-
-    let cached_stale = stale_cached_manifest();
-    let (manifest, fetched_live) =
-        resolve_read_only_manifest(fetch_manifest_live().await, cached_stale)?;
-
-    if fetched_live {
-        update_manifest_cache(manifest.clone());
-    }
-    Ok(manifest)
 }
 
 fn resolve_read_only_manifest(

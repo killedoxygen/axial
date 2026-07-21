@@ -206,6 +206,7 @@ where
             .await
         {
             Ok(report) => {
+                installed.push(authenticated_pack_file(file, report.bytes_written));
                 for fact in report.facts {
                     on_download_fact(fact);
                 }
@@ -217,7 +218,6 @@ where
                 return Err(ContentError::Download(error));
             }
         }
-        installed.push(file.clone());
         relative_paths.push(file.path.clone());
     }
 
@@ -267,6 +267,12 @@ where
 
     on_progress(done(total));
     Ok(report)
+}
+
+fn authenticated_pack_file(file: &PackFile, bytes_written: u64) -> PackFile {
+    let mut authenticated = file.clone();
+    authenticated.size = Some(bytes_written);
+    authenticated
 }
 
 fn validate_pack_download_url(raw: &str) -> ContentResult<(Url, PackDownloadOrigin)> {
@@ -983,6 +989,22 @@ mod tests {
                 sha512: Some("a".repeat(128)),
             }
         );
+    }
+
+    #[test]
+    fn p00_b11_contract_pack_report_replaces_missing_size_with_observed_bytes() {
+        let file = PackFile {
+            path: "mods/managed.jar".to_string(),
+            url: "https://cdn.modrinth.com/managed.jar".to_string(),
+            sha1: None,
+            sha512: Some("a".repeat(128)),
+            size: None,
+        };
+
+        let authenticated = authenticated_pack_file(&file, 42);
+
+        assert_eq!(authenticated.size, Some(42));
+        assert_eq!(authenticated.sha512, file.sha512);
     }
 
     #[test]

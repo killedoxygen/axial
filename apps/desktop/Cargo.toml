@@ -20,7 +20,6 @@ tracing-subscriber.workspace = true
 serde_json.workspace = true
 axial-api = { path = "../api", default-features = false }
 axial-config = { path = "../../core/config" }
-axial-launcher = { path = "../../core/launcher" }
 axial-performance = { path = "../../core/performance" }
 
 [target.'cfg(windows)'.dependencies]

@@ -3,14 +3,6 @@ use crate::loaders::types::{LoaderBuildMetadata, LoaderComponentId};
 use crate::version_meta::MinecraftVersionMeta;
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct VersionSummary {
-    pub id: String,
-    pub launchable: bool,
-    #[serde(default)]
-    pub java_version: Option<u32>,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum VersionSubjectKind {

@@ -185,13 +185,6 @@ fn execution_fact_shape(fact: &ExecutionFact) -> (GuardianFactId, GuardianDomain
         ExecutionFactKind::JvmArgAgentOverride => {
             (GuardianFactId::JvmArgAgentOverride, GuardianDomain::Jvm)
         }
-        ExecutionFactKind::LaunchCommandInvalid => {
-            (GuardianFactId::LaunchCommandInvalid, GuardianDomain::Launch)
-        }
-        ExecutionFactKind::LaunchCommandPrepared => (
-            GuardianFactId::LaunchCommandPrepared,
-            GuardianDomain::Launch,
-        ),
         ExecutionFactKind::ProcessSpawned => {
             (GuardianFactId::ProcessSpawned, GuardianDomain::Session)
         }

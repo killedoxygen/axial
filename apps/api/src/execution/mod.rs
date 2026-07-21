@@ -9,7 +9,6 @@ pub mod download;
 pub mod file;
 pub(crate) mod integrity;
 pub mod jvm;
-pub mod launch;
 mod low_priority;
 pub(crate) mod persistence;
 pub mod process;
@@ -147,8 +146,6 @@ execution_fact_kinds! {
     JvmArgUnsafeClasspathOverride => ("jvm_arg_unsafe_classpath_override", ConditionEvidence),
     JvmArgUnsafeNativePathOverride => ("jvm_arg_unsafe_native_path_override", ConditionEvidence),
     JvmArgAgentOverride => ("jvm_arg_agent_override", ConditionEvidence),
-    LaunchCommandInvalid => ("launch_command_invalid", Diagnostic),
-    LaunchCommandPrepared => ("launch_command_prepared", ConditionEvidence),
     ProcessSpawned => ("process_spawned", ConditionEvidence),
     ProcessStopIntent => ("process_stop_intent", ConditionEvidence),
     ProcessKilled => ("process_killed", ConditionEvidence),
@@ -179,14 +176,6 @@ pub fn execution_fact_stage_evidence(facts: &[ExecutionFact]) -> Vec<LaunchStage
 
 fn execution_fact_stage_copy(kind: ExecutionFactKind) -> (&'static str, &'static str) {
     match kind {
-        ExecutionFactKind::LaunchCommandPrepared => (
-            "execution_launch_command_prepared",
-            "Execution prepared a runnable launch command.",
-        ),
-        ExecutionFactKind::LaunchCommandInvalid => (
-            "execution_launch_command_invalid",
-            "Execution rejected a non-runnable launch command.",
-        ),
         ExecutionFactKind::ProcessSpawned => (
             "execution_process_spawned",
             "Execution started the game process.",

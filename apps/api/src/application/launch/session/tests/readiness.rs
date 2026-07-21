@@ -1242,7 +1242,7 @@ async fn damaged_runtime_rebuilds_minimal_component_and_launches_once() {
     #[cfg(unix)]
     {
         let rebuilt_java = managed_runtime_java_path(&runtime_root);
-        let session_id = prepared.task.intent.session_id.clone();
+        let session_id = prepared.task.session_id.0.clone();
         let launched = tokio::time::timeout(
             std::time::Duration::from_secs(10),
             crate::application::launch::launch_session_with_persisted_runtime_manifest_for_test(

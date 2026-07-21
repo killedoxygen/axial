@@ -119,15 +119,9 @@ async fn own_launch_proof_and_benchmark_outcome(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::application::launch::launch_command_stage_evidence;
     use crate::application::performance::{
         benchmark_suite_manifest_run_inputs, benchmark_suite_plan,
-    };
-    use crate::execution::launch::{
-        LaunchCommandPreparationRequest, launch_command_stage_evidence, prepare_launch_command,
-    };
-
-    use crate::state::contracts::{
-        OwnershipClass, StabilizationSystem, TargetDescriptor, TargetKind,
     };
     use crate::state::{AppStateInit, InstallStore, SessionStore};
     use axial_config::{AppPaths, ConfigStore, InstanceRegistrySnapshot, InstanceStore};
@@ -154,20 +148,12 @@ mod tests {
             "-cp".to_string(),
             "libraries".to_string(),
         ];
-        let prepared = prepare_launch_command(LaunchCommandPreparationRequest::new(
-            TargetDescriptor::new(
-                StabilizationSystem::Execution,
-                TargetKind::Session,
-                session_id,
-                OwnershipClass::LauncherManaged,
-            ),
-            &command,
-            &root,
-        ))
-        .expect("prepared command");
         state
             .sessions()
-            .record_stage_evidence(session_id, launch_command_stage_evidence(&prepared.facts))
+            .record_stage_evidence(
+                session_id,
+                launch_command_stage_evidence(true, command.len()),
+            )
             .await;
 
         let instance_id = "instance";
@@ -191,7 +177,7 @@ mod tests {
             .load(session_id)
             .expect("proof exists");
         let proof_json = serde_json::to_string(&proof).expect("proof json");
-        assert!(proof_json.contains("execution_launch_command_prepared"));
+        assert!(proof_json.contains("application_launch_command_prepared"));
         assert!(proof_json.contains("arg_count:3"));
         assert_no_sensitive_stage_evidence(&proof_json);
 

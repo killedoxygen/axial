@@ -10,7 +10,7 @@ use crate::limits::{
     MAX_RESOLUTION_QUEUE, MAX_RESOLUTION_SELECTIONS,
 };
 use crate::{
-    CanonicalId, ContentDependency, ContentError, ContentKind, ContentManifest, ContentRegistry,
+    CanonicalId, ContentDependency, ContentError, ContentKind, ContentManifest, ContentService,
     ContentVersion, DependencyKind, FileRef, LoaderGameFilter, ManifestEntry, PlannedFile,
     ProjectMetadata, ProviderId, ReleaseChannel, VersionIdentity, entry_file_present,
 };
@@ -398,7 +398,7 @@ struct ResolvePass {
 }
 
 pub async fn resolve_content(
-    registry: &ContentRegistry,
+    service: &ContentService,
     target: &ResolutionTarget,
     selections: &[ResolutionSelection],
     manifest: &ContentManifest,
@@ -425,7 +425,7 @@ pub async fn resolve_content(
         .map(|selection| CanonicalId(selection.canonical_id.clone()))
         .collect();
     for (canonical_id, version_id) in
-        installed_exact_requirements(registry, target, manifest, &replacing, &mut work_budget)
+        installed_exact_requirements(service, target, manifest, &replacing, &mut work_budget)
             .await?
     {
         if let Some(conflict) =
@@ -458,7 +458,7 @@ pub async fn resolve_content(
 
     for _ in 0..=(MAX_RESOLUTION_DEPTH + 1) {
         let pass = resolve_pass(
-            registry,
+            service,
             target,
             selections,
             manifest,
@@ -498,7 +498,7 @@ fn insert_exact_requirement(
 }
 
 async fn installed_exact_requirements(
-    registry: &ContentRegistry,
+    service: &ContentService,
     target: &ResolutionTarget,
     manifest: &ContentManifest,
     replacing: &HashSet<CanonicalId>,
@@ -539,7 +539,7 @@ async fn installed_exact_requirements(
     let version_identities = if unresolved_version_ids.is_empty() {
         HashMap::new()
     } else {
-        registry.version_identities(&unresolved_version_ids).await?
+        service.version_identities(&unresolved_version_ids).await?
     };
 
     let mut requirements = Vec::new();
@@ -571,7 +571,7 @@ async fn installed_exact_requirements(
 }
 
 async fn resolve_pass(
-    registry: &ContentRegistry,
+    service: &ContentService,
     target: &ResolutionTarget,
     selections: &[ResolutionSelection],
     manifest: &ContentManifest,
@@ -582,7 +582,7 @@ async fn resolve_pass(
         .iter()
         .map(|selection| CanonicalId(selection.canonical_id.clone()))
         .collect();
-    let mut metadata = registry.metadata(&selected_ids).await?;
+    let mut metadata = service.metadata(&selected_ids).await?;
     validate_selected_kinds(selections, &metadata, target)?;
     let mut metadata_requested: HashSet<CanonicalId> = selected_ids.into_iter().collect();
     let mut resolved_versions: HashMap<CanonicalId, String> = HashMap::new();
@@ -659,7 +659,7 @@ async fn resolve_pass(
                     .map(|(queued_id, _, _, _)| queued_id.clone()),
             );
             let missing_ids: Vec<CanonicalId> = missing_ids.into_iter().collect();
-            let fetched = registry.metadata(&missing_ids).await?;
+            let fetched = service.metadata(&missing_ids).await?;
             metadata.extend(fetched);
             metadata_requested.extend(missing_ids);
         }
@@ -671,7 +671,7 @@ async fn resolve_pass(
         require_installable_kind(kind, target)?;
 
         let filter = target.filter_for(kind);
-        let versions = match registry.versions(&canonical_id, &filter).await {
+        let versions = match service.versions(&canonical_id, &filter).await {
             Ok(versions) => versions,
             Err(ContentError::Status { status, .. }) if status.as_u16() == 404 => {
                 push_conflict(&mut conflicts, unavailable_conflict(&canonical_id))?;
@@ -703,7 +703,7 @@ async fn resolve_pass(
             .collect();
         if !missing_dependency_versions.is_empty() {
             dependency_versions.extend(
-                registry
+                service
                     .version_identities(&missing_dependency_versions)
                     .await?,
             );
@@ -1176,7 +1176,7 @@ mod tests {
     }
 
     struct ProviderFixture {
-        registry: ContentRegistry,
+        service: ContentService,
         requests: Arc<Mutex<Vec<String>>>,
         task: tokio::task::JoinHandle<()>,
     }
@@ -1279,13 +1279,9 @@ mod tests {
                 .no_proxy()
                 .build()
                 .expect("content provider fixture client");
-            let provider = crate::modrinth::ModrinthProvider::with_base_url(
-                client.clone(),
-                format!("http://{address}/v2"),
-            );
-            let registry = ContentRegistry::with_modrinth(client, provider);
+            let service = ContentService::with_base_url(client, format!("http://{address}/v2"));
             Self {
-                registry,
+                service,
                 requests,
                 task,
             }
@@ -1391,7 +1387,7 @@ mod tests {
         .await;
 
         let resolution = resolve_content(
-            &fixture.registry,
+            &fixture.service,
             &resolver_target(),
             &[selection("modrinth:root", ContentKind::Mod)],
             &ContentManifest::default(),
@@ -1436,7 +1432,7 @@ mod tests {
         .await;
 
         let resolution = resolve_content(
-            &fixture.registry,
+            &fixture.service,
             &resolver_target(),
             &[selection("modrinth:first", ContentKind::Mod)],
             &ContentManifest::default(),
@@ -1459,10 +1455,10 @@ mod tests {
 
     #[tokio::test]
     async fn duplicate_selections_fail_before_provider_work() {
-        let registry = ContentRegistry::new(reqwest::Client::new());
+        let service = ContentService::new(reqwest::Client::new());
         let duplicate = selection("modrinth:duplicate", ContentKind::Mod);
         let error = resolve_content(
-            &registry,
+            &service,
             &resolver_target(),
             &[duplicate.clone(), duplicate],
             &ContentManifest::default(),
@@ -1496,7 +1492,7 @@ mod tests {
 
         let mut work_budget = ResolutionBudget::default();
         let error = installed_exact_requirements(
-            &ContentRegistry::new(reqwest::Client::new()),
+            &ContentService::new(reqwest::Client::new()),
             &resolver_target(),
             &manifest,
             &HashSet::new(),
@@ -1555,7 +1551,7 @@ mod tests {
         .await;
 
         let resolution = resolve_content(
-            &fixture.registry,
+            &fixture.service,
             &resolver_target(),
             &[
                 selection("modrinth:root", ContentKind::Mod),
@@ -1641,7 +1637,7 @@ mod tests {
         .await;
 
         let resolution = resolve_content(
-            &fixture.registry,
+            &fixture.service,
             &resolver_target(),
             &[
                 selection("modrinth:root", ContentKind::Mod),
@@ -1718,7 +1714,7 @@ mod tests {
         .await;
 
         let resolution = resolve_content(
-            &fixture.registry,
+            &fixture.service,
             &resolver_target(),
             &[
                 selection("modrinth:root-a", ContentKind::Mod),
@@ -1756,7 +1752,7 @@ mod tests {
         .await;
 
         let error = resolve_content(
-            &fixture.registry,
+            &fixture.service,
             &resolver_target(),
             &[selection("modrinth:root", ContentKind::Mod)],
             &ContentManifest::default(),
@@ -1800,7 +1796,7 @@ mod tests {
         .await;
 
         let resolution = resolve_content(
-            &fixture.registry,
+            &fixture.service,
             &resolver_target(),
             &[
                 selection("modrinth:first", ContentKind::Mod),

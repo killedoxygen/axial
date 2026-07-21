@@ -76,12 +76,12 @@ pub use java::{JavaRuntimesResponse, java_runtimes};
 pub(crate) use known_good::{
     rebuild_registered_known_good, registered_known_good_is_live, spawn_startup_known_good_rebuilds,
 };
+pub(crate) use launch::launch_preflight_stage_evidence;
 pub use launch::{
     LaunchPreflightMemory, LaunchPreflightOverride, LaunchPreflightOverrides,
     LaunchPreflightResourceBudget, LaunchPreflightResponse, LaunchRequest,
     prepare_launch_preflight,
 };
-pub(crate) use launch::{launch_application_stage_evidence, launch_preflight_stage_evidence};
 pub use music::{
     MusicStatusResponse, MusicTrackBytes, MusicTrackError, MusicTrackRequest, music_status,
     music_track,

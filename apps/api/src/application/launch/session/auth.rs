@@ -15,7 +15,6 @@ use serde_json::json;
 pub(super) struct LaunchAuthRefreshOptions;
 
 pub(super) struct LaunchAuthContextResolution {
-    pub(super) username: String,
     pub(super) auth: LaunchAuthContext,
     pub(super) online_launch: bool,
 }
@@ -62,7 +61,6 @@ pub(super) async fn resolve_launch_auth_context(
         || (active_account.is_none() && config.launch_auth_mode == LAUNCH_AUTH_MODE_ONLINE);
 
     Ok(LaunchAuthContextResolution {
-        username: offline_username,
         auth,
         online_launch,
     })

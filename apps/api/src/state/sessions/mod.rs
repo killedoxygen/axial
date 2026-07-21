@@ -4540,9 +4540,9 @@ mod tests {
                     notice: None,
                     evidence: vec![
                         LaunchStageEvidence {
-                            id: "execution_launch_command_prepared".to_string(),
-                            system: "execution".to_string(),
-                            summary: "Execution prepared a runnable launch command.".to_string(),
+                            id: "application_launch_command_prepared".to_string(),
+                            system: "application".to_string(),
+                            summary: "Application prepared a runnable launch command.".to_string(),
                             details: vec![
                                 "arg_count:3".to_string(),
                                 r"program:C:\Users\Alice\.jdks\java.exe".to_string(),
@@ -4568,7 +4568,7 @@ mod tests {
         assert_eq!(status.stages[1].evidence.len(), 1);
         assert_eq!(
             status.stages[1].evidence[0].id,
-            "execution_launch_command_prepared"
+            "application_launch_command_prepared"
         );
         assert_eq!(status.stages[1].evidence[0].details, vec!["arg_count:3"]);
 
@@ -4797,9 +4797,9 @@ mod tests {
             .record_stage_evidence(
                 session_id,
                 vec![LaunchStageEvidence {
-                    id: "execution_launch_command_prepared".to_string(),
-                    system: "execution".to_string(),
-                    summary: "Execution prepared the launch command.".to_string(),
+                    id: "application_launch_command_prepared".to_string(),
+                    system: "application".to_string(),
+                    summary: "Application prepared the launch command.".to_string(),
                     details: vec!["arg_count:3".to_string()],
                 }],
             )

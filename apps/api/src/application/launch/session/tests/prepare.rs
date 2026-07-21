@@ -204,7 +204,7 @@ async fn prepare_launch_session_creates_no_user_owned_paths() {
 }
 
 #[tokio::test]
-async fn prepare_launch_session_syncs_active_offline_account_from_config_username() {
+async fn p00_b11_contract_preparation_uses_authenticated_player_and_application_identity() {
     let fixture = TestFixture::new("prepare-syncs-offline-account-name");
     fixture.write_ready_install("1.21.1");
     fixture
@@ -225,7 +225,7 @@ async fn prepare_launch_session_syncs_active_offline_account_from_config_usernam
     let prepared = prepare_launch_session(
         &fixture.state,
         LaunchRequest {
-            instance_id,
+            instance_id: instance_id.clone(),
             username: None,
             max_memory_mb: None,
             min_memory_mb: None,
@@ -236,7 +236,18 @@ async fn prepare_launch_session_syncs_active_offline_account_from_config_usernam
     .expect("prepare launch session");
 
     assert_eq!(prepared.task.intent.auth.player_name, "NewName");
-    assert_eq!(prepared.task.intent.username, "NewName");
+    assert_eq!(prepared.task.instance.id, instance_id);
+    assert_eq!(prepared.task.performance_mode, "managed");
+    assert!(prepared.task.intent.low_impact_startup);
+    assert!(!prepared.task.session_id.0.is_empty());
+    let record = fixture
+        .state
+        .sessions()
+        .get(&prepared.task.session_id.0)
+        .await
+        .expect("prepared session record");
+    assert_eq!(record.session_id, prepared.task.session_id);
+    assert_eq!(record.instance_id, prepared.task.instance.id);
     let active = fixture
         .state
         .accounts()
@@ -290,7 +301,6 @@ async fn prepare_launch_session_uses_online_auth_context_from_active_minecraft_a
         .await
         .expect("prepare launch session");
 
-    assert_eq!(prepared.task.intent.username, "Player");
     assert_eq!(prepared.task.intent.auth.player_name, "ProfileName");
     assert_eq!(
         prepared.task.intent.auth.uuid,

@@ -1,13 +1,13 @@
-use axial_content::{CanonicalId, ContentKind, ContentQuery, ContentRegistry, LoaderGameFilter};
+use axial_content::{CanonicalId, ContentKind, ContentQuery, ContentService, LoaderGameFilter};
 
-fn registry() -> ContentRegistry {
-    ContentRegistry::new(reqwest::Client::new())
+fn service() -> ContentService {
+    ContentService::new(reqwest::Client::new())
 }
 
 #[tokio::test]
 #[ignore = "hits the live Modrinth API"]
 async fn search_detail_versions_identify_roundtrip() {
-    let registry = registry();
+    let service = service();
 
     let mut query = ContentQuery::new(ContentKind::Mod);
     query.search = Some("sodium".to_string());
@@ -15,7 +15,7 @@ async fn search_detail_versions_identify_roundtrip() {
     query.game_version = Some("1.21.6".to_string());
     query.limit = 5;
 
-    let page = registry.search(&query).await.expect("search");
+    let page = service.search(&query).await.expect("search");
     assert!(!page.items.is_empty(), "expected search hits");
     let first = &page.items[0];
     println!(
@@ -27,7 +27,7 @@ async fn search_detail_versions_identify_roundtrip() {
     );
 
     let sodium = CanonicalId::for_project(axial_content::ProviderId::Modrinth, "AANobbMI");
-    let detail = registry.detail(&sodium).await.expect("detail");
+    let detail = service.detail(&sodium).await.expect("detail");
     println!(
         "detail: {} — {} versions, {} gallery",
         detail.content.title,
@@ -36,7 +36,7 @@ async fn search_detail_versions_identify_roundtrip() {
     );
     assert_eq!(detail.content.title.to_lowercase(), "sodium");
 
-    let versions = registry
+    let versions = service
         .versions(
             &sodium,
             &LoaderGameFilter {
@@ -56,7 +56,7 @@ async fn search_detail_versions_identify_roundtrip() {
     );
     let sha512 = file.sha512.clone().expect("sha512 present");
 
-    let identified = registry
+    let identified = service
         .identify(std::slice::from_ref(&sha512))
         .await
         .expect("identify");

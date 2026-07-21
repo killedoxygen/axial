@@ -337,7 +337,6 @@ dependencies = [
  "reqwest 0.12.28",
  "serde",
  "serde_json",
- "sha1",
  "sha2",
  "thiserror 2.0.18",
  "tokio",
@@ -351,7 +350,6 @@ version = "0.4.0-dev.5"
 dependencies = [
  "axial-api",
  "axial-config",
- "axial-launcher",
  "axial-performance",
  "serde",
  "serde_json",

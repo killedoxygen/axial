@@ -12,7 +12,7 @@ pub const PRESET_LEGACY_HEAVY: &str = "legacy_heavy";
 const ULTRA_LOW_LATENCY_MIN_LOGICAL_CORES: usize = 8;
 const ULTRA_LOW_LATENCY_MIN_TOTAL_MEMORY_MB: u64 = 8 * 1024;
 
-pub fn recommended_preset(
+pub(crate) fn recommended_preset(
     requested: &str,
     version_id: &str,
     loader: &str,
@@ -28,7 +28,7 @@ pub fn recommended_preset(
     sanitize_preset(&preset, version_id, loader, is_modded, info)
 }
 
-pub fn gc_preset_args(
+pub(crate) fn gc_preset_args(
     preset: &str,
     info: &JavaRuntimeInfo,
     low_impact_startup: bool,
@@ -58,7 +58,7 @@ fn smooth_args(low_impact_startup: bool) -> Vec<String> {
     args
 }
 
-pub fn boot_throttle_args(java_major: u32) -> Vec<String> {
+pub(crate) fn boot_throttle_args(java_major: u32) -> Vec<String> {
     let cpus = std::thread::available_parallelism()
         .map(|value| value.get())
         .unwrap_or(4);
@@ -74,7 +74,7 @@ pub fn boot_throttle_args(java_major: u32) -> Vec<String> {
     args
 }
 
-pub fn sanitize_preset(
+pub(crate) fn sanitize_preset(
     preset: &str,
     version_id: &str,
     loader: &str,
@@ -128,32 +128,6 @@ pub fn sanitize_preset(
     }
 
     preset.to_string()
-}
-
-pub fn known_fatal_explicit_preset_reason(
-    preset: &str,
-    info: &JavaRuntimeInfo,
-) -> Option<&'static str> {
-    let preset = preset.trim();
-    if !is_known_preset(preset) {
-        return None;
-    }
-    if !supports_hotspot_tuning(info) {
-        return Some("the selected runtime does not support HotSpot JVM tuning flags");
-    }
-
-    match preset {
-        PRESET_SMOOTH if !supports_shenandoah(info) => {
-            Some("the selected runtime does not support Shenandoah GC flags")
-        }
-        PRESET_ULTRA_LOW_LATENCY if !supports_zgc(info) => {
-            Some("the selected runtime does not support ZGC flags")
-        }
-        PRESET_GRAALVM if info.distribution != "graalvm" || info.major < 17 => {
-            Some("the GraalVM preset requires GraalVM Java 17 or newer")
-        }
-        _ => None,
-    }
 }
 
 pub fn supports_hotspot_tuning(info: &JavaRuntimeInfo) -> bool {
@@ -321,19 +295,6 @@ fn legacy_preset_for_target(version_id: &str, loader: &str, is_modded: bool) -> 
 
 fn is_modded_launch(loader: &str, is_modded: bool) -> bool {
     loader == "forge" || loader == "neoforge" || is_modded
-}
-
-fn is_known_preset(preset: &str) -> bool {
-    matches!(
-        preset,
-        PRESET_SMOOTH
-            | PRESET_PERFORMANCE
-            | PRESET_ULTRA_LOW_LATENCY
-            | PRESET_GRAALVM
-            | PRESET_LEGACY
-            | PRESET_LEGACY_PVP
-            | PRESET_LEGACY_HEAVY
-    )
 }
 
 #[cfg(test)]

@@ -1529,7 +1529,7 @@ exit 0
         )
         .await
         .unwrap_or_else(|(_, payload)| panic!("prepare repaired component launch: {payload:?}"));
-        let session_id = prepared.task.intent.session_id.clone();
+        let session_id = prepared.task.session_id.0.clone();
         tokio::time::timeout(
             Duration::from_secs(10),
             crate::application::launch::launch_session(state.clone(), prepared.task, producer),
@@ -1750,7 +1750,7 @@ exec sleep 30
         )
         .await
         .unwrap_or_else(|(_, payload)| panic!("prepare R5 launch: {payload:?}"));
-        let session_id = prepared.task.intent.session_id.clone();
+        let session_id = prepared.task.session_id.0.clone();
         tokio::time::timeout(
             Duration::from_secs(10),
             crate::application::launch::launch_session(state.clone(), prepared.task, producer),

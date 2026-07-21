@@ -13,25 +13,20 @@ use serde::{Deserialize, Serialize};
 
 pub use healing::{HealingSummaryInput, build_healing_summary};
 pub use mapping::{
-    failure_class_name, format_failure_class, is_terminal_state, is_terminal_status,
-    launch_stage_label, launch_state_name, snapshot_status,
+    failure_class_name, format_failure_class, launch_stage_label, launch_state_name,
+    snapshot_status,
 };
 #[cfg(feature = "test-support")]
 pub use prepare::prepare_launch_attempt_with_persisted_runtime_manifest_for_test;
-pub use prepare::{
-    LaunchPreparationEvent, prepare_launch_attempt_with_events, sanitize_effective_runtime_major,
-};
+pub use prepare::{LaunchPreparationEvent, prepare_launch_attempt_with_events};
 
 #[derive(Debug, Clone)]
 pub struct LaunchIntent {
-    pub session_id: String,
     pub library_dir: std::path::PathBuf,
-    pub instance_id: String,
     pub version_id: String,
     pub target_version_id: String,
     pub loader: String,
     pub is_modded: bool,
-    pub username: String,
     pub auth: LaunchAuthContext,
     pub requested_java: String,
     pub requested_preset: String,
@@ -43,7 +38,7 @@ pub struct LaunchIntent {
     pub launcher_version: String,
     pub game_dir: Option<std::path::PathBuf>,
     pub guardian: LaunchGuardianContext,
-    pub performance_mode: String,
+    pub low_impact_startup: bool,
 }
 
 #[derive(Debug, Clone, Default)]

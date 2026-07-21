@@ -87,8 +87,7 @@ async fn handle_launch(
         .try_claim()
         .map_err(launch_app::launch_shutdown_error_response)?;
     let prepared = launch_app::prepare_launch_session_owned(&state, payload, &producer).await?;
-    let initial_status =
-        launch_app::launch_status(&state, &prepared.task.intent.session_id).await?;
+    let initial_status = launch_app::launch_status(&state, &prepared.task.session_id.0).await?;
     let response = launch_app::launch_prepared_response_payload(&prepared.task, &initial_status);
     spawn_launch_session(state, prepared.task, producer);
 
@@ -100,7 +99,7 @@ fn spawn_launch_session(
     task: launch_app::LaunchSessionTask,
     producer: crate::state::ProducerLease,
 ) {
-    let session_id = task.intent.session_id.clone();
+    let session_id = task.session_id.0.clone();
     let launch_owner = producer.claim_child();
     producer.spawn(async move {
         if let Err(error) = launch_app::launch_session(state, task, launch_owner).await {

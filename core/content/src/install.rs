@@ -104,6 +104,8 @@ where
         .await
         {
             Ok(report) => {
+                entries[index].size = Some(report.bytes_written);
+                entries[index].sha512 = planned.file.sha512.clone();
                 for fact in report.facts {
                     on_download_fact(fact);
                 }
@@ -343,9 +345,7 @@ fn prepare_install_destinations(
             let path = contained_path(game_dir, variant)?;
             match fs::symlink_metadata(&path) {
                 Ok(metadata) if metadata.is_file() && !owners.is_empty() => {
-                    if owners.iter().any(|owner| {
-                        !entry_has_checksum(owner) || !entry_path_matches(&path, owner)
-                    }) {
+                    if owners.iter().any(|owner| !entry_path_matches(&path, owner)) {
                         return Err(ContentError::Invalid(
                             "a content destination is occupied by a file no longer owned by the manifest"
                                 .to_string(),
@@ -860,7 +860,7 @@ pub fn verified_removable_variants(
                     "a managed content path is no longer a regular file".to_string(),
                 ));
             }
-            Ok(_) if entry_has_checksum(entry) && entry_path_matches(&path, entry) => {
+            Ok(_) if entry_path_matches(&path, entry) => {
                 removable.push(ManagedRemoval {
                     relative,
                     owner: entry.clone(),
@@ -874,10 +874,6 @@ pub fn verified_removable_variants(
         }
     }
     Ok(removable)
-}
-
-fn entry_has_checksum(entry: &ManifestEntry) -> bool {
-    entry.sha512.is_some() || entry.sha1.is_some()
 }
 
 /// Relative enabled and disabled paths owned by one manifest entry.
@@ -1038,16 +1034,13 @@ mod tests {
 
     fn recorded(project: &str, filename: &str) -> ManifestEntry {
         let planned = planned(project, filename);
-        let mut recorded_file = planned.file;
-        recorded_file.sha512 = None;
-        recorded_file.size = None;
         ManifestEntry::managed(
             planned.canonical_id,
             planned.provider,
             planned.project_id,
             planned.version_id,
             planned.kind,
-            &recorded_file,
+            &planned.file,
             Vec::new(),
             planned.title,
         )
@@ -1343,8 +1336,11 @@ mod tests {
                 url: "https://example.invalid/old.jar".to_string(),
                 filename: "old.jar".to_string(),
                 sha1: None,
-                sha512: None,
-                size: None,
+                sha512: Some(
+                    crate::manifest::sha512_file(&mods.join("old.jar.disabled"))
+                        .expect("disabled hash"),
+                ),
+                size: Some(b"disabled".len() as u64),
                 primary: true,
             },
             Vec::new(),
@@ -1380,9 +1376,9 @@ mod tests {
             &FileRef {
                 url: "https://example.invalid/managed.jar".to_string(),
                 filename: "managed.jar".to_string(),
-                sha1: Some("0".repeat(40)),
-                sha512: None,
-                size: None,
+                sha1: None,
+                sha512: Some("0".repeat(128)),
+                size: Some(1),
                 primary: true,
             },
             Vec::new(),
@@ -1671,12 +1667,14 @@ mod tests {
                 crate::manifest::sha512_file(&root.join("mods/dependency.jar"))
                     .expect("dependency hash"),
             );
+            dependency.size = Some(b"dependency".len() as u64);
             let dependency_id = dependency.canonical_id.clone();
             let mut dependent = recorded("dependent", "dependent.jar");
             dependent.sha512 = Some(
                 crate::manifest::sha512_file(&root.join("mods/dependent.jar"))
                     .expect("dependent hash"),
             );
+            dependent.size = Some(b"dependent".len() as u64);
             dependent.dependencies.push(ContentDependency {
                 project_id: (!version_only).then(|| dependency.project_id.clone()),
                 version_id: Some(dependency.version_id.clone()),
@@ -1714,11 +1712,13 @@ mod tests {
             crate::manifest::sha512_file(&root.join("mods/dependency.jar"))
                 .expect("dependency hash"),
         );
+        dependency.size = Some(b"dependency".len() as u64);
         let dependency_id = dependency.canonical_id.clone();
         let mut dependent = recorded("dependent", "dependent.jar");
         dependent.sha512 = Some(
             crate::manifest::sha512_file(&root.join("mods/dependent.jar")).expect("dependent hash"),
         );
+        dependent.size = Some(b"dependent".len() as u64);
         let dependent_id = dependent.canonical_id.clone();
         dependent.dependencies.push(ContentDependency {
             project_id: Some(dependency.project_id.clone()),

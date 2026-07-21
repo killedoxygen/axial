@@ -2,7 +2,6 @@ use crate::error::{ContentError, ContentResult};
 use crate::model::{CanonicalId, ContentDependency, ContentKind, FileRef, ProviderId};
 use crate::transaction::promote_replacement;
 use serde::{Deserialize, Serialize};
-use sha1::Sha1;
 use sha2::{Digest, Sha256, Sha512};
 use std::collections::HashSet;
 use std::fs;
@@ -12,7 +11,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const MANIFEST_FILE: &str = "axial.content.json";
-const MANIFEST_SCHEMA_VERSION: u32 = 1;
+const MANIFEST_SCHEMA_VERSION: u32 = 2;
 const MANIFEST_TEMP_PREFIX: &str = ".axial.content.json.tmp";
 const MAX_MANIFEST_BYTES: usize = 4 * 1024 * 1024;
 const MAX_MANIFEST_ENTRIES: usize = 4096;
@@ -35,8 +34,6 @@ pub struct ManifestEntry {
     /// Enabled-state base filename (no `.disabled` suffix), relative to the
     /// kind's install subdirectory.
     pub filename: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub sha1: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sha512: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -109,7 +106,6 @@ impl ManifestEntry {
             version_id,
             kind,
             filename: file.filename.clone(),
-            sha1: file.sha1.clone(),
             sha512: file.sha512.clone(),
             size: file.size,
             dependencies,
@@ -353,12 +349,19 @@ fn validate_entry(entry: &ManifestEntry) -> ContentResult<()> {
         ));
     }
     validate_filename(entry.kind, &entry.filename)?;
-    validate_optional_hash("sha1", entry.sha1.as_deref(), 40)?;
-    validate_optional_hash("sha512", entry.sha512.as_deref(), 128)?;
-    if entry.kind != ContentKind::Modpack && entry.sha1.is_none() && entry.sha512.is_none() {
-        return Err(ContentError::Invalid(
-            "content manifest file entry is missing an integrity checksum".to_string(),
-        ));
+    if entry.kind == ContentKind::Modpack {
+        if !entry.filename.is_empty() || entry.sha512.is_some() || entry.size.is_some() {
+            return Err(ContentError::Invalid(
+                "content manifest modpack provenance cannot own a file".to_string(),
+            ));
+        }
+    } else {
+        validate_sha512(entry.sha512.as_deref())?;
+        if !entry.size.is_some_and(|size| size > 0) {
+            return Err(ContentError::Invalid(
+                "content manifest file entry is missing an exact positive size".to_string(),
+            ));
+        }
     }
     if entry.dependencies.len() > MAX_ENTRY_DEPENDENCIES {
         return Err(ContentError::Invalid(
@@ -428,13 +431,16 @@ fn validate_filename(kind: ContentKind, filename: &str) -> ContentResult<()> {
     Ok(())
 }
 
-fn validate_optional_hash(label: &str, value: Option<&str>, length: usize) -> ContentResult<()> {
-    if value.is_some_and(|value| {
-        value.len() != length || !value.bytes().all(|byte| byte.is_ascii_hexdigit())
+fn validate_sha512(value: Option<&str>) -> ContentResult<()> {
+    if !value.is_some_and(|value| {
+        value.len() == 128
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
     }) {
-        return Err(ContentError::Invalid(format!(
-            "content manifest {label} is invalid"
-        )));
+        return Err(ContentError::Invalid(
+            "content manifest sha512 is invalid".to_string(),
+        ));
     }
     Ok(())
 }
@@ -503,9 +509,8 @@ fn create_manifest_temp(game_dir: &Path) -> ContentResult<(PathBuf, fs::File)> {
     )))
 }
 
-/// Whether an entry still owns a regular file on disk. When provenance carries
-/// integrity metadata, presence includes matching the recorded size and
-/// strongest available hash so a same-name manual replacement is not trusted.
+/// Whether an entry still owns a regular file on disk. Presence requires the
+/// exact recorded size and SHA-512 so a same-name replacement is not trusted.
 pub fn entry_file_present(game_dir: &Path, entry: &ManifestEntry) -> bool {
     matching_entry_filename(game_dir, entry).is_some()
 }
@@ -514,7 +519,8 @@ fn matching_entry_filename(game_dir: &Path, entry: &ManifestEntry) -> Option<Str
     // A modpack entry records which pack the instance came from and owns no file
     // of its own, so it can never go missing.
     let Some(kind_dir) = entry.kind.install_subdir() else {
-        return Some(entry.filename.clone());
+        return (entry.filename.is_empty() && entry.sha512.is_none() && entry.size.is_none())
+            .then(String::new);
     };
     let dir = game_dir.join(kind_dir);
     let enabled = entry.filename.clone();
@@ -533,19 +539,19 @@ fn matching_entry_filename(game_dir: &Path, entry: &ManifestEntry) -> Option<Str
 /// manifest entry. Callers that are about to replace a particular variant must
 /// use this rather than accepting ownership from the filename alone.
 pub fn entry_path_matches(path: &Path, entry: &ManifestEntry) -> bool {
+    let (Some(expected_size), Some(expected_sha512)) = (entry.size, entry.sha512.as_deref()) else {
+        return false;
+    };
+    if expected_size == 0 || validate_sha512(Some(expected_sha512)).is_err() {
+        return false;
+    }
     let Ok(metadata) = fs::symlink_metadata(path) else {
         return false;
     };
-    if !metadata.is_file() || entry.size.is_some_and(|size| size != metadata.len()) {
+    if !metadata.is_file() || expected_size != metadata.len() {
         return false;
     }
-    if let Some(expected) = entry.sha512.as_deref() {
-        return hash_file::<Sha512>(path).is_ok_and(|actual| actual.eq_ignore_ascii_case(expected));
-    }
-    if let Some(expected) = entry.sha1.as_deref() {
-        return hash_file::<Sha1>(path).is_ok_and(|actual| actual.eq_ignore_ascii_case(expected));
-    }
-    false
+    hash_file::<Sha512>(path).is_ok_and(|actual| actual == expected_sha512)
 }
 
 pub fn manifest_path(game_dir: &Path) -> PathBuf {
@@ -599,9 +605,9 @@ mod tests {
         FileRef {
             url: format!("https://example.invalid/{filename}"),
             filename: filename.to_string(),
-            sha1: Some("0".repeat(40)),
-            sha512: None,
-            size: None,
+            sha1: None,
+            sha512: Some("0".repeat(128)),
+            size: Some(1),
             primary: true,
         }
     }
@@ -756,14 +762,15 @@ mod tests {
     }
 
     #[test]
-    fn load_requires_the_exact_v1_schema() {
+    fn p00_b11_contract_load_requires_the_exact_v2_schema_without_rewriting_rejections() {
         let dir = temp_game_dir("strict-schema");
         let path = manifest_path(&dir);
         let cases = [
             r#"{"entries":[]}"#,
-            r#"{"schema_version":2,"entries":[]}"#,
+            r#"{"schema_version":1,"entries":[]}"#,
+            r#"{"schema_version":3,"entries":[]}"#,
             r#"{"schema_version":1,"entries":[],"unidentified":[]}"#,
-            r#"{"schema_version":1,"entries":[],"extra":true}"#,
+            r#"{"schema_version":2,"entries":[],"extra":true}"#,
         ];
 
         for body in cases {
@@ -771,6 +778,11 @@ mod tests {
             assert!(
                 ContentManifest::load(&dir).is_err(),
                 "manifest should fail closed: {body}"
+            );
+            assert_eq!(
+                fs::read(&path).expect("read rejected manifest"),
+                body.as_bytes(),
+                "rejected manifests must remain byte-exact"
             );
         }
         fs::remove_dir_all(&dir).ok();
@@ -822,6 +834,16 @@ mod tests {
             .as_object_mut()
             .expect("entry object")
             .remove("source");
+        value["entries"][0]["sha1"] = serde_json::json!("0".repeat(40));
+        let legacy_sha1 = serde_json::to_vec(&value).expect("legacy sha1 body");
+        fs::write(&path, &legacy_sha1).expect("write legacy sha1");
+        assert!(ContentManifest::load(&dir).is_err());
+        assert_eq!(fs::read(&path).expect("read legacy sha1"), legacy_sha1);
+
+        value["entries"][0]
+            .as_object_mut()
+            .expect("entry object")
+            .remove("sha1");
         value["entries"][0]["unknown"] = serde_json::json!(true);
         fs::write(
             &path,
@@ -927,11 +949,10 @@ mod tests {
     }
 
     #[test]
-    fn file_entries_require_integrity_before_they_can_own_a_path() {
+    fn p00_b11_contract_file_owners_require_canonical_sha512_and_positive_exact_size() {
         let dir = temp_game_dir("checksum-required");
         let path = manifest_path(&dir);
         let mut entry = managed_entry("AAA", "tracked.jar");
-        entry.sha1 = None;
         entry.sha512 = None;
         fs::write(
             &path,
@@ -949,9 +970,40 @@ mod tests {
         fs::write(&tracked, b"unverified").expect("write unverified file");
         assert!(!entry_path_matches(&tracked, &entry));
 
+        entry.sha512 = Some("A".repeat(128));
+        assert!(
+            ContentManifest {
+                entries: vec![entry.clone()],
+                ..ContentManifest::default()
+            }
+            .validate()
+            .is_err()
+        );
+        entry.sha512 = Some("a".repeat(128));
+        entry.size = Some(0);
+        assert!(
+            ContentManifest {
+                entries: vec![entry.clone()],
+                ..ContentManifest::default()
+            }
+            .validate()
+            .is_err()
+        );
+        entry.size = None;
+        assert!(
+            ContentManifest {
+                entries: vec![entry.clone()],
+                ..ContentManifest::default()
+            }
+            .validate()
+            .is_err()
+        );
+
         fs::remove_file(&path).expect("remove rejected manifest");
         entry.kind = ContentKind::Modpack;
         entry.filename.clear();
+        entry.sha512 = None;
+        entry.size = None;
         let mut manifest = ContentManifest::default();
         manifest.upsert(entry);
         manifest
@@ -961,7 +1013,7 @@ mod tests {
     }
 
     #[test]
-    fn entry_presence_accepts_disabled_state_but_rejects_replacement() {
+    fn p00_b11_contract_entry_presence_rejects_same_size_corruption() {
         let dir = temp_game_dir("entry-presence");
         let mods_dir = dir.join("mods");
         fs::create_dir_all(&mods_dir).expect("mods dir");

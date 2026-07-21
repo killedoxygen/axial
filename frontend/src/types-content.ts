@@ -3,12 +3,6 @@ export type ProviderId = 'modrinth';
 export type ReleaseChannel = 'release' | 'beta' | 'alpha';
 export type ContentSort = 'relevance' | 'downloads' | 'follows' | 'newest' | 'updated';
 
-export interface ProviderRef {
-  provider: ProviderId;
-  project_id: string;
-  slug?: string;
-}
-
 export interface CanonicalContent {
   canonical_id: string;
   kind: ContentKind;
@@ -25,7 +19,6 @@ export interface CanonicalContent {
   game_versions: string[];
   loaders: string[];
   updated?: string;
-  sources: ProviderRef[];
 }
 
 export interface FileRef {

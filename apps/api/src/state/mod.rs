@@ -42,7 +42,7 @@ use axial_config::{
     InstanceStore as StartupInstanceStore, InstanceStoreError, generate_instance_id,
     is_canonical_instance_id,
 };
-use axial_content::ContentRegistry;
+use axial_content::ContentService;
 pub use axial_launcher::{
     LaunchEvent, LaunchLogEvent, LaunchSessionRecord, LaunchStatusEvent, RevisionedLaunchStatus,
 };
@@ -203,7 +203,7 @@ pub struct AppState {
     telemetry: Arc<TelemetryHub>,
     updater: Arc<UpdaterStore>,
     update_admission: update_admission::UpdateAdmissionCoordinator,
-    content: Arc<ContentRegistry>,
+    content: Arc<ContentService>,
     launch_reports: Arc<launch_reports::LaunchReportStore>,
     persisted_state_load: Arc<PersistedStateLoadEvidence>,
     persisted_state_rejection_streaks:
@@ -654,7 +654,7 @@ impl AppState {
             )?;
         }
         let updater = Arc::new(UpdaterStore::new(&config.paths().config_dir));
-        let content = Arc::new(ContentRegistry::new(content_http_client()));
+        let content = Arc::new(ContentService::new(content_http_client()));
         let (config_changes, _) = broadcast::channel(32);
 
         Ok(Self {
@@ -811,7 +811,7 @@ impl AppState {
         &self.installs
     }
 
-    pub fn content(&self) -> &Arc<ContentRegistry> {
+    pub fn content(&self) -> &Arc<ContentService> {
         &self.content
     }
 

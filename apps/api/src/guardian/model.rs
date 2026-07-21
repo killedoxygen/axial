@@ -87,8 +87,6 @@ pub enum GuardianFactId {
     JvmArgsEmpty,
     JvmArgsParseFailed,
     JvmPresetCompatibilityAdjusted,
-    LaunchCommandInvalid,
-    LaunchCommandPrepared,
     LaunchFailureClassified,
     LaunchJvmPresetDowngradeAvailable,
     LaunchJvmStripAvailable,
@@ -145,7 +143,7 @@ pub enum GuardianFactId {
 }
 
 impl GuardianFactId {
-    pub const ALL: [Self; 123] = [
+    pub const ALL: [Self; 121] = [
         Self::AgentHookFailed,
         Self::AgentUnavailable,
         Self::ArtifactChecksumMismatch,
@@ -203,8 +201,6 @@ impl GuardianFactId {
         Self::JvmArgsEmpty,
         Self::JvmArgsParseFailed,
         Self::JvmPresetCompatibilityAdjusted,
-        Self::LaunchCommandInvalid,
-        Self::LaunchCommandPrepared,
         Self::LaunchFailureClassified,
         Self::LaunchJvmPresetDowngradeAvailable,
         Self::LaunchJvmStripAvailable,
@@ -330,8 +326,6 @@ impl GuardianFactId {
             Self::JvmArgsEmpty => "jvm_args_empty",
             Self::JvmArgsParseFailed => "jvm_args_parse_failed",
             Self::JvmPresetCompatibilityAdjusted => "jvm_preset_compatibility_adjusted",
-            Self::LaunchCommandInvalid => "launch_command_invalid",
-            Self::LaunchCommandPrepared => "launch_command_prepared",
             Self::LaunchFailureClassified => "launch_failure_classified",
             Self::LaunchJvmPresetDowngradeAvailable => "launch_jvm_preset_downgrade_available",
             Self::LaunchJvmStripAvailable => "launch_jvm_strip_available",
@@ -475,8 +469,6 @@ pub enum DiagnosisId {
     JvmArgUnsupported,
     JvmArgsEmpty,
     JvmArgsMalformed,
-    LaunchCommandInvalid,
-    LaunchCommandPrepared,
     LauncherManagedArtifactCorrupt,
     LauncherManagedArtifactSignatureCorrupt,
     ManagedRuntimeCorrupt,
@@ -529,7 +521,7 @@ pub enum DiagnosisId {
 }
 
 impl DiagnosisId {
-    pub const ALL: [Self; 79] = [
+    pub const ALL: [Self; 77] = [
         Self::ArtifactOwnershipUnsafe,
         Self::AtomicPromotionFailed,
         Self::DownloadUnavailable,
@@ -547,8 +539,6 @@ impl DiagnosisId {
         Self::JvmArgUnsupported,
         Self::JvmArgsEmpty,
         Self::JvmArgsMalformed,
-        Self::LaunchCommandInvalid,
-        Self::LaunchCommandPrepared,
         Self::LauncherManagedArtifactCorrupt,
         Self::LauncherManagedArtifactSignatureCorrupt,
         Self::ManagedRuntimeCorrupt,
@@ -630,8 +620,6 @@ impl DiagnosisId {
             Self::JvmArgUnsupported => "jvm_arg_unsupported",
             Self::JvmArgsEmpty => "jvm_args_empty",
             Self::JvmArgsMalformed => "jvm_args_malformed",
-            Self::LaunchCommandInvalid => "launch_command_invalid",
-            Self::LaunchCommandPrepared => "launch_command_prepared",
             Self::LauncherManagedArtifactCorrupt => "launcher_managed_artifact_corrupt",
             Self::LauncherManagedArtifactSignatureCorrupt => {
                 "launcher_managed_artifact_signature_corrupt"

@@ -1,7 +1,7 @@
 //! Content discovery orchestration: search and browse upstream content, resolve
 //! a backend-authored install plan against a target, and install verified files
-//! into an instance. Provider access, canonicalization, verified download, the
-//! provenance manifest and modpack import live in `axial-content`; this module
+//! into an instance. Modrinth access and mapping, verified download, the
+//! provenance manifest, and modpack import live in `axial-content`; this module
 //! adapts them to the HTTP surface and keeps policy — dependency resolution,
 //! conflict detection, compatibility ranking — on the backend.
 //!
@@ -247,7 +247,14 @@ pub async fn content_search(
         HashSet::new()
     };
 
-    Ok(Page {
+    Ok(project_search_page(page, &installed_ids))
+}
+
+fn project_search_page(
+    page: Page<CanonicalContent>,
+    installed_ids: &HashSet<CanonicalId>,
+) -> Page<SearchHit> {
+    Page {
         items: page
             .items
             .into_iter()
@@ -261,7 +268,7 @@ pub async fn content_search(
         offset: page.offset,
         limit: page.limit,
         total: page.total,
-    })
+    }
 }
 
 fn present_installed_ids(
@@ -839,16 +846,84 @@ pub fn json_error(status: StatusCode, message: &str) -> ContentApiError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axial_content::FileRef;
+    use axial_content::{ContentService, FileRef};
     use sha2::{Digest, Sha512};
     use std::fs;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
 
     fn test_sha512(bytes: &[u8]) -> String {
         hex::encode(Sha512::digest(bytes))
     }
 
+    #[tokio::test]
+    async fn p00_b11_contract_cross_owner_direct_service_projects_without_sources() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind Application content fixture");
+        let address = listener.local_addr().expect("Application fixture address");
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept search request");
+            let mut request = Vec::new();
+            let mut chunk = [0_u8; 1024];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let read = socket.read(&mut chunk).await.expect("read search request");
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&chunk[..read]);
+            }
+            let body = serde_json::to_vec(&serde_json::json!({
+                "hits": [{
+                    "project_id": "application-project",
+                    "slug": "application-project",
+                    "title": "Application Project",
+                    "author": "Author",
+                    "description": "Summary",
+                    "project_type": "mod"
+                }],
+                "offset": 0,
+                "limit": 1,
+                "total_hits": 1
+            }))
+            .expect("encode search response");
+            let headers = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            socket
+                .write_all(headers.as_bytes())
+                .await
+                .expect("write search headers");
+            socket.write_all(&body).await.expect("write search body");
+            String::from_utf8(request).expect("search request is UTF-8")
+        });
+        let service = ContentService::with_base_url(
+            reqwest::Client::builder()
+                .no_proxy()
+                .build()
+                .expect("Application fixture client"),
+            format!("http://{address}/v2"),
+        );
+        let mut query = ContentQuery::new(ContentKind::Mod);
+        query.limit = 1;
+
+        let page = service.search(&query).await.expect("Core service search");
+        let request = server.await.expect("search fixture task");
+        let projected = project_search_page(page, &HashSet::new());
+        let wire = serde_json::to_value(&projected).expect("serialize Application page");
+
+        assert!(request.starts_with("GET /v2/search?"));
+        assert_eq!(
+            wire["items"][0]["canonical_id"],
+            serde_json::json!("modrinth:application-project")
+        );
+        assert!(wire["items"][0].get("install_state").is_none());
+        assert!(wire["items"][0].get("sources").is_none());
+    }
+
     #[test]
-    fn search_install_state_requires_the_tracked_file_to_exist() {
+    fn p00_b11_contract_search_install_state_requires_exact_live_bytes() {
         let root = std::env::temp_dir().join(format!(
             "axial-content-search-presence-{}-{}",
             std::process::id(),
@@ -864,7 +939,7 @@ mod tests {
             filename: "tracked.jar".to_string(),
             sha1: None,
             sha512: Some(test_sha512(b"tracked")),
-            size: None,
+            size: Some(b"tracked".len() as u64),
             primary: true,
         };
         let mut manifest = ContentManifest::default();
@@ -898,7 +973,7 @@ mod tests {
     }
 
     #[test]
-    fn instance_content_is_a_read_only_live_projection() {
+    fn p00_b11_contract_instance_content_is_an_exact_live_projection() {
         let root = std::env::temp_dir().join(format!(
             "axial-content-live-projection-{}-{}",
             std::process::id(),
@@ -920,7 +995,7 @@ mod tests {
                 filename: "live.jar".to_string(),
                 sha1: None,
                 sha512: Some(test_sha512(b"live")),
-                size: None,
+                size: Some(b"live".len() as u64),
                 primary: true,
             },
             Vec::new(),
@@ -937,7 +1012,7 @@ mod tests {
                 filename: "missing.jar".to_string(),
                 sha1: None,
                 sha512: Some(test_sha512(b"missing")),
-                size: None,
+                size: Some(b"missing".len() as u64),
                 primary: true,
             },
             Vec::new(),

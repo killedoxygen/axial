@@ -60,15 +60,15 @@ fn benchmark_launch_request_missing_instance_id_returns_json_error() {
 }
 
 #[tokio::test]
-async fn launch_prepared_response_payload_exposes_queued_session_metadata() {
+async fn p00_b11_contract_cross_owner_response_uses_application_task_identity() {
     let fixture = RouteTestFixture::new("prepared-response-payload");
     let producer = fixture
         .state
         .try_claim_producer()
         .expect("claim prepared response producer");
     let task = test_launch_session_task(&fixture.state, &producer).await;
-    let mut queued = test_record(&task.intent.session_id);
-    queued.instance_id = task.intent.instance_id.clone();
+    let mut queued = test_record(&task.session_id.0);
+    queued.instance_id = task.instance.id.clone();
     queued.guardian = Some(serde_json::to_value(&task.guardian).expect("serialize guardian"));
     fixture
         .state
@@ -76,7 +76,7 @@ async fn launch_prepared_response_payload_exposes_queued_session_metadata() {
         .insert(queued)
         .await
         .expect("insert prepared session");
-    let initial_status = launch_app::launch_status(&fixture.state, &task.intent.session_id)
+    let initial_status = launch_app::launch_status(&fixture.state, &task.session_id.0)
         .await
         .expect("queued status");
     let public_status = serde_json::to_value(&initial_status).expect("serialize queued status");
@@ -90,6 +90,8 @@ async fn launch_prepared_response_payload_exposes_queued_session_metadata() {
     assert_eq!(payload["revision"], serde_json::json!(0));
     assert_eq!(payload["session_id"], serde_json::json!("session-queued"));
     assert_eq!(payload["instance_id"], serde_json::json!("instance-queued"));
+    assert_eq!(payload["session_id"], serde_json::json!(task.session_id.0));
+    assert_eq!(payload["instance_id"], serde_json::json!(task.instance.id));
     assert_eq!(payload["pid"], serde_json::Value::Null);
     assert_eq!(
         payload["launched_at"],
@@ -201,9 +203,9 @@ async fn launch_status_transport_reads_revisioned_benchmark_and_stage_mutations(
         .record_stage_evidence(
             session_id,
             vec![LaunchStageEvidence {
-                id: "execution_launch_command_prepared".to_string(),
-                system: "execution".to_string(),
-                summary: "Execution prepared the launch command.".to_string(),
+                id: "application_launch_command_prepared".to_string(),
+                system: "application".to_string(),
+                summary: "Application prepared the launch command.".to_string(),
                 details: vec!["arg_count:3".to_string()],
             }],
         )
@@ -232,7 +234,7 @@ async fn launch_status_transport_reads_revisioned_benchmark_and_stage_mutations(
     assert_eq!(payload["benchmark"]["id"], json!("benchmark-refresh"));
     assert_eq!(
         payload["stages"][0]["evidence"][0]["id"],
-        json!("execution_launch_command_prepared")
+        json!("application_launch_command_prepared")
     );
 }
 
@@ -4928,6 +4930,7 @@ async fn test_launch_session_task(
             ),
             "managed",
         ),
+        session_id: axial_launcher::SessionId("session-queued".to_string()),
         instance: Instance {
             id: "instance-queued".to_string(),
             name: "Queued Instance".to_string(),
@@ -4950,14 +4953,11 @@ async fn test_launch_session_task(
             minecraft_version: String::new(),
         },
         intent: LaunchIntent {
-            session_id: "session-queued".to_string(),
             library_dir: PathBuf::from("/tmp/axial-test-library"),
-            instance_id: "instance-queued".to_string(),
             version_id: "1.21.1".to_string(),
             target_version_id: "1.21.1".to_string(),
             loader: "vanilla".to_string(),
             is_modded: false,
-            username: "Player".to_string(),
             auth: LaunchAuthContext::offline("Player"),
             requested_java: String::new(),
             requested_preset: String::new(),
@@ -4969,8 +4969,9 @@ async fn test_launch_session_task(
             launcher_version: "test".to_string(),
             game_dir: None,
             guardian: LaunchGuardianContext::default(),
-            performance_mode: "managed".to_string(),
+            low_impact_startup: true,
         },
+        performance_mode: "managed".to_string(),
         guardian: guardian_summary_for_test(
             GuardianMode::Managed,
             GuardianSummaryDecision::Allowed,

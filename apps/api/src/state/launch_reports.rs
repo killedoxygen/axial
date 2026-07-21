@@ -322,9 +322,9 @@ pub(crate) struct LaunchProofContext {
 }
 
 impl LaunchProofContext {
-    pub(crate) fn from_intent(intent: &LaunchIntent) -> Self {
+    pub(crate) fn from_intent(intent: &LaunchIntent, performance_mode: &str) -> Self {
         Self {
-            performance_mode: trimmed_or_unknown(&intent.performance_mode),
+            performance_mode: trimmed_or_unknown(performance_mode),
             requested_memory_mb: positive_i32(intent.max_memory_mb),
             version_id: non_empty_string(&intent.version_id),
             benchmark: None,
@@ -3001,9 +3001,9 @@ mod tests {
         let mut record = test_record("stage-evidence");
         record.stages[0].evidence = vec![
             LaunchStageEvidence {
-                id: "execution_launch_command_prepared".to_string(),
-                system: "execution".to_string(),
-                summary: "Execution prepared a runnable launch command.".to_string(),
+                id: "application_launch_command_prepared".to_string(),
+                system: "application".to_string(),
+                summary: "Application prepared a runnable launch command.".to_string(),
                 details: vec![
                     "arg_count:3".to_string(),
                     r"program:C:\Users\Alice\.jdks\java.exe".to_string(),
@@ -3023,13 +3023,13 @@ mod tests {
         assert_eq!(proof.stages[0].evidence.len(), 1);
         assert_eq!(
             proof.stages[0].evidence[0].id,
-            "execution_launch_command_prepared"
+            "application_launch_command_prepared"
         );
         assert_eq!(proof.stages[0].evidence[0].details, vec!["arg_count:3"]);
 
         let persisted_json = fs::read_to_string(report_path(&paths, "stage-evidence"))
             .expect("read persisted report");
-        assert!(persisted_json.contains("execution_launch_command_prepared"));
+        assert!(persisted_json.contains("application_launch_command_prepared"));
         assert!(!persisted_json.contains("Alice"));
         assert!(!persisted_json.contains("-Xmx"));
         assert!(!persisted_json.contains("token"));
@@ -3976,14 +3976,11 @@ mod tests {
         let paths = test_paths(&root);
         let record = test_record("normal-context");
         let intent = LaunchIntent {
-            session_id: "normal-context".to_string(),
             library_dir: root.join("library"),
-            instance_id: "instance".to_string(),
             version_id: "1.21.4".to_string(),
             target_version_id: "1.21.4".to_string(),
             loader: "vanilla".to_string(),
             is_modded: false,
-            username: "Player".to_string(),
             auth: axial_launcher::LaunchAuthContext::offline("Player"),
             requested_java: String::new(),
             requested_preset: String::new(),
@@ -3995,9 +3992,9 @@ mod tests {
             launcher_version: "test".to_string(),
             game_dir: None,
             guardian: axial_launcher::LaunchGuardianContext::default(),
-            performance_mode: "managed".to_string(),
+            low_impact_startup: true,
         };
-        let context = LaunchProofContext::from_intent(&intent);
+        let context = LaunchProofContext::from_intent(&intent, "managed");
 
         assert_eq!(context.benchmark, None);
         assert_eq!(context.resource_budget, None);

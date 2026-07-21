@@ -68,6 +68,29 @@ pub(crate) fn launch_application_stage_evidence() -> Vec<LaunchStageEvidence> {
     )]
 }
 
+pub(crate) fn launch_command_stage_evidence(
+    runnable: bool,
+    arg_count: usize,
+) -> Vec<LaunchStageEvidence> {
+    let (id, summary) = if runnable {
+        (
+            "application_launch_command_prepared",
+            "Application prepared a runnable launch command.",
+        )
+    } else {
+        (
+            "application_launch_command_invalid",
+            "Application rejected a non-runnable launch command.",
+        )
+    };
+    vec![launch_stage_evidence(
+        id,
+        "application",
+        summary,
+        vec![format!("arg_count:{arg_count}")],
+    )]
+}
+
 pub(crate) fn launch_preflight_stage_evidence(
     outcome: &GuardianPreflightOutcome,
     performance_mode: &str,
@@ -105,7 +128,7 @@ pub(crate) fn launch_prepared_response_payload(
     status: &PublicLaunchStatus,
 ) -> Value {
     let mut response = json!(status);
-    response["instance_id"] = json!(&task.intent.instance_id);
+    response["instance_id"] = json!(&task.instance.id);
     response["launched_at"] = json!(&task.launched_at);
     response["max_memory_mb"] = json!(task.intent.max_memory_mb);
     response["min_memory_mb"] = json!(task.intent.min_memory_mb);
@@ -170,7 +193,7 @@ fn launch_stage_evidence(
 
 #[cfg(test)]
 mod tests {
-    use super::launch_application_stage_evidence;
+    use super::{launch_application_stage_evidence, launch_command_stage_evidence};
     use crate::execution::ExecutionFactKind;
     use crate::execution::runtime::runtime_fact;
     use crate::guardian::guardian_fact_from_execution;
@@ -199,6 +222,26 @@ mod tests {
                 "status:Planned",
             ]
         );
+    }
+
+    #[test]
+    fn p00_b11_contract_command_evidence_is_bounded_without_command_material() {
+        let prepared = launch_command_stage_evidence(true, 3);
+        let invalid = launch_command_stage_evidence(false, 1);
+
+        assert_eq!(prepared.len(), 1);
+        assert_eq!(prepared[0].id, "application_launch_command_prepared");
+        assert_eq!(prepared[0].system, "application");
+        assert_eq!(prepared[0].details, ["arg_count:3"]);
+        assert_eq!(invalid.len(), 1);
+        assert_eq!(invalid[0].id, "application_launch_command_invalid");
+        assert_eq!(invalid[0].system, "application");
+        assert_eq!(invalid[0].details, ["arg_count:1"]);
+
+        let encoded = serde_json::to_string(&(prepared, invalid)).expect("stage evidence");
+        for secret in ["java.exe", "--accessToken", "-Xmx", "C:\\\\Users"] {
+            assert!(!encoded.contains(secret));
+        }
     }
 
     #[test]

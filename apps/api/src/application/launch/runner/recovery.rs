@@ -44,6 +44,7 @@ impl RecoveryDirectiveStage {
 pub(super) struct RecoveryDirectiveRequest<'a> {
     pub(super) state: &'a AppState,
     pub(super) session_id: &'a str,
+    pub(super) instance_id: &'a str,
     pub(super) intent: &'a axial_launcher::LaunchIntent,
     pub(super) directive: GuardianDirective,
     pub(super) stage: RecoveryDirectiveStage,
@@ -66,6 +67,7 @@ pub(super) async fn handle_recovery_directive(
     *request.recovery_attempts += 1;
 
     let Ok(plan) = plan_guardian_launch_recovery_directive(
+        request.instance_id,
         request.intent,
         request.directive,
         request.mode,
@@ -107,6 +109,7 @@ pub(super) async fn handle_recovery_directive(
 }
 
 fn plan_guardian_launch_recovery_directive(
+    instance_id: &str,
     intent: &axial_launcher::LaunchIntent,
     directive: GuardianDirective,
     mode: crate::guardian::GuardianMode,
@@ -123,7 +126,7 @@ fn plan_guardian_launch_recovery_directive(
     )
     .ok_or(GuardianLaunchRecoveryPlanRejection::InvalidUserIntentFingerprint)?;
     plan_launch_recovery_directive(GuardianLaunchRecoveryPlanRequest {
-        instance_id: &intent.instance_id,
+        instance_id,
         mode,
         directive,
         failure_class,
@@ -804,6 +807,7 @@ mod tests {
         let outcome = handle_recovery_directive(RecoveryDirectiveRequest {
             state: &state,
             session_id,
+            instance_id: "instance",
             intent: &intent,
             directive: test_recovery_directive(RecoveryCase::StripRawJvmArgs),
             stage: RecoveryDirectiveStage::Prepare,
@@ -865,6 +869,7 @@ mod tests {
         let outcome = handle_recovery_directive(RecoveryDirectiveRequest {
             state: &state,
             session_id,
+            instance_id: "instance",
             intent: &intent,
             directive: test_recovery_directive(RecoveryCase::StripRawJvmArgs),
             stage: RecoveryDirectiveStage::Prepare,
@@ -930,7 +935,7 @@ mod tests {
         let intent = test_launch_intent(&root, session_id);
         let plan = test_recovery_plan(&intent, RecoveryCase::StripRawJvmArgs);
         assert_eq!(plan.target.kind, TargetKind::Instance);
-        assert_eq!(plan.target.id, intent.instance_id);
+        assert_eq!(plan.target.id, "instance");
 
         let attempt = record_guardian_launch_recovery_attempt(&state, session_id, &plan)
             .await
@@ -1328,17 +1333,45 @@ mod tests {
     }
 
     #[test]
+    fn p00_b11_contract_cross_owner_recovery_uses_application_instance_identity() {
+        let root = Path::new("/tmp/axial-test");
+        let intent = test_launch_intent(root, "application-session");
+        let application_instance_id = "application-instance";
+
+        let plan = plan_guardian_launch_recovery_directive(
+            application_instance_id,
+            &intent,
+            GuardianDirective::StripJvmArgs {
+                reason: GuardianStripJvmArgsReason::PrepareFailure,
+            },
+            crate::guardian::GuardianMode::Managed,
+            LaunchFailureClass::JvmUnsupportedOption,
+        )
+        .expect("canonical application identity should produce recovery plan");
+
+        assert_eq!(plan.target.kind, TargetKind::Instance);
+        assert_eq!(plan.target.id, application_instance_id);
+    }
+
+    #[test]
     fn application_recovery_planning_rejects_unfingerprintable_intent() {
-        for mut intent in [
-            test_launch_intent(Path::new("/tmp/axial-test"), "invalid-version"),
-            test_launch_intent(Path::new("/tmp/axial-test"), "oversized-args"),
+        for (invalid_version, mut intent) in [
+            (
+                true,
+                test_launch_intent(Path::new("/tmp/axial-test"), "invalid-version"),
+            ),
+            (
+                false,
+                test_launch_intent(Path::new("/tmp/axial-test"), "oversized-args"),
+            ),
         ] {
-            if intent.session_id == "invalid-version" {
+            if invalid_version {
                 intent.target_version_id = "/invalid/version".to_string();
             } else {
                 intent.extra_jvm_args = vec!["x".repeat(4_097)];
             }
             let rejection = plan_guardian_launch_recovery_directive(
+                "instance",
                 &intent,
                 GuardianDirective::StripJvmArgs {
                     reason: GuardianStripJvmArgsReason::PrepareFailure,
@@ -1377,6 +1410,7 @@ mod tests {
         failure_class: LaunchFailureClass,
     ) -> GuardianLaunchRecoveryPlan {
         plan_guardian_launch_recovery_directive(
+            "instance",
             intent,
             directive,
             crate::guardian::GuardianMode::Managed,
@@ -1460,16 +1494,13 @@ mod tests {
         }
     }
 
-    fn test_launch_intent(root: &Path, session_id: &str) -> axial_launcher::LaunchIntent {
+    fn test_launch_intent(root: &Path, _session_id: &str) -> axial_launcher::LaunchIntent {
         axial_launcher::LaunchIntent {
-            session_id: session_id.to_string(),
             library_dir: root.join("library"),
-            instance_id: "instance".to_string(),
             version_id: "1.21.1".to_string(),
             target_version_id: "1.21.1".to_string(),
             loader: "vanilla".to_string(),
             is_modded: false,
-            username: "Player".to_string(),
             auth: axial_launcher::LaunchAuthContext::offline("Player"),
             requested_java: "/home/alice/.jdks/bad-java/bin/java".to_string(),
             requested_preset: "graalvm".to_string(),
@@ -1489,7 +1520,7 @@ mod tests {
                 preset_override_origin: Some(axial_launcher::OverrideOrigin::Instance),
                 raw_jvm_args_origin: Some(axial_launcher::OverrideOrigin::Instance),
             },
-            performance_mode: "managed".to_string(),
+            low_impact_startup: true,
         }
     }
 

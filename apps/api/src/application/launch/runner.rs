@@ -5,17 +5,14 @@ mod recovery;
 mod spawn;
 mod status;
 
+use super::{launch_application_stage_evidence, launch_command_stage_evidence};
 use crate::application::guardian_conversion::api_guardian_mode;
-use crate::application::launch_application_stage_evidence;
 use crate::application::registered_artifact_recovery::{
     REGISTERED_ARTIFACT_REPAIR_SUPPRESSION_MINUTES, RegisteredArtifactComponentRebuildSource,
     RegisteredArtifactRecoveryEntry, execute_registered_artifact_recovery_sequence,
     new_registered_artifact_repair_operation_id,
 };
 use crate::execution::integrity::sense_integrity_tier1;
-use crate::execution::launch::{
-    LaunchCommandPreparationRequest, launch_command_stage_evidence, prepare_launch_command,
-};
 use crate::guardian::{
     DiagnosisId, GuardianActionKind, GuardianArtifactRepairStatus, GuardianCopyRequest,
     GuardianFact, GuardianLaunchRecoveryPlan, GuardianObservedLaunchFailurePhase,
@@ -54,9 +51,7 @@ use recovery::{
     record_failed_self_healing_if_any, record_prelaunch_preset_adjustment_directive,
     record_successful_self_healing_if_any,
 };
-use spawn::{
-    launch_command_target, launch_spawn_failed_stage_evidence, launch_spawn_stage_evidence,
-};
+use spawn::{launch_spawn_failed_stage_evidence, launch_spawn_stage_evidence};
 use status::{
     emit_status, launch_state_for_preparation_event, launch_status_event, serialize_guardian,
 };
@@ -116,8 +111,10 @@ enum TerminalObservationHandoff {
 
 struct LaunchSessionRunTask {
     preflight_stage_evidence: Vec<axial_launcher::LaunchStageEvidence>,
+    session_id: axial_launcher::SessionId,
     instance: axial_config::Instance,
     intent: axial_launcher::LaunchIntent,
+    performance_mode: String,
     guardian: GuardianSummary,
     launched_at: String,
     benchmark: Option<crate::state::launch_reports::LaunchBenchmarkMetadata>,
@@ -137,8 +134,10 @@ impl LaunchSessionRunTask {
             update_admission,
             integrity_foreground,
             preflight_stage_evidence,
+            session_id,
             instance,
             intent,
+            performance_mode,
             guardian,
             launched_at,
             benchmark,
@@ -150,8 +149,10 @@ impl LaunchSessionRunTask {
             update_admission,
             Self {
                 preflight_stage_evidence,
+                session_id,
                 instance,
                 intent,
+                performance_mode,
                 guardian,
                 launched_at,
                 benchmark,
@@ -194,12 +195,12 @@ async fn launch_session_with_control(
     producer: crate::state::ProducerLease,
     control: LaunchLoopControl,
 ) -> Result<LaunchSuccess, LaunchRequestError> {
-    let session_id = task.intent.session_id.clone();
-    let instance_id = task.intent.instance_id.clone();
+    let session_id = task.session_id.0.clone();
+    let instance_id = task.instance.id.clone();
     let guardian_mode = api_guardian_mode(task.intent.guardian.mode);
     let initial_guardian = task.guardian.clone();
     let launched_at = task.launched_at.clone();
-    let proof_context = LaunchProofContext::from_intent(&task.intent)
+    let proof_context = LaunchProofContext::from_intent(&task.intent, &task.performance_mode)
         .with_benchmark(task.benchmark.clone())
         .with_resource_budget(task.resource_budget.clone());
     let sessions = state.sessions().clone();
@@ -686,15 +687,18 @@ async fn launch_session_inner_with_control(
 ) -> Result<LaunchSuccess, LaunchRequestError> {
     let LaunchSessionRunTask {
         preflight_stage_evidence,
+        session_id,
         instance,
         intent,
+        performance_mode,
         mut guardian,
         launched_at,
         benchmark,
         resource_budget,
         java_probe_receipt,
     } = task;
-    let session_id = intent.session_id.clone();
+    let session_id = session_id.0;
+    let instance_id = instance.id.clone();
     let mut initial_evidence = launch_application_stage_evidence();
     initial_evidence.extend(preflight_stage_evidence);
     state
@@ -710,7 +714,7 @@ async fn launch_session_inner_with_control(
             .attach_benchmark(&session_id, benchmark_payload)
             .await;
     }
-    let proof_context = LaunchProofContext::from_intent(&intent)
+    let proof_context = LaunchProofContext::from_intent(&intent, &performance_mode)
         .with_benchmark(benchmark)
         .with_resource_budget(resource_budget);
     let mut attempt = axial_launcher::service::AttemptOverrides::default();
@@ -803,6 +807,7 @@ async fn launch_session_inner_with_control(
                         match handle_recovery_directive(RecoveryDirectiveRequest {
                             state: &state,
                             session_id: &session_id,
+                            instance_id: &instance_id,
                             intent: &intent,
                             directive,
                             stage: RecoveryDirectiveStage::Prepare,
@@ -927,28 +932,27 @@ async fn launch_session_inner_with_control(
             )
             .await;
 
-        let launch_command = match prepare_launch_command(LaunchCommandPreparationRequest::new(
-            launch_command_target(&session_id),
-            &prepared.plan.command,
-            &prepared.plan.game_dir,
-        )) {
-            Ok(command) => {
+        let (program, args) = match prepared.plan.command.split_first() {
+            Some((program, args)) if !args.is_empty() => {
                 state
                     .sessions()
                     .record_stage_evidence(
                         &session_id,
-                        launch_command_stage_evidence(&command.facts),
+                        launch_command_stage_evidence(true, prepared.plan.command.len()),
                     )
                     .await;
-                command
+                (program, args)
             }
-            Err(error) => {
+            _ => {
                 record_failed_self_healing_if_any(&state, &session_id, last_recovery_plan.as_ref())
                     .await
                     .map_err(guardian_journal_error)?;
                 state
                     .sessions()
-                    .record_stage_evidence(&session_id, launch_command_stage_evidence(&error.facts))
+                    .record_stage_evidence(
+                        &session_id,
+                        launch_command_stage_evidence(false, prepared.plan.command.len()),
+                    )
                     .await;
                 return Err(finish_launch_failure(
                     &state,
@@ -958,7 +962,7 @@ async fn launch_session_inner_with_control(
                     LaunchFailure {
                         proof_context: Some(&proof_context),
                         class: LaunchFailureClass::Unknown,
-                        message: &error.to_string(),
+                        message: "launch command did not produce a runnable command",
                         healing: prepared.healing.clone(),
                         guardian: Some(guardian.clone()),
                         outcome: None,
@@ -1016,13 +1020,13 @@ async fn launch_session_inner_with_control(
             .await);
         }
 
-        let mut command = Command::new(launch_command.program);
-        command.args(launch_command.args);
-        command.current_dir(launch_command.game_dir);
+        let mut command = Command::new(program);
+        command.args(args);
+        command.current_dir(&prepared.plan.game_dir);
 
         let record = crate::state::LaunchSessionRecord {
             session_id: axial_launcher::SessionId(session_id.clone()),
-            instance_id: intent.instance_id.clone(),
+            instance_id: instance_id.clone(),
             version_id: intent.version_id.clone(),
             launched_at: Some(launched_at.clone()),
             benchmark: None,
@@ -1194,7 +1198,7 @@ async fn launch_session_inner_with_control(
                             .as_ref()
                             .expect("successful launch must retain foreground through metadata"),
                         &instance.id,
-                        &intent.username,
+                        &intent.auth.player_name,
                         intent.max_memory_mb,
                         intent.min_memory_mb,
                         &launched_at,
@@ -1209,12 +1213,12 @@ async fn launch_session_inner_with_control(
                         integrity_foreground.as_ref().expect(
                             "successful launch must retain foreground through witness publication",
                         ),
-                        &intent.instance_id,
+                        &instance_id,
                     ));
                 }
                 return Ok(LaunchSuccess {
                     session_id: session_id.clone(),
-                    instance_id: intent.instance_id.clone(),
+                    instance_id: instance_id.clone(),
                     launched_at: launched_at.clone(),
                     max_memory_mb: intent.max_memory_mb,
                     min_memory_mb: intent.min_memory_mb,
@@ -1254,7 +1258,7 @@ async fn launch_session_inner_with_control(
                     integrity_foreground
                         .as_ref()
                         .expect("preboot launch must retain foreground authority"),
-                    &intent.instance_id,
+                    &instance_id,
                     failure_class,
                 )
                 .await;
@@ -1266,7 +1270,7 @@ async fn launch_session_inner_with_control(
                         integrity_foreground
                             .as_ref()
                             .expect("preboot launch must retain foreground authority"),
-                        &intent.instance_id,
+                        &instance_id,
                         &intent.library_dir,
                         failure_class,
                     )
@@ -1306,7 +1310,7 @@ async fn launch_session_inner_with_control(
                     let observed_at = timestamp_utc();
                     if let Err(error) = record_launch_failure_observation(
                         state.failure_memory(),
-                        &intent.instance_id,
+                        &instance_id,
                         guardian_mode,
                         failure_class,
                         &observed_at,
@@ -1600,6 +1604,7 @@ async fn launch_session_inner_with_control(
                         match handle_recovery_directive(RecoveryDirectiveRequest {
                             state: &state,
                             session_id: &session_id,
+                            instance_id: &instance_id,
                             intent: &intent,
                             directive,
                             stage: RecoveryDirectiveStage::Startup,
@@ -4411,7 +4416,7 @@ mod tests {
             .try_claim_producer()
             .expect("claim observer task producer");
         let task = test_recovery_launch_task(&state, session_id, &root).await;
-        let proof_context = LaunchProofContext::from_intent(&task.intent);
+        let proof_context = LaunchProofContext::from_intent(&task.intent, &task.performance_mode);
         drop(task);
 
         own_terminal_observation(
@@ -4457,7 +4462,7 @@ mod tests {
             .try_claim_producer()
             .expect("claim recovery-event producer");
         let task = test_recovery_launch_task(&state, session_id, &root).await;
-        let proof_context = LaunchProofContext::from_intent(&task.intent);
+        let proof_context = LaunchProofContext::from_intent(&task.intent, &task.performance_mode);
         drop(task);
         let observer_state = state.clone();
         let mut observer = tokio::spawn(own_terminal_observation(
@@ -5139,15 +5144,12 @@ mod tests {
             "-cp".to_string(),
             "libraries".to_string(),
         ];
-        let prepared = prepare_launch_command(LaunchCommandPreparationRequest::new(
-            launch_command_target(session_id),
-            &command,
-            &root,
-        ))
-        .expect("prepared command");
         state
             .sessions()
-            .record_stage_evidence(session_id, launch_command_stage_evidence(&prepared.facts))
+            .record_stage_evidence(
+                session_id,
+                launch_command_stage_evidence(true, command.len()),
+            )
             .await;
 
         emit_status(
@@ -5189,7 +5191,7 @@ mod tests {
             preparing_stage
                 .evidence
                 .iter()
-                .any(|evidence| evidence.id == "execution_launch_command_prepared")
+                .any(|evidence| evidence.id == "application_launch_command_prepared")
         );
         let status_json = serde_json::to_string(&status).expect("status json");
         assert_no_sensitive_stage_evidence(&status_json);
@@ -5283,16 +5285,14 @@ mod tests {
                 ),
                 "managed",
             ),
+            session_id: axial_launcher::SessionId(session_id.to_string()),
             instance: test_recovery_launch_instance(),
             intent: LaunchIntent {
-                session_id: session_id.to_string(),
                 library_dir: root.join("library"),
-                instance_id: "instance".to_string(),
                 version_id: "1.21.1".to_string(),
                 target_version_id: "1.21.1".to_string(),
                 loader: "vanilla".to_string(),
                 is_modded: false,
-                username: "Player".to_string(),
                 auth: LaunchAuthContext::offline("Player"),
                 requested_java: "configured-java".to_string(),
                 requested_preset: String::new(),
@@ -5309,8 +5309,9 @@ mod tests {
                     preset_override_origin: None,
                     raw_jvm_args_origin: None,
                 },
-                performance_mode: "managed".to_string(),
+                low_impact_startup: true,
             },
+            performance_mode: "managed".to_string(),
             guardian: empty_guardian_summary(axial_launcher::GuardianMode::Managed),
             launched_at: "2026-01-01T00:00:00Z".to_string(),
             benchmark: None,
@@ -5325,7 +5326,6 @@ mod tests {
         instance_id: &str,
     ) {
         task.instance.id = instance_id.to_string();
-        task.intent.instance_id = instance_id.to_string();
     }
 
     #[cfg(unix)]
@@ -6437,14 +6437,11 @@ exit 1
         .expect("managed launch asset index");
 
         LaunchIntent {
-            session_id: "launch-runtime-epoch".to_string(),
             library_dir,
-            instance_id: "instance".to_string(),
             version_id: "1.21.1".to_string(),
             target_version_id: "1.21.1".to_string(),
             loader: "vanilla".to_string(),
             is_modded: false,
-            username: "Player".to_string(),
             auth: LaunchAuthContext::offline("Player"),
             requested_java: String::new(),
             requested_preset: String::new(),
@@ -6461,7 +6458,7 @@ exit 1
                 preset_override_origin: None,
                 raw_jvm_args_origin: None,
             },
-            performance_mode: "managed".to_string(),
+            low_impact_startup: true,
         }
     }
 

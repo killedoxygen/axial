@@ -13,11 +13,11 @@ axial-minecraft = { path = "../minecraft" }
 md5.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-sha1.workspace = true
 sysinfo.workspace = true
 thiserror.workspace = true
 zip.workspace = true
 
 [dev-dependencies]
 axial-minecraft = { path = "../minecraft", features = ["test-support"] }
+sha1.workspace = true
 tokio.workspace = true

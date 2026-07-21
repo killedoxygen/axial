@@ -85,8 +85,10 @@ pub(crate) struct LaunchSessionTask {
     pub update_admission: UpdateOperationLease,
     pub integrity_foreground: IntegrityForegroundLease,
     pub preflight_stage_evidence: Vec<LaunchStageEvidence>,
+    pub session_id: axial_launcher::SessionId,
     pub instance: Instance,
     pub intent: LaunchIntent,
+    pub performance_mode: String,
     pub guardian: GuardianSummary,
     pub launched_at: String,
     pub benchmark: Option<LaunchBenchmarkMetadata>,
@@ -264,7 +266,6 @@ async fn prepare_launch_session_with_auth_refresh(
     if auth_context.online_launch {
         flush_pending_saved_skin_applies_for_launch(state).await?;
     }
-    let username = auth_context.username.clone();
     let preflight_started_at = Instant::now();
     let mut preflight = build_launch_preflight_facts(
         state,
@@ -343,15 +344,13 @@ async fn prepare_launch_session_with_auth_refresh(
 
     let launched_at = timestamp_utc();
     let session_id = policy::generate_session_id();
+    let performance_mode = policy::selected_performance_mode(&instance, &config);
     let intent = LaunchIntent {
-        session_id: session_id.0.clone(),
         library_dir: library_dir.clone(),
-        instance_id: instance.id.clone(),
         version_id: instance.version_id.clone(),
         target_version_id: preflight.target_version_id.clone(),
         loader: preflight.loader.clone(),
         is_modded: preflight.is_modded,
-        username: username.clone(),
         auth: auth_context.auth,
         requested_java: preflight.requested_java.clone(),
         requested_preset: preflight.requested_preset.clone(),
@@ -363,7 +362,7 @@ async fn prepare_launch_session_with_auth_refresh(
         launcher_version: state.version().to_string(),
         game_dir: Some(game_dir),
         guardian: preflight.guardian.clone(),
-        performance_mode: policy::selected_performance_mode(&instance, &config),
+        low_impact_startup: performance_mode != "custom",
     };
 
     let insert_started_at = Instant::now();
@@ -418,8 +417,10 @@ async fn prepare_launch_session_with_auth_refresh(
             update_admission,
             integrity_foreground,
             preflight_stage_evidence: preflight.preflight_stage_evidence,
-            instance: instance.clone(),
+            session_id,
+            instance,
             intent,
+            performance_mode,
             guardian: preflight.guardian_summary,
             launched_at,
             benchmark: None,

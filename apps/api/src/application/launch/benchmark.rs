@@ -332,7 +332,7 @@ pub(crate) async fn launch_benchmark(
             let mut prepared =
                 super::prepare_launch_session_owned(&state, input.launch, &launch_owner).await?;
             let benchmark = crate::state::launch_reports::LaunchBenchmarkMetadata::new(
-                Some(prepared.task.intent.session_id.as_str()),
+                Some(prepared.task.session_id.0.as_str()),
                 input.profile.as_deref(),
                 input.run_type.as_deref(),
                 input.benchmark_mode.as_deref(),
@@ -747,7 +747,7 @@ async fn own_benchmark_suite_launch(
             return;
         }
     };
-    let session_id = prepared.task.intent.session_id.clone();
+    let session_id = prepared.task.session_id.0.clone();
     prepared.task.benchmark = Some(benchmark.clone());
     if state
         .sessions()
@@ -911,7 +911,7 @@ async fn finish_benchmark_suite_reservation_failure(
     error_class: &'static str,
     release_retention_hold: bool,
 ) {
-    let session_id = task.intent.session_id.as_str();
+    let session_id = task.session_id.0.as_str();
     let mut initial_evidence = super::launch_application_stage_evidence();
     initial_evidence.extend(task.preflight_stage_evidence.clone());
     state
@@ -949,7 +949,7 @@ async fn finish_benchmark_suite_reservation_failure(
         )
         .await;
 
-    let proof_context = LaunchProofContext::from_intent(&task.intent)
+    let proof_context = LaunchProofContext::from_intent(&task.intent, &task.performance_mode)
         .with_benchmark(Some(benchmark))
         .with_resource_budget(task.resource_budget.clone());
     super::runner::persist_launch_proof_for_reservation_failure(

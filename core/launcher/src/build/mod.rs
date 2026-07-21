@@ -1,10 +1,8 @@
-pub mod steps;
-
 use crate::runtime::RuntimeSelection;
 use axial_minecraft::{
     LaunchModelError, LaunchVars, ResolvedLibrary, VersionJson,
     asset_index_requires_virtual_repair, build_classpath, client_jar_path, default_environment,
-    libraries_dir, offline_uuid, resolve_arguments, resolve_libraries, resolve_version,
+    libraries_dir, offline_uuid, resolve_arguments, resolve_libraries,
 };
 use md5::compute as md5_compute;
 use std::fmt;
@@ -72,8 +70,7 @@ impl fmt::Debug for LaunchAuthContext {
 }
 
 #[derive(Debug, Clone)]
-pub struct VanillaLaunchRequest {
-    pub session_id: String,
+pub(crate) struct VanillaLaunchRequest {
     pub mc_dir: PathBuf,
     pub version_id: String,
     pub target_version_id: String,
@@ -104,31 +101,18 @@ pub struct VanillaLaunchPlan {
 }
 
 #[derive(Debug, Error)]
-pub enum VanillaLaunchPlanError {
+pub(crate) enum VanillaLaunchPlanError {
     #[error(transparent)]
     LaunchModel(#[from] LaunchModelError),
     #[error(transparent)]
     AssetIndexFlags(#[from] axial_minecraft::AssetIndexFlagsError),
-    #[error("effective runtime path is empty")]
-    MissingRuntime,
     #[error("failed to prepare legacy natives: {0}")]
     PrepareNatives(#[from] io::Error),
     #[error("failed to extract legacy natives: {0}")]
     ExtractNatives(#[from] zip::result::ZipError),
 }
 
-pub fn plan_vanilla_launch(
-    request: &VanillaLaunchRequest,
-) -> Result<VanillaLaunchPlan, VanillaLaunchPlanError> {
-    if request.runtime.effective_path.trim().is_empty() {
-        return Err(VanillaLaunchPlanError::MissingRuntime);
-    }
-
-    let version = resolve_version(&request.mc_dir, &request.version_id)?;
-    plan_resolved_launch(request, version)
-}
-
-pub fn plan_resolved_launch(
+pub(crate) fn plan_resolved_launch(
     request: &VanillaLaunchRequest,
     version: VersionJson,
 ) -> Result<VanillaLaunchPlan, VanillaLaunchPlanError> {
@@ -297,36 +281,6 @@ fn effective_minecraft_version_id<'a>(
         return version_id;
     }
     request.version_id.trim()
-}
-
-pub fn cleanup_natives_dir(dir: &Path) -> io::Result<()> {
-    let cleaned = dir.to_string_lossy();
-    let managed_legacy = format!(
-        "{}axial{}natives",
-        std::path::MAIN_SEPARATOR,
-        std::path::MAIN_SEPARATOR
-    );
-    let managed_cache = format!(
-        "{}axial{}cache{}natives",
-        std::path::MAIN_SEPARATOR,
-        std::path::MAIN_SEPARATOR,
-        std::path::MAIN_SEPARATOR
-    );
-    if !cleaned.contains(&managed_legacy)
-        && !cleaned.ends_with(&format!("axial{}natives", std::path::MAIN_SEPARATOR))
-        && !cleaned.contains(&managed_cache)
-        && !cleaned.ends_with(&format!(
-            "axial{}cache{}natives",
-            std::path::MAIN_SEPARATOR,
-            std::path::MAIN_SEPARATOR
-        ))
-    {
-        return Err(io::Error::other(format!(
-            "refusing to remove non-axial natives directory: {}",
-            dir.display()
-        )));
-    }
-    fs::remove_dir_all(dir)
 }
 
 pub(crate) fn find_client_jar(
@@ -623,7 +577,6 @@ mod tests {
         let library_dir = root.join("library");
         let plan = plan_resolved_launch(
             &VanillaLaunchRequest {
-                session_id: "test-session".to_string(),
                 mc_dir: library_dir.clone(),
                 version_id: "test".to_string(),
                 target_version_id: String::new(),
@@ -694,7 +647,6 @@ mod tests {
 
         let plan = plan_resolved_launch(
             &VanillaLaunchRequest {
-                session_id: "test-session".to_string(),
                 mc_dir: root.clone(),
                 version_id: "auth-test".to_string(),
                 target_version_id: String::new(),
@@ -780,7 +732,6 @@ mod tests {
 
         let plan = plan_resolved_launch(
             &VanillaLaunchRequest {
-                session_id: "test-session".to_string(),
                 mc_dir: root.clone(),
                 version_id: "fabric-loader-0.16.10-1.16.5".to_string(),
                 target_version_id: "1.16.5".to_string(),
@@ -828,7 +779,6 @@ mod tests {
 
         let plan = plan_resolved_launch(
             &VanillaLaunchRequest {
-                session_id: "test-session".to_string(),
                 mc_dir: root.clone(),
                 version_id: "1.16.4".to_string(),
                 target_version_id: String::new(),
@@ -870,7 +820,6 @@ mod tests {
 
         let online_plan = plan_resolved_launch(
             &VanillaLaunchRequest {
-                session_id: "test-session".to_string(),
                 mc_dir: root.clone(),
                 version_id: "1.16.5".to_string(),
                 target_version_id: "1.16.5".to_string(),
@@ -897,7 +846,6 @@ mod tests {
         for adjacent_version in ["1.16.3", "1.17.1"] {
             let adjacent_plan = plan_resolved_launch(
                 &VanillaLaunchRequest {
-                    session_id: "test-session".to_string(),
                     mc_dir: root.clone(),
                     version_id: adjacent_version.to_string(),
                     target_version_id: adjacent_version.to_string(),
@@ -952,7 +900,6 @@ mod tests {
 
         let plan = plan_resolved_launch(
             &VanillaLaunchRequest {
-                session_id: "test-session".to_string(),
                 mc_dir: root.clone(),
                 version_id: "1.5.2-forge-7.8.1.738".to_string(),
                 target_version_id: "1.5.2".to_string(),
@@ -987,7 +934,6 @@ mod tests {
         let version: VersionJson = auth_version_json();
         let vanilla_plan = plan_resolved_launch(
             &VanillaLaunchRequest {
-                session_id: "test-session".to_string(),
                 mc_dir: root.clone(),
                 version_id: "1.5.2".to_string(),
                 target_version_id: "1.5.2".to_string(),
@@ -1021,7 +967,6 @@ mod tests {
             });
         let modern_plan = plan_resolved_launch(
             &VanillaLaunchRequest {
-                session_id: "test-session".to_string(),
                 mc_dir: root.clone(),
                 version_id: "1.6.4-forge-9.11.1.1345".to_string(),
                 target_version_id: "1.6.4".to_string(),
@@ -1080,7 +1025,6 @@ mod tests {
 
         let plan = plan_resolved_launch(
             &VanillaLaunchRequest {
-                session_id: "test-session".to_string(),
                 mc_dir: root.clone(),
                 version_id: "auth-test".to_string(),
                 target_version_id: String::new(),
@@ -1174,31 +1118,34 @@ mod tests {
         zip.write_all(b"native").expect("write native entry");
         zip.finish().expect("finish native jar");
 
-        let plan = plan_vanilla_launch(&VanillaLaunchRequest {
-            session_id: "test-session".to_string(),
-            mc_dir: root.clone(),
-            version_id: "test".to_string(),
-            target_version_id: String::new(),
-            auth: LaunchAuthContext::offline("Player"),
-            runtime: RuntimeSelection {
-                effective_path: "/usr/bin/java".to_string(),
-                effective_info: axial_minecraft::JavaRuntimeInfo {
-                    id: "java".to_string(),
-                    major: 21,
-                    update: 0,
-                    distribution: "test".to_string(),
-                    path: "/usr/bin/java".to_string(),
+        let version = axial_minecraft::resolve_version(&root, "test").expect("resolved version");
+        let plan = plan_resolved_launch(
+            &VanillaLaunchRequest {
+                mc_dir: root.clone(),
+                version_id: "test".to_string(),
+                target_version_id: String::new(),
+                auth: LaunchAuthContext::offline("Player"),
+                runtime: RuntimeSelection {
+                    effective_path: "/usr/bin/java".to_string(),
+                    effective_info: axial_minecraft::JavaRuntimeInfo {
+                        id: "java".to_string(),
+                        major: 21,
+                        update: 0,
+                        distribution: "test".to_string(),
+                        path: "/usr/bin/java".to_string(),
+                    },
+                    effective_source: "managed".to_string(),
                 },
-                effective_source: "managed".to_string(),
+                game_dir: None,
+                launcher_name: "axial".to_string(),
+                launcher_version: "test".to_string(),
+                min_memory_mb: None,
+                max_memory_mb: None,
+                extra_jvm_args: Vec::new(),
+                resolution: None,
             },
-            game_dir: None,
-            launcher_name: "axial".to_string(),
-            launcher_version: "test".to_string(),
-            min_memory_mb: None,
-            max_memory_mb: None,
-            extra_jvm_args: Vec::new(),
-            resolution: None,
-        })
+            version,
+        )
         .expect("launch plan");
 
         assert!(plan.natives_dir.is_some());
@@ -1229,8 +1176,8 @@ mod tests {
                 .any(|arg| arg.starts_with("-Djava.io.tmpdir="))
         );
 
+        let _ = fs::remove_dir_all(natives_dir);
         let _ = fs::remove_dir_all(root);
-        let _ = cleanup_natives_dir(natives_dir);
     }
 
     #[test]
@@ -1371,21 +1318,25 @@ mod tests {
             }),
         );
 
-        let plan = plan_vanilla_launch(&VanillaLaunchRequest {
-            session_id: "test-session".to_string(),
-            mc_dir: root.clone(),
-            version_id: version_id.to_string(),
-            target_version_id: String::new(),
-            auth: LaunchAuthContext::offline("Player"),
-            runtime: test_runtime(),
-            game_dir: None,
-            launcher_name: "axial".to_string(),
-            launcher_version: "test".to_string(),
-            min_memory_mb: None,
-            max_memory_mb: None,
-            extra_jvm_args: Vec::new(),
-            resolution: None,
-        })
+        let version =
+            axial_minecraft::resolve_version(&root, version_id).expect("resolved version");
+        let plan = plan_resolved_launch(
+            &VanillaLaunchRequest {
+                mc_dir: root.clone(),
+                version_id: version_id.to_string(),
+                target_version_id: String::new(),
+                auth: LaunchAuthContext::offline("Player"),
+                runtime: test_runtime(),
+                game_dir: None,
+                launcher_name: "axial".to_string(),
+                launcher_version: "test".to_string(),
+                min_memory_mb: None,
+                max_memory_mb: None,
+                extra_jvm_args: Vec::new(),
+                resolution: None,
+            },
+            version,
+        )
         .expect("launch plan");
 
         assert_eq!(plan.client_jar_path.as_deref(), Some(game_jar.as_path()));
@@ -1464,7 +1415,6 @@ mod tests {
 
     fn test_launch_request(root: &Path, version_id: &str) -> VanillaLaunchRequest {
         VanillaLaunchRequest {
-            session_id: "test-session".to_string(),
             mc_dir: root.to_path_buf(),
             version_id: version_id.to_string(),
             target_version_id: String::new(),

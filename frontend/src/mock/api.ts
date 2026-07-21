@@ -456,7 +456,6 @@ function seedContent(seed: MockSeed): CanonicalContent {
     game_versions: seed.games ?? MOCK_GAME_VERSIONS,
     loaders,
     updated: daysAgo(seed.updatedDays),
-    sources: [{ provider: 'modrinth', project_id: projectId, slug: projectId }],
   };
 }
 
