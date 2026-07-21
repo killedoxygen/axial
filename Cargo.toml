@@ -4,6 +4,7 @@ members = [
   "apps/desktop",
   "core/config",
   "core/content",
+  "core/fs",
   "core/launcher",
   "core/minecraft",
   "core/performance",
@@ -61,6 +62,7 @@ url = "2.5.7"
 uuid = { version = "1.23.0", features = ["v4", "serde"] }
 zip = { version = "2.4.2", default-features = false, features = ["deflate"] }
 hex = "0.4.3"
+axial-fs = { path = "core/fs" }
 
 # Managed publication repeats cryptographic admission proofs; keep dev SHA-1 throughput usable.
 [profile.dev.package.sha1]

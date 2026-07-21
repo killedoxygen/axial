@@ -1,0 +1,7005 @@
+mod platform;
+
+use std::collections::HashMap;
+use std::ffi::{OsStr, OsString};
+use std::fmt;
+use std::fs::File;
+use std::io::{self, Read, Write};
+use std::path::Path;
+use std::sync::{Arc, Mutex, Weak};
+
+const ROOT_LEASE_NAME: &str = ".axial-root.lease";
+const MAX_LEAF_UNITS: usize = 255;
+const MAX_STAGE_ATTEMPTS: usize = 32;
+const MAX_DIRECTORY_LIST_ENTRIES: usize = 100_000;
+const MAX_OUTSTANDING_EFFECTS: usize = 512;
+
+macro_rules! impl_redacted_debug {
+    ($type:ty) => {
+        impl fmt::Debug for $type {
+            fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter
+                    .debug_struct(stringify!($type))
+                    .finish_non_exhaustive()
+            }
+        }
+    };
+}
+
+#[derive(Clone, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct LeafName(OsString);
+
+impl LeafName {
+    pub fn new(value: impl Into<OsString>) -> Result<Self, InvalidLeafName> {
+        let value = value.into();
+        validate_leaf_name(&value)?;
+        Ok(Self(value))
+    }
+
+    fn as_os_str(&self) -> &OsStr {
+        &self.0
+    }
+}
+
+impl fmt::Debug for LeafName {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.debug_tuple("LeafName").finish()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+#[error("filesystem capability leaf name is invalid")]
+pub struct InvalidLeafName;
+
+fn validate_leaf_name(value: &OsStr) -> Result<(), InvalidLeafName> {
+    if value.is_empty() || value == OsStr::new(".") || value == OsStr::new("..") {
+        return Err(InvalidLeafName);
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+
+        let bytes = value.as_bytes();
+        if bytes.len() > MAX_LEAF_UNITS || bytes.iter().any(|byte| matches!(byte, 0 | b'/')) {
+            return Err(InvalidLeafName);
+        }
+    }
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+
+        let units = value.encode_wide().collect::<Vec<_>>();
+        if units.len() > MAX_LEAF_UNITS
+            || units
+                .iter()
+                .any(|unit| matches!(*unit, 0 | 0x2f | 0x3a | 0x5c))
+        {
+            return Err(InvalidLeafName);
+        }
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    if value.to_string_lossy().contains(['\0', '/', '\\']) {
+        return Err(InvalidLeafName);
+    }
+
+    Ok(())
+}
+
+#[derive(Clone, Copy, Eq, Hash, PartialEq)]
+pub struct DirectoryIdentity {
+    session: [u8; 16],
+    physical: platform::Identity,
+}
+
+impl fmt::Debug for DirectoryIdentity {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DirectoryIdentity")
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EntryKind {
+    File,
+    Directory,
+    Link,
+    Other,
+}
+
+#[derive(Clone)]
+pub struct DirectoryEntry {
+    name: OsString,
+    kind: EntryKind,
+    parent: DirectoryIdentity,
+}
+
+impl fmt::Debug for DirectoryEntry {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DirectoryEntry")
+            .field("kind", &self.kind)
+            .finish_non_exhaustive()
+    }
+}
+
+impl DirectoryEntry {
+    pub fn name(&self) -> &OsStr {
+        &self.name
+    }
+
+    pub fn utf8_name(&self) -> Option<&str> {
+        self.name.to_str()
+    }
+
+    pub fn kind(&self) -> EntryKind {
+        self.kind
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DirectoryListingState {
+    Complete,
+    Truncated,
+}
+
+#[derive(Debug)]
+pub struct DirectoryListing {
+    entries: Vec<DirectoryEntry>,
+    state: DirectoryListingState,
+}
+
+impl DirectoryListing {
+    pub fn entries(&self) -> &[DirectoryEntry] {
+        &self.entries
+    }
+
+    pub fn state(&self) -> DirectoryListingState {
+        self.state
+    }
+}
+
+#[must_use = "directory creation effects must be explicitly settled or preserved"]
+#[derive(Debug)]
+pub enum DirectoryCreateOutcome {
+    Created(Directory),
+    NoEffect(io::Error),
+    CreatedUnclassified {
+        error: io::Error,
+        preservation: DirectoryCreatePreservation,
+    },
+    AppliedUnverified(DirectoryCreateObligation),
+}
+
+#[must_use = "an unclassified created directory must be explicitly acknowledged as preserved"]
+pub struct DirectoryCreatePreservation {
+    token: DirectoryCreateEffectToken,
+}
+
+impl_redacted_debug!(DirectoryCreatePreservation);
+
+impl DirectoryCreatePreservation {
+    pub fn acknowledge_preserved(mut self) -> Result<(), Self> {
+        let authority = match self.token.authority.upgrade() {
+            Some(authority) => authority,
+            None => return Err(self),
+        };
+        let operation = match authority.enter() {
+            Ok(operation) => operation,
+            Err(_) => return Err(self),
+        };
+        match authority.acknowledge_unclassified_directory_create(
+            &operation,
+            &mut self.token,
+        ) {
+            Ok(()) => Ok(()),
+            Err(_) => Err(self),
+        }
+    }
+
+    fn acknowledge_preserved_with_recovery(
+        mut self,
+        permit: &DrainRecoveryPermit,
+    ) -> Result<(), Self> {
+        let authority = match self.token.authority.upgrade() {
+            Some(authority) => authority,
+            None => return Err(self),
+        };
+        let operation = match authority.enter_directory_create_recovery(permit, &self.token) {
+            Ok(operation) => operation,
+            Err(_) => return Err(self),
+        };
+        match authority.acknowledge_unclassified_directory_create(
+            &operation,
+            &mut self.token,
+        ) {
+            Ok(()) => Ok(()),
+            Err(_) => Err(self),
+        }
+    }
+
+    fn transfer_to_reset(mut self, permit: &DrainRecoveryPermit) -> Result<(), Self> {
+        let authority = match self.token.authority.upgrade() {
+            Some(authority) => authority,
+            None => return Err(self),
+        };
+        match authority.transfer_unclassified_directory_create_to_reset(
+            permit,
+            &mut self.token,
+        ) {
+            Ok(()) => Ok(()),
+            Err(_) => Err(self),
+        }
+    }
+}
+
+#[must_use = "directory create obligations must be reconciled"]
+pub struct DirectoryCreateObligation {
+    error: io::Error,
+    token: DirectoryCreateEffectToken,
+}
+
+impl_redacted_debug!(DirectoryCreateObligation);
+
+impl DirectoryCreateObligation {
+    pub fn error(&self) -> &io::Error {
+        &self.error
+    }
+
+    pub fn reconcile(mut self) -> DirectoryCreateResolution {
+        let authority = match self.token.authority.upgrade() {
+            Some(authority) => authority,
+            None => return DirectoryCreateResolution::Indeterminate(self),
+        };
+        let operation = match authority.enter() {
+            Ok(operation) => operation,
+            Err(_) => return DirectoryCreateResolution::Indeterminate(self),
+        };
+        match finish_directory_create(&authority, &operation, &mut self.token) {
+            Ok(directory) => DirectoryCreateResolution::Created(directory),
+            Err(_) => DirectoryCreateResolution::Indeterminate(self),
+        }
+    }
+}
+
+fn finish_directory_create(
+    authority: &Arc<CapabilityAuthority>,
+    operation: &CapabilityOperation,
+    reservation: &mut DirectoryCreateEffectToken,
+) -> io::Result<Directory> {
+    let mut guard = authority.take_directory_create(operation, reservation)?;
+    if guard.record().phase != DirectoryCreateEffectPhase::Applied {
+        return Err(io::Error::other(
+            "directory create effect is not yet classified",
+        ));
+    }
+    guard.record().parent.validate(operation)?;
+    let created = guard
+        .record()
+        .created
+        .as_ref()
+        .ok_or_else(|| io::Error::other("directory create authority is not retained"))?;
+    let identity = platform::directory_identity(created)?;
+    if platform::directory_binding_state(
+        &guard.record().parent.inner.handle,
+        guard.record().name.as_os_str(),
+        identity,
+    )? != platform::BindingState::Exact
+    {
+        return Err(identity_changed("created directory binding is not exact"));
+    }
+    let (ordinary, ordinary_identity) = platform::open_directory(
+        &guard.record().parent.inner.handle,
+        guard.record().name.as_os_str(),
+    )?;
+    if ordinary_identity != identity {
+        return Err(identity_changed(
+            "created directory changed before least-authority admission",
+        ));
+    }
+    let parent = guard.record().parent.clone();
+    let name = guard.record().name.clone();
+    let directory = Directory::from_handle(
+        ordinary,
+        authority.identity(identity),
+        Arc::downgrade(authority),
+        Some(DirectoryParent {
+            directory: parent,
+            name: name.as_os_str().to_os_string(),
+        }),
+    );
+    directory.validate(operation)?;
+    drop(guard.record_mut().created.take());
+    guard.disarm(reservation, operation);
+    Ok(directory)
+}
+
+#[must_use = "directory create resolutions must be handled"]
+#[derive(Debug)]
+pub enum DirectoryCreateResolution {
+    Created(Directory),
+    Indeterminate(DirectoryCreateObligation),
+}
+
+#[must_use = "file create effects must be explicitly settled"]
+#[derive(Debug)]
+pub enum FileCreateOutcome {
+    Created(StagedFile),
+    NoEffect(io::Error),
+    AppliedUnverified(FileCreateObligation),
+}
+
+#[must_use = "file create obligations must be reconciled"]
+pub struct FileCreateObligation {
+    error: io::Error,
+    token: StageCreateToken,
+}
+
+impl_redacted_debug!(FileCreateObligation);
+
+impl FileCreateObligation {
+    pub fn error(&self) -> &io::Error {
+        &self.error
+    }
+
+    pub fn reconcile(mut self) -> FileCreateResolution {
+        let authority = match self.token.authority.upgrade() {
+            Some(authority) => authority,
+            None => return FileCreateResolution::Indeterminate(self),
+        };
+        let operation = match authority.enter() {
+            Ok(operation) => operation,
+            Err(_) => return FileCreateResolution::Indeterminate(self),
+        };
+        match finish_stage_create(&authority, &operation, &mut self.token) {
+            Ok(staged) => FileCreateResolution::Created(staged),
+            Err(_) => FileCreateResolution::Indeterminate(self),
+        }
+    }
+}
+
+fn finish_stage_create(
+    authority: &Arc<CapabilityAuthority>,
+    operation: &CapabilityOperation,
+    reservation: &mut StageCreateToken,
+) -> io::Result<StagedFile> {
+    let mut guard = authority.take_stage_create(operation, reservation)?;
+    if guard.record().phase != StageCreatePhase::Applied {
+        return Err(io::Error::other("stage create effect is not yet classified"));
+    }
+    guard.record().parent.validate(operation)?;
+    let created = guard
+        .record()
+        .created
+        .as_ref()
+        .ok_or_else(|| io::Error::other("stage create authority is not retained"))?;
+    let identity = platform::file_identity(created)?;
+    if platform::file_binding_state(
+        &guard.record().parent.inner.handle,
+        guard.record().name.as_os_str(),
+        identity,
+    )? != platform::BindingState::Exact
+    {
+        return Err(identity_changed("created stage binding is not exact"));
+    }
+    let cleanup = platform::clone_stage_cleanup(
+        &guard.record().parent.inner.handle,
+        guard.record().name.as_os_str(),
+        created,
+        identity,
+    )?;
+    let parent = guard.record().parent.clone();
+    let name = guard.record().name.clone();
+    let stage_token = authority.register_stage_record(
+        parent.clone(),
+        name.clone(),
+        identity,
+        cleanup,
+        operation,
+    )?;
+    let handle = guard
+        .record_mut()
+        .created
+        .take()
+        .expect("classified stage create retains its handle");
+    guard.transfer(reservation, operation);
+    Ok(StagedFile {
+        file: FileCapability::new(handle, identity, parent, name, Arc::downgrade(authority)),
+        token: stage_token,
+    })
+}
+
+#[must_use = "file create resolutions must be handled"]
+#[derive(Debug)]
+pub enum FileCreateResolution {
+    Created(StagedFile),
+    Indeterminate(FileCreateObligation),
+}
+
+#[must_use = "file promotion effects must be explicitly settled"]
+#[derive(Debug)]
+pub enum FilePromotionOutcome {
+    Applied(FileCapability),
+    NoEffect {
+        error: io::Error,
+        staged: SealedStagedFile,
+    },
+    AppliedUnverified(FilePromotionObligation),
+}
+
+#[must_use = "file promotion obligations must be reconciled"]
+pub struct FilePromotionObligation {
+    error: io::Error,
+    retained: SealedStagedFile,
+    destination: Directory,
+    destination_name: LeafName,
+}
+
+impl fmt::Debug for FilePromotionObligation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("FilePromotionObligation")
+            .finish_non_exhaustive()
+    }
+}
+
+impl FilePromotionObligation {
+    pub fn error(&self) -> &io::Error {
+        &self.error
+    }
+
+    pub fn reconcile(mut self) -> FilePromotionResolution {
+        let authority = match self.retained.file.parent.authority() {
+            Ok(authority) => authority,
+            Err(_) => return FilePromotionResolution::Indeterminate(self),
+        };
+        let operation = match authority.enter() {
+            Ok(operation) => operation,
+            Err(_) => return FilePromotionResolution::Indeterminate(self),
+        };
+        if self.retained.file.parent.validate(&operation).is_err()
+            || self.destination.validate(&operation).is_err()
+            || platform::file_identity(&self.retained.file.handle).ok()
+                != Some(self.retained.file.identity)
+        {
+            return FilePromotionResolution::Indeterminate(self);
+        }
+        let source = platform::file_binding_state(
+            &self.retained.file.parent.inner.handle,
+            self.retained.file.name.as_os_str(),
+            self.retained.file.identity,
+        );
+        let destination = platform::file_binding_state(
+            &self.destination.inner.handle,
+            self.destination_name.as_os_str(),
+            self.retained.file.identity,
+        );
+        match (source, destination) {
+            (Ok(platform::BindingState::Absent), Ok(platform::BindingState::Exact)) => {
+                if sync_rename_parents(&self.retained.file.parent, &self.destination).is_err()
+                    || self.destination.validate(&operation).is_err()
+                {
+                    return FilePromotionResolution::Indeterminate(self);
+                }
+                let handle = match platform::open_file(
+                    &self.destination.inner.handle,
+                    self.destination_name.as_os_str(),
+                ) {
+                    Ok(handle)
+                        if platform::file_identity(&handle).ok()
+                            == Some(self.retained.file.identity) => handle,
+                    _ => return FilePromotionResolution::Indeterminate(self),
+                };
+                let applied = FileCapability::new(
+                    handle,
+                    self.retained.file.identity,
+                    self.destination.clone(),
+                    self.destination_name.clone(),
+                    self.retained.file.authority.clone(),
+                );
+                if applied.validate(&operation).is_err()
+                    || self.retained.token.disarm().is_err()
+                {
+                    return FilePromotionResolution::Indeterminate(self);
+                }
+                FilePromotionResolution::Applied(applied)
+            }
+            (Ok(platform::BindingState::Exact), _) => {
+                if self.retained.token.update(StageRegistryPhase::Sealed).is_err()
+                    || self.retained.file.validate(&operation).is_err()
+                {
+                    return FilePromotionResolution::Indeterminate(self);
+                }
+                FilePromotionResolution::NoEffect(self.retained)
+            }
+            _ => FilePromotionResolution::Indeterminate(self),
+        }
+    }
+}
+
+#[must_use = "file promotion resolutions must be handled"]
+#[derive(Debug)]
+pub enum FilePromotionResolution {
+    Applied(FileCapability),
+    NoEffect(SealedStagedFile),
+    Indeterminate(FilePromotionObligation),
+}
+
+pub enum ReplaceDestination {
+    Vacant { parent: Directory, name: LeafName },
+    Existing(FileParkRequest),
+}
+
+impl_redacted_debug!(ReplaceDestination);
+
+#[must_use = "file replacement effects must be explicitly settled"]
+#[derive(Debug)]
+pub enum FileReplaceOutcome {
+    Replaced {
+        current: FileCapability,
+        displaced: Option<ParkedFile>,
+    },
+    NoEffect {
+        error: io::Error,
+        staged: SealedStagedFile,
+        destination: ReplaceDestination,
+    },
+    AppliedUnverified(FileReplaceObligation),
+}
+
+#[must_use = "file replacement resolutions must be handled"]
+#[derive(Debug)]
+pub enum FileReplaceResolution {
+    Replaced {
+        current: FileCapability,
+        displaced: Option<ParkedFile>,
+    },
+    NoEffect {
+        staged: SealedStagedFile,
+        destination: ReplaceDestination,
+    },
+    Indeterminate(FileReplaceObligation),
+}
+
+struct ExpectedContentReceipt {
+    authority: Weak<CapabilityAuthority>,
+    identity: platform::Identity,
+    size: u64,
+    stamp: platform::FileStamp,
+    sha256: [u8; 32],
+}
+
+impl ExpectedContentReceipt {
+    fn capture(request: &FileParkRequest) -> Self {
+        Self {
+            authority: request.expected.revision.authority.clone(),
+            identity: request.expected.revision.identity,
+            size: request.expected.revision.size,
+            stamp: request.expected.revision.stamp,
+            sha256: request.expected.sha256,
+        }
+    }
+
+    fn rebuild(self, file: FileCapability) -> FileParkRequest {
+        FileParkRequest {
+            file,
+            expected: ExpectedFileContent {
+                revision: FileRevision {
+                    authority: self.authority,
+                    identity: self.identity,
+                    size: self.size,
+                    stamp: self.stamp,
+                },
+                sha256: self.sha256,
+            },
+        }
+    }
+}
+
+enum FileReplaceObligationState {
+    Parking {
+        park: FileParkObligation,
+        staged: SealedStagedFile,
+        receipt: ExpectedContentReceipt,
+    },
+    Promoting {
+        promotion: FilePromotionObligation,
+        displaced: Option<ParkedFile>,
+        fallback: ReplaceDestination,
+        receipt: Option<ExpectedContentReceipt>,
+    },
+    RestoreParked {
+        parked: ParkedFile,
+        staged: SealedStagedFile,
+        receipt: ExpectedContentReceipt,
+    },
+    RestoreObligation {
+        restore: FileRestoreObligation,
+        staged: SealedStagedFile,
+        receipt: ExpectedContentReceipt,
+    },
+}
+
+#[must_use = "file replacement obligations must be reconciled"]
+pub struct FileReplaceObligation {
+    error: io::Error,
+    state: Option<FileReplaceObligationState>,
+}
+
+impl_redacted_debug!(FileReplaceObligation);
+
+impl FileReplaceObligation {
+    pub fn error(&self) -> &io::Error {
+        &self.error
+    }
+
+    pub fn reconcile(mut self) -> FileReplaceResolution {
+        let state = self.state.take().expect("replace obligation retains state");
+        settle_file_replace(state).unwrap_or_else(|state| {
+            self.state = Some(state);
+            FileReplaceResolution::Indeterminate(self)
+        })
+    }
+}
+
+#[must_use = "file park effects must be explicitly settled"]
+#[derive(Debug)]
+pub enum FileParkOutcome {
+    Parked(ParkedFile),
+    NoEffect { error: io::Error, request: FileParkRequest },
+    AppliedUnverified(FileParkObligation),
+}
+
+#[must_use = "file park resolutions must be handled"]
+#[derive(Debug)]
+pub enum FileParkResolution {
+    Parked(ParkedFile),
+    NoEffect(FileParkRequest),
+    Indeterminate(FileParkObligation),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FileParkPhase {
+    Parking,
+    RestoringRejectedReceipt,
+}
+
+#[must_use = "file park obligations must be reconciled"]
+pub struct FileParkObligation {
+    error: io::Error,
+    request: Option<FileParkRequest>,
+    token: FileParkRegistryToken,
+    park_name: LeafName,
+    phase: FileParkPhase,
+    digest_verified: bool,
+}
+
+impl_redacted_debug!(FileParkObligation);
+
+impl FileParkObligation {
+    pub fn error(&self) -> &io::Error {
+        &self.error
+    }
+
+    pub fn reconcile(self) -> FileParkResolution {
+        settle_file_park(self, false)
+    }
+
+    pub fn restore(self) -> FileParkResolution {
+        settle_file_park(self, true)
+    }
+}
+
+#[must_use = "a parked file must be removed, restored, or retained as an obligation"]
+pub struct ParkedFile {
+    parent: Directory,
+    original_name: LeafName,
+    park_name: LeafName,
+    identity: platform::Identity,
+    size: u64,
+    stamp: platform::FileStamp,
+    verified: bool,
+    token: FileParkRegistryToken,
+    authority: Weak<CapabilityAuthority>,
+}
+
+impl_redacted_debug!(ParkedFile);
+
+#[must_use = "file removal effects must be explicitly settled"]
+#[derive(Debug)]
+pub enum FileRemovalOutcome {
+    Removed,
+    NoEffect { error: io::Error, parked: ParkedFile },
+    AppliedUnverified(FileRemovalObligation),
+}
+
+#[must_use = "file removal resolutions must be handled"]
+#[derive(Debug)]
+pub enum FileRemovalResolution {
+    Removed,
+    NoEffect(ParkedFile),
+    Indeterminate(FileRemovalObligation),
+}
+
+#[must_use = "file removal obligations must be reconciled"]
+pub struct FileRemovalObligation {
+    error: io::Error,
+    parked: Option<ParkedFile>,
+}
+
+impl_redacted_debug!(FileRemovalObligation);
+
+impl FileRemovalObligation {
+    pub fn error(&self) -> &io::Error {
+        &self.error
+    }
+
+    pub fn reconcile(mut self) -> FileRemovalResolution {
+        let parked = self.parked.take().expect("removal obligation retains parked file");
+        let authority = match parked.authority() {
+            Ok(authority) => authority,
+            Err(_) => return self.retain(parked),
+        };
+        let operation = match authority.enter_file_park(&parked.token) {
+            Ok(operation) => operation,
+            Err(_) => return self.retain(parked),
+        };
+        self.reconcile_admitted(parked, authority, operation)
+    }
+
+    fn reconcile_with_recovery(
+        mut self,
+        permit: &DrainRecoveryPermit,
+    ) -> FileRemovalResolution {
+        let parked = self.parked.take().expect("removal obligation retains parked file");
+        let authority = match parked.authority() {
+            Ok(authority) => authority,
+            Err(_) => return self.retain(parked),
+        };
+        let operation = match authority.enter_file_park_recovery(permit, &parked.token) {
+            Ok(operation) => operation,
+            Err(_) => return self.retain(parked),
+        };
+        self.reconcile_admitted(parked, authority, operation)
+    }
+
+    fn reconcile_admitted(
+        mut self,
+        mut parked: ParkedFile,
+        authority: Arc<CapabilityAuthority>,
+        operation: CapabilityOperation,
+    ) -> FileRemovalResolution {
+        if parked.parent.validate(&operation).is_err() {
+            drop(operation);
+            return self.retain(parked);
+        }
+        let guard = match authority.take_file_park(&operation, &parked.token) {
+            Ok(guard) => guard,
+            Err(_) => return self.retain(parked),
+        };
+        match platform::settle_removed_file(
+            &guard.record().parent.inner.handle,
+            guard.record().name.as_os_str(),
+            &guard.record().cleanup,
+            guard.record().identity,
+        ) {
+            Ok(()) if parked.parent.validate(&operation).is_ok() => {
+                guard.disarm(&mut parked.token, &operation);
+                FileRemovalResolution::Removed
+            }
+            Ok(()) => {
+                drop(operation);
+                self.parked = Some(parked);
+                FileRemovalResolution::Indeterminate(self)
+            }
+            Err(_) => {
+                drop(operation);
+                self.parked = Some(parked);
+                FileRemovalResolution::Indeterminate(self)
+            }
+        }
+    }
+
+    fn retain(mut self, parked: ParkedFile) -> FileRemovalResolution {
+        self.parked = Some(parked);
+        FileRemovalResolution::Indeterminate(self)
+    }
+}
+
+#[must_use = "file restore effects must be explicitly settled"]
+#[derive(Debug)]
+pub enum FileRestoreOutcome {
+    Restored(FileCapability),
+    NoEffect { error: io::Error, parked: ParkedFile },
+    AppliedUnverified(FileRestoreObligation),
+}
+
+#[must_use = "file restore resolutions must be handled"]
+#[derive(Debug)]
+pub enum FileRestoreResolution {
+    Restored(FileCapability),
+    NoEffect(ParkedFile),
+    Indeterminate(FileRestoreObligation),
+}
+
+#[must_use = "file restore obligations must be reconciled"]
+pub struct FileRestoreObligation {
+    error: io::Error,
+    parked: Option<ParkedFile>,
+}
+
+impl_redacted_debug!(FileRestoreObligation);
+
+impl FileRestoreObligation {
+    pub fn error(&self) -> &io::Error {
+        &self.error
+    }
+
+    pub fn reconcile(mut self) -> FileRestoreResolution {
+        let parked = self.parked.take().expect("restore obligation retains parked file");
+        let authority = match parked.authority() {
+            Ok(authority) => authority,
+            Err(_) => return self.retain(parked),
+        };
+        let operation = match authority.enter_file_park(&parked.token) {
+            Ok(operation) => operation,
+            Err(_) => return self.retain(parked),
+        };
+        self.reconcile_admitted(parked, authority, operation)
+    }
+
+    fn reconcile_with_recovery(
+        mut self,
+        permit: &DrainRecoveryPermit,
+    ) -> FileRestoreResolution {
+        let parked = self.parked.take().expect("restore obligation retains parked file");
+        let authority = match parked.authority() {
+            Ok(authority) => authority,
+            Err(_) => return self.retain(parked),
+        };
+        let operation = match authority.enter_file_park_recovery(permit, &parked.token) {
+            Ok(operation) => operation,
+            Err(_) => return self.retain(parked),
+        };
+        self.reconcile_admitted(parked, authority, operation)
+    }
+
+    fn reconcile_admitted(
+        mut self,
+        parked: ParkedFile,
+        authority: Arc<CapabilityAuthority>,
+        operation: CapabilityOperation,
+    ) -> FileRestoreResolution {
+        match settle_file_restore_admitted(parked, authority, operation) {
+            FileRestoreSettlement::Restored(file) => FileRestoreResolution::Restored(file),
+            FileRestoreSettlement::NoEffect(parked) => FileRestoreResolution::NoEffect(parked),
+            FileRestoreSettlement::Indeterminate(parked) => self.retain(parked),
+        }
+    }
+
+    fn retain(mut self, parked: ParkedFile) -> FileRestoreResolution {
+        self.parked = Some(parked);
+        FileRestoreResolution::Indeterminate(self)
+    }
+}
+
+enum FileRestoreSettlement {
+    Restored(FileCapability),
+    NoEffect(ParkedFile),
+    Indeterminate(ParkedFile),
+}
+
+impl ParkedFile {
+    pub fn remove(mut self) -> FileRemovalOutcome {
+        if !self.verified {
+            return FileRemovalOutcome::NoEffect {
+                error: identity_changed("unverified parked file can only be restored"),
+                parked: self,
+            };
+        }
+        let authority = match self.authority() {
+            Ok(authority) => authority,
+            Err(error) => return FileRemovalOutcome::NoEffect { error, parked: self },
+        };
+        let operation = match authority.enter_file_park(&self.token) {
+            Ok(operation) => operation,
+            Err(error) => return FileRemovalOutcome::NoEffect { error, parked: self },
+        };
+        if let Err(error) = self.validate(&operation) {
+            return FileRemovalOutcome::NoEffect { error, parked: self };
+        }
+        let mut guard = match authority.take_file_park(&operation, &self.token) {
+            Ok(guard) => guard,
+            Err(error) => return FileRemovalOutcome::NoEffect { error, parked: self },
+        };
+        let removal = {
+            let record = guard.record_mut();
+            platform::remove_parked_file(
+                &record.parent.inner.handle,
+                record.name.as_os_str(),
+                &mut record.cleanup,
+                record.identity,
+            )
+        };
+        match removal {
+            Ok(()) if self.parent.validate(&operation).is_ok() => {
+                guard.disarm(&mut self.token, &operation);
+                FileRemovalOutcome::Removed
+            }
+            Ok(()) => FileRemovalOutcome::AppliedUnverified(FileRemovalObligation {
+                error: identity_changed("file removal lost its authority chain"),
+                parked: Some(self),
+            }),
+            Err(error) => {
+                drop(guard);
+                match self.binding_state() {
+                Ok(platform::BindingState::Exact) if self.validate(&operation).is_ok() => {
+                    FileRemovalOutcome::NoEffect { error, parked: self }
+                }
+                _ => FileRemovalOutcome::AppliedUnverified(FileRemovalObligation {
+                    error,
+                    parked: Some(self),
+                }),
+                }
+            }
+        }
+    }
+
+    fn remove_with_recovery(
+        mut self,
+        permit: &DrainRecoveryPermit,
+    ) -> FileRemovalOutcome {
+        let authority = match self.authority() {
+            Ok(authority) => authority,
+            Err(error) => return FileRemovalOutcome::NoEffect { error, parked: self },
+        };
+        let operation = match authority.enter_file_park_recovery(permit, &self.token) {
+            Ok(operation) => operation,
+            Err(error) => return FileRemovalOutcome::NoEffect { error, parked: self },
+        };
+        self.remove_admitted(authority, operation)
+    }
+
+    fn remove_admitted(
+        mut self,
+        authority: Arc<CapabilityAuthority>,
+        operation: CapabilityOperation,
+    ) -> FileRemovalOutcome {
+        if !self.verified {
+            return FileRemovalOutcome::NoEffect {
+                error: identity_changed("unverified parked file can only be restored"),
+                parked: self,
+            };
+        }
+        if let Err(error) = self.validate(&operation) {
+            return FileRemovalOutcome::NoEffect { error, parked: self };
+        }
+        let mut guard = match authority.take_file_park(&operation, &self.token) {
+            Ok(guard) => guard,
+            Err(error) => return FileRemovalOutcome::NoEffect { error, parked: self },
+        };
+        let removal = {
+            let record = guard.record_mut();
+            platform::remove_parked_file(
+                &record.parent.inner.handle,
+                record.name.as_os_str(),
+                &mut record.cleanup,
+                record.identity,
+            )
+        };
+        match removal {
+            Ok(()) if self.parent.validate(&operation).is_ok() => {
+                guard.disarm(&mut self.token, &operation);
+                FileRemovalOutcome::Removed
+            }
+            Ok(()) => FileRemovalOutcome::AppliedUnverified(FileRemovalObligation {
+                error: identity_changed("file removal lost its authority chain"),
+                parked: Some(self),
+            }),
+            Err(error) => {
+                drop(guard);
+                match self.binding_state() {
+                Ok(platform::BindingState::Exact) if self.validate(&operation).is_ok() => {
+                    FileRemovalOutcome::NoEffect { error, parked: self }
+                }
+                _ => FileRemovalOutcome::AppliedUnverified(FileRemovalObligation {
+                    error,
+                    parked: Some(self),
+                }),
+                }
+            }
+        }
+    }
+
+    pub fn restore(mut self) -> FileRestoreOutcome {
+        let authority = match self.authority() {
+            Ok(authority) => authority,
+            Err(error) => return FileRestoreOutcome::NoEffect { error, parked: self },
+        };
+        let operation = match authority.enter_file_park(&self.token) {
+            Ok(operation) => operation,
+            Err(error) => return FileRestoreOutcome::NoEffect { error, parked: self },
+        };
+        if let Err(error) = self.validate(&operation) {
+            return FileRestoreOutcome::NoEffect { error, parked: self };
+        }
+        let mut guard = match authority.take_file_park(&operation, &self.token) {
+            Ok(guard) => guard,
+            Err(error) => return FileRestoreOutcome::NoEffect { error, parked: self },
+        };
+        let restoration = {
+            let record = guard.record_mut();
+            platform::restore_parked_file(
+                &record.parent.inner.handle,
+                record.name.as_os_str(),
+                &mut record.cleanup,
+                record.identity,
+                record.original_name.as_os_str(),
+            )
+        };
+        match restoration {
+            Ok(handle) => {
+                let restored = FileCapability::new(
+                    handle,
+                    self.identity,
+                    self.parent.clone(),
+                    self.original_name.clone(),
+                    self.authority.clone(),
+                );
+                if restored.validate(&operation).is_ok() {
+                    guard.disarm(&mut self.token, &operation);
+                    FileRestoreOutcome::Restored(restored)
+                } else {
+                    FileRestoreOutcome::AppliedUnverified(FileRestoreObligation {
+                        error: identity_changed("restored file lost its authority chain"),
+                        parked: Some(self),
+                    })
+                }
+            }
+            Err(error) => {
+                drop(guard);
+                match self.binding_state() {
+                Ok(platform::BindingState::Exact) if self.validate(&operation).is_ok() => {
+                    FileRestoreOutcome::NoEffect { error, parked: self }
+                }
+                _ => FileRestoreOutcome::AppliedUnverified(FileRestoreObligation {
+                    error,
+                    parked: Some(self),
+                }),
+                }
+            }
+        }
+    }
+
+    fn restore_with_recovery(
+        mut self,
+        permit: &DrainRecoveryPermit,
+    ) -> FileRestoreOutcome {
+        let authority = match self.authority() {
+            Ok(authority) => authority,
+            Err(error) => return FileRestoreOutcome::NoEffect { error, parked: self },
+        };
+        let operation = match authority.enter_file_park_recovery(permit, &self.token) {
+            Ok(operation) => operation,
+            Err(error) => return FileRestoreOutcome::NoEffect { error, parked: self },
+        };
+        self.restore_admitted(authority, operation)
+    }
+
+    fn restore_admitted(
+        mut self,
+        authority: Arc<CapabilityAuthority>,
+        operation: CapabilityOperation,
+    ) -> FileRestoreOutcome {
+        if let Err(error) = self.validate(&operation) {
+            return FileRestoreOutcome::NoEffect { error, parked: self };
+        }
+        let mut guard = match authority.take_file_park(&operation, &self.token) {
+            Ok(guard) => guard,
+            Err(error) => return FileRestoreOutcome::NoEffect { error, parked: self },
+        };
+        let restoration = {
+            let record = guard.record_mut();
+            platform::restore_parked_file(
+                &record.parent.inner.handle,
+                record.name.as_os_str(),
+                &mut record.cleanup,
+                record.identity,
+                record.original_name.as_os_str(),
+            )
+        };
+        match restoration {
+            Ok(handle) => {
+                let restored = FileCapability::new(
+                    handle,
+                    self.identity,
+                    self.parent.clone(),
+                    self.original_name.clone(),
+                    self.authority.clone(),
+                );
+                if restored.validate(&operation).is_ok() {
+                    guard.disarm(&mut self.token, &operation);
+                    FileRestoreOutcome::Restored(restored)
+                } else {
+                    FileRestoreOutcome::AppliedUnverified(FileRestoreObligation {
+                        error: identity_changed("restored file lost its authority chain"),
+                        parked: Some(self),
+                    })
+                }
+            }
+            Err(error) => {
+                drop(guard);
+                match self.binding_state() {
+                Ok(platform::BindingState::Exact) if self.validate(&operation).is_ok() => {
+                    FileRestoreOutcome::NoEffect { error, parked: self }
+                }
+                _ => FileRestoreOutcome::AppliedUnverified(FileRestoreObligation {
+                    error,
+                    parked: Some(self),
+                }),
+                }
+            }
+        }
+    }
+
+    fn authority(&self) -> io::Result<Arc<CapabilityAuthority>> {
+        self.authority.upgrade().ok_or_else(stale_capability)
+    }
+
+    fn binding_state(&self) -> io::Result<platform::BindingState> {
+        platform::file_binding_state(
+            &self.parent.inner.handle,
+            self.park_name.as_os_str(),
+            self.identity,
+        )
+    }
+
+    fn validate(&self, operation: &CapabilityOperation) -> io::Result<()> {
+        self.parent.validate(operation)?;
+        if self.authority.as_ptr() != Arc::as_ptr(&operation.authority)
+            || self.token.authority.as_ptr() != Arc::as_ptr(&operation.authority)
+        {
+            return Err(identity_changed("parked file capability changed"));
+        }
+        let registered = {
+            let state = operation.authority.operations.lock().map_err(|_| {
+                io::Error::other("filesystem capability operation lock was poisoned")
+            })?;
+            state.file_parks.get(&self.token.id).is_some_and(|record| {
+                record.phase == FileParkRegistryPhase::Live
+                    && record.identity == self.identity
+                    && record.size == self.size
+                    && record.stamp == self.stamp
+                    && record.name == self.park_name
+                    && record.original_name == self.original_name
+            })
+        };
+        if !registered || self.binding_state()? != platform::BindingState::Exact {
+            return Err(identity_changed("parked file capability changed"));
+        }
+        Ok(())
+    }
+}
+
+fn settle_file_restore_admitted(
+    mut parked: ParkedFile,
+    authority: Arc<CapabilityAuthority>,
+    operation: CapabilityOperation,
+) -> FileRestoreSettlement {
+    if parked.parent.validate(&operation).is_err() {
+        return FileRestoreSettlement::Indeterminate(parked);
+    }
+    let guard = match authority.take_file_park(&operation, &parked.token) {
+        Ok(guard) => guard,
+        Err(_) => return FileRestoreSettlement::Indeterminate(parked),
+    };
+    match platform::settle_restored_file(
+        &guard.record().parent.inner.handle,
+        guard.record().name.as_os_str(),
+        &guard.record().cleanup,
+        guard.record().identity,
+        guard.record().original_name.as_os_str(),
+    ) {
+        Ok(handle) => {
+            let restored = FileCapability::new(
+                handle,
+                parked.identity,
+                parked.parent.clone(),
+                parked.original_name.clone(),
+                parked.authority.clone(),
+            );
+            if restored.validate(&operation).is_ok() {
+                guard.disarm(&mut parked.token, &operation);
+                FileRestoreSettlement::Restored(restored)
+            } else {
+                drop(guard);
+                FileRestoreSettlement::Indeterminate(parked)
+            }
+        }
+        Err(_) => {
+            drop(guard);
+            match parked.binding_state() {
+            Ok(platform::BindingState::Exact) if parked.validate(&operation).is_ok() => {
+                FileRestoreSettlement::NoEffect(parked)
+            }
+            _ => FileRestoreSettlement::Indeterminate(parked),
+            }
+        }
+    }
+}
+
+#[must_use = "directory park effects must be explicitly settled"]
+#[derive(Debug)]
+pub enum DirectoryParkOutcome {
+    Parked(ParkedDirectory),
+    NoEffect { error: io::Error, directory: Directory },
+    AppliedUnverified(DirectoryParkObligation),
+}
+
+#[must_use = "directory park resolutions must be handled"]
+#[derive(Debug)]
+pub enum DirectoryParkResolution {
+    Parked(ParkedDirectory),
+    NoEffect(Directory),
+    Indeterminate(DirectoryParkObligation),
+}
+
+#[must_use = "directory park obligations must be reconciled"]
+pub struct DirectoryParkObligation {
+    error: io::Error,
+    parent: Directory,
+    directory: Option<Directory>,
+    original_name: LeafName,
+    token: DirectoryParkRegistryToken,
+    park_name: LeafName,
+}
+
+impl_redacted_debug!(DirectoryParkObligation);
+
+impl DirectoryParkObligation {
+    pub fn error(&self) -> &io::Error {
+        &self.error
+    }
+
+    pub fn reconcile(self) -> DirectoryParkResolution {
+        settle_directory_park(self, false)
+    }
+
+    pub fn restore(self) -> DirectoryParkResolution {
+        settle_directory_park(self, true)
+    }
+}
+
+#[must_use = "a parked directory must be removed, restored, or retained as an obligation"]
+pub struct ParkedDirectory {
+    parent: Directory,
+    original_name: LeafName,
+    park_name: LeafName,
+    identity: DirectoryIdentity,
+    token: DirectoryParkRegistryToken,
+    authority: Weak<CapabilityAuthority>,
+}
+
+impl_redacted_debug!(ParkedDirectory);
+
+#[must_use = "directory removal effects must be explicitly settled"]
+#[derive(Debug)]
+pub enum DirectoryRemovalOutcome {
+    Removed,
+    NoEffect { error: io::Error, parked: ParkedDirectory },
+    AppliedUnverified(DirectoryRemovalObligation),
+}
+
+#[must_use = "directory removal resolutions must be handled"]
+#[derive(Debug)]
+pub enum DirectoryRemovalResolution {
+    Removed,
+    NoEffect(ParkedDirectory),
+    Indeterminate(DirectoryRemovalObligation),
+}
+
+#[must_use = "directory removal obligations must be reconciled"]
+pub struct DirectoryRemovalObligation {
+    error: io::Error,
+    parked: Option<ParkedDirectory>,
+}
+
+impl_redacted_debug!(DirectoryRemovalObligation);
+
+#[must_use = "directory restore effects must be explicitly settled"]
+#[derive(Debug)]
+pub enum DirectoryRestoreOutcome {
+    Restored(Directory),
+    NoEffect { error: io::Error, parked: ParkedDirectory },
+    AppliedUnverified(DirectoryRestoreObligation),
+}
+
+#[must_use = "directory restore resolutions must be handled"]
+#[derive(Debug)]
+pub enum DirectoryRestoreResolution {
+    Restored(Directory),
+    NoEffect(ParkedDirectory),
+    Indeterminate(DirectoryRestoreObligation),
+}
+
+#[must_use = "directory restore obligations must be reconciled"]
+pub struct DirectoryRestoreObligation {
+    error: io::Error,
+    parked: Option<ParkedDirectory>,
+}
+
+impl_redacted_debug!(DirectoryRestoreObligation);
+
+#[derive(Debug, thiserror::Error)]
+pub enum RootSessionError {
+    #[error("running process image could not be retained")]
+    ProcessImage(#[source] io::Error),
+    #[error("application root could not be created")]
+    Create(#[source] io::Error),
+    #[error("application root is not an exact physical directory")]
+    Open(#[source] io::Error),
+    #[error("application root is already leased by another process")]
+    Busy,
+    #[error("application root lease could not be acquired")]
+    Lease(#[source] io::Error),
+}
+
+#[must_use = "root acquisition effects must be explicitly acquired, cleaned up, or reconciled"]
+#[derive(Debug)]
+pub enum RootSessionAcquireOutcome {
+    Acquired(RootSession),
+    NoEffect(RootSessionError),
+    AppliedUnverified(RootSessionAcquireObligation),
+}
+
+#[must_use = "partial root construction must be reconciled or cleaned up"]
+pub struct RootSessionAcquireObligation {
+    error: RootSessionError,
+    construction: Option<platform::RootConstruction>,
+    lease: Option<platform::LeaseAcquisitionObligation>,
+    process_image: Option<platform::ProcessImageAncestry>,
+}
+
+impl_redacted_debug!(RootSessionAcquireObligation);
+
+impl RootSessionAcquireObligation {
+    pub fn error(&self) -> &RootSessionError {
+        &self.error
+    }
+
+    pub fn reconcile(mut self) -> RootSessionAcquireOutcome {
+        let construction = self
+            .construction
+            .take()
+            .expect("root acquisition obligation retains construction");
+        if let Some(lease) = self.lease.take() {
+            let root = match platform::root_construction_guard(&construction) {
+                Ok(root) => root,
+                Err(error) => {
+                    self.error = RootSessionError::Create(error);
+                    self.construction = Some(construction);
+                    self.lease = Some(lease);
+                    return RootSessionAcquireOutcome::AppliedUnverified(self);
+                }
+            };
+            let identity = match platform::root_construction_identity(&construction) {
+                Ok(identity) => identity,
+                Err(error) => {
+                    self.error = RootSessionError::Create(error);
+                    self.construction = Some(construction);
+                    self.lease = Some(lease);
+                    return RootSessionAcquireOutcome::AppliedUnverified(self);
+                }
+            };
+            match platform::reconcile_lease_acquisition(root, lease) {
+                Ok(lease) => {
+                    let process_image = self
+                        .process_image
+                        .take()
+                        .expect("root acquisition obligation retains process image ancestry");
+                    return finish_root_session(
+                        construction,
+                        identity,
+                        lease,
+                        process_image,
+                    );
+                }
+                Err(lease) => {
+                    self.error = RootSessionError::Lease(copy_io_error(
+                        platform::lease_acquisition_error(&lease),
+                    ));
+                    self.construction = Some(construction);
+                    self.lease = Some(lease);
+                    return RootSessionAcquireOutcome::AppliedUnverified(self);
+                }
+            }
+        }
+        match platform::reconcile_root_construction(construction) {
+            Ok(construction) => {
+                let process_image = self
+                    .process_image
+                    .take()
+                    .expect("root acquisition obligation retains process image ancestry");
+                try_acquire_lease_and_finish_root(construction, process_image)
+            }
+            Err(error) => {
+                let (error, construction) = error.into_parts();
+                self.error = RootSessionError::Create(error);
+                self.construction = construction;
+                RootSessionAcquireOutcome::AppliedUnverified(self)
+            }
+        }
+    }
+
+    pub fn cleanup(mut self) -> Result<(), Self> {
+        let construction = self
+            .construction
+            .take()
+            .expect("root acquisition obligation retains construction");
+        if let Some(lease) = self.lease.take() {
+            let root = match platform::root_construction_guard(&construction) {
+                Ok(root) => root,
+                Err(error) => {
+                    self.error = RootSessionError::Create(error);
+                    self.construction = Some(construction);
+                    self.lease = Some(lease);
+                    return Err(self);
+                }
+            };
+            let lease_name = LeafName::new(ROOT_LEASE_NAME).expect("fixed lease name is valid");
+            if let Err(lease) =
+                platform::cleanup_lease_acquisition(root, lease_name.as_os_str(), lease)
+            {
+                self.error = RootSessionError::Lease(copy_io_error(
+                    platform::lease_acquisition_error(&lease),
+                ));
+                self.construction = Some(construction);
+                self.lease = Some(lease);
+                return Err(self);
+            }
+        }
+        match platform::cleanup_root_construction(construction) {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                let (error, construction) = error.into_parts();
+                self.error = RootSessionError::Create(error);
+                self.construction = construction;
+                Err(self)
+            }
+        }
+    }
+
+    pub fn acknowledge_preserved(mut self) -> Result<(), Self> {
+        let construction = self
+            .construction
+            .take()
+            .expect("root acquisition obligation retains construction");
+        if !platform::root_construction_has_unclassified(&construction) {
+            self.construction = Some(construction);
+            return Err(self);
+        }
+        if let Some(lease) = self.lease.take() {
+            let root = match platform::root_construction_guard(&construction) {
+                Ok(root) => root,
+                Err(error) => {
+                    self.error = RootSessionError::Create(error);
+                    self.construction = Some(construction);
+                    self.lease = Some(lease);
+                    return Err(self);
+                }
+            };
+            let lease_name = LeafName::new(ROOT_LEASE_NAME).expect("fixed lease name is valid");
+            if let Err(lease) =
+                platform::cleanup_lease_acquisition(root, lease_name.as_os_str(), lease)
+            {
+                self.error = RootSessionError::Lease(copy_io_error(
+                    platform::lease_acquisition_error(&lease),
+                ));
+                self.construction = Some(construction);
+                self.lease = Some(lease);
+                return Err(self);
+            }
+        }
+        platform::acknowledge_preserved_root_construction(construction);
+        Ok(())
+    }
+}
+
+impl Drop for RootSessionAcquireObligation {
+    fn drop(&mut self) {
+        if self.construction.is_some() || self.lease.is_some() {
+            std::process::abort();
+        }
+    }
+}
+
+fn copy_io_error(error: &io::Error) -> io::Error {
+    io::Error::new(error.kind(), error.to_string())
+}
+
+const AUTHORITY_LIVE: u8 = 0;
+const AUTHORITY_DRAINING: u8 = 1;
+const AUTHORITY_RESETTING: u8 = 2;
+const AUTHORITY_REVOKED: u8 = 3;
+
+struct CapabilityAuthority {
+    operations: Mutex<OperationState>,
+    session_nonce: [u8; 16],
+    root: platform::RootGuard,
+    lease: platform::LeaseHandle,
+    process_image: platform::ProcessImageAncestry,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StageRegistryPhase {
+    Writing,
+    Sealed,
+    CleanupAttempted,
+    PromotionAttempted,
+    Unresolved,
+}
+
+struct StageRecord {
+    parent: Directory,
+    name: LeafName,
+    identity: platform::Identity,
+    cleanup: platform::FileCleanupHandle,
+    phase: StageRegistryPhase,
+    destination: Option<StageDestination>,
+}
+
+struct StageDestination {
+    parent: Directory,
+    name: LeafName,
+}
+
+struct StageToken {
+    id: u64,
+    authority: Weak<CapabilityAuthority>,
+    armed: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StageCreatePhase {
+    Reserved,
+    Applied,
+    Abandoned,
+    CleanupAttempted,
+}
+
+struct StageCreateRecord {
+    parent: Directory,
+    name: LeafName,
+    created: Option<File>,
+    cleanup: Option<platform::FileCleanupHandle>,
+    identity: Option<platform::Identity>,
+    phase: StageCreatePhase,
+}
+
+struct StageCreateToken {
+    id: u64,
+    authority: Weak<CapabilityAuthority>,
+    armed: bool,
+}
+
+impl_redacted_debug!(StageCreateToken);
+
+struct StageCreateRecordGuard {
+    authority: Arc<CapabilityAuthority>,
+    id: u64,
+    record: Option<StageCreateRecord>,
+}
+
+impl StageCreateRecordGuard {
+    fn record(&self) -> &StageCreateRecord {
+        self.record.as_ref().expect("stage create guard retains record")
+    }
+
+    fn record_mut(&mut self) -> &mut StageCreateRecord {
+        self.record.as_mut().expect("stage create guard retains record")
+    }
+
+    fn disarm(mut self, token: &mut StageCreateToken, operation: &CapabilityOperation) {
+        assert!(Arc::ptr_eq(&self.authority, &operation.authority));
+        self.record.take();
+        let mut state = self
+            .authority
+            .operations
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        state.release_effect(operation);
+        token.armed = false;
+    }
+
+    fn transfer(mut self, token: &mut StageCreateToken, operation: &CapabilityOperation) {
+        assert!(Arc::ptr_eq(&self.authority, &operation.authority));
+        self.record.take();
+        token.armed = false;
+    }
+}
+
+impl Drop for StageCreateRecordGuard {
+    fn drop(&mut self) {
+        let Some(record) = self.record.take() else {
+            return;
+        };
+        let mut state = self
+            .authority
+            .operations
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        assert!(state.stage_creations.insert(self.id, record).is_none());
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DirectoryCreateEffectPhase {
+    Reserved,
+    Applied,
+    Abandoned,
+    CleanupAttempted,
+    CreatedUnclassified,
+    UnclassifiedAbandoned,
+    UnclassifiedRecovery,
+    CreatedUnclassifiedResetPending,
+}
+
+struct DirectoryCreateEffectRecord {
+    parent: Directory,
+    name: LeafName,
+    created: Option<platform::DirectoryHandle>,
+    cleanup: Option<platform::DirectoryCleanupHandle>,
+    identity: Option<platform::Identity>,
+    phase: DirectoryCreateEffectPhase,
+}
+
+struct DirectoryCreateEffectToken {
+    id: u64,
+    authority: Weak<CapabilityAuthority>,
+    armed: bool,
+}
+
+impl_redacted_debug!(DirectoryCreateEffectToken);
+
+struct DirectoryCreateEffectGuard {
+    authority: Arc<CapabilityAuthority>,
+    id: u64,
+    record: Option<DirectoryCreateEffectRecord>,
+}
+
+impl DirectoryCreateEffectGuard {
+    fn record(&self) -> &DirectoryCreateEffectRecord {
+        self.record
+            .as_ref()
+            .expect("directory create guard retains record")
+    }
+
+    fn record_mut(&mut self) -> &mut DirectoryCreateEffectRecord {
+        self.record
+            .as_mut()
+            .expect("directory create guard retains record")
+    }
+
+    fn disarm(
+        mut self,
+        token: &mut DirectoryCreateEffectToken,
+        operation: &CapabilityOperation,
+    ) {
+        assert!(Arc::ptr_eq(&self.authority, &operation.authority));
+        self.record.take();
+        let mut state = self
+            .authority
+            .operations
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        state.release_effect(operation);
+        token.armed = false;
+    }
+}
+
+impl Drop for DirectoryCreateEffectGuard {
+    fn drop(&mut self) {
+        let Some(record) = self.record.take() else {
+            return;
+        };
+        let mut state = self
+            .authority
+            .operations
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        assert!(state.directory_creations.insert(self.id, record).is_none());
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FileParkRegistryPhase {
+    Reserved,
+    Live,
+    Abandoned,
+}
+
+struct FileParkRegistryRecord {
+    parent: Directory,
+    original_name: LeafName,
+    name: LeafName,
+    identity: platform::Identity,
+    size: u64,
+    stamp: platform::FileStamp,
+    expected_digest: Option<[u8; 32]>,
+    cleanup: platform::FileCleanupHandle,
+    phase: FileParkRegistryPhase,
+}
+
+struct FileParkRegistryToken {
+    id: u64,
+    authority: Weak<CapabilityAuthority>,
+    armed: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DirectoryParkRegistryPhase {
+    Reserved,
+    Live,
+    Abandoned,
+}
+
+struct DirectoryParkRegistryRecord {
+    parent: Directory,
+    original_name: LeafName,
+    name: LeafName,
+    identity: platform::Identity,
+    cleanup: platform::DirectoryCleanupHandle,
+    phase: DirectoryParkRegistryPhase,
+}
+
+struct DirectoryParkRegistryToken {
+    id: u64,
+    authority: Weak<CapabilityAuthority>,
+    armed: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+enum DrainRecoveryParkId {
+    File(u64),
+    Directory(u64),
+    DirectoryCreate(u64),
+}
+
+struct DrainRecoveryPermit {
+    authority: Arc<CapabilityAuthority>,
+    park_token_id: DrainRecoveryParkId,
+}
+
+impl_redacted_debug!(DrainRecoveryPermit);
+
+impl_redacted_debug!(FileParkRegistryToken);
+impl_redacted_debug!(DirectoryParkRegistryToken);
+
+struct FileParkRecordGuard {
+    authority: Arc<CapabilityAuthority>,
+    id: u64,
+    record: Option<FileParkRegistryRecord>,
+}
+
+impl FileParkRecordGuard {
+    fn record(&self) -> &FileParkRegistryRecord {
+        self.record.as_ref().expect("file park guard retains record")
+    }
+
+    fn record_mut(&mut self) -> &mut FileParkRegistryRecord {
+        self.record.as_mut().expect("file park guard retains record")
+    }
+
+    fn disarm(mut self, token: &mut FileParkRegistryToken, operation: &CapabilityOperation) {
+        assert!(Arc::ptr_eq(&self.authority, &operation.authority));
+        self.record.take();
+        let mut state = self
+            .authority
+            .operations
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        assert!(state.file_parks_checked_out > 0);
+        state.file_parks_checked_out -= 1;
+        state.release_effect(operation);
+        token.armed = false;
+    }
+}
+
+impl Drop for FileParkRecordGuard {
+    fn drop(&mut self) {
+        let Some(record) = self.record.take() else {
+            return;
+        };
+        let mut state = self
+            .authority
+            .operations
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        assert!(state.file_parks_checked_out > 0);
+        state.file_parks_checked_out -= 1;
+        assert!(state.file_parks.insert(self.id, record).is_none());
+    }
+}
+
+struct DirectoryParkRecordGuard {
+    authority: Arc<CapabilityAuthority>,
+    id: u64,
+    record: Option<DirectoryParkRegistryRecord>,
+}
+
+enum SessionDrainSettlement {
+    Ready,
+    Pending,
+    Recovery {
+        recovery: SessionDrainRecoveryState,
+        permits: Vec<DrainRecoveryPermit>,
+    },
+}
+
+impl DirectoryParkRecordGuard {
+    fn record(&self) -> &DirectoryParkRegistryRecord {
+        self.record
+            .as_ref()
+            .expect("directory park guard retains record")
+    }
+
+    fn record_mut(&mut self) -> &mut DirectoryParkRegistryRecord {
+        self.record
+            .as_mut()
+            .expect("directory park guard retains record")
+    }
+
+    fn disarm(
+        mut self,
+        token: &mut DirectoryParkRegistryToken,
+        operation: &CapabilityOperation,
+    ) {
+        assert!(Arc::ptr_eq(&self.authority, &operation.authority));
+        self.record.take();
+        let mut state = self
+            .authority
+            .operations
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        assert!(state.directory_parks_checked_out > 0);
+        state.directory_parks_checked_out -= 1;
+        state.release_effect(operation);
+        token.armed = false;
+    }
+}
+
+impl Drop for DirectoryParkRecordGuard {
+    fn drop(&mut self) {
+        let Some(record) = self.record.take() else {
+            return;
+        };
+        let mut state = self
+            .authority
+            .operations
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        assert!(state.directory_parks_checked_out > 0);
+        state.directory_parks_checked_out -= 1;
+        assert!(state.directory_parks.insert(self.id, record).is_none());
+    }
+}
+
+impl fmt::Debug for StageToken {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.debug_struct("StageToken").finish_non_exhaustive()
+    }
+}
+
+impl CapabilityAuthority {
+    fn validate_retained_process_image_outside_root(&self) -> io::Result<()> {
+        platform::validate_process_image_outside_root(&self.process_image, &self.root)
+    }
+
+    fn enter(self: &Arc<Self>) -> io::Result<CapabilityOperation> {
+        let mut state = self
+            .operations
+            .lock()
+            .map_err(|_| io::Error::other("filesystem capability operation lock was poisoned"))?;
+        if state.phase != AUTHORITY_LIVE {
+            return Err(stale_capability());
+        }
+        state.active = state
+            .active
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("filesystem capability operation count overflowed"))?;
+        let operation = CapabilityOperation {
+            authority: self.clone(),
+        };
+        drop(state);
+        platform::validate_lease(&self.lease)?;
+        platform::validate_root(&self.root)?;
+        Ok(operation)
+    }
+
+    fn enter_file_park(
+        self: &Arc<Self>,
+        token: &FileParkRegistryToken,
+    ) -> io::Result<CapabilityOperation> {
+        let mut state = self
+            .operations
+            .lock()
+            .map_err(|_| io::Error::other("filesystem capability operation lock was poisoned"))?;
+        let admitted = token.armed
+            && token.authority.as_ptr() == Arc::as_ptr(self)
+            && state
+                .file_parks
+                .get(&token.id)
+                .is_some_and(|record| record.phase == FileParkRegistryPhase::Live);
+        if !admitted || state.phase != AUTHORITY_LIVE {
+            return Err(stale_capability());
+        }
+        state.active = state
+            .active
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("filesystem capability operation count overflowed"))?;
+        let operation = CapabilityOperation {
+            authority: self.clone(),
+        };
+        drop(state);
+        platform::validate_lease(&self.lease)?;
+        platform::validate_root(&self.root)?;
+        Ok(operation)
+    }
+
+    fn enter_file_park_recovery(
+        self: &Arc<Self>,
+        permit: &DrainRecoveryPermit,
+        token: &FileParkRegistryToken,
+    ) -> io::Result<CapabilityOperation> {
+        let mut state = self
+            .operations
+            .lock()
+            .map_err(|_| io::Error::other("filesystem capability operation lock was poisoned"))?;
+        let admitted = Arc::ptr_eq(self, &permit.authority)
+            && token.armed
+            && token.authority.as_ptr() == Arc::as_ptr(self)
+            && permit.park_token_id == DrainRecoveryParkId::File(token.id)
+            && state
+                .file_parks
+                .get(&token.id)
+                .is_some_and(|record| record.phase == FileParkRegistryPhase::Live);
+        if !admitted || state.phase != AUTHORITY_DRAINING {
+            return Err(stale_capability());
+        }
+        state.active = state
+            .active
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("filesystem capability operation count overflowed"))?;
+        let operation = CapabilityOperation {
+            authority: self.clone(),
+        };
+        drop(state);
+        platform::validate_lease(&self.lease)?;
+        platform::validate_root(&self.root)?;
+        Ok(operation)
+    }
+
+    fn enter_directory_park(
+        self: &Arc<Self>,
+        token: &DirectoryParkRegistryToken,
+    ) -> io::Result<CapabilityOperation> {
+        let mut state = self
+            .operations
+            .lock()
+            .map_err(|_| io::Error::other("filesystem capability operation lock was poisoned"))?;
+        let admitted = token.armed
+            && token.authority.as_ptr() == Arc::as_ptr(self)
+            && state
+                .directory_parks
+                .get(&token.id)
+                .is_some_and(|record| record.phase == DirectoryParkRegistryPhase::Live);
+        if !admitted || state.phase != AUTHORITY_LIVE {
+            return Err(stale_capability());
+        }
+        state.active = state
+            .active
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("filesystem capability operation count overflowed"))?;
+        let operation = CapabilityOperation {
+            authority: self.clone(),
+        };
+        drop(state);
+        platform::validate_lease(&self.lease)?;
+        platform::validate_root(&self.root)?;
+        Ok(operation)
+    }
+
+    fn enter_directory_park_recovery(
+        self: &Arc<Self>,
+        permit: &DrainRecoveryPermit,
+        token: &DirectoryParkRegistryToken,
+    ) -> io::Result<CapabilityOperation> {
+        let mut state = self
+            .operations
+            .lock()
+            .map_err(|_| io::Error::other("filesystem capability operation lock was poisoned"))?;
+        let admitted = Arc::ptr_eq(self, &permit.authority)
+            && token.armed
+            && token.authority.as_ptr() == Arc::as_ptr(self)
+            && permit.park_token_id == DrainRecoveryParkId::Directory(token.id)
+            && state
+                .directory_parks
+                .get(&token.id)
+                .is_some_and(|record| record.phase == DirectoryParkRegistryPhase::Live);
+        if !admitted || state.phase != AUTHORITY_DRAINING {
+            return Err(stale_capability());
+        }
+        state.active = state
+            .active
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("filesystem capability operation count overflowed"))?;
+        let operation = CapabilityOperation {
+            authority: self.clone(),
+        };
+        drop(state);
+        platform::validate_lease(&self.lease)?;
+        platform::validate_root(&self.root)?;
+        Ok(operation)
+    }
+
+    fn enter_directory_create_recovery(
+        self: &Arc<Self>,
+        permit: &DrainRecoveryPermit,
+        token: &DirectoryCreateEffectToken,
+    ) -> io::Result<CapabilityOperation> {
+        let mut state = self
+            .operations
+            .lock()
+            .map_err(|_| io::Error::other("filesystem capability operation lock was poisoned"))?;
+        let admitted = Arc::ptr_eq(self, &permit.authority)
+            && token.armed
+            && token.authority.as_ptr() == Arc::as_ptr(self)
+            && permit.park_token_id == DrainRecoveryParkId::DirectoryCreate(token.id)
+            && state.directory_creations.get(&token.id).is_some_and(|record| {
+                record.phase == DirectoryCreateEffectPhase::UnclassifiedRecovery
+            });
+        if !admitted || state.phase != AUTHORITY_DRAINING {
+            return Err(stale_capability());
+        }
+        state.active = state
+            .active
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("filesystem capability operation count overflowed"))?;
+        let operation = CapabilityOperation {
+            authority: self.clone(),
+        };
+        drop(state);
+        platform::validate_lease(&self.lease)?;
+        platform::validate_root(&self.root)?;
+        Ok(operation)
+    }
+
+    fn transfer_unclassified_directory_create_to_reset(
+        self: &Arc<Self>,
+        permit: &DrainRecoveryPermit,
+        token: &mut DirectoryCreateEffectToken,
+    ) -> io::Result<()> {
+        let mut state = self
+            .operations
+            .lock()
+            .map_err(|_| io::Error::other("filesystem capability operation lock was poisoned"))?;
+        let admitted = Arc::ptr_eq(self, &permit.authority)
+            && token.armed
+            && token.authority.as_ptr() == Arc::as_ptr(self)
+            && permit.park_token_id == DrainRecoveryParkId::DirectoryCreate(token.id);
+        if !admitted || state.phase != AUTHORITY_DRAINING {
+            return Err(stale_capability());
+        }
+        let record = state
+            .directory_creations
+            .get_mut(&token.id)
+            .filter(|record| {
+                record.phase == DirectoryCreateEffectPhase::UnclassifiedRecovery
+            })
+            .ok_or_else(stale_capability)?;
+        if !record.parent.is_managed_root_descendant() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "external directory creation cannot transfer to app-root reset",
+            ));
+        }
+        record.phase = DirectoryCreateEffectPhase::CreatedUnclassifiedResetPending;
+        token.armed = false;
+        Ok(())
+    }
+
+    fn cancel_reset_pending_directory_creates(&self) -> io::Result<()> {
+        let mut state = self
+            .operations
+            .lock()
+            .map_err(|_| io::Error::other("filesystem capability operation lock was poisoned"))?;
+        if state.phase != AUTHORITY_DRAINING {
+            return Err(stale_capability());
+        }
+        for record in state.directory_creations.values_mut() {
+            if record.phase == DirectoryCreateEffectPhase::CreatedUnclassifiedResetPending {
+                record.phase = DirectoryCreateEffectPhase::UnclassifiedAbandoned;
+            }
+        }
+        Ok(())
+    }
+
+    fn enter_reset_operation(self: &Arc<Self>) -> io::Result<CapabilityOperation> {
+        let mut state = self
+            .operations
+            .lock()
+            .map_err(|_| io::Error::other("filesystem capability operation lock was poisoned"))?;
+        if state.phase != AUTHORITY_RESETTING || state.active != 0 {
+            return Err(stale_capability());
+        }
+        state.active = state
+            .active
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("filesystem capability operation count overflowed"))?;
+        Ok(CapabilityOperation {
+            authority: self.clone(),
+        })
+    }
+
+    fn has_reset_pending_directory_creates(&self) -> bool {
+        let state = self
+            .operations
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        state.directory_creations.values().any(|record| {
+            record.phase == DirectoryCreateEffectPhase::CreatedUnclassifiedResetPending
+        })
+    }
+
+    fn directory_create_is_external(&self, token: &DirectoryCreateEffectToken) -> bool {
+        let state = self
+            .operations
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        state
+            .directory_creations
+            .get(&token.id)
+            .is_some_and(|record| !record.parent.is_managed_root_descendant())
+    }
+
+    fn retire_reset_pending_directory_creates(
+        self: &Arc<Self>,
+        operation: &CapabilityOperation,
+    ) -> io::Result<()> {
+        if !Arc::ptr_eq(self, &operation.authority) {
+            return Err(stale_capability());
+        }
+        let mut state = self
+            .operations
+            .lock()
+            .map_err(|_| io::Error::other("filesystem capability operation lock was poisoned"))?;
+        if state.phase != AUTHORITY_RESETTING || state.active == 0 {
+            return Err(stale_capability());
+        }
+        let ids = state
+            .directory_creations
+            .iter()
+            .filter_map(|(id, record)| {
+                (record.phase
+                    == DirectoryCreateEffectPhase::CreatedUnclassifiedResetPending)
+                    .then_some(*id)
+            })
+            .collect::<Vec<_>>();
+        for id in ids {
+            state
+                .directory_creations
+                .remove(&id)
+                .expect("reset-pending directory create remains registered");
+            state.release_effect(operation);
+        }
+        Ok(())
+    }
+
+    fn identity(&self, physical: platform::Identity) -> DirectoryIdentity {
+        DirectoryIdentity {
+            session: self.session_nonce,
+            physical,
+        }
+    }
+
+    fn ensure_leaf_not_preserved_unclassified(
+        self: &Arc<Self>,
+        operation: &CapabilityOperation,
+        parent: &Directory,
+        name: &LeafName,
+    ) -> io::Result<()> {
+        if !Arc::ptr_eq(self, &operation.authority) {
+            return Err(stale_capability());
+        }
+        let state = self
+            .operations
+            .lock()
+            .map_err(|_| io::Error::other("filesystem capability operation lock was poisoned"))?;
+        if state.directory_creations.values().any(|record| {
+            record.parent.inner.identity == parent.inner.identity
+                && record.name == *name
+                && matches!(
+                    record.phase,
+                    DirectoryCreateEffectPhase::CreatedUnclassified
+                        | DirectoryCreateEffectPhase::UnclassifiedAbandoned
+                        | DirectoryCreateEffectPhase::UnclassifiedRecovery
+                )
+        }) {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "directory name is retained as an unclassified creation",
+            ));
+        }
+        Ok(())
+    }
+
+    fn register_stage_record(
+        self: &Arc<Self>,
+        parent: Directory,
+        name: LeafName,
+        identity: platform::Identity,
+        cleanup: platform::FileCleanupHandle,
+        operation: &CapabilityOperation,
+    ) -> io::Result<StageToken> {
+        if !Arc::ptr_eq(self, &operation.authority) {
+            return Err(stale_capability());
+        }
+        let mut state = self
+            .operations
+            .lock()
+            .map_err(|_| io::Error::other("filesystem capability operation lock was poisoned"))?;
+        if !matches!(state.phase, AUTHORITY_LIVE | AUTHORITY_DRAINING) {
+            return Err(stale_capability());
+        }
+        let id = state.next_stage_id;
+        state.next_stage_id = state
+            .next_stage_id
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("stage registry identity overflowed"))?;
+        debug_assert!(state.outstanding_effects > 0);
+        state.stages.insert(
+            id,
+            StageRecord {
+                parent,
+                name,
+                identity,
+                cleanup,
+                phase: StageRegistryPhase::Writing,
+                destination: None,
+            },
+        );
+        Ok(StageToken {
+            id,
+            authority: Arc::downgrade(self),
+            armed: true,
+        })
+    }
+
+    fn reserve_stage_create(
+        self: &Arc<Self>,
+        operation: &CapabilityOperation,
+        parent: &Directory,
+        name: &LeafName,
+    ) -> io::Result<StageCreateToken> {
+        if !Arc::ptr_eq(self, &operation.authority) {
+            return Err(stale_capability());
+        }
+        let mut state = self
+            .operations
+            .lock()
+            .map_err(|_| io::Error::other("filesystem capability operation lock was poisoned"))?;
+        if !matches!(state.phase, AUTHORITY_LIVE | AUTHORITY_DRAINING) {
+            return Err(stale_capability());
+        }
+        let id = state.next_stage_create_id;
+        state.next_stage_create_id = state
+            .next_stage_create_id
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("stage create registry identity overflowed"))?;
+        state.reserve_effect()?;
+        state.stage_creations.insert(
+            id,
+            StageCreateRecord {
+                parent: parent.clone(),
+                name: name.clone(),
+                created: None,
+                cleanup: None,
+                identity: None,
+                phase: StageCreatePhase::Reserved,
+            },
+        );
+        Ok(StageCreateToken {
+            id,
+            authority: Arc::downgrade(self),
+            armed: true,
+        })
+    }
+
+    fn attach_stage_create(&self, token: &StageCreateToken, created: File) {
+        let mut state = self
+            .operations
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let record = state
+            .stage_creations
+            .get_mut(&token.id)
+            .expect("admitted stage create reservation remains registered");
+        record.created = Some(created);
+        record.phase = StageCreatePhase::Applied;
+    }
+
+    fn take_stage_create(
+        self: &Arc<Self>,
+        operation: &CapabilityOperation,
+        token: &StageCreateToken,
+    ) -> io::Result<StageCreateRecordGuard> {
+        if !token.armed
+            || !Arc::ptr_eq(self, &operation.authority)
+            || token.authority.as_ptr() != Arc::as_ptr(self)
+        {
+            return Err(stale_capability());
+        }
+        let record = self
+            .operations
+            .lock()
+            .map_err(|_| io::Error::other("filesystem capability operation lock was poisoned"))?
+            .stage_creations
+            .remove(&token.id)
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::NotFound, "stage create record is absent")
+            })?;
+        Ok(StageCreateRecordGuard {
+            authority: self.clone(),
+            id: token.id,
+            record: Some(record),
+        })
+    }
+
+    fn abandon_stage_create(&self, id: u64) {
+        let mut state = self
+            .operations
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if let Some(record) = state.stage_creations.get_mut(&id) {
+            record.phase = StageCreatePhase::Abandoned;
+        }
+    }
+
+    fn reserve_directory_create(
+        self: &Arc<Self>,
+        operation: &CapabilityOperation,
+        parent: &Directory,
+        name: &LeafName,
+    ) -> io::Result<DirectoryCreateEffectToken> {
+        if !Arc::ptr_eq(self, &operation.authority) {
+            return Err(stale_capability());
+        }
+        let mut state = self
+            .operations
+            .lock()
+            .map_err(|_| io::Error::other("filesystem capability operation lock was poisoned"))?;
+        if !matches!(state.phase, AUTHORITY_LIVE | AUTHORITY_DRAINING) {
+            return Err(stale_capability());
+        }
+        let id = state.next_directory_create_id;
+        state.next_directory_create_id = state
+            .next_directory_create_id
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("directory create registry identity overflowed"))?;
+        state.reserve_effect()?;
+        state.directory_creations.insert(
+            id,
+            DirectoryCreateEffectRecord {
+                parent: parent.clone(),
+                name: name.clone(),
+                created: None,
+                cleanup: None,
+                identity: None,
+                phase: DirectoryCreateEffectPhase::Reserved,
+            },
+        );
+        Ok(DirectoryCreateEffectToken {
+            id,
+            authority: Arc::downgrade(self),
+            armed: true,
+        })
+    }
+
+    fn attach_directory_create(
+        &self,
+        token: &DirectoryCreateEffectToken,
+        created: platform::DirectoryHandle,
+    ) {
+        let mut state = self
+            .operations
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let record = state
+            .directory_creations
+            .get_mut(&token.id)
+            .expect("admitted directory create reservation remains registered");
+        record.created = Some(created);
+        record.phase = DirectoryCreateEffectPhase::Applied;
+    }
+
+    fn mark_directory_create_unclassified(&self, token: &DirectoryCreateEffectToken) {
+        let mut state = self
+            .operations
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let record = state
+            .directory_creations
+            .get_mut(&token.id)
+            .expect("admitted directory create reservation remains registered");
+        record.phase = DirectoryCreateEffectPhase::CreatedUnclassified;
+    }
+
+    fn acknowledge_unclassified_directory_create(
+        self: &Arc<Self>,
+        operation: &CapabilityOperation,
+        token: &mut DirectoryCreateEffectToken,
+    ) -> io::Result<()> {
+        let guard = self.take_directory_create(operation, token)?;
+        if !matches!(
+            guard.record().phase,
+            DirectoryCreateEffectPhase::CreatedUnclassified
+                | DirectoryCreateEffectPhase::UnclassifiedRecovery
+        ) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "directory creation is not an unclassified preservation",
+            ));
+        }
+        guard.disarm(token, operation);
+        Ok(())
+    }
+
+    fn take_directory_create(
+        self: &Arc<Self>,
+        operation: &CapabilityOperation,
+        token: &DirectoryCreateEffectToken,
+    ) -> io::Result<DirectoryCreateEffectGuard> {
+        if !token.armed
+            || !Arc::ptr_eq(self, &operation.authority)
+            || token.authority.as_ptr() != Arc::as_ptr(self)
+        {
+            return Err(stale_capability());
+        }
+        let record = self
+            .operations
+            .lock()
+            .map_err(|_| io::Error::other("filesystem capability operation lock was poisoned"))?
+            .directory_creations
+            .remove(&token.id)
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::NotFound, "directory create record is absent")
+            })?;
+        Ok(DirectoryCreateEffectGuard {
+            authority: self.clone(),
+            id: token.id,
+            record: Some(record),
+        })
+    }
+
+    fn abandon_directory_create(&self, id: u64) {
+        let mut state = self
+            .operations
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if let Some(record) = state.directory_creations.get_mut(&id) {
+            record.phase = match record.phase {
+                DirectoryCreateEffectPhase::CreatedUnclassified
+                | DirectoryCreateEffectPhase::UnclassifiedRecovery => {
+                    DirectoryCreateEffectPhase::UnclassifiedAbandoned
+                }
+                phase => phase,
+            };
+            if matches!(
+                record.phase,
+                DirectoryCreateEffectPhase::Reserved | DirectoryCreateEffectPhase::Applied
+            ) {
+                record.phase = DirectoryCreateEffectPhase::Abandoned;
+            }
+        }
+    }
+
+    fn reserve_file_park(
+        self: &Arc<Self>,
+        operation: &CapabilityOperation,
+        request: &FileParkRequest,
+        park_name: LeafName,
+        cleanup: platform::FileCleanupHandle,
+    ) -> io::Result<FileParkRegistryToken> {
+        if !Arc::ptr_eq(self, &operation.authority) {
+            return Err(stale_capability());
+        }
+        let mut state = self
+            .operations
+            .lock()
+            .map_err(|_| io::Error::other("filesystem capability operation lock was poisoned"))?;
+        if state.phase != AUTHORITY_LIVE {
+            return Err(stale_capability());
+        }
+        let id = state.next_file_park_id;
+        state.next_file_park_id = state
+            .next_file_park_id
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("file park registry identity overflowed"))?;
+        state.reserve_effect()?;
+        state.file_parks.insert(
+            id,
+            FileParkRegistryRecord {
+                parent: request.file.parent.clone(),
+                original_name: request.file.name.clone(),
+                name: park_name,
+                identity: request.file.identity,
+                size: request.expected.revision.size,
+                stamp: request.expected.revision.stamp,
+                expected_digest: Some(request.expected.sha256),
+                cleanup,
+                phase: FileParkRegistryPhase::Reserved,
+            },
+        );
+        Ok(FileParkRegistryToken {
+            id,
+            authority: Arc::downgrade(self),
+            armed: true,
+        })
+    }
+
+    fn take_file_park(
+        self: &Arc<Self>,
+        operation: &CapabilityOperation,
+        token: &FileParkRegistryToken,
+    ) -> io::Result<FileParkRecordGuard> {
+        if !token.armed
+            || !Arc::ptr_eq(self, &operation.authority)
+            || token.authority.as_ptr() != Arc::as_ptr(self)
+        {
+            return Err(stale_capability());
+        }
+        let mut state = self
+            .operations
+            .lock()
+            .map_err(|_| io::Error::other("filesystem capability operation lock was poisoned"))?;
+        let checked_out = state
+            .file_parks_checked_out
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("checked-out file park count overflowed"))?;
+        let record = state
+            .file_parks
+            .remove(&token.id)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "file park record is absent"))?;
+        state.file_parks_checked_out = checked_out;
+        drop(state);
+        Ok(FileParkRecordGuard {
+            authority: self.clone(),
+            id: token.id,
+            record: Some(record),
+        })
+    }
+
+    fn reserve_directory_park(
+        self: &Arc<Self>,
+        operation: &CapabilityOperation,
+        parent: &Directory,
+        directory: &Directory,
+        original_name: LeafName,
+        park_name: LeafName,
+        cleanup: platform::DirectoryCleanupHandle,
+    ) -> io::Result<DirectoryParkRegistryToken> {
+        if !Arc::ptr_eq(self, &operation.authority) {
+            return Err(stale_capability());
+        }
+        let mut state = self
+            .operations
+            .lock()
+            .map_err(|_| io::Error::other("filesystem capability operation lock was poisoned"))?;
+        if state.phase != AUTHORITY_LIVE {
+            return Err(stale_capability());
+        }
+        let id = state.next_directory_park_id;
+        state.next_directory_park_id = state
+            .next_directory_park_id
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("directory park registry identity overflowed"))?;
+        state.reserve_effect()?;
+        state.directory_parks.insert(
+            id,
+            DirectoryParkRegistryRecord {
+                parent: parent.clone(),
+                original_name,
+                name: park_name,
+                identity: directory.inner.identity.physical,
+                cleanup,
+                phase: DirectoryParkRegistryPhase::Reserved,
+            },
+        );
+        Ok(DirectoryParkRegistryToken {
+            id,
+            authority: Arc::downgrade(self),
+            armed: true,
+        })
+    }
+
+    fn take_directory_park(
+        self: &Arc<Self>,
+        operation: &CapabilityOperation,
+        token: &DirectoryParkRegistryToken,
+    ) -> io::Result<DirectoryParkRecordGuard> {
+        if !token.armed
+            || !Arc::ptr_eq(self, &operation.authority)
+            || token.authority.as_ptr() != Arc::as_ptr(self)
+        {
+            return Err(stale_capability());
+        }
+        let mut state = self
+            .operations
+            .lock()
+            .map_err(|_| io::Error::other("filesystem capability operation lock was poisoned"))?;
+        let checked_out = state
+            .directory_parks_checked_out
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("checked-out directory park count overflowed"))?;
+        let record = state
+            .directory_parks
+            .remove(&token.id)
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::NotFound, "directory park record is absent")
+            })?;
+        state.directory_parks_checked_out = checked_out;
+        drop(state);
+        Ok(DirectoryParkRecordGuard {
+            authority: self.clone(),
+            id: token.id,
+            record: Some(record),
+        })
+    }
+
+    fn abandon_file_park(&self, id: u64) {
+        let mut state = self
+            .operations
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if let Some(record) = state.file_parks.get_mut(&id) {
+            record.phase = FileParkRegistryPhase::Abandoned;
+        }
+    }
+
+    fn abandon_directory_park(&self, id: u64) {
+        let mut state = self
+            .operations
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if let Some(record) = state.directory_parks.get_mut(&id) {
+            record.phase = DirectoryParkRegistryPhase::Abandoned;
+        }
+    }
+
+    fn update_stage(&self, id: u64, phase: StageRegistryPhase) -> io::Result<()> {
+        let mut state = self
+            .operations
+            .lock()
+            .map_err(|_| io::Error::other("filesystem capability operation lock was poisoned"))?;
+        let record = state
+            .stages
+            .get_mut(&id)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "stage registry entry is absent"))?;
+        record.phase = phase;
+        if matches!(phase, StageRegistryPhase::Writing | StageRegistryPhase::Sealed) {
+            record.destination = None;
+        }
+        Ok(())
+    }
+
+    fn prepare_stage_promotion(
+        &self,
+        id: u64,
+        destination: Directory,
+        name: LeafName,
+    ) -> io::Result<()> {
+        let mut state = self
+            .operations
+            .lock()
+            .map_err(|_| io::Error::other("filesystem capability operation lock was poisoned"))?;
+        if !matches!(state.phase, AUTHORITY_LIVE | AUTHORITY_DRAINING) {
+            return Err(stale_capability());
+        }
+        let record = state
+            .stages
+            .get_mut(&id)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "stage registry entry is absent"))?;
+        record.destination = Some(StageDestination {
+            parent: destination,
+            name,
+        });
+        record.phase = StageRegistryPhase::PromotionAttempted;
+        Ok(())
+    }
+
+    fn disarm_stage(&self, id: u64, operation: &CapabilityOperation) -> io::Result<()> {
+        assert!(Arc::ptr_eq(&operation.authority, self));
+        let mut state = self
+            .operations
+            .lock()
+            .map_err(|_| io::Error::other("filesystem capability operation lock was poisoned"))?;
+        state
+            .stages
+            .remove(&id)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "stage registry entry is absent"))?;
+        state.release_effect(operation);
+        Ok(())
+    }
+
+    fn cleanup_stage(self: &Arc<Self>, id: u64) -> io::Result<()> {
+        let (mut record, operation) = {
+            let mut state = self.operations.lock().map_err(|_| {
+                io::Error::other("filesystem capability operation lock was poisoned")
+            })?;
+            if !matches!(state.phase, AUTHORITY_LIVE | AUTHORITY_DRAINING) {
+                return Err(stale_capability());
+            }
+            let record = match state.stages.remove(&id) {
+                Some(record) => record,
+                None => return Ok(()),
+            };
+            state.active = state.active.checked_add(1).ok_or_else(|| {
+                io::Error::other("filesystem capability operation count overflowed")
+            })?;
+            (
+                record,
+                CapabilityOperation {
+                    authority: self.clone(),
+                },
+            )
+        };
+        let result = platform::validate_lease(&self.lease)
+            .and_then(|()| platform::validate_root(&self.root))
+            .and_then(|()| record.parent.validate(&operation))
+            .and_then(|()| match record.phase {
+                StageRegistryPhase::PromotionAttempted | StageRegistryPhase::Unresolved => {
+                    let destination = record.destination.as_ref().ok_or_else(|| {
+                        io::Error::other("promotion stage lost its destination authority")
+                    })?;
+                    destination.parent.validate(&operation)?;
+                    let source = platform::file_binding_state(
+                        &record.parent.inner.handle,
+                        record.name.as_os_str(),
+                        record.identity,
+                    )?;
+                    let published = platform::file_binding_state(
+                        &destination.parent.inner.handle,
+                        destination.name.as_os_str(),
+                        record.identity,
+                    )?;
+                    match (source, published) {
+                        (platform::BindingState::Exact, platform::BindingState::Absent) => {
+                            platform::remove_parked_file(
+                                &record.parent.inner.handle,
+                                record.name.as_os_str(),
+                                &mut record.cleanup,
+                                record.identity,
+                            )
+                        }
+                        (platform::BindingState::Absent, platform::BindingState::Exact) => {
+                            sync_rename_parents(&record.parent, &destination.parent)?;
+                            destination.parent.validate(&operation)
+                        }
+                        _ => Err(identity_changed(
+                            "promotion-attempted stage topology is indeterminate",
+                        )),
+                    }
+                }
+                StageRegistryPhase::CleanupAttempted => {
+                    if platform::settle_removed_file(
+                        &record.parent.inner.handle,
+                        record.name.as_os_str(),
+                        &record.cleanup,
+                        record.identity,
+                    )
+                    .is_ok()
+                    {
+                        Ok(())
+                    } else {
+                        platform::remove_parked_file(
+                            &record.parent.inner.handle,
+                            record.name.as_os_str(),
+                            &mut record.cleanup,
+                            record.identity,
+                        )
+                    }
+                }
+                StageRegistryPhase::Writing | StageRegistryPhase::Sealed => {
+                    platform::remove_parked_file(
+                        &record.parent.inner.handle,
+                        record.name.as_os_str(),
+                        &mut record.cleanup,
+                        record.identity,
+                    )
+                }
+            });
+        if let Err(error) = result {
+            record.phase = match record.phase {
+                StageRegistryPhase::PromotionAttempted | StageRegistryPhase::Unresolved => {
+                    StageRegistryPhase::Unresolved
+                }
+                _ => StageRegistryPhase::CleanupAttempted,
+            };
+            let mut state = self
+                .operations
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            state.stages.insert(id, record);
+            drop(state);
+            return Err(error);
+        }
+        {
+            assert!(Arc::ptr_eq(&operation.authority, self));
+            let mut state = self
+                .operations
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            state.release_effect(&operation);
+        }
+        Ok(())
+    }
+
+    fn cleanup_abandoned_stage_create(self: &Arc<Self>, id: u64) -> io::Result<()> {
+        let (mut record, operation) = {
+            let mut state = self.operations.lock().map_err(|_| {
+                io::Error::other("filesystem capability operation lock was poisoned")
+            })?;
+            if state.phase != AUTHORITY_DRAINING {
+                return Err(stale_capability());
+            }
+            let record = state.stage_creations.remove(&id).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::NotFound, "stage create record is absent")
+            })?;
+            if !matches!(
+                record.phase,
+                StageCreatePhase::Abandoned | StageCreatePhase::CleanupAttempted
+            ) {
+                state.stage_creations.insert(id, record);
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "stage create authority is still live",
+                ));
+            }
+            state.active = state.active.checked_add(1).ok_or_else(|| {
+                io::Error::other("filesystem capability operation count overflowed")
+            })?;
+            (
+                record,
+                CapabilityOperation {
+                    authority: self.clone(),
+                },
+            )
+        };
+        let result = platform::validate_lease(&self.lease)
+            .and_then(|()| platform::validate_root(&self.root))
+            .and_then(|()| record.parent.validate(&operation))
+            .and_then(|()| {
+                if record.cleanup.is_none() {
+                    let created = record
+                        .created
+                        .as_ref()
+                        .expect("abandoned stage create retains its created file");
+                    let identity = platform::file_identity(created)?;
+                    record.cleanup = Some(platform::clone_stage_cleanup(
+                        &record.parent.inner.handle,
+                        record.name.as_os_str(),
+                        created,
+                        identity,
+                    )?);
+                    record.identity = Some(identity);
+                    drop(record.created.take());
+                }
+                let cleanup = record
+                    .cleanup
+                    .as_mut()
+                    .expect("abandoned stage create retains cleanup authority");
+                let identity = record
+                    .identity
+                    .ok_or_else(|| identity_changed("stage create identity is absent"))?;
+                if record.phase == StageCreatePhase::CleanupAttempted
+                    && platform::settle_removed_file(
+                        &record.parent.inner.handle,
+                        record.name.as_os_str(),
+                        cleanup,
+                        identity,
+                    )
+                    .is_ok()
+                {
+                    Ok(())
+                } else {
+                    platform::remove_parked_file(
+                        &record.parent.inner.handle,
+                        record.name.as_os_str(),
+                        cleanup,
+                        identity,
+                    )
+                }
+            });
+        if let Err(error) = result {
+            record.phase = StageCreatePhase::CleanupAttempted;
+            let mut state = self
+                .operations
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            state.stage_creations.insert(id, record);
+            drop(state);
+            return Err(error);
+        }
+        {
+            assert!(Arc::ptr_eq(&operation.authority, self));
+            let mut state = self
+                .operations
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            state.release_effect(&operation);
+        }
+        Ok(())
+    }
+
+    fn cleanup_abandoned_directory_create(self: &Arc<Self>, id: u64) -> io::Result<()> {
+        let (mut record, operation) = {
+            let mut state = self.operations.lock().map_err(|_| {
+                io::Error::other("filesystem capability operation lock was poisoned")
+            })?;
+            if state.phase != AUTHORITY_DRAINING {
+                return Err(stale_capability());
+            }
+            let record = state.directory_creations.remove(&id).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::NotFound, "directory create record is absent")
+            })?;
+            if !matches!(
+                record.phase,
+                DirectoryCreateEffectPhase::Abandoned
+                    | DirectoryCreateEffectPhase::CleanupAttempted
+            ) {
+                state.directory_creations.insert(id, record);
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "directory create authority is still live",
+                ));
+            }
+            state.active = state.active.checked_add(1).ok_or_else(|| {
+                io::Error::other("filesystem capability operation count overflowed")
+            })?;
+            (
+                record,
+                CapabilityOperation {
+                    authority: self.clone(),
+                },
+            )
+        };
+        let result = platform::validate_lease(&self.lease)
+            .and_then(|()| platform::validate_root(&self.root))
+            .and_then(|()| record.parent.validate(&operation))
+            .and_then(|()| {
+                if record.cleanup.is_none() {
+                    let created = record
+                        .created
+                        .as_ref()
+                        .expect("abandoned directory create retains its created directory");
+                    let identity = platform::directory_identity(created)?;
+                    record.cleanup = Some(platform::open_parked_directory(
+                        &record.parent.inner.handle,
+                        record.name.as_os_str(),
+                        identity,
+                    )?);
+                    record.identity = Some(identity);
+                    drop(record.created.take());
+                }
+                let cleanup = record
+                    .cleanup
+                    .as_mut()
+                    .expect("abandoned directory create retains cleanup authority");
+                let identity = record
+                    .identity
+                    .ok_or_else(|| identity_changed("directory create identity is absent"))?;
+                if record.phase == DirectoryCreateEffectPhase::CleanupAttempted
+                    && platform::settle_removed_directory(
+                        &record.parent.inner.handle,
+                        record.name.as_os_str(),
+                        cleanup,
+                        identity,
+                    )
+                    .is_ok()
+                {
+                    Ok(())
+                } else {
+                    platform::remove_parked_directory(
+                        &record.parent.inner.handle,
+                        record.name.as_os_str(),
+                        cleanup,
+                        identity,
+                    )
+                }
+            });
+        if let Err(error) = result {
+            record.phase = DirectoryCreateEffectPhase::CleanupAttempted;
+            let mut state = self
+                .operations
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            state.directory_creations.insert(id, record);
+            drop(state);
+            return Err(error);
+        }
+        {
+            assert!(Arc::ptr_eq(&operation.authority, self));
+            let mut state = self
+                .operations
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            state.release_effect(&operation);
+        }
+        Ok(())
+    }
+
+    fn begin_terminal_drain(&self) -> io::Result<()> {
+        let mut state = self
+            .operations
+            .lock()
+            .map_err(|_| io::Error::other("filesystem capability operation lock was poisoned"))?;
+        if state.phase != AUTHORITY_LIVE {
+            return Err(stale_capability());
+        }
+        if state.active != 0
+            || state.file_parks_checked_out != 0
+            || state.directory_parks_checked_out != 0
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "filesystem session still has active capability operations",
+            ));
+        }
+        let registered_effects = state
+            .stages
+            .len()
+            .checked_add(state.stage_creations.len())
+            .and_then(|count| count.checked_add(state.directory_creations.len()))
+            .and_then(|count| count.checked_add(state.file_parks.len()))
+            .and_then(|count| count.checked_add(state.directory_parks.len()))
+            .ok_or_else(|| io::Error::other("filesystem effect registry count overflowed"))?;
+        if state.outstanding_effects != registered_effects {
+            return Err(io::Error::other(
+                "filesystem effect registry accounting is inconsistent",
+            ));
+        }
+        if state
+            .file_parks
+            .values()
+            .any(|record| record.phase != FileParkRegistryPhase::Abandoned)
+            || state
+                .directory_parks
+                .values()
+                .any(|record| record.phase != DirectoryParkRegistryPhase::Abandoned)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "filesystem session still has an externally owned park obligation",
+            ));
+        }
+        if state.stages.values().any(|record| {
+            !matches!(
+                record.phase,
+                StageRegistryPhase::CleanupAttempted | StageRegistryPhase::Unresolved
+            )
+        })
+            || state
+                .stage_creations
+                .values()
+                .any(|record| {
+                    !matches!(
+                        record.phase,
+                        StageCreatePhase::Abandoned | StageCreatePhase::CleanupAttempted
+                    )
+                })
+            || state
+                .directory_creations
+                .values()
+                .any(|record| {
+                    !matches!(
+                        record.phase,
+                        DirectoryCreateEffectPhase::Abandoned
+                            | DirectoryCreateEffectPhase::CleanupAttempted
+                            | DirectoryCreateEffectPhase::UnclassifiedAbandoned
+                    )
+                })
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "filesystem session still has an externally owned effect obligation",
+            ));
+        }
+        state.phase = AUTHORITY_DRAINING;
+        Ok(())
+    }
+
+    fn try_finish_terminal_drain(
+        self: &Arc<Self>,
+        terminal_phase: u8,
+        validate_owned_root: bool,
+    ) -> io::Result<SessionDrainSettlement> {
+        let (cleanup_ids, create_cleanup_ids, directory_create_cleanup_ids) = {
+            let state = self.operations.lock().map_err(|_| {
+                io::Error::other("filesystem capability operation lock was poisoned")
+            })?;
+            if state.phase != AUTHORITY_DRAINING {
+                return Err(stale_capability());
+            }
+            if state.active != 0
+                || state.file_parks_checked_out != 0
+                || state.directory_parks_checked_out != 0
+            {
+                return Ok(SessionDrainSettlement::Pending);
+            }
+            (
+                state
+                    .stages
+                    .iter()
+                    .filter_map(|(id, record)| {
+                        matches!(
+                            record.phase,
+                            StageRegistryPhase::CleanupAttempted | StageRegistryPhase::Unresolved
+                        )
+                        .then_some(*id)
+                    })
+                    .collect::<Vec<_>>(),
+                state
+                    .stage_creations
+                    .iter()
+                    .filter_map(|(id, record)| {
+                        matches!(
+                            record.phase,
+                            StageCreatePhase::Abandoned | StageCreatePhase::CleanupAttempted
+                        )
+                        .then_some(*id)
+                    })
+                    .collect::<Vec<_>>(),
+                state
+                    .directory_creations
+                    .iter()
+                    .filter_map(|(id, record)| {
+                        matches!(
+                            record.phase,
+                            DirectoryCreateEffectPhase::Abandoned
+                                | DirectoryCreateEffectPhase::CleanupAttempted
+                        )
+                        .then_some(*id)
+                    })
+                    .collect::<Vec<_>>(),
+            )
+        };
+        if validate_owned_root {
+            platform::validate_lease(&self.lease)?;
+            platform::validate_root(&self.root)?;
+            self.validate_retained_process_image_outside_root()?;
+        }
+        for id in cleanup_ids {
+            let _ = self.cleanup_stage(id);
+        }
+        for id in create_cleanup_ids {
+            let _ = self.cleanup_abandoned_stage_create(id);
+        }
+        for id in directory_create_cleanup_ids {
+            let _ = self.cleanup_abandoned_directory_create(id);
+        }
+        let mut state = self
+            .operations
+            .lock()
+            .map_err(|_| io::Error::other("filesystem capability operation lock was poisoned"))?;
+        if state.active != 0
+            || state.file_parks_checked_out != 0
+            || state.directory_parks_checked_out != 0
+            || !state.stages.is_empty()
+            || !state.stage_creations.is_empty()
+            || state.directory_creations.values().any(|record| {
+                record.phase != DirectoryCreateEffectPhase::UnclassifiedAbandoned
+                    && !(terminal_phase == AUTHORITY_RESETTING
+                        && record.phase
+                            == DirectoryCreateEffectPhase::CreatedUnclassifiedResetPending)
+            })
+        {
+            return Ok(SessionDrainSettlement::Pending);
+        }
+        let abandoned_count = state
+            .file_parks
+            .values()
+            .filter(|record| record.phase == FileParkRegistryPhase::Abandoned)
+            .count()
+            .checked_add(
+                state
+                    .directory_parks
+                    .values()
+                    .filter(|record| record.phase == DirectoryParkRegistryPhase::Abandoned)
+                    .count(),
+            )
+            .and_then(|count| {
+                count.checked_add(
+                    state
+                        .directory_creations
+                        .values()
+                        .filter(|record| {
+                            record.phase
+                                == DirectoryCreateEffectPhase::UnclassifiedAbandoned
+                        })
+                        .count(),
+                )
+            })
+            .ok_or_else(|| io::Error::other("abandoned effect recovery count overflowed"))?;
+        debug_assert!(abandoned_count <= MAX_OUTSTANDING_EFFECTS);
+        if abandoned_count != 0 {
+            let mut files = Vec::new();
+            let mut directories = Vec::new();
+            let mut directory_create_preservations = Vec::new();
+            let mut permits = Vec::with_capacity(abandoned_count);
+            for (id, record) in &mut state.file_parks {
+                if record.phase != FileParkRegistryPhase::Abandoned {
+                    continue;
+                }
+                record.phase = FileParkRegistryPhase::Live;
+                files.push(ParkedFile {
+                    parent: record.parent.clone(),
+                    original_name: record.original_name.clone(),
+                    park_name: record.name.clone(),
+                    identity: record.identity,
+                    size: record.size,
+                    stamp: record.stamp,
+                    verified: record.expected_digest.is_none(),
+                    token: FileParkRegistryToken {
+                        id: *id,
+                        authority: Arc::downgrade(self),
+                        armed: true,
+                    },
+                    authority: Arc::downgrade(self),
+                });
+                permits.push(DrainRecoveryPermit {
+                    authority: self.clone(),
+                    park_token_id: DrainRecoveryParkId::File(*id),
+                });
+            }
+            for (id, record) in &mut state.directory_parks {
+                if record.phase != DirectoryParkRegistryPhase::Abandoned {
+                    continue;
+                }
+                record.phase = DirectoryParkRegistryPhase::Live;
+                directories.push(ParkedDirectory {
+                    parent: record.parent.clone(),
+                    original_name: record.original_name.clone(),
+                    park_name: record.name.clone(),
+                    identity: DirectoryIdentity {
+                        session: self.session_nonce,
+                        physical: record.identity,
+                    },
+                    token: DirectoryParkRegistryToken {
+                        id: *id,
+                        authority: Arc::downgrade(self),
+                        armed: true,
+                    },
+                    authority: Arc::downgrade(self),
+                });
+                permits.push(DrainRecoveryPermit {
+                    authority: self.clone(),
+                    park_token_id: DrainRecoveryParkId::Directory(*id),
+                });
+            }
+            for (id, record) in &mut state.directory_creations {
+                if record.phase != DirectoryCreateEffectPhase::UnclassifiedAbandoned {
+                    continue;
+                }
+                record.phase = DirectoryCreateEffectPhase::UnclassifiedRecovery;
+                directory_create_preservations.push(DirectoryCreatePreservation {
+                    token: DirectoryCreateEffectToken {
+                        id: *id,
+                        authority: Arc::downgrade(self),
+                        armed: true,
+                    },
+                });
+                permits.push(DrainRecoveryPermit {
+                    authority: self.clone(),
+                    park_token_id: DrainRecoveryParkId::DirectoryCreate(*id),
+                });
+            }
+            return Ok(SessionDrainSettlement::Recovery {
+                recovery: SessionDrainRecoveryState {
+                    files,
+                    directories,
+                    directory_create_preservations,
+                    file_removals: Vec::new(),
+                    file_restores: Vec::new(),
+                    directory_removals: Vec::new(),
+                    directory_restores: Vec::new(),
+                },
+                permits,
+            });
+        }
+        let reset_pending_count = state
+            .directory_creations
+            .values()
+            .filter(|record| {
+                record.phase == DirectoryCreateEffectPhase::CreatedUnclassifiedResetPending
+            })
+            .count();
+        let expected_outstanding = if terminal_phase == AUTHORITY_RESETTING {
+            reset_pending_count
+        } else {
+            0
+        };
+        if terminal_phase != AUTHORITY_RESETTING && state.outstanding_effects != 0 {
+            return Ok(SessionDrainSettlement::Pending);
+        }
+        if !state.file_parks.is_empty()
+            || !state.directory_parks.is_empty()
+            || state.outstanding_effects != expected_outstanding
+        {
+            return Ok(SessionDrainSettlement::Pending);
+        }
+        drop(state);
+        if validate_owned_root {
+            self.validate_retained_process_image_outside_root()?;
+        }
+        let mut state = self
+            .operations
+            .lock()
+            .map_err(|_| io::Error::other("filesystem capability operation lock was poisoned"))?;
+        if state.phase != AUTHORITY_DRAINING {
+            return Err(stale_capability());
+        }
+        let directory_creations_settled = state.directory_creations.is_empty()
+            || (terminal_phase == AUTHORITY_RESETTING
+                && state.directory_creations.len() == reset_pending_count
+                && state.directory_creations.values().all(|record| {
+                    record.phase
+                        == DirectoryCreateEffectPhase::CreatedUnclassifiedResetPending
+                }));
+        if state.active != 0
+            || state.outstanding_effects != expected_outstanding
+            || !state.stages.is_empty()
+            || !state.stage_creations.is_empty()
+            || !directory_creations_settled
+            || !state.file_parks.is_empty()
+            || !state.directory_parks.is_empty()
+        {
+            return Ok(SessionDrainSettlement::Pending);
+        }
+        state.phase = terminal_phase;
+        Ok(SessionDrainSettlement::Ready)
+    }
+}
+
+struct OperationState {
+    phase: u8,
+    active: usize,
+    outstanding_effects: usize,
+    next_stage_id: u64,
+    stages: HashMap<u64, StageRecord>,
+    next_stage_create_id: u64,
+    stage_creations: HashMap<u64, StageCreateRecord>,
+    next_directory_create_id: u64,
+    directory_creations: HashMap<u64, DirectoryCreateEffectRecord>,
+    next_file_park_id: u64,
+    file_parks: HashMap<u64, FileParkRegistryRecord>,
+    file_parks_checked_out: usize,
+    next_directory_park_id: u64,
+    directory_parks: HashMap<u64, DirectoryParkRegistryRecord>,
+    directory_parks_checked_out: usize,
+}
+
+impl OperationState {
+    fn reserve_effect(&mut self) -> io::Result<()> {
+        if self.outstanding_effects >= MAX_OUTSTANDING_EFFECTS {
+            return Err(io::Error::other(
+                "filesystem effect registry capacity is exhausted",
+            ));
+        }
+        self.outstanding_effects = self
+            .outstanding_effects
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("filesystem effect registry capacity overflowed"))?;
+        Ok(())
+    }
+
+    fn release_effect(&mut self, _operation: &CapabilityOperation) {
+        assert!(
+            self.active > 0,
+            "filesystem effect release requires a live operation"
+        );
+        assert!(
+            self.outstanding_effects > 0,
+            "filesystem effect registry count underflowed"
+        );
+        self.outstanding_effects -= 1;
+    }
+}
+
+struct CapabilityOperation {
+    authority: Arc<CapabilityAuthority>,
+}
+
+impl Drop for CapabilityOperation {
+    fn drop(&mut self) {
+        let mut state = self
+            .authority
+            .operations
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        assert!(state.active > 0, "filesystem capability operation count underflowed");
+        state.active -= 1;
+    }
+}
+
+impl StageToken {
+    fn update(&self, phase: StageRegistryPhase) -> io::Result<()> {
+        self.authority
+            .upgrade()
+            .ok_or_else(stale_capability)?
+            .update_stage(self.id, phase)
+    }
+
+    fn prepare_promotion(&self, destination: &Directory, name: &LeafName) -> io::Result<()> {
+        self.authority
+            .upgrade()
+            .ok_or_else(stale_capability)?
+            .prepare_stage_promotion(self.id, destination.clone(), name.clone())
+    }
+
+    fn discard(&mut self) -> io::Result<()> {
+        if !self.armed {
+            return Ok(());
+        }
+        self.authority
+            .upgrade()
+            .ok_or_else(stale_capability)?
+            .cleanup_stage(self.id)?;
+        self.armed = false;
+        Ok(())
+    }
+
+    fn disarm(&mut self) -> io::Result<()> {
+        if !self.armed {
+            return Ok(());
+        }
+        let authority = self
+            .authority
+            .upgrade()
+            .ok_or_else(stale_capability)?;
+        let operation = authority.enter()?;
+        authority.disarm_stage(self.id, &operation)?;
+        self.armed = false;
+        Ok(())
+    }
+}
+
+impl Drop for StageToken {
+    fn drop(&mut self) {
+        let _ = self.discard();
+    }
+}
+
+impl Drop for StageCreateToken {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        if let Some(authority) = self.authority.upgrade() {
+            authority.abandon_stage_create(self.id);
+        }
+    }
+}
+
+impl Drop for DirectoryCreateEffectToken {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        if let Some(authority) = self.authority.upgrade() {
+            authority.abandon_directory_create(self.id);
+        }
+    }
+}
+
+impl Drop for FileParkRegistryToken {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        if let Some(authority) = self.authority.upgrade() {
+            authority.abandon_file_park(self.id);
+        }
+    }
+}
+
+impl Drop for DirectoryParkRegistryToken {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        if let Some(authority) = self.authority.upgrade() {
+            authority.abandon_directory_park(self.id);
+        }
+    }
+}
+
+struct DirectoryInner {
+    handle: platform::DirectoryHandle,
+    identity: DirectoryIdentity,
+    authority: Weak<CapabilityAuthority>,
+    parent: Option<DirectoryParent>,
+    absolute_ancestry: Option<platform::AbsoluteDirectoryGuard>,
+}
+
+struct DirectoryParent {
+    directory: Directory,
+    name: OsString,
+}
+
+#[derive(Clone)]
+pub struct Directory {
+    inner: Arc<DirectoryInner>,
+}
+
+impl fmt::Debug for Directory {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.debug_struct("Directory").finish_non_exhaustive()
+    }
+}
+
+impl Directory {
+    pub fn park(self) -> DirectoryParkOutcome {
+        let Some(binding) = self.inner.parent.as_ref() else {
+            return DirectoryParkOutcome::NoEffect {
+                error: io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "a root directory capability cannot be parked",
+                ),
+                directory: self,
+            };
+        };
+        let parent = binding.directory.clone();
+        let original_name = match LeafName::new(binding.name.clone()) {
+            Ok(name) => name,
+            Err(_) => {
+                return DirectoryParkOutcome::NoEffect {
+                    error: io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "directory binding is not a valid native leaf",
+                    ),
+                    directory: self,
+                };
+            }
+        };
+        let authority = match parent.authority() {
+            Ok(authority) => authority,
+            Err(error) => {
+                return DirectoryParkOutcome::NoEffect {
+                    error,
+                    directory: self,
+                };
+            }
+        };
+        let operation = match authority.enter() {
+            Ok(operation) => operation,
+            Err(error) => {
+                return DirectoryParkOutcome::NoEffect {
+                    error,
+                    directory: self,
+                };
+            }
+        };
+        if let Err(error) = self.validate(&operation) {
+            return DirectoryParkOutcome::NoEffect {
+                error,
+                directory: self,
+            };
+        }
+
+        let mut last_collision = None;
+        for _ in 0..MAX_STAGE_ATTEMPTS {
+            let park_name = random_leaf(".axial-dir-park-");
+            let cleanup = match platform::open_parked_directory(
+                &parent.inner.handle,
+                original_name.as_os_str(),
+                self.inner.identity.physical,
+            ) {
+                Ok(cleanup) => cleanup,
+                Err(error) => {
+                    return DirectoryParkOutcome::NoEffect {
+                        error,
+                        directory: self,
+                    };
+                }
+            };
+            let mut token = match authority.reserve_directory_park(
+                &operation,
+                &parent,
+                &self,
+                original_name.clone(),
+                park_name.clone(),
+                cleanup,
+            ) {
+                Ok(token) => token,
+                Err(error) => {
+                    return DirectoryParkOutcome::NoEffect {
+                        error,
+                        directory: self,
+                    };
+                }
+            };
+            let mut guard = match authority.take_directory_park(&operation, &token) {
+                Ok(guard) => guard,
+                Err(error) => {
+                    return DirectoryParkOutcome::AppliedUnverified(
+                        DirectoryParkObligation {
+                            error,
+                            parent,
+                            directory: Some(self),
+                            original_name,
+                            token,
+                            park_name,
+                        },
+                    );
+                }
+            };
+            let effect = platform::park_directory_no_replace(
+                &parent.inner.handle,
+                original_name.as_os_str(),
+                &self.inner.handle,
+                self.inner.identity.physical,
+                park_name.as_os_str(),
+                &guard.record().cleanup,
+            );
+            match effect {
+                Ok(()) => {
+                    if let Err(error) = parent.validate(&operation) {
+                        drop(guard);
+                        return DirectoryParkOutcome::AppliedUnverified(
+                            DirectoryParkObligation {
+                                error,
+                                parent,
+                                directory: Some(self),
+                                original_name,
+                                token,
+                                park_name,
+                            },
+                        );
+                    }
+                    guard.record_mut().phase = DirectoryParkRegistryPhase::Live;
+                    drop(guard);
+                    return DirectoryParkOutcome::Parked(ParkedDirectory {
+                        parent,
+                        original_name,
+                        park_name,
+                        identity: self.inner.identity,
+                        token,
+                        authority: self.inner.authority.clone(),
+                    });
+                }
+                Err(platform::ParkDirectoryError::NoEffect(error))
+                    if error.kind() == io::ErrorKind::AlreadyExists =>
+                {
+                    guard.disarm(&mut token, &operation);
+                    last_collision = Some(error);
+                }
+                Err(platform::ParkDirectoryError::NoEffect(error)) => {
+                    guard.disarm(&mut token, &operation);
+                    return DirectoryParkOutcome::NoEffect {
+                        error,
+                        directory: self,
+                    };
+                }
+                Err(platform::ParkDirectoryError::AppliedUnverified(error)) => {
+                    drop(guard);
+                    return DirectoryParkOutcome::AppliedUnverified(DirectoryParkObligation {
+                        error,
+                        parent,
+                        directory: Some(self),
+                        original_name,
+                        token,
+                        park_name,
+                    });
+                }
+            }
+        }
+        DirectoryParkOutcome::NoEffect {
+            error: last_collision.unwrap_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "could not reserve a unique parked directory name",
+                )
+            }),
+            directory: self,
+        }
+    }
+
+    fn validate(&self, operation: &CapabilityOperation) -> io::Result<()> {
+        let mut current = self.inner.as_ref();
+        loop {
+            if current.authority.as_ptr() != Arc::as_ptr(&operation.authority) {
+                return Err(stale_capability());
+            }
+            if platform::directory_identity(&current.handle)? != current.identity.physical {
+                return Err(identity_changed("directory capability changed identity"));
+            }
+            if let Some(ancestry) = &current.absolute_ancestry {
+                platform::validate_absolute_directory_guard(ancestry)?;
+            }
+            let Some(binding) = &current.parent else {
+                break;
+            };
+            if platform::directory_binding_state(
+                &binding.directory.inner.handle,
+                &binding.name,
+                current.identity.physical,
+            )? != platform::BindingState::Exact
+            {
+                return Err(identity_changed("directory capability changed binding"));
+            }
+            current = binding.directory.inner.as_ref();
+        }
+        Ok(())
+    }
+}
+
+fn settle_directory_park(
+    mut obligation: DirectoryParkObligation,
+    force_restore: bool,
+) -> DirectoryParkResolution {
+    let directory_identity = obligation
+        .directory
+        .as_ref()
+        .expect("directory park obligation retains directory")
+        .inner
+        .identity;
+    let authority = match obligation.parent.authority() {
+        Ok(authority) => authority,
+        Err(_) => return DirectoryParkResolution::Indeterminate(obligation),
+    };
+    let operation = match authority.enter() {
+        Ok(operation) => operation,
+        Err(_) => return DirectoryParkResolution::Indeterminate(obligation),
+    };
+    if obligation.parent.validate(&operation).is_err() {
+        return DirectoryParkResolution::Indeterminate(obligation);
+    }
+    let mut guard = match authority.take_directory_park(&operation, &obligation.token) {
+        Ok(guard) => guard,
+        Err(_) => return DirectoryParkResolution::Indeterminate(obligation),
+    };
+    let original = platform::directory_binding_state(
+        &guard.record().parent.inner.handle,
+        guard.record().original_name.as_os_str(),
+        guard.record().identity,
+    );
+    let parked_state = platform::directory_binding_state(
+        &guard.record().parent.inner.handle,
+        guard.record().name.as_os_str(),
+        guard.record().identity,
+    );
+    match (original, parked_state) {
+        (Ok(platform::BindingState::Exact), Ok(platform::BindingState::Absent)) => {
+            guard.disarm(&mut obligation.token, &operation);
+            DirectoryParkResolution::NoEffect(
+                obligation.directory.take().expect("parked directory"),
+            )
+        }
+        (Ok(platform::BindingState::Absent), Ok(platform::BindingState::Exact)) => {
+            if force_restore {
+                let restoration = {
+                    let record = guard.record_mut();
+                    platform::restore_parked_directory(
+                        &record.parent.inner.handle,
+                        record.name.as_os_str(),
+                        &mut record.cleanup,
+                        record.identity,
+                        record.original_name.as_os_str(),
+                    )
+                };
+                return match restoration {
+                    Ok(_)
+                        if obligation
+                            .directory
+                            .as_ref()
+                            .expect("directory park obligation retains directory")
+                            .validate(&operation)
+                            .is_ok() =>
+                    {
+                        guard.disarm(&mut obligation.token, &operation);
+                        DirectoryParkResolution::NoEffect(
+                            obligation.directory.take().expect("parked directory"),
+                        )
+                    }
+                    _ => DirectoryParkResolution::Indeterminate(obligation),
+                };
+            }
+            let directory = obligation.directory.take().expect("parked directory");
+            if obligation.parent.validate(&operation).is_err() {
+                return DirectoryParkResolution::Indeterminate(obligation);
+            }
+            guard.record_mut().phase = DirectoryParkRegistryPhase::Live;
+            drop(guard);
+            DirectoryParkResolution::Parked(ParkedDirectory {
+                parent: obligation.parent,
+                original_name: obligation.original_name,
+                park_name: obligation.park_name,
+                identity: directory_identity,
+                token: obligation.token,
+                authority: directory.inner.authority.clone(),
+            })
+        }
+        _ => DirectoryParkResolution::Indeterminate(obligation),
+    }
+}
+
+impl ParkedDirectory {
+    pub fn remove_empty(mut self) -> DirectoryRemovalOutcome {
+        let authority = match self.authority() {
+            Ok(authority) => authority,
+            Err(error) => return DirectoryRemovalOutcome::NoEffect { error, parked: self },
+        };
+        let operation = match authority.enter_directory_park(&self.token) {
+            Ok(operation) => operation,
+            Err(error) => return DirectoryRemovalOutcome::NoEffect { error, parked: self },
+        };
+        if let Err(error) = self.validate(&operation) {
+            return DirectoryRemovalOutcome::NoEffect { error, parked: self };
+        }
+        let mut guard = match authority.take_directory_park(&operation, &self.token) {
+            Ok(guard) => guard,
+            Err(error) => return DirectoryRemovalOutcome::NoEffect { error, parked: self },
+        };
+        let removal = {
+            let record = guard.record_mut();
+            platform::remove_parked_directory(
+                &record.parent.inner.handle,
+                record.name.as_os_str(),
+                &mut record.cleanup,
+                record.identity,
+            )
+        };
+        match removal {
+            Ok(()) if self.parent.validate(&operation).is_ok() => {
+                guard.disarm(&mut self.token, &operation);
+                DirectoryRemovalOutcome::Removed
+            }
+            Ok(()) => DirectoryRemovalOutcome::AppliedUnverified(DirectoryRemovalObligation {
+                error: identity_changed("directory removal lost its authority chain"),
+                parked: Some(self),
+            }),
+            Err(error) => {
+                drop(guard);
+                match self.binding_state() {
+                Ok(platform::BindingState::Exact) if self.validate(&operation).is_ok() => {
+                    DirectoryRemovalOutcome::NoEffect { error, parked: self }
+                }
+                _ => DirectoryRemovalOutcome::AppliedUnverified(DirectoryRemovalObligation {
+                    error,
+                    parked: Some(self),
+                }),
+                }
+            }
+        }
+    }
+
+    fn remove_empty_with_recovery(
+        mut self,
+        permit: &DrainRecoveryPermit,
+    ) -> DirectoryRemovalOutcome {
+        let authority = match self.authority() {
+            Ok(authority) => authority,
+            Err(error) => return DirectoryRemovalOutcome::NoEffect { error, parked: self },
+        };
+        let operation = match authority.enter_directory_park_recovery(permit, &self.token) {
+            Ok(operation) => operation,
+            Err(error) => return DirectoryRemovalOutcome::NoEffect { error, parked: self },
+        };
+        self.remove_empty_admitted(authority, operation)
+    }
+
+    fn remove_empty_admitted(
+        mut self,
+        authority: Arc<CapabilityAuthority>,
+        operation: CapabilityOperation,
+    ) -> DirectoryRemovalOutcome {
+        if let Err(error) = self.validate(&operation) {
+            return DirectoryRemovalOutcome::NoEffect { error, parked: self };
+        }
+        let mut guard = match authority.take_directory_park(&operation, &self.token) {
+            Ok(guard) => guard,
+            Err(error) => return DirectoryRemovalOutcome::NoEffect { error, parked: self },
+        };
+        let removal = {
+            let record = guard.record_mut();
+            platform::remove_parked_directory(
+                &record.parent.inner.handle,
+                record.name.as_os_str(),
+                &mut record.cleanup,
+                record.identity,
+            )
+        };
+        match removal {
+            Ok(()) if self.parent.validate(&operation).is_ok() => {
+                guard.disarm(&mut self.token, &operation);
+                DirectoryRemovalOutcome::Removed
+            }
+            Ok(()) => DirectoryRemovalOutcome::AppliedUnverified(DirectoryRemovalObligation {
+                error: identity_changed("directory removal lost its authority chain"),
+                parked: Some(self),
+            }),
+            Err(error) => {
+                drop(guard);
+                match self.binding_state() {
+                Ok(platform::BindingState::Exact) if self.validate(&operation).is_ok() => {
+                    DirectoryRemovalOutcome::NoEffect { error, parked: self }
+                }
+                _ => DirectoryRemovalOutcome::AppliedUnverified(DirectoryRemovalObligation {
+                    error,
+                    parked: Some(self),
+                }),
+                }
+            }
+        }
+    }
+
+    pub fn restore(mut self) -> DirectoryRestoreOutcome {
+        let authority = match self.authority() {
+            Ok(authority) => authority,
+            Err(error) => return DirectoryRestoreOutcome::NoEffect { error, parked: self },
+        };
+        let operation = match authority.enter_directory_park(&self.token) {
+            Ok(operation) => operation,
+            Err(error) => return DirectoryRestoreOutcome::NoEffect { error, parked: self },
+        };
+        if let Err(error) = self.validate(&operation) {
+            return DirectoryRestoreOutcome::NoEffect { error, parked: self };
+        }
+        let mut guard = match authority.take_directory_park(&operation, &self.token) {
+            Ok(guard) => guard,
+            Err(error) => return DirectoryRestoreOutcome::NoEffect { error, parked: self },
+        };
+        let restoration = {
+            let record = guard.record_mut();
+            platform::restore_parked_directory(
+                &record.parent.inner.handle,
+                record.name.as_os_str(),
+                &mut record.cleanup,
+                record.identity,
+                record.original_name.as_os_str(),
+            )
+        };
+        match restoration {
+            Ok(handle) => {
+                let restored = Directory::from_handle(
+                    handle,
+                    self.identity,
+                    self.authority.clone(),
+                    Some(DirectoryParent {
+                        directory: self.parent.clone(),
+                        name: self.original_name.as_os_str().to_os_string(),
+                    }),
+                );
+                if restored.validate(&operation).is_ok() {
+                    guard.disarm(&mut self.token, &operation);
+                    DirectoryRestoreOutcome::Restored(restored)
+                } else {
+                    DirectoryRestoreOutcome::AppliedUnverified(DirectoryRestoreObligation {
+                        error: identity_changed("restored directory lost its authority chain"),
+                        parked: Some(self),
+                    })
+                }
+            }
+            Err(error) => {
+                drop(guard);
+                match self.binding_state() {
+                Ok(platform::BindingState::Exact) if self.validate(&operation).is_ok() => {
+                    DirectoryRestoreOutcome::NoEffect { error, parked: self }
+                }
+                _ => DirectoryRestoreOutcome::AppliedUnverified(DirectoryRestoreObligation {
+                    error,
+                    parked: Some(self),
+                }),
+                }
+            }
+        }
+    }
+
+    fn restore_with_recovery(
+        mut self,
+        permit: &DrainRecoveryPermit,
+    ) -> DirectoryRestoreOutcome {
+        let authority = match self.authority() {
+            Ok(authority) => authority,
+            Err(error) => return DirectoryRestoreOutcome::NoEffect { error, parked: self },
+        };
+        let operation = match authority.enter_directory_park_recovery(permit, &self.token) {
+            Ok(operation) => operation,
+            Err(error) => return DirectoryRestoreOutcome::NoEffect { error, parked: self },
+        };
+        self.restore_admitted(authority, operation)
+    }
+
+    fn restore_admitted(
+        mut self,
+        authority: Arc<CapabilityAuthority>,
+        operation: CapabilityOperation,
+    ) -> DirectoryRestoreOutcome {
+        if let Err(error) = self.validate(&operation) {
+            return DirectoryRestoreOutcome::NoEffect { error, parked: self };
+        }
+        let mut guard = match authority.take_directory_park(&operation, &self.token) {
+            Ok(guard) => guard,
+            Err(error) => return DirectoryRestoreOutcome::NoEffect { error, parked: self },
+        };
+        let restoration = {
+            let record = guard.record_mut();
+            platform::restore_parked_directory(
+                &record.parent.inner.handle,
+                record.name.as_os_str(),
+                &mut record.cleanup,
+                record.identity,
+                record.original_name.as_os_str(),
+            )
+        };
+        match restoration {
+            Ok(handle) => {
+                let restored = Directory::from_handle(
+                    handle,
+                    self.identity,
+                    self.authority.clone(),
+                    Some(DirectoryParent {
+                        directory: self.parent.clone(),
+                        name: self.original_name.as_os_str().to_os_string(),
+                    }),
+                );
+                if restored.validate(&operation).is_ok() {
+                    guard.disarm(&mut self.token, &operation);
+                    DirectoryRestoreOutcome::Restored(restored)
+                } else {
+                    DirectoryRestoreOutcome::AppliedUnverified(DirectoryRestoreObligation {
+                        error: identity_changed("restored directory lost its authority chain"),
+                        parked: Some(self),
+                    })
+                }
+            }
+            Err(error) => {
+                drop(guard);
+                match self.binding_state() {
+                Ok(platform::BindingState::Exact) if self.validate(&operation).is_ok() => {
+                    DirectoryRestoreOutcome::NoEffect { error, parked: self }
+                }
+                _ => DirectoryRestoreOutcome::AppliedUnverified(DirectoryRestoreObligation {
+                    error,
+                    parked: Some(self),
+                }),
+                }
+            }
+        }
+    }
+
+    fn authority(&self) -> io::Result<Arc<CapabilityAuthority>> {
+        self.authority.upgrade().ok_or_else(stale_capability)
+    }
+
+    fn binding_state(&self) -> io::Result<platform::BindingState> {
+        platform::directory_binding_state(
+            &self.parent.inner.handle,
+            self.park_name.as_os_str(),
+            self.identity.physical,
+        )
+    }
+
+    fn validate(&self, operation: &CapabilityOperation) -> io::Result<()> {
+        self.parent.validate(operation)?;
+        if self.authority.as_ptr() != Arc::as_ptr(&operation.authority)
+            || self.token.authority.as_ptr() != Arc::as_ptr(&operation.authority)
+        {
+            return Err(identity_changed("parked directory capability changed"));
+        }
+        let registered = {
+            let state = operation.authority.operations.lock().map_err(|_| {
+                io::Error::other("filesystem capability operation lock was poisoned")
+            })?;
+            state
+                .directory_parks
+                .get(&self.token.id)
+                .is_some_and(|record| {
+                    record.phase == DirectoryParkRegistryPhase::Live
+                        && record.identity == self.identity.physical
+                        && record.name == self.park_name
+                        && record.original_name == self.original_name
+                })
+        };
+        if !registered || self.binding_state()? != platform::BindingState::Exact {
+            return Err(identity_changed("parked directory capability changed"));
+        }
+        Ok(())
+    }
+}
+
+impl DirectoryRemovalObligation {
+    pub fn error(&self) -> &io::Error {
+        &self.error
+    }
+
+    pub fn reconcile(mut self) -> DirectoryRemovalResolution {
+        let parked = self
+            .parked
+            .take()
+            .expect("removal obligation retains parked directory");
+        let authority = match parked.authority() {
+            Ok(authority) => authority,
+            Err(_) => return self.retain(parked),
+        };
+        let operation = match authority.enter_directory_park(&parked.token) {
+            Ok(operation) => operation,
+            Err(_) => return self.retain(parked),
+        };
+        self.reconcile_admitted(parked, authority, operation)
+    }
+
+    fn reconcile_with_recovery(
+        mut self,
+        permit: &DrainRecoveryPermit,
+    ) -> DirectoryRemovalResolution {
+        let parked = self
+            .parked
+            .take()
+            .expect("removal obligation retains parked directory");
+        let authority = match parked.authority() {
+            Ok(authority) => authority,
+            Err(_) => return self.retain(parked),
+        };
+        let operation = match authority.enter_directory_park_recovery(permit, &parked.token) {
+            Ok(operation) => operation,
+            Err(_) => return self.retain(parked),
+        };
+        self.reconcile_admitted(parked, authority, operation)
+    }
+
+    fn reconcile_admitted(
+        mut self,
+        mut parked: ParkedDirectory,
+        authority: Arc<CapabilityAuthority>,
+        operation: CapabilityOperation,
+    ) -> DirectoryRemovalResolution {
+        if parked.parent.validate(&operation).is_err() {
+            return self.retain(parked);
+        }
+        let guard = match authority.take_directory_park(&operation, &parked.token) {
+            Ok(guard) => guard,
+            Err(_) => return self.retain(parked),
+        };
+        match platform::settle_removed_directory(
+            &guard.record().parent.inner.handle,
+            guard.record().name.as_os_str(),
+            &guard.record().cleanup,
+            guard.record().identity,
+        ) {
+            Ok(()) if parked.parent.validate(&operation).is_ok() => {
+                guard.disarm(&mut parked.token, &operation);
+                DirectoryRemovalResolution::Removed
+            }
+            Ok(()) => {
+                drop(operation);
+                self.parked = Some(parked);
+                DirectoryRemovalResolution::Indeterminate(self)
+            }
+            Err(_) => {
+                drop(operation);
+                self.parked = Some(parked);
+                DirectoryRemovalResolution::Indeterminate(self)
+            }
+        }
+    }
+
+    fn retain(mut self, parked: ParkedDirectory) -> DirectoryRemovalResolution {
+        self.parked = Some(parked);
+        DirectoryRemovalResolution::Indeterminate(self)
+    }
+}
+
+impl DirectoryRestoreObligation {
+    pub fn error(&self) -> &io::Error {
+        &self.error
+    }
+
+    pub fn reconcile(mut self) -> DirectoryRestoreResolution {
+        let parked = self
+            .parked
+            .take()
+            .expect("restore obligation retains parked directory");
+        let authority = match parked.authority() {
+            Ok(authority) => authority,
+            Err(_) => return self.retain(parked),
+        };
+        let operation = match authority.enter_directory_park(&parked.token) {
+            Ok(operation) => operation,
+            Err(_) => return self.retain(parked),
+        };
+        self.reconcile_admitted(parked, authority, operation)
+    }
+
+    fn reconcile_with_recovery(
+        mut self,
+        permit: &DrainRecoveryPermit,
+    ) -> DirectoryRestoreResolution {
+        let parked = self
+            .parked
+            .take()
+            .expect("restore obligation retains parked directory");
+        let authority = match parked.authority() {
+            Ok(authority) => authority,
+            Err(_) => return self.retain(parked),
+        };
+        let operation = match authority.enter_directory_park_recovery(permit, &parked.token) {
+            Ok(operation) => operation,
+            Err(_) => return self.retain(parked),
+        };
+        self.reconcile_admitted(parked, authority, operation)
+    }
+
+    fn reconcile_admitted(
+        mut self,
+        mut parked: ParkedDirectory,
+        authority: Arc<CapabilityAuthority>,
+        operation: CapabilityOperation,
+    ) -> DirectoryRestoreResolution {
+        if parked.parent.validate(&operation).is_err() {
+            return self.retain(parked);
+        }
+        let guard = match authority.take_directory_park(&operation, &parked.token) {
+            Ok(guard) => guard,
+            Err(_) => return self.retain(parked),
+        };
+        match platform::settle_restored_directory(
+            &guard.record().parent.inner.handle,
+            guard.record().name.as_os_str(),
+            &guard.record().cleanup,
+            guard.record().identity,
+            guard.record().original_name.as_os_str(),
+        ) {
+            Ok(handle) => {
+                let restored = Directory::from_handle(
+                    handle,
+                    parked.identity,
+                    parked.authority.clone(),
+                    Some(DirectoryParent {
+                        directory: parked.parent.clone(),
+                        name: parked.original_name.as_os_str().to_os_string(),
+                    }),
+                );
+                if restored.validate(&operation).is_ok() {
+                    guard.disarm(&mut parked.token, &operation);
+                    DirectoryRestoreResolution::Restored(restored)
+                } else {
+                    drop(guard);
+                    drop(operation);
+                    self.parked = Some(parked);
+                    DirectoryRestoreResolution::Indeterminate(self)
+                }
+            }
+            Err(_) => {
+                drop(guard);
+                match parked.binding_state() {
+                Ok(platform::BindingState::Exact) if parked.validate(&operation).is_ok() => {
+                    DirectoryRestoreResolution::NoEffect(parked)
+                }
+                _ => {
+                    drop(operation);
+                    self.parked = Some(parked);
+                    DirectoryRestoreResolution::Indeterminate(self)
+                }
+                }
+            }
+        }
+    }
+
+    fn retain(mut self, parked: ParkedDirectory) -> DirectoryRestoreResolution {
+        self.parked = Some(parked);
+        DirectoryRestoreResolution::Indeterminate(self)
+    }
+}
+
+impl Directory {
+    fn is_managed_root_descendant(&self) -> bool {
+        let mut current = self;
+        loop {
+            if current.inner.absolute_ancestry.is_some() {
+                return false;
+            }
+            match current.inner.parent.as_ref() {
+                Some(parent) => current = &parent.directory,
+                None => return true,
+            }
+        }
+    }
+
+    pub fn identity(&self) -> io::Result<DirectoryIdentity> {
+        let authority = self.authority()?;
+        let operation = authority.enter()?;
+        self.validate(&operation)?;
+        Ok(self.inner.identity)
+    }
+
+    pub fn open_directory(&self, name: &LeafName) -> io::Result<Self> {
+        let authority = self.authority()?;
+        let operation = authority.enter()?;
+        self.validate(&operation)?;
+        authority.ensure_leaf_not_preserved_unclassified(&operation, self, name)?;
+        let (handle, identity) = platform::open_directory(&self.inner.handle, name.as_os_str())?;
+        let opened = Self::from_handle(
+            handle,
+            authority.identity(identity),
+            self.inner.authority.clone(),
+            Some(DirectoryParent {
+                directory: self.clone(),
+                name: name.as_os_str().to_os_string(),
+            }),
+        );
+        opened.validate(&operation)?;
+        Ok(opened)
+    }
+
+    pub fn create_directory(&self, name: &LeafName) -> DirectoryCreateOutcome {
+        let authority = match self.authority() {
+            Ok(authority) => authority,
+            Err(error) => return DirectoryCreateOutcome::NoEffect(error),
+        };
+        let operation = match authority.enter() {
+            Ok(operation) => operation,
+            Err(error) => return DirectoryCreateOutcome::NoEffect(error),
+        };
+        if let Err(error) = self.validate(&operation) {
+            return DirectoryCreateOutcome::NoEffect(error);
+        }
+        if let Err(error) =
+            authority.ensure_leaf_not_preserved_unclassified(&operation, self, name)
+        {
+            return DirectoryCreateOutcome::NoEffect(error);
+        }
+        let mut reservation = match authority.reserve_directory_create(&operation, self, name) {
+            Ok(reservation) => reservation,
+            Err(error) => return DirectoryCreateOutcome::NoEffect(error),
+        };
+        let handle = match platform::create_directory(&self.inner.handle, name.as_os_str()) {
+            Ok(handle) => handle,
+            Err(platform::CreateDirectoryError::NoEffect(error)) => {
+                match authority.take_directory_create(&operation, &reservation) {
+                    Ok(guard) => guard.disarm(&mut reservation, &operation),
+                    Err(settlement) => {
+                        return DirectoryCreateOutcome::AppliedUnverified(
+                            DirectoryCreateObligation {
+                                error: io::Error::other(format!(
+                                    "directory create had no native effect but its reservation did not settle: {error}; {settlement}"
+                                )),
+                                token: reservation,
+                            },
+                        );
+                    }
+                }
+                return DirectoryCreateOutcome::NoEffect(error);
+            }
+            Err(platform::CreateDirectoryError::CreatedUnclassified(error)) => {
+                authority.mark_directory_create_unclassified(&reservation);
+                return DirectoryCreateOutcome::CreatedUnclassified {
+                    error,
+                    preservation: DirectoryCreatePreservation { token: reservation },
+                };
+            }
+            Err(platform::CreateDirectoryError::AppliedUnverified { error, retained }) => {
+                authority.attach_directory_create(&reservation, retained);
+                return DirectoryCreateOutcome::AppliedUnverified(DirectoryCreateObligation {
+                    error,
+                    token: reservation,
+                });
+            }
+        };
+        authority.attach_directory_create(&reservation, handle);
+        match finish_directory_create(&authority, &operation, &mut reservation) {
+            Ok(directory) => DirectoryCreateOutcome::Created(directory),
+            Err(error) => {
+                DirectoryCreateOutcome::AppliedUnverified(DirectoryCreateObligation {
+                    error,
+                    token: reservation,
+                })
+            }
+        }
+    }
+
+    pub fn open_file(&self, name: &LeafName) -> io::Result<FileCapability> {
+        let authority = self.authority()?;
+        let operation = authority.enter()?;
+        self.validate(&operation)?;
+        authority.ensure_leaf_not_preserved_unclassified(&operation, self, name)?;
+        let handle = platform::open_file(&self.inner.handle, name.as_os_str())?;
+        let identity = platform::file_identity(&handle)?;
+        let file = FileCapability::new(
+            handle,
+            identity,
+            self.clone(),
+            name.clone(),
+            self.inner.authority.clone(),
+        );
+        file.validate(&operation)?;
+        Ok(file)
+    }
+
+    pub fn create_file_create_only(&self, name: &LeafName) -> FileCreateOutcome {
+        let authority = match self.authority() {
+            Ok(authority) => authority,
+            Err(error) => return FileCreateOutcome::NoEffect(error),
+        };
+        let operation = match authority.enter() {
+            Ok(operation) => operation,
+            Err(error) => return FileCreateOutcome::NoEffect(error),
+        };
+        if let Err(error) = self.validate(&operation) {
+            return FileCreateOutcome::NoEffect(error);
+        }
+        if let Err(error) =
+            authority.ensure_leaf_not_preserved_unclassified(&operation, self, name)
+        {
+            return FileCreateOutcome::NoEffect(error);
+        }
+        let mut reservation = match authority.reserve_stage_create(&operation, self, name) {
+            Ok(reservation) => reservation,
+            Err(error) => return FileCreateOutcome::NoEffect(error),
+        };
+        let handle = match platform::create_file(&self.inner.handle, name.as_os_str()) {
+            Ok(handle) => handle,
+            Err(platform::CreateFileError::NoEffect(error)) => {
+                match authority.take_stage_create(&operation, &reservation) {
+                    Ok(guard) => guard.disarm(&mut reservation, &operation),
+                    Err(settlement) => {
+                        return FileCreateOutcome::AppliedUnverified(FileCreateObligation {
+                            error: io::Error::other(format!(
+                                "stage create had no native effect but its reservation did not settle: {error}; {settlement}"
+                            )),
+                            token: reservation,
+                        });
+                    }
+                }
+                return FileCreateOutcome::NoEffect(error);
+            }
+            Err(platform::CreateFileError::AppliedUnverified { error, retained }) => {
+                authority.attach_stage_create(&reservation, retained);
+                return FileCreateOutcome::AppliedUnverified(FileCreateObligation {
+                    error,
+                    token: reservation,
+                });
+            }
+        };
+        authority.attach_stage_create(&reservation, handle);
+        match finish_stage_create(&authority, &operation, &mut reservation) {
+            Ok(staged) => FileCreateOutcome::Created(staged),
+            Err(error) => FileCreateOutcome::AppliedUnverified(FileCreateObligation {
+                error,
+                token: reservation,
+            }),
+        }
+    }
+
+    pub fn create_stage(&self) -> FileCreateOutcome {
+        use rand::RngCore;
+
+        for _ in 0..MAX_STAGE_ATTEMPTS {
+            let mut nonce = [0_u8; 16];
+            rand::rngs::OsRng.fill_bytes(&mut nonce);
+            let name = format!(".axial-stage-{}", encode_hex(&nonce));
+            let name = LeafName::new(name).expect("generated stage leaf is valid");
+            match self.create_file_create_only(&name) {
+                FileCreateOutcome::NoEffect(error)
+                    if error.kind() == io::ErrorKind::AlreadyExists => {}
+                outcome => return outcome,
+            }
+        }
+        FileCreateOutcome::NoEffect(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "could not reserve a unique staged file",
+        ))
+    }
+
+    pub fn entries(&self, limit: usize) -> io::Result<DirectoryListing> {
+        if limit == 0 || limit > MAX_DIRECTORY_LIST_ENTRIES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "directory listing limit is outside the supported range",
+            ));
+        }
+        let authority = self.authority()?;
+        let operation = authority.enter()?;
+        self.validate(&operation)?;
+        let listing = platform::entries(&self.inner.handle, limit)?;
+        self.validate(&operation)?;
+        let state = if listing.complete {
+            DirectoryListingState::Complete
+        } else {
+            DirectoryListingState::Truncated
+        };
+        let entries = listing
+            .entries
+            .into_iter()
+            .map(|(name, kind)| DirectoryEntry {
+                name,
+                kind,
+                parent: self.inner.identity,
+            })
+            .collect();
+        Ok(DirectoryListing { entries, state })
+    }
+
+    pub fn open_observed_directory(&self, entry: &DirectoryEntry) -> io::Result<Self> {
+        if entry.parent != self.inner.identity {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "observed entry belongs to another directory",
+            ));
+        }
+        let authority = self.authority()?;
+        let operation = authority.enter()?;
+        self.validate(&operation)?;
+        let name = LeafName::new(entry.name.clone()).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidData, "observed entry name is invalid")
+        })?;
+        authority.ensure_leaf_not_preserved_unclassified(&operation, self, &name)?;
+        let (handle, identity) =
+            platform::open_directory(&self.inner.handle, entry.name.as_os_str())?;
+        let opened = Self::from_handle(
+            handle,
+            authority.identity(identity),
+            self.inner.authority.clone(),
+            Some(DirectoryParent {
+                directory: self.clone(),
+                name: entry.name.clone(),
+            }),
+        );
+        opened.validate(&operation)?;
+        Ok(opened)
+    }
+
+    pub fn park_file(&self, request: FileParkRequest) -> FileParkOutcome {
+        let authority = match self.authority() {
+            Ok(authority) => authority,
+            Err(error) => return FileParkOutcome::NoEffect { error, request },
+        };
+        let operation = match authority.enter() {
+            Ok(operation) => operation,
+            Err(error) => return FileParkOutcome::NoEffect { error, request },
+        };
+        if let Err(error) = self.validate(&operation) {
+            return FileParkOutcome::NoEffect { error, request };
+        }
+        if let Err(error) = request.file.validate_bound_to(self, &operation) {
+            return FileParkOutcome::NoEffect { error, request };
+        }
+        if let Err(error) = request.validate_revision(&operation) {
+            return FileParkOutcome::NoEffect { error, request };
+        }
+
+        let mut last_collision = None;
+        for _ in 0..MAX_STAGE_ATTEMPTS {
+            let park_name = random_leaf(".axial-park-");
+            let cleanup = match platform::open_parked_file(
+                &self.inner.handle,
+                request.file.name.as_os_str(),
+                request.file.identity,
+            ) {
+                Ok(cleanup) => cleanup,
+                Err(error) => return FileParkOutcome::NoEffect { error, request },
+            };
+            let mut token = match authority.reserve_file_park(
+                &operation,
+                &request,
+                park_name.clone(),
+                cleanup,
+            ) {
+                Ok(token) => token,
+                Err(error) => return FileParkOutcome::NoEffect { error, request },
+            };
+            let guard = match authority.take_file_park(&operation, &token) {
+                Ok(guard) => guard,
+                Err(error) => {
+                    return FileParkOutcome::AppliedUnverified(FileParkObligation {
+                        error,
+                        request: Some(request),
+                        token,
+                        park_name,
+                        phase: FileParkPhase::Parking,
+                        digest_verified: false,
+                    });
+                }
+            };
+            let effect = platform::park_file_no_replace(
+                &self.inner.handle,
+                request.file.name.as_os_str(),
+                &request.file.handle,
+                request.file.identity,
+                park_name.as_os_str(),
+                &guard.record().cleanup,
+            );
+            match effect {
+                Ok(()) => {
+                    drop(guard);
+                    return finish_new_file_park(request, park_name, token, &operation);
+                }
+                Err(platform::ParkFileError::NoEffect(error))
+                    if error.kind() == io::ErrorKind::AlreadyExists =>
+                {
+                    guard.disarm(&mut token, &operation);
+                    last_collision = Some(error);
+                }
+                Err(platform::ParkFileError::NoEffect(error)) => {
+                    guard.disarm(&mut token, &operation);
+                    return FileParkOutcome::NoEffect { error, request };
+                }
+                Err(platform::ParkFileError::AppliedUnverified(error)) => {
+                    drop(guard);
+                    return FileParkOutcome::AppliedUnverified(FileParkObligation {
+                        error,
+                        request: Some(request),
+                        token,
+                        park_name,
+                        phase: FileParkPhase::Parking,
+                        digest_verified: false,
+                    });
+                }
+            }
+        }
+        FileParkOutcome::NoEffect {
+            error: last_collision.unwrap_or_else(|| io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "could not reserve a unique parked file name",
+            )),
+            request,
+        }
+    }
+
+    pub fn sync(&self) -> io::Result<()> {
+        let authority = self.authority()?;
+        let operation = authority.enter()?;
+        self.validate(&operation)?;
+        platform::sync_directory(&self.inner.handle)?;
+        self.validate(&operation)
+    }
+
+    fn from_handle(
+        handle: platform::DirectoryHandle,
+        identity: DirectoryIdentity,
+        authority: Weak<CapabilityAuthority>,
+        parent: Option<DirectoryParent>,
+    ) -> Self {
+        Self {
+            inner: Arc::new(DirectoryInner {
+                handle,
+                identity,
+                authority,
+                parent,
+                absolute_ancestry: None,
+            }),
+        }
+    }
+
+    fn from_absolute_handle(
+        handle: platform::DirectoryHandle,
+        identity: DirectoryIdentity,
+        authority: Weak<CapabilityAuthority>,
+        absolute_ancestry: platform::AbsoluteDirectoryGuard,
+    ) -> Self {
+        Self {
+            inner: Arc::new(DirectoryInner {
+                handle,
+                identity,
+                authority,
+                parent: None,
+                absolute_ancestry: Some(absolute_ancestry),
+            }),
+        }
+    }
+
+    fn file_binding_matches(
+        &self,
+        file: &FileCapability,
+        operation: &CapabilityOperation,
+    ) -> io::Result<bool> {
+        self.validate(operation)?;
+        Ok(platform::file_binding_state(
+            &self.inner.handle,
+            file.name.as_os_str(),
+            file.identity,
+        )? == platform::BindingState::Exact)
+    }
+
+    fn authority(&self) -> io::Result<Arc<CapabilityAuthority>> {
+        self.inner.authority.upgrade().ok_or_else(stale_capability)
+    }
+}
+
+pub struct FileCapability {
+    handle: File,
+    identity: platform::Identity,
+    parent: Directory,
+    name: LeafName,
+    authority: Weak<CapabilityAuthority>,
+}
+
+pub struct FileRevision {
+    authority: Weak<CapabilityAuthority>,
+    identity: platform::Identity,
+    size: u64,
+    stamp: platform::FileStamp,
+}
+
+impl_redacted_debug!(FileRevision);
+
+impl FileRevision {
+    pub fn size(&self) -> u64 {
+        self.size
+    }
+}
+
+pub struct ExpectedFileContent {
+    revision: FileRevision,
+    sha256: [u8; 32],
+}
+
+impl_redacted_debug!(ExpectedFileContent);
+
+impl ExpectedFileContent {
+    pub fn new(revision: FileRevision, sha256: [u8; 32]) -> Self {
+        Self { revision, sha256 }
+    }
+}
+
+pub struct FileParkRequest {
+    file: FileCapability,
+    expected: ExpectedFileContent,
+}
+
+impl_redacted_debug!(FileParkRequest);
+
+impl FileParkRequest {
+    fn validate_revision(&self, operation: &CapabilityOperation) -> io::Result<()> {
+        if self.expected.revision.authority.as_ptr() != Arc::as_ptr(&operation.authority)
+            || self.expected.revision.identity != self.file.identity
+            || platform::file_receipt_fields(&self.file.handle)?
+                != (self.expected.revision.size, self.expected.revision.stamp)
+        {
+            return Err(identity_changed("file revision changed before parking"));
+        }
+        Ok(())
+    }
+}
+
+impl fmt::Debug for FileCapability {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("FileCapability")
+            .finish_non_exhaustive()
+    }
+}
+
+impl FileCapability {
+    pub fn revision(&self) -> io::Result<FileRevision> {
+        let authority = self.parent.authority()?;
+        let operation = authority.enter()?;
+        self.validate(&operation)?;
+        let (size, stamp) = platform::file_receipt_fields(&self.handle)?;
+        self.validate(&operation)?;
+        Ok(FileRevision {
+            authority: self.authority.clone(),
+            identity: self.identity,
+            size,
+            stamp,
+        })
+    }
+
+    pub fn park_request(self, expected: ExpectedFileContent) -> FileParkRequest {
+        FileParkRequest {
+            file: self,
+            expected,
+        }
+    }
+
+    pub fn reader(&self, max_bytes: u64) -> io::Result<FileReader<'_>> {
+        let authority = self.parent.authority()?;
+        let operation = authority.enter()?;
+        self.validate(&operation)?;
+        Ok(FileReader {
+            file: self,
+            operation,
+            position: 0,
+            max_bytes,
+        })
+    }
+
+    pub fn read_bounded(&self, max_bytes: u64) -> io::Result<Vec<u8>> {
+        let mut reader = self.reader(max_bytes)?;
+        let mut bytes = Vec::new();
+        reader.read_to_end(&mut bytes)?;
+        reader.finish()?;
+        Ok(bytes)
+    }
+
+    fn new(
+        handle: File,
+        identity: platform::Identity,
+        parent: Directory,
+        name: LeafName,
+        authority: Weak<CapabilityAuthority>,
+    ) -> Self {
+        Self {
+            handle,
+            identity,
+            parent,
+            name,
+            authority,
+        }
+    }
+
+    fn validate(&self, operation: &CapabilityOperation) -> io::Result<()> {
+        self.parent.validate(operation)?;
+        if platform::file_identity(&self.handle)? != self.identity
+            || platform::file_binding_state(
+                &self.parent.inner.handle,
+                self.name.as_os_str(),
+                self.identity,
+            )? != platform::BindingState::Exact
+        {
+            return Err(identity_changed("file capability changed binding"));
+        }
+        Ok(())
+    }
+
+    fn validate_bound_to(
+        &self,
+        parent: &Directory,
+        operation: &CapabilityOperation,
+    ) -> io::Result<()> {
+        self.validate(operation)?;
+        parent.validate(operation)?;
+        if Weak::ptr_eq(&self.authority, &parent.inner.authority)
+            && Arc::ptr_eq(&self.parent.inner, &parent.inner)
+        {
+            Ok(())
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "file capability belongs to another directory",
+            ))
+        }
+    }
+}
+
+#[must_use = "file readers must call finish to prove EOF and final binding; Drop only cancels the read"]
+pub struct FileReader<'a> {
+    file: &'a FileCapability,
+    operation: CapabilityOperation,
+    position: u64,
+    max_bytes: u64,
+}
+
+impl fmt::Debug for FileReader<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.debug_struct("FileReader").finish_non_exhaustive()
+    }
+}
+
+impl FileReader<'_> {
+    pub fn finish(self) -> io::Result<()> {
+        let mut probe = [0_u8; 1];
+        if platform::read_at(&self.file.handle, &mut probe, self.position)? != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "file capability was not read to completion",
+            ));
+        }
+        self.file.validate(&self.operation)
+    }
+}
+
+impl Read for FileReader<'_> {
+    fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+        if bytes.is_empty() {
+            return Ok(0);
+        }
+        if self.position == self.max_bytes {
+            let mut probe = [0_u8; 1];
+            return match platform::read_at(&self.file.handle, &mut probe, self.position)? {
+                0 => Ok(0),
+                _ => Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "file capability exceeded its read bound",
+                )),
+            };
+        }
+        let allowed = usize::try_from((self.max_bytes - self.position).min(bytes.len() as u64))
+            .map_err(|_| io::Error::other("file read bound does not fit this platform"))?;
+        let read = platform::read_at(&self.file.handle, &mut bytes[..allowed], self.position)?;
+        self.position = self
+            .position
+            .checked_add(read as u64)
+            .ok_or_else(|| io::Error::other("file read offset overflowed"))?;
+        Ok(read)
+    }
+}
+
+#[must_use = "a staged file must be sealed, discarded, or retained as an obligation"]
+pub struct StagedFile {
+    file: FileCapability,
+    token: StageToken,
+}
+
+impl fmt::Debug for StagedFile {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.debug_struct("StagedFile").finish_non_exhaustive()
+    }
+}
+
+impl StagedFile {
+    pub fn writer(&mut self) -> io::Result<StagedWriter<'_>> {
+        let authority = self.file.parent.authority()?;
+        let operation = authority.enter()?;
+        self.file.validate(&operation)?;
+        self.file.handle.set_len(0)?;
+        Ok(StagedWriter {
+            staged: self,
+            operation,
+            position: 0,
+        })
+    }
+
+    pub fn write_all(&mut self, bytes: &[u8]) -> io::Result<()> {
+        let mut writer = self.writer()?;
+        writer.write_all(bytes)?;
+        writer.finish()
+    }
+
+    pub fn seal(self) -> Result<SealedStagedFile, StageSealFailure> {
+        let authority = match self.file.parent.authority() {
+            Ok(authority) => authority,
+            Err(error) => return Err(StageSealFailure::new(error, self)),
+        };
+        let operation = match authority.enter() {
+            Ok(operation) => operation,
+            Err(error) => return Err(StageSealFailure::new(error, self)),
+        };
+        if let Err(error) = self.file.validate(&operation) {
+            return Err(StageSealFailure::new(error, self));
+        }
+        if let Err(error) = self.file.handle.sync_all() {
+            return Err(StageSealFailure::new(error, self));
+        }
+        if let Err(error) = self.file.validate(&operation) {
+            return Err(StageSealFailure::new(error, self));
+        }
+        if let Err(error) = self.token.update(StageRegistryPhase::Sealed) {
+            return Err(StageSealFailure::new(error, self));
+        }
+        Ok(SealedStagedFile {
+            file: self.file,
+            token: self.token,
+        })
+    }
+
+    pub fn discard(self) -> StageDiscardOutcome {
+        let Self { file, mut token } = self;
+        drop(file);
+        match token.discard() {
+            Ok(()) => StageDiscardOutcome::Discarded,
+            Err(error) => StageDiscardOutcome::AppliedUnverified(StageDiscardObligation {
+                error,
+                token: Some(token),
+            }),
+        }
+    }
+}
+
+#[must_use = "stage seal failures retain the staged file"]
+pub struct StageSealFailure {
+    error: io::Error,
+    staged: Option<StagedFile>,
+}
+
+impl fmt::Debug for StageSealFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("StageSealFailure")
+            .finish_non_exhaustive()
+    }
+}
+
+impl StageSealFailure {
+    fn new(error: io::Error, staged: StagedFile) -> Self {
+        Self {
+            error,
+            staged: Some(staged),
+        }
+    }
+
+    pub fn error(&self) -> &io::Error {
+        &self.error
+    }
+
+    pub fn into_staged(mut self) -> StagedFile {
+        self.staged.take().expect("failed stage is retained")
+    }
+}
+
+#[must_use = "a sealed stage must be published, discarded, or retained as an obligation"]
+pub struct SealedStagedFile {
+    file: FileCapability,
+    token: StageToken,
+}
+
+impl fmt::Debug for SealedStagedFile {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SealedStagedFile")
+            .finish_non_exhaustive()
+    }
+}
+
+impl SealedStagedFile {
+    pub fn discard(self) -> StageDiscardOutcome {
+        StagedFile {
+            file: self.file,
+            token: self.token,
+        }
+        .discard()
+    }
+}
+
+#[must_use = "stage discard effects must be explicitly settled"]
+#[derive(Debug)]
+pub enum StageDiscardOutcome {
+    Discarded,
+    AppliedUnverified(StageDiscardObligation),
+}
+
+#[must_use = "stage discard resolutions must be handled"]
+#[derive(Debug)]
+pub enum StageDiscardResolution {
+    Discarded,
+    Indeterminate(StageDiscardObligation),
+}
+
+#[must_use = "stage discard obligations must be reconciled"]
+pub struct StageDiscardObligation {
+    error: io::Error,
+    token: Option<StageToken>,
+}
+
+impl_redacted_debug!(StageDiscardObligation);
+
+impl StageDiscardObligation {
+    pub fn error(&self) -> &io::Error {
+        &self.error
+    }
+
+    pub fn reconcile(mut self) -> StageDiscardResolution {
+        let mut token = self.token.take().expect("discard obligation retains token");
+        match token.discard() {
+            Ok(()) => StageDiscardResolution::Discarded,
+            Err(_) => {
+                self.token = Some(token);
+                StageDiscardResolution::Indeterminate(self)
+            }
+        }
+    }
+}
+
+impl SealedStagedFile {
+    pub fn replace_nondurable(self, destination: ReplaceDestination) -> FileReplaceOutcome {
+        match destination {
+            ReplaceDestination::Vacant { parent, name } => {
+                let fallback = ReplaceDestination::Vacant {
+                    parent: parent.clone(),
+                    name: name.clone(),
+                };
+                continue_file_replace(self, &parent, &name, None, fallback, None)
+            }
+            ReplaceDestination::Existing(request) => {
+                let receipt = ExpectedContentReceipt::capture(&request);
+                let parent = request.file.parent.clone();
+                let name = request.file.name.clone();
+                match parent.park_file(request) {
+                    FileParkOutcome::Parked(displaced) => continue_file_replace(
+                        self,
+                        &parent,
+                        &name,
+                        Some(displaced),
+                        ReplaceDestination::Vacant {
+                            parent: parent.clone(),
+                            name: name.clone(),
+                        },
+                        Some(receipt),
+                    ),
+                    FileParkOutcome::NoEffect { error, request } => {
+                        FileReplaceOutcome::NoEffect {
+                            error,
+                            staged: self,
+                            destination: ReplaceDestination::Existing(request),
+                        }
+                    }
+                    FileParkOutcome::AppliedUnverified(park) => {
+                        FileReplaceOutcome::AppliedUnverified(FileReplaceObligation {
+                            error: io::Error::other(
+                                "replacement destination park is not yet settled",
+                            ),
+                            state: Some(FileReplaceObligationState::Parking {
+                                park,
+                                staged: self,
+                                receipt,
+                            }),
+                        })
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn promote_no_replace(
+        mut self,
+        source_parent: &Directory,
+        destination_parent: &Directory,
+        destination_name: &LeafName,
+    ) -> FilePromotionOutcome {
+        let authority = match source_parent.authority() {
+            Ok(authority) => authority,
+            Err(error) => {
+                return FilePromotionOutcome::NoEffect {
+                    error,
+                    staged: self,
+                };
+            }
+        };
+        let operation = match authority.enter() {
+            Ok(operation) => operation,
+            Err(error) => {
+                return FilePromotionOutcome::NoEffect {
+                    error,
+                    staged: self,
+                };
+            }
+        };
+        if let Err(error) = self.file.validate_bound_to(source_parent, &operation) {
+            return FilePromotionOutcome::NoEffect {
+                error,
+                staged: self,
+            };
+        }
+        if let Err(error) = destination_parent.validate(&operation) {
+            return FilePromotionOutcome::NoEffect {
+                error,
+                staged: self,
+            };
+        }
+        if !Weak::ptr_eq(
+            &source_parent.inner.authority,
+            &destination_parent.inner.authority,
+        ) {
+            return FilePromotionOutcome::NoEffect {
+                error: stale_capability(),
+                staged: self,
+            };
+        }
+        if let Err(error) = self
+            .token
+            .prepare_promotion(destination_parent, destination_name)
+        {
+            return FilePromotionOutcome::NoEffect {
+                error,
+                staged: self,
+            };
+        }
+
+        let rename = platform::rename_no_replace(
+            &source_parent.inner.handle,
+            self.file.name.as_os_str(),
+            &self.file.handle,
+            &destination_parent.inner.handle,
+            destination_name.as_os_str(),
+        );
+        let source = platform::file_binding_state(
+            &source_parent.inner.handle,
+            self.file.name.as_os_str(),
+            self.file.identity,
+        );
+        let destination = platform::file_binding_state(
+            &destination_parent.inner.handle,
+            destination_name.as_os_str(),
+            self.file.identity,
+        );
+
+        match (rename, source, destination) {
+            (_, Ok(platform::BindingState::Absent), Ok(platform::BindingState::Exact)) => {
+                if let Err(error) = sync_rename_parents(source_parent, destination_parent) {
+                    return FilePromotionOutcome::AppliedUnverified(FilePromotionObligation {
+                        error,
+                        retained: self,
+                        destination: destination_parent.clone(),
+                        destination_name: destination_name.clone(),
+                    });
+                }
+                match platform::open_file(
+                    &destination_parent.inner.handle,
+                    destination_name.as_os_str(),
+                ) {
+                    Ok(handle)
+                        if platform::file_identity(&handle).ok() == Some(self.file.identity) =>
+                    {
+                        let applied = FileCapability::new(
+                            handle,
+                            self.file.identity,
+                            destination_parent.clone(),
+                            destination_name.clone(),
+                            self.file.authority.clone(),
+                        );
+                        if applied.validate(&operation).is_err()
+                            || self.token.disarm().is_err()
+                        {
+                            FilePromotionOutcome::AppliedUnverified(FilePromotionObligation {
+                                error: identity_changed(
+                                    "promoted file lost its authority chain",
+                                ),
+                                retained: self,
+                                destination: destination_parent.clone(),
+                                destination_name: destination_name.clone(),
+                            })
+                        } else {
+                            FilePromotionOutcome::Applied(applied)
+                        }
+                    }
+                    Ok(_) => FilePromotionOutcome::AppliedUnverified(
+                        FilePromotionObligation {
+                            error: identity_changed(
+                                "promoted file changed before read capability admission",
+                            ),
+                            retained: self,
+                            destination: destination_parent.clone(),
+                            destination_name: destination_name.clone(),
+                        },
+                    ),
+                    Err(error) => FilePromotionOutcome::AppliedUnverified(
+                        FilePromotionObligation {
+                            error,
+                            retained: self,
+                            destination: destination_parent.clone(),
+                            destination_name: destination_name.clone(),
+                        },
+                    ),
+                }
+            }
+            (Err(error), Ok(platform::BindingState::Exact), _) => {
+                match self.token.update(StageRegistryPhase::Sealed) {
+                    Ok(()) => FilePromotionOutcome::NoEffect {
+                        error,
+                        staged: self,
+                    },
+                    Err(update) => FilePromotionOutcome::AppliedUnverified(
+                        FilePromotionObligation {
+                            error: io::Error::other(format!(
+                                "promotion failed and stage registry could not settle: {error}; {update}"
+                            )),
+                            retained: self,
+                            destination: destination_parent.clone(),
+                            destination_name: destination_name.clone(),
+                        },
+                    ),
+                }
+            }
+            (Ok(()), _, _) => {
+                FilePromotionOutcome::AppliedUnverified(FilePromotionObligation {
+                    error: identity_changed("file promotion effect could not be verified"),
+                    retained: self,
+                    destination: destination_parent.clone(),
+                    destination_name: destination_name.clone(),
+                })
+            }
+            (Err(error), _, _) => {
+                FilePromotionOutcome::AppliedUnverified(FilePromotionObligation {
+                    error,
+                    retained: self,
+                    destination: destination_parent.clone(),
+                    destination_name: destination_name.clone(),
+                })
+            }
+        }
+    }
+}
+
+fn continue_file_replace(
+    staged: SealedStagedFile,
+    parent: &Directory,
+    name: &LeafName,
+    displaced: Option<ParkedFile>,
+    fallback: ReplaceDestination,
+    receipt: Option<ExpectedContentReceipt>,
+) -> FileReplaceOutcome {
+    let source = staged.file.parent.clone();
+    match staged.promote_no_replace(&source, parent, name) {
+        FilePromotionOutcome::Applied(current) => FileReplaceOutcome::Replaced {
+            current,
+            displaced,
+        },
+        FilePromotionOutcome::NoEffect { error, staged } => {
+            let Some(displaced) = displaced else {
+                return FileReplaceOutcome::NoEffect {
+                    error,
+                    staged,
+                    destination: fallback,
+                };
+            };
+            restore_displaced_after_failed_replace(
+                staged,
+                displaced,
+                receipt.expect("existing replacement retains its receipt"),
+                error,
+            )
+        }
+        FilePromotionOutcome::AppliedUnverified(promotion) => {
+            FileReplaceOutcome::AppliedUnverified(FileReplaceObligation {
+                error: io::Error::other("replacement promotion is not yet settled"),
+                state: Some(FileReplaceObligationState::Promoting {
+                    promotion,
+                    displaced,
+                    fallback,
+                    receipt,
+                }),
+            })
+        }
+    }
+}
+
+fn restore_displaced_after_failed_replace(
+    staged: SealedStagedFile,
+    displaced: ParkedFile,
+    receipt: ExpectedContentReceipt,
+    promotion_error: io::Error,
+) -> FileReplaceOutcome {
+    match displaced.restore() {
+        FileRestoreOutcome::Restored(file) => FileReplaceOutcome::NoEffect {
+            error: promotion_error,
+            staged,
+            destination: ReplaceDestination::Existing(receipt.rebuild(file)),
+        },
+        FileRestoreOutcome::NoEffect { error, parked } => {
+            FileReplaceOutcome::AppliedUnverified(FileReplaceObligation {
+                error,
+                state: Some(FileReplaceObligationState::RestoreParked {
+                    parked,
+                    staged,
+                    receipt,
+                }),
+            })
+        }
+        FileRestoreOutcome::AppliedUnverified(restore) => {
+            FileReplaceOutcome::AppliedUnverified(FileReplaceObligation {
+                error: io::Error::other("replacement rollback is not yet settled"),
+                state: Some(FileReplaceObligationState::RestoreObligation {
+                    restore,
+                    staged,
+                    receipt,
+                }),
+            })
+        }
+    }
+}
+
+fn settle_file_replace(
+    state: FileReplaceObligationState,
+) -> Result<FileReplaceResolution, FileReplaceObligationState> {
+    match state {
+        FileReplaceObligationState::Parking {
+            park,
+            staged,
+            receipt,
+        } => {
+            let (parent, name) = {
+                let request = park.request.as_ref().expect("park obligation retains request");
+                (request.file.parent.clone(), request.file.name.clone())
+            };
+            match park.reconcile() {
+                FileParkResolution::Parked(displaced) => replace_outcome_to_resolution(
+                    continue_file_replace(
+                        staged,
+                        &parent,
+                        &name,
+                        Some(displaced),
+                        ReplaceDestination::Vacant {
+                            parent: parent.clone(),
+                            name: name.clone(),
+                        },
+                        Some(receipt),
+                    ),
+                ),
+                FileParkResolution::NoEffect(request) => Ok(FileReplaceResolution::NoEffect {
+                    staged,
+                    destination: ReplaceDestination::Existing(request),
+                }),
+                FileParkResolution::Indeterminate(park) => {
+                    Err(FileReplaceObligationState::Parking {
+                        park,
+                        staged,
+                        receipt,
+                    })
+                }
+            }
+        }
+        FileReplaceObligationState::Promoting {
+            promotion,
+            displaced,
+            fallback,
+            receipt,
+        } => match promotion.reconcile() {
+            FilePromotionResolution::Applied(current) => Ok(FileReplaceResolution::Replaced {
+                current,
+                displaced,
+            }),
+            FilePromotionResolution::NoEffect(staged) => {
+                let Some(displaced) = displaced else {
+                    return Ok(FileReplaceResolution::NoEffect {
+                        staged,
+                        destination: fallback,
+                    });
+                };
+                replace_outcome_to_resolution(restore_displaced_after_failed_replace(
+                    staged,
+                    displaced,
+                    receipt.expect("existing replacement retains its receipt"),
+                    io::Error::other("replacement promotion had no effect"),
+                ))
+            }
+            FilePromotionResolution::Indeterminate(promotion) => {
+                Err(FileReplaceObligationState::Promoting {
+                    promotion,
+                    displaced,
+                    fallback,
+                    receipt,
+                })
+            }
+        },
+        FileReplaceObligationState::RestoreParked {
+            parked,
+            staged,
+            receipt,
+        } => match parked.restore() {
+            FileRestoreOutcome::Restored(file) => Ok(FileReplaceResolution::NoEffect {
+                staged,
+                destination: ReplaceDestination::Existing(receipt.rebuild(file)),
+            }),
+            FileRestoreOutcome::NoEffect { parked, .. } => {
+                Err(FileReplaceObligationState::RestoreParked {
+                    parked,
+                    staged,
+                    receipt,
+                })
+            }
+            FileRestoreOutcome::AppliedUnverified(restore) => {
+                Err(FileReplaceObligationState::RestoreObligation {
+                    restore,
+                    staged,
+                    receipt,
+                })
+            }
+        },
+        FileReplaceObligationState::RestoreObligation {
+            restore,
+            staged,
+            receipt,
+        } => match restore.reconcile() {
+            FileRestoreResolution::Restored(file) => Ok(FileReplaceResolution::NoEffect {
+                staged,
+                destination: ReplaceDestination::Existing(receipt.rebuild(file)),
+            }),
+            FileRestoreResolution::NoEffect(parked) => {
+                Err(FileReplaceObligationState::RestoreParked {
+                    parked,
+                    staged,
+                    receipt,
+                })
+            }
+            FileRestoreResolution::Indeterminate(restore) => {
+                Err(FileReplaceObligationState::RestoreObligation {
+                    restore,
+                    staged,
+                    receipt,
+                })
+            }
+        },
+    }
+}
+
+fn replace_outcome_to_resolution(
+    outcome: FileReplaceOutcome,
+) -> Result<FileReplaceResolution, FileReplaceObligationState> {
+    match outcome {
+        FileReplaceOutcome::Replaced { current, displaced } => {
+            Ok(FileReplaceResolution::Replaced { current, displaced })
+        }
+        FileReplaceOutcome::NoEffect {
+            staged,
+            destination,
+            ..
+        } => Ok(FileReplaceResolution::NoEffect {
+            staged,
+            destination,
+        }),
+        FileReplaceOutcome::AppliedUnverified(mut obligation) => Err(obligation
+            .state
+            .take()
+            .expect("replace obligation retains state")),
+    }
+}
+
+pub struct StagedWriter<'a> {
+    staged: &'a mut StagedFile,
+    operation: CapabilityOperation,
+    position: u64,
+}
+
+impl fmt::Debug for StagedWriter<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("StagedWriter")
+            .finish_non_exhaustive()
+    }
+}
+
+impl StagedWriter<'_> {
+    pub fn finish(self) -> io::Result<()> {
+        self.staged.file.handle.sync_all()?;
+        self.staged.file.validate(&self.operation)
+    }
+}
+
+impl Write for StagedWriter<'_> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let written = platform::write_at(&self.staged.file.handle, bytes, self.position)?;
+        self.position = self
+            .position
+            .checked_add(written as u64)
+            .ok_or_else(|| io::Error::other("staged file write offset overflowed"))?;
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.staged.file.handle.sync_data()
+    }
+}
+
+#[must_use = "a root session must be explicitly revoked or transferred into reset"]
+pub struct RootSession {
+    root_identity: DirectoryIdentity,
+    authority: Arc<CapabilityAuthority>,
+}
+
+struct SessionDrainRecoveryState {
+    files: Vec<ParkedFile>,
+    directories: Vec<ParkedDirectory>,
+    directory_create_preservations: Vec<DirectoryCreatePreservation>,
+    file_removals: Vec<FileRemovalObligation>,
+    file_restores: Vec<FileRestoreObligation>,
+    directory_removals: Vec<DirectoryRemovalObligation>,
+    directory_restores: Vec<DirectoryRestoreObligation>,
+}
+
+impl_redacted_debug!(SessionDrainRecoveryState);
+
+#[derive(Clone, Copy)]
+enum DrainRecoveryDecision {
+    Remove,
+    Restore,
+}
+
+impl SessionDrainRecoveryState {
+    fn file_count(&self) -> usize {
+        self.files
+            .len()
+            .saturating_add(self.file_removals.len())
+            .saturating_add(self.file_restores.len())
+    }
+
+    fn directory_count(&self) -> usize {
+        self.directories
+            .len()
+            .saturating_add(self.directory_removals.len())
+            .saturating_add(self.directory_restores.len())
+    }
+
+    fn preserved_directory_create_count(&self) -> usize {
+        self.directory_create_preservations.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.files.is_empty()
+            && self.directories.is_empty()
+            && self.directory_create_preservations.is_empty()
+            && self.file_removals.is_empty()
+            && self.file_restores.is_empty()
+            && self.directory_removals.is_empty()
+            && self.directory_restores.is_empty()
+    }
+
+    fn settle(&mut self, permits: &[DrainRecoveryPermit], decision: DrainRecoveryDecision) {
+        let permit_by_park = permits
+            .iter()
+            .map(|permit| (permit.park_token_id, permit))
+            .collect::<HashMap<_, _>>();
+
+        for obligation in std::mem::take(&mut self.file_removals) {
+            let token_id = obligation
+                .parked
+                .as_ref()
+                .expect("file removal recovery retains parked file")
+                .token
+                .id;
+            let Some(permit) = permit_by_park.get(&DrainRecoveryParkId::File(token_id)) else {
+                self.file_removals.push(obligation);
+                continue;
+            };
+            match obligation.reconcile_with_recovery(permit) {
+                FileRemovalResolution::Removed => {}
+                FileRemovalResolution::NoEffect(parked) => {
+                    self.files.push(parked);
+                }
+                FileRemovalResolution::Indeterminate(obligation) => {
+                    self.file_removals.push(obligation);
+                }
+            };
+        }
+        for obligation in std::mem::take(&mut self.file_restores) {
+            let token_id = obligation
+                .parked
+                .as_ref()
+                .expect("file restore recovery retains parked file")
+                .token
+                .id;
+            let Some(permit) = permit_by_park.get(&DrainRecoveryParkId::File(token_id)) else {
+                self.file_restores.push(obligation);
+                continue;
+            };
+            match obligation.reconcile_with_recovery(permit) {
+                FileRestoreResolution::Restored(_) => {}
+                FileRestoreResolution::NoEffect(parked) => {
+                    self.files.push(parked);
+                }
+                FileRestoreResolution::Indeterminate(obligation) => {
+                    self.file_restores.push(obligation);
+                }
+            };
+        }
+
+        for parked in std::mem::take(&mut self.files) {
+            let Some(permit) = permit_by_park.get(&DrainRecoveryParkId::File(parked.token.id)) else {
+                self.files.push(parked);
+                continue;
+            };
+            match decision {
+                DrainRecoveryDecision::Remove => match parked.remove_with_recovery(permit) {
+                    FileRemovalOutcome::Removed => {}
+                    FileRemovalOutcome::NoEffect { parked, .. } => self.files.push(parked),
+                    FileRemovalOutcome::AppliedUnverified(obligation) => {
+                        self.file_removals.push(obligation);
+                    }
+                },
+                DrainRecoveryDecision::Restore => match parked.restore_with_recovery(permit) {
+                    FileRestoreOutcome::Restored(_) => {}
+                    FileRestoreOutcome::NoEffect { parked, .. } => self.files.push(parked),
+                    FileRestoreOutcome::AppliedUnverified(obligation) => {
+                        self.file_restores.push(obligation);
+                    }
+                },
+            }
+        }
+
+        for obligation in std::mem::take(&mut self.directory_removals) {
+            let token_id = obligation
+                .parked
+                .as_ref()
+                .expect("directory removal recovery retains parked directory")
+                .token
+                .id;
+            let Some(permit) = permit_by_park.get(&DrainRecoveryParkId::Directory(token_id)) else {
+                self.directory_removals.push(obligation);
+                continue;
+            };
+            match obligation.reconcile_with_recovery(permit) {
+                DirectoryRemovalResolution::Removed => {}
+                DirectoryRemovalResolution::NoEffect(parked) => {
+                    self.directories.push(parked);
+                }
+                DirectoryRemovalResolution::Indeterminate(obligation) => {
+                    self.directory_removals.push(obligation);
+                }
+            };
+        }
+        for obligation in std::mem::take(&mut self.directory_restores) {
+            let token_id = obligation
+                .parked
+                .as_ref()
+                .expect("directory restore recovery retains parked directory")
+                .token
+                .id;
+            let Some(permit) = permit_by_park.get(&DrainRecoveryParkId::Directory(token_id)) else {
+                self.directory_restores.push(obligation);
+                continue;
+            };
+            match obligation.reconcile_with_recovery(permit) {
+                DirectoryRestoreResolution::Restored(_) => {}
+                DirectoryRestoreResolution::NoEffect(parked) => {
+                    self.directories.push(parked);
+                }
+                DirectoryRestoreResolution::Indeterminate(obligation) => {
+                    self.directory_restores.push(obligation);
+                }
+            };
+        }
+
+        for parked in std::mem::take(&mut self.directories) {
+            let Some(permit) = permit_by_park
+                .get(&DrainRecoveryParkId::Directory(parked.token.id))
+            else {
+                self.directories.push(parked);
+                continue;
+            };
+            match decision {
+                DrainRecoveryDecision::Remove => {
+                    match parked.remove_empty_with_recovery(permit) {
+                        DirectoryRemovalOutcome::Removed => {}
+                        DirectoryRemovalOutcome::NoEffect { parked, .. } => {
+                            self.directories.push(parked);
+                        }
+                        DirectoryRemovalOutcome::AppliedUnverified(obligation) => {
+                            self.directory_removals.push(obligation);
+                        }
+                    }
+                }
+                DrainRecoveryDecision::Restore => match parked.restore_with_recovery(permit) {
+                    DirectoryRestoreOutcome::Restored(_) => {}
+                    DirectoryRestoreOutcome::NoEffect { parked, .. } => {
+                        self.directories.push(parked);
+                    }
+                    DirectoryRestoreOutcome::AppliedUnverified(obligation) => {
+                        self.directory_restores.push(obligation);
+                    }
+                },
+            }
+        }
+    }
+
+    fn acknowledge_preserved_directory_creates(&mut self, permits: &[DrainRecoveryPermit]) {
+        let permit_by_effect = permits
+            .iter()
+            .map(|permit| (permit.park_token_id, permit))
+            .collect::<HashMap<_, _>>();
+        for preservation in std::mem::take(&mut self.directory_create_preservations) {
+            let token_id = preservation.token.id;
+            let Some(permit) =
+                permit_by_effect.get(&DrainRecoveryParkId::DirectoryCreate(token_id))
+            else {
+                self.directory_create_preservations.push(preservation);
+                continue;
+            };
+            if let Err(preservation) = preservation.acknowledge_preserved_with_recovery(permit) {
+                self.directory_create_preservations.push(preservation);
+            }
+        }
+    }
+
+    fn acknowledge_external_directory_creates(&mut self, permits: &[DrainRecoveryPermit]) {
+        let permit_by_effect = permits
+            .iter()
+            .map(|permit| (permit.park_token_id, permit))
+            .collect::<HashMap<_, _>>();
+        for preservation in std::mem::take(&mut self.directory_create_preservations) {
+            let token_id = preservation.token.id;
+            let Some(permit) =
+                permit_by_effect.get(&DrainRecoveryParkId::DirectoryCreate(token_id))
+            else {
+                self.directory_create_preservations.push(preservation);
+                continue;
+            };
+            if !permit
+                .authority
+                .directory_create_is_external(&preservation.token)
+            {
+                self.directory_create_preservations.push(preservation);
+                continue;
+            }
+            if let Err(preservation) = preservation.acknowledge_preserved_with_recovery(permit) {
+                self.directory_create_preservations.push(preservation);
+            }
+        }
+    }
+
+    fn transfer_preserved_directory_creates_to_reset(
+        &mut self,
+        permits: &[DrainRecoveryPermit],
+    ) {
+        let permit_by_effect = permits
+            .iter()
+            .map(|permit| (permit.park_token_id, permit))
+            .collect::<HashMap<_, _>>();
+        for preservation in std::mem::take(&mut self.directory_create_preservations) {
+            let token_id = preservation.token.id;
+            let Some(permit) =
+                permit_by_effect.get(&DrainRecoveryParkId::DirectoryCreate(token_id))
+            else {
+                self.directory_create_preservations.push(preservation);
+                continue;
+            };
+            if let Err(preservation) = preservation.transfer_to_reset(permit) {
+                self.directory_create_preservations.push(preservation);
+            }
+        }
+    }
+
+}
+
+impl fmt::Debug for RootSession {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.debug_struct("RootSession").finish_non_exhaustive()
+    }
+}
+
+impl RootSession {
+    pub fn acquire(path: &Path) -> RootSessionAcquireOutcome {
+        let process_image = match capture_process_image_ancestry() {
+            Ok(process_image) => process_image,
+            Err(error) => {
+                return RootSessionAcquireOutcome::NoEffect(
+                    RootSessionError::ProcessImage(error),
+                );
+            }
+        };
+        match platform::open_or_create_root(path) {
+            Ok(construction) => {
+                try_acquire_lease_and_finish_root(construction, process_image)
+            }
+            Err(error) => {
+                let (error, construction) = error.into_parts();
+                match construction {
+                    Some(construction) => RootSessionAcquireOutcome::AppliedUnverified(
+                        RootSessionAcquireObligation {
+                            error: RootSessionError::Create(error),
+                            construction: Some(construction),
+                            lease: None,
+                            process_image: Some(process_image),
+                        },
+                    ),
+                    None => RootSessionAcquireOutcome::NoEffect(RootSessionError::Open(error)),
+                }
+            }
+        }
+    }
+
+    pub fn identity(&self) -> DirectoryIdentity {
+        self.root_identity
+    }
+
+    pub fn root(&self) -> io::Result<Directory> {
+        let operation = self.authority.enter()?;
+        Ok(Directory::from_handle(
+            platform::clone_root(&self.authority.root)?,
+            self.root_identity,
+            Arc::downgrade(&self.authority),
+            None,
+        ))
+        .and_then(|root| {
+            root.validate(&operation)?;
+            Ok(root)
+        })
+    }
+
+    pub fn admit_absolute_directory(&self, path: &Path) -> io::Result<Directory> {
+        if !path.is_absolute() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "external directory is not absolute",
+            ));
+        }
+        let operation = self.authority.enter()?;
+        let ancestry: platform::AbsoluteDirectoryGuard =
+            platform::open_absolute_directory_guard(path)?;
+        let identity = platform::absolute_directory_identity(&ancestry);
+        let handle = platform::clone_absolute_directory_guard(&ancestry)?;
+        let directory = Directory::from_absolute_handle(
+            handle,
+            self.authority.identity(identity),
+            Arc::downgrade(&self.authority),
+            ancestry,
+        );
+        directory.validate(&operation)?;
+        Ok(directory)
+    }
+
+    pub fn validate_reset_preflight(&self) -> io::Result<()> {
+        self.authority
+            .validate_retained_process_image_outside_root()?;
+        platform::validate_lease(&self.authority.lease)?;
+        platform::validate_root(&self.authority.root)
+    }
+
+    pub fn revoke(self) -> RootRevokeOutcome {
+        let start = self.authority.begin_terminal_drain();
+        match start {
+            Ok(()) => RootRevokeDrain {
+                session: Some(self),
+            }
+            .try_settle(),
+            Err(error) => {
+                RootRevokeOutcome::Refused(RootRevokeStartFailure::new(self, error))
+            }
+        }
+    }
+
+    pub fn begin_reset(self) -> ResetStartOutcome {
+        if let Err(error) = self
+            .authority
+            .validate_retained_process_image_outside_root()
+        {
+            return ResetStartOutcome::Refused(ResetStartFailure::new(self, error));
+        }
+        let start = self.authority.begin_terminal_drain();
+        match start {
+            Ok(()) => ResetDrainAuthority {
+                session: Some(self),
+            }
+            .try_settle(),
+            Err(error) => ResetStartOutcome::Refused(ResetStartFailure::new(self, error)),
+        }
+    }
+}
+
+fn capture_process_image_ancestry() -> io::Result<platform::ProcessImageAncestry> {
+    let executable = std::env::current_exe()?;
+    platform::capture_process_image_ancestry(&executable)
+}
+
+fn try_acquire_lease_and_finish_root(
+    construction: platform::RootConstruction,
+    process_image: platform::ProcessImageAncestry,
+) -> RootSessionAcquireOutcome {
+    let identity = match platform::root_construction_identity(&construction) {
+        Ok(identity) => identity,
+        Err(error) => {
+            return if platform::root_construction_has_effect(&construction) {
+                RootSessionAcquireOutcome::AppliedUnverified(RootSessionAcquireObligation {
+                    error: RootSessionError::Create(error),
+                    construction: Some(construction),
+                    lease: None,
+                    process_image: Some(process_image),
+                })
+            } else {
+                RootSessionAcquireOutcome::NoEffect(RootSessionError::Open(error))
+            };
+        }
+    };
+    let root = match platform::root_construction_guard(&construction) {
+        Ok(root) => root,
+        Err(error) => {
+            return RootSessionAcquireOutcome::AppliedUnverified(RootSessionAcquireObligation {
+                error: RootSessionError::Create(error),
+                construction: Some(construction),
+                lease: None,
+                process_image: Some(process_image),
+            });
+        }
+    };
+    let lease_name = LeafName::new(ROOT_LEASE_NAME).expect("fixed lease name is valid");
+    let lease = match platform::try_acquire_lease(root, lease_name.as_os_str()) {
+        platform::LeaseAcquisitionOutcome::Acquired(lease) => lease,
+        platform::LeaseAcquisitionOutcome::NoEffect(error)
+            if error.kind() == io::ErrorKind::WouldBlock =>
+        {
+            return if platform::root_construction_has_effect(&construction) {
+                RootSessionAcquireOutcome::AppliedUnverified(RootSessionAcquireObligation {
+                    error: RootSessionError::Busy,
+                    construction: Some(construction),
+                    lease: None,
+                    process_image: Some(process_image),
+                })
+            } else {
+                RootSessionAcquireOutcome::NoEffect(RootSessionError::Busy)
+            };
+        }
+        platform::LeaseAcquisitionOutcome::NoEffect(error) => {
+            return if platform::root_construction_has_effect(&construction) {
+                RootSessionAcquireOutcome::AppliedUnverified(RootSessionAcquireObligation {
+                    error: RootSessionError::Lease(error),
+                    construction: Some(construction),
+                    lease: None,
+                    process_image: Some(process_image),
+                })
+            } else {
+                RootSessionAcquireOutcome::NoEffect(RootSessionError::Lease(error))
+            };
+        }
+        platform::LeaseAcquisitionOutcome::AppliedUnverified(lease) => {
+            let error = RootSessionError::Lease(copy_io_error(
+                platform::lease_acquisition_error(&lease),
+            ));
+            return RootSessionAcquireOutcome::AppliedUnverified(
+                RootSessionAcquireObligation {
+                    error,
+                    construction: Some(construction),
+                    lease: Some(lease),
+                    process_image: Some(process_image),
+                },
+            );
+        }
+    };
+    finish_root_session(construction, identity, lease, process_image)
+}
+
+fn finish_root_session(
+    construction: platform::RootConstruction,
+    identity: platform::Identity,
+    lease: platform::LeaseHandle,
+    process_image: platform::ProcessImageAncestry,
+) -> RootSessionAcquireOutcome {
+    use rand::RngCore;
+
+    let root = platform::finish_root_construction(construction);
+    let mut session_nonce = [0_u8; 16];
+    rand::rngs::OsRng.fill_bytes(&mut session_nonce);
+    RootSessionAcquireOutcome::Acquired(RootSession {
+        root_identity: DirectoryIdentity {
+            session: session_nonce,
+            physical: identity,
+        },
+        authority: Arc::new(CapabilityAuthority {
+            operations: Mutex::new(OperationState {
+                phase: AUTHORITY_LIVE,
+                active: 0,
+                outstanding_effects: 0,
+                next_stage_id: 1,
+                stages: HashMap::new(),
+                next_stage_create_id: 1,
+                stage_creations: HashMap::new(),
+                next_directory_create_id: 1,
+                directory_creations: HashMap::new(),
+                next_file_park_id: 1,
+                file_parks: HashMap::new(),
+                file_parks_checked_out: 0,
+                next_directory_park_id: 1,
+                directory_parks: HashMap::new(),
+                directory_parks_checked_out: 0,
+            }),
+            session_nonce,
+            root,
+            lease,
+            process_image,
+        }),
+    })
+}
+
+impl Drop for RootSession {
+    fn drop(&mut self) {
+        let mut state = match self.authority.operations.lock() {
+            Ok(state) => state,
+            Err(_) => std::process::abort(),
+        };
+        if state.phase == AUTHORITY_LIVE {
+            state.phase = AUTHORITY_DRAINING;
+        }
+        if state.active != 0
+            || state.outstanding_effects != 0
+            || state.file_parks_checked_out != 0
+            || state.directory_parks_checked_out != 0
+            || !state.stages.is_empty()
+            || !state.stage_creations.is_empty()
+            || !state.directory_creations.is_empty()
+            || !state.file_parks.is_empty()
+            || !state.directory_parks.is_empty()
+        {
+            std::process::abort();
+        }
+    }
+}
+
+#[must_use = "revocation outcome retains linear session authority until it is terminal"]
+#[derive(Debug)]
+pub enum RootRevokeOutcome {
+    Revoked,
+    Pending(RootRevokeDrain),
+    Recovery {
+        recovery: RootRevokeRecovery,
+    },
+    Refused(RootRevokeStartFailure),
+    Failed(RootRevokeDrainFailure),
+}
+
+#[must_use = "revocation drain must be settled or transferred with recovery authority"]
+pub struct RootRevokeDrain {
+    session: Option<RootSession>,
+}
+
+impl_redacted_debug!(RootRevokeDrain);
+
+impl RootRevokeDrain {
+    pub fn try_settle(mut self) -> RootRevokeOutcome {
+        let session = self.session.take().expect("revoke drain retains session");
+        let authority = session.authority.clone();
+        let settlement = authority.try_finish_terminal_drain(AUTHORITY_REVOKED, false);
+        match settlement {
+            Ok(SessionDrainSettlement::Ready) => RootRevokeOutcome::Revoked,
+            Ok(SessionDrainSettlement::Pending) => {
+                self.session = Some(session);
+                RootRevokeOutcome::Pending(self)
+            }
+            Ok(SessionDrainSettlement::Recovery { recovery, permits }) => {
+                self.session = Some(session);
+                RootRevokeOutcome::Recovery {
+                    recovery: RootRevokeRecovery {
+                        drain: self,
+                        recovery,
+                        permits,
+                    },
+                }
+            }
+            Err(error) => {
+                self.session = Some(session);
+                RootRevokeOutcome::Failed(RootRevokeDrainFailure::new(self, error))
+            }
+        }
+    }
+}
+
+#[must_use = "revocation recovery must settle every abandoned effect before the drain can finish"]
+pub struct RootRevokeRecovery {
+    drain: RootRevokeDrain,
+    recovery: SessionDrainRecoveryState,
+    permits: Vec<DrainRecoveryPermit>,
+}
+
+impl_redacted_debug!(RootRevokeRecovery);
+
+impl RootRevokeRecovery {
+    pub fn file_count(&self) -> usize {
+        self.recovery.file_count()
+    }
+
+    pub fn directory_count(&self) -> usize {
+        self.recovery.directory_count()
+    }
+
+    pub fn preserved_directory_create_count(&self) -> usize {
+        self.recovery.preserved_directory_create_count()
+    }
+
+    pub fn acknowledge_preserved_directory_creates(mut self) -> RootRevokeOutcome {
+        self.recovery
+            .acknowledge_preserved_directory_creates(&self.permits);
+        self.finish()
+    }
+
+    pub fn restore_all(mut self) -> RootRevokeOutcome {
+        self.recovery
+            .settle(&self.permits, DrainRecoveryDecision::Restore);
+        self.finish()
+    }
+
+    pub fn remove_all(mut self) -> RootRevokeOutcome {
+        self.recovery
+            .settle(&self.permits, DrainRecoveryDecision::Remove);
+        self.finish()
+    }
+
+    fn finish(self) -> RootRevokeOutcome {
+        if self.recovery.is_empty() {
+            self.drain.try_settle()
+        } else {
+            RootRevokeOutcome::Recovery {
+                recovery: self,
+            }
+        }
+    }
+}
+
+#[must_use = "revocation start refusal retains the live session and must be retried"]
+pub struct RootRevokeStartFailure {
+    error: io::Error,
+    session: Option<RootSession>,
+}
+
+impl_redacted_debug!(RootRevokeStartFailure);
+
+impl RootRevokeStartFailure {
+    fn new(session: RootSession, error: io::Error) -> Self {
+        Self {
+            error,
+            session: Some(session),
+        }
+    }
+
+    pub fn error(&self) -> &io::Error {
+        &self.error
+    }
+
+    pub fn retry(mut self) -> RootRevokeOutcome {
+        self.session
+            .take()
+            .expect("revocation start refusal retains session")
+            .revoke()
+    }
+}
+
+#[must_use = "revocation drain failure retains the draining authority and must be retried"]
+pub struct RootRevokeDrainFailure {
+    error: io::Error,
+    drain: Option<RootRevokeDrain>,
+}
+
+impl_redacted_debug!(RootRevokeDrainFailure);
+
+impl RootRevokeDrainFailure {
+    fn new(drain: RootRevokeDrain, error: io::Error) -> Self {
+        Self {
+            error,
+            drain: Some(drain),
+        }
+    }
+
+    pub fn error(&self) -> &io::Error {
+        &self.error
+    }
+
+    pub fn retry(mut self) -> RootRevokeOutcome {
+        self.drain
+            .take()
+            .expect("revocation failure retains drain")
+            .try_settle()
+    }
+}
+
+#[must_use = "reset outcome retains linear session authority until it is terminal"]
+#[derive(Debug)]
+pub enum ResetStartOutcome {
+    Ready(RootResetAuthority),
+    Pending(ResetDrainAuthority),
+    Recovery {
+        recovery: ResetDrainRecovery,
+    },
+    Refused(ResetStartFailure),
+    Failed(ResetDrainFailure),
+}
+
+#[must_use = "reset drain must be settled or transferred with recovery authority"]
+pub struct ResetDrainAuthority {
+    session: Option<RootSession>,
+}
+
+impl_redacted_debug!(ResetDrainAuthority);
+
+impl ResetDrainAuthority {
+    pub fn try_settle(mut self) -> ResetStartOutcome {
+        let session = self.session.take().expect("reset drain retains session");
+        let authority = session.authority.clone();
+        let settlement = authority.try_finish_terminal_drain(AUTHORITY_RESETTING, true);
+        match settlement {
+            Ok(SessionDrainSettlement::Ready) => ResetStartOutcome::Ready(RootResetAuthority {
+                session: Some(session),
+            }),
+            Ok(SessionDrainSettlement::Pending) => {
+                self.session = Some(session);
+                ResetStartOutcome::Pending(self)
+            }
+            Ok(SessionDrainSettlement::Recovery { recovery, permits }) => {
+                self.session = Some(session);
+                ResetStartOutcome::Recovery {
+                    recovery: ResetDrainRecovery {
+                        drain: self,
+                        recovery,
+                        permits,
+                    },
+                }
+            }
+            Err(error) => {
+                self.session = Some(session);
+                ResetStartOutcome::Failed(ResetDrainFailure::new(self, error))
+            }
+        }
+    }
+
+    fn cancel_reset(mut self) -> RootRevokeOutcome {
+        let session = self.session.take().expect("reset drain retains session");
+        let cancellation = session
+            .authority
+            .cancel_reset_pending_directory_creates();
+        let revoke = RootRevokeDrain {
+            session: Some(session),
+        };
+        match cancellation {
+            Ok(()) => revoke.try_settle(),
+            Err(error) => {
+                RootRevokeOutcome::Failed(RootRevokeDrainFailure::new(revoke, error))
+            }
+        }
+    }
+}
+
+#[must_use = "reset recovery must settle every abandoned effect before the drain can finish"]
+pub struct ResetDrainRecovery {
+    drain: ResetDrainAuthority,
+    recovery: SessionDrainRecoveryState,
+    permits: Vec<DrainRecoveryPermit>,
+}
+
+impl_redacted_debug!(ResetDrainRecovery);
+
+impl ResetDrainRecovery {
+    pub fn file_count(&self) -> usize {
+        self.recovery.file_count()
+    }
+
+    pub fn directory_count(&self) -> usize {
+        self.recovery.directory_count()
+    }
+
+    pub fn unsettled_external_or_deferred_count(&self) -> usize {
+        self.recovery.preserved_directory_create_count()
+    }
+
+    pub fn defer_managed_reset(mut self) -> ResetStartOutcome {
+        self.recovery
+            .transfer_preserved_directory_creates_to_reset(&self.permits);
+        self.finish()
+    }
+
+    pub fn acknowledge_external(mut self) -> ResetStartOutcome {
+        self.recovery
+            .acknowledge_external_directory_creates(&self.permits);
+        self.finish()
+    }
+
+    pub fn restore_all(mut self) -> ResetStartOutcome {
+        self.recovery
+            .settle(&self.permits, DrainRecoveryDecision::Restore);
+        self.finish()
+    }
+
+    pub fn remove_all(mut self) -> ResetStartOutcome {
+        self.recovery
+            .settle(&self.permits, DrainRecoveryDecision::Remove);
+        self.finish()
+    }
+
+    fn finish(self) -> ResetStartOutcome {
+        if self.recovery.is_empty() {
+            self.drain.try_settle()
+        } else {
+            ResetStartOutcome::Recovery {
+                recovery: self,
+            }
+        }
+    }
+}
+
+#[must_use = "reset start failure retains the sole session and must be retried or explicitly cancelled"]
+pub struct ResetStartFailure {
+    error: io::Error,
+    session: Option<RootSession>,
+}
+
+impl fmt::Debug for ResetStartFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ResetStartFailure")
+            .finish_non_exhaustive()
+    }
+}
+
+impl ResetStartFailure {
+    fn new(session: RootSession, error: io::Error) -> Self {
+        Self {
+            error,
+            session: Some(session),
+        }
+    }
+
+    pub fn error(&self) -> &io::Error {
+        &self.error
+    }
+
+    pub fn retry(mut self) -> ResetStartOutcome {
+        self.session
+            .take()
+            .expect("reset start refusal retains session")
+            .begin_reset()
+    }
+
+    pub fn cancel_reset(mut self) -> RootSession {
+        self.session
+            .take()
+            .expect("reset start refusal retains session")
+    }
+}
+
+impl Drop for ResetStartFailure {
+    fn drop(&mut self) {
+        if self.session.is_some() {
+            std::process::abort();
+        }
+    }
+}
+
+#[must_use = "reset drain failure retains authority and must be retried or cancelled into revocation"]
+pub struct ResetDrainFailure {
+    error: io::Error,
+    drain: Option<ResetDrainAuthority>,
+}
+
+impl_redacted_debug!(ResetDrainFailure);
+
+impl ResetDrainFailure {
+    fn new(drain: ResetDrainAuthority, error: io::Error) -> Self {
+        Self {
+            error,
+            drain: Some(drain),
+        }
+    }
+
+    pub fn error(&self) -> &io::Error {
+        &self.error
+    }
+
+    pub fn retry(mut self) -> ResetStartOutcome {
+        self.drain
+            .take()
+            .expect("reset failure retains drain")
+            .try_settle()
+    }
+
+    pub fn cancel_reset(mut self) -> RootRevokeOutcome {
+        self.drain
+            .take()
+            .expect("reset failure retains drain")
+            .cancel_reset()
+    }
+}
+
+impl Drop for ResetDrainFailure {
+    fn drop(&mut self) {
+        if self.drain.is_some() {
+            std::process::abort();
+        }
+    }
+}
+
+#[must_use = "reset authority must clear the root or explicitly preserve pending effects"]
+pub struct RootResetAuthority {
+    session: Option<RootSession>,
+}
+
+#[must_use = "root clear outcomes retain reset authority until deletion is proven"]
+#[derive(Debug)]
+pub enum RootClearOutcome {
+    Cleared,
+    Failed(RootClearFailure),
+}
+
+#[must_use = "failed root clear authority must be retried or explicitly preserved"]
+pub struct RootClearFailure {
+    error: io::Error,
+    authority: Option<RootResetAuthority>,
+}
+
+impl_redacted_debug!(RootClearFailure);
+
+impl RootClearFailure {
+    pub fn error(&self) -> &io::Error {
+        &self.error
+    }
+
+    pub fn retry(mut self) -> RootClearOutcome {
+        self.authority
+            .take()
+            .expect("root clear failure retains reset authority")
+            .clear_root()
+    }
+
+    pub fn acknowledge_preserved(mut self) -> Result<(), Self> {
+        let authority = self
+            .authority
+            .take()
+            .expect("root clear failure retains reset authority");
+        match authority.acknowledge_preserved_directory_creates() {
+            Ok(()) => Ok(()),
+            Err(authority) => {
+                self.authority = Some(authority);
+                Err(self)
+            }
+        }
+    }
+}
+
+impl Drop for RootClearFailure {
+    fn drop(&mut self) {
+        if self.authority.is_some() {
+            std::process::abort();
+        }
+    }
+}
+
+impl fmt::Debug for RootResetAuthority {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RootResetAuthority")
+            .finish_non_exhaustive()
+    }
+}
+
+impl RootResetAuthority {
+    pub fn root_identity(&self) -> DirectoryIdentity {
+        self.session
+            .as_ref()
+            .expect("reset session is retained")
+            .root_identity
+    }
+
+    pub fn clear_root(mut self) -> RootClearOutcome {
+        let result = (|| {
+            let session = self
+                .session
+                .as_ref()
+                .expect("reset session is retained");
+            let operation = session.authority.enter_reset_operation()?;
+            platform::validate_lease(&session.authority.lease)?;
+            platform::validate_root(&session.authority.root)?;
+            let lease_name = LeafName::new(ROOT_LEASE_NAME).expect("fixed lease name is valid");
+            platform::validate_process_image_outside_root(
+                &session.authority.process_image,
+                &session.authority.root,
+            )?;
+            platform::clear_root_children(
+                &session.authority.root,
+                &session.authority.lease,
+                lease_name.as_os_str(),
+            )?;
+            session
+                .authority
+                .retire_reset_pending_directory_creates(&operation)
+        })();
+        if let Err(error) = result {
+            return RootClearOutcome::Failed(RootClearFailure {
+                error,
+                authority: Some(self),
+            });
+        }
+        self.revoke();
+        drop(self.session.take());
+        RootClearOutcome::Cleared
+    }
+
+    pub fn acknowledge_preserved_directory_creates(mut self) -> Result<(), Self> {
+        let session = self
+            .session
+            .as_ref()
+            .expect("reset session is retained");
+        let operation = match session.authority.enter_reset_operation() {
+            Ok(operation) => operation,
+            Err(_) => return Err(self),
+        };
+        if session
+            .authority
+            .retire_reset_pending_directory_creates(&operation)
+            .is_err()
+        {
+            return Err(self);
+        }
+        drop(operation);
+        self.revoke();
+        drop(self.session.take());
+        Ok(())
+    }
+
+    pub fn release(mut self) -> Result<(), Self> {
+        if self
+            .session
+            .as_ref()
+            .expect("reset session is retained")
+            .authority
+            .has_reset_pending_directory_creates()
+        {
+            return Err(self);
+        }
+        self.revoke();
+        drop(self.session.take());
+        Ok(())
+    }
+
+    fn revoke(&self) {
+        if let Some(session) = &self.session {
+            let mut state = session
+                .authority
+                .operations
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            state.phase = AUTHORITY_REVOKED;
+        }
+    }
+}
+
+impl Drop for RootResetAuthority {
+    fn drop(&mut self) {
+        if self.session.as_ref().is_some_and(|session| {
+            session
+                .authority
+                .has_reset_pending_directory_creates()
+        }) {
+            std::process::abort();
+        }
+        self.revoke();
+    }
+}
+
+fn stale_capability() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::PermissionDenied,
+        "filesystem capability has been revoked",
+    )
+}
+
+fn identity_changed(message: &'static str) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, message)
+}
+
+fn sync_rename_parents(source: &Directory, destination: &Directory) -> io::Result<()> {
+    platform::sync_directory(&destination.inner.handle)?;
+    if !Arc::ptr_eq(&source.inner, &destination.inner) {
+        platform::sync_directory(&source.inner.handle)?;
+    }
+    Ok(())
+}
+
+fn random_leaf(prefix: &str) -> LeafName {
+    use rand::RngCore;
+
+    let mut nonce = [0_u8; 16];
+    rand::rngs::OsRng.fill_bytes(&mut nonce);
+    LeafName::new(format!("{prefix}{}", encode_hex(&nonce)))
+        .expect("generated filesystem leaf is valid")
+}
+
+fn hash_parked_file(
+    file: &platform::FileCleanupHandle,
+    size: u64,
+) -> io::Result<[u8; 32]> {
+    use sha2::{Digest, Sha256};
+
+    let mut digest = Sha256::new();
+    let mut offset = 0_u64;
+    while offset < size {
+        let mut chunk = [0_u8; 64 * 1024];
+        let wanted = usize::try_from((size - offset).min(chunk.len() as u64))
+            .map_err(|_| io::Error::other("file hash bound does not fit this platform"))?;
+        let read = platform::read_parked_at(file, &mut chunk[..wanted], offset)?;
+        if read == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "file ended before its authenticated size",
+            ));
+        }
+        digest.update(&chunk[..read]);
+        offset = offset
+            .checked_add(read as u64)
+            .ok_or_else(|| io::Error::other("file hash offset overflowed"))?;
+    }
+    let mut probe = [0_u8; 1];
+    if platform::read_parked_at(file, &mut probe, size)? != 0 {
+        return Err(identity_changed(
+            "file exceeded its authenticated size during hashing",
+        ));
+    }
+    Ok(digest.finalize().into())
+}
+
+fn verify_parked_file(
+    parent: &Directory,
+    park_name: &LeafName,
+    parked: &platform::FileCleanupHandle,
+    expected_content: &ExpectedFileContent,
+) -> io::Result<()> {
+    verify_parked_revision(parent, park_name, parked, &expected_content.revision)?;
+    if hash_parked_file(parked, expected_content.revision.size)? != expected_content.sha256
+        || verify_parked_revision(parent, park_name, parked, &expected_content.revision).is_err()
+    {
+        return Err(identity_changed(
+            "parked file did not match its expected content receipt",
+        ));
+    }
+    Ok(())
+}
+
+fn verify_parked_revision(
+    parent: &Directory,
+    park_name: &LeafName,
+    parked: &platform::FileCleanupHandle,
+    revision: &FileRevision,
+) -> io::Result<()> {
+    if platform::parked_file_receipt_fields(parked)? != (revision.size, revision.stamp)
+        || platform::file_binding_state(
+            &parent.inner.handle,
+            park_name.as_os_str(),
+            revision.identity,
+        )? != platform::BindingState::Exact
+    {
+        return Err(identity_changed("parked file revision changed"));
+    }
+    Ok(())
+}
+
+fn finish_new_file_park(
+    request: FileParkRequest,
+    park_name: LeafName,
+    mut token: FileParkRegistryToken,
+    operation: &CapabilityOperation,
+) -> FileParkOutcome {
+    let parent = request.file.parent.clone();
+    let original_name = request.file.name.clone();
+    let identity = request.file.identity;
+    let authority = operation.authority.clone();
+    let mut guard = match authority.take_file_park(operation, &token) {
+        Ok(guard) => guard,
+        Err(error) => {
+            return FileParkOutcome::AppliedUnverified(FileParkObligation {
+                error,
+                request: Some(request),
+                token,
+                park_name,
+                phase: FileParkPhase::Parking,
+                digest_verified: false,
+            });
+        }
+    };
+    match verify_parked_file(
+        &parent,
+        &park_name,
+        &guard.record().cleanup,
+        &request.expected,
+    ) {
+        Ok(()) if parent.validate(operation).is_ok() => {
+            guard.record_mut().expected_digest = None;
+            guard.record_mut().phase = FileParkRegistryPhase::Live;
+            drop(guard);
+            FileParkOutcome::Parked(ParkedFile {
+                parent,
+                original_name,
+                park_name,
+                identity,
+                size: request.expected.revision.size,
+                stamp: request.expected.revision.stamp,
+                verified: true,
+                token,
+                authority: request.file.authority.clone(),
+            })
+        }
+        Ok(()) => {
+            guard.record_mut().expected_digest = None;
+            drop(guard);
+            FileParkOutcome::AppliedUnverified(FileParkObligation {
+                error: identity_changed("file park lost its authority chain"),
+                request: Some(request),
+                token,
+                park_name,
+                phase: FileParkPhase::Parking,
+                digest_verified: true,
+            })
+        }
+        Err(error) => {
+            let restoration = {
+                let record = guard.record_mut();
+                platform::restore_parked_file(
+                    &record.parent.inner.handle,
+                    record.name.as_os_str(),
+                    &mut record.cleanup,
+                    record.identity,
+                    record.original_name.as_os_str(),
+                )
+            };
+            match restoration {
+            Ok(_) if request.file.validate(operation).is_ok() => {
+                guard.disarm(&mut token, operation);
+                FileParkOutcome::NoEffect { error, request }
+            }
+            Ok(_) => {
+                drop(guard);
+                FileParkOutcome::AppliedUnverified(FileParkObligation {
+                    error: identity_changed(
+                        "rejected file receipt was restored but not re-admitted",
+                    ),
+                    request: Some(request),
+                    token,
+                    park_name,
+                    phase: FileParkPhase::RestoringRejectedReceipt,
+                    digest_verified: false,
+                })
+            }
+            Err(restore) => {
+                drop(guard);
+                FileParkOutcome::AppliedUnverified(FileParkObligation {
+                    error: io::Error::other(format!(
+                        "file receipt was rejected and restoration was not proven: {error}; {restore}"
+                    )),
+                    request: Some(request),
+                    token,
+                    park_name,
+                    phase: FileParkPhase::RestoringRejectedReceipt,
+                    digest_verified: false,
+                })
+            }
+        }
+        }
+    }
+}
+
+fn settle_file_park(mut obligation: FileParkObligation, force_restore: bool) -> FileParkResolution {
+    let request = obligation.request.as_ref().expect("park obligation retains request");
+    let authority = match request.file.parent.authority() {
+        Ok(authority) => authority,
+        Err(_) => return FileParkResolution::Indeterminate(obligation),
+    };
+    let operation = match authority.enter() {
+        Ok(operation) => operation,
+        Err(_) => return FileParkResolution::Indeterminate(obligation),
+    };
+    if request.file.parent.validate(&operation).is_err()
+        || request.validate_revision(&operation).is_err()
+    {
+        return FileParkResolution::Indeterminate(obligation);
+    }
+    let mut guard = match authority.take_file_park(&operation, &obligation.token) {
+        Ok(guard) => guard,
+        Err(_) => return FileParkResolution::Indeterminate(obligation),
+    };
+    let original = platform::file_binding_state(
+        &guard.record().parent.inner.handle,
+        guard.record().original_name.as_os_str(),
+        guard.record().identity,
+    );
+    let parked_state = platform::file_binding_state(
+        &guard.record().parent.inner.handle,
+        guard.record().name.as_os_str(),
+        guard.record().identity,
+    );
+    match (original, parked_state) {
+        (Ok(platform::BindingState::Exact), Ok(platform::BindingState::Absent)) => {
+            guard.disarm(&mut obligation.token, &operation);
+            FileParkResolution::NoEffect(obligation.request.take().expect("park request"))
+        }
+        (Ok(platform::BindingState::Absent), Ok(platform::BindingState::Exact)) => {
+            if force_restore || obligation.phase == FileParkPhase::RestoringRejectedReceipt {
+                let restoration = {
+                    let record = guard.record_mut();
+                    platform::restore_parked_file(
+                        &record.parent.inner.handle,
+                        record.name.as_os_str(),
+                        &mut record.cleanup,
+                        record.identity,
+                        record.original_name.as_os_str(),
+                    )
+                };
+                return match restoration {
+                    Ok(_) if request.file.validate(&operation).is_ok() => {
+                        guard.disarm(&mut obligation.token, &operation);
+                        FileParkResolution::NoEffect(
+                            obligation.request.take().expect("park request"),
+                        )
+                    }
+                    _ => FileParkResolution::Indeterminate(obligation),
+                };
+            }
+            if !obligation.digest_verified {
+                if let Err(error) = verify_parked_file(
+                    &request.file.parent,
+                    &obligation.park_name,
+                    &guard.record().cleanup,
+                    &request.expected,
+                ) {
+                    obligation.error = error;
+                    obligation.phase = FileParkPhase::RestoringRejectedReceipt;
+                    drop(guard);
+                    return settle_file_park(obligation, true);
+                }
+                obligation.digest_verified = true;
+                guard.record_mut().expected_digest = None;
+            }
+            let request = obligation.request.take().expect("park request");
+            if verify_parked_revision(
+                &request.file.parent,
+                &obligation.park_name,
+                &guard.record().cleanup,
+                &request.expected.revision,
+            )
+            .is_err()
+            {
+                obligation.request = Some(request);
+                return FileParkResolution::Indeterminate(obligation);
+            }
+            if request.file.parent.validate(&operation).is_err() {
+                obligation.request = Some(request);
+                return FileParkResolution::Indeterminate(obligation);
+            }
+            guard.record_mut().phase = FileParkRegistryPhase::Live;
+            drop(guard);
+            FileParkResolution::Parked(ParkedFile {
+                parent: request.file.parent.clone(),
+                original_name: request.file.name.clone(),
+                park_name: obligation.park_name,
+                identity: request.file.identity,
+                size: request.expected.revision.size,
+                stamp: request.expected.revision.stamp,
+                verified: true,
+                token: obligation.token,
+                authority: request.file.authority.clone(),
+            })
+        }
+        _ => FileParkResolution::Indeterminate(obligation),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn acquire_test_root(path: &Path) -> RootSession {
+        match RootSession::acquire(path) {
+            RootSessionAcquireOutcome::Acquired(session) => session,
+            RootSessionAcquireOutcome::NoEffect(error) => {
+                panic!("root acquisition had no effect: {error}")
+            }
+            RootSessionAcquireOutcome::AppliedUnverified(obligation) => {
+                match obligation.reconcile() {
+                    RootSessionAcquireOutcome::Acquired(session) => session,
+                    RootSessionAcquireOutcome::NoEffect(error) => {
+                        panic!("root acquisition reconciliation had no effect: {error}")
+                    }
+                    RootSessionAcquireOutcome::AppliedUnverified(obligation) => {
+                        let error = obligation.error().to_string();
+                        let _ = obligation.cleanup();
+                        panic!("root acquisition remained indeterminate: {error}")
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn leaf_names_are_exact_single_components() {
+        for value in ["", ".", "..", "nested/name"] {
+            assert!(LeafName::new(value).is_err());
+        }
+        assert!(LeafName::new("state.json").is_ok());
+    }
+
+    #[test]
+    fn a_second_root_session_fails_without_waiting() {
+        let temporary = tempfile::tempdir().expect("temporary root");
+        let first = acquire_test_root(temporary.path());
+        assert!(matches!(
+            RootSession::acquire(temporary.path()),
+            RootSessionAcquireOutcome::NoEffect(RootSessionError::Busy)
+        ));
+        drop(first);
+        drop(acquire_test_root(temporary.path()));
+    }
+
+    #[test]
+    fn revoked_capabilities_refuse_operations() {
+        let temporary = tempfile::tempdir().expect("temporary root");
+        let session = acquire_test_root(temporary.path());
+        let root = session.root().expect("root capability");
+        assert!(matches!(session.revoke(), RootRevokeOutcome::Revoked));
+        assert_eq!(
+            root.entries(1).expect_err("revoked capability must refuse").kind(),
+            io::ErrorKind::PermissionDenied
+        );
+    }
+}
