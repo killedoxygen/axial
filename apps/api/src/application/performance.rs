@@ -1,14 +1,13 @@
-//! Application commands for Performance-owned workflows.
+//! Performance-owned application workflows.
 //!
-//! Application orchestrates command handling here while `axial-performance`
-//! keeps ownership of rules refresh mechanics and validation.
+//! Application orchestrates workflow requests here while `axial-performance`
+//! owns rules refresh mechanics and validation.
 
 mod benchmark_matrix;
 mod host;
 mod qualification;
 mod workflow;
 
-use super::{ApplicationCommand, PerformancePlanSummaryViewModel, ViewModelAction, ViewModelTone};
 use crate::guardian::{GuardianFact, performance_rules_guardian_facts};
 use crate::observability::{
     RedactionAudience, bounded_descriptor_token, evidence_text_looks_sensitive,
@@ -29,7 +28,7 @@ use axial_performance::{
     RuleChannel, RuleSource, RulesRefreshError, RulesValidation,
 };
 use axum::{Json, http::StatusCode};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -101,6 +100,42 @@ pub use workflow::{
 pub(crate) use workflow::{
     performance_health, performance_install, spawn_pending_performance_operations,
 };
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ViewModelTone {
+    Ok,
+    Warn,
+    Err,
+    Mute,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ViewModelAction {
+    pub command: CommandKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action: Option<String>,
+    pub label: String,
+    pub enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disabled_reason: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PerformancePlanSummaryViewModel {
+    pub state_id: String,
+    pub title: String,
+    pub detail: String,
+    pub tone: ViewModelTone,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub health: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub composition_id: Option<String>,
+    #[serde(default)]
+    pub managed_artifact_count: usize,
+    #[serde(default)]
+    pub actions: Vec<ViewModelAction>,
+}
 
 #[derive(Debug, Serialize)]
 pub struct PerformanceRulesStatusResponse {
@@ -406,7 +441,6 @@ pub(crate) async fn refresh_performance_rules(
     producer.spawn(async move {
         let result = handle_refresh_performance_rules(
             &state,
-            ApplicationCommand::new(CommandKind::RefreshPerformanceRules),
             abandoned.as_ref(),
             ready_tx,
             terminal_failure_task,
@@ -506,17 +540,10 @@ pub fn refresh_performance_rules_error_response(
 
 async fn handle_refresh_performance_rules(
     state: &AppState,
-    command: ApplicationCommand,
     abandoned: &AtomicBool,
     ready_for_effect: tokio::sync::oneshot::Sender<()>,
     terminal_failure: Arc<tokio::sync::Notify>,
 ) -> Result<PerformanceRulesStatusResponse, RefreshPerformanceRulesError> {
-    if command.kind != CommandKind::RefreshPerformanceRules {
-        return Err(RefreshPerformanceRulesError::UnsupportedCommand {
-            actual: command.kind,
-        });
-    }
-
     let operation_id = new_refresh_rules_operation_id();
     let mut entry = OperationJournalEntry::new(
         JournalId::new(format!("journal-{}", operation_id.as_str())),
@@ -970,8 +997,6 @@ pub enum RefreshPerformanceRulesError {
     Unconfigured,
     #[error("performance operations are shutting down")]
     ShuttingDown,
-    #[error("unsupported application command for performance rules refresh: {actual:?}")]
-    UnsupportedCommand { actual: CommandKind },
     #[error(transparent)]
     Refresh(RulesRefreshError),
     #[error(transparent)]

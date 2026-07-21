@@ -12,9 +12,9 @@ use super::{
     record_loader_base_install_dependency_guardian_failure_outcome,
     record_loader_install_operation_guardian_failure_outcome, register_install_foreground,
     retain_install_foreground, sanitize_install_progress, spawn_install_foreground_retention,
-    stage_install_version_command, terminal_failure_progress_or_default,
+    terminal_failure_progress_or_default,
 };
-use crate::application::{InstallVersionCommand, instances::invalidate_create_view_source};
+use crate::application::instances::invalidate_create_view_source;
 use crate::dto::loaders::{
     LoaderBuildsResponse, LoaderComponentsResponse, LoaderGameVersionsResponse,
 };
@@ -94,13 +94,6 @@ pub(super) async fn start_loader_install_with_foreground(
         }
     };
     let operation_id = install_operation_id(&install_id);
-    let staging = stage_install_version_command(
-        InstallVersionCommand {
-            version_id: target_version_id.clone(),
-        },
-        install_id.clone(),
-        operation_id.clone(),
-    );
     let store = state.installs().clone();
     let journals = state.journals().clone();
     let reservation = begin_install_journal_with_owned_reconciliation(
@@ -382,7 +375,7 @@ pub(super) async fn start_loader_install_with_foreground(
 
     Ok(InstallStartResponse {
         install_id,
-        operation_id: staging.result.operation_id.unwrap_or(operation_id),
+        operation_id,
         view_model: InstallProgressViewModel::starting(),
     })
 }

@@ -1,5 +1,4 @@
 use super::*;
-use crate::application::InstallVersionCommand;
 use crate::execution::file::{FileWriteRequest, write_file_atomically};
 use crate::execution::persistence::{AtomicWriteBackend, PersistenceCoordinator};
 use crate::guardian::{DiagnosisId, GuardianInstallArtifactFailureKind};
@@ -30,38 +29,6 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 use tokio::sync::{Notify, mpsc as tokio_mpsc};
 use tokio::time::timeout;
-
-#[test]
-fn install_staging_builds_command_operation_and_payload() {
-    let operation_id = install_operation_id("install-1");
-    let staging = stage_install_version_command(
-        InstallVersionCommand {
-            version_id: "1.21.5".to_string(),
-        },
-        "install-1".to_string(),
-        operation_id.clone(),
-    );
-
-    assert_eq!(staging.command.kind, CommandKind::InstallVersion);
-    assert_eq!(
-        staging.command.target.as_ref().map(|target| target.kind),
-        Some(TargetKind::Version)
-    );
-    assert_eq!(staging.result.operation_id, Some(operation_id.clone()));
-    assert_eq!(
-        staging
-            .result
-            .carriers
-            .operation
-            .as_ref()
-            .and_then(|operation| operation.operation_id.as_ref()),
-        Some(&operation_id)
-    );
-    assert_eq!(
-        staging.result.payload.install_id.as_deref(),
-        Some("install-1")
-    );
-}
 
 #[test]
 fn known_good_acceptance_failure_replaces_terminal_success_with_bounded_failure() {
@@ -950,7 +917,7 @@ async fn install_events_return_bounded_not_found_for_unknown_install() {
 }
 
 #[tokio::test]
-async fn install_existing_active_response_includes_backend_operation_id() {
+async fn p00_b07_contract_install_response_uses_direct_operation_identity() {
     let root = temp_root("install-existing-active-operation");
     let state = build_test_state(&root);
     configure_library_dir(&state, &root.join("library"));
@@ -978,6 +945,10 @@ async fn install_existing_active_response_includes_backend_operation_id() {
 
     assert_eq!(response.install_id, "existing-install");
     assert_eq!(response.operation_id, operation_id);
+    assert_eq!(
+        response.operation_id,
+        install_operation_id(&response.install_id)
+    );
     assert!(state.journals().get(&operation_id).is_some());
 
     let _ = fs::remove_dir_all(root);

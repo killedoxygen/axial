@@ -224,6 +224,17 @@ pub enum InstallQueueEnqueueOutcome {
     MovedToFront { queue_id: String },
 }
 
+impl InstallQueueEnqueueOutcome {
+    pub(crate) fn queue_id(&self) -> &str {
+        match self {
+            Self::Enqueued { queue_id }
+            | Self::AlreadyActive { queue_id }
+            | Self::AlreadyQueued { queue_id }
+            | Self::MovedToFront { queue_id } => queue_id,
+        }
+    }
+}
+
 #[derive(Default)]
 struct InstallQueueInner {
     active: Option<ActiveQueuedInstallEntry>,

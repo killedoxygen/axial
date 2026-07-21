@@ -162,7 +162,7 @@ pub async fn execute_instance_setup(
         state,
         producer,
         move |state, producer, update_admission| async move {
-            let mut created = handle_create_instance_from_continuation(
+            let created = handle_create_instance_from_continuation(
                 &state,
                 request.create,
                 true,
@@ -170,16 +170,14 @@ pub async fn execute_instance_setup(
                 update_admission.clone(),
             )
             .await?;
-            let instance_id = created.instance.id.clone();
+            let instance_id = created.response.instance.id.clone();
             let setup_cleanup = crate::application::install::setup_instance_cleanup(
                 &state,
-                &created.instance,
+                &created.response.instance,
                 true,
             );
-            let prerequisite_queue_id = created
-                .queued_install
-                .as_ref()
-                .and_then(|queued| queued.queue_id.clone());
+            let prerequisite_queue_id = created.prerequisite_queue_id;
+            let mut response = created.response;
             match queue_content_install_with_cleanup_after_admitted(
                 &state,
                 ContentInstallRequest {
@@ -195,8 +193,8 @@ pub async fn execute_instance_setup(
             .await
             {
                 Ok(queue) => {
-                    created.install_queue = Some(queue);
-                    Ok(created)
+                    response.install_queue = Some(queue);
+                    Ok(response)
                 }
                 Err(error) => {
                     let _ = crate::application::install::remove_pristine_setup_instance_admitted(
@@ -238,7 +236,7 @@ pub async fn execute_modpack_instance_setup(
         state,
         producer,
         move |state, producer, update_admission| async move {
-            let mut created = handle_create_instance_from_continuation(
+            let created = handle_create_instance_from_continuation(
                 &state,
                 request.create,
                 false,
@@ -246,16 +244,14 @@ pub async fn execute_modpack_instance_setup(
                 update_admission.clone(),
             )
             .await?;
-            let instance_id = created.instance.id.clone();
+            let instance_id = created.response.instance.id.clone();
             let setup_cleanup = crate::application::install::setup_instance_cleanup(
                 &state,
-                &created.instance,
+                &created.response.instance,
                 false,
             );
-            let prerequisite_queue_id = created
-                .queued_install
-                .as_ref()
-                .and_then(|queued| queued.queue_id.clone());
+            let prerequisite_queue_id = created.prerequisite_queue_id;
+            let mut response = created.response;
             let queued = queue_modpack_install_after_admitted(
                 &state,
                 ModpackInstallRequest {
@@ -273,8 +269,8 @@ pub async fn execute_modpack_instance_setup(
             .await;
             match queued {
                 Ok(queue) => {
-                    created.install_queue = Some(queue);
-                    Ok(created)
+                    response.install_queue = Some(queue);
+                    Ok(response)
                 }
                 Err(error) => {
                     let _ = crate::application::install::remove_pristine_setup_instance_admitted(

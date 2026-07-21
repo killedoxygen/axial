@@ -1,16 +1,9 @@
-use super::super::{ApplicationCommand, CommandResult, InstallVersionPayload};
 use crate::guardian::GuardianInstallOutcomeSummary;
 use crate::observability::OperationProofRecord;
 use crate::state::contracts::OperationId;
 use axial_content::ContentKind;
 use axial_minecraft::{DownloadProgress, LoaderComponentId};
 use serde::{Deserialize, Serialize};
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-pub struct InstallVersionStaging {
-    pub command: ApplicationCommand,
-    pub result: CommandResult<InstallVersionPayload>,
-}
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct InstallVersionStartRequest {

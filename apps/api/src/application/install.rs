@@ -14,7 +14,6 @@ mod stream;
 #[cfg(test)]
 pub(crate) use operation::loader_install_guardian_evidence_kind;
 
-use super::InstallVersionCommand;
 use crate::application::instances::instance_version_is_installed_and_launchable;
 use crate::guardian::{
     DiagnosisId, GuardianInstallArtifactFailureEvidence, GuardianInstallOutcomeSummary,
@@ -548,6 +547,12 @@ pub(crate) struct ContinuationInstallQueueResult {
     pub outcome: InstallQueueEnqueueOutcome,
 }
 
+impl ContinuationInstallQueueResult {
+    pub(crate) fn queue_id(&self) -> &str {
+        self.outcome.queue_id()
+    }
+}
+
 struct InstallQueueSelection {
     notice: InstallQueueNoticeViewModel,
     outcome: InstallQueueEnqueueOutcome,
@@ -570,7 +575,7 @@ pub use model::{
     InstallQueueContentItemViewModel, InstallQueueContentSelection,
     InstallQueueInstallItemViewModel, InstallQueueLoaderItemViewModel, InstallQueueNoticeViewModel,
     InstallQueueRequest, InstallQueueStateResponse, InstallQueueViewModel,
-    InstallQueuedItemViewModel, InstallStartResponse, InstallStatusResponse, InstallVersionStaging,
+    InstallQueuedItemViewModel, InstallStartResponse, InstallStatusResponse,
     InstallVersionStartRequest, LoaderBuildsRequest, LoaderInstallStartRequest,
 };
 use operation::{
@@ -592,7 +597,7 @@ pub use operation::{
     install_guardian_outcome_summary_from_journal, install_operation_id,
     public_loader_install_progress_record_json, public_vanilla_install_progress_record_json,
     record_install_operation_interrupted, record_install_operation_progress,
-    sanitize_install_progress, stage_install_version_command,
+    sanitize_install_progress,
 };
 #[cfg(test)]
 use operation::{loader_install_progress_view_model, typed_runtime_failure_evidence};
@@ -654,13 +659,6 @@ async fn start_install_version_with_foreground(
         }
     };
     let operation_id = install_operation_id(&install_id);
-    let staging = stage_install_version_command(
-        InstallVersionCommand {
-            version_id: version_id.clone(),
-        },
-        install_id.clone(),
-        operation_id.clone(),
-    );
     let store = state.installs().clone();
     let journals = state.journals().clone();
     let reservation = begin_install_journal_with_owned_reconciliation(
@@ -906,7 +904,7 @@ async fn start_install_version_with_foreground(
 
     Ok(InstallStartResponse {
         install_id,
-        operation_id: staging.result.operation_id.unwrap_or(operation_id),
+        operation_id,
         view_model: InstallProgressViewModel::starting(),
     })
 }
@@ -1220,7 +1218,7 @@ pub(crate) async fn enqueue_install_from_continuation(
     };
     let selection =
         enqueue_install_request(state, request, InstallQueuePlacement::Back, None, None).await?;
-    let selected_queue_id = install_queue_outcome_id(&selection.outcome).to_string();
+    let selected_queue_id = selection.outcome.queue_id().to_string();
     let owns_selected_queue = matches!(
         &selection.outcome,
         InstallQueueEnqueueOutcome::Enqueued { .. }
@@ -1507,7 +1505,7 @@ async fn enqueue_install_with_placement(
         setup_cleanup,
     )
     .await?;
-    let selected_queue_id = install_queue_outcome_id(&selection.outcome).to_string();
+    let selected_queue_id = selection.outcome.queue_id().to_string();
     let owns_selected_queue = matches!(
         &selection.outcome,
         InstallQueueEnqueueOutcome::Enqueued { .. }
@@ -2915,15 +2913,6 @@ fn install_queue_notice_for_outcome(
             "Retry moved to the front of the queue",
             Some(label),
         ),
-    }
-}
-
-fn install_queue_outcome_id(outcome: &InstallQueueEnqueueOutcome) -> &str {
-    match outcome {
-        InstallQueueEnqueueOutcome::Enqueued { queue_id }
-        | InstallQueueEnqueueOutcome::AlreadyActive { queue_id }
-        | InstallQueueEnqueueOutcome::AlreadyQueued { queue_id }
-        | InstallQueueEnqueueOutcome::MovedToFront { queue_id } => queue_id,
     }
 }
 

@@ -368,7 +368,7 @@ mod tests {
             include_str!("../routes/mod.rs"),
             include_str!("../routes/instances.rs"),
             include_str!("../dto/mod.rs"),
-            include_str!("../application/commands.rs"),
+            include_str!("../application/instances/create.rs"),
         );
 
         assert!(!guardian.contains("impl GuardianUserConfigRestoreOffer"));

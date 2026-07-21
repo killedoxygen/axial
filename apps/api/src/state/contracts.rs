@@ -828,9 +828,7 @@ pub enum StabilizationSystem {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
 pub enum CommandKind {
-    CreateInstance,
     LaunchInstance,
-    StopSession,
     InstallVersion,
     ModifyInstanceContent,
     RepairInstance,
@@ -838,8 +836,6 @@ pub enum CommandKind {
     ApplyPerformancePlan,
     RefreshPerformanceRules,
     ValidateInstance,
-    OpenInstanceFolder,
-    RefreshAccountReadiness,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]

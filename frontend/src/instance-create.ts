@@ -33,20 +33,10 @@ export interface CreateInstanceResult {
   error?: string;
 }
 
-interface CreateQueuedInstallSummary {
-  state_id?: string;
-  kind?: string;
-  label?: string;
-  queue_id?: string | null;
-  install_id?: string | null;
-  operation_id?: string | null;
-}
-
 interface CreateResponse extends CreateResultPresentationSource {
   id?: string;
   error?: string;
   install_queue?: InstallQueueStateResponse;
-  queued_install?: CreateQueuedInstallSummary;
 }
 
 function isInstance(value: CreateResponse & Partial<Instance>): value is CreateResponse & Instance {

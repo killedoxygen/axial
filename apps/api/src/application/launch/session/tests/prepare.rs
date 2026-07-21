@@ -174,31 +174,6 @@ async fn prepare_launch_session_creates_no_user_owned_paths() {
     .await
     .expect("prepare launch session");
 
-    assert_eq!(
-        prepared.task.application.command.kind,
-        crate::state::contracts::CommandKind::LaunchInstance
-    );
-    assert_eq!(
-        prepared
-            .task
-            .application
-            .result
-            .payload
-            .session_id
-            .as_deref(),
-        Some(prepared.task.intent.session_id.as_str())
-    );
-    assert_eq!(
-        prepared
-            .task
-            .application
-            .result
-            .carriers
-            .session
-            .as_ref()
-            .and_then(|session| session.state.as_deref()),
-        Some("queued")
-    );
     assert_eq!(prepared.task.preflight_stage_evidence.len(), 2);
     assert_eq!(
         prepared.task.preflight_stage_evidence[0].id,

@@ -117,7 +117,6 @@ enum TerminalObservationHandoff {
 }
 
 struct LaunchSessionRunTask {
-    application: crate::application::LaunchInstanceStaging,
     preflight_stage_evidence: Vec<axial_launcher::LaunchStageEvidence>,
     instance: axial_config::Instance,
     intent: axial_launcher::LaunchIntent,
@@ -139,7 +138,6 @@ impl LaunchSessionRunTask {
         let super::session::LaunchSessionTask {
             update_admission,
             integrity_foreground,
-            application,
             preflight_stage_evidence,
             instance,
             intent,
@@ -153,7 +151,6 @@ impl LaunchSessionRunTask {
             integrity_foreground,
             update_admission,
             Self {
-                application,
                 preflight_stage_evidence,
                 instance,
                 intent,
@@ -687,7 +684,6 @@ async fn launch_session_inner_with_control(
     control: &LaunchLoopControl,
 ) -> Result<LaunchSuccess, LaunchRequestError> {
     let LaunchSessionRunTask {
-        application,
         preflight_stage_evidence,
         instance,
         intent,
@@ -698,11 +694,8 @@ async fn launch_session_inner_with_control(
         java_probe_receipt,
     } = task;
     let session_id = intent.session_id.clone();
-    trace_launch_event(
-        &session_id,
-        &format!("application command staged: {:?}", application.command.kind),
-    );
-    let mut initial_evidence = launch_application_stage_evidence(&application);
+    trace_launch_event(&session_id, "application command staged: LaunchInstance");
+    let mut initial_evidence = launch_application_stage_evidence();
     initial_evidence.extend(preflight_stage_evidence);
     state
         .sessions()
@@ -5665,16 +5658,6 @@ mod tests {
                 .try_admit_update_sensitive_operation()
                 .expect("admit test launch"),
             integrity_foreground,
-            application: crate::application::stage_launch_instance_command(
-                crate::application::LaunchInstanceCommand {
-                    instance_id: "instance".to_string(),
-                    username: None,
-                    max_memory_mb: None,
-                    min_memory_mb: None,
-                    client_started_at_ms: None,
-                },
-                Some(session_id.to_string()),
-            ),
             preflight_stage_evidence: crate::application::launch_preflight_stage_evidence(
                 &crate::guardian::guardian_preflight_outcome(
                     crate::guardian::GuardianPreflightOutcomeRequest::new(
@@ -5727,16 +5710,6 @@ mod tests {
     ) {
         task.instance.id = instance_id.to_string();
         task.intent.instance_id = instance_id.to_string();
-        task.application = crate::application::stage_launch_instance_command(
-            crate::application::LaunchInstanceCommand {
-                instance_id: instance_id.to_string(),
-                username: None,
-                max_memory_mb: None,
-                min_memory_mb: None,
-                client_started_at_ms: None,
-            },
-            Some(task.intent.session_id.clone()),
-        );
     }
 
     #[cfg(unix)]

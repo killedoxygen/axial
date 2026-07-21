@@ -441,7 +441,9 @@ mod tests {
             payload["guardian_notice"]["state_id"],
             "unknown_reset_to_auto"
         );
-        assert_eq!(payload["result"]["command"], "CreateInstance");
+        assert!(payload.get("result").is_none());
+        assert!(payload.get("queued_install").is_none());
+        assert!(payload.get("view_model").is_some());
         assert_no_route_sensitive_fragments(&payload);
     }
 

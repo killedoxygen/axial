@@ -71,7 +71,7 @@ keep this short and real. if the codebase changes, update this file.
 - `core/launcher`, `core/minecraft`, `core/performance`, and `core/config` are the long-term Rust product logic crates
 - if backend work is part of this branch, add it in Rust
 - loader-specific install behavior belongs in `core/minecraft/src/loaders/strategies/`, not in route handlers
-- Application owns command staging, operation ids, route orchestration, and command result/view-model carriers
+- Application owns workflow request/response contracts, operation ids, route orchestration, and backend-authored view models
 - Execution owns primitive facts/effects only; it must not decide Guardian policy
 - Guardian owns horizontal safety diagnosis, action selection, self-healing orchestration, failure-memory loop control, and backend-authored safety outcomes
 - State owns sessions, operation journals, operation state, failure memory, proof persistence, and runtime admission/lifecycle coordination for identity-bound managed composition state

@@ -1,21 +1,10 @@
-//! Application-owned launch command staging.
-//!
-//! This module owns the Application command identity for launch workflows. It
-//! does not perform route extraction, core launch preparation, process spawning,
-//! or self-healing.
-
-use super::{
-    ApplicationCommand, ApplicationCommandRequest, CommandResult, CommandResultCarriers,
-    LaunchInstanceCommand, LaunchInstancePayload, SessionCommandCarrier,
-};
+//! Application-owned launch workflow orchestration and presentation.
 use crate::guardian::{
     GuardianPreflightOutcome, GuardianSummaryDecision, guardian_launch_stage_evidence,
 };
 use crate::observability::{RedactionAudience, sanitize_evidence_text, sanitize_evidence_token};
-use crate::state::contracts::{CommandKind, OperationStatus};
 use axial_launcher::LaunchStageEvidence;
 use axum::{Json, http::StatusCode};
-use serde::Serialize;
 use serde_json::{Value, json};
 
 mod benchmark;
@@ -66,62 +55,16 @@ pub(crate) fn launch_shutdown_error_response(
     )
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-pub struct LaunchInstanceStaging {
-    pub command: ApplicationCommand,
-    pub result: CommandResult<LaunchInstancePayload>,
-}
-
-pub fn stage_launch_instance_command(
-    request: LaunchInstanceCommand,
-    session_id: Option<String>,
-) -> LaunchInstanceStaging {
-    let command = ApplicationCommandRequest::LaunchInstance(request).command();
-    let result = CommandResult {
-        command: CommandKind::LaunchInstance,
-        operation_id: None,
-        status: OperationStatus::Planned,
-        safety: None,
-        carriers: CommandResultCarriers {
-            session: Some(SessionCommandCarrier {
-                session_id: session_id.clone(),
-                state: session_id.as_ref().map(|_| "queued".to_string()),
-                pid: None,
-                exit_code: None,
-            }),
-            ..CommandResultCarriers::default()
-        },
-        payload: LaunchInstancePayload {
-            session_id,
-            operation_id: None,
-        },
-        view_model: None,
-    };
-
-    LaunchInstanceStaging { command, result }
-}
-
-pub fn launch_application_stage_evidence(
-    staging: &LaunchInstanceStaging,
-) -> Vec<LaunchStageEvidence> {
-    let mut details = vec!["command:launch_instance".to_string()];
-    if let Some(session_state) = staging
-        .result
-        .carriers
-        .session
-        .as_ref()
-        .and_then(|session| session.state.as_deref())
-        .and_then(|state| sanitize_evidence_token(state, RedactionAudience::UserVisible, 32))
-    {
-        details.push(format!("session_state:{session_state}"));
-    }
-    details.push(format!("status:{:?}", staging.result.status));
-
+pub(crate) fn launch_application_stage_evidence() -> Vec<LaunchStageEvidence> {
     vec![launch_stage_evidence(
         "application_launch_command_staged",
         "application",
         "Application staged the launch command.",
-        details,
+        vec![
+            "command:launch_instance".to_string(),
+            "session_state:queued".to_string(),
+            "status:Planned".to_string(),
+        ],
     )]
 }
 
@@ -227,48 +170,33 @@ fn launch_stage_evidence(
 
 #[cfg(test)]
 mod tests {
-    use super::stage_launch_instance_command;
-    use crate::application::LaunchInstanceCommand;
+    use super::launch_application_stage_evidence;
     use crate::execution::ExecutionFactKind;
     use crate::execution::runtime::runtime_fact;
     use crate::guardian::guardian_fact_from_execution;
     use crate::state::contracts::{
-        CommandKind, OperationPhase, OperationStatus, OwnershipClass, StabilizationSystem,
-        TargetDescriptor, TargetKind,
+        OperationPhase, OwnershipClass, StabilizationSystem, TargetDescriptor, TargetKind,
     };
     use axial_launcher::LaunchStageEvidence;
 
     #[test]
-    fn launch_staging_builds_application_command_and_session_carrier() {
-        let staging = stage_launch_instance_command(
-            LaunchInstanceCommand {
-                instance_id: "instance-1".to_string(),
-                username: Some("Player".to_string()),
-                max_memory_mb: Some(4096),
-                min_memory_mb: None,
-                client_started_at_ms: Some(42),
-            },
-            Some("session-1".to_string()),
-        );
+    fn p00_b07_contract_launch_stage_evidence_is_unchanged() {
+        let evidence = launch_application_stage_evidence();
 
-        assert_eq!(staging.command.kind, CommandKind::LaunchInstance);
+        assert_eq!(evidence.len(), 1);
+        assert_eq!(evidence[0].id, "application_launch_command_staged");
+        assert_eq!(evidence[0].system, "application");
         assert_eq!(
-            staging.command.target.as_ref().map(|target| target.kind),
-            Some(TargetKind::Instance)
-        );
-        assert_eq!(staging.result.status, OperationStatus::Planned);
-        assert_eq!(
-            staging.result.payload.session_id.as_deref(),
-            Some("session-1")
+            evidence[0].summary,
+            "Application staged the launch command."
         );
         assert_eq!(
-            staging
-                .result
-                .carriers
-                .session
-                .as_ref()
-                .and_then(|session| session.state.as_deref()),
-            Some("queued")
+            evidence[0].details,
+            [
+                "command:launch_instance",
+                "session_state:queued",
+                "status:Planned",
+            ]
         );
     }
 

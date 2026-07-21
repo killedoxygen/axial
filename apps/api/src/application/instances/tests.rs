@@ -2005,7 +2005,8 @@ async fn create_queued_instance_does_not_rebuild_known_good() {
     .await
     .expect("create queued instance");
 
-    assert!(created.queued_install.is_some());
+    assert!(created.install_queue.is_some());
+    assert_eq!(created.view_model.state_id, "created_install_queued");
     assert_eq!(rebuilds.load(Ordering::SeqCst), 0);
 }
 
@@ -2510,6 +2511,100 @@ async fn normal_setup_transaction_creates_and_queues_once() {
     let _ = fs::remove_dir_all(root);
 }
 
+#[tokio::test]
+async fn p00_b07_contract_cross_owner_setup_uses_exact_create_prerequisite() {
+    let fixture = TestFixture::new("setup-exact-create-prerequisite");
+    fixture.configure_create_manifest(&["1.21.2"]);
+    seed_committed_busy_install(&fixture.state, "busy-setup-prerequisite").await;
+    fixture
+        .state
+        .installs()
+        .enqueue_queued_install(
+            "older-setup-prerequisite".to_string(),
+            InstallQueueSpec::vanilla("1.20.1".to_string()),
+            InstallQueuePlacement::Back,
+        )
+        .await;
+
+    let producer = fixture.producer.claim_child();
+    let (instance_id, selected_queue_id) = super::setup::execute_setup_mutation_owned(
+        &fixture.state,
+        producer,
+        move |state, producer, update_admission| async move {
+            let created = super::create::handle_create_instance_from_continuation(
+                &state,
+                CreateInstanceRequest {
+                    name: "Exact setup prerequisite".to_string(),
+                    selection_id: "vanilla|1.21.2".to_string(),
+                    ..CreateInstanceRequest::default()
+                },
+                true,
+                producer.claim_child(),
+                update_admission.clone(),
+            )
+            .await?;
+            let selected_queue_id = created
+                .prerequisite_queue_id
+                .expect("create selected install identity");
+            let instance_id = created.response.instance.id.clone();
+            let cleanup = crate::application::install::setup_instance_cleanup(
+                &state,
+                &created.response.instance,
+                true,
+            );
+            crate::application::content::queue_content_install_with_cleanup_after_admitted(
+                &state,
+                crate::application::ContentInstallRequest {
+                    instance_id: instance_id.clone(),
+                    selections: vec![crate::application::content::ContentSelection {
+                        canonical_id: "modrinth:exact-setup-prerequisite".to_string(),
+                        kind: axial_content::ContentKind::Mod,
+                        version_id: Some("exact-setup-prerequisite-v1".to_string()),
+                    }],
+                    allow_incompatible: false,
+                },
+                Some(cleanup),
+                Some(selected_queue_id.clone()),
+                producer,
+                update_admission,
+            )
+            .await?;
+            Ok((instance_id, selected_queue_id))
+        },
+    )
+    .await
+    .expect("create setup queue dependency");
+
+    let snapshot = fixture.state.installs().queue_snapshot().await;
+    let selected_base = snapshot
+        .pending
+        .iter()
+        .find(|entry| {
+            matches!(
+                &entry.spec,
+                InstallQueueSpec::Vanilla { version_id } if version_id == "1.21.2"
+            )
+        })
+        .expect("selected base install remains queued");
+    assert_eq!(selected_base.queue_id, selected_queue_id);
+    assert_ne!(selected_base.queue_id, "older-setup-prerequisite");
+
+    let content_prerequisite = snapshot
+        .pending
+        .iter()
+        .find_map(|entry| match &entry.spec {
+            InstallQueueSpec::Content {
+                instance_id: queued_instance_id,
+                prerequisite_queue_id,
+                ..
+            } if queued_instance_id == &instance_id => prerequisite_queue_id.as_deref(),
+            _ => None,
+        })
+        .expect("dependent setup content remains queued");
+    assert_eq!(content_prerequisite, selected_queue_id);
+    assert_ne!(content_prerequisite, "older-setup-prerequisite");
+}
+
 async fn enqueue_test_setup_content(
     state: &AppState,
     instance: &axial_config::Instance,
@@ -2789,10 +2884,7 @@ async fn create_instance_applies_initial_settings_and_supported_preset_in_backen
     .await
     .expect("create tuned instance");
 
-    assert_eq!(
-        created.result.command,
-        crate::state::contracts::CommandKind::CreateInstance
-    );
+    assert_eq!(created.view_model.state_id, "created_install_queued");
     assert_eq!(created.instance.max_memory_mb, 6144);
     assert_eq!(created.instance.min_memory_mb, 1024);
     assert_eq!(created.instance.window_width, 1280);
@@ -3090,9 +3182,17 @@ async fn create_instance_loader_version_uses_beta_build_when_only_beta_builds_ex
     .expect("beta-only loader version should create");
 
     assert_eq!(created.instance.version_id, beta_version_id);
-    let queued = created.queued_install.expect("queued install summary");
+    let install_queue = created.install_queue.expect("install queue");
+    let queued = install_queue
+        .items
+        .iter()
+        .find(|item| {
+            item.install_item.loader.as_ref().is_some_and(|loader| {
+                loader.component_id == axial_minecraft::LoaderComponentId::NeoForge.as_str()
+            })
+        })
+        .expect("queued NeoForge install");
     assert_eq!(queued.kind, "loader");
-    assert_eq!(queued.state_id, "install_queued");
     assert_eq!(queued.label, "NeoForge 26.2.0.3-beta for Minecraft 26.2");
 }
 
@@ -3136,7 +3236,16 @@ async fn create_instance_quilt_java25_default_uses_compatible_beta_fallback() {
         )
         .expect("valid Quilt identity")
     );
-    let queued = created.queued_install.expect("queued install summary");
+    let install_queue = created.install_queue.expect("install queue");
+    let queued = install_queue
+        .items
+        .iter()
+        .find(|item| {
+            item.install_item.loader.as_ref().is_some_and(|loader| {
+                loader.component_id == axial_minecraft::LoaderComponentId::Quilt.as_str()
+            })
+        })
+        .expect("queued Quilt install");
     assert_eq!(queued.kind, "loader");
     assert_eq!(queued.label, "Quilt 0.30.0-beta.8 for Minecraft 26.1.2");
 }
@@ -3567,7 +3676,7 @@ async fn create_instance_view_enables_quilt_java25_when_compatible_beta_is_defau
 }
 
 #[tokio::test]
-async fn create_instance_vanilla_selection_returns_backend_queue_state() {
+async fn p00_b07_contract_cross_owner_create_response_uses_one_exact_queue_projection() {
     let fixture = TestFixture::new("create-vanilla-queue");
     fixture
         .state
@@ -3595,23 +3704,32 @@ async fn create_instance_vanilla_selection_returns_backend_queue_state() {
     .await
     .expect("create and queue install");
 
+    let serialized = serde_json::to_value(&created).expect("serialize create response");
+    assert!(serialized.get("install_queue").is_some());
+    assert!(serialized.get("result").is_none());
+    assert!(serialized.get("queued_install").is_none());
+    assert_eq!(
+        serialized["view_model"]["state_id"],
+        "created_install_queued"
+    );
+    assert_eq!(
+        serialized["view_model"]["summary"],
+        "Created Queued; Minecraft 1.21.2 queued."
+    );
+
     assert_eq!(created.instance.version_id, "1.21.2");
-    let queued = created.queued_install.expect("queued install summary");
-    assert_eq!(queued.state_id, "install_queued");
-    assert_eq!(queued.kind, "vanilla");
-    assert_eq!(queued.label, "Minecraft 1.21.2");
-    assert!(queued.queue_id.is_some());
     let install_queue = created.install_queue.expect("install queue");
     assert_eq!(
         install_queue.items.first().map(|item| item.label.as_str()),
         Some("Minecraft 1.20.1")
     );
-    assert!(
-        install_queue
-            .items
-            .iter()
-            .any(|item| item.queue_id.as_str() == queued.queue_id.as_deref().unwrap_or_default())
-    );
+    let queued = install_queue
+        .items
+        .iter()
+        .find(|item| item.install_item.loader.is_none() && item.install_item.version_id == "1.21.2")
+        .expect("selected 1.21.2 queue item");
+    assert_eq!(queued.kind, "vanilla");
+    assert_eq!(queued.label, "Minecraft 1.21.2");
 }
 
 #[tokio::test]
@@ -3638,7 +3756,6 @@ async fn create_instance_installed_vanilla_selection_does_not_queue_install() {
     assert_eq!(created.instance.version_id, "1.21.1");
     assert!(created.instance.launchable);
     assert!(created.install_queue.is_none());
-    assert!(created.queued_install.is_none());
     assert_eq!(created.view_model.state_id, "created");
 }
 
@@ -3661,7 +3778,7 @@ async fn create_instance_missing_library_queues_install() {
     .expect("create instance and queue repair install");
 
     assert!(!created.instance.launchable);
-    assert!(created.queued_install.is_some());
+    assert!(created.install_queue.is_some());
 }
 
 #[tokio::test]
@@ -3682,7 +3799,7 @@ async fn create_instance_missing_asset_object_does_not_queue_install() {
     .expect("create instance without asset object walk");
 
     assert!(created.instance.launchable);
-    assert!(created.queued_install.is_none());
+    assert!(created.install_queue.is_none());
 }
 
 #[tokio::test]
@@ -3703,7 +3820,7 @@ async fn create_instance_same_size_client_drift_does_not_queue_install() {
     .expect("create instance without client hash scan");
 
     assert!(created.instance.launchable);
-    assert!(created.queued_install.is_none());
+    assert!(created.install_queue.is_none());
 }
 
 #[tokio::test]
@@ -3793,7 +3910,7 @@ async fn create_instance_checksumless_loader_probe_stays_strict_without_instance
     .expect("create checksumless loader instance");
 
     assert!(!created.instance.launchable);
-    assert!(created.queued_install.is_some());
+    assert!(created.install_queue.is_some());
 }
 
 #[tokio::test]

@@ -17,8 +17,7 @@ use crate::application::timing::{
 };
 use crate::application::version::VERSION_SCAN_DEGRADED_MESSAGE;
 use crate::application::{
-    LaunchInstanceCommand, LaunchInstanceStaging, flush_pending_saved_skin_applies_for_launch,
-    launch_preflight_stage_evidence, stage_launch_instance_command,
+    flush_pending_saved_skin_applies_for_launch, launch_preflight_stage_evidence,
 };
 use crate::execution::integrity::{IntegrityTier0Report, sense_integrity_tier0};
 use crate::guardian::{
@@ -86,7 +85,6 @@ pub struct LaunchRequest {
 pub(crate) struct LaunchSessionTask {
     pub update_admission: UpdateOperationLease,
     pub integrity_foreground: IntegrityForegroundLease,
-    pub application: LaunchInstanceStaging,
     pub preflight_stage_evidence: Vec<LaunchStageEvidence>,
     pub instance: Instance,
     pub intent: LaunchIntent,
@@ -346,17 +344,6 @@ async fn prepare_launch_session_with_auth_refresh(
 
     let launched_at = timestamp_utc();
     let session_id = policy::generate_session_id();
-    let application = stage_launch_instance_command(
-        LaunchInstanceCommand {
-            instance_id: instance.id.clone(),
-            username: payload.username.clone(),
-            max_memory_mb: payload.max_memory_mb,
-            min_memory_mb: payload.min_memory_mb,
-            client_started_at_ms: payload.client_started_at_ms,
-        },
-        Some(session_id.0.clone()),
-    );
-
     let intent = LaunchIntent {
         session_id: session_id.0.clone(),
         library_dir: library_dir.clone(),
@@ -438,7 +425,6 @@ async fn prepare_launch_session_with_auth_refresh(
         task: LaunchSessionTask {
             update_admission,
             integrity_foreground,
-            application,
             preflight_stage_evidence: preflight.preflight_stage_evidence,
             instance: instance.clone(),
             intent,

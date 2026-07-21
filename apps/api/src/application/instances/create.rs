@@ -12,7 +12,6 @@ use super::{
     instance_store_error_class, instance_write_error_response, known_good_rebuild_error_response,
     rollback_new_instance,
 };
-use crate::application::install::InstallQueueInstallItemViewModel;
 use crate::application::timing::{
     CreateInstanceTiming, CreateViewTiming, trace_create_instance, trace_create_view,
 };
@@ -20,8 +19,7 @@ use crate::application::version::{
     VERSION_SCAN_DEGRADED_MESSAGE, installed_versions_scan, version_scan_degraded_response,
 };
 use crate::application::{
-    CommandResult, CommandResultCarriers, CreateInstancePayload, InstallQueueRequest,
-    InstallQueueStateResponse, enqueue_install_from_continuation,
+    InstallQueueRequest, InstallQueueStateResponse, enqueue_install_from_continuation,
     loader_pre_operation_error_response, rebuild_registered_known_good,
     registered_known_good_is_live,
 };
@@ -30,7 +28,6 @@ use crate::guardian::{
     guardian_jvm_preset_notice, guardian_jvm_preset_options, normalize_create_jvm_preset,
 };
 use crate::observability::telemetry::TelemetryEvent;
-use crate::state::contracts::{CommandKind, OperationId, OperationStatus};
 use crate::state::{
     AppState, InstallQueueEnqueueOutcome, InstalledVersionsLookup, IntegrityForegroundLease,
     ProducerLease, RequestProducerHandoff, UpdateOperationLease, new_instance,
@@ -247,30 +244,19 @@ pub(crate) struct CreateInstanceResultViewModel {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-pub(crate) struct CreateQueuedInstallSummary {
-    pub state_id: String,
-    pub kind: String,
-    pub label: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub queue_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub install_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub operation_id: Option<OperationId>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub(crate) struct CreateInstanceResponse {
     #[serde(flatten)]
     pub instance: EnrichedInstance,
-    pub result: CommandResult<CreateInstancePayload>,
     pub view_model: CreateInstanceResultViewModel,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub install_queue: Option<InstallQueueStateResponse>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub queued_install: Option<CreateQueuedInstallSummary>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub guardian_notice: Option<GuardianJvmPresetNotice>,
+}
+
+pub(super) struct CreateInstanceCompletion {
+    pub response: CreateInstanceResponse,
+    pub prerequisite_queue_id: Option<String>,
 }
 
 pub(crate) async fn handle_create_instance_view(
@@ -446,6 +432,7 @@ pub(crate) async fn handle_create_instance_owned(
         },
     )
     .await
+    .map(|completion| completion.response)
 }
 
 async fn handle_create_instance_owned_with_rebuild<Rebuild, RebuildFuture>(
@@ -455,7 +442,7 @@ async fn handle_create_instance_owned_with_rebuild<Rebuild, RebuildFuture>(
     seed_shared_files: bool,
     inherited_update_admission: Option<UpdateOperationLease>,
     rebuild: Rebuild,
-) -> Result<CreateInstanceResponse, (StatusCode, Json<serde_json::Value>)>
+) -> Result<CreateInstanceCompletion, (StatusCode, Json<serde_json::Value>)>
 where
     Rebuild: FnOnce(AppState, IntegrityForegroundLease, ProducerLease, String) -> RebuildFuture
         + Send
@@ -494,7 +481,6 @@ where
                 &installed_scan,
                 &selection,
             )?;
-            let queued_install_request = install_request.clone();
             let instance = build_created_instance(&payload, &selection, &preset)?;
             let rebuild_owner = producer.claim_child();
             let queue_owner = install_request.as_ref().map(|_| producer.claim_child());
@@ -528,7 +514,8 @@ where
                         {
                             Err(active_install_missed_instance_response())
                         } else {
-                            Ok(Some(queued.response))
+                            let queue_id = queued.queue_id().to_string();
+                            Ok((Some(queued.response), Some(queue_id)))
                         }
                     }
                     Err(error) => Err(error),
@@ -540,13 +527,13 @@ where
                     instance_id.clone(),
                 )
                 .await
-                .map(|()| None)
+                .map(|()| (None, None))
                 .map_err(|error| {
                     known_good_rebuild_error_response(InstanceWriteOperation::Create, error)
                 }),
             };
-            let install_queue = match completion {
-                Ok(install_queue) => install_queue,
+            let (install_queue, prerequisite_queue_id) = match completion {
+                Ok(completion) => completion,
                 Err(error) => {
                     if let Err(rollback_error) =
                         rollback_new_instance(&transaction_state, &foreground, &instance_id).await
@@ -575,25 +562,30 @@ where
                 .emit(TelemetryEvent::instance_created(Some(
                     enriched.version_display.loader_key.clone(),
                 )));
-            let queued_install = install_queue.as_ref().and_then(|response| {
-                queued_install_request
-                    .as_ref()
-                    .and_then(|request| create_queued_install_summary(response, request))
+            let install_queue_label = install_queue.as_ref().and_then(|response| {
+                prerequisite_queue_id
+                    .as_deref()
+                    .and_then(|queue_id| create_install_queue_label(response, queue_id))
             });
+            let install_queued = prerequisite_queue_id.is_some();
             trace_create_instance(CreateInstanceTiming {
                 total: started_at.elapsed(),
                 version_count: installed_scan.versions.len(),
                 scan_source: installed_lookup.source.as_str(),
                 refresh_count: installed_lookup.refresh_count,
-                queued_install: queued_install.is_some(),
+                queued_install: install_queued,
             });
 
-            Ok(create_instance_response(
-                enriched,
-                install_queue,
-                queued_install,
-                guardian_jvm_preset_notice(preset),
-            ))
+            Ok(CreateInstanceCompletion {
+                response: create_instance_response(
+                    enriched,
+                    install_queue,
+                    install_queued,
+                    install_queue_label,
+                    guardian_jvm_preset_notice(preset),
+                ),
+                prerequisite_queue_id,
+            })
         })
         .await
         .map_err(|_| instance_internal_error_response(InstanceWriteOperation::Create))?
@@ -641,19 +633,19 @@ impl CreateSelection {
         }
     }
 
-    fn install_queue_request(&self) -> Option<InstallQueueRequest> {
+    fn install_queue_request(&self) -> InstallQueueRequest {
         match self {
-            Self::Vanilla { version_id } => Some(InstallQueueRequest::Vanilla {
+            Self::Vanilla { version_id } => InstallQueueRequest::Vanilla {
                 version_id: version_id.clone(),
-            }),
+            },
             Self::Loader {
                 component_id,
                 build_id,
                 ..
-            } => Some(InstallQueueRequest::Loader {
+            } => InstallQueueRequest::Loader {
                 component_id: *component_id,
                 build_id: build_id.clone(),
-            }),
+            },
         }
     }
 
@@ -916,9 +908,7 @@ fn create_install_queue_request_if_needed(
     installed_scan: &crate::application::version::InstalledVersionsScan,
     selection: &CreateSelection,
 ) -> Result<Option<InstallQueueRequest>, (StatusCode, Json<serde_json::Value>)> {
-    let Some(request) = selection.install_queue_request() else {
-        return Ok(None);
-    };
+    let request = selection.install_queue_request();
     if version_is_launch_ready_or_user_blocked(
         state,
         installed_lookup,
@@ -945,7 +935,7 @@ pub(super) async fn handle_create_instance_from_continuation(
     seed_shared_files: bool,
     producer: ProducerLease,
     update_admission: UpdateOperationLease,
-) -> Result<CreateInstanceResponse, (StatusCode, Json<serde_json::Value>)> {
+) -> Result<CreateInstanceCompletion, (StatusCode, Json<serde_json::Value>)> {
     handle_create_instance_owned_with_rebuild(
         state,
         payload,
@@ -979,7 +969,9 @@ where
         .producer_handoff()
         .try_claim()
         .expect("claim test create producer");
-    handle_create_instance_owned_with_rebuild(state, payload, producer, true, None, rebuild).await
+    handle_create_instance_owned_with_rebuild(state, payload, producer, true, None, rebuild)
+        .await
+        .map(|completion| completion.response)
 }
 
 fn version_is_launch_ready_or_user_blocked(
@@ -1011,37 +1003,23 @@ fn version_is_launch_ready_or_user_blocked(
         .all(|reason| reason.id == LaunchReadinessReasonId::JavaOverrideMissing))
 }
 
-fn create_queued_install_summary(
+fn create_install_queue_label(
     response: &InstallQueueStateResponse,
-    request: &InstallQueueRequest,
-) -> Option<CreateQueuedInstallSummary> {
+    queue_id: &str,
+) -> Option<String> {
     if let Some(active) = response
         .active
         .as_ref()
-        .filter(|active| install_queue_item_matches_request(&active.install_item, request))
+        .filter(|active| active.queue_id == queue_id)
     {
-        return Some(CreateQueuedInstallSummary {
-            state_id: "install_active".to_string(),
-            kind: active.kind.clone(),
-            label: active.label.clone(),
-            queue_id: Some(active.queue_id.clone()),
-            install_id: active.install_id.clone(),
-            operation_id: active.operation_id.clone(),
-        });
+        return Some(active.label.clone());
     }
 
     response
         .items
         .iter()
-        .find(|item| install_queue_item_matches_request(&item.install_item, request))
-        .map(|item| CreateQueuedInstallSummary {
-            state_id: "install_queued".to_string(),
-            kind: item.kind.clone(),
-            label: item.label.clone(),
-            queue_id: Some(item.queue_id.clone()),
-            install_id: None,
-            operation_id: None,
-        })
+        .find(|item| item.queue_id == queue_id)
+        .map(|item| item.label.clone())
 }
 
 fn active_install_missed_instance_response() -> (StatusCode, Json<serde_json::Value>) {
@@ -1053,61 +1031,23 @@ fn active_install_missed_instance_response() -> (StatusCode, Json<serde_json::Va
     )
 }
 
-fn install_queue_item_matches_request(
-    item: &InstallQueueInstallItemViewModel,
-    request: &InstallQueueRequest,
-) -> bool {
-    match request {
-        InstallQueueRequest::Vanilla { version_id } => {
-            item.loader.is_none() && item.version_id == *version_id
-        }
-        InstallQueueRequest::Loader {
-            component_id,
-            build_id,
-        } => item.loader.as_ref().is_some_and(|loader| {
-            loader.component_id == component_id.as_str() && loader.build_id == *build_id
-        }),
-        InstallQueueRequest::Content { .. } => false,
-    }
-}
-
 fn create_instance_response(
     instance: EnrichedInstance,
     install_queue: Option<InstallQueueStateResponse>,
-    queued_install: Option<CreateQueuedInstallSummary>,
+    install_queued: bool,
+    install_queue_label: Option<String>,
     guardian_notice: Option<GuardianJvmPresetNotice>,
 ) -> CreateInstanceResponse {
-    let payload = CreateInstancePayload {
-        instance_id: Some(instance.id.clone()),
-        queue_id: queued_install
-            .as_ref()
-            .and_then(|summary| summary.queue_id.clone()),
-        install_id: queued_install
-            .as_ref()
-            .and_then(|summary| summary.install_id.clone()),
-        operation_id: queued_install
-            .as_ref()
-            .and_then(|summary| summary.operation_id.clone()),
+    let summary = match (install_queued, install_queue_label) {
+        (_, Some(label)) => format!("Created {}; {label} queued.", instance.name),
+        (true, None) => format!("Created {}; install queued.", instance.name),
+        (false, None) => format!("Created {}", instance.name),
     };
-    let operation_id = payload.operation_id.clone();
-    let summary = queued_install
-        .as_ref()
-        .map(|queued| format!("Created {}; {} queued.", instance.name, queued.label))
-        .unwrap_or_else(|| format!("Created {}", instance.name));
 
     CreateInstanceResponse {
         instance,
-        result: CommandResult {
-            command: CommandKind::CreateInstance,
-            operation_id,
-            status: OperationStatus::Succeeded,
-            safety: None,
-            carriers: CommandResultCarriers::default(),
-            payload,
-            view_model: None,
-        },
         view_model: CreateInstanceResultViewModel {
-            state_id: if queued_install.is_some() {
+            state_id: if install_queued {
                 "created_install_queued".to_string()
             } else {
                 "created".to_string()
@@ -1125,7 +1065,6 @@ fn create_instance_response(
                 .map(str::to_string),
         },
         install_queue,
-        queued_install,
         guardian_notice,
     }
 }
@@ -1631,6 +1570,33 @@ fn stale_loader_catalog_response() -> (StatusCode, Json<serde_json::Value>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn p00_b07_contract_create_selection_install_request_is_total_and_exact() {
+        let vanilla = CreateSelection::Vanilla {
+            version_id: "1.21.5".to_string(),
+        };
+        assert_eq!(
+            vanilla.install_queue_request(),
+            InstallQueueRequest::Vanilla {
+                version_id: "1.21.5".to_string(),
+            }
+        );
+
+        let loader = CreateSelection::Loader {
+            component_id: LoaderComponentId::Fabric,
+            build_id: "net.fabricmc.fabric-loader|1.21.5|0.16.14".to_string(),
+            target_version_id: "fabric-loader-0.16.14-1.21.5".to_string(),
+            minecraft_version: "1.21.5".to_string(),
+        };
+        assert_eq!(
+            loader.install_queue_request(),
+            InstallQueueRequest::Loader {
+                component_id: LoaderComponentId::Fabric,
+                build_id: "net.fabricmc.fabric-loader|1.21.5|0.16.14".to_string(),
+            }
+        );
+    }
 
     #[test]
     fn stale_loader_catalog_requirement_uses_current_installed_state() {

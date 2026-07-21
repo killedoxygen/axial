@@ -131,20 +131,6 @@ interface CreateLoaderBuildsViewResponse {
 
 interface CreateInstanceResponse extends EnrichedInstance {
   install_queue?: InstallQueueStateResponse;
-  result: {
-    command: 'CreateInstance';
-    operation_id: null;
-    status: 'succeeded';
-    safety: null;
-    carriers: Record<string, never>;
-    payload: {
-      instance_id: string;
-      queue_id: null;
-      install_id: null;
-      operation_id: null;
-    };
-    view_model: null;
-  };
   view_model: {
     state_id: 'created';
     tone: 'success';
@@ -1342,20 +1328,6 @@ function createInstance(body: unknown): CreateInstanceResponse {
 
   return {
     ...created,
-    result: {
-      command: 'CreateInstance',
-      operation_id: null,
-      status: 'succeeded',
-      safety: null,
-      carriers: {},
-      payload: {
-        instance_id: created.id,
-        queue_id: null,
-        install_id: null,
-        operation_id: null,
-      },
-      view_model: null,
-    },
     view_model: {
       state_id: 'created',
       tone: 'success',

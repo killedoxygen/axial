@@ -4923,16 +4923,6 @@ async fn test_launch_session_task(
             .try_admit_update_sensitive_operation()
             .expect("admit prepared response launch"),
         integrity_foreground,
-        application: crate::application::stage_launch_instance_command(
-            crate::application::LaunchInstanceCommand {
-                instance_id: "instance-queued".to_string(),
-                username: None,
-                max_memory_mb: Some(6144),
-                min_memory_mb: Some(1024),
-                client_started_at_ms: None,
-            },
-            Some("session-queued".to_string()),
-        ),
         preflight_stage_evidence: crate::application::launch_preflight_stage_evidence(
             &crate::guardian::guardian_preflight_outcome(
                 crate::guardian::GuardianPreflightOutcomeRequest::new(

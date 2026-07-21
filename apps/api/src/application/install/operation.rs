@@ -1,10 +1,6 @@
 use super::{
     INSTALL_FAILURE_MESSAGE, InstallJournalReconciliation, InstallProgressStepViewModel,
-    InstallProgressViewModel, InstallVersionStaging, reconcile_install_journal_transition,
-};
-use crate::application::{
-    ApplicationCommandRequest, CommandResult, CommandResultCarriers, InstallVersionCommand,
-    InstallVersionPayload, OperationCommandCarrier,
+    InstallProgressViewModel, reconcile_install_journal_transition,
 };
 use crate::guardian::{
     DiagnosisId, GuardianActionKind, GuardianDomain, GuardianInstallArtifactFailureEvidence,
@@ -172,37 +168,6 @@ async fn reconcile_install_journal_error(
     expected: impl Fn(&OperationJournalEntry) -> bool,
 ) -> Result<InstallJournalReconciliation, OperationJournalStoreError> {
     reconcile_install_journal_transition(journals, operation_id, error, expected).await
-}
-
-pub fn stage_install_version_command(
-    request: InstallVersionCommand,
-    install_id: String,
-    operation_id: OperationId,
-) -> InstallVersionStaging {
-    let command = ApplicationCommandRequest::InstallVersion(request).command();
-    let result = CommandResult {
-        command: CommandKind::InstallVersion,
-        operation_id: Some(operation_id.clone()),
-        status: OperationStatus::Planned,
-        safety: None,
-        carriers: CommandResultCarriers {
-            operation: Some(OperationCommandCarrier {
-                operation_id: Some(operation_id.clone()),
-                status: Some(OperationStatus::Planned),
-                journal: None,
-                events: Vec::new(),
-                evidence: Vec::new(),
-            }),
-            ..CommandResultCarriers::default()
-        },
-        payload: InstallVersionPayload {
-            install_id: Some(install_id),
-            operation_id: Some(operation_id),
-        },
-        view_model: None,
-    };
-
-    InstallVersionStaging { command, result }
 }
 
 pub fn install_operation_id(install_id: &str) -> OperationId {
