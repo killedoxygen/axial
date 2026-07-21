@@ -96,6 +96,10 @@ keep this short and real. if the codebase changes, update this file.
 - frontend CSS is imported through `frontend/src/styles.ts`; `frontend/static` contains source assets only
 - production and watch builds atomically publish one complete, budget-checked generation under ignored `frontend/dist`; every generated and public file is owned by its deterministic receipt
 - frontend generation mutations hold one OS-released, portable case-folded loopback lease and fail closed on contention
+- Task-owned Cargo target writers and storage reports share one fail-fast loopback lease only within the same network namespace; direct Cargo, other namespaces, and orphaned Cargo remain unobserved
+- storage source receipts admit fixed regular no-link inputs, hash owned descriptors, and bound observable reads; POSIX descriptor admission uses no-follow/nonblocking flags, while Windows verifies pre/post-open identity and retains the unavoidable reparse/open and kernel-stall boundary
+- the Cargo wrapper isolates a detached process group and performs bounded tree termination for ordinary wrapper signals; POSIX group settlement is also probed after natural Cargo close, while Windows `taskkill` is snapshot-based because Node does not provide Job Object ownership
+- a supervisor hard kill or failed tree-control proof can leave Cargo descendants outside cooperative ownership; the wrapper reports that boundary and does not claim quiescence for them
 - standalone API builds serve only the verified embedded generation; desktop API builds have no frontend fallback and Tauri owns `frontend/dist`
 - frontend mock mode is build-time gated via `__AXIAL_MOCK_API__` and lives at the `api()` seam in `frontend/src/mock/`; run it with `task dev:web:mock`
 - frontend package manager is `pnpm`, pinned through `frontend/package.json`

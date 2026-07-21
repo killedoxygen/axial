@@ -86,7 +86,6 @@ tasks:
 
   dev:
     desc: run the desktop app in dev mode (frontend dev server + Rust hot-restart)
-    dir: apps/desktop
     env:
       PORT: "{{.DEV_PORT}}"
     cmds:
@@ -101,12 +100,11 @@ tasks:
             exit 1
           fi
         platforms: [linux]
-      - cargo tauri dev --config '{{.DEV_TAURI_CONFIG}}' -- --locked
+      - "node scripts/cargo-target.mjs run -- cargo tauri dev --config '{{.DEV_TAURI_CONFIG}}' -- --locked"
 
   dev:windows:
     desc: run the desktop app in dev mode as a Windows app from Linux/WSL
     platforms: [linux]
-    dir: apps/desktop
     env:
       PORT: "{{.DEV_PORT}}"
     cmds:
@@ -115,7 +113,7 @@ tasks:
       - task: ensure:tauri-cli
       - task: toolchain:desktop
       - task: ensure:windows-cross
-      - cargo tauri dev --target {{.WINDOWS_TARGET}} --config '{{.DEV_TAURI_CONFIG}}' -- --locked
+      - "node scripts/cargo-target.mjs run -- cargo tauri dev --target {{.WINDOWS_TARGET}} --config '{{.DEV_TAURI_CONFIG}}' -- --locked"
 
   dev:web:
     desc: run the frontend-only dev server (browser mode, works headless)
@@ -144,7 +142,7 @@ tasks:
     cmds:
       - task: toolchain:rust
       - task: frontend:build
-      - cargo run --locked -p axial-api
+      - node scripts/cargo-target.mjs run -- cargo run --locked -p axial-api
 
   check:
     desc: run all static checks (matches CI)
@@ -155,14 +153,14 @@ tasks:
       - pnpm --dir frontend run format:check
       - task: frontend:build
       - cargo fmt --all --check
-      - cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+      - node scripts/cargo-target.mjs run -- cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 
   test:
     desc: run Rust workspace tests
     cmds:
       - task: toolchain:rust
       - task: frontend:build
-      - cargo test --workspace --locked
+      - node scripts/cargo-target.mjs run -- cargo test --workspace --locked
 
   verify:
     desc: run checks, tests, and a release desktop build (full CI parity)
@@ -227,8 +225,8 @@ tasks:
     cmds:
       - task: toolchain:rust
       - cargo fmt --all --check
-      - cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
-      - cargo test --workspace --locked
+      - node scripts/cargo-target.mjs run -- cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+      - node scripts/cargo-target.mjs run -- cargo test --workspace --locked
 
   verify:delivery:
     internal: true
@@ -237,7 +235,7 @@ tasks:
       - task: verify:contracts
       - task: verify:frontend
       - task: verify:rust:ready
-      - cargo build --locked -p axial-desktop --release
+      - node scripts/cargo-target.mjs run -- cargo build --locked -p axial-desktop --release
 
   verify:linux:
     desc: run the canonical Linux delivery inventory
@@ -257,9 +255,10 @@ tasks:
       - node --test scripts/tests/capability.test.mjs
       - node --test scripts/tests/contracts/p00-b03-contract.test.mjs scripts/tests/contracts/p00-b03-contract-cross-owner.test.mjs
       - node --test scripts/tests/contracts/p00-b12-contract.test.mjs scripts/tests/contracts/p00-b12-contract-cross-owner.test.mjs
+      - node --test scripts/tests/contracts/p00-b13-contract.test.mjs scripts/tests/contracts/p00-b13-contract-cross-owner.test.mjs
       - node scripts/verify-assets.mjs
-      - cargo check --workspace --all-targets --no-default-features --locked
-      - cargo test --locked -p axial-minecraft contained_
+      - node scripts/cargo-target.mjs run -- cargo check --workspace --all-targets --no-default-features --locked
+      - node scripts/cargo-target.mjs run -- cargo test --locked -p axial-minecraft contained_
 
   verify:native:macos:
     desc: compile the workspace and run native macOS process and priority contracts
@@ -271,11 +270,12 @@ tasks:
       - node --test scripts/tests/capability.test.mjs
       - node --test scripts/tests/contracts/p00-b03-contract.test.mjs scripts/tests/contracts/p00-b03-contract-cross-owner.test.mjs
       - node --test scripts/tests/contracts/p00-b12-contract.test.mjs scripts/tests/contracts/p00-b12-contract-cross-owner.test.mjs
+      - node --test scripts/tests/contracts/p00-b13-contract.test.mjs scripts/tests/contracts/p00-b13-contract-cross-owner.test.mjs
       - node scripts/verify-assets.mjs
-      - cargo check --workspace --all-targets --no-default-features --locked
-      - cargo test --locked -p axial-minecraft contained_
-      - cargo test --locked -p axial-api --no-default-features macos_system_low_priority_round_trip_restores_disk_policy
-      - cargo check --locked -p axial-desktop --target x86_64-apple-darwin
+      - node scripts/cargo-target.mjs run -- cargo check --workspace --all-targets --no-default-features --locked
+      - node scripts/cargo-target.mjs run -- cargo test --locked -p axial-minecraft contained_
+      - node scripts/cargo-target.mjs run -- cargo test --locked -p axial-api --no-default-features macos_system_low_priority_round_trip_restores_disk_policy
+      - node scripts/cargo-target.mjs run -- cargo check --locked -p axial-desktop --target x86_64-apple-darwin
 
   capability:self-test:
     desc: verify the fail-closed capability, toolchain, workflow, and frontend contracts
@@ -321,7 +321,7 @@ tasks:
     cmds:
       - task: toolchain:preflight
       - task: frontend:build
-      - cargo build --locked -p axial-desktop --release
+      - node scripts/cargo-target.mjs run -- cargo build --locked -p axial-desktop --release
       - cmd: echo "artifact → target/release/axial-desktop{{exeExt}}"
         silent: true
 
@@ -330,7 +330,7 @@ tasks:
     cmds:
       - task: toolchain:preflight
       - task: frontend:build
-      - cargo build --locked -p axial-desktop
+      - node scripts/cargo-target.mjs run -- cargo build --locked -p axial-desktop
       - cmd: echo "artifact → target/debug/axial-desktop{{exeExt}}"
         silent: true
 
@@ -340,7 +340,7 @@ tasks:
       - task: toolchain:preflight
       - task: ensure:windows-cross
       - task: frontend:build
-      - cargo build --locked -p axial-desktop --release --target {{.WINDOWS_TARGET}}
+      - node scripts/cargo-target.mjs run -- cargo build --locked -p axial-desktop --release --target {{.WINDOWS_TARGET}}
       - cmd: echo "artifact → target/{{.WINDOWS_TARGET}}/release/axial-desktop.exe"
         silent: true
 
@@ -350,7 +350,7 @@ tasks:
       - task: toolchain:preflight
       - task: ensure:windows-cross
       - task: frontend:build
-      - cargo build --locked -p axial-desktop --target {{.WINDOWS_TARGET}}
+      - node scripts/cargo-target.mjs run -- cargo build --locked -p axial-desktop --target {{.WINDOWS_TARGET}}
       - cmd: echo "artifact → target/{{.WINDOWS_TARGET}}/debug/axial-desktop.exe"
         silent: true
 
@@ -359,24 +359,23 @@ tasks:
     cmds:
       - task: toolchain:preflight
       - task: frontend:build
-      - cargo build --locked -p axial-api
+      - node scripts/cargo-target.mjs run -- cargo build --locked -p axial-api
 
   build:api:release:
     desc: build the release API binary
     cmds:
       - task: toolchain:preflight
       - task: frontend:build
-      - cargo build --locked -p axial-api --release
+      - node scripts/cargo-target.mjs run -- cargo build --locked -p axial-api --release
 
   bundle:
     desc: build native installers/bundles via tauri (.app/.dmg, .msi/.exe, .deb/.rpm)
-    dir: apps/desktop
     cmds:
       - task: toolchain:preflight
       - task: assets:verify
       - task: ensure:tauri-cli
       - task: toolchain:desktop
-      - cargo tauri build --config '{{.BUNDLE_TAURI_CONFIG}}' -- --locked
+      - "node scripts/cargo-target.mjs run -- cargo tauri build --config '{{.BUNDLE_TAURI_CONFIG}}' -- --locked"
 
   doctor:
     desc: show detected tools and platform state
@@ -414,7 +413,7 @@ tasks:
     desc: report Windows host Java and Minecraft/Axial folder evidence (redacted, no paths)
     silent: true
     cmds:
-      - cmd: powershell -NoProfile -ExecutionPolicy Bypass -File scripts/host-launch-evidence.ps1
+      - cmd: powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File scripts/host-launch-evidence.ps1
         platforms: [windows]
       - cmd: |
           if [ -z "${WSL_DISTRO_NAME:-}" ] && ! grep -qi microsoft /proc/version 2>/dev/null; then
@@ -433,11 +432,27 @@ tasks:
       - cmd: echo "windows_host_evidence skipped (not applicable on macOS)"
         platforms: [darwin]
 
+  storage:report:
+    desc: report bounded storage facts for this repository's canonical Cargo target
+    silent: true
+    cmds:
+      - node scripts/build-storage.mjs report
+
+  clean:cargo:release:
+    desc: remove this repository's host release Cargo output
+    cmds:
+      - node scripts/cargo-target.mjs run -- cargo clean --profile release
+
+  clean:cargo:windows:
+    desc: remove this repository's Windows GNU Cargo output
+    cmds:
+      - node scripts/cargo-target.mjs run -- cargo clean --target x86_64-pc-windows-gnu
+
   clean:
     desc: remove build outputs and caches
     cmds:
+      - node scripts/cargo-target.mjs run -- cargo clean
       - pnpm --dir frontend run clean
-      - cargo clean
       - rm -rf dist
 
   # ── internal helpers ──────────────────────────────────────────────
@@ -460,7 +475,7 @@ tasks:
   verify:contracts:
     internal: true
     cmds:
-      - node --test scripts/tests/toolchain.test.mjs scripts/tests/capability.test.mjs scripts/tests/dependency-policy.test.mjs scripts/tests/contracts/p00-b01-contract.test.mjs scripts/tests/contracts/p00-b01-contract-cross-owner.test.mjs scripts/tests/contracts/p00-b02-contract.test.mjs scripts/tests/contracts/p00-b03-contract.test.mjs scripts/tests/contracts/p00-b03-contract-cross-owner.test.mjs scripts/tests/contracts/p00-b12-contract.test.mjs scripts/tests/contracts/p00-b12-contract-cross-owner.test.mjs frontend/test/contracts/p00-b06-contract-cross-owner.test.mjs
+      - node --test scripts/tests/toolchain.test.mjs scripts/tests/capability.test.mjs scripts/tests/dependency-policy.test.mjs scripts/tests/contracts/p00-b01-contract.test.mjs scripts/tests/contracts/p00-b01-contract-cross-owner.test.mjs scripts/tests/contracts/p00-b02-contract.test.mjs scripts/tests/contracts/p00-b03-contract.test.mjs scripts/tests/contracts/p00-b03-contract-cross-owner.test.mjs scripts/tests/contracts/p00-b12-contract.test.mjs scripts/tests/contracts/p00-b12-contract-cross-owner.test.mjs scripts/tests/contracts/p00-b13-contract.test.mjs scripts/tests/contracts/p00-b13-contract-cross-owner.test.mjs frontend/test/contracts/p00-b06-contract-cross-owner.test.mjs
       - task: capability:audit
 
   assets:verify:

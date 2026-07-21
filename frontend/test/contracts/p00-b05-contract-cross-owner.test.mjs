@@ -50,7 +50,7 @@ test('frozen graph budgets cannot exceed the reviewed P00 baseline', async () =>
 });
 
 test('Task, Tauri, and release consume the same complete generation', async () => {
-  const [taskfile, tauri, release, ignore, prettierIgnore, packageManifest, esbuildScript, generation] =
+  const [taskfile, tauri, release, ignore, prettierIgnore, packageManifest, esbuildScript, generation, loopbackLease] =
     await Promise.all([
       read('Taskfile.yml'),
       read('apps/desktop/tauri.conf.json').then(JSON.parse),
@@ -60,6 +60,7 @@ test('Task, Tauri, and release consume the same complete generation', async () =
       read('frontend/package.json').then(JSON.parse),
       read('frontend/esbuild.mjs'),
       read('frontend/build-generation.mjs'),
+      read('scripts/loopback-lease.mjs'),
     ]);
   assert.equal(tauri.build.frontendDist, '../../frontend/dist');
   assert.equal(packageManifest.scripts.clean, 'node esbuild.mjs clean');
@@ -87,13 +88,17 @@ test('Task, Tauri, and release consume the same complete generation', async () =
     /invocation\.mode === 'watch'[\s\S]*?await reconcileFrontendPublication\(outputRoot\);[\s\S]*?context\(/,
   );
   assert.match(generation, /\['app\.js', 'app\.css', 'chunks'\]/);
-  assert.match(generation, /function leasePortForIdentity\(identity\)/);
+  assert.match(generation, /from '\.\.\/scripts\/loopback-lease\.mjs'/);
   assert.match(
     generation,
-    /const identity = await canonicalLeaseIdentity\(outputRoot\);\s+const port = leasePortForIdentity\(identity\);/,
+    /const identity = await portablePathLeaseIdentity\(outputRoot\);\s+const port = privateLoopbackLeasePort\(identity\);/,
   );
-  assert.match(generation, /server\.listen\(\{ host: '127\.0\.0\.1', port, exclusive: true \}\)/);
   assert.match(generation, /publication_lease_contended/);
+  assert.doesNotMatch(generation, /net\.createServer|server\.listen/);
+  assert.match(loopbackLease, /export async function portablePathLeaseIdentity\(candidate\)/);
+  assert.match(loopbackLease, /return path[\s\S]*?\.toLowerCase\(\)/);
+  assert.match(loopbackLease, /export function privateLoopbackLeasePort\(identity\)/);
+  assert.match(loopbackLease, /server\.listen\(\{ host: ["']127\.0\.0\.1["'], port, exclusive: true \}\)/);
 });
 
 test('standalone API embeds only manifest files and desktop has one Tauri payload', async () => {

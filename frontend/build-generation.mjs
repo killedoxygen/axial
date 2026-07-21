@@ -1,12 +1,15 @@
 import { createHash, randomUUID } from 'node:crypto';
-import net from 'node:net';
-import { lstat, mkdir, readFile, readdir, realpath, rename, rm, writeFile } from 'node:fs/promises';
+import { lstat, mkdir, readFile, readdir, rename, rm, writeFile } from 'node:fs/promises';
 import { watch as watchFileSystem } from 'node:fs';
 import path from 'node:path';
 
+import {
+  acquireExclusiveLoopbackPort,
+  portablePathLeaseIdentity,
+  privateLoopbackLeasePort,
+} from '../scripts/loopback-lease.mjs';
+
 const GENERATION_MANIFEST = 'generation.json';
-const PRIVATE_PORT_START = 49_152;
-const PRIVATE_PORT_COUNT = 16_384;
 const BUDGET_KEYS = Object.freeze([
   'initial_javascript',
   'initial_css',
@@ -371,55 +374,21 @@ export async function replacePublishedDirectoryOwned(stage, outputRoot, { rename
   }
 }
 
-async function canonicalLeaseIdentity(outputRoot) {
-  const resolved = path.resolve(outputRoot);
-  const canonicalParent = await realpath(path.dirname(resolved));
-  const canonical = path.normalize(path.join(canonicalParent, path.basename(resolved)));
-  return canonical.toLowerCase();
-}
-
-function leasePortForIdentity(identity) {
-  const digest = createHash('sha256').update(identity).digest();
-  return PRIVATE_PORT_START + (digest.readUInt32BE(0) % PRIVATE_PORT_COUNT);
-}
-
 export async function frontendGenerationLeasePort(outputRoot) {
-  return leasePortForIdentity(await canonicalLeaseIdentity(outputRoot));
+  return privateLoopbackLeasePort(await portablePathLeaseIdentity(outputRoot));
 }
 
 export async function acquireFrontendGenerationLease(outputRoot) {
-  const identity = await canonicalLeaseIdentity(outputRoot);
-  const port = leasePortForIdentity(identity);
-  const server = net.createServer((socket) => socket.destroy());
-  server.unref();
-  await new Promise((resolve, reject) => {
-    const onError = (error) => {
-      server.removeListener('listening', onListening);
-      if (error?.code === 'EADDRINUSE') {
-        reject(new Error(`frontend_generation:publication_lease_contended:${identity}:${port}`));
-      } else {
-        reject(error);
-      }
-    };
-    const onListening = () => {
-      server.removeListener('error', onError);
-      resolve();
-    };
-    server.once('error', onError);
-    server.once('listening', onListening);
-    server.listen({ host: '127.0.0.1', port, exclusive: true });
-  });
-  let released = false;
-  return async () => {
-    if (released) return;
-    await new Promise((resolve, reject) => {
-      server.close((error) => {
-        if (error) reject(error);
-        else resolve();
-      });
-    });
-    released = true;
-  };
+  const identity = await portablePathLeaseIdentity(outputRoot);
+  const port = privateLoopbackLeasePort(identity);
+  try {
+    return await acquireExclusiveLoopbackPort(port, { unref: true });
+  } catch (error) {
+    if (error?.code === 'EADDRINUSE') {
+      throw new Error(`frontend_generation:publication_lease_contended:${identity}:${port}`);
+    }
+    throw error;
+  }
 }
 
 export async function reconcileFrontendPublicationOwned(outputRoot) {

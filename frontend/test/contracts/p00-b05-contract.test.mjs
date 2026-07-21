@@ -489,11 +489,18 @@ test('clean removes current generations and retired generated static outputs onl
 });
 
 test('clean remains dependency-free when node_modules is absent', async () => {
-  const frontendRoot = await mkdtemp(path.join(os.tmpdir(), 'axial-p00-b05-clean-'));
+  const fixtureRoot = await mkdtemp(path.join(os.tmpdir(), 'axial-p00-b05-clean-'));
+  const frontendRoot = path.join(fixtureRoot, 'frontend');
   try {
+    await mkdir(frontendRoot);
+    await mkdir(path.join(fixtureRoot, 'scripts'));
     for (const script of ['build-config.mjs', 'build-generation.mjs', 'esbuild.mjs']) {
       await copyFile(path.join(frontendDependencyRoot, script), path.join(frontendRoot, script));
     }
+    await copyFile(
+      path.join(repositoryRoot, 'scripts/loopback-lease.mjs'),
+      path.join(fixtureRoot, 'scripts/loopback-lease.mjs'),
+    );
     await mkdir(path.join(frontendRoot, 'dist'));
     await mkdir(path.join(frontendRoot, 'dist.stage-stale'));
     await mkdir(path.join(frontendRoot, 'static/chunks'), { recursive: true });
@@ -510,7 +517,7 @@ test('clean remains dependency-free when node_modules is absent', async () => {
     await assert.rejects(() => readFile(path.join(frontendRoot, 'static/app.js')), /ENOENT/);
     assert.equal(await readFile(path.join(frontendRoot, 'static/index.html'), 'utf8'), 'source');
   } finally {
-    await rm(frontendRoot, { recursive: true, force: true });
+    await rm(fixtureRoot, { recursive: true, force: true });
   }
 });
 
@@ -782,7 +789,7 @@ test('the loopback lease admits one owner and blocks mutation by every loser', a
       assert.equal(buildStarted, false);
       assert.deepEqual(await fileInventory(outputRoot), inventory);
     } finally {
-      await release();
+      await Promise.all([release(), release(), release()]);
       await release();
     }
 
